@@ -1,0 +1,23 @@
+# Rust
+/target
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude
+CLAUDE.md
+
+# Opencode
+AGENTS.md
+
+# Cursor
+.cursor
+
+# Zed
+.zed
+
+# Credentials (should never be committed)
+*.pem
+*.key
