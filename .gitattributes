@@ -1,0 +1,9 @@
+# Normalize line endings to LF in repository
+* text=auto eol=lf
+
+# Shell scripts MUST use LF (even on Windows Git Bash)
+*.sh text eol=lf
+
+# Windows scripts use CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf

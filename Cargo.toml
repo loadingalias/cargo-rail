@@ -1,0 +1,10 @@
+[package]
+name = "cargo-rail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+authors = ["cargo-rail contributors"]
+description = "A modern, pure Rust implementation of source code transformation and migration tooling"
+
+[dependencies]
