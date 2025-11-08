@@ -25,6 +25,6 @@ mod new_tests {
   }
 }
 
-pub fn another_mono_feature() -> &str {
+pub fn another_mono_feature() -> &'static str {
   "From monorepo"
 }

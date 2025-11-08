@@ -79,7 +79,9 @@ pub fn run_init(all: bool) -> Result<()> {
       remote: String::new(), // Empty - user will fill this in
       branch: "main".to_string(),
       mode: SplitMode::Single,
-      paths: vec![CratePath { path: crate_path.into() }],
+      paths: vec![CratePath {
+        path: crate_path.into(),
+      }],
       include: vec![
         "src/**".to_string(),
         "tests/**".to_string(),
