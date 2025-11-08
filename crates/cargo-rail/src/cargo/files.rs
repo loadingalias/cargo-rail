@@ -17,12 +17,17 @@ struct AuxiliaryFile {
   target_path: PathBuf,
 }
 
+/// Handler for project files (README, LICENSE) with crate-first, workspace-fallback logic
+pub struct ProjectFiles {
+  files: Vec<AuxiliaryFile>,
+}
+
 impl AuxiliaryFiles {
   /// Discover auxiliary files in workspace that should be copied to split repos
   pub fn discover(workspace_root: &Path) -> Result<Self> {
     let mut files = Vec::new();
 
-    // Common auxiliary files to look for
+    // Common auxiliary files to look for (workspace-level configs)
     let candidates = vec![
       ("rust-toolchain.toml", "rust-toolchain.toml"),
       ("rust-toolchain", "rust-toolchain"),
@@ -30,6 +35,7 @@ impl AuxiliaryFiles {
       (".rustfmt.toml", ".rustfmt.toml"),
       (".cargo/config.toml", ".cargo/config.toml"),
       (".cargo/config", ".cargo/config"),
+      ("deny.toml", "deny.toml"),
       (".editorconfig", ".editorconfig"),
     ];
 
@@ -88,6 +94,75 @@ impl AuxiliaryFiles {
   /// Check if any files were discovered
   pub fn is_empty(&self) -> bool {
     self.files.is_empty()
+  }
+}
+
+impl ProjectFiles {
+  /// Discover project files with crate-first, workspace-fallback logic
+  pub fn discover(workspace_root: &Path, crate_path: &Path) -> Result<Self> {
+    let mut files = Vec::new();
+
+    // Project files to look for (check crate dir first, then workspace root)
+    let candidates = vec![
+      "README.md",
+      "LICENSE",
+      "LICENSE-MIT",
+      "LICENSE-APACHE",
+    ];
+
+    for filename in candidates {
+      // Check crate directory first
+      let crate_file = crate_path.join(filename);
+      let workspace_file = workspace_root.join(filename);
+
+      let source_path = if crate_file.exists() && crate_file.is_file() {
+        crate_file
+      } else if workspace_file.exists() && workspace_file.is_file() {
+        workspace_file
+      } else {
+        continue; // File doesn't exist in either location
+      };
+
+      files.push(AuxiliaryFile {
+        source_path,
+        target_path: PathBuf::from(filename),
+      });
+    }
+
+    Ok(Self { files })
+  }
+
+  /// Copy discovered project files to split repo
+  pub fn copy_to_split(&self, workspace_root: &Path, target_repo_root: &Path) -> Result<()> {
+    for file in &self.files {
+      let target_path = target_repo_root.join(&file.target_path);
+
+      // Copy the file
+      fs::copy(&file.source_path, &target_path).with_context(|| {
+        format!(
+          "Failed to copy {} to {}",
+          file.source_path.display(),
+          target_path.display()
+        )
+      })?;
+
+      println!(
+        "  📄 Copied {} to {}",
+        file
+          .source_path
+          .strip_prefix(workspace_root)
+          .unwrap_or(&file.source_path)
+          .display(),
+        file.target_path.display()
+      );
+    }
+
+    Ok(())
+  }
+
+  /// Get count of discovered files
+  pub fn count(&self) -> usize {
+    self.files.len()
   }
 }
 

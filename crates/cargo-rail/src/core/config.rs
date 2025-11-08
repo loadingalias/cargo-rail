@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Configuration for cargo-rail, stored in .rail/config.toml
+/// Configuration for cargo-rail
+/// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RailConfig {
   pub workspace: WorkspaceConfig,
@@ -20,17 +21,21 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitConfig {
   pub name: String,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub path: Option<PathBuf>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub paths: Option<Vec<PathBuf>>,
   pub remote: String,
   pub branch: String,
   pub mode: SplitMode,
   #[serde(default)]
+  pub paths: Vec<CratePath>,
+  #[serde(default)]
   pub include: Vec<String>,
   #[serde(default)]
   pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CratePath {
+  #[serde(rename = "crate")]
+  pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,9 +46,28 @@ pub enum SplitMode {
 }
 
 impl RailConfig {
-  /// Load config from .rail/config.toml
+  /// Find config file in search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+  fn find_config_path(path: &Path) -> Option<PathBuf> {
+    let candidates = vec![
+      path.join("rail.toml"),
+      path.join(".rail.toml"),
+      path.join(".cargo").join("rail.toml"),
+      path.join(".config").join("rail.toml"),
+    ];
+
+    candidates.into_iter().find(|p| p.exists())
+  }
+
+  /// Load config from rail.toml (searches multiple locations)
   pub fn load(path: &Path) -> Result<Self> {
-    let config_path = path.join(".rail").join("config.toml");
+    let config_path = Self::find_config_path(path).ok_or_else(|| {
+      anyhow::anyhow!(
+        "No cargo-rail configuration found.\n\
+         Searched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\n\
+         Run `cargo rail init` to create one."
+      )
+    })?;
+
     let content = fs::read_to_string(&config_path)
       .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
     let config: RailConfig =
@@ -51,13 +75,9 @@ impl RailConfig {
     Ok(config)
   }
 
-  /// Save config to .rail/config.toml
+  /// Save config to rail.toml (default location)
   pub fn save(&self, path: &Path) -> Result<()> {
-    let rail_dir = path.join(".rail");
-    fs::create_dir_all(&rail_dir)
-      .with_context(|| format!("Failed to create .rail directory at {}", rail_dir.display()))?;
-
-    let config_path = rail_dir.join("config.toml");
+    let config_path = path.join("rail.toml");
     let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
     fs::write(&config_path, content).with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     Ok(())
@@ -65,7 +85,7 @@ impl RailConfig {
 
   /// Check if config exists at the given path
   pub fn exists(path: &Path) -> bool {
-    path.join(".rail").join("config.toml").exists()
+    Self::find_config_path(path).is_some()
   }
 
   /// Create a new empty config
@@ -80,37 +100,44 @@ impl RailConfig {
 impl SplitConfig {
   /// Get the path(s) for this split configuration
   pub fn get_paths(&self) -> Vec<&PathBuf> {
-    if let Some(ref path) = self.path {
-      vec![path]
-    } else if let Some(ref paths) = self.paths {
-      paths.iter().collect()
-    } else {
-      Vec::new()
-    }
+    self.paths.iter().map(|cp| &cp.path).collect()
   }
 
   /// Validate the split configuration
   pub fn validate(&self) -> Result<()> {
+    // Check paths exist
+    if self.paths.is_empty() {
+      anyhow::bail!("Split '{}' must have at least one crate path", self.name);
+    }
+
+    // Check remote is not empty
+    if self.remote.is_empty() {
+      anyhow::bail!(
+        "Split '{}' has no remote configured.\n\
+         → Edit rail.toml and set the remote URL (e.g., git@github.com:user/{}.git)",
+        self.name,
+        self.name
+      );
+    }
+
+    // Validate mode-specific requirements
     match self.mode {
       SplitMode::Single => {
-        if self.path.is_none() {
-          anyhow::bail!("Single mode split '{}' must have 'path' field", self.name);
-        }
-        if self.paths.is_some() {
-          anyhow::bail!("Single mode split '{}' cannot have 'paths' field", self.name);
+        if self.paths.len() != 1 {
+          anyhow::bail!(
+            "Single mode split '{}' must have exactly one path (found {})",
+            self.name,
+            self.paths.len()
+          );
         }
       }
       SplitMode::Combined => {
-        if self.paths.is_none() {
-          anyhow::bail!("Combined mode split '{}' must have 'paths' field", self.name);
-        }
-        if self.path.is_some() {
-          anyhow::bail!("Combined mode split '{}' cannot have 'path' field", self.name);
-        }
-        if let Some(ref paths) = self.paths
-          && paths.is_empty()
-        {
-          anyhow::bail!("Combined mode split '{}' must have at least one path", self.name);
+        if self.paths.len() < 2 {
+          anyhow::bail!(
+            "Combined mode split '{}' should have multiple paths (found {})",
+            self.name,
+            self.paths.len()
+          );
         }
       }
     }

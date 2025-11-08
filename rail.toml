@@ -1,0 +1,53 @@
+[workspace]
+root = "/Users/mr.wolf/loadingalias/cargo-rail"
+
+[[splits]]
+name = "cargo-rail"
+remote = ""
+branch = "main"
+mode = "single"
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "benches/**",
+    "Cargo.toml",
+]
+exclude = []
+
+[[splits.paths]]
+crate = "crates/cargo-rail"
+
+[[splits]]
+name = "test-crate-a"
+remote = "git@github.com:loadingalias/cargo-rail-test-public.git"
+branch = "main"
+mode = "single"
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "benches/**",
+    "Cargo.toml",
+]
+exclude = []
+
+[[splits.paths]]
+crate = "crates/test-crate-a"
+
+[[splits]]
+name = "test-crate-b"
+remote = "git@github.com:loadingalias/cargo-rail-test-private.git"
+branch = "main"
+mode = "single"
+include = [
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "benches/**",
+    "Cargo.toml",
+]
+exclude = []
+
+[[splits.paths]]
+crate = "crates/test-crate-b"

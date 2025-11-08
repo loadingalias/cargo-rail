@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cargo::metadata::WorkspaceMetadata;
-use crate::core::config::{RailConfig, SplitConfig, SplitMode};
+use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode};
 
 /// Run the init command to set up cargo-rail configuration
 pub fn run_init(all: bool) -> Result<()> {
@@ -61,24 +61,11 @@ pub fn run_init(all: bool) -> Result<()> {
   // Create config with selected crates
   let mut config = RailConfig::new(workspace_root.clone());
 
-  println!("\n🔧 Configuring selected crates...");
+  println!("\n🔧 Scaffolding configuration for selected crates...");
   for idx in selected_indices {
     let pkg = &crates[idx];
-    println!("\n📦 Configuring: {}", pkg.name);
 
-    // Prompt for remote URL
-    print!("  Remote URL (e.g., git@github.com:user/{}.git): ", pkg.name);
-    io::stdout().flush()?;
-    let mut remote = String::new();
-    io::stdin().read_line(&mut remote)?;
-    let remote = remote.trim().to_string();
-
-    if remote.is_empty() {
-      println!("  ⚠️  Skipping {} (no remote provided)", pkg.name);
-      continue;
-    }
-
-    // Default to single mode and main branch
+    // Get crate path relative to workspace root
     let crate_path = pkg
       .manifest_path
       .parent()
@@ -89,22 +76,21 @@ pub fn run_init(all: bool) -> Result<()> {
 
     config.splits.push(SplitConfig {
       name: pkg.name.to_string(),
-      path: Some(crate_path.into()),
-      paths: None,
-      remote,
+      remote: String::new(), // Empty - user will fill this in
       branch: "main".to_string(),
       mode: SplitMode::Single,
+      paths: vec![CratePath { path: crate_path.into() }],
       include: vec![
         "src/**".to_string(),
+        "tests/**".to_string(),
+        "examples/**".to_string(),
+        "benches/**".to_string(),
         "Cargo.toml".to_string(),
-        "README.md".to_string(),
-        "LICENSE".to_string(),
-        "rust-toolchain.toml".to_string(),
       ],
       exclude: vec![],
     });
 
-    println!("  ✅ Configured {}", pkg.name);
+    println!("  ✅ {}", pkg.name);
   }
 
   // Save configuration
@@ -112,13 +98,12 @@ pub fn run_init(all: bool) -> Result<()> {
   config.save(&workspace_root)?;
 
   println!("\n✅ Successfully initialized cargo-rail!");
-  println!(
-    "   Configuration saved to: {}/.rail/config.toml",
-    workspace_root.display()
-  );
+  println!("   Configuration saved to: {}/rail.toml", workspace_root.display());
   println!("\n🚀 Next steps:");
-  println!("   1. Create empty target repositories on GitHub/GitLab");
-  println!("   2. Run: cargo rail split --all");
+  println!("   1. Edit rail.toml and fill in the remote URLs for each crate");
+  println!("      Example: remote = \"git@github.com:user/crate-name.git\"");
+  println!("   2. Create empty target repositories on GitHub/GitLab");
+  println!("   3. Run: cargo rail split <crate-name>");
 
   Ok(())
 }
