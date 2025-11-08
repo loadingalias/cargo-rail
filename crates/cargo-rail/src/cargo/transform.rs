@@ -44,8 +44,8 @@ impl CargoTransform {
   fn flatten_workspace_inheritance(&self, doc: &mut DocumentMut) -> Result<()> {
     // Load workspace Cargo.toml to get inherited values
     let workspace_toml_path = self.workspace_metadata.workspace_root().join("Cargo.toml");
-    let workspace_content = std::fs::read_to_string(&workspace_toml_path)
-      .context("Failed to read workspace Cargo.toml")?;
+    let workspace_content =
+      std::fs::read_to_string(&workspace_toml_path).context("Failed to read workspace Cargo.toml")?;
     let workspace_doc = workspace_content
       .parse::<DocumentMut>()
       .context("Failed to parse workspace Cargo.toml")?;

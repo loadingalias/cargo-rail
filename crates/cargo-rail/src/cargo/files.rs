@@ -103,12 +103,7 @@ impl ProjectFiles {
     let mut files = Vec::new();
 
     // Project files to look for (check crate dir first, then workspace root)
-    let candidates = vec![
-      "README.md",
-      "LICENSE",
-      "LICENSE-MIT",
-      "LICENSE-APACHE",
-    ];
+    let candidates = vec!["README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE"];
 
     for filename in candidates {
       // Check crate directory first
