@@ -8,3 +8,26 @@ authors = ["cargo-rail contributors"]
 description = "A modern, pure Rust implementation of source code transformation and migration tooling"
 
 [dependencies]
+# Git operations (pure Rust gitoxide)
+gix = "0.74.1"
+
+# CLI parsing with completions
+clap = { version = "4.5.51", features = ["derive", "cargo"] }
+anstyle = "1.0.13"
+
+# Workspace introspection
+cargo_metadata = "0.23.0"
+
+# Lossless TOML editing (preserves formatting)
+toml_edit = "0.23.7"
+
+# Error handling
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+
+# Serialization for config
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"
+
+[dev-dependencies]
+tempfile = "3.23.0"

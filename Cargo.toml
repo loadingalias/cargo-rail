@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "crates/cargo-rail",
+  "crates/test-crate-a",
+  "crates/test-crate-b",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+authors = ["cargo-rail contributors"]
+
+[workspace.dependencies]
+# Shared dependencies
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+
+# Test crate dependencies
+test-crate-a = { path = "crates/test-crate-a", version = "0.1.0" }
+test-crate-b = { path = "crates/test-crate-b", version = "0.1.0" }
