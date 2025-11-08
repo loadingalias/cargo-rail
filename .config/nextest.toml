@@ -1,0 +1,8 @@
+[profile.default]
+status-level = "pass"
+success-output = "never"
+failure-output = "immediate"
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "30s", terminate-after = 4 }
+retries = 0
