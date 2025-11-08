@@ -24,3 +24,7 @@ mod new_tests {
     assert!(true);
   }
 }
+
+pub fn another_mono_feature() -> &str {
+  "From monorepo"
+}
