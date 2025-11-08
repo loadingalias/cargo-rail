@@ -12,3 +12,7 @@ mod tests {
     assert_eq!(hello_from_b(), "Hello from crate B!");
   }
 }
+
+pub fn new_feature() -> String {
+  "This is a new feature!".to_string()
+}
