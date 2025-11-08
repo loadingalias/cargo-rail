@@ -42,13 +42,30 @@ impl CargoTransform {
 
   /// Flatten workspace = true fields with actual values
   fn flatten_workspace_inheritance(&self, doc: &mut DocumentMut) -> Result<()> {
-    // Get workspace package metadata if it exists
-    let workspace_package = doc.get("package").and_then(|p| p.as_table()).cloned();
+    // Load workspace Cargo.toml to get inherited values
+    let workspace_toml_path = self.workspace_metadata.workspace_root().join("Cargo.toml");
+    let workspace_content = std::fs::read_to_string(&workspace_toml_path)
+      .context("Failed to read workspace Cargo.toml")?;
+    let workspace_doc = workspace_content
+      .parse::<DocumentMut>()
+      .context("Failed to parse workspace Cargo.toml")?;
 
-    if let Some(package) = workspace_package
-      && let Some(package_table) = doc.get_mut("package").and_then(|p| p.as_table_like_mut())
-    {
-      // Fields that can be inherited from workspace
+    // Get workspace.package section
+    let workspace_pkg = workspace_doc
+      .get("workspace")
+      .and_then(|w| w.as_table())
+      .and_then(|t| t.get("package"))
+      .and_then(|p| p.as_table());
+
+    // Get workspace.dependencies section
+    let workspace_deps = workspace_doc
+      .get("workspace")
+      .and_then(|w| w.as_table())
+      .and_then(|t| t.get("dependencies"))
+      .and_then(|d| d.as_table());
+
+    // Flatten [package] fields
+    if let Some(package_table) = doc.get_mut("package").and_then(|p| p.as_table_like_mut()) {
       let inheritable_fields = [
         "version",
         "authors",
@@ -64,19 +81,72 @@ impl CargoTransform {
       ];
 
       for field in inheritable_fields {
-        if let Some(value) = package.get(field)
-          && value
-            .as_table()
-            .and_then(|t| t.get("workspace"))
-            .and_then(|w| w.as_bool())
-            == Some(true)
-        {
-          // Get actual value from workspace Cargo.toml
-          // For now, we'll handle version specifically since it's most common
-          if field == "version" {
-            // Try to get from our crate's package
-            if let Some(pkg) = self.workspace_metadata.list_crates().first() {
-              package_table.insert(field, Item::Value(Value::from(pkg.version.to_string())));
+        // Check if field has workspace = true (handles both inline table and regular table)
+        let has_workspace_inheritance = if let Some(value) = package_table.get(field) {
+          // Check if it's an inline table with workspace = true
+          if let Some(inline_table) = value.as_inline_table() {
+            inline_table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+          }
+          // Check if it's a regular table with workspace = true
+          else if let Some(table) = value.as_table() {
+            table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+          }
+          // Check if it's a table-like with workspace = true
+          else if let Some(table_like) = value.as_table_like() {
+            table_like.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+          } else {
+            false
+          }
+        } else {
+          false
+        };
+
+        if has_workspace_inheritance {
+          // Replace with actual value from workspace
+          if let Some(workspace_pkg) = workspace_pkg
+            && let Some(workspace_value) = workspace_pkg.get(field)
+          {
+            // Insert the actual value
+            package_table.insert(field, workspace_value.clone());
+          }
+        }
+      }
+    }
+
+    // Flatten [dependencies], [dev-dependencies], [build-dependencies]
+    let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+    for section in dep_sections {
+      if let Some(deps_table) = doc.get_mut(section).and_then(|d| d.as_table_like_mut()) {
+        let dep_names: Vec<String> = deps_table.iter().map(|(k, _)| k.to_string()).collect();
+
+        for dep_name in dep_names {
+          // Check if dependency has workspace = true
+          let has_workspace_inheritance = if let Some(value) = deps_table.get(&dep_name) {
+            // Check if it's an inline table with workspace = true
+            if let Some(inline_table) = value.as_inline_table() {
+              inline_table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+            }
+            // Check if it's a regular table with workspace = true
+            else if let Some(table) = value.as_table() {
+              table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+            }
+            // Check if it's a table-like with workspace = true
+            else if let Some(table_like) = value.as_table_like() {
+              table_like.get("workspace").and_then(|w| w.as_bool()) == Some(true)
+            } else {
+              false
+            }
+          } else {
+            false
+          };
+
+          if has_workspace_inheritance {
+            // Replace with actual value from workspace.dependencies
+            if let Some(workspace_deps) = workspace_deps
+              && let Some(workspace_dep) = workspace_deps.get(&dep_name)
+            {
+              // Insert the actual value
+              deps_table.insert(&dep_name, workspace_dep.clone());
             }
           }
         }

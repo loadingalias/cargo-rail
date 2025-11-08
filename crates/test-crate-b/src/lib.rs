@@ -16,3 +16,11 @@ mod tests {
 pub fn new_feature() -> String {
   "This is a new feature!".to_string()
 }
+
+#[cfg(test)]
+mod new_tests {
+  #[test]
+  fn test_from_remote() {
+    assert!(true);
+  }
+}

@@ -131,6 +131,12 @@ impl MappingStore {
   pub fn push_notes(&self, repo_path: &Path, remote: &str) -> Result<()> {
     use std::process::Command;
 
+    // Skip if no mappings exist
+    if self.mappings.is_empty() {
+      println!("   No git-notes to push (no mappings recorded)");
+      return Ok(());
+    }
+
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
 
     println!("   Pushing git-notes to remote '{}'...", remote);

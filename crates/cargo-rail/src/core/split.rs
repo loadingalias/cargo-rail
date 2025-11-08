@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::cargo::files::AuxiliaryFiles;
+use crate::cargo::files::{AuxiliaryFiles, ProjectFiles};
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::cargo::transform::CargoTransform;
 use crate::core::config::SplitMode;
@@ -245,21 +245,74 @@ impl Splitter {
     Ok(commit_sha)
   }
 
-  /// Execute a split operation
+  /// Check if remote repository exists and has content
+  fn check_remote_exists(&self, remote_url: &str) -> Result<bool> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+      .args(["ls-remote", "--heads", remote_url])
+      .output()
+      .context("Failed to check remote")?;
+
+    // If command succeeds and has output, remote exists with content
+    Ok(output.status.success() && !output.stdout.is_empty())
+  }
+
+  /// Clone remote repository to local path
+  fn clone_remote(&self, remote_url: &str, target_path: &Path) -> Result<()> {
+    use std::process::Command;
+
+    println!("   Cloning existing remote repository...");
+
+    let output = Command::new("git")
+      .args(["clone", remote_url, target_path.to_str().unwrap()])
+      .output()
+      .context("Failed to clone remote")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      anyhow::bail!("git clone failed: {}", stderr);
+    }
+
+    println!("   ✅ Cloned remote repository");
+    Ok(())
+  }
+
+  /// Execute a split operation (ONE-TIME ONLY - use sync for updates)
   pub fn split(&self, config: &SplitConfig) -> Result<()> {
     println!("🚂 Splitting crate: {}", config.crate_name);
     println!("   Mode: {:?}", config.mode);
     println!("   Target: {}", config.target_repo_path.display());
 
-    // Ensure target repo exists and is initialized
+    // Check if remote already exists - if so, error with helpful message
+    if let Some(ref remote_url) = config.remote_url {
+      let remote_exists = self.check_remote_exists(remote_url)?;
+      if remote_exists {
+        anyhow::bail!(
+          "Split already exists at {}\n\n\
+           Split is a one-time operation. To update the split repo, use:\n  \
+           cargo rail sync {}\n\n\
+           This will sync new commits from the monorepo to the split repo.",
+          remote_url,
+          config.crate_name
+        );
+      }
+    }
+
+    // Create fresh target repo
     self.ensure_target_repo(&config.target_repo_path)?;
 
     // Create transformer for Cargo.toml
     let transformer = CargoTransform::new(WorkspaceMetadata::load(&self.workspace_root)?);
 
-    // Discover auxiliary files
+    // Discover workspace-level auxiliary files (rust-toolchain, rustfmt, etc.)
     let aux_files = AuxiliaryFiles::discover(&self.workspace_root)?;
-    println!("   Found {} auxiliary files to copy", aux_files.count());
+    println!("   Found {} workspace config files", aux_files.count());
+
+    // Discover project files (README, LICENSE) with crate-first fallback
+    let crate_path = &config.crate_paths[0]; // Use first crate path for project files
+    let project_files = ProjectFiles::discover(&self.workspace_root, crate_path)?;
+    println!("   Found {} project files (README, LICENSE)", project_files.count());
 
     // Create mapping store
     let mut mapping_store = MappingStore::new(config.crate_name.clone());
@@ -318,12 +371,14 @@ impl Splitter {
         mapping_store.record_mapping(&commit.sha, &new_sha)?;
       }
 
-      // Copy auxiliary files to the final state
-      if !aux_files.is_empty() {
-        println!("   Copying auxiliary files");
+      // Copy workspace config files and project files to the final state
+      let has_files = !aux_files.is_empty() || project_files.count() > 0;
+      if has_files {
+        println!("   Copying workspace configs and project files...");
         aux_files.copy_to_split(&self.workspace_root, &config.target_repo_path)?;
+        project_files.copy_to_split(&self.workspace_root, &config.target_repo_path)?;
 
-        // Create a final commit for auxiliary files if any were added
+        // Create a final commit if any files were added
         let status = std::process::Command::new("git")
           .current_dir(&config.target_repo_path)
           .args(["status", "--porcelain"])
@@ -337,14 +392,15 @@ impl Splitter {
             .status()?;
           std::process::Command::new("git")
             .current_dir(&config.target_repo_path)
-            .args(["commit", "-m", "Add auxiliary files (rust-toolchain, rustfmt, etc.)"])
+            .args(["commit", "-m", "Add workspace configs and project files"])
             .status()?;
         }
       }
     }
 
-    // Save mappings
+    // Save mappings to both workspace and target repo
     mapping_store.save(&self.workspace_root)?;
+    mapping_store.save(&config.target_repo_path)?;
 
     // Push to remote if URL is configured
     if let Some(ref remote_url) = config.remote_url {
