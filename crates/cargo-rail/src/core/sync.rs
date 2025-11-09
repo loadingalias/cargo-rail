@@ -3,8 +3,9 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::core::config::SplitMode;
+use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::mapping::MappingStore;
+use crate::core::security::SecurityValidator;
 use crate::core::transform::{Transform, TransformContext};
 use crate::core::vcs::Vcs;
 use crate::core::vcs::git::GitBackend;
@@ -47,12 +48,20 @@ pub struct SyncEngine {
   mono_git: GitBackend,
   mapping_store: MappingStore,
   transformer: Box<dyn Transform>,
+  security_config: SecurityConfig,
+  security_validator: SecurityValidator,
 }
 
 impl SyncEngine {
-  pub fn new(workspace_root: PathBuf, config: SyncConfig, transformer: Box<dyn Transform>) -> Result<Self> {
+  pub fn new(
+    workspace_root: PathBuf,
+    config: SyncConfig,
+    transformer: Box<dyn Transform>,
+    security_config: SecurityConfig,
+  ) -> Result<Self> {
     let mono_git = GitBackend::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
+    let security_validator = SecurityValidator::new(security_config.clone());
 
     Ok(Self {
       workspace_root,
@@ -60,6 +69,8 @@ impl SyncEngine {
       mono_git,
       mapping_store,
       transformer,
+      security_config,
+      security_validator,
     })
   }
 
@@ -81,6 +92,12 @@ impl SyncEngine {
 
   pub fn sync_to_remote(&mut self) -> Result<SyncResult> {
     println!("   Syncing monorepo → remote...");
+
+    // Validate SSH key before any remote operations
+    if !self.is_local_remote() {
+      self.security_validator.validate_ssh_key()?;
+      self.security_validator.validate_signing_key()?;
+    }
 
     // Load mappings
     self.mapping_store.load(&self.workspace_root)?;
@@ -159,6 +176,29 @@ impl SyncEngine {
   pub fn sync_from_remote(&mut self) -> Result<SyncResult> {
     println!("   Syncing remote → monorepo...");
 
+    // Validate SSH key before any remote operations
+    if !self.is_local_remote() {
+      self.security_validator.validate_ssh_key()?;
+      self.security_validator.validate_signing_key()?;
+    }
+
+    // Check current branch - NEVER commit directly to protected branches
+    let current_branch = self.mono_git.current_branch()?;
+    let needs_pr_branch = self.security_config.protected_branches.contains(&current_branch);
+
+    let pr_branch_name = if needs_pr_branch {
+      let pr_branch = self.security_validator.generate_pr_branch(&self.config.crate_name);
+      println!("   ⚠️  Current branch '{}' is protected", current_branch);
+      println!("   📝 Creating PR branch: {}", pr_branch);
+
+      // Create and checkout the PR branch
+      self.mono_git.create_and_checkout_branch(&pr_branch)?;
+
+      Some(pr_branch)
+    } else {
+      None
+    };
+
     // Load mappings
     self.mapping_store.load(&self.workspace_root)?;
 
@@ -228,6 +268,25 @@ impl SyncEngine {
 
     // Save mappings
     self.mapping_store.save(&self.workspace_root)?;
+
+    // If we created a PR branch, remind the user to create a pull request
+    if let Some(ref pr_branch) = pr_branch_name {
+      println!("\n   🎯 Changes synced to PR branch: {}", pr_branch);
+      println!("   📝 Next steps:");
+      println!(
+        "      1. Review the changes: git diff {}..{}",
+        current_branch, pr_branch
+      );
+      println!("      2. Push the branch: git push origin {}", pr_branch);
+      println!(
+        "      3. Create a pull request from {} to {}",
+        pr_branch, current_branch
+      );
+      println!(
+        "\n   ⚠️  Protected branch '{}' was NOT modified directly",
+        current_branch
+      );
+    }
 
     Ok(SyncResult {
       commits_synced: synced_count,

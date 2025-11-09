@@ -99,8 +99,13 @@ pub fn run_sync(crate_name: Option<String>, all: bool, from_remote: bool, to_rem
     let metadata = WorkspaceMetadata::load(&config.workspace.root)?;
     let transformer = Box::new(CargoTransform::new(metadata));
 
-    // Create sync engine
-    let mut engine = SyncEngine::new(config.workspace.root.clone(), sync_config, transformer)?;
+    // Create sync engine with security config
+    let mut engine = SyncEngine::new(
+      config.workspace.root.clone(),
+      sync_config,
+      transformer,
+      config.security.clone(),
+    )?;
 
     // Perform sync based on direction
     let result = match direction {

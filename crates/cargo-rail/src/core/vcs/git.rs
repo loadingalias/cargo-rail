@@ -282,6 +282,73 @@ impl GitBackend {
         .map(|(_, url)| url),
     )
   }
+
+  /// Get the current branch name
+  pub fn current_branch(&self) -> Result<String> {
+    let head = self.repo.head()?;
+    let head_ref = head.referent_name().context("HEAD is detached")?;
+
+    let branch_name = head_ref.shorten().to_string();
+
+    Ok(branch_name)
+  }
+
+  /// Create a new branch from the current HEAD
+  pub fn create_branch(&self, branch_name: &str) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+      .current_dir(&self.root)
+      .args(["branch", branch_name])
+      .output()
+      .context("Failed to execute git branch")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      anyhow::bail!("git branch failed: {}", stderr);
+    }
+
+    println!("   ✅ Created branch: {}", branch_name);
+    Ok(())
+  }
+
+  /// Checkout a branch
+  pub fn checkout_branch(&self, branch_name: &str) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+      .current_dir(&self.root)
+      .args(["checkout", branch_name])
+      .output()
+      .context("Failed to execute git checkout")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      anyhow::bail!("git checkout failed: {}", stderr);
+    }
+
+    println!("   ✅ Switched to branch: {}", branch_name);
+    Ok(())
+  }
+
+  /// Create and checkout a new branch in one step
+  pub fn create_and_checkout_branch(&self, branch_name: &str) -> Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+      .current_dir(&self.root)
+      .args(["checkout", "-b", branch_name])
+      .output()
+      .context("Failed to execute git checkout -b")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      anyhow::bail!("git checkout -b failed: {}", stderr);
+    }
+
+    println!("   ✅ Created and switched to branch: {}", branch_name);
+    Ok(())
+  }
 }
 
 // Additional methods for split operations (not part of Vcs trait)

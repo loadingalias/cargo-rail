@@ -10,12 +10,58 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RailConfig {
   pub workspace: WorkspaceConfig,
+  #[serde(default)]
+  pub security: SecurityConfig,
   pub splits: Vec<SplitConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
   pub root: PathBuf,
+}
+
+/// Security configuration for mono↔remote syncing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+  /// SSH key path (default: ~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
+  #[serde(default)]
+  pub ssh_key_path: Option<PathBuf>,
+
+  /// Require SSH signing key for commits (optional, default: false)
+  #[serde(default)]
+  pub require_signed_commits: bool,
+
+  /// SSH signing key path (default: same as ssh_key_path)
+  #[serde(default)]
+  pub signing_key_path: Option<PathBuf>,
+
+  /// PR branch pattern for remote→mono syncs (default: "rail/sync/{crate}/{timestamp}")
+  #[serde(default = "default_pr_branch_pattern")]
+  pub pr_branch_pattern: String,
+
+  /// Protected branches that cannot be directly committed to (default: ["main", "master"])
+  #[serde(default = "default_protected_branches")]
+  pub protected_branches: Vec<String>,
+}
+
+fn default_pr_branch_pattern() -> String {
+  "rail/sync/{crate}/{timestamp}".to_string()
+}
+
+fn default_protected_branches() -> Vec<String> {
+  vec!["main".to_string(), "master".to_string()]
+}
+
+impl Default for SecurityConfig {
+  fn default() -> Self {
+    Self {
+      ssh_key_path: None,
+      require_signed_commits: false,
+      signing_key_path: None,
+      pr_branch_pattern: default_pr_branch_pattern(),
+      protected_branches: default_protected_branches(),
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +138,7 @@ impl RailConfig {
   pub fn new(workspace_root: PathBuf) -> Self {
     Self {
       workspace: WorkspaceConfig { root: workspace_root },
+      security: SecurityConfig::default(),
       splits: Vec::new(),
     }
   }
