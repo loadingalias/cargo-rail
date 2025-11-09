@@ -31,6 +31,7 @@ struct RecreateCommitParams<'a> {
   crate_name: &'a str,
   mode: &'a SplitMode,
   mapping_store: &'a MappingStore,
+  last_recreated_sha: Option<&'a str>,
 }
 
 /// Parameters for creating a git commit
@@ -71,20 +72,25 @@ impl Splitter {
   fn walk_filtered_history(&self, paths: &[PathBuf]) -> Result<Vec<CommitInfo>> {
     println!("   Walking commit history to find commits touching crate...");
 
-    // Get all commits in chronological order (oldest first)
-    let all_commits = self.git.get_all_commits_chronological()?;
-    println!("   Found {} total commits in repository", all_commits.len());
+    // Collect commits that touch any of the paths
+    // Use IndexMap to deduplicate while preserving insertion order from git log
+    let mut commits_by_sha = indexmap::IndexMap::new();
 
-    // Filter commits that touch any of the crate paths
-    let mut filtered_commits = Vec::new();
-    for commit in all_commits {
-      if self.git.commit_touches_paths(&commit.sha, paths)? {
-        filtered_commits.push(commit);
+    for path in paths {
+      // Get all commits that touch this path (already in chronological order from git log --reverse)
+      let path_commits = self.git.get_commits_touching_path(path, None, "HEAD")?;
+
+      // Add to our deduplication map (preserves first insertion order)
+      for commit in path_commits {
+        commits_by_sha.entry(commit.sha.clone()).or_insert(commit);
       }
     }
 
+    // Convert to vec - order is already chronological from git log
+    let filtered_commits: Vec<_> = commits_by_sha.into_values().collect();
+
     println!(
-      "   Filtered to {} commits that touch the crate paths",
+      "   Found {} total commits that touch the crate paths",
       filtered_commits.len()
     );
 
@@ -153,12 +159,18 @@ impl Splitter {
 
     // Create commit using git command for determinism
     // Map parent SHAs from monorepo to split repo
-    let mapped_parents: Vec<String> = params
+    let mut mapped_parents: Vec<String> = params
       .commit
       .parent_shas
       .iter()
       .filter_map(|parent_sha| params.mapping_store.get_mapping(parent_sha).ok().flatten())
       .collect();
+
+    // If no mapped parents (because original parents were filtered out),
+    // use the last recreated commit as parent to maintain linear history
+    if mapped_parents.is_empty() && params.last_recreated_sha.is_some() {
+      mapped_parents.push(params.last_recreated_sha.unwrap().to_string());
+    }
 
     self.create_git_commit(&CommitParams {
       repo_path: params.target_repo_path,
@@ -354,6 +366,8 @@ impl Splitter {
         filtered_commits.len()
       );
 
+      let mut last_recreated_sha: Option<String> = None;
+
       for (idx, commit) in filtered_commits.iter().enumerate() {
         println!("   [{}/{}] {}", idx + 1, filtered_commits.len(), commit.summary());
 
@@ -365,10 +379,14 @@ impl Splitter {
           crate_name: &config.crate_name,
           mode: &config.mode,
           mapping_store: &mapping_store,
+          last_recreated_sha: last_recreated_sha.as_deref(),
         })?;
 
         // Record mapping
         mapping_store.record_mapping(&commit.sha, &new_sha)?;
+
+        // Track last recreated commit
+        last_recreated_sha = Some(new_sha);
       }
 
       // Copy workspace config files and project files to the final state
@@ -402,28 +420,48 @@ impl Splitter {
     mapping_store.save(&self.workspace_root)?;
     mapping_store.save(&config.target_repo_path)?;
 
-    // Push to remote if URL is configured
+    // Push to remote if URL is configured and is not a local file path
     if let Some(ref remote_url) = config.remote_url {
-      println!("\n🚀 Pushing to remote...");
+      // Check if this is a local file path (absolute path or relative)
+      let is_local_path = remote_url.starts_with('/') || remote_url.starts_with("./") || remote_url.starts_with("../");
 
-      // Open the target repo
-      let target_git = GitBackend::open(&config.target_repo_path)?;
+      if !remote_url.is_empty() && !is_local_path {
+        println!("\n🚀 Pushing to remote...");
 
-      // Add or update remote
-      if !target_git.has_remote("origin")? {
-        println!("   Adding remote 'origin': {}", remote_url);
-        target_git.add_remote("origin", remote_url)?;
+        // Open the target repo
+        let target_git = GitBackend::open(&config.target_repo_path)?;
+
+        // Add or update remote
+        if !target_git.has_remote("origin")? {
+          println!("   Adding remote 'origin': {}", remote_url);
+          target_git.add_remote("origin", remote_url)?;
+        } else {
+          println!("   Remote 'origin' already exists");
+        }
+
+        // Push to remote
+        target_git.push_to_remote("origin", &config.branch)?;
+
+        // Push git-notes
+        mapping_store.push_notes(&config.target_repo_path, "origin")?;
+
+        println!("   ✅ Pushed to {}", remote_url);
       } else {
-        println!("   Remote 'origin' already exists");
+        println!("\n💾 Split repository created locally");
+        if is_local_path {
+          println!("   Note: Remote is a local path, skipping push");
+          println!(
+            "   Local testing mode - split repo at: {}",
+            config.target_repo_path.display()
+          );
+        } else {
+          println!("   No remote URL configured");
+        }
+        println!("\n   To push to a real remote later:");
+        println!("   cd {}", config.target_repo_path.display());
+        println!("   git remote add origin <url>");
+        println!("   git push -u origin {}", config.branch);
       }
-
-      // Push to remote
-      target_git.push_to_remote("origin", &config.branch)?;
-
-      // Push git-notes
-      mapping_store.push_notes(&config.target_repo_path, "origin")?;
-
-      println!("   ✅ Pushed to {}", remote_url);
     } else {
       println!("\n⚠️  No remote URL configured - repository created locally only");
       println!("   To push manually:");
@@ -594,6 +632,17 @@ mod tests {
   use std::fs;
   use tempfile::TempDir;
 
+  /// Helper to find the git repository root from the current directory.
+  /// This is needed because tests run from the crate directory, but the
+  /// git repository may be at the workspace root.
+  fn find_git_root() -> PathBuf {
+    let current_dir = std::env::current_dir().unwrap();
+    match gix::discover(&current_dir) {
+      Ok(repo) => repo.workdir().unwrap().to_path_buf(),
+      Err(_) => current_dir,
+    }
+  }
+
   #[test]
   fn test_copy_directory_recursive() {
     let temp = TempDir::new().unwrap();
@@ -606,7 +655,7 @@ mod tests {
     fs::write(source.join("src/lib.rs"), "pub fn test() {}").unwrap();
     fs::create_dir(source.join(".git")).unwrap(); // Should be excluded
 
-    let workspace_root = std::env::current_dir().unwrap();
+    let workspace_root = find_git_root();
     let splitter = Splitter::new(workspace_root).unwrap();
 
     splitter.copy_directory_recursive(&source, &target).unwrap();

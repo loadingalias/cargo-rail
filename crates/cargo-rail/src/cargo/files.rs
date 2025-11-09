@@ -95,6 +95,11 @@ impl AuxiliaryFiles {
   pub fn is_empty(&self) -> bool {
     self.files.is_empty()
   }
+
+  /// Get list of target paths for discovered files
+  pub fn list_target_paths(&self) -> Vec<PathBuf> {
+    self.files.iter().map(|f| f.target_path.clone()).collect()
+  }
 }
 
 impl ProjectFiles {

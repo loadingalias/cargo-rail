@@ -29,5 +29,12 @@ thiserror = "2.0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9.8"
 
+# Ordered map for preserving commit order
+indexmap = "2.7.1"
+
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[[test]]
+name = "integration"
+path = "../../tests/integration/mod.rs"

@@ -156,6 +156,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "gix",
+ "indexmap",
  "serde",
  "tempfile",
  "thiserror",

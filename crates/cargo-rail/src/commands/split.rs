@@ -47,16 +47,26 @@ pub fn run_split(crate_name: Option<String>, all: bool) -> Result<()> {
   for split_config in crates_to_split {
     let crate_paths = split_config.get_paths().into_iter().cloned().collect();
 
-    // Prompt for target repo path if not using a configured remote
-    // For MVP, we'll use a local path based on the remote URL
-    let remote_name = split_config
-      .remote
-      .rsplit('/')
-      .next()
-      .unwrap_or(&split_config.name)
-      .trim_end_matches(".git");
+    // Determine target repo path
+    // If remote is a local file path, use it directly as the target
+    // Otherwise, derive the name from the remote URL and create in parent dir
+    let target_repo_path = if split_config.remote.starts_with('/')
+      || split_config.remote.starts_with("./")
+      || split_config.remote.starts_with("../")
+    {
+      // Remote is a local file path, use it as-is
+      std::path::PathBuf::from(&split_config.remote)
+    } else {
+      // Remote is a URL (git@github.com:... or https://...), extract name
+      let remote_name = split_config
+        .remote
+        .rsplit('/')
+        .next()
+        .unwrap_or(&split_config.name)
+        .trim_end_matches(".git");
 
-    let target_repo_path = current_dir.join("..").join(remote_name);
+      current_dir.join("..").join(remote_name)
+    };
 
     let split_cfg = SplitConfig {
       crate_name: split_config.name.clone(),

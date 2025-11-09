@@ -321,30 +321,56 @@ impl GitBackend {
   }
 
   /// Check if a commit touches any of the given paths
-  /// For MVP: Returns true if the paths exist in the commit's tree
-  /// A full implementation would diff with parent to detect actual changes
+  /// Returns true if the commit actually changed any of the given paths
   pub fn commit_touches_paths(&self, sha: &str, paths: &[PathBuf]) -> Result<bool> {
     let commit_id = gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", sha))?;
     let commit_obj = self.repo.find_object(commit_id)?.try_into_commit()?;
-    let tree = commit_obj.tree()?;
 
-    // Check if any path exists in this commit's tree
-    for path in paths {
-      let relative_path = if path.is_absolute() {
-        path.strip_prefix(&self.root).unwrap_or(path)
-      } else {
-        path
-      };
-
-      // Check if path exists in tree (direct match)
-      if tree.lookup_entry_by_path(relative_path).ok().flatten().is_some() {
-        return Ok(true);
+    // For root commits (no parents), check if paths exist
+    if commit_obj.parent_ids().count() == 0 {
+      let tree = commit_obj.tree()?;
+      for path in paths {
+        let relative_path = if path.is_absolute() {
+          path.strip_prefix(&self.root).unwrap_or(path)
+        } else {
+          path
+        };
+        if tree.lookup_entry_by_path(relative_path).ok().flatten().is_some()
+          || self.tree_contains_path_prefix(&tree, relative_path)?
+        {
+          return Ok(true);
+        }
       }
+      return Ok(false);
+    }
 
-      // Check if any entry starts with this path (directory case)
-      // We need to traverse the tree to check all entries
-      if self.tree_contains_path_prefix(&tree, relative_path)? {
-        return Ok(true);
+    // For commits with parents, get all changed files and check if any match our paths
+    let output = std::process::Command::new("git")
+      .current_dir(&self.root)
+      .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
+      .output()
+      .context("Failed to run git diff-tree")?;
+
+    if !output.status.success() {
+      anyhow::bail!("git diff-tree failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let changed_files = String::from_utf8_lossy(&output.stdout);
+
+    // Check if any changed file is under any of our target paths
+    for changed_file in changed_files.lines() {
+      let changed_path = Path::new(changed_file);
+      for target_path in paths {
+        let relative_target = if target_path.is_absolute() {
+          target_path.strip_prefix(&self.root).unwrap_or(target_path)
+        } else {
+          target_path
+        };
+
+        // Check if the changed file is under the target path
+        if changed_path.starts_with(relative_target) {
+          return Ok(true);
+        }
       }
     }
 
@@ -619,17 +645,28 @@ fn collect_files_recursive(tree: &gix::Tree, base_path: &Path, files: &mut Vec<(
 mod tests {
   use super::*;
 
+  /// Helper to find the git repository root from the current directory.
+  /// This is needed because tests run from the crate directory, but the
+  /// git repository may be at the workspace root.
+  fn find_git_root() -> PathBuf {
+    let current_dir = std::env::current_dir().unwrap();
+    match gix::discover(&current_dir) {
+      Ok(repo) => repo.workdir().unwrap().to_path_buf(),
+      Err(_) => current_dir,
+    }
+  }
+
   #[test]
   fn test_open_current_repo() {
-    let current_dir = std::env::current_dir().unwrap();
-    let result = GitBackend::open(&current_dir);
+    let git_root = find_git_root();
+    let result = GitBackend::open(&git_root);
     assert!(result.is_ok(), "Should be able to open current git repo");
   }
 
   #[test]
   fn test_head_commit() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
     let head = git.head_commit();
     assert!(head.is_ok());
     let sha = head.unwrap();
@@ -638,8 +675,8 @@ mod tests {
 
   #[test]
   fn test_commit_history() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
     let commits = git.commit_history(Path::new("."), Some(5));
     assert!(commits.is_ok());
     let commits = commits.unwrap();
@@ -655,8 +692,8 @@ mod tests {
 
   #[test]
   fn test_is_tracked() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
 
     // Cargo.toml should be tracked
     let result = git.is_tracked(Path::new("Cargo.toml"));
@@ -671,8 +708,8 @@ mod tests {
 
   #[test]
   fn test_list_remotes() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
 
     // Should be able to list remotes (may be empty for local repo)
     let result = git.list_remotes();
@@ -688,8 +725,8 @@ mod tests {
 
   #[test]
   fn test_has_remote() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
 
     // Check if origin exists (may or may not)
     let has_origin = git.has_remote("origin");
@@ -703,8 +740,8 @@ mod tests {
 
   #[test]
   fn test_get_remote_url() {
-    let current_dir = std::env::current_dir().unwrap();
-    let git = GitBackend::open(&current_dir).unwrap();
+    let git_root = find_git_root();
+    let git = GitBackend::open(&git_root).unwrap();
 
     // Try to get origin URL (may or may not exist)
     let url = git.get_remote_url("origin");

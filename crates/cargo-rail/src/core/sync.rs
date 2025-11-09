@@ -63,6 +63,22 @@ impl SyncEngine {
     })
   }
 
+  /// Check if the remote URL is a local file path
+  fn is_local_remote(&self) -> bool {
+    self.config.remote_url.starts_with('/')
+      || self.config.remote_url.starts_with("./")
+      || self.config.remote_url.starts_with("../")
+  }
+
+  /// Get the appropriate branch reference (origin/branch for remotes, just branch for local)
+  fn get_branch_ref(&self) -> String {
+    if self.is_local_remote() {
+      self.config.branch.clone()
+    } else {
+      format!("origin/{}", self.config.branch)
+    }
+  }
+
   pub fn sync_to_remote(&mut self) -> Result<SyncResult> {
     println!("   Syncing monorepo → remote...");
 
@@ -72,11 +88,15 @@ impl SyncEngine {
     // Open remote repo
     let remote_git = GitBackend::open(&self.config.target_repo_path)?;
 
-    // Fetch latest from remote
-    remote_git.fetch_from_remote("origin")?;
-    self
-      .mapping_store
-      .fetch_notes(&self.config.target_repo_path, "origin")?;
+    // Fetch latest from remote (skip for local paths)
+    if !self.is_local_remote() {
+      remote_git.fetch_from_remote("origin")?;
+      self
+        .mapping_store
+        .fetch_notes(&self.config.target_repo_path, "origin")?;
+    } else {
+      println!("   Skipping fetch (local testing mode)");
+    }
     self.mapping_store.load(&self.config.target_repo_path)?;
 
     // Find last synced commit in mono
@@ -119,10 +139,14 @@ impl SyncEngine {
     self.mapping_store.save(&self.workspace_root)?;
     self.mapping_store.save(&self.config.target_repo_path)?;
 
-    // Push to remote
+    // Push to remote (skip for local paths)
     if synced_count > 0 {
-      remote_git.push_to_remote("origin", &self.config.branch)?;
-      self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
+      if !self.is_local_remote() {
+        remote_git.push_to_remote("origin", &self.config.branch)?;
+        self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
+      } else {
+        println!("   Skipping push (local testing mode)");
+      }
     }
 
     Ok(SyncResult {
@@ -141,21 +165,26 @@ impl SyncEngine {
     // Open remote repo
     let remote_git = GitBackend::open(&self.config.target_repo_path)?;
 
-    // Fetch latest from remote
-    remote_git.fetch_from_remote("origin")?;
-    self
-      .mapping_store
-      .fetch_notes(&self.config.target_repo_path, "origin")?;
+    // Fetch latest from remote (skip for local paths)
+    if !self.is_local_remote() {
+      remote_git.fetch_from_remote("origin")?;
+      self
+        .mapping_store
+        .fetch_notes(&self.config.target_repo_path, "origin")?;
+    } else {
+      println!("   Skipping fetch (local testing mode)");
+    }
     self.mapping_store.load(&self.config.target_repo_path)?;
 
     // Find last synced commit in remote
     let last_synced_remote = self.find_last_synced_remote_commit(&remote_git)?;
 
     // Get new commits in remote
+    let branch_ref = self.get_branch_ref();
     let new_commits = if let Some(ref last) = last_synced_remote {
-      remote_git.get_commits_touching_path(Path::new("."), Some(last), &format!("origin/{}", self.config.branch))?
+      remote_git.get_commits_touching_path(Path::new("."), Some(last), &branch_ref)?
     } else {
-      remote_git.get_commits_touching_path(Path::new("."), None, &format!("origin/{}", self.config.branch))?
+      remote_git.get_commits_touching_path(Path::new("."), None, &branch_ref)?
     };
 
     println!("   Found {} new commits in remote", new_commits.len());
@@ -486,14 +515,19 @@ impl SyncEngine {
 
   fn check_remote_has_changes(&self) -> Result<bool> {
     let remote_git = GitBackend::open(&self.config.target_repo_path)?;
-    remote_git.fetch_from_remote("origin")?;
+
+    // Fetch from remote (skip for local paths)
+    if !self.is_local_remote() {
+      remote_git.fetch_from_remote("origin")?;
+    }
 
     let last_synced = self.find_last_synced_remote_commit(&remote_git)?;
 
+    let branch_ref = self.get_branch_ref();
     let new_commits = if let Some(ref last) = last_synced {
-      remote_git.get_commits_touching_path(Path::new("."), Some(last), &format!("origin/{}", self.config.branch))?
+      remote_git.get_commits_touching_path(Path::new("."), Some(last), &branch_ref)?
     } else {
-      remote_git.get_commits_touching_path(Path::new("."), None, &format!("origin/{}", self.config.branch))?
+      remote_git.get_commits_touching_path(Path::new("."), None, &branch_ref)?
     };
 
     // Filter out commits from mono
