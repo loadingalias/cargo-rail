@@ -1,3 +1,4 @@
+mod adapters;
 mod cargo;
 mod commands;
 mod core;

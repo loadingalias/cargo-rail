@@ -60,14 +60,24 @@ pub fn run_sync(crate_name: Option<String>, all: bool, from_remote: bool, to_rem
 
     let crate_paths = split_config.get_paths().into_iter().cloned().collect();
 
-    let remote_name = split_config
-      .remote
-      .rsplit('/')
-      .next()
-      .unwrap_or(&split_config.name)
-      .trim_end_matches(".git");
+    // Determine target repo path (same logic as split command)
+    let target_repo_path = if split_config.remote.starts_with('/')
+      || split_config.remote.starts_with("./")
+      || split_config.remote.starts_with("../")
+    {
+      // Remote is a local file path, use it as-is
+      std::path::PathBuf::from(&split_config.remote)
+    } else {
+      // Remote is a URL, extract name
+      let remote_name = split_config
+        .remote
+        .rsplit('/')
+        .next()
+        .unwrap_or(&split_config.name)
+        .trim_end_matches(".git");
 
-    let target_repo_path = current_dir.join("..").join(remote_name);
+      current_dir.join("..").join(remote_name)
+    };
 
     // Check if target repo exists
     if !target_repo_path.exists() {
