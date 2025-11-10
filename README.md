@@ -23,6 +23,18 @@ Until then, use only for testing and experimentation.
 
 ---
 
+## Key Features
+
+- **Dry-run by default** - All operations show a plan first; `--apply` required to execute
+- **Full git history preservation** - Every commit touching your crate is preserved with original author, date, and message
+- **Bidirectional sync** - Changes flow both ways: monorepo ↔ split repo
+- **Protected branch safety** - Never commits directly to `main`/`master` when syncing from remote; creates PR branches instead
+- **Cargo.toml transforms** - Automatically converts workspace dependencies to version dependencies
+- **Git-notes mapping** - Tracks commit relationships for perfect deduplication
+- **Conflict resolution** - Multiple strategies: `ours`, `theirs`, `manual`, `union`
+
+---
+
 ## Quick Start
 
 ```bash
@@ -31,11 +43,17 @@ cd your-workspace/
 cargo rail init
 
 # Configure a crate to split (edit rail.toml)
-# Then split it out
+# Preview what will happen (dry-run by default)
 cargo rail split your-crate
 
-# Sync changes bidirectionally
+# Actually perform the split
+cargo rail split your-crate --apply
+
+# Preview sync changes (dry-run by default)
 cargo rail sync your-crate
+
+# Actually sync changes bidirectionally
+cargo rail sync your-crate --apply
 ```
 
 ## Security Model (v1.0)

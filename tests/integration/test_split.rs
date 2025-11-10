@@ -27,7 +27,7 @@ fn test_split_creates_repo_with_history() -> Result<()> {
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
   // Run split
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Verify split repo exists
   assert!(split_dir.exists());
@@ -83,7 +83,7 @@ remote = "{}""#,
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
   // Split app-crate
-  run_cargo_rail(&workspace.path, &["rail", "split", "app-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "app-crate", "--apply"])?;
 
   // Read transformed Cargo.toml
   let cargo_toml = std::fs::read_to_string(split_dir.join("Cargo.toml"))?;
@@ -135,7 +135,7 @@ remote = "{}""#,
   );
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "crate-a"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "crate-a", "--apply"])?;
 
   // Verify split repo only has commits that touched crate-a
   let log = git(&split_dir, &["log", "--oneline"])?;
@@ -174,7 +174,7 @@ fn test_split_copies_auxiliary_files() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Verify auxiliary files were copied
   assert!(split_dir.join("rust-toolchain.toml").exists());

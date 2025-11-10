@@ -180,6 +180,7 @@ dependencies = [
  "gix",
  "indexmap",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",

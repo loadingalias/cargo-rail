@@ -40,6 +40,12 @@ enum Commands {
     /// Split all configured crates
     #[arg(short, long)]
     all: bool,
+    /// Actually perform the split (default: dry-run mode showing plan)
+    #[arg(long)]
+    apply: bool,
+    /// Output plan in JSON format (useful for CI/automation)
+    #[arg(long)]
+    json: bool,
   },
   /// Sync changes between monorepo and split repos
   Sync {
@@ -57,6 +63,12 @@ enum Commands {
     /// Conflict resolution strategy: ours (use monorepo), theirs (use remote), manual (create markers), union (combine both)
     #[arg(long, default_value = "manual")]
     strategy: String,
+    /// Actually perform the sync (default: dry-run mode showing plan)
+    #[arg(long)]
+    apply: bool,
+    /// Output plan in JSON format (useful for CI/automation)
+    #[arg(long)]
+    json: bool,
   },
 }
 
@@ -99,14 +111,21 @@ fn main() -> Result<()> {
 
   match cli.command {
     Commands::Init { all } => commands::run_init(all)?,
-    Commands::Split { crate_name, all } => commands::run_split(crate_name, all)?,
+    Commands::Split {
+      crate_name,
+      all,
+      apply,
+      json,
+    } => commands::run_split(crate_name, all, apply, json)?,
     Commands::Sync {
       crate_name,
       all,
       from_remote,
       to_remote,
       strategy,
-    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy)?,
+      apply,
+      json,
+    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy, apply, json)?,
   }
 
   Ok(())

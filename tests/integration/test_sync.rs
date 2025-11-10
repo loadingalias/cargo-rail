@@ -17,14 +17,14 @@ fn test_sync_mono_to_remote() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make changes in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo change\npub fn new() {}")?;
   workspace.commit("Update in monorepo")?;
 
   // Sync to remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Verify changes appear in split repo
   let split_lib = std::fs::read_to_string(split_dir.join("src/lib.rs"))?;
@@ -53,7 +53,7 @@ fn test_sync_remote_to_mono() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make changes in split repo
   std::fs::write(
@@ -64,7 +64,10 @@ fn test_sync_remote_to_mono() -> Result<()> {
   git(&split_dir, &["commit", "-m", "Update in split repo"])?;
 
   // Sync from remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--from-remote"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--apply"],
+  )?;
 
   // Verify changes appear in monorepo
   let mono_lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
@@ -92,14 +95,14 @@ fn test_sync_bidirectional() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Change in monorepo
   workspace.modify_file("my-crate", "README.md", "# Updated from mono")?;
   workspace.commit("Mono change")?;
 
   // Sync to remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Change in split repo
   std::fs::write(split_dir.join("src/lib.rs"), "// From split")?;
@@ -107,7 +110,10 @@ fn test_sync_bidirectional() -> Result<()> {
   git(&split_dir, &["commit", "-m", "Split change"])?;
 
   // Sync from remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--from-remote"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--apply"],
+  )?;
 
   // Verify both changes are present
   let readme = workspace.read_file("crates/my-crate/README.md")?;
@@ -133,17 +139,17 @@ fn test_sync_deduplicates_commits() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make a change in mono
   workspace.modify_file("my-crate", "src/lib.rs", "// Change 1")?;
   workspace.commit("Change 1")?;
 
   // Sync to remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Try syncing again (should be no-op)
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Count commits in split repo (should not have duplicates)
   let log = git(&split_dir, &["log", "--oneline"])?;
@@ -171,14 +177,14 @@ fn test_conflict_resolution_ours_strategy() -> Result<()> {
     .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
   workspace.commit("Monorepo change")?;
 
   // Sync to remote first (establish baseline)
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Make another change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
@@ -192,7 +198,14 @@ fn test_conflict_resolution_ours_strategy() -> Result<()> {
   // Sync from remote with --strategy=ours (should keep monorepo version)
   run_cargo_rail(
     &workspace.path,
-    &["rail", "sync", "my-crate", "--from-remote", "--strategy=ours"],
+    &[
+      "rail",
+      "sync",
+      "my-crate",
+      "--from-remote",
+      "--strategy=ours",
+      "--apply",
+    ],
   )?;
 
   // Verify monorepo version is kept
@@ -225,14 +238,14 @@ fn test_conflict_resolution_theirs_strategy() -> Result<()> {
     .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
   workspace.commit("Monorepo change")?;
 
   // Sync to remote first
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Make another change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
@@ -246,7 +259,14 @@ fn test_conflict_resolution_theirs_strategy() -> Result<()> {
   // Sync from remote with --strategy=theirs (should use remote version)
   run_cargo_rail(
     &workspace.path,
-    &["rail", "sync", "my-crate", "--from-remote", "--strategy=theirs"],
+    &[
+      "rail",
+      "sync",
+      "my-crate",
+      "--from-remote",
+      "--strategy=theirs",
+      "--apply",
+    ],
   )?;
 
   // Verify remote version is used
@@ -275,14 +295,14 @@ fn test_conflict_resolution_manual_strategy() -> Result<()> {
     .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
   workspace.commit("Monorepo change")?;
 
   // Sync to remote first
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Make another change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
@@ -296,7 +316,14 @@ fn test_conflict_resolution_manual_strategy() -> Result<()> {
   // Sync from remote with --strategy=manual (should create conflict markers)
   run_cargo_rail(
     &workspace.path,
-    &["rail", "sync", "my-crate", "--from-remote", "--strategy=manual"],
+    &[
+      "rail",
+      "sync",
+      "my-crate",
+      "--from-remote",
+      "--strategy=manual",
+      "--apply",
+    ],
   )?;
 
   // Verify conflict markers are present
@@ -326,14 +353,14 @@ fn test_conflict_resolution_union_strategy() -> Result<()> {
     .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
   workspace.commit("Monorepo change")?;
 
   // Sync to remote first
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote", "--apply"])?;
 
   // Make another change in monorepo
   workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
@@ -347,7 +374,14 @@ fn test_conflict_resolution_union_strategy() -> Result<()> {
   // Sync from remote with --strategy=union (should combine both)
   run_cargo_rail(
     &workspace.path,
-    &["rail", "sync", "my-crate", "--from-remote", "--strategy=union"],
+    &[
+      "rail",
+      "sync",
+      "my-crate",
+      "--from-remote",
+      "--strategy=union",
+      "--apply",
+    ],
   )?;
 
   // Verify both versions are present (union merge combines them)
@@ -378,7 +412,7 @@ fn test_no_conflict_with_non_overlapping_changes() -> Result<()> {
   let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
   std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
 
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
 
   // Make change in monorepo (modify README)
   workspace.modify_file("my-crate", "README.md", "# Updated from mono")?;
@@ -390,7 +424,10 @@ fn test_no_conflict_with_non_overlapping_changes() -> Result<()> {
   git(&split_dir, &["commit", "-m", "Add new function"])?;
 
   // Sync from remote (should auto-merge cleanly)
-  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--from-remote"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--apply"],
+  )?;
 
   // Verify both changes are present
   let readme = workspace.read_file("crates/my-crate/README.md")?;
