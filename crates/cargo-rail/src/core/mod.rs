@@ -1,5 +1,6 @@
 pub mod config;
 pub mod conflict;
+pub mod error;
 pub mod mapping;
 pub mod plan;
 pub mod security;

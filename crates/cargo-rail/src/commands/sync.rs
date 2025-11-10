@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
 use std::env;
 
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::cargo::transform::CargoTransform;
 use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
+use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine};
 
@@ -17,26 +17,28 @@ pub fn run_sync(
   strategy_str: String,
   apply: bool,
   json: bool,
-) -> Result<()> {
+) -> RailResult<()> {
   // Parse conflict strategy
-  let strategy = ConflictStrategy::from_str(&strategy_str)?;
-  let current_dir = env::current_dir().context("Failed to get current directory")?;
+  let strategy = ConflictStrategy::from_str(&strategy_str).map_err(RailError::Other)?;
+  let current_dir = env::current_dir()?;
 
   // Load configuration
   if !RailConfig::exists(&current_dir) {
-    anyhow::bail!(
-      "No cargo-rail configuration found. Run `cargo rail init` first.\n\
-       Expected file: {}/.rail/config.toml",
-      current_dir.display()
-    );
+    return Err(RailError::Config(ConfigError::NotFound {
+      workspace_root: current_dir,
+    }));
   }
 
-  let config = RailConfig::load(&current_dir)?;
+  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
   println!("📦 Loaded configuration from .rail/config.toml");
 
   // Determine sync direction
   let direction = match (from_remote, to_remote) {
-    (true, true) => anyhow::bail!("Cannot use both --from-remote and --to-remote"),
+    (true, true) => {
+      return Err(RailError::Other(anyhow::anyhow!(
+        "Cannot use both --from-remote and --to-remote"
+      )));
+    }
     (true, false) => {
       println!("   Direction: remote → monorepo");
       SyncDirection::RemoteToMono
@@ -60,10 +62,12 @@ pub fn run_sync(
       .splits
       .iter()
       .find(|s| s.name == *name)
-      .ok_or_else(|| anyhow::anyhow!("Crate '{}' not found in configuration", name))?;
+      .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
     vec![split_config.clone()]
   } else {
-    anyhow::bail!("Must specify a crate name or use --all");
+    return Err(RailError::Other(anyhow::anyhow!(
+      "Must specify a crate name or use --all"
+    )));
   };
 
   // Build plans using the unified Plan system
@@ -288,7 +292,7 @@ pub fn run_sync(
     };
 
     // Create transformer
-    let metadata = WorkspaceMetadata::load(&config.workspace.root)?;
+    let metadata = WorkspaceMetadata::load(&config.workspace.root).map_err(RailError::Other)?;
     let transformer = Box::new(CargoTransform::new(metadata));
 
     // Create sync engine
@@ -298,13 +302,14 @@ pub fn run_sync(
       transformer,
       config.security.clone(),
       strategy,
-    )?;
+    )
+    .map_err(RailError::Other)?;
 
     // Perform sync
     let result = match direction {
-      SyncDirection::MonoToRemote => engine.sync_to_remote()?,
-      SyncDirection::RemoteToMono => engine.sync_from_remote()?,
-      SyncDirection::Both => engine.sync_bidirectional()?,
+      SyncDirection::MonoToRemote => engine.sync_to_remote().map_err(RailError::Other)?,
+      SyncDirection::RemoteToMono => engine.sync_from_remote().map_err(RailError::Other)?,
+      SyncDirection::Both => engine.sync_bidirectional().map_err(RailError::Other)?,
       SyncDirection::None => unreachable!(),
     };
 

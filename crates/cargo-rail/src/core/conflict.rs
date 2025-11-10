@@ -40,6 +40,7 @@ impl ConflictStrategy {
 pub struct ConflictInfo {
   pub file_path: PathBuf,
   pub message: String,
+  #[allow(dead_code)]
   pub resolved: bool,
 }
 

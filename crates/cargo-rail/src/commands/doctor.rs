@@ -2,13 +2,13 @@
 //!
 //! The doctor command runs all health checks and reports any issues found.
 
-use anyhow::Result;
 use std::env;
 
 use crate::checks::{CheckContext, create_default_runner};
+use crate::core::error::{RailError, RailResult};
 
 /// Run the doctor command to diagnose issues
-pub fn run_doctor(thorough: bool, json: bool) -> Result<()> {
+pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
   let current_dir = env::current_dir()?;
 
   let ctx = CheckContext {
@@ -18,11 +18,11 @@ pub fn run_doctor(thorough: bool, json: bool) -> Result<()> {
   };
 
   let runner = create_default_runner();
-  let results = runner.run_all(&ctx)?;
+  let results = runner.run_all(&ctx).map_err(RailError::Other)?;
 
   if json {
     // JSON output for CI/automation
-    let json_output = serde_json::to_string_pretty(&results)?;
+    let json_output = serde_json::to_string_pretty(&results).map_err(|e| RailError::Other(e.into()))?;
     println!("{}", json_output);
   } else {
     // Human-readable output
