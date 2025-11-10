@@ -7,11 +7,13 @@ cargo-rail uses git-notes to maintain bidirectional mappings between monorepo co
 ## How Git-Notes Are Used
 
 Git-notes store the mapping in the refs namespace:
+
 ```
 refs/notes/rail/<crate-name>
 ```
 
 Each note maps a monorepo commit SHA to its corresponding split repo commit SHA (or vice versa). This enables:
+
 - Deduplication (skipping already-synced commits)
 - Bidirectional sync tracking
 - Merge conflict detection
@@ -21,6 +23,7 @@ Each note maps a monorepo commit SHA to its corresponding split repo commit SHA 
 Git-notes conflicts happen when:
 
 1. **Non-Fast-Forward Updates**: The remote git-notes have diverged from local notes
+
    ```
    ! [rejected]  refs/notes/rail/my-crate -> refs/notes/rail/my-crate  (non-fast-forward)
    ```
@@ -40,6 +43,7 @@ git notes merge --strategy=union refs/notes/rail/<crate-name>
 ### Union Strategy Behavior
 
 The union strategy combines all notes from both sides:
+
 - **No data loss**: All mappings from both local and remote are preserved
 - **Automatic**: Merges without manual intervention
 - **Safe**: Duplicate mappings are harmless (same SHA maps to same SHA)
@@ -71,6 +75,7 @@ Manual resolution required:
 ### Manual Resolution Process
 
 1. **Inspect the conflict**:
+
    ```bash
    cd <split-repo>
    git notes --ref=refs/notes/rail/<crate-name> show <conflicting-sha>
@@ -78,27 +83,32 @@ Manual resolution required:
 
 2. **Choose resolution strategy**:
    - **Keep ours** (local mapping):
+
      ```bash
      git notes merge --strategy=ours refs/notes/rail/<crate-name>
      ```
 
    - **Keep theirs** (remote mapping):
+
      ```bash
      git notes merge --strategy=theirs refs/notes/rail/<crate-name>
      ```
 
    - **Manual edit**:
+
      ```bash
      git notes edit <sha>
      # Edit to correct mapping, save and exit
      ```
 
 3. **Push resolved notes**:
+
    ```bash
    git push origin refs/notes/rail/<crate-name>
    ```
 
 4. **Retry sync**:
+
    ```bash
    cargo rail sync <crate> --from-remote
    ```
@@ -116,17 +126,20 @@ Manual resolution required:
 If git-notes become corrupted:
 
 1. **Backup current notes**:
+
    ```bash
    git fetch origin refs/notes/rail/<crate>:refs/notes/rail/<crate>-backup
    ```
 
 2. **Reset to remote**:
+
    ```bash
    git fetch origin refs/notes/rail/<crate>:refs/notes/rail/<crate>
    git push -f origin refs/notes/rail/<crate>
    ```
 
 3. **Rebuild from scratch** (last resort):
+
    ```bash
    # Delete local notes
    git notes --ref=refs/notes/rail/<crate> remove $(git rev-list HEAD)
@@ -143,6 +156,7 @@ If git-notes become corrupted:
 ### "Non-fast-forward" Error
 
 **Symptom**:
+
 ```
 ! [rejected]  refs/notes/rail/my-crate -> refs/notes/rail/my-crate  (non-fast-forward)
 ```
@@ -152,11 +166,13 @@ If git-notes become corrupted:
 ### "Conflicting notes" Error
 
 **Symptom**:
+
 ```
 error: Automatic notes merge failed. Fix conflicts in refs/notes/commits and commit the result with 'git notes merge --commit'
 ```
 
 **Solution**:
+
 1. Manual resolution required (rare)
 2. Follow manual resolution steps above
 3. Contact maintainers if issue persists
@@ -174,6 +190,7 @@ error: Automatic notes merge failed. Fix conflicts in refs/notes/commits and com
 ### Git-Notes Format
 
 Each note is a simple text mapping:
+
 ```
 <monorepo-sha> <split-repo-sha>
 ```
