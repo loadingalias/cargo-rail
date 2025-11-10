@@ -32,9 +32,17 @@ wildcards = "allow"
 highlight = "all"
 
 skip = [
+  # Windows ecosystem - commonly has version mismatches
   "windows-sys",
+  "windows-targets",
+  "windows_aarch64_msvc",
+  "windows_x86_64_gnu",
+  "windows_x86_64_msvc",
+  # Low-level hash/system dependencies
   "hashbrown",
   "foldhash",
+  "linux-raw-sys",
+  "rustix",
 ]
 
 [sources]
