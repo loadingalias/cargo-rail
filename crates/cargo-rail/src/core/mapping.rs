@@ -173,10 +173,60 @@ impl MappingStore {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
+
       // Ignore "couldn't find remote ref" - notes may not exist yet
-      if !stderr.contains("couldn't find remote ref") {
-        anyhow::bail!("git fetch notes failed: {}", stderr);
+      if stderr.contains("couldn't find remote ref") {
+        println!("   ℹ️  No remote git-notes found yet (this is normal for first sync)");
+        return Ok(());
       }
+
+      // Handle non-fast-forward (notes conflict)
+      if stderr.contains("non-fast-forward") || stderr.contains("rejected") {
+        println!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
+        println!("   🔄 Attempting automatic merge with union strategy...");
+
+        // Fetch to FETCH_HEAD without updating the ref
+        let fetch_output = Command::new("git")
+          .current_dir(repo_path)
+          .args(["fetch", remote, &notes_ref])
+          .output()
+          .context("Failed to fetch notes to FETCH_HEAD")?;
+
+        if !fetch_output.status.success() {
+          let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
+          if !fetch_stderr.contains("couldn't find remote ref") {
+            anyhow::bail!("git fetch notes to FETCH_HEAD failed: {}", fetch_stderr);
+          }
+          return Ok(()); // No remote notes
+        }
+
+        // Merge notes using union strategy (combines both without conflict)
+        let merge_output = Command::new("git")
+          .current_dir(repo_path)
+          .args(["notes", "--ref", &notes_ref, "merge", "--strategy=union", "FETCH_HEAD"])
+          .output()
+          .context("Failed to merge git-notes")?;
+
+        if !merge_output.status.success() {
+          let merge_stderr = String::from_utf8_lossy(&merge_output.stderr);
+
+          // If union merge fails, provide clear guidance
+          eprintln!("   ❌ Automatic git-notes merge failed");
+          eprintln!("   📋 Manual resolution required:");
+          eprintln!("      1. cd {}", repo_path.display());
+          eprintln!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
+          eprintln!("      3. Resolve conflicts manually");
+          eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
+          eprintln!("");
+          anyhow::bail!("git notes merge failed: {}\n\nThis usually happens when the same commit has different mappings on different machines.\nPlease resolve manually using the steps above.", merge_stderr);
+        }
+
+        println!("   ✅ Git-notes merged successfully (union strategy)");
+        return Ok(());
+      }
+
+      // Unknown error
+      anyhow::bail!("git fetch notes failed: {}", stderr);
     }
 
     println!("   ✅ Fetched git-notes");
