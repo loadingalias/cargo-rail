@@ -269,19 +269,40 @@ impl SyncEngine {
     // Save mappings
     self.mapping_store.save(&self.workspace_root)?;
 
-    // If we created a PR branch, remind the user to create a pull request
+    // If we created a PR branch, push it to remote and remind user to create PR
     if let Some(ref pr_branch) = pr_branch_name {
       println!("\n   🎯 Changes synced to PR branch: {}", pr_branch);
-      println!("   📝 Next steps:");
-      println!(
-        "      1. Review the changes: git diff {}..{}",
-        current_branch, pr_branch
-      );
-      println!("      2. Push the branch: git push origin {}", pr_branch);
-      println!(
-        "      3. Create a pull request from {} to {}",
-        pr_branch, current_branch
-      );
+
+      // Push PR branch to remote (skip for local testing)
+      if !self.is_local_remote() && synced_count > 0 {
+        println!("   📤 Pushing PR branch to remote...");
+        self.mono_git.push_to_remote("origin", pr_branch)?;
+        println!("   ✅ PR branch pushed to origin/{}", pr_branch);
+
+        println!("\n   📝 Next step:");
+        println!("      • Create a pull request on GitHub/GitLab:");
+        println!(
+          "        {} → {}",
+          pr_branch, current_branch
+        );
+        println!("      • Or visit your repository's PR creation page");
+      } else if synced_count == 0 {
+        println!("   ℹ️  No new commits to sync - PR branch not pushed");
+        println!("   📝 To review: git diff {}..{}", current_branch, pr_branch);
+      } else {
+        // Local testing mode
+        println!("   📝 Next steps:");
+        println!(
+          "      1. Review the changes: git diff {}..{}",
+          current_branch, pr_branch
+        );
+        println!("      2. Push the branch: git push origin {}", pr_branch);
+        println!(
+          "      3. Create a pull request from {} to {}",
+          pr_branch, current_branch
+        );
+      }
+
       println!(
         "\n   ⚠️  Protected branch '{}' was NOT modified directly",
         current_branch
