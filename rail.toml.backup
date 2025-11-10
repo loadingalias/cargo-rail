@@ -1,14 +1,6 @@
 [workspace]
 root = "/Users/mr.wolf/loadingalias/cargo-rail"
 
-[security]
-require_signed_commits = false
-pr_branch_pattern = "rail/sync/{crate}/{timestamp}"
-protected_branches = [
-    "main",
-    "master",
-]
-
 [[splits]]
 name = "cargo-rail"
 remote = ""
