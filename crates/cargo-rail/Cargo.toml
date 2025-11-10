@@ -27,6 +27,7 @@ thiserror = "2.0.17"
 
 # Serialization for config
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.9.8"
 
 # Ordered map for preserving commit order

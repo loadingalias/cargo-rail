@@ -635,7 +635,11 @@ impl SyncEngine {
           println!("      ✅ Auto-merged {}", mono_path.display());
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
-            message: format!("Auto-merged {} using {:?} strategy", mono_path.display(), self.conflict_resolver.strategy()),
+            message: format!(
+              "Auto-merged {} using {:?} strategy",
+              mono_path.display(),
+              self.conflict_resolver.strategy()
+            ),
             resolved: true,
           });
         }
