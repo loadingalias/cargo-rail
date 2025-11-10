@@ -24,3 +24,8 @@ pub fn new_monorepo_function() {
     println!("Added from monorepo");
 }
 
+
+// Change from remote repo
+pub fn from_remote() {
+    println\!("This change came from the split repo");
+}
