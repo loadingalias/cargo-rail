@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::core::config::{SecurityConfig, SplitMode};
+use crate::core::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
 use crate::core::transform::{Transform, TransformContext};
@@ -35,12 +36,6 @@ pub enum SyncDirection {
   None,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConflictInfo {
-  pub file_path: PathBuf,
-  pub message: String,
-}
-
 /// Bidirectional sync engine
 pub struct SyncEngine {
   workspace_root: PathBuf,
@@ -50,6 +45,7 @@ pub struct SyncEngine {
   transformer: Box<dyn Transform>,
   security_config: SecurityConfig,
   security_validator: SecurityValidator,
+  conflict_resolver: ConflictResolver,
 }
 
 impl SyncEngine {
@@ -58,10 +54,16 @@ impl SyncEngine {
     config: SyncConfig,
     transformer: Box<dyn Transform>,
     security_config: SecurityConfig,
+    conflict_strategy: ConflictStrategy,
   ) -> Result<Self> {
     let mono_git = GitBackend::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let security_validator = SecurityValidator::new(security_config.clone());
+
+    // Create temporary directory for conflict resolution
+    let temp_dir = std::env::temp_dir().join(format!("cargo-rail-conflicts-{}", config.crate_name));
+    std::fs::create_dir_all(&temp_dir)?;
+    let conflict_resolver = ConflictResolver::new(conflict_strategy, temp_dir);
 
     Ok(Self {
       workspace_root,
@@ -71,6 +73,7 @@ impl SyncEngine {
       transformer,
       security_config,
       security_validator,
+      conflict_resolver,
     })
   }
 
@@ -247,19 +250,26 @@ impl SyncEngine {
 
       println!("   Syncing {} - {}", &commit.sha[..7], commit.summary());
 
-      // Check for conflicts
-      let has_conflict = self.check_for_conflicts(commit, &remote_git)?;
-      if has_conflict {
-        conflicts.push(ConflictInfo {
-          file_path: PathBuf::from(&commit.sha),
-          message: format!("Commit {} conflicts with local changes", &commit.sha[..7]),
-        });
-        println!("   ⚠️  Conflict detected, skipping");
-        continue;
+      // Resolve conflicts using 3-way merge
+      let conflict_infos = self.resolve_conflicts_for_commit(commit, &remote_git)?;
+
+      // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
+      let resolved_files: Vec<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
+
+      if !conflict_infos.is_empty() {
+        for info in &conflict_infos {
+          if info.resolved {
+            println!("      ✓ Auto-resolved: {}", info.message);
+          } else {
+            println!("      ⚠️  {}", info.message);
+          }
+        }
+        conflicts.extend(conflict_infos);
+        // Continue applying commit - files already merged by conflict resolver
       }
 
-      // Apply commit to mono
-      let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git)?;
+      // Apply commit to mono (skipping already-resolved files)
+      let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files)?;
 
       // Record mapping (remote -> mono)
       self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
@@ -281,10 +291,7 @@ impl SyncEngine {
 
         println!("\n   📝 Next step:");
         println!("      • Create a pull request on GitHub/GitLab:");
-        println!(
-          "        {} → {}",
-          pr_branch, current_branch
-        );
+        println!("        {} → {}", pr_branch, current_branch);
         println!("      • Or visit your repository's PR creation page");
       } else if synced_count == 0 {
         println!("   ℹ️  No new commits to sync - PR branch not pushed");
@@ -458,6 +465,7 @@ impl SyncEngine {
     &self,
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &GitBackend,
+    resolved_files: &[PathBuf],
   ) -> Result<String> {
     // Get changed files in remote
     let changed_files = remote_git.get_changed_files(&commit.sha)?;
@@ -465,6 +473,12 @@ impl SyncEngine {
     // Apply each file to mono
     for (remote_path, change_type) in changed_files {
       let mono_path = self.map_remote_path_to_mono(&remote_path)?;
+
+      // Skip files that were already resolved by conflict resolution
+      if resolved_files.iter().any(|p| p == &mono_path) {
+        println!("      Skipping {} (already resolved)", mono_path.display());
+        continue;
+      }
 
       match change_type {
         'D' => {
@@ -547,33 +561,107 @@ impl SyncEngine {
     }
   }
 
-  fn check_for_conflicts(&self, remote_commit: &crate::core::vcs::CommitInfo, remote_git: &GitBackend) -> Result<bool> {
+  /// Resolve conflicts for a commit using 3-way merge
+  /// Returns: Vec of conflict infos (empty if no conflicts or all resolved)
+  fn resolve_conflicts_for_commit(
+    &self,
+    remote_commit: &crate::core::vcs::CommitInfo,
+    remote_git: &GitBackend,
+  ) -> Result<Vec<ConflictInfo>> {
+    let mut conflicts = Vec::new();
+
     // Get files changed in this remote commit
     let changed_files = remote_git.get_changed_files(&remote_commit.sha)?;
 
-    // Map to mono paths
+    // Find the base commit (common ancestor)
+    let last_synced = self.find_last_synced_mono_commit()?;
+
     for (remote_path, _) in changed_files {
       let mono_path = self.map_remote_path_to_mono(&remote_path)?;
       let full_mono_path = self.workspace_root.join(&mono_path);
 
-      // Check if file was modified in mono since last sync
-      if full_mono_path.exists() {
-        // Simple check: if file exists and was modified, it might conflict
-        // TODO: More sophisticated conflict detection
-        let last_synced = self.find_last_synced_mono_commit()?;
-        if let Some(last) = last_synced {
-          let mono_commits = self
-            .mono_git
-            .get_commits_touching_path(&mono_path, Some(&last), "HEAD")?;
+      // Skip if file doesn't exist in monorepo (new file, no conflict)
+      if !full_mono_path.exists() {
+        continue;
+      }
 
-          if !mono_commits.is_empty() {
-            return Ok(true); // Conflict detected
-          }
+      // Check if file was modified in mono since last sync
+      let mono_modified = if let Some(ref last) = last_synced {
+        let mono_commits = self
+          .mono_git
+          .get_commits_touching_path(&mono_path, Some(last), "HEAD")?;
+        !mono_commits.is_empty()
+      } else {
+        false
+      };
+
+      // If not modified in mono, no conflict - will be cleanly applied
+      if !mono_modified {
+        continue;
+      }
+
+      // Both sides modified - need 3-way merge
+      // Get base content (last synced version)
+      let base_content = if let Some(ref last_sha) = last_synced {
+        match self.mono_git.get_file_at_commit(last_sha, &mono_path) {
+          Ok(Some(content)) => content,
+          Ok(None) | Err(_) => Vec::new(), // File didn't exist at base
+        }
+      } else {
+        Vec::new()
+      };
+
+      // Get incoming content (from remote)
+      let incoming_content = match remote_git.get_file_at_commit(&remote_commit.sha, &remote_path)? {
+        Some(content) => content,
+        None => continue, // File was deleted in remote, skip
+      };
+
+      // Perform 3-way merge
+      match self
+        .conflict_resolver
+        .resolve_file(&full_mono_path, &base_content, &incoming_content)
+      {
+        Ok(crate::core::conflict::MergeResult::Success) => {
+          // Merged successfully, no conflict
+          println!("      ✅ Auto-merged {}", mono_path.display());
+        }
+        Ok(crate::core::conflict::MergeResult::Conflicts(_paths)) => {
+          // Check if using auto-resolve strategy
+          let is_auto_resolved = matches!(
+            self.conflict_resolver.strategy(),
+            ConflictStrategy::Ours | ConflictStrategy::Theirs | ConflictStrategy::Union
+          );
+          conflicts.push(ConflictInfo {
+            file_path: mono_path.clone(),
+            message: format!("Conflict in {}", mono_path.display()),
+            resolved: is_auto_resolved,
+          });
+        }
+        Ok(crate::core::conflict::MergeResult::Failed(msg)) => {
+          conflicts.push(ConflictInfo {
+            file_path: mono_path.clone(),
+            message: format!("Merge failed: {}", msg),
+            resolved: false,
+          });
+        }
+        Err(e) => {
+          conflicts.push(ConflictInfo {
+            file_path: mono_path.clone(),
+            message: format!("Merge error: {}", e),
+            resolved: false,
+          });
         }
       }
     }
 
-    Ok(false)
+    Ok(conflicts)
+  }
+
+  /// Legacy method - kept for compatibility but now uses resolve_conflicts_for_commit
+  fn check_for_conflicts(&self, remote_commit: &crate::core::vcs::CommitInfo, remote_git: &GitBackend) -> Result<bool> {
+    let conflicts = self.resolve_conflicts_for_commit(remote_commit, remote_git)?;
+    Ok(!conflicts.is_empty())
   }
 
   fn check_mono_has_changes(&self) -> Result<bool> {

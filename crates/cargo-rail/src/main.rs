@@ -54,6 +54,9 @@ enum Commands {
     /// Only sync from monorepo to remote
     #[arg(long)]
     to_remote: bool,
+    /// Conflict resolution strategy: ours (use monorepo), theirs (use remote), manual (create markers), union (combine both)
+    #[arg(long, default_value = "manual")]
+    strategy: String,
   },
 }
 
@@ -102,7 +105,8 @@ fn main() -> Result<()> {
       all,
       from_remote,
       to_remote,
-    } => commands::run_sync(crate_name, all, from_remote, to_remote)?,
+      strategy,
+    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy)?,
   }
 
   Ok(())
