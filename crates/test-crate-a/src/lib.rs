@@ -19,3 +19,8 @@ mod tests {
 // New comment from monorepo test
 // Mono change 2
 // Change A
+// Change from monorepo
+pub fn new_monorepo_function() {
+    println!("Added from monorepo");
+}
+
