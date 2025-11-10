@@ -1,5 +1,6 @@
 mod adapters;
 mod cargo;
+mod checks;
 mod commands;
 mod core;
 
@@ -70,6 +71,15 @@ enum Commands {
     #[arg(long)]
     json: bool,
   },
+  /// Run health checks and diagnostics
+  Doctor {
+    /// Run thorough checks (includes network tests)
+    #[arg(long)]
+    thorough: bool,
+    /// Output results in JSON format
+    #[arg(long)]
+    json: bool,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -126,6 +136,7 @@ fn main() -> Result<()> {
       apply,
       json,
     } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy, apply, json)?,
+    Commands::Doctor { thorough, json } => commands::run_doctor(thorough, json)?,
   }
 
   Ok(())

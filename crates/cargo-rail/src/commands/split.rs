@@ -1,22 +1,9 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::env;
 
 use crate::core::config::RailConfig;
+use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::split::{SplitConfig, Splitter};
-
-/// Plan for a split operation
-#[derive(Debug, Serialize, Deserialize)]
-struct SplitPlan {
-  crate_name: String,
-  mode: String,
-  source_paths: Vec<String>,
-  target_repo: String,
-  remote_url: String,
-  branch: String,
-  estimated_commits: Option<usize>,
-  operations: Vec<String>,
-}
 
 /// Run the split command
 pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> Result<()> {
@@ -57,7 +44,7 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
   // Create splitter
   let splitter = Splitter::new(config.workspace.root.clone())?;
 
-  // Collect plans and execute
+  // Build plans using the unified Plan system
   let mut plans = Vec::new();
 
   for split_config in &crates_to_split {
@@ -79,24 +66,44 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       current_dir.join("..").join(remote_name)
     };
 
-    // Create plan
-    let plan = SplitPlan {
-      crate_name: split_config.name.clone(),
-      mode: format!("{:?}", split_config.mode).to_lowercase(),
-      source_paths: crate_paths.iter().map(|p| p.display().to_string()).collect(),
-      target_repo: target_repo_path.display().to_string(),
-      remote_url: split_config.remote.clone(),
+    // Build unified Plan
+    let mut plan = Plan::new(OperationType::Split, Some(split_config.name.clone()));
+
+    // Add operations
+    plan.add_operation(Operation::InitRepo {
+      path: target_repo_path.display().to_string(),
+    });
+
+    plan.add_operation(Operation::CreateCommit {
+      message: "Walking commit history for crate paths".to_string(),
+      files: crate_paths.iter().map(|p| p.display().to_string()).collect(),
+    });
+
+    plan.add_operation(Operation::Transform {
+      path: target_repo_path.join("Cargo.toml").display().to_string(),
+      transform_type: "workspace_to_concrete".to_string(),
+    });
+
+    plan.add_operation(Operation::Copy {
+      from: "auxiliary_files".to_string(),
+      to: target_repo_path.display().to_string(),
+    });
+
+    plan.add_operation(Operation::Push {
+      remote: split_config.remote.clone(),
       branch: split_config.branch.clone(),
-      estimated_commits: None, // Could calculate this in dry-run mode
-      operations: vec![
-        "Initialize target repository".to_string(),
-        "Walk commit history for crate paths".to_string(),
-        "Recreate commits in target repo".to_string(),
-        "Transform Cargo.toml (workspace → concrete values)".to_string(),
-        "Copy auxiliary files (LICENSE, README, etc.)".to_string(),
-        "Push to remote".to_string(),
-      ],
-    };
+      force: false,
+    });
+
+    // Add metadata
+    plan = plan
+      .with_summary(format!(
+        "Split crate '{}' to {} (mode: {:?})",
+        split_config.name, split_config.remote, split_config.mode
+      ))
+      .mark_destructive()
+      .add_trailer("Rail-Operation", "split")
+      .add_trailer("Rail-Crate", &split_config.name);
 
     plans.push((split_config.clone(), crate_paths, target_repo_path, plan));
   }
@@ -105,27 +112,25 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
   if !apply {
     if json {
       // JSON output for CI/automation
-      let json_plans: Vec<&SplitPlan> = plans.iter().map(|(_, _, _, plan)| plan).collect();
-      println!("{}", serde_json::to_string_pretty(&json_plans)?);
+      let json_plans: Vec<&Plan> = plans.iter().map(|(_, _, _, plan)| plan).collect();
+      for plan in json_plans {
+        println!("{}", plan.to_json()?);
+      }
     } else {
       // Human-readable plan
       println!("\n🔍 DRY-RUN MODE - No changes will be made");
       println!("   Add --apply to actually perform the split\n");
 
-      for (_, _, _, plan) in &plans {
-        println!("📦 Plan for crate: {}", plan.crate_name);
-        println!("   Mode: {}", plan.mode);
+      for (split_config, crate_paths, target_repo_path, plan) in &plans {
+        println!("{}", plan.to_human_readable());
+        println!("   Mode: {:?}", split_config.mode);
         println!("   Source paths:");
-        for path in &plan.source_paths {
-          println!("     • {}", path);
+        for path in crate_paths {
+          println!("     • {}", path.display());
         }
-        println!("   Target: {}", plan.target_repo);
-        println!("   Remote: {}", plan.remote_url);
-        println!("   Branch: {}", plan.branch);
-        println!("\n   Operations:");
-        for (i, op) in plan.operations.iter().enumerate() {
-          println!("     {}. {}", i + 1, op);
-        }
+        println!("   Target: {}", target_repo_path.display());
+        println!("   Remote: {}", split_config.remote);
+        println!("   Branch: {}", split_config.branch);
         println!();
       }
 

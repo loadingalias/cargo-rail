@@ -1,27 +1,12 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::env;
 
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::cargo::transform::CargoTransform;
 use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
+use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine};
-
-/// Plan for a sync operation
-#[derive(Debug, Serialize, Deserialize)]
-struct SyncPlan {
-  crate_name: String,
-  direction: String,
-  source: String,
-  target: String,
-  remote_url: String,
-  branch: String,
-  strategy: String,
-  estimated_commits: Option<usize>,
-  operations: Vec<String>,
-  protected_branch_handling: Option<String>,
-}
 
 /// Run the sync command
 pub fn run_sync(
@@ -81,7 +66,7 @@ pub fn run_sync(
     anyhow::bail!("Must specify a crate name or use --all");
   };
 
-  // Collect plans and execute
+  // Build plans using the unified Plan system
   let mut plans = Vec::new();
 
   for split_config in &crates_to_sync {
@@ -111,91 +96,148 @@ pub fn run_sync(
       continue;
     }
 
-    // Create plan
-    let (source, target, dir_str, protected_handling) = match direction {
-      SyncDirection::MonoToRemote => (
-        config.workspace.root.display().to_string(),
-        target_repo_path.display().to_string(),
-        "monorepo → remote",
-        None,
-      ),
-      SyncDirection::RemoteToMono => (
-        target_repo_path.display().to_string(),
-        config.workspace.root.display().to_string(),
-        "remote → monorepo",
-        Some(format!(
-          "Will create PR branch if target is protected ({})",
-          config.security.protected_branches.join(", ")
-        )),
-      ),
-      SyncDirection::Both => (
-        "both".to_string(),
-        "both".to_string(),
-        "bidirectional",
-        Some(format!(
-          "Will create PR branch for remote → mono if needed ({})",
-          config.security.protected_branches.join(", ")
-        )),
-      ),
+    // Build unified Plan
+    let mut plan = Plan::new(OperationType::Sync, Some(split_config.name.clone()));
+
+    // Add operations based on direction
+    let dir_str = match direction {
+      SyncDirection::MonoToRemote => {
+        plan.add_operation(Operation::Pull {
+          remote: split_config.remote.clone(),
+          branch: split_config.branch.clone(),
+        });
+
+        plan.add_operation(Operation::Transform {
+          path: "Cargo.toml".to_string(),
+          transform_type: "path_to_version".to_string(),
+        });
+
+        plan.add_operation(Operation::CreateCommit {
+          message: "Sync from monorepo".to_string(),
+          files: crate_paths.iter().map(|p| p.display().to_string()).collect(),
+        });
+
+        plan.add_operation(Operation::Push {
+          remote: split_config.remote.clone(),
+          branch: split_config.branch.clone(),
+          force: false,
+        });
+
+        "monorepo → remote"
+      }
+      SyncDirection::RemoteToMono => {
+        plan.add_operation(Operation::Pull {
+          remote: split_config.remote.clone(),
+          branch: split_config.branch.clone(),
+        });
+
+        plan.add_operation(Operation::Transform {
+          path: "Cargo.toml".to_string(),
+          transform_type: "version_to_path".to_string(),
+        });
+
+        plan.add_operation(Operation::CreatePrBranch {
+          name: format!("rail/sync/{}", split_config.name),
+          base: "main".to_string(),
+          message: "Sync from remote".to_string(),
+        });
+
+        plan.add_operation(Operation::Push {
+          remote: "origin".to_string(),
+          branch: format!("rail/sync/{}", split_config.name),
+          force: false,
+        });
+
+        "remote → monorepo"
+      }
+      SyncDirection::Both => {
+        // Both directions
+        plan.add_operation(Operation::Pull {
+          remote: split_config.remote.clone(),
+          branch: split_config.branch.clone(),
+        });
+
+        plan.add_operation(Operation::Merge {
+          from: split_config.branch.clone(),
+          into: "main".to_string(),
+          strategy: strategy_str.clone(),
+        });
+
+        plan.add_operation(Operation::Push {
+          remote: split_config.remote.clone(),
+          branch: split_config.branch.clone(),
+          force: false,
+        });
+
+        "bidirectional"
+      }
       SyncDirection::None => continue,
     };
 
-    let plan = SyncPlan {
-      crate_name: split_config.name.clone(),
-      direction: dir_str.to_string(),
-      source,
-      target,
-      remote_url: split_config.remote.clone(),
-      branch: split_config.branch.clone(),
-      strategy: strategy_str.clone(),
-      estimated_commits: None, // Could calculate in dry-run
-      operations: vec![
-        "Load git-notes mappings".to_string(),
-        "Fetch latest from remote".to_string(),
-        "Find commits to sync (filtering duplicates)".to_string(),
-        "Apply transforms (Cargo.toml path ↔ version)".to_string(),
-        "Detect and resolve conflicts".to_string(),
-        "Create commits with Rail-Origin trailers".to_string(),
-        "Update git-notes mappings".to_string(),
-        "Push to remote".to_string(),
-      ],
-      protected_branch_handling: protected_handling,
+    // Add common operations
+    plan.add_operation(Operation::UpdateNotes {
+      notes_ref: format!("refs/notes/rail/{}", split_config.name),
+      commit: "HEAD".to_string(),
+      note_content: "sync mapping".to_string(),
+    });
+
+    // Add metadata
+    let protected_handling = if matches!(direction, SyncDirection::RemoteToMono | SyncDirection::Both) {
+      Some(format!(
+        "Will create PR branch if target is protected ({})",
+        config.security.protected_branches.join(", ")
+      ))
+    } else {
+      None
     };
 
-    plans.push((split_config.clone(), crate_paths, target_repo_path, plan, target_exists));
+    plan = plan
+      .with_summary(format!(
+        "Sync crate '{}' ({}) with conflict strategy: {}",
+        split_config.name, dir_str, strategy_str
+      ))
+      .add_trailer("Rail-Operation", "sync")
+      .add_trailer("Rail-Crate", &split_config.name)
+      .add_trailer("Rail-Direction", dir_str)
+      .add_trailer("Rail-Strategy", &strategy_str);
+
+    plans.push((
+      split_config.clone(),
+      crate_paths,
+      target_repo_path,
+      plan,
+      target_exists,
+      protected_handling,
+    ));
   }
 
   // Output plans
   if !apply {
     if json {
       // JSON output for CI/automation
-      let json_plans: Vec<&SyncPlan> = plans.iter().map(|(_, _, _, plan, _)| plan).collect();
-      println!("{}", serde_json::to_string_pretty(&json_plans)?);
+      let json_plans: Vec<&Plan> = plans.iter().map(|(_, _, _, plan, _, _)| plan).collect();
+      for plan in json_plans {
+        println!("{}", plan.to_json()?);
+      }
     } else {
       // Human-readable plan
       println!("\n🔍 DRY-RUN MODE - No changes will be made");
       println!("   Add --apply to actually perform the sync\n");
 
-      for (_, _, _, plan, target_exists) in &plans {
-        println!("📦 Plan for crate: {}", plan.crate_name);
-        println!("   Direction: {}", plan.direction);
-        println!("   Source: {}", plan.source);
-        println!("   Target: {}", plan.target);
-        println!("   Remote: {}", plan.remote_url);
-        println!("   Branch: {}", plan.branch);
-        println!("   Conflict strategy: {}", plan.strategy);
+      for (split_config, _, target_repo_path, plan, target_exists, protected_handling) in &plans {
+        println!("{}", plan.to_human_readable());
+        println!("   Target: {}", target_repo_path.display());
+        println!("   Remote: {}", split_config.remote);
+        println!("   Branch: {}", split_config.branch);
+        println!("   Conflict strategy: {}", strategy_str);
         if !target_exists {
           println!(
             "   ⚠️  Target repo does not exist yet - run `cargo rail split {}` first",
-            plan.crate_name
+            split_config.name
           );
         }
-        if let Some(ref handling) = plan.protected_branch_handling {
+        if let Some(handling) = protected_handling {
           println!("   🛡️  {}", handling);
-        }
-        println!("\n   Operations:");
-        for (i, op) in plan.operations.iter().enumerate() {
-          println!("     {}. {}", i + 1, op);
         }
         println!();
       }
@@ -233,7 +275,7 @@ pub fn run_sync(
   // Apply mode - execute the sync
   println!("\n🚀 APPLY MODE - Executing sync operations\n");
 
-  for (split_config, crate_paths, target_repo_path, _, _) in plans {
+  for (split_config, crate_paths, target_repo_path, _, _, _) in plans {
     println!("\n🔄 Syncing crate: {}", split_config.name);
 
     let sync_config = SyncConfig {
