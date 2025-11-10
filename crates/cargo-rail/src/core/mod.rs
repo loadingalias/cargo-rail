@@ -1,6 +1,7 @@
 pub mod config;
 pub mod conflict;
 pub mod mapping;
+pub mod plan;
 pub mod security;
 pub mod split;
 pub mod sync;

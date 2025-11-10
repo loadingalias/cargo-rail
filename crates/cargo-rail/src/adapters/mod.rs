@@ -12,6 +12,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 pub mod cargo;
+pub mod descriptor;
 
 /// Generic workspace information
 #[derive(Debug, Clone)]
