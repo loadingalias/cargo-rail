@@ -361,16 +361,16 @@ impl Splitter {
       }
     } else {
       // Recreate history in target repo
-      println!(
-        "   Recreating {} commits in target repository...",
-        filtered_commits.len()
+      use crate::ui::progress::CommitProgress;
+
+      let mut progress = CommitProgress::new(
+        filtered_commits.len(),
+        format!("Processing {} commits", filtered_commits.len()),
       );
 
       let mut last_recreated_sha: Option<String> = None;
 
-      for (idx, commit) in filtered_commits.iter().enumerate() {
-        println!("   [{}/{}] {}", idx + 1, filtered_commits.len(), commit.summary());
-
+      for commit in filtered_commits.iter() {
         let new_sha = self.recreate_commit_in_target(&RecreateCommitParams {
           commit,
           crate_paths: &config.crate_paths,
@@ -387,6 +387,9 @@ impl Splitter {
 
         // Track last recreated commit
         last_recreated_sha = Some(new_sha);
+
+        // Update progress
+        progress.inc();
       }
 
       // Copy workspace config files and project files to the final state

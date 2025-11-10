@@ -1,24 +1,22 @@
-use anyhow::{Context, Result};
 use std::env;
 
 use crate::core::config::RailConfig;
+use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::split::{SplitConfig, Splitter};
 
 /// Run the split command
-pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> Result<()> {
-  let current_dir = env::current_dir().context("Failed to get current directory")?;
+pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> RailResult<()> {
+  let current_dir = env::current_dir()?;
 
   // Load configuration
   if !RailConfig::exists(&current_dir) {
-    anyhow::bail!(
-      "No cargo-rail configuration found. Run `cargo rail init` first.\n\
-       Expected file: {}/.rail/config.toml",
-      current_dir.display()
-    );
+    return Err(RailError::Config(ConfigError::NotFound {
+      workspace_root: current_dir,
+    }));
   }
 
-  let config = RailConfig::load(&current_dir)?;
+  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
   println!("📦 Loaded configuration from .rail/config.toml");
 
   // Determine which crates to split
@@ -30,19 +28,21 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       .splits
       .iter()
       .find(|s| s.name == *name)
-      .ok_or_else(|| anyhow::anyhow!("Crate '{}' not found in configuration", name))?;
+      .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
     vec![split_config.clone()]
   } else {
-    anyhow::bail!("Must specify a crate name or use --all");
+    return Err(RailError::Other(anyhow::anyhow!(
+      "Must specify a crate name or use --all"
+    )));
   };
 
   // Validate all configurations before starting
   for split_config in &crates_to_split {
-    split_config.validate()?;
+    split_config.validate().map_err(RailError::Other)?;
   }
 
   // Create splitter
-  let splitter = Splitter::new(config.workspace.root.clone())?;
+  let splitter = Splitter::new(config.workspace.root.clone()).map_err(RailError::Other)?;
 
   // Build plans using the unified Plan system
   let mut plans = Vec::new();
@@ -158,7 +158,7 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       remote_url: Some(split_config.remote.clone()),
     };
 
-    splitter.split(&split_cfg)?;
+    splitter.split(&split_cfg).map_err(RailError::Other)?;
     println!();
   }
 

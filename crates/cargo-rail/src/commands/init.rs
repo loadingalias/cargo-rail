@@ -1,16 +1,17 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode};
+use crate::core::error::{RailError, RailResult};
 
 /// Run the init command to set up cargo-rail configuration
-pub fn run_init(all: bool) -> Result<()> {
+pub fn run_init(all: bool) -> RailResult<()> {
   // Find workspace root
-  let current_dir = env::current_dir().context("Failed to get current directory")?;
-  let workspace_root = find_workspace_root(&current_dir)?;
+  let current_dir = env::current_dir()?;
+  let workspace_root = find_workspace_root(&current_dir).map_err(RailError::Other)?;
 
   println!("📦 Found workspace at: {}", workspace_root.display());
 
@@ -28,11 +29,11 @@ pub fn run_init(all: bool) -> Result<()> {
 
   // Load workspace metadata
   println!("🔍 Discovering workspace crates...");
-  let metadata = WorkspaceMetadata::load(&workspace_root)?;
+  let metadata = WorkspaceMetadata::load(&workspace_root).map_err(RailError::Other)?;
   let crates = metadata.list_crates();
 
   if crates.is_empty() {
-    anyhow::bail!("No crates found in workspace");
+    return Err(RailError::Other(anyhow::anyhow!("No crates found in workspace")));
   }
 
   println!("\n📋 Found {} crates:", crates.len());
@@ -50,7 +51,7 @@ pub fn run_init(all: bool) -> Result<()> {
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
 
-    parse_selection(&input, crates.len())?
+    parse_selection(&input, crates.len()).map_err(RailError::Other)?
   };
 
   if selected_indices.is_empty() {
@@ -97,7 +98,7 @@ pub fn run_init(all: bool) -> Result<()> {
 
   // Save configuration
   println!("\n💾 Saving configuration...");
-  config.save(&workspace_root)?;
+  config.save(&workspace_root).map_err(RailError::Other)?;
 
   println!("\n✅ Successfully initialized cargo-rail!");
   println!("   Configuration saved to: {}/rail.toml", workspace_root.display());
@@ -111,7 +112,7 @@ pub fn run_init(all: bool) -> Result<()> {
 }
 
 /// Find the workspace root by looking for Cargo.toml with \[workspace\]
-fn find_workspace_root(start: &Path) -> Result<PathBuf> {
+fn find_workspace_root(start: &Path) -> anyhow::Result<PathBuf> {
   let mut current = start.to_path_buf();
 
   loop {
@@ -134,7 +135,7 @@ fn find_workspace_root(start: &Path) -> Result<PathBuf> {
 }
 
 /// Parse user selection input like "1,3,5" or "1-3,5"
-fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>> {
+fn parse_selection(input: &str, max: usize) -> anyhow::Result<Vec<usize>> {
   let mut indices = Vec::new();
   let input = input.trim();
 

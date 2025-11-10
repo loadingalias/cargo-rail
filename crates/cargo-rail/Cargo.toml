@@ -27,7 +27,7 @@ thiserror = "2.0.17"
 
 # Serialization for config
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0"
+serde_json = "1.0.145"
 toml = "0.9.8"
 
 # Ordered map for preserving commit order
@@ -37,10 +37,18 @@ indexmap = "2.7.1"
 chrono = "0.4.42"
 
 # Cryptographic hashing for plan IDs
-sha2 = "0.10"
+sha2 = "0.10.9"
+
+# Progress indicators (allocation-free, concurrency-optimized)
+linya = "0.3.1"
+
+# Structured logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+criterion = "0.7.0"
 
 [[test]]
 name = "integration"

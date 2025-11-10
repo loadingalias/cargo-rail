@@ -136,32 +136,59 @@ impl SyncEngine {
       .mono_git
       .get_commits_touching_path(crate_path, last_synced_mono.as_deref(), "HEAD")?;
 
-    println!("   Found {} new commits in monorepo", new_commits.len());
+    if new_commits.is_empty() {
+      println!("   No new commits to sync");
+    } else {
+      use crate::ui::progress::CommitProgress;
 
-    let mut synced_count = 0;
+      let mut progress = CommitProgress::new(
+        new_commits.len(),
+        format!("Syncing {} commits to remote", new_commits.len()),
+      );
 
-    for commit in &new_commits {
-      // Skip if already synced
-      if self.mapping_store.has_mapping(&commit.sha) {
-        println!("   Skipping {} (already synced)", &commit.sha[..7]);
-        continue;
+      let mut synced_count = 0;
+
+      for commit in &new_commits {
+        // Skip if already synced
+        if self.mapping_store.has_mapping(&commit.sha) {
+          progress.inc();
+          continue;
+        }
+
+        // Skip if this commit came from remote (check trailer)
+        if commit.message.contains("Rail-Origin: remote@") {
+          progress.inc();
+          continue;
+        }
+
+        // Apply commit to remote
+        let remote_sha = self.apply_mono_commit_to_remote(commit, &remote_git)?;
+
+        // Record mapping
+        self.mapping_store.record_mapping(&commit.sha, &remote_sha)?;
+        synced_count += 1;
+
+        progress.inc();
       }
 
-      // Skip if this commit came from remote (check trailer)
-      if commit.message.contains("Rail-Origin: remote@") {
-        println!("   Skipping {} (from remote)", &commit.sha[..7]);
-        continue;
+      // Save mappings after processing commits
+      self.mapping_store.save(&self.workspace_root)?;
+      self.mapping_store.save(&self.config.target_repo_path)?;
+
+      // Push to remote (skip for local paths)
+      if synced_count > 0 && !self.is_local_remote() {
+        remote_git.push_to_remote("origin", &self.config.branch)?;
+        self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       }
 
-      println!("   Syncing {} - {}", &commit.sha[..7], commit.summary());
-
-      // Apply commit to remote
-      let remote_sha = self.apply_mono_commit_to_remote(commit, &remote_git)?;
-
-      // Record mapping
-      self.mapping_store.record_mapping(&commit.sha, &remote_sha)?;
-      synced_count += 1;
+      return Ok(SyncResult {
+        commits_synced: synced_count,
+        direction: SyncDirection::MonoToRemote,
+        conflicts: Vec::new(),
+      });
     }
+
+    let synced_count = 0;
 
     // Save mappings
     self.mapping_store.save(&self.workspace_root)?;
@@ -238,51 +265,57 @@ impl SyncEngine {
       remote_git.get_commits_touching_path(Path::new("."), None, &branch_ref)?
     };
 
-    println!("   Found {} new commits in remote", new_commits.len());
-
-    let mut synced_count = 0;
     let mut conflicts = Vec::new();
 
-    for commit in &new_commits {
-      // Skip if this commit came from mono (check trailer)
-      if commit.message.contains("Rail-Origin: mono@") {
-        println!("   Skipping {} (from mono)", &commit.sha[..7]);
-        continue;
-      }
+    let synced_count = if new_commits.is_empty() {
+      println!("   No new commits to sync");
+      0
+    } else {
+      use crate::ui::progress::CommitProgress;
 
-      // Skip if already synced (reverse mapping)
-      if self.mapping_store.all_mappings().values().any(|v| v == &commit.sha) {
-        println!("   Skipping {} (already synced)", &commit.sha[..7]);
-        continue;
-      }
+      let mut progress = CommitProgress::new(
+        new_commits.len(),
+        format!("Syncing {} commits from remote", new_commits.len()),
+      );
 
-      println!("   Syncing {} - {}", &commit.sha[..7], commit.summary());
+      let mut count = 0;
 
-      // Resolve conflicts using 3-way merge
-      let conflict_infos = self.resolve_conflicts_for_commit(commit, &remote_git)?;
-
-      // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
-      let resolved_files: Vec<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
-
-      if !conflict_infos.is_empty() {
-        for info in &conflict_infos {
-          if info.resolved {
-            println!("      ✓ Auto-resolved: {}", info.message);
-          } else {
-            println!("      ⚠️  {}", info.message);
-          }
+      for commit in &new_commits {
+        // Skip if this commit came from mono (check trailer)
+        if commit.message.contains("Rail-Origin: mono@") {
+          progress.inc();
+          continue;
         }
-        conflicts.extend(conflict_infos);
-        // Continue applying commit - files already merged by conflict resolver
+
+        // Skip if already synced (reverse mapping)
+        if self.mapping_store.all_mappings().values().any(|v| v == &commit.sha) {
+          progress.inc();
+          continue;
+        }
+
+        // Resolve conflicts using 3-way merge
+        let conflict_infos = self.resolve_conflicts_for_commit(commit, &remote_git)?;
+
+        // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
+        let resolved_files: Vec<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
+
+        if !conflict_infos.is_empty() {
+          conflicts.extend(conflict_infos);
+          // Continue applying commit - files already merged by conflict resolver
+        }
+
+        // Apply commit to mono (skipping already-resolved files)
+        let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files)?;
+
+        // Record mapping (remote -> mono)
+        self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
+        count += 1;
+
+        progress.inc();
       }
 
-      // Apply commit to mono (skipping already-resolved files)
-      let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files)?;
-
-      // Record mapping (remote -> mono)
-      self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
-      synced_count += 1;
-    }
+      count
+    };
 
     // Save mappings
     self.mapping_store.save(&self.workspace_root)?;

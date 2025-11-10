@@ -3,9 +3,10 @@ mod cargo;
 mod checks;
 mod commands;
 mod core;
+mod ui;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
+use core::error::RailError;
 
 /// Split Rust crates from monorepos, keep them in sync
 #[derive(Parser)]
@@ -80,6 +81,23 @@ enum Commands {
     #[arg(long)]
     json: bool,
   },
+  /// Show status of all configured crates
+  Status {
+    /// Output status in JSON format
+    #[arg(long)]
+    json: bool,
+  },
+  /// Inspect git-notes mappings for a crate
+  Mappings {
+    /// Name of the crate to inspect
+    crate_name: String,
+    /// Validate mapping integrity
+    #[arg(long)]
+    check: bool,
+    /// Output mappings in JSON format
+    #[arg(long)]
+    json: bool,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -116,17 +134,17 @@ fn get_styles() -> clap::builder::Styles {
     .placeholder(anstyle::Style::new().fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::White))))
 }
 
-fn main() -> Result<()> {
+fn main() {
   let CargoCli::Rail(cli) = CargoCli::parse();
 
-  match cli.command {
-    Commands::Init { all } => commands::run_init(all)?,
+  let result = match cli.command {
+    Commands::Init { all } => commands::run_init(all),
     Commands::Split {
       crate_name,
       all,
       apply,
       json,
-    } => commands::run_split(crate_name, all, apply, json)?,
+    } => commands::run_split(crate_name, all, apply, json),
     Commands::Sync {
       crate_name,
       all,
@@ -135,9 +153,27 @@ fn main() -> Result<()> {
       strategy,
       apply,
       json,
-    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy, apply, json)?,
-    Commands::Doctor { thorough, json } => commands::run_doctor(thorough, json)?,
+    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy, apply, json),
+    Commands::Doctor { thorough, json } => commands::run_doctor(thorough, json),
+    Commands::Status { json } => commands::run_status(json),
+    Commands::Mappings {
+      crate_name,
+      check,
+      json,
+    } => commands::run_mappings(crate_name, check, json),
+  };
+
+  if let Err(err) = result {
+    handle_error(err);
+  }
+}
+
+fn handle_error(err: RailError) -> ! {
+  eprintln!("Error: {}", err);
+
+  if let Some(help) = err.help_message() {
+    eprintln!("\nHelp: {}", help);
   }
 
-  Ok(())
+  std::process::exit(err.exit_code().as_i32());
 }
