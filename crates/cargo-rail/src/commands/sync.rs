@@ -4,10 +4,19 @@ use std::env;
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::cargo::transform::CargoTransform;
 use crate::core::config::RailConfig;
+use crate::core::conflict::ConflictStrategy;
 use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine};
 
 /// Run the sync command
-pub fn run_sync(crate_name: Option<String>, all: bool, from_remote: bool, to_remote: bool) -> Result<()> {
+pub fn run_sync(
+  crate_name: Option<String>,
+  all: bool,
+  from_remote: bool,
+  to_remote: bool,
+  strategy_str: String,
+) -> Result<()> {
+  // Parse conflict strategy
+  let strategy = ConflictStrategy::from_str(&strategy_str)?;
   let current_dir = env::current_dir().context("Failed to get current directory")?;
 
   // Load configuration
@@ -99,12 +108,13 @@ pub fn run_sync(crate_name: Option<String>, all: bool, from_remote: bool, to_rem
     let metadata = WorkspaceMetadata::load(&config.workspace.root)?;
     let transformer = Box::new(CargoTransform::new(metadata));
 
-    // Create sync engine with security config
+    // Create sync engine with security config and conflict strategy
     let mut engine = SyncEngine::new(
       config.workspace.root.clone(),
       sync_config,
       transformer,
       config.security.clone(),
+      strategy,
     )?;
 
     // Perform sync based on direction
