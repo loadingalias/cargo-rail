@@ -217,8 +217,11 @@ impl MappingStore {
           eprintln!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
           eprintln!("      3. Resolve conflicts manually");
           eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
-          eprintln!("");
-          anyhow::bail!("git notes merge failed: {}\n\nThis usually happens when the same commit has different mappings on different machines.\nPlease resolve manually using the steps above.", merge_stderr);
+          eprintln!();
+          anyhow::bail!(
+            "git notes merge failed: {}\n\nThis usually happens when the same commit has different mappings on different machines.\nPlease resolve manually using the steps above.",
+            merge_stderr
+          );
         }
 
         println!("   ✅ Git-notes merged successfully (union strategy)");

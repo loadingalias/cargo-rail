@@ -1,4 +1,5 @@
 pub mod config;
+pub mod conflict;
 pub mod mapping;
 pub mod security;
 pub mod split;

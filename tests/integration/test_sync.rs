@@ -154,3 +154,255 @@ fn test_sync_deduplicates_commits() -> Result<()> {
 
   Ok(())
 }
+
+#[test]
+fn test_conflict_resolution_ours_strategy() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create and split a crate
+  workspace.add_crate("my-crate", "0.1.0", &[])?;
+  workspace.commit("Add my-crate")?;
+
+  run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
+  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let config = workspace.read_file("rail.toml")?;
+  let updated_config = config
+    .replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()))
+    .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
+  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
+
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+
+  // Make change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
+  workspace.commit("Monorepo change")?;
+
+  // Sync to remote first (establish baseline)
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+
+  // Make another change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
+  workspace.commit("Monorepo change v2")?;
+
+  // Make conflicting change in split repo (same file)
+  std::fs::write(split_dir.join("src/lib.rs"), "// Split version\npub fn split() {}")?;
+  git(&split_dir, &["add", "."])?;
+  git(&split_dir, &["commit", "-m", "Split change"])?;
+
+  // Sync from remote with --strategy=ours (should keep monorepo version)
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--strategy=ours"],
+  )?;
+
+  // Verify monorepo version is kept
+  let lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
+  assert!(
+    lib.contains("Monorepo version v2"),
+    "Expected 'Monorepo version v2' in:\n{}",
+    lib
+  );
+  assert!(lib.contains("pub fn mono()"));
+  assert!(!lib.contains("Split version"));
+  assert!(!lib.contains("pub fn split()"));
+
+  Ok(())
+}
+
+#[test]
+fn test_conflict_resolution_theirs_strategy() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create and split a crate
+  workspace.add_crate("my-crate", "0.1.0", &[])?;
+  workspace.commit("Add my-crate")?;
+
+  run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
+  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let config = workspace.read_file("rail.toml")?;
+  let updated_config = config
+    .replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()))
+    .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
+  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
+
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+
+  // Make change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
+  workspace.commit("Monorepo change")?;
+
+  // Sync to remote first
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+
+  // Make another change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
+  workspace.commit("Monorepo change v2")?;
+
+  // Make conflicting change in split repo
+  std::fs::write(split_dir.join("src/lib.rs"), "// Split version\npub fn split() {}")?;
+  git(&split_dir, &["add", "."])?;
+  git(&split_dir, &["commit", "-m", "Split change"])?;
+
+  // Sync from remote with --strategy=theirs (should use remote version)
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--strategy=theirs"],
+  )?;
+
+  // Verify remote version is used
+  let lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
+  assert!(lib.contains("Split version"));
+  assert!(lib.contains("pub fn split()"));
+  assert!(!lib.contains("Monorepo version"));
+  assert!(!lib.contains("pub fn mono()"));
+
+  Ok(())
+}
+
+#[test]
+fn test_conflict_resolution_manual_strategy() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create and split a crate
+  workspace.add_crate("my-crate", "0.1.0", &[])?;
+  workspace.commit("Add my-crate")?;
+
+  run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
+  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let config = workspace.read_file("rail.toml")?;
+  let updated_config = config
+    .replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()))
+    .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
+  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
+
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+
+  // Make change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
+  workspace.commit("Monorepo change")?;
+
+  // Sync to remote first
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+
+  // Make another change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
+  workspace.commit("Monorepo change v2")?;
+
+  // Make conflicting change in split repo
+  std::fs::write(split_dir.join("src/lib.rs"), "// Split version\npub fn split() {}")?;
+  git(&split_dir, &["add", "."])?;
+  git(&split_dir, &["commit", "-m", "Split change"])?;
+
+  // Sync from remote with --strategy=manual (should create conflict markers)
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--strategy=manual"],
+  )?;
+
+  // Verify conflict markers are present
+  let lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
+  assert!(lib.contains("<<<<<<<"));
+  assert!(lib.contains("======="));
+  assert!(lib.contains(">>>>>>>"));
+  // Should contain both versions in the conflict markers
+  assert!(lib.contains("Monorepo version v2") || lib.contains("Split version"));
+
+  Ok(())
+}
+
+#[test]
+fn test_conflict_resolution_union_strategy() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create and split a crate
+  workspace.add_crate("my-crate", "0.1.0", &[])?;
+  workspace.commit("Add my-crate")?;
+
+  run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
+  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let config = workspace.read_file("rail.toml")?;
+  let updated_config = config
+    .replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()))
+    .replace(r#"protected_branches = ["main"]"#, r#"protected_branches = []"#);
+  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
+
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+
+  // Make change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version\npub fn mono() {}")?;
+  workspace.commit("Monorepo change")?;
+
+  // Sync to remote first
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--to-remote"])?;
+
+  // Make another change in monorepo
+  workspace.modify_file("my-crate", "src/lib.rs", "// Monorepo version v2\npub fn mono() {}")?;
+  workspace.commit("Monorepo change v2")?;
+
+  // Make conflicting change in split repo
+  std::fs::write(split_dir.join("src/lib.rs"), "// Split version\npub fn split() {}")?;
+  git(&split_dir, &["add", "."])?;
+  git(&split_dir, &["commit", "-m", "Split change"])?;
+
+  // Sync from remote with --strategy=union (should combine both)
+  run_cargo_rail(
+    &workspace.path,
+    &["rail", "sync", "my-crate", "--from-remote", "--strategy=union"],
+  )?;
+
+  // Verify both versions are present (union merge combines them)
+  let lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
+  // Union merge should contain elements from both sides
+  let has_mono_content = lib.contains("pub fn mono()") || lib.contains("Monorepo");
+  let has_split_content = lib.contains("pub fn split()") || lib.contains("Split");
+  assert!(
+    has_mono_content && has_split_content,
+    "Union merge should contain both versions. File content:\n{}",
+    lib
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_no_conflict_with_non_overlapping_changes() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create and split a crate
+  workspace.add_crate("my-crate", "0.1.0", &[])?;
+  workspace.commit("Add my-crate")?;
+
+  run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
+  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let config = workspace.read_file("rail.toml")?;
+  let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
+  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
+
+  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate"])?;
+
+  // Make change in monorepo (modify README)
+  workspace.modify_file("my-crate", "README.md", "# Updated from mono")?;
+  workspace.commit("Mono change")?;
+
+  // Make non-conflicting change in split repo (modify lib.rs)
+  std::fs::write(split_dir.join("src/lib.rs"), "// New function\npub fn new_fn() {}")?;
+  git(&split_dir, &["add", "."])?;
+  git(&split_dir, &["commit", "-m", "Add new function"])?;
+
+  // Sync from remote (should auto-merge cleanly)
+  run_cargo_rail(&workspace.path, &["rail", "sync", "my-crate", "--from-remote"])?;
+
+  // Verify both changes are present
+  let readme = workspace.read_file("crates/my-crate/README.md")?;
+  assert!(readme.contains("Updated from mono"));
+
+  let lib = workspace.read_file("crates/my-crate/src/lib.rs")?;
+  assert!(lib.contains("New function"));
+  assert!(lib.contains("pub fn new_fn()"));
+
+  // Should not have conflict markers
+  assert!(!lib.contains("<<<<<<<"));
+  assert!(!lib.contains(">>>>>>>"));
+
+  Ok(())
+}
