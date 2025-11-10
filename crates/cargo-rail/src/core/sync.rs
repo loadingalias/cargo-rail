@@ -60,8 +60,16 @@ impl SyncEngine {
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let security_validator = SecurityValidator::new(security_config.clone());
 
-    // Create temporary directory for conflict resolution
-    let temp_dir = std::env::temp_dir().join(format!("cargo-rail-conflicts-{}", config.crate_name));
+    // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
+    let temp_dir = std::env::temp_dir().join(format!(
+      "cargo-rail-conflicts-{}-{}-{}",
+      config.crate_name,
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
     std::fs::create_dir_all(&temp_dir)?;
     let conflict_resolver = ConflictResolver::new(conflict_strategy, temp_dir);
 
@@ -623,8 +631,13 @@ impl SyncEngine {
         .resolve_file(&full_mono_path, &base_content, &incoming_content)
       {
         Ok(crate::core::conflict::MergeResult::Success) => {
-          // Merged successfully, no conflict
+          // Merged successfully - add to resolved files to prevent overwriting
           println!("      ✅ Auto-merged {}", mono_path.display());
+          conflicts.push(ConflictInfo {
+            file_path: mono_path.clone(),
+            message: format!("Auto-merged {} using {:?} strategy", mono_path.display(), self.conflict_resolver.strategy()),
+            resolved: true,
+          });
         }
         Ok(crate::core::conflict::MergeResult::Conflicts(_paths)) => {
           // Check if using auto-resolve strategy
