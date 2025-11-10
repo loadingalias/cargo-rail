@@ -16,3 +16,4 @@ mod tests {
     assert!(msg.contains("Hello from crate B"));
   }
 }
+// New comment from monorepo test
