@@ -340,7 +340,7 @@ impl Splitter {
     // Create fresh target repo
     self.ensure_target_repo(&config.target_repo_path)?;
 
-    // Discover workspace-level auxiliary files using adapter
+    // Discover workspace-level auxiliary files from workspace
     let aux_files = AuxiliaryFiles::discover(&self.workspace_root)?;
     println!("   Found {} workspace config files", aux_files.count());
 

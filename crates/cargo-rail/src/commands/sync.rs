@@ -421,7 +421,7 @@ pub fn run_sync(
         remote_url: split_config.remote.clone(),
       };
 
-      // Create sync engine (adapter auto-detected)
+      // Create sync engine (Cargo workspace detected)
       let mut engine = SyncEngine::new(
         config.workspace.root.clone(),
         sync_config,

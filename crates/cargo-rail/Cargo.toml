@@ -6,6 +6,17 @@ rust-version = "1.91"
 license = "MIT"
 authors = ["loadingalias"]
 description = "Split Rust crates from Cargo workspaces into standalone repos with bidirectional sync"
+repository = "https://github.com/loadingalias/cargo-rail"
+homepage = "https://github.com/loadingalias/cargo-rail"
+documentation = "https://docs.rs/cargo-rail"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["monorepo", "cargo", "workspace", "git", "split"]
+readme = "../../README.md"
+exclude = [
+    "tests/*",
+    ".rail/*",
+    "*.md"
+]
 
 [dependencies]
 # Git operations (pure Rust gitoxide)
