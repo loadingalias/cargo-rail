@@ -1,7 +1,7 @@
 //! SSH key validation checks
 
 use super::trait_def::{Check, CheckContext, CheckResult};
-use anyhow::Result;
+use crate::core::error::RailResult;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ impl Check for SshKeyCheck {
     "Validates SSH key existence and permissions"
   }
 
-  fn run(&self, ctx: &CheckContext) -> Result<CheckResult> {
+  fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
     let home = match std::env::var("HOME") {
       Ok(h) => PathBuf::from(h),
       Err(_) => {
@@ -130,7 +130,7 @@ impl Check for SshKeyCheck {
 }
 
 /// Test SSH connectivity to a host
-fn test_ssh_connectivity(host: &str) -> Result<bool> {
+fn test_ssh_connectivity(host: &str) -> RailResult<bool> {
   let output = Command::new("ssh")
     .arg("-T")
     .arg("-o")

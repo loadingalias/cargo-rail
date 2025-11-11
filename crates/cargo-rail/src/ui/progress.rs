@@ -38,13 +38,11 @@ impl CommitProgress {
 }
 
 /// Progress bar wrapper for file operations
-#[allow(dead_code)]
 pub struct FileProgress {
   progress: Progress,
   bar: Bar,
 }
 
-#[allow(dead_code)]
 impl FileProgress {
   /// Create a new progress bar for file transformations
   pub fn new(total: usize, label: impl Into<String>) -> Self {
@@ -59,11 +57,13 @@ impl FileProgress {
   }
 
   /// Set progress to a specific value
+  #[allow(dead_code)]
   pub fn set(&mut self, pos: usize) {
     self.progress.set_and_draw(&self.bar, pos);
   }
 
   /// Get the bar handle
+  #[allow(dead_code)]
   pub fn bar(&self) -> &Bar {
     &self.bar
   }

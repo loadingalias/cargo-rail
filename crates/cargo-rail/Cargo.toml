@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-authors = ["cargo-rail contributors"]
+authors = ["loadingalias"]
 description = "A modern, pure Rust implementation of source code transformation and migration tooling"
 
 [dependencies]
@@ -19,22 +19,15 @@ anstyle = "1.0.13"
 cargo_metadata = "0.23.0"
 
 # Lossless TOML editing (preserves formatting)
-toml_edit = "0.23.7"
+toml_edit = { version = "0.23.7", features = ["serde"] }
 
 # Error handling
 anyhow = "1.0.100"
-thiserror = "2.0.17"
 
 # Serialization for config
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-toml = "0.9.8"
-
-# Ordered map for preserving commit order
-indexmap = "2.7.1"
-
-# Date/time for PR branch naming
-chrono = "0.4.42"
+saphyr = "0.0.6"
 
 # Cryptographic hashing for plan IDs
 sha2 = "0.10.9"
@@ -42,9 +35,11 @@ sha2 = "0.10.9"
 # Progress indicators (allocation-free, concurrency-optimized)
 linya = "0.3.1"
 
-# Structured logging
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+# Path utilities
+pathdiff = "0.2.3"
+
+# Parallelism and concurrency
+rayon = "1.11.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"

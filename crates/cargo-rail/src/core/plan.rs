@@ -41,7 +41,7 @@
 //! }
 //! ```
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -251,12 +251,12 @@ impl Plan {
   }
 
   /// Serialize to JSON
-  pub fn to_json(&self) -> Result<String> {
+  pub fn to_json(&self) -> RailResult<String> {
     Ok(serde_json::to_string_pretty(self)?)
   }
 
   /// Deserialize from JSON
-  pub fn from_json(json: &str) -> Result<Self> {
+  pub fn from_json(json: &str) -> RailResult<Self> {
     Ok(serde_json::from_str(json)?)
   }
 

@@ -12,7 +12,7 @@
 //!
 //! Future extensions (WASM plugins, custom org checks) can implement the same trait.
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -140,7 +140,7 @@ pub struct CheckContext {
 ///     "Validates my custom requirement"
 ///   }
 ///
-///   fn run(&self, ctx: &CheckContext) -> Result<CheckResult> {
+///   fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
 ///     // Run validation logic
 ///     if everything_ok {
 ///       Ok(CheckResult::pass(self.name(), "All good!"))
@@ -162,7 +162,7 @@ pub trait Check: Send + Sync {
   fn description(&self) -> &str;
 
   /// Run the check and return a result
-  fn run(&self, ctx: &CheckContext) -> Result<CheckResult>;
+  fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult>;
 
   /// Whether this check is expensive (requires network, etc.)
   /// Default: false

@@ -1,9 +1,11 @@
 use std::env;
 
+use crate::commands::doctor;
 use crate::core::config::RailConfig;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::split::{SplitConfig, Splitter};
+use crate::ui::progress::FileProgress;
 
 /// Run the split command
 pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> RailResult<()> {
@@ -16,12 +18,11 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
     }));
   }
 
-  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
+  let config = RailConfig::load(&current_dir)?;
   println!("📦 Loaded configuration from .rail/config.toml");
 
-  // Determine which crates to split
-  let crates_to_split: Vec<_> = if all {
-    println!("   Splitting all {} configured crates", config.splits.len());
+  // Determine which crates to split (need this to check if they're all local)
+  let crates_to_split_check: Vec<_> = if all {
     config.splits.clone()
   } else if let Some(ref name) = crate_name {
     let split_config = config
@@ -31,18 +32,69 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
     vec![split_config.clone()]
   } else {
-    return Err(RailError::Other(anyhow::anyhow!(
-      "Must specify a crate name or use --all"
-    )));
+    return Err(RailError::with_help(
+      "Must specify a crate name or use --all",
+      "Try: cargo rail split --all OR cargo rail split <crate-name>",
+    ));
   };
 
-  // Validate all configurations before starting
-  for split_config in &crates_to_split {
-    split_config.validate().map_err(RailError::Other)?;
+  // Check if all remotes are local paths (skip SSH checks for local testing)
+  let all_local = crates_to_split_check
+    .iter()
+    .all(|s| s.remote.starts_with('/') || s.remote.starts_with("./") || s.remote.starts_with("../"));
+
+  // Run preflight health checks before proceeding (skip for local-only operations)
+  if !json && apply && !all_local {
+    println!("🏥 Running preflight health checks...");
+    if !doctor::run_preflight_check(false)? {
+      return Err(RailError::with_help(
+        "Preflight checks failed - environment is not ready",
+        "Run 'cargo rail doctor' for detailed diagnostics and fixes",
+      ));
+    }
+    println!("   ✅ All preflight checks passed\n");
+  } else if all_local && apply {
+    println!("   Skipping preflight checks (local testing mode)\n");
   }
 
-  // Create splitter
-  let splitter = Splitter::new(config.workspace.root.clone()).map_err(RailError::Other)?;
+  // Use the crates we already determined
+  let crates_to_split = crates_to_split_check;
+  if all {
+    println!("   Splitting all {} configured crates", crates_to_split.len());
+  }
+
+  // Validate all configurations and run health checks before starting
+  let mut progress = if apply && !json && !all_local && crates_to_split.len() > 1 {
+    Some(FileProgress::new(
+      crates_to_split.len(),
+      format!("Running pre-flight checks for {} crates", crates_to_split.len()),
+    ))
+  } else {
+    None
+  };
+
+  for split_config in &crates_to_split {
+    split_config.validate()?;
+
+    // Run crate-specific health checks (skip for local testing)
+    if apply && !json && !all_local {
+      if progress.is_none() {
+        println!("   🏥 Checking crate '{}'...", split_config.name);
+      }
+      if !doctor::run_crate_check(&split_config.name, false)? {
+        return Err(RailError::with_help(
+          format!("Health checks failed for crate '{}'", split_config.name),
+          "Run 'cargo rail doctor' for detailed diagnostics",
+        ));
+      }
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
+    }
+  }
+
+  // Create splitter with security config
+  let splitter = Splitter::new(config.workspace.root.clone(), config.security.clone())?;
 
   // Build plans using the unified Plan system
   let mut plans = Vec::new();
@@ -148,7 +200,21 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
   // Apply mode - execute the split
   println!("\n🚀 APPLY MODE - Executing split operations\n");
 
+  let plan_count = plans.len();
+  let mut crate_progress = if plan_count > 1 {
+    Some(FileProgress::new(
+      plan_count,
+      format!("Splitting {} crates", plan_count),
+    ))
+  } else {
+    None
+  };
+
   for (split_config, crate_paths, target_repo_path, _) in plans {
+    if crate_progress.is_none() {
+      println!("🔨 Splitting crate '{}'...", split_config.name);
+    }
+
     let split_cfg = SplitConfig {
       crate_name: split_config.name.clone(),
       crate_paths,
@@ -158,7 +224,11 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       remote_url: Some(split_config.remote.clone()),
     };
 
-    splitter.split(&split_cfg).map_err(RailError::Other)?;
+    splitter.split(&split_cfg)?;
+
+    if let Some(ref mut p) = crate_progress {
+      p.inc();
+    }
     println!();
   }
 

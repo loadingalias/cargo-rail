@@ -1,14 +1,14 @@
 #![allow(dead_code)]
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 
 /// Transform trait for language-agnostic file transformations
 pub trait Transform {
   /// Transform file contents when splitting from monorepo to split repo
-  fn transform_to_split(&self, content: &str, context: &TransformContext) -> Result<String>;
+  fn transform_to_split(&self, content: &str, context: &TransformContext) -> RailResult<String>;
 
   /// Transform file contents when syncing from split repo to monorepo
-  fn transform_to_mono(&self, content: &str, context: &TransformContext) -> Result<String>;
+  fn transform_to_mono(&self, content: &str, context: &TransformContext) -> RailResult<String>;
 }
 
 /// Context provided to transforms

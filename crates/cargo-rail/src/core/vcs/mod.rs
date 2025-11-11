@@ -2,13 +2,13 @@
 
 pub mod git;
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 use std::path::{Path, PathBuf};
 
 /// VCS abstraction trait for swappable version control backends
 pub trait Vcs {
   /// Open a repository at the given path
-  fn open(path: &Path) -> Result<Self>
+  fn open(path: &Path) -> RailResult<Self>
   where
     Self: Sized;
 
@@ -16,19 +16,19 @@ pub trait Vcs {
   fn root(&self) -> &Path;
 
   /// Get the current HEAD commit SHA
-  fn head_commit(&self) -> Result<String>;
+  fn head_commit(&self) -> RailResult<String>;
 
   /// Get commit history for a specific path
-  fn commit_history(&self, path: &Path, limit: Option<usize>) -> Result<Vec<CommitInfo>>;
+  fn commit_history(&self, path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>>;
 
   /// Check if a path is tracked by the repository
-  fn is_tracked(&self, path: &Path) -> Result<bool>;
+  fn is_tracked(&self, path: &Path) -> RailResult<bool>;
 
   /// Get the list of files at a specific commit for a path
-  fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> Result<Vec<PathBuf>>;
+  fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<PathBuf>>;
 
   /// Get file contents at a specific commit
-  fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> Result<Vec<u8>>;
+  fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>>;
 }
 
 /// Information about a commit

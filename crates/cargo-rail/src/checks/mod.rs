@@ -35,6 +35,7 @@
 mod git_notes;
 mod remotes;
 mod runner;
+mod security_config;
 mod ssh;
 mod trait_def;
 mod workspace;

@@ -5,9 +5,11 @@
 use std::env;
 
 use crate::checks::{CheckContext, create_default_runner};
-use crate::core::error::{RailError, RailResult};
+use crate::core::error::{ExitCode, RailError, RailResult};
 
 /// Run the doctor command to diagnose issues
+///
+/// Returns Ok(()) if all checks pass, or exits with error code if checks fail
 pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
   let current_dir = env::current_dir()?;
 
@@ -18,11 +20,12 @@ pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
   };
 
   let runner = create_default_runner();
-  let results = runner.run_all(&ctx).map_err(RailError::Other)?;
+  let results = runner.run_all(&ctx)?;
 
   if json {
     // JSON output for CI/automation
-    let json_output = serde_json::to_string_pretty(&results).map_err(|e| RailError::Other(e.into()))?;
+    let json_output = serde_json::to_string_pretty(&results)
+      .map_err(|e| RailError::message(format!("Failed to serialize JSON: {}", e)))?;
     println!("{}", json_output);
   } else {
     // Human-readable output
@@ -65,7 +68,7 @@ pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
 
     if has_errors {
       println!("\n⚠️  Critical issues found. Please fix errors before proceeding.");
-      std::process::exit(3); // Exit code 3 for validation failures
+      std::process::exit(ExitCode::ValidationError.as_i32());
     } else if has_warnings {
       println!("\n⚠️  Some warnings found. Consider addressing them.");
     } else {
@@ -74,4 +77,37 @@ pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
   }
 
   Ok(())
+}
+
+/// Run a quick pre-flight check before operations
+///
+/// This is useful for commands that want to verify the environment is ready
+/// before starting work. Returns true if all checks pass, false otherwise.
+pub fn run_preflight_check(thorough: bool) -> RailResult<bool> {
+  let current_dir = env::current_dir()?;
+
+  let ctx = CheckContext {
+    workspace_root: current_dir,
+    crate_name: None,
+    thorough,
+  };
+
+  let runner = create_default_runner();
+  runner.run_all_and_check(&ctx)
+}
+
+/// Run checks for a specific crate
+///
+/// Useful for validating a single crate before split/sync operations
+pub fn run_crate_check(crate_name: &str, thorough: bool) -> RailResult<bool> {
+  let current_dir = env::current_dir()?;
+
+  let ctx = CheckContext {
+    workspace_root: current_dir,
+    crate_name: Some(crate_name.to_string()),
+    thorough,
+  };
+
+  let runner = create_default_runner();
+  runner.run_all_and_check(&ctx)
 }

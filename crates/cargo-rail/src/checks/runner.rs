@@ -1,11 +1,10 @@
 //! Check runner for executing health checks
 
 use super::trait_def::{Check, CheckContext, CheckResult};
-use anyhow::Result;
+use crate::core::error::RailResult;
 use std::sync::Arc;
 
 /// Check runner that executes multiple checks
-#[allow(dead_code)] // Used via create_default_runner() return type
 pub struct CheckRunner {
   checks: Vec<Arc<dyn Check>>,
 }
@@ -22,7 +21,7 @@ impl CheckRunner {
   }
 
   /// Run all checks and collect results
-  pub fn run_all(&self, ctx: &CheckContext) -> Result<Vec<CheckResult>> {
+  pub fn run_all(&self, ctx: &CheckContext) -> RailResult<Vec<CheckResult>> {
     let mut results = Vec::new();
 
     for check in &self.checks {
@@ -53,8 +52,10 @@ impl CheckRunner {
   }
 
   /// Run all checks and return whether all passed
-  #[allow(dead_code)]
-  pub fn run_all_and_check(&self, ctx: &CheckContext) -> Result<bool> {
+  ///
+  /// This is a convenience method for programmatic health checks
+  /// where you only need a boolean result.
+  pub fn run_all_and_check(&self, ctx: &CheckContext) -> RailResult<bool> {
     let results = self.run_all(ctx)?;
     Ok(results.iter().all(|r| r.passed))
   }
@@ -78,6 +79,7 @@ pub fn create_default_runner() -> CheckRunner {
   // Add built-in checks
   runner.add_check(Arc::new(super::workspace::WorkspaceValidityCheck));
   runner.add_check(Arc::new(super::ssh::SshKeyCheck));
+  runner.add_check(Arc::new(super::security_config::SecurityConfigCheck));
   runner.add_check(Arc::new(super::git_notes::GitNotesCheck));
   runner.add_check(Arc::new(super::remotes::RemoteAccessCheck));
 

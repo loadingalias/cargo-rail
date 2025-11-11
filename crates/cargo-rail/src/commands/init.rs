@@ -1,18 +1,18 @@
-use anyhow::Context;
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::cargo::metadata::WorkspaceMetadata;
+use crate::adapters::{self, LanguageAdapter};
 use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode};
-use crate::core::error::{RailError, RailResult};
+use crate::core::error::{RailError, RailResult, ResultExt};
 
 /// Run the init command to set up cargo-rail configuration
 pub fn run_init(all: bool) -> RailResult<()> {
-  // Find workspace root
+  // Detect language adapter and workspace root
   let current_dir = env::current_dir()?;
-  let workspace_root = find_workspace_root(&current_dir).map_err(RailError::Other)?;
+  let workspace_root = find_workspace_root(&current_dir)?;
 
+  let adapter = adapters::detect_adapter(&workspace_root)?;
   println!("📦 Found workspace at: {}", workspace_root.display());
 
   // Check if config already exists
@@ -27,69 +27,85 @@ pub fn run_init(all: bool) -> RailResult<()> {
     }
   }
 
-  // Load workspace metadata
-  println!("🔍 Discovering workspace crates...");
-  let metadata = WorkspaceMetadata::load(&workspace_root).map_err(RailError::Other)?;
-  let crates = metadata.list_crates();
+  // Load workspace using adapter
+  println!("🔍 Discovering workspace packages...");
+  let workspace_info = adapter.load_workspace(&workspace_root)?;
+  let packages = &workspace_info.packages;
 
-  if crates.is_empty() {
-    return Err(RailError::Other(anyhow::anyhow!("No crates found in workspace")));
+  if packages.is_empty() {
+    return Err(RailError::Validation(
+      crate::core::error::ValidationError::WorkspaceInvalid {
+        reason: "No packages found in workspace".to_string(),
+      },
+    ));
   }
 
-  println!("\n📋 Found {} crates:", crates.len());
-  for (idx, pkg) in crates.iter().enumerate() {
-    println!("  {}. {} ({})", idx + 1, pkg.name, pkg.manifest_path.parent().unwrap());
+  println!("\n📋 Found {} packages:", packages.len());
+  for (idx, pkg) in packages.iter().enumerate() {
+    let pkg_path = pkg.path.strip_prefix(&workspace_root).unwrap_or(&pkg.path).display();
+    println!("  {}. {} v{} ({})", idx + 1, pkg.name, pkg.version, pkg_path);
   }
 
-  // Select crates to track
+  // Select packages to track
   let selected_indices = if all {
-    println!("\n✨ Using --all flag, selecting all crates");
-    (0..crates.len()).collect()
+    println!("\n✨ Using --all flag, selecting all packages");
+    (0..packages.len()).collect()
   } else {
-    print!("\nEnter crate numbers to track (comma-separated, e.g., 1,3,5): ");
+    print!("\nEnter package numbers to track (comma-separated, e.g., 1,3,5): ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
 
-    parse_selection(&input, crates.len()).map_err(RailError::Other)?
+    parse_selection(&input, packages.len())?
   };
 
   if selected_indices.is_empty() {
-    println!("No crates selected. Exiting.");
+    println!("No packages selected. Exiting.");
     return Ok(());
   }
 
-  // Create config with selected crates
+  // Create config with selected packages
   let mut config = RailConfig::new(workspace_root.clone());
 
-  println!("\n🔧 Scaffolding configuration for selected crates...");
+  println!("\n🔧 Scaffolding configuration for selected packages...");
   for idx in selected_indices {
-    let pkg = &crates[idx];
+    let pkg = &packages[idx];
 
-    // Get crate path relative to workspace root
-    let crate_path = pkg
-      .manifest_path
-      .parent()
-      .unwrap()
+    // Get package path relative to workspace root
+    let package_path = pkg
+      .path
       .strip_prefix(&workspace_root)
-      .unwrap()
+      .with_context(|| format!("Package '{}' is not within workspace root", pkg.name))?
       .to_path_buf();
 
-    config.splits.push(SplitConfig {
-      name: pkg.name.to_string(),
-      remote: String::new(), // Empty - user will fill this in
-      branch: "main".to_string(),
-      mode: SplitMode::Single,
-      paths: vec![CratePath {
-        path: crate_path.into(),
-      }],
-      include: vec![
+    // Determine include patterns based on manifest type
+    let include_patterns = if adapter.manifest_filename() == "Cargo.toml" {
+      vec![
         "src/**".to_string(),
         "tests/**".to_string(),
         "examples/**".to_string(),
         "benches/**".to_string(),
         "Cargo.toml".to_string(),
-      ],
+      ]
+    } else if adapter.manifest_filename() == "package.json" {
+      vec![
+        "src/**".to_string(),
+        "lib/**".to_string(),
+        "tests/**".to_string(),
+        "package.json".to_string(),
+        "tsconfig.json".to_string(),
+      ]
+    } else {
+      vec!["src/**".to_string(), adapter.manifest_filename().to_string()]
+    };
+
+    config.splits.push(SplitConfig {
+      name: pkg.name.clone(),
+      remote: String::new(), // Empty - user will fill this in
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      paths: vec![CratePath { path: package_path }],
+      include: include_patterns,
       exclude: vec![],
     });
 
@@ -98,7 +114,7 @@ pub fn run_init(all: bool) -> RailResult<()> {
 
   // Save configuration
   println!("\n💾 Saving configuration...");
-  config.save(&workspace_root).map_err(RailError::Other)?;
+  config.save(&workspace_root)?;
 
   println!("\n✅ Successfully initialized cargo-rail!");
   println!("   Configuration saved to: {}/rail.toml", workspace_root.display());
@@ -111,31 +127,36 @@ pub fn run_init(all: bool) -> RailResult<()> {
   Ok(())
 }
 
-/// Find the workspace root by looking for Cargo.toml with \[workspace\]
-fn find_workspace_root(start: &Path) -> anyhow::Result<PathBuf> {
+/// Find the workspace root by detecting any supported workspace type
+fn find_workspace_root(start: &Path) -> RailResult<PathBuf> {
   let mut current = start.to_path_buf();
 
   loop {
-    let cargo_toml = current.join("Cargo.toml");
-    if cargo_toml.exists() {
-      // Check if it's a workspace
-      let content = std::fs::read_to_string(&cargo_toml).context("Failed to read Cargo.toml")?;
-      if content.contains("[workspace]") {
-        return Ok(current);
-      }
+    // Try to detect a workspace at this level using adapters
+    let cargo_adapter: Box<dyn LanguageAdapter> = Box::new(adapters::cargo::CargoAdapter::new());
+    if cargo_adapter.can_handle(&current) {
+      return Ok(current);
+    }
+
+    let node_adapter: Box<dyn LanguageAdapter> = Box::new(adapters::node::NodeAdapter::new());
+    if node_adapter.can_handle(&current) {
+      return Ok(current);
     }
 
     // Try parent directory
     if let Some(parent) = current.parent() {
       current = parent.to_path_buf();
     } else {
-      anyhow::bail!("Could not find workspace root (no Cargo.toml with [workspace] found)");
+      return Err(RailError::with_help(
+        "Could not find workspace root",
+        "Supported workspaces: Cargo (Cargo.toml with [workspace]), Node.js (package.json with workspaces or pnpm-workspace.yaml)",
+      ));
     }
   }
 }
 
 /// Parse user selection input like "1,3,5" or "1-3,5"
-fn parse_selection(input: &str, max: usize) -> anyhow::Result<Vec<usize>> {
+fn parse_selection(input: &str, max: usize) -> RailResult<Vec<usize>> {
   let mut indices = Vec::new();
   let input = input.trim();
 
@@ -149,7 +170,7 @@ fn parse_selection(input: &str, max: usize) -> anyhow::Result<Vec<usize>> {
       // Range like "1-3"
       let parts: Vec<&str> = part.split('-').collect();
       if parts.len() != 2 {
-        anyhow::bail!("Invalid range format: {}", part);
+        return Err(RailError::message(format!("Invalid range format: {}", part)));
       }
       let start: usize = parts[0]
         .trim()
@@ -161,10 +182,10 @@ fn parse_selection(input: &str, max: usize) -> anyhow::Result<Vec<usize>> {
         .with_context(|| format!("Invalid number: {}", parts[1]))?;
 
       if start == 0 || end == 0 || start > max || end > max {
-        anyhow::bail!("Range out of bounds: {}", part);
+        return Err(RailError::message(format!("Range out of bounds: {}", part)));
       }
       if start > end {
-        anyhow::bail!("Invalid range (start > end): {}", part);
+        return Err(RailError::message(format!("Invalid range (start > end): {}", part)));
       }
 
       for i in start..=end {
@@ -174,7 +195,7 @@ fn parse_selection(input: &str, max: usize) -> anyhow::Result<Vec<usize>> {
       // Single number
       let num: usize = part.parse().with_context(|| format!("Invalid number: {}", part))?;
       if num == 0 || num > max {
-        anyhow::bail!("Number out of range: {}", num);
+        return Err(RailError::message(format!("Number out of range: {}", num)));
       }
       indices.push(num - 1); // Convert to 0-indexed
     }
