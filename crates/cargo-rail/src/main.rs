@@ -1,4 +1,3 @@
-mod adapters;
 mod cargo;
 mod checks;
 mod commands;

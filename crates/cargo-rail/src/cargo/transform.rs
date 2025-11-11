@@ -2,9 +2,15 @@
 
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::core::error::{RailError, RailResult, ResultExt};
-use crate::core::transform::{Transform, TransformContext};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Value};
+
+/// Context for transforming Cargo.toml
+pub struct TransformContext {
+  pub crate_name: String,
+  pub workspace_root: PathBuf,
+}
 
 /// Cargo-specific transformations for Cargo.toml
 /// Handles: path ↔ version, workspace flattening
@@ -195,8 +201,8 @@ impl CargoTransform {
   }
 }
 
-impl Transform for CargoTransform {
-  fn transform_to_split(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
+impl CargoTransform {
+  pub fn transform_to_split(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 
     // 1. Flatten workspace = true to actual values
@@ -211,7 +217,7 @@ impl Transform for CargoTransform {
     Ok(doc.to_string())
   }
 
-  fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
+  pub fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 
     // Transform version dependencies back to path dependencies

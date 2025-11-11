@@ -4,6 +4,7 @@
 //! Perfect for monorepo operations with multiple concurrent tasks
 
 use linya::{Bar, Progress};
+use std::sync::{Arc, Mutex};
 
 /// Progress bar wrapper for commits processing
 pub struct CommitProgress {
@@ -70,33 +71,30 @@ impl FileProgress {
 }
 
 /// Multi-bar progress for parallel operations
-#[allow(dead_code)]
+/// Thread-safe wrapper for concurrent progress tracking
+#[derive(Clone)]
 pub struct MultiProgress {
-  progress: Progress,
+  progress: Arc<Mutex<Progress>>,
 }
 
-#[allow(dead_code)]
 impl MultiProgress {
   /// Create a new multi-progress container
   pub fn new() -> Self {
     Self {
-      progress: Progress::new(),
+      progress: Arc::new(Mutex::new(Progress::new())),
     }
   }
 
   /// Add a new bar with a label and total
-  pub fn add_bar(&mut self, total: usize, label: impl Into<String>) -> Bar {
-    self.progress.bar(total, label.into())
+  pub fn add_bar(&self, total: usize, label: impl Into<String>) -> Bar {
+    let mut progress = self.progress.lock().unwrap();
+    progress.bar(total, label.into())
   }
 
-  /// Increment a bar
-  pub fn inc(&mut self, bar: &Bar) {
-    self.progress.inc_and_draw(bar, 1);
-  }
-
-  /// Set a bar to a specific value
-  pub fn set(&mut self, bar: &Bar, pos: usize) {
-    self.progress.set_and_draw(bar, pos);
+  /// Increment a bar (thread-safe)
+  pub fn inc(&self, bar: &Bar) {
+    let mut progress = self.progress.lock().unwrap();
+    progress.inc_and_draw(bar, 1);
   }
 }
 

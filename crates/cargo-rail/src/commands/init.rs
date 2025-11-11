@@ -2,18 +2,17 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::adapters::{self, LanguageAdapter};
+use crate::cargo::metadata::WorkspaceMetadata;
 use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode};
 use crate::core::error::{RailError, RailResult, ResultExt};
 
 /// Run the init command to set up cargo-rail configuration
 pub fn run_init(all: bool) -> RailResult<()> {
-  // Detect language adapter and workspace root
+  // Find Cargo workspace root
   let current_dir = env::current_dir()?;
   let workspace_root = find_workspace_root(&current_dir)?;
 
-  let adapter = adapters::detect_adapter(&workspace_root)?;
-  println!("📦 Found workspace at: {}", workspace_root.display());
+  println!("📦 Found Cargo workspace at: {}", workspace_root.display());
 
   // Check if config already exists
   if RailConfig::exists(&workspace_root) {
@@ -27,22 +26,27 @@ pub fn run_init(all: bool) -> RailResult<()> {
     }
   }
 
-  // Load workspace using adapter
-  println!("🔍 Discovering workspace packages...");
-  let workspace_info = adapter.load_workspace(&workspace_root)?;
-  let packages = &workspace_info.packages;
+  // Load Cargo workspace metadata
+  println!("🔍 Discovering workspace crates...");
+  let metadata = WorkspaceMetadata::load(&workspace_root)?;
+  let packages = metadata.list_crates();
 
   if packages.is_empty() {
     return Err(RailError::Validation(
       crate::core::error::ValidationError::WorkspaceInvalid {
-        reason: "No packages found in workspace".to_string(),
+        reason: "No crates found in workspace".to_string(),
       },
     ));
   }
 
-  println!("\n📋 Found {} packages:", packages.len());
+  println!("\n📋 Found {} crates:", packages.len());
   for (idx, pkg) in packages.iter().enumerate() {
-    let pkg_path = pkg.path.strip_prefix(&workspace_root).unwrap_or(&pkg.path).display();
+    let pkg_path = pkg
+      .manifest_path
+      .parent()
+      .and_then(|p| p.strip_prefix(&workspace_root).ok())
+      .map(|p| p.as_str())
+      .unwrap_or_else(|| pkg.manifest_path.as_str());
     println!("  {}. {} v{} ({})", idx + 1, pkg.name, pkg.version, pkg_path);
   }
 
@@ -64,43 +68,34 @@ pub fn run_init(all: bool) -> RailResult<()> {
     return Ok(());
   }
 
-  // Create config with selected packages
+  // Create config with selected crates
   let mut config = RailConfig::new(workspace_root.clone());
 
-  println!("\n🔧 Scaffolding configuration for selected packages...");
+  println!("\n🔧 Scaffolding configuration for selected crates...");
   for idx in selected_indices {
     let pkg = &packages[idx];
 
-    // Get package path relative to workspace root
+    // Get crate path relative to workspace root
     let package_path = pkg
-      .path
+      .manifest_path
+      .parent()
+      .ok_or_else(|| RailError::message(format!("Invalid manifest path for crate '{}'", pkg.name)))?
       .strip_prefix(&workspace_root)
-      .with_context(|| format!("Package '{}' is not within workspace root", pkg.name))?
-      .to_path_buf();
+      .with_context(|| format!("Crate '{}' is not within workspace root", pkg.name))?
+      .to_path_buf()
+      .into(); // Convert Utf8PathBuf to PathBuf
 
-    // Determine include patterns based on manifest type
-    let include_patterns = if adapter.manifest_filename() == "Cargo.toml" {
-      vec![
-        "src/**".to_string(),
-        "tests/**".to_string(),
-        "examples/**".to_string(),
-        "benches/**".to_string(),
-        "Cargo.toml".to_string(),
-      ]
-    } else if adapter.manifest_filename() == "package.json" {
-      vec![
-        "src/**".to_string(),
-        "lib/**".to_string(),
-        "tests/**".to_string(),
-        "package.json".to_string(),
-        "tsconfig.json".to_string(),
-      ]
-    } else {
-      vec!["src/**".to_string(), adapter.manifest_filename().to_string()]
-    };
+    // Standard Cargo include patterns
+    let include_patterns = vec![
+      "src/**".to_string(),
+      "tests/**".to_string(),
+      "examples/**".to_string(),
+      "benches/**".to_string(),
+      "Cargo.toml".to_string(),
+    ];
 
     config.splits.push(SplitConfig {
-      name: pkg.name.clone(),
+      name: pkg.name.to_string(),
       remote: String::new(), // Empty - user will fill this in
       branch: "main".to_string(),
       mode: SplitMode::Single,
@@ -127,19 +122,18 @@ pub fn run_init(all: bool) -> RailResult<()> {
   Ok(())
 }
 
-/// Find the workspace root by detecting any supported workspace type
+/// Find the Cargo workspace root
 fn find_workspace_root(start: &Path) -> RailResult<PathBuf> {
   let mut current = start.to_path_buf();
 
   loop {
-    // Try to detect a workspace at this level using adapters
-    let cargo_adapter: Box<dyn LanguageAdapter> = Box::new(adapters::cargo::CargoAdapter::new());
-    if cargo_adapter.can_handle(&current) {
-      return Ok(current);
-    }
+    let cargo_toml = current.join("Cargo.toml");
 
-    let node_adapter: Box<dyn LanguageAdapter> = Box::new(adapters::node::NodeAdapter::new());
-    if node_adapter.can_handle(&current) {
+    // Check if this is a Cargo workspace
+    if cargo_toml.exists()
+      && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+      && content.contains("[workspace]")
+    {
       return Ok(current);
     }
 
@@ -148,8 +142,8 @@ fn find_workspace_root(start: &Path) -> RailResult<PathBuf> {
       current = parent.to_path_buf();
     } else {
       return Err(RailError::with_help(
-        "Could not find workspace root",
-        "Supported workspaces: Cargo (Cargo.toml with [workspace]), Node.js (package.json with workspaces or pnpm-workspace.yaml)",
+        "Could not find Cargo workspace root",
+        "cargo-rail requires a Cargo.toml file with a [workspace] section. Run this command from within a Rust workspace.",
       ));
     }
   }

@@ -68,7 +68,7 @@ pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
 
     if has_errors {
       println!("\n⚠️  Critical issues found. Please fix errors before proceeding.");
-      std::process::exit(ExitCode::ValidationError.as_i32());
+      std::process::exit(ExitCode::Validation.as_i32());
     } else if has_warnings {
       println!("\n⚠️  Some warnings found. Consider addressing them.");
     } else {

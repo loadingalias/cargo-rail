@@ -12,11 +12,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
   /// User error (config, invalid args, missing files)
-  UserError = 1,
+  User = 1,
   /// System error (git, network, I/O)
-  SystemError = 2,
+  System = 2,
   /// Validation failure (checks failed, SSH, remotes)
-  ValidationError = 3,
+  Validation = 3,
 }
 
 impl ExitCode {
@@ -84,11 +84,11 @@ impl RailError {
   /// Get the appropriate exit code for this error
   pub fn exit_code(&self) -> ExitCode {
     match self {
-      RailError::Config(_) => ExitCode::UserError,
-      RailError::Git(_) => ExitCode::SystemError,
-      RailError::Validation(_) => ExitCode::ValidationError,
-      RailError::Io(_) => ExitCode::SystemError,
-      RailError::Message { .. } => ExitCode::UserError,
+      RailError::Config(_) => ExitCode::User,
+      RailError::Git(_) => ExitCode::System,
+      RailError::Validation(_) => ExitCode::Validation,
+      RailError::Io(_) => ExitCode::System,
+      RailError::Message { .. } => ExitCode::User,
     }
   }
 
@@ -395,9 +395,6 @@ pub enum ValidationError {
   /// SSH key not found or invalid
   SshKey { message: String },
 
-  /// Path validation failed
-  PathValidation { path: PathBuf, reason: String },
-
   /// Workspace validation failed
   WorkspaceInvalid { reason: String },
 }
@@ -411,7 +408,6 @@ impl ValidationError {
       ValidationError::WorkspaceInvalid { .. } => {
         Some("Run `cargo rail doctor` to diagnose workspace issues.".to_string())
       }
-      _ => None,
     }
   }
 }
@@ -421,9 +417,6 @@ impl fmt::Display for ValidationError {
     match self {
       ValidationError::SshKey { message } => {
         write!(f, "SSH key validation failed: {}", message)
-      }
-      ValidationError::PathValidation { path, reason } => {
-        write!(f, "Path validation failed for '{}': {}", path.display(), reason)
       }
       ValidationError::WorkspaceInvalid { reason } => {
         write!(f, "Workspace validation failed: {}", reason)
