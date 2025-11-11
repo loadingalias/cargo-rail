@@ -445,7 +445,7 @@ impl SyncEngine {
     // Get changed files in mono
     let changed_files = self.mono_git.get_changed_files(&commit.sha)?;
 
-    // Filter to only files in crate path and not excluded by adapter
+    // Filter to only files in crate path
     let crate_path = &self.config.crate_paths[0];
     let relevant_files: Vec<_> = changed_files
       .into_iter()
