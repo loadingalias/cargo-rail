@@ -1,12 +1,12 @@
 use std::env;
 
-use crate::cargo::metadata::WorkspaceMetadata;
-use crate::cargo::transform::CargoTransform;
+use crate::commands::doctor;
 use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine};
+use crate::ui::progress::FileProgress;
 
 /// Run the sync command
 pub fn run_sync(
@@ -19,7 +19,7 @@ pub fn run_sync(
   json: bool,
 ) -> RailResult<()> {
   // Parse conflict strategy
-  let strategy = ConflictStrategy::from_str(&strategy_str).map_err(RailError::Other)?;
+  let strategy = ConflictStrategy::from_str(&strategy_str)?;
   let current_dir = env::current_dir()?;
 
   // Load configuration
@@ -29,15 +29,52 @@ pub fn run_sync(
     }));
   }
 
-  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
+  let config = RailConfig::load(&current_dir)?;
   println!("📦 Loaded configuration from .rail/config.toml");
+
+  // Determine which crates to sync (need this to check if they're all local)
+  let crates_to_sync_check: Vec<_> = if all {
+    config.splits.clone()
+  } else if let Some(ref name) = crate_name {
+    let split_config = config
+      .splits
+      .iter()
+      .find(|s| s.name == *name)
+      .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
+    vec![split_config.clone()]
+  } else {
+    return Err(RailError::with_help(
+      "Must specify a crate name or use --all",
+      "Try: cargo rail sync --all OR cargo rail sync <crate-name>",
+    ));
+  };
+
+  // Check if all remotes are local paths (skip SSH checks for local testing)
+  let all_local = crates_to_sync_check
+    .iter()
+    .all(|s| s.remote.starts_with('/') || s.remote.starts_with("./") || s.remote.starts_with("../"));
+
+  // Run preflight health checks before proceeding (skip for local-only operations)
+  if !json && apply && !all_local {
+    println!("🏥 Running preflight health checks...");
+    if !doctor::run_preflight_check(false)? {
+      return Err(RailError::with_help(
+        "Preflight checks failed - environment is not ready",
+        "Run 'cargo rail doctor' for detailed diagnostics and fixes",
+      ));
+    }
+    println!("   ✅ All preflight checks passed\n");
+  } else if all_local && apply {
+    println!("   Skipping preflight checks (local testing mode)\n");
+  }
 
   // Determine sync direction
   let direction = match (from_remote, to_remote) {
     (true, true) => {
-      return Err(RailError::Other(anyhow::anyhow!(
-        "Cannot use both --from-remote and --to-remote"
-      )));
+      return Err(RailError::with_help(
+        "Cannot use both --from-remote and --to-remote",
+        "Choose one direction: use --from-remote OR --to-remote (or neither for bidirectional sync)",
+      ));
     }
     (true, false) => {
       println!("   Direction: remote → monorepo");
@@ -53,22 +90,38 @@ pub fn run_sync(
     }
   };
 
-  // Determine which crates to sync
-  let crates_to_sync: Vec<_> = if all {
-    println!("   Syncing all {} configured crates", config.splits.len());
-    config.splits.clone()
-  } else if let Some(ref name) = crate_name {
-    let split_config = config
-      .splits
-      .iter()
-      .find(|s| s.name == *name)
-      .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
-    vec![split_config.clone()]
-  } else {
-    return Err(RailError::Other(anyhow::anyhow!(
-      "Must specify a crate name or use --all"
-    )));
-  };
+  // Use the crates we already determined
+  let crates_to_sync = crates_to_sync_check;
+  if all {
+    println!("   Syncing all {} configured crates", crates_to_sync.len());
+  }
+
+  // Validate crates with health checks before starting (skip for local testing)
+  if apply && !json && !all_local {
+    let mut progress = if crates_to_sync.len() > 1 {
+      Some(FileProgress::new(
+        crates_to_sync.len(),
+        format!("Running pre-flight checks for {} crates", crates_to_sync.len()),
+      ))
+    } else {
+      None
+    };
+
+    for split_config in &crates_to_sync {
+      if progress.is_none() {
+        println!("   🏥 Checking crate '{}'...", split_config.name);
+      }
+      if !doctor::run_crate_check(&split_config.name, false)? {
+        return Err(RailError::with_help(
+          format!("Health checks failed for crate '{}'", split_config.name),
+          "Run 'cargo rail doctor' for detailed diagnostics",
+        ));
+      }
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
+    }
+  }
 
   // Build plans using the unified Plan system
   let mut plans = Vec::new();
@@ -279,8 +332,17 @@ pub fn run_sync(
   // Apply mode - execute the sync
   println!("\n🚀 APPLY MODE - Executing sync operations\n");
 
+  let plan_count = plans.len();
+  let mut crate_progress = if plan_count > 1 {
+    Some(FileProgress::new(plan_count, format!("Syncing {} crates", plan_count)))
+  } else {
+    None
+  };
+
   for (split_config, crate_paths, target_repo_path, _, _, _) in plans {
-    println!("\n🔄 Syncing crate: {}", split_config.name);
+    if crate_progress.is_none() {
+      println!("\n🔄 Syncing crate: {}", split_config.name);
+    }
 
     let sync_config = SyncConfig {
       crate_name: split_config.name.clone(),
@@ -291,35 +353,46 @@ pub fn run_sync(
       remote_url: split_config.remote.clone(),
     };
 
-    // Create transformer
-    let metadata = WorkspaceMetadata::load(&config.workspace.root).map_err(RailError::Other)?;
-    let transformer = Box::new(CargoTransform::new(metadata));
-
-    // Create sync engine
+    // Create sync engine (adapter auto-detected)
     let mut engine = SyncEngine::new(
       config.workspace.root.clone(),
       sync_config,
-      transformer,
       config.security.clone(),
       strategy,
-    )
-    .map_err(RailError::Other)?;
+    )?;
 
     // Perform sync
     let result = match direction {
-      SyncDirection::MonoToRemote => engine.sync_to_remote().map_err(RailError::Other)?,
-      SyncDirection::RemoteToMono => engine.sync_from_remote().map_err(RailError::Other)?,
-      SyncDirection::Both => engine.sync_bidirectional().map_err(RailError::Other)?,
+      SyncDirection::MonoToRemote => engine.sync_to_remote()?,
+      SyncDirection::RemoteToMono => engine.sync_from_remote()?,
+      SyncDirection::Both => engine.sync_bidirectional()?,
       SyncDirection::None => unreachable!(),
     };
 
     println!("   ✅ Synced {} commits", result.commits_synced);
 
     if !result.conflicts.is_empty() {
-      println!("\n   ⚠️  {} conflicts detected:", result.conflicts.len());
-      for conflict in &result.conflicts {
-        println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+      let unresolved_count = result.conflicts.iter().filter(|c| !c.resolved).count();
+      let resolved_count = result.conflicts.len() - unresolved_count;
+
+      if resolved_count > 0 {
+        println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
+        for conflict in result.conflicts.iter().filter(|c| c.resolved) {
+          println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+        }
       }
+
+      if unresolved_count > 0 {
+        println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
+        for conflict in result.conflicts.iter().filter(|c| !c.resolved) {
+          println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+        }
+        println!("\n   💡 Resolve conflicts manually and run sync again");
+      }
+    }
+
+    if let Some(ref mut p) = crate_progress {
+      p.inc();
     }
   }
 

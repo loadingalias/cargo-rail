@@ -6,7 +6,7 @@ mod core;
 mod ui;
 
 use clap::{Parser, Subcommand};
-use core::error::RailError;
+use core::error::{RailError, print_error};
 
 /// Split Rust crates from monorepos, keep them in sync
 #[derive(Parser)]
@@ -169,11 +169,6 @@ fn main() {
 }
 
 fn handle_error(err: RailError) -> ! {
-  eprintln!("Error: {}", err);
-
-  if let Some(help) = err.help_message() {
-    eprintln!("\nHelp: {}", help);
-  }
-
+  print_error(&err);
   std::process::exit(err.exit_code().as_i32());
 }

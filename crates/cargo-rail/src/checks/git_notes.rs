@@ -2,7 +2,8 @@
 
 use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::config::RailConfig;
-use anyhow::Result;
+use crate::core::error::RailResult;
+use crate::ui::progress::FileProgress;
 use std::process::Command;
 
 /// Check that validates git-notes mappings
@@ -17,7 +18,7 @@ impl Check for GitNotesCheck {
     "Validates git-notes mappings integrity"
   }
 
-  fn run(&self, ctx: &CheckContext) -> Result<CheckResult> {
+  fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
     // Load config to get crate information
     let config = match RailConfig::load(&ctx.workspace_root) {
       Ok(c) => c,
@@ -78,7 +79,14 @@ impl Check for GitNotesCheck {
         // In thorough mode, validate that all noted commits still exist
         if ctx.thorough && count > 0 {
           let notes_list = String::from_utf8_lossy(&count_output.stdout);
-          for line in notes_list.lines() {
+          let lines: Vec<&str> = notes_list.lines().collect();
+
+          let mut progress = FileProgress::new(
+            lines.len(),
+            format!("Validating {} notes for '{}'", lines.len(), split_config.name),
+          );
+
+          for line in lines {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
               let commit_sha = parts[1];
@@ -98,6 +106,7 @@ impl Check for GitNotesCheck {
                 ));
               }
             }
+            progress.inc();
           }
         }
       }

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use crate::core::error::{ConfigError, RailError, RailResult, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,26 +105,24 @@ impl RailConfig {
   }
 
   /// Load config from rail.toml (searches multiple locations)
-  pub fn load(path: &Path) -> Result<Self> {
+  pub fn load(path: &Path) -> RailResult<Self> {
     let config_path = Self::find_config_path(path).ok_or_else(|| {
-      anyhow::anyhow!(
-        "No cargo-rail configuration found.\n\
-         Searched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\n\
-         Run `cargo rail init` to create one."
-      )
+      RailError::Config(ConfigError::NotFound {
+        workspace_root: path.to_path_buf(),
+      })
     })?;
 
     let content = fs::read_to_string(&config_path)
       .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
-    let config: RailConfig =
-      toml::from_str(&content).with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
+    let config: RailConfig = toml_edit::de::from_str(&content)
+      .with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
     Ok(config)
   }
 
   /// Save config to rail.toml (default location)
-  pub fn save(&self, path: &Path) -> Result<()> {
+  pub fn save(&self, path: &Path) -> RailResult<()> {
     let config_path = path.join("rail.toml");
-    let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
+    let content = toml_edit::ser::to_string_pretty(self).context("Failed to serialize config to TOML")?;
     fs::write(&config_path, content).with_context(|| format!("Failed to write config to {}", config_path.display()))?;
     Ok(())
   }
@@ -151,40 +149,46 @@ impl SplitConfig {
   }
 
   /// Validate the split configuration
-  pub fn validate(&self) -> Result<()> {
+  pub fn validate(&self) -> RailResult<()> {
     // Check paths exist
     if self.paths.is_empty() {
-      anyhow::bail!("Split '{}' must have at least one crate path", self.name);
+      return Err(RailError::with_help(
+        format!("Split '{}' must have at least one crate path", self.name),
+        "Add at least one crate path in rail.toml under [[splits]]",
+      ));
     }
 
     // Check remote is not empty
     if self.remote.is_empty() {
-      anyhow::bail!(
-        "Split '{}' has no remote configured.\n\
-         → Edit rail.toml and set the remote URL (e.g., git@github.com:user/{}.git)",
-        self.name,
-        self.name
-      );
+      return Err(RailError::Config(ConfigError::MissingField {
+        field: format!("remote for split '{}'", self.name),
+      }));
     }
 
     // Validate mode-specific requirements
     match self.mode {
       SplitMode::Single => {
         if self.paths.len() != 1 {
-          anyhow::bail!(
-            "Single mode split '{}' must have exactly one path (found {})",
-            self.name,
-            self.paths.len()
-          );
+          return Err(RailError::with_help(
+            format!(
+              "Single mode split '{}' must have exactly one path (found {})",
+              self.name,
+              self.paths.len()
+            ),
+            "Change mode to 'combined' or remove extra paths",
+          ));
         }
       }
       SplitMode::Combined => {
         if self.paths.len() < 2 {
-          anyhow::bail!(
-            "Combined mode split '{}' should have multiple paths (found {})",
-            self.name,
-            self.paths.len()
-          );
+          return Err(RailError::with_help(
+            format!(
+              "Combined mode split '{}' should have multiple paths (found {})",
+              self.name,
+              self.paths.len()
+            ),
+            "Change mode to 'single' or add more crate paths",
+          ));
         }
       }
     }

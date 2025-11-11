@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use crate::core::error::{RailResult, ResultExt};
+use crate::ui::progress::FileProgress;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +25,7 @@ pub struct ProjectFiles {
 
 impl AuxiliaryFiles {
   /// Discover auxiliary files in workspace that should be copied to split repos
-  pub fn discover(workspace_root: &Path) -> Result<Self> {
+  pub fn discover(workspace_root: &Path) -> RailResult<Self> {
     let mut files = Vec::new();
 
     // Common auxiliary files to look for (workspace-level configs)
@@ -53,7 +54,13 @@ impl AuxiliaryFiles {
   }
 
   /// Copy discovered auxiliary files to split repo
-  pub fn copy_to_split(&self, workspace_root: &Path, target_repo_root: &Path) -> Result<()> {
+  pub fn copy_to_split(&self, _workspace_root: &Path, target_repo_root: &Path) -> RailResult<()> {
+    if self.files.is_empty() {
+      return Ok(());
+    }
+
+    let mut progress = FileProgress::new(self.files.len(), "Copying auxiliary files");
+
     for file in &self.files {
       let target_path = target_repo_root.join(&file.target_path);
 
@@ -72,15 +79,7 @@ impl AuxiliaryFiles {
         )
       })?;
 
-      println!(
-        "  📄 Copied {} to {}",
-        file
-          .source_path
-          .strip_prefix(workspace_root)
-          .unwrap_or(&file.source_path)
-          .display(),
-        file.target_path.display()
-      );
+      progress.inc();
     }
 
     Ok(())
@@ -104,7 +103,7 @@ impl AuxiliaryFiles {
 
 impl ProjectFiles {
   /// Discover project files with crate-first, workspace-fallback logic
-  pub fn discover(workspace_root: &Path, crate_path: &Path) -> Result<Self> {
+  pub fn discover(workspace_root: &Path, crate_path: &Path) -> RailResult<Self> {
     let mut files = Vec::new();
 
     // Project files to look for (check crate dir first, then workspace root)
@@ -133,7 +132,13 @@ impl ProjectFiles {
   }
 
   /// Copy discovered project files to split repo
-  pub fn copy_to_split(&self, workspace_root: &Path, target_repo_root: &Path) -> Result<()> {
+  pub fn copy_to_split(&self, _workspace_root: &Path, target_repo_root: &Path) -> RailResult<()> {
+    if self.files.is_empty() {
+      return Ok(());
+    }
+
+    let mut progress = FileProgress::new(self.files.len(), "Copying project files");
+
     for file in &self.files {
       let target_path = target_repo_root.join(&file.target_path);
 
@@ -146,15 +151,7 @@ impl ProjectFiles {
         )
       })?;
 
-      println!(
-        "  📄 Copied {} to {}",
-        file
-          .source_path
-          .strip_prefix(workspace_root)
-          .unwrap_or(&file.source_path)
-          .display(),
-        file.target_path.display()
-      );
+      progress.inc();
     }
 
     Ok(())

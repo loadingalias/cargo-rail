@@ -1,6 +1,5 @@
-#![allow(dead_code)]
-
-use anyhow::{Context, Result};
+use crate::core::error::{GitError, RailError, RailResult, ResultExt};
+use crate::ui::progress::FileProgress;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -25,7 +24,7 @@ impl MappingStore {
   }
 
   /// Load mappings from git-notes in a repository
-  pub fn load(&mut self, repo_path: &Path) -> Result<()> {
+  pub fn load(&mut self, repo_path: &Path) -> RailResult<()> {
     use std::process::Command;
 
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
@@ -44,15 +43,27 @@ impl MappingStore {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse output: each line is "{note_sha} {commit_sha}"
-    for line in stdout.lines() {
-      let parts: Vec<&str> = line.split_whitespace().collect();
-      if parts.len() != 2 {
-        continue;
-      }
+    // Collect all commit SHAs first to show progress
+    let commit_shas: Vec<&str> = stdout
+      .lines()
+      .filter_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 2 { Some(parts[1]) } else { None }
+      })
+      .collect();
 
-      let commit_sha = parts[1];
+    // Show progress bar if we have notes to load
+    let mut progress = if !commit_shas.is_empty() {
+      Some(FileProgress::new(
+        commit_shas.len(),
+        format!("Loading {} git-notes", commit_shas.len()),
+      ))
+    } else {
+      None
+    };
 
+    // Read each note
+    for commit_sha in commit_shas {
       // Read the note content: git notes --ref=refs/notes/rail/{crate} show {commit_sha}
       let note_output = Command::new("git")
         .current_dir(repo_path)
@@ -65,16 +76,30 @@ impl MappingStore {
         let target_sha = note_content.trim();
         self.mappings.insert(commit_sha.to_string(), target_sha.to_string());
       }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
     }
 
     Ok(())
   }
 
   /// Save mappings to git-notes in a repository
-  pub fn save(&self, repo_path: &Path) -> Result<()> {
+  pub fn save(&self, repo_path: &Path) -> RailResult<()> {
     use std::process::Command;
 
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
+
+    // Show progress bar if we have mappings to save
+    let mut progress = if !self.mappings.is_empty() {
+      Some(FileProgress::new(
+        self.mappings.len(),
+        format!("Saving {} git-notes", self.mappings.len()),
+      ))
+    } else {
+      None
+    };
 
     // For each mapping, add a note: git notes --ref=refs/notes/rail/{crate} add -f -m "{target_sha}" {source_sha}
     for (source_sha, target_sha) in &self.mappings {
@@ -88,8 +113,15 @@ impl MappingStore {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore "already has a note" errors
         if !stderr.contains("already has a note") {
-          anyhow::bail!("git notes add failed: {}", stderr);
+          return Err(RailError::Git(GitError::CommandFailed {
+            command: "git notes add".to_string(),
+            stderr: stderr.to_string(),
+          }));
         }
+      }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
       }
     }
 
@@ -97,13 +129,13 @@ impl MappingStore {
   }
 
   /// Record a mapping between two commits
-  pub fn record_mapping(&mut self, from_sha: &str, to_sha: &str) -> Result<()> {
+  pub fn record_mapping(&mut self, from_sha: &str, to_sha: &str) -> RailResult<()> {
     self.mappings.insert(from_sha.to_string(), to_sha.to_string());
     Ok(())
   }
 
   /// Get the mapped commit SHA if it exists
-  pub fn get_mapping(&self, sha: &str) -> Result<Option<String>> {
+  pub fn get_mapping(&self, sha: &str) -> RailResult<Option<String>> {
     Ok(self.mappings.get(sha).cloned())
   }
 
@@ -128,7 +160,7 @@ impl MappingStore {
   }
 
   /// Push git-notes to a remote repository
-  pub fn push_notes(&self, repo_path: &Path, remote: &str) -> Result<()> {
+  pub fn push_notes(&self, repo_path: &Path, remote: &str) -> RailResult<()> {
     use std::process::Command;
 
     // Skip if no mappings exist
@@ -149,7 +181,10 @@ impl MappingStore {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git push notes failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git push notes".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     println!("   ✅ Pushed git-notes");
@@ -157,7 +192,7 @@ impl MappingStore {
   }
 
   /// Fetch git-notes from a remote repository
-  pub fn fetch_notes(&self, repo_path: &Path, remote: &str) -> Result<()> {
+  pub fn fetch_notes(&self, repo_path: &Path, remote: &str) -> RailResult<()> {
     use std::process::Command;
 
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
@@ -195,7 +230,10 @@ impl MappingStore {
         if !fetch_output.status.success() {
           let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
           if !fetch_stderr.contains("couldn't find remote ref") {
-            anyhow::bail!("git fetch notes to FETCH_HEAD failed: {}", fetch_stderr);
+            return Err(RailError::Git(GitError::CommandFailed {
+              command: "git fetch notes to FETCH_HEAD".to_string(),
+              stderr: fetch_stderr.to_string(),
+            }));
           }
           return Ok(()); // No remote notes
         }
@@ -218,10 +256,20 @@ impl MappingStore {
           eprintln!("      3. Resolve conflicts manually");
           eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
           eprintln!();
-          anyhow::bail!(
-            "git notes merge failed: {}\n\nThis usually happens when the same commit has different mappings on different machines.\nPlease resolve manually using the steps above.",
-            merge_stderr
-          );
+          return Err(RailError::with_help(
+            format!("git notes merge failed: {}", merge_stderr),
+            format!(
+              "This usually happens when the same commit has different mappings on different machines.\n\
+               Manual resolution steps:\n  \
+               1. cd {}\n  \
+               2. git notes --ref={} merge FETCH_HEAD\n  \
+               3. Resolve conflicts manually\n  \
+               4. git notes --ref={} merge --commit",
+              repo_path.display(),
+              notes_ref,
+              notes_ref
+            ),
+          ));
         }
 
         println!("   ✅ Git-notes merged successfully (union strategy)");
@@ -229,7 +277,10 @@ impl MappingStore {
       }
 
       // Unknown error
-      anyhow::bail!("git fetch notes failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git fetch notes".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     println!("   ✅ Fetched git-notes");

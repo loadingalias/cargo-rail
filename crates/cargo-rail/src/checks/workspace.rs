@@ -2,7 +2,7 @@
 
 use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::config::RailConfig;
-use anyhow::Result;
+use crate::core::error::RailResult;
 use std::path::Path;
 
 /// Check that validates workspace structure and configuration
@@ -17,7 +17,7 @@ impl Check for WorkspaceValidityCheck {
     "Validates workspace structure and rail.toml configuration"
   }
 
-  fn run(&self, ctx: &CheckContext) -> Result<CheckResult> {
+  fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
     // Check if rail.toml exists
     if !RailConfig::exists(&ctx.workspace_root) {
       return Ok(CheckResult::error(
@@ -39,16 +39,12 @@ impl Check for WorkspaceValidityCheck {
           ));
         }
 
-        // Check if Cargo.toml exists in workspace root
-        let cargo_toml = config.workspace.root.join("Cargo.toml");
-        if !cargo_toml.exists() {
+        // Check if Cargo.toml exists in workspace root and is actually a workspace
+        if !is_cargo_workspace(&config.workspace.root) {
           return Ok(CheckResult::error(
             self.name(),
-            format!(
-              "No Cargo.toml found in workspace root: {}",
-              config.workspace.root.display()
-            ),
-            Some("Ensure workspace.root points to a valid Cargo workspace"),
+            format!("No valid Cargo workspace found in: {}", config.workspace.root.display()),
+            Some("Ensure workspace.root points to a directory with Cargo.toml containing [workspace]"),
           ));
         }
 
@@ -100,7 +96,6 @@ impl Check for WorkspaceValidityCheck {
 }
 
 /// Helper to check if a path looks like a valid Cargo workspace
-#[allow(dead_code)]
 fn is_cargo_workspace(path: &Path) -> bool {
   let cargo_toml = path.join("Cargo.toml");
   if !cargo_toml.exists() {

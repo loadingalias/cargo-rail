@@ -65,7 +65,7 @@ pub fn run_status(json: bool) -> RailResult<()> {
     }));
   }
 
-  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
+  let config = RailConfig::load(&current_dir)?;
 
   // Gather status for all crates
   let mut statuses = Vec::new();
@@ -122,7 +122,7 @@ pub fn run_status(json: bool) -> RailResult<()> {
   if json {
     println!(
       "{}",
-      serde_json::to_string_pretty(&statuses).map_err(|e| RailError::Other(e.into()))?
+      serde_json::to_string_pretty(&statuses).map_err(|e| RailError::message(format!("Serialization error: {}", e)))?
     );
   } else {
     print_status_table(&statuses);

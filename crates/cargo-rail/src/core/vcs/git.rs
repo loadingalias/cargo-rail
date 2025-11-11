@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use super::{CommitInfo, Vcs};
-use anyhow::{Context, Result};
+use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use gix::Repository;
 use std::path::{Path, PathBuf};
 
@@ -12,14 +12,22 @@ pub struct GitBackend {
 }
 
 impl Vcs for GitBackend {
-  fn open(path: &Path) -> Result<Self>
+  fn open(path: &Path) -> RailResult<Self>
   where
     Self: Sized,
   {
-    let repo = gix::open(path).with_context(|| format!("Failed to open git repository at {}", path.display()))?;
+    let repo = gix::open(path).map_err(|e| {
+      if e.to_string().contains("not found") || e.to_string().contains("Not a git repository") {
+        RailError::Git(crate::core::error::GitError::RepoNotFound {
+          path: path.to_path_buf(),
+        })
+      } else {
+        RailError::message(format!("Failed to open git repository at {}: {}", path.display(), e))
+      }
+    })?;
     let root = repo
       .workdir()
-      .context("Repository has no working directory")?
+      .ok_or_else(|| RailError::message("Repository has no working directory"))?
       .to_path_buf();
 
     Ok(Self { repo, root })
@@ -29,13 +37,13 @@ impl Vcs for GitBackend {
     &self.root
   }
 
-  fn head_commit(&self) -> Result<String> {
+  fn head_commit(&self) -> RailResult<String> {
     let mut head = self.repo.head()?;
     let commit = head.peel_to_commit()?;
     Ok(commit.id().to_string())
   }
 
-  fn commit_history(&self, _path: &Path, limit: Option<usize>) -> Result<Vec<CommitInfo>> {
+  fn commit_history(&self, _path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
     let mut head = self.repo.head()?;
     let commit = head.peel_to_commit()?;
 
@@ -51,7 +59,9 @@ impl Vcs for GitBackend {
       }
 
       let commit_id = commit_obj.id();
-      let commit = commit_obj.decode()?;
+      let commit = commit_obj
+        .decode()
+        .map_err(|e| RailError::message(format!("Failed to decode commit: {}", e)))?;
 
       // Get author and committer info
       let author = commit.author();
@@ -88,7 +98,7 @@ impl Vcs for GitBackend {
     Ok(commits)
   }
 
-  fn is_tracked(&self, path: &Path) -> Result<bool> {
+  fn is_tracked(&self, path: &Path) -> RailResult<bool> {
     // Check if the file exists in the index
     let relative_path = if path.is_absolute() {
       path.strip_prefix(&self.root).unwrap_or(path)
@@ -102,10 +112,18 @@ impl Vcs for GitBackend {
     Ok(index.entry_by_path(path_bytes).is_some())
   }
 
-  fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> Result<Vec<PathBuf>> {
-    let commit_id =
-      gix::ObjectId::from_hex(commit_sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", commit_sha))?;
-    let commit = self.repo.find_object(commit_id)?.try_into_commit()?;
+  fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<PathBuf>> {
+    let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
+    let commit = self
+      .repo
+      .find_object(commit_id)
+      .map_err(|_| {
+        RailError::Git(crate::core::error::GitError::CommitNotFound {
+          sha: commit_sha.to_string(),
+        })
+      })?
+      .try_into_commit()?;
     let tree = commit.tree()?;
 
     let mut files = Vec::new();
@@ -118,7 +136,7 @@ impl Vcs for GitBackend {
     // If path is empty or ".", list all files
     if relative_path.as_os_str().is_empty() || relative_path == Path::new(".") {
       for entry in tree.iter() {
-        let entry = entry?;
+        let entry = entry.map_err(|e| RailError::message(format!("Failed to iterate tree: {}", e)))?;
         if entry.mode().is_blob() {
           files.push(PathBuf::from(entry.filename().to_string()));
         }
@@ -129,7 +147,7 @@ impl Vcs for GitBackend {
         if entry.mode().is_tree() {
           let subtree = entry.object()?.into_tree();
           for entry in subtree.iter() {
-            let entry = entry?;
+            let entry = entry.map_err(|e| RailError::message(format!("Failed to iterate tree: {}", e)))?;
             if entry.mode().is_blob() {
               let full_path = relative_path.join(entry.filename().to_string());
               files.push(full_path);
@@ -144,9 +162,9 @@ impl Vcs for GitBackend {
     Ok(files)
   }
 
-  fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> Result<Vec<u8>> {
-    let commit_id =
-      gix::ObjectId::from_hex(commit_sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", commit_sha))?;
+  fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
+    let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
     let commit = self.repo.find_object(commit_id)?.try_into_commit()?;
     let tree = commit.tree()?;
 
@@ -158,7 +176,7 @@ impl Vcs for GitBackend {
 
     let entry = tree
       .lookup_entry_by_path(relative_path)?
-      .with_context(|| format!("File not found at commit {}: {}", commit_sha, path.display()))?;
+      .ok_or_else(|| RailError::message(format!("File not found at commit {}: {}", commit_sha, path.display())))?;
 
     let blob = entry.object()?.into_blob();
     Ok(blob.data.to_vec())
@@ -168,7 +186,7 @@ impl Vcs for GitBackend {
 // Remote operations (push, fetch, remotes)
 impl GitBackend {
   /// Add a remote to the repository
-  pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
+  pub fn add_remote(&self, name: &str, url: &str) -> RailResult<()> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -183,14 +201,17 @@ impl GitBackend {
       if stderr.contains("already exists") {
         return Ok(());
       }
-      anyhow::bail!("git remote add failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git remote add".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     Ok(())
   }
 
   /// List all remotes in the repository
-  pub fn list_remotes(&self) -> Result<Vec<(String, String)>> {
+  pub fn list_remotes(&self) -> RailResult<Vec<(String, String)>> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -201,7 +222,10 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git remote -v failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git remote -v".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -225,7 +249,7 @@ impl GitBackend {
 
   /// Push commits to a remote repository
   /// Uses SSH authentication (must be configured in git/ssh config)
-  pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> Result<()> {
+  pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> RailResult<()> {
     use std::process::Command;
 
     println!("   Pushing to remote '{}'...", remote_name);
@@ -238,7 +262,11 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git push failed: {}", stderr);
+      return Err(RailError::Git(GitError::PushFailed {
+        remote: remote_name.to_string(),
+        branch: branch.to_string(),
+        reason: stderr.to_string(),
+      }));
     }
 
     println!("   ✅ Pushed to {}/{}", remote_name, branch);
@@ -246,7 +274,7 @@ impl GitBackend {
   }
 
   /// Fetch commits from a remote repository
-  pub fn fetch_from_remote(&self, remote_name: &str) -> Result<()> {
+  pub fn fetch_from_remote(&self, remote_name: &str) -> RailResult<()> {
     use std::process::Command;
 
     println!("   Fetching from remote '{}'...", remote_name);
@@ -259,7 +287,10 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git fetch failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git fetch".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     println!("   ✅ Fetched from {}", remote_name);
@@ -267,13 +298,13 @@ impl GitBackend {
   }
 
   /// Check if a remote exists
-  pub fn has_remote(&self, name: &str) -> Result<bool> {
+  pub fn has_remote(&self, name: &str) -> RailResult<bool> {
     let remotes = self.list_remotes()?;
     Ok(remotes.iter().any(|(remote_name, _)| remote_name == name))
   }
 
   /// Get the URL of a remote
-  pub fn get_remote_url(&self, name: &str) -> Result<Option<String>> {
+  pub fn get_remote_url(&self, name: &str) -> RailResult<Option<String>> {
     let remotes = self.list_remotes()?;
     Ok(
       remotes
@@ -284,9 +315,11 @@ impl GitBackend {
   }
 
   /// Get the current branch name
-  pub fn current_branch(&self) -> Result<String> {
+  pub fn current_branch(&self) -> RailResult<String> {
     let head = self.repo.head()?;
-    let head_ref = head.referent_name().context("HEAD is detached")?;
+    let head_ref = head
+      .referent_name()
+      .ok_or_else(|| RailError::message("HEAD is detached"))?;
 
     let branch_name = head_ref.shorten().to_string();
 
@@ -294,7 +327,7 @@ impl GitBackend {
   }
 
   /// Create a new branch from the current HEAD
-  pub fn create_branch(&self, branch_name: &str) -> Result<()> {
+  pub fn create_branch(&self, branch_name: &str) -> RailResult<()> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -305,7 +338,9 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git branch failed: {}", stderr);
+      return Err(RailError::Git(GitError::BranchError {
+        message: format!("Failed to create branch '{}': {}", branch_name, stderr),
+      }));
     }
 
     println!("   ✅ Created branch: {}", branch_name);
@@ -313,7 +348,7 @@ impl GitBackend {
   }
 
   /// Checkout a branch
-  pub fn checkout_branch(&self, branch_name: &str) -> Result<()> {
+  pub fn checkout_branch(&self, branch_name: &str) -> RailResult<()> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -324,7 +359,9 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git checkout failed: {}", stderr);
+      return Err(RailError::Git(GitError::BranchError {
+        message: format!("Failed to checkout branch '{}': {}", branch_name, stderr),
+      }));
     }
 
     println!("   ✅ Switched to branch: {}", branch_name);
@@ -332,7 +369,7 @@ impl GitBackend {
   }
 
   /// Create and checkout a new branch in one step
-  pub fn create_and_checkout_branch(&self, branch_name: &str) -> Result<()> {
+  pub fn create_and_checkout_branch(&self, branch_name: &str) -> RailResult<()> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -343,7 +380,9 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git checkout -b failed: {}", stderr);
+      return Err(RailError::Git(GitError::BranchError {
+        message: format!("Failed to create and checkout branch '{}': {}", branch_name, stderr),
+      }));
     }
 
     println!("   ✅ Created and switched to branch: {}", branch_name);
@@ -354,10 +393,13 @@ impl GitBackend {
 // Additional methods for split operations (not part of Vcs trait)
 impl GitBackend {
   /// Get detailed information about a specific commit
-  pub fn get_commit(&self, sha: &str) -> Result<CommitInfo> {
-    let commit_id = gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", sha))?;
+  pub fn get_commit(&self, sha: &str) -> RailResult<CommitInfo> {
+    let commit_id = gix::ObjectId::from_hex(sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", sha, e)))?;
     let commit_obj = self.repo.find_object(commit_id)?.try_into_commit()?;
-    let commit = commit_obj.decode()?;
+    let commit = commit_obj
+      .decode()
+      .map_err(|e| RailError::message(format!("Failed to decode commit: {}", e)))?;
 
     let author = commit.author();
     let committer = commit.committer();
@@ -381,7 +423,7 @@ impl GitBackend {
   }
 
   /// Get all commits in chronological order (oldest first)
-  pub fn get_all_commits_chronological(&self) -> Result<Vec<CommitInfo>> {
+  pub fn get_all_commits_chronological(&self) -> RailResult<Vec<CommitInfo>> {
     let mut commits = self.commit_history(Path::new("."), None)?;
     commits.reverse(); // Reverse to get chronological order
     Ok(commits)
@@ -389,8 +431,9 @@ impl GitBackend {
 
   /// Check if a commit touches any of the given paths
   /// Returns true if the commit actually changed any of the given paths
-  pub fn commit_touches_paths(&self, sha: &str, paths: &[PathBuf]) -> Result<bool> {
-    let commit_id = gix::ObjectId::from_hex(sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", sha))?;
+  pub fn commit_touches_paths(&self, sha: &str, paths: &[PathBuf]) -> RailResult<bool> {
+    let commit_id = gix::ObjectId::from_hex(sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", sha, e)))?;
     let commit_obj = self.repo.find_object(commit_id)?.try_into_commit()?;
 
     // For root commits (no parents), check if paths exist
@@ -419,7 +462,10 @@ impl GitBackend {
       .context("Failed to run git diff-tree")?;
 
     if !output.status.success() {
-      anyhow::bail!("git diff-tree failed: {}", String::from_utf8_lossy(&output.stderr));
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git diff-tree".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+      }));
     }
 
     let changed_files = String::from_utf8_lossy(&output.stdout);
@@ -445,7 +491,7 @@ impl GitBackend {
   }
 
   /// Helper to check if a tree contains any entries with the given path prefix
-  fn tree_contains_path_prefix(&self, tree: &gix::Tree, prefix: &Path) -> Result<bool> {
+  fn tree_contains_path_prefix(&self, tree: &gix::Tree, prefix: &Path) -> RailResult<bool> {
     check_tree_recursive(tree, Path::new(""), prefix)
   }
 
@@ -456,7 +502,7 @@ impl GitBackend {
     path: &Path,
     since_sha: Option<&str>,
     until_ref: &str,
-  ) -> Result<Vec<CommitInfo>> {
+  ) -> RailResult<Vec<CommitInfo>> {
     use std::process::Command;
 
     let relative_path = if path.is_absolute() {
@@ -489,7 +535,10 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git log failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git log".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -507,7 +556,7 @@ impl GitBackend {
 
   /// Get files changed in a specific commit
   /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted)
-  pub fn get_changed_files(&self, commit_sha: &str) -> Result<Vec<(PathBuf, char)>> {
+  pub fn get_changed_files(&self, commit_sha: &str) -> RailResult<Vec<(PathBuf, char)>> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -518,7 +567,10 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git diff-tree failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git diff-tree".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -537,7 +589,7 @@ impl GitBackend {
   }
 
   /// Get file content at a specific commit (returns None if file doesn't exist)
-  pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> Result<Option<Vec<u8>>> {
+  pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
     use std::process::Command;
 
     let relative_path = if path.is_absolute() {
@@ -571,7 +623,7 @@ impl GitBackend {
     author_email: &str,
     timestamp: i64,
     parent_shas: &[String],
-  ) -> Result<String> {
+  ) -> RailResult<String> {
     use std::process::Command;
 
     // Stage all changes
@@ -615,7 +667,10 @@ impl GitBackend {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git commit-tree failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git commit-tree".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
@@ -631,9 +686,9 @@ impl GitBackend {
   }
 
   /// Recursively collect all files under a path in a tree
-  pub fn collect_tree_files(&self, commit_sha: &str, path: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-    let commit_id =
-      gix::ObjectId::from_hex(commit_sha.as_bytes()).with_context(|| format!("Invalid commit SHA: {}", commit_sha))?;
+  pub fn collect_tree_files(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<(PathBuf, Vec<u8>)>> {
+    let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
     let commit = self.repo.find_object(commit_id)?.try_into_commit()?;
     let tree = commit.tree()?;
 
@@ -663,9 +718,9 @@ impl GitBackend {
 }
 
 /// Recursively check if any entry in the tree matches the prefix
-fn check_tree_recursive(tree: &gix::Tree, current_path: &Path, prefix: &Path) -> Result<bool> {
+fn check_tree_recursive(tree: &gix::Tree, current_path: &Path, prefix: &Path) -> RailResult<bool> {
   for entry in tree.iter() {
-    let entry = entry?;
+    let entry = entry.map_err(|e| RailError::message(format!("Failed to iterate tree: {}", e)))?;
     let name = entry.filename().to_string();
     let entry_path = current_path.join(&name);
 
@@ -687,9 +742,9 @@ fn check_tree_recursive(tree: &gix::Tree, current_path: &Path, prefix: &Path) ->
 }
 
 /// Helper to recursively collect files from a tree
-fn collect_files_recursive(tree: &gix::Tree, base_path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+fn collect_files_recursive(tree: &gix::Tree, base_path: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) -> RailResult<()> {
   for entry in tree.iter() {
-    let entry = entry?;
+    let entry = entry.map_err(|e| RailError::message(format!("Failed to iterate tree: {}", e)))?;
     let name = entry.filename().to_string();
     let entry_path = if base_path.as_os_str().is_empty() || base_path == Path::new(".") {
       PathBuf::from(&name)

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 use cargo_metadata::{MetadataCommand, Package};
 use std::path::Path;
 
@@ -10,7 +10,7 @@ pub struct WorkspaceMetadata {
 }
 
 impl WorkspaceMetadata {
-  pub fn load(workspace_root: &Path) -> Result<Self> {
+  pub fn load(workspace_root: &Path) -> RailResult<Self> {
     let metadata = MetadataCommand::new()
       .manifest_path(workspace_root.join("Cargo.toml"))
       .exec()?;

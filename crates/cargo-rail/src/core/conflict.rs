@@ -2,7 +2,7 @@
 ///
 /// Handles file-level conflicts when syncing changes between monorepo and split repos.
 /// Uses Git's battle-tested 3-way merge algorithm via `git merge-file`.
-use anyhow::{Context, Result};
+use crate::core::error::{RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,16 +21,16 @@ pub enum ConflictStrategy {
 }
 
 impl ConflictStrategy {
-  pub fn from_str(s: &str) -> Result<Self> {
+  pub fn from_str(s: &str) -> RailResult<Self> {
     match s.to_lowercase().as_str() {
       "ours" | "use-mono" => Ok(Self::Ours),
       "theirs" | "use-remote" => Ok(Self::Theirs),
       "manual" => Ok(Self::Manual),
       "union" => Ok(Self::Union),
-      _ => anyhow::bail!(
-        "Invalid conflict strategy '{}'. Valid options: ours, theirs, manual, union",
-        s
-      ),
+      _ => Err(RailError::with_help(
+        format!("Invalid conflict strategy '{}'", s),
+        "Valid options: ours, theirs, manual, union",
+      )),
     }
   }
 }
@@ -40,7 +40,6 @@ impl ConflictStrategy {
 pub struct ConflictInfo {
   pub file_path: PathBuf,
   pub message: String,
-  #[allow(dead_code)]
   pub resolved: bool,
 }
 
@@ -84,7 +83,12 @@ impl ConflictResolver {
   /// * `Ok(MergeResult::Success)` - Merged successfully
   /// * `Ok(MergeResult::Conflicts)` - Conflicts detected (markers inserted)
   /// * `Err(_)` - Merge failed
-  pub fn resolve_file(&self, current_path: &Path, base_content: &[u8], incoming_content: &[u8]) -> Result<MergeResult> {
+  pub fn resolve_file(
+    &self,
+    current_path: &Path,
+    base_content: &[u8],
+    incoming_content: &[u8],
+  ) -> RailResult<MergeResult> {
     // Create temporary files for 3-way merge
     let temp_base = self.work_dir.join("merge-base");
     let temp_current = self.work_dir.join("merge-current");

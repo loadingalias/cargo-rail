@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::core::error::{RailError, RailResult, ResultExt, ValidationError};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,7 +15,7 @@ impl SecurityValidator {
   }
 
   /// Find and validate SSH key for git operations
-  pub fn validate_ssh_key(&self) -> Result<PathBuf> {
+  pub fn validate_ssh_key(&self) -> RailResult<PathBuf> {
     let ssh_key = if let Some(ref path) = self.config.ssh_key_path {
       // Use configured path
       path.clone()
@@ -26,20 +26,22 @@ impl SecurityValidator {
 
     // Check if key file exists
     if !ssh_key.exists() {
-      anyhow::bail!(
-        "SSH key not found: {}\n\
-         \n\
-         To fix this:\n\
-         1. Generate an SSH key: ssh-keygen -t ed25519 -C \"your_email@example.com\"\n\
-         2. Add the key to your SSH agent: ssh-add {}\n\
-         3. Add the public key to your git remote (GitHub/GitLab/etc.)\n\
-         \n\
-         Or specify a custom key path in rail.toml:\n\
-         [security]\n\
-         ssh_key_path = \"/path/to/your/key\"",
-        ssh_key.display(),
-        ssh_key.display()
-      );
+      return Err(RailError::Validation(ValidationError::SshKey {
+        message: format!(
+          "SSH key not found: {}\n\
+           \n\
+           To fix this:\n\
+           1. Generate an SSH key: ssh-keygen -t ed25519 -C \"your_email@example.com\"\n\
+           2. Add the key to your SSH agent: ssh-add {}\n\
+           3. Add the public key to your git remote (GitHub/GitLab/etc.)\n\
+           \n\
+           Or specify a custom key path in rail.toml:\n\
+           [security]\n\
+           ssh_key_path = \"/path/to/your/key\"",
+          ssh_key.display(),
+          ssh_key.display()
+        ),
+      }));
     }
 
     // Check if key is readable
@@ -64,7 +66,7 @@ impl SecurityValidator {
   }
 
   /// Find default SSH key in standard locations
-  fn find_default_ssh_key(&self) -> Result<PathBuf> {
+  fn find_default_ssh_key(&self) -> RailResult<PathBuf> {
     let home = std::env::var("HOME")
       .or_else(|_| std::env::var("USERPROFILE"))
       .context(
@@ -87,8 +89,8 @@ impl SecurityValidator {
       }
     }
 
-    anyhow::bail!(
-      "No SSH key found in standard locations:\n\
+    Err(RailError::Validation(ValidationError::SshKey {
+      message: "No SSH key found in standard locations:\n\
        → ~/.ssh/id_ed25519\n\
        → ~/.ssh/id_rsa\n\
        → ~/.ssh/id_ecdsa\n\
@@ -97,11 +99,12 @@ impl SecurityValidator {
        Or specify a custom path in rail.toml:\n\
        [security]\n\
        ssh_key_path = \"/path/to/your/key\""
-    )
+        .to_string(),
+    }))
   }
 
   /// Validate signing key (if required)
-  pub fn validate_signing_key(&self) -> Result<Option<PathBuf>> {
+  pub fn validate_signing_key(&self) -> RailResult<Option<PathBuf>> {
     if !self.config.require_signed_commits {
       return Ok(None);
     }
@@ -114,22 +117,24 @@ impl SecurityValidator {
     };
 
     if !signing_key.exists() {
-      anyhow::bail!(
-        "Signing key not found: {}\n\
-         \n\
-         Signing is required by your rail.toml configuration.\n\
-         \n\
-         To fix this:\n\
-         1. Generate a signing key: ssh-keygen -t ed25519 -f ~/.ssh/id_signing\n\
-         2. Configure git to use it: git config --global gpg.format ssh\n\
-         3. git config --global user.signingkey {}\n\
-         \n\
-         Or disable signing in rail.toml:\n\
-         [security]\n\
-         require_signed_commits = false",
-        signing_key.display(),
-        signing_key.display()
-      );
+      return Err(RailError::Validation(ValidationError::SshKey {
+        message: format!(
+          "Signing key not found: {}\n\
+           \n\
+           Signing is required by your rail.toml configuration.\n\
+           \n\
+           To fix this:\n\
+           1. Generate a signing key: ssh-keygen -t ed25519 -f ~/.ssh/id_signing\n\
+           2. Configure git to use it: git config --global gpg.format ssh\n\
+           3. git config --global user.signingkey {}\n\
+           \n\
+           Or disable signing in rail.toml:\n\
+           [security]\n\
+           require_signed_commits = false",
+          signing_key.display(),
+          signing_key.display()
+        ),
+      }));
     }
 
     println!("✅ Signing key validated: {}", signing_key.display());
@@ -137,28 +142,13 @@ impl SecurityValidator {
     Ok(Some(signing_key))
   }
 
-  /// Check if current branch is protected
-  #[allow(dead_code)]
-  pub fn check_branch_protected(&self, branch_name: &str) -> Result<()> {
-    if self.config.protected_branches.contains(&branch_name.to_string()) {
-      anyhow::bail!(
-        "Cannot commit directly to protected branch: {}\n\
-         \n\
-         Protected branches: {:?}\n\
-         \n\
-         For remote→mono syncs, cargo-rail will automatically create a PR branch.\n\
-         Direct commits to protected branches are blocked to prevent accidental changes.",
-        branch_name,
-        self.config.protected_branches
-      );
-    }
-
-    Ok(())
-  }
-
   /// Generate PR branch name from pattern
   pub fn generate_pr_branch(&self, crate_name: &str) -> String {
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    // Use Unix timestamp for simple, unique branch names
+    let timestamp = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+      .as_secs();
 
     self
       .config
@@ -168,8 +158,7 @@ impl SecurityValidator {
   }
 
   /// Verify a commit is signed (if required)
-  #[allow(dead_code)]
-  pub fn verify_commit_signature(&self, repo_path: &Path, commit_sha: &str) -> Result<bool> {
+  pub fn verify_commit_signature(&self, repo_path: &Path, commit_sha: &str) -> RailResult<bool> {
     if !self.config.require_signed_commits {
       return Ok(true); // Not required, so pass
     }
@@ -206,21 +195,9 @@ mod tests {
 
     let branch = validator.generate_pr_branch("test-crate");
     assert!(branch.starts_with("rail/sync/test-crate/"));
-    assert!(branch.contains("202")); // Should have a year in timestamp
-  }
-
-  #[test]
-  fn test_protected_branch_check() {
-    let config = SecurityConfig::default();
-    let validator = SecurityValidator::new(config);
-
-    // Should fail for main
-    assert!(validator.check_branch_protected("main").is_err());
-
-    // Should fail for master
-    assert!(validator.check_branch_protected("master").is_err());
-
-    // Should pass for feature branch
-    assert!(validator.check_branch_protected("feature/test").is_ok());
+    // Should have a Unix timestamp (numeric string > 1600000000 for 2020+)
+    let timestamp_part = branch.split('/').next_back().unwrap();
+    let timestamp: u64 = timestamp_part.parse().expect("timestamp should be numeric");
+    assert!(timestamp > 1600000000, "timestamp should be recent (post-2020)");
   }
 }

@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::cargo::metadata::WorkspaceMetadata;
+use crate::core::error::{RailError, RailResult, ResultExt};
 use crate::core::transform::{Transform, TransformContext};
-use anyhow::{Context, Result};
 use std::collections::HashMap;
 use toml_edit::{DocumentMut, Item, Value};
 
@@ -41,7 +41,7 @@ impl CargoTransform {
   }
 
   /// Flatten workspace = true fields with actual values
-  fn flatten_workspace_inheritance(&self, doc: &mut DocumentMut) -> Result<()> {
+  fn flatten_workspace_inheritance(&self, doc: &mut DocumentMut) -> RailResult<()> {
     // Load workspace Cargo.toml to get inherited values
     let workspace_toml_path = self.workspace_metadata.workspace_root().join("Cargo.toml");
     let workspace_content =
@@ -157,7 +157,7 @@ impl CargoTransform {
   }
 
   /// Transform path dependencies to version dependencies
-  fn transform_dependencies_to_versions(&self, doc: &mut DocumentMut) -> Result<()> {
+  fn transform_dependencies_to_versions(&self, doc: &mut DocumentMut) -> RailResult<()> {
     let dep_sections = ["dependencies", "dev-dependencies", "build-dependencies"];
 
     for section in dep_sections {
@@ -177,11 +177,13 @@ impl CargoTransform {
                 dep_table.insert("version", Item::Value(Value::from(version.clone())));
               } else {
                 // Path dependency to non-workspace crate - ERROR
-                anyhow::bail!(
-                  "Cannot split: dependency '{}' has path to non-workspace crate. \
-                     Convert to version dependency first.",
-                  dep_name
-                );
+                return Err(RailError::with_help(
+                  format!(
+                    "Cannot split: dependency '{}' has path to non-workspace crate",
+                    dep_name
+                  ),
+                  "Convert to version dependency first",
+                ));
               }
             }
           }
@@ -194,7 +196,7 @@ impl CargoTransform {
 }
 
 impl Transform for CargoTransform {
-  fn transform_to_split(&self, content: &str, _context: &TransformContext) -> Result<String> {
+  fn transform_to_split(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 
     // 1. Flatten workspace = true to actual values
@@ -209,7 +211,7 @@ impl Transform for CargoTransform {
     Ok(doc.to_string())
   }
 
-  fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> Result<String> {
+  fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 
     // Transform version dependencies back to path dependencies

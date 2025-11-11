@@ -1,12 +1,8 @@
 //! Error types for cargo-rail with contextual messages and exit codes
 //!
 //! This module provides a unified error type that categorizes errors and provides
-//! contextual help messages to users.
-//!
-//! Note: Many error types are defined but not yet fully integrated. They will be used
-//! as we migrate commands to use the RailError type with contextual help messages.
-
-#![allow(dead_code)]
+//! contextual help messages to users. Every error includes a helpful suggestion
+//! to guide users toward resolution.
 
 use std::fmt;
 use std::io;
@@ -15,8 +11,6 @@ use std::path::PathBuf;
 /// Exit codes for cargo-rail
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
-  /// Success
-  Success = 0,
   /// User error (config, invalid args, missing files)
   UserError = 1,
   /// System error (git, network, I/O)
@@ -41,29 +35,60 @@ pub enum RailError {
   /// Git operation errors
   Git(GitError),
 
-  /// Network/remote errors
-  Network(NetworkError),
-
   /// Validation errors (SSH, paths, etc.)
   Validation(ValidationError),
 
   /// I/O errors
   Io(io::Error),
 
-  /// Generic error with context
-  Other(anyhow::Error),
+  /// Generic error with message and optional context
+  Message {
+    message: String,
+    context: Option<String>,
+    help: Option<String>,
+  },
 }
 
 impl RailError {
+  /// Create a simple error message
+  pub fn message(msg: impl Into<String>) -> Self {
+    RailError::Message {
+      message: msg.into(),
+      context: None,
+      help: None,
+    }
+  }
+
+  /// Create an error with help text
+  pub fn with_help(msg: impl Into<String>, help: impl Into<String>) -> Self {
+    RailError::Message {
+      message: msg.into(),
+      context: None,
+      help: Some(help.into()),
+    }
+  }
+
+  /// Add context to an existing error
+  pub fn context(self, ctx: impl Into<String>) -> Self {
+    let ctx_str = ctx.into();
+    match self {
+      RailError::Message { message, context, help } => RailError::Message {
+        message,
+        context: Some(context.map(|c| format!("{}\n{}", ctx_str, c)).unwrap_or(ctx_str)),
+        help,
+      },
+      _ => self,
+    }
+  }
+
   /// Get the appropriate exit code for this error
   pub fn exit_code(&self) -> ExitCode {
     match self {
       RailError::Config(_) => ExitCode::UserError,
       RailError::Git(_) => ExitCode::SystemError,
-      RailError::Network(_) => ExitCode::SystemError,
       RailError::Validation(_) => ExitCode::ValidationError,
       RailError::Io(_) => ExitCode::SystemError,
-      RailError::Other(_) => ExitCode::UserError,
+      RailError::Message { .. } => ExitCode::UserError,
     }
   }
 
@@ -72,8 +97,8 @@ impl RailError {
     match self {
       RailError::Config(e) => e.help_message(),
       RailError::Git(e) => e.help_message(),
-      RailError::Network(e) => e.help_message(),
       RailError::Validation(e) => e.help_message(),
+      RailError::Message { help, .. } => help.clone(),
       _ => None,
     }
   }
@@ -84,10 +109,15 @@ impl fmt::Display for RailError {
     match self {
       RailError::Config(e) => write!(f, "{}", e),
       RailError::Git(e) => write!(f, "{}", e),
-      RailError::Network(e) => write!(f, "{}", e),
       RailError::Validation(e) => write!(f, "{}", e),
       RailError::Io(e) => write!(f, "I/O error: {}", e),
-      RailError::Other(e) => write!(f, "{}", e),
+      RailError::Message { message, context, .. } => {
+        write!(f, "{}", message)?;
+        if let Some(ctx) = context {
+          write!(f, "\n{}", ctx)?;
+        }
+        Ok(())
+      }
     }
   }
 }
@@ -96,7 +126,6 @@ impl std::error::Error for RailError {
   fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
     match self {
       RailError::Io(e) => Some(e),
-      RailError::Other(e) => e.source(),
       _ => None,
     }
   }
@@ -108,9 +137,143 @@ impl From<io::Error> for RailError {
   }
 }
 
-impl From<anyhow::Error> for RailError {
-  fn from(err: anyhow::Error) -> Self {
-    RailError::Other(err)
+impl From<String> for RailError {
+  fn from(msg: String) -> Self {
+    RailError::message(msg)
+  }
+}
+
+impl From<&str> for RailError {
+  fn from(msg: &str) -> Self {
+    RailError::message(msg)
+  }
+}
+
+impl From<toml_edit::TomlError> for RailError {
+  fn from(err: toml_edit::TomlError) -> Self {
+    RailError::message(format!("TOML parse error: {}", err))
+  }
+}
+
+impl From<cargo_metadata::Error> for RailError {
+  fn from(err: cargo_metadata::Error) -> Self {
+    RailError::message(format!("Cargo metadata error: {}", err))
+  }
+}
+
+impl From<std::num::ParseIntError> for RailError {
+  fn from(err: std::num::ParseIntError) -> Self {
+    RailError::message(format!("Parse error: {}", err))
+  }
+}
+
+impl From<toml_edit::de::Error> for RailError {
+  fn from(err: toml_edit::de::Error) -> Self {
+    RailError::message(format!("TOML deserialization error: {}", err))
+  }
+}
+
+impl From<toml_edit::ser::Error> for RailError {
+  fn from(err: toml_edit::ser::Error) -> Self {
+    RailError::message(format!("TOML serialization error: {}", err))
+  }
+}
+
+impl From<serde_json::Error> for RailError {
+  fn from(err: serde_json::Error) -> Self {
+    RailError::message(format!("JSON error: {}", err))
+  }
+}
+
+impl From<std::str::Utf8Error> for RailError {
+  fn from(err: std::str::Utf8Error) -> Self {
+    RailError::message(format!("UTF-8 error: {}", err))
+  }
+}
+
+impl From<std::string::FromUtf8Error> for RailError {
+  fn from(err: std::string::FromUtf8Error) -> Self {
+    RailError::message(format!("UTF-8 conversion error: {}", err))
+  }
+}
+
+// Gix (gitoxide) error types
+impl From<gix::open::Error> for RailError {
+  fn from(err: gix::open::Error) -> Self {
+    RailError::message(format!("Git repository error: {}", err))
+  }
+}
+
+impl From<gix::reference::find::existing::Error> for RailError {
+  fn from(err: gix::reference::find::existing::Error) -> Self {
+    RailError::message(format!("Git reference error: {}", err))
+  }
+}
+
+impl From<gix::object::find::existing::Error> for RailError {
+  fn from(err: gix::object::find::existing::Error) -> Self {
+    RailError::message(format!("Git object error: {}", err))
+  }
+}
+
+impl From<gix::object::peel::to_kind::Error> for RailError {
+  fn from(err: gix::object::peel::to_kind::Error) -> Self {
+    RailError::message(format!("Git object peel error: {}", err))
+  }
+}
+
+impl From<gix::traverse::tree::breadthfirst::Error> for RailError {
+  fn from(err: gix::traverse::tree::breadthfirst::Error) -> Self {
+    RailError::message(format!("Git tree traversal error: {}", err))
+  }
+}
+
+impl From<gix::object::commit::Error> for RailError {
+  fn from(err: gix::object::commit::Error) -> Self {
+    RailError::message(format!("Git commit error: {}", err))
+  }
+}
+
+// Additional gix error types for comprehensive coverage
+impl From<gix::object::try_into::Error> for RailError {
+  fn from(err: gix::object::try_into::Error) -> Self {
+    RailError::message(format!("Git object conversion error: {}", err))
+  }
+}
+
+impl From<gix::head::peel::to_commit::Error> for RailError {
+  fn from(err: gix::head::peel::to_commit::Error) -> Self {
+    RailError::message(format!("Git HEAD peel error: {}", err))
+  }
+}
+
+impl From<gix::worktree::open_index::Error> for RailError {
+  fn from(err: gix::worktree::open_index::Error) -> Self {
+    RailError::message(format!("Git worktree index error: {}", err))
+  }
+}
+
+impl From<gix::path::Utf8Error> for RailError {
+  fn from(err: gix::path::Utf8Error) -> Self {
+    RailError::message(format!("Git path UTF-8 error: {}", err))
+  }
+}
+
+impl From<std::path::StripPrefixError> for RailError {
+  fn from(err: std::path::StripPrefixError) -> Self {
+    RailError::message(format!("Path strip prefix error: {}", err))
+  }
+}
+
+impl From<std::env::VarError> for RailError {
+  fn from(err: std::env::VarError) -> Self {
+    RailError::message(format!("Environment variable error: {}", err))
+  }
+}
+
+impl From<gix::init::Error> for RailError {
+  fn from(err: gix::init::Error) -> Self {
+    RailError::message(format!("Git init error: {}", err))
   }
 }
 
@@ -120,36 +283,17 @@ pub enum ConfigError {
   /// rail.toml not found
   NotFound { workspace_root: PathBuf },
 
-  /// Invalid TOML syntax
-  InvalidToml { path: PathBuf, message: String },
-
   /// Missing required field
   MissingField { field: String },
 
-  /// Invalid remote URL
-  InvalidRemote { url: String, reason: String },
-
   /// Crate not found in configuration
   CrateNotFound { name: String },
-
-  /// Path validation failed
-  InvalidPath { path: PathBuf, reason: String },
 }
 
 impl ConfigError {
   fn help_message(&self) -> Option<String> {
     match self {
       ConfigError::NotFound { .. } => Some("Run `cargo rail init` to create a configuration file.".to_string()),
-      ConfigError::InvalidToml { .. } => {
-        Some("Check your .rail/config.toml syntax. Use `cargo rail doctor` to validate.".to_string())
-      }
-      ConfigError::InvalidRemote { url, .. } => {
-        if url.starts_with("http://") {
-          Some("Use SSH URLs (git@github.com:...) or HTTPS (https://...) for remotes.".to_string())
-        } else {
-          Some("Ensure the remote URL is valid. Example: git@github.com:user/repo.git".to_string())
-        }
-      }
       ConfigError::CrateNotFound { name } => Some(format!(
         "Available crates can be listed with `cargo rail status`. Did you mean to run `cargo rail init` for '{}'?",
         name
@@ -169,20 +313,11 @@ impl fmt::Display for ConfigError {
           workspace_root.display()
         )
       }
-      ConfigError::InvalidToml { path, message } => {
-        write!(f, "Invalid TOML in {}: {}", path.display(), message)
-      }
       ConfigError::MissingField { field } => {
         write!(f, "Missing required field in config: {}", field)
       }
-      ConfigError::InvalidRemote { url, reason } => {
-        write!(f, "Invalid remote URL '{}': {}", url, reason)
-      }
       ConfigError::CrateNotFound { name } => {
         write!(f, "Crate '{}' not found in configuration", name)
-      }
-      ConfigError::InvalidPath { path, reason } => {
-        write!(f, "Invalid path '{}': {}", path.display(), reason)
       }
     }
   }
@@ -205,13 +340,6 @@ pub enum GitError {
 
   /// Push failed
   PushFailed {
-    remote: String,
-    branch: String,
-    reason: String,
-  },
-
-  /// Pull failed
-  PullFailed {
     remote: String,
     branch: String,
     reason: String,
@@ -257,52 +385,6 @@ impl fmt::Display for GitError {
       GitError::PushFailed { remote, branch, reason } => {
         write!(f, "Push to {}/{} failed: {}", remote, branch, reason)
       }
-      GitError::PullFailed { remote, branch, reason } => {
-        write!(f, "Pull from {}/{} failed: {}", remote, branch, reason)
-      }
-    }
-  }
-}
-
-/// Network and remote operation errors
-#[derive(Debug)]
-pub enum NetworkError {
-  /// Remote not accessible
-  RemoteUnreachable { url: String, reason: String },
-
-  /// SSH connection failed
-  SshFailed { host: String, reason: String },
-
-  /// Timeout
-  Timeout { operation: String },
-}
-
-impl NetworkError {
-  fn help_message(&self) -> Option<String> {
-    match self {
-      NetworkError::RemoteUnreachable { .. } => Some(
-        "Check your network connection and remote URL. Use `cargo rail doctor --thorough` to test remotes.".to_string(),
-      ),
-      NetworkError::SshFailed { .. } => {
-        Some("Verify SSH key is added to GitHub/GitLab. Test with: ssh -T git@github.com".to_string())
-      }
-      _ => None,
-    }
-  }
-}
-
-impl fmt::Display for NetworkError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      NetworkError::RemoteUnreachable { url, reason } => {
-        write!(f, "Remote '{}' is unreachable: {}", url, reason)
-      }
-      NetworkError::SshFailed { host, reason } => {
-        write!(f, "SSH connection to '{}' failed: {}", host, reason)
-      }
-      NetworkError::Timeout { operation } => {
-        write!(f, "Operation timed out: {}", operation)
-      }
     }
   }
 }
@@ -318,9 +400,6 @@ pub enum ValidationError {
 
   /// Workspace validation failed
   WorkspaceInvalid { reason: String },
-
-  /// Check failed
-  CheckFailed { check_name: String, message: String },
 }
 
 impl ValidationError {
@@ -349,12 +428,52 @@ impl fmt::Display for ValidationError {
       ValidationError::WorkspaceInvalid { reason } => {
         write!(f, "Workspace validation failed: {}", reason)
       }
-      ValidationError::CheckFailed { check_name, message } => {
-        write!(f, "Check '{}' failed: {}", check_name, message)
-      }
     }
   }
 }
 
 /// Result type alias for cargo-rail
 pub type RailResult<T> = Result<T, RailError>;
+
+/// Helper trait to add context to Results
+pub trait ResultExt<T> {
+  /// Add context to an error result
+  fn context(self, ctx: impl Into<String>) -> RailResult<T>;
+
+  /// Add context using a closure (lazy evaluation)
+  fn with_context<F>(self, f: F) -> RailResult<T>
+  where
+    F: FnOnce() -> String;
+}
+
+impl<T, E> ResultExt<T> for Result<T, E>
+where
+  E: Into<RailError>,
+{
+  fn context(self, ctx: impl Into<String>) -> RailResult<T> {
+    self.map_err(|e| e.into().context(ctx))
+  }
+
+  fn with_context<F>(self, f: F) -> RailResult<T>
+  where
+    F: FnOnce() -> String,
+  {
+    self.map_err(|e| e.into().context(f()))
+  }
+}
+
+/// Pretty-print an error to stderr with colors and help text
+pub fn print_error(error: &RailError) {
+  eprintln!("\n❌ {}\n", error);
+
+  if let Some(help) = error.help_message() {
+    eprintln!("💡 Help: {}\n", help);
+  }
+}
+
+/// Convert anyhow::Error to RailError (for transition period)
+impl From<anyhow::Error> for RailError {
+  fn from(err: anyhow::Error) -> Self {
+    RailError::message(err.to_string())
+  }
+}

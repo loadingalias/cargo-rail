@@ -1,15 +1,16 @@
 #![allow(dead_code)]
 
-use anyhow::Result;
+use crate::core::error::RailResult;
 use std::path::{Path, PathBuf};
 
+use crate::adapters::{self, LanguageAdapter, TransformContext as AdapterTransformContext, TransformMode};
 use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
-use crate::core::transform::{Transform, TransformContext};
 use crate::core::vcs::Vcs;
 use crate::core::vcs::git::GitBackend;
+use crate::ui::progress::FileProgress;
 
 /// Configuration for sync operation
 pub struct SyncConfig {
@@ -42,7 +43,7 @@ pub struct SyncEngine {
   config: SyncConfig,
   mono_git: GitBackend,
   mapping_store: MappingStore,
-  transformer: Box<dyn Transform>,
+  adapter: Box<dyn LanguageAdapter>,
   security_config: SecurityConfig,
   security_validator: SecurityValidator,
   conflict_resolver: ConflictResolver,
@@ -52,12 +53,12 @@ impl SyncEngine {
   pub fn new(
     workspace_root: PathBuf,
     config: SyncConfig,
-    transformer: Box<dyn Transform>,
     security_config: SecurityConfig,
     conflict_strategy: ConflictStrategy,
-  ) -> Result<Self> {
+  ) -> RailResult<Self> {
     let mono_git = GitBackend::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
+    let adapter = adapters::detect_adapter(&workspace_root)?;
     let security_validator = SecurityValidator::new(security_config.clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
@@ -67,7 +68,7 @@ impl SyncEngine {
       std::process::id(),
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_nanos()
     ));
     std::fs::create_dir_all(&temp_dir)?;
@@ -78,7 +79,7 @@ impl SyncEngine {
       config,
       mono_git,
       mapping_store,
-      transformer,
+      adapter,
       security_config,
       security_validator,
       conflict_resolver,
@@ -101,7 +102,7 @@ impl SyncEngine {
     }
   }
 
-  pub fn sync_to_remote(&mut self) -> Result<SyncResult> {
+  pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
     println!("   Syncing monorepo → remote...");
 
     // Validate SSH key before any remote operations
@@ -211,7 +212,7 @@ impl SyncEngine {
     })
   }
 
-  pub fn sync_from_remote(&mut self) -> Result<SyncResult> {
+  pub fn sync_from_remote(&mut self) -> RailResult<SyncResult> {
     println!("   Syncing remote → monorepo...");
 
     // Validate SSH key before any remote operations
@@ -364,7 +365,7 @@ impl SyncEngine {
     })
   }
 
-  pub fn sync_bidirectional(&mut self) -> Result<SyncResult> {
+  pub fn sync_bidirectional(&mut self) -> RailResult<SyncResult> {
     println!("   Detecting changes...");
 
     // Check both directions
@@ -404,7 +405,7 @@ impl SyncEngine {
 
   // Helper methods
 
-  fn find_last_synced_mono_commit(&self) -> Result<Option<String>> {
+  fn find_last_synced_mono_commit(&self) -> RailResult<Option<String>> {
     // Find the most recent mono commit that has a mapping
     let commits = self.mono_git.commit_history(Path::new("."), Some(100))?;
 
@@ -417,7 +418,7 @@ impl SyncEngine {
     Ok(None)
   }
 
-  fn find_last_synced_remote_commit(&self, remote_git: &GitBackend) -> Result<Option<String>> {
+  fn find_last_synced_remote_commit(&self, remote_git: &GitBackend) -> RailResult<Option<String>> {
     // Find the most recent remote commit that has a reverse mapping
     let commits = remote_git.commit_history(Path::new("."), Some(100))?;
     let all_mappings = self.mapping_store.all_mappings();
@@ -436,18 +437,24 @@ impl SyncEngine {
     &self,
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &GitBackend,
-  ) -> Result<String> {
+  ) -> RailResult<String> {
     // Get changed files in mono
     let changed_files = self.mono_git.get_changed_files(&commit.sha)?;
 
-    // Filter to only files in crate path
+    // Filter to only files in crate path and not excluded by adapter
     let crate_path = &self.config.crate_paths[0];
     let relevant_files: Vec<_> = changed_files
       .into_iter()
-      .filter(|(path, _)| path.starts_with(crate_path))
+      .filter(|(path, _)| path.starts_with(crate_path) && !self.adapter.should_exclude(path))
       .collect();
 
     // Apply each file to remote
+    let mut progress = if !relevant_files.is_empty() {
+      Some(FileProgress::new(relevant_files.len(), "Applying files to remote"))
+    } else {
+      None
+    };
+
     for (mono_path, change_type) in relevant_files {
       let remote_path = self.map_mono_path_to_remote(&mono_path)?;
 
@@ -469,23 +476,31 @@ impl SyncEngine {
               std::fs::create_dir_all(parent)?;
             }
 
-            // Transform if Cargo.toml
-            if mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-              let content_str = String::from_utf8(content)?;
-              let transformed = self.transformer.transform_to_split(
-                &content_str,
-                &TransformContext {
-                  crate_name: self.config.crate_name.clone(),
-                  workspace_root: self.workspace_root.clone(),
-                },
-              )?;
-              std::fs::write(&full_remote_path, transformed)?;
-            } else {
-              std::fs::write(&full_remote_path, content)?;
+            // Write file first, then transform manifest if applicable
+            std::fs::write(&full_remote_path, content)?;
+
+            // Transform manifest (Cargo.toml, package.json, etc.)
+            if mono_path.file_name() == Some(std::ffi::OsStr::new(self.adapter.manifest_filename())) {
+              let context = AdapterTransformContext {
+                workspace_root: self.workspace_root.clone(),
+                package_name: self.config.crate_name.clone(),
+                target_mode: TransformMode::SyncToRemote,
+              };
+              self.adapter.transform_manifest(&full_remote_path, &context)?;
             }
           }
         }
       }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
+    }
+
+    // Security checks before creating commit
+    // Note: Branch protection doesn't apply to remote repos - only to monorepo
+    if self.security_config.require_signed_commits {
+      self.security_validator.validate_signing_key()?;
     }
 
     // Create commit with trailer
@@ -493,13 +508,22 @@ impl SyncEngine {
 
     let parent_shas = vec![remote_git.head_commit()?];
 
-    remote_git.create_commit_with_metadata(
+    let new_commit_sha = remote_git.create_commit_with_metadata(
       &message,
       &commit.author,
       &commit.author_email,
       commit.timestamp,
       &parent_shas,
-    )
+    )?;
+
+    // Verify commit signature if required
+    if self.security_config.require_signed_commits {
+      self
+        .security_validator
+        .verify_commit_signature(&self.config.target_repo_path, &new_commit_sha)?;
+    }
+
+    Ok(new_commit_sha)
   }
 
   fn apply_remote_commit_to_mono(
@@ -507,13 +531,24 @@ impl SyncEngine {
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &GitBackend,
     resolved_files: &[PathBuf],
-  ) -> Result<String> {
+  ) -> RailResult<String> {
     // Get changed files in remote
     let changed_files = remote_git.get_changed_files(&commit.sha)?;
 
     // Apply each file to mono
+    let mut progress = if !changed_files.is_empty() {
+      Some(FileProgress::new(changed_files.len(), "Applying files to mono"))
+    } else {
+      None
+    };
+
     for (remote_path, change_type) in changed_files {
       let mono_path = self.map_remote_path_to_mono(&remote_path)?;
+
+      // Skip files excluded by adapter (node_modules, target, etc.)
+      if self.adapter.should_exclude(&mono_path) {
+        continue;
+      }
 
       // Skip files that were already resolved by conflict resolution
       if resolved_files.iter().any(|p| p == &mono_path) {
@@ -539,23 +574,31 @@ impl SyncEngine {
               std::fs::create_dir_all(parent)?;
             }
 
-            // Transform if Cargo.toml
-            if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-              let content_str = String::from_utf8(content)?;
-              let transformed = self.transformer.transform_to_mono(
-                &content_str,
-                &TransformContext {
-                  crate_name: self.config.crate_name.clone(),
-                  workspace_root: self.workspace_root.clone(),
-                },
-              )?;
-              std::fs::write(&full_mono_path, transformed)?;
-            } else {
-              std::fs::write(&full_mono_path, content)?;
+            // Write file first, then transform manifest if applicable
+            std::fs::write(&full_mono_path, content)?;
+
+            // Transform manifest (Cargo.toml, package.json, etc.)
+            if remote_path.file_name() == Some(std::ffi::OsStr::new(self.adapter.manifest_filename())) {
+              let context = AdapterTransformContext {
+                workspace_root: self.workspace_root.clone(),
+                package_name: self.config.crate_name.clone(),
+                target_mode: TransformMode::SyncToMono,
+              };
+              self.adapter.transform_manifest(&full_mono_path, &context)?;
             }
           }
         }
       }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
+    }
+
+    // Security checks before creating commit
+    // Note: Branch protection applies to the monorepo's current branch
+    if self.security_config.require_signed_commits {
+      self.security_validator.validate_signing_key()?;
     }
 
     // Create commit with trailer
@@ -563,16 +606,25 @@ impl SyncEngine {
 
     let parent_shas = vec![self.mono_git.head_commit()?];
 
-    self.mono_git.create_commit_with_metadata(
+    let new_commit_sha = self.mono_git.create_commit_with_metadata(
       &message,
       &commit.author,
       &commit.author_email,
       commit.timestamp,
       &parent_shas,
-    )
+    )?;
+
+    // Verify commit signature if required
+    if self.security_config.require_signed_commits {
+      self
+        .security_validator
+        .verify_commit_signature(&self.workspace_root, &new_commit_sha)?;
+    }
+
+    Ok(new_commit_sha)
   }
 
-  fn map_mono_path_to_remote(&self, mono_path: &Path) -> Result<PathBuf> {
+  fn map_mono_path_to_remote(&self, mono_path: &Path) -> RailResult<PathBuf> {
     let crate_path = &self.config.crate_paths[0];
 
     match self.config.mode {
@@ -587,7 +639,7 @@ impl SyncEngine {
     }
   }
 
-  fn map_remote_path_to_mono(&self, remote_path: &Path) -> Result<PathBuf> {
+  fn map_remote_path_to_mono(&self, remote_path: &Path) -> RailResult<PathBuf> {
     let crate_path = &self.config.crate_paths[0];
 
     match self.config.mode {
@@ -608,11 +660,21 @@ impl SyncEngine {
     &self,
     remote_commit: &crate::core::vcs::CommitInfo,
     remote_git: &GitBackend,
-  ) -> Result<Vec<ConflictInfo>> {
+  ) -> RailResult<Vec<ConflictInfo>> {
     let mut conflicts = Vec::new();
 
     // Get files changed in this remote commit
     let changed_files = remote_git.get_changed_files(&remote_commit.sha)?;
+
+    // Show progress bar for conflict resolution if many files
+    let mut progress = if changed_files.len() > 5 {
+      Some(FileProgress::new(
+        changed_files.len(),
+        format!("Resolving conflicts for {} files", changed_files.len()),
+      ))
+    } else {
+      None
+    };
 
     // Find the base commit (common ancestor)
     let last_synced = self.find_last_synced_mono_commit()?;
@@ -703,18 +765,26 @@ impl SyncEngine {
           });
         }
       }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
     }
 
     Ok(conflicts)
   }
 
   /// Legacy method - kept for compatibility but now uses resolve_conflicts_for_commit
-  fn check_for_conflicts(&self, remote_commit: &crate::core::vcs::CommitInfo, remote_git: &GitBackend) -> Result<bool> {
+  fn check_for_conflicts(
+    &self,
+    remote_commit: &crate::core::vcs::CommitInfo,
+    remote_git: &GitBackend,
+  ) -> RailResult<bool> {
     let conflicts = self.resolve_conflicts_for_commit(remote_commit, remote_git)?;
     Ok(!conflicts.is_empty())
   }
 
-  fn check_mono_has_changes(&self) -> Result<bool> {
+  fn check_mono_has_changes(&self) -> RailResult<bool> {
     let last_synced = self.find_last_synced_mono_commit()?;
     let crate_path = &self.config.crate_paths[0];
 
@@ -731,7 +801,7 @@ impl SyncEngine {
     Ok(!relevant_commits.is_empty())
   }
 
-  fn check_remote_has_changes(&self) -> Result<bool> {
+  fn check_remote_has_changes(&self) -> RailResult<bool> {
     let remote_git = GitBackend::open(&self.config.target_repo_path)?;
 
     // Fetch from remote (skip for local paths)

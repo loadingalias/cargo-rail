@@ -5,6 +5,7 @@ use std::process::Command;
 use crate::core::config::RailConfig;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::mapping::MappingStore;
+use crate::ui::progress::FileProgress;
 
 /// A single SHA mapping
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +65,7 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
     }));
   }
 
-  let config = RailConfig::load(&current_dir).map_err(RailError::Other)?;
+  let config = RailConfig::load(&current_dir)?;
 
   // Find crate configuration
   let split_config = config.splits.iter().find(|s| s.name == crate_name).ok_or_else(|| {
@@ -76,12 +77,23 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
   // Load mappings
   let notes_ref = format!("refs/notes/rail/{}", crate_name);
   let mut mapping_store = MappingStore::new(crate_name.clone());
-  mapping_store.load(&current_dir).map_err(RailError::Other)?;
+  mapping_store.load(&current_dir)?;
 
   let raw_mappings = mapping_store.all_mappings();
 
   // Convert to our structure
   let mut mappings = Vec::new();
+
+  // Show progress bar if checking validity and there are many mappings
+  let mut progress = if check && !raw_mappings.is_empty() {
+    Some(FileProgress::new(
+      raw_mappings.len(),
+      format!("Validating {} commit mappings", raw_mappings.len()),
+    ))
+  } else {
+    None
+  };
+
   for (mono_sha, remote_sha) in raw_mappings {
     let mut mapping = Mapping {
       mono_sha: mono_sha.clone(),
@@ -99,6 +111,10 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
       };
 
       mapping.valid = Some(mono_exists && remote_exists);
+
+      if let Some(ref mut p) = progress {
+        p.inc();
+      }
     }
 
     mappings.push(mapping);
@@ -135,7 +151,8 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
   if json {
     println!(
       "{}",
-      serde_json::to_string_pretty(&crate_mappings).map_err(|e| RailError::Other(e.into()))?
+      serde_json::to_string_pretty(&crate_mappings)
+        .map_err(|e| RailError::message(format!("Serialization error: {}", e)))?
     );
   } else {
     print_mappings_table(&crate_mappings, check);

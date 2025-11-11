@@ -2,7 +2,8 @@
 
 use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::config::RailConfig;
-use anyhow::Result;
+use crate::core::error::RailResult;
+use crate::ui::progress::FileProgress;
 use std::process::Command;
 
 /// Check that validates remote repository accessibility
@@ -17,7 +18,7 @@ impl Check for RemoteAccessCheck {
     "Validates remote repository accessibility"
   }
 
-  fn run(&self, ctx: &CheckContext) -> Result<CheckResult> {
+  fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
     // This is an expensive check, only run in thorough mode
     if !ctx.thorough {
       return Ok(CheckResult::pass(
@@ -51,6 +52,16 @@ impl Check for RemoteAccessCheck {
       config.splits.iter().collect::<Vec<_>>()
     };
 
+    // Show progress bar for remote access checks (network operations are slow)
+    let mut progress = if !crates_to_check.is_empty() {
+      Some(FileProgress::new(
+        crates_to_check.len(),
+        format!("Checking access to {} remotes", crates_to_check.len()),
+      ))
+    } else {
+      None
+    };
+
     for split_config in crates_to_check {
       checked += 1;
 
@@ -60,6 +71,9 @@ impl Check for RemoteAccessCheck {
           "'{}': Invalid remote URL format: {}",
           split_config.name, split_config.remote
         ));
+        if let Some(ref mut p) = progress {
+          p.inc();
+        }
         continue;
       }
 
@@ -80,6 +94,10 @@ impl Check for RemoteAccessCheck {
             split_config.name, split_config.remote, err
           ));
         }
+      }
+
+      if let Some(ref mut p) = progress {
+        p.inc();
       }
     }
 
@@ -127,7 +145,7 @@ fn is_valid_remote_url(url: &str) -> bool {
 }
 
 /// Test if we can access a remote repository
-fn test_remote_access(url: &str) -> Result<bool> {
+fn test_remote_access(url: &str) -> RailResult<bool> {
   // For local paths, just check if directory exists
   if url.starts_with('/') || url.starts_with("./") || url.starts_with("../") {
     let path = std::path::Path::new(url);

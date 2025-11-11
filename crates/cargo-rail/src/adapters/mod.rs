@@ -3,21 +3,19 @@
 //! This module provides a clean abstraction for supporting multiple
 //! language ecosystems (Rust/Cargo, Node.js/npm, Python/uv, etc.)
 //!
-//! NOTE: This architecture is designed for future polyglot support (JS/TS, Python, etc.)
-//! and is not yet fully utilized in v1.0 (Rust-only).
+//! Currently supports:
+//! - Rust (Cargo workspaces)
+//! - JavaScript/TypeScript (npm/pnpm/yarn workspaces)
 
-#![allow(dead_code)]
-
-use anyhow::Result;
+use crate::core::error::{RailError, RailResult};
 use std::path::{Path, PathBuf};
 
 pub mod cargo;
-pub mod descriptor;
+pub mod node;
 
 /// Generic workspace information
 #[derive(Debug, Clone)]
 pub struct WorkspaceInfo {
-  pub root: PathBuf,
   pub packages: Vec<PackageInfo>,
 }
 
@@ -76,13 +74,13 @@ pub trait LanguageAdapter: Send + Sync {
   fn can_handle(&self, root: &Path) -> bool;
 
   /// Load workspace metadata
-  fn load_workspace(&self, root: &Path) -> Result<WorkspaceInfo>;
+  fn load_workspace(&self, root: &Path) -> RailResult<WorkspaceInfo>;
 
   /// Transform a package manifest for the given mode
-  fn transform_manifest(&self, manifest_path: &Path, context: &TransformContext) -> Result<()>;
+  fn transform_manifest(&self, manifest_path: &Path, context: &TransformContext) -> RailResult<()>;
 
   /// Discover auxiliary files that should be copied (e.g., rust-toolchain.toml, .nvmrc)
-  fn discover_aux_files(&self, package_path: &Path) -> Result<Vec<PathBuf>>;
+  fn discover_aux_files(&self, package_path: &Path) -> RailResult<Vec<PathBuf>>;
 
   /// Check if a path should be excluded from operations (e.g., node_modules, target)
   fn should_exclude(&self, path: &Path) -> bool;
@@ -92,16 +90,26 @@ pub trait LanguageAdapter: Send + Sync {
 }
 
 /// Detect the appropriate language adapter for a workspace
-pub fn detect_adapter(root: &Path) -> Result<Box<dyn LanguageAdapter>> {
+///
+/// Tries adapters in order: Cargo → Node
+pub fn detect_adapter(root: &Path) -> RailResult<Box<dyn LanguageAdapter>> {
+  // Try Cargo first
   let cargo_adapter = cargo::CargoAdapter::new();
-
   if cargo_adapter.can_handle(root) {
     return Ok(Box::new(cargo_adapter));
   }
 
-  anyhow::bail!(
-    "Could not detect language ecosystem for workspace at {}\n\
-     Supported: Cargo (Cargo.toml with [workspace])",
-    root.display()
-  )
+  // Try Node.js
+  let node_adapter = node::NodeAdapter::new();
+  if node_adapter.can_handle(root) {
+    return Ok(Box::new(node_adapter));
+  }
+
+  Err(RailError::with_help(
+    format!(
+      "Could not detect language ecosystem for workspace at {}",
+      root.display()
+    ),
+    "Supported: Cargo (Cargo.toml with [workspace]), Node.js (package.json with workspaces or pnpm-workspace.yaml)",
+  ))
 }

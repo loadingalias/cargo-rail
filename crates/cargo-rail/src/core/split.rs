@@ -1,14 +1,11 @@
-#![allow(dead_code)]
-
-use anyhow::{Context, Result};
+use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 
+use crate::adapters::{self, LanguageAdapter, TransformContext as AdapterTransformContext, TransformMode};
 use crate::cargo::files::{AuxiliaryFiles, ProjectFiles};
-use crate::cargo::metadata::WorkspaceMetadata;
-use crate::cargo::transform::CargoTransform;
-use crate::core::config::SplitMode;
+use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::mapping::MappingStore;
-use crate::core::transform::{Transform, TransformContext};
+use crate::core::security::SecurityValidator;
 use crate::core::vcs::git::GitBackend;
 use crate::core::vcs::{CommitInfo, Vcs};
 
@@ -27,7 +24,8 @@ struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
   crate_paths: &'a [PathBuf],
   target_repo_path: &'a Path,
-  transformer: &'a CargoTransform,
+  adapter: &'a dyn LanguageAdapter,
+  workspace_root: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,
   mapping_store: &'a MappingStore,
@@ -51,43 +49,46 @@ struct CommitParams<'a> {
 pub struct Splitter {
   workspace_root: PathBuf,
   git: GitBackend,
-  metadata: WorkspaceMetadata,
+  adapter: Box<dyn LanguageAdapter>,
+  security_validator: SecurityValidator,
 }
 
 impl Splitter {
   /// Create a new splitter for a workspace
-  pub fn new(workspace_root: PathBuf) -> Result<Self> {
+  pub fn new(workspace_root: PathBuf, security_config: SecurityConfig) -> RailResult<Self> {
     let git = GitBackend::open(&workspace_root)?;
-    let metadata = WorkspaceMetadata::load(&workspace_root)?;
+    let adapter = adapters::detect_adapter(&workspace_root)?;
+    let security_validator = SecurityValidator::new(security_config);
 
     Ok(Self {
       workspace_root,
       git,
-      metadata,
+      adapter,
+      security_validator,
     })
   }
 
   /// Walk commit history and filter commits that touch the given paths
   /// Returns commits in chronological order (oldest first)
-  fn walk_filtered_history(&self, paths: &[PathBuf]) -> Result<Vec<CommitInfo>> {
+  fn walk_filtered_history(&self, paths: &[PathBuf]) -> RailResult<Vec<CommitInfo>> {
     println!("   Walking commit history to find commits touching crate...");
 
     // Collect commits that touch any of the paths
-    // Use IndexMap to deduplicate while preserving insertion order from git log
-    let mut commits_by_sha = indexmap::IndexMap::new();
+    // Use HashSet + Vec to deduplicate while preserving insertion order from git log
+    let mut seen_shas = std::collections::HashSet::new();
+    let mut filtered_commits = Vec::new();
 
     for path in paths {
       // Get all commits that touch this path (already in chronological order from git log --reverse)
       let path_commits = self.git.get_commits_touching_path(path, None, "HEAD")?;
 
-      // Add to our deduplication map (preserves first insertion order)
+      // Add to our deduplication list (skip if already seen)
       for commit in path_commits {
-        commits_by_sha.entry(commit.sha.clone()).or_insert(commit);
+        if seen_shas.insert(commit.sha.clone()) {
+          filtered_commits.push(commit);
+        }
       }
     }
-
-    // Convert to vec - order is already chronological from git log
-    let filtered_commits: Vec<_> = commits_by_sha.into_values().collect();
 
     println!(
       "   Found {} total commits that touch the crate paths",
@@ -99,7 +100,7 @@ impl Splitter {
 
   /// Recreate a commit in the target repository with transforms applied
   /// Returns the new commit SHA
-  fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> Result<String> {
+  fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<String> {
     // Collect all files for the crate at this commit
     let mut all_files = Vec::new();
     for crate_path in params.crate_paths {
@@ -108,11 +109,10 @@ impl Splitter {
     }
 
     if all_files.is_empty() {
-      anyhow::bail!(
+      return Err(RailError::message(format!(
         "No files found for commit {} at paths {:?}",
-        params.commit.sha,
-        params.crate_paths
-      );
+        params.commit.sha, params.crate_paths
+      )));
     }
 
     // Write files to target repo, applying transforms
@@ -140,20 +140,52 @@ impl Splitter {
         std::fs::create_dir_all(parent)?;
       }
 
-      // Apply Cargo.toml transformation if applicable
-      if file_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        let content_str = String::from_utf8(content.clone())
-          .with_context(|| format!("Cargo.toml is not valid UTF-8 at {}", file_path.display()))?;
-        let transformed = params.transformer.transform_to_split(
-          &content_str,
-          &TransformContext {
-            crate_name: params.crate_name.to_string(),
-            workspace_root: self.workspace_root.clone(),
-          },
-        )?;
-        std::fs::write(&target_path, transformed)?;
+      // Apply manifest transformation if applicable
+      if file_path.file_name() == Some(std::ffi::OsStr::new(params.adapter.manifest_filename())) {
+        // Write the file first so adapter can read/transform in place
+        std::fs::write(&target_path, content)?;
+
+        // Transform using adapter
+        let context = AdapterTransformContext {
+          workspace_root: params.workspace_root.to_path_buf(),
+          package_name: params.crate_name.to_string(),
+          target_mode: TransformMode::SplitToRemote,
+        };
+        params.adapter.transform_manifest(&target_path, &context)?;
       } else {
         std::fs::write(&target_path, content)?;
+      }
+    }
+
+    // Copy auxiliary files discovered by the adapter (e.g., .nvmrc, tsconfig.json)
+    for crate_path in params.crate_paths {
+      let package_root = params.workspace_root.join(crate_path);
+      let aux_files = params.adapter.discover_aux_files(&package_root)?;
+
+      for aux_file in aux_files {
+        let source_path = package_root.join(&aux_file);
+
+        // Only copy if the file exists
+        if source_path.exists() {
+          let target_path = match params.mode {
+            SplitMode::Single => {
+              // For single mode, copy to root
+              params.target_repo_path.join(&aux_file)
+            }
+            SplitMode::Combined => {
+              // For combined mode, preserve the crate path structure
+              params.target_repo_path.join(crate_path).join(&aux_file)
+            }
+          };
+
+          // Create parent directories if needed
+          if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+          }
+
+          // Copy the auxiliary file
+          std::fs::copy(&source_path, &target_path)?;
+        }
       }
     }
 
@@ -168,8 +200,10 @@ impl Splitter {
 
     // If no mapped parents (because original parents were filtered out),
     // use the last recreated commit as parent to maintain linear history
-    if mapped_parents.is_empty() && params.last_recreated_sha.is_some() {
-      mapped_parents.push(params.last_recreated_sha.unwrap().to_string());
+    if mapped_parents.is_empty()
+      && let Some(ref sha) = params.last_recreated_sha
+    {
+      mapped_parents.push(sha.to_string());
     }
 
     self.create_git_commit(&CommitParams {
@@ -186,7 +220,7 @@ impl Splitter {
 
   /// Create a git commit using git commands for determinism
   /// Uses git commit-tree for full control over parents
-  fn create_git_commit(&self, params: &CommitParams) -> Result<String> {
+  fn create_git_commit(&self, params: &CommitParams) -> RailResult<String> {
     use std::process::Command;
 
     // Stage all files
@@ -197,7 +231,10 @@ impl Splitter {
       .context("Failed to run git add")?;
 
     if !status.success() {
-      anyhow::bail!("git add failed");
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git add".to_string(),
+        stderr: "git add failed".to_string(),
+      }));
     }
 
     // Write the tree
@@ -208,7 +245,10 @@ impl Splitter {
       .context("Failed to write tree")?;
 
     if !output.status.success() {
-      anyhow::bail!("git write-tree failed");
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git write-tree".to_string(),
+        stderr: "git write-tree failed".to_string(),
+      }));
     }
 
     let tree_sha = String::from_utf8(output.stdout)?.trim().to_string();
@@ -242,7 +282,10 @@ impl Splitter {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git commit-tree failed: {}", stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git commit-tree".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
@@ -258,7 +301,7 @@ impl Splitter {
   }
 
   /// Check if remote repository exists and has content
-  fn check_remote_exists(&self, remote_url: &str) -> Result<bool> {
+  fn check_remote_exists(&self, remote_url: &str) -> RailResult<bool> {
     use std::process::Command;
 
     let output = Command::new("git")
@@ -270,28 +313,8 @@ impl Splitter {
     Ok(output.status.success() && !output.stdout.is_empty())
   }
 
-  /// Clone remote repository to local path
-  fn clone_remote(&self, remote_url: &str, target_path: &Path) -> Result<()> {
-    use std::process::Command;
-
-    println!("   Cloning existing remote repository...");
-
-    let output = Command::new("git")
-      .args(["clone", remote_url, target_path.to_str().unwrap()])
-      .output()
-      .context("Failed to clone remote")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      anyhow::bail!("git clone failed: {}", stderr);
-    }
-
-    println!("   ✅ Cloned remote repository");
-    Ok(())
-  }
-
   /// Execute a split operation (ONE-TIME ONLY - use sync for updates)
-  pub fn split(&self, config: &SplitConfig) -> Result<()> {
+  pub fn split(&self, config: &SplitConfig) -> RailResult<()> {
     println!("🚂 Splitting crate: {}", config.crate_name);
     println!("   Mode: {:?}", config.mode);
     println!("   Target: {}", config.target_repo_path.display());
@@ -300,24 +323,22 @@ impl Splitter {
     if let Some(ref remote_url) = config.remote_url {
       let remote_exists = self.check_remote_exists(remote_url)?;
       if remote_exists {
-        anyhow::bail!(
-          "Split already exists at {}\n\n\
-           Split is a one-time operation. To update the split repo, use:\n  \
-           cargo rail sync {}\n\n\
-           This will sync new commits from the monorepo to the split repo.",
-          remote_url,
-          config.crate_name
-        );
+        return Err(RailError::with_help(
+          format!("Split already exists at {}", remote_url),
+          format!(
+            "Split is a one-time operation. To update the split repo, use:\n  \
+             cargo rail sync {}\n\n\
+             This will sync new commits from the monorepo to the split repo.",
+            config.crate_name
+          ),
+        ));
       }
     }
 
     // Create fresh target repo
     self.ensure_target_repo(&config.target_repo_path)?;
 
-    // Create transformer for Cargo.toml
-    let transformer = CargoTransform::new(WorkspaceMetadata::load(&self.workspace_root)?);
-
-    // Discover workspace-level auxiliary files (rust-toolchain, rustfmt, etc.)
+    // Discover workspace-level auxiliary files using adapter
     let aux_files = AuxiliaryFiles::discover(&self.workspace_root)?;
     println!("   Found {} workspace config files", aux_files.count());
 
@@ -341,19 +362,12 @@ impl Splitter {
       match config.mode {
         SplitMode::Single => {
           let crate_path = &config.crate_paths[0];
-          self.split_single_crate(
-            crate_path,
-            &config.target_repo_path,
-            &transformer,
-            &aux_files,
-            &config.crate_name,
-          )?;
+          self.split_single_crate(crate_path, &config.target_repo_path, &aux_files, &config.crate_name)?;
         }
         SplitMode::Combined => {
           self.split_combined_crates(
             &config.crate_paths,
             &config.target_repo_path,
-            &transformer,
             &aux_files,
             &config.crate_name,
           )?;
@@ -375,7 +389,8 @@ impl Splitter {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
-          transformer: &transformer,
+          adapter: self.adapter.as_ref(),
+          workspace_root: &self.workspace_root,
           crate_name: &config.crate_name,
           mode: &config.mode,
           mapping_store: &mapping_store,
@@ -431,6 +446,10 @@ impl Splitter {
       if !remote_url.is_empty() && !is_local_path {
         println!("\n🚀 Pushing to remote...");
 
+        // Security checks before push
+        // Note: Branch protection doesn't apply to remote repos - only to monorepo
+        self.security_validator.validate_ssh_key()?;
+
         // Open the target repo
         let target_git = GitBackend::open(&config.target_repo_path)?;
 
@@ -480,7 +499,7 @@ impl Splitter {
   }
 
   /// Ensure target repository exists and is initialized
-  fn ensure_target_repo(&self, target_path: &Path) -> Result<()> {
+  fn ensure_target_repo(&self, target_path: &Path) -> RailResult<()> {
     if !target_path.exists() {
       std::fs::create_dir_all(target_path)
         .with_context(|| format!("Failed to create target directory: {}", target_path.display()))?;
@@ -504,29 +523,25 @@ impl Splitter {
     &self,
     crate_path: &Path,
     target_repo_path: &Path,
-    transformer: &CargoTransform,
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
-  ) -> Result<()> {
+  ) -> RailResult<()> {
     let source_path = self.workspace_root.join(crate_path);
 
     // Copy source files
     println!("   Copying source files from {}", crate_path.display());
     self.copy_directory_recursive(&source_path, target_repo_path)?;
 
-    // Transform Cargo.toml
-    let cargo_toml_path = target_repo_path.join("Cargo.toml");
-    if cargo_toml_path.exists() {
-      println!("   Transforming Cargo.toml");
-      let content = std::fs::read_to_string(&cargo_toml_path)?;
-      let transformed = transformer.transform_to_split(
-        &content,
-        &TransformContext {
-          crate_name: crate_name.to_string(),
-          workspace_root: self.workspace_root.clone(),
-        },
-      )?;
-      std::fs::write(&cargo_toml_path, transformed)?;
+    // Transform manifest (Cargo.toml, package.json, etc.)
+    let manifest_path = target_repo_path.join(self.adapter.manifest_filename());
+    if manifest_path.exists() {
+      println!("   Transforming {}", self.adapter.manifest_filename());
+      let context = AdapterTransformContext {
+        workspace_root: self.workspace_root.clone(),
+        package_name: crate_name.to_string(),
+        target_mode: TransformMode::SplitToRemote,
+      };
+      self.adapter.transform_manifest(&manifest_path, &context)?;
     }
 
     // Copy auxiliary files
@@ -543,10 +558,9 @@ impl Splitter {
     &self,
     crate_paths: &[PathBuf],
     target_repo_path: &Path,
-    transformer: &CargoTransform,
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
-  ) -> Result<()> {
+  ) -> RailResult<()> {
     for crate_path in crate_paths {
       let source_path = self.workspace_root.join(crate_path);
       let target_path = target_repo_path.join(crate_path);
@@ -560,18 +574,15 @@ impl Splitter {
 
       self.copy_directory_recursive(&source_path, &target_path)?;
 
-      // Transform Cargo.toml
-      let cargo_toml_path = target_path.join("Cargo.toml");
-      if cargo_toml_path.exists() {
-        let content = std::fs::read_to_string(&cargo_toml_path)?;
-        let transformed = transformer.transform_to_split(
-          &content,
-          &TransformContext {
-            crate_name: crate_name.to_string(),
-            workspace_root: self.workspace_root.clone(),
-          },
-        )?;
-        std::fs::write(&cargo_toml_path, transformed)?;
+      // Transform manifest (Cargo.toml, package.json, etc.)
+      let manifest_path = target_path.join(self.adapter.manifest_filename());
+      if manifest_path.exists() {
+        let context = AdapterTransformContext {
+          workspace_root: self.workspace_root.clone(),
+          package_name: crate_name.to_string(),
+          target_mode: TransformMode::SplitToRemote,
+        };
+        self.adapter.transform_manifest(&manifest_path, &context)?;
       }
     }
 
@@ -585,15 +596,18 @@ impl Splitter {
   }
 
   /// Recursively copy a directory, excluding .git
-  fn copy_directory_recursive(&self, source: &Path, target: &Path) -> Result<()> {
+  fn copy_directory_recursive(&self, source: &Path, target: &Path) -> RailResult<()> {
     copy_directory_recursive_impl(source, target)
   }
 }
 
 /// Helper function to recursively copy a directory, excluding .git
-fn copy_directory_recursive_impl(source: &Path, target: &Path) -> Result<()> {
+fn copy_directory_recursive_impl(source: &Path, target: &Path) -> RailResult<()> {
   if !source.exists() {
-    anyhow::bail!("Source path does not exist: {}", source.display());
+    return Err(RailError::message(format!(
+      "Source path does not exist: {}",
+      source.display()
+    )));
   }
 
   if source.is_file() {
@@ -659,7 +673,7 @@ mod tests {
     fs::create_dir(source.join(".git")).unwrap(); // Should be excluded
 
     let workspace_root = find_git_root();
-    let splitter = Splitter::new(workspace_root).unwrap();
+    let splitter = Splitter::new(workspace_root, SecurityConfig::default()).unwrap();
 
     splitter.copy_directory_recursive(&source, &target).unwrap();
 
