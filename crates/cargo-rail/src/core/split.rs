@@ -1,13 +1,15 @@
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 
-use crate::adapters::{self, LanguageAdapter, TransformContext as AdapterTransformContext, TransformMode};
 use crate::cargo::files::{AuxiliaryFiles, ProjectFiles};
+use crate::cargo::helpers;
+use crate::cargo::metadata::WorkspaceMetadata;
+use crate::cargo::transform::{CargoTransform, TransformContext};
 use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
+use crate::core::vcs::CommitInfo;
 use crate::core::vcs::git::GitBackend;
-use crate::core::vcs::{CommitInfo, Vcs};
 
 /// Configuration for a split operation
 pub struct SplitConfig {
@@ -24,7 +26,7 @@ struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
   crate_paths: &'a [PathBuf],
   target_repo_path: &'a Path,
-  adapter: &'a dyn LanguageAdapter,
+  transform: &'a CargoTransform,
   workspace_root: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,
@@ -49,7 +51,7 @@ struct CommitParams<'a> {
 pub struct Splitter {
   workspace_root: PathBuf,
   git: GitBackend,
-  adapter: Box<dyn LanguageAdapter>,
+  transform: CargoTransform,
   security_validator: SecurityValidator,
 }
 
@@ -57,13 +59,14 @@ impl Splitter {
   /// Create a new splitter for a workspace
   pub fn new(workspace_root: PathBuf, security_config: SecurityConfig) -> RailResult<Self> {
     let git = GitBackend::open(&workspace_root)?;
-    let adapter = adapters::detect_adapter(&workspace_root)?;
+    let metadata = WorkspaceMetadata::load(&workspace_root)?;
+    let transform = CargoTransform::new(metadata);
     let security_validator = SecurityValidator::new(security_config);
 
     Ok(Self {
       workspace_root,
       git,
-      adapter,
+      transform,
       security_validator,
     })
   }
@@ -116,7 +119,7 @@ impl Splitter {
     }
 
     // Write files to target repo, applying transforms
-    for (file_path, content) in &all_files {
+    for (file_path, content_bytes) in &all_files {
       let target_path = match params.mode {
         SplitMode::Single => {
           // For single mode, move files to root (strip crate path prefix)
@@ -140,27 +143,26 @@ impl Splitter {
         std::fs::create_dir_all(parent)?;
       }
 
-      // Apply manifest transformation if applicable
-      if file_path.file_name() == Some(std::ffi::OsStr::new(params.adapter.manifest_filename())) {
-        // Write the file first so adapter can read/transform in place
-        std::fs::write(&target_path, content)?;
-
-        // Transform using adapter
-        let context = AdapterTransformContext {
+      // Apply Cargo.toml transformation if applicable
+      if file_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        // Transform the manifest
+        let content = String::from_utf8(content_bytes.clone())
+          .map_err(|_| RailError::message(format!("File '{}' is not valid UTF-8", file_path.display())))?;
+        let context = TransformContext {
+          crate_name: params.crate_name.to_string(),
           workspace_root: params.workspace_root.to_path_buf(),
-          package_name: params.crate_name.to_string(),
-          target_mode: TransformMode::SplitToRemote,
         };
-        params.adapter.transform_manifest(&target_path, &context)?;
+        let transformed = params.transform.transform_to_split(&content, &context)?;
+        std::fs::write(&target_path, transformed)?;
       } else {
-        std::fs::write(&target_path, content)?;
+        std::fs::write(&target_path, content_bytes)?;
       }
     }
 
-    // Copy auxiliary files discovered by the adapter (e.g., .nvmrc, tsconfig.json)
+    // Copy auxiliary files for Cargo crates (e.g., rust-toolchain.toml, .cargo/config.toml)
     for crate_path in params.crate_paths {
       let package_root = params.workspace_root.join(crate_path);
-      let aux_files = params.adapter.discover_aux_files(&package_root)?;
+      let aux_files = helpers::discover_aux_files(&package_root)?;
 
       for aux_file in aux_files {
         let source_path = package_root.join(&aux_file);
@@ -389,7 +391,7 @@ impl Splitter {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
-          adapter: self.adapter.as_ref(),
+          transform: &self.transform,
           workspace_root: &self.workspace_root,
           crate_name: &config.crate_name,
           mode: &config.mode,
@@ -532,16 +534,17 @@ impl Splitter {
     println!("   Copying source files from {}", crate_path.display());
     self.copy_directory_recursive(&source_path, target_repo_path)?;
 
-    // Transform manifest (Cargo.toml, package.json, etc.)
-    let manifest_path = target_repo_path.join(self.adapter.manifest_filename());
+    // Transform Cargo.toml manifest
+    let manifest_path = target_repo_path.join("Cargo.toml");
     if manifest_path.exists() {
-      println!("   Transforming {}", self.adapter.manifest_filename());
-      let context = AdapterTransformContext {
+      println!("   Transforming Cargo.toml");
+      let content = std::fs::read_to_string(&manifest_path)?;
+      let context = TransformContext {
+        crate_name: crate_name.to_string(),
         workspace_root: self.workspace_root.clone(),
-        package_name: crate_name.to_string(),
-        target_mode: TransformMode::SplitToRemote,
       };
-      self.adapter.transform_manifest(&manifest_path, &context)?;
+      let transformed = self.transform.transform_to_split(&content, &context)?;
+      std::fs::write(&manifest_path, transformed)?;
     }
 
     // Copy auxiliary files
@@ -574,15 +577,16 @@ impl Splitter {
 
       self.copy_directory_recursive(&source_path, &target_path)?;
 
-      // Transform manifest (Cargo.toml, package.json, etc.)
-      let manifest_path = target_path.join(self.adapter.manifest_filename());
+      // Transform Cargo.toml manifest
+      let manifest_path = target_path.join("Cargo.toml");
       if manifest_path.exists() {
-        let context = AdapterTransformContext {
+        let content = std::fs::read_to_string(&manifest_path)?;
+        let context = TransformContext {
+          crate_name: crate_name.to_string(),
           workspace_root: self.workspace_root.clone(),
-          package_name: crate_name.to_string(),
-          target_mode: TransformMode::SplitToRemote,
         };
-        self.adapter.transform_manifest(&manifest_path, &context)?;
+        let transformed = self.transform.transform_to_split(&content, &context)?;
+        std::fs::write(&manifest_path, transformed)?;
       }
     }
 

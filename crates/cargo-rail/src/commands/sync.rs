@@ -5,8 +5,9 @@ use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
-use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine};
-use crate::ui::progress::FileProgress;
+use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine, SyncResult};
+use crate::ui::progress::{FileProgress, MultiProgress};
+use rayon::prelude::*;
 
 /// Run the sync command
 pub fn run_sync(
@@ -333,66 +334,134 @@ pub fn run_sync(
   println!("\n🚀 APPLY MODE - Executing sync operations\n");
 
   let plan_count = plans.len();
-  let mut crate_progress = if plan_count > 1 {
-    Some(FileProgress::new(plan_count, format!("Syncing {} crates", plan_count)))
+
+  // Use parallel processing for multiple crates
+  if plan_count > 1 && all {
+    println!("🚀 Processing {} crates in parallel...\n", plan_count);
+
+    let multi_progress = MultiProgress::new();
+    let bars: Vec<_> = plans
+      .iter()
+      .map(|(split_config, _, _, _, _, _)| multi_progress.add_bar(1, format!("Syncing {}", split_config.name)))
+      .collect();
+
+    let results: Vec<RailResult<SyncResult>> = plans
+      .into_par_iter()
+      .enumerate()
+      .map(|(idx, (split_config, crate_paths, target_repo_path, _, _, _))| {
+        let sync_config = SyncConfig {
+          crate_name: split_config.name.clone(),
+          crate_paths,
+          mode: split_config.mode.clone(),
+          target_repo_path,
+          branch: split_config.branch.clone(),
+          remote_url: split_config.remote.clone(),
+        };
+
+        // Create sync engine for this thread
+        let mut engine = SyncEngine::new(
+          config.workspace.root.clone(),
+          sync_config,
+          config.security.clone(),
+          strategy,
+        )?;
+
+        // Perform sync
+        let result = match direction {
+          SyncDirection::MonoToRemote => engine.sync_to_remote(),
+          SyncDirection::RemoteToMono => engine.sync_from_remote(),
+          SyncDirection::Both => engine.sync_bidirectional(),
+          SyncDirection::None => unreachable!(),
+        };
+
+        multi_progress.inc(&bars[idx]);
+        result
+      })
+      .collect();
+
+    // Report results
+    for result in results {
+      let sync_result = result?;
+      if sync_result.commits_synced > 0 || !sync_result.conflicts.is_empty() {
+        println!("   ✅ Synced {} commits", sync_result.commits_synced);
+
+        if !sync_result.conflicts.is_empty() {
+          let unresolved_count = sync_result.conflicts.iter().filter(|c| !c.resolved).count();
+          let resolved_count = sync_result.conflicts.len() - unresolved_count;
+
+          if resolved_count > 0 {
+            println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
+          }
+
+          if unresolved_count > 0 {
+            println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
+          }
+        }
+      }
+    }
   } else {
-    None
-  };
-
-  for (split_config, crate_paths, target_repo_path, _, _, _) in plans {
-    if crate_progress.is_none() {
-      println!("\n🔄 Syncing crate: {}", split_config.name);
-    }
-
-    let sync_config = SyncConfig {
-      crate_name: split_config.name.clone(),
-      crate_paths,
-      mode: split_config.mode.clone(),
-      target_repo_path,
-      branch: split_config.branch.clone(),
-      remote_url: split_config.remote.clone(),
+    // Sequential processing for single crate or when not using --all
+    let mut crate_progress = if plan_count > 1 {
+      Some(FileProgress::new(plan_count, format!("Syncing {} crates", plan_count)))
+    } else {
+      None
     };
 
-    // Create sync engine (adapter auto-detected)
-    let mut engine = SyncEngine::new(
-      config.workspace.root.clone(),
-      sync_config,
-      config.security.clone(),
-      strategy,
-    )?;
+    for (split_config, crate_paths, target_repo_path, _, _, _) in plans {
+      if crate_progress.is_none() {
+        println!("\n🔄 Syncing crate: {}", split_config.name);
+      }
 
-    // Perform sync
-    let result = match direction {
-      SyncDirection::MonoToRemote => engine.sync_to_remote()?,
-      SyncDirection::RemoteToMono => engine.sync_from_remote()?,
-      SyncDirection::Both => engine.sync_bidirectional()?,
-      SyncDirection::None => unreachable!(),
-    };
+      let sync_config = SyncConfig {
+        crate_name: split_config.name.clone(),
+        crate_paths,
+        mode: split_config.mode.clone(),
+        target_repo_path,
+        branch: split_config.branch.clone(),
+        remote_url: split_config.remote.clone(),
+      };
 
-    println!("   ✅ Synced {} commits", result.commits_synced);
+      // Create sync engine (adapter auto-detected)
+      let mut engine = SyncEngine::new(
+        config.workspace.root.clone(),
+        sync_config,
+        config.security.clone(),
+        strategy,
+      )?;
 
-    if !result.conflicts.is_empty() {
-      let unresolved_count = result.conflicts.iter().filter(|c| !c.resolved).count();
-      let resolved_count = result.conflicts.len() - unresolved_count;
+      // Perform sync
+      let result = match direction {
+        SyncDirection::MonoToRemote => engine.sync_to_remote()?,
+        SyncDirection::RemoteToMono => engine.sync_from_remote()?,
+        SyncDirection::Both => engine.sync_bidirectional()?,
+        SyncDirection::None => unreachable!(),
+      };
 
-      if resolved_count > 0 {
-        println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
-        for conflict in result.conflicts.iter().filter(|c| c.resolved) {
-          println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+      println!("   ✅ Synced {} commits", result.commits_synced);
+
+      if !result.conflicts.is_empty() {
+        let unresolved_count = result.conflicts.iter().filter(|c| !c.resolved).count();
+        let resolved_count = result.conflicts.len() - unresolved_count;
+
+        if resolved_count > 0 {
+          println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
+          for conflict in result.conflicts.iter().filter(|c| c.resolved) {
+            println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+          }
+        }
+
+        if unresolved_count > 0 {
+          println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
+          for conflict in result.conflicts.iter().filter(|c| !c.resolved) {
+            println!("      - {}: {}", conflict.file_path.display(), conflict.message);
+          }
+          println!("\n   💡 Resolve conflicts manually and run sync again");
         }
       }
 
-      if unresolved_count > 0 {
-        println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
-        for conflict in result.conflicts.iter().filter(|c| !c.resolved) {
-          println!("      - {}: {}", conflict.file_path.display(), conflict.message);
-        }
-        println!("\n   💡 Resolve conflicts manually and run sync again");
+      if let Some(ref mut p) = crate_progress {
+        p.inc();
       }
-    }
-
-    if let Some(ref mut p) = crate_progress {
-      p.inc();
     }
   }
 

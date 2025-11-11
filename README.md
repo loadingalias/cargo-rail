@@ -1,8 +1,8 @@
 # cargo-rail
 
-**Monorepo split/sync for Rust workspaces**
+**The Rust Monorepo Tool**
 
-Split crates from a monorepo into standalone repositories while preserving full git history. Bidirectional sync keeps monorepo and split repos in perfect harmony.
+Split Rust crates from Cargo workspaces into standalone repositories while preserving full git history. Bidirectional sync keeps your monorepo and split repos in perfect harmony.
 
 ---
 

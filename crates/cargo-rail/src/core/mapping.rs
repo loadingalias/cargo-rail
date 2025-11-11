@@ -149,12 +149,14 @@ impl MappingStore {
     &self.mappings
   }
 
-  /// Clear all mappings
+  /// Clear all mappings (only used in tests)
+  #[cfg(test)]
   pub fn clear(&mut self) {
     self.mappings.clear();
   }
 
-  /// Get the number of mappings
+  /// Get the number of mappings (only used in tests)
+  #[cfg(test)]
   pub fn count(&self) -> usize {
     self.mappings.len()
   }

@@ -5,7 +5,8 @@ use crate::core::config::RailConfig;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::split::{SplitConfig, Splitter};
-use crate::ui::progress::FileProgress;
+use crate::ui::progress::{FileProgress, MultiProgress};
+use rayon::prelude::*;
 
 /// Run the split command
 pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> RailResult<()> {
@@ -201,35 +202,75 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
   println!("\n🚀 APPLY MODE - Executing split operations\n");
 
   let plan_count = plans.len();
-  let mut crate_progress = if plan_count > 1 {
-    Some(FileProgress::new(
-      plan_count,
-      format!("Splitting {} crates", plan_count),
-    ))
-  } else {
-    None
-  };
 
-  for (split_config, crate_paths, target_repo_path, _) in plans {
-    if crate_progress.is_none() {
-      println!("🔨 Splitting crate '{}'...", split_config.name);
+  // Use parallel processing for multiple crates
+  if plan_count > 1 && all {
+    println!("🚀 Processing {} crates in parallel...\n", plan_count);
+
+    let multi_progress = MultiProgress::new();
+    let bars: Vec<_> = plans
+      .iter()
+      .map(|(split_config, _, _, _)| multi_progress.add_bar(1, format!("Splitting {}", split_config.name)))
+      .collect();
+
+    let results: Vec<RailResult<()>> = plans
+      .into_par_iter()
+      .enumerate()
+      .map(|(idx, (split_config, crate_paths, target_repo_path, _))| {
+        let split_cfg = SplitConfig {
+          crate_name: split_config.name.clone(),
+          crate_paths,
+          mode: split_config.mode.clone(),
+          target_repo_path,
+          branch: split_config.branch.clone(),
+          remote_url: Some(split_config.remote.clone()),
+        };
+
+        // Create a new splitter for this thread
+        let thread_splitter = Splitter::new(config.workspace.root.clone(), config.security.clone())?;
+        let result = thread_splitter.split(&split_cfg);
+
+        multi_progress.inc(&bars[idx]);
+        result
+      })
+      .collect();
+
+    // Check for errors
+    for result in results {
+      result?;
     }
-
-    let split_cfg = SplitConfig {
-      crate_name: split_config.name.clone(),
-      crate_paths,
-      mode: split_config.mode.clone(),
-      target_repo_path,
-      branch: split_config.branch.clone(),
-      remote_url: Some(split_config.remote.clone()),
+  } else {
+    // Sequential processing for single crate or when not using --all
+    let mut crate_progress = if plan_count > 1 {
+      Some(FileProgress::new(
+        plan_count,
+        format!("Splitting {} crates", plan_count),
+      ))
+    } else {
+      None
     };
 
-    splitter.split(&split_cfg)?;
+    for (split_config, crate_paths, target_repo_path, _) in plans {
+      if crate_progress.is_none() {
+        println!("🔨 Splitting crate '{}'...", split_config.name);
+      }
 
-    if let Some(ref mut p) = crate_progress {
-      p.inc();
+      let split_cfg = SplitConfig {
+        crate_name: split_config.name.clone(),
+        crate_paths,
+        mode: split_config.mode.clone(),
+        target_repo_path,
+        branch: split_config.branch.clone(),
+        remote_url: Some(split_config.remote.clone()),
+      };
+
+      splitter.split(&split_cfg)?;
+
+      if let Some(ref mut p) = crate_progress {
+        p.inc();
+      }
+      println!();
     }
-    println!();
   }
 
   println!("🎉 Split operation complete!");

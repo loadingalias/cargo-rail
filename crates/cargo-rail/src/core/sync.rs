@@ -3,12 +3,13 @@
 use crate::core::error::RailResult;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::{self, LanguageAdapter, TransformContext as AdapterTransformContext, TransformMode};
+use crate::cargo::helpers;
+use crate::cargo::metadata::WorkspaceMetadata;
+use crate::cargo::transform::{CargoTransform, TransformContext};
 use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
-use crate::core::vcs::Vcs;
 use crate::core::vcs::git::GitBackend;
 use crate::ui::progress::FileProgress;
 
@@ -43,7 +44,8 @@ pub struct SyncEngine {
   config: SyncConfig,
   mono_git: GitBackend,
   mapping_store: MappingStore,
-  adapter: Box<dyn LanguageAdapter>,
+  metadata: WorkspaceMetadata,
+  transform: CargoTransform,
   security_config: SecurityConfig,
   security_validator: SecurityValidator,
   conflict_resolver: ConflictResolver,
@@ -58,7 +60,8 @@ impl SyncEngine {
   ) -> RailResult<Self> {
     let mono_git = GitBackend::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
-    let adapter = adapters::detect_adapter(&workspace_root)?;
+    let metadata = WorkspaceMetadata::load(&workspace_root)?;
+    let transform = CargoTransform::new(metadata.clone());
     let security_validator = SecurityValidator::new(security_config.clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
@@ -79,7 +82,8 @@ impl SyncEngine {
       config,
       mono_git,
       mapping_store,
-      adapter,
+      metadata,
+      transform,
       security_config,
       security_validator,
       conflict_resolver,
@@ -445,7 +449,7 @@ impl SyncEngine {
     let crate_path = &self.config.crate_paths[0];
     let relevant_files: Vec<_> = changed_files
       .into_iter()
-      .filter(|(path, _)| path.starts_with(crate_path) && !self.adapter.should_exclude(path))
+      .filter(|(path, _)| path.starts_with(crate_path) && !helpers::should_exclude_cargo_path(path))
       .collect();
 
     // Apply each file to remote
@@ -479,14 +483,15 @@ impl SyncEngine {
             // Write file first, then transform manifest if applicable
             std::fs::write(&full_remote_path, content)?;
 
-            // Transform manifest (Cargo.toml, package.json, etc.)
-            if mono_path.file_name() == Some(std::ffi::OsStr::new(self.adapter.manifest_filename())) {
-              let context = AdapterTransformContext {
+            // Transform Cargo.toml manifest
+            if mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+              let content = std::fs::read_to_string(&full_remote_path)?;
+              let context = TransformContext {
+                crate_name: self.config.crate_name.clone(),
                 workspace_root: self.workspace_root.clone(),
-                package_name: self.config.crate_name.clone(),
-                target_mode: TransformMode::SyncToRemote,
               };
-              self.adapter.transform_manifest(&full_remote_path, &context)?;
+              let transformed = self.transform.transform_to_split(&content, &context)?;
+              std::fs::write(&full_remote_path, transformed)?;
             }
           }
         }
@@ -545,8 +550,8 @@ impl SyncEngine {
     for (remote_path, change_type) in changed_files {
       let mono_path = self.map_remote_path_to_mono(&remote_path)?;
 
-      // Skip files excluded by adapter (node_modules, target, etc.)
-      if self.adapter.should_exclude(&mono_path) {
+      // Skip files excluded by Cargo helper (target, etc.)
+      if helpers::should_exclude_cargo_path(&mono_path) {
         continue;
       }
 
@@ -577,14 +582,15 @@ impl SyncEngine {
             // Write file first, then transform manifest if applicable
             std::fs::write(&full_mono_path, content)?;
 
-            // Transform manifest (Cargo.toml, package.json, etc.)
-            if remote_path.file_name() == Some(std::ffi::OsStr::new(self.adapter.manifest_filename())) {
-              let context = AdapterTransformContext {
+            // Transform Cargo.toml manifest
+            if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+              let content = std::fs::read_to_string(&full_mono_path)?;
+              let context = TransformContext {
+                crate_name: self.config.crate_name.clone(),
                 workspace_root: self.workspace_root.clone(),
-                package_name: self.config.crate_name.clone(),
-                target_mode: TransformMode::SyncToMono,
               };
-              self.adapter.transform_manifest(&full_mono_path, &context)?;
+              let transformed = self.transform.transform_to_mono(&content, &context)?;
+              std::fs::write(&full_mono_path, transformed)?;
             }
           }
         }

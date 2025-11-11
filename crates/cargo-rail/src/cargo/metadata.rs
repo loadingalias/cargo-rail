@@ -5,6 +5,7 @@ use cargo_metadata::{MetadataCommand, Package};
 use std::path::Path;
 
 /// Workspace introspection using cargo_metadata
+#[derive(Clone)]
 pub struct WorkspaceMetadata {
   metadata: cargo_metadata::Metadata,
 }

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::{CommitInfo, Vcs};
+use super::CommitInfo;
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use gix::Repository;
 use std::path::{Path, PathBuf};
@@ -11,11 +11,8 @@ pub struct GitBackend {
   root: PathBuf,
 }
 
-impl Vcs for GitBackend {
-  fn open(path: &Path) -> RailResult<Self>
-  where
-    Self: Sized,
-  {
+impl GitBackend {
+  pub fn open(path: &Path) -> RailResult<Self> {
     let repo = gix::open(path).map_err(|e| {
       if e.to_string().contains("not found") || e.to_string().contains("Not a git repository") {
         RailError::Git(crate::core::error::GitError::RepoNotFound {
@@ -33,17 +30,17 @@ impl Vcs for GitBackend {
     Ok(Self { repo, root })
   }
 
-  fn root(&self) -> &Path {
+  pub fn root(&self) -> &Path {
     &self.root
   }
 
-  fn head_commit(&self) -> RailResult<String> {
+  pub fn head_commit(&self) -> RailResult<String> {
     let mut head = self.repo.head()?;
     let commit = head.peel_to_commit()?;
     Ok(commit.id().to_string())
   }
 
-  fn commit_history(&self, _path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
+  pub fn commit_history(&self, _path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
     let mut head = self.repo.head()?;
     let commit = head.peel_to_commit()?;
 
@@ -98,7 +95,7 @@ impl Vcs for GitBackend {
     Ok(commits)
   }
 
-  fn is_tracked(&self, path: &Path) -> RailResult<bool> {
+  pub fn is_tracked(&self, path: &Path) -> RailResult<bool> {
     // Check if the file exists in the index
     let relative_path = if path.is_absolute() {
       path.strip_prefix(&self.root).unwrap_or(path)
@@ -112,7 +109,7 @@ impl Vcs for GitBackend {
     Ok(index.entry_by_path(path_bytes).is_some())
   }
 
-  fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<PathBuf>> {
+  pub fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<PathBuf>> {
     let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
       .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
     let commit = self
@@ -162,7 +159,7 @@ impl Vcs for GitBackend {
     Ok(files)
   }
 
-  fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
+  pub fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
     let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
       .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
     let commit = self.repo.find_object(commit_id)?.try_into_commit()?;
