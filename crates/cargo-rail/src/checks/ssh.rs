@@ -2,6 +2,7 @@
 
 use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::error::RailResult;
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -51,7 +52,7 @@ impl Check for SshKeyCheck {
     ];
 
     let mut found_keys = Vec::new();
-    let mut permission_issues = Vec::new();
+    let mut permission_issues: Vec<String> = Vec::new();
 
     for (key_name, key_desc) in key_types {
       let key_path = ssh_dir.join(key_name);
