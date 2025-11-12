@@ -73,6 +73,9 @@ impl ReleaseTag {
   }
 
   /// Format tag name in preferred format
+  ///
+  /// Will be used by `cargo rail release finalize` to create git tags.
+  #[allow(dead_code)]
   pub fn format(crate_name: &str, version: &Version) -> String {
     format!("{}@v{}", crate_name, version)
   }
