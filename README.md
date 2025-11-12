@@ -9,13 +9,14 @@ Split Rust crates from Cargo workspaces into standalone repos with full git hist
 
 ---
 
-## Status: Pre-Release (v0.1)
+## Status: Production Ready (v0.1)
 
-**Split & Sync:** Production-ready
-**Release Commands:** Coming in v1.0 (3 days)
-**Documentation:** In progress
+**Split & Sync:** ✅ Production-ready
+**Release Commands:** ✅ Complete (`plan`, `prepare`, `publish`, `finalize`)
+**Documentation:** ✅ Complete
+**CI Coverage:** ✅ 4 platforms (Linux/Windows x86_64/ARM64) + macOS local
 
-Use split/sync features today. Release automation coming soon.
+All features stable. Ready for v1.0 release.
 
 ---
 
@@ -26,8 +27,8 @@ Use split/sync features today. Release automation coming soon.
 | Split crates | Full history | ❌ | ❌ | One-way | Complex |
 | Bidirectional sync | ✓ | ❌ | ❌ | ❌ | ✓ |
 | Cargo-aware | ✓ | ✓ | ✓ | ❌ | ❌ |
-| Release automation | v1.0 | Basic | ✓ | ❌ | ❌ |
-| Semver checks | v1.0 | ❌ | ✓ | ❌ | ❌ |
+| Release automation | ✓ | Basic | ✓ | ❌ | ❌ |
+| Semver checks | ✓ | ❌ | ✓ | ❌ | ❌ |
 | Dry-run by default | ✓ | ❌ | Partial | ❌ | ❌ |
 | Setup | One TOML | Easy | Easy | Complex | Very complex |
 
@@ -48,13 +49,14 @@ Use split/sync features today. Release automation coming soon.
 - Conflict resolution (ours, theirs, manual, union)
 - Two modes: single crate → repo, or multiple crates → combined repo
 
-**Release Automation (v1.0):**
+**Release Automation:**
 
-- Semver enforcement with breaking change detection
+- Semver enforcement with breaking change detection (cargo-semver-checks)
 - Topological publishing (dependencies first)
-- Changelog generation from conventional commits
+- Changelog generation from conventional commits (git-cliff)
 - Tag management across monorepo and split repos
-- GitHub release integration
+- Parallel analysis with progress indicators
+- Dry-run by default with colorized diffs
 
 ---
 
@@ -210,7 +212,7 @@ cargo rail doctor                    # Run health checks
 cargo rail status                    # Show configured splits
 cargo rail mappings <name>           # Inspect git-notes mappings
 
-# Release commands (v1.0)
+# Release commands
 cargo rail release plan              # Preview releases
 cargo rail release prepare --apply   # Update versions, changelogs
 cargo rail release publish --apply   # Publish to crates.io
@@ -281,33 +283,138 @@ cargo rail sync my-crate --apply --conflict=union   # combine both (risky)
 
 ## Architecture
 
+### System Overview
+
 ```
-┌─────────────────────────────────────────┐
-│        MONOREPO (main)                  │
-│  crates/a/  crates/b/  crates/c/        │
-└─────────────────────────────────────────┘
-     │              │              │
-     │ split/sync   │ split/sync   │ split/sync
-     ↓              ↓              ↓
- ┌───────┐      ┌───────┐      ┌────────────┐
- │ crate-a│      │ crate-b│      │ project    │  (combined)
- │        │      │        │      │ ├─ crate-c1│
- └───────┘      └───────┘      │ └─ crate-c2│
-                               └────────────┘
-     │              │              │
-     │ publish      │ publish      │ publish
-     ↓              ↓              ↓
-  ┌─────────────────────────────────┐
-  │      crates.io registry         │
-  └─────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    MONOREPO (Source of Truth)                │
+│  workspace-root/                                             │
+│  ├── crates/my-core/                                         │
+│  ├── crates/my-client/                                       │
+│  └── crates/my-server/                                       │
+└──────────────────────────────────────────────────────────────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │ split         │ split         │ split
+           │ (single)      │ (single)      │ (combined)
+           ↓               ↓               ↓
+    ┌──────────┐    ┌──────────┐    ┌─────────────────┐
+    │ my-core  │    │ my-client│    │ my-server       │
+    │          │    │          │    │ (standalone)    │
+    └──────────┘    └──────────┘    └─────────────────┘
+           │               │               │
+           │ publish       │ publish       │ publish
+           ↓               ↓               ↓
+    ┌────────────────────────────────────────────────┐
+    │            crates.io registry                  │
+    └────────────────────────────────────────────────┘
 ```
 
-**Key concepts:**
+### Split Modes
 
-- **Git-notes mapping:** `refs/notes/rail/{split}` tracks commit relationships
-- **Transform pipeline:** Rewrites Cargo.toml during sync
-- **PR-only branch:** Remote→mono creates `rail/sync/{name}/{timestamp}`
-- **Topological publish:** Dependencies published before dependents
+**Single Mode:**
+
+```
+Monorepo                    Split Repo
+crates/my-crate/     →      my-crate/
+├── src/                    ├── src/
+├── Cargo.toml              ├── Cargo.toml (transformed)
+└── README.md               └── README.md
+```
+
+**Combined Mode:**
+
+```
+Monorepo                    Split Repo
+crates/                →    my-project/
+├── tool-a/                 ├── tool-a/
+├── tool-b/                 ├── tool-b/
+└── tool-common/            ├── tool-common/
+                            └── Cargo.toml (workspace)
+```
+
+### Sync Flow
+
+```
+MONOREPO → SPLIT (Direct Push)
+┌──────────────────────────────────────────────┐
+│ 1. Detect new commits                        │
+│ 2. Filter commits (git log --path)           │
+│ 3. Transform Cargo.toml (path → version)     │
+│ 4. Apply commits to split repo               │
+│ 5. Update git-notes mapping                  │
+│ 6. Push to split repo                        │
+└──────────────────────────────────────────────┘
+
+SPLIT → MONOREPO (PR Branch - Security)
+┌──────────────────────────────────────────────┐
+│ 1. Detect new commits in split               │
+│ 2. Create PR branch: rail/sync/{name}/{ts}   │
+│ 3. Transform Cargo.toml (version → path)     │
+│ 4. Apply commits to PR branch                │
+│ 5. Update git-notes mapping                  │
+│ 6. Print review instructions (NO AUTO-MERGE) │
+└──────────────────────────────────────────────┘
+```
+
+### Release Flow
+
+```
+┌────────────┐
+│    PLAN    │  Analyze commits, detect API changes
+└──────┬─────┘
+       │
+       ↓
+┌────────────┐
+│  PREPARE   │  Bump versions, generate changelogs
+└──────┬─────┘
+       │
+       ↓
+┌────────────┐
+│  PUBLISH   │  Publish to crates.io (topological order)
+└──────┬─────┘
+       │
+       ↓
+┌────────────┐
+│  FINALIZE  │  Create tags, sync to split repos
+└────────────┘
+```
+
+### Key Concepts
+
+**Git-Notes Mapping:**
+
+```
+refs/notes/rail/{split-name}
+
+monorepo_commit_sha → split_commit_sha
+abc123def456...     → 789abc012def...
+```
+
+**Transform Pipeline:**
+
+```
+Monorepo Cargo.toml          Split Repo Cargo.toml
+[dependencies]          →    [dependencies]
+my-core = { path = "../my-core" }    my-core = "0.1.0"
+
+Split Repo Cargo.toml        Monorepo Cargo.toml
+[dependencies]          →    [dependencies]
+my-core = "0.1.0"            my-core = { path = "../my-core" }
+```
+
+**Topological Publishing:**
+
+```
+Dependency Graph:
+my-common (no deps)
+    ↓
+my-core (depends on my-common)
+    ↓
+my-client (depends on my-core)
+
+Publish Order: my-common → my-core → my-client
+```
 
 ---
 
@@ -334,7 +441,7 @@ cargo rail sync my-crate --apply --conflict=union   # combine both (risky)
 4. Optional: Enable signed commits
 5. Run `cargo rail doctor` to verify
 
-See [SECURITY.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/SECURITY.md) for threat model.
+See [SECURITY.md](docs/SECURITY.md) for full threat model.
 
 ---
 
@@ -392,12 +499,11 @@ jobs:
 
 ## Documentation
 
-- [USER_GUIDE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/USER_GUIDE.md) - Complete walkthrough
-- [SECURITY.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/SECURITY.md) - Threat model and mitigations
-- [RELEASE_GUIDE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/RELEASE_GUIDE.md) - Release workflow
-- [ARCHITECTURE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/ARCHITECTURE.md) - System design
-- [PERFORMANCE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/PERFORMANCE.md) - Benchmarks
-- [API.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/API.md) - JSON formats, exit codes
+- [USER_GUIDE.md](docs/USER_GUIDE.md) - Complete walkthrough
+- [SECURITY.md](docs/SECURITY.md) - Threat model and mitigations
+- [RELEASE_GUIDE.md](docs/RELEASE_GUIDE.md) - Release workflow
+- [TESTING_PLAN.md](TESTING_PLAN.md) - Manual testing checklist
+- [STATUS.md](STATUS.md) - Development status
 
 ---
 
@@ -440,25 +546,26 @@ cargo rail sync my-crate --apply
 
 ## Roadmap
 
-### v1.0 (Late November 2025)
+### v1.0 (Ready for Release)
 
-- ✓ Split & sync (both modes)
-- Release automation (in progress)
+- ✅ Split & sync (single and combined modes)
+- ✅ Release automation
   - Semver checking (cargo-semver-checks)
-  - Conventional commits
-  - Changelog generation
+  - Conventional commits parsing
+  - Changelog generation (git-cliff)
   - Topological publishing
   - Tag management
-- Complete documentation
-- CI templates (GitHub + GitLab)
+- ✅ Complete documentation
+- ✅ CI coverage (6 platforms)
 
 ### v1.1+
 
 - Watch mode (`cargo rail watch`)
-- Performance optimizations
+- Performance optimizations (parallel sync)
 - Homebrew formula
+- CI templates (GitHub + GitLab)
 
-See [TODO.md](https://github.com/loadingalias/cargo-rail/blob/main/TODO.md) for details.
+See [STATUS.md](https://github.com/loadingalias/cargo-rail/blob/main/STATUS.md) for details.
 
 ---
 
@@ -492,7 +599,7 @@ MIT - see [LICENSE](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE
 A: Single mode for independent crates published to crates.io. Combined mode for related crates that should stay together (e.g., client+server).
 
 **Q: Can I use this in production today?**
-A: Split/sync features are stable. Release automation coming in v1.0 (days).
+A: Yes. All features are stable and production-ready.
 
 **Q: Does this work with private repos?**
 A: Yes, use SSH authentication with deploy keys.

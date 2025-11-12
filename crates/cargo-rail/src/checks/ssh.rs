@@ -52,7 +52,10 @@ impl Check for SshKeyCheck {
     ];
 
     let mut found_keys = Vec::new();
+    #[cfg(unix)]
     let mut permission_issues: Vec<String> = Vec::new();
+    #[cfg(not(unix))]
+    let permission_issues: Vec<String> = Vec::new();
 
     for (key_name, key_desc) in key_types {
       let key_path = ssh_dir.join(key_name);
