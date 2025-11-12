@@ -50,11 +50,30 @@ skip = [
   "windows_aarch64_msvc",
   "windows_x86_64_gnu",
   "windows_x86_64_msvc",
+  "windows-link",
+  "windows-interface",
+  "windows-implement",
+  "windows",
   # Low-level hash/system dependencies
   "hashbrown",
   "foldhash",
   "linux-raw-sys",
   "rustix",
+  # git-cliff-core transitive dependencies (via tera, cacache, rust-embed)
+  "base64",
+  "getrandom",
+  "rand",
+  "rand_chacha",
+  "rand_core",
+  "memmap2",
+  "syn",
+  "thiserror",
+  "thiserror-impl",
+  # cargo-semver-checks intentionally uses multiple rustdoc-types versions
+  # to support different Rust toolchain versions
+  "rustdoc-types",
+  "trustfall-rustdoc-adapter",
+  "itertools",
 ]
 
 [sources]
