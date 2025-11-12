@@ -136,7 +136,11 @@ pub fn generate_release_plan(show_progress: bool) -> RailResult<ReleasePlan> {
     println!("🔍 Analyzing {} crates in parallel...\n", workspace_pkgs.len());
   }
 
-  let multi_progress = if show_progress { Some(MultiProgress::new()) } else { None };
+  let multi_progress = if show_progress {
+    Some(MultiProgress::new())
+  } else {
+    None
+  };
   let bars: Vec<_> = if let Some(ref mp) = multi_progress {
     workspace_pkgs
       .iter()
