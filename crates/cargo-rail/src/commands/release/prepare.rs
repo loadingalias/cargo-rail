@@ -12,15 +12,32 @@ use toml_edit::DocumentMut;
 
 /// Run release prepare command
 pub fn run_release_prepare(crate_name: Option<&str>, apply: bool, no_changelog: bool) -> RailResult<()> {
-  // Load workspace metadata
+  // Generate release plan (with progress tracking)
+  println!("📊 Analyzing workspace for release plan...");
+  let mut full_plan = plan::generate_release_plan(true)?;
+  println!();
+
+  // Filter to specific crate if requested
+  if let Some(name) = crate_name {
+    full_plan.crates.retain(|c| c.name == name);
+    full_plan.publish_order.retain(|n| n == name);
+  }
+
+  // Only process crates with changes
+  let plan = full_plan.only_changed();
+
+  if plan.crates.is_empty() {
+    if crate_name.is_some() {
+      println!("ℹ️  No changes detected for the specified crate");
+    } else {
+      println!("ℹ️  No crates need to be released");
+    }
+    return Ok(());
+  }
+
+  // Load workspace metadata for file paths
   let metadata = load_workspace_metadata()?;
   let workspace_root = metadata.workspace_root.as_std_path();
-
-  // TODO: Refactor plan.rs to export a function that returns ReleasePlan directly
-  // For now, implement a simplified version that processes all workspace crates
-  println!("📊 Analyzing workspace for release plan...");
-  plan::run_release_plan(crate_name, false, false)?;
-  println!();
   let workspace_pkgs: Vec<_> = metadata.workspace_packages().iter().cloned().cloned().collect();
 
   // Collect crate paths
@@ -36,45 +53,23 @@ pub fn run_release_prepare(crate_name: Option<&str>, apply: bool, no_changelog: 
     })
     .collect();
 
-  // Filter to specific crate if requested
-  let pkgs_to_process: Vec<_> = if let Some(name) = crate_name {
-    workspace_pkgs
-      .iter()
-      .filter(|pkg| pkg.name.as_str() == name)
-      .cloned()
-      .collect()
-  } else {
-    workspace_pkgs.clone()
-  };
-
-  if pkgs_to_process.is_empty() {
-    if let Some(name) = crate_name {
-      return Err(anyhow::anyhow!("Crate '{}' not found in workspace", name).into());
-    } else {
-      println!("ℹ️  No crates to prepare");
-      return Ok(());
-    }
-  }
-
-  println!("📦 Preparing {} crate(s) for release", pkgs_to_process.len());
+  println!("📦 Preparing {} crate(s) for release", plan.crates.len());
   println!();
 
-  // Process each crate
-  for pkg in &pkgs_to_process {
+  // Process each crate from the plan
+  for crate_plan in &plan.crates {
     let crate_path = crate_paths
-      .get(pkg.name.as_str())
-      .ok_or_else(|| anyhow::anyhow!("Failed to find path for crate {}", pkg.name))?;
+      .get(&crate_plan.name)
+      .ok_or_else(|| anyhow::anyhow!("Failed to find path for crate {}", crate_plan.name))?;
 
-    // For this simple implementation, we'll just bump patch version
-    // TODO: Use actual release plan to determine correct bump
-    let current_version = pkg.version.to_string();
-    let next_version = bump_patch_version(&current_version)?;
-
-    println!("📌 {} ({} → {})", pkg.name, current_version, next_version);
+    println!(
+      "📌 {} ({} → {}) - {}",
+      crate_plan.name, crate_plan.current_version, crate_plan.next_version, crate_plan.reason
+    );
 
     // Bump version in Cargo.toml
     let cargo_toml_path = crate_path.join("Cargo.toml");
-    let (old_manifest, new_manifest) = bump_version_in_manifest(&cargo_toml_path, &next_version)?;
+    let (old_manifest, new_manifest) = bump_version_in_manifest(&cargo_toml_path, &crate_plan.next_version)?;
 
     if apply {
       // Apply the change
@@ -105,10 +100,10 @@ pub fn run_release_prepare(crate_name: Option<&str>, apply: bool, no_changelog: 
 
       let new_changelog = match changelog::generate_changelog_for_crate(
         workspace_root,
-        pkg.name.as_str(),
+        &crate_plan.name,
         relative_path,
-        Some(&current_version),
-        &next_version,
+        Some(&crate_plan.current_version),
+        &crate_plan.next_version,
       ) {
         Ok(content) => content,
         Err(e) => {
@@ -181,16 +176,6 @@ fn bump_version_in_manifest(path: &Path, new_version: &str) -> RailResult<(Strin
   Ok((old_content, new_content))
 }
 
-/// Simple patch version bump (temporary - should use release plan)
-fn bump_patch_version(current: &str) -> RailResult<String> {
-  let mut version: semver::Version = current
-    .parse()
-    .map_err(|e| anyhow::anyhow!("Invalid semver version '{}': {}", current, e))?;
-
-  version.patch += 1;
-  Ok(version.to_string())
-}
-
 /// Show a unified diff between old and new content
 fn show_diff(filename: &str, old: &str, new: &str) {
   if old == new {
@@ -202,10 +187,9 @@ fn show_diff(filename: &str, old: &str, new: &str) {
   println!("   {}", "─".repeat(60));
 
   let diff = TextDiff::from_lines(old, new);
-  let mut line_count = 0;
   const MAX_LINES: usize = 20;
 
-  for change in diff.iter_all_changes() {
+  for (line_count, change) in diff.iter_all_changes().enumerate() {
     if line_count >= MAX_LINES {
       println!("   ... ({} more lines)", diff.iter_all_changes().count() - line_count);
       break;
@@ -218,26 +202,10 @@ fn show_diff(filename: &str, old: &str, new: &str) {
     };
 
     print!("   {}{}{}\x1b[0m", color, sign, change);
-    line_count += 1;
   }
 
   println!();
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_bump_patch_version() {
-    assert_eq!(bump_patch_version("1.2.3").unwrap(), "1.2.4");
-    assert_eq!(bump_patch_version("0.1.0").unwrap(), "0.1.1");
-    assert_eq!(bump_patch_version("2.0.0").unwrap(), "2.0.1");
-  }
-
-  #[test]
-  fn test_bump_version_invalid() {
-    assert!(bump_patch_version("invalid").is_err());
-    assert!(bump_patch_version("1.2").is_err());
-  }
-}
+// Note: Version bumping logic is tested in src/commands/release/semver.rs
+// Changelog generation is tested in src/commands/release/changelog.rs

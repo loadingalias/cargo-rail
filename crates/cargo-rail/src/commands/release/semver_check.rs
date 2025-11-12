@@ -10,12 +10,29 @@ use std::process::Command;
 pub struct SemverReport {
   /// Has major (breaking) changes
   pub has_major: bool,
+
   /// Has minor (non-breaking feature) changes
+  ///
+  /// NOTE: cargo-semver-checks doesn't distinguish between minor and patch changes,
+  /// so this field is currently always false. Kept for API completeness and future
+  /// enhancements.
+  #[allow(dead_code)]
   pub has_minor: bool,
+
   /// Has patch (bug fix) changes
+  ///
+  /// NOTE: Set to true when there are non-breaking API changes.
+  /// Kept for detailed reporting in future versions.
+  #[allow(dead_code)]
   pub has_patch: bool,
+
   /// Detected changes (human-readable descriptions)
+  ///
+  /// NOTE: Currently only populated for breaking changes.
+  /// Future versions will provide more detailed change descriptions.
+  #[allow(dead_code)]
   pub changes: Vec<String>,
+
   /// Suggested bump type based on API analysis
   pub suggested_bump: BumpType,
 }

@@ -50,11 +50,8 @@ impl BumpType {
   }
 }
 
-/// Analyze semver compatibility between versions
-pub fn analyze_semver_changes(_crate_name: &str, _current_version: &str) -> RailResult<BumpType> {
-  // TODO: Integrate cargo-semver-checks
-  Ok(BumpType::None)
-}
+// NOTE: Semver analysis moved to semver_check.rs module
+// That module provides proper cargo-semver-checks integration
 
 #[cfg(test)]
 mod tests {

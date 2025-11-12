@@ -15,6 +15,7 @@ use crate::commands::release::semver::BumpType;
 use crate::commands::release::semver_check;
 use crate::commands::release::tags;
 use crate::core::error::RailResult;
+use crate::ui::progress::MultiProgress;
 use cargo_metadata::MetadataCommand;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -91,8 +92,11 @@ impl ReleasePlan {
   }
 }
 
-/// Run release plan command
-pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> RailResult<()> {
+/// Generate a release plan without printing (for programmatic use)
+///
+/// Returns a complete ReleasePlan with version bump suggestions for all workspace crates.
+/// Callers can filter the plan using `ReleasePlan::only_changed()` if desired.
+pub fn generate_release_plan(show_progress: bool) -> RailResult<ReleasePlan> {
   // Load workspace metadata
   let metadata = load_workspace_metadata()?;
   let workspace_root = metadata.workspace_root.as_std_path();
@@ -128,11 +132,24 @@ pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> Rail
   });
 
   // Create plans for each crate by analyzing commits (in parallel with progress tracking)
-  // Parallel analysis of crate changes (progress tracking would require thread-safe wrappers,
-  // so we'll keep it simple for now and add progress in a future iteration)
+  if show_progress {
+    println!("🔍 Analyzing {} crates in parallel...\n", workspace_pkgs.len());
+  }
+
+  let multi_progress = if show_progress { Some(MultiProgress::new()) } else { None };
+  let bars: Vec<_> = if let Some(ref mp) = multi_progress {
+    workspace_pkgs
+      .iter()
+      .map(|pkg| mp.add_bar(1, format!("Analyzing {}", pkg.name)))
+      .collect()
+  } else {
+    vec![]
+  };
+
   let crate_plans: Vec<CratePlan> = workspace_pkgs
     .par_iter()
-    .map(|pkg| {
+    .enumerate()
+    .map(|(idx, pkg)| {
       let crate_name = pkg.name.as_str();
       let has_changes = changed_crates.get(crate_name).copied().unwrap_or(false);
 
@@ -217,6 +234,13 @@ pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> Rail
           .unwrap_or_else(|_| pkg.version.to_string())
       };
 
+      // Update progress bar (if enabled)
+      if let Some(ref mp) = multi_progress {
+        if idx < bars.len() {
+          mp.inc(&bars[idx]);
+        }
+      }
+
       CratePlan {
         name: pkg.name.to_string(),
         current_version: pkg.version.to_string(),
@@ -228,10 +252,20 @@ pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> Rail
     })
     .collect();
 
-  let mut plan = ReleasePlan {
+  if show_progress {
+    println!(); // Newline after progress bars
+  }
+
+  Ok(ReleasePlan {
     crates: crate_plans,
     publish_order,
-  };
+  })
+}
+
+/// Run release plan command (CLI entry point)
+pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> RailResult<()> {
+  // Generate the plan with progress tracking
+  let mut plan = generate_release_plan(true)?;
 
   // Filter to specific crate if requested
   if let Some(name) = crate_name {

@@ -88,11 +88,18 @@ impl CrateGraph {
   }
 
   /// Check if graph has cycles (circular dependencies)
+  ///
+  /// Utility method for additional validation.
+  /// Currently, cycles are detected during topological_order().
+  #[allow(dead_code)]
   pub fn has_cycles(&self) -> bool {
     toposort(&self.graph, None).is_err()
   }
 
   /// Get dependencies of a specific crate
+  ///
+  /// Utility method for dependency analysis and visualization.
+  #[allow(dead_code)]
   pub fn dependencies_of(&self, crate_name: &str) -> Option<Vec<String>> {
     let idx = self.node_map.get(crate_name)?;
     let deps: Vec<String> = self
@@ -104,11 +111,13 @@ impl CrateGraph {
   }
 
   /// Get number of crates in graph
+  #[allow(dead_code)]
   pub fn len(&self) -> usize {
     self.graph.node_count()
   }
 
   /// Check if graph is empty
+  #[allow(dead_code)]
   pub fn is_empty(&self) -> bool {
     self.graph.node_count() == 0
   }
