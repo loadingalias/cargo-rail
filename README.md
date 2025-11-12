@@ -5,7 +5,7 @@
 Split Rust crates from Cargo workspaces into standalone repos with full git history. Bidirectional sync keeps monorepo and split repos in line. Release automation with semver checks and topological publishing.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE)
 
 ---
 
@@ -334,7 +334,7 @@ cargo rail sync my-crate --apply --conflict=union   # combine both (risky)
 4. Optional: Enable signed commits
 5. Run `cargo rail doctor` to verify
 
-See [docs/SECURITY.md](docs/SECURITY.md) for threat model.
+See [SECURITY.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/SECURITY.md) for threat model.
 
 ---
 
@@ -392,12 +392,12 @@ jobs:
 
 ## Documentation
 
-- [USER_GUIDE.md](docs/USER_GUIDE.md) - Complete walkthrough
-- [SECURITY.md](docs/SECURITY.md) - Threat model and mitigations
-- [RELEASE_GUIDE.md](docs/RELEASE_GUIDE.md) - Release workflow
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System design
-- [PERFORMANCE.md](docs/PERFORMANCE.md) - Benchmarks
-- [API.md](docs/API.md) - JSON formats, exit codes
+- [USER_GUIDE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/USER_GUIDE.md) - Complete walkthrough
+- [SECURITY.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/SECURITY.md) - Threat model and mitigations
+- [RELEASE_GUIDE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/RELEASE_GUIDE.md) - Release workflow
+- [ARCHITECTURE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/ARCHITECTURE.md) - System design
+- [PERFORMANCE.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/PERFORMANCE.md) - Benchmarks
+- [API.md](https://github.com/loadingalias/cargo-rail/blob/main/docs/API.md) - JSON formats, exit codes
 
 ---
 
@@ -458,13 +458,13 @@ cargo rail sync my-crate --apply
 - Performance optimizations
 - Homebrew formula
 
-See [TODO.md](TODO.md) for details.
+See [TODO.md](https://github.com/loadingalias/cargo-rail/blob/main/TODO.md) for details.
 
 ---
 
 ## Contributing
 
-Contributions welcome! See [TODO.md](TODO.md) for planned features.
+Contributions welcome! See [TODO.md](https://github.com/loadingalias/cargo-rail/blob/main/TODO.md) for planned features.
 
 1. Check roadmap
 2. Open issue to discuss
@@ -474,7 +474,7 @@ Contributions welcome! See [TODO.md](TODO.md) for planned features.
 
 ## License
 
-MIT - see [LICENSE](LICENSE)
+MIT - see [LICENSE](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE)
 
 ---
 

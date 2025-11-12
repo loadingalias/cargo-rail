@@ -97,6 +97,11 @@ enum Commands {
     #[arg(long)]
     json: bool,
   },
+  /// Release automation (plan, prepare, publish, finalize)
+  Release {
+    #[command(subcommand)]
+    command: commands::ReleaseCommand,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -160,6 +165,7 @@ fn main() {
       check,
       json,
     } => commands::run_mappings(crate_name, check, json),
+    Commands::Release { command } => command.execute(),
   };
 
   if let Err(err) = result {

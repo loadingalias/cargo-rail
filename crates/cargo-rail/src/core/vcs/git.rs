@@ -2,6 +2,7 @@
 
 use super::CommitInfo;
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
+use gix::bstr::ByteSlice;
 use gix::Repository;
 use std::path::{Path, PathBuf};
 
@@ -711,6 +712,103 @@ impl GitBackend {
     collect_files_recursive(&subtree, relative_path, &mut files)?;
 
     Ok(files)
+  }
+
+  /// List all tags in the repository
+  pub fn list_tags(&self) -> RailResult<Vec<String>> {
+    let mut tags = Vec::new();
+
+    let references = self
+      .repo
+      .references()
+      .map_err(|e| RailError::message(format!("Failed to get references: {}", e)))?;
+
+    for reference in references
+      .all()
+      .map_err(|e| RailError::message(format!("Failed to iterate references: {}", e)))?
+      .filter_map(Result::ok)
+    {
+      if let Some(name) = reference.name().as_bstr().to_str().ok() {
+        if name.starts_with("refs/tags/") {
+          tags.push(name.strip_prefix("refs/tags/").unwrap().to_string());
+        }
+      }
+    }
+
+    Ok(tags)
+  }
+
+  /// Resolve a git reference (tag, branch) to a commit SHA
+  pub fn resolve_reference(&self, ref_name: &str) -> RailResult<String> {
+    let reference = self
+      .repo
+      .find_reference(ref_name)
+      .map_err(|e| RailError::message(format!("Failed to find reference '{}': {}", ref_name, e)))?;
+
+    let oid = reference
+      .try_id()
+      .ok_or_else(|| RailError::message(format!("Reference '{}' is not a direct reference", ref_name)))?;
+
+    Ok(oid.to_hex().to_string())
+  }
+
+  /// Get all commits since a given commit SHA
+  pub fn get_commits_since(&self, since_sha: &str) -> RailResult<Vec<String>> {
+    let since_id = gix::ObjectId::from_hex(since_sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", since_sha, e)))?;
+
+    let head = self.repo.head()?;
+    let head_id = head.id().ok_or_else(|| RailError::message("HEAD is unborn"))?;
+
+    let mut commits = Vec::new();
+    let rev_walk = self.repo.rev_walk(Some(head_id));
+
+    for info in rev_walk
+      .all()
+      .map_err(|e| RailError::message(format!("Failed to walk commits: {}", e)))?
+      .filter_map(Result::ok)
+    {
+      // Stop when we reach the since commit
+      if info.id == since_id {
+        break;
+      }
+      commits.push(info.id.to_hex().to_string());
+    }
+
+    Ok(commits)
+  }
+
+  /// Get commit message for a given commit SHA
+  pub fn get_commit_message(&self, commit_sha: &str) -> RailResult<String> {
+    let commit_id = gix::ObjectId::from_hex(commit_sha.as_bytes())
+      .map_err(|e| RailError::message(format!("Invalid commit SHA {}: {}", commit_sha, e)))?;
+
+    let commit = self
+      .repo
+      .find_object(commit_id)
+      .map_err(|e| RailError::message(format!("Failed to find commit {}: {}", commit_sha, e)))?
+      .try_into_commit()
+      .map_err(|e| RailError::message(format!("Object {} is not a commit: {}", commit_sha, e)))?;
+
+    let message_ref = commit
+      .message()
+      .map_err(|e| RailError::message(format!("Failed to read commit message: {}", e)))?;
+
+    // Reconstruct full message from title and body
+    let title = message_ref.title.to_str().map_err(|e| {
+      RailError::message(format!("Failed to decode commit title: {}", e))
+    })?;
+
+    let full_message = if let Some(body) = message_ref.body {
+      let body_str = body.to_str().map_err(|e| {
+        RailError::message(format!("Failed to decode commit body: {}", e))
+      })?;
+      format!("{}\n\n{}", title, body_str)
+    } else {
+      title.to_string()
+    };
+
+    Ok(full_message)
   }
 }
 
