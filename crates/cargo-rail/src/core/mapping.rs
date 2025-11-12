@@ -327,6 +327,18 @@ mod tests {
       .output()
       .unwrap();
 
+    // Configure git identity (required for commits in CI environments)
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "user.name", "Test User"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "user.email", "test@example.com"])
+      .output()
+      .unwrap();
+
     // Create an initial commit (git-notes need at least one commit)
     std::fs::write(repo_path.join("test.txt"), "test").unwrap();
     Command::new("git")
