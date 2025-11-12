@@ -515,6 +515,76 @@ impl Splitter {
       // Initialize using gix
       gix::init(target_path)
         .with_context(|| format!("Failed to initialize git repository at {}", target_path.display()))?;
+
+      // Configure git identity from source repository
+      self.configure_git_identity(target_path)?;
+    }
+
+    Ok(())
+  }
+
+  /// Configure git identity in the target repository by copying from source
+  fn configure_git_identity(&self, target_path: &Path) -> RailResult<()> {
+    use std::process::Command;
+
+    // Get identity from source repository
+    let user_name = Command::new("git")
+      .current_dir(&self.workspace_root)
+      .args(["config", "user.name"])
+      .output()
+      .ok()
+      .and_then(|o| {
+        if o.status.success() {
+          Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else {
+          None
+        }
+      });
+
+    let user_email = Command::new("git")
+      .current_dir(&self.workspace_root)
+      .args(["config", "user.email"])
+      .output()
+      .ok()
+      .and_then(|o| {
+        if o.status.success() {
+          Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else {
+          None
+        }
+      });
+
+    // Set identity in target repository
+    // Use a fallback if source doesn't have identity configured
+    let name = user_name.as_deref().unwrap_or("Cargo Rail");
+    let email = user_email.as_deref().unwrap_or("cargo-rail@localhost");
+
+    let output = Command::new("git")
+      .current_dir(target_path)
+      .args(["config", "user.name", name])
+      .output()
+      .context("Failed to configure git user.name")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git config user.name".to_string(),
+        stderr: stderr.to_string(),
+      }));
+    }
+
+    let output = Command::new("git")
+      .current_dir(target_path)
+      .args(["config", "user.email", email])
+      .output()
+      .context("Failed to configure git user.email")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git config user.email".to_string(),
+        stderr: stderr.to_string(),
+      }));
     }
 
     Ok(())
