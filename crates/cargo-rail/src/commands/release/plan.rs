@@ -235,10 +235,10 @@ pub fn generate_release_plan(show_progress: bool) -> RailResult<ReleasePlan> {
       };
 
       // Update progress bar (if enabled)
+      // Note: idx is always < bars.len() since we enumerate workspace_pkgs
+      // and bars has exactly workspace_pkgs.len() elements
       if let Some(ref mp) = multi_progress {
-        if idx < bars.len() {
-          mp.inc(&bars[idx]);
-        }
+        mp.inc(&bars[idx]);
       }
 
       CratePlan {
