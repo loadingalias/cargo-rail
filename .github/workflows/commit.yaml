@@ -37,15 +37,30 @@ jobs:
             runner: ubuntu-latest
             cache-key: commit-linux-x64
 
-          # Linux ARM64 (GitHub Pro)
+          # Linux ARM64 (GitHub Teams/Enterprise)
           - name: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             cache-key: commit-linux-arm64
+
+          # macOS ARM64 - Sonoma (GitHub Free)
+          - name: aarch64-apple-darwin
+            runner: macos-14
+            cache-key: commit-macos-arm64
+
+          # macOS ARM64 - Sequoia (GitHub Free)
+          - name: aarch64-apple-darwin
+            runner: macos-15
+            cache-key: commit-macos-latest
 
           # Windows x86-64 (GitHub Free)
           - name: x86_64-pc-windows-msvc
             runner: windows-latest
             cache-key: commit-windows-x64
+
+          # Windows ARM64 (GitHub Teams/Enterprise)
+          - name: aarch64-pc-windows-msvc
+            runner: windows-11-arm64
+            cache-key: commit-windows-arm64
 
     steps:
       - name: Checkout
