@@ -51,8 +51,9 @@ fn create_git_cliff_config(crate_path: &str) -> RailResult<Config> {
     // Don't split commits on newlines
     split_commits: false,
     // Include only commits that touch this crate's path (monorepo support!)
-    include_paths: vec![Pattern::new(&format!("{}/**", crate_path))
-      .map_err(|e| anyhow::anyhow!("Invalid path pattern: {}", e))?],
+    include_paths: vec![
+      Pattern::new(&format!("{}/**", crate_path)).map_err(|e| anyhow::anyhow!("Invalid path pattern: {}", e))?,
+    ],
     // Don't exclude any paths
     exclude_paths: vec![],
     // Default configs
@@ -139,21 +140,17 @@ pub fn analyze_commits_for_crate(
     let changed_files = git.get_changed_files(commit_sha)?;
 
     // Check if any changed file is in this crate's path (pre-filter for efficiency)
-    let affects_crate = changed_files
-      .iter()
-      .any(|(path, _)| path.starts_with(crate_path));
+    let affects_crate = changed_files.iter().any(|(path, _)| path.starts_with(crate_path));
 
-    if affects_crate {
-      if let Ok(message) = git.get_commit_message(commit_sha) {
-        // Create git-cliff Commit
-        let commit = Commit::new(commit_sha.clone(), message);
+    if affects_crate && let Ok(message) = git.get_commit_message(commit_sha) {
+      // Create git-cliff Commit
+      let commit = Commit::new(commit_sha.clone(), message);
 
-        // Process commit with git-cliff (parses conventional commits, filters, etc.)
-        match commit.process(&config.git) {
-          Ok(processed) => cliff_commits.push(processed),
-          Err(_e) => {
-            // Skip commits that don't match our filters (e.g., non-conventional)
-          }
+      // Process commit with git-cliff (parses conventional commits, filters, etc.)
+      match commit.process(&config.git) {
+        Ok(processed) => cliff_commits.push(processed),
+        Err(_e) => {
+          // Skip commits that don't match our filters (e.g., non-conventional)
         }
       }
     }
@@ -178,14 +175,6 @@ pub fn analyze_commits_for_crate(
     submodule_commits: Default::default(),
     statistics: None,
     extra: None,
-    #[cfg(feature = "github")]
-    github: Default::default(),
-    #[cfg(feature = "gitlab")]
-    gitlab: Default::default(),
-    #[cfg(feature = "gitea")]
-    gitea: Default::default(),
-    #[cfg(feature = "bitbucket")]
-    bitbucket: Default::default(),
   };
 
   // Determine bump type from commits
@@ -302,16 +291,12 @@ pub fn generate_changelog_for_crate(
   let mut cliff_commits = Vec::new();
   for commit_sha in &commit_shas {
     let changed_files = git.get_changed_files(commit_sha)?;
-    let affects_crate = changed_files
-      .iter()
-      .any(|(path, _)| path.starts_with(crate_path));
+    let affects_crate = changed_files.iter().any(|(path, _)| path.starts_with(crate_path));
 
-    if affects_crate {
-      if let Ok(message) = git.get_commit_message(commit_sha) {
-        let commit = Commit::new(commit_sha.clone(), message);
-        if let Ok(processed) = commit.process(&config.git) {
-          cliff_commits.push(processed);
-        }
+    if affects_crate && let Ok(message) = git.get_commit_message(commit_sha) {
+      let commit = Commit::new(commit_sha.clone(), message);
+      if let Ok(processed) = commit.process(&config.git) {
+        cliff_commits.push(processed);
       }
     }
   }
@@ -329,14 +314,6 @@ pub fn generate_changelog_for_crate(
     submodule_commits: Default::default(),
     statistics: None,
     extra: None,
-    #[cfg(feature = "github")]
-    github: Default::default(),
-    #[cfg(feature = "gitlab")]
-    gitlab: Default::default(),
-    #[cfg(feature = "gitea")]
-    gitea: Default::default(),
-    #[cfg(feature = "bitbucket")]
-    bitbucket: Default::default(),
   };
 
   // Generate changelog using git-cliff
@@ -380,9 +357,6 @@ mod tests {
   #[test]
   fn test_git_cliff_config_monorepo_filtering() {
     let config = create_git_cliff_config("crates/my-crate").unwrap();
-    assert_eq!(
-      config.git.include_paths[0].as_str(),
-      "crates/my-crate/**"
-    );
+    assert_eq!(config.git.include_paths[0].as_str(), "crates/my-crate/**");
   }
 }

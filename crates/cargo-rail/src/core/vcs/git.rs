@@ -2,8 +2,8 @@
 
 use super::CommitInfo;
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
-use gix::bstr::ByteSlice;
 use gix::Repository;
+use gix::bstr::ByteSlice;
 use std::path::{Path, PathBuf};
 
 /// Git implementation using gix (gitoxide)
@@ -728,10 +728,10 @@ impl GitBackend {
       .map_err(|e| RailError::message(format!("Failed to iterate references: {}", e)))?
       .filter_map(Result::ok)
     {
-      if let Some(name) = reference.name().as_bstr().to_str().ok() {
-        if name.starts_with("refs/tags/") {
-          tags.push(name.strip_prefix("refs/tags/").unwrap().to_string());
-        }
+      if let Ok(name) = reference.name().as_bstr().to_str()
+        && name.starts_with("refs/tags/")
+      {
+        tags.push(name.strip_prefix("refs/tags/").unwrap().to_string());
       }
     }
 
@@ -795,14 +795,15 @@ impl GitBackend {
       .map_err(|e| RailError::message(format!("Failed to read commit message: {}", e)))?;
 
     // Reconstruct full message from title and body
-    let title = message_ref.title.to_str().map_err(|e| {
-      RailError::message(format!("Failed to decode commit title: {}", e))
-    })?;
+    let title = message_ref
+      .title
+      .to_str()
+      .map_err(|e| RailError::message(format!("Failed to decode commit title: {}", e)))?;
 
     let full_message = if let Some(body) = message_ref.body {
-      let body_str = body.to_str().map_err(|e| {
-        RailError::message(format!("Failed to decode commit body: {}", e))
-      })?;
+      let body_str = body
+        .to_str()
+        .map_err(|e| RailError::message(format!("Failed to decode commit body: {}", e)))?;
       format!("{}\n\n{}", title, body_str)
     } else {
       title.to_string()

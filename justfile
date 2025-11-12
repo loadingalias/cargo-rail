@@ -2,9 +2,8 @@ build:
     cargo build --workspace --all-targets --all-features
     @echo "✅ Success!"
 
-test:
-    cargo nextest run --workspace --all-targets --all-features --config-file .config/nextest.toml
-    @echo "✅ Tests passed!"
+test crate="":
+    @scripts/test/test.sh "{{crate}}"
 
 check:
     cargo fmt --all
@@ -30,3 +29,11 @@ waste:
 update:
     cargo update --workspace
     cargo upgrade --recursive
+
+# Pin GitHub Actions to commit SHAs for security
+pin-actions:
+    @scripts/ci/pin-actions.sh --update-lock
+
+# Verify all GitHub Actions are properly pinned
+verify-actions:
+    @scripts/ci/pin-actions.sh --verify-only

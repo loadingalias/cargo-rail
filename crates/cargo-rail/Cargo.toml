@@ -18,6 +18,13 @@ exclude = [
     "*.md",
 ]
 
+[features]
+# Remote integration features (future use)
+github = []
+gitlab = []
+gitea = []
+bitbucket = []
+
 [dependencies]
 # Git operations (pure Rust gitoxide)
 gix = "0.74.1"
@@ -59,10 +66,10 @@ petgraph = "0.8.3"
 chrono = "0.4.40"
 regex = "1.11.1"
 glob = "0.3.3"
+similar = "2.7.0"
 
 [dev-dependencies]
 tempfile = "3.23.0"
-criterion = "0.7.0"
 
 [[test]]
 name = "integration"
