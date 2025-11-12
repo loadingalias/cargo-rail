@@ -3,6 +3,7 @@
 use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::error::RailResult;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,12 +58,15 @@ impl Check for SshKeyCheck {
       if key_path.exists() {
         found_keys.push(format!("{} ({})", key_name, key_desc));
 
-        // Check permissions (should be 600 or 400)
-        if let Ok(metadata) = fs::metadata(&key_path) {
-          let permissions = metadata.permissions();
-          let mode = permissions.mode() & 0o777;
-          if mode != 0o600 && mode != 0o400 {
-            permission_issues.push(format!("{}: has mode {:o} (should be 600 or 400)", key_name, mode));
+        // Check permissions (should be 600 or 400) - Unix only
+        #[cfg(unix)]
+        {
+          if let Ok(metadata) = fs::metadata(&key_path) {
+            let permissions = metadata.permissions();
+            let mode = permissions.mode() & 0o777;
+            if mode != 0o600 && mode != 0o400 {
+              permission_issues.push(format!("{}: has mode {:o} (should be 600 or 400)", key_name, mode));
+            }
           }
         }
       }

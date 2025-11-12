@@ -81,6 +81,15 @@ impl ReleaseTag {
   }
 }
 
+/// Format a tag name for a crate and version
+///
+/// Module-level convenience function that delegates to ReleaseTag::format
+pub fn format_tag(crate_name: &str, version: &str) -> String {
+  // Parse version string to semver
+  let semver_version = version.parse::<Version>().unwrap_or_else(|_| Version::new(0, 0, 0));
+  ReleaseTag::format(crate_name, &semver_version)
+}
+
 /// Find the last release tag for each crate in the workspace
 pub fn find_last_release_tags(repo_path: &Path, crate_names: &[String]) -> RailResult<HashMap<String, ReleaseTag>> {
   let git = GitBackend::open(repo_path)?;

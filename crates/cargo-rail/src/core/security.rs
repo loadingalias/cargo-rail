@@ -1,4 +1,6 @@
 use crate::core::error::{RailError, RailResult, ResultExt, ValidationError};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -44,10 +46,9 @@ impl SecurityValidator {
       }));
     }
 
-    // Check if key is readable
-    if !ssh_key.metadata()?.permissions().readonly() && cfg!(unix) {
-      // On Unix, check permissions (should be 600 or 400)
-      use std::os::unix::fs::PermissionsExt;
+    // Check if key is readable and has secure permissions (Unix only)
+    #[cfg(unix)]
+    {
       let perms = ssh_key.metadata()?.permissions();
       let mode = perms.mode();
       if mode & 0o077 != 0 {
