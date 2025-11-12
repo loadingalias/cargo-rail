@@ -1,0 +1,58 @@
+# GitHub Actions Version Lock File
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Single source of truth for all GitHub Actions used in workflows.
+# Managed by Dependabot - DO NOT EDIT MANUALLY UNLESS ADDING NEW ACTIONS.
+#
+# Usage:
+#   1. Add new actions here first with desired semantic version
+#   2. Run: just pin-actions (generates SHA-pinned workflows)
+#   3. Dependabot automatically updates SHAs when new versions release
+#
+# Format:
+#   <action-name>:
+#     ref: <semantic-version>  # What we want (Dependabot monitors this)
+#     sha: <commit-sha>         # Immutable pin (generated)
+#     updated: <ISO-8601>       # Last verification timestamp
+#
+# Security Note:
+#   Workflows use SHA-pinned format: uses: actions/checkout@abc123...  # v4.1.7
+#   Dependabot reads the comment (# v4.1.7) and updates the SHA when new versions release.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Official GitHub Actions
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+actions/checkout:
+  ref: v5.0.0
+  sha: "08c6903cd8c0fde910a37f88322edcfb5dd907a8"
+  updated: "2025-01-11T00:00:00Z"
+  notes: "Repository checkout - used in every workflow"
+
+actions/upload-artifact:
+  ref: v5.0.0
+  sha: "330a01c490aca151604b8cf639adc76d48f6c5d4"
+  updated: "2025-01-11T00:00:00Z"
+  notes: "Upload build artifacts and test results"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Rust Toolchain & Ecosystem
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+dtolnay/rust-toolchain:
+  ref: master
+  sha: "6d653acede28d24f02e3cd41383119e8b1b35921"
+  updated: "2025-01-11T00:00:00Z"
+  notes: "Rust toolchain installation - always tracks latest nightly"
+
+taiki-e/install-action:
+  ref: v2
+  sha: "6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b"
+  updated: "2025-01-11T00:00:00Z"
+  notes: "Install cargo tools (nextest, just, deny, audit)"
+
+Swatinem/rust-cache:
+  ref: v2.8.1
+  sha: "f13886b937689c021905a6b90929199931d60db1"
+  updated: "2025-01-11T00:00:00Z"
+  notes: "GitHub runner Rust cache"

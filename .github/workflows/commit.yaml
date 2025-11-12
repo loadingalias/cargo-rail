@@ -1,0 +1,75 @@
+name: Commit
+
+on:
+  push:
+    branches:
+      - "**"
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  CARGO_RAIL_TEST_MODE: commit
+  CARGO_INCREMENTAL: 0
+
+# Lock down permissions to read-only by default
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI (${{ matrix.target.name }})
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        target:
+          # Linux x86-64 (GitHub Free)
+          - name: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cache-key: commit-linux-x64
+
+          # Linux ARM64 (GitHub Pro)
+          - name: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            cache-key: commit-linux-arm64
+
+          # Windows x86-64 (GitHub Free)
+          - name: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cache-key: commit-windows-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          cache-key: ${{ matrix.target.cache-key }}
+
+      - name: Quality Checks
+        run: just ci-check
+
+      - name: Build
+        run: just build
+
+      - name: Tests
+        run: just test
+
+      - name: Upload Test Results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: test-results-${{ matrix.target.name }}
+          path: target/nextest/
+          retention-days: 7
+          if-no-files-found: ignore

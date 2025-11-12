@@ -6,3 +6,15 @@ fail-fast = false
 test-threads = "num-cpus"
 slow-timeout = { period = "30s", terminate-after = 4 }
 retries = 0
+
+[profile.commit]
+status-level = "fail"
+success-output = "never"
+failure-output = "immediate-final"
+fail-fast = false
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 4 }
+retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
+
+[profile.commit.junit]
+path = "junit.xml"

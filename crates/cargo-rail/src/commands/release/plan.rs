@@ -12,9 +12,11 @@
 use crate::commands::release::changelog;
 use crate::commands::release::graph::CrateGraph;
 use crate::commands::release::semver::BumpType;
+use crate::commands::release::semver_check;
 use crate::commands::release::tags;
 use crate::core::error::RailResult;
 use cargo_metadata::MetadataCommand;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -119,17 +121,17 @@ pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> Rail
   let last_tags = tags::find_last_release_tags(workspace_root, &crate_names).unwrap_or_default();
 
   // Detect which crates have changed since last release
-  let changed_crates = tags::detect_changed_crates(workspace_root, &crate_names, &crate_paths)
-    .unwrap_or_else(|e| {
-      // If change detection fails, treat all crates as changed
-      eprintln!("Warning: Failed to detect changes: {}", e);
-      crate_names.iter().map(|name| (name.clone(), true)).collect()
-    });
+  let changed_crates = tags::detect_changed_crates(workspace_root, &crate_names, &crate_paths).unwrap_or_else(|e| {
+    // If change detection fails, treat all crates as changed
+    eprintln!("Warning: Failed to detect changes: {}", e);
+    crate_names.iter().map(|name| (name.clone(), true)).collect()
+  });
 
-  // Create plans for each crate by analyzing commits
-  let crate_plans: Vec<CratePlan> = metadata
-    .workspace_packages()
-    .iter()
+  // Create plans for each crate by analyzing commits (in parallel with progress tracking)
+  // Parallel analysis of crate changes (progress tracking would require thread-safe wrappers,
+  // so we'll keep it simple for now and add progress in a future iteration)
+  let crate_plans: Vec<CratePlan> = workspace_pkgs
+    .par_iter()
     .map(|pkg| {
       let crate_name = pkg.name.as_str();
       let has_changes = changed_crates.get(crate_name).copied().unwrap_or(false);
@@ -141,20 +143,61 @@ pub fn run_release_plan(crate_name: Option<&str>, json: bool, all: bool) -> Rail
         let crate_path = crate_paths.get(crate_name).unwrap_or(&default_path);
 
         match changelog::analyze_commits_for_crate(workspace_root, crate_path, last_commit) {
-          Ok((bump, commit_count)) => {
-            let reason = if bump == BumpType::None && commit_count > 0 {
+          Ok((commit_bump, commit_count)) => {
+            // Also check API changes with cargo-semver-checks (if available and has baseline)
+            let api_bump = if let Some(last_tag) = last_tags.get(crate_name) {
+              let crate_abs_path = workspace_root.join(crate_path);
+              match semver_check::check_api_changes(&crate_abs_path, &last_tag.version.to_string()) {
+                Ok(Some(report)) => {
+                  if report.has_major {
+                    eprintln!(
+                      "⚠️  {} has API breaking changes detected by cargo-semver-checks",
+                      crate_name
+                    );
+                  }
+                  report.suggested_bump
+                }
+                Ok(None) => {
+                  // cargo-semver-checks not available or failed, skip API check
+                  BumpType::None
+                }
+                Err(e) => {
+                  eprintln!("Warning: cargo-semver-checks failed for {}: {}", crate_name, e);
+                  BumpType::None
+                }
+              }
+            } else {
+              BumpType::None
+            };
+
+            // Combine commit-based bump and API-based bump (take the larger)
+            let combined_bump = commit_bump.combine(api_bump);
+
+            // Generate reason text
+            let reason = if combined_bump == BumpType::None && commit_count > 0 {
               format!("{} non-version-bumping changes", commit_count)
             } else if commit_count == 0 {
               "New crate (no previous release)".to_string()
             } else {
-              match bump {
-                BumpType::Major => format!("Breaking changes detected ({} commits)", commit_count),
-                BumpType::Minor => format!("New features added ({} commits)", commit_count),
-                BumpType::Patch => format!("Bug fixes ({} commits)", commit_count),
-                BumpType::None => format!("{} changes (docs, chore, etc.)", commit_count),
+              let mut reason_parts = Vec::new();
+
+              // Add commit-based reason
+              match commit_bump {
+                BumpType::Major => reason_parts.push(format!("Breaking changes ({} commits)", commit_count)),
+                BumpType::Minor => reason_parts.push(format!("New features ({} commits)", commit_count)),
+                BumpType::Patch => reason_parts.push(format!("Bug fixes ({} commits)", commit_count)),
+                BumpType::None => reason_parts.push(format!("{} changes (docs, chore)", commit_count)),
               }
+
+              // Add API analysis if it increased the bump
+              if api_bump > commit_bump {
+                reason_parts.push("API breaking changes detected".to_string());
+              }
+
+              reason_parts.join("; ")
             };
-            (bump, reason)
+
+            (combined_bump, reason)
           }
           Err(e) => {
             eprintln!("Warning: Failed to analyze commits for {}: {}", crate_name, e);
