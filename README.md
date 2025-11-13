@@ -2,7 +2,7 @@
 
 **Split Rust crates from monorepos, keep them in sync**
 
-Split Rust crates from Cargo workspaces into standalone repos with full git history. Bidirectional sync keeps monorepo and split repos in line. Release automation with semver checks and topological publishing.
+Split Rust crates from Cargo workspaces into standalone repos with full git history. Bidirectional sync keeps monorepo and split repos in line.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE)
@@ -12,27 +12,24 @@ Split Rust crates from Cargo workspaces into standalone repos with full git hist
 ## Status: Production Ready (v0.1)
 
 **Split & Sync:** ✅ Production-ready
-**Release Commands:** ✅ Complete (`plan`, `prepare`, `publish`, `finalize`)
 **Documentation:** ✅ Complete
 **CI Coverage:** ✅ 4 platforms (Linux/Windows x86_64/ARM64) + macOS local
 
-All features stable. Ready for v1.0 release.
+All features stable. Focused on split/sync only - use cargo-release or release-plz for publishing.
 
 ---
 
 ## Why cargo-rail?
 
-| Feature | cargo-rail | cargo-workspaces | release-plz | git-subtree | Copybara |
-|---------|------------|------------------|-------------|-------------|----------|
-| Split crates | Full history | ❌ | ❌ | One-way | Complex |
-| Bidirectional sync | ✓ | ❌ | ❌ | ❌ | ✓ |
-| Cargo-aware | ✓ | ✓ | ✓ | ❌ | ❌ |
-| Release automation | ✓ | Basic | ✓ | ❌ | ❌ |
-| Semver checks | ✓ | ❌ | ✓ | ❌ | ❌ |
-| Dry-run by default | ✓ | ❌ | Partial | ❌ | ❌ |
-| Setup | One TOML | Easy | Easy | Complex | Very complex |
+| Feature | cargo-rail | git-subtree | Copybara |
+|---------|------------|-------------|----------|
+| Split crates | Full history | One-way | Complex |
+| Bidirectional sync | ✓ | ❌ | ✓ |
+| Cargo-aware transforms | ✓ | ❌ | ❌ |
+| Dry-run by default | ✓ | ❌ | ❌ |
+| Setup | One TOML | Complex | Very complex |
 
-**cargo-rail = cargo-workspaces + release-plz + git-subtree**
+**cargo-rail = git-subtree + cargo transforms + bidirectional sync**
 
 ---
 
@@ -48,15 +45,6 @@ All features stable. Ready for v1.0 release.
 - Git-notes commit mapping (rebase-tolerant)
 - Conflict resolution (ours, theirs, manual, union)
 - Two modes: single crate → repo, or multiple crates → combined repo
-
-**Release Automation:**
-
-- Semver enforcement with breaking change detection (cargo-semver-checks)
-- Topological publishing (dependencies first)
-- Changelog generation from conventional commits (git-cliff)
-- Tag management across monorepo and split repos
-- Parallel analysis with progress indicators
-- Dry-run by default with colorized diffs
 
 ---
 
@@ -149,53 +137,49 @@ my-project/
 
 ---
 
-## Modes Explained
+## Workflow Example: 25-Crate Monorepo
 
-### Single Mode
+**Scenario:** 5 proprietary crates, 20 OSS (5 split to separate repos, 15 stay in monorepo)
 
-- **One crate → One repo**
-- Use when: Publishing independent crates to crates.io
-- Example: Split `crates/http-client` → `http-client` standalone repo
-
-### Combined Mode
-
-- **Multiple crates → One repo**
-- Use when: Related crates that should live together
-- Example: Split `crates/{client,server,common}` → `my-project` workspace repo
-- Maintains workspace structure in split repo
-- All crates keep their workspace dependencies
-
----
-
-## Sync Workflow
-
-### Monorepo → Split Repo
+### Development (Monorepo)
 
 ```bash
-cd your-workspace/
-# Make changes in crates/my-crate/
+cd monorepo/
+# ... make changes to crates/my-oss-lib ...
 git commit -am "feat: Add feature"
 
-# Sync to split repo (pushes automatically)
-cargo rail sync my-crate --apply
+# Sync to split repo
+cargo rail sync my-oss-lib --apply
 ```
 
-### Split Repo → Monorepo
+### Publishing
+
+**Option 1: Monorepo-only crates** (20 crates)
+```bash
+cd monorepo/
+cargo release --workspace  # or release-plz
+```
+
+**Option 2: Split crates** (5 crates)
+```bash
+# Ensure synced
+cargo rail sync my-oss-lib --apply
+
+# Publish from split repo
+cd ../my-oss-lib-split/
+cargo release
+# Contributors see a normal standalone crate
+```
+
+### External Contributions
 
 ```bash
-cd my-crate-split/
-# Make changes
-git commit -am "fix: Bug fix"
-git push origin main
-
-cd ../your-workspace/
-# Sync from split repo (creates PR branch)
-cargo rail sync my-crate --apply
-# Creates branch: rail/sync/my-crate/2025-11-11-143022
-# Review and merge PR manually
+# PR comes into split repo
+cd ../monorepo/
+cargo rail sync my-oss-lib --apply
+# Creates PR branch: rail/sync/my-oss-lib/1763010755
+# Review and merge manually
 ```
-
-**Security:** Split→mono syncs NEVER commit directly to main. Always creates PR branch for review.
 
 ---
 
@@ -211,12 +195,6 @@ cargo rail sync --all --apply        # Sync all configured splits
 cargo rail doctor                    # Run health checks
 cargo rail status                    # Show configured splits
 cargo rail mappings <name>           # Inspect git-notes mappings
-
-# Release commands
-cargo rail release plan              # Preview releases
-cargo rail release prepare --apply   # Update versions, changelogs
-cargo rail release publish --apply   # Publish to crates.io
-cargo rail release finalize --apply  # Create tags, sync to splits
 ```
 
 ---
@@ -234,13 +212,6 @@ ssh_key_path = "~/.ssh/id_ed25519"
 require_signed_commits = false
 pr_branch_pattern = "rail/sync/{crate}/{timestamp}"
 protected_branches = ["main", "master"]
-
-[release]
-strategy = "conventional"  # or "manual"
-tag_format = "{name}@v{version}"
-publish_delay = 30  # seconds between dependent publishes
-create_github_releases = true
-auto_sync_split_repos = true
 
 # Single mode example
 [[splits]]
@@ -303,34 +274,11 @@ cargo rail sync my-crate --apply --conflict=union   # combine both (risky)
     │          │    │          │    │ (standalone)    │
     └──────────┘    └──────────┘    └─────────────────┘
            │               │               │
-           │ publish       │ publish       │ publish
+           │ cargo release │ cargo release │ cargo release
            ↓               ↓               ↓
     ┌────────────────────────────────────────────────┐
     │            crates.io registry                  │
     └────────────────────────────────────────────────┘
-```
-
-### Split Modes
-
-**Single Mode:**
-
-```
-Monorepo                    Split Repo
-crates/my-crate/     →      my-crate/
-├── src/                    ├── src/
-├── Cargo.toml              ├── Cargo.toml (transformed)
-└── README.md               └── README.md
-```
-
-**Combined Mode:**
-
-```
-Monorepo                    Split Repo
-crates/                →    my-project/
-├── tool-a/                 ├── tool-a/
-├── tool-b/                 ├── tool-b/
-└── tool-common/            ├── tool-common/
-                            └── Cargo.toml (workspace)
 ```
 
 ### Sync Flow
@@ -355,65 +303,6 @@ SPLIT → MONOREPO (PR Branch - Security)
 │ 5. Update git-notes mapping                  │
 │ 6. Print review instructions (NO AUTO-MERGE) │
 └──────────────────────────────────────────────┘
-```
-
-### Release Flow
-
-```
-┌────────────┐
-│    PLAN    │  Analyze commits, detect API changes
-└──────┬─────┘
-       │
-       ↓
-┌────────────┐
-│  PREPARE   │  Bump versions, generate changelogs
-└──────┬─────┘
-       │
-       ↓
-┌────────────┐
-│  PUBLISH   │  Publish to crates.io (topological order)
-└──────┬─────┘
-       │
-       ↓
-┌────────────┐
-│  FINALIZE  │  Create tags, sync to split repos
-└────────────┘
-```
-
-### Key Concepts
-
-**Git-Notes Mapping:**
-
-```
-refs/notes/rail/{split-name}
-
-monorepo_commit_sha → split_commit_sha
-abc123def456...     → 789abc012def...
-```
-
-**Transform Pipeline:**
-
-```
-Monorepo Cargo.toml          Split Repo Cargo.toml
-[dependencies]          →    [dependencies]
-my-core = { path = "../my-core" }    my-core = "0.1.0"
-
-Split Repo Cargo.toml        Monorepo Cargo.toml
-[dependencies]          →    [dependencies]
-my-core = "0.1.0"            my-core = { path = "../my-core" }
-```
-
-**Topological Publishing:**
-
-```
-Dependency Graph:
-my-common (no deps)
-    ↓
-my-core (depends on my-common)
-    ↓
-my-client (depends on my-core)
-
-Publish Order: my-common → my-core → my-client
 ```
 
 ---
@@ -470,29 +359,26 @@ jobs:
         env: { SSH_PRIVATE_KEY: '${{ secrets.DEPLOY_KEY }}' }
 ```
 
-### Release on Tag
+---
 
-`.github/workflows/rail-release.yml`:
+## Publishing Workflow
 
-```yaml
-name: Release
-on:
-  push:
-    tags: ['v*']
+cargo-rail focuses on split/sync. Use existing tools for releases:
 
-jobs:
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-rail
-      - run: |
-          cargo rail release prepare --apply
-          cargo rail release publish --apply --yes
-          cargo rail release finalize --apply
-        env:
-          CARGO_REGISTRY_TOKEN: '${{ secrets.CARGO_TOKEN }}'
+**Recommended:**
+- [cargo-release](https://github.com/crate-ci/cargo-release) - Simple, battle-tested
+- [release-plz](https://github.com/MarcoIeni/release-plz) - Automated releases from CI
+- [git-cliff](https://github.com/orhun/git-cliff) - Changelog generation
+
+```bash
+# Monorepo-only crates
+cd monorepo/
+cargo release --workspace
+
+# Split crates
+cargo rail sync my-crate --apply  # Ensure synced
+cd ../my-crate-split/
+cargo release  # Publish from split repo
 ```
 
 ---
@@ -501,7 +387,6 @@ jobs:
 
 - [USER_GUIDE.md](docs/USER_GUIDE.md) - Complete walkthrough
 - [SECURITY.md](docs/SECURITY.md) - Threat model and mitigations
-- [RELEASE_GUIDE.md](docs/RELEASE_GUIDE.md) - Release workflow
 - [E2E_TESTING_SETUP.md](E2E_TESTING_SETUP.md) - End-to-end testing guide
 - [STATUS.md](STATUS.md) - Development status
 
@@ -536,36 +421,11 @@ cargo rail sync my-crate --apply
 
 ## Comparison
 
-**vs cargo-workspaces:** cargo-rail adds split/sync + release (complete workflow)
-**vs release-plz:** cargo-rail adds split/sync to release automation
 **vs git-subtree:** cargo-rail is bidirectional + Cargo-aware
 **vs Copybara:** cargo-rail is simpler (one TOML vs Starlark)
 **vs git-filter-repo:** cargo-rail preserves monorepo (non-destructive)
-
----
-
-## Roadmap
-
-### v1.0 (Ready for Release)
-
-- ✅ Split & sync (single and combined modes)
-- ✅ Release automation
-  - Semver checking (cargo-semver-checks)
-  - Conventional commits parsing
-  - Changelog generation (git-cliff)
-  - Topological publishing
-  - Tag management
-- ✅ Complete documentation
-- ✅ CI coverage (6 platforms)
-
-### v1.1+
-
-- Watch mode (`cargo rail watch`)
-- Performance optimizations (parallel sync)
-- Homebrew formula
-- CI templates (GitHub + GitLab)
-
-See [STATUS.md](https://github.com/loadingalias/cargo-rail/blob/main/STATUS.md) for details.
+**vs cargo-workspaces:** cargo-rail adds split/sync
+**vs release-plz:** cargo-rail adds split/sync (use release-plz for releases!)
 
 ---
 
@@ -589,7 +449,6 @@ MIT - see [LICENSE](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE
 
 - Inspired by Google's Copybara and Meta's Sapling
 - Built on [gitoxide](https://github.com/Byron/gitoxide) (pure Rust git)
-- Semver checking via [cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks)
 
 ---
 
@@ -610,8 +469,11 @@ A: cargo-rail never commits directly to monorepo main. All syncs create PR branc
 **Q: Can I sync multiple splits at once?**
 A: Yes: `cargo rail sync --all --apply`
 
+**Q: How do I publish crates?**
+A: Use cargo-release or release-plz. cargo-rail focuses on split/sync only.
+
 **Q: Large monorepos (100+ crates)?**
-A: v1.0 focuses on 5-50 crates. Larger workspaces need performance tuning (v1.2).
+A: Current focus is 5-50 crates. Larger workspaces may need performance tuning.
 
 ---
 

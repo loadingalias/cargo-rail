@@ -59,15 +59,6 @@ pathdiff = "0.2.3"
 # Parallelism and concurrency
 rayon = "1.11.0"
 
-# Release automation
-cargo-semver-checks = "0.45.0"
-git-cliff-core = "2.10.1"
-petgraph = "0.8.3"
-chrono = "0.4.40"
-regex = "1.11.1"
-glob = "0.3.3"
-similar = "2.7.0"
-
 [dev-dependencies]
 tempfile = "3.23.0"
 
