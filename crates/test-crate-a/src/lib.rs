@@ -24,6 +24,11 @@ pub fn fix_a1() -> bool {
 }
 // Update to test-crate-a
 
+// Phase 3 Test 3.2: New feature added in monorepo
+pub fn phase3_feature() -> &'static str {
+  "This is a new feature from Phase 3 testing"
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
