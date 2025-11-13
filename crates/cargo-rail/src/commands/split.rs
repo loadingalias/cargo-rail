@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{self, Write};
 
 use crate::commands::doctor;
 use crate::core::config::RailConfig;
@@ -7,6 +8,18 @@ use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::split::{SplitConfig, Splitter};
 use crate::ui::progress::{FileProgress, MultiProgress};
 use rayon::prelude::*;
+
+/// Prompt user for confirmation
+fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
+  print!("\n{}: ", message);
+  io::stdout().flush()?;
+
+  let mut input = String::new();
+  io::stdin().read_line(&mut input)?;
+
+  // If user just presses Enter (empty line), that's a confirmation
+  Ok(input.trim().is_empty())
+}
 
 /// Run the split command
 pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> RailResult<()> {
@@ -169,6 +182,7 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       for plan in json_plans {
         println!("{}", plan.to_json()?);
       }
+      return Ok(());
     } else {
       // Human-readable plan
       println!("\n🔍 DRY-RUN MODE - No changes will be made");
@@ -193,13 +207,22 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       } else if let Some(ref name) = crate_name {
         println!("   cargo rail split {} --apply", name);
       }
-    }
+      println!();
 
-    return Ok(());
+      // Interactive confirmation
+      if prompt_for_confirmation("Press Enter to apply this plan, or Ctrl+C to cancel")? {
+        // User confirmed, continue to apply logic below
+        println!("\n🚀 APPLY MODE - Executing split operations\n");
+      } else {
+        return Ok(());
+      }
+    }
   }
 
-  // Apply mode - execute the split
-  println!("\n🚀 APPLY MODE - Executing split operations\n");
+  // Apply mode - execute the split (message already printed above or from --apply flag)
+  if apply {
+    println!("\n🚀 APPLY MODE - Executing split operations\n");
+  }
 
   let plan_count = plans.len();
 
