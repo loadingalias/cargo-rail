@@ -1,6 +1,11 @@
 #![allow(dead_code)]
 
 pub mod git;
+pub mod system_git;
+mod system_git_ops;
+
+pub use git::GitBackend;
+pub use system_git::SystemGit;
 
 /// Information about a commit
 #[derive(Debug, Clone)]

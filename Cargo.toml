@@ -9,16 +9,9 @@ description = "Split Rust crates from Cargo workspaces into standalone repos wit
 repository = "https://github.com/loadingalias/cargo-rail"
 homepage = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
-categories = ["command-line-utilities", "development-tools"]
-keywords = ["monorepo", "cargo", "workspace", "git", "split"]
+categories = ["command-line-utilities", "development-tools", "git", "cargo", "monorepo-tools"]
+keywords = ["monorepo", "cargo", "workspace", "git", "split", "sync"]
 readme = "README.md"
-
-[features]
-# Remote integration features (future use)
-github = []
-gitlab = []
-gitea = []
-bitbucket = []
 
 [dependencies]
 # Git operations (pure Rust gitoxide)
@@ -29,7 +22,7 @@ clap = { version = "4.5.51", features = ["derive", "cargo"] }
 anstyle = "1.0.13"
 
 # Workspace introspection
-cargo_metadata = "0.23.0"
+cargo_metadata = "0.23.1"
 
 # Lossless TOML editing (preserves formatting)
 toml_edit = { version = "0.23.7", features = ["serde"] }
