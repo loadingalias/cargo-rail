@@ -39,3 +39,5 @@ pub fn fix_b1() -> bool {
   true
 }
 pub fn sync_feature() -> &'static str { "Synced from monorepo" }
+pub fn from_split_v2() -> &'static str { "Modified in split repo }
+// Split repo change
