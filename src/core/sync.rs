@@ -10,7 +10,7 @@ use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
-use crate::core::vcs::git::GitBackend;
+use crate::core::vcs::SystemGit;
 use crate::ui::progress::FileProgress;
 
 /// Configuration for sync operation
@@ -42,7 +42,7 @@ pub enum SyncDirection {
 pub struct SyncEngine {
   workspace_root: PathBuf,
   config: SyncConfig,
-  mono_git: GitBackend,
+  mono_git: SystemGit,
   mapping_store: MappingStore,
   metadata: WorkspaceMetadata,
   transform: CargoTransform,
@@ -58,7 +58,7 @@ impl SyncEngine {
     security_config: SecurityConfig,
     conflict_strategy: ConflictStrategy,
   ) -> RailResult<Self> {
-    let mono_git = GitBackend::open(&workspace_root)?;
+    let mono_git = SystemGit::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let metadata = WorkspaceMetadata::load(&workspace_root)?;
     let transform = CargoTransform::new(metadata.clone());
@@ -119,7 +119,7 @@ impl SyncEngine {
     self.mapping_store.load(&self.workspace_root)?;
 
     // Open remote repo
-    let remote_git = GitBackend::open(&self.config.target_repo_path)?;
+    let remote_git = SystemGit::open(&self.config.target_repo_path)?;
 
     // Fetch latest from remote (skip for local paths)
     if !self.is_local_remote() {
@@ -246,7 +246,7 @@ impl SyncEngine {
     self.mapping_store.load(&self.workspace_root)?;
 
     // Open remote repo
-    let remote_git = GitBackend::open(&self.config.target_repo_path)?;
+    let remote_git = SystemGit::open(&self.config.target_repo_path)?;
 
     // Fetch latest from remote (skip for local paths)
     if !self.is_local_remote() {
@@ -422,7 +422,7 @@ impl SyncEngine {
     Ok(None)
   }
 
-  fn find_last_synced_remote_commit(&self, remote_git: &GitBackend) -> RailResult<Option<String>> {
+  fn find_last_synced_remote_commit(&self, remote_git: &SystemGit) -> RailResult<Option<String>> {
     // Find the most recent remote commit that has a reverse mapping
     let commits = remote_git.commit_history(Path::new("."), Some(100))?;
     let all_mappings = self.mapping_store.all_mappings();
@@ -440,7 +440,7 @@ impl SyncEngine {
   fn apply_mono_commit_to_remote(
     &self,
     commit: &crate::core::vcs::CommitInfo,
-    remote_git: &GitBackend,
+    remote_git: &SystemGit,
   ) -> RailResult<String> {
     // Get changed files in mono
     let changed_files = self.mono_git.get_changed_files(&commit.sha)?;
@@ -534,7 +534,7 @@ impl SyncEngine {
   fn apply_remote_commit_to_mono(
     &self,
     commit: &crate::core::vcs::CommitInfo,
-    remote_git: &GitBackend,
+    remote_git: &SystemGit,
     resolved_files: &[PathBuf],
   ) -> RailResult<String> {
     // Get changed files in remote
@@ -665,7 +665,7 @@ impl SyncEngine {
   fn resolve_conflicts_for_commit(
     &self,
     remote_commit: &crate::core::vcs::CommitInfo,
-    remote_git: &GitBackend,
+    remote_git: &SystemGit,
   ) -> RailResult<Vec<ConflictInfo>> {
     let mut conflicts = Vec::new();
 
@@ -784,7 +784,7 @@ impl SyncEngine {
   fn check_for_conflicts(
     &self,
     remote_commit: &crate::core::vcs::CommitInfo,
-    remote_git: &GitBackend,
+    remote_git: &SystemGit,
   ) -> RailResult<bool> {
     let conflicts = self.resolve_conflicts_for_commit(remote_commit, remote_git)?;
     Ok(!conflicts.is_empty())
@@ -808,7 +808,7 @@ impl SyncEngine {
   }
 
   fn check_remote_has_changes(&self) -> RailResult<bool> {
-    let remote_git = GitBackend::open(&self.config.target_repo_path)?;
+    let remote_git = SystemGit::open(&self.config.target_repo_path)?;
 
     // Fetch from remote (skip for local paths)
     if !self.is_local_remote() {

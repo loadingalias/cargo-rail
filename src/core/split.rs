@@ -9,7 +9,7 @@ use crate::core::config::{SecurityConfig, SplitMode};
 use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
 use crate::core::vcs::CommitInfo;
-use crate::core::vcs::git::GitBackend;
+use crate::core::vcs::SystemGit;
 
 /// Configuration for a split operation
 pub struct SplitConfig {
@@ -50,7 +50,7 @@ struct CommitParams<'a> {
 /// Extracts crates with full history, ensuring same input = same commit SHAs
 pub struct Splitter {
   workspace_root: PathBuf,
-  git: GitBackend,
+  git: SystemGit,
   transform: CargoTransform,
   security_validator: SecurityValidator,
 }
@@ -58,7 +58,7 @@ pub struct Splitter {
 impl Splitter {
   /// Create a new splitter for a workspace
   pub fn new(workspace_root: PathBuf, security_config: SecurityConfig) -> RailResult<Self> {
-    let git = GitBackend::open(&workspace_root)?;
+    let git = SystemGit::open(&workspace_root)?;
     let metadata = WorkspaceMetadata::load(&workspace_root)?;
     let transform = CargoTransform::new(metadata);
     let security_validator = SecurityValidator::new(security_config);
@@ -453,7 +453,7 @@ impl Splitter {
         self.security_validator.validate_ssh_key()?;
 
         // Open the target repo
-        let target_git = GitBackend::open(&config.target_repo_path)?;
+        let target_git = SystemGit::open(&config.target_repo_path)?;
 
         // Add or update remote
         if !target_git.has_remote("origin")? {
@@ -512,8 +512,12 @@ impl Splitter {
     if !git_dir.exists() {
       println!("   Initializing git repository at {}", target_path.display());
 
-      // Initialize using gix
-      gix::init(target_path)
+      // Initialize using system git with main as default branch
+      std::process::Command::new("git")
+        .arg("init")
+        .arg("--initial-branch=main")
+        .arg(target_path)
+        .output()
         .with_context(|| format!("Failed to initialize git repository at {}", target_path.display()))?;
 
       // Configure git identity from source repository
@@ -728,8 +732,8 @@ mod tests {
   /// git repository may be at the workspace root.
   fn find_git_root() -> PathBuf {
     let current_dir = std::env::current_dir().unwrap();
-    match gix::discover(&current_dir) {
-      Ok(repo) => repo.workdir().unwrap().to_path_buf(),
+    match SystemGit::open(&current_dir) {
+      Ok(git) => git.root().to_path_buf(),
       Err(_) => current_dir,
     }
   }

@@ -14,8 +14,7 @@ keywords = ["monorepo", "cargo", "workspace", "git", "split", "sync"]
 readme = "README.md"
 
 [dependencies]
-# Git operations (pure Rust gitoxide)
-gix = "0.74.1"
+# Git operations via system git (zero dependencies)
 
 # CLI parsing with completions
 clap = { version = "4.5.51", features = ["derive", "cargo"] }

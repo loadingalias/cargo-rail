@@ -17,8 +17,8 @@ impl TestWorkspace {
     let root = TempDir::new()?;
     let path = root.path().to_path_buf();
 
-    // Initialize git repo
-    git(&path, &["init"])?;
+    // Initialize git repo with main as default branch
+    git(&path, &["init", "--initial-branch=main"])?;
     git(&path, &["config", "user.name", "Test User"])?;
     git(&path, &["config", "user.email", "test@example.com"])?;
 

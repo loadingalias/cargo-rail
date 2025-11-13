@@ -197,68 +197,6 @@ impl From<std::string::FromUtf8Error> for RailError {
   }
 }
 
-// Gix (gitoxide) error types
-impl From<gix::open::Error> for RailError {
-  fn from(err: gix::open::Error) -> Self {
-    RailError::message(format!("Git repository error: {}", err))
-  }
-}
-
-impl From<gix::reference::find::existing::Error> for RailError {
-  fn from(err: gix::reference::find::existing::Error) -> Self {
-    RailError::message(format!("Git reference error: {}", err))
-  }
-}
-
-impl From<gix::object::find::existing::Error> for RailError {
-  fn from(err: gix::object::find::existing::Error) -> Self {
-    RailError::message(format!("Git object error: {}", err))
-  }
-}
-
-impl From<gix::object::peel::to_kind::Error> for RailError {
-  fn from(err: gix::object::peel::to_kind::Error) -> Self {
-    RailError::message(format!("Git object peel error: {}", err))
-  }
-}
-
-impl From<gix::traverse::tree::breadthfirst::Error> for RailError {
-  fn from(err: gix::traverse::tree::breadthfirst::Error) -> Self {
-    RailError::message(format!("Git tree traversal error: {}", err))
-  }
-}
-
-impl From<gix::object::commit::Error> for RailError {
-  fn from(err: gix::object::commit::Error) -> Self {
-    RailError::message(format!("Git commit error: {}", err))
-  }
-}
-
-// Additional gix error types for comprehensive coverage
-impl From<gix::object::try_into::Error> for RailError {
-  fn from(err: gix::object::try_into::Error) -> Self {
-    RailError::message(format!("Git object conversion error: {}", err))
-  }
-}
-
-impl From<gix::head::peel::to_commit::Error> for RailError {
-  fn from(err: gix::head::peel::to_commit::Error) -> Self {
-    RailError::message(format!("Git HEAD peel error: {}", err))
-  }
-}
-
-impl From<gix::worktree::open_index::Error> for RailError {
-  fn from(err: gix::worktree::open_index::Error) -> Self {
-    RailError::message(format!("Git worktree index error: {}", err))
-  }
-}
-
-impl From<gix::path::Utf8Error> for RailError {
-  fn from(err: gix::path::Utf8Error) -> Self {
-    RailError::message(format!("Git path UTF-8 error: {}", err))
-  }
-}
-
 impl From<std::path::StripPrefixError> for RailError {
   fn from(err: std::path::StripPrefixError) -> Self {
     RailError::message(format!("Path strip prefix error: {}", err))
@@ -268,12 +206,6 @@ impl From<std::path::StripPrefixError> for RailError {
 impl From<std::env::VarError> for RailError {
   fn from(err: std::env::VarError) -> Self {
     RailError::message(format!("Environment variable error: {}", err))
-  }
-}
-
-impl From<gix::init::Error> for RailError {
-  fn from(err: gix::init::Error) -> Self {
-    RailError::message(format!("Git init error: {}", err))
   }
 }
 
