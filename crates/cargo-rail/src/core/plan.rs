@@ -284,7 +284,8 @@ impl Plan {
     }
 
     if self.metadata.is_destructive {
-      output.push_str("\n⚠️  WARNING: This plan includes destructive operations\n");
+      output.push_str("\n⚠️  NOTE: This operation will modify the target repository\n");
+      output.push_str("   (Pushes to remote - ensure target is empty or has been backed up)\n");
     }
 
     if let Some(duration) = self.metadata.estimated_duration {
