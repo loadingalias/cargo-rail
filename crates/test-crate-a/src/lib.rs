@@ -30,3 +30,4 @@ mod tests {
   }
 }
 pub fn feature_a1() -> &'static str { "Feature A1" }
+pub fn fix_a1() -> bool { false }
