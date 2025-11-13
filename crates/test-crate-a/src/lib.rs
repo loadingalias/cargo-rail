@@ -29,6 +29,11 @@ pub fn phase3_feature() -> &'static str {
   "This is a new feature from Phase 3 testing"
 }
 
+// Phase 3 Test 3.3: New feature added in split repo
+pub fn split_repo_feature() -> &'static str {
+  "This change originates from the split repo"
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
