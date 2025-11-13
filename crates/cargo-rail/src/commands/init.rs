@@ -100,6 +100,7 @@ pub fn run_init(all: bool) -> RailResult<()> {
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(), // Standalone by default
+      publish: true, // Default to publishable
       paths: vec![CratePath { path: package_path }],
       include: include_patterns,
       exclude: vec![],

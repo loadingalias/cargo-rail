@@ -14,12 +14,13 @@ use crate::commands::release::graph::CrateGraph;
 use crate::commands::release::semver::BumpType;
 use crate::commands::release::semver_check;
 use crate::commands::release::tags;
+use crate::core::config::RailConfig;
 use crate::core::error::RailResult;
 use crate::ui::progress::MultiProgress;
 use cargo_metadata::MetadataCommand;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 /// A release plan for a single crate
@@ -101,8 +102,31 @@ pub fn generate_release_plan(show_progress: bool) -> RailResult<ReleasePlan> {
   let metadata = load_workspace_metadata()?;
   let workspace_root = metadata.workspace_root.as_std_path();
 
+  // Try to load rail config to check publish settings (optional - may not exist for standalone repos)
+  let publishable_crates: HashSet<String> = match RailConfig::load(workspace_root) {
+    Ok(config) => {
+      // Build set of crate names that have publish=true (or default true)
+      config
+        .splits
+        .iter()
+        .filter(|split| split.publish)
+        .map(|split| split.name.clone())
+        .collect()
+    }
+    Err(_) => {
+      // No config found - treat all crates as publishable (standalone repo mode)
+      HashSet::new()
+    }
+  };
+
   // Build dependency graph for publish ordering (workspace packages only)
-  let workspace_pkgs: Vec<_> = metadata.workspace_packages().iter().cloned().cloned().collect();
+  let mut workspace_pkgs: Vec<_> = metadata.workspace_packages().iter().cloned().cloned().collect();
+
+  // Filter to publishable crates if config exists
+  if !publishable_crates.is_empty() {
+    workspace_pkgs.retain(|pkg| publishable_crates.contains(&pkg.name.to_string()));
+  }
+
   let graph = CrateGraph::from_workspace(&workspace_pkgs)?;
   let publish_order = graph.topological_order()?;
 

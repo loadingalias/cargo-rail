@@ -73,12 +73,19 @@ pub struct SplitConfig {
   /// For combined mode: how to structure the split repo
   #[serde(default)]
   pub workspace_mode: WorkspaceMode,
+  /// Whether this crate should be included in release plans (default: true)
+  #[serde(default = "default_publish")]
+  pub publish: bool,
   #[serde(default)]
   pub paths: Vec<CratePath>,
   #[serde(default)]
   pub include: Vec<String>,
   #[serde(default)]
   pub exclude: Vec<String>,
+}
+
+fn default_publish() -> bool {
+  true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
