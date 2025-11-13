@@ -17,7 +17,7 @@ pub fn from_remote() {
   println!("This change came from the split repo");
 }
 pub fn feature_a1() -> &'static str {
-  "Feature A1"
+  "Feature A1 - MONOREPO VERSION"
 }
 pub fn fix_a1() -> bool {
   false
