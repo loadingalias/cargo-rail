@@ -22,9 +22,14 @@ AGENTS.md
 *.pem
 *.key
 
+# Cargo-Rail (Testing)
+rail.toml
 # Notes
-TESTING_PLAN.md
 STATUS.md
+E2E_TESTING_SETUP.md
+CLEAN.md
+
+# Documentation
 docs/RELEASE_GUIDE.md
 docs/SECURITY.md
 docs/USER_GUIDE.md

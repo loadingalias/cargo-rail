@@ -93,7 +93,7 @@ pub enum SplitMode {
 
 impl RailConfig {
   /// Find config file in search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
-  fn find_config_path(path: &Path) -> Option<PathBuf> {
+  pub fn find_config_path(path: &Path) -> Option<PathBuf> {
     let candidates = vec![
       path.join("rail.toml"),
       path.join(".rail.toml"),

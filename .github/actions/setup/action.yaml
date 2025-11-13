@@ -34,6 +34,16 @@ runs:
       with:
         tool: cargo-audit
 
+    - name: Install cargo-semver-checks
+      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      with:
+        tool: cargo-semver-checks
+
+    - name: Install git-cliff
+      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      with:
+        tool: git-cliff
+
     - name: Install Rust Nightly Toolchain
       uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd41383119e8b1b35921  # master
       with:

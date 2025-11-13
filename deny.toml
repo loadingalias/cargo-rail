@@ -1,5 +1,4 @@
 [graph]
-# Target Coverage for Rail Substrate
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
@@ -11,7 +10,7 @@ targets = [
 [advisories]
 yanked = "warn"
 
-# Ignore unmaintained advisories for transitive dependencies we cannot easily control
+# Ignore unmaintained advisories for transitive dependencies we cannot easily control - TODO: Remove this once we have a better solution
 ignore = [
   "RUSTSEC-2024-0370", # proc-macro-error (via git-cliff-core → rust-embed → include-flate)
 ]
