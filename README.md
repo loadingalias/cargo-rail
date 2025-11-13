@@ -155,12 +155,14 @@ cargo rail sync my-oss-lib --apply
 ### Publishing
 
 **Option 1: Monorepo-only crates** (20 crates)
+
 ```bash
 cd monorepo/
 cargo release --workspace  # or release-plz
 ```
 
 **Option 2: Split crates** (5 crates)
+
 ```bash
 # Ensure synced
 cargo rail sync my-oss-lib --apply
@@ -366,6 +368,7 @@ jobs:
 cargo-rail focuses on split/sync. Use existing tools for releases:
 
 **Recommended:**
+
 - [cargo-release](https://github.com/crate-ci/cargo-release) - Simple, battle-tested
 - [release-plz](https://github.com/MarcoIeni/release-plz) - Automated releases from CI
 - [git-cliff](https://github.com/orhun/git-cliff) - Changelog generation
