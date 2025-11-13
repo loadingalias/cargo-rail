@@ -29,3 +29,4 @@ mod tests {
     assert!(msg.contains("Hello from crate B"));
   }
 }
+pub fn feature_a1() -> &'static str { "Feature A1" }
