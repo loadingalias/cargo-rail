@@ -62,7 +62,7 @@ enum Commands {
     #[arg(long)]
     to_remote: bool,
     /// Conflict resolution strategy: ours (use monorepo), theirs (use remote), manual (create markers), union (combine both)
-    #[arg(long, default_value = "manual")]
+    #[arg(long, visible_alias = "conflict", default_value = "manual")]
     strategy: String,
     /// Actually perform the sync (default: dry-run mode showing plan)
     #[arg(long)]
