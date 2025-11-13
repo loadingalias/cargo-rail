@@ -70,6 +70,9 @@ pub struct SplitConfig {
   pub remote: String,
   pub branch: String,
   pub mode: SplitMode,
+  /// For combined mode: how to structure the split repo
+  #[serde(default)]
+  pub workspace_mode: WorkspaceMode,
   #[serde(default)]
   pub paths: Vec<CratePath>,
   #[serde(default)]
@@ -84,11 +87,23 @@ pub struct CratePath {
   pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitMode {
+  #[default]
   Single,
   Combined,
+}
+
+/// How to structure a combined split repository
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+  /// Multiple standalone crates in one repo (no workspace structure)
+  #[default]
+  Standalone,
+  /// Workspace structure with root Cargo.toml (mirrors monorepo)
+  Workspace,
 }
 
 impl RailConfig {
