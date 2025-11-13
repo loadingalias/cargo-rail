@@ -216,7 +216,7 @@ fn print_status_table(statuses: &[CrateStatus]) {
 
   // Header
   println!("{:<20} {:<12} {:<20} {:<10} REMOTE", "CRATE", "SPLIT", "SYNC", "DIRTY");
-  println!("{:-<80}", "");
+  println!("{:-<120}", "");
 
   for status in statuses {
     let split_str = match status.split_status {
@@ -235,9 +235,12 @@ fn print_status_table(statuses: &[CrateStatus]) {
 
     let dirty_str = if status.dirty { "yes" } else { "no" };
 
-    // Truncate remote URL for display
-    let remote_display = if status.remote.len() > 35 {
-      format!("{}...", &status.remote[..32])
+    // Intelligently truncate remote URL for display (preserve end which has repo name)
+    let remote_display = if status.remote.len() > 75 {
+      // Truncate from middle to preserve repo name at end
+      let start = &status.remote[..35];
+      let end = &status.remote[status.remote.len().saturating_sub(35)..];
+      format!("{}...{}", start, end)
     } else {
       status.remote.clone()
     };

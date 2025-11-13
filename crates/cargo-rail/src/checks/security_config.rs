@@ -18,6 +18,9 @@ impl Check for SecurityConfigCheck {
   }
 
   fn run(&self, ctx: &CheckContext) -> RailResult<CheckResult> {
+    // Detect actual config file location
+    let config_path = RailConfig::find_config_path(&ctx.workspace_root);
+
     // Try to load configuration
     let config = match RailConfig::load(&ctx.workspace_root) {
       Ok(c) => c,
@@ -109,11 +112,15 @@ impl Check for SecurityConfigCheck {
     if warnings.is_empty() {
       Ok(CheckResult::pass(self.name(), message))
     } else {
-      Ok(CheckResult::warning(
-        self.name(),
-        message,
-        Some("Review security settings in .rail/config.toml"),
-      ))
+      // Use actual config path in suggestion
+      let suggestion = if let Some(path) = config_path {
+        let relative_path = path.strip_prefix(&ctx.workspace_root).unwrap_or(&path);
+        format!("Review security settings in {}", relative_path.display())
+      } else {
+        "Review security settings in rail.toml".to_string()
+      };
+
+      Ok(CheckResult::warning(self.name(), message, Some(&suggestion)))
     }
   }
 

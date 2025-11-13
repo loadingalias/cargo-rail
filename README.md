@@ -502,7 +502,7 @@ jobs:
 - [USER_GUIDE.md](docs/USER_GUIDE.md) - Complete walkthrough
 - [SECURITY.md](docs/SECURITY.md) - Threat model and mitigations
 - [RELEASE_GUIDE.md](docs/RELEASE_GUIDE.md) - Release workflow
-- [TESTING_PLAN.md](TESTING_PLAN.md) - Manual testing checklist
+- [E2E_TESTING_SETUP.md](E2E_TESTING_SETUP.md) - End-to-end testing guide
 - [STATUS.md](STATUS.md) - Development status
 
 ---
