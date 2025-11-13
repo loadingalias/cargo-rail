@@ -2,7 +2,7 @@
 use test_crate_b::hello_from_b;
 
 pub fn hello() -> String {
-  format!("Hello from crate A! {}", hello_from_b())
+  format!("Hello from crate A (MONOREPO EDIT)! {}", hello_from_b())
 }
 // New comment from monorepo test
 // Mono change 2
