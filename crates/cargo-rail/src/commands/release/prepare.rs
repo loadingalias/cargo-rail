@@ -126,6 +126,33 @@ pub fn run_release_prepare(crate_name: Option<&str>, apply: bool, no_changelog: 
     println!();
   }
 
+  // Update workspace dependencies (only in multi-crate workspaces)
+  if !plan.crates.is_empty() && is_multi_crate_workspace(&metadata) {
+    let workspace_toml_path = workspace_root.join("Cargo.toml");
+    if workspace_toml_path.exists() {
+      // Build version map
+      let version_map: HashMap<String, String> = plan
+        .crates
+        .iter()
+        .map(|c| (c.name.clone(), c.next_version.clone()))
+        .collect();
+
+      let (old_workspace, new_workspace) = update_workspace_dependencies(&workspace_toml_path, &version_map)?;
+
+      if old_workspace != new_workspace {
+        println!("📌 Updating workspace dependencies");
+        if apply {
+          fs::write(&workspace_toml_path, &new_workspace)
+            .map_err(|e| anyhow::anyhow!("Failed to write workspace Cargo.toml: {}", e))?;
+          println!("   ✅ Updated workspace Cargo.toml");
+        } else {
+          show_diff("Cargo.toml (workspace)", &old_workspace, &new_workspace);
+        }
+        println!();
+      }
+    }
+  }
+
   // Summary
   if !apply {
     println!("💡 This was a dry-run. Use --apply to make these changes.");
@@ -152,6 +179,11 @@ fn load_workspace_metadata() -> RailResult<cargo_metadata::Metadata> {
       e
     )
   })?)
+}
+
+/// Check if we're in a multi-crate workspace (vs standalone crate)
+fn is_multi_crate_workspace(metadata: &cargo_metadata::Metadata) -> bool {
+  metadata.workspace_members.len() > 1
 }
 
 /// Bump version in a Cargo.toml file
@@ -205,6 +237,41 @@ fn show_diff(filename: &str, old: &str, new: &str) {
   }
 
   println!();
+}
+
+/// Update workspace dependencies in the root Cargo.toml
+fn update_workspace_dependencies(path: &Path, version_map: &HashMap<String, String>) -> RailResult<(String, String)> {
+  let old_content =
+    fs::read_to_string(path).map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
+
+  let mut doc = old_content
+    .parse::<DocumentMut>()
+    .map_err(|e| anyhow::anyhow!("Failed to parse TOML: {}", e))?;
+
+  // Update workspace.dependencies
+  if let Some(workspace) = doc.get_mut("workspace") &&
+     let Some(workspace_table) = workspace.as_table_mut() &&
+     let Some(dependencies) = workspace_table.get_mut("dependencies") &&
+     let Some(deps_table) = dependencies.as_table_mut()
+  {
+    for (crate_name, new_version) in version_map {
+      if let Some(dep) = deps_table.get_mut(crate_name) {
+        // Handle both inline table and table format
+        if let Some(dep_table) = dep.as_inline_table_mut() {
+          if dep_table.contains_key("version") {
+            dep_table.insert("version", new_version.clone().into());
+          }
+        } else if let Some(dep_table) = dep.as_table_mut() {
+          if dep_table.contains_key("version") {
+            dep_table["version"] = toml_edit::value(new_version);
+          }
+        }
+      }
+    }
+  }
+
+  let new_content = doc.to_string();
+  Ok((old_content, new_content))
 }
 
 // Note: Version bumping logic is tested in src/commands/release/semver.rs
