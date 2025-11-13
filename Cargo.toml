@@ -1,22 +1,59 @@
-[workspace]
-members = [
-  "crates/cargo-rail",
-  "crates/test-crate-a",
-  "crates/test-crate-b",
-]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "cargo-rail"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 authors = ["loadingalias"]
+description = "Split Rust crates from Cargo workspaces into standalone repos with bidirectional sync"
+repository = "https://github.com/loadingalias/cargo-rail"
+homepage = "https://github.com/loadingalias/cargo-rail"
+documentation = "https://docs.rs/cargo-rail"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["monorepo", "cargo", "workspace", "git", "split"]
+readme = "README.md"
 
-[workspace.dependencies]
-# Shared dependencies
+[features]
+# Remote integration features (future use)
+github = []
+gitlab = []
+gitea = []
+bitbucket = []
+
+[dependencies]
+# Git operations (pure Rust gitoxide)
+gix = "0.74.1"
+
+# CLI parsing with completions
+clap = { version = "4.5.51", features = ["derive", "cargo"] }
+anstyle = "1.0.13"
+
+# Workspace introspection
+cargo_metadata = "0.23.0"
+
+# Lossless TOML editing (preserves formatting)
+toml_edit = { version = "0.23.7", features = ["serde"] }
+
+# Error handling
 anyhow = "1.0.100"
-serde = { version = "1.0.228", features = ["derive"] }
 
-# Test crate dependencies
-test-crate-a = { path = "crates/test-crate-a", version = "0.1.0" }
-test-crate-b = { path = "crates/test-crate-b", version = "0.1.0" }
+# Serialization for config
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+semver = "1.0.27"
+
+# Cryptographic hashing for plan IDs
+sha2 = "0.10.9"
+
+# Progress indicators (allocation-free, concurrency-optimized)
+linya = "0.3.1"
+
+# Parallelism and concurrency
+rayon = "1.11.0"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"

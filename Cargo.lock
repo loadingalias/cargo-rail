@@ -157,7 +157,6 @@ dependencies = [
  "clap",
  "gix",
  "linya",
- "pathdiff",
  "rayon",
  "semver",
  "serde",
@@ -1735,12 +1734,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2096,21 +2089,6 @@ checksum = "21bebf2b7c9e0a515f6e0f8c51dc0f8e4696391e6f1ff30379559f8365fb0df7"
 dependencies = [
  "rustix 0.38.44",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "test-crate-a"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "test-crate-b",
-]
-
-[[package]]
-name = "test-crate-b"
-version = "0.1.0"
-dependencies = [
- "anyhow",
 ]
 
 [[package]]
