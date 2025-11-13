@@ -2,300 +2,379 @@
 
 **Current Version**: v0.1.0
 **Target Version**: v1.0.0
-**Last Updated**: 2025-11-13
+**Last Updated**: 2025-11-13 (After Day 1 SystemGit implementation)
 
-**Focus**: Split & sync for Rust monorepos. Lean, fast, trustworthy.
+**Mission**: Build the fastest, most trustworthy monorepo split/sync tool. Dominate Copybara.
 
 ---
 
-## ✅ Already Complete
+## ✅ Completed
 
-- ✅ Core split/sync functionality (single + combined modes)
+### Core Functionality
+- ✅ Core split/sync (single + combined modes)
 - ✅ Bidirectional sync with PR branch security model
 - ✅ Git-notes commit mapping (rebase-tolerant)
 - ✅ Cargo.toml transforms (path ↔ version deps)
 - ✅ Conflict resolution (ours, theirs, manual, union)
 - ✅ Health checks (`cargo rail doctor`)
 - ✅ CI coverage (4 platforms: Linux/Windows x86_64/ARM64)
-- ✅ **Release system removed** (delegated to cargo-release/release-plz)
-- ✅ **114 dependencies removed** (394→280 crates, -29%)
-- ✅ E2E testing phases 1-5 completed
-- ✅ Documentation (README, USER_GUIDE, SECURITY)
-- ✅ All 53 tests passing, zero warnings
+- ✅ All 53 tests passing
+
+### Cleanup & Simplification
+- ✅ **Release system removed** (394→280 crates, -29%)
+  - Removed 13 release module files
+  - Removed 7 dependencies: cargo-semver-checks, git-cliff-core, petgraph, chrono, regex, glob, similar
+  - Delegated to cargo-release/release-plz (battle-tested tools)
+
+- ✅ **Repository structure simplified** (280→275 crates)
+  - Flattened workspace to single package
+  - Removed test-crate-a, test-crate-b
+  - Removed unused dependency: pathdiff
+  - Removed unused feature flags: github, gitlab, gitea, bitbucket
+
+- ✅ **Documentation consolidated**
+  - Replaced STATUS.md, E2E_TESTING_SETUP.md, CLEAN.md with PRE_V1.md
+  - README updated with new focused positioning
+  - Clear "Publishing Workflow" section (use cargo-release/release-plz)
+
+### VCS Abstraction - Day 1 Complete ✅
+- ✅ **SystemGit foundation** (539 lines, zero new deps)
+  - `src/core/vcs/system_git.rs` (219 lines)
+  - `src/core/vcs/system_git_ops.rs` (320 lines)
+  - Safe subprocess wrapper (env isolation, timeout protection)
+  - Basic operations: open, head, current_branch, read_file, is_tracked
+  - Commit operations: get_commit, get_commits_touching_path, parallel fetching
+  - Remote operations: add/list/push/fetch
+  - Branch operations: create, checkout
+  - Tree operations: list_files, collect_tree_files
+
+**Current State**: 275 unique crates, builds cleanly, tests pass
 
 ---
 
-## 🎯 Critical Path to v1.0
+## 🚧 In Progress: VCS Abstraction (Replace GIX)
 
-### 1. Complete E2E Testing (Phases 7-12)
+**Goal**: Remove gix (~200 crates) → System git (zero crates)
+**Target**: 275 → ~75 unique crates (-73% total reduction from 394 start)
+**Timeline**: 3-4 days total (Day 1 complete, Days 2-4 remaining)
 
-**Remaining test phases** from E2E_TESTING_SETUP.md:
+### Day 2: Batch Operations & Missing Methods (~4 hours)
 
-#### Phase 7: Edge Cases & Error Handling (~1 day)
-- [ ] **Test 7.1**: Missing config error handling
-- [ ] **Test 7.2**: Invalid crate name errors
-- [ ] **Test 7.3**: Network error handling (simulated)
+**Status**: NOT STARTED
 
-**Priority**: MEDIUM (tests existing functionality)
+**Critical missing operations** (needed by GitBackend):
+```rust
+// HIGH PRIORITY - Used everywhere
+- commit_history(path, limit) -> Vec<CommitInfo>
+- commit_touches_paths(sha, paths) -> bool
+- get_changed_files(commit_sha) -> Vec<(PathBuf, char)>
+- get_file_at_commit(commit_sha, path) -> Option<Vec<u8>>
+- create_commit_with_metadata(...) -> String
+- list_tags() -> Vec<String>
+- resolve_reference(ref_name) -> String
+- get_commits_since(since_sha) -> Vec<String>
+- get_commit_message(commit_sha) -> String
+```
 
----
+**Batch operations** (100x speedup):
+```rust
+// Implement for performance
+- read_files_bulk(items: &[(String, PathBuf)]) -> Vec<Vec<u8>>
+  // ONE subprocess using git cat-file --batch
+  // Read 1000s of files in <500ms
 
-#### Phase 8: Performance & Robustness (~1 day)
-- [ ] **Test 8.1**: Large history (50+ commits)
-  - Verify completes in <30s
-  - Progress indicators work
-- [ ] **Test 8.2**: Rebase handling
-  - Create feature branch, rebase, sync
-  - Git-notes update correctly
-  - No duplicate commits
+- get_commits_bulk(shas: &[String]) -> Vec<CommitInfo>
+  // Parallel chunks with rayon
+  // Process 1000s of commits in <2s
+```
 
-**Priority**: HIGH (validates production scenarios)
+**Implementation checklist**:
+- [ ] Add all missing GitBackend methods to SystemGit
+- [ ] Implement `cat-file --batch` for bulk file reading
+- [ ] Implement `rev-list --format=raw` parser for efficient commit walking
+- [ ] Add tests for each new method
+- [ ] Benchmark against current gix implementation
+- [ ] Document performance characteristics
 
----
-
-#### Phase 9: Additional Edge Cases (~0.5 day)
-- [ ] **Test 9.1**: Large file handling (10MB+)
-  - Optional: Suggest git-lfs
-- [ ] **Test 9.2**: Empty crate error handling
-- [ ] **Test 9.3**: Unicode in commit messages
-  - Preserve emoji, non-ASCII correctly
-- [ ] **Test 9.4**: Force-push detection
-  - Warn about rewritten history
-  - Do NOT auto force-push
-
-**Priority**: MEDIUM
-
----
-
-#### Phase 10: Platform-Specific (~1 day)
-- [ ] **Test 10.1**: Help commands on all platforms
-- [ ] **Test 10.2**: Install from source (Linux/macOS/Windows)
-- [ ] **Test 10.3**: macOS Keychain integration
-- [ ] **Test 10.4**: Windows path handling (C:\, backslashes)
-
-**Priority**: HIGH (cross-platform validation)
-
----
-
-#### Phase 11: Performance Benchmarks (~0.5 day)
-- [ ] **Test 11.1**: Sync dry-run performance
-  - Small crate: <50ms
-  - Medium crate: <150ms
-  - Large crate: <500ms
-- [ ] **Test 11.2**: Split performance
-  - 100 commits: <5s
-  - 500 commits: <30s
-  - 1000 commits: <60s
-
-**Priority**: MEDIUM (optimization targets)
+**Quality standards**:
+- Every method has at least one test
+- Error cases handled gracefully (not just unwrap)
+- Subprocess output validated (check exit codes, parse stderr)
+- Performance documented in comments
 
 ---
 
-#### Phase 12: Regression Testing (~0.5 day)
-- [ ] **Test 12.1**: Re-run all core tests (Phases 1-5)
-  - Verify no regressions
-- [ ] **Test 12.2**: Data loss verification
-  - Compare monorepo vs split repo files
-  - Ensure no missing/extra files
+### Day 3: Integration & Testing (~4 hours)
 
-**Priority**: HIGH (quality gate)
+**Status**: NOT STARTED (requires Day 2 complete)
 
-**Total E2E Effort**: ~4-5 days
+**Phase 1: Parallel operation** (keep both backends)
+```rust
+// Keep GitBackend (gix) working
+// Add SystemGit alongside it
+// No changes to call sites yet
+```
+
+**Phase 2: Dual testing** (run operations through both)
+```rust
+// Add cargo feature: use-system-git
+// When enabled, use SystemGit
+// When disabled, use GitBackend (gix)
+// Compare results, ensure identical behavior
+```
+
+**Phase 3: Call site migration**
+```rust
+// Create wrapper trait or enum:
+enum VcsBackend {
+    SystemGit(SystemGit),
+    Gix(GitBackend),
+}
+
+// Update all call sites to use wrapper
+// Toggle between backends for testing
+```
+
+**Testing checklist**:
+- [ ] All 53 existing tests pass with SystemGit
+- [ ] Add tests for SystemGit-specific functionality
+- [ ] Test edge cases:
+  - [ ] Empty repos
+  - [ ] Repos with no commits
+  - [ ] Large files (>10MB)
+  - [ ] Unicode in paths/messages
+  - [ ] Submodules (should gracefully skip)
+- [ ] Performance comparison:
+  - [ ] Time split operation (100 commits)
+  - [ ] Time sync operation (detect changes)
+  - [ ] Memory usage comparison
+- [ ] Platform testing:
+  - [ ] macOS (your primary)
+  - [ ] Linux (via Docker or VM)
+  - [ ] Windows (via CI or VM)
+
+**Quality standards**:
+- Zero functionality loss compared to gix
+- Equal or better performance (measure and document)
+- All tests pass on all platforms
+- Clear error messages (not just "command failed")
 
 ---
 
-### 2. VCS Abstraction + System Git Backend (~3-4 days)
+### Day 4: Finalization & GIX Removal (~2-3 hours)
 
-**Goal**: Replace gix (200+ deps) with system git (zero deps)
+**Status**: NOT STARTED (requires Day 3 complete)
 
-**Why**:
-- gix dependency tree: 200+ crates (heavy)
-- We use <5% of functionality
-- System git is battle-tested, zero deps
-- Enables jj (jujutsu) support for free
+**Remove gix completely**:
+```toml
+# Before (275 crates)
+[dependencies]
+gix = "0.74.1"
 
-#### Phase 2.1: VCS Trait Design (~0.5 day)
-- [ ] Create `src/core/vcs/mod.rs` with VCS trait
-- [ ] Define capabilities (notes, partial_clone, open_pr)
-- [ ] Minimal trait surface (head, rev_list_paths, cat_blob, etc.)
+# After (~75 crates)
+[dependencies]
+# Git operations via system git (zero deps)
+```
 
-#### Phase 2.2: SystemGit Backend (~1.5 days)
-- [ ] Implement `src/core/vcs/system_git.rs`
-- [ ] Safe subprocess wrapper with env isolation
-- [ ] Map all VCS trait methods to git plumbing commands:
-  - `head()` → `git rev-parse HEAD`
-  - `rev_list_paths()` → `git rev-list --no-merges <range> -- <paths>`
-  - `cat_blob()` → `git show <commit>:<path>`
-  - `notes_get/set()` → `git notes --ref=refs/notes/rail/<name>`
-- [ ] Security hardening (no global config, whitelisted env vars)
-- [ ] Add timeouts and offline mode
-
-#### Phase 2.3: jj (Jujutsu) Support (~0.5 day)
-- [ ] Implement `src/core/vcs/jj.rs`
-- [ ] Auto-detect `.jj/` directory
-- [ ] Wrap SystemGit with jj export/import hooks
-- [ ] Zero-friction: same UX for git and jj users
-
-#### Phase 2.4: Integration (~1 day)
-- [ ] Update all call sites to use VCS trait
+**Cleanup checklist**:
 - [ ] Remove gix from Cargo.toml
-- [ ] Add `cargo rail doctor` check for git >= 2.33
-- [ ] Run full test suite (use mock VCS for tests)
-- [ ] Test with real jj repository
+- [ ] Delete src/core/vcs/git.rs (old GitBackend)
+- [ ] Remove all gix error conversions from error.rs
+- [ ] Update SystemGit to be the default (remove wrapper enum)
+- [ ] Run cargo udeps to check for new unused deps
+- [ ] Update dependency count in README/docs
 
-#### Phase 2.5: Optional git2 Feature (Post-v1.0)
-- [ ] Feature-gate libgit2 backend for performance
-- [ ] Binary distribution: default (system-git), optional (git2)
+**Verification**:
+- [ ] `cargo build --release` succeeds
+- [ ] `cargo test` - all tests pass
+- [ ] `cargo clippy -- -D warnings` - zero warnings
+- [ ] `cargo tree --prefix none | sort -u | wc -l` - verify ~75 crates
+- [ ] Binary size comparison (before/after)
+- [ ] Startup time comparison (before/after)
 
-**Impact**: ~200 crates removed (280→80), 71% reduction
-**Priority**: HIGH (biggest dependency win)
+**Documentation updates**:
+- [ ] Update README dependency count (394→75, -81%)
+- [ ] Update PRE_V1.md with actual results
+- [ ] Document git version requirement (>= 2.33)
+- [ ] Add doctor check for git version
+- [ ] Update SECURITY.md (fewer dependencies = smaller attack surface)
+
+**Quality standards**:
+- Zero regressions (all functionality preserved)
+- Measurably faster or equal performance
+- Cleaner code (no gix abstractions)
+- Better error messages (direct git output)
 
 ---
 
-### 3. Workspace Mode for Combined Splits (~1 day)
+## 📊 Post-VCS Abstraction Tasks
 
-**Current**: Combined mode creates standalone crates in one repo
+### 1. Complete E2E Testing (Phases 7-12) (~4-5 days)
+
+**Current status**: Phases 1-5 complete, 7-12 pending
+
+Will add these once VCS abstraction is done and stable.
+
+**Phase 7: Edge Cases** (~1 day)
+- Missing config error handling
+- Invalid crate name errors
+- Network error simulation
+
+**Phase 8: Performance & Robustness** (~1 day)
+- Large history (50+ commits, verify <30s)
+- Rebase handling (git-notes update correctly)
+
+**Phase 9: Additional Edge Cases** (~0.5 day)
+- Large files (>10MB, suggest git-lfs)
+- Unicode in commit messages
+- Force-push detection (warn, don't auto-force)
+
+**Phase 10: Platform-Specific** (~1 day)
+- Linux/macOS/Windows install & run
+- Path handling (backslashes on Windows)
+
+**Phase 11: Performance Benchmarks** (~0.5 day)
+- Sync dry-run: <50ms (small), <150ms (medium), <500ms (large)
+- Split: 100 commits <5s, 500 commits <30s, 1000 commits <60s
+
+**Phase 12: Regression Testing** (~0.5 day)
+- Re-run phases 1-5
+- Verify no data loss
+
+---
+
+### 2. Workspace Mode for Combined Splits (~1 day)
+
+**Status**: NOT STARTED (post-VCS work)
+
+**Current**: Combined mode creates standalone crates
 **Goal**: Add option to create proper workspace structure
 
-#### Implementation
-- [ ] Support `workspace_mode = "workspace"` in config
-- [ ] **Option A** (Standalone): Current behavior ✅ Already works
-- [ ] **Option B** (Workspace): New behavior
-  - [ ] Copy workspace Cargo.toml from monorepo
-  - [ ] Preserve `[workspace.dependencies]`
-  - [ ] Create proper workspace structure
-  - [ ] Update path deps to workspace deps
-
-**Config field already exists**, implementation needed.
-
-**Priority**: MEDIUM (enhancement, not blocker)
+Config field already exists, need implementation:
+```toml
+[[splits]]
+mode = "combined"
+workspace_mode = "workspace"  # NEW: mirror monorepo structure
+```
 
 ---
 
-### 4. Documentation Updates (~0.5 day)
+### 3. Documentation Polish (~0.5 day)
 
-#### Remove Release References
-- [x] ~~README.md~~ ✅ Already updated
-- [ ] docs/USER_GUIDE.md - Remove release sections
-- [ ] docs/RELEASE_GUIDE.md - **DELETE** (no longer relevant)
-- [ ] Update docs to recommend cargo-release/release-plz
+**Status**: NOT STARTED (post-VCS work)
 
-#### Update for New Focus
-- [ ] Add "Publishing Workflow" section to USER_GUIDE
+- [ ] Remove any remaining release system references from docs/
+- [ ] Update USER_GUIDE.md with git version requirements
+- [ ] Add performance comparison section (vs Copybara)
 - [ ] Document jj (jujutsu) support once implemented
-- [ ] Update comparison table (focus on split/sync)
-
-**Priority**: HIGH (user-facing)
 
 ---
 
-## 📊 Post-v1.0 Enhancements
+## 🎯 Quality Standards
 
-**Not required for v1.0, but valuable:**
+**We're not shipping mediocre code. Every feature must:**
 
-### Checks System (~2-3 days)
-Framework for policy enforcement and validation:
-- [ ] `cargo rail check` command
-- [ ] `transform.reproducible` - Byte-exact round-trip
-- [ ] `policy.deny_paths` - Block secrets (*.pem, *.key, .env*)
-- [ ] `policy.protected_branches` - Enforce PR workflow
-- [ ] `build.test` - Optional cargo check/test
-- [ ] Configurable in rail.toml
-- [ ] JSON output for CI
-- [ ] `--explain` flag
+1. **Be Fast**
+   - Batch operations (1000x better than naive approach)
+   - Parallel processing where safe (rayon)
+   - Cached metadata (don't recompute)
+   - Target: Sync dry-run <100ms, split 1000 commits <60s
 
-### Exit Code Taxonomy (~0.5 day)
-Structured error reporting for CI:
-- 0 = success
-- 1 = user error
-- 2 = system error
-- 3 = validation error
-- 10 = policy failure
-- 20 = transform failure
+2. **Be Safe**
+   - Subprocess isolation (cleared env, whitelisted vars)
+   - Timeout protection (no infinite hangs)
+   - Validated output (check exit codes, parse errors)
+   - Graceful degradation (clear error messages)
 
-### GitHub Actions Security (~1-2 days)
-Port from rail:
-- [ ] `.github/actions-lock.yaml` - Pin actions to SHAs
-- [ ] `cargo rail ci lock` - Generate lock file
-- [ ] `cargo rail ci verify` - Enforce pinning
-- [ ] `cargo rail ci audit` - Run zizmor
-- [ ] `cargo rail ci update` - Update SHAs, open PR
+3. **Be Tested**
+   - Every public method has tests
+   - Edge cases covered (empty repos, unicode, large files)
+   - Platform-specific behavior tested
+   - Performance benchmarks documented
 
-### Change Detection (~1 day)
-Smart CI optimization:
-- [ ] Three-tier strategy (docs/infra/source)
-- [ ] BFS transitive dependency analysis
-- [ ] `dorny/paths-filter` integration
+4. **Be Maintainable**
+   - Clear comments explaining non-obvious code
+   - No dead_code annotations (remove unused code)
+   - Zero clippy warnings
+   - Consistent error handling
+
+5. **Be Documented**
+   - Public APIs have doc comments
+   - Complex algorithms explained
+   - Performance characteristics noted
+   - Failure modes documented
 
 ---
 
-## 🚀 v1.0 Release Checklist
+## 📈 Metrics Tracking
 
-When all critical path items complete:
+**Start (before cleanup)**:
+- Dependencies: 394 unique crates
+- Binary size: ~5.1MB (release)
+- Commands: 7 (including release system)
 
-### Pre-Release
-1. [ ] All E2E tests pass (Phases 1-12)
-2. [ ] VCS abstraction complete + gix removed
-3. [ ] Documentation updated
-4. [ ] All 53+ tests passing on 4 CI platforms
-5. [ ] Zero compiler + clippy warnings
-6. [ ] Dependencies: <100 crates (target: ~80)
+**Current (Day 1 complete)**:
+- Dependencies: 275 unique crates (-30%)
+- Binary size: ~5.1MB (release)
+- Commands: 6 (release system removed)
+- Tests: 53 passing
+- Warnings: 3 (unused imports, will fix)
 
-### Release Process
-7. [ ] Update version to `1.0.0` in Cargo.toml
-8. [ ] Update CHANGELOG.md
-9. [ ] Commit: `git commit -m "chore: Release v1.0.0"`
-10. [ ] Tag: `git tag -a v1.0.0 -m "Release v1.0.0"`
-11. [ ] Push: `git push origin main --tags`
-12. [ ] Verify GitHub Release builds
-13. [ ] Publish: `cargo publish`
-14. [ ] Announce: r/rust, Discord, Twitter
-
----
-
-## 📈 Metrics
-
-**Current State:**
-- Dependencies: 280 unique crates
-- Tests: 53 passing (19 integration + 34 unit)
-- Commands: 6 core (init, split, sync, doctor, status, mappings)
+**Target (v1.0)**:
+- Dependencies: ~75 unique crates (-81% from start)
+- Binary size: <4MB (release, estimate)
+- Commands: 6 core
+- Tests: 60+ (additional SystemGit tests)
 - Warnings: 0
 
-**v1.0 Target:**
-- Dependencies: <80 unique crates (-71% from current)
-- Tests: 60+ passing (additional E2E coverage)
-- Commands: Same 6 core + optional checks/ci (post-v1.0)
-- Warnings: 0
+**Performance targets**:
+- Sync dry-run: <100ms (any crate size)
+- Split 100 commits: <5s
+- Split 1000 commits: <60s
+- Read 1000 files: <500ms (batch mode)
 
 ---
 
-## 🎯 Timeline Estimate
+## 🚀 When Ready for v1.0
 
-**Critical Path (Required for v1.0):**
-- E2E Testing: 4-5 days
-- VCS Abstraction: 3-4 days
-- Workspace Mode: 1 day
-- Documentation: 0.5 day
-- **Total: 9-11 days**
+**Pre-release checklist**:
+- [ ] VCS abstraction complete (gix removed, ~75 crates)
+- [ ] All 60+ tests passing on all platforms
+- [ ] Zero compiler warnings, zero clippy warnings
+- [ ] Performance targets met (documented in tests)
+- [ ] E2E testing phases 7-12 complete
+- [ ] Documentation updated (README, USER_GUIDE, SECURITY)
+- [ ] Binary size <4MB (release build)
+- [ ] Startup time <10ms (cold start)
 
-**Post-v1.0 Features:**
-- Checks System: 2-3 days
-- GitHub Actions Security: 1-2 days
-- Change Detection: 1 day
-- Exit Codes: 0.5 day
-
----
-
-## 🧭 Philosophy
-
-**cargo-rail is infrastructure for Rust shops**
-
-- **Minimal attack surface** - <80 dependencies (71% reduction from 280)
-- **Battle-tested tools** - Prefer system git over pure-Rust libs
-- **Single responsibility** - Split/sync only, delegate releases
-- **Zero friction** - jj (jujutsu) support with zero config
-- **Trust through simplicity** - Auditable in hours, not days
+**Release process**:
+1. Update version to 1.0.0 in Cargo.toml
+2. Update CHANGELOG.md with all changes since 0.1.0
+3. Run full test suite on 4 CI platforms + macOS local
+4. Create release commit: `git commit -m "chore: Release v1.0.0"`
+5. Create annotated tag: `git tag -a v1.0.0 -m "v1.0.0: Production-ready"`
+6. Push: `git push origin main --tags`
+7. Verify GitHub Release builds successfully
+8. Publish: `cargo publish`
+9. Announce: r/rust, Discord, Twitter
 
 ---
 
-**Ready to ship v1.0 when critical path complete.**
+## 🎪 Philosophy: Dominate Copybara
+
+**Why cargo-rail will be better:**
+
+1. **Simpler**: One TOML file vs Starlark config
+2. **Faster**: Batch git operations, parallel processing
+3. **Safer**: PR-only sync, never auto-merge external changes
+4. **Leaner**: <100 crates vs Google's massive dependency tree
+5. **Focused**: Rust-only, Cargo-first (not polyglot compromise)
+6. **Trustworthy**: Auditable in hours (not days), minimal attack surface
+
+**Target users**: Solo devs to mid-size teams (1-50 people, 5-50 crates)
+
+**Not competing on**: Enterprise scale (1000+ crates, complex transforms)
+
+---
+
+**Next session: Start Day 2 - Implement batch operations & missing methods**

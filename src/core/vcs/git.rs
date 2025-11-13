@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::CommitInfo;
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use gix::Repository;

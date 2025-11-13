@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod git;
 pub mod system_git;
 mod system_git_ops;
