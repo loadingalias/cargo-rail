@@ -16,6 +16,12 @@ pub fn new_monorepo_function() {
 pub fn from_remote() {
   println!("This change came from the split repo");
 }
+pub fn feature_a1() -> &'static str {
+  "Feature A1"
+}
+pub fn fix_a1() -> bool {
+  false
+}
 // Update to test-crate-a
 
 #[cfg(test)]
@@ -29,5 +35,3 @@ mod tests {
     assert!(msg.contains("Hello from crate B"));
   }
 }
-pub fn feature_a1() -> &'static str { "Feature A1" }
-pub fn fix_a1() -> bool { false }
