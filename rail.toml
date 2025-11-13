@@ -48,6 +48,7 @@ name = "test-combined"
 remote = "git@github.com:loadingalias/cargo-rail-test-combined.git"
 branch = "main"
 mode = "combined"
+workspace_mode = "workspace" # "workspace" (mirror monorepo) or "standalone" (independent crates)
 include = [
     "src/**",
     "tests/**",

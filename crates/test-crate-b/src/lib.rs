@@ -38,3 +38,4 @@ pub fn feature_b1() -> &'static str {
 pub fn fix_b1() -> bool {
   true
 }
+pub fn sync_feature() -> &'static str { "Synced from monorepo" }

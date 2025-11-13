@@ -23,7 +23,8 @@ AGENTS.md
 *.key
 
 # Cargo-Rail (Testing)
-rail.toml
+*rail.toml
+
 # Notes
 STATUS.md
 E2E_TESTING_SETUP.md

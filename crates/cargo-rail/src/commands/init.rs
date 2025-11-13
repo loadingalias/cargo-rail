@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cargo::metadata::WorkspaceMetadata;
-use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode};
+use crate::core::config::{CratePath, RailConfig, SplitConfig, SplitMode, WorkspaceMode};
 use crate::core::error::{RailError, RailResult, ResultExt};
 
 /// Run the init command to set up cargo-rail configuration
@@ -99,6 +99,7 @@ pub fn run_init(all: bool) -> RailResult<()> {
       remote: String::new(), // Empty - user will fill this in
       branch: "main".to_string(),
       mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(), // Standalone by default
       paths: vec![CratePath { path: package_path }],
       include: include_patterns,
       exclude: vec![],
