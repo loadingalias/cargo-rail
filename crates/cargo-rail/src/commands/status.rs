@@ -88,7 +88,13 @@ pub fn run_status(json: bool) -> RailResult<()> {
 
     let target_exists = target_repo_path.exists();
 
-    let split_status = if target_exists {
+    // Check if split exists by checking git-notes (more reliable than directory check)
+    let has_git_notes = check_git_notes_exist(&current_dir, &split_config.name)?;
+
+    let split_status = if has_git_notes {
+      SplitStatus::Split
+    } else if target_exists {
+      // Fallback: local directory exists but no git-notes yet
       SplitStatus::Split
     } else {
       SplitStatus::NotSplit
@@ -181,6 +187,19 @@ fn extract_number_after(text: &str, prefix: &str) -> u64 {
     .and_then(|(_, rest)| rest.split(&[',', ']'][..]).next())
     .and_then(|num_str| num_str.trim().parse().ok())
     .unwrap_or(0)
+}
+
+/// Check if git-notes exist for a split (indicates split has been performed)
+fn check_git_notes_exist(repo_path: &std::path::Path, split_name: &str) -> RailResult<bool> {
+  let notes_ref = format!("refs/notes/rail/{}", split_name);
+
+  let output = Command::new("git")
+    .current_dir(repo_path)
+    .args(["notes", "--ref", &notes_ref, "list"])
+    .output()?;
+
+  // If git notes list succeeds and has output, notes exist
+  Ok(output.status.success() && !output.stdout.is_empty())
 }
 
 /// Check if paths have uncommitted changes
