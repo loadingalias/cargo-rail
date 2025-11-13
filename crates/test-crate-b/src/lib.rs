@@ -33,3 +33,4 @@ pub fn another_mono_feature() -> &'static str {
 // Change B
 // Update to test-crate-b
 pub fn feature_b1() -> &'static str { "Feature B1" }
+pub fn fix_b1() -> bool { true }
