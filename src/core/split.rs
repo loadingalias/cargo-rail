@@ -733,7 +733,7 @@ mod tests {
   fn find_git_root() -> PathBuf {
     let current_dir = std::env::current_dir().unwrap();
     match SystemGit::open(&current_dir) {
-      Ok(git) => git.root().to_path_buf(),
+      Ok(git) => git.work_tree.clone(),
       Err(_) => current_dir,
     }
   }

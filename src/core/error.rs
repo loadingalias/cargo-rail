@@ -267,9 +267,6 @@ pub enum GitError {
   /// Commit not found
   CommitNotFound { sha: String },
 
-  /// Branch operation failed
-  BranchError { message: String },
-
   /// Push failed
   PushFailed {
     remote: String,
@@ -310,9 +307,6 @@ impl fmt::Display for GitError {
       }
       GitError::CommitNotFound { sha } => {
         write!(f, "Commit not found: {}", sha)
-      }
-      GitError::BranchError { message } => {
-        write!(f, "Branch operation failed: {}", message)
       }
       GitError::PushFailed { remote, branch, reason } => {
         write!(f, "Push to {}/{} failed: {}", remote, branch, reason)

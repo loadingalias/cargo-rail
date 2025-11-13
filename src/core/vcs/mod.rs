@@ -15,10 +15,3 @@ pub struct CommitInfo {
   pub timestamp: i64,
   pub parent_shas: Vec<String>,
 }
-
-impl CommitInfo {
-  /// Get the first line of the commit message
-  pub fn summary(&self) -> &str {
-    self.message.lines().next().unwrap_or("")
-  }
-}
