@@ -20,7 +20,7 @@ pub fn feature_a1() -> &'static str {
   "Feature A1 - MONOREPO VERSION"
 }
 pub fn fix_a1() -> bool {
-  false
+  true // Monorepo says true
 }
 // Update to test-crate-a
 
