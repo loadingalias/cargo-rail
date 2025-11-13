@@ -13,16 +13,16 @@ use std::process::Command;
 /// Git backend using system git (zero crate dependencies)
 pub struct SystemGit {
     /// Repository working directory
-    repo_path: PathBuf,
+    pub(crate) repo_path: PathBuf,
 
     /// Git directory (.git or bare repo)
-    git_dir: PathBuf,
+    pub(crate) git_dir: PathBuf,
 
     /// Working tree root
-    work_tree: PathBuf,
+    pub(crate) work_tree: PathBuf,
 
     /// Cached metadata
-    cache: GitCache,
+    pub(crate) cache: GitCache,
 }
 
 /// Cached git metadata (invalidated on mutation operations)
