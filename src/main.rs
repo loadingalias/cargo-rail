@@ -2,6 +2,7 @@ mod cargo;
 mod checks;
 mod commands;
 mod core;
+mod graph;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -97,6 +98,24 @@ enum Commands {
     #[arg(long)]
     json: bool,
   },
+  /// Show which crates are affected by changes
+  Affected {
+    /// Git ref to compare against (default: origin/main)
+    #[arg(long, default_value = "origin/main")]
+    since: String,
+    /// Start ref (for SHA pair mode)
+    #[arg(long, conflicts_with = "since")]
+    from: Option<String>,
+    /// End ref (for SHA pair mode)
+    #[arg(long, requires = "from")]
+    to: Option<String>,
+    /// Output format: text (default), json, names-only
+    #[arg(long, default_value = "text")]
+    format: String,
+    /// Show dry-run plan without execution
+    #[arg(long)]
+    dry_run: bool,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -160,6 +179,13 @@ fn main() {
       check,
       json,
     } => commands::run_mappings(crate_name, check, json),
+    Commands::Affected {
+      since,
+      from,
+      to,
+      format,
+      dry_run,
+    } => commands::run_affected(since, from, to, format, dry_run),
   };
 
   if let Err(err) = result {

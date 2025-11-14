@@ -33,6 +33,7 @@
 //! ```
 
 mod git_notes;
+mod graph_cycles;
 mod remotes;
 mod runner;
 mod security_config;

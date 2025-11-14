@@ -78,6 +78,7 @@ pub fn create_default_runner() -> CheckRunner {
 
   // Add built-in checks
   runner.add_check(Arc::new(super::workspace::WorkspaceValidityCheck));
+  runner.add_check(Arc::new(super::graph_cycles::GraphCyclesCheck));
   runner.add_check(Arc::new(super::ssh::SshKeyCheck));
   runner.add_check(Arc::new(super::security_config::SecurityConfigCheck));
   runner.add_check(Arc::new(super::git_notes::GitNotesCheck));

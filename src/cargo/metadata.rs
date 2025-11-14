@@ -33,4 +33,15 @@ impl WorkspaceMetadata {
   pub fn workspace_root(&self) -> &std::path::Path {
     self.metadata.workspace_root.as_std_path()
   }
+
+  /// Get raw JSON string for external tools
+  pub fn to_json_string(&self) -> RailResult<String> {
+    serde_json::to_string(&self.metadata)
+      .map_err(|e| crate::core::error::RailError::message(format!("Failed to serialize metadata: {}", e)))
+  }
+
+  /// Access raw cargo_metadata::Metadata for graph construction
+  pub fn metadata_json(&self) -> &cargo_metadata::Metadata {
+    &self.metadata
+  }
 }

@@ -98,6 +98,43 @@ impl SystemGit {
     Ok(files)
   }
 
+  /// Get all files that changed between two refs.
+  ///
+  /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted).
+  ///
+  /// # Performance
+  /// Uses `git diff --name-status` which is optimized for listing changes.
+  /// Typically <100ms even for large diffs with 1000s of files.
+  pub fn get_changed_files_between(&self, base_ref: &str, head_ref: &str) -> RailResult<Vec<(PathBuf, char)>> {
+    let output = self
+      .git_cmd()
+      .args(["diff", "--name-status", base_ref, head_ref])
+      .output()
+      .context("Failed to get changed files between refs")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: format!("git diff --name-status {} {}", base_ref, head_ref),
+        stderr: stderr.to_string(),
+      }));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+
+    for line in stdout.lines() {
+      let parts: Vec<&str> = line.split_whitespace().collect();
+      if parts.len() >= 2 {
+        let change_type = parts[0].chars().next().unwrap_or('M');
+        let path = PathBuf::from(parts[1]);
+        files.push((path, change_type));
+      }
+    }
+
+    Ok(files)
+  }
+
   /// Get file content at a specific commit
   ///
   /// Returns None if file doesn't exist at that commit.
@@ -277,10 +314,7 @@ impl SystemGit {
     let contents = self.read_files_bulk(&items)?;
 
     // Combine paths with contents
-    let results: Vec<(PathBuf, Vec<u8>)> = files
-      .into_iter()
-      .zip(contents)
-      .collect();
+    let results: Vec<(PathBuf, Vec<u8>)> = files.into_iter().zip(contents).collect();
 
     Ok(results)
   }
