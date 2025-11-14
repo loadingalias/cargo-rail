@@ -9,27 +9,17 @@ targets = [
 
 [advisories]
 yanked = "warn"
-
-# Ignore unmaintained advisories for transitive dependencies we cannot easily control - TODO: Remove this once we have a better solution
-ignore = [
-  "RUSTSEC-2024-0370", # proc-macro-error (via git-cliff-core → rust-embed → include-flate)
-]
+ignore = []
 
 [licenses]
-# Common Open Source Licenses
+# Only allow licenses we actually encounter
 allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
   "BSL-1.0",
-  "CDLA-Permissive-2.0",
-  "ISC",
   "Unicode-3.0",
-  "CC0-1.0",
   "Zlib",
-  "MPL-2.0",
 ]
 
 confidence-threshold = 0.93
@@ -40,39 +30,15 @@ wildcards = "allow"
 highlight = "all"
 
 skip = [
-  # Windows ecosystem - commonly has version mismatches
+  # Windows ecosystem - commonly has version mismatches across targets
   "windows-sys",
   "windows-targets",
-  "windows-result",
-  "windows-strings",
-  "windows-core",
   "windows_aarch64_msvc",
   "windows_x86_64_gnu",
   "windows_x86_64_msvc",
-  "windows-link",
-  "windows-interface",
-  "windows-implement",
-  "windows",
-  # Low-level hash/system dependencies
+  # Low-level system dependencies - acceptable to have multiple versions
+  # petgraph depends on hashbrown v0.15, while indexmap uses v0.16
   "hashbrown",
-  "foldhash",
-  "linux-raw-sys",
-  "rustix",
-  # git-cliff-core transitive dependencies (via tera, cacache, rust-embed)
-  "base64",
-  "getrandom",
-  "rand",
-  "rand_chacha",
-  "rand_core",
-  "memmap2",
-  "syn",
-  "thiserror",
-  "thiserror-impl",
-  # cargo-semver-checks intentionally uses multiple rustdoc-types versions
-  # to support different Rust toolchain versions
-  "rustdoc-types",
-  "trustfall-rustdoc-adapter",
-  "itertools",
 ]
 
 [sources]
