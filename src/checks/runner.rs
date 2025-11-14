@@ -79,10 +79,26 @@ pub fn create_default_runner() -> CheckRunner {
   // Add built-in checks
   runner.add_check(Arc::new(super::workspace::WorkspaceValidityCheck));
   runner.add_check(Arc::new(super::graph_cycles::GraphCyclesCheck));
+  runner.add_check(Arc::new(super::edition_consistency::EditionConsistencyCheck));
+  runner.add_check(Arc::new(super::msrv::MSRVCheck));
+  runner.add_check(Arc::new(super::patch_replace::PatchReplaceCheck));
   runner.add_check(Arc::new(super::ssh::SshKeyCheck));
   runner.add_check(Arc::new(super::security_config::SecurityConfigCheck));
   runner.add_check(Arc::new(super::git_notes::GitNotesCheck));
   runner.add_check(Arc::new(super::remotes::RemoteAccessCheck));
+
+  runner
+}
+
+/// Create a runner with manifest-specific checks only
+/// Used by `cargo rail lint manifest` command
+pub fn create_manifest_runner() -> CheckRunner {
+  let mut runner = CheckRunner::new();
+
+  // Add manifest policy checks
+  runner.add_check(Arc::new(super::edition_consistency::EditionConsistencyCheck));
+  runner.add_check(Arc::new(super::msrv::MSRVCheck));
+  runner.add_check(Arc::new(super::patch_replace::PatchReplaceCheck));
 
   runner
 }

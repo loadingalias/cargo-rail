@@ -32,8 +32,11 @@
 //! }
 //! ```
 
+mod edition_consistency;
 mod git_notes;
 mod graph_cycles;
+mod msrv;
+mod patch_replace;
 mod remotes;
 mod runner;
 mod security_config;
@@ -42,8 +45,8 @@ mod trait_def;
 mod workspace;
 
 // Re-export public API
-pub use runner::create_default_runner;
-pub use trait_def::{CheckContext, Severity};
+pub use runner::{create_default_runner, create_manifest_runner};
+pub use trait_def::{CheckContext, CheckResult, Severity};
 
 // Individual checks are not exported - they're registered in create_default_runner()
 // This keeps the API simple and prevents misuse

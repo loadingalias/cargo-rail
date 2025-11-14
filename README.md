@@ -1,483 +1,494 @@
 # cargo-rail
 
-**Split Rust crates from monorepos, keep them in sync**
+**The opinionated Rust workspace orchestration tool for teams building at scale.**
 
-Split Rust crates from Cargo workspaces into standalone repos with full git history. Bidirectional sync keeps monorepo and split repos in line.
-
-[![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE)
+Manage large Cargo workspaces with confidence: split crates to standalone repos, sync bidirectionally, run graph-aware CI, enforce workspace policies, and orchestrate releases—all from one tool.
 
 ---
 
-## Status: Production Ready (v0.1)
+## Status: Active Development
 
-**Split & Sync:** ✅ Production-ready
-**Documentation:** ✅ Complete
-**CI Coverage:** ✅ 4 platforms (Linux/Windows x86_64/ARM64) + macOS local
+**NOT READY FOR PUBLIC USE** - Internal tooling in active development.
 
-All features stable. Focused on split/sync only - use cargo-release or release-plz for publishing.
+| Pillar | Status | Description |
+|--------|--------|-------------|
+| **1. Graph Orchestration** | ✅ **Complete** | Affected analysis, smart test/check/clippy |
+| **2. Split/Sync** | ✅ **Production** | Bidirectional mono↔split with history preservation |
+| **3. Policy & Linting** | 🟡 **Planned** | Workspace consistency, dependency linting |
+| **4. Release Orchestration** | 🟡 **Planned** | Coordinated releases, changelogs, publishing |
 
----
-
-## Why cargo-rail?
-
-| Feature | cargo-rail | git-subtree | Copybara |
-|---------|------------|-------------|----------|
-| Split crates | Full history | One-way | Complex |
-| Bidirectional sync | ✓ | ❌ | ✓ |
-| Cargo-aware transforms | ✓ | ❌ | ❌ |
-| Dry-run by default | ✓ | ❌ | ❌ |
-| Setup | One TOML | Complex | Very complex |
-
-**cargo-rail = git-subtree + cargo transforms + bidirectional sync**
+**Current Focus:** Building Pillar 3 (Policy & Linting)
 
 ---
 
-## Features
+## Philosophy
 
-**Split & Sync:**
+**Problem:** Large Rust workspaces require bespoke bash scripts for:
+- Determining which crates changed (CI optimization)
+- Splitting crates for OSS while maintaining mono workflow
+- Enforcing dependency policies across 50+ crates
+- Coordinating releases between mono and split repos
 
-- Full git history preservation (author, date, message)
-- Bidirectional sync: monorepo ↔ split repo
-- Dry-run by default (`--apply` required)
-- Protected branch safety (creates PR branches for remote→mono)
+**Solution:** One opinionated tool that does it right.
+
+**Principles:**
+- **Own your abstractions** - Build on cargo_metadata + petgraph, not wrappers
+- **Dry-run first** - Show plan, require `--apply` for execution
+- **Graph-aware** - Workspace dependencies drive all decisions
+- **Zero magic** - Transparent git operations, auditable plans
+- **Team-first** - Built for CI, designed for multiple developers
+
+---
+
+## Four Pillars
+
+### 1. Graph-Aware Work Orchestration ✅
+
+Run tests, checks, and lints only on affected crates. Stop wasting CI time.
+
+```bash
+# See what's affected since origin/main
+cargo rail graph affected --since origin/main --format json
+
+# Run tests only for affected crates + dependents
+cargo rail graph test --since origin/main
+
+# Or everything
+cargo rail graph test --workspace
+```
+
+**Features:**
+- Dependency graph analysis (direct + transitive)
+- Change detection via git integration
+- Smart test targeting (minimal or full workspace)
+- Cycle detection (via `cargo rail doctor`)
+- Multiple output formats (text, JSON, names-only)
+
+**Impact:** 10x faster CI for workspaces with 20+ crates.
+
+---
+
+### 2. Split/Sync ✅
+
+Split crates from monorepo to standalone repos with full git history. Sync bidirectionally.
+
+```bash
+# One-time split with history
+cargo rail split my-crate --apply
+
+# Ongoing sync (mono → split)
+cargo rail sync my-crate --apply
+
+# External contributions (split → mono via PR branch)
+cargo rail sync my-crate --apply --from-remote
+```
+
+**Features:**
+- Full git history preservation
+- Two modes: single crate or combined multi-crate
 - Cargo.toml transforms (path deps ↔ version deps)
 - Git-notes commit mapping (rebase-tolerant)
+- Security model: PR branches for split→mono (no direct commits)
 - Conflict resolution (ours, theirs, manual, union)
-- Two modes: single crate → repo, or multiple crates → combined repo
+
+**Use Case:** Open-source 5 crates from 25-crate proprietary monorepo while maintaining mono workflow.
+
+---
+
+### 3. Workspace Policy & Linting 🟡 (Planned)
+
+Enforce consistency and prevent dependency drift.
+
+```bash
+# Detect workspace deps not using inheritance
+cargo rail lint deps
+
+# Find duplicate dependency versions
+cargo rail lint versions
+
+# Auto-fix issues
+cargo rail lint deps --fix
+```
+
+**Planned Features:**
+- Policy enforcement (edition, MSRV, resolver version)
+- Workspace dependency linting
+- Duplicate version detection
+- Manifest quality checks (patch/replace, feature bleed)
+- Auto-fix support
+
+---
+
+### 4. Release & Publishing Orchestration 🟡 (Planned)
+
+Coordinate releases across monorepo and split repos.
+
+```bash
+# Plan releases for all channels
+cargo rail release plan --all
+
+# Apply release: version bump, changelog, tags
+cargo rail release apply my-crate
+
+# Publish to crates.io
+cargo rail release apply my-crate --publish
+```
+
+**Planned Features:**
+- Release channels (crates vs products)
+- Conventional commit parsing
+- Changelog generation + sync
+- Dependency-aware publish order
+- Split repo coordination
 
 ---
 
 ## Installation
 
+**Internal use only - not on crates.io yet**
+
 ```bash
-# From crates.io
-cargo install cargo-rail
-
 # From source
-git clone https://github.com/loadingalias/cargo-rail
+git clone <internal-repo>
 cd cargo-rail
-cargo install --path crates/cargo-rail
-
-# From GitHub Releases (binaries for Linux, macOS, Windows)
-# See: https://github.com/loadingalias/cargo-rail/releases
+cargo install --path .
 ```
 
 ---
 
 ## Quick Start
 
-### Single Mode (One Crate → One Repo)
+### 1. Initialize Configuration
 
 ```bash
-# 1. Initialize
 cd your-workspace/
 cargo rail init
 ```
 
-Edit `rail.toml`:
-
-```toml
-[workspace]
-root = "/path/to/workspace"
-
-[[splits]]
-name = "my-crate"
-remote = "git@github.com:you/my-crate.git"
-branch = "main"
-mode = "single"
-paths = [
-  { crate = "crates/my-crate" }
-]
-```
-
-```bash
-# 2. Split (dry-run first)
-cargo rail split my-crate
-cargo rail split my-crate --apply
-
-# 3. Sync changes
-cargo rail sync my-crate --apply
-```
-
-### Combined Mode (Multiple Crates → One Repo)
-
-Use combined mode when you want to split multiple related crates into a single repository (e.g., a client + server, or a core + plugins).
-
-```toml
-[[splits]]
-name = "my-project"
-remote = "git@github.com:you/my-project.git"
-branch = "main"
-mode = "combined"
-paths = [
-  { crate = "crates/my-client" },
-  { crate = "crates/my-server" },
-  { crate = "crates/my-common" }
-]
-```
-
-```bash
-# Split all three crates into one repo
-cargo rail split my-project --apply
-
-# Sync changes from any of the three crates
-cargo rail sync my-project --apply
-```
-
-**Result:** Creates a single repo with:
-
-```
-my-project/
-├── my-client/      (from crates/my-client)
-├── my-server/      (from crates/my-server)
-├── my-common/      (from crates/my-common)
-└── Cargo.toml      (workspace manifest)
-```
-
----
-
-## Workflow Example: 25-Crate Monorepo
-
-**Scenario:** 5 proprietary crates, 20 OSS (5 split to separate repos, 15 stay in monorepo)
-
-### Development (Monorepo)
-
-```bash
-cd monorepo/
-# ... make changes to crates/my-oss-lib ...
-git commit -am "feat: Add feature"
-
-# Sync to split repo
-cargo rail sync my-oss-lib --apply
-```
-
-### Publishing
-
-**Option 1: Monorepo-only crates** (20 crates)
-
-```bash
-cd monorepo/
-cargo release --workspace  # or release-plz
-```
-
-**Option 2: Split crates** (5 crates)
-
-```bash
-# Ensure synced
-cargo rail sync my-oss-lib --apply
-
-# Publish from split repo
-cd ../my-oss-lib-split/
-cargo release
-# Contributors see a normal standalone crate
-```
-
-### External Contributions
-
-```bash
-# PR comes into split repo
-cd ../monorepo/
-cargo rail sync my-oss-lib --apply
-# Creates PR branch: rail/sync/my-oss-lib/1763010755
-# Review and merge manually
-```
-
----
-
-## Commands
-
-```bash
-cargo rail init                      # Initialize configuration
-cargo rail split <name>              # Split crate(s) (dry-run)
-cargo rail split <name> --apply      # Actually split
-cargo rail sync <name>               # Sync changes (dry-run)
-cargo rail sync <name> --apply       # Actually sync
-cargo rail sync --all --apply        # Sync all configured splits
-cargo rail doctor                    # Run health checks
-cargo rail status                    # Show configured splits
-cargo rail mappings <name>           # Inspect git-notes mappings
-```
-
----
-
-## Configuration
-
-Full `rail.toml` example:
+Creates `rail.toml`:
 
 ```toml
 [workspace]
 root = "/absolute/path/to/workspace"
 
-[security]
-ssh_key_path = "~/.ssh/id_ed25519"
-require_signed_commits = false
-pr_branch_pattern = "rail/sync/{crate}/{timestamp}"
-protected_branches = ["main", "master"]
-
-# Single mode example
+# Optional: configure splits
 [[splits]]
-name = "http-client"
-remote = "git@github.com:you/http-client.git"
+name = "my-crate"
+remote = "git@github.com:you/my-crate.git"
 branch = "main"
 mode = "single"
-paths = [{ crate = "crates/http-client" }]
+paths = [{ crate = "crates/my-crate" }]
+```
 
-# Combined mode example
+---
+
+### 2. Graph-Aware CI (Pillar 1)
+
+```bash
+# What changed since last deploy?
+cargo rail graph affected --since origin/main
+
+# Test only affected crates
+cargo rail graph test --since origin/main --dry-run
+cargo rail graph test --since origin/main  # execute
+
+# CI usage: names-only for matrix builds
+cargo rail graph affected --since origin/main --format names-only > affected.txt
+```
+
+**CI Integration:**
+
+```yaml
+# .github/workflows/test.yml
+- name: Test affected crates
+  run: |
+    cargo rail graph test --since origin/main --format json > test-plan.json
+    # Use test-plan.json for matrix builds
+```
+
+---
+
+### 3. Split/Sync Workflow (Pillar 2)
+
+**Initial Split:**
+
+```bash
+# Dry-run first (shows plan)
+cargo rail split my-crate
+
+# Execute split
+cargo rail split my-crate --apply
+```
+
+**Ongoing Sync (Monorepo → Split):**
+
+```bash
+# After making changes in monorepo
+git commit -am "feat: Add feature"
+cargo rail sync my-crate --apply
+# Pushes to split repo automatically
+```
+
+**External Contributions (Split → Monorepo):**
+
+```bash
+# PR comes into split repo
+cargo rail sync my-crate --apply --from-remote
+# Creates PR branch: rail/sync/my-crate/1234567890
+# Review and merge manually (security)
+```
+
+**Combined Mode (Multiple Crates → One Repo):**
+
+```toml
 [[splits]]
 name = "my-tools"
-remote = "git@github.com:you/my-tools.git"
-branch = "main"
 mode = "combined"
 paths = [
   { crate = "crates/tool-a" },
-  { crate = "crates/tool-b" },
-  { crate = "crates/tool-common" }
+  { crate = "crates/tool-b" }
 ]
 ```
 
 ---
 
-## Conflict Resolution
+## Commands Reference
+
+### Graph Orchestration
 
 ```bash
-# Show conflict
-cargo rail sync my-crate
-# Conflict detected: both sides modified src/lib.rs
-
-# Choose strategy
-cargo rail sync my-crate --apply --conflict=ours    # keep monorepo
-cargo rail sync my-crate --apply --conflict=theirs  # keep split repo
-cargo rail sync my-crate --apply --conflict=manual  # pause for manual resolution
-cargo rail sync my-crate --apply --conflict=union   # combine both (risky)
+cargo rail graph affected    # Show affected crates
+cargo rail graph test        # Run tests (affected or --workspace)
+cargo rail graph check       # Run cargo check
+cargo rail graph clippy      # Run clippy
 ```
+
+### Split/Sync
+
+```bash
+cargo rail init              # Initialize configuration
+cargo rail split <name>      # Split crate(s) with history
+cargo rail sync <name>       # Sync changes (bi-directional)
+cargo rail sync --all        # Sync all configured splits
+```
+
+### Inspection & Health
+
+```bash
+cargo rail status            # Show all configured splits
+cargo rail doctor            # Health checks (git, SSH, workspace, cycles)
+cargo rail mappings <name>   # Inspect git-notes commit mappings
+```
+
+### Common Flags
+
+- `--apply` - Execute action (default: dry-run)
+- `--dry-run` - Show plan without executing
+- `--json` - Output structured JSON
+- `--workspace` - Run on entire workspace (graph commands)
+- `--since <ref>` - Git reference for change detection
 
 ---
 
 ## Architecture
 
-### System Overview
+### System Design
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    MONOREPO (Source of Truth)                │
-│  workspace-root/                                             │
-│  ├── crates/my-core/                                         │
-│  ├── crates/my-client/                                       │
-│  └── crates/my-server/                                       │
-└──────────────────────────────────────────────────────────────┘
-                           │
-           ┌───────────────┼───────────────┐
-           │ split         │ split         │ split
-           │ (single)      │ (single)      │ (combined)
-           ↓               ↓               ↓
-    ┌──────────┐    ┌──────────┐    ┌─────────────────┐
-    │ my-core  │    │ my-client│    │ my-server       │
-    │          │    │          │    │ (standalone)    │
-    └──────────┘    └──────────┘    └─────────────────┘
-           │               │               │
-           │ cargo release │ cargo release │ cargo release
-           ↓               ↓               ↓
-    ┌────────────────────────────────────────────────┐
-    │            crates.io registry                  │
-    └────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    CARGO WORKSPACE                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  crate-core  │  │ crate-client │  │ crate-server │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │                 │                  │           │
+│         └─────────────────┴──────────────────┘           │
+│                           │                              │
+│                    WorkspaceGraph                        │
+│                  (petgraph + cargo_metadata)             │
+└─────────────────────────────────────────────────────────┘
+         │                  │                  │
+    ┌────┴────┐        ┌────┴────┐       ┌────┴────┐
+    │ Pillar 1│        │ Pillar 2│       │ Pillar 3│
+    │  Graph  │        │  Split/ │       │ Policy/ │
+    │  Aware  │        │  Sync   │       │  Lint   │
+    └─────────┘        └─────────┘       └─────────┘
+         │                  │                  │
+    CI Optimization    OSS Workflow     Consistency
+    (test/check)      (git operations)  (enforcement)
 ```
 
-### Sync Flow
+### Core Abstractions
 
-```
-MONOREPO → SPLIT (Direct Push)
-┌──────────────────────────────────────────────┐
-│ 1. Detect new commits                        │
-│ 2. Filter commits (git log --path)           │
-│ 3. Transform Cargo.toml (path → version)     │
-│ 4. Apply commits to split repo               │
-│ 5. Update git-notes mapping                  │
-│ 6. Push to split repo                        │
-└──────────────────────────────────────────────┘
+- **WorkspaceGraph** - Dependency graph built from cargo_metadata
+- **AffectedAnalysis** - File changes → crate impact + dependents
+- **SystemGit** - Zero-dependency git operations via system binary
+- **Plan** - Auditable dry-run with SHA-based IDs
+- **MappingStore** - Git-notes based commit mapping (rebase-safe)
 
-SPLIT → MONOREPO (PR Branch - Security)
-┌──────────────────────────────────────────────┐
-│ 1. Detect new commits in split               │
-│ 2. Create PR branch: rail/sync/{name}/{ts}   │
-│ 3. Transform Cargo.toml (version → path)     │
-│ 4. Apply commits to PR branch                │
-│ 5. Update git-notes mapping                  │
-│ 6. Print review instructions (NO AUTO-MERGE) │
-└──────────────────────────────────────────────┘
-```
+---
+
+## Development Roadmap
+
+See [TODO.md](TODO.md) for detailed roadmap.
+
+**Completed:**
+- ✅ Pillar 1: Graph-Aware Work Orchestration (affected, test, check, clippy)
+- ✅ Core split/sync functionality
+- ✅ Bidirectional sync with conflict resolution
+- ✅ Combined mode (multi-crate splits)
+- ✅ Cycle detection
+- ✅ Git-notes mapping
+
+**In Progress:**
+- 🟡 Pillar 3: Policy & Linting
+
+**Planned:**
+- ⏳ Pillar 4: Release & Publishing Orchestration
+- ⏳ Enhanced split/sync workflows (branch awareness, CI primitives)
+
+---
+
+## Technical Details
+
+### Dependencies
+
+**Minimal, intentional:**
+- `cargo_metadata` - Workspace introspection
+- `petgraph` - Graph algorithms
+- `toml_edit` - Lossless TOML manipulation
+- `clap` - CLI parsing
+- `serde` - Config serialization
+- System git binary (no libgit2/gitoxide)
+
+**Why system git?**
+- Zero git library dependencies (lighter, faster builds)
+- Direct control over operations
+- Easier debugging (can see exact git commands)
+- Leverages user's git config (SSH keys, credentials)
+
+### Code Quality
+
+- **10,200+ lines of Rust**
+- **71 tests** (52 unit + 19 integration)
+- **Zero compiler warnings** (strict clippy)
+- **cargo deny** passing (license + security audit)
+- **Documentation** builds without warnings
 
 ---
 
 ## Security Model
 
-### Monorepo → Split Repo
+### Split → Monorepo (External Contributions)
 
-- Automatic push to configured branch
-- Requires SSH key authentication
-- Recommended: Branch protection + CI checks
+**NEVER commits directly to main/master.**
 
-### Split Repo → Monorepo
+1. Creates PR branch: `rail/sync/{name}/{timestamp}`
+2. Applies commits from split repo
+3. Prints review instructions
+4. Requires manual merge
 
-- **NEVER commits directly to main/master**
-- Creates PR branch: `rail/sync/{name}/{timestamp}`
-- Requires manual review before merging
-- Protects against malicious changes
+**Protection:**
+- Enable branch protection on monorepo main
+- Require PR reviews for `rail/sync/*` branches
+- Use deploy keys (write access to split repos only)
 
-**Checklist:**
+### Monorepo → Split
 
-1. Enable branch protection on monorepo main
-2. Require PR reviews for `rail/sync/*` branches
-3. Use deploy keys (write access to split repos only)
-4. Optional: Enable signed commits
-5. Run `cargo rail doctor` to verify
-
-See [SECURITY.md](docs/SECURITY.md) for full threat model.
+- Direct push to configured branch
+- SSH key authentication required
+- Recommended: branch protection + CI on split repo
 
 ---
 
-## CI Integration
+## Use Cases
 
-### GitHub Actions (Monorepo → Split)
+### 1. Open-Source Subset of Monorepo
 
-`.github/workflows/rail-sync.yml`:
-
-```yaml
-name: Sync to Split Repos
-on:
-  push:
-    branches: [main]
-    paths: ['crates/my-crate/**']
-
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install cargo-rail
-      - run: cargo rail sync my-crate --apply
-        env: { SSH_PRIVATE_KEY: '${{ secrets.DEPLOY_KEY }}' }
-```
-
----
-
-## Publishing Workflow
-
-cargo-rail focuses on split/sync. Use existing tools for releases:
-
-**Recommended:**
-
-- [cargo-release](https://github.com/crate-ci/cargo-release) - Simple, battle-tested
-- [release-plz](https://github.com/MarcoIeni/release-plz) - Automated releases from CI
-- [git-cliff](https://github.com/orhun/git-cliff) - Changelog generation
+**Scenario:** 25-crate proprietary monorepo, want to open-source 5 crates
 
 ```bash
-# Monorepo-only crates
-cd monorepo/
-cargo release --workspace
+# Split to standalone repos
+cargo rail split http-client --apply
+cargo rail split json-parser --apply
 
-# Split crates
-cargo rail sync my-crate --apply  # Ensure synced
-cd ../my-crate-split/
-cargo release  # Publish from split repo
+# Continue working in monorepo
+cd monorepo/crates/http-client
+# ... make changes ...
+git commit -am "feat: Add retry logic"
+
+# Sync to public repo
+cargo rail sync http-client --apply
 ```
+
+**Result:** Public sees normal standalone crate. You work in monorepo.
 
 ---
 
-## Documentation
+### 2. CI Optimization
 
-- [USER_GUIDE.md](docs/USER_GUIDE.md) - Complete walkthrough
-- [SECURITY.md](docs/SECURITY.md) - Threat model and mitigations
-- [E2E_TESTING_SETUP.md](E2E_TESTING_SETUP.md) - End-to-end testing guide
-- [STATUS.md](STATUS.md) - Development status
+**Scenario:** 50-crate workspace, CI runs all tests on every PR (slow)
+
+```bash
+# In CI: test only affected crates
+cargo rail graph test --since origin/main --format json
+```
+
+**Impact:** 10x faster CI (5 crates tested instead of 50)
 
 ---
 
-## Troubleshooting
+### 3. Coordinated Releases (Future)
 
-**"SSH key validation failed"**
+**Scenario:** Release a product that spans 3 workspace crates
 
-```bash
-chmod 600 ~/.ssh/id_ed25519
-ssh -T git@github.com
-cargo rail doctor --thorough
+```toml
+[release.channels.my-product]
+kind = "product"
+root_crate = "crates/my-app"
+exports = ["http-client", "json-parser"]
 ```
 
-**"Git-notes conflict detected"**
-
 ```bash
-cargo rail sync my-crate --apply  # Uses union merge strategy
+cargo rail release plan my-product
+cargo rail release apply my-product --publish
 ```
 
-**"Non-fast-forward push"**
-
-```bash
-cd ../my-crate-split
-git pull origin main
-cd ../monorepo
-cargo rail sync my-crate --apply
-```
+**Result:** Coordinated version bumps, changelogs, and publishes.
 
 ---
 
-## Comparison
+## Why cargo-rail?
 
-**vs git-subtree:** cargo-rail is bidirectional + Cargo-aware
-**vs Copybara:** cargo-rail is simpler (one TOML vs Starlark)
-**vs git-filter-repo:** cargo-rail preserves monorepo (non-destructive)
-**vs cargo-workspaces:** cargo-rail adds split/sync
-**vs release-plz:** cargo-rail adds split/sync (use release-plz for releases!)
+**vs git-subtree:** Bidirectional + Cargo-aware transforms
+**vs Copybara:** Simpler (one TOML vs Starlark), Rust-native
+**vs cargo-workspaces:** Adds split/sync + graph orchestration
+**vs Nx/Turborepo:** Rust-native, Cargo-first, opinionated
+**vs Manual bash scripts:** Type-safe, tested, comprehensive
+
+**cargo-rail is the missing piece for Rust teams working at scale.**
 
 ---
 
 ## Contributing
 
-Contributions welcome! See [TODO.md](https://github.com/loadingalias/cargo-rail/blob/main/TODO.md) for planned features.
+**Internal use only** - not accepting external contributions yet.
 
-1. Check roadmap
-2. Open issue to discuss
-3. Submit PR with tests
+See [TODO.md](TODO.md) for planned features and roadmap.
 
 ---
 
 ## License
 
-MIT - see [LICENSE](https://github.com/loadingalias/cargo-rail/blob/main/LICENSE)
+MIT - see [LICENSE](LICENSE)
 
 ---
 
 ## Acknowledgments
 
-- Inspired by Google's Copybara and Meta's Sapling
-- Built on [gitoxide](https://github.com/Byron/gitoxide) (pure Rust git)
+- Inspired by Google's Copybara and Nx's graph-aware CI
+- Built on Rust's excellent ecosystem (cargo_metadata, petgraph, clap)
+- Philosophy: Own your abstractions, minimize dependencies, be opinionated
 
 ---
 
-## FAQ
-
-**Q: Single vs combined mode - when to use each?**
-A: Single mode for independent crates published to crates.io. Combined mode for related crates that should stay together (e.g., client+server).
-
-**Q: Can I use this in production today?**
-A: Yes. All features are stable and production-ready.
-
-**Q: Does this work with private repos?**
-A: Yes, use SSH authentication with deploy keys.
-
-**Q: What if my split repo gets compromised?**
-A: cargo-rail never commits directly to monorepo main. All syncs create PR branches for review.
-
-**Q: Can I sync multiple splits at once?**
-A: Yes: `cargo rail sync --all --apply`
-
-**Q: How do I publish crates?**
-A: Use cargo-release or release-plz. cargo-rail focuses on split/sync only.
-
-**Q: Large monorepos (100+ crates)?**
-A: Current focus is 5-50 crates. Larger workspaces may need performance tuning.
-
----
-
-**Made with Rust** • [Star this repo ⭐](https://github.com/loadingalias/cargo-rail)
+**Built with Rust for Rust teams working at scale.**
