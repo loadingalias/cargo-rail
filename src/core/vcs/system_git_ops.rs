@@ -18,6 +18,23 @@ impl SystemGit {
     }
   }
 
+  /// Convert a path to Git format (always forward slashes)
+  ///
+  /// Git expects paths with forward slashes, even on Windows.
+  /// This function converts backslashes to forward slashes for use in Git commands.
+  fn path_to_git_format(&self, path: &Path) -> String {
+    // On Windows, convert backslashes to forward slashes
+    // On Unix, this is a no-op since paths already use forward slashes
+    #[cfg(target_os = "windows")]
+    {
+      path.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+      path.to_string_lossy().to_string()
+    }
+  }
+
   /// Get commit history from HEAD with optional limit
   ///
   /// Returns commits in reverse chronological order (newest first).
@@ -153,8 +170,9 @@ impl SystemGit {
   #[allow(dead_code)]
   pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
     let relative_path = self.normalize_path(path);
+    let git_path = self.path_to_git_format(relative_path);
 
-    let spec = format!("{}:{}", commit_sha, relative_path.display());
+    let spec = format!("{}:{}", commit_sha, git_path);
 
     let output = self
       .git_cmd()
@@ -334,7 +352,8 @@ impl SystemGit {
     let spec = if path.as_os_str().is_empty() {
       commit_sha.to_string()
     } else {
-      format!("{}:{}", commit_sha, path.display())
+      let git_path = self.path_to_git_format(path);
+      format!("{}:{}", commit_sha, git_path)
     };
 
     let output = self
@@ -746,7 +765,8 @@ impl SystemGit {
     // Write all requests to stdin
     for (commit_sha, path) in items {
       let relative_path = self.normalize_path(path);
-      let spec = format!("{}:{}\n", commit_sha, relative_path.display());
+      let git_path = self.path_to_git_format(relative_path);
+      let spec = format!("{}:{}\n", commit_sha, git_path);
       stdin
         .write_all(spec.as_bytes())
         .context("Failed to write to git cat-file stdin")?;
