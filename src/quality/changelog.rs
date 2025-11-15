@@ -11,8 +11,6 @@ use std::fmt;
 /// Format: `<type>(<scope>): <description>`
 ///
 /// Example: `feat(auth): add OAuth2 support`
-// TODO(quality): Used by ChangelogGenerator, wire into release apply command
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConventionalCommit {
   /// Commit type (feat, fix, chore, docs, etc.)
@@ -30,8 +28,6 @@ pub struct ConventionalCommit {
 }
 
 /// Conventional commit types
-// TODO(quality): Used by ConventionalCommit, wire into release apply command
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommitType {
   /// New feature
@@ -62,8 +58,6 @@ pub enum CommitType {
 
 impl CommitType {
   /// Parse commit type from string
-  // TODO(quality): Used by ConventionalCommit parser
-  #[allow(dead_code)]
   #[track_caller]
   pub fn from_str(s: &str) -> Self {
     match s.to_lowercase().as_str() {
@@ -83,15 +77,12 @@ impl CommitType {
   }
 
   /// Check if this commit type triggers a version bump
-  // TODO(quality): Used by ChangelogGenerator for filtering
-  #[allow(dead_code)]
+  #[allow(dead_code)] // Used by has_user_facing_changes() and in tests
   pub fn is_user_facing(&self) -> bool {
     matches!(self, Self::Feat | Self::Fix | Self::Perf)
   }
 
   /// Get the display name for this commit type
-  // TODO(quality): Used by ChangelogGenerator for section headers
-  #[allow(dead_code)]
   pub fn display_name(&self) -> &'static str {
     match self {
       Self::Feat => "Features",
@@ -117,19 +108,16 @@ impl fmt::Display for CommitType {
 }
 
 /// Changelog output format
-// TODO(quality): Wire into release apply command
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangelogFormat {
   /// Markdown format (default)
   Markdown,
   /// JSON format for programmatic use
+  #[allow(dead_code)] // Used by render() and in tests
   Json,
 }
 
 /// Generated changelog
-// TODO(quality): Wire into release apply command
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Changelog {
   /// Version for this changelog
@@ -144,8 +132,6 @@ pub struct Changelog {
 
 impl Changelog {
   /// Create a new changelog
-  // TODO(quality): Called by ChangelogGenerator
-  #[allow(dead_code)]
   pub fn new(version: String, date: String) -> Self {
     Self {
       version,
@@ -156,23 +142,18 @@ impl Changelog {
   }
 
   /// Add a commit to the changelog
-  // TODO(quality): Called by ChangelogGenerator
-  #[allow(dead_code)]
   pub fn add_commit(&mut self, commit: ConventionalCommit, sha: String) {
     self.all_commit_shas.push(sha);
     self.commits_by_type.entry(commit.commit_type).or_default().push(commit);
   }
 
   /// Check if there are any user-facing changes
-  // TODO(quality): Used in release apply to determine if changelog should be generated
-  #[allow(dead_code)]
+  #[allow(dead_code)] // Public API for future use, tested in test_changelog_has_user_facing_changes
   pub fn has_user_facing_changes(&self) -> bool {
     self.commits_by_type.keys().any(|t| t.is_user_facing())
   }
 
   /// Render as markdown
-  // TODO(quality): Used by release apply to write CHANGELOG.md
-  #[allow(dead_code)]
   pub fn to_markdown(&self) -> String {
     let mut output = String::new();
 
@@ -232,8 +213,6 @@ impl Changelog {
   }
 
   /// Render as JSON
-  // TODO(quality): Used by release apply with --json flag
-  #[allow(dead_code)]
   pub fn to_json(&self) -> Result<String, serde_json::Error> {
     use serde::{Serialize, Serializer};
 
@@ -296,8 +275,6 @@ impl Changelog {
   }
 
   /// Render in the specified format
-  // TODO(quality): Main entry point for release apply
-  #[allow(dead_code)]
   pub fn render(&self, format: ChangelogFormat) -> Result<String, String> {
     match format {
       ChangelogFormat::Markdown => Ok(self.to_markdown()),
@@ -308,8 +285,6 @@ impl Changelog {
 
 impl ConventionalCommit {
   /// Check if this commit is a breaking change
-  // TODO(quality): Used by ChangelogGenerator for version bump detection
-  #[allow(dead_code)]
   pub fn is_breaking(&self) -> bool {
     self.breaking_change.is_some()
   }
@@ -318,8 +293,6 @@ impl ConventionalCommit {
   ///
   /// Returns None if the message doesn't follow conventional commit format.
   /// This is intentional - not all commits need to be conventional.
-  // TODO(quality): Wire into release apply command for changelog generation
-  #[allow(dead_code)]
   #[track_caller]
   pub fn parse(message: &str) -> Option<Self> {
     use winnow::ascii::{alphanumeric1, space0};
