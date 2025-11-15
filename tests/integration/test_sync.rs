@@ -12,7 +12,7 @@ fn test_sync_mono_to_remote() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -65,7 +65,7 @@ fn test_sync_remote_to_mono() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -121,7 +121,7 @@ fn test_sync_bidirectional() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -190,7 +190,7 @@ fn test_sync_deduplicates_commits() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -254,7 +254,7 @@ fn test_conflict_resolution_ours_strategy() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
 
   run_cargo_rail(
     &workspace.path,
@@ -334,7 +334,7 @@ fn test_conflict_resolution_theirs_strategy() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
 
   run_cargo_rail(
     &workspace.path,
@@ -410,7 +410,7 @@ fn test_conflict_resolution_manual_strategy() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
 
   run_cargo_rail(
     &workspace.path,
@@ -487,7 +487,7 @@ fn test_conflict_resolution_union_strategy() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
 
   run_cargo_rail(
     &workspace.path,
@@ -567,7 +567,7 @@ fn test_no_conflict_with_non_overlapping_changes() -> Result<()> {
   workspace.commit("Add my-crate")?;
 
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[

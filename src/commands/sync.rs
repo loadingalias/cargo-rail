@@ -187,10 +187,7 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
     let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
 
     // Determine target repo path
-    let target_repo_path = if split_config.remote.starts_with('/')
-      || split_config.remote.starts_with("./")
-      || split_config.remote.starts_with("../")
-    {
+    let target_repo_path = if utils::is_local_path(&split_config.remote) {
       std::path::PathBuf::from(&split_config.remote)
     } else {
       let remote_name = split_config

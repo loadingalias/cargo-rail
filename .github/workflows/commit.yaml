@@ -81,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
         with:
           name: junit-report-${{ matrix.target.name }}
-          path: junit.xml
+          path: target/nextest/commit/junit.xml
           retention-days: 7
           if-no-files-found: ignore
 
@@ -89,11 +89,14 @@ jobs:
         if: always()
         uses: mikepenz/action-junit-report@e08919a3b1fb83a78393dfb775a9c37f17d8eea6  # v6.0.1
         with:
-          report_paths: 'junit.xml'
+          report_paths: 'target/nextest/commit/junit.xml'
           check_name: 'Test Results (${{ matrix.target.name }})'
           detailed_summary: true
           include_passed: false
           fail_on_failure: true
+          require_tests: true
+          annotate_only: false
+          summary: true
 
       - name: Upload Nextest Results (on failure)
         if: failure()

@@ -35,7 +35,17 @@ pub fn is_local_path(path: &str) -> bool {
     return true;
   }
 
-  // Check for absolute paths (works on Unix, and Windows on Windows)
+  // Check for Unix absolute paths (/path/to/repo)
+  // Important: Check this BEFORE is_absolute() because on Windows,
+  // Path::is_absolute() returns false for Unix-style paths
+  if path.starts_with('/') {
+    // Make sure it's not part of a URL pattern
+    if !path.contains("://") && !path.contains('@') {
+      return true;
+    }
+  }
+
+  // Check for absolute paths (fallback for platform-specific cases)
   if p.is_absolute() {
     return true;
   }

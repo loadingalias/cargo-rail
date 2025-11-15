@@ -6,6 +6,7 @@ use crate::core::config::RailConfig;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::mapping::MappingStore;
 use crate::ui::progress::FileProgress;
+use crate::utils;
 
 /// A single SHA mapping
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,10 +177,7 @@ fn get_target_path(
   current_dir: &std::path::Path,
   split_config: &crate::core::config::SplitConfig,
 ) -> Option<std::path::PathBuf> {
-  let target_repo_path = if split_config.remote.starts_with('/')
-    || split_config.remote.starts_with("./")
-    || split_config.remote.starts_with("../")
-  {
+  let target_repo_path = if utils::is_local_path(&split_config.remote) {
     std::path::PathBuf::from(&split_config.remote)
   } else {
     let remote_name = split_config

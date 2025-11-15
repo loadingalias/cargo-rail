@@ -24,8 +24,8 @@ fn test_full_workflow_init_split_sync() -> Result<()> {
   assert!(workspace.file_exists("rail.toml"));
 
   // Step 3: Split both crates with remote overrides
-  let core_split = workspace.path.join("split-repos/lib-core-split");
-  let utils_split = workspace.path.join("split-repos/lib-utils-split");
+  let core_split = workspace.path.join("split-repos").join("lib-core-split");
+  let utils_split = workspace.path.join("split-repos").join("lib-utils-split");
 
   run_cargo_rail(
     &workspace.path,
@@ -173,7 +173,7 @@ fn test_workflow_handles_workspace_dependencies() -> Result<()> {
 
   // Initialize and split with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/derived-split");
+  let split_dir = workspace.path.join("split-repos").join("derived-split");
   run_cargo_rail(
     &workspace.path,
     &[

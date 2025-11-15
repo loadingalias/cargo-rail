@@ -5,6 +5,7 @@ use std::process::Command;
 
 use crate::core::config::RailConfig;
 use crate::core::error::{ConfigError, RailError, RailResult};
+use crate::utils;
 
 /// Status of a crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,10 +72,7 @@ pub fn run_status(json: bool) -> RailResult<()> {
   let mut statuses = Vec::new();
 
   for split_config in &config.splits {
-    let target_repo_path = if split_config.remote.starts_with('/')
-      || split_config.remote.starts_with("./")
-      || split_config.remote.starts_with("../")
-    {
+    let target_repo_path = if utils::is_local_path(&split_config.remote) {
       std::path::PathBuf::from(&split_config.remote)
     } else {
       let remote_name = split_config

@@ -4,6 +4,7 @@ use super::trait_def::{Check, CheckContext, CheckResult};
 use crate::core::config::RailConfig;
 use crate::core::error::RailResult;
 use crate::ui::progress::FileProgress;
+use crate::utils;
 use std::process::Command;
 
 /// Check that validates remote repository accessibility
@@ -137,7 +138,7 @@ fn is_valid_remote_url(url: &str) -> bool {
   }
 
   // Local path (absolute or relative)
-  if url.starts_with('/') || url.starts_with("./") || url.starts_with("../") {
+  if utils::is_local_path(url) {
     return true;
   }
 
@@ -147,7 +148,7 @@ fn is_valid_remote_url(url: &str) -> bool {
 /// Test if we can access a remote repository
 fn test_remote_access(url: &str) -> RailResult<bool> {
   // For local paths, just check if directory exists
-  if url.starts_with('/') || url.starts_with("./") || url.starts_with("../") {
+  if utils::is_local_path(url) {
     let path = std::path::Path::new(url);
     return Ok(path.exists());
   }

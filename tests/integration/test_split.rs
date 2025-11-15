@@ -21,7 +21,7 @@ fn test_split_creates_repo_with_history() -> Result<()> {
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
 
   // Run split with remote override
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -74,7 +74,7 @@ fn test_split_transforms_cargo_toml() -> Result<()> {
 
   // Initialize and split app-crate with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/app-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("app-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -124,7 +124,7 @@ fn test_split_filters_commits() -> Result<()> {
 
   // Initialize and split crate-a with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/crate-a-split");
+  let split_dir = workspace.path.join("split-repos").join("crate-a-split");
   run_cargo_rail(
     &workspace.path,
     &[
@@ -169,7 +169,7 @@ fn test_split_copies_auxiliary_files() -> Result<()> {
 
   // Initialize and split with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
-  let split_dir = workspace.path.join("split-repos/my-crate-split");
+  let split_dir = workspace.path.join("split-repos").join("my-crate-split");
   run_cargo_rail(
     &workspace.path,
     &[
