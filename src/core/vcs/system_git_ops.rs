@@ -138,6 +138,11 @@ impl SystemGit {
   /// Get file content at a specific commit
   ///
   /// Returns None if file doesn't exist at that commit.
+  ///
+  /// NOTE: This is a convenience API kept for single-file reads. For multiple files,
+  /// use `read_files_bulk()` which is significantly more efficient (single subprocess call).
+  /// Currently unused but maintained as a tested public API for future use cases.
+  #[allow(dead_code)]
   pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
     let relative_path = if path.is_absolute() {
       path.strip_prefix(&self.work_tree).unwrap_or(path)

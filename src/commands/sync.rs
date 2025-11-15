@@ -345,6 +345,9 @@ pub fn run_sync(
       .map(|(split_config, _, _, _, _, _)| multi_progress.add_bar(1, format!("Syncing {}", split_config.name)))
       .collect();
 
+    // Wrap security config in Arc for cheap sharing across threads (avoid deep clones)
+    let security_config = std::sync::Arc::new(config.security.clone());
+
     let results: Vec<RailResult<SyncResult>> = plans
       .into_par_iter()
       .enumerate()
@@ -358,11 +361,11 @@ pub fn run_sync(
           remote_url: split_config.remote.clone(),
         };
 
-        // Create sync engine for this thread
+        // Create sync engine for this thread (security_config Arc clone is cheap)
         let mut engine = SyncEngine::new(
           config.workspace.root.clone(),
           sync_config,
-          config.security.clone(),
+          security_config.clone(),
           strategy,
         )?;
 
@@ -425,7 +428,7 @@ pub fn run_sync(
       let mut engine = SyncEngine::new(
         config.workspace.root.clone(),
         sync_config,
-        config.security.clone(),
+        std::sync::Arc::new(config.security.clone()),
         strategy,
       )?;
 

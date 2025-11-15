@@ -316,6 +316,36 @@ fn get_styles() -> clap::builder::Styles {
 fn main() {
   let CargoCli::Rail(cli) = CargoCli::parse();
 
+  // Build workspace context once (loads metadata, graph, config)
+  // Some commands don't need all of this, but the cost is negligible vs. the benefit
+  // of a unified, single-load architecture
+  let workspace_root = match std::env::current_dir() {
+    Ok(dir) => dir,
+    Err(e) => {
+      eprintln!("Error: Failed to get current directory: {}", e);
+      std::process::exit(1);
+    }
+  };
+
+  let ctx = match core::context::WorkspaceContext::build(&workspace_root) {
+    Ok(ctx) => ctx,
+    Err(e) => {
+      // Some commands (like init) may run before rail.toml exists
+      // For those, we'll handle the error in the command itself
+      // For now, print a warning but continue
+      if !matches!(cli.command, Commands::Init { .. }) {
+        eprintln!("Warning: Could not build full workspace context: {}", e);
+      }
+      // Create a minimal context for commands that can run without full setup
+      match try_minimal_context(&workspace_root) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+          handle_error(e);
+        }
+      }
+    }
+  };
+
   let result = match cli.command {
     // Setup & Inspection
     Commands::Init { all } => commands::run_init(all),
@@ -352,25 +382,25 @@ fn main() {
         to,
         format,
         dry_run,
-      } => commands::run_affected(since, from, to, format, dry_run),
+      } => commands::run_affected(&ctx, since, from, to, format, dry_run),
       GraphCommands::Test {
         since,
         workspace,
         dry_run,
         cargo_args,
-      } => commands::run_test(since, workspace, dry_run, cargo_args),
+      } => commands::run_test(&ctx, since, workspace, dry_run, cargo_args),
       GraphCommands::Check {
         since,
         workspace,
         dry_run,
         cargo_args,
-      } => commands::run_check(since, workspace, dry_run, cargo_args),
+      } => commands::run_check(&ctx, since, workspace, dry_run, cargo_args),
       GraphCommands::Clippy {
         since,
         workspace,
         dry_run,
         cargo_args,
-      } => commands::run_clippy(since, workspace, dry_run, cargo_args),
+      } => commands::run_clippy(&ctx, since, workspace, dry_run, cargo_args),
     },
 
     // Lint Commands (Pillar 3)
@@ -409,4 +439,22 @@ fn main() {
 fn handle_error(err: RailError) -> ! {
   print_error(&err);
   std::process::exit(err.exit_code().as_i32());
+}
+
+/// Try to build a minimal context when full context fails
+/// This allows commands like init to run before rail.toml exists
+fn try_minimal_context(workspace_root: &std::path::Path) -> core::error::RailResult<core::context::WorkspaceContext> {
+  use crate::cargo::metadata::WorkspaceMetadata;
+  use crate::graph::workspace_graph::WorkspaceGraph;
+  use std::sync::Arc;
+
+  let metadata = WorkspaceMetadata::load(workspace_root)?;
+  let graph = Arc::new(WorkspaceGraph::load(workspace_root)?);
+
+  Ok(core::context::WorkspaceContext {
+    root: workspace_root.to_path_buf(),
+    metadata,
+    graph,
+    config: None, // No config - this is minimal mode
+  })
 }

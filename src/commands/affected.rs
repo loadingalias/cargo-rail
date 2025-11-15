@@ -5,10 +5,10 @@
 //! - Which crates transitively depend on those changed crates
 //! - The minimal set of crates that need testing/building
 
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{RailError, RailResult};
 use crate::core::vcs::SystemGit;
-use crate::graph::{AffectedAnalysis, WorkspaceGraph};
-use std::env;
+use crate::graph::AffectedAnalysis;
 use std::path::{Path, PathBuf};
 
 /// Output format for affected command
@@ -35,20 +35,17 @@ impl OutputFormat {
 
 /// Run the affected command
 pub fn run_affected(
+  ctx: &WorkspaceContext,
   since: String,
   from: Option<String>,
   to: Option<String>,
   format: String,
   dry_run: bool,
 ) -> RailResult<()> {
-  let workspace_root = env::current_dir()?;
   let output_format = OutputFormat::from_str(&format)?;
 
-  // Load workspace graph
-  let graph = WorkspaceGraph::load(&workspace_root)?;
-
   // Get changed files from git
-  let changed_files = get_changed_files(&workspace_root, &since, from.as_deref(), to.as_deref())?;
+  let changed_files = get_changed_files(ctx.workspace_root(), &since, from.as_deref(), to.as_deref())?;
 
   if dry_run {
     println!("DRY RUN: Would analyze {} changed files", changed_files.len());
@@ -59,7 +56,7 @@ pub fn run_affected(
   }
 
   // Analyze affected crates
-  let analysis = crate::graph::affected::analyze(&graph, &changed_files)?;
+  let analysis = crate::graph::affected::analyze(&ctx.graph, &changed_files)?;
 
   // Output results
   display_results(&analysis, output_format)?;

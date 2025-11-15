@@ -10,25 +10,29 @@
 //! - `--dry-run` to show the plan without executing
 //! - Parallel execution via rayon
 
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{RailError, RailResult};
 use crate::core::vcs::SystemGit;
-use crate::graph::{AffectedAnalysis, WorkspaceGraph};
-use std::env;
+use crate::graph::AffectedAnalysis;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run the test command
-pub fn run_test(since: Option<String>, workspace: bool, dry_run: bool, cargo_args: Vec<String>) -> RailResult<()> {
-  let workspace_root = env::current_dir()?;
-
+pub fn run_test(
+  ctx: &WorkspaceContext,
+  since: Option<String>,
+  workspace: bool,
+  dry_run: bool,
+  cargo_args: Vec<String>,
+) -> RailResult<()> {
   if workspace {
     // Run tests for entire workspace
-    return run_workspace_tests(&workspace_root, dry_run, &cargo_args);
+    return run_workspace_tests(ctx.workspace_root(), dry_run, &cargo_args);
   }
 
   // Default: run targeted tests based on affected analysis
   let since_ref = since.unwrap_or_else(|| "origin/main".to_string());
-  run_affected_tests(&workspace_root, &since_ref, dry_run, &cargo_args)
+  run_affected_tests(ctx, &since_ref, dry_run, &cargo_args)
 }
 
 /// Run tests for the entire workspace
@@ -65,12 +69,9 @@ fn run_workspace_tests(workspace_root: &Path, dry_run: bool, cargo_args: &[Strin
 }
 
 /// Run tests for affected crates only
-fn run_affected_tests(workspace_root: &Path, since: &str, dry_run: bool, cargo_args: &[String]) -> RailResult<()> {
-  // Load workspace graph
-  let graph = WorkspaceGraph::load(workspace_root)?;
-
+fn run_affected_tests(ctx: &WorkspaceContext, since: &str, dry_run: bool, cargo_args: &[String]) -> RailResult<()> {
   // Get changed files from git
-  let changed_files = get_changed_files(workspace_root, since)?;
+  let changed_files = get_changed_files(ctx.workspace_root(), since)?;
 
   if changed_files.is_empty() {
     println!("✅ No changes detected since {}", since);
@@ -79,7 +80,7 @@ fn run_affected_tests(workspace_root: &Path, since: &str, dry_run: bool, cargo_a
   }
 
   // Analyze affected crates
-  let analysis = crate::graph::affected::analyze(&graph, &changed_files)?;
+  let analysis = crate::graph::affected::analyze(&ctx.graph, &changed_files)?;
 
   if analysis.impact.test_targets.is_empty() {
     println!("✅ Changes detected but no workspace crates affected");
@@ -101,7 +102,7 @@ fn run_affected_tests(workspace_root: &Path, since: &str, dry_run: bool, cargo_a
 
   // Execute tests for each affected crate
   println!("\nExecuting tests...\n");
-  execute_tests(&analysis.impact.test_targets, workspace_root, cargo_args)?;
+  execute_tests(&analysis.impact.test_targets, ctx.workspace_root(), cargo_args)?;
 
   println!("\n✅ All tests completed successfully");
   Ok(())

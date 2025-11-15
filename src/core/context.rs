@@ -42,6 +42,8 @@ pub struct WorkspaceContext {
   pub root: PathBuf,
 
   /// Cargo metadata (workspace members, dependencies, etc.)
+  /// TODO: Used by split/sync/lint/release commands for manifest transformation
+  #[allow(dead_code)]
   pub metadata: WorkspaceMetadata,
 
   /// Dependency graph (built from metadata)
@@ -51,6 +53,8 @@ pub struct WorkspaceContext {
   /// Rail configuration (rail.toml)
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
+  /// TODO: Used by split/sync/lint/release commands for policy enforcement
+  #[allow(dead_code)]
   pub config: Option<Arc<RailConfig>>,
 }
 
@@ -83,6 +87,8 @@ impl WorkspaceContext {
   /// Get config or error if not found.
   ///
   /// Use this in commands that require rail.toml configuration.
+  /// TODO: Used by split/sync/lint/release commands
+  #[allow(dead_code)]
   pub fn require_config(&self) -> RailResult<&Arc<RailConfig>> {
     self
       .config

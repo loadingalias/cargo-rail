@@ -10,8 +10,10 @@ use std::path::Path;
 /// Each note contains: `mono_sha -> remote_sha` or `remote_sha -> mono_sha`
 pub struct MappingStore {
   crate_name: String,
-  /// In-memory cache of mappings
+  /// In-memory cache of mappings (from_sha -> to_sha)
   mappings: HashMap<String, String>,
+  /// Reverse index for O(1) reverse lookups (to_sha -> from_sha)
+  reverse_mappings: HashMap<String, String>,
 }
 
 impl MappingStore {
@@ -20,6 +22,7 @@ impl MappingStore {
     Self {
       crate_name,
       mappings: HashMap::new(),
+      reverse_mappings: HashMap::new(),
     }
   }
 
@@ -74,7 +77,10 @@ impl MappingStore {
       if note_output.status.success() {
         let note_content = String::from_utf8_lossy(&note_output.stdout);
         let target_sha = note_content.trim();
-        self.mappings.insert(commit_sha.to_string(), target_sha.to_string());
+        let from = commit_sha.to_string();
+        let to = target_sha.to_string();
+        self.mappings.insert(from.clone(), to.clone());
+        self.reverse_mappings.insert(to, from);
       }
 
       if let Some(ref mut p) = progress {
@@ -130,7 +136,10 @@ impl MappingStore {
 
   /// Record a mapping between two commits
   pub fn record_mapping(&mut self, from_sha: &str, to_sha: &str) -> RailResult<()> {
-    self.mappings.insert(from_sha.to_string(), to_sha.to_string());
+    let from = from_sha.to_string();
+    let to = to_sha.to_string();
+    self.mappings.insert(from.clone(), to.clone());
+    self.reverse_mappings.insert(to, from);
     Ok(())
   }
 
@@ -139,9 +148,15 @@ impl MappingStore {
     Ok(self.mappings.get(sha).cloned())
   }
 
-  /// Check if a commit has been mapped
+  /// Check if a commit has been mapped (forward direction)
   pub fn has_mapping(&self, sha: &str) -> bool {
     self.mappings.contains_key(sha)
+  }
+
+  /// Check if a commit exists as a mapping target (reverse direction)
+  /// O(1) lookup using reverse index
+  pub fn has_reverse_mapping(&self, sha: &str) -> bool {
+    self.reverse_mappings.contains_key(sha)
   }
 
   /// Get all mappings
@@ -153,6 +168,7 @@ impl MappingStore {
   #[cfg(test)]
   pub fn clear(&mut self) {
     self.mappings.clear();
+    self.reverse_mappings.clear();
   }
 
   /// Get the number of mappings (only used in tests)
@@ -409,5 +425,86 @@ mod tests {
     assert_eq!(all.len(), 2);
     assert_eq!(all.get("sha1"), Some(&"sha2".to_string()));
     assert_eq!(all.get("sha3"), Some(&"sha4".to_string()));
+  }
+
+  #[test]
+  fn test_reverse_mapping() {
+    let mut store = MappingStore::new("test-crate".to_string());
+
+    // Record mapping: mono_sha -> remote_sha
+    store.record_mapping("mono_abc123", "remote_def456").unwrap();
+
+    // Forward lookup works
+    assert!(store.has_mapping("mono_abc123"));
+    assert_eq!(
+      store.get_mapping("mono_abc123").unwrap(),
+      Some("remote_def456".to_string())
+    );
+
+    // Reverse lookup works (O(1) instead of O(n) scan)
+    assert!(store.has_reverse_mapping("remote_def456"));
+    assert!(!store.has_reverse_mapping("mono_abc123"));
+    assert!(!store.has_reverse_mapping("nonexistent"));
+  }
+
+  #[test]
+  fn test_reverse_mapping_persistence() {
+    use std::process::Command;
+
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path();
+
+    // Initialize git repo with config
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["init"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "user.name", "Test User"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "user.email", "test@example.com"])
+      .output()
+      .unwrap();
+
+    // Create initial commit
+    std::fs::write(repo_path.join("test.txt"), "test").unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["add", "."])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["commit", "-m", "Initial commit"])
+      .output()
+      .unwrap();
+
+    let output = Command::new("git")
+      .current_dir(repo_path)
+      .args(["rev-parse", "HEAD"])
+      .output()
+      .unwrap();
+    let mono_sha = String::from_utf8(output.stdout).unwrap().trim().to_string();
+
+    // Create and save mappings
+    let mut store = MappingStore::new("test-crate".to_string());
+    store.record_mapping(&mono_sha, "remote_sha_xyz").unwrap();
+
+    // Verify reverse mapping before save
+    assert!(store.has_reverse_mapping("remote_sha_xyz"));
+
+    store.save(repo_path).unwrap();
+
+    // Load into new store and verify reverse mapping is rebuilt
+    let mut loaded_store = MappingStore::new("test-crate".to_string());
+    loaded_store.load(repo_path).unwrap();
+
+    assert!(loaded_store.has_mapping(&mono_sha));
+    assert!(loaded_store.has_reverse_mapping("remote_sha_xyz"));
   }
 }
