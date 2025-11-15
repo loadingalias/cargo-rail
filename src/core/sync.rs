@@ -877,18 +877,6 @@ impl SyncEngine {
     Ok((conflicts, changed_files))
   }
 
-  /// Legacy method - kept for compatibility but now uses resolve_conflicts_for_commit
-  /// TODO: Remove in favor of resolve_conflicts_for_commit once all call sites updated
-  #[allow(dead_code)]
-  fn check_for_conflicts(
-    &self,
-    remote_commit: &crate::core::vcs::CommitInfo,
-    remote_git: &SystemGit,
-  ) -> RailResult<bool> {
-    let (conflicts, _) = self.resolve_conflicts_for_commit(remote_commit, remote_git)?;
-    Ok(!conflicts.is_empty())
-  }
-
   fn check_mono_has_changes(&self) -> RailResult<bool> {
     let last_synced = self.find_last_synced_mono_commit()?;
     let crate_path = &self.config.crate_paths[0];
