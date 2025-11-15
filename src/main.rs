@@ -360,13 +360,13 @@ fn main() {
   let result = match cli.command {
     // Setup & Inspection
     Commands::Init { all } => commands::run_init(all),
-    Commands::Doctor { thorough, json } => commands::run_doctor(thorough, json),
-    Commands::Status { json } => commands::run_status(json),
+    Commands::Doctor { thorough, json } => commands::run_doctor(&ctx, thorough, json),
+    Commands::Status { json } => commands::run_status(&ctx, json),
     Commands::Mappings {
       crate_name,
       check,
       json,
-    } => commands::run_mappings(crate_name, check, json),
+    } => commands::run_mappings(&ctx, crate_name, check, json),
 
     // Split/Sync (Pillar 2)
     Commands::Split {
@@ -375,7 +375,7 @@ fn main() {
       remote,
       apply,
       json,
-    } => commands::run_split(crate_name, all, remote, apply, json),
+    } => commands::run_split(&ctx, crate_name, all, remote, apply, json),
     Commands::Sync {
       crate_name,
       all,
@@ -387,6 +387,7 @@ fn main() {
       apply,
       json,
     } => commands::run_sync(
+      &ctx,
       crate_name,
       all,
       remote,
@@ -434,24 +435,24 @@ fn main() {
         apply,
         json,
         strict,
-      } => commands::run_lint_deps(fix, apply, json, strict),
+      } => commands::run_lint_deps(&ctx, fix, apply, json, strict),
       LintCommands::Versions {
         fix,
         apply,
         json,
         strict,
-      } => commands::run_lint_versions(fix, apply, json, strict),
-      LintCommands::Manifest { json, strict } => commands::run_lint_manifest(json, strict),
+      } => commands::run_lint_versions(&ctx, fix, apply, json, strict),
+      LintCommands::Manifest { json, strict } => commands::run_lint_manifest(&ctx, json, strict),
     },
 
     // Release Commands (Pillar 4)
     Commands::Release(release_cmd) => match release_cmd {
-      ReleaseCommands::Plan { name, all, json } => commands::run_release_plan(name, all, json),
+      ReleaseCommands::Plan { name, all, json } => commands::run_release_plan(&ctx, name, all, json),
       ReleaseCommands::Apply {
         name,
         dry_run,
         skip_sync,
-      } => commands::run_release_apply(name, dry_run, skip_sync),
+      } => commands::run_release_apply(&ctx, name, dry_run, skip_sync),
     },
   };
 

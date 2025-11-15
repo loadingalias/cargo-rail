@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::core::config::RailConfig;
-use crate::core::error::{ConfigError, RailError, RailResult};
+use crate::core::context::WorkspaceContext;
+use crate::core::error::{RailError, RailResult};
 use crate::utils;
 
 /// Status of a crate
@@ -56,17 +55,11 @@ pub struct CrateStatus {
 }
 
 /// Run the status command
-pub fn run_status(json: bool) -> RailResult<()> {
-  let current_dir = env::current_dir()?;
+pub fn run_status(ctx: &WorkspaceContext, json: bool) -> RailResult<()> {
+  let workspace_root = ctx.workspace_root();
 
   // Load configuration
-  if !RailConfig::exists(&current_dir) {
-    return Err(RailError::Config(ConfigError::NotFound {
-      workspace_root: current_dir,
-    }));
-  }
-
-  let config = RailConfig::load(&current_dir)?;
+  let config = ctx.require_config()?.as_ref();
 
   // Gather status for all crates
   let mut statuses = Vec::new();
@@ -81,13 +74,13 @@ pub fn run_status(json: bool) -> RailResult<()> {
         .next()
         .unwrap_or(&split_config.name)
         .trim_end_matches(".git");
-      current_dir.join("..").join(remote_name)
+      workspace_root.join("..").join(remote_name)
     };
 
     let target_exists = target_repo_path.exists();
 
     // Check if split exists by checking git-notes (more reliable than directory check)
-    let has_git_notes = check_git_notes_exist(&current_dir, &split_config.name)?;
+    let has_git_notes = check_git_notes_exist(workspace_root, &split_config.name)?;
 
     let split_status = if has_git_notes {
       SplitStatus::Split
@@ -101,7 +94,7 @@ pub fn run_status(json: bool) -> RailResult<()> {
     // Check sync status if target exists
     let sync_status = if target_exists {
       Some(check_sync_status(
-        &current_dir,
+        workspace_root,
         &target_repo_path,
         &split_config.branch,
       )?)
@@ -110,7 +103,7 @@ pub fn run_status(json: bool) -> RailResult<()> {
     };
 
     // Check for dirty state in monorepo paths
-    let dirty = check_dirty_state(&current_dir, split_config.get_paths())?;
+    let dirty = check_dirty_state(workspace_root, split_config.get_paths())?;
 
     statuses.push(CrateStatus {
       name: split_config.name.clone(),

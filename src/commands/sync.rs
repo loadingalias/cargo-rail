@@ -1,7 +1,4 @@
-use std::env;
-
 use crate::commands::doctor;
-use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
 use crate::core::context::WorkspaceContext;
 use crate::core::error::{ConfigError, RailError, RailResult};
@@ -28,6 +25,7 @@ pub struct SyncParams {
 /// Run the sync command
 #[allow(clippy::too_many_arguments)]
 pub fn run_sync(
+  ctx: &WorkspaceContext,
   crate_name: Option<String>,
   all: bool,
   remote: Option<String>,
@@ -50,11 +48,11 @@ pub fn run_sync(
     apply,
     json,
   };
-  run_sync_impl(params)
+  run_sync_impl(ctx, params)
 }
 
 /// Internal implementation of sync command
-fn run_sync_impl(params: SyncParams) -> RailResult<()> {
+fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
   let SyncParams {
     crate_name,
     all,
@@ -68,16 +66,9 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
   } = params;
   // Parse conflict strategy (validate it, then use as string in ExecuteSync operation)
   let _strategy = ConflictStrategy::from_str(&strategy_str)?;
-  let current_dir = env::current_dir()?;
 
   // Load configuration
-  if !RailConfig::exists(&current_dir) {
-    return Err(RailError::Config(ConfigError::NotFound {
-      workspace_root: current_dir,
-    }));
-  }
-
-  let mut config = RailConfig::load(&current_dir)?;
+  let mut config = ctx.require_config()?.as_ref().clone();
 
   // Apply CLI overrides to security config if provided
   if no_protected_branches {
@@ -116,7 +107,7 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
   // Run preflight health checks before proceeding (skip for local-only operations)
   if !json && apply && !all_local {
     println!("🏥 Running preflight health checks...");
-    if !doctor::run_preflight_check(false)? {
+    if !doctor::run_preflight_check(ctx, false)? {
       return Err(RailError::with_help(
         "Preflight checks failed - environment is not ready",
         "Run 'cargo rail doctor' for detailed diagnostics and fixes",
@@ -170,7 +161,7 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
       if progress.is_none() {
         println!("   🏥 Checking crate '{}'...", split_config.name);
       }
-      if !doctor::run_crate_check(&split_config.name, false)? {
+      if !doctor::run_crate_check(ctx, &split_config.name, false)? {
         return Err(RailError::with_help(
           format!("Health checks failed for crate '{}'", split_config.name),
           "Run 'cargo rail doctor' for detailed diagnostics",
@@ -198,7 +189,7 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
         .next()
         .unwrap_or(&split_config.name)
         .trim_end_matches(".git");
-      current_dir.join("..").join(remote_name)
+      ctx.workspace_root().join("..").join(remote_name)
     };
 
     // Check if target repo exists
@@ -333,9 +324,8 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
   // Apply mode - execute the sync
   println!("\n🚀 APPLY MODE - Executing sync operations\n");
 
-  // Build workspace context for execution
-  let workspace_context = WorkspaceContext::build(&current_dir)?;
-  let executor = PlanExecutor::new(&workspace_context);
+  // Use existing workspace context for execution
+  let executor = PlanExecutor::new(ctx);
 
   let plan_count = plans.len();
 
@@ -350,12 +340,13 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
       .collect();
 
     // For parallel execution, we need to build contexts per-thread
+    let workspace_root = ctx.workspace_root().to_path_buf();
     let results: Vec<RailResult<()>> = plans
       .into_par_iter()
       .enumerate()
       .map(|(idx, (_, _, _, plan, _, _))| {
         // Build workspace context for this thread
-        let thread_context = WorkspaceContext::build(&current_dir)?;
+        let thread_context = WorkspaceContext::build(&workspace_root)?;
         let thread_executor = PlanExecutor::new(&thread_context);
         let result = thread_executor.execute(&plan);
 

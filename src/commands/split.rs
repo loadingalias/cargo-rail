@@ -1,8 +1,6 @@
-use std::env;
 use std::io::{self, Write};
 
 use crate::commands::doctor;
-use crate::core::config::RailConfig;
 use crate::core::context::WorkspaceContext;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::executor::PlanExecutor;
@@ -25,22 +23,14 @@ fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
 
 /// Run the split command
 pub fn run_split(
+  ctx: &WorkspaceContext,
   crate_name: Option<String>,
   all: bool,
   remote: Option<String>,
   apply: bool,
   json: bool,
 ) -> RailResult<()> {
-  let current_dir = env::current_dir()?;
-
-  // Load configuration
-  if !RailConfig::exists(&current_dir) {
-    return Err(RailError::Config(ConfigError::NotFound {
-      workspace_root: current_dir,
-    }));
-  }
-
-  let config = RailConfig::load(&current_dir)?;
+  let config = ctx.require_config()?.as_ref();
   println!("📦 Loaded configuration from .rail/config.toml");
 
   // Determine which crates to split
@@ -73,7 +63,7 @@ pub fn run_split(
   // Run preflight health checks before proceeding (skip for local-only operations)
   if !json && apply && !all_local {
     println!("🏥 Running preflight health checks...");
-    if !doctor::run_preflight_check(false)? {
+    if !doctor::run_preflight_check(ctx, false)? {
       return Err(RailError::with_help(
         "Preflight checks failed - environment is not ready",
         "Run 'cargo rail doctor' for detailed diagnostics and fixes",
@@ -108,7 +98,7 @@ pub fn run_split(
       if progress.is_none() {
         println!("   🏥 Checking crate '{}'...", split_config.name);
       }
-      if !doctor::run_crate_check(&split_config.name, false)? {
+      if !doctor::run_crate_check(ctx, &split_config.name, false)? {
         return Err(RailError::with_help(
           format!("Health checks failed for crate '{}'", split_config.name),
           "Run 'cargo rail doctor' for detailed diagnostics",
@@ -136,7 +126,7 @@ pub fn run_split(
         .next()
         .unwrap_or(&split_config.name)
         .trim_end_matches(".git");
-      current_dir.join("..").join(remote_name)
+      ctx.workspace_root().join("..").join(remote_name)
     };
 
     // Build unified Plan with ExecuteSplit operation
@@ -215,9 +205,8 @@ pub fn run_split(
     println!("\n🚀 APPLY MODE - Executing split operations\n");
   }
 
-  // Build workspace context for execution
-  let workspace_context = WorkspaceContext::build(&current_dir)?;
-  let executor = PlanExecutor::new(&workspace_context);
+  // Use existing workspace context for execution
+  let executor = PlanExecutor::new(ctx);
 
   let plan_count = plans.len();
 
@@ -232,12 +221,13 @@ pub fn run_split(
       .collect();
 
     // For parallel execution, we need to build contexts per-thread
+    let workspace_root = ctx.workspace_root().to_path_buf();
     let results: Vec<RailResult<()>> = plans
       .into_par_iter()
       .enumerate()
       .map(|(idx, (_, _, _, plan))| {
         // Build workspace context for this thread
-        let thread_context = WorkspaceContext::build(&current_dir)?;
+        let thread_context = WorkspaceContext::build(&workspace_root)?;
         let thread_executor = PlanExecutor::new(&thread_context);
         let result = thread_executor.execute(&plan);
 
