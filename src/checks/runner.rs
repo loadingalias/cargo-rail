@@ -82,6 +82,7 @@ pub fn create_default_runner() -> CheckRunner {
   runner.add_check(Arc::new(super::edition_consistency::EditionConsistencyCheck));
   runner.add_check(Arc::new(super::msrv::MSRVCheck));
   runner.add_check(Arc::new(super::patch_replace::PatchReplaceCheck));
+  runner.add_check(Arc::new(super::tier_violations::TierViolationCheck));
   runner.add_check(Arc::new(super::ssh::SshKeyCheck));
   runner.add_check(Arc::new(super::security_config::SecurityConfigCheck));
   runner.add_check(Arc::new(super::git_notes::GitNotesCheck));
@@ -99,6 +100,7 @@ pub fn create_manifest_runner() -> CheckRunner {
   runner.add_check(Arc::new(super::edition_consistency::EditionConsistencyCheck));
   runner.add_check(Arc::new(super::msrv::MSRVCheck));
   runner.add_check(Arc::new(super::patch_replace::PatchReplaceCheck));
+  runner.add_check(Arc::new(super::tier_violations::TierViolationCheck));
 
   runner
 }
