@@ -8,14 +8,9 @@ Split crates to standalone repos, sync bidirectionally, run smart CI, enforce po
 
 ## Status
 
-| Pillar | Status |
-|--------|--------|
-| **Graph Orchestration** | ✅ Complete |
-| **Split/Sync** | ✅ Production |
-| **Policy & Linting** | ✅ Complete |
-| **Release Orchestration** | ✅ Core Complete |
+This crate is under active development. I've deliberately not published anything yet. If you stumble upon it and are interested in it; feel free. I'd love any reviews early on. However, be aware, it's not ready for any kind of high-stakes, production work. It has many things that need to be fixed. It has many unhinged comments/TODO items.
 
-**113 tests passing. Zero warnings. Ready for internal use.**
+I estimate this will be v1 ready in the next 3-5 days. (Today: 11/14/2025)
 
 ---
 
@@ -91,6 +86,7 @@ cargo rail release apply my-crate --dry-run
 ## Commands
 
 ### Graph
+
 ```bash
 cargo rail graph affected       # Show affected crates
 cargo rail graph test          # Smart test targeting
@@ -101,6 +97,7 @@ cargo rail graph clippy        # Smart clippy
 **Flags:** `--since <ref>`, `--workspace`, `--dry-run`, `--format json|names`
 
 ### Split/Sync
+
 ```bash
 cargo rail init                # Initialize rail.toml
 cargo rail split <name>        # Split with history
@@ -111,6 +108,7 @@ cargo rail sync --all          # Sync all splits
 **Flags:** `--apply` (default: dry-run), `--json`, `--from-remote`
 
 ### Lint
+
 ```bash
 cargo rail lint deps           # Workspace inheritance
 cargo rail lint versions       # Duplicate versions
@@ -120,6 +118,7 @@ cargo rail lint manifest       # Quality checks
 **Flags:** `--fix --apply`, `--json`, `--strict`
 
 ### Release
+
 ```bash
 cargo rail release plan        # Analyze commits
 cargo rail release apply       # Bump, tag, sync
@@ -128,6 +127,7 @@ cargo rail release apply       # Bump, tag, sync
 **Flags:** `--all`, `--json`, `--dry-run`
 
 ### Inspect
+
 ```bash
 cargo rail status              # Show all splits
 cargo rail doctor              # Health checks
@@ -180,7 +180,7 @@ last_date = "2025-01-15T00:00:00Z"
 - **Plan** - Auditable dry-run with SHA IDs
 - **MappingStore** - Git-notes commit mapping (rebase-safe)
 
-**Dependencies:** cargo_metadata, petgraph, toml_edit, clap, serde. No libgit2/gitoxide.
+**Dependencies:** cargo_metadata, petgraph, toml_edit, clap, serde. No libgit2/gitoxide by design; no guppy by design.
 
 ---
 
@@ -201,31 +201,3 @@ last_date = "2025-01-15T00:00:00Z"
 **Policy enforcement:** Uniform edition, MSRV, dependency versions across 50+ crates.
 
 **Release coordination:** Version bump + tag + changelog across mono + split repos.
-
----
-
-## Stats
-
-- **10,200+ lines Rust**
-- **113 tests** (77 unit + 36 integration)
-- **Zero warnings** (strict clippy)
-- **cargo deny + audit** passing
-
----
-
-## vs Alternatives
-
-- **vs git-subtree:** Bidirectional + Cargo transforms
-- **vs Copybara:** Simpler (TOML vs Starlark), Rust-native
-- **vs cargo-workspaces:** Adds split/sync + graph orchestration
-- **vs Nx/Turborepo:** Rust-native, Cargo-first, opinionated
-
----
-
-## License
-
-MIT
-
----
-
-**Built for Rust teams working at scale.**

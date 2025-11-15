@@ -25,9 +25,9 @@ use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
 use petgraph::algo;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 /// A package node in the dependency graph.
 #[derive(Debug, Clone)]
@@ -61,8 +61,9 @@ pub struct WorkspaceGraph {
   workspace_members: HashSet<String>,
 
   /// Path cache: directory → owning crate name
-  /// Built lazily on first file lookup (interior mutability for caching)
-  path_cache: RefCell<Option<HashMap<PathBuf, String>>>,
+  /// Built lazily on first file lookup (thread-safe interior mutability)
+  /// Uses RwLock instead of RefCell for Send/Sync compatibility
+  path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
 
   /// Original metadata (for fallback queries)
   // TODO: Used for feature analysis and detailed package info queries
@@ -124,7 +125,7 @@ impl WorkspaceGraph {
       name_to_node,
       id_to_node,
       workspace_members,
-      path_cache: RefCell::new(None),
+      path_cache: RwLock::new(None),
       metadata,
     })
   }
@@ -221,15 +222,19 @@ impl WorkspaceGraph {
   ///
   /// Builds path cache on first call, then O(1) lookups.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
-    // Build cache if needed (interior mutability)
-    if self.path_cache.borrow().is_none() {
-      self.build_path_cache();
+    // Build cache if needed (interior mutability with RwLock)
+    {
+      let cache = self.path_cache.read().unwrap();
+      if cache.is_none() {
+        drop(cache); // Release read lock before acquiring write lock
+        self.build_path_cache();
+      }
     }
 
     // Normalize path
     let normalized = file_path.canonicalize().ok()?;
 
-    let cache = self.path_cache.borrow();
+    let cache = self.path_cache.read().unwrap();
     let cache_ref = cache.as_ref()?;
 
     // Direct lookup
@@ -288,7 +293,7 @@ impl WorkspaceGraph {
       }
     }
 
-    *self.path_cache.borrow_mut() = Some(cache);
+    *self.path_cache.write().unwrap() = Some(cache);
   }
 
   /// Access raw metadata for advanced queries.

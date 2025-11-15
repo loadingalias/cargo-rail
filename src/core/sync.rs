@@ -152,6 +152,7 @@ impl SyncEngine {
       );
 
       let mut synced_count = 0;
+      let mut current_remote_head = remote_git.head_commit()?; // Cache HEAD, update after each commit
 
       for commit in &new_commits {
         // Skip if already synced
@@ -167,11 +168,12 @@ impl SyncEngine {
         }
 
         // Apply commit to remote
-        let remote_sha = self.apply_mono_commit_to_remote(commit, &remote_git)?;
+        let remote_sha = self.apply_mono_commit_to_remote(commit, &remote_git, &current_remote_head)?;
 
         // Record mapping
         self.mapping_store.record_mapping(&commit.sha, &remote_sha)?;
         synced_count += 1;
+        current_remote_head = remote_sha.clone(); // Update cached HEAD
 
         progress.inc();
       }
@@ -284,6 +286,7 @@ impl SyncEngine {
       );
 
       let mut count = 0;
+      let mut current_mono_head = self.mono_git.head_commit()?; // Cache HEAD, update after each commit
 
       for commit in &new_commits {
         // Skip if this commit came from mono (check trailer)
@@ -310,11 +313,12 @@ impl SyncEngine {
         }
 
         // Apply commit to mono (skipping already-resolved files)
-        let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files)?;
+        let mono_sha = self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files, &current_mono_head)?;
 
         // Record mapping (remote -> mono)
         self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
         count += 1;
+        current_mono_head = mono_sha.clone(); // Update cached HEAD
 
         progress.inc();
       }
@@ -441,6 +445,7 @@ impl SyncEngine {
     &self,
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &SystemGit,
+    current_remote_head: &str,
   ) -> RailResult<String> {
     // Get changed files in mono
     let changed_files = self.mono_git.get_changed_files(&commit.sha)?;
@@ -511,7 +516,7 @@ impl SyncEngine {
     // Create commit with trailer
     let message = format!("{}\n\nRail-Origin: mono@{}", commit.message.trim(), commit.sha);
 
-    let parent_shas = vec![remote_git.head_commit()?];
+    let parent_shas = vec![current_remote_head.to_string()];
 
     let new_commit_sha = remote_git.create_commit_with_metadata(
       &message,
@@ -536,6 +541,7 @@ impl SyncEngine {
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &SystemGit,
     resolved_files: &[PathBuf],
+    current_mono_head: &str,
   ) -> RailResult<String> {
     // Get changed files in remote
     let changed_files = remote_git.get_changed_files(&commit.sha)?;
@@ -610,7 +616,7 @@ impl SyncEngine {
     // Create commit with trailer
     let message = format!("{}\n\nRail-Origin: remote@{}", commit.message.trim(), commit.sha);
 
-    let parent_shas = vec![self.mono_git.head_commit()?];
+    let parent_shas = vec![current_mono_head.to_string()];
 
     let new_commit_sha = self.mono_git.create_commit_with_metadata(
       &message,
