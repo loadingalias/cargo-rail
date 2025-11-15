@@ -130,6 +130,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml_edit",
+ "winnow",
 ]
 
 [[package]]

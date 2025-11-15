@@ -200,6 +200,20 @@ pub enum WorkspaceMode {
   Workspace,
 }
 
+/// Visibility tier for releases (OSS/internal/enterprise)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum Visibility {
+  /// Open source release (publicly accessible)
+  Oss,
+  /// Internal release (company-internal use)
+  #[default]
+  Internal,
+  /// Enterprise release (commercial offering)
+  Enterprise,
+}
+
 /// Release configuration for a crate or product
 ///
 /// # Invariants
@@ -215,6 +229,9 @@ pub enum WorkspaceMode {
 /// name = "lib-core"
 /// crate = "crates/lib-core"
 /// split = "lib_core"  # optional: link to splits config
+/// changelog = "crates/lib-core/CHANGELOG.md"
+/// visibility = "oss"
+/// includes = ["lib-core", "lib-utils"]  # for bundled products
 /// last_version = "0.3.1"
 /// last_sha = "abc123..."
 /// last_date = "2025-01-15"
@@ -232,6 +249,21 @@ pub struct ReleaseConfig {
   /// If set, releases will be synced to the split repo
   #[serde(default)]
   pub split: Option<String>,
+
+  /// Path to changelog file (e.g., "crates/lib-core/CHANGELOG.md")
+  /// Used by `cargo rail release apply` to generate changelog entries
+  #[serde(default)]
+  pub changelog: Option<PathBuf>,
+
+  /// Release visibility tier (oss, internal, enterprise)
+  /// Enables tier-based graph filtering and tier violation checks
+  #[serde(default)]
+  pub visibility: Visibility,
+
+  /// List of crate names included in this release
+  /// For products that bundle multiple crates together
+  #[serde(default)]
+  pub includes: Vec<String>,
 
   /// Last released version (updated by `cargo rail release apply`)
   #[serde(default)]
@@ -264,6 +296,75 @@ impl ReleaseConfig {
       .as_ref()
       .and_then(|v| semver::Version::parse(v).ok())
       .unwrap_or_else(|| semver::Version::new(0, 0, 0))
+  }
+
+  /// Validate release configuration
+  pub fn validate(&self, workspace_root: &Path) -> RailResult<()> {
+    // Validate crate path exists
+    let crate_abs_path = workspace_root.join(&self.crate_path);
+    if !crate_abs_path.exists() {
+      return Err(RailError::with_help(
+        format!(
+          "Release '{}': crate path '{}' does not exist",
+          self.name,
+          self.crate_path.display()
+        ),
+        "Ensure the crate path is correct in rail.toml",
+      ));
+    }
+
+    // Validate changelog path if specified
+    if let Some(ref changelog) = self.changelog {
+      // Check for valid extension
+      if let Some(ext) = changelog.extension() {
+        if ext != "md" {
+          return Err(RailError::with_help(
+            format!(
+              "Release '{}': changelog must be a Markdown file (*.md), found '{}'",
+              self.name,
+              changelog.display()
+            ),
+            "Use a .md extension for changelog files",
+          ));
+        }
+      } else {
+        return Err(RailError::with_help(
+          format!(
+            "Release '{}': changelog path '{}' has no file extension",
+            self.name,
+            changelog.display()
+          ),
+          "Changelog must be a Markdown file (*.md)",
+        ));
+      }
+
+      // Validate parent directory exists (file itself can be created later)
+      let changelog_abs = workspace_root.join(changelog);
+      if let Some(parent) = changelog_abs.parent()
+        && !parent.exists()
+      {
+        return Err(RailError::with_help(
+          format!(
+            "Release '{}': changelog parent directory '{}' does not exist",
+            self.name,
+            parent.display()
+          ),
+          "Create the directory or adjust the changelog path",
+        ));
+      }
+    }
+
+    // Validate includes are not empty strings
+    for include in &self.includes {
+      if include.trim().is_empty() {
+        return Err(RailError::with_help(
+          format!("Release '{}': includes cannot contain empty strings", self.name),
+          "Remove empty strings from the includes list",
+        ));
+      }
+    }
+
+    Ok(())
   }
 }
 
@@ -298,6 +399,14 @@ impl RailConfig {
       .policy
       .validate()
       .with_context(|| format!("Invalid policy configuration in {}", config_path.display()))?;
+
+    // Validate release configurations
+    let workspace_root = &config.workspace.root;
+    for release in &config.releases {
+      release
+        .validate(workspace_root)
+        .with_context(|| format!("Invalid release configuration in {}", config_path.display()))?;
+    }
 
     Ok(config)
   }
@@ -433,5 +542,153 @@ mod tests {
       ..Default::default()
     };
     assert!(policy_enabled.is_enabled());
+  }
+
+  #[test]
+  fn test_visibility_default() {
+    assert_eq!(Visibility::default(), Visibility::Internal);
+  }
+
+  #[test]
+  fn test_visibility_serialization() {
+    assert_eq!(serde_json::to_string(&Visibility::Oss).unwrap(), "\"oss\"");
+    assert_eq!(serde_json::to_string(&Visibility::Internal).unwrap(), "\"internal\"");
+    assert_eq!(
+      serde_json::to_string(&Visibility::Enterprise).unwrap(),
+      "\"enterprise\""
+    );
+  }
+
+  #[test]
+  fn test_release_config_validation_valid() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cargo-rail-test-release-valid");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let crate_dir = temp_dir.join("my-crate");
+    fs::create_dir_all(&crate_dir).unwrap();
+
+    let release = ReleaseConfig {
+      name: "test-release".to_string(),
+      crate_path: PathBuf::from("my-crate"),
+      split: None,
+      changelog: Some(PathBuf::from("my-crate/CHANGELOG.md")),
+      visibility: Visibility::Oss,
+      includes: vec!["my-crate".to_string(), "other-crate".to_string()],
+      last_version: None,
+      last_sha: None,
+      last_date: None,
+    };
+
+    assert!(release.validate(&temp_dir).is_ok());
+    let _ = fs::remove_dir_all(&temp_dir);
+  }
+
+  #[test]
+  fn test_release_config_validation_invalid_crate_path() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cargo-rail-test-release-invalid-path");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let release = ReleaseConfig {
+      name: "test-release".to_string(),
+      crate_path: PathBuf::from("nonexistent-crate"),
+      split: None,
+      changelog: None,
+      visibility: Visibility::Internal,
+      includes: vec![],
+      last_version: None,
+      last_sha: None,
+      last_date: None,
+    };
+
+    assert!(release.validate(&temp_dir).is_err());
+    let _ = fs::remove_dir_all(&temp_dir);
+  }
+
+  #[test]
+  fn test_release_config_validation_invalid_changelog_extension() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cargo-rail-test-release-invalid-changelog");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let crate_dir = temp_dir.join("my-crate");
+    fs::create_dir_all(&crate_dir).unwrap();
+
+    let release = ReleaseConfig {
+      name: "test-release".to_string(),
+      crate_path: PathBuf::from("my-crate"),
+      split: None,
+      changelog: Some(PathBuf::from("my-crate/CHANGELOG.txt")),
+      visibility: Visibility::Oss,
+      includes: vec![],
+      last_version: None,
+      last_sha: None,
+      last_date: None,
+    };
+
+    assert!(release.validate(&temp_dir).is_err());
+    let _ = fs::remove_dir_all(&temp_dir);
+  }
+
+  #[test]
+  fn test_release_config_validation_invalid_changelog_parent() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cargo-rail-test-release-invalid-parent");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let crate_dir = temp_dir.join("my-crate");
+    fs::create_dir_all(&crate_dir).unwrap();
+
+    let release = ReleaseConfig {
+      name: "test-release".to_string(),
+      crate_path: PathBuf::from("my-crate"),
+      split: None,
+      changelog: Some(PathBuf::from("nonexistent/CHANGELOG.md")),
+      visibility: Visibility::Oss,
+      includes: vec![],
+      last_version: None,
+      last_sha: None,
+      last_date: None,
+    };
+
+    assert!(release.validate(&temp_dir).is_err());
+    let _ = fs::remove_dir_all(&temp_dir);
+  }
+
+  #[test]
+  fn test_release_config_validation_empty_includes() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cargo-rail-test-release-empty-includes");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let crate_dir = temp_dir.join("my-crate");
+    fs::create_dir_all(&crate_dir).unwrap();
+
+    let release = ReleaseConfig {
+      name: "test-release".to_string(),
+      crate_path: PathBuf::from("my-crate"),
+      split: None,
+      changelog: None,
+      visibility: Visibility::Internal,
+      includes: vec!["valid".to_string(), "  ".to_string()],
+      last_version: None,
+      last_sha: None,
+      last_date: None,
+    };
+
+    assert!(release.validate(&temp_dir).is_err());
+    let _ = fs::remove_dir_all(&temp_dir);
   }
 }

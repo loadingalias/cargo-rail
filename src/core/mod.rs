@@ -2,6 +2,7 @@ pub mod config;
 pub mod conflict;
 pub mod context;
 pub mod error;
+pub mod executor;
 pub mod mapping;
 pub mod plan;
 pub mod security;

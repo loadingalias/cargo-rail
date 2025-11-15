@@ -3,9 +3,10 @@ use std::io::{self, Write};
 
 use crate::commands::doctor;
 use crate::core::config::RailConfig;
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{ConfigError, RailError, RailResult};
+use crate::core::executor::PlanExecutor;
 use crate::core::plan::{Operation, OperationType, Plan};
-use crate::core::split::{SplitConfig, Splitter};
 use crate::ui::progress::{FileProgress, MultiProgress};
 use crate::utils;
 use rayon::prelude::*;
@@ -119,9 +120,6 @@ pub fn run_split(
     }
   }
 
-  // Create splitter with security config
-  let splitter = Splitter::new(config.workspace.root.clone(), config.security.clone())?;
-
   // Build plans using the unified Plan system
   let mut plans = Vec::new();
 
@@ -141,33 +139,17 @@ pub fn run_split(
       current_dir.join("..").join(remote_name)
     };
 
-    // Build unified Plan
+    // Build unified Plan with ExecuteSplit operation
     let mut plan = Plan::new(OperationType::Split, Some(split_config.name.clone()));
 
-    // Add operations
-    plan.add_operation(Operation::InitRepo {
-      path: target_repo_path.display().to_string(),
-    });
-
-    plan.add_operation(Operation::CreateCommit {
-      message: "Walking commit history for crate paths".to_string(),
-      files: crate_paths.iter().map(|p| p.display().to_string()).collect(),
-    });
-
-    plan.add_operation(Operation::Transform {
-      path: target_repo_path.join("Cargo.toml").display().to_string(),
-      transform_type: "workspace_to_concrete".to_string(),
-    });
-
-    plan.add_operation(Operation::Copy {
-      from: "auxiliary_files".to_string(),
-      to: target_repo_path.display().to_string(),
-    });
-
-    plan.add_operation(Operation::Push {
-      remote: split_config.remote.clone(),
+    // Add high-level ExecuteSplit operation
+    plan.add_operation(Operation::ExecuteSplit {
+      crate_name: split_config.name.clone(),
+      crate_paths: crate_paths.iter().map(|p| p.display().to_string()).collect(),
+      mode: format!("{:?}", split_config.mode),
+      target_repo_path: target_repo_path.display().to_string(),
       branch: split_config.branch.clone(),
-      force: false,
+      remote_url: Some(split_config.remote.clone()),
     });
 
     // Add metadata
@@ -233,6 +215,10 @@ pub fn run_split(
     println!("\n🚀 APPLY MODE - Executing split operations\n");
   }
 
+  // Build workspace context for execution
+  let workspace_context = WorkspaceContext::build(&current_dir)?;
+  let executor = PlanExecutor::new(&workspace_context);
+
   let plan_count = plans.len();
 
   // Use parallel processing for multiple crates
@@ -245,22 +231,15 @@ pub fn run_split(
       .map(|(split_config, _, _, _)| multi_progress.add_bar(1, format!("Splitting {}", split_config.name)))
       .collect();
 
+    // For parallel execution, we need to build contexts per-thread
     let results: Vec<RailResult<()>> = plans
       .into_par_iter()
       .enumerate()
-      .map(|(idx, (split_config, crate_paths, target_repo_path, _))| {
-        let split_cfg = SplitConfig {
-          crate_name: split_config.name.clone(),
-          crate_paths,
-          mode: split_config.mode.clone(),
-          target_repo_path,
-          branch: split_config.branch.clone(),
-          remote_url: Some(split_config.remote.clone()),
-        };
-
-        // Create a new splitter for this thread
-        let thread_splitter = Splitter::new(config.workspace.root.clone(), config.security.clone())?;
-        let result = thread_splitter.split(&split_cfg);
+      .map(|(idx, (_, _, _, plan))| {
+        // Build workspace context for this thread
+        let thread_context = WorkspaceContext::build(&current_dir)?;
+        let thread_executor = PlanExecutor::new(&thread_context);
+        let result = thread_executor.execute(&plan);
 
         multi_progress.inc(&bars[idx]);
         result
@@ -282,21 +261,12 @@ pub fn run_split(
       None
     };
 
-    for (split_config, crate_paths, target_repo_path, _) in plans {
+    for (split_config, _, _, plan) in plans {
       if crate_progress.is_none() {
         println!("🔨 Splitting crate '{}'...", split_config.name);
       }
 
-      let split_cfg = SplitConfig {
-        crate_name: split_config.name.clone(),
-        crate_paths,
-        mode: split_config.mode.clone(),
-        target_repo_path,
-        branch: split_config.branch.clone(),
-        remote_url: Some(split_config.remote.clone()),
-      };
-
-      splitter.split(&split_cfg)?;
+      executor.execute(&plan)?;
 
       if let Some(ref mut p) = crate_progress {
         p.inc();

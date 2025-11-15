@@ -127,6 +127,30 @@ pub enum Operation {
     base: String,
     message: String,
   },
+
+  /// Execute a split workflow
+  /// This is a high-level operation that encapsulates the full split process
+  ExecuteSplit {
+    crate_name: String,
+    crate_paths: Vec<String>,
+    mode: String,
+    target_repo_path: String,
+    branch: String,
+    remote_url: Option<String>,
+  },
+
+  /// Execute a sync workflow
+  /// This is a high-level operation that encapsulates the full sync process
+  ExecuteSync {
+    crate_name: String,
+    crate_paths: Vec<String>,
+    mode: String,
+    target_repo_path: String,
+    branch: String,
+    remote_url: String,
+    direction: String,
+    conflict_strategy: String,
+  },
 }
 
 /// Plan metadata
@@ -329,6 +353,15 @@ fn operation_to_string(op: &Operation) -> String {
     Operation::Merge { from, into, strategy } => format!("Merge {} into {} (strategy: {})", from, into, strategy),
     Operation::UpdateNotes { notes_ref, commit, .. } => format!("Update git-notes {} for {}", notes_ref, commit),
     Operation::CreatePrBranch { name, base, .. } => format!("Create PR branch {} from {}", name, base),
+    Operation::ExecuteSplit {
+      crate_name,
+      mode,
+      target_repo_path,
+      ..
+    } => format!("Split crate '{}' (mode: {}) to {}", crate_name, mode, target_repo_path),
+    Operation::ExecuteSync {
+      crate_name, direction, ..
+    } => format!("Sync crate '{}' (direction: {})", crate_name, direction),
   }
 }
 

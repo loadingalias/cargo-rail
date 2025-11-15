@@ -118,6 +118,7 @@ impl ReleaseMetadata {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::core::config::Visibility;
 
   #[test]
   fn test_release_metadata_first_release() {
@@ -125,6 +126,9 @@ mod tests {
       name: "test-crate".to_string(),
       crate_path: "crates/test".into(),
       split: None,
+      changelog: None,
+      visibility: Visibility::default(),
+      includes: vec![],
       last_version: None,
       last_sha: None,
       last_date: None,
@@ -140,6 +144,9 @@ mod tests {
       name: "test-crate".to_string(),
       crate_path: "crates/test".into(),
       split: Some("test".to_string()),
+      changelog: None,
+      visibility: Visibility::default(),
+      includes: vec![],
       last_version: Some("0.1.0".to_string()),
       last_sha: Some("abc123".to_string()),
       last_date: Some("2025-01-15T10:00:00Z".to_string()),

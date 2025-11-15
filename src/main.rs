@@ -4,6 +4,7 @@ mod commands;
 mod core;
 mod graph;
 mod lint;
+mod quality;
 mod release;
 mod ui;
 mod utils;

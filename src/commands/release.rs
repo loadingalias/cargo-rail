@@ -5,7 +5,9 @@
 //! 2. Changelogs per-thing
 //! 3. Every release has name + version + last_sha
 
+use crate::core::config::ReleaseConfig;
 use crate::core::error::{RailError, RailResult};
+use crate::quality::changelog::{Changelog, ChangelogFormat, ConventionalCommit};
 use crate::release::{ReleasePlan, ReleaseTracker, VersionBump};
 use std::env;
 
@@ -126,15 +128,21 @@ pub fn run_release_apply(
   update_crate_version(&workspace_root, &release.crate_path, &plan.proposed_version.to_string())?;
   println!("   Updated Cargo.toml version");
 
-  // 2. Get current HEAD SHA
+  // 2. Generate and update changelog (if configured)
+  if let Some(changelog_path) = &release.changelog {
+    generate_changelog(&workspace_root, &release, &plan, changelog_path)?;
+    println!("   Updated {}", changelog_path.display());
+  }
+
+  // 3. Get current HEAD SHA
   let head_sha = get_head_sha(&workspace_root)?;
 
-  // 3. Update rail.toml metadata
+  // 4. Update rail.toml metadata
   tracker.update_release(&name, &plan.proposed_version.to_string(), &head_sha)?;
   tracker.save()?;
   println!("   Updated rail.toml metadata");
 
-  // 4. Create git tag
+  // 5. Create git tag
   create_git_tag(&workspace_root, &name, &plan.proposed_version.to_string())?;
   println!("   Created tag: {}-v{}", name, plan.proposed_version);
 
@@ -211,6 +219,63 @@ fn create_git_tag(workspace_root: &std::path::Path, name: &str, version: &str) -
       String::from_utf8_lossy(&output.stderr)
     )));
   }
+
+  Ok(())
+}
+
+/// Generate and update changelog
+fn generate_changelog(
+  workspace_root: &std::path::Path,
+  release: &ReleaseConfig,
+  plan: &ReleasePlan,
+  changelog_path: &std::path::Path,
+) -> RailResult<()> {
+  // Create changelog from commits
+  let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+  let mut changelog = Changelog::new(plan.proposed_version.to_string(), current_date);
+
+  // Parse commits and add to changelog
+  for commit in &plan.commits {
+    if let Some(parsed) = ConventionalCommit::parse(&commit.message) {
+      changelog.add_commit(parsed, commit.sha.clone());
+    }
+  }
+
+  // Generate markdown
+  let changelog_entry = changelog
+    .render(ChangelogFormat::Markdown)
+    .map_err(RailError::message)?;
+
+  // Read existing changelog or create new
+  let changelog_abs_path = workspace_root.join(changelog_path);
+  let existing_content = if changelog_abs_path.exists() {
+    std::fs::read_to_string(&changelog_abs_path)
+      .map_err(|e| RailError::message(format!("Failed to read changelog: {}", e)))?
+  } else {
+    // Create header for new changelog
+    format!(
+      "# Changelog\n\nAll notable changes to {} will be documented in this file.\n\n",
+      release.name
+    )
+  };
+
+  // Prepend new entry to existing content
+  let new_content = if existing_content.contains("# Changelog") {
+    // Find where to insert (after header)
+    if let Some(header_end) = existing_content.find("\n\n") {
+      let (header, rest) = existing_content.split_at(header_end + 2);
+      format!("{}{}{}", header, changelog_entry, rest)
+    } else {
+      format!("{}\n\n{}", existing_content, changelog_entry)
+    }
+  } else {
+    // No header, just prepend
+    format!("{}{}", changelog_entry, existing_content)
+  };
+
+  // Write updated changelog
+  std::fs::write(&changelog_abs_path, new_content)
+    .map_err(|e| RailError::message(format!("Failed to write changelog: {}", e)))?;
 
   Ok(())
 }

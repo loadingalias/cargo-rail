@@ -39,7 +39,11 @@ impl ConflictStrategy {
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
   pub file_path: PathBuf,
+  /// Conflict description (used by SyncEngine, may be logged in future)
+  #[allow(dead_code)]
   pub message: String,
+  /// Whether conflict was auto-resolved (used by SyncEngine, may be logged in future)
+  #[allow(dead_code)]
   pub resolved: bool,
 }
 

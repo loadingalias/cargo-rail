@@ -3,9 +3,11 @@ use std::env;
 use crate::commands::doctor;
 use crate::core::config::RailConfig;
 use crate::core::conflict::ConflictStrategy;
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{ConfigError, RailError, RailResult};
+use crate::core::executor::PlanExecutor;
 use crate::core::plan::{Operation, OperationType, Plan};
-use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine, SyncResult};
+use crate::core::sync::SyncDirection;
 use crate::ui::progress::{FileProgress, MultiProgress};
 use crate::utils;
 use rayon::prelude::*;
@@ -64,8 +66,8 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
     apply,
     json,
   } = params;
-  // Parse conflict strategy
-  let strategy = ConflictStrategy::from_str(&strategy_str)?;
+  // Parse conflict strategy (validate it, then use as string in ExecuteSync operation)
+  let _strategy = ConflictStrategy::from_str(&strategy_str)?;
   let current_dir = env::current_dir()?;
 
   // Load configuration
@@ -207,90 +209,35 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
       continue;
     }
 
-    // Build unified Plan
+    // Build unified Plan with ExecuteSync operation
     let mut plan = Plan::new(OperationType::Sync, Some(split_config.name.clone()));
 
-    // Add operations based on direction
+    // Determine direction string for the plan
     let dir_str = match direction {
-      SyncDirection::MonoToRemote => {
-        plan.add_operation(Operation::Pull {
-          remote: split_config.remote.clone(),
-          branch: split_config.branch.clone(),
-        });
-
-        plan.add_operation(Operation::Transform {
-          path: "Cargo.toml".to_string(),
-          transform_type: "path_to_version".to_string(),
-        });
-
-        plan.add_operation(Operation::CreateCommit {
-          message: "Sync from monorepo".to_string(),
-          files: crate_paths.iter().map(|p| p.display().to_string()).collect(),
-        });
-
-        plan.add_operation(Operation::Push {
-          remote: split_config.remote.clone(),
-          branch: split_config.branch.clone(),
-          force: false,
-        });
-
-        "monorepo → remote"
-      }
-      SyncDirection::RemoteToMono => {
-        plan.add_operation(Operation::Pull {
-          remote: split_config.remote.clone(),
-          branch: split_config.branch.clone(),
-        });
-
-        plan.add_operation(Operation::Transform {
-          path: "Cargo.toml".to_string(),
-          transform_type: "version_to_path".to_string(),
-        });
-
-        plan.add_operation(Operation::CreatePrBranch {
-          name: format!("rail/sync/{}", split_config.name),
-          base: "main".to_string(),
-          message: "Sync from remote".to_string(),
-        });
-
-        plan.add_operation(Operation::Push {
-          remote: "origin".to_string(),
-          branch: format!("rail/sync/{}", split_config.name),
-          force: false,
-        });
-
-        "remote → monorepo"
-      }
-      SyncDirection::Both => {
-        // Both directions
-        plan.add_operation(Operation::Pull {
-          remote: split_config.remote.clone(),
-          branch: split_config.branch.clone(),
-        });
-
-        plan.add_operation(Operation::Merge {
-          from: split_config.branch.clone(),
-          into: "main".to_string(),
-          strategy: strategy_str.clone(),
-        });
-
-        plan.add_operation(Operation::Push {
-          remote: split_config.remote.clone(),
-          branch: split_config.branch.clone(),
-          force: false,
-        });
-
-        "bidirectional"
-      }
+      SyncDirection::MonoToRemote => "to_remote",
+      SyncDirection::RemoteToMono => "from_remote",
+      SyncDirection::Both => "bidirectional",
       SyncDirection::None => continue,
     };
 
-    // Add common operations
-    plan.add_operation(Operation::UpdateNotes {
-      notes_ref: format!("refs/notes/rail/{}", split_config.name),
-      commit: "HEAD".to_string(),
-      note_content: "sync mapping".to_string(),
+    // Add high-level ExecuteSync operation
+    plan.add_operation(Operation::ExecuteSync {
+      crate_name: split_config.name.clone(),
+      crate_paths: crate_paths.iter().map(|p| p.display().to_string()).collect(),
+      mode: format!("{:?}", split_config.mode),
+      target_repo_path: target_repo_path.display().to_string(),
+      branch: split_config.branch.clone(),
+      remote_url: split_config.remote.clone(),
+      direction: dir_str.to_string(),
+      conflict_strategy: strategy_str.clone(),
     });
+
+    let dir_display = match direction {
+      SyncDirection::MonoToRemote => "monorepo → remote",
+      SyncDirection::RemoteToMono => "remote → monorepo",
+      SyncDirection::Both => "bidirectional",
+      SyncDirection::None => "none",
+    };
 
     // Add metadata
     let protected_handling = if matches!(direction, SyncDirection::RemoteToMono | SyncDirection::Both) {
@@ -305,11 +252,11 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
     plan = plan
       .with_summary(format!(
         "Sync crate '{}' ({}) with conflict strategy: {}",
-        split_config.name, dir_str, strategy_str
+        split_config.name, dir_display, strategy_str
       ))
       .add_trailer("Rail-Operation", "sync")
       .add_trailer("Rail-Crate", &split_config.name)
-      .add_trailer("Rail-Direction", dir_str)
+      .add_trailer("Rail-Direction", dir_display)
       .add_trailer("Rail-Strategy", &strategy_str);
 
     plans.push((
@@ -386,6 +333,10 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
   // Apply mode - execute the sync
   println!("\n🚀 APPLY MODE - Executing sync operations\n");
 
+  // Build workspace context for execution
+  let workspace_context = WorkspaceContext::build(&current_dir)?;
+  let executor = PlanExecutor::new(&workspace_context);
+
   let plan_count = plans.len();
 
   // Use parallel processing for multiple crates
@@ -398,62 +349,24 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
       .map(|(split_config, _, _, _, _, _)| multi_progress.add_bar(1, format!("Syncing {}", split_config.name)))
       .collect();
 
-    // Wrap security config in Arc for cheap sharing across threads (avoid deep clones)
-    let security_config = std::sync::Arc::new(config.security.clone());
-
-    let results: Vec<RailResult<SyncResult>> = plans
+    // For parallel execution, we need to build contexts per-thread
+    let results: Vec<RailResult<()>> = plans
       .into_par_iter()
       .enumerate()
-      .map(|(idx, (split_config, crate_paths, target_repo_path, _, _, _))| {
-        let sync_config = SyncConfig {
-          crate_name: split_config.name.clone(),
-          crate_paths,
-          mode: split_config.mode.clone(),
-          target_repo_path,
-          branch: split_config.branch.clone(),
-          remote_url: split_config.remote.clone(),
-        };
-
-        // Create sync engine for this thread (security_config Arc clone is cheap)
-        let mut engine = SyncEngine::new(
-          config.workspace.root.clone(),
-          sync_config,
-          security_config.clone(),
-          strategy,
-        )?;
-
-        // Perform sync
-        let result = match direction {
-          SyncDirection::MonoToRemote => engine.sync_to_remote(),
-          SyncDirection::RemoteToMono => engine.sync_from_remote(),
-          SyncDirection::Both => engine.sync_bidirectional(),
-          SyncDirection::None => unreachable!(),
-        };
+      .map(|(idx, (_, _, _, plan, _, _))| {
+        // Build workspace context for this thread
+        let thread_context = WorkspaceContext::build(&current_dir)?;
+        let thread_executor = PlanExecutor::new(&thread_context);
+        let result = thread_executor.execute(&plan);
 
         multi_progress.inc(&bars[idx]);
         result
       })
       .collect();
 
-    // Report results
+    // Check for errors
     for result in results {
-      let sync_result = result?;
-      if sync_result.commits_synced > 0 || !sync_result.conflicts.is_empty() {
-        println!("   ✅ Synced {} commits", sync_result.commits_synced);
-
-        if !sync_result.conflicts.is_empty() {
-          let unresolved_count = sync_result.conflicts.iter().filter(|c| !c.resolved).count();
-          let resolved_count = sync_result.conflicts.len() - unresolved_count;
-
-          if resolved_count > 0 {
-            println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
-          }
-
-          if unresolved_count > 0 {
-            println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
-          }
-        }
-      }
+      result?;
     }
   } else {
     // Sequential processing for single crate or when not using --all
@@ -463,57 +376,12 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
       None
     };
 
-    for (split_config, crate_paths, target_repo_path, _, _, _) in plans {
+    for (split_config, _, _, plan, _, _) in plans {
       if crate_progress.is_none() {
         println!("\n🔄 Syncing crate: {}", split_config.name);
       }
 
-      let sync_config = SyncConfig {
-        crate_name: split_config.name.clone(),
-        crate_paths,
-        mode: split_config.mode.clone(),
-        target_repo_path,
-        branch: split_config.branch.clone(),
-        remote_url: split_config.remote.clone(),
-      };
-
-      // Create sync engine (Cargo workspace detected)
-      let mut engine = SyncEngine::new(
-        config.workspace.root.clone(),
-        sync_config,
-        std::sync::Arc::new(config.security.clone()),
-        strategy,
-      )?;
-
-      // Perform sync
-      let result = match direction {
-        SyncDirection::MonoToRemote => engine.sync_to_remote()?,
-        SyncDirection::RemoteToMono => engine.sync_from_remote()?,
-        SyncDirection::Both => engine.sync_bidirectional()?,
-        SyncDirection::None => unreachable!(),
-      };
-
-      println!("   ✅ Synced {} commits", result.commits_synced);
-
-      if !result.conflicts.is_empty() {
-        let unresolved_count = result.conflicts.iter().filter(|c| !c.resolved).count();
-        let resolved_count = result.conflicts.len() - unresolved_count;
-
-        if resolved_count > 0 {
-          println!("\n   ✅ {} conflicts auto-resolved:", resolved_count);
-          for conflict in result.conflicts.iter().filter(|c| c.resolved) {
-            println!("      - {}: {}", conflict.file_path.display(), conflict.message);
-          }
-        }
-
-        if unresolved_count > 0 {
-          println!("\n   ⚠️  {} conflicts need manual resolution:", unresolved_count);
-          for conflict in result.conflicts.iter().filter(|c| !c.resolved) {
-            println!("      - {}: {}", conflict.file_path.display(), conflict.message);
-          }
-          println!("\n   💡 Resolve conflicts manually and run sync again");
-        }
-      }
+      executor.execute(&plan)?;
 
       if let Some(ref mut p) = crate_progress {
         p.inc();
