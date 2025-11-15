@@ -12,6 +12,7 @@ use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
 use crate::core::vcs::SystemGit;
 use crate::ui::progress::FileProgress;
+use crate::utils;
 
 /// Configuration for sync operation
 pub struct SyncConfig {
@@ -107,16 +108,9 @@ impl SyncEngine {
     Ok(())
   }
 
-  /// Check if the remote URL is a local file path
-  fn is_local_remote(&self) -> bool {
-    self.config.remote_url.starts_with('/')
-      || self.config.remote_url.starts_with("./")
-      || self.config.remote_url.starts_with("../")
-  }
-
   /// Get the appropriate branch reference (origin/branch for remotes, just branch for local)
   fn get_branch_ref(&self) -> String {
-    if self.is_local_remote() {
+    if utils::is_local_path(&self.config.remote_url) {
       self.config.branch.clone()
     } else {
       format!("origin/{}", self.config.branch)
@@ -127,7 +121,7 @@ impl SyncEngine {
     println!("   Syncing monorepo → remote...");
 
     // Validate SSH key before any remote operations
-    if !self.is_local_remote() {
+    if !utils::is_local_path(&self.config.remote_url) {
       self.security_validator.validate_ssh_key()?;
       self.security_validator.validate_signing_key()?;
     }
@@ -141,7 +135,7 @@ impl SyncEngine {
     let remote_git = SystemGit::open(&target_repo_path)?;
 
     // Fetch latest from remote (skip for local paths)
-    if !self.is_local_remote() {
+    if !utils::is_local_path(&self.config.remote_url) {
       remote_git.fetch_from_remote("origin")?;
       self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
@@ -203,7 +197,7 @@ impl SyncEngine {
       self.mapping_store.save(&self.config.target_repo_path)?;
 
       // Push to remote (skip for local paths)
-      if synced_count > 0 && !self.is_local_remote() {
+      if synced_count > 0 && !utils::is_local_path(&self.config.remote_url) {
         remote_git.push_to_remote("origin", &self.config.branch)?;
         self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       }
@@ -223,7 +217,7 @@ impl SyncEngine {
 
     // Push to remote (skip for local paths)
     if synced_count > 0 {
-      if !self.is_local_remote() {
+      if !utils::is_local_path(&self.config.remote_url) {
         remote_git.push_to_remote("origin", &self.config.branch)?;
         self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       } else {
@@ -242,7 +236,7 @@ impl SyncEngine {
     println!("   Syncing remote → monorepo...");
 
     // Validate SSH key before any remote operations
-    if !self.is_local_remote() {
+    if !utils::is_local_path(&self.config.remote_url) {
       self.security_validator.validate_ssh_key()?;
       self.security_validator.validate_signing_key()?;
     }
@@ -273,7 +267,7 @@ impl SyncEngine {
     let remote_git = SystemGit::open(&target_repo_path)?;
 
     // Fetch latest from remote (skip for local paths)
-    if !self.is_local_remote() {
+    if !utils::is_local_path(&self.config.remote_url) {
       remote_git.fetch_from_remote("origin")?;
       self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
@@ -359,7 +353,7 @@ impl SyncEngine {
       println!("\n   🎯 Changes synced to PR branch: {}", pr_branch);
 
       // Push PR branch to remote (skip for local testing)
-      if !self.is_local_remote() && synced_count > 0 {
+      if !utils::is_local_path(&self.config.remote_url) && synced_count > 0 {
         println!("   📤 Pushing PR branch to remote...");
         self.mono_git.push_to_remote("origin", pr_branch)?;
         println!("   ✅ PR branch pushed to origin/{}", pr_branch);
@@ -916,7 +910,7 @@ impl SyncEngine {
     let remote_git = SystemGit::open(&self.config.target_repo_path)?;
 
     // Fetch from remote (skip for local paths)
-    if !self.is_local_remote() {
+    if !utils::is_local_path(&self.config.remote_url) {
       remote_git.fetch_from_remote("origin")?;
     }
 

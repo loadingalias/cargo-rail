@@ -6,6 +6,7 @@ mod graph;
 mod lint;
 mod release;
 mod ui;
+mod utils;
 
 use clap::{Parser, Subcommand};
 use core::error::{RailError, print_error};

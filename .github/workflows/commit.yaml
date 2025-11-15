@@ -22,6 +22,8 @@ env:
 # Lock down permissions to read-only by default
 permissions:
   contents: read
+  checks: write  # Required for publishing test reports
+  pull-requests: write  # Required for PR comments on test results
 
 jobs:
   ci:
@@ -56,7 +58,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          persist-credentials: false
 
       - name: Setup
         uses: ./.github/actions/setup
@@ -72,11 +76,30 @@ jobs:
       - name: Tests
         run: just test
 
-      - name: Upload Test Results (on failure)
-        if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      - name: Upload JUnit Test Report
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
         with:
-          name: test-results-${{ matrix.target.name }}
+          name: junit-report-${{ matrix.target.name }}
+          path: junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Publish Test Report
+        if: always()
+        uses: mikepenz/action-junit-report@e08919a3b1fb83a78393dfb775a9c37f17d8eea6  # v6.0.1
+        with:
+          report_paths: 'junit.xml'
+          check_name: 'Test Results (${{ matrix.target.name }})'
+          detailed_summary: true
+          include_passed: false
+          fail_on_failure: true
+
+      - name: Upload Nextest Results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        with:
+          name: nextest-results-${{ matrix.target.name }}
           path: target/nextest/
           retention-days: 7
           if-no-files-found: ignore

@@ -10,6 +10,7 @@ use crate::core::mapping::MappingStore;
 use crate::core::security::SecurityValidator;
 use crate::core::vcs::CommitInfo;
 use crate::core::vcs::SystemGit;
+use crate::utils;
 
 /// Configuration for a split operation
 pub struct SplitConfig {
@@ -440,10 +441,7 @@ impl Splitter {
 
     // Push to remote if URL is configured and is not a local file path
     if let Some(ref remote_url) = config.remote_url {
-      // Check if this is a local file path (absolute path or relative)
-      let is_local_path = remote_url.starts_with('/') || remote_url.starts_with("./") || remote_url.starts_with("../");
-
-      if !remote_url.is_empty() && !is_local_path {
+      if !remote_url.is_empty() && !utils::is_local_path(remote_url) {
         println!("\n🚀 Pushing to remote...");
 
         // Security checks before push
@@ -470,7 +468,7 @@ impl Splitter {
         println!("   ✅ Pushed to {}", remote_url);
       } else {
         println!("\n💾 Split repository created locally");
-        if is_local_path {
+        if utils::is_local_path(remote_url) {
           println!("   Note: Remote is a local path, skipping push");
           println!(
             "   Local testing mode - split repo at: {}",

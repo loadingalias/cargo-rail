@@ -15,37 +15,37 @@ runs:
     # Install cargo tools FIRST, before Rust toolchain installation
     # This prevents Windows issues where massive toolchain updates interfere with cargo bin directory
     - name: Install just
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: just
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: cargo-nextest
 
     - name: Install cargo-deny
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: cargo-deny
 
     - name: Install cargo-audit
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: cargo-audit
 
     - name: Install cargo-semver-checks
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: cargo-semver-checks
 
     - name: Install git-cliff
-      uses: taiki-e/install-action@6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b  # v2
+      uses: taiki-e/install-action@0be4756f42223b67aa4b7df5effad59010cbf4b9  # v2
       with:
         tool: git-cliff
 
     - name: Install Rust Nightly Toolchain
-      uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd41383119e8b1b35921  # master
+      uses: dtolnay/rust-toolchain@0f44b27771c32bda9f458f75a1e241b09791b331  # master
       with:
         toolchain: nightly
         components: clippy, rustfmt

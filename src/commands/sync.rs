@@ -1,5 +1,4 @@
 use std::env;
-use std::path::Path;
 
 use crate::commands::doctor;
 use crate::core::config::RailConfig;
@@ -8,51 +7,8 @@ use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::plan::{Operation, OperationType, Plan};
 use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine, SyncResult};
 use crate::ui::progress::{FileProgress, MultiProgress};
+use crate::utils;
 use rayon::prelude::*;
-
-/// Check if a path is a local filesystem path (not a remote URL)
-///
-/// Returns true for:
-/// - Absolute paths on Unix: /path/to/repo
-/// - Absolute paths on Windows: C:\path\to\repo or C:/path/to/repo
-/// - Relative paths: ./path or ../path
-/// - UNC paths on Windows: \\server\share
-///
-/// Returns false for:
-/// - SSH URLs: git@github.com:user/repo.git
-/// - HTTPS URLs: <https://github.com/user/repo.git>
-fn is_local_path(path: &str) -> bool {
-  let p = Path::new(path);
-
-  // Check for relative paths
-  if path.starts_with("./") || path.starts_with("../") {
-    return true;
-  }
-
-  // Check for absolute paths (works on both Unix and Windows)
-  if p.is_absolute() {
-    return true;
-  }
-
-  // Check for Windows UNC paths (\\server\share)
-  #[cfg(target_os = "windows")]
-  if path.starts_with("\\\\") {
-    return true;
-  }
-
-  // If it contains :// it's a URL
-  if path.contains("://") {
-    return false;
-  }
-
-  // If it contains @ it's likely an SSH URL (git@github.com:user/repo.git)
-  if path.contains('@') {
-    return false;
-  }
-
-  // Default to false for safety (require preflight checks)
-  false
-}
 
 /// Sync command parameters
 pub struct SyncParams {
@@ -153,7 +109,7 @@ fn run_sync_impl(params: SyncParams) -> RailResult<()> {
   }
 
   // Check if all remotes are local paths (skip SSH checks for local testing)
-  let all_local = crates_to_sync_check.iter().all(|s| is_local_path(&s.remote));
+  let all_local = crates_to_sync_check.iter().all(|s| utils::is_local_path(&s.remote));
 
   // Run preflight health checks before proceeding (skip for local-only operations)
   if !json && apply && !all_local {

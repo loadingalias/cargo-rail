@@ -26,33 +26,36 @@
 actions/checkout:
   ref: v5.0.0
   sha: "08c6903cd8c0fde910a37f88322edcfb5dd907a8"
-  updated: "2025-01-11T00:00:00Z"
+  updated: "2025-11-15T04:25:54Z"
   notes: "Repository checkout - used in every workflow"
-
 actions/upload-artifact:
   ref: v5.0.0
   sha: "330a01c490aca151604b8cf639adc76d48f6c5d4"
-  updated: "2025-01-11T00:00:00Z"
+  updated: "2025-11-15T04:25:55Z"
   notes: "Upload build artifacts and test results"
-
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Testing & Reporting
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+mikepenz/action-junit-report:
+  ref: v6.0.1
+  sha: "e08919a3b1fb83a78393dfb775a9c37f17d8eea6"
+  updated: "2025-11-15T04:25:56Z"
+  notes: "Publish JUnit test reports as GitHub Checks"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Rust Toolchain & Ecosystem
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 dtolnay/rust-toolchain:
   ref: master
-  sha: "6d653acede28d24f02e3cd41383119e8b1b35921"
-  updated: "2025-01-11T00:00:00Z"
+  sha: "0f44b27771c32bda9f458f75a1e241b09791b331"
+  updated: "2025-11-15T04:25:57Z"
   notes: "Rust toolchain installation - always tracks latest nightly"
-
 taiki-e/install-action:
   ref: v2
-  sha: "6f9c7cc51aa54b13cbcbd12f8bbf69d8ba405b4b"
-  updated: "2025-01-11T00:00:00Z"
+  sha: "0be4756f42223b67aa4b7df5effad59010cbf4b9"
+  updated: "2025-11-15T04:25:57Z"
   notes: "Install cargo tools (nextest, just, deny, audit)"
-
 Swatinem/rust-cache:
   ref: v2.8.1
   sha: "f13886b937689c021905a6b90929199931d60db1"
-  updated: "2025-01-11T00:00:00Z"
+  updated: "2025-11-15T04:25:58Z"
   notes: "GitHub runner Rust cache"

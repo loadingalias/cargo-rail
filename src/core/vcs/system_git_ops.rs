@@ -3,6 +3,7 @@
 use super::CommitInfo;
 use super::system_git::SystemGit;
 use crate::core::error::{GitError, RailError, RailResult, ResultExt};
+use crate::utils;
 use std::path::{Path, PathBuf};
 
 impl SystemGit {
@@ -15,23 +16,6 @@ impl SystemGit {
       path.strip_prefix(&self.work_tree).unwrap_or(path)
     } else {
       path
-    }
-  }
-
-  /// Convert a path to Git format (always forward slashes)
-  ///
-  /// Git expects paths with forward slashes, even on Windows.
-  /// This function converts backslashes to forward slashes for use in Git commands.
-  fn path_to_git_format(&self, path: &Path) -> String {
-    // On Windows, convert backslashes to forward slashes
-    // On Unix, this is a no-op since paths already use forward slashes
-    #[cfg(target_os = "windows")]
-    {
-      path.to_string_lossy().replace('\\', "/")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-      path.to_string_lossy().to_string()
     }
   }
 
@@ -170,7 +154,7 @@ impl SystemGit {
   #[allow(dead_code)]
   pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
     let relative_path = self.normalize_path(path);
-    let git_path = self.path_to_git_format(relative_path);
+    let git_path = utils::path_to_git_format(relative_path);
 
     let spec = format!("{}:{}", commit_sha, git_path);
 
@@ -352,7 +336,7 @@ impl SystemGit {
     let spec = if path.as_os_str().is_empty() {
       commit_sha.to_string()
     } else {
-      let git_path = self.path_to_git_format(path);
+      let git_path = utils::path_to_git_format(path);
       format!("{}:{}", commit_sha, git_path)
     };
 
@@ -765,7 +749,7 @@ impl SystemGit {
     // Write all requests to stdin
     for (commit_sha, path) in items {
       let relative_path = self.normalize_path(path);
-      let git_path = self.path_to_git_format(relative_path);
+      let git_path = utils::path_to_git_format(relative_path);
       let spec = format!("{}:{}\n", commit_sha, git_path);
       stdin
         .write_all(spec.as_bytes())
