@@ -41,6 +41,7 @@ mod remotes;
 mod runner;
 mod security_config;
 mod ssh;
+mod tier_violations;
 mod trait_def;
 mod workspace;
 

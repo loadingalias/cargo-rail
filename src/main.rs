@@ -143,6 +143,22 @@ enum Commands {
   /// Release planning and publishing orchestration
   #[command(subcommand)]
   Release(ReleaseCommands),
+
+  // ============================================================================
+  // Quality Analysis (Pillar 5)
+  // ============================================================================
+  /// Unified quality analysis (replaces cargo-deny/audit/udeps)
+  Quality {
+    /// Run specific analysis by name
+    #[arg(long)]
+    analysis: Option<String>,
+    /// Output results in JSON format
+    #[arg(long)]
+    json: bool,
+    /// Apply auto-fixes (if supported by analysis)
+    #[arg(long)]
+    fix: bool,
+  },
 }
 
 // Graph subcommands (Pillar 1)
@@ -454,6 +470,22 @@ fn main() {
         skip_sync,
       } => commands::run_release_apply(&ctx, name, dry_run, skip_sync),
     },
+
+    // Quality Analysis (Pillar 5)
+    Commands::Quality { analysis, json, fix } => {
+      if fix {
+        if let Some(analysis_name) = analysis {
+          commands::apply_fixes(&ctx, &analysis_name)
+        } else {
+          Err(RailError::with_help(
+            "Must specify --analysis when using --fix",
+            "Example: cargo rail quality --analysis duplicate-versions --fix",
+          ))
+        }
+      } else {
+        commands::run_quality(&ctx, json, analysis)
+      }
+    }
   };
 
   if let Err(err) = result {

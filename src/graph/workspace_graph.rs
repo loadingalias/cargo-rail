@@ -20,6 +20,7 @@
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
 use crate::cargo::metadata::WorkspaceMetadata;
+use crate::core::config::{RailConfig, Visibility};
 use crate::core::error::{RailError, RailResult};
 use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
@@ -38,6 +39,11 @@ pub struct PackageNode {
   pub version: String,
   pub manifest_path: PathBuf,
   pub is_workspace_member: bool,
+  /// Visibility tiers this crate belongs to (computed from ReleaseConfig)
+  /// A crate can appear in multiple releases with different visibility levels
+  /// TODO: Used by visibility-filtered graph commands and tier violation checks
+  #[allow(dead_code)]
+  pub visibilities: HashSet<Visibility>,
 }
 
 /// Workspace dependency graph.
@@ -74,12 +80,54 @@ pub struct WorkspaceGraph {
 impl WorkspaceGraph {
   /// Load workspace graph from root directory.
   ///
+  /// Optionally accepts RailConfig to compute visibility annotations for each crate.
+  ///
   /// # Performance
   /// - cargo_metadata: 50-200ms for large workspaces
   /// - Graph construction: 10-50ms
   /// - Path cache: deferred until first file lookup
   pub fn load(workspace_root: &Path) -> RailResult<Self> {
+    Self::load_with_config(workspace_root, None)
+  }
+
+  /// Load workspace graph with optional RailConfig for visibility annotations.
+  ///
+  /// If config is provided, crates will be annotated with their visibility tiers
+  /// based on ReleaseConfig entries that include them.
+  pub fn load_with_config(workspace_root: &Path, config: Option<&RailConfig>) -> RailResult<Self> {
     let metadata = WorkspaceMetadata::load(workspace_root)?;
+
+    // Build visibility mapping from release configs
+    // Maps crate_name → Set<Visibility>
+    let mut visibility_map: HashMap<String, HashSet<Visibility>> = HashMap::new();
+    if let Some(config) = config {
+      for release in &config.releases {
+        // Get the crate name from the crate_path
+        if let Ok(manifest_path) = release.crate_path.join("Cargo.toml").canonicalize() {
+          // Find the package in metadata that matches this manifest path
+          for package in &metadata.metadata_json().packages {
+            if let Ok(pkg_manifest) = package.manifest_path.clone().into_std_path_buf().canonicalize()
+              && pkg_manifest == manifest_path
+            {
+              // This crate is part of this release
+              visibility_map
+                .entry(package.name.as_ref().to_string())
+                .or_default()
+                .insert(release.visibility);
+
+              // Also add all crates listed in `includes`
+              for included_crate in &release.includes {
+                visibility_map
+                  .entry(included_crate.clone())
+                  .or_default()
+                  .insert(release.visibility);
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
 
     // Build petgraph
     let mut graph = DiGraph::new();
@@ -92,11 +140,15 @@ impl WorkspaceGraph {
 
     // Add all packages as nodes (workspace + dependencies)
     for package in &metadata.metadata_json().packages {
+      let crate_name = package.name.as_ref().to_string();
+      let visibilities = visibility_map.get(&crate_name).cloned().unwrap_or_default();
+
       let node = PackageNode {
-        name: package.name.as_ref().to_string(),
+        name: crate_name.clone(),
         version: package.version.to_string(),
         manifest_path: package.manifest_path.clone().into_std_path_buf(),
         is_workspace_member: workspace_pkg_ids.contains(&package.id),
+        visibilities,
       };
 
       let node_idx = graph.add_node(node.clone());
@@ -445,6 +497,77 @@ impl WorkspaceGraph {
     );
 
     format!("{:?}", dot)
+  }
+
+  /// Get all workspace crates with the specified visibility tier.
+  ///
+  /// Returns crates that are included in releases with this visibility level.
+  ///
+  /// TODO: Used by `cargo rail graph affected --visibility=X` command
+  #[allow(dead_code)]
+  pub fn crates_with_visibility(&self, visibility: Visibility) -> Vec<String> {
+    let mut crates: Vec<String> = self
+      .workspace_members
+      .iter()
+      .filter(|name| {
+        if let Some(node_idx) = self.name_to_node.get(*name) {
+          let node = &self.graph[*node_idx];
+          node.visibilities.contains(&visibility)
+        } else {
+          false
+        }
+      })
+      .cloned()
+      .collect();
+
+    crates.sort();
+    crates
+  }
+
+  /// Get the visibilities for a specific crate.
+  ///
+  /// Returns the set of visibility tiers this crate belongs to,
+  /// or an empty set if not found or not in any releases.
+  ///
+  /// TODO: Used by tier violation checks
+  #[allow(dead_code)]
+  pub fn crate_visibilities(&self, crate_name: &str) -> HashSet<Visibility> {
+    self
+      .name_to_node
+      .get(crate_name)
+      .map(|idx| self.graph[*idx].visibilities.clone())
+      .unwrap_or_default()
+  }
+
+  /// Check if a crate has the specified visibility.
+  ///
+  /// TODO: Used by tier violation checks
+  #[allow(dead_code)]
+  pub fn has_visibility(&self, crate_name: &str, visibility: Visibility) -> bool {
+    self.crate_visibilities(crate_name).contains(&visibility)
+  }
+
+  /// Get transitive dependents filtered by visibility.
+  ///
+  /// Returns all workspace crates that:
+  /// 1. Depend on `crate_name` (directly or transitively)
+  /// 2. Have the specified visibility tier
+  ///
+  /// TODO: Used by `cargo rail graph test --visibility=X` command
+  #[allow(dead_code)]
+  pub fn transitive_dependents_with_visibility(
+    &self,
+    crate_name: &str,
+    visibility: Visibility,
+  ) -> RailResult<Vec<String>> {
+    let all_dependents = self.transitive_dependents(crate_name)?;
+
+    let filtered: Vec<String> = all_dependents
+      .into_iter()
+      .filter(|dep| self.has_visibility(dep, visibility))
+      .collect();
+
+    Ok(filtered)
   }
 }
 
