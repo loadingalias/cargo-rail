@@ -6,6 +6,18 @@ use crate::core::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 
 impl SystemGit {
+  /// Normalize a path to be relative to the work tree
+  ///
+  /// If the path is absolute, strips the work tree prefix.
+  /// If the path is already relative or stripping fails, returns the path as-is.
+  fn normalize_path<'a>(&self, path: &'a Path) -> &'a Path {
+    if path.is_absolute() {
+      path.strip_prefix(&self.work_tree).unwrap_or(path)
+    } else {
+      path
+    }
+  }
+
   /// Get commit history from HEAD with optional limit
   ///
   /// Returns commits in reverse chronological order (newest first).
@@ -50,11 +62,7 @@ impl SystemGit {
     // Check if any changed file is under any of our target paths
     for (changed_path, _) in changed_files {
       for target_path in paths {
-        let relative_target = if target_path.is_absolute() {
-          target_path.strip_prefix(&self.work_tree).unwrap_or(target_path)
-        } else {
-          target_path
-        };
+        let relative_target = self.normalize_path(target_path);
 
         if changed_path.starts_with(relative_target) {
           return Ok(true);
@@ -144,11 +152,7 @@ impl SystemGit {
   /// Currently unused but maintained as a tested public API for future use cases.
   #[allow(dead_code)]
   pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
-    let relative_path = if path.is_absolute() {
-      path.strip_prefix(&self.work_tree).unwrap_or(path)
-    } else {
-      path
-    };
+    let relative_path = self.normalize_path(path);
 
     let spec = format!("{}:{}", commit_sha, relative_path.display());
 
@@ -175,11 +179,7 @@ impl SystemGit {
     since_sha: Option<&str>,
     until_ref: &str,
   ) -> RailResult<Vec<CommitInfo>> {
-    let relative_path = if path.is_absolute() {
-      path.strip_prefix(&self.work_tree).unwrap_or(path)
-    } else {
-      path
-    };
+    let relative_path = self.normalize_path(path);
 
     let mut cmd = self.git_cmd();
     cmd.args(["log", "--reverse", "--format=%H"]);
@@ -212,6 +212,62 @@ impl SystemGit {
       .collect();
 
     // Fetch commit info sequentially to preserve order
+    let mut commits = Vec::new();
+    for sha in shas {
+      commits.push(self.get_commit(&sha)?);
+    }
+
+    Ok(commits)
+  }
+
+  /// Get commits touching any of the given paths (batched for performance)
+  /// Returns commits in chronological order (oldest first), deduplicated
+  pub fn get_commits_touching_paths(
+    &self,
+    paths: &[PathBuf],
+    since_sha: Option<&str>,
+    until_ref: &str,
+  ) -> RailResult<Vec<CommitInfo>> {
+    if paths.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    // Normalize all paths
+    let relative_paths: Vec<&Path> = paths.iter().map(|path| self.normalize_path(path)).collect();
+
+    let mut cmd = self.git_cmd();
+    cmd.args(["log", "--reverse", "--format=%H"]);
+
+    // Add range
+    if let Some(since) = since_sha {
+      cmd.arg(format!("{}..{}", since, until_ref));
+    } else {
+      cmd.arg(until_ref);
+    }
+
+    // Add all path filters in a single command
+    cmd.arg("--");
+    for path in relative_paths {
+      cmd.arg(path);
+    }
+
+    let output = cmd.output().context("Failed to get commits touching paths")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git log".to_string(),
+        stderr: stderr.to_string(),
+      }));
+    }
+
+    let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .map(|s| s.trim().to_string())
+      .filter(|s| !s.is_empty())
+      .collect();
+
+    // Fetch commit info sequentially to preserve order (already deduplicated by git)
     let mut commits = Vec::new();
     for sha in shas {
       commits.push(self.get_commit(&sha)?);
@@ -689,11 +745,7 @@ impl SystemGit {
 
     // Write all requests to stdin
     for (commit_sha, path) in items {
-      let relative_path = if path.is_absolute() {
-        path.strip_prefix(&self.work_tree).unwrap_or(path)
-      } else {
-        path
-      };
+      let relative_path = self.normalize_path(path);
       let spec = format!("{}:{}\n", commit_sha, relative_path.display());
       stdin
         .write_all(spec.as_bytes())

@@ -1,6 +1,5 @@
-#![allow(dead_code)]
-
 use crate::core::error::RailResult;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,6 +26,8 @@ pub struct SyncConfig {
 /// Result of a sync operation
 pub struct SyncResult {
   pub commits_synced: usize,
+  /// Direction of sync operation - useful for logging/auditing
+  #[allow(dead_code)]
   pub direction: SyncDirection,
   pub conflicts: Vec<ConflictInfo>,
 }
@@ -49,7 +50,6 @@ pub struct SyncEngine {
   config: SyncConfig,
   mono_git: SystemGit,
   mapping_store: MappingStore,
-  metadata: WorkspaceMetadata,
   transform: CargoTransform,
   /// Wrapped in Arc for cheap cloning in parallel execution
   security_config: Arc<SecurityConfig>,
@@ -69,7 +69,7 @@ impl SyncEngine {
     let mono_git = SystemGit::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let metadata = WorkspaceMetadata::load(&workspace_root)?;
-    let transform = CargoTransform::new(metadata.clone());
+    let transform = CargoTransform::new(metadata); // No clone needed - metadata moved into transform
     let security_validator = SecurityValidator::new((*security_config).clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
@@ -90,7 +90,6 @@ impl SyncEngine {
       config,
       mono_git,
       mapping_store,
-      metadata,
       transform,
       security_config,
       security_validator,
@@ -156,11 +155,11 @@ impl SyncEngine {
     // Find last synced commit in mono
     let last_synced_mono = self.find_last_synced_mono_commit()?;
 
-    // Get new commits in mono that touch the crate path
-    let crate_path = &self.config.crate_paths[0]; // TODO: Handle combined mode
-    let new_commits = self
-      .mono_git
-      .get_commits_touching_path(crate_path, last_synced_mono.as_deref(), "HEAD")?;
+    // Get new commits in mono that touch any of the crate paths (handles both single and combined modes)
+    let new_commits =
+      self
+        .mono_git
+        .get_commits_touching_paths(&self.config.crate_paths, last_synced_mono.as_deref(), "HEAD")?;
 
     if new_commits.is_empty() {
       println!("   No new commits to sync");
@@ -329,7 +328,8 @@ impl SyncEngine {
         let (conflict_infos, changed_files) = self.resolve_conflicts_for_commit(commit, &remote_git)?;
 
         // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
-        let resolved_files: Vec<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
+        // Using HashSet for O(1) membership testing instead of O(n)
+        let resolved_files: HashSet<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
 
         if !conflict_infos.is_empty() {
           conflicts.extend(conflict_infos);
@@ -582,7 +582,7 @@ impl SyncEngine {
     &self,
     commit: &crate::core::vcs::CommitInfo,
     remote_git: &SystemGit,
-    resolved_files: &[PathBuf],
+    resolved_files: &HashSet<PathBuf>,
     current_mono_head: &str,
     changed_files: &[(PathBuf, char)], // Pre-fetched from resolve_conflicts to avoid duplicate subprocess call
   ) -> RailResult<String> {
@@ -606,8 +606,8 @@ impl SyncEngine {
           return None;
         }
 
-        // Skip files that were already resolved by conflict resolution
-        if resolved_files.iter().any(|p| p == &mono_path) {
+        // Skip files that were already resolved by conflict resolution (O(1) HashSet lookup)
+        if resolved_files.contains(&mono_path) {
           println!("      Skipping {} (already resolved)", mono_path.display());
           return None;
         }
@@ -884,6 +884,8 @@ impl SyncEngine {
   }
 
   /// Legacy method - kept for compatibility but now uses resolve_conflicts_for_commit
+  /// TODO: Remove in favor of resolve_conflicts_for_commit once all call sites updated
+  #[allow(dead_code)]
   fn check_for_conflicts(
     &self,
     remote_commit: &crate::core::vcs::CommitInfo,

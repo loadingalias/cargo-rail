@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::core::error::{RailResult, ResultExt};
 use crate::ui::progress::FileProgress;
 use std::fs;

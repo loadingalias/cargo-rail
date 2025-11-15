@@ -20,14 +20,19 @@ fn test_split_creates_repo_with_history() -> Result<()> {
   // Initialize cargo-rail config
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
 
-  // Update config to set local remote path
+  // Run split with remote override
   let split_dir = workspace.path.join("split-repos/my-crate-split");
-  let config = workspace.read_file("rail.toml")?;
-  let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
-  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
-
-  // Run split
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "my-crate",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Verify split repo exists
   assert!(split_dir.exists());
@@ -67,23 +72,20 @@ fn test_split_transforms_cargo_toml() -> Result<()> {
   )?;
   workspace.commit("Add crates with dependencies")?;
 
-  // Initialize and configure
+  // Initialize and split app-crate with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   let split_dir = workspace.path.join("split-repos/app-crate-split");
-  let config = workspace.read_file("rail.toml")?;
-  let updated_config = config.replace(
-    r#"name = "app-crate"
-remote = """#,
-    &format!(
-      r#"name = "app-crate"
-remote = "{}""#,
-      split_dir.display()
-    ),
-  );
-  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
-
-  // Split app-crate
-  run_cargo_rail(&workspace.path, &["rail", "split", "app-crate", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "app-crate",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Read transformed Cargo.toml
   let cargo_toml = std::fs::read_to_string(split_dir.join("Cargo.toml"))?;
@@ -120,22 +122,20 @@ fn test_split_filters_commits() -> Result<()> {
   workspace.modify_file("crate-a", "README.md", "# A Updated")?;
   workspace.commit("Update crate-a README")?;
 
-  // Initialize and split crate-a
+  // Initialize and split crate-a with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   let split_dir = workspace.path.join("split-repos/crate-a-split");
-  let config = workspace.read_file("rail.toml")?;
-  let updated_config = config.replace(
-    r#"name = "crate-a"
-remote = """#,
-    &format!(
-      r#"name = "crate-a"
-remote = "{}""#,
-      split_dir.display()
-    ),
-  );
-  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
-
-  run_cargo_rail(&workspace.path, &["rail", "split", "crate-a", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "crate-a",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Verify split repo only has commits that touched crate-a
   let log = git(&split_dir, &["log", "--oneline"])?;
@@ -167,14 +167,20 @@ fn test_split_copies_auxiliary_files() -> Result<()> {
   workspace.add_crate("my-crate", "0.1.0", &[])?;
   workspace.commit("Add crate with aux files")?;
 
-  // Initialize and split
+  // Initialize and split with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   let split_dir = workspace.path.join("split-repos/my-crate-split");
-  let config = workspace.read_file("rail.toml")?;
-  let updated_config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
-  std::fs::write(workspace.path.join("rail.toml"), updated_config)?;
-
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "my-crate",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Verify auxiliary files were copied
   assert!(split_dir.join("rust-toolchain.toml").exists());

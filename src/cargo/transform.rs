@@ -1,14 +1,16 @@
-#![allow(dead_code)]
-
 use crate::cargo::metadata::WorkspaceMetadata;
 use crate::core::error::{RailError, RailResult, ResultExt};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Value};
 
-/// Context for transforming Cargo.toml
+/// Context for transformation operations
 pub struct TransformContext {
+  /// Crate name being transformed - public API field for future use
+  #[allow(dead_code)]
   pub crate_name: String,
+  /// Workspace root path - public API field for future use
+  #[allow(dead_code)]
   pub workspace_root: PathBuf,
 }
 

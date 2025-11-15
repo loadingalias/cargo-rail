@@ -22,7 +22,13 @@ fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
 }
 
 /// Run the split command
-pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool) -> RailResult<()> {
+pub fn run_split(
+  crate_name: Option<String>,
+  all: bool,
+  remote: Option<String>,
+  apply: bool,
+  json: bool,
+) -> RailResult<()> {
   let current_dir = env::current_dir()?;
 
   // Load configuration
@@ -35,8 +41,8 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
   let config = RailConfig::load(&current_dir)?;
   println!("📦 Loaded configuration from .rail/config.toml");
 
-  // Determine which crates to split (need this to check if they're all local)
-  let crates_to_split_check: Vec<_> = if all {
+  // Determine which crates to split
+  let mut crates_to_split_check: Vec<_> = if all {
     config.splits.clone()
   } else if let Some(ref name) = crate_name {
     let split_config = config
@@ -51,6 +57,13 @@ pub fn run_split(crate_name: Option<String>, all: bool, apply: bool, json: bool)
       "Try: cargo rail split --all OR cargo rail split <crate-name>",
     ));
   };
+
+  // Apply remote override if provided (before all_local check)
+  if let Some(ref remote_override) = remote {
+    for split_config in &mut crates_to_split_check {
+      split_config.remote = remote_override.clone();
+    }
+  }
 
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_split_check

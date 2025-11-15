@@ -63,7 +63,8 @@ pub fn run_release_plan(name: Option<String>, all: bool, json: bool) -> RailResu
 pub fn run_release_apply(
   name: String,
   dry_run: bool,
-  _skip_sync: bool, // TODO: Implement split sync
+  // Skip syncing to split repos - deferred to post-v1 (see TODO.md Post-v1: Auto-sync to split repos)
+  #[allow(unused_variables)] skip_sync: bool,
 ) -> RailResult<()> {
   let workspace_root = env::current_dir()?;
 

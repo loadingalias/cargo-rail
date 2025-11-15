@@ -23,34 +23,32 @@ fn test_full_workflow_init_split_sync() -> Result<()> {
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   assert!(workspace.file_exists("rail.toml"));
 
-  // Step 3: Configure remotes
+  // Step 3: Split both crates with remote overrides
   let core_split = workspace.path.join("split-repos/lib-core-split");
   let utils_split = workspace.path.join("split-repos/lib-utils-split");
 
-  let config = workspace.read_file("rail.toml")?;
-  let config = config.replace(
-    r#"name = "lib-core"
-remote = """#,
-    &format!(
-      r#"name = "lib-core"
-remote = "{}""#,
-      core_split.display()
-    ),
-  );
-  let config = config.replace(
-    r#"name = "lib-utils"
-remote = """#,
-    &format!(
-      r#"name = "lib-utils"
-remote = "{}""#,
-      utils_split.display()
-    ),
-  );
-  std::fs::write(workspace.path.join("rail.toml"), config)?;
-
-  // Step 4: Split both crates
-  run_cargo_rail(&workspace.path, &["rail", "split", "lib-core", "--apply"])?;
-  run_cargo_rail(&workspace.path, &["rail", "split", "lib-utils", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "lib-core",
+      "--remote",
+      &core_split.display().to_string(),
+      "--apply",
+    ],
+  )?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "lib-utils",
+      "--remote",
+      &utils_split.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   assert!(core_split.exists());
   assert!(utils_split.exists());
@@ -66,7 +64,18 @@ remote = "{}""#,
   workspace.commit("Update core")?;
 
   // Step 7: Sync to remote
-  run_cargo_rail(&workspace.path, &["rail", "sync", "lib-core", "--to-remote", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "sync",
+      "lib-core",
+      "--remote",
+      &core_split.display().to_string(),
+      "--to-remote",
+      "--apply",
+    ],
+  )?;
 
   // Step 8: Verify sync worked
   let core_lib = std::fs::read_to_string(core_split.join("src/lib.rs"))?;
@@ -80,7 +89,15 @@ remote = "{}""#,
   // Step 10: Sync back to monorepo
   run_cargo_rail(
     &workspace.path,
-    &["rail", "sync", "lib-utils", "--from-remote", "--apply"],
+    &[
+      "rail",
+      "sync",
+      "lib-utils",
+      "--remote",
+      &utils_split.display().to_string(),
+      "--from-remote",
+      "--apply",
+    ],
   )?;
 
   // Step 11: Verify changes in monorepo
@@ -107,14 +124,20 @@ fn test_workflow_with_multiple_commits() -> Result<()> {
   workspace.modify_file("my-crate", "README.md", "# V3")?;
   workspace.commit("Version 3")?;
 
-  // Initialize and split
+  // Initialize and split with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   let split_dir = workspace.path.join("split-repos/my-crate-split");
-  let config = workspace.read_file("rail.toml")?;
-  let config = config.replace(r#"remote = """#, &format!(r#"remote = "{}""#, split_dir.display()));
-  std::fs::write(workspace.path.join("rail.toml"), config)?;
-
-  run_cargo_rail(&workspace.path, &["rail", "split", "my-crate", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "my-crate",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Verify all commits are present
   let log = git(&split_dir, &["log", "--oneline"])?;
@@ -148,22 +171,20 @@ fn test_workflow_handles_workspace_dependencies() -> Result<()> {
   )?;
   workspace.commit("Add crates with workspace deps")?;
 
-  // Initialize and split
+  // Initialize and split with remote override
   run_cargo_rail(&workspace.path, &["rail", "init", "--all"])?;
   let split_dir = workspace.path.join("split-repos/derived-split");
-  let config = workspace.read_file("rail.toml")?;
-  let config = config.replace(
-    r#"name = "derived"
-remote = """#,
-    &format!(
-      r#"name = "derived"
-remote = "{}""#,
-      split_dir.display()
-    ),
-  );
-  std::fs::write(workspace.path.join("rail.toml"), config)?;
-
-  run_cargo_rail(&workspace.path, &["rail", "split", "derived", "--apply"])?;
+  run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "split",
+      "derived",
+      "--remote",
+      &split_dir.display().to_string(),
+      "--apply",
+    ],
+  )?;
 
   // Verify workspace dependencies were flattened
   let cargo_toml = std::fs::read_to_string(split_dir.join("Cargo.toml"))?;

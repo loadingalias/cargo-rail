@@ -9,16 +9,60 @@ use crate::core::sync::{SyncConfig, SyncDirection, SyncEngine, SyncResult};
 use crate::ui::progress::{FileProgress, MultiProgress};
 use rayon::prelude::*;
 
+/// Sync command parameters
+pub struct SyncParams {
+  pub crate_name: Option<String>,
+  pub all: bool,
+  pub remote: Option<String>,
+  pub from_remote: bool,
+  pub to_remote: bool,
+  pub strategy_str: String,
+  pub no_protected_branches: bool,
+  pub apply: bool,
+  pub json: bool,
+}
+
 /// Run the sync command
+#[allow(clippy::too_many_arguments)]
 pub fn run_sync(
   crate_name: Option<String>,
   all: bool,
+  remote: Option<String>,
   from_remote: bool,
   to_remote: bool,
   strategy_str: String,
+  no_protected_branches: bool,
   apply: bool,
   json: bool,
 ) -> RailResult<()> {
+  // Convert to struct for internal use
+  let params = SyncParams {
+    crate_name,
+    all,
+    remote,
+    from_remote,
+    to_remote,
+    strategy_str,
+    no_protected_branches,
+    apply,
+    json,
+  };
+  run_sync_impl(params)
+}
+
+/// Internal implementation of sync command
+fn run_sync_impl(params: SyncParams) -> RailResult<()> {
+  let SyncParams {
+    crate_name,
+    all,
+    remote,
+    from_remote,
+    to_remote,
+    strategy_str,
+    no_protected_branches,
+    apply,
+    json,
+  } = params;
   // Parse conflict strategy
   let strategy = ConflictStrategy::from_str(&strategy_str)?;
   let current_dir = env::current_dir()?;
@@ -30,11 +74,17 @@ pub fn run_sync(
     }));
   }
 
-  let config = RailConfig::load(&current_dir)?;
+  let mut config = RailConfig::load(&current_dir)?;
+
+  // Apply CLI overrides to security config if provided
+  if no_protected_branches {
+    config.security.protected_branches.clear();
+  }
+
   println!("📦 Loaded configuration from .rail/config.toml");
 
-  // Determine which crates to sync (need this to check if they're all local)
-  let crates_to_sync_check: Vec<_> = if all {
+  // Determine which crates to sync
+  let mut crates_to_sync_check: Vec<_> = if all {
     config.splits.clone()
   } else if let Some(ref name) = crate_name {
     let split_config = config
@@ -49,6 +99,13 @@ pub fn run_sync(
       "Try: cargo rail sync --all OR cargo rail sync <crate-name>",
     ));
   };
+
+  // Apply remote override if provided (before all_local check)
+  if let Some(ref remote_override) = remote {
+    for split_config in &mut crates_to_sync_check {
+      split_config.remote = remote_override.clone();
+    }
+  }
 
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_sync_check

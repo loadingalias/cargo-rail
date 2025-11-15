@@ -47,16 +47,16 @@ jobs:
             runner: windows-latest
             cache-key: commit-windows-x64
 
-          # Windows ARM64 (GitHub Teams/Enterprise)
+          # Windows ARM64 (GitHub Free in public repos)
           - name: aarch64-pc-windows-msvc
-            runner: windows-11-arm64
+            runner: windows-11-arm
             cache-key: commit-windows-arm64
 
           # macOS tested locally (not in CI)
 
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Setup
         uses: ./.github/actions/setup
@@ -74,7 +74,7 @@ jobs:
 
       - name: Upload Test Results (on failure)
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: test-results-${{ matrix.target.name }}
           path: target/nextest/

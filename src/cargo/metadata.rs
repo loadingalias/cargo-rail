@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::core::error::RailResult;
 use cargo_metadata::{MetadataCommand, Package};
 use std::path::Path;
@@ -22,6 +20,8 @@ impl WorkspaceMetadata {
     self.metadata.workspace_packages()
   }
 
+  /// Get package by name - public API for external use
+  #[allow(dead_code)]
   pub fn get_package(&self, name: &str) -> Option<&Package> {
     self
       .metadata
@@ -34,7 +34,8 @@ impl WorkspaceMetadata {
     self.metadata.workspace_root.as_std_path()
   }
 
-  /// Get raw JSON string for external tools
+  /// Get raw JSON string for external tools - public API for debugging/logging
+  #[allow(dead_code)]
   pub fn to_json_string(&self) -> RailResult<String> {
     serde_json::to_string(&self.metadata)
       .map_err(|e| crate::core::error::RailError::message(format!("Failed to serialize metadata: {}", e)))

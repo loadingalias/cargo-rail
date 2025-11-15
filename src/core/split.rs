@@ -26,7 +26,6 @@ struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
   crate_paths: &'a [PathBuf],
   target_repo_path: &'a Path,
-  transform: &'a CargoTransform,
   workspace_root: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,
@@ -76,22 +75,8 @@ impl Splitter {
   fn walk_filtered_history(&self, paths: &[PathBuf]) -> RailResult<Vec<CommitInfo>> {
     println!("   Walking commit history to find commits touching crate...");
 
-    // Collect commits that touch any of the paths
-    // Use HashSet + Vec to deduplicate while preserving insertion order from git log
-    let mut seen_shas = std::collections::HashSet::new();
-    let mut filtered_commits = Vec::new();
-
-    for path in paths {
-      // Get all commits that touch this path (already in chronological order from git log --reverse)
-      let path_commits = self.git.get_commits_touching_path(path, None, "HEAD")?;
-
-      // Add to our deduplication list (skip if already seen)
-      for commit in path_commits {
-        if seen_shas.insert(commit.sha.clone()) {
-          filtered_commits.push(commit);
-        }
-      }
-    }
+    // Use batched git command for all paths at once (much faster than N separate calls)
+    let filtered_commits = self.git.get_commits_touching_paths(paths, None, "HEAD")?;
 
     println!(
       "   Found {} total commits that touch the crate paths",
@@ -99,6 +84,23 @@ impl Splitter {
     );
 
     Ok(filtered_commits)
+  }
+
+  /// Apply Cargo.toml transformation to a manifest file
+  /// Returns Ok(()) if transform succeeded or file doesn't exist
+  fn apply_manifest_transform(&self, manifest_path: &Path, crate_name: &str) -> RailResult<()> {
+    if !manifest_path.exists() {
+      return Ok(());
+    }
+
+    let content = std::fs::read_to_string(manifest_path)?;
+    let context = TransformContext {
+      crate_name: crate_name.to_string(),
+      workspace_root: self.workspace_root.clone(),
+    };
+    let transformed = self.transform.transform_to_split(&content, &context)?;
+    std::fs::write(manifest_path, transformed)?;
+    Ok(())
   }
 
   /// Recreate a commit in the target repository with transforms applied
@@ -143,19 +145,12 @@ impl Splitter {
         std::fs::create_dir_all(parent)?;
       }
 
+      // Write file content
+      std::fs::write(&target_path, content_bytes)?;
+
       // Apply Cargo.toml transformation if applicable
       if file_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        // Transform the manifest
-        let content = String::from_utf8(content_bytes.clone())
-          .map_err(|_| RailError::message(format!("File '{}' is not valid UTF-8", file_path.display())))?;
-        let context = TransformContext {
-          crate_name: params.crate_name.to_string(),
-          workspace_root: params.workspace_root.to_path_buf(),
-        };
-        let transformed = params.transform.transform_to_split(&content, &context)?;
-        std::fs::write(&target_path, transformed)?;
-      } else {
-        std::fs::write(&target_path, content_bytes)?;
+        self.apply_manifest_transform(&target_path, params.crate_name)?;
       }
     }
 
@@ -391,7 +386,6 @@ impl Splitter {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
-          transform: &self.transform,
           workspace_root: &self.workspace_root,
           crate_name: &config.crate_name,
           mode: &config.mode,
@@ -417,17 +411,21 @@ impl Splitter {
         project_files.copy_to_split(&self.workspace_root, &config.target_repo_path)?;
 
         // Create a final commit if any files were added
-        let status = std::process::Command::new("git")
+        // git add -A is safe to run unconditionally (no-op if no changes)
+        std::process::Command::new("git")
           .current_dir(&config.target_repo_path)
-          .args(["status", "--porcelain"])
-          .output()?;
+          .args(["add", "-A"])
+          .status()?;
 
-        if !status.stdout.is_empty() {
+        // Check if there are staged changes before committing
+        let diff_cached = std::process::Command::new("git")
+          .current_dir(&config.target_repo_path)
+          .args(["diff", "--cached", "--quiet"])
+          .status()?;
+
+        if !diff_cached.success() {
+          // Exit code 1 means there are differences (i.e., staged changes)
           println!("   Creating commit for auxiliary files");
-          std::process::Command::new("git")
-            .current_dir(&config.target_repo_path)
-            .args(["add", "-A"])
-            .status()?;
           std::process::Command::new("git")
             .current_dir(&config.target_repo_path)
             .args(["commit", "-m", "Add workspace configs and project files"])
@@ -609,17 +607,9 @@ impl Splitter {
     self.copy_directory_recursive(&source_path, target_repo_path)?;
 
     // Transform Cargo.toml manifest
+    println!("   Transforming Cargo.toml");
     let manifest_path = target_repo_path.join("Cargo.toml");
-    if manifest_path.exists() {
-      println!("   Transforming Cargo.toml");
-      let content = std::fs::read_to_string(&manifest_path)?;
-      let context = TransformContext {
-        crate_name: crate_name.to_string(),
-        workspace_root: self.workspace_root.clone(),
-      };
-      let transformed = self.transform.transform_to_split(&content, &context)?;
-      std::fs::write(&manifest_path, transformed)?;
-    }
+    self.apply_manifest_transform(&manifest_path, crate_name)?;
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
@@ -653,15 +643,7 @@ impl Splitter {
 
       // Transform Cargo.toml manifest
       let manifest_path = target_path.join("Cargo.toml");
-      if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path)?;
-        let context = TransformContext {
-          crate_name: crate_name.to_string(),
-          workspace_root: self.workspace_root.clone(),
-        };
-        let transformed = self.transform.transform_to_split(&content, &context)?;
-        std::fs::write(&manifest_path, transformed)?;
-      }
+      self.apply_manifest_transform(&manifest_path, crate_name)?;
     }
 
     // Copy auxiliary files

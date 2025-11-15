@@ -80,6 +80,9 @@ enum Commands {
     /// Split all configured crates
     #[arg(short, long)]
     all: bool,
+    /// Override remote repository path (useful for testing)
+    #[arg(long)]
+    remote: Option<String>,
     /// Actually perform the split (default: dry-run mode showing plan)
     #[arg(long)]
     apply: bool,
@@ -95,6 +98,9 @@ enum Commands {
     /// Sync all configured crates
     #[arg(short, long)]
     all: bool,
+    /// Override remote repository path (useful for testing)
+    #[arg(long)]
+    remote: Option<String>,
     /// Only sync from remote to monorepo
     #[arg(long)]
     from_remote: bool,
@@ -104,6 +110,9 @@ enum Commands {
     /// Conflict resolution strategy: ours (use monorepo), theirs (use remote), manual (create markers), union (combine both)
     #[arg(long, visible_alias = "conflict", default_value = "manual")]
     strategy: String,
+    /// Disable protected branch checks (useful for testing)
+    #[arg(long)]
+    no_protected_branches: bool,
     /// Actually perform the sync (default: dry-run mode showing plan)
     #[arg(long)]
     apply: bool,
@@ -361,18 +370,31 @@ fn main() {
     Commands::Split {
       crate_name,
       all,
+      remote,
       apply,
       json,
-    } => commands::run_split(crate_name, all, apply, json),
+    } => commands::run_split(crate_name, all, remote, apply, json),
     Commands::Sync {
       crate_name,
       all,
+      remote,
       from_remote,
       to_remote,
       strategy,
+      no_protected_branches,
       apply,
       json,
-    } => commands::run_sync(crate_name, all, from_remote, to_remote, strategy, apply, json),
+    } => commands::run_sync(
+      crate_name,
+      all,
+      remote,
+      from_remote,
+      to_remote,
+      strategy,
+      no_protected_branches,
+      apply,
+      json,
+    ),
 
     // Graph Commands (Pillar 1) - New grouped interface
     Commands::Graph(graph_cmd) => match graph_cmd {

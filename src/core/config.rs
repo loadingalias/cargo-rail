@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::core::error::{ConfigError, RailError, RailResult, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -147,7 +145,8 @@ impl PolicyConfig {
     Ok(())
   }
 
-  /// Check if policy is enabled (any field is set)
+  /// Check if policy is enabled (any field is set) - public API for conditional logic
+  #[allow(dead_code)]
   pub fn is_enabled(&self) -> bool {
     self.resolver.is_some()
       || self.msrv.is_some()
