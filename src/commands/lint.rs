@@ -1,17 +1,16 @@
 //! Lint command implementation
 
 use crate::checks::{CheckContext, Severity, create_manifest_runner};
-use crate::core::config::RailConfig;
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{RailError, RailResult};
 use crate::lint::{DepsLinter, DepsReport, VersionsLinter, VersionsReport};
 use cargo_metadata::MetadataCommand;
-use std::env;
 
 /// Run the lint deps command
-pub fn run_lint_deps(fix: bool, apply: bool, json: bool, strict: bool) -> RailResult<()> {
+pub fn run_lint_deps(ctx: &WorkspaceContext, fix: bool, apply: bool, json: bool, strict: bool) -> RailResult<()> {
   // Load workspace metadata
   let metadata = MetadataCommand::new()
-    .current_dir(env::current_dir()?)
+    .current_dir(ctx.workspace_root())
     .exec()
     .map_err(|e| RailError::message(format!("Failed to load workspace metadata: {}", e)))?;
 
@@ -130,16 +129,16 @@ fn print_fix_report(report: &crate::lint::DepsFixReport) {
 }
 
 /// Run the lint versions command
-pub fn run_lint_versions(fix: bool, apply: bool, json: bool, strict: bool) -> RailResult<()> {
+pub fn run_lint_versions(ctx: &WorkspaceContext, fix: bool, apply: bool, json: bool, strict: bool) -> RailResult<()> {
   // Load workspace metadata
   let metadata = MetadataCommand::new()
-    .current_dir(env::current_dir()?)
+    .current_dir(ctx.workspace_root())
     .exec()
     .map_err(|e| RailError::message(format!("Failed to load workspace metadata: {}", e)))?;
 
   // Try to load policy config
-  let config = RailConfig::load(&env::current_dir()?).ok();
-  let policy = config.as_ref().map(|c| c.policy.clone());
+  let config = ctx.config.as_ref();
+  let policy = config.map(|c| c.policy.clone());
 
   let linter = VersionsLinter::new(metadata, policy);
 
@@ -282,19 +281,17 @@ fn print_versions_fix_report(report: &crate::lint::VersionsFixReport) {
 }
 
 /// Run the lint manifest command
-pub fn run_lint_manifest(json: bool, strict: bool) -> RailResult<()> {
-  let workspace_root = env::current_dir()?;
-
+pub fn run_lint_manifest(ctx: &WorkspaceContext, json: bool, strict: bool) -> RailResult<()> {
   // Create context for checks
-  let ctx = CheckContext {
-    workspace_root: workspace_root.clone(),
+  let check_ctx = CheckContext {
+    workspace_root: ctx.workspace_root().to_path_buf(),
     crate_name: None,
     thorough: false, // Manifest checks are never expensive
   };
 
   // Run manifest-specific checks
   let runner = create_manifest_runner();
-  let results = runner.run_all(&ctx)?;
+  let results = runner.run_all(&check_ctx)?;
 
   // Output results
   if json {

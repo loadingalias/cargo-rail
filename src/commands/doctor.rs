@@ -2,25 +2,22 @@
 //!
 //! The doctor command runs all health checks and reports any issues found.
 
-use std::env;
-
 use crate::checks::{CheckContext, create_default_runner};
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{ExitCode, RailError, RailResult};
 
 /// Run the doctor command to diagnose issues
 ///
 /// Returns Ok(()) if all checks pass, or exits with error code if checks fail
-pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
-  let current_dir = env::current_dir()?;
-
-  let ctx = CheckContext {
-    workspace_root: current_dir,
+pub fn run_doctor(ctx: &WorkspaceContext, thorough: bool, json: bool) -> RailResult<()> {
+  let check_ctx = CheckContext {
+    workspace_root: ctx.workspace_root().to_path_buf(),
     crate_name: None,
     thorough,
   };
 
   let runner = create_default_runner();
-  let results = runner.run_all(&ctx)?;
+  let results = runner.run_all(&check_ctx)?;
 
   if json {
     // JSON output for CI/automation
@@ -83,31 +80,27 @@ pub fn run_doctor(thorough: bool, json: bool) -> RailResult<()> {
 ///
 /// This is useful for commands that want to verify the environment is ready
 /// before starting work. Returns true if all checks pass, false otherwise.
-pub fn run_preflight_check(thorough: bool) -> RailResult<bool> {
-  let current_dir = env::current_dir()?;
-
-  let ctx = CheckContext {
-    workspace_root: current_dir,
+pub fn run_preflight_check(ctx: &WorkspaceContext, thorough: bool) -> RailResult<bool> {
+  let check_ctx = CheckContext {
+    workspace_root: ctx.workspace_root().to_path_buf(),
     crate_name: None,
     thorough,
   };
 
   let runner = create_default_runner();
-  runner.run_all_and_check(&ctx)
+  runner.run_all_and_check(&check_ctx)
 }
 
 /// Run checks for a specific crate
 ///
 /// Useful for validating a single crate before split/sync operations
-pub fn run_crate_check(crate_name: &str, thorough: bool) -> RailResult<bool> {
-  let current_dir = env::current_dir()?;
-
-  let ctx = CheckContext {
-    workspace_root: current_dir,
+pub fn run_crate_check(ctx: &WorkspaceContext, crate_name: &str, thorough: bool) -> RailResult<bool> {
+  let check_ctx = CheckContext {
+    workspace_root: ctx.workspace_root().to_path_buf(),
     crate_name: Some(crate_name.to_string()),
     thorough,
   };
 
   let runner = create_default_runner();
-  runner.run_all_and_check(&ctx)
+  runner.run_all_and_check(&check_ctx)
 }

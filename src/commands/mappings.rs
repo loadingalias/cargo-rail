@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::process::Command;
 
-use crate::core::config::RailConfig;
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{ConfigError, RailError, RailResult};
 use crate::core::mapping::MappingStore;
 use crate::ui::progress::FileProgress;
@@ -56,17 +55,8 @@ pub struct IntegrityCheck {
 }
 
 /// Run the mappings command
-pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<()> {
-  let current_dir = env::current_dir()?;
-
-  // Load configuration
-  if !RailConfig::exists(&current_dir) {
-    return Err(RailError::Config(ConfigError::NotFound {
-      workspace_root: current_dir,
-    }));
-  }
-
-  let config = RailConfig::load(&current_dir)?;
+pub fn run_mappings(ctx: &WorkspaceContext, crate_name: String, check: bool, json: bool) -> RailResult<()> {
+  let config = ctx.require_config()?.as_ref();
 
   // Find crate configuration
   let split_config = config.splits.iter().find(|s| s.name == crate_name).ok_or_else(|| {
@@ -78,7 +68,7 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
   // Load mappings
   let notes_ref = format!("refs/notes/rail/{}", crate_name);
   let mut mapping_store = MappingStore::new(crate_name.clone());
-  mapping_store.load(&current_dir)?;
+  mapping_store.load(ctx.workspace_root())?;
 
   let raw_mappings = mapping_store.all_mappings();
 
@@ -104,8 +94,8 @@ pub fn run_mappings(crate_name: String, check: bool, json: bool) -> RailResult<(
 
     if check {
       // Verify both commits exist
-      let mono_exists = commit_exists(&current_dir, mono_sha)?;
-      let remote_exists = if let Some(target_path) = get_target_path(&current_dir, split_config) {
+      let mono_exists = commit_exists(ctx.workspace_root(), mono_sha)?;
+      let remote_exists = if let Some(target_path) = get_target_path(ctx.workspace_root(), split_config) {
         commit_exists(&target_path, remote_sha)?
       } else {
         false

@@ -6,17 +6,15 @@
 //! 3. Every release has name + version + last_sha
 
 use crate::core::config::ReleaseConfig;
+use crate::core::context::WorkspaceContext;
 use crate::core::error::{RailError, RailResult};
 use crate::quality::changelog::{Changelog, ChangelogFormat, ConventionalCommit};
 use crate::release::{ReleasePlan, ReleaseTracker, VersionBump};
-use std::env;
 
 /// Run the release plan command
-pub fn run_release_plan(name: Option<String>, all: bool, json: bool) -> RailResult<()> {
-  let workspace_root = env::current_dir()?;
-
+pub fn run_release_plan(ctx: &WorkspaceContext, name: Option<String>, all: bool, json: bool) -> RailResult<()> {
   // Load release tracker
-  let tracker = ReleaseTracker::load(&workspace_root)?;
+  let tracker = ReleaseTracker::load(ctx.workspace_root())?;
 
   // Determine which releases to plan
   let releases: Vec<_> = if all {
@@ -47,7 +45,7 @@ pub fn run_release_plan(name: Option<String>, all: bool, json: bool) -> RailResu
   // Analyze each release
   let mut plans = Vec::new();
   for release in &releases {
-    let plan = ReleasePlan::analyze(&workspace_root, release)?;
+    let plan = ReleasePlan::analyze(ctx.workspace_root(), release)?;
     plans.push(plan);
   }
 
@@ -63,15 +61,14 @@ pub fn run_release_plan(name: Option<String>, all: bool, json: bool) -> RailResu
 
 /// Run the release apply command
 pub fn run_release_apply(
+  ctx: &WorkspaceContext,
   name: String,
   dry_run: bool,
   // Skip syncing to split repos - deferred to post-v1 (see TODO.md Post-v1: Auto-sync to split repos)
   #[allow(unused_variables)] skip_sync: bool,
 ) -> RailResult<()> {
-  let workspace_root = env::current_dir()?;
-
   // Load release tracker
-  let mut tracker = ReleaseTracker::load(&workspace_root)?;
+  let mut tracker = ReleaseTracker::load(ctx.workspace_root())?;
 
   // Find the release
   let release = tracker
@@ -80,7 +77,7 @@ pub fn run_release_apply(
     .clone();
 
   // Generate plan
-  let plan = ReleasePlan::analyze(&workspace_root, &release)?;
+  let plan = ReleasePlan::analyze(ctx.workspace_root(), &release)?;
 
   if !plan.has_changes {
     println!("⚠️  No changes detected for '{}'", name);
@@ -125,17 +122,21 @@ pub fn run_release_apply(
   println!("✅ Applying release...");
 
   // 1. Update Cargo.toml version
-  update_crate_version(&workspace_root, &release.crate_path, &plan.proposed_version.to_string())?;
+  update_crate_version(
+    ctx.workspace_root(),
+    &release.crate_path,
+    &plan.proposed_version.to_string(),
+  )?;
   println!("   Updated Cargo.toml version");
 
   // 2. Generate and update changelog (if configured)
   if let Some(changelog_path) = &release.changelog {
-    generate_changelog(&workspace_root, &release, &plan, changelog_path)?;
+    generate_changelog(ctx.workspace_root(), &release, &plan, changelog_path)?;
     println!("   Updated {}", changelog_path.display());
   }
 
   // 3. Get current HEAD SHA
-  let head_sha = get_head_sha(&workspace_root)?;
+  let head_sha = get_head_sha(ctx.workspace_root())?;
 
   // 4. Update rail.toml metadata
   tracker.update_release(&name, &plan.proposed_version.to_string(), &head_sha)?;
@@ -143,7 +144,7 @@ pub fn run_release_apply(
   println!("   Updated rail.toml metadata");
 
   // 5. Create git tag
-  create_git_tag(&workspace_root, &name, &plan.proposed_version.to_string())?;
+  create_git_tag(ctx.workspace_root(), &name, &plan.proposed_version.to_string())?;
   println!("   Created tag: {}-v{}", name, plan.proposed_version);
 
   println!();
