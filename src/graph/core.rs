@@ -19,9 +19,9 @@
 //! - **Algorithms**: Toposort, SCC, shortest paths, reachability
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
+use crate::cargo::WorkspaceMetadata;
 use crate::config::{RailConfig, Visibility};
 use crate::error::{RailError, RailResult};
-use crate::workspace::metadata::WorkspaceMetadata;
 use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
 use petgraph::algo;
@@ -273,7 +273,13 @@ impl WorkspaceGraph {
   /// Map a file path to its owning crate.
   ///
   /// Builds path cache on first call, then O(1) lookups.
+  /// Filters out VCS directories (.git, .jj) and other non-source paths.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
+    // Filter out VCS directories (git, jj, etc.)
+    if Self::should_ignore_path(file_path) {
+      return None;
+    }
+
     // Build cache if needed (interior mutability with RwLock)
     {
       let cache = self.path_cache.read().unwrap();
@@ -323,6 +329,26 @@ impl WorkspaceGraph {
         crate_name,
         self.workspace_members().join(", ")
       ))
+    })
+  }
+
+  /// Check if a path should be ignored (VCS directories, build artifacts, etc.)
+  fn should_ignore_path(path: &Path) -> bool {
+    path.components().any(|component| {
+      if let std::path::Component::Normal(name) = component {
+        let name_str = name.to_string_lossy();
+        // Ignore VCS directories
+        matches!(
+          name_str.as_ref(),
+          ".git" | ".jj" | ".hg" | ".svn" |
+          // Ignore build/target directories
+          "target" | "node_modules" |
+          // Ignore common temp/cache dirs
+          ".cache" | "tmp" | ".tmp"
+        )
+      } else {
+        false
+      }
     })
   }
 
@@ -598,5 +624,94 @@ mod tests {
       let deps = graph.direct_dependencies("cargo-rail").unwrap();
       assert!(!deps.is_empty());
     }
+  }
+
+  #[test]
+  fn test_should_ignore_path() {
+    // VCS directories
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".git")),
+      ".git should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".git/objects")),
+      ".git/objects should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("foo/.git/bar")),
+      "nested .git should be ignored"
+    );
+
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".jj")),
+      ".jj should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".jj/repo")),
+      ".jj/repo should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("src/.jj/file")),
+      "nested .jj should be ignored"
+    );
+
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".hg")),
+      ".hg should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".svn")),
+      ".svn should be ignored"
+    );
+
+    // Build/dependency directories
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("target")),
+      "target should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("target/debug")),
+      "target/debug should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("node_modules")),
+      "node_modules should be ignored"
+    );
+
+    // Cache/temp directories
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".cache")),
+      ".cache should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new("tmp")),
+      "tmp should be ignored"
+    );
+    assert!(
+      WorkspaceGraph::should_ignore_path(Path::new(".tmp")),
+      ".tmp should be ignored"
+    );
+
+    // Normal paths should NOT be ignored
+    assert!(
+      !WorkspaceGraph::should_ignore_path(Path::new("src")),
+      "src should not be ignored"
+    );
+    assert!(
+      !WorkspaceGraph::should_ignore_path(Path::new("src/main.rs")),
+      "src/main.rs should not be ignored"
+    );
+    assert!(
+      !WorkspaceGraph::should_ignore_path(Path::new("Cargo.toml")),
+      "Cargo.toml should not be ignored"
+    );
+    assert!(
+      !WorkspaceGraph::should_ignore_path(Path::new("crates/foo/src/lib.rs")),
+      "crate files should not be ignored"
+    );
+    assert!(
+      !WorkspaceGraph::should_ignore_path(Path::new("README.md")),
+      "README.md should not be ignored"
+    );
   }
 }

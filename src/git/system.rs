@@ -24,6 +24,7 @@ pub struct CommitInfo {
 }
 
 /// Git backend using system git (zero crate dependencies)
+#[derive(Clone)]
 pub struct SystemGit {
   /// Repository working directory
   pub(crate) repo_path: PathBuf,

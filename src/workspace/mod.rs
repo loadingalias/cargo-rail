@@ -1,14 +1,18 @@
-//! Cargo workspace integration.
+//! Workspace context and state management
 //!
-//! This module provides:
-//! - Workspace metadata loading via cargo_metadata
-//! - WorkspaceContext for single-load pattern
-//! - Cargo.toml transformations (workspace flattening, path→version deps)
-//! - Auxiliary file handling
+//! This module unifies Git, Cargo, and Graph into a single WorkspaceContext.
+//!
+//! # Architecture
+//!
+//! WorkspaceContext = GitState + CargoState + DependencyGraph + Config
+//!
+//! Built once at startup, passed by reference to all commands.
 
+pub mod cargo_state;
 pub mod context;
 pub mod files;
-pub mod metadata;
-pub mod transform;
+pub mod git_state;
 
+pub use cargo_state::CargoState;
 pub use context::WorkspaceContext;
+pub use git_state::GitState;

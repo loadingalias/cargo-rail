@@ -5,7 +5,7 @@
 //! - Which crates transitively depend on the changed crates
 //! - Minimal set of crates that need testing
 
-use super::builder::WorkspaceGraph;
+use super::core::WorkspaceGraph;
 use crate::error::RailResult;
 use std::collections::HashSet;
 use std::path::Path;
@@ -116,16 +116,4 @@ pub fn minimal_test_set(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path
   let mut targets: Vec<_> = analysis.impact.test_targets.into_iter().collect();
   targets.sort();
   Ok(targets)
-}
-
-#[cfg(test)]
-mod tests {
-  #[test]
-  fn test_empty_changeset() {
-    // Test with no changed files
-    let files: Vec<&str> = vec![];
-    // Would need actual WorkspaceGraph to test properly
-    // Just verify API compiles
-    assert!(files.is_empty());
-  }
 }

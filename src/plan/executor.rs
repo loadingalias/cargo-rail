@@ -11,16 +11,14 @@
 //! - Idempotent operations (same plan = same result)
 //! - Auditability (plans are JSON-serializable)
 
+use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SecurityConfig, SplitMode};
 use crate::error::{RailError, RailResult, ResultExt};
-use crate::git::SystemGit;
 use crate::plan::{Operation, Plan};
 use crate::split::engine::{SplitConfig, Splitter};
 use crate::sync::conflict::ConflictStrategy;
 use crate::sync::engine::{SyncConfig, SyncDirection, SyncEngine};
 use crate::workspace::WorkspaceContext;
-use crate::workspace::metadata::WorkspaceMetadata;
-use crate::workspace::transform::{CargoTransform, TransformContext};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -159,7 +157,7 @@ impl<'a> PlanExecutor<'a> {
     // Stage files
     for file in files {
       let output = std::process::Command::new("git")
-        .current_dir(&self.context.root)
+        .current_dir(&self.context.workspace_root)
         .arg("add")
         .arg(file)
         .output()
@@ -175,7 +173,7 @@ impl<'a> PlanExecutor<'a> {
 
     // Create commit
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(["commit", "-m", message])
       .output()
       .context("Failed to create commit")?;
@@ -198,7 +196,7 @@ impl<'a> PlanExecutor<'a> {
     }
 
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(&args)
       .output()
       .with_context(|| format!("Failed to push to {}/{}", remote, branch))?;
@@ -216,7 +214,7 @@ impl<'a> PlanExecutor<'a> {
   /// Pull from remote
   fn execute_pull(&self, remote: &str, branch: &str) -> RailResult<()> {
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(["pull", remote, branch])
       .output()
       .with_context(|| format!("Failed to pull from {}/{}", remote, branch))?;
@@ -248,14 +246,14 @@ impl<'a> PlanExecutor<'a> {
       .with_context(|| format!("Failed to read file for transform: {}", file_path.display()))?;
 
     // Load workspace metadata and create transformer
-    let metadata = WorkspaceMetadata::load(&self.context.root)?;
+    let metadata = self.context.cargo.metadata().clone();
     let transformer = CargoTransform::new(metadata);
 
     // Determine crate name from context or path
     let crate_name = self
       .context
-      .metadata
-      .list_crates()
+      .cargo
+      .workspace_packages()
       .iter()
       .find(|pkg| {
         if let (Some(pkg_dir), Some(file_dir)) = (pkg.manifest_path.parent(), file_path.parent()) {
@@ -269,7 +267,7 @@ impl<'a> PlanExecutor<'a> {
 
     let transform_context = TransformContext {
       crate_name,
-      workspace_root: self.context.root.clone(),
+      workspace_root: self.context.workspace_root.clone(),
     };
 
     // Apply the appropriate transformation
@@ -320,7 +318,7 @@ impl<'a> PlanExecutor<'a> {
   /// Create a branch
   fn execute_create_branch(&self, name: &str, from: &str) -> RailResult<()> {
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(["branch", name, from])
       .output()
       .with_context(|| format!("Failed to create branch {} from {}", name, from))?;
@@ -337,14 +335,14 @@ impl<'a> PlanExecutor<'a> {
 
   /// Checkout a branch
   fn execute_checkout(&self, branch: &str) -> RailResult<()> {
-    let git = SystemGit::open(&self.context.root)?;
+    let git = self.context.git.git();
     git.checkout_branch(branch)?;
     Ok(())
   }
 
   /// Merge branches
   fn execute_merge(&self, from: &str, into: &str, strategy: &str) -> RailResult<()> {
-    let git = SystemGit::open(&self.context.root)?;
+    let git = self.context.git.git();
 
     // Checkout target branch
     git.checkout_branch(into)?;
@@ -356,7 +354,7 @@ impl<'a> PlanExecutor<'a> {
     }
 
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(&args)
       .output()
       .with_context(|| format!("Failed to merge {} into {}", from, into))?;
@@ -374,7 +372,7 @@ impl<'a> PlanExecutor<'a> {
   /// Update git notes
   fn execute_update_notes(&self, notes_ref: &str, commit: &str, note_content: &str) -> RailResult<()> {
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(["notes", "--ref", notes_ref, "add", "-m", note_content, commit])
       .output()
       .with_context(|| format!("Failed to add note to commit {}", commit))?;
@@ -399,7 +397,7 @@ impl<'a> PlanExecutor<'a> {
 
     // Create empty commit
     let output = std::process::Command::new("git")
-      .current_dir(&self.context.root)
+      .current_dir(&self.context.workspace_root)
       .args(["commit", "--allow-empty", "-m", message])
       .output()
       .context("Failed to create PR commit")?;
@@ -437,7 +435,7 @@ impl<'a> PlanExecutor<'a> {
 
     // Get security config from context
     // Create splitter
-    let splitter = Splitter::new(self.context.root.clone())?;
+    let splitter = Splitter::new(self.context.workspace_root.clone())?;
 
     // Build split config
     let split_config = SplitConfig {
@@ -509,7 +507,12 @@ impl<'a> PlanExecutor<'a> {
     };
 
     // Create sync engine
-    let mut sync_engine = SyncEngine::new(self.context.root.clone(), sync_config, security_config, strategy)?;
+    let mut sync_engine = SyncEngine::new(
+      self.context.workspace_root.clone(),
+      sync_config,
+      security_config,
+      strategy,
+    )?;
 
     // Execute the sync based on direction
     match sync_direction {

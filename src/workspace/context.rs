@@ -24,8 +24,8 @@
 
 use crate::config::RailConfig;
 use crate::error::RailResult;
-use crate::graph::builder::WorkspaceGraph;
-use crate::workspace::metadata::WorkspaceMetadata;
+use crate::graph::WorkspaceGraph;
+use crate::workspace::{CargoState, GitState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -38,47 +38,71 @@ use std::sync::Arc;
 /// Uses Arc for efficient sharing of graph data without expensive clones.
 #[derive(Clone)]
 pub struct WorkspaceContext {
-  /// Workspace root directory (absolute path)
-  pub root: PathBuf,
+  /// Git repository root (working tree root, typically same as workspace_root)
+  pub repo_root: PathBuf,
 
-  /// Cargo metadata (workspace members, dependencies, etc.)
-  /// TODO: Used by split/sync/lint/release commands for manifest transformation
-  #[allow(dead_code)]
-  pub metadata: WorkspaceMetadata,
+  /// Cargo workspace root (Cargo.toml location)
+  pub workspace_root: PathBuf,
 
-  /// Dependency graph (built from metadata)
+  /// Git state and operations
+  pub git: GitState,
+
+  /// Cargo metadata and workspace info
+  pub cargo: CargoState,
+
+  /// Dependency graph (built from cargo metadata)
   /// Wrapped in Arc for efficient sharing across threads/commands
   pub graph: Arc<WorkspaceGraph>,
 
   /// Rail configuration (rail.toml)
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
-  /// TODO: Used by split/sync/lint/release commands for policy enforcement
-  #[allow(dead_code)]
   pub config: Option<Arc<RailConfig>>,
 }
 
 impl WorkspaceContext {
   /// Build workspace context from a root directory.
   ///
-  /// Loads metadata, builds graph, and attempts to load rail.toml config.
+  /// Loads git state, cargo metadata, builds graph, and attempts to load rail.toml config.
   /// Config is optional - commands that require it should check and error.
   ///
   /// # Performance
   ///
-  /// - Metadata load: 50-200ms for large workspaces
+  /// - Git state: <5ms (single git rev-parse)
+  /// - Cargo metadata: 50-200ms for large workspaces
   /// - Graph build: 10-50ms
   /// - Config load: <5ms (or None if not found)
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    let root = workspace_root.to_path_buf();
-    let metadata = WorkspaceMetadata::load(&root)?;
-    let graph = Arc::new(WorkspaceGraph::load(&root)?);
-    let config = RailConfig::load(&root).ok().map(Arc::new); // Optional - not all commands need it
+    // Load git state
+    let git = GitState::open(workspace_root)?;
+    let repo_root = git.repo_root().to_path_buf();
+
+    // Load cargo state
+    let cargo = CargoState::load(workspace_root)?;
+    let workspace_root = cargo.workspace_root().to_path_buf();
+
+    // Validate repo_root and workspace_root match (or document when they differ)
+    // For now, we allow them to differ but could add a warning if needed
+    if repo_root != workspace_root {
+      eprintln!(
+        "⚠️  Warning: Git repo root ({}) differs from Cargo workspace root ({})",
+        repo_root.display(),
+        workspace_root.display()
+      );
+    }
+
+    // Build dependency graph
+    let graph = Arc::new(WorkspaceGraph::load(&workspace_root)?);
+
+    // Load optional config
+    let config = RailConfig::load(&workspace_root).ok().map(Arc::new);
 
     Ok(Self {
-      root,
-      metadata,
+      repo_root,
+      workspace_root,
+      git,
+      cargo,
       graph,
       config,
     })
@@ -87,8 +111,6 @@ impl WorkspaceContext {
   /// Get config or error if not found.
   ///
   /// Use this in commands that require rail.toml configuration.
-  /// TODO: Used by split/sync/lint/release commands
-  #[allow(dead_code)]
   pub fn require_config(&self) -> RailResult<&Arc<RailConfig>> {
     self
       .config
@@ -98,6 +120,140 @@ impl WorkspaceContext {
 
   /// Get workspace root as Path reference (convenience)
   pub fn workspace_root(&self) -> &Path {
-    &self.root
+    &self.workspace_root
+  }
+
+  /// Get repository root as Path reference (convenience)
+  pub fn repo_root(&self) -> &Path {
+    &self.repo_root
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_workspace_context_build() {
+    // Use current directory as test workspace
+    let current_dir = std::env::current_dir().unwrap();
+
+    // Should successfully build workspace context
+    let ctx = WorkspaceContext::build(&current_dir);
+    assert!(ctx.is_ok(), "Should successfully build workspace context");
+
+    let ctx = ctx.unwrap();
+
+    // Verify all components are initialized
+    assert!(ctx.repo_root.exists(), "Repo root should exist");
+    assert!(ctx.workspace_root.exists(), "Workspace root should exist");
+
+    // Git state should be initialized
+    assert_eq!(
+      ctx.git.repo_root(),
+      &ctx.repo_root,
+      "Git repo root should match context repo root"
+    );
+
+    // Cargo state should be initialized
+    assert_eq!(
+      ctx.cargo.workspace_root(),
+      &ctx.workspace_root,
+      "Cargo workspace root should match"
+    );
+
+    // Should find cargo-rail in workspace
+    let packages = ctx.cargo.workspace_packages();
+    assert!(!packages.is_empty(), "Should have workspace packages");
+    assert!(
+      packages.iter().any(|p| p.name == "cargo-rail"),
+      "Should find cargo-rail package"
+    );
+
+    // Graph should be initialized
+    let members = ctx.graph.workspace_members();
+    assert!(!members.is_empty(), "Graph should have workspace members");
+    assert!(
+      members.contains(&"cargo-rail".to_string()),
+      "Graph should contain cargo-rail"
+    );
+
+    // Config may or may not be loaded depending on workspace
+    // Just verify it's an Option
+    let _ = ctx.config.as_ref();
+  }
+
+  #[test]
+  fn test_workspace_context_convenience_methods() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // Test convenience methods
+    let workspace_root = ctx.workspace_root();
+    assert!(
+      workspace_root.exists(),
+      "Workspace root from convenience method should exist"
+    );
+    assert_eq!(
+      workspace_root, &ctx.workspace_root,
+      "Convenience method should return same path"
+    );
+
+    let repo_root = ctx.repo_root();
+    assert!(repo_root.exists(), "Repo root from convenience method should exist");
+    assert_eq!(repo_root, &ctx.repo_root, "Convenience method should return same path");
+  }
+
+  #[test]
+  fn test_git_state_wrapper() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // Should be able to access git operations
+    let head = ctx.git.head_commit();
+    assert!(head.is_ok(), "Should get HEAD commit");
+
+    let head_sha = head.unwrap();
+    assert_eq!(head_sha.len(), 40, "HEAD SHA should be 40 characters");
+
+    // Should be able to get current branch
+    let branch = ctx.git.current_branch();
+    assert!(branch.is_ok(), "Should get current branch");
+  }
+
+  #[test]
+  fn test_cargo_state_wrapper() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // Should be able to access cargo metadata
+    let metadata = ctx.cargo.metadata();
+    let packages = metadata.list_crates();
+    assert!(!packages.is_empty(), "Should have packages");
+
+    // Should be able to get specific package
+    let cargo_rail = ctx.cargo.get_package("cargo-rail");
+    assert!(cargo_rail.is_some(), "Should find cargo-rail package");
+
+    let pkg = cargo_rail.unwrap();
+    assert_eq!(pkg.name.as_str(), "cargo-rail");
+  }
+
+  #[test]
+  fn test_graph_integration() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // Graph should be consistent with cargo metadata
+    let graph_members = ctx.graph.workspace_members();
+    let cargo_packages: Vec<_> = ctx.cargo.workspace_packages().iter().map(|p| p.name.as_str()).collect();
+
+    for member in &graph_members {
+      assert!(
+        cargo_packages.contains(&member.as_str()),
+        "Graph member {} should be in cargo packages",
+        member
+      );
+    }
   }
 }

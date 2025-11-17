@@ -1,15 +1,13 @@
-use crate::error::RailResult;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
+use crate::cargo::{CargoTransform, TransformContext, WorkspaceMetadata};
 use crate::config::{SecurityConfig, SplitMode};
+use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
 use crate::sync::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
-use crate::workspace::metadata::WorkspaceMetadata;
-use crate::workspace::transform::{CargoTransform, TransformContext};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Configuration for sync operation
 pub struct SyncConfig {

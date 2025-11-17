@@ -15,7 +15,6 @@ readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5.52", features = ["derive", "cargo"] }
-anstyle = "1.0.13"
 
 # Workspace introspection
 cargo_metadata = "0.23.1"
@@ -39,7 +38,6 @@ sha2 = "0.10.9"
 
 # Parallelism and concurrency
 rayon = "1.11.0"
-chrono = { version = "0.4.42", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

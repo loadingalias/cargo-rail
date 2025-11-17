@@ -1,14 +1,12 @@
-use crate::error::{GitError, RailError, RailResult, ResultExt};
-use std::path::{Path, PathBuf};
-
+use crate::cargo::{CargoTransform, TransformContext, WorkspaceMetadata};
 use crate::config::SplitMode;
+use crate::error::{GitError, RailError, RailResult, ResultExt};
 use crate::git::CommitInfo;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
 use crate::utils;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
-use crate::workspace::metadata::WorkspaceMetadata;
-use crate::workspace::transform::{CargoTransform, TransformContext};
+use std::path::{Path, PathBuf};
 
 /// Configuration for a split operation
 pub struct SplitConfig {
