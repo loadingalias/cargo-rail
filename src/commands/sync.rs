@@ -1,11 +1,8 @@
-use crate::commands::doctor;
-use crate::core::conflict::ConflictStrategy;
-use crate::core::context::WorkspaceContext;
-use crate::core::error::{ConfigError, RailError, RailResult};
-use crate::core::executor::PlanExecutor;
-use crate::core::plan::{Operation, OperationType, Plan};
-use crate::core::sync::SyncDirection;
-use crate::ui::progress::{FileProgress, MultiProgress};
+use crate::sync::{ConflictStrategy, SyncDirection};
+use crate::workspace::WorkspaceContext;
+use crate::error::{ConfigError, RailError, RailResult};
+use crate::plan::PlanExecutor;
+use crate::plan::{Operation, OperationType, Plan};
 use crate::utils;
 use rayon::prelude::*;
 
@@ -104,18 +101,9 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_sync_check.iter().all(|s| utils::is_local_path(&s.remote));
 
-  // Run preflight health checks before proceeding (skip for local-only operations)
-  if !json && apply && !all_local {
-    println!("🏥 Running preflight health checks...");
-    if !doctor::run_preflight_check(ctx, false)? {
-      return Err(RailError::with_help(
-        "Preflight checks failed - environment is not ready",
-        "Run 'cargo rail doctor' for detailed diagnostics and fixes",
-      ));
-    }
-    println!("   ✅ All preflight checks passed\n");
-  } else if all_local && apply {
-    println!("   Skipping preflight checks (local testing mode)\n");
+  // Preflight health checks disabled (doctor module removed)
+  if all_local && apply {
+    println!("   Local testing mode\n");
   }
 
   // Determine sync direction
@@ -146,32 +134,7 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
     println!("   Syncing all {} configured crates", crates_to_sync.len());
   }
 
-  // Validate crates with health checks before starting (skip for local testing)
-  if apply && !json && !all_local {
-    let mut progress = if crates_to_sync.len() > 1 {
-      Some(FileProgress::new(
-        crates_to_sync.len(),
-        format!("Running pre-flight checks for {} crates", crates_to_sync.len()),
-      ))
-    } else {
-      None
-    };
-
-    for split_config in &crates_to_sync {
-      if progress.is_none() {
-        println!("   🏥 Checking crate '{}'...", split_config.name);
-      }
-      if !doctor::run_crate_check(ctx, &split_config.name, false)? {
-        return Err(RailError::with_help(
-          format!("Health checks failed for crate '{}'", split_config.name),
-          "Run 'cargo rail doctor' for detailed diagnostics",
-        ));
-      }
-      if let Some(ref mut p) = progress {
-        p.inc();
-      }
-    }
-  }
+  // Validate crates (health checks disabled - doctor module removed)
 
   // Build plans using the unified Plan system
   let mut plans = Vec::new();
@@ -333,25 +296,16 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
   if plan_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", plan_count);
 
-    let multi_progress = MultiProgress::new();
-    let bars: Vec<_> = plans
-      .iter()
-      .map(|(split_config, _, _, _, _, _)| multi_progress.add_bar(1, format!("Syncing {}", split_config.name)))
-      .collect();
-
     // For parallel execution, we need to build contexts per-thread
     let workspace_root = ctx.workspace_root().to_path_buf();
     let results: Vec<RailResult<()>> = plans
       .into_par_iter()
-      .enumerate()
-      .map(|(idx, (_, _, _, plan, _, _))| {
+      .map(|(split_config, _, _, plan, _, _)| {
+        println!("🔄 Syncing crate: {}", split_config.name);
         // Build workspace context for this thread
         let thread_context = WorkspaceContext::build(&workspace_root)?;
         let thread_executor = PlanExecutor::new(&thread_context);
-        let result = thread_executor.execute(&plan);
-
-        multi_progress.inc(&bars[idx]);
-        result
+        thread_executor.execute(&plan)
       })
       .collect();
 
@@ -361,22 +315,9 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
     }
   } else {
     // Sequential processing for single crate or when not using --all
-    let mut crate_progress = if plan_count > 1 {
-      Some(FileProgress::new(plan_count, format!("Syncing {} crates", plan_count)))
-    } else {
-      None
-    };
-
     for (split_config, _, _, plan, _, _) in plans {
-      if crate_progress.is_none() {
-        println!("\n🔄 Syncing crate: {}", split_config.name);
-      }
-
+      println!("\n🔄 Syncing crate: {}", split_config.name);
       executor.execute(&plan)?;
-
-      if let Some(ref mut p) = crate_progress {
-        p.inc();
-      }
     }
   }
 

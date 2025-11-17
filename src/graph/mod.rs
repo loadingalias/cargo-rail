@@ -1,10 +1,15 @@
-//! Graph-aware workspace analysis
+//! Graph-aware workspace analysis.
+//!
+//! This module provides:
+//! - Workspace dependency graph construction
+//! - Affected crate analysis (changed files → impacted crates)
+//! - Graph queries (transitive dependents, paths, etc.)
 //!
 //! Built on cargo_metadata + petgraph for direct control and minimal abstraction.
 //! No guppy - we own our domain types and queries.
 
-pub mod affected;
-pub mod workspace_graph;
+pub mod builder;
+pub mod query;
 
-pub use affected::AffectedAnalysis;
-pub use workspace_graph::WorkspaceGraph;
+pub use builder::WorkspaceGraph;
+pub use query::{AffectedAnalysis, analyze};

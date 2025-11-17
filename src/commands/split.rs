@@ -1,11 +1,9 @@
 use std::io::{self, Write};
 
-use crate::commands::doctor;
-use crate::core::context::WorkspaceContext;
-use crate::core::error::{ConfigError, RailError, RailResult};
-use crate::core::executor::PlanExecutor;
-use crate::core::plan::{Operation, OperationType, Plan};
-use crate::ui::progress::{FileProgress, MultiProgress};
+use crate::workspace::WorkspaceContext;
+use crate::error::{ConfigError, RailError, RailResult};
+use crate::plan::PlanExecutor;
+use crate::plan::{Operation, OperationType, Plan};
 use crate::utils;
 use rayon::prelude::*;
 
@@ -60,18 +58,9 @@ pub fn run_split(
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_split_check.iter().all(|s| utils::is_local_path(&s.remote));
 
-  // Run preflight health checks before proceeding (skip for local-only operations)
-  if !json && apply && !all_local {
-    println!("🏥 Running preflight health checks...");
-    if !doctor::run_preflight_check(ctx, false)? {
-      return Err(RailError::with_help(
-        "Preflight checks failed - environment is not ready",
-        "Run 'cargo rail doctor' for detailed diagnostics and fixes",
-      ));
-    }
-    println!("   ✅ All preflight checks passed\n");
-  } else if all_local && apply {
-    println!("   Skipping preflight checks (local testing mode)\n");
+  // Preflight health checks disabled (doctor module removed)
+  if all_local && apply {
+    println!("   Local testing mode\n");
   }
 
   // Use the crates we already determined
@@ -80,34 +69,9 @@ pub fn run_split(
     println!("   Splitting all {} configured crates", crates_to_split.len());
   }
 
-  // Validate all configurations and run health checks before starting
-  let mut progress = if apply && !json && !all_local && crates_to_split.len() > 1 {
-    Some(FileProgress::new(
-      crates_to_split.len(),
-      format!("Running pre-flight checks for {} crates", crates_to_split.len()),
-    ))
-  } else {
-    None
-  };
-
+  // Validate all configurations
   for split_config in &crates_to_split {
     split_config.validate()?;
-
-    // Run crate-specific health checks (skip for local testing)
-    if apply && !json && !all_local {
-      if progress.is_none() {
-        println!("   🏥 Checking crate '{}'...", split_config.name);
-      }
-      if !doctor::run_crate_check(ctx, &split_config.name, false)? {
-        return Err(RailError::with_help(
-          format!("Health checks failed for crate '{}'", split_config.name),
-          "Run 'cargo rail doctor' for detailed diagnostics",
-        ));
-      }
-      if let Some(ref mut p) = progress {
-        p.inc();
-      }
-    }
   }
 
   // Build plans using the unified Plan system
@@ -214,25 +178,16 @@ pub fn run_split(
   if plan_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", plan_count);
 
-    let multi_progress = MultiProgress::new();
-    let bars: Vec<_> = plans
-      .iter()
-      .map(|(split_config, _, _, _)| multi_progress.add_bar(1, format!("Splitting {}", split_config.name)))
-      .collect();
-
     // For parallel execution, we need to build contexts per-thread
     let workspace_root = ctx.workspace_root().to_path_buf();
     let results: Vec<RailResult<()>> = plans
       .into_par_iter()
-      .enumerate()
-      .map(|(idx, (_, _, _, plan))| {
+      .map(|(split_config, _, _, plan)| {
+        println!("🔨 Splitting crate '{}'...", split_config.name);
         // Build workspace context for this thread
         let thread_context = WorkspaceContext::build(&workspace_root)?;
         let thread_executor = PlanExecutor::new(&thread_context);
-        let result = thread_executor.execute(&plan);
-
-        multi_progress.inc(&bars[idx]);
-        result
+        thread_executor.execute(&plan)
       })
       .collect();
 
@@ -242,25 +197,9 @@ pub fn run_split(
     }
   } else {
     // Sequential processing for single crate or when not using --all
-    let mut crate_progress = if plan_count > 1 {
-      Some(FileProgress::new(
-        plan_count,
-        format!("Splitting {} crates", plan_count),
-      ))
-    } else {
-      None
-    };
-
     for (split_config, _, _, plan) in plans {
-      if crate_progress.is_none() {
-        println!("🔨 Splitting crate '{}'...", split_config.name);
-      }
-
+      println!("🔨 Splitting crate '{}'...", split_config.name);
       executor.execute(&plan)?;
-
-      if let Some(ref mut p) = crate_progress {
-        p.inc();
-      }
       println!();
     }
   }

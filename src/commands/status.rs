@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::core::context::WorkspaceContext;
-use crate::core::error::{RailError, RailResult};
+use crate::workspace::WorkspaceContext;
+use crate::error::{RailError, RailResult};
 use crate::utils;
 
 /// Status of a crate

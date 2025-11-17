@@ -9,9 +9,9 @@
 //! - `--workspace` to override and lint all workspace crates
 //! - `--dry-run` to show the plan without executing
 
-use crate::core::context::WorkspaceContext;
-use crate::core::error::{RailError, RailResult};
-use crate::core::vcs::SystemGit;
+use crate::workspace::WorkspaceContext;
+use crate::error::{RailError, RailResult};
+use crate::git::SystemGit;
 use crate::graph::AffectedAnalysis;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -81,7 +81,7 @@ fn run_affected_clippy(ctx: &WorkspaceContext, since: &str, dry_run: bool, cargo
   }
 
   // Analyze affected crates
-  let analysis = crate::graph::affected::analyze(&ctx.graph, &changed_files)?;
+  let analysis = crate::graph::analyze(&ctx.graph, &changed_files)?;
 
   if analysis.impact.test_targets.is_empty() {
     println!("✅ Changes detected but no workspace crates affected");

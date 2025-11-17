@@ -5,9 +5,9 @@
 //! - Which crates transitively depend on those changed crates
 //! - The minimal set of crates that need testing/building
 
-use crate::core::context::WorkspaceContext;
-use crate::core::error::{RailError, RailResult};
-use crate::core::vcs::SystemGit;
+use crate::workspace::WorkspaceContext;
+use crate::error::{RailError, RailResult};
+use crate::git::SystemGit;
 use crate::graph::AffectedAnalysis;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +56,7 @@ pub fn run_affected(
   }
 
   // Analyze affected crates
-  let analysis = crate::graph::affected::analyze(&ctx.graph, &changed_files)?;
+  let analysis = crate::graph::analyze(&ctx.graph, &changed_files)?;
 
   // Output results
   display_results(&analysis, output_format)?;

@@ -1,18 +1,18 @@
-mod cargo;
-mod checks;
 mod commands;
-mod core;
+mod config;
+mod error;
+mod git;
 mod graph;
-mod lint;
-mod quality;
-mod release;
-mod ui;
+mod plan;
+mod split;
+mod sync;
 mod utils;
+mod workspace;
 
 use clap::{Parser, Subcommand};
-use core::error::{RailError, print_error};
+use error::{RailError, print_error};
 
-/// Split Rust crates from monorepos, keep them in sync
+/// Graph-aware workspace orchestration for Rust monorepos
 #[derive(Parser)]
 #[command(name = "cargo")]
 #[command(bin_name = "cargo")]
@@ -34,46 +34,14 @@ struct RailCli {
 #[derive(Subcommand)]
 enum Commands {
   // ============================================================================
-  // Setup & Inspection
+  // Graph-Aware CI Optimization
   // ============================================================================
-  /// Initialize cargo-rail configuration for a workspace
-  Init {
-    /// Process all crates in the workspace
-    #[arg(short, long)]
-    all: bool,
-  },
-
-  /// Run health checks and diagnostics
-  Doctor {
-    /// Run thorough checks (includes network tests)
-    #[arg(long)]
-    thorough: bool,
-    /// Output results in JSON format
-    #[arg(long)]
-    json: bool,
-  },
-
-  /// Show status of all configured crates
-  Status {
-    /// Output status in JSON format
-    #[arg(long)]
-    json: bool,
-  },
-
-  /// Inspect git-notes mappings for a crate
-  Mappings {
-    /// Name of the crate to inspect
-    crate_name: String,
-    /// Validate mapping integrity
-    #[arg(long)]
-    check: bool,
-    /// Output mappings in JSON format
-    #[arg(long)]
-    json: bool,
-  },
+  /// Graph-aware workspace operations
+  #[command(subcommand)]
+  Graph(GraphCommands),
 
   // ============================================================================
-  // Split/Sync (Pillar 2)
+  // Split/Sync Orchestration
   // ============================================================================
   /// Split a crate from monorepo to separate repo with history
   Split {
@@ -82,13 +50,13 @@ enum Commands {
     /// Split all configured crates
     #[arg(short, long)]
     all: bool,
-    /// Override remote repository path (useful for testing)
+    /// Override remote repository path
     #[arg(long)]
     remote: Option<String>,
-    /// Actually perform the split (default: dry-run mode showing plan)
+    /// Actually perform the split (default: dry-run)
     #[arg(long)]
     apply: bool,
-    /// Output plan in JSON format (useful for CI/automation)
+    /// Output plan in JSON format
     #[arg(long)]
     json: bool,
   },
@@ -100,7 +68,7 @@ enum Commands {
     /// Sync all configured crates
     #[arg(short, long)]
     all: bool,
-    /// Override remote repository path (useful for testing)
+    /// Override remote repository path
     #[arg(long)]
     remote: Option<String>,
     /// Only sync from remote to monorepo
@@ -109,59 +77,28 @@ enum Commands {
     /// Only sync from monorepo to remote
     #[arg(long)]
     to_remote: bool,
-    /// Conflict resolution strategy: ours (use monorepo), theirs (use remote), manual (create markers), union (combine both)
-    #[arg(long, visible_alias = "conflict", default_value = "manual")]
+    /// Conflict resolution strategy: ours, theirs, manual, union
+    #[arg(long, default_value = "manual")]
     strategy: String,
-    /// Disable protected branch checks (useful for testing)
-    #[arg(long)]
-    no_protected_branches: bool,
-    /// Actually perform the sync (default: dry-run mode showing plan)
+    /// Actually perform the sync (default: dry-run)
     #[arg(long)]
     apply: bool,
-    /// Output plan in JSON format (useful for CI/automation)
+    /// Output plan in JSON format
     #[arg(long)]
     json: bool,
   },
 
   // ============================================================================
-  // Graph Orchestration (Pillar 1)
+  // Workspace Inspection
   // ============================================================================
-  /// Graph-aware workspace operations (affected analysis, smart CI)
-  #[command(subcommand)]
-  Graph(GraphCommands),
-
-  // ============================================================================
-  // Policy & Linting (Pillar 3)
-  // ============================================================================
-  /// Workspace policy enforcement and linting
-  #[command(subcommand)]
-  Lint(LintCommands),
-
-  // ============================================================================
-  // Release & Publishing (Pillar 4)
-  // ============================================================================
-  /// Release planning and publishing orchestration
-  #[command(subcommand)]
-  Release(ReleaseCommands),
-
-  // ============================================================================
-  // Quality Analysis (Pillar 5)
-  // ============================================================================
-  /// Unified quality analysis (replaces cargo-deny/audit/udeps)
-  Quality {
-    /// Run specific analysis by name
-    #[arg(long)]
-    analysis: Option<String>,
-    /// Output results in JSON format
+  /// Show status of all configured crates
+  Status {
+    /// Output status in JSON format
     #[arg(long)]
     json: bool,
-    /// Apply auto-fixes (if supported by analysis)
-    #[arg(long)]
-    fix: bool,
   },
 }
 
-// Graph subcommands (Pillar 1)
 #[derive(Subcommand)]
 enum GraphCommands {
   /// Show which crates are affected by changes
@@ -175,20 +112,17 @@ enum GraphCommands {
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
     to: Option<String>,
-    /// Output format: text (default), json, names-only
+    /// Output format: text, json, names-only
     #[arg(long, default_value = "text")]
     format: String,
-    /// Show dry-run plan without execution
-    #[arg(long)]
-    dry_run: bool,
   },
 
   /// Run tests for affected crates
   Test {
-    /// Git ref to compare against (default: origin/main)
+    /// Git ref to compare against
     #[arg(long)]
     since: Option<String>,
-    /// Run tests for entire workspace instead of affected crates
+    /// Run tests for entire workspace
     #[arg(long)]
     workspace: bool,
     /// Show dry-run plan without execution
@@ -201,10 +135,10 @@ enum GraphCommands {
 
   /// Run check for affected crates
   Check {
-    /// Git ref to compare against (default: origin/main)
+    /// Git ref to compare against
     #[arg(long)]
     since: Option<String>,
-    /// Run check for entire workspace instead of affected crates
+    /// Run check for entire workspace
     #[arg(long)]
     workspace: bool,
     /// Show dry-run plan without execution
@@ -217,10 +151,10 @@ enum GraphCommands {
 
   /// Run clippy for affected crates
   Clippy {
-    /// Git ref to compare against (default: origin/main)
+    /// Git ref to compare against
     #[arg(long)]
     since: Option<String>,
-    /// Run clippy for entire workspace instead of affected crates
+    /// Run clippy for entire workspace
     #[arg(long)]
     workspace: bool,
     /// Show dry-run plan without execution
@@ -229,80 +163,6 @@ enum GraphCommands {
     /// Additional arguments to pass to cargo clippy
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cargo_args: Vec<String>,
-  },
-}
-
-// Lint subcommands (Pillar 3)
-#[derive(Subcommand)]
-enum LintCommands {
-  /// Check workspace dependency usage and inheritance
-  Deps {
-    /// Automatically fix issues (requires --apply)
-    #[arg(long)]
-    fix: bool,
-    /// Actually apply fixes (default: dry-run)
-    #[arg(long)]
-    apply: bool,
-    /// Output results in JSON format
-    #[arg(long)]
-    json: bool,
-    /// Treat warnings as errors (exit code 1)
-    #[arg(long)]
-    strict: bool,
-  },
-
-  /// Detect and fix duplicate dependency versions
-  Versions {
-    /// Automatically fix issues (requires --apply)
-    #[arg(long)]
-    fix: bool,
-    /// Actually apply fixes (default: dry-run)
-    #[arg(long)]
-    apply: bool,
-    /// Output results in JSON format
-    #[arg(long)]
-    json: bool,
-    /// Treat warnings as errors (exit code 1)
-    #[arg(long)]
-    strict: bool,
-  },
-
-  /// Validate Cargo.toml manifest quality and policy compliance
-  Manifest {
-    /// Output results in JSON format
-    #[arg(long)]
-    json: bool,
-    /// Treat warnings as errors (exit code 1)
-    #[arg(long)]
-    strict: bool,
-  },
-}
-
-// Release subcommands (Pillar 4)
-#[derive(Subcommand)]
-enum ReleaseCommands {
-  /// Plan a release (analyze changes, suggest version bump)
-  Plan {
-    /// Name of the release to plan (from rail.toml `[[releases]]`)
-    name: Option<String>,
-    /// Plan all configured releases
-    #[arg(short, long)]
-    all: bool,
-    /// Output results in JSON format
-    #[arg(long)]
-    json: bool,
-  },
-
-  /// Apply a release (update version, create tag, sync to split)
-  Apply {
-    /// Name of the release to apply
-    name: String,
-    /// Show what would happen without making changes
-    #[arg(long)]
-    dry_run: bool,
-    /// Skip syncing to split repo (if configured)
-    #[arg(long)]
-    skip_sync: bool,
   },
 }
 
@@ -343,9 +203,7 @@ fn get_styles() -> clap::builder::Styles {
 fn main() {
   let CargoCli::Rail(cli) = CargoCli::parse();
 
-  // Build workspace context once (loads metadata, graph, config)
-  // Some commands don't need all of this, but the cost is negligible vs. the benefit
-  // of a unified, single-load architecture
+  // Build workspace context once (single-load pattern)
   let workspace_root = match std::env::current_dir() {
     Ok(dir) => dir,
     Err(e) => {
@@ -354,76 +212,22 @@ fn main() {
     }
   };
 
-  let ctx = match core::context::WorkspaceContext::build(&workspace_root) {
+  let ctx = match workspace::WorkspaceContext::build(&workspace_root) {
     Ok(ctx) => ctx,
     Err(e) => {
-      // Some commands (like init) may run before rail.toml exists
-      // For those, we'll handle the error in the command itself
-      // For now, print a warning but continue
-      if !matches!(cli.command, Commands::Init { .. }) {
-        eprintln!("Warning: Could not build full workspace context: {}", e);
-      }
-      // Create a minimal context for commands that can run without full setup
-      match try_minimal_context(&workspace_root) {
-        Ok(ctx) => ctx,
-        Err(e) => {
-          handle_error(e);
-        }
-      }
+      handle_error(e);
     }
   };
 
   let result = match cli.command {
-    // Setup & Inspection
-    Commands::Init { all } => commands::run_init(all),
-    Commands::Doctor { thorough, json } => commands::run_doctor(&ctx, thorough, json),
-    Commands::Status { json } => commands::run_status(&ctx, json),
-    Commands::Mappings {
-      crate_name,
-      check,
-      json,
-    } => commands::run_mappings(&ctx, crate_name, check, json),
-
-    // Split/Sync (Pillar 2)
-    Commands::Split {
-      crate_name,
-      all,
-      remote,
-      apply,
-      json,
-    } => commands::run_split(&ctx, crate_name, all, remote, apply, json),
-    Commands::Sync {
-      crate_name,
-      all,
-      remote,
-      from_remote,
-      to_remote,
-      strategy,
-      no_protected_branches,
-      apply,
-      json,
-    } => commands::run_sync(
-      &ctx,
-      crate_name,
-      all,
-      remote,
-      from_remote,
-      to_remote,
-      strategy,
-      no_protected_branches,
-      apply,
-      json,
-    ),
-
-    // Graph Commands (Pillar 1) - New grouped interface
+    // Graph Commands
     Commands::Graph(graph_cmd) => match graph_cmd {
       GraphCommands::Affected {
         since,
         from,
         to,
         format,
-        dry_run,
-      } => commands::run_affected(&ctx, since, from, to, format, dry_run),
+      } => commands::run_affected(&ctx, since, from, to, format, false),
       GraphCommands::Test {
         since,
         workspace,
@@ -444,48 +248,38 @@ fn main() {
       } => commands::run_clippy(&ctx, since, workspace, dry_run, cargo_args),
     },
 
-    // Lint Commands (Pillar 3)
-    Commands::Lint(lint_cmd) => match lint_cmd {
-      LintCommands::Deps {
-        fix,
-        apply,
-        json,
-        strict,
-      } => commands::run_lint_deps(&ctx, fix, apply, json, strict),
-      LintCommands::Versions {
-        fix,
-        apply,
-        json,
-        strict,
-      } => commands::run_lint_versions(&ctx, fix, apply, json, strict),
-      LintCommands::Manifest { json, strict } => commands::run_lint_manifest(&ctx, json, strict),
-    },
+    // Split/Sync
+    Commands::Split {
+      crate_name,
+      all,
+      remote,
+      apply,
+      json,
+    } => commands::run_split(&ctx, crate_name, all, remote, apply, json),
+    Commands::Sync {
+      crate_name,
+      all,
+      remote,
+      from_remote,
+      to_remote,
+      strategy,
+      apply,
+      json,
+    } => commands::run_sync(
+      &ctx,
+      crate_name,
+      all,
+      remote,
+      from_remote,
+      to_remote,
+      strategy,
+      false, // no_protected_branches
+      apply,
+      json,
+    ),
 
-    // Release Commands (Pillar 4)
-    Commands::Release(release_cmd) => match release_cmd {
-      ReleaseCommands::Plan { name, all, json } => commands::run_release_plan(&ctx, name, all, json),
-      ReleaseCommands::Apply {
-        name,
-        dry_run,
-        skip_sync,
-      } => commands::run_release_apply(&ctx, name, dry_run, skip_sync),
-    },
-
-    // Quality Analysis (Pillar 5)
-    Commands::Quality { analysis, json, fix } => {
-      if fix {
-        if let Some(analysis_name) = analysis {
-          commands::apply_fixes(&ctx, &analysis_name)
-        } else {
-          Err(RailError::with_help(
-            "Must specify --analysis when using --fix",
-            "Example: cargo rail quality --analysis duplicate-versions --fix",
-          ))
-        }
-      } else {
-        commands::run_quality(&ctx, json, analysis)
-      }
-    }
+    // Status
+    Commands::Status { json } => commands::run_status(&ctx, json),
   };
 
   if let Err(err) = result {
@@ -496,22 +290,4 @@ fn main() {
 fn handle_error(err: RailError) -> ! {
   print_error(&err);
   std::process::exit(err.exit_code().as_i32());
-}
-
-/// Try to build a minimal context when full context fails
-/// This allows commands like init to run before rail.toml exists
-fn try_minimal_context(workspace_root: &std::path::Path) -> core::error::RailResult<core::context::WorkspaceContext> {
-  use crate::cargo::metadata::WorkspaceMetadata;
-  use crate::graph::workspace_graph::WorkspaceGraph;
-  use std::sync::Arc;
-
-  let metadata = WorkspaceMetadata::load(workspace_root)?;
-  let graph = Arc::new(WorkspaceGraph::load(workspace_root)?);
-
-  Ok(core::context::WorkspaceContext {
-    root: workspace_root.to_path_buf(),
-    metadata,
-    graph,
-    config: None, // No config - this is minimal mode
-  })
 }
