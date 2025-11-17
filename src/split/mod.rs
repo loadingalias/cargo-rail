@@ -7,5 +7,3 @@
 //! - Git-notes based commit mapping
 
 pub mod engine;
-
-pub use engine::Splitter;

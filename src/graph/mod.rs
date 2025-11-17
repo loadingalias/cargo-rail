@@ -11,5 +11,4 @@
 pub mod builder;
 pub mod query;
 
-pub use builder::WorkspaceGraph;
 pub use query::{AffectedAnalysis, analyze};

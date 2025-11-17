@@ -9,4 +9,4 @@ pub mod conflict;
 pub mod engine;
 
 pub use conflict::ConflictStrategy;
-pub use engine::{SyncEngine, SyncDirection};
+pub use engine::SyncDirection;

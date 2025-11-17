@@ -15,8 +15,6 @@ pub enum ExitCode {
   User = 1,
   /// System error (git, network, I/O)
   System = 2,
-  /// Validation failure (checks failed, SSH, remotes)
-  Validation = 3,
 }
 
 impl ExitCode {
@@ -34,9 +32,6 @@ pub enum RailError {
 
   /// Git operation errors
   Git(GitError),
-
-  /// Validation errors (SSH, paths, etc.)
-  Validation(ValidationError),
 
   /// I/O errors
   Io(io::Error),
@@ -86,7 +81,6 @@ impl RailError {
     match self {
       RailError::Config(_) => ExitCode::User,
       RailError::Git(_) => ExitCode::System,
-      RailError::Validation(_) => ExitCode::Validation,
       RailError::Io(_) => ExitCode::System,
       RailError::Message { .. } => ExitCode::User,
     }
@@ -97,7 +91,6 @@ impl RailError {
     match self {
       RailError::Config(e) => e.help_message(),
       RailError::Git(e) => e.help_message(),
-      RailError::Validation(e) => e.help_message(),
       RailError::Message { help, .. } => help.clone(),
       _ => None,
     }
@@ -109,7 +102,6 @@ impl fmt::Display for RailError {
     match self {
       RailError::Config(e) => write!(f, "{}", e),
       RailError::Git(e) => write!(f, "{}", e),
-      RailError::Validation(e) => write!(f, "{}", e),
       RailError::Io(e) => write!(f, "I/O error: {}", e),
       RailError::Message { message, context, .. } => {
         write!(f, "{}", message)?;
@@ -310,42 +302,6 @@ impl fmt::Display for GitError {
       }
       GitError::PushFailed { remote, branch, reason } => {
         write!(f, "Push to {}/{} failed: {}", remote, branch, reason)
-      }
-    }
-  }
-}
-
-/// Validation errors
-#[derive(Debug)]
-pub enum ValidationError {
-  /// SSH key not found or invalid
-  SshKey { message: String },
-
-  /// Workspace validation failed
-  WorkspaceInvalid { reason: String },
-}
-
-impl ValidationError {
-  fn help_message(&self) -> Option<String> {
-    match self {
-      ValidationError::SshKey { .. } => {
-        Some("Create an SSH key with: ssh-keygen -t ed25519 -C \"your_email@example.com\"".to_string())
-      }
-      ValidationError::WorkspaceInvalid { .. } => {
-        Some("Run `cargo rail doctor` to diagnose workspace issues.".to_string())
-      }
-    }
-  }
-}
-
-impl fmt::Display for ValidationError {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      ValidationError::SshKey { message } => {
-        write!(f, "SSH key validation failed: {}", message)
-      }
-      ValidationError::WorkspaceInvalid { reason } => {
-        write!(f, "Workspace validation failed: {}", reason)
       }
     }
   }

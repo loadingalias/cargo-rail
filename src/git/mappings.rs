@@ -131,6 +131,7 @@ impl MappingStore {
   }
 
   /// Get all mappings
+  #[allow(dead_code)]
   pub fn all_mappings(&self) -> &HashMap<String, String> {
     &self.mappings
   }

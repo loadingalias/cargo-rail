@@ -9,10 +9,10 @@
 //! - `--workspace` to override and check all workspace crates
 //! - `--dry-run` to show the plan without executing
 
-use crate::workspace::WorkspaceContext;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::AffectedAnalysis;
+use crate::workspace::WorkspaceContext;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

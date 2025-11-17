@@ -12,6 +12,3 @@ pub mod metadata;
 pub mod transform;
 
 pub use context::WorkspaceContext;
-pub use files::{AuxiliaryFiles, ProjectFiles};
-pub use metadata::WorkspaceMetadata;
-pub use transform::CargoTransform;

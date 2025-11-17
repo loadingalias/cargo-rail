@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::workspace::WorkspaceContext;
 use crate::error::{RailError, RailResult};
 use crate::utils;
+use crate::workspace::WorkspaceContext;
 
 /// Status of a crate
 #[derive(Debug, Clone, Serialize, Deserialize)]

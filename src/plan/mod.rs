@@ -6,7 +6,8 @@
 //! - SHA256-based plan IDs for caching
 
 mod executor;
+#[allow(clippy::module_inception)]
 mod plan;
 
 pub use executor::PlanExecutor;
-pub use plan::{Plan, PlanId, Operation, OperationType};
+pub use plan::{Operation, OperationType, Plan};

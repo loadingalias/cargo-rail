@@ -9,5 +9,4 @@ pub mod mappings;
 pub mod ops;
 pub mod system;
 
-pub use mappings::MappingStore;
-pub use system::{SystemGit, CommitInfo};
+pub use system::{CommitInfo, SystemGit};

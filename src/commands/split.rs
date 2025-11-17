@@ -1,10 +1,10 @@
 use std::io::{self, Write};
 
-use crate::workspace::WorkspaceContext;
 use crate::error::{ConfigError, RailError, RailResult};
 use crate::plan::PlanExecutor;
 use crate::plan::{Operation, OperationType, Plan};
 use crate::utils;
+use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
 /// Prompt user for confirmation

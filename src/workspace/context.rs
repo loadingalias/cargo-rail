@@ -22,10 +22,10 @@
 //!   fn execute(ctx: &WorkspaceContext)
 //! ```
 
-use crate::workspace::metadata::WorkspaceMetadata;
 use crate::config::RailConfig;
 use crate::error::RailResult;
 use crate::graph::builder::WorkspaceGraph;
+use crate::workspace::metadata::WorkspaceMetadata;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

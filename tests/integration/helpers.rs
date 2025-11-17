@@ -120,6 +120,7 @@ mod tests {{
   }
 
   /// Get git log
+  #[allow(dead_code)]
   pub fn git_log(&self, n: usize) -> Result<Vec<String>> {
     let output = git(&self.path, &["log", &format!("-{}", n), "--oneline"])?;
     Ok(
@@ -131,11 +132,13 @@ mod tests {{
   }
 
   /// Check if a file exists
+  #[allow(dead_code)]
   pub fn file_exists(&self, path: &str) -> bool {
     self.path.join(path).exists()
   }
 
   /// Read a file
+  #[allow(dead_code)]
   pub fn read_file(&self, path: &str) -> Result<String> {
     Ok(std::fs::read_to_string(self.path.join(path))?)
   }

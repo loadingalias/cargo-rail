@@ -1,7 +1,7 @@
 //! Additional operations for SystemGit (commit walking, remotes, etc.)
 
-use super::system::CommitInfo;
 use super::SystemGit;
+use super::system::CommitInfo;
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use crate::utils;
 use std::path::{Path, PathBuf};

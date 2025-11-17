@@ -11,16 +11,16 @@
 //! - Idempotent operations (same plan = same result)
 //! - Auditability (plans are JSON-serializable)
 
-use crate::workspace::metadata::WorkspaceMetadata;
-use crate::workspace::transform::{CargoTransform, TransformContext};
 use crate::config::{SecurityConfig, SplitMode};
-use crate::sync::conflict::ConflictStrategy;
-use crate::workspace::WorkspaceContext;
 use crate::error::{RailError, RailResult, ResultExt};
+use crate::git::SystemGit;
 use crate::plan::{Operation, Plan};
 use crate::split::engine::{SplitConfig, Splitter};
+use crate::sync::conflict::ConflictStrategy;
 use crate::sync::engine::{SyncConfig, SyncDirection, SyncEngine};
-use crate::git::SystemGit;
+use crate::workspace::WorkspaceContext;
+use crate::workspace::metadata::WorkspaceMetadata;
+use crate::workspace::transform::{CargoTransform, TransformContext};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

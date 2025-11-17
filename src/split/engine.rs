@@ -1,14 +1,14 @@
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 
+use crate::config::SplitMode;
+use crate::git::CommitInfo;
+use crate::git::SystemGit;
+use crate::git::mappings::MappingStore;
+use crate::utils;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
 use crate::workspace::metadata::WorkspaceMetadata;
 use crate::workspace::transform::{CargoTransform, TransformContext};
-use crate::config::SplitMode;
-use crate::git::mappings::MappingStore;
-use crate::git::CommitInfo;
-use crate::git::SystemGit;
-use crate::utils;
 
 /// Configuration for a split operation
 pub struct SplitConfig {
@@ -25,6 +25,7 @@ struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
   crate_paths: &'a [PathBuf],
   target_repo_path: &'a Path,
+  #[allow(dead_code)]
   workspace_root: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,

@@ -1,9 +1,9 @@
-use crate::sync::{ConflictStrategy, SyncDirection};
-use crate::workspace::WorkspaceContext;
 use crate::error::{ConfigError, RailError, RailResult};
 use crate::plan::PlanExecutor;
 use crate::plan::{Operation, OperationType, Plan};
+use crate::sync::{ConflictStrategy, SyncDirection};
 use crate::utils;
+use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
 /// Sync command parameters

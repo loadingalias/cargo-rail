@@ -5,10 +5,10 @@
 //! - Which crates transitively depend on those changed crates
 //! - The minimal set of crates that need testing/building
 
-use crate::workspace::WorkspaceContext;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::AffectedAnalysis;
+use crate::workspace::WorkspaceContext;
 use std::path::{Path, PathBuf};
 
 /// Output format for affected command

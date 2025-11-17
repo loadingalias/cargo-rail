@@ -279,25 +279,6 @@ pub struct ReleaseConfig {
 }
 
 impl ReleaseConfig {
-  /// Check if this release has a split repo configured
-  pub fn has_split(&self) -> bool {
-    self.split.is_some()
-  }
-
-  /// Check if this is a new release (never released before)
-  pub fn is_first_release(&self) -> bool {
-    self.last_version.is_none() || self.last_sha.is_none()
-  }
-
-  /// Get the last version or default to "0.0.0"
-  pub fn current_version(&self) -> semver::Version {
-    self
-      .last_version
-      .as_ref()
-      .and_then(|v| semver::Version::parse(v).ok())
-      .unwrap_or_else(|| semver::Version::new(0, 0, 0))
-  }
-
   /// Validate release configuration
   pub fn validate(&self, workspace_root: &Path) -> RailResult<()> {
     // Validate crate path exists
@@ -409,30 +390,6 @@ impl RailConfig {
     }
 
     Ok(config)
-  }
-
-  /// Save config to rail.toml (default location)
-  pub fn save(&self, path: &Path) -> RailResult<()> {
-    let config_path = path.join("rail.toml");
-    let content = toml_edit::ser::to_string_pretty(self).context("Failed to serialize config to TOML")?;
-    fs::write(&config_path, content).with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-    Ok(())
-  }
-
-  /// Check if config exists at the given path
-  pub fn exists(path: &Path) -> bool {
-    Self::find_config_path(path).is_some()
-  }
-
-  /// Create a new empty config
-  pub fn new(workspace_root: PathBuf) -> Self {
-    Self {
-      workspace: WorkspaceConfig { root: workspace_root },
-      security: SecurityConfig::default(),
-      policy: PolicyConfig::default(),
-      splits: Vec::new(),
-      releases: Vec::new(),
-    }
   }
 }
 

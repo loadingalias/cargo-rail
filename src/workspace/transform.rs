@@ -1,5 +1,5 @@
-use crate::workspace::metadata::WorkspaceMetadata;
 use crate::error::{RailError, RailResult, ResultExt};
+use crate::workspace::metadata::WorkspaceMetadata;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Value};

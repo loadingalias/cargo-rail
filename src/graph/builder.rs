@@ -19,9 +19,9 @@
 //! - **Algorithms**: Toposort, SCC, shortest paths, reachability
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
-use crate::workspace::metadata::WorkspaceMetadata;
 use crate::config::{RailConfig, Visibility};
 use crate::error::{RailError, RailResult};
+use crate::workspace::metadata::WorkspaceMetadata;
 use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
 use petgraph::algo;
