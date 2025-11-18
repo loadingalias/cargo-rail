@@ -396,6 +396,13 @@ impl CargoTransform {
     // Replace dependency with workspace inheritance
     deps.insert(dep_name, toml_edit::Item::Value(new_dep.into()));
 
+    // Add trailing comment to mark this as unified
+    if let Some(item) = deps.get_mut(dep_name)
+      && let Some(value) = item.as_value_mut()
+    {
+      value.decor_mut().set_suffix(" # unified by cargo-rail\n");
+    }
+
     // Write back to file
     std::fs::write(member_toml_path, doc.to_string()).context("Failed to write member Cargo.toml")?;
 

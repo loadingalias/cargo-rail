@@ -106,7 +106,9 @@ impl SystemGit {
   ///
   /// Returns empty Vec if file doesn't exist at that commit.
   /// For reading multiple files, use `read_files_bulk` instead for 100x+ speedup.
-  #[allow(dead_code)] // Kept as convenience API for single-file reads
+  ///
+  /// Note: This is a convenience API for single-file reads. Kept for potential future use.
+  #[cfg(test)]
   pub fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
     let spec = format!("{}:{}", commit_sha, path.display());
 

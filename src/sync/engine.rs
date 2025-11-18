@@ -23,7 +23,7 @@ pub struct SyncConfig {
 /// Result of a sync operation
 pub struct SyncResult {
   pub commits_synced: usize,
-  /// Direction of sync operation - useful for logging/auditing
+  /// Direction of sync operation - public API field for logging/auditing
   #[allow(dead_code)]
   pub direction: SyncDirection,
   pub conflicts: Vec<ConflictInfo>,
@@ -773,22 +773,39 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn check_mono_has_changes(&self) -> RailResult<bool> {
+    use crate::workspace::ChangeImpact;
+
     let last_synced = self.find_last_synced_mono_commit()?;
-    let crate_path = &self.config.crate_paths[0];
+    let from = last_synced.as_deref().unwrap_or("HEAD~1");
 
-    let new_commits = self
-      .ctx
-      .git
-      .git()
-      .get_commits_touching_path(crate_path, last_synced.as_deref(), "HEAD")?;
+    // Use ChangeImpact for smarter detection
+    let analyzer = ChangeImpact::new(self.ctx);
 
-    // Filter out commits from remote
-    let relevant_commits: Vec<_> = new_commits
-      .into_iter()
-      .filter(|c| !c.message.contains("Rail-Origin: remote@"))
-      .collect();
+    // Check if this specific crate has changes
+    if let Some(impact) = analyzer.analyze_crate_changes(&self.config.crate_name, from, "HEAD")? {
+      // Filter out commits from remote
+      let crate_path = &self.config.crate_paths[0];
+      let new_commits = self
+        .ctx
+        .git
+        .git()
+        .get_commits_touching_path(crate_path, last_synced.as_deref(), "HEAD")?;
 
-    Ok(!relevant_commits.is_empty())
+      let relevant_commits: Vec<_> = new_commits
+        .into_iter()
+        .filter(|c| !c.message.contains("Rail-Origin: remote@"))
+        .collect();
+
+      // Skip if only docs changed (no rebuild needed)
+      if impact.categories.is_docs_only() {
+        eprintln!("Skipping sync: only documentation changed");
+        return Ok(false);
+      }
+
+      Ok(!relevant_commits.is_empty())
+    } else {
+      Ok(false)
+    }
   }
 
   fn check_remote_has_changes(&self) -> RailResult<bool> {

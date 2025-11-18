@@ -83,23 +83,40 @@ impl WorkspaceMetadata {
     self.metadata.resolve.as_ref()
   }
 
-  /// Get all features defined by a package
+  /// Get all features defined by a package.
   ///
-  /// Returns map of feature_name -> Vec of required features
+  /// Returns map of feature_name -> Vec of required features.
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Feature audit: `cargo rail audit features` to detect unused features
-  /// - Feature analysis: understanding feature dependencies
+  /// # Future Use
+  /// Will power feature analysis and auditing:
+  /// - `cargo rail audit features`: Detect unused or redundant features
+  /// - Feature dependency analysis: Understand feature activation chains
+  /// - Feature optimization: Identify minimal feature sets for build times
+  ///
+  /// # Example
+  /// ```ignore
+  /// let features = metadata.package_features("serde")?;
+  /// // Returns: {"derive": ["serde_derive"], "std": [], ...}
+  /// ```
   #[allow(dead_code)]
   pub fn package_features(&self, name: &str) -> Option<&BTreeMap<String, Vec<String>>> {
     self.get_package(name).map(|pkg| &pkg.features)
   }
 
-  /// Get all targets (lib, bin, test, etc.) for a package
+  /// Get all targets (lib, bin, test, etc.) for a package.
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Quality engine: only test packages that have test targets
-  /// - Target filtering: `cargo rail test --bins-only`
+  /// # Future Use
+  /// Will enable smart testing and target filtering:
+  /// - Quality engine: Only test packages that have test targets
+  /// - `cargo rail test --bins-only`: Run tests only for binary targets
+  /// - `cargo rail build --lib`: Build only library targets
+  /// - Target coverage: Ensure all crates have appropriate targets
+  ///
+  /// # Example
+  /// ```ignore
+  /// let targets = metadata.package_targets("cargo-rail");
+  /// let has_tests = targets.iter().any(|t| t.is_test());
+  /// ```
   #[allow(dead_code)]
   pub fn package_targets(&self, name: &str) -> Vec<&Target> {
     self
@@ -108,21 +125,38 @@ impl WorkspaceMetadata {
       .unwrap_or_default()
   }
 
-  /// Get package edition (2015, 2018, 2021, 2024)
+  /// Get package edition (2015, 2018, 2021, 2024).
   ///
-  /// TODO: Wire into unify.rs - will be used for:
-  /// - Edition compatibility validation before unification
-  /// - Warning if deps have edition conflicts
+  /// # Future Use
+  /// **Ready to wire into unify.rs** for edition compatibility validation:
+  /// - Pre-unification check: Warn if dependencies have edition conflicts
+  /// - Migration planning: Identify crates stuck on old editions
+  /// - Compatibility matrix: Track edition usage across workspace
+  ///
+  /// # Example
+  /// ```ignore
+  /// if metadata.package_edition("lib-core")? == "2021" {
+  ///   // Safe to use 2021 edition features
+  /// }
+  /// ```
   #[allow(dead_code)]
   pub fn package_edition(&self, name: &str) -> Option<&str> {
     self.get_package(name).map(|pkg| pkg.edition.as_str())
   }
 
-  /// Get package MSRV (minimum supported Rust version)
+  /// Get package MSRV (minimum supported Rust version).
   ///
-  /// TODO: Wire into unify.rs - will be used for:
-  /// - MSRV validation before unification
-  /// - Warning if deps have MSRV conflicts
+  /// # Future Use
+  /// **Ready to wire into unify.rs** for MSRV validation:
+  /// - Pre-unification check: Ensure dependencies are MSRV-compatible
+  /// - Workspace MSRV policy: Enforce minimum Rust version across crates
+  /// - CI matrix: Generate test matrix based on supported Rust versions
+  ///
+  /// # Example
+  /// ```ignore
+  /// let msrv = metadata.package_rust_version("lib-core")?;
+  /// // Returns: Some(Version { major: 1, minor: 76, patch: 0 })
+  /// ```
   #[allow(dead_code)]
   pub fn package_rust_version(&self, name: &str) -> Option<&Version> {
     self.get_package(name).and_then(|pkg| pkg.rust_version.as_ref())
@@ -132,11 +166,20 @@ impl WorkspaceMetadata {
   // Tier 3: Advanced Dependency Analysis
   // ============================================================================
 
-  /// Get all dependencies for a package (normal + dev + build)
+  /// Get all dependencies for a package (normal + dev + build).
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Quality engine: comprehensive dependency audit
-  /// - Dependency graph: full dep tree visualization
+  /// # Future Use
+  /// Will enable comprehensive dependency analysis:
+  /// - Quality engine: Full dependency audit and vulnerability scanning
+  /// - Dependency graph: Visualize complete dependency tree
+  /// - License compliance: Check all dependency licenses
+  /// - Duplicate detection: Find dependencies listed multiple times
+  ///
+  /// # Example
+  /// ```ignore
+  /// let deps = metadata.package_dependencies("cargo-rail");
+  /// println!("Total dependencies: {}", deps.len());
+  /// ```
   #[allow(dead_code)]
   pub fn package_dependencies(&self, name: &str) -> Vec<&Dependency> {
     self
@@ -145,11 +188,23 @@ impl WorkspaceMetadata {
       .unwrap_or_default()
   }
 
-  /// Get dependencies of a specific kind (normal, dev, or build)
+  /// Get dependencies of a specific kind (normal, dev, or build).
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Quality engine: "find all dev-only deps"
-  /// - Audit: detect mis-categorized dependencies
+  /// # Future Use
+  /// Will enable targeted dependency analysis:
+  /// - Quality engine: "Find all dev-only dependencies"
+  /// - Audit: Detect mis-categorized dependencies (prod code using dev deps)
+  /// - Build optimization: Separate build-time vs runtime dependencies
+  /// - Release validation: Ensure dev deps aren't leaked into releases
+  ///
+  /// # Example
+  /// ```ignore
+  /// use cargo_metadata::DependencyKind;
+  /// let dev_deps = metadata.package_dependencies_by_kind(
+  ///   "cargo-rail",
+  ///   DependencyKind::Development
+  /// );
+  /// ```
   #[allow(dead_code)]
   pub fn package_dependencies_by_kind(&self, name: &str, kind: DependencyKind) -> Vec<&Dependency> {
     self
@@ -159,11 +214,20 @@ impl WorkspaceMetadata {
       .collect()
   }
 
-  /// Get all optional dependencies for a package
+  /// Get all optional dependencies for a package.
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Quality engine: optional dependency management
-  /// - Feature analysis: map features to optional deps
+  /// # Future Use
+  /// Will power optional dependency management:
+  /// - Quality engine: Validate optional deps are feature-gated
+  /// - Feature analysis: Map features to their optional dependencies
+  /// - Documentation: Auto-generate feature documentation
+  /// - Build variants: Create minimal builds by excluding optional deps
+  ///
+  /// # Example
+  /// ```ignore
+  /// let optional = metadata.package_optional_dependencies("serde");
+  /// // Returns deps like "serde_derive" (optional feature)
+  /// ```
   #[allow(dead_code)]
   pub fn package_optional_dependencies(&self, name: &str) -> Vec<&Dependency> {
     self
@@ -173,11 +237,21 @@ impl WorkspaceMetadata {
       .collect()
   }
 
-  /// Check if a dependency uses default features
+  /// Check if a dependency uses default features.
   ///
-  /// TODO: Wire into unify.rs - will be used for:
-  /// - Smarter default_features handling in unification
-  /// - Better feature merging logic
+  /// # Future Use
+  /// **Ready to wire into unify.rs** for smarter feature handling:
+  /// - Smarter default_features handling during unification
+  /// - Better feature merging logic: Respect default_features = false
+  /// - Feature conflict resolution: Detect incompatible feature sets
+  /// - Build optimization: Minimize features when default_features = false
+  ///
+  /// # Example
+  /// ```ignore
+  /// if metadata.dependency_uses_default_features("lib-core", "serde")? {
+  ///   println!("Using serde with default features");
+  /// }
+  /// ```
   #[allow(dead_code)]
   pub fn dependency_uses_default_features(&self, package: &str, dep_name: &str) -> Option<bool> {
     self
@@ -187,11 +261,22 @@ impl WorkspaceMetadata {
       .map(|dep| dep.uses_default_features)
   }
 
-  /// Get platform-specific dependencies (e.g., only on Windows, Unix, etc.)
+  /// Get platform-specific dependencies (e.g., only on Windows, Unix, etc.).
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Quality engine: platform compatibility matrix
-  /// - Cross-platform testing: detect platform-specific issues
+  /// Returns tuples of (Dependency, target_spec) for platform-conditional deps.
+  ///
+  /// # Future Use
+  /// Will enable cross-platform analysis:
+  /// - Quality engine: Build platform compatibility matrix
+  /// - Cross-platform testing: Detect platform-specific dependency issues
+  /// - CI optimization: Only test relevant platforms for changed deps
+  /// - Documentation: Auto-generate platform-specific setup guides
+  ///
+  /// # Example
+  /// ```ignore
+  /// let platform_deps = metadata.package_platform_specific_dependencies("tokio");
+  /// // Returns: [(winapi, "cfg(windows)"), (libc, "cfg(unix)"), ...]
+  /// ```
   #[allow(dead_code)]
   pub fn package_platform_specific_dependencies(&self, name: &str) -> Vec<(&Dependency, String)> {
     self
@@ -201,11 +286,21 @@ impl WorkspaceMetadata {
       .collect()
   }
 
-  /// Get all packages (workspace members + dependencies)
+  /// Get all packages (workspace members + dependencies).
   ///
-  /// TODO: Future feature - will be used for:
-  /// - Graph queries: include external deps in dependency graph
-  /// - Full workspace analysis: not just workspace members
+  /// # Future Use
+  /// Will enable full workspace + dependency tree analysis:
+  /// - Graph queries: Include external deps in dependency visualization
+  /// - Full workspace analysis: Audit not just workspace but all transitive deps
+  /// - Dependency tree: Build complete dependency graph with versions
+  /// - Supply chain security: Analyze entire dependency chain
+  ///
+  /// # Example
+  /// ```ignore
+  /// let all = metadata.all_packages();
+  /// let external_count = all.len() - metadata.list_crates().len();
+  /// println!("External dependencies: {}", external_count);
+  /// ```
   #[allow(dead_code)]
   pub fn all_packages(&self) -> &[Package] {
     &self.metadata.packages
@@ -263,11 +358,23 @@ impl WorkspaceMetadata {
     &self.metadata
   }
 
-  /// Get raw JSON string for external tools
+  /// Get raw JSON string for external tools.
   ///
-  /// TODO: Future feature - will be used for:
-  /// - External tooling integration: Pass metadata to other tools
-  /// - Debugging: Export full metadata for inspection
+  /// Serializes the complete cargo metadata to JSON format.
+  ///
+  /// # Future Use
+  /// Will enable external tooling integration and debugging:
+  /// - External tooling: Pass metadata to other cargo ecosystem tools
+  /// - Debugging: Export full metadata for inspection and issue reporting
+  /// - Custom analysis: Process metadata with external scripts/tools
+  /// - CI integration: Export metadata for build system consumption
+  ///
+  /// # Example
+  /// ```ignore
+  /// let json = metadata.to_json_string()?;
+  /// std::fs::write("metadata.json", json)?;
+  /// // Use with: cargo metadata | jq .packages
+  /// ```
   #[allow(dead_code)]
   pub fn to_json_string(&self) -> RailResult<String> {
     serde_json::to_string(&self.metadata)

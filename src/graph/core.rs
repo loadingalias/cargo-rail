@@ -16,15 +16,13 @@
 //! - **Nodes**: Packages (workspace members + dependencies)
 //! - **Edges**: Dependency relationships (normal/dev/build)
 //! - **Index**: Fast lookups by crate name / package ID
-//! - **Algorithms**: Toposort, SCC, shortest paths, reachability
+//! - **Algorithms**: Shortest paths, reachability, transitive closure
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
 use crate::cargo::WorkspaceMetadata;
-use crate::config::{RailConfig, Visibility};
 use crate::error::{RailError, RailResult};
 use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
-use petgraph::algo;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -34,16 +32,17 @@ use std::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct PackageNode {
   pub name: String,
-  // TODO: Used by future version analysis and MSRV checks
+
+  /// Package version from Cargo.toml.
+  ///
+  /// # Future Use
+  /// - Version conflict detection: Find crates with mismatched versions
+  /// - MSRV analysis: Detect minimum Rust version requirements across workspace
   #[allow(dead_code)]
   pub version: String,
+
   pub manifest_path: PathBuf,
   pub is_workspace_member: bool,
-  /// Visibility tiers this crate belongs to (computed from ReleaseConfig)
-  /// A crate can appear in multiple releases with different visibility levels
-  /// TODO: Used by visibility-filtered graph commands and tier violation checks
-  #[allow(dead_code)]
-  pub visibilities: HashSet<Visibility>,
 }
 
 /// Workspace dependency graph.
@@ -58,8 +57,12 @@ pub struct WorkspaceGraph {
   /// Index: package name → node index
   name_to_node: HashMap<String, NodeIndex>,
 
-  /// Index: PackageId → node index
-  // TODO: Used for advanced graph queries and cross-referencing with cargo metadata
+  /// Index: PackageId → node index (for resolve graph traversal).
+  ///
+  /// # Future Use
+  /// - Resolve graph traversal: Map resolved dependencies to graph nodes
+  /// - Feature analysis: Cross-reference cargo metadata with dependency graph
+  /// - External dependency queries: Look up non-workspace packages efficiently
   #[allow(dead_code)]
   id_to_node: HashMap<PackageId, NodeIndex>,
 
@@ -71,8 +74,12 @@ pub struct WorkspaceGraph {
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
   path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
 
-  /// Original metadata (for fallback queries)
-  // TODO: Used for feature analysis and detailed package info queries
+  /// Original cargo metadata for advanced queries.
+  ///
+  /// # Future Use
+  /// - Feature analysis: Query feature flags and their dependencies
+  /// - Target analysis: Find packages with specific build targets (bins, libs, tests)
+  /// - Edition/MSRV queries: Validate compatibility across workspace
   #[allow(dead_code)]
   metadata: WorkspaceMetadata,
 }
@@ -80,54 +87,12 @@ pub struct WorkspaceGraph {
 impl WorkspaceGraph {
   /// Load workspace graph from root directory.
   ///
-  /// Optionally accepts RailConfig to compute visibility annotations for each crate.
-  ///
   /// # Performance
   /// - cargo_metadata: 50-200ms for large workspaces
   /// - Graph construction: 10-50ms
   /// - Path cache: deferred until first file lookup
   pub fn load(workspace_root: &Path) -> RailResult<Self> {
-    Self::load_with_config(workspace_root, None)
-  }
-
-  /// Load workspace graph with optional RailConfig for visibility annotations.
-  ///
-  /// If config is provided, crates will be annotated with their visibility tiers
-  /// based on ReleaseConfig entries that include them.
-  pub fn load_with_config(workspace_root: &Path, config: Option<&RailConfig>) -> RailResult<Self> {
     let metadata = WorkspaceMetadata::load(workspace_root)?;
-
-    // Build visibility mapping from release configs
-    // Maps crate_name → Set<Visibility>
-    let mut visibility_map: HashMap<String, HashSet<Visibility>> = HashMap::new();
-    if let Some(config) = config {
-      for release in &config.releases {
-        // Get the crate name from the crate_path
-        if let Ok(manifest_path) = release.crate_path.join("Cargo.toml").canonicalize() {
-          // Find the package in metadata that matches this manifest path
-          for package in &metadata.metadata_json().packages {
-            if let Ok(pkg_manifest) = package.manifest_path.clone().into_std_path_buf().canonicalize()
-              && pkg_manifest == manifest_path
-            {
-              // This crate is part of this release
-              visibility_map
-                .entry(package.name.as_ref().to_string())
-                .or_default()
-                .insert(release.visibility);
-
-              // Also add all crates listed in `includes`
-              for included_crate in &release.includes {
-                visibility_map
-                  .entry(included_crate.clone())
-                  .or_default()
-                  .insert(release.visibility);
-              }
-              break;
-            }
-          }
-        }
-      }
-    }
 
     // Build petgraph
     let mut graph = DiGraph::new();
@@ -141,14 +106,12 @@ impl WorkspaceGraph {
     // Add all packages as nodes (workspace + dependencies)
     for package in &metadata.metadata_json().packages {
       let crate_name = package.name.as_ref().to_string();
-      let visibilities = visibility_map.get(&crate_name).cloned().unwrap_or_default();
 
       let node = PackageNode {
         name: crate_name.clone(),
         version: package.version.to_string(),
         manifest_path: package.manifest_path.clone().into_std_path_buf(),
         is_workspace_member: workspace_pkg_ids.contains(&package.id),
-        visibilities,
       };
 
       let node_idx = graph.add_node(node.clone());
@@ -191,7 +154,11 @@ impl WorkspaceGraph {
 
   /// Get direct dependencies of a crate (what it uses).
   ///
-  /// TODO: Used by `cargo rail graph --crate X` command
+  /// # Future Use
+  /// Will power `cargo rail graph --crate X` to display:
+  /// - Direct dependencies: "lib-core depends on: serde, tokio, anyhow"
+  /// - Dependency analysis: Find immediate dependencies for auditing
+  /// - Visualization: Generate dependency tree for a specific crate
   #[allow(dead_code)]
   pub fn direct_dependencies(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node_idx = self.find_node(crate_name)?;
@@ -209,7 +176,11 @@ impl WorkspaceGraph {
 
   /// Get direct dependents of a crate (what uses it).
   ///
-  /// TODO: Used by `cargo rail graph --crate X` command
+  /// # Future Use
+  /// Will power `cargo rail graph --crate X` to display:
+  /// - Direct dependents: "lib-core is used by: bin-cli, lib-api, lib-web"
+  /// - Impact analysis: See what breaks when modifying this crate
+  /// - Reverse dependency tree: Understand crate usage across workspace
   #[allow(dead_code)]
   pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node_idx = self.find_node(crate_name)?;
@@ -374,84 +345,42 @@ impl WorkspaceGraph {
     *self.path_cache.write().unwrap() = Some(cache);
   }
 
-  /// Access raw metadata for advanced queries.
+  /// Access raw cargo metadata for advanced queries.
   ///
-  /// TODO: Used for feature analysis and package metadata queries
+  /// # Future Use
+  /// - Feature analysis: Query and validate feature flags
+  /// - Package metadata: Access detailed package information
+  /// - Custom graph algorithms: Build domain-specific graph queries
+  ///
+  /// # Example
+  /// ```ignore
+  /// let graph = WorkspaceGraph::load(root)?;
+  /// let metadata = graph.metadata();
+  /// let features = metadata.package_features("lib-core");
+  /// ```
   #[allow(dead_code)]
   pub fn metadata(&self) -> &WorkspaceMetadata {
     &self.metadata
-  }
-
-  /// Get topological order of workspace crates (build order).
-  ///
-  /// Returns crates in dependency order: if A depends on B, B appears before A.
-  ///
-  /// # Errors
-  /// Returns error if the dependency graph contains cycles.
-  ///
-  /// TODO: Used by `cargo rail doctor` and release publish ordering
-  #[allow(dead_code)]
-  pub fn topological_order(&self) -> RailResult<Vec<String>> {
-    // toposort returns NodeIndex in topo order
-    let topo = algo::toposort(&self.graph, None).map_err(|cycle| {
-      let node = &self.graph[cycle.node_id()];
-      RailError::message(format!("Dependency cycle detected involving crate '{}'", node.name))
-    })?;
-
-    // Filter to workspace members only and extract names
-    let order: Vec<String> = topo
-      .into_iter()
-      .filter_map(|idx| {
-        let node = &self.graph[idx];
-        if node.is_workspace_member {
-          Some(node.name.clone())
-        } else {
-          None
-        }
-      })
-      .collect();
-
-    Ok(order)
-  }
-
-  /// Detect dependency cycles using Tarjan's SCC algorithm.
-  ///
-  /// Returns strongly connected components with size > 1 (cycles).
-  ///
-  /// TODO: Used by `cargo rail doctor` for workspace health checks
-  #[allow(dead_code)]
-  pub fn find_cycles(&self) -> Vec<Vec<String>> {
-    let sccs = algo::tarjan_scc(&self.graph);
-
-    sccs
-      .into_iter()
-      .filter(|component| component.len() > 1)
-      .map(|component| {
-        component
-          .into_iter()
-          .filter_map(|idx| {
-            let node = &self.graph[idx];
-            if node.is_workspace_member {
-              Some(node.name.clone())
-            } else {
-              None
-            }
-          })
-          .collect()
-      })
-      .filter(|cycle: &Vec<String>| !cycle.is_empty())
-      .collect()
   }
 
   /// Find dependency path: why does `from` depend on `to`?
   ///
   /// Returns the shortest dependency chain, or None if no dependency exists.
   ///
-  /// # Example
-  /// If bin-cli → lib-core → lib-util, and you ask why_depends_on("bin-cli", "lib-util"),
-  /// returns: vec!["bin-cli", "lib-core", "lib-util"]
+  /// Uses BFS to find the shortest path in the dependency graph.
   ///
-  /// TODO: Used by `cargo rail graph --why <from> <to>` command
+  /// # Future Use
+  /// Will power `cargo rail graph --why <from> <to>` for dependency debugging:
+  /// - Understand transitive dependencies: "Why does bin-cli pull in tokio?"
+  /// - Audit dependency chains: Trace the path from app to vulnerable dependency
+  /// - Refactoring decisions: Identify dependency paths to break or preserve
+  ///
+  /// # Example
+  /// ```ignore
+  /// // If bin-cli → lib-core → lib-util:
+  /// let path = graph.why_depends_on("bin-cli", "lib-util")?;
+  /// assert_eq!(path, Some(vec!["bin-cli", "lib-core", "lib-util"]));
+  /// ```
   #[allow(dead_code)]
   pub fn why_depends_on(&self, from: &str, to: &str) -> RailResult<Option<Vec<String>>> {
     let from_idx = self.find_node(from)?;
@@ -491,15 +420,27 @@ impl WorkspaceGraph {
     Ok(None)
   }
 
-  /// Export graph to DOT format (Graphviz).
+  /// Export graph to DOT format (Graphviz) for visualization.
+  ///
+  /// Outputs workspace dependency graph in DOT format with:
+  /// - Workspace members: Blue boxes
+  /// - External dependencies: Ellipses
+  /// - Dev dependencies: Blue edges
+  /// - Build dependencies: Orange edges
+  /// - Normal dependencies: Black edges
+  ///
+  /// # Future Use
+  /// Will power `cargo rail graph --dot` for visualization:
+  /// - Generate dependency diagrams for documentation
+  /// - Visual debugging: See complex dependency relationships at a glance
+  /// - Architecture analysis: Understand workspace structure visually
   ///
   /// # Example
   /// ```bash
   /// cargo rail graph --dot > graph.dot
   /// dot -Tpng graph.dot -o graph.png
+  /// open graph.png
   /// ```
-  ///
-  /// TODO: Used by `cargo rail graph --dot` command
   #[allow(dead_code)]
   pub fn to_dot(&self) -> String {
     use petgraph::dot::{Config, Dot};
@@ -523,77 +464,6 @@ impl WorkspaceGraph {
     );
 
     format!("{:?}", dot)
-  }
-
-  /// Get all workspace crates with the specified visibility tier.
-  ///
-  /// Returns crates that are included in releases with this visibility level.
-  ///
-  /// TODO: Used by `cargo rail graph affected --visibility=X` command
-  #[allow(dead_code)]
-  pub fn crates_with_visibility(&self, visibility: Visibility) -> Vec<String> {
-    let mut crates: Vec<String> = self
-      .workspace_members
-      .iter()
-      .filter(|name| {
-        if let Some(node_idx) = self.name_to_node.get(*name) {
-          let node = &self.graph[*node_idx];
-          node.visibilities.contains(&visibility)
-        } else {
-          false
-        }
-      })
-      .cloned()
-      .collect();
-
-    crates.sort();
-    crates
-  }
-
-  /// Get the visibilities for a specific crate.
-  ///
-  /// Returns the set of visibility tiers this crate belongs to,
-  /// or an empty set if not found or not in any releases.
-  ///
-  /// TODO: Used by tier violation checks
-  #[allow(dead_code)]
-  pub fn crate_visibilities(&self, crate_name: &str) -> HashSet<Visibility> {
-    self
-      .name_to_node
-      .get(crate_name)
-      .map(|idx| self.graph[*idx].visibilities.clone())
-      .unwrap_or_default()
-  }
-
-  /// Check if a crate has the specified visibility.
-  ///
-  /// TODO: Used by tier violation checks
-  #[allow(dead_code)]
-  pub fn has_visibility(&self, crate_name: &str, visibility: Visibility) -> bool {
-    self.crate_visibilities(crate_name).contains(&visibility)
-  }
-
-  /// Get transitive dependents filtered by visibility.
-  ///
-  /// Returns all workspace crates that:
-  /// 1. Depend on `crate_name` (directly or transitively)
-  /// 2. Have the specified visibility tier
-  ///
-  /// TODO: Used by `cargo rail graph test --visibility=X` command
-  #[allow(dead_code)]
-  pub fn transitive_dependents_with_visibility(
-    &self,
-    crate_name: &str,
-    visibility: Visibility,
-  ) -> RailResult<Vec<String>> {
-    let all_dependents = self.transitive_dependents(crate_name)?;
-
-    let filtered: Vec<String> = all_dependents
-      .into_iter()
-      .filter(|dep| self.has_visibility(dep, visibility))
-      .collect();
-
-    Ok(filtered)
   }
 }
 

@@ -130,6 +130,16 @@ enum GraphCommands {
     #[arg(long, default_value = "text")]
     format: String,
   },
+
+  /// Run tests only for affected crates (smart test runner)
+  Test {
+    /// Git ref to compare against (default: origin/main)
+    #[arg(long, default_value = "origin/main")]
+    since: String,
+    /// Pass additional arguments to cargo test
+    #[arg(last = true)]
+    test_args: Vec<String>,
+  },
 }
 
 #[derive(Subcommand)]
@@ -219,6 +229,7 @@ fn main() {
         to,
         format,
       } => commands::run_affected(&ctx, since, from, to, format, false),
+      GraphCommands::Test { since, test_args } => commands::run_test(&ctx, since, test_args),
     },
 
     // Dependency Unification

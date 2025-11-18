@@ -24,13 +24,25 @@ pub struct AffectedSet {
 }
 
 impl AffectedSet {
-  // TODO: Used by future `cargo rail test --since` to skip empty test sets
+  /// Check if any crates were affected by the changes.
+  ///
+  /// # Future Use
+  /// Will be used by `cargo rail test --since` to:
+  /// - Skip running tests when no crates are affected
+  /// - Optimize CI by avoiding unnecessary test runs
+  /// - Provide early exit for empty change sets
   #[allow(dead_code)]
   pub fn is_empty(&self) -> bool {
     self.direct.is_empty()
   }
 
-  // TODO: Used by future CI summary output and --dry-run stats
+  /// Get the total count of affected crates (direct + transitive dependents).
+  ///
+  /// # Future Use
+  /// Will be used for:
+  /// - CI summary output: "5 crates affected by this PR"
+  /// - `--dry-run` mode: show impact without running tests
+  /// - Cost estimation: predict CI runtime based on affected count
   #[allow(dead_code)]
   pub fn total_affected(&self) -> usize {
     self.test_targets.len()
@@ -107,9 +119,21 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
 
 /// Compute minimal test set from changed files.
 ///
-/// Convenience function that returns just the crate names.
+/// Convenience function that returns just the crate names in sorted order.
 ///
-/// TODO: Used by `cargo rail test --since` and `cargo rail check --since`
+/// # Future Use
+/// Will power smart testing commands:
+/// - `cargo rail test --since <commit>`: Only test affected crates
+/// - `cargo rail check --since <commit>`: Only check affected crates
+/// - `cargo rail build --since <commit>`: Incremental workspace builds
+///
+/// # Example
+/// ```ignore
+/// // Get crates affected by changes since main branch
+/// let changed_files = git_diff("main", "HEAD");
+/// let test_set = minimal_test_set(&graph, &changed_files)?;
+/// // test_set = ["lib-core", "lib-util", "bin-cli"]
+/// ```
 #[allow(dead_code)]
 pub fn minimal_test_set(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> RailResult<Vec<String>> {
   let analysis = analyze(graph, changed_files)?;
