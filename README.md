@@ -1,117 +1,136 @@
 # cargo-rail
 
-**Hyper-efficient Rust monorepo orchestration.**
-
----
-
-## Status
-
-**NOT READY FOR PUBLIC USE.** Active development. Internal testing only.
+**Rust monorepo orchestration. Zero waste.**
 
 ---
 
 ## What It Does
 
-### 1. Workspace Dependency Unification
-
-**Replaces cargo-hakari and workspace-hack crates.**
-
-- Native Cargo `[workspace.dependencies]` unification
-- No fake crates, no guppy, no runtime overhead
-- CI-enforceable via `cargo rail unify check`
-- Invisible after initial application
+### 1. Replace cargo-hakari
 
 ```bash
-cargo rail unify analyze              # Dry-run analysis
-cargo rail unify apply --backup       # Apply unification
-cargo rail unify check                # CI verification (exit 0 = unified)
+cargo rail unify
 ```
 
-### 2. Split & Sync
+Native `[workspace.dependencies]` unification. No workspace-hack crates. No guppy. No maintenance.
 
-**Split crates from monorepo to standalone repos. Sync bidirectionally.**
+### 2. Distribute Crates
 
 ```bash
-# Split: Monorepo → Standalone Repo (with full git history)
-cargo rail split my-crate --apply
-
-# Sync: Monorepo → Split Repo (direct push to main)
-cargo rail sync my-crate --to-remote --apply
-
-# Sync: Split Repo → Monorepo (creates PR branch, never commits to main)
-cargo rail sync my-crate --from-remote --apply
+cargo rail split my-crate
+cargo rail sync my-crate
 ```
 
-**Modes:**
-- **Single crate** → Single repo
-- **Multiple crates** → Single repo
-- **Multiple crates** → Separate monorepo
+Split monorepo crates to standalone repos. Sync bidirectionally. Full git history preserved.
 
-### 3. Centralized Configuration Management
+**Replaces:** Copybara, git-filter-repo, bash scripts
 
-**Enforce uniform policies across all workspace crates.**
+### 3. Test Only What Changed
 
-- Edition, MSRV, resolver version
-- Dependency version consistency
-- Workspace inheritance validation
+```bash
+cargo rail test
+```
 
-```toml
-# rail.toml
-[policy]
-edition = "2024"
-msrv = "1.76.0"
-resolver = "2"
-forbid_multiple_versions = ["tokio", "serde"]
+Graph-aware change detection. Docs-only changes skip tests. Source changes test affected crates only.
+
+**Nextest/Cargo native. Saves CI costs.**
+
+### 4. Release & Changelog
+
+```bash
+cargo rail release my-crate
+```
+
+Validates edition, MSRV, dependencies. Publishes to crates.io. Tags releases. Generates changelogs.
+
+---
+
+## Why It Matters
+
+| Problem | cargo-rail |
+|---------|------------|
+| Fragmented features → slow builds | Native workspace unification |
+| Distributing crates from monorepo | Split/sync with full history |
+| Testing everything on every PR | Graph-aware test runner |
+| Version drift across workspace | Enforced policies |
+
+---
+
+## Install
+
+```bash
+cargo install cargo-rail
 ```
 
 ---
 
-## Architecture
+## Quick Start
 
-- **Git + Cargo + Petgraph** - Core foundation
-- **Zero libgit2/gitoxide** - System git binary only
-- **Zero guppy** - Direct cargo_metadata usage
-- **Workspace-aware graph** - Dependency + reverse-dependency tracking
+```bash
+# Unify dependencies
+cargo rail unify
+
+# Split a crate (one-time)
+cargo rail split my-crate
+
+# Sync changes
+cargo rail sync my-crate
+
+# Test what changed
+cargo rail test
+
+# Release a crate
+cargo rail release my-crate
+```
 
 ---
 
 ## Configuration
 
-`rail.toml`:
-
 ```toml
-[workspace]
-root = "."
-
-# Split configuration
+# rail.toml
 [[splits]]
 name = "my-crate"
 remote = "git@github.com:user/my-crate.git"
-branch = "main"
-mode = "single"
 paths = [{ crate = "crates/my-crate" }]
 
-# Unification configuration (optional)
-[unify]
-strategy = "all"
-normal_only = false
-exclude = ["some-special-dep"]
-
-# Policy enforcement
 [policy]
 edition = "2024"
-msrv = "1.76.0"
-resolver = "2"
+msrv = "1.83.0"
 forbid_multiple_versions = ["tokio"]
 ```
 
 ---
 
-## Security
+## How It Works
 
-**Split → Mono:** Creates PR branch `rail/sync/{name}/{timestamp}`. Never commits to main.
+- **Zero libgit2/gitoxide** - System git only
+- **Zero guppy** - cargo_metadata + petgraph
+- **Graph-first** - Dependency graph drives everything
+- **Minimal deps** - Supply-chain security matters
+- **Deterministic** - Same input = same git SHAs
 
-**Mono → Split:** Direct push. Use SSH keys + branch protection.
+---
+
+## Safety
+
+- Syncs from remote create PR branches, never commit to main
+- Destructive operations require explicit flags
+- Backups created automatically
+
+---
+
+## Status
+
+**Beta:**
+
+- ✅ Dependency unification
+- ✅ Split/sync with history preservation
+- ✅ Graph-aware change detection
+
+**Coming soon:**
+
+- 🚧 Release/publish/changelog automation
 
 ---
 
