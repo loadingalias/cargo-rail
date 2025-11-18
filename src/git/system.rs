@@ -109,6 +109,7 @@ impl SystemGit {
   ///
   /// Note: This is a convenience API for single-file reads. Kept for potential future use.
   #[cfg(test)]
+  #[allow(dead_code)]
   pub fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
     let spec = format!("{}:{}", commit_sha, path.display());
 
