@@ -1,5 +1,6 @@
 use crate::cargo::WorkspaceMetadata;
 use crate::error::{RailError, RailResult, ResultExt};
+use cargo_metadata::DependencyKind;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Value};
@@ -257,6 +258,149 @@ impl CargoTransform {
 
     Ok(doc.to_string())
   }
+
+  /// Write unified dependencies to workspace Cargo.toml [workspace.dependencies] section
+  ///
+  /// Takes a UnificationPlan and writes all unified dependencies to the workspace
+  /// Cargo.toml file's [workspace.dependencies] section.
+  pub fn write_workspace_dependencies(
+    &self,
+    workspace_toml_path: &std::path::Path,
+    unified_deps: &[crate::cargo::unify::UnifiedDep],
+  ) -> RailResult<()> {
+    use toml_edit::{Array, InlineTable, table};
+
+    // Read workspace Cargo.toml
+    let content = std::fs::read_to_string(workspace_toml_path).context("Failed to read workspace Cargo.toml")?;
+    let mut doc: DocumentMut = content.parse().context("Failed to parse workspace Cargo.toml")?;
+
+    // Ensure [workspace] section exists
+    if !doc.contains_key("workspace") {
+      doc["workspace"] = table();
+    }
+
+    // Ensure [workspace.dependencies] section exists
+    let workspace = doc["workspace"]
+      .as_table_mut()
+      .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
+
+    if !workspace.contains_key("dependencies") {
+      workspace["dependencies"] = table();
+    }
+
+    let workspace_deps = workspace["dependencies"]
+      .as_table_mut()
+      .ok_or_else(|| RailError::message("[workspace.dependencies] is not a table"))?;
+
+    // Write each unified dependency
+    for unified in unified_deps {
+      let mut dep_table = InlineTable::new();
+
+      // Version is required
+      dep_table.insert("version", Value::from(unified.version_req.to_string()));
+
+      // Add default-features if false (true is the default, so we only specify false)
+      if !unified.default_features {
+        dep_table.insert("default-features", Value::from(false));
+      }
+
+      // Add features if any
+      if !unified.features.is_empty() {
+        let mut features_array = Array::new();
+        for feature in &unified.features {
+          features_array.push(feature.as_str());
+        }
+        dep_table.insert("features", Value::from(features_array));
+      }
+
+      // Insert the dependency
+      workspace_deps.insert(&unified.name, toml_edit::Item::Value(dep_table.into()));
+    }
+
+    // Write back to file
+    std::fs::write(workspace_toml_path, doc.to_string()).context("Failed to write workspace Cargo.toml")?;
+
+    Ok(())
+  }
+
+  /// Convert a member's dependency to use workspace inheritance
+  ///
+  /// Transforms a dependency entry in a member's Cargo.toml to use
+  /// `{ workspace = true }` syntax, optionally preserving additional fields
+  /// like `optional` or `features` that add to workspace definition.
+  pub fn convert_to_workspace_inheritance(
+    &self,
+    member_toml_path: &std::path::Path,
+    dep_name: &str,
+    dep_kind: &DependencyKind,
+  ) -> RailResult<()> {
+    use toml_edit::InlineTable;
+
+    // Read member Cargo.toml
+    let content = std::fs::read_to_string(member_toml_path).context("Failed to read member Cargo.toml")?;
+    let mut doc: DocumentMut = content.parse().context("Failed to parse member Cargo.toml")?;
+
+    // Determine which section to modify
+    let section_name = match dep_kind {
+      DependencyKind::Normal => "dependencies",
+      DependencyKind::Development => "dev-dependencies",
+      DependencyKind::Build => "build-dependencies",
+      DependencyKind::Unknown => {
+        return Err(RailError::message("Unknown dependency kind"));
+      }
+    };
+
+    // Get the dependencies section
+    let deps = doc
+      .get_mut(section_name)
+      .and_then(|d| d.as_table_mut())
+      .ok_or_else(|| RailError::message(format!("[{}] section not found or not a table", section_name)))?;
+
+    // Check if dependency exists
+    if !deps.contains_key(dep_name) {
+      return Err(RailError::message(format!(
+        "Dependency '{}' not found in [{}]",
+        dep_name, section_name
+      )));
+    }
+
+    // Get current dependency value
+    let current_dep = deps.get(dep_name).unwrap();
+
+    // Build new dependency value with workspace = true
+    let mut new_dep = InlineTable::new();
+    new_dep.insert("workspace", Value::from(true));
+
+    // Preserve certain fields that can be specified alongside workspace = true:
+    // - optional: can be different per member
+    // - features: can ADD to workspace features
+    if let Some(dep_table) = current_dep.as_inline_table() {
+      if let Some(optional) = dep_table.get("optional")
+        && let Some(optional_bool) = optional.as_bool()
+        && optional_bool
+      {
+        new_dep.insert("optional", Value::from(true));
+      }
+
+      // Note: We don't preserve features here because the unification plan
+      // already computed the union. If we wanted to support per-member feature
+      // additions, we'd handle that differently.
+    } else if let Some(dep_table) = current_dep.as_table()
+      && let Some(optional) = dep_table.get("optional")
+      && let Some(optional_bool) = optional.as_bool()
+      && optional_bool
+    {
+      new_dep.insert("optional", Value::from(true));
+    }
+
+    // Replace dependency with workspace inheritance
+    deps.insert(dep_name, toml_edit::Item::Value(new_dep.into()));
+
+    // Write back to file
+    std::fs::write(member_toml_path, doc.to_string()).context("Failed to write member Cargo.toml")?;
+
+    Ok(())
+  }
 }
 
 #[cfg(test)]
@@ -422,5 +566,291 @@ anyhow = "1.0"
     // Should parse as valid TOML
     let doc: Result<DocumentMut, _> = split_output.parse();
     assert!(doc.is_ok());
+  }
+
+  // ==========================================================================
+  // Workspace Dependency Unification Tests
+  // ==========================================================================
+
+  #[test]
+  fn test_write_workspace_dependencies_creates_section() {
+    use crate::cargo::unify::UnifiedDep;
+    use semver::VersionReq;
+    use std::collections::HashSet;
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    // Create a temporary workspace Cargo.toml
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let workspace_toml = r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+"#;
+    std::io::Write::write_all(&mut temp_file, workspace_toml.as_bytes()).unwrap();
+
+    // Create unified dependencies
+    let unified_deps = vec![UnifiedDep {
+      name: "serde".to_string(),
+      version_req: VersionReq::parse("1.0").unwrap(),
+      features: vec!["derive".to_string()],
+      default_features: true,
+      used_by: vec!["crate-a".to_string(), "crate-b".to_string()],
+      dep_kinds: HashSet::new(),
+      fragmentation_count: 2,
+    }];
+
+    // Write workspace dependencies
+    let result = transformer.write_workspace_dependencies(temp_file.path(), &unified_deps);
+    assert!(result.is_ok(), "Should successfully write workspace dependencies");
+
+    // Read back and verify
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    // Verify [workspace.dependencies] exists
+    let workspace_deps = doc["workspace"]["dependencies"].as_table().unwrap();
+    assert!(workspace_deps.contains_key("serde"), "Should have serde dependency");
+
+    // Verify serde entry structure
+    let serde_dep = workspace_deps.get("serde").unwrap();
+    assert!(serde_dep.is_inline_table(), "Should be inline table");
+
+    let serde_table = serde_dep.as_inline_table().unwrap();
+    assert_eq!(
+      serde_table.get("version").and_then(|v| v.as_str()),
+      Some("^1.0"),
+      "Should have correct version (with caret notation)"
+    );
+
+    // Features should be present
+    assert!(serde_table.contains_key("features"), "Should have features");
+  }
+
+  #[test]
+  fn test_write_workspace_dependencies_no_features() {
+    use crate::cargo::unify::UnifiedDep;
+    use semver::VersionReq;
+    use std::collections::HashSet;
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let workspace_toml = r#"
+[workspace]
+members = ["crate-a"]
+"#;
+    std::io::Write::write_all(&mut temp_file, workspace_toml.as_bytes()).unwrap();
+
+    let unified_deps = vec![UnifiedDep {
+      name: "anyhow".to_string(),
+      version_req: VersionReq::parse("1.0").unwrap(),
+      features: vec![], // No features
+      default_features: true,
+      used_by: vec!["crate-a".to_string()],
+      dep_kinds: HashSet::new(),
+      fragmentation_count: 1,
+    }];
+
+    transformer
+      .write_workspace_dependencies(temp_file.path(), &unified_deps)
+      .unwrap();
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let anyhow_dep = doc["workspace"]["dependencies"]["anyhow"].as_inline_table().unwrap();
+    assert_eq!(anyhow_dep.get("version").and_then(|v| v.as_str()), Some("^1.0"));
+    assert!(!anyhow_dep.contains_key("features"), "Should not have features field");
+  }
+
+  #[test]
+  fn test_write_workspace_dependencies_default_features_false() {
+    use crate::cargo::unify::UnifiedDep;
+    use semver::VersionReq;
+    use std::collections::HashSet;
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let workspace_toml = "[workspace]\nmembers = []";
+    std::io::Write::write_all(&mut temp_file, workspace_toml.as_bytes()).unwrap();
+
+    let unified_deps = vec![UnifiedDep {
+      name: "tokio".to_string(),
+      version_req: VersionReq::parse("1.0").unwrap(),
+      features: vec!["fs".to_string(), "net".to_string()],
+      default_features: false, // Explicitly disabled
+      used_by: vec!["crate-a".to_string()],
+      dep_kinds: HashSet::new(),
+      fragmentation_count: 1,
+    }];
+
+    transformer
+      .write_workspace_dependencies(temp_file.path(), &unified_deps)
+      .unwrap();
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let tokio_dep = doc["workspace"]["dependencies"]["tokio"].as_inline_table().unwrap();
+    assert_eq!(
+      tokio_dep.get("default-features").and_then(|v| v.as_bool()),
+      Some(false),
+      "Should have default-features = false"
+    );
+  }
+
+  #[test]
+  fn test_convert_to_workspace_inheritance_simple() {
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let member_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+"#;
+    std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
+
+    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "serde", &DependencyKind::Normal);
+    assert!(result.is_ok(), "Should successfully convert to workspace inheritance");
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let serde_dep = doc["dependencies"]["serde"].as_inline_table().unwrap();
+    assert_eq!(
+      serde_dep.get("workspace").and_then(|v| v.as_bool()),
+      Some(true),
+      "Should have workspace = true"
+    );
+    assert!(!serde_dep.contains_key("version"), "Should not have version");
+    assert!(!serde_dep.contains_key("features"), "Should not preserve features");
+  }
+
+  #[test]
+  fn test_convert_to_workspace_inheritance_optional() {
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let member_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dependencies]
+tokio = { version = "1.0", optional = true, features = ["fs"] }
+"#;
+    std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
+
+    transformer
+      .convert_to_workspace_inheritance(temp_file.path(), "tokio", &DependencyKind::Normal)
+      .unwrap();
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let tokio_dep = doc["dependencies"]["tokio"].as_inline_table().unwrap();
+    assert_eq!(tokio_dep.get("workspace").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+      tokio_dep.get("optional").and_then(|v| v.as_bool()),
+      Some(true),
+      "Should preserve optional = true"
+    );
+  }
+
+  #[test]
+  fn test_convert_to_workspace_inheritance_dev_dependencies() {
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let member_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dev-dependencies]
+tempfile = "3.0"
+"#;
+    std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
+
+    let result =
+      transformer.convert_to_workspace_inheritance(temp_file.path(), "tempfile", &DependencyKind::Development);
+    assert!(result.is_ok(), "Should handle dev-dependencies");
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let tempfile_dep = doc["dev-dependencies"]["tempfile"].as_inline_table().unwrap();
+    assert_eq!(tempfile_dep.get("workspace").and_then(|v| v.as_bool()), Some(true));
+  }
+
+  #[test]
+  fn test_convert_to_workspace_inheritance_build_dependencies() {
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let member_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+
+[build-dependencies]
+cc = "1.0"
+"#;
+    std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
+
+    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "cc", &DependencyKind::Build);
+    assert!(result.is_ok(), "Should handle build-dependencies");
+
+    let content = std::fs::read_to_string(temp_file.path()).unwrap();
+    let doc: DocumentMut = content.parse().unwrap();
+
+    let cc_dep = doc["build-dependencies"]["cc"].as_inline_table().unwrap();
+    assert_eq!(cc_dep.get("workspace").and_then(|v| v.as_bool()), Some(true));
+  }
+
+  #[test]
+  fn test_convert_to_workspace_inheritance_missing_dependency() {
+    use tempfile::NamedTempFile;
+
+    let metadata = create_test_metadata();
+    let transformer = CargoTransform::new(metadata);
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let member_toml = r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#;
+    std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
+
+    // Try to convert non-existent dependency
+    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "nonexistent", &DependencyKind::Normal);
+    assert!(result.is_err(), "Should error on missing dependency");
   }
 }

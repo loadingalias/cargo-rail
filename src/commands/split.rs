@@ -1,8 +1,7 @@
 use std::io::{self, Write};
 
 use crate::error::{ConfigError, RailError, RailResult};
-use crate::plan::PlanExecutor;
-use crate::plan::{Operation, OperationType, Plan};
+use crate::split::{SplitConfig, SplitEngine};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
@@ -48,7 +47,7 @@ pub fn run_split(
     ));
   };
 
-  // Apply remote override if provided (before all_local check)
+  // Apply remote override if provided
   if let Some(ref remote_override) = remote {
     for split_config in &mut crates_to_split_check {
       split_config.remote = remote_override.clone();
@@ -58,12 +57,10 @@ pub fn run_split(
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_split_check.iter().all(|s| utils::is_local_path(&s.remote));
 
-  // Preflight health checks disabled (doctor module removed)
   if all_local && apply {
     println!("   Local testing mode\n");
   }
 
-  // Use the crates we already determined
   let crates_to_split = crates_to_split_check;
   if all {
     println!("   Splitting all {} configured crates", crates_to_split.len());
@@ -74,8 +71,8 @@ pub fn run_split(
     split_config.validate()?;
   }
 
-  // Build plans using the unified Plan system
-  let mut plans = Vec::new();
+  // Build SplitConfig for each crate
+  let mut configs = Vec::new();
 
   for split_config in &crates_to_split {
     let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
@@ -93,39 +90,33 @@ pub fn run_split(
       ctx.workspace_root().join("..").join(remote_name)
     };
 
-    // Build unified Plan with ExecuteSplit operation
-    let mut plan = Plan::new(OperationType::Split, Some(split_config.name.clone()));
-
-    // Add high-level ExecuteSplit operation
-    plan.add_operation(Operation::ExecuteSplit {
+    let config = SplitConfig {
       crate_name: split_config.name.clone(),
-      crate_paths: crate_paths.iter().map(|p| p.display().to_string()).collect(),
-      mode: format!("{:?}", split_config.mode),
-      target_repo_path: target_repo_path.display().to_string(),
+      crate_paths,
+      mode: split_config.mode.clone(),
+      target_repo_path,
       branch: split_config.branch.clone(),
       remote_url: Some(split_config.remote.clone()),
-    });
+    };
 
-    // Add metadata
-    plan = plan
-      .with_summary(format!(
-        "Split crate '{}' to {} (mode: {:?})",
-        split_config.name, split_config.remote, split_config.mode
-      ))
-      .mark_destructive()
-      .add_trailer("Rail-Operation", "split")
-      .add_trailer("Rail-Crate", &split_config.name);
-
-    plans.push((split_config.clone(), crate_paths, target_repo_path, plan));
+    configs.push(config);
   }
 
-  // Output plans
+  // Dry-run mode: show what would be done
   if !apply {
     if json {
       // JSON output for CI/automation
-      let json_plans: Vec<&Plan> = plans.iter().map(|(_, _, _, plan)| plan).collect();
-      for plan in json_plans {
-        println!("{}", plan.to_json()?);
+      for config in &configs {
+        println!(
+          "{}",
+          serde_json::to_string_pretty(&serde_json::json!({
+            "crate_name": config.crate_name,
+            "mode": format!("{:?}", config.mode),
+            "target_repo": config.target_repo_path,
+            "branch": config.branch,
+            "remote_url": config.remote_url,
+          }))?
+        );
       }
       return Ok(());
     } else {
@@ -133,16 +124,18 @@ pub fn run_split(
       println!("\n🔍 DRY-RUN MODE - No changes will be made");
       println!("   Add --apply to actually perform the split\n");
 
-      for (split_config, crate_paths, target_repo_path, plan) in &plans {
-        println!("{}", plan.to_human_readable());
-        println!("   Mode: {:?}", split_config.mode);
+      for config in &configs {
+        println!("📦 Crate: {}", config.crate_name);
+        println!("   Mode: {:?}", config.mode);
         println!("   Source paths:");
-        for path in crate_paths {
+        for path in &config.crate_paths {
           println!("     • {}", path.display());
         }
-        println!("   Target: {}", target_repo_path.display());
-        println!("   Remote: {}", split_config.remote);
-        println!("   Branch: {}", split_config.branch);
+        println!("   Target: {}", config.target_repo_path.display());
+        if let Some(ref remote) = config.remote_url {
+          println!("   Remote: {}", remote);
+        }
+        println!("   Branch: {}", config.branch);
         println!();
       }
 
@@ -156,38 +149,33 @@ pub fn run_split(
 
       // Interactive confirmation
       if prompt_for_confirmation("Press Enter to apply this plan, or Ctrl+C to cancel")? {
-        // User confirmed, continue to apply logic below
         println!("\n🚀 APPLY MODE - Executing split operations\n");
+        // Fall through to apply mode
       } else {
         return Ok(());
       }
     }
-  }
-
-  // Apply mode - execute the split (message already printed above or from --apply flag)
-  if apply {
+  } else {
     println!("\n🚀 APPLY MODE - Executing split operations\n");
   }
 
-  // Use existing workspace context for execution
-  let executor = PlanExecutor::new(ctx);
-
-  let plan_count = plans.len();
+  // Apply mode - execute the splits
+  let config_count = configs.len();
 
   // Use parallel processing for multiple crates
-  if plan_count > 1 && all {
-    println!("🚀 Processing {} crates in parallel...\n", plan_count);
+  if config_count > 1 && all {
+    println!("🚀 Processing {} crates in parallel...\n", config_count);
 
     // For parallel execution, we need to build contexts per-thread
     let workspace_root = ctx.workspace_root().to_path_buf();
-    let results: Vec<RailResult<()>> = plans
+    let results: Vec<RailResult<()>> = configs
       .into_par_iter()
-      .map(|(split_config, _, _, plan)| {
-        println!("🔨 Splitting crate '{}'...", split_config.name);
+      .map(|config| {
+        println!("🔨 Splitting crate '{}'...", config.crate_name);
         // Build workspace context for this thread
         let thread_context = WorkspaceContext::build(&workspace_root)?;
-        let thread_executor = PlanExecutor::new(&thread_context);
-        thread_executor.execute(&plan)
+        let engine = SplitEngine::new(&thread_context)?;
+        engine.split(&config)
       })
       .collect();
 
@@ -197,18 +185,14 @@ pub fn run_split(
     }
   } else {
     // Sequential processing for single crate or when not using --all
-    for (split_config, _, _, plan) in plans {
-      println!("🔨 Splitting crate '{}'...", split_config.name);
-      executor.execute(&plan)?;
+    for config in configs {
+      println!("🔨 Splitting crate '{}'...", config.crate_name);
+      let engine = SplitEngine::new(ctx)?;
+      engine.split(&config)?;
       println!();
     }
   }
 
-  println!("🎉 Split operation complete!");
-  println!("\n📌 Next steps:");
-  println!("   1. Review the generated repositories");
-  println!("   2. Make sure remote repositories exist on GitHub/GitLab");
-  println!("   3. If push failed, you may need to create the remote repo first");
-
+  println!("✅ Split operation completed successfully");
   Ok(())
 }

@@ -42,11 +42,17 @@ impl GitState {
   }
 
   /// Get current HEAD commit SHA
+  ///
+  /// Part of git backbone - will be used for sync/split operations
+  #[allow(dead_code)]
   pub fn head_commit(&self) -> RailResult<String> {
     self.git.head_commit()
   }
 
   /// Get current branch name
+  ///
+  /// Part of git backbone - will be used for git operations
+  #[allow(dead_code)]
   pub fn current_branch(&self) -> RailResult<String> {
     self.git.current_branch()
   }

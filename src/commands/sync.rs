@@ -1,22 +1,22 @@
+use std::io::{self, Write};
+use std::sync::Arc;
+
 use crate::error::{ConfigError, RailError, RailResult};
-use crate::plan::PlanExecutor;
-use crate::plan::{Operation, OperationType, Plan};
-use crate::sync::{ConflictStrategy, SyncDirection};
+use crate::sync::{ConflictStrategy, SyncConfig, SyncDirection, SyncEngine};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
-/// Sync command parameters
-pub struct SyncParams {
-  pub crate_name: Option<String>,
-  pub all: bool,
-  pub remote: Option<String>,
-  pub from_remote: bool,
-  pub to_remote: bool,
-  pub strategy_str: String,
-  pub no_protected_branches: bool,
-  pub apply: bool,
-  pub json: bool,
+/// Prompt user for confirmation
+fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
+  print!("\n{}: ", message);
+  io::stdout().flush()?;
+
+  let mut input = String::new();
+  io::stdin().read_line(&mut input)?;
+
+  // If user just presses Enter (empty line), that's a confirmation
+  Ok(input.trim().is_empty())
 }
 
 /// Run the sync command
@@ -33,36 +33,8 @@ pub fn run_sync(
   apply: bool,
   json: bool,
 ) -> RailResult<()> {
-  // Convert to struct for internal use
-  let params = SyncParams {
-    crate_name,
-    all,
-    remote,
-    from_remote,
-    to_remote,
-    strategy_str,
-    no_protected_branches,
-    apply,
-    json,
-  };
-  run_sync_impl(ctx, params)
-}
-
-/// Internal implementation of sync command
-fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
-  let SyncParams {
-    crate_name,
-    all,
-    remote,
-    from_remote,
-    to_remote,
-    strategy_str,
-    no_protected_branches,
-    apply,
-    json,
-  } = params;
-  // Parse conflict strategy (validate it, then use as string in ExecuteSync operation)
-  let _strategy = ConflictStrategy::from_str(&strategy_str)?;
+  // Parse conflict strategy
+  let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
 
   // Load configuration
   let mut config = ctx.require_config()?.as_ref().clone();
@@ -91,7 +63,7 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
     ));
   };
 
-  // Apply remote override if provided (before all_local check)
+  // Apply remote override if provided
   if let Some(ref remote_override) = remote {
     for split_config in &mut crates_to_sync_check {
       split_config.remote = remote_override.clone();
@@ -101,7 +73,6 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
   // Check if all remotes are local paths (skip SSH checks for local testing)
   let all_local = crates_to_sync_check.iter().all(|s| utils::is_local_path(&s.remote));
 
-  // Preflight health checks disabled (doctor module removed)
   if all_local && apply {
     println!("   Local testing mode\n");
   }
@@ -128,16 +99,13 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
     }
   };
 
-  // Use the crates we already determined
   let crates_to_sync = crates_to_sync_check;
   if all {
     println!("   Syncing all {} configured crates", crates_to_sync.len());
   }
 
-  // Validate crates (health checks disabled - doctor module removed)
-
-  // Build plans using the unified Plan system
-  let mut plans = Vec::new();
+  // Build SyncConfig for each crate
+  let mut configs = Vec::new();
 
   for split_config in &crates_to_sync {
     let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
@@ -157,99 +125,83 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
 
     // Check if target repo exists
     let target_exists = target_repo_path.exists();
-    if !target_exists && apply {
-      eprintln!("⚠️  Error: Target repo not found at: {}", target_repo_path.display());
-      eprintln!("   Run `cargo rail split {}` first", split_config.name);
-      continue;
-    }
 
-    // Build unified Plan with ExecuteSync operation
-    let mut plan = Plan::new(OperationType::Sync, Some(split_config.name.clone()));
-
-    // Determine direction string for the plan
-    let dir_str = match direction {
-      SyncDirection::MonoToRemote => "to_remote",
-      SyncDirection::RemoteToMono => "from_remote",
-      SyncDirection::Both => "bidirectional",
-      SyncDirection::None => continue,
-    };
-
-    // Add high-level ExecuteSync operation
-    plan.add_operation(Operation::ExecuteSync {
+    let sync_config = SyncConfig {
       crate_name: split_config.name.clone(),
-      crate_paths: crate_paths.iter().map(|p| p.display().to_string()).collect(),
-      mode: format!("{:?}", split_config.mode),
-      target_repo_path: target_repo_path.display().to_string(),
+      crate_paths,
+      mode: split_config.mode.clone(),
+      target_repo_path: target_repo_path.clone(),
       branch: split_config.branch.clone(),
       remote_url: split_config.remote.clone(),
-      direction: dir_str.to_string(),
-      conflict_strategy: strategy_str.clone(),
-    });
-
-    let dir_display = match direction {
-      SyncDirection::MonoToRemote => "monorepo → remote",
-      SyncDirection::RemoteToMono => "remote → monorepo",
-      SyncDirection::Both => "bidirectional",
-      SyncDirection::None => "none",
     };
 
-    // Add metadata
-    let protected_handling = if matches!(direction, SyncDirection::RemoteToMono | SyncDirection::Both) {
-      Some(format!(
-        "Will create PR branch if target is protected ({})",
-        config.security.protected_branches.join(", ")
-      ))
-    } else {
-      None
-    };
-
-    plan = plan
-      .with_summary(format!(
-        "Sync crate '{}' ({}) with conflict strategy: {}",
-        split_config.name, dir_display, strategy_str
-      ))
-      .add_trailer("Rail-Operation", "sync")
-      .add_trailer("Rail-Crate", &split_config.name)
-      .add_trailer("Rail-Direction", dir_display)
-      .add_trailer("Rail-Strategy", &strategy_str);
-
-    plans.push((
-      split_config.clone(),
-      crate_paths,
-      target_repo_path,
-      plan,
-      target_exists,
-      protected_handling,
-    ));
+    configs.push((sync_config, target_exists));
   }
 
-  // Output plans
+  // Dry-run mode: show what would be done
   if !apply {
     if json {
       // JSON output for CI/automation
-      let json_plans: Vec<&Plan> = plans.iter().map(|(_, _, _, plan, _, _)| plan).collect();
-      for plan in json_plans {
-        println!("{}", plan.to_json()?);
+      for (sync_config, target_exists) in &configs {
+        let dir_str = match direction {
+          SyncDirection::MonoToRemote => "to_remote",
+          SyncDirection::RemoteToMono => "from_remote",
+          SyncDirection::Both => "bidirectional",
+          SyncDirection::None => "none",
+        };
+
+        println!(
+          "{}",
+          serde_json::to_string_pretty(&serde_json::json!({
+            "crate_name": sync_config.crate_name,
+            "mode": format!("{:?}", sync_config.mode),
+            "target_repo": sync_config.target_repo_path,
+            "branch": sync_config.branch,
+            "remote_url": sync_config.remote_url,
+            "direction": dir_str,
+            "conflict_strategy": strategy_str,
+            "target_exists": target_exists,
+          }))?
+        );
       }
+      return Ok(());
     } else {
       // Human-readable plan
       println!("\n🔍 DRY-RUN MODE - No changes will be made");
       println!("   Add --apply to actually perform the sync\n");
 
-      for (split_config, _, target_repo_path, plan, target_exists, protected_handling) in &plans {
-        println!("{}", plan.to_human_readable());
-        println!("   Target: {}", target_repo_path.display());
-        println!("   Remote: {}", split_config.remote);
-        println!("   Branch: {}", split_config.branch);
+      let dir_display = match direction {
+        SyncDirection::MonoToRemote => "monorepo → remote",
+        SyncDirection::RemoteToMono => "remote → monorepo",
+        SyncDirection::Both => "bidirectional",
+        SyncDirection::None => "none",
+      };
+
+      for (sync_config, target_exists) in &configs {
+        println!("📦 Crate: {}", sync_config.crate_name);
+        println!("   Mode: {:?}", sync_config.mode);
+        println!("   Direction: {}", dir_display);
+        println!("   Source paths:");
+        for path in &sync_config.crate_paths {
+          println!("     • {}", path.display());
+        }
+        println!("   Target: {}", sync_config.target_repo_path.display());
+        println!("   Remote: {}", sync_config.remote_url);
+        println!("   Branch: {}", sync_config.branch);
         println!("   Conflict strategy: {}", strategy_str);
         if !target_exists {
           println!(
             "   ⚠️  Target repo does not exist yet - run `cargo rail split {}` first",
-            split_config.name
+            sync_config.crate_name
           );
         }
-        if let Some(handling) = protected_handling {
-          println!("   🛡️  {}", handling);
+        if matches!(direction, SyncDirection::RemoteToMono | SyncDirection::Both)
+          && !config.security.protected_branches.is_empty()
+        {
+          println!(
+            "   🛡️  Will create PR branch if target is protected ({})",
+            config.security.protected_branches.join(", ")
+          );
         }
         println!();
       }
@@ -279,33 +231,57 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
           }
         );
       }
-    }
+      println!();
 
-    return Ok(());
+      // Interactive confirmation
+      if prompt_for_confirmation("Press Enter to apply this plan, or Ctrl+C to cancel")? {
+        println!("\n🚀 APPLY MODE - Executing sync operations\n");
+        // Fall through to apply mode
+      } else {
+        return Ok(());
+      }
+    }
+  } else {
+    println!("\n🚀 APPLY MODE - Executing sync operations\n");
   }
 
-  // Apply mode - execute the sync
-  println!("\n🚀 APPLY MODE - Executing sync operations\n");
-
-  // Use existing workspace context for execution
-  let executor = PlanExecutor::new(ctx);
-
-  let plan_count = plans.len();
+  // Apply mode - execute the syncs
+  let config_count = configs.len();
+  let security_config = Arc::new(config.security.clone());
 
   // Use parallel processing for multiple crates
-  if plan_count > 1 && all {
-    println!("🚀 Processing {} crates in parallel...\n", plan_count);
+  if config_count > 1 && all {
+    println!("🚀 Processing {} crates in parallel...\n", config_count);
 
     // For parallel execution, we need to build contexts per-thread
     let workspace_root = ctx.workspace_root().to_path_buf();
-    let results: Vec<RailResult<()>> = plans
+    let results: Vec<RailResult<()>> = configs
       .into_par_iter()
-      .map(|(split_config, _, _, plan, _, _)| {
-        println!("🔄 Syncing crate: {}", split_config.name);
+      .map(|(sync_config, target_exists)| {
+        if !target_exists {
+          eprintln!(
+            "⚠️  Error: Target repo not found at: {}",
+            sync_config.target_repo_path.display()
+          );
+          eprintln!("   Run `cargo rail split {}` first", sync_config.crate_name);
+          return Ok(());
+        }
+
+        println!("🔄 Syncing crate '{}'...", sync_config.crate_name);
+
         // Build workspace context for this thread
         let thread_context = WorkspaceContext::build(&workspace_root)?;
-        let thread_executor = PlanExecutor::new(&thread_context);
-        thread_executor.execute(&plan)
+        let mut engine = SyncEngine::new(&thread_context, sync_config, security_config.clone(), conflict_strategy)?;
+
+        // Execute sync based on direction
+        let _result = match direction {
+          SyncDirection::MonoToRemote => engine.sync_to_remote()?,
+          SyncDirection::RemoteToMono => engine.sync_from_remote()?,
+          SyncDirection::Both => engine.sync_bidirectional()?,
+          SyncDirection::None => return Ok(()),
+        };
+
+        Ok(())
       })
       .collect();
 
@@ -315,13 +291,31 @@ fn run_sync_impl(ctx: &WorkspaceContext, params: SyncParams) -> RailResult<()> {
     }
   } else {
     // Sequential processing for single crate or when not using --all
-    for (split_config, _, _, plan, _, _) in plans {
-      println!("\n🔄 Syncing crate: {}", split_config.name);
-      executor.execute(&plan)?;
+    for (sync_config, target_exists) in configs {
+      if !target_exists {
+        eprintln!(
+          "⚠️  Error: Target repo not found at: {}",
+          sync_config.target_repo_path.display()
+        );
+        eprintln!("   Run `cargo rail split {}` first", sync_config.crate_name);
+        continue;
+      }
+
+      println!("🔄 Syncing crate '{}'...", sync_config.crate_name);
+      let mut engine = SyncEngine::new(ctx, sync_config, security_config.clone(), conflict_strategy)?;
+
+      // Execute sync based on direction
+      let _result = match direction {
+        SyncDirection::MonoToRemote => engine.sync_to_remote()?,
+        SyncDirection::RemoteToMono => engine.sync_from_remote()?,
+        SyncDirection::Both => engine.sync_bidirectional()?,
+        SyncDirection::None => continue,
+      };
+
+      println!();
     }
   }
 
-  println!("\n🎉 Sync operation complete!");
-
+  println!("🎉 Sync operation complete!");
   Ok(())
 }

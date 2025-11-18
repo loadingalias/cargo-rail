@@ -1,10 +1,10 @@
-use crate::cargo::{CargoTransform, TransformContext, WorkspaceMetadata};
+use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::SplitMode;
 use crate::error::{GitError, RailError, RailResult, ResultExt};
-use crate::git::CommitInfo;
-use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
+use crate::git::{CommitInfo, SystemGit};
 use crate::utils;
+use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
 use std::path::{Path, PathBuf};
 
@@ -43,26 +43,22 @@ struct CommitParams<'a> {
   parent_shas: &'a [String],
 }
 
-/// Deterministic Git splitter
-/// Extracts crates with full history, ensuring same input = same commit SHAs
-pub struct Splitter {
-  workspace_root: PathBuf,
-  git: SystemGit,
+/// Split engine - extracts crates with full history
+///
+/// Deterministic git splitting: same input = same commit SHAs
+/// Uses WorkspaceContext for git and cargo operations - no duplicate loads.
+pub struct SplitEngine<'a> {
+  ctx: &'a WorkspaceContext,
   transform: CargoTransform,
 }
 
-impl Splitter {
-  /// Create a new splitter for a workspace
-  pub fn new(workspace_root: PathBuf) -> RailResult<Self> {
-    let git = SystemGit::open(&workspace_root)?;
-    let metadata = WorkspaceMetadata::load(&workspace_root)?;
-    let transform = CargoTransform::new(metadata);
+impl<'a> SplitEngine<'a> {
+  /// Create a new split engine from workspace context
+  pub fn new(ctx: &'a WorkspaceContext) -> RailResult<Self> {
+    // Build CargoTransform from context's metadata
+    let transform = CargoTransform::new(ctx.cargo.metadata().clone());
 
-    Ok(Self {
-      workspace_root,
-      git,
-      transform,
-    })
+    Ok(Self { ctx, transform })
   }
 
   /// Walk commit history and filter commits that touch the given paths
@@ -71,7 +67,7 @@ impl Splitter {
     println!("   Walking commit history to find commits touching crate...");
 
     // Use batched git command for all paths at once (much faster than N separate calls)
-    let filtered_commits = self.git.get_commits_touching_paths(paths, None, "HEAD")?;
+    let filtered_commits = self.ctx.git.git().get_commits_touching_paths(paths, None, "HEAD")?;
 
     println!(
       "   Found {} total commits that touch the crate paths",
@@ -91,7 +87,7 @@ impl Splitter {
     let content = std::fs::read_to_string(manifest_path)?;
     let context = TransformContext {
       crate_name: crate_name.to_string(),
-      workspace_root: self.workspace_root.clone(),
+      workspace_root: self.ctx.workspace_root().to_path_buf(),
     };
     let transformed = self.transform.transform_to_split(&content, &context)?;
     std::fs::write(manifest_path, transformed)?;
@@ -104,7 +100,7 @@ impl Splitter {
     // Collect all files for the crate at this commit
     let mut all_files = Vec::new();
     for crate_path in params.crate_paths {
-      let files = self.git.collect_tree_files(&params.commit.sha, crate_path)?;
+      let files = self.ctx.git.git().collect_tree_files(&params.commit.sha, crate_path)?;
       all_files.extend(files);
     }
 
@@ -302,17 +298,17 @@ impl Splitter {
     self.ensure_target_repo(&config.target_repo_path)?;
 
     // Discover workspace-level auxiliary files from workspace
-    let aux_files = AuxiliaryFiles::discover(&self.workspace_root)?;
+    let aux_files = AuxiliaryFiles::discover(self.ctx.workspace_root())?;
     println!("   Found {} workspace config files", aux_files.count());
 
     // Discover project files (README, LICENSE) with crate-first fallback
     let crate_path = &config.crate_paths[0]; // Use first crate path for project files
-    let project_files = ProjectFiles::discover(&self.workspace_root, crate_path)?;
+    let project_files = ProjectFiles::discover(self.ctx.workspace_root(), crate_path)?;
     println!("   Found {} project files (README, LICENSE)", project_files.count());
 
     // Create mapping store
     let mut mapping_store = MappingStore::new(config.crate_name.clone());
-    mapping_store.load(&self.workspace_root)?;
+    mapping_store.load(self.ctx.workspace_root())?;
 
     // Walk filtered history to find commits touching the crate
     let filtered_commits = self.walk_filtered_history(&config.crate_paths)?;
@@ -350,7 +346,7 @@ impl Splitter {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
-          workspace_root: &self.workspace_root,
+          workspace_root: self.ctx.workspace_root(),
           crate_name: &config.crate_name,
           mode: &config.mode,
           mapping_store: &mapping_store,
@@ -368,8 +364,8 @@ impl Splitter {
       let has_files = !aux_files.is_empty() || project_files.count() > 0;
       if has_files {
         println!("   Copying workspace configs and project files...");
-        aux_files.copy_to_split(&self.workspace_root, &config.target_repo_path)?;
-        project_files.copy_to_split(&self.workspace_root, &config.target_repo_path)?;
+        aux_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
+        project_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
 
         // Create a final commit if any files were added
         // git add -A is safe to run unconditionally (no-op if no changes)
@@ -396,7 +392,7 @@ impl Splitter {
     }
 
     // Save mappings to both workspace and target repo
-    mapping_store.save(&self.workspace_root)?;
+    mapping_store.save(self.ctx.workspace_root())?;
     mapping_store.save(&config.target_repo_path)?;
 
     // Push to remote if URL is configured and is not a local file path
@@ -485,7 +481,7 @@ impl Splitter {
 
     // Get identity from source repository
     let user_name = Command::new("git")
-      .current_dir(&self.workspace_root)
+      .current_dir(self.ctx.workspace_root())
       .args(["config", "user.name"])
       .output()
       .ok()
@@ -498,7 +494,7 @@ impl Splitter {
       });
 
     let user_email = Command::new("git")
-      .current_dir(&self.workspace_root)
+      .current_dir(self.ctx.workspace_root())
       .args(["config", "user.email"])
       .output()
       .ok()
@@ -554,7 +550,7 @@ impl Splitter {
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
   ) -> RailResult<()> {
-    let source_path = self.workspace_root.join(crate_path);
+    let source_path = self.ctx.workspace_root().join(crate_path);
 
     // Copy source files
     println!("   Copying source files from {}", crate_path.display());
@@ -568,7 +564,7 @@ impl Splitter {
     // Copy auxiliary files
     if !aux_files.is_empty() {
       println!("   Copying auxiliary files");
-      aux_files.copy_to_split(&self.workspace_root, target_repo_path)?;
+      aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
     }
 
     Ok(())
@@ -583,7 +579,7 @@ impl Splitter {
     crate_name: &str,
   ) -> RailResult<()> {
     for crate_path in crate_paths {
-      let source_path = self.workspace_root.join(crate_path);
+      let source_path = self.ctx.workspace_root().join(crate_path);
       let target_path = target_repo_path.join(crate_path);
 
       println!("   Copying {} to {}", crate_path.display(), crate_path.display());
@@ -603,7 +599,7 @@ impl Splitter {
     // Copy auxiliary files
     if !aux_files.is_empty() {
       println!("   Copying auxiliary files");
-      aux_files.copy_to_split(&self.workspace_root, target_repo_path)?;
+      aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
     }
 
     Ok(())
@@ -687,9 +683,10 @@ mod tests {
     fs::create_dir(source.join(".git")).unwrap(); // Should be excluded
 
     let workspace_root = find_git_root();
-    let splitter = Splitter::new(workspace_root).unwrap();
+    let ctx = WorkspaceContext::build(&workspace_root).unwrap();
+    let engine = SplitEngine::new(&ctx).unwrap();
 
-    splitter.copy_directory_recursive(&source, &target).unwrap();
+    engine.copy_directory_recursive(&source, &target).unwrap();
 
     // Verify files copied
     assert!(target.join("Cargo.toml").exists());

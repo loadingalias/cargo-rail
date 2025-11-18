@@ -4,7 +4,6 @@ mod config;
 mod error;
 mod git;
 mod graph;
-mod plan;
 mod split;
 mod sync;
 mod utils;
@@ -40,6 +39,13 @@ enum Commands {
   /// Graph-aware workspace operations
   #[command(subcommand)]
   Graph(GraphCommands),
+
+  // ============================================================================
+  // Dependency Unification
+  // ============================================================================
+  /// Workspace dependency unification (eliminates workspace-hack crates)
+  #[command(subcommand)]
+  Unify(UnifyCommands),
 
   // ============================================================================
   // Split/Sync Orchestration
@@ -117,53 +123,47 @@ enum GraphCommands {
     #[arg(long, default_value = "text")]
     format: String,
   },
+}
 
-  /// Run tests for affected crates
-  Test {
-    /// Git ref to compare against
+#[derive(Subcommand)]
+enum UnifyCommands {
+  /// Analyze dependencies and show unification plan (dry-run)
+  Analyze {
+    /// Exclude specific dependencies from unification
     #[arg(long)]
-    since: Option<String>,
-    /// Run tests for entire workspace
+    exclude: Vec<String>,
+    /// Force include specific dependencies
     #[arg(long)]
-    workspace: bool,
-    /// Show dry-run plan without execution
+    include: Vec<String>,
+    /// Only unify normal dependencies (exclude dev and build dependencies)
     #[arg(long)]
-    dry_run: bool,
-    /// Additional arguments to pass to cargo test
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    cargo_args: Vec<String>,
+    normal_only: bool,
   },
 
-  /// Run check for affected crates
+  /// Apply workspace dependency unification (modifies Cargo.toml files)
+  Apply {
+    /// Exclude specific dependencies from unification
+    #[arg(long)]
+    exclude: Vec<String>,
+    /// Force include specific dependencies
+    #[arg(long)]
+    include: Vec<String>,
+    /// Create .bak backups of all modified files
+    #[arg(long)]
+    backup: bool,
+    /// Only unify normal dependencies (exclude dev and build dependencies)
+    #[arg(long)]
+    normal_only: bool,
+  },
+
+  /// Check workspace dependencies are properly unified (for CI)
   Check {
-    /// Git ref to compare against
+    /// Exclude specific dependencies from check
     #[arg(long)]
-    since: Option<String>,
-    /// Run check for entire workspace
+    exclude: Vec<String>,
+    /// Only check normal dependencies
     #[arg(long)]
-    workspace: bool,
-    /// Show dry-run plan without execution
-    #[arg(long)]
-    dry_run: bool,
-    /// Additional arguments to pass to cargo check
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    cargo_args: Vec<String>,
-  },
-
-  /// Run clippy for affected crates
-  Clippy {
-    /// Git ref to compare against
-    #[arg(long)]
-    since: Option<String>,
-    /// Run clippy for entire workspace
-    #[arg(long)]
-    workspace: bool,
-    /// Show dry-run plan without execution
-    #[arg(long)]
-    dry_run: bool,
-    /// Additional arguments to pass to cargo clippy
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    cargo_args: Vec<String>,
+    normal_only: bool,
   },
 }
 
@@ -199,24 +199,22 @@ fn main() {
         to,
         format,
       } => commands::run_affected(&ctx, since, from, to, format, false),
-      GraphCommands::Test {
-        since,
-        workspace,
-        dry_run,
-        cargo_args,
-      } => commands::run_test(&ctx, since, workspace, dry_run, cargo_args),
-      GraphCommands::Check {
-        since,
-        workspace,
-        dry_run,
-        cargo_args,
-      } => commands::run_check(&ctx, since, workspace, dry_run, cargo_args),
-      GraphCommands::Clippy {
-        since,
-        workspace,
-        dry_run,
-        cargo_args,
-      } => commands::run_clippy(&ctx, since, workspace, dry_run, cargo_args),
+    },
+
+    // Dependency Unification
+    Commands::Unify(unify_cmd) => match unify_cmd {
+      UnifyCommands::Analyze {
+        exclude,
+        include,
+        normal_only,
+      } => commands::run_unify_analyze(&ctx, exclude, include, normal_only),
+      UnifyCommands::Apply {
+        exclude,
+        include,
+        backup,
+        normal_only,
+      } => commands::run_unify_apply(&ctx, exclude, include, backup, normal_only),
+      UnifyCommands::Check { exclude, normal_only } => commands::run_unify_check(&ctx, exclude, normal_only),
     },
 
     // Split/Sync

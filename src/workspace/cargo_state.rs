@@ -45,7 +45,8 @@ impl CargoState {
     &self.metadata
   }
 
-  /// Get all workspace member packages
+  /// Get all workspace member packages (backbone API - used in tests/contexts)
+  #[allow(dead_code)]
   pub fn workspace_packages(&self) -> Vec<&Package> {
     self.metadata.list_crates()
   }

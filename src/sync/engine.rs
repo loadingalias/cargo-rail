@@ -1,10 +1,11 @@
-use crate::cargo::{CargoTransform, TransformContext, WorkspaceMetadata};
+use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SecurityConfig, SplitMode};
 use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
 use crate::sync::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
+use crate::workspace::WorkspaceContext;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,10 +42,9 @@ pub enum SyncDirection {
 type ConflictResolutionResult = (Vec<ConflictInfo>, Vec<(PathBuf, char)>);
 
 /// Bidirectional sync engine
-pub struct SyncEngine {
-  workspace_root: PathBuf,
+pub struct SyncEngine<'a> {
+  ctx: &'a WorkspaceContext,
   config: SyncConfig,
-  mono_git: SystemGit,
   mapping_store: MappingStore,
   transform: CargoTransform,
   /// Wrapped in Arc for cheap cloning in parallel execution
@@ -54,17 +54,15 @@ pub struct SyncEngine {
   loaded_repos: std::collections::HashSet<PathBuf>,
 }
 
-impl SyncEngine {
+impl<'a> SyncEngine<'a> {
   pub fn new(
-    workspace_root: PathBuf,
+    ctx: &'a WorkspaceContext,
     config: SyncConfig,
     security_config: Arc<SecurityConfig>,
     conflict_strategy: ConflictStrategy,
   ) -> RailResult<Self> {
-    let mono_git = SystemGit::open(&workspace_root)?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
-    let metadata = WorkspaceMetadata::load(&workspace_root)?;
-    let transform = CargoTransform::new(metadata); // No clone needed - metadata moved into transform
+    let transform = CargoTransform::new(ctx.cargo.metadata().clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
     let temp_dir = std::env::temp_dir().join(format!(
@@ -80,9 +78,8 @@ impl SyncEngine {
     let conflict_resolver = ConflictResolver::new(conflict_strategy, temp_dir);
 
     Ok(Self {
-      workspace_root,
+      ctx,
       config,
-      mono_git,
       mapping_store,
       transform,
       security_config,
@@ -113,8 +110,8 @@ impl SyncEngine {
     println!("   Syncing monorepo → remote...");
 
     // Load mappings (cached - only loads if not already loaded)
-    let workspace_root = self.workspace_root.clone();
-    self.ensure_mappings_loaded(&workspace_root)?;
+
+    self.ensure_mappings_loaded(self.ctx.workspace_root())?;
 
     // Open remote repo
     let target_repo_path = self.config.target_repo_path.clone();
@@ -138,7 +135,9 @@ impl SyncEngine {
     // Get new commits in mono that touch any of the crate paths (handles both single and combined modes)
     let new_commits =
       self
-        .mono_git
+        .ctx
+        .git
+        .git()
         .get_commits_touching_paths(&self.config.crate_paths, last_synced_mono.as_deref(), "HEAD")?;
 
     if new_commits.is_empty() {
@@ -170,7 +169,7 @@ impl SyncEngine {
       }
 
       // Save mappings after processing commits
-      self.mapping_store.save(&self.workspace_root)?;
+      self.mapping_store.save(self.ctx.workspace_root())?;
       self.mapping_store.save(&self.config.target_repo_path)?;
 
       // Push to remote (skip for local paths)
@@ -189,7 +188,7 @@ impl SyncEngine {
     let synced_count = 0;
 
     // Save mappings
-    self.mapping_store.save(&self.workspace_root)?;
+    self.mapping_store.save(self.ctx.workspace_root())?;
     self.mapping_store.save(&self.config.target_repo_path)?;
 
     // Push to remote (skip for local paths)
@@ -213,7 +212,7 @@ impl SyncEngine {
     println!("   Syncing remote → monorepo...");
 
     // Check current branch - NEVER commit directly to protected branches
-    let current_branch = self.mono_git.current_branch()?;
+    let current_branch = self.ctx.git.git().current_branch()?;
     let needs_pr_branch = self.security_config.protected_branches.contains(&current_branch);
 
     let pr_branch_name: Option<String> = if needs_pr_branch {
@@ -222,7 +221,7 @@ impl SyncEngine {
       println!("   📝 Creating PR branch: {}", pr_branch);
 
       // Create and checkout the PR branch
-      self.mono_git.create_and_checkout_branch(&pr_branch)?;
+      self.ctx.git.git().create_and_checkout_branch(&pr_branch)?;
 
       Some(pr_branch)
     } else {
@@ -230,8 +229,8 @@ impl SyncEngine {
     };
 
     // Load mappings (cached - only loads if not already loaded)
-    let workspace_root = self.workspace_root.clone();
-    self.ensure_mappings_loaded(&workspace_root)?;
+
+    self.ensure_mappings_loaded(self.ctx.workspace_root())?;
 
     // Open remote repo
     let target_repo_path = self.config.target_repo_path.clone();
@@ -269,7 +268,7 @@ impl SyncEngine {
       println!("   Syncing {} commits from remote...", new_commits.len());
 
       let mut count = 0;
-      let mut current_mono_head = self.mono_git.head_commit()?; // Cache HEAD, update after each commit
+      let mut current_mono_head = self.ctx.git.git().head_commit()?; // Cache HEAD, update after each commit
 
       for commit in &new_commits {
         // Skip if this commit came from mono (check trailer)
@@ -308,7 +307,7 @@ impl SyncEngine {
     };
 
     // Save mappings
-    self.mapping_store.save(&self.workspace_root)?;
+    self.mapping_store.save(self.ctx.workspace_root())?;
 
     // If we created a PR branch, push it to remote and remind user to create PR
     if let Some(ref pr_branch) = pr_branch_name {
@@ -317,7 +316,7 @@ impl SyncEngine {
       // Push PR branch to remote (skip for local testing)
       if !utils::is_local_path(&self.config.remote_url) && synced_count > 0 {
         println!("   📤 Pushing PR branch to remote...");
-        self.mono_git.push_to_remote("origin", pr_branch)?;
+        self.ctx.git.git().push_to_remote("origin", pr_branch)?;
         println!("   ✅ PR branch pushed to origin/{}", pr_branch);
 
         println!("\n   📝 Next step:");
@@ -396,7 +395,7 @@ impl SyncEngine {
 
   fn find_last_synced_mono_commit(&self) -> RailResult<Option<String>> {
     // Find the most recent mono commit that has a mapping
-    let commits = self.mono_git.commit_history(Path::new("."), Some(100))?;
+    let commits = self.ctx.git.git().commit_history(Path::new("."), Some(100))?;
 
     for commit in commits {
       if self.mapping_store.has_mapping(&commit.sha) {
@@ -428,7 +427,7 @@ impl SyncEngine {
     current_remote_head: &str,
   ) -> RailResult<String> {
     // Get changed files in mono
-    let changed_files = self.mono_git.get_changed_files(&commit.sha)?;
+    let changed_files = self.ctx.git.git().get_changed_files(&commit.sha)?;
 
     // Filter to only files in crate path
     let crate_path = &self.config.crate_paths[0];
@@ -462,7 +461,7 @@ impl SyncEngine {
       .collect();
 
     let file_contents = if !bulk_items.is_empty() {
-      self.mono_git.read_files_bulk(&bulk_items)?
+      self.ctx.git.git().read_files_bulk(&bulk_items)?
     } else {
       vec![]
     };
@@ -486,7 +485,7 @@ impl SyncEngine {
         let content = std::fs::read_to_string(&full_remote_path)?;
         let context = TransformContext {
           crate_name: self.config.crate_name.clone(),
-          workspace_root: self.workspace_root.clone(),
+          workspace_root: self.ctx.workspace_root().to_path_buf(),
         };
         let transformed = self.transform.transform_to_split(&content, &context)?;
         std::fs::write(&full_remote_path, transformed)?;
@@ -549,7 +548,7 @@ impl SyncEngine {
 
     // Handle deletions
     for (_, mono_path, _) in &deletions {
-      let full_mono_path = self.workspace_root.join(mono_path);
+      let full_mono_path = self.ctx.workspace_root().join(mono_path);
       if full_mono_path.exists() {
         std::fs::remove_file(&full_mono_path)?;
       }
@@ -570,7 +569,7 @@ impl SyncEngine {
     // Apply files to mono
     for (idx, (remote_path, mono_path, _)) in modifications.iter().enumerate() {
       let content = &file_contents[idx];
-      let full_mono_path = self.workspace_root.join(mono_path);
+      let full_mono_path = self.ctx.workspace_root().join(mono_path);
 
       // Create parent directories
       if let Some(parent) = full_mono_path.parent() {
@@ -585,7 +584,7 @@ impl SyncEngine {
         let content = std::fs::read_to_string(&full_mono_path)?;
         let context = TransformContext {
           crate_name: self.config.crate_name.clone(),
-          workspace_root: self.workspace_root.clone(),
+          workspace_root: self.ctx.workspace_root().to_path_buf(),
         };
         let transformed = self.transform.transform_to_mono(&content, &context)?;
         std::fs::write(&full_mono_path, transformed)?;
@@ -597,7 +596,7 @@ impl SyncEngine {
 
     let parent_shas = vec![current_mono_head.to_string()];
 
-    let new_commit_sha = self.mono_git.create_commit_with_metadata(
+    let new_commit_sha = self.ctx.git.git().create_commit_with_metadata(
       &message,
       &commit.author,
       &commit.author_email,
@@ -657,7 +656,9 @@ impl SyncEngine {
     // Single git call instead of N calls (one per remote file)
     let mono_changed_paths: std::collections::HashSet<PathBuf> = if let Some(ref last) = last_synced {
       self
-        .mono_git
+        .ctx
+        .git
+        .git()
         .get_changed_files_between(last, "HEAD")?
         .into_iter()
         .map(|(path, _)| path)
@@ -670,7 +671,7 @@ impl SyncEngine {
     let mut conflicting_files = Vec::new();
     for (remote_path, _) in &changed_files {
       let mono_path = self.map_remote_path_to_mono(remote_path)?;
-      let full_mono_path = self.workspace_root.join(&mono_path);
+      let full_mono_path = self.ctx.workspace_root().join(&mono_path);
 
       // Skip if file doesn't exist in monorepo (new file, no conflict)
       if !full_mono_path.exists() {
@@ -701,7 +702,7 @@ impl SyncEngine {
       .collect();
 
     let base_contents = if !base_items.is_empty() {
-      self.mono_git.read_files_bulk(&base_items)?
+      self.ctx.git.git().read_files_bulk(&base_items)?
     } else {
       vec![Vec::new(); conflicting_files.len()]
     };
@@ -776,7 +777,9 @@ impl SyncEngine {
     let crate_path = &self.config.crate_paths[0];
 
     let new_commits = self
-      .mono_git
+      .ctx
+      .git
+      .git()
       .get_commits_touching_path(crate_path, last_synced.as_deref(), "HEAD")?;
 
     // Filter out commits from remote

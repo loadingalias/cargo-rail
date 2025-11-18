@@ -6,10 +6,9 @@
 //! - The minimal set of crates that need testing/building
 
 use crate::error::{RailError, RailResult};
-use crate::git::SystemGit;
 use crate::graph::AffectedAnalysis;
 use crate::workspace::WorkspaceContext;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Output format for affected command
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +44,7 @@ pub fn run_affected(
   let output_format = OutputFormat::from_str(&format)?;
 
   // Get changed files from git
-  let changed_files = get_changed_files(ctx.workspace_root(), &since, from.as_deref(), to.as_deref())?;
+  let changed_files = get_changed_files(ctx, &since, from.as_deref(), to.as_deref())?;
 
   if dry_run {
     println!("DRY RUN: Would analyze {} changed files", changed_files.len());
@@ -66,20 +65,18 @@ pub fn run_affected(
 
 /// Get changed files from git
 fn get_changed_files(
-  workspace_root: &Path,
+  ctx: &WorkspaceContext,
   since: &str,
   from: Option<&str>,
   to: Option<&str>,
 ) -> RailResult<Vec<PathBuf>> {
-  let git = SystemGit::open(workspace_root)?;
-
   // Determine git range
   let changes = if let (Some(from_ref), Some(to_ref)) = (from, to) {
     // SHA pair mode: from..to
-    git.get_changed_files_between(from_ref, to_ref)?
+    ctx.git.git().get_changed_files_between(from_ref, to_ref)?
   } else {
     // Single ref mode: since..HEAD
-    git.get_changed_files_between(since, "HEAD")?
+    ctx.git.git().get_changed_files_between(since, "HEAD")?
   };
 
   // Extract just the file paths (ignore status char)

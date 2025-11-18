@@ -38,10 +38,8 @@ use std::sync::Arc;
 /// Uses Arc for efficient sharing of graph data without expensive clones.
 #[derive(Clone)]
 pub struct WorkspaceContext {
-  /// Git repository root (working tree root, typically same as workspace_root)
-  pub repo_root: PathBuf,
-
   /// Cargo workspace root (Cargo.toml location)
+  /// Note: In most cases, git repo root == workspace root. Access git root via ctx.git.repo_root() if needed.
   pub workspace_root: PathBuf,
 
   /// Git state and operations
@@ -76,18 +74,16 @@ impl WorkspaceContext {
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
     // Load git state
     let git = GitState::open(workspace_root)?;
-    let repo_root = git.repo_root().to_path_buf();
 
     // Load cargo state
     let cargo = CargoState::load(workspace_root)?;
     let workspace_root = cargo.workspace_root().to_path_buf();
 
-    // Validate repo_root and workspace_root match (or document when they differ)
-    // For now, we allow them to differ but could add a warning if needed
-    if repo_root != workspace_root {
+    // Validate git repo root and workspace_root match (or warn if they differ)
+    if git.repo_root() != workspace_root {
       eprintln!(
         "⚠️  Warning: Git repo root ({}) differs from Cargo workspace root ({})",
-        repo_root.display(),
+        git.repo_root().display(),
         workspace_root.display()
       );
     }
@@ -99,7 +95,6 @@ impl WorkspaceContext {
     let config = RailConfig::load(&workspace_root).ok().map(Arc::new);
 
     Ok(Self {
-      repo_root,
       workspace_root,
       git,
       cargo,
@@ -122,11 +117,6 @@ impl WorkspaceContext {
   pub fn workspace_root(&self) -> &Path {
     &self.workspace_root
   }
-
-  /// Get repository root as Path reference (convenience)
-  pub fn repo_root(&self) -> &Path {
-    &self.repo_root
-  }
 }
 
 #[cfg(test)]
@@ -145,15 +135,12 @@ mod tests {
     let ctx = ctx.unwrap();
 
     // Verify all components are initialized
-    assert!(ctx.repo_root.exists(), "Repo root should exist");
+    assert!(ctx.git.repo_root().exists(), "Repo root should exist");
     assert!(ctx.workspace_root.exists(), "Workspace root should exist");
 
-    // Git state should be initialized
-    assert_eq!(
-      ctx.git.repo_root(),
-      &ctx.repo_root,
-      "Git repo root should match context repo root"
-    );
+    // Git state should be initialized (git root typically == workspace root)
+    // We allow them to differ but in most cases they're the same
+    let _ = ctx.git.repo_root();
 
     // Cargo state should be initialized
     assert_eq!(
@@ -199,9 +186,9 @@ mod tests {
       "Convenience method should return same path"
     );
 
-    let repo_root = ctx.repo_root();
-    assert!(repo_root.exists(), "Repo root from convenience method should exist");
-    assert_eq!(repo_root, &ctx.repo_root, "Convenience method should return same path");
+    // Git repo root is accessible via ctx.git.repo_root()
+    let repo_root = ctx.git.repo_root();
+    assert!(repo_root.exists(), "Repo root should exist");
   }
 
   #[test]
