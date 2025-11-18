@@ -27,12 +27,8 @@ impl WorkspaceMetadata {
 
   /// Load workspace metadata with custom feature configuration
   ///
-  /// Useful for simulating different feature combinations to detect fragmentation
-  ///
-  /// TODO: Future feature - will be used for:
-  /// - Feature testing: `cargo rail test --all-features`
-  /// - Feature simulation: detect fragmentation under different configs
-  #[allow(dead_code)]
+  /// Used by unify commands to gather metadata with --all-features for accurate
+  /// feature union across the workspace. Can also be used for feature simulation.
   pub fn load_with_features(
     workspace_root: &Path,
     all_features: bool,

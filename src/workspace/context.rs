@@ -113,6 +113,11 @@ impl WorkspaceContext {
       .ok_or_else(|| crate::error::RailError::message("No rail.toml found. Run 'cargo rail init' to create one."))
   }
 
+  /// Get rail config (convenience wrapper for require_config)
+  pub fn rail_config(&self) -> RailResult<&RailConfig> {
+    self.require_config().map(|arc| arc.as_ref())
+  }
+
   /// Get workspace root as Path reference (convenience)
   pub fn workspace_root(&self) -> &Path {
     &self.workspace_root

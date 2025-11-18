@@ -7,10 +7,107 @@
 //!
 //! Replaces cargo-hakari with native Cargo workspace dependency unification.
 
-use crate::cargo::{CargoTransform, UnifyConfig, UnifyStrategy, WorkspaceUnifier};
+use crate::cargo::{CargoTransform, UnifyConfig, UnifyStrategy, WorkspaceMetadata, WorkspaceUnifier, validate_targets};
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 use std::path::Path;
+
+/// Get workspace metadata for unify operations
+///
+/// Checks rail.toml `[unify]` configuration to determine if --all-features should be used.
+/// If use_all_features=true (default), reloads metadata with --all-features for accurate
+/// feature union across the workspace.
+fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<WorkspaceMetadata> {
+  // Try to load rail config (optional)
+  let use_all_features = ctx
+    .config
+    .as_ref()
+    .map(|cfg| cfg.unify.use_all_features)
+    .unwrap_or(true); // Default to true if no config
+
+  if use_all_features {
+    // Reload metadata with --all-features for accurate feature resolution
+    WorkspaceMetadata::load_with_features(ctx.workspace_root(), true, false, vec![])
+  } else {
+    // Use existing metadata from context
+    Ok(ctx.cargo.metadata().clone())
+  }
+}
+
+/// Run config sync if configured
+fn maybe_sync_config(ctx: &WorkspaceContext) -> RailResult<()> {
+  // Check if sync_on_unify is enabled (default: true)
+  let sync_enabled = ctx.config.as_ref().map(|cfg| cfg.unify.sync_on_unify).unwrap_or(true);
+
+  if sync_enabled {
+    // Run config sync (non-check mode)
+    crate::commands::run_config_sync(ctx, false)?;
+    println!(); // Add newline separator
+  }
+
+  Ok(())
+}
+
+/// Run optional per-target validation if configured
+fn maybe_run_validation(ctx: &WorkspaceContext) -> RailResult<()> {
+  // Check if validation is enabled via config
+  let (validate_targets_list, max_parallel_jobs) = if let Some(cfg) = ctx.config.as_ref() {
+    if !cfg.unify.validation_enabled() {
+      return Ok(()); // Validation not enabled
+    }
+    (cfg.unify.validate_targets.clone(), cfg.unify.effective_parallelism())
+  } else {
+    return Ok(()); // No config, validation not enabled
+  };
+
+  println!("🔍 Running optional per-target validation...\n");
+
+  // Run parallel validation
+  let summary = validate_targets(ctx.workspace_root(), &validate_targets_list, max_parallel_jobs)?;
+
+  // Print summary
+  println!("📊 Validation Summary:");
+  println!("  Total targets: {}", summary.total_targets);
+  println!("  Successful: {}", summary.successful);
+  println!("  Failed: {}", summary.failed);
+  println!();
+
+  // Print detailed results
+  for result in &summary.results {
+    if result.success {
+      println!("  ✓ {} - OK", result.target);
+      // Show warnings even on success
+      if !result.warnings.is_empty() {
+        for warning in &result.warnings {
+          println!("    ⚠️  {}", warning);
+        }
+      }
+    } else {
+      println!("  ✗ {} - FAILED", result.target);
+      if let Some(ref error) = result.error {
+        println!("    Error: {}", error);
+      }
+      if !result.warnings.is_empty() {
+        for warning in &result.warnings {
+          println!("    ⚠️  {}", warning);
+        }
+      }
+    }
+  }
+  println!();
+
+  // Fail if any target failed
+  if !summary.all_passed() {
+    return Err(RailError::message(format!(
+      "Validation failed for {} target(s): {}",
+      summary.failed,
+      summary.failed_targets().join(", ")
+    )));
+  }
+
+  println!("✅ All target validations passed!\n");
+  Ok(())
+}
 
 /// Run dependency unification analysis (dry-run)
 pub fn run_unify_analyze(
@@ -19,7 +116,13 @@ pub fn run_unify_analyze(
   include: Vec<String>,
   normal_only: bool,
 ) -> RailResult<()> {
+  // Sync config if enabled
+  maybe_sync_config(ctx)?;
+
   println!("🔍 Analyzing workspace dependencies...\n");
+
+  // Get metadata (with --all-features if configured)
+  let metadata = get_unify_metadata(ctx)?;
 
   // Build config from CLI args (or load from rail.toml if we want)
   let mut config = UnifyConfig {
@@ -37,7 +140,7 @@ pub fn run_unify_analyze(
   }
 
   // Run analysis
-  let unifier = WorkspaceUnifier::with_config(ctx.cargo.metadata(), config);
+  let unifier = WorkspaceUnifier::with_config(&metadata, config);
   let plan = unifier.analyze()?;
 
   // Display summary
@@ -53,6 +156,9 @@ pub fn run_unify_analyze(
     return Err(RailError::message("Unification has blocking issues"));
   }
 
+  // Run optional validation if configured
+  maybe_run_validation(ctx)?;
+
   println!("\n✅ Analysis complete. Run 'cargo rail unify apply' to make changes.");
   Ok(())
 }
@@ -65,7 +171,13 @@ pub fn run_unify_apply(
   backup: bool,
   normal_only: bool,
 ) -> RailResult<()> {
+  // Sync config if enabled
+  maybe_sync_config(ctx)?;
+
   println!("🔧 Applying workspace dependency unification...\n");
+
+  // Get metadata (with --all-features if configured)
+  let metadata = get_unify_metadata(ctx)?;
 
   // Build config
   let mut config = UnifyConfig {
@@ -83,7 +195,7 @@ pub fn run_unify_apply(
   }
 
   // Run analysis first
-  let unifier = WorkspaceUnifier::with_config(ctx.cargo.metadata(), config);
+  let unifier = WorkspaceUnifier::with_config(&metadata, config);
   let plan = unifier.analyze()?;
 
   // Check for issues
@@ -95,8 +207,11 @@ pub fn run_unify_apply(
     return Err(RailError::message("Fix issues before applying"));
   }
 
-  // Create transformer
-  let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
+  // Run optional validation if configured (before applying changes)
+  maybe_run_validation(ctx)?;
+
+  // Create transformer (use the same metadata we used for analysis)
+  let transformer = CargoTransform::new(metadata);
 
   // 1. Write [workspace.dependencies]
   let workspace_toml = ctx.workspace_root().join("Cargo.toml");
@@ -162,8 +277,24 @@ pub fn run_unify_apply(
 }
 
 /// Check workspace dependencies are properly unified (for CI)
-pub fn run_unify_check(ctx: &WorkspaceContext, exclude: Vec<String>, normal_only: bool) -> RailResult<()> {
+pub fn run_unify_check(
+  ctx: &WorkspaceContext,
+  exclude: Vec<String>,
+  normal_only: bool,
+  validate_targets_flag: bool,
+) -> RailResult<()> {
+  // Sync config check (don't modify, just validate)
+  let sync_enabled = ctx.config.as_ref().map(|cfg| cfg.unify.sync_on_unify).unwrap_or(true);
+
+  if sync_enabled {
+    crate::commands::run_config_sync(ctx, true)?; // check=true
+    println!();
+  }
+
   println!("🔍 Checking workspace dependency unification...\n");
+
+  // Get metadata (with --all-features if configured)
+  let metadata = get_unify_metadata(ctx)?;
 
   // Build config
   let mut config = UnifyConfig {
@@ -177,7 +308,7 @@ pub fn run_unify_check(ctx: &WorkspaceContext, exclude: Vec<String>, normal_only
   }
 
   // Run analysis
-  let unifier = WorkspaceUnifier::with_config(ctx.cargo.metadata(), config);
+  let unifier = WorkspaceUnifier::with_config(&metadata, config);
   let plan = unifier.analyze()?;
 
   // Check for issues
@@ -210,6 +341,69 @@ pub fn run_unify_check(ctx: &WorkspaceContext, exclude: Vec<String>, normal_only
   println!("\nStats:");
   println!("  - {} dependencies analyzed", plan.stats.total_deps);
   println!("  - No unification opportunities found");
+
+  // Run optional per-target validation if CLI flag is set
+  if validate_targets_flag {
+    // Get targets from config
+    let targets = if let Some(cfg) = ctx.config.as_ref() {
+      if cfg.toolchain.targets.is_empty() {
+        println!("\n⚠️  --validate-targets flag set but no targets configured in rail.toml [toolchain.targets]");
+        println!("Add targets to .config/rail.toml to enable validation.");
+        return Ok(());
+      }
+      cfg.toolchain.targets.clone()
+    } else {
+      println!("\n⚠️  --validate-targets flag set but no rail.toml found");
+      println!("Create .config/rail.toml with [toolchain.targets] to enable validation.");
+      return Ok(());
+    };
+
+    println!("\n🔍 Running per-target validation for {} targets...\n", targets.len());
+
+    // Use configured parallelism or auto-detect
+    let max_parallel_jobs = ctx
+      .config
+      .as_ref()
+      .map(|cfg| cfg.unify.effective_parallelism())
+      .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+
+    let summary = validate_targets(ctx.workspace_root(), &targets, max_parallel_jobs)?;
+
+    // Print summary
+    println!("📊 Validation Summary:");
+    println!("  Total targets: {}", summary.total_targets);
+    println!("  Successful: {}", summary.successful);
+    println!("  Failed: {}", summary.failed);
+    println!();
+
+    // Print results
+    for result in &summary.results {
+      if result.success {
+        println!("  ✓ {} - OK", result.target);
+        if !result.warnings.is_empty() {
+          for warning in &result.warnings {
+            println!("    ⚠️  {}", warning);
+          }
+        }
+      } else {
+        println!("  ✗ {} - FAILED", result.target);
+        if let Some(ref error) = result.error {
+          println!("    Error: {}", error);
+        }
+      }
+    }
+
+    if !summary.all_passed() {
+      println!("\n❌ Target validation FAILED");
+      return Err(RailError::message(format!(
+        "Validation failed for {} target(s): {}",
+        summary.failed,
+        summary.failed_targets().join(", ")
+      )));
+    }
+
+    println!("\n✅ All target validations passed!");
+  }
 
   Ok(())
 }

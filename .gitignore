@@ -24,6 +24,7 @@ AGENTS.md
 
 # Cargo-Rail (Testing)
 *rail.toml
+.config/rail.toml.example
 
 # Notes
 TODO.md

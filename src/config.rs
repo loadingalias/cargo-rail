@@ -13,6 +13,10 @@ pub struct RailConfig {
   #[serde(default)]
   pub policy: PolicyConfig,
   #[serde(default)]
+  pub toolchain: ToolchainConfig,
+  #[serde(default)]
+  pub unify: UnifyConfig,
+  #[serde(default)]
   pub splits: Vec<SplitConfig>,
   #[serde(default)]
   pub releases: Vec<ReleaseConfig>,
@@ -155,6 +159,158 @@ impl PolicyConfig {
       || self.require_workspace_inheritance
       || !self.allowed_licenses.is_empty()
       || self.forbid_patch_replace
+  }
+}
+
+/// Toolchain configuration - source of truth for rust-toolchain.toml
+///
+/// This configuration drives `cargo rail config sync` to generate/validate rust-toolchain.toml
+/// Supports all rust-toolchain.toml fields as documented in rustup docs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolchainConfig {
+  /// Rust channel (stable, beta, nightly, or specific version like "1.76.0")
+  /// Mutually exclusive with `path`. If both are set, validation will fail.
+  #[serde(default = "default_channel")]
+  pub channel: String,
+
+  /// Path to custom local toolchain (absolute path)
+  /// Mutually exclusive with `channel`. When set, components and targets have no effect.
+  #[serde(default)]
+  pub path: Option<String>,
+
+  /// Toolchain profile (minimal, default, complete)
+  #[serde(default = "default_profile")]
+  pub profile: String,
+
+  /// Additional components (e.g., clippy, rustfmt, rust-src)
+  /// Additive to the current profile. No effect if `path` is set.
+  #[serde(default)]
+  pub components: Vec<String>,
+
+  /// Target triples for cross-compilation
+  /// Used by unify for optional validation and by config sync for rust-toolchain.toml
+  /// The host platform is automatically included. No effect if `path` is set.
+  #[serde(default)]
+  pub targets: Vec<String>,
+}
+
+fn default_channel() -> String {
+  "stable".to_string()
+}
+
+fn default_profile() -> String {
+  "default".to_string()
+}
+
+impl Default for ToolchainConfig {
+  fn default() -> Self {
+    Self {
+      channel: default_channel(),
+      path: None,
+      profile: default_profile(),
+      components: vec![],
+      targets: vec![],
+    }
+  }
+}
+
+impl ToolchainConfig {
+  /// Validate toolchain configuration
+  pub fn validate(&self) -> RailResult<()> {
+    // Validate mutual exclusivity: channel and path cannot both be set
+    if self.path.is_some() && !self.channel.is_empty() && self.channel != "stable" {
+      // Allow default "stable" to coexist with path (path takes precedence)
+      // But if user explicitly sets a non-default channel, that's an error
+      return Err(RailError::message(
+        "Toolchain 'channel' and 'path' are mutually exclusive. Use one or the other.",
+      ));
+    }
+
+    // Validate profile
+    match self.profile.as_str() {
+      "minimal" | "default" | "complete" => {}
+      _ => {
+        return Err(RailError::message(format!(
+          "Invalid toolchain profile '{}'. Must be 'minimal', 'default', or 'complete'",
+          self.profile
+        )));
+      }
+    }
+
+    // Validate channel format (basic check) - only if not using path
+    if self.path.is_none() && self.channel.is_empty() {
+      return Err(RailError::message("Toolchain channel cannot be empty"));
+    }
+
+    // Validate path if specified
+    if let Some(ref path) = self.path
+      && path.is_empty()
+    {
+      return Err(RailError::message("Toolchain path cannot be empty"));
+    }
+    // Note: We don't validate that the path exists here, as it might not exist yet
+    // or might be created after config is written. rustup will validate it.
+
+    Ok(())
+  }
+}
+
+/// Unify configuration - controls workspace dependency unification behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifyConfig {
+  /// Use --all-features when gathering metadata (default: true)
+  /// This ensures the feature union across all workspace members is captured
+  #[serde(default = "default_use_all_features")]
+  pub use_all_features: bool,
+
+  /// Automatically sync rust-toolchain.toml before unify runs (default: true)
+  #[serde(default = "default_sync_on_unify")]
+  pub sync_on_unify: bool,
+
+  /// Optional: validate unification against specific target triples
+  /// When enabled, runs parallel metadata checks per target to catch platform-specific issues
+  /// Examples: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+  #[serde(default)]
+  pub validate_targets: Vec<String>,
+
+  /// Maximum parallel jobs for validation (0 = auto-detect CPUs, >0 = explicit limit)
+  #[serde(default)]
+  pub max_parallel_jobs: usize,
+}
+
+fn default_use_all_features() -> bool {
+  true
+}
+
+fn default_sync_on_unify() -> bool {
+  true
+}
+
+impl Default for UnifyConfig {
+  fn default() -> Self {
+    Self {
+      use_all_features: default_use_all_features(),
+      sync_on_unify: default_sync_on_unify(),
+      validate_targets: vec![],
+      max_parallel_jobs: 0, // Auto-detect
+    }
+  }
+}
+
+impl UnifyConfig {
+  /// Check if target validation is enabled
+  pub fn validation_enabled(&self) -> bool {
+    !self.validate_targets.is_empty()
+  }
+
+  /// Get effective parallel job count (auto-detect if 0)
+  pub fn effective_parallelism(&self) -> usize {
+    if self.max_parallel_jobs == 0 {
+      // Auto-detect: use number of logical CPUs
+      std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+      self.max_parallel_jobs
+    }
   }
 }
 
@@ -380,6 +536,12 @@ impl RailConfig {
       .policy
       .validate()
       .with_context(|| format!("Invalid policy configuration in {}", config_path.display()))?;
+
+    // Validate toolchain configuration
+    config
+      .toolchain
+      .validate()
+      .with_context(|| format!("Invalid toolchain configuration in {}", config_path.display()))?;
 
     // Validate release configurations
     let workspace_root = &config.workspace.root;
@@ -647,5 +809,146 @@ mod tests {
 
     assert!(release.validate(&temp_dir).is_err());
     let _ = fs::remove_dir_all(&temp_dir);
+  }
+
+  // ============================================================================
+  // Toolchain Config Tests
+  // ============================================================================
+
+  #[test]
+  fn test_toolchain_config_default() {
+    let toolchain = ToolchainConfig::default();
+    assert_eq!(toolchain.channel, "stable");
+    assert_eq!(toolchain.profile, "default");
+    assert!(toolchain.components.is_empty());
+    assert!(toolchain.targets.is_empty());
+  }
+
+  #[test]
+  fn test_toolchain_config_validation_valid() {
+    let toolchain = ToolchainConfig {
+      channel: "1.76.0".to_string(),
+      path: None,
+      profile: "minimal".to_string(),
+      components: vec!["clippy".to_string(), "rustfmt".to_string()],
+      targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+    };
+    assert!(toolchain.validate().is_ok());
+  }
+
+  #[test]
+  fn test_toolchain_config_path_mode() {
+    let toolchain = ToolchainConfig {
+      channel: "stable".to_string(), // Default, allowed with path
+      path: Some("/path/to/custom/toolchain".to_string()),
+      profile: "default".to_string(),
+      components: vec![],
+      targets: vec![],
+    };
+    assert!(toolchain.validate().is_ok());
+  }
+
+  #[test]
+  fn test_toolchain_config_path_channel_conflict() {
+    let toolchain = ToolchainConfig {
+      channel: "nightly".to_string(), // Non-default channel conflicts with path
+      path: Some("/path/to/custom/toolchain".to_string()),
+      profile: "default".to_string(),
+      components: vec![],
+      targets: vec![],
+    };
+    assert!(toolchain.validate().is_err());
+  }
+
+  #[test]
+  fn test_toolchain_config_validation_invalid_profile() {
+    let toolchain = ToolchainConfig {
+      channel: "stable".to_string(),
+      path: None,
+      profile: "invalid".to_string(),
+      components: vec![],
+      targets: vec![],
+    };
+    assert!(toolchain.validate().is_err());
+  }
+
+  #[test]
+  fn test_toolchain_config_validation_empty_channel() {
+    let toolchain = ToolchainConfig {
+      channel: "".to_string(),
+      path: None,
+      profile: "default".to_string(),
+      components: vec![],
+      targets: vec![],
+    };
+    assert!(toolchain.validate().is_err());
+  }
+
+  // ============================================================================
+  // Unify Config Tests
+  // ============================================================================
+
+  #[test]
+  fn test_unify_config_default() {
+    let unify = UnifyConfig::default();
+    assert!(unify.use_all_features);
+    assert!(unify.sync_on_unify);
+    assert!(unify.validate_targets.is_empty());
+    assert_eq!(unify.max_parallel_jobs, 0); // Auto-detect
+  }
+
+  #[test]
+  fn test_unify_config_validation_enabled() {
+    let unify_disabled = UnifyConfig::default();
+    assert!(!unify_disabled.validation_enabled());
+
+    let unify_enabled = UnifyConfig {
+      validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+      ..Default::default()
+    };
+    assert!(unify_enabled.validation_enabled());
+  }
+
+  #[test]
+  fn test_unify_config_effective_parallelism_auto() {
+    let unify = UnifyConfig {
+      max_parallel_jobs: 0, // Auto-detect
+      ..Default::default()
+    };
+    let parallelism = unify.effective_parallelism();
+    assert!(parallelism >= 1, "Should detect at least 1 CPU");
+  }
+
+  #[test]
+  fn test_unify_config_effective_parallelism_explicit() {
+    let unify = UnifyConfig {
+      max_parallel_jobs: 4,
+      ..Default::default()
+    };
+    assert_eq!(unify.effective_parallelism(), 4);
+  }
+
+  #[test]
+  fn test_unify_config_serialization() {
+    let unify = UnifyConfig {
+      use_all_features: true,
+      sync_on_unify: false,
+      validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+      max_parallel_jobs: 2,
+    };
+
+    // Serialize to TOML
+    let toml = toml_edit::ser::to_string(&unify).unwrap();
+    assert!(toml.contains("use_all_features = true"));
+    assert!(toml.contains("sync_on_unify = false"));
+    assert!(toml.contains("x86_64-unknown-linux-gnu"));
+    assert!(toml.contains("max_parallel_jobs = 2"));
+
+    // Deserialize back
+    let parsed: UnifyConfig = toml_edit::de::from_str(&toml).unwrap();
+    assert_eq!(parsed.use_all_features, unify.use_all_features);
+    assert_eq!(parsed.sync_on_unify, unify.sync_on_unify);
+    assert_eq!(parsed.validate_targets, unify.validate_targets);
+    assert_eq!(parsed.max_parallel_jobs, unify.max_parallel_jobs);
   }
 }

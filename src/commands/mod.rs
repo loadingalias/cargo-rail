@@ -5,6 +5,9 @@
 //! ## Dependency Unification
 //! - **unify**: Eliminate workspace-hack crates via native workspace dependency unification
 //!
+//! ## Configuration Management
+//! - **config**: Sync configuration files (rust-toolchain.toml, etc.)
+//!
 //! ## Split & Sync
 //! - **split**: Split monorepo crates to separate repositories
 //! - **sync**: Bidirectional sync between monorepo and split repos
@@ -16,12 +19,14 @@
 //! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
 
 pub mod affected;
+pub mod config_sync;
 pub mod split;
 pub mod status;
 pub mod sync;
 pub mod unify;
 
 pub use affected::run_affected;
+pub use config_sync::run_config_sync;
 pub use split::run_split;
 pub use status::run_status;
 pub use sync::run_sync;

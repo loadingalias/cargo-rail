@@ -96,6 +96,13 @@ enum Commands {
   },
 
   // ============================================================================
+  // Configuration Management
+  // ============================================================================
+  /// Configuration management (sync rust-toolchain.toml, etc.)
+  #[command(subcommand)]
+  Config(ConfigCommands),
+
+  // ============================================================================
   // Workspace Inspection
   // ============================================================================
   /// Show status of all configured crates
@@ -164,6 +171,19 @@ enum UnifyCommands {
     /// Only check normal dependencies
     #[arg(long)]
     normal_only: bool,
+    /// Enable per-target validation (runs cargo metadata for each target)
+    #[arg(long)]
+    validate_targets: bool,
+  },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+  /// Sync rust-toolchain.toml from rail.toml configuration
+  Sync {
+    /// Check if rust-toolchain.toml matches config (don't modify)
+    #[arg(long)]
+    check: bool,
   },
 }
 
@@ -214,7 +234,16 @@ fn main() {
         backup,
         normal_only,
       } => commands::run_unify_apply(&ctx, exclude, include, backup, normal_only),
-      UnifyCommands::Check { exclude, normal_only } => commands::run_unify_check(&ctx, exclude, normal_only),
+      UnifyCommands::Check {
+        exclude,
+        normal_only,
+        validate_targets,
+      } => commands::run_unify_check(&ctx, exclude, normal_only, validate_targets),
+    },
+
+    // Configuration Management
+    Commands::Config(config_cmd) => match config_cmd {
+      ConfigCommands::Sync { check } => commands::run_config_sync(&ctx, check),
     },
 
     // Split/Sync
