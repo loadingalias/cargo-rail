@@ -6,6 +6,7 @@
 //! - **unify**: Eliminate workspace-hack crates via native workspace dependency unification
 //!
 //! ## Configuration Management
+//! - **init**: Initialize cargo-rail configuration (rail.toml)
 //! - **config**: Sync configuration files (rust-toolchain.toml, etc.)
 //!
 //! ## Split & Sync
@@ -21,6 +22,7 @@
 pub mod affected;
 pub mod common;
 pub mod config_sync;
+pub mod init;
 pub mod split;
 pub mod status;
 pub mod sync;
@@ -30,6 +32,7 @@ pub mod watch;
 
 pub use affected::run_affected;
 pub use config_sync::run_config_sync;
+pub use init::run_init;
 pub use split::run_split;
 pub use status::run_status;
 pub use sync::run_sync;

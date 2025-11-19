@@ -76,6 +76,25 @@ enum Commands {
   Unify(UnifyCommands),
 
   // ============================================================================
+  // Configuration Management
+  // ============================================================================
+  /// Initialize cargo-rail configuration (rail.toml)
+  Init {
+    /// Output path for rail.toml (default: .config/rail.toml)
+    #[arg(long, short, default_value = ".config/rail.toml")]
+    output: String,
+    /// Overwrite existing rail.toml
+    #[arg(long)]
+    force: bool,
+    /// Skip interactive prompts and use all defaults
+    #[arg(long)]
+    non_interactive: bool,
+    /// Output the generated config to stdout instead of writing to file
+    #[arg(long)]
+    dry_run: bool,
+  },
+
+  // ============================================================================
   // Split/Sync Orchestration
   // ============================================================================
   /// Split a crate from monorepo to separate repo with history
@@ -266,6 +285,14 @@ fn main() {
         commands::run_test(&ctx, config)
       }
     }
+
+    // Configuration Management
+    Commands::Init {
+      output,
+      force,
+      non_interactive,
+      dry_run,
+    } => commands::run_init(&ctx, &output, force, non_interactive, dry_run),
 
     // Dependency Unification
     Commands::Unify(unify_cmd) => match unify_cmd {

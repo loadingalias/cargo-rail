@@ -78,12 +78,18 @@ pub fn validate_targets(
   pool.install(|| {
     targets.par_iter().for_each(|target| {
       let result = validate_single_target(workspace_root, target);
-      results.lock().unwrap().push(result);
+      results
+        .lock()
+        .expect("Mutex poisoned: another thread panicked while holding the lock")
+        .push(result);
     });
   });
 
   // Collect results
-  let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+  let results = Arc::try_unwrap(results)
+    .expect("Arc still has multiple owners")
+    .into_inner()
+    .expect("Mutex poisoned: another thread panicked while holding the lock");
   let successful = results.iter().filter(|r| r.success).count();
   let failed = results.iter().filter(|r| !r.success).count();
 

@@ -183,7 +183,9 @@ fn display_json(analysis: &AffectedAnalysis) -> RailResult<()> {
       }
   });
 
-  println!("{}", serde_json::to_string_pretty(&output).unwrap());
+  let json_output = serde_json::to_string_pretty(&output)
+    .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))?;
+  println!("{}", json_output);
 
   Ok(())
 }

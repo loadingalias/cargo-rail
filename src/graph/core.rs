@@ -259,7 +259,10 @@ impl WorkspaceGraph {
 
     // Build cache if needed (interior mutability with RwLock)
     {
-      let cache = self.path_cache.read().unwrap();
+      let cache = self
+        .path_cache
+        .read()
+        .expect("RwLock poisoned: another thread panicked while holding the lock");
       if cache.is_none() {
         drop(cache); // Release read lock before acquiring write lock
         self.build_path_cache();
@@ -269,7 +272,10 @@ impl WorkspaceGraph {
     // Normalize path
     let normalized = file_path.canonicalize().ok()?;
 
-    let cache = self.path_cache.read().unwrap();
+    let cache = self
+      .path_cache
+      .read()
+      .expect("RwLock poisoned: another thread panicked while holding the lock");
     let cache_ref = cache.as_ref()?;
 
     // Direct lookup

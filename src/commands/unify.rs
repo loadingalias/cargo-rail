@@ -275,9 +275,15 @@ pub fn run_unify_apply(
         frag.feature_sets.len()
       );
 
-      // Parse version
+      // Parse version - try exact version first, then bare version
       let version_req = semver::VersionReq::parse(&format!("={}", frag.version))
-        .unwrap_or_else(|_| semver::VersionReq::parse(&frag.version).unwrap());
+        .or_else(|_| semver::VersionReq::parse(&frag.version))
+        .map_err(|e| {
+          RailError::message(format!(
+            "Failed to parse version '{}' for transitive dependency '{}': {}",
+            frag.version, frag.name, e
+          ))
+        })?;
 
       transitive_deps_to_add.push(crate::cargo::UnifiedDep {
         name: frag.name.clone(),
