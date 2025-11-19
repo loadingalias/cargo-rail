@@ -233,7 +233,7 @@ impl fmt::Display for ConfigError {
       ConfigError::NotFound { workspace_root } => {
         write!(
           f,
-          "No cargo-rail configuration found.\nExpected file: {}/.rail/config.toml",
+          "No cargo-rail configuration found in: {}\nSearched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\nRun 'cargo rail init' to create one.",
           workspace_root.display()
         )
       }

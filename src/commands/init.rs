@@ -616,6 +616,109 @@ fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
   Ok(())
 }
 
+/// Standalone init that doesn't require WorkspaceContext
+///
+/// This is used when init is called on a directory that may not have
+/// a valid Cargo workspace yet (e.g., empty workspace or invalid state).
+pub fn run_init_standalone(
+  workspace_root: &Path,
+  output_path: &str,
+  force: bool,
+  _non_interactive: bool,
+  dry_run: bool,
+) -> RailResult<()> {
+  let config_path = workspace_root.join(output_path);
+
+  // 1. Check for existing config
+  if let Some(existing) = check_existing_config(workspace_root) {
+    if !force {
+      return Err(RailError::with_help(
+        format!(
+          "Configuration already exists at: {}\nUse --force to overwrite or --output to specify a different location",
+          existing.display()
+        ),
+        "Example: cargo rail init --force",
+      ));
+    }
+    if !dry_run {
+      println!("⚠️  Overwriting existing config at: {}", existing.display());
+    }
+  }
+
+  // 2. Detection phase
+  println!("🔍 Detecting workspace configuration...\n");
+
+  let toolchain_config = detect_toolchain_config(workspace_root)?;
+  let policy_config = detect_policy_config(workspace_root)?;
+
+  // Display detected settings
+  println!("  Toolchain: {} ({})", toolchain_config.channel, toolchain_config.profile);
+  if let Some(ref resolver) = policy_config.resolver {
+    println!("  Resolver: {}", resolver);
+  }
+  if let Some(ref edition) = policy_config.edition {
+    println!("  Edition: {}", edition);
+  }
+  if let Some(ref msrv) = policy_config.msrv {
+    println!("  MSRV: {}", msrv);
+  }
+  println!();
+
+  // 3. Build config
+  let config = RailConfig {
+    workspace: WorkspaceConfig {
+      root: PathBuf::from("."),
+    },
+    toolchain: toolchain_config,
+    policy: policy_config,
+    unify: UnifyConfig {
+      use_all_features: true,
+      sync_on_unify: true,
+      validate_targets: vec![],
+      max_parallel_jobs: 0,
+      pin_transitives: false,
+      pin_hosts: vec![],
+    },
+    security: SecurityConfig {
+      ssh_key_path: None,
+      signing_key_path: None,
+      require_signed_commits: false,
+      pr_branch_pattern: "rail/sync/{crate}/{timestamp}".to_string(),
+      protected_branches: vec!["main".to_string(), "master".to_string()],
+    },
+    splits: vec![],
+  };
+
+  // 4. Serialize with rich comments
+  let config_toml = serialize_config_with_comments(&config)?;
+
+  // 5. Output
+  if dry_run {
+    println!("--- {} ---", output_path);
+    println!("{}", config_toml);
+    println!("\n✅ Dry-run complete (no files written)");
+  } else {
+    // Create parent directory if needed
+    if let Some(parent) = config_path.parent() {
+      fs::create_dir_all(parent).map_err(|e| {
+        RailError::with_help(
+          format!("Failed to create directory {}: {}", parent.display(), e),
+          "Check file permissions",
+        )
+      })?;
+    }
+
+    write_config_file(&config_path, &config_toml)?;
+    println!("✅ Created {}", config_path.display());
+    println!("\nNext steps:");
+    println!("  1. Review and customize {}", output_path);
+    println!("  2. Run `cargo rail unify` to normalize dependencies");
+    println!("  3. Run `cargo rail test` for change-based testing");
+  }
+
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

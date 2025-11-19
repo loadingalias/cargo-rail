@@ -14,7 +14,13 @@ pub struct TestWorkspace {
 impl TestWorkspace {
   /// Create a new test workspace with basic structure
   pub fn new() -> Result<Self> {
-    let root = TempDir::new()?;
+    Self::new_named("test-workspace")
+  }
+
+  /// Create a new test workspace with specific name
+  pub fn new_named(name: &str) -> Result<Self> {
+    let root = TempDir::new_in(std::env::temp_dir())
+      .with_context(|| format!("Failed to create temp dir for test workspace '{}'", name))?;
     let path = root.path().to_path_buf();
 
     // Initialize git repo with main as default branch
@@ -161,6 +167,15 @@ mod tests {{
   pub fn read_file(&self, path: &str) -> Result<String> {
     Ok(std::fs::read_to_string(self.path.join(path))?)
   }
+
+  /// Remove the rail.toml config file (useful for init tests)
+  pub fn remove_config(&self) -> Result<()> {
+    let config_path = self.path.join(".config/rail.toml");
+    if config_path.exists() {
+      std::fs::remove_file(config_path)?;
+    }
+    Ok(())
+  }
 }
 
 /// Run git command in a directory
@@ -189,16 +204,11 @@ pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
     .output()
     .context("Failed to run cargo-rail")?;
 
-  if !output.status.success() {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    anyhow::bail!(
-      "cargo-rail command failed: cargo rail {}\nstdout: {}\nstderr: {}",
-      args.join(" "),
-      stdout,
-      stderr
-    );
-  }
-
   Ok(output)
+}
+
+/// Load RailConfig from a workspace
+pub fn load_rail_config(workspace_root: &Path) -> Result<cargo_rail::config::RailConfig> {
+  cargo_rail::config::RailConfig::load(workspace_root)
+    .context("Failed to load rail.toml configuration")
 }

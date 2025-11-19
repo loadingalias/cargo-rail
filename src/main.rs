@@ -231,7 +231,7 @@ fn get_styles() -> clap::builder::Styles {
 fn main() {
   let CargoCli::Rail(cli) = CargoCli::parse();
 
-  // Build workspace context once (single-load pattern)
+  // Get workspace root
   let workspace_root = match std::env::current_dir() {
     Ok(dir) => dir,
     Err(e) => {
@@ -240,6 +240,22 @@ fn main() {
     }
   };
 
+  // Handle init command specially - it doesn't require a valid workspace
+  if let Commands::Init {
+    output,
+    force,
+    non_interactive,
+    dry_run,
+  } = cli.command
+  {
+    let result = commands::run_init_standalone(&workspace_root, &output, force, non_interactive, dry_run);
+    if let Err(e) = result {
+      handle_error(e);
+    }
+    return;
+  }
+
+  // Build workspace context once (single-load pattern) for all other commands
   let ctx = match workspace::WorkspaceContext::build(&workspace_root) {
     Ok(ctx) => ctx,
     Err(e) => {
@@ -286,13 +302,8 @@ fn main() {
       }
     }
 
-    // Configuration Management
-    Commands::Init {
-      output,
-      force,
-      non_interactive,
-      dry_run,
-    } => commands::run_init(&ctx, &output, force, non_interactive, dry_run),
+    // Configuration Management (Init is handled above before building WorkspaceContext)
+    Commands::Init { .. } => unreachable!("Init command should be handled earlier"),
 
     // Dependency Unification
     Commands::Unify(unify_cmd) => match unify_cmd {

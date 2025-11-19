@@ -32,7 +32,7 @@ pub mod watch;
 
 pub use affected::run_affected;
 pub use config_sync::run_config_sync;
-pub use init::run_init;
+pub use init::{run_init, run_init_standalone};
 pub use split::run_split;
 pub use status::run_status;
 pub use sync::run_sync;

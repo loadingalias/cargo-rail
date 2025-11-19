@@ -9,9 +9,9 @@ check:
     cargo fmt --all
     cargo check --workspace --all-targets --all-features
     cargo clippy --workspace --all-targets --all-features --fix --allow-dirty -- -D warnings
-    # cargo deny check all
+    cargo deny check all
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-    # cargo audit
+    cargo audit
     @echo "✅ All checks passed!"
 
 ci-check:

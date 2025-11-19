@@ -511,7 +511,7 @@ pub fn run_unify_check(
       cfg.toolchain.targets.clone()
     } else {
       println!("\n⚠️  --validate-targets flag set but no rail.toml found");
-      println!("Create .config/rail.toml with [toolchain.targets] to enable validation.");
+      println!("Run 'cargo rail init' to create a configuration file with [toolchain.targets].");
       return Ok(());
     };
 
