@@ -1,6 +1,6 @@
 //! Integration tests for `cargo rail init` command
 
-use crate::helpers::{load_rail_config, run_cargo_rail, TestWorkspace};
+use crate::helpers::{TestWorkspace, load_rail_config, run_cargo_rail};
 use anyhow::Result;
 
 #[test]
@@ -19,7 +19,7 @@ fn test_init_creates_config() -> Result<()> {
   assert!(config_path.exists(), "config file should be created");
 
   // Verify config is valid TOML and contains expected sections
-  let config_content = std::fs::read_to_string(&config_path)?;
+  let config_content = std::fs::read_to_string(config_path)?;
   assert!(config_content.contains("[workspace]"));
   assert!(config_content.contains("[toolchain]"));
   assert!(config_content.contains("[unify]"));
@@ -69,7 +69,7 @@ fn test_init_detects_toolchain() -> Result<()> {
 
   // Create rust-toolchain.toml with specific version
   std::fs::write(
-    &ws.path.join("rust-toolchain.toml"),
+    ws.path.join("rust-toolchain.toml"),
     r#"[toolchain]
 channel = "1.76.0"
 profile = "minimal"
@@ -81,7 +81,7 @@ components = ["clippy", "rustfmt"]
   run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
 
   // Verify config detects toolchain
-  let config_content = std::fs::read_to_string(&ws.path.join(".config/rail.toml"))?;
+  let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
   assert!(
     config_content.contains("channel = \"1.76.0\""),
     "should detect channel from rust-toolchain.toml"
@@ -105,20 +105,17 @@ fn test_init_detects_policy_from_cargo_toml() -> Result<()> {
 
   // Update workspace Cargo.toml to add rust-version to existing workspace.package
   let cargo_toml = &ws.path.join("Cargo.toml");
-  let existing_content = std::fs::read_to_string(&cargo_toml)?;
+  let existing_content = std::fs::read_to_string(cargo_toml)?;
 
   // Add rust-version to existing [workspace.package] section
-  let new_content = existing_content.replace(
-    "edition = \"2021\"",
-    "edition = \"2021\"\nrust-version = \"1.75.0\"",
-  );
-  std::fs::write(&cargo_toml, new_content)?;
+  let new_content = existing_content.replace("edition = \"2021\"", "edition = \"2021\"\nrust-version = \"1.75.0\"");
+  std::fs::write(cargo_toml, new_content)?;
 
   // Run init
   run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
 
   // Verify config detects policy
-  let config_content = std::fs::read_to_string(&ws.path.join(".config/rail.toml"))?;
+  let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
   assert!(
     config_content.contains("resolver = \"2\""),
     "should detect resolver from Cargo.toml"
@@ -221,9 +218,9 @@ fn test_init_generated_config_is_valid() -> Result<()> {
   assert_eq!(config.workspace.root.to_str().unwrap(), ".");
   assert_eq!(config.toolchain.channel, "stable");
   assert_eq!(config.toolchain.profile, "default");
-  assert_eq!(config.unify.use_all_features, true);
-  assert_eq!(config.unify.sync_on_unify, true);
-  assert_eq!(config.security.require_signed_commits, false);
+  assert!(config.unify.use_all_features);
+  assert!(config.unify.sync_on_unify);
+  assert!(!config.security.require_signed_commits);
   assert_eq!(config.security.protected_branches, vec!["main", "master"]);
 
   Ok(())
@@ -235,13 +232,13 @@ fn test_init_with_rust_toolchain_plain_file() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Create plain rust-toolchain file (no .toml extension)
-  std::fs::write(&ws.path.join("rust-toolchain"), "1.80.0\n")?;
+  std::fs::write(ws.path.join("rust-toolchain"), "1.80.0\n")?;
 
   // Run init
   run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
 
   // Verify config detects channel
-  let config_content = std::fs::read_to_string(&ws.path.join(".config/rail.toml"))?;
+  let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
   assert!(
     config_content.contains("channel = \"1.80.0\""),
     "should detect channel from rust-toolchain file"
@@ -258,7 +255,7 @@ fn test_init_all_fields_present() -> Result<()> {
   // Run init
   run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
 
-  let config_content = std::fs::read_to_string(&ws.path.join(".config/rail.toml"))?;
+  let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
 
   // Verify ALL config sections and fields are present (active or commented)
 

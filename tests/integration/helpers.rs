@@ -209,6 +209,5 @@ pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
 
 /// Load RailConfig from a workspace
 pub fn load_rail_config(workspace_root: &Path) -> Result<cargo_rail::config::RailConfig> {
-  cargo_rail::config::RailConfig::load(workspace_root)
-    .context("Failed to load rail.toml configuration")
+  cargo_rail::config::RailConfig::load(workspace_root).context("Failed to load rail.toml configuration")
 }

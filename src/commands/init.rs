@@ -166,10 +166,12 @@ fn detect_workspace_patterns(ctx: &WorkspaceContext) -> WorkspacePatternInfo {
   for pkg in &members {
     if let Ok(rel_path) = pkg.manifest_path.strip_prefix(workspace_root)
       && let Some(first_component) = rel_path.components().next()
-        && let Some(dir_name) = first_component.as_os_str().to_str()
-          && dir_name != "Cargo.toml" && !dir_name.starts_with('.') {
-            subdirs.insert(dir_name.to_string());
-          }
+      && let Some(dir_name) = first_component.as_os_str().to_str()
+      && dir_name != "Cargo.toml"
+      && !dir_name.starts_with('.')
+    {
+      subdirs.insert(dir_name.to_string());
+    }
   }
 
   let subdirectories: Vec<_> = subdirs.into_iter().collect();
@@ -590,11 +592,12 @@ fn check_existing_config(workspace_root: &Path) -> Option<PathBuf> {
 /// Ensure output directory exists (create if needed)
 fn ensure_output_dir(output_path: &Path) -> RailResult<()> {
   if let Some(parent) = output_path.parent()
-    && !parent.exists() {
-      println!("📁 Creating directory: {}", parent.display());
-      fs::create_dir_all(parent)
-        .map_err(|e| RailError::message(format!("Failed to create directory {}: {}", parent.display(), e)))?;
-    }
+    && !parent.exists()
+  {
+    println!("📁 Creating directory: {}", parent.display());
+    fs::create_dir_all(parent)
+      .map_err(|e| RailError::message(format!("Failed to create directory {}: {}", parent.display(), e)))?;
+  }
   Ok(())
 }
 
@@ -652,7 +655,10 @@ pub fn run_init_standalone(
   let policy_config = detect_policy_config(workspace_root)?;
 
   // Display detected settings
-  println!("  Toolchain: {} ({})", toolchain_config.channel, toolchain_config.profile);
+  println!(
+    "  Toolchain: {} ({})",
+    toolchain_config.channel, toolchain_config.profile
+  );
   if let Some(ref resolver) = policy_config.resolver {
     println!("  Resolver: {}", resolver);
   }
