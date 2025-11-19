@@ -368,15 +368,61 @@ pub enum WorkspaceMode {
 
 impl RailConfig {
   /// Find config file in search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+  ///
+  /// On Windows, this handles path canonicalization issues (UNC paths, 8.3 short names)
+  /// by checking both the original path and its parent's canonicalization.
   pub fn find_config_path(path: &Path) -> Option<PathBuf> {
-    let candidates = vec![
+    let candidates = [
       path.join("rail.toml"),
       path.join(".rail.toml"),
       path.join(".cargo").join("rail.toml"),
       path.join(".config").join("rail.toml"),
     ];
 
-    candidates.into_iter().find(|p| p.exists())
+    // First, try the candidates as-is
+    if let Some(found) = candidates.iter().find(|p| p.exists()) {
+      return Some(found.to_path_buf());
+    }
+
+    // On Windows, if path is canonicalized (e.g., from cargo metadata),
+    // we may need to check using the original non-canonicalized path.
+    // We do this by checking if a de-canonicalized version exists.
+    #[cfg(target_os = "windows")]
+    {
+      // Try to find the config by reconstructing paths from the parent
+      // This handles cases where:
+      // 1. cargo metadata returns \\?\C:\Users\RUNNER~1\AppData\Local\Temp\...
+      // 2. But test wrote file to C:\Users\RUNNER~1\AppData\Local\Temp\...
+      // Or the short name (8.3) vs long name issue
+
+      // Check if we can read the directory to find config files
+      if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+          let file_name = entry.file_name();
+          let file_name_str = file_name.to_string_lossy();
+
+          // Check if this entry matches any of our config file names
+          if file_name_str == "rail.toml" || file_name_str == ".rail.toml" {
+            return Some(entry.path());
+          }
+        }
+      }
+
+      // Also check subdirectories .cargo and .config
+      for subdir in &[".cargo", ".config"] {
+        let subdir_path = path.join(subdir);
+        if let Ok(entries) = std::fs::read_dir(&subdir_path) {
+          for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if file_name.to_string_lossy() == "rail.toml" {
+              return Some(entry.path());
+            }
+          }
+        }
+      }
+    }
+
+    None
   }
 
   /// Load config from rail.toml (searches multiple locations)

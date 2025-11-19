@@ -114,10 +114,12 @@ impl WorkspaceContext {
   ///
   /// Use this in commands that require rail.toml configuration.
   pub fn require_config(&self) -> RailResult<&Arc<RailConfig>> {
-    self
-      .config
-      .as_ref()
-      .ok_or_else(|| crate::error::RailError::message("No rail.toml found. Run 'cargo rail init' to create one."))
+    self.config.as_ref().ok_or_else(|| {
+      crate::error::RailError::message(format!(
+        "No rail.toml found in: {}\nSearched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\nRun 'cargo rail init' to create one.",
+        self.workspace_root.display()
+      ))
+    })
   }
 
   /// Get rail config (convenience wrapper for require_config)
