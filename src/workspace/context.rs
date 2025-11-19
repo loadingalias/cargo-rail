@@ -80,7 +80,14 @@ impl WorkspaceContext {
     let workspace_root = cargo.workspace_root().to_path_buf();
 
     // Validate git repo root and workspace_root match (or warn if they differ)
-    if git.repo_root() != workspace_root {
+    // Canonicalize both paths to handle Windows short (8.3) vs long path formats
+    let git_root_canonical = git
+      .repo_root()
+      .canonicalize()
+      .unwrap_or_else(|_| git.repo_root().to_path_buf());
+    let workspace_root_canonical = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
+
+    if git_root_canonical != workspace_root_canonical {
       eprintln!(
         "⚠️  Warning: Git repo root ({}) differs from Cargo workspace root ({})",
         git.repo_root().display(),
