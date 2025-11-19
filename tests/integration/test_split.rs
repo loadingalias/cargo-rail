@@ -27,7 +27,7 @@ branch = "main"
 mode = "single"
 paths = [{{ crate = "crates/mylib" }}]
 "#,
-    split_path.display()
+    split_path.display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
@@ -78,7 +78,7 @@ branch = "main"
 mode = "single"
 paths = [{{ crate = "crates/mylib" }}]
 "#,
-    split_dir.path().display()
+    split_dir.path().display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
@@ -122,7 +122,7 @@ branch = "main"
 mode = "single"
 paths = [{{ crate = "crates/lib-a" }}]
 "#,
-    split_dir.path().display()
+    split_dir.path().display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
@@ -162,7 +162,7 @@ branch = "main"
 mode = "single"
 paths = [{{ crate = "crates/lib-core" }}]
 "#,
-    split_dir.path().display()
+    split_dir.path().display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 

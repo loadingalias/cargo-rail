@@ -23,7 +23,7 @@ mode = "single"
 paths = [{{ crate = "crates/{}" }}]
 "#,
     crate_name,
-    split_dir.path().display(),
+    split_dir.path().display().to_string().replace('\\', "\\\\"),
     crate_name
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
