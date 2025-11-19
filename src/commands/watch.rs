@@ -110,7 +110,7 @@ fn run_with_bacon(_ctx: &WorkspaceContext, _config: TestConfig) -> RailResult<()
   println!("   Running: bacon test\n");
 
   // Note: In the future, we could generate a custom bacon.toml that runs
-  // `cargo rail graph test` instead of `cargo test` to get smart change detection
+  // `cargo rail test` instead of `cargo test` to get smart change detection
   // while still benefiting from bacon's UI. For now, users get standard bacon behavior.
 
   let status = Command::new("bacon")
@@ -133,8 +133,8 @@ fn run_with_cargo_watch(ctx: &WorkspaceContext, config: TestConfig) -> RailResul
   let mut cmd = Command::new("cargo-watch");
   cmd.current_dir(ctx.workspace_root());
 
-  // cargo-watch -x "rail graph test --since HEAD~1"
-  let mut rail_cmd = String::from("rail graph test");
+  // cargo-watch -x "rail test --since HEAD~1"
+  let mut rail_cmd = String::from("rail test");
 
   if let Some(ref since) = config.since {
     rail_cmd.push_str(&format!(" --since {}", since));

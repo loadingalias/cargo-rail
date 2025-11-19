@@ -27,9 +27,46 @@ enum Commands {
   // ============================================================================
   // Graph-Aware CI Optimization
   // ============================================================================
-  /// Graph-aware workspace operations
-  #[command(subcommand)]
-  Graph(GraphCommands),
+  /// Show which crates are affected by changes
+  Affected {
+    /// Git ref to compare against (default: origin/main)
+    #[arg(long, default_value = "origin/main")]
+    since: String,
+    /// Start ref (for SHA pair mode)
+    #[arg(long, conflicts_with = "since")]
+    from: Option<String>,
+    /// End ref (for SHA pair mode)
+    #[arg(long, requires = "from")]
+    to: Option<String>,
+    /// Output format: text, json, names-only
+    #[arg(long, default_value = "text")]
+    format: String,
+  },
+
+  /// Run tests only for affected crates (smart test runner)
+  Test {
+    /// Git ref to compare against (auto-detects origin/main, origin/master, or HEAD~1)
+    #[arg(long)]
+    since: Option<String>,
+    /// Use cargo-nextest if available
+    #[arg(long)]
+    nextest: bool,
+    /// Show what would be tested without running tests
+    #[arg(long)]
+    dry_run: bool,
+    /// Explain why tests are being run
+    #[arg(long)]
+    explain: bool,
+    /// Watch for file changes and re-run tests automatically
+    #[arg(long)]
+    watch: bool,
+    /// Watch mode backend: bacon, cargo-watch, auto (default: auto)
+    #[arg(long, default_value = "auto")]
+    watch_mode: String,
+    /// Pass additional arguments to the test runner
+    #[arg(last = true)]
+    test_args: Vec<String>,
+  },
 
   // ============================================================================
   // Dependency Unification
@@ -104,50 +141,6 @@ enum Commands {
     /// Output status in JSON format
     #[arg(long)]
     json: bool,
-  },
-}
-
-#[derive(Subcommand)]
-enum GraphCommands {
-  /// Show which crates are affected by changes
-  Affected {
-    /// Git ref to compare against (default: origin/main)
-    #[arg(long, default_value = "origin/main")]
-    since: String,
-    /// Start ref (for SHA pair mode)
-    #[arg(long, conflicts_with = "since")]
-    from: Option<String>,
-    /// End ref (for SHA pair mode)
-    #[arg(long, requires = "from")]
-    to: Option<String>,
-    /// Output format: text, json, names-only
-    #[arg(long, default_value = "text")]
-    format: String,
-  },
-
-  /// Run tests only for affected crates (smart test runner)
-  Test {
-    /// Git ref to compare against (auto-detects origin/main, origin/master, or HEAD~1)
-    #[arg(long)]
-    since: Option<String>,
-    /// Use cargo-nextest if available
-    #[arg(long)]
-    nextest: bool,
-    /// Show what would be tested without running tests
-    #[arg(long)]
-    dry_run: bool,
-    /// Explain why tests are being run
-    #[arg(long)]
-    explain: bool,
-    /// Watch for file changes and re-run tests automatically
-    #[arg(long)]
-    watch: bool,
-    /// Watch mode backend: bacon, cargo-watch, auto (default: auto)
-    #[arg(long, default_value = "auto")]
-    watch_mode: String,
-    /// Pass additional arguments to the test runner
-    #[arg(last = true)]
-    test_args: Vec<String>,
   },
 }
 
@@ -237,44 +230,42 @@ fn main() {
 
   let result = match cli.command {
     // Graph Commands
-    Commands::Graph(graph_cmd) => match graph_cmd {
-      GraphCommands::Affected {
+    Commands::Affected {
+      since,
+      from,
+      to,
+      format,
+    } => commands::run_affected(&ctx, since, from, to, format, false),
+    Commands::Test {
+      since,
+      nextest,
+      dry_run,
+      explain,
+      watch,
+      watch_mode,
+      test_args,
+    } => {
+      let config = commands::test::TestConfig {
         since,
-        from,
-        to,
-        format,
-      } => commands::run_affected(&ctx, since, from, to, format, false),
-      GraphCommands::Test {
-        since,
-        nextest,
         dry_run,
         explain,
-        watch,
-        watch_mode,
+        prefer_nextest: nextest,
         test_args,
-      } => {
-        let config = commands::test::TestConfig {
-          since,
-          dry_run,
-          explain,
-          prefer_nextest: nextest,
-          test_args,
-        };
+      };
 
-        if watch {
-          // Parse watch mode
-          let mode = match watch_mode.as_str() {
-            "bacon" => commands::watch::WatchMode::Bacon,
-            "cargo-watch" => commands::watch::WatchMode::CargoWatch,
-            "auto" => commands::watch::WatchMode::Auto,
-            _ => commands::watch::WatchMode::Auto,
-          };
-          commands::run_test_watch(&ctx, config, mode)
-        } else {
-          commands::run_test(&ctx, config)
-        }
+      if watch {
+        // Parse watch mode
+        let mode = match watch_mode.as_str() {
+          "bacon" => commands::watch::WatchMode::Bacon,
+          "cargo-watch" => commands::watch::WatchMode::CargoWatch,
+          "auto" => commands::watch::WatchMode::Auto,
+          _ => commands::watch::WatchMode::Auto,
+        };
+        commands::run_test_watch(&ctx, config, mode)
+      } else {
+        commands::run_test(&ctx, config)
       }
-    },
+    }
 
     // Dependency Unification
     Commands::Unify(unify_cmd) => match unify_cmd {

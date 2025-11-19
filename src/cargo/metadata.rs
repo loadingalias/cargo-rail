@@ -119,7 +119,7 @@ impl WorkspaceMetadata {
   /// - Feature dependency analysis: Understand feature activation chains
   /// - Feature optimization: Identify minimal feature sets for build times
   ///
-  /// TODO: Use this for `cargo rail audit` or `cargo rail graph` to inspect specific packages.
+  /// TODO: Use this for `cargo rail audit` or `cargo rail inspect` to inspect specific packages.
   /// For global analysis (like unification), use `cargo_metadata` directly to avoid O(N) lookups.
   ///
   /// # Example
@@ -210,7 +210,7 @@ impl WorkspaceMetadata {
   /// - License compliance: Check all dependency licenses
   /// - Duplicate detection: Find dependencies listed multiple times
   ///
-  /// TODO: Use this for `cargo rail graph` or `cargo rail audit` to inspect dependencies of a specific crate.
+  /// TODO: Use this for `cargo rail inspect` or `cargo rail audit` to inspect dependencies of a specific crate.
   /// For global analysis, iterate `metadata.packages` directly.
   ///
   /// # Example

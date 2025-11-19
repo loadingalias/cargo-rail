@@ -64,7 +64,7 @@ pub struct WorkspaceGraph {
   /// - Feature analysis: Cross-reference cargo metadata with dependency graph
   /// - External dependency queries: Look up non-workspace packages efficiently
   ///
-  /// TODO: Expose this via a public method when implementing `cargo rail graph --resolve` or similar advanced analysis.
+  /// TODO: Expose this via a public method when implementing `cargo rail resolve` or similar advanced analysis.
   #[allow(dead_code)]
   id_to_node: HashMap<PackageId, NodeIndex>,
 
@@ -162,7 +162,7 @@ impl WorkspaceGraph {
   /// - Dependency analysis: Find immediate dependencies for auditing
   /// - Visualization: Generate dependency tree for a specific crate
   ///
-  /// TODO: Use this for `cargo rail graph` CLI command.
+  /// TODO: Use this for `cargo rail inspect` CLI command.
   #[allow(dead_code)]
   pub fn direct_dependencies(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node_idx = self.find_node(crate_name)?;
@@ -186,7 +186,7 @@ impl WorkspaceGraph {
   /// - Impact analysis: See what breaks when modifying this crate
   /// - Reverse dependency tree: Understand crate usage across workspace
   ///
-  /// TODO: Use this for `cargo rail graph` or `cargo rail affected` CLI commands.
+  /// TODO: Use this for `cargo rail inspect` or `cargo rail affected` CLI commands.
   #[allow(dead_code)]
   pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node_idx = self.find_node(crate_name)?;
@@ -381,7 +381,7 @@ impl WorkspaceGraph {
   /// - Audit dependency chains: Trace the path from app to vulnerable dependency
   /// - Refactoring decisions: Identify dependency paths to break or preserve
   ///
-  /// TODO: Implement `cargo rail graph --why` command using this method.
+  /// TODO: Implement `cargo rail why` command using this method.
   ///
   /// # Example
   /// ```ignore
@@ -443,7 +443,7 @@ impl WorkspaceGraph {
   /// - Visual debugging: See complex dependency relationships at a glance
   /// - Architecture analysis: Understand workspace structure visually
   ///
-  /// TODO: Implement `cargo rail graph --dot` command using this method.
+  /// TODO: Implement `cargo rail graph` command (as a top-level visualization command) using this method.
   ///
   /// # Example
   /// ```bash

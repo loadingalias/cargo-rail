@@ -1,4 +1,4 @@
-//! Integration tests for `cargo rail graph test` command
+//! Integration tests for `cargo rail test` command
 //!
 //! Tests the smart test runner with change detection
 
@@ -21,7 +21,7 @@ fn test_runner_basic_change_detection() -> Result<()> {
   ws.commit("Modify lib-a")?;
 
   // Run test with change detection
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should detect both crates need testing
@@ -45,7 +45,7 @@ fn test_runner_no_changes() -> Result<()> {
   git(&ws.path, &["branch", "baseline"])?;
 
   // Run test with no changes
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should skip all tests
@@ -72,7 +72,7 @@ fn test_runner_docs_only_change() -> Result<()> {
   ws.commit("Update README")?;
 
   // Run test
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Documentation-only changes might still trigger tests depending on implementation
@@ -102,7 +102,7 @@ fn test_runner_transitive_dependencies() -> Result<()> {
   ws.commit("Modify lib-a")?;
 
   // Run test
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // All three should be tested (lib-a changed, lib-b and lib-c depend on it)
@@ -140,7 +140,7 @@ fn test_runner_isolated_change() -> Result<()> {
   ws.commit("Modify lib-a only")?;
 
   // Run test
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should test only lib-a, not lib-b
@@ -173,7 +173,7 @@ fn test_runner_with_explain() -> Result<()> {
   // Run with --explain flag
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "graph", "test", "--since", "baseline", "--dry-run", "--explain"],
+    &["rail", "test", "--since", "baseline", "--dry-run", "--explain"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -202,7 +202,7 @@ fn test_runner_auto_detect_base_ref() -> Result<()> {
   ws.commit("Feature work")?;
 
   // Run without --since (should auto-detect base ref or use HEAD)
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should successfully run (whether it detects changes or not is okay)
@@ -232,7 +232,7 @@ fn test_runner_config_file_changes() -> Result<()> {
   )?;
   ws.commit("Modify Cargo.toml")?;
 
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Config changes should trigger testing
@@ -262,7 +262,7 @@ fn test_runner_test_file_changes() -> Result<()> {
   )?;
   ws.commit("Add integration test")?;
 
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "test", "--since", "baseline", "--dry-run"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Test file changes should trigger testing

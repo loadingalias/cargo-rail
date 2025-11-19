@@ -1,4 +1,4 @@
-//! Integration tests for `cargo rail graph affected` command
+//! Integration tests for `cargo rail affected` command
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
@@ -19,7 +19,7 @@ fn test_affected_basic() -> Result<()> {
   ws.commit("Modify lib-a")?;
 
   // Run affected command
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "affected", "--since", "origin/main"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "origin/main"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show lib-a as directly affected and lib-b as dependent
@@ -40,7 +40,7 @@ fn test_affected_no_changes() -> Result<()> {
   git(&ws.path, &["branch", "origin/main"])?;
 
   // Run affected with no changes
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "affected", "--since", "origin/main"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "origin/main"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should indicate no changes
@@ -69,15 +69,7 @@ fn test_affected_json_output() -> Result<()> {
   // Run with --format json
   let output = run_cargo_rail(
     &ws.path,
-    &[
-      "rail",
-      "graph",
-      "affected",
-      "--since",
-      "origin/main",
-      "--format",
-      "json",
-    ],
+    &["rail", "affected", "--since", "origin/main", "--format", "json"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -105,15 +97,7 @@ fn test_affected_names_only() -> Result<()> {
   // Run with --format names
   let output = run_cargo_rail(
     &ws.path,
-    &[
-      "rail",
-      "graph",
-      "affected",
-      "--since",
-      "origin/main",
-      "--format",
-      "names",
-    ],
+    &["rail", "affected", "--since", "origin/main", "--format", "names"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -137,7 +121,7 @@ fn test_affected_sha_pair_mode() -> Result<()> {
   let sha2 = ws.commit("Update lib-a")?;
 
   // Run with --from/--to
-  let output = run_cargo_rail(&ws.path, &["rail", "graph", "affected", "--from", &sha1, "--to", &sha2])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--from", &sha1, "--to", &sha2])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(stdout.contains("lib-a"), "lib-a should be affected");
