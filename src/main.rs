@@ -1,15 +1,4 @@
-mod cargo;
-mod change_detection;
-mod commands;
-mod config;
-mod error;
-mod git;
-mod graph;
-mod split;
-mod sync;
-mod test;
-mod utils;
-mod workspace;
+use cargo_rail::{commands, error, workspace};
 
 use clap::{Parser, Subcommand};
 use error::{RailError, print_error};

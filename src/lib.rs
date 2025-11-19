@@ -2,18 +2,18 @@
 //!
 //! This library provides workspace orchestration tools for Rust monorepos.
 
-// Only expose what's needed for testing
-pub mod change_detection {
-  pub mod classify {
-    pub use crate::main_change_detection::classify::*;
-  }
-}
-
+pub mod cargo;
+pub mod change_detection;
+pub mod commands;
+pub mod config;
 pub mod error;
-
-// Internal module path (used by main.rs)
-#[path = "change_detection/mod.rs"]
-mod main_change_detection;
+pub mod git;
+pub mod graph;
+pub mod split;
+pub mod sync;
+pub mod test;
+pub mod utils;
+pub mod workspace;
 
 // Re-export commonly used types
 pub use error::{RailError, RailResult};

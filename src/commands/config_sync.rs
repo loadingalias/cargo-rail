@@ -113,6 +113,12 @@ pub struct SyncRegistry {
   syncers: Vec<Box<dyn ConfigSyncer>>,
 }
 
+impl Default for SyncRegistry {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl SyncRegistry {
   pub fn new() -> Self {
     Self { syncers: Vec::new() }

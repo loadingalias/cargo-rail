@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::commands::common::SplitSyncConfigBuilder;

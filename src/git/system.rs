@@ -102,31 +102,6 @@ impl SystemGit {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
-  /// Read a file at a specific commit
-  ///
-  /// Returns empty Vec if file doesn't exist at that commit.
-  /// For reading multiple files, use `read_files_bulk` instead for 100x+ speedup.
-  ///
-  /// Note: This is a convenience API for single-file reads. Kept for potential future use.
-  #[cfg(test)]
-  #[allow(dead_code)]
-  pub fn read_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<u8>> {
-    let spec = format!("{}:{}", commit_sha, path.display());
-
-    let output = self
-      .git_cmd()
-      .args(["show", &spec])
-      .output()
-      .context("Failed to read file from commit")?;
-
-    if !output.status.success() {
-      // File doesn't exist at this commit
-      return Ok(vec![]);
-    }
-
-    Ok(output.stdout)
-  }
-
   /// Create a safe git command with isolated environment
   ///
   /// - Sets working directory to repo path

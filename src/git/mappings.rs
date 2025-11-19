@@ -1,6 +1,8 @@
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use std::collections::HashMap;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 /// Commit mapping store using git-notes
 /// Maps commits between monorepo and split repos
@@ -163,19 +165,22 @@ impl MappingStore {
 
     println!("   Pushing git-notes to remote '{}'...", remote);
 
-    let output = Command::new("git")
-      .current_dir(repo_path)
-      .args(["push", remote, &notes_ref])
-      .output()
-      .context("Failed to push git-notes")?;
+    retry_operation(|| {
+      let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["push", remote, &notes_ref])
+        .output()
+        .context("Failed to push git-notes")?;
 
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git push notes".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
+      if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(RailError::Git(GitError::CommandFailed {
+          command: "git push notes".to_string(),
+          stderr: stderr.to_string(),
+        }));
+      }
+      Ok(())
+    })?;
 
     println!("   ✅ Pushed git-notes");
     Ok(())
@@ -190,91 +195,154 @@ impl MappingStore {
 
     println!("   Fetching git-notes from remote '{}'...", remote);
 
-    let output = Command::new("git")
-      .current_dir(repo_path)
-      .args(["fetch", remote, &refspec])
-      .output()
-      .context("Failed to fetch git-notes")?;
+    // Retry the fetch operation
+    let result = retry_operation(|| {
+      let output = Command::new("git")
+        .current_dir(repo_path)
+        .args(["fetch", remote, &refspec])
+        .output()
+        .context("Failed to fetch git-notes")?;
 
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
+      if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-      // Ignore "couldn't find remote ref" - notes may not exist yet
-      if stderr.contains("couldn't find remote ref") {
-        println!("   ℹ️  No remote git-notes found yet (this is normal for first sync)");
-        return Ok(());
+        // Ignore "couldn't find remote ref" - notes may not exist yet
+        if stderr.contains("couldn't find remote ref") {
+          return Ok(()); // Treat as success (no notes yet)
+        }
+
+        return Err(RailError::Git(GitError::CommandFailed {
+          command: "git fetch notes".to_string(),
+          stderr: stderr.to_string(),
+        }));
       }
+      Ok(())
+    });
 
-      // Handle non-fast-forward (notes conflict)
-      if stderr.contains("non-fast-forward") || stderr.contains("rejected") {
-        println!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
-        println!("   🔄 Attempting automatic merge with union strategy...");
+    match result {
+      Ok(_) => {
+        println!("   ✅ Fetched git-notes");
+        Ok(())
+      }
+      Err(e) => {
+        // Check if it's a conflict (non-fast-forward)
+        let is_conflict = if let RailError::Git(GitError::CommandFailed { stderr, .. }) = &e {
+          stderr.contains("non-fast-forward") || stderr.contains("rejected")
+        } else {
+          false
+        };
 
-        // Fetch to FETCH_HEAD without updating the ref
-        let fetch_output = Command::new("git")
-          .current_dir(repo_path)
-          .args(["fetch", remote, &notes_ref])
-          .output()
-          .context("Failed to fetch notes to FETCH_HEAD")?;
+        if is_conflict {
+          println!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
+          println!("   🔄 Attempting automatic merge with union strategy...");
 
-        if !fetch_output.status.success() {
-          let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
-          if !fetch_stderr.contains("couldn't find remote ref") {
-            return Err(RailError::Git(GitError::CommandFailed {
-              command: "git fetch notes to FETCH_HEAD".to_string(),
-              stderr: fetch_stderr.to_string(),
-            }));
+          // Fetch to FETCH_HEAD without updating the ref
+          let fetch_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["fetch", remote, &notes_ref])
+            .output()
+            .context("Failed to fetch notes to FETCH_HEAD")?;
+
+          if !fetch_output.status.success() {
+            let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
+            if !fetch_stderr.contains("couldn't find remote ref") {
+              return Err(RailError::Git(GitError::CommandFailed {
+                command: "git fetch notes to FETCH_HEAD".to_string(),
+                stderr: fetch_stderr.to_string(),
+              }));
+            }
+            return Ok(()); // No remote notes
           }
-          return Ok(()); // No remote notes
+
+          // Merge notes using union strategy (combines both without conflict)
+          let merge_output = Command::new("git")
+            .current_dir(repo_path)
+            .args(["notes", "--ref", &notes_ref, "merge", "--strategy=union", "FETCH_HEAD"])
+            .output()
+            .context("Failed to merge git-notes")?;
+
+          if !merge_output.status.success() {
+            let merge_stderr = String::from_utf8_lossy(&merge_output.stderr);
+
+            // If union merge fails, provide clear guidance
+            eprintln!("   ❌ Automatic git-notes merge failed");
+            eprintln!("   📋 Manual resolution required:");
+            eprintln!("      1. cd {}", repo_path.display());
+            eprintln!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
+            eprintln!("      3. Resolve conflicts manually");
+            eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
+            eprintln!();
+            return Err(RailError::with_help(
+              format!("git notes merge failed: {}", merge_stderr),
+              format!(
+                "This usually happens when the same commit has different mappings on different machines.\n\
+                 Manual resolution steps:\n  \
+                 1. cd {}\n  \
+                 2. git notes --ref={} merge FETCH_HEAD\n  \
+                 3. Resolve conflicts manually\n  \
+                 4. git notes --ref={} merge --commit",
+                repo_path.display(),
+                notes_ref,
+                notes_ref
+              ),
+            ));
+          }
+
+          println!("   ✅ Git-notes merged successfully (union strategy)");
+          Ok(())
+        } else {
+          // Propagate other errors
+          Err(e)
         }
-
-        // Merge notes using union strategy (combines both without conflict)
-        let merge_output = Command::new("git")
-          .current_dir(repo_path)
-          .args(["notes", "--ref", &notes_ref, "merge", "--strategy=union", "FETCH_HEAD"])
-          .output()
-          .context("Failed to merge git-notes")?;
-
-        if !merge_output.status.success() {
-          let merge_stderr = String::from_utf8_lossy(&merge_output.stderr);
-
-          // If union merge fails, provide clear guidance
-          eprintln!("   ❌ Automatic git-notes merge failed");
-          eprintln!("   📋 Manual resolution required:");
-          eprintln!("      1. cd {}", repo_path.display());
-          eprintln!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
-          eprintln!("      3. Resolve conflicts manually");
-          eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
-          eprintln!();
-          return Err(RailError::with_help(
-            format!("git notes merge failed: {}", merge_stderr),
-            format!(
-              "This usually happens when the same commit has different mappings on different machines.\n\
-               Manual resolution steps:\n  \
-               1. cd {}\n  \
-               2. git notes --ref={} merge FETCH_HEAD\n  \
-               3. Resolve conflicts manually\n  \
-               4. git notes --ref={} merge --commit",
-              repo_path.display(),
-              notes_ref,
-              notes_ref
-            ),
-          ));
-        }
-
-        println!("   ✅ Git-notes merged successfully (union strategy)");
-        return Ok(());
       }
-
-      // Unknown error
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git fetch notes".to_string(),
-        stderr: stderr.to_string(),
-      }));
     }
+  }
+}
 
-    println!("   ✅ Fetched git-notes");
-    Ok(())
+/// Retry an operation with exponential backoff
+fn retry_operation<F, T>(mut operation: F) -> RailResult<T>
+where
+  F: FnMut() -> RailResult<T>,
+{
+  let max_retries = 3;
+  let mut attempt = 0;
+  let mut delay = Duration::from_millis(500);
+
+  loop {
+    match operation() {
+      Ok(result) => return Ok(result),
+      Err(e) => {
+        attempt += 1;
+        if attempt > max_retries {
+          return Err(e);
+        }
+
+        // Only retry on network/lock errors, not logical errors
+        // For now, we assume most git command failures in this context are transient or lock-related
+        // unless it's a conflict which we handle separately in fetch_notes
+        let should_retry = match &e {
+          RailError::Git(GitError::CommandFailed { stderr, .. }) => {
+            stderr.contains("lock")
+              || stderr.contains("temporarily unavailable")
+              || stderr.contains("Connection timed out")
+              || stderr.contains("Could not resolve host")
+              || stderr.contains("Failed to connect")
+          }
+          _ => false,
+        };
+
+        if !should_retry {
+          return Err(e);
+        }
+
+        println!(
+          "   ⚠️  Operation failed. Retrying in {:?}... (Attempt {}/{})",
+          delay, attempt, max_retries
+        );
+        thread::sleep(delay);
+        delay *= 2;
+      }
+    }
   }
 }
 

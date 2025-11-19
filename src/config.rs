@@ -389,13 +389,22 @@ impl RailConfig {
     // We do this by checking if a de-canonicalized version exists.
     #[cfg(target_os = "windows")]
     {
-      // Try to find the config by reconstructing paths from the parent
-      // This handles cases where:
-      // 1. cargo metadata returns \\?\C:\Users\RUNNER~1\AppData\Local\Temp\...
-      // 2. But test wrote file to C:\Users\RUNNER~1\AppData\Local\Temp\...
-      // Or the short name (8.3) vs long name issue
+      // 1. Try canonicalizing the path and searching there
+      // This handles 8.3 short paths vs long paths issues (RUNNER~1 vs runneradmin)
+      if let Ok(canonical) = path.canonicalize() {
+        let canonical_candidates = [
+          canonical.join("rail.toml"),
+          canonical.join(".rail.toml"),
+          canonical.join(".cargo").join("rail.toml"),
+          canonical.join(".config").join("rail.toml"),
+        ];
+        if let Some(found) = canonical_candidates.iter().find(|p| p.exists()) {
+          return Some(found.to_path_buf());
+        }
+      }
 
-      // Check if we can read the directory to find config files
+      // 2. Try to find the config by reading the directory entries
+      // This handles cases where exact path string matching fails but the file is in the directory
       if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
           let file_name = entry.file_name();
@@ -408,7 +417,7 @@ impl RailConfig {
         }
       }
 
-      // Also check subdirectories .cargo and .config
+      // Also check subdirectories .cargo and .config via read_dir
       for subdir in &[".cargo", ".config"] {
         let subdir_path = path.join(subdir);
         if let Ok(entries) = std::fs::read_dir(&subdir_path) {

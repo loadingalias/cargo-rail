@@ -20,8 +20,10 @@ pub enum ConflictStrategy {
   Union,
 }
 
-impl ConflictStrategy {
-  pub fn from_str(s: &str) -> RailResult<Self> {
+impl std::str::FromStr for ConflictStrategy {
+  type Err = RailError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
     match s.to_lowercase().as_str() {
       "ours" | "use-mono" => Ok(Self::Ours),
       "theirs" | "use-remote" => Ok(Self::Theirs),
@@ -172,6 +174,7 @@ impl ConflictResolver {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::str::FromStr;
   use tempfile::TempDir;
 
   #[test]

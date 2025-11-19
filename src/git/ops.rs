@@ -300,37 +300,6 @@ impl SystemGit {
     parse_commit_output(&output.stdout)
   }
 
-  /// Get all commits in chronological order (oldest first)
-  #[allow(dead_code)]
-  pub fn get_all_commits_chronological(&self) -> RailResult<Vec<CommitInfo>> {
-    // Get all commits from HEAD in reverse order
-    let mut cmd = self.git_cmd();
-    cmd.args(["log", "--reverse", "--format=%H"]);
-
-    let output = cmd.output().context("Failed to get all commits")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
-      .lines()
-      .map(|s| s.trim().to_string())
-      .filter(|s| !s.is_empty())
-      .collect();
-
-    // Get all commits in parallel chunks
-    use rayon::prelude::*;
-
-    let commits: Result<Vec<_>, _> = shas.par_iter().map(|sha| self.get_commit(sha)).collect();
-
-    commits
-  }
-
   /// List all files at a specific commit under a path
   pub fn list_files_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<PathBuf>> {
     let spec = if path.as_os_str().is_empty() {
@@ -1051,23 +1020,6 @@ mod tests {
 
     let message = git.get_commit_message(&head).unwrap();
     assert!(!message.is_empty());
-  }
-
-  #[test]
-  fn test_get_all_commits_chronological() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-
-    // Get all commits (this might be slow for large repos, but tests should be on small repos)
-    let commits = git.get_all_commits_chronological().unwrap();
-    assert!(!commits.is_empty());
-
-    // Verify chronological order (oldest first)
-    if commits.len() >= 2 {
-      assert!(
-        commits[0].timestamp <= commits[1].timestamp,
-        "Commits should be in chronological order"
-      );
-    }
   }
 
   #[test]

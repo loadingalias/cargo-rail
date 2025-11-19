@@ -119,6 +119,9 @@ impl WorkspaceMetadata {
   /// - Feature dependency analysis: Understand feature activation chains
   /// - Feature optimization: Identify minimal feature sets for build times
   ///
+  /// TODO: Use this for `cargo rail audit` or `cargo rail graph` to inspect specific packages.
+  /// For global analysis (like unification), use `cargo_metadata` directly to avoid O(N) lookups.
+  ///
   /// # Example
   /// ```ignore
   /// let features = metadata.package_features("serde")?;
@@ -137,6 +140,8 @@ impl WorkspaceMetadata {
   /// - `cargo rail test --bins-only`: Run tests only for binary targets
   /// - `cargo rail build --lib`: Build only library targets
   /// - Target coverage: Ensure all crates have appropriate targets
+  ///
+  /// TODO: Use this for `cargo rail test` filtering or `cargo rail check` to validate targets.
   ///
   /// # Example
   /// ```ignore
@@ -159,6 +164,8 @@ impl WorkspaceMetadata {
   /// - Migration planning: Identify crates stuck on old editions
   /// - Compatibility matrix: Track edition usage across workspace
   ///
+  /// TODO: Integrate into `unify` pre-checks or `cargo rail lint` to ensure consistent editions.
+  ///
   /// # Example
   /// ```ignore
   /// if metadata.package_edition("lib-core")? == "2021" {
@@ -177,6 +184,8 @@ impl WorkspaceMetadata {
   /// - Pre-unification check: Ensure dependencies are MSRV-compatible
   /// - Workspace MSRV policy: Enforce minimum Rust version across crates
   /// - CI matrix: Generate test matrix based on supported Rust versions
+  ///
+  /// TODO: Integrate into `unify` pre-checks or `cargo rail lint` to enforce MSRV policy.
   ///
   /// # Example
   /// ```ignore
@@ -200,6 +209,9 @@ impl WorkspaceMetadata {
   /// - Dependency graph: Visualize complete dependency tree
   /// - License compliance: Check all dependency licenses
   /// - Duplicate detection: Find dependencies listed multiple times
+  ///
+  /// TODO: Use this for `cargo rail graph` or `cargo rail audit` to inspect dependencies of a specific crate.
+  /// For global analysis, iterate `metadata.packages` directly.
   ///
   /// # Example
   /// ```ignore

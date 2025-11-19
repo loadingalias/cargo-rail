@@ -23,8 +23,6 @@ struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
   crate_paths: &'a [PathBuf],
   target_repo_path: &'a Path,
-  #[allow(dead_code)]
-  workspace_root: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,
   mapping_store: &'a MappingStore,
@@ -346,7 +344,6 @@ impl<'a> SplitEngine<'a> {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
-          workspace_root: self.ctx.workspace_root(),
           crate_name: &config.crate_name,
           mode: &config.mode,
           mapping_store: &mapping_store,
