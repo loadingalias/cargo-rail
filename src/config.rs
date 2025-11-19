@@ -17,6 +17,8 @@ pub struct RailConfig {
   #[serde(default)]
   pub unify: UnifyConfig,
   #[serde(default)]
+  pub release: ReleaseConfig,
+  #[serde(default)]
   pub splits: Vec<SplitConfig>,
 }
 
@@ -324,6 +326,73 @@ impl UnifyConfig {
   }
 }
 
+/// Release configuration (workspace-wide defaults)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseConfig {
+  /// Git tag prefix (default: "v")
+  #[serde(default = "default_tag_prefix")]
+  pub tag_prefix: String,
+
+  /// Tag format template (default: "{crate}-v{version}" for monorepos, "v{version}" for single crates)
+  /// Variables: {crate}, {version}
+  #[serde(default = "default_tag_format")]
+  pub tag_format: String,
+
+  /// Require clean working directory before release (default: true)
+  #[serde(default = "default_true")]
+  pub require_clean: bool,
+
+  /// Delay between crate publishes in seconds (default: 5)
+  #[serde(default = "default_publish_delay")]
+  pub publish_delay: u64,
+
+  /// Create GitHub releases via gh CLI (default: false)
+  #[serde(default)]
+  pub create_github_release: bool,
+
+  /// Sign git tags with GPG/SSH (default: false)
+  #[serde(default)]
+  pub sign_tags: bool,
+
+  /// Default changelog path for all crates (default: "CHANGELOG.md")
+  #[serde(default = "default_changelog_path")]
+  pub changelog_path: String,
+}
+
+impl Default for ReleaseConfig {
+  fn default() -> Self {
+    Self {
+      tag_prefix: default_tag_prefix(),
+      tag_format: default_tag_format(),
+      require_clean: true,
+      publish_delay: default_publish_delay(),
+      create_github_release: false,
+      sign_tags: false,
+      changelog_path: default_changelog_path(),
+    }
+  }
+}
+
+fn default_tag_prefix() -> String {
+  "v".to_string()
+}
+
+fn default_tag_format() -> String {
+  "{crate}-v{version}".to_string()
+}
+
+fn default_publish_delay() -> u64 {
+  5
+}
+
+fn default_changelog_path() -> String {
+  "CHANGELOG.md".to_string()
+}
+
+fn default_true() -> bool {
+  true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitConfig {
   pub name: String,
@@ -339,6 +408,14 @@ pub struct SplitConfig {
   pub include: Vec<String>,
   #[serde(default)]
   pub exclude: Vec<String>,
+
+  /// Release configuration: enable/disable publishing for this crate
+  #[serde(default = "default_true")]
+  pub publish: bool,
+
+  /// Per-crate changelog path override (default: CHANGELOG.md)
+  #[serde(default)]
+  pub changelog_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

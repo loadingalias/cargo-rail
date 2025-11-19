@@ -3,7 +3,10 @@
 //! Auto-detects workspace structure, toolchain settings, and generates
 //! a sensible .config/rail.toml with smart defaults.
 
-use crate::config::{PolicyConfig, RailConfig, SecurityConfig, ToolchainConfig, UnifyConfig, WorkspaceConfig};
+use crate::config::{
+  CratePath, PolicyConfig, RailConfig, SecurityConfig, SplitConfig, SplitMode, ToolchainConfig, UnifyConfig,
+  WorkspaceConfig, WorkspaceMode,
+};
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 use std::fs;
@@ -52,6 +55,7 @@ pub fn run_init(
   let policy = detect_policy_config(workspace_root)?;
   let unify = default_unify_config();
   let security = default_security_config();
+  let splits = detect_workspace_splits(ctx);
 
   // 3. Display summary
   println!("Workspace Analysis:");
@@ -105,7 +109,7 @@ pub fn run_init(
   // 5. Build config
   println!("\n✅ Generated configuration with smart defaults\n");
 
-  let config = build_rail_config(workspace_root.to_path_buf(), toolchain, policy, unify, security);
+  let config = build_rail_config(workspace_root.to_path_buf(), toolchain, policy, unify, security, splits);
 
   // 6. Serialize with comments
   let toml_content = serialize_config_with_comments(&config)?;
@@ -291,6 +295,44 @@ fn default_security_config() -> SecurityConfig {
   SecurityConfig::default()
 }
 
+/// Auto-detect workspace members and create split configs
+fn detect_workspace_splits(ctx: &WorkspaceContext) -> Vec<SplitConfig> {
+  let workspace_root = ctx.workspace_root();
+  let members = ctx.cargo.metadata().list_crates();
+
+  let mut splits = Vec::new();
+
+  for pkg in members {
+    // Get relative path from workspace root to crate directory
+    let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
+    let rel_path = match crate_dir.strip_prefix(workspace_root) {
+      Ok(p) => p.to_path_buf(),
+      Err(_) => continue, // Skip if not under workspace root
+    };
+
+    // Generate a reasonable remote URL placeholder (GitHub org/repo pattern)
+    let remote = format!("git@github.com:org/{}.git", pkg.name);
+
+    // Check if crate has publish = false in Cargo.toml
+    let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+
+    splits.push(SplitConfig {
+      name: pkg.name.to_string(),
+      remote,
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![CratePath { path: rel_path.into() }],
+      include: vec![],
+      exclude: vec![],
+      publish,
+      changelog_path: None, // Use default from ReleaseConfig
+    });
+  }
+
+  splits
+}
+
 /// Build a complete RailConfig from detected/default values
 fn build_rail_config(
   _workspace_root: PathBuf,
@@ -298,6 +340,7 @@ fn build_rail_config(
   policy: PolicyConfig,
   unify: UnifyConfig,
   security: SecurityConfig,
+  splits: Vec<SplitConfig>,
 ) -> RailConfig {
   RailConfig {
     workspace: WorkspaceConfig {
@@ -307,7 +350,8 @@ fn build_rail_config(
     policy,
     unify,
     security,
-    splits: vec![],
+    release: crate::config::ReleaseConfig::default(),
+    splits,
   }
 }
 
@@ -553,33 +597,138 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
 
   output.push('\n');
 
+  // Release
+  output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
+  output.push_str("# │ Release & Publishing                                                    │\n");
+  output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
+  output.push_str("# Workspace-wide release defaults for version bumping and publishing.\n");
+  output.push_str("# Per-crate settings are configured in [[splits]] below.\n");
+  output.push_str("#\n");
+  output.push_str("# Commands:\n");
+  output.push_str("#   cargo rail release plan             - Preview release changes (dry-run)\n");
+  output.push_str("#   cargo rail release publish --execute - Execute release\n");
+  output.push_str("#   cargo rail release check            - Validate release readiness (CI)\n");
+  output.push_str("#\n");
+  output.push_str("# Fields:\n");
+  output.push_str("#   tag_prefix           - Prefix for git tags (default: \"v\")\n");
+  output.push_str("#   tag_format           - Tag template: {crate}-v{version} for monorepos\n");
+  output.push_str("#   require_clean        - Require clean working directory\n");
+  output.push_str("#   publish_delay        - Seconds between crate publishes\n");
+  output.push_str("#   create_github_release - Auto-create GitHub releases via gh CLI\n");
+  output.push_str("#   sign_tags            - Sign git tags with GPG/SSH\n");
+  output.push_str("#   changelog_path       - Default changelog filename\n\n");
+
+  output.push_str("[release]\n");
+  output.push_str(&format!(
+    "tag_prefix = \"{}\"  # Prefix for version tags\n",
+    config.release.tag_prefix
+  ));
+  output.push_str(&format!(
+    "tag_format = \"{}\"  # Variables: {{crate}}, {{version}}\n",
+    config.release.tag_format
+  ));
+  output.push_str(&format!(
+    "require_clean = {}  # Require clean working directory\n",
+    config.release.require_clean
+  ));
+  output.push_str(&format!(
+    "publish_delay = {}  # Seconds between publishes\n",
+    config.release.publish_delay
+  ));
+  output.push_str(&format!(
+    "create_github_release = {}  # Create GitHub releases\n",
+    config.release.create_github_release
+  ));
+  output.push_str(&format!(
+    "sign_tags = {}  # Sign tags with GPG/SSH\n",
+    config.release.sign_tags
+  ));
+  output.push_str(&format!(
+    "changelog_path = \"{}\"  # Default changelog file\n",
+    config.release.changelog_path
+  ));
+
+  output.push('\n');
+
   // Split/Sync
   output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
   output.push_str("# │ Split/Sync Configuration (Monorepo ↔ Separate Repos)                   │\n");
   output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
-  output.push_str("# Configure crates to split from monorepo into standalone repositories\n");
-  output.push_str("# with bidirectional synchronization.\n");
+  output.push_str("# Each workspace member is auto-detected and configured for split/sync.\n");
+  output.push_str("# Update 'remote' URLs and 'publish' flags as needed.\n");
   output.push_str("#\n");
   output.push_str("# Commands:\n");
   output.push_str("#   cargo rail split <crate>   - Extract crate to separate repo\n");
   output.push_str("#   cargo rail sync <crate>    - Bidirectional sync\n");
   output.push_str("#   cargo rail status          - Show split/sync status\n");
   output.push_str("#\n");
-  output.push_str("# Example configuration:\n");
+  output.push_str("# Fields per [[splits]] entry:\n");
+  output.push_str("#   name           - Crate name\n");
+  output.push_str("#   remote         - Target repository URL (update this!)\n");
+  output.push_str("#   branch         - Branch to sync (default: main)\n");
+  output.push_str("#   mode           - \"single\" or \"combined\" layout\n");
+  output.push_str("#   publish        - Enable publishing to crates.io (default: true)\n");
+  output.push_str("#   changelog_path - Per-crate changelog override (optional)\n");
   output.push_str("#\n");
-  output.push_str("# [[splits]]\n");
-  output.push_str("# name = \"my-crate\"  # Crate name\n");
-  output.push_str("# remote = \"git@github.com:org/my-crate.git\"  # Target repository\n");
-  output.push_str("# branch = \"main\"  # Branch to sync\n");
-  output.push_str("# mode = \"single\"  # \"single\" or \"multi\" (layout mode)\n");
-  output.push_str("#\n");
-  output.push_str("# # Paths to include in split (workspace members)\n");
-  output.push_str("# [[splits.paths]]\n");
-  output.push_str("# crate = \"crates/my-crate\"  # Relative path from workspace root\n");
-  output.push_str("#\n");
-  output.push_str("# # Optional: Additional paths to sync\n");
-  output.push_str("# [[splits.paths]]\n");
-  output.push_str("# crate = \"crates/my-crate-macros\"\n");
+
+  // Serialize detected splits
+  if config.splits.is_empty() {
+    output.push_str("# No workspace members detected. Example:\n");
+    output.push_str("#\n");
+    output.push_str("# [[splits]]\n");
+    output.push_str("# name = \"my-crate\"\n");
+    output.push_str("# remote = \"git@github.com:org/my-crate.git\"\n");
+    output.push_str("# branch = \"main\"\n");
+    output.push_str("# mode = \"single\"\n");
+    output.push_str("# publish = true\n");
+    output.push_str("#\n");
+    output.push_str("# [[splits.paths]]\n");
+    output.push_str("# crate = \"crates/my-crate\"\n");
+  } else {
+    output.push_str(&format!(
+      "# Auto-detected {} workspace member(s):\n\n",
+      config.splits.len()
+    ));
+
+    for split in &config.splits {
+      output.push_str("[[splits]]\n");
+      output.push_str(&format!("name = \"{}\"\n", split.name));
+      output.push_str(&format!(
+        "remote = \"{}\"  # TODO: Update with actual repository URL\n",
+        split.remote
+      ));
+      output.push_str(&format!("branch = \"{}\"\n", split.branch));
+      output.push_str(&format!(
+        "mode = \"{}\"\n",
+        match split.mode {
+          SplitMode::Single => "single",
+          SplitMode::Combined => "combined",
+        }
+      ));
+      output.push_str(&format!(
+        "publish = {}  # {}\n",
+        split.publish,
+        if split.publish {
+          "Enable crates.io publishing"
+        } else {
+          "Skip publishing (publish = false in Cargo.toml)"
+        }
+      ));
+
+      if let Some(ref changelog) = split.changelog_path {
+        output.push_str(&format!("changelog_path = \"{}\"\n", changelog.display()));
+      }
+
+      output.push('\n');
+
+      for path in &split.paths {
+        output.push_str("[[splits.paths]]\n");
+        output.push_str(&format!("crate = \"{}\"\n", path.path.display()));
+      }
+
+      output.push('\n');
+    }
+  }
 
   Ok(output)
 }
@@ -692,6 +841,7 @@ pub fn run_init_standalone(
       pr_branch_pattern: "rail/sync/{crate}/{timestamp}".to_string(),
       protected_branches: vec!["main".to_string(), "master".to_string()],
     },
+    release: crate::config::ReleaseConfig::default(),
     splits: vec![],
   };
 
@@ -830,6 +980,7 @@ rust-version = "1.91"
       policy: PolicyConfig::default(),
       unify: UnifyConfig::default(),
       security: SecurityConfig::default(),
+      release: crate::config::ReleaseConfig::default(),
       splits: vec![],
     };
 

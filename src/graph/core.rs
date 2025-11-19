@@ -23,6 +23,7 @@ use crate::cargo::WorkspaceMetadata;
 use crate::error::{RailError, RailResult};
 use cargo_metadata::{DependencyKind, PackageId};
 use petgraph::Direction;
+use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -244,6 +245,46 @@ impl WorkspaceGraph {
 
     let mut result: Vec<_> = dependents.into_iter().collect();
     result.sort();
+    Ok(result)
+  }
+
+  /// Get workspace members in dependency order (dependencies first, dependents last).
+  ///
+  /// Returns crates in the order they should be published: a crate's dependencies
+  /// are always published before the crate itself.
+  ///
+  /// Uses topological sort on the dependency graph to ensure correct ordering.
+  ///
+  /// # Errors
+  /// Returns error if circular dependencies are detected (should never happen with Cargo).
+  ///
+  /// # Performance
+  /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
+  pub fn publish_order(&self) -> RailResult<Vec<String>> {
+    // Topological sort gives us the order (roots first)
+    let sorted = toposort(&self.graph, None).map_err(|cycle| {
+      let node = &self.graph[cycle.node_id()];
+      RailError::message(format!(
+        "Circular dependency detected involving crate: '{}'. This should not happen in a valid Cargo workspace.",
+        node.name
+      ))
+    })?;
+
+    // Filter to workspace members only and collect names
+    // toposort returns in "dependency order" - roots (no deps) first, leaves (most deps) last
+    // For publishing, we want dependencies before dependents, so this order is correct
+    let result: Vec<String> = sorted
+      .into_iter()
+      .filter_map(|idx| {
+        let node = &self.graph[idx];
+        if node.is_workspace_member {
+          Some(node.name.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+
     Ok(result)
   }
 

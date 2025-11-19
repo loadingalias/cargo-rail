@@ -36,6 +36,9 @@ semver = "1.0.27"
 # Parallelism and concurrency
 rayon = "1.11.0"
 
+# Parsing (zero-copy, minimal deps)
+winnow = "0.7.13"
+
 [dev-dependencies]
 tempfile = "3.23.0"
 

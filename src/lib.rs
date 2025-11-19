@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod git;
 pub mod graph;
+pub mod release;
 pub mod split;
 pub mod sync;
 pub mod test;

@@ -153,6 +153,13 @@ enum Commands {
   Config(ConfigCommands),
 
   // ============================================================================
+  // Release & Publishing
+  // ============================================================================
+  /// Release automation (version bumping, changelog, publishing)
+  #[command(subcommand)]
+  Release(ReleaseCommands),
+
+  // ============================================================================
   // Workspace Inspection
   // ============================================================================
   /// Show status of all configured crates
@@ -221,6 +228,54 @@ enum ConfigCommands {
     /// Check if rust-toolchain.toml matches config (don't modify)
     #[arg(long)]
     check: bool,
+  },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCommands {
+  /// Plan a release (version bumping, changelog, validation) - dry-run mode
+  Plan {
+    /// Crate name(s) to release (omit for --all)
+    crate_names: Vec<String>,
+    /// Release all workspace crates
+    #[arg(short, long)]
+    all: bool,
+    /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
+    #[arg(long, default_value = "patch")]
+    bump: String,
+    /// Output plan in JSON format
+    #[arg(long)]
+    json: bool,
+  },
+
+  /// Execute a release (publish to crates.io, create git tags, update changelogs)
+  Publish {
+    /// Crate name(s) to release (omit for --all)
+    crate_names: Vec<String>,
+    /// Release all workspace crates in dependency order
+    #[arg(short, long)]
+    all: bool,
+    /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
+    #[arg(long, default_value = "patch")]
+    bump: String,
+    /// Execute the release (default is dry-run, requires this flag)
+    #[arg(long, short = 'x')]
+    execute: bool,
+    /// Skip publishing to crates.io (only create tags and update changelogs)
+    #[arg(long)]
+    skip_publish: bool,
+    /// Skip git tag creation
+    #[arg(long)]
+    skip_tag: bool,
+  },
+
+  /// Validate release readiness (for CI)
+  Check {
+    /// Crate name(s) to check (omit for --all)
+    crate_names: Vec<String>,
+    /// Check all workspace crates
+    #[arg(short, long)]
+    all: bool,
   },
 }
 
@@ -362,6 +417,34 @@ fn main() {
       dry_run,
       json,
     ),
+
+    // Release
+    Commands::Release(release_cmd) => match release_cmd {
+      ReleaseCommands::Plan {
+        crate_names,
+        all,
+        bump,
+        json,
+      } => {
+        let names = if all { None } else { Some(crate_names) };
+        commands::run_release_plan(&ctx, names, bump, json)
+      }
+      ReleaseCommands::Publish {
+        crate_names,
+        all,
+        bump,
+        execute,
+        skip_publish,
+        skip_tag,
+      } => {
+        let names = if all { None } else { Some(crate_names) };
+        commands::run_release_publish(&ctx, names, all, bump, execute, skip_publish, skip_tag)
+      }
+      ReleaseCommands::Check { crate_names, all } => {
+        let names = if all { None } else { Some(crate_names) };
+        commands::run_release_check(&ctx, names, all)
+      }
+    },
 
     // Status
     Commands::Status { json } => commands::run_status(&ctx, json),
