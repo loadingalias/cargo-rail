@@ -1,6 +1,9 @@
 //! Utility functions for cross-platform path handling
 
+use std::io::{self, Write};
 use std::path::Path;
+
+use crate::error::RailResult;
 
 /// Check if a path is a local filesystem path (not a remote URL)
 ///
@@ -62,6 +65,21 @@ pub fn is_local_path(path: &str) -> bool {
 
   // Default to false for safety (require preflight checks)
   false
+}
+
+/// Prompt user for confirmation (Enter to confirm, Ctrl+C or any input to cancel)
+///
+/// Returns Ok(true) if user presses Enter without typing anything.
+/// Returns Ok(false) if user types anything before pressing Enter.
+pub fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
+  print!("\n{}: ", message);
+  io::stdout().flush()?;
+
+  let mut input = String::new();
+  io::stdin().read_line(&mut input)?;
+
+  // If user just presses Enter (empty line), that's a confirmation
+  Ok(input.trim().is_empty())
 }
 
 /// Convert a path to Git format (always forward slashes)

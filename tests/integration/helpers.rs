@@ -40,6 +40,22 @@ serde = { version = "1.0", features = ["derive"] }
 "#,
     )?;
 
+    // Create .config/rail.toml to disable sync_on_unify for tests
+    std::fs::create_dir_all(path.join(".config"))?;
+    std::fs::write(
+      path.join(".config/rail.toml"),
+      r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
+
+[unify]
+sync_on_unify = false
+use_all_features = true
+"#,
+    )?;
+
     git(&path, &["add", "."])?;
     git(&path, &["commit", "-m", "Initial workspace setup"])?;
 

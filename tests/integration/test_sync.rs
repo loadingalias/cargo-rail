@@ -29,7 +29,7 @@ paths = [{{ crate = "crates/{}" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform initial split
-  run_cargo_rail(&ws.path, &["rail", "split", crate_name, "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", crate_name])?;
 
   Ok((ws, split_dir))
 }
@@ -43,7 +43,7 @@ fn test_sync_to_remote_basic() -> Result<()> {
   ws.commit("Update mylib in mono")?;
 
   // Sync to remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Verify change in split
   let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
@@ -70,7 +70,7 @@ fn test_sync_from_remote_basic() -> Result<()> {
   git(split_dir.path(), &["commit", "-m", "Update in split"])?;
 
   // Sync from remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
 
   // Verify change in monorepo
   let mono_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
@@ -98,14 +98,14 @@ fn test_sync_roundtrip_preserves_content() -> Result<()> {
   ws.commit("Set test function")?;
 
   // Sync to split
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Verify in split
   let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
   assert_eq!(split_content, original, "Split should have original content");
 
   // Sync back from split (should be no-op)
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
 
   // Verify still matches
   let final_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
@@ -129,7 +129,7 @@ fn test_sync_multiple_commits() -> Result<()> {
   ws.commit("Update v3")?;
 
   // Sync all to remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Check that all commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -161,7 +161,7 @@ fn test_sync_preserves_commit_order() -> Result<()> {
   ws.commit("Update README v2")?;
 
   // Sync to split
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Get split commit history
   let log_output = git(split_dir.path(), &["log", "--reverse", "--format=%s"])?;
@@ -191,7 +191,7 @@ fn test_sync_skips_already_synced_commits() -> Result<()> {
   ws.modify_file("mylib", "src/lib.rs", "// First change")?;
   ws.commit("First change")?;
 
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Get commit count
   let log1 = git(split_dir.path(), &["log", "--oneline"])?;
@@ -201,7 +201,7 @@ fn test_sync_skips_already_synced_commits() -> Result<()> {
   ws.modify_file("mylib", "src/lib.rs", "// Second change")?;
   ws.commit("Second change")?;
 
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
 
   // Get new commit count
   let log2 = git(split_dir.path(), &["log", "--oneline"])?;

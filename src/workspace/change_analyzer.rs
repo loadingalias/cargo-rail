@@ -2,21 +2,23 @@
 //!
 //! This module provides intelligent change detection by combining:
 //! - Git file-level changes
+//! - Advanced file classification
 //! - Workspace dependency graph
 //! - Cargo package metadata
-//!
-//! This enables smarter decisions about what needs to be rebuilt, retested, or synced.
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::change_detection::classify::{ChangeKind, classify_file};
+
 /// Categorization of changed files by type
 #[derive(Debug, Default)]
 pub struct ChangeCategories {
   pub source_files: Vec<PathBuf>,
   pub test_files: Vec<PathBuf>,
+  pub example_files: Vec<PathBuf>,
   pub doc_files: Vec<PathBuf>,
   pub config_files: Vec<PathBuf>,
   pub build_scripts: Vec<PathBuf>,
@@ -28,6 +30,7 @@ impl ChangeCategories {
   pub fn is_docs_only(&self) -> bool {
     self.source_files.is_empty()
       && self.test_files.is_empty()
+      && self.example_files.is_empty()
       && self.config_files.is_empty()
       && self.build_scripts.is_empty()
       && !self.doc_files.is_empty()
@@ -47,13 +50,17 @@ impl ChangeCategories {
   pub fn has_config_changes(&self) -> bool {
     !self.config_files.is_empty()
   }
+
+  /// Check if any examples changed
+  pub fn has_example_changes(&self) -> bool {
+    !self.example_files.is_empty()
+  }
 }
 
 /// Comprehensive change impact report
 #[derive(Debug)]
 pub struct ImpactReport {
   /// All changed files with their change types (A/M/D)
-  #[allow(dead_code)] // Public API field
   pub changed_files: Vec<(PathBuf, char)>,
 
   /// Workspace crates directly containing changed files
@@ -66,11 +73,9 @@ pub struct ImpactReport {
   pub categories: ChangeCategories,
 
   /// Whether changes require rebuild
-  #[allow(dead_code)] // Public API field
   pub requires_rebuild: bool,
 
   /// Whether changes require re-testing
-  #[allow(dead_code)] // Public API field
   pub requires_retest: bool,
 }
 
@@ -111,7 +116,7 @@ impl<'a> ChangeImpact<'a> {
     // 1. Get changed files from git
     let changed_files = self.ctx.git.git().get_changed_files_between(from, to)?;
 
-    // 2. Categorize changes by file type
+    // 2. Categorize changes by file type using new classification system
     let categories = self.categorize_changes(&changed_files);
 
     // 3. Use graph to find affected crates
@@ -120,7 +125,7 @@ impl<'a> ChangeImpact<'a> {
 
     // 4. Determine rebuild/retest requirements
     let requires_rebuild = categories.has_source_changes() || categories.has_config_changes();
-    let requires_retest = requires_rebuild || categories.has_test_changes();
+    let requires_retest = requires_rebuild || categories.has_test_changes() || categories.has_example_changes();
 
     // Convert HashSets to Vecs
     let mut direct_crates: Vec<String> = analysis.impact.direct.into_iter().collect();
@@ -151,32 +156,32 @@ impl<'a> ChangeImpact<'a> {
     Ok(Some(full_report))
   }
 
-  /// Categorize changed files by type
+  /// Categorize changed files using advanced classification
   fn categorize_changes(&self, files: &[(PathBuf, char)]) -> ChangeCategories {
     let mut categories = ChangeCategories::default();
 
     for (path, _change_type) in files {
-      let path_str = path.to_string_lossy();
+      let mut kind = classify_file(path);
 
-      // Categorize by file type and location (order matters - most specific first)
-      if path_str.ends_with("build.rs") {
-        categories.build_scripts.push(path.clone());
-      } else if path_str.ends_with("Cargo.toml") || path_str.ends_with("Cargo.lock") {
-        categories.config_files.push(path.clone());
-      } else if path_str.ends_with(".md") || path_str.ends_with(".txt") {
-        categories.doc_files.push(path.clone());
-      } else if path_str.ends_with(".rs") {
-        if path_str.contains("/tests/")
-          || path_str.contains("/benches/")
-          || path_str.starts_with("tests/")
-          || path_str.starts_with("benches/")
-        {
-          categories.test_files.push(path.clone());
-        } else {
-          categories.source_files.push(path.clone());
+      // Enhance classification with proc-macro detection
+      if let ChangeKind::Source { is_proc_macro } = kind
+        && !is_proc_macro
+      {
+        // Check if this file belongs to a proc-macro crate
+        if let Some(crate_name) = self.ctx.graph.file_to_crate(path) {
+          let is_proc_macro = self.ctx.cargo.metadata().is_proc_macro_crate(&crate_name);
+          kind = ChangeKind::Source { is_proc_macro };
         }
-      } else {
-        categories.other_files.push(path.clone());
+      }
+
+      match kind {
+        ChangeKind::Source { .. } => categories.source_files.push(path.clone()),
+        ChangeKind::Test { .. } => categories.test_files.push(path.clone()),
+        ChangeKind::Example => categories.example_files.push(path.clone()),
+        ChangeKind::BuildScript => categories.build_scripts.push(path.clone()),
+        ChangeKind::Config { .. } => categories.config_files.push(path.clone()),
+        ChangeKind::Documentation => categories.doc_files.push(path.clone()),
+        ChangeKind::Other => categories.other_files.push(path.clone()),
       }
     }
 
@@ -191,6 +196,17 @@ mod tests {
   fn create_test_context() -> WorkspaceContext {
     let current_dir = std::env::current_dir().unwrap();
     WorkspaceContext::build(&current_dir).unwrap()
+  }
+
+  #[test]
+  fn test_proc_macro_detection() {
+    let ctx = create_test_context();
+
+    // cargo-rail is not a proc-macro crate
+    assert!(
+      !ctx.cargo.metadata().is_proc_macro_crate("cargo-rail"),
+      "cargo-rail should not be detected as proc-macro crate"
+    );
   }
 
   #[test]
@@ -213,55 +229,46 @@ mod tests {
   }
 
   #[test]
+  fn test_change_categories_example_changes() {
+    let mut cat = ChangeCategories::default();
+    cat.example_files.push(PathBuf::from("examples/demo.rs"));
+
+    assert!(!cat.is_docs_only());
+    assert!(cat.has_example_changes());
+  }
+
+  #[test]
   fn test_change_impact_analyzer_creation() {
     let ctx = create_test_context();
     let _analyzer = ChangeImpact::new(&ctx);
   }
 
   #[test]
-  fn test_categorize_rust_files() {
+  fn test_categorize_comprehensive() {
     let ctx = create_test_context();
     let analyzer = ChangeImpact::new(&ctx);
 
     let files = vec![
       (PathBuf::from("src/lib.rs"), 'M'),
       (PathBuf::from("tests/integration.rs"), 'M'),
+      (PathBuf::from("examples/demo.rs"), 'M'),
       (PathBuf::from("README.md"), 'M'),
       (PathBuf::from("Cargo.toml"), 'M'),
       (PathBuf::from("build.rs"), 'M'),
+      (PathBuf::from(".cargo/config.toml"), 'M'),
     ];
 
     let cat = analyzer.categorize_changes(&files);
 
-    assert_eq!(
-      cat.source_files.len(),
-      1,
-      "Expected 1 source file (src/lib.rs), got: {:?}",
-      cat.source_files
-    );
-    assert_eq!(
-      cat.test_files.len(),
-      1,
-      "Expected 1 test file (tests/integration.rs), got: {:?}",
-      cat.test_files
-    );
-    assert_eq!(
-      cat.doc_files.len(),
-      1,
-      "Expected 1 doc file (README.md), got: {:?}",
-      cat.doc_files
-    );
+    assert_eq!(cat.source_files.len(), 1, "Expected 1 source file");
+    assert_eq!(cat.test_files.len(), 1, "Expected 1 test file");
+    assert_eq!(cat.example_files.len(), 1, "Expected 1 example file");
+    assert_eq!(cat.doc_files.len(), 1, "Expected 1 doc file");
     assert_eq!(
       cat.config_files.len(),
-      1,
-      "Expected 1 config file (Cargo.toml), got: {:?}",
-      cat.config_files
+      2,
+      "Expected 2 config files (Cargo.toml + .cargo/config.toml)"
     );
-    assert_eq!(
-      cat.build_scripts.len(),
-      1,
-      "Expected 1 build script (build.rs), got: {:?}",
-      cat.build_scripts
-    );
+    assert_eq!(cat.build_scripts.len(), 1, "Expected 1 build script");
   }
 }

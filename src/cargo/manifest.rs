@@ -296,8 +296,15 @@ impl CargoTransform {
     for unified in unified_deps {
       let mut dep_table = InlineTable::new();
 
-      // Version is required
-      dep_table.insert("version", Value::from(unified.version_req.to_string()));
+      // INVISIBLE FEATURE: Support workspace member path dependencies
+      // If this dependency has a path (workspace member), use path instead of version
+      if let Some(ref path) = unified.path {
+        // This is a workspace member - use path
+        dep_table.insert("path", Value::from(path.to_string()));
+      } else {
+        // External dependency - use version
+        dep_table.insert("version", Value::from(unified.version_req.to_string()));
+      }
 
       // Add default-features if false (true is the default, so we only specify false)
       if !unified.default_features {
@@ -606,6 +613,7 @@ members = ["crate-a", "crate-b"]
       used_by: vec!["crate-a".to_string(), "crate-b".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 2,
+      path: None,
     }];
 
     // Write workspace dependencies
@@ -660,6 +668,7 @@ members = ["crate-a"]
       used_by: vec!["crate-a".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
+      path: None,
     }];
 
     transformer
@@ -696,6 +705,7 @@ members = ["crate-a"]
       used_by: vec!["crate-a".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
+      path: None,
     }];
 
     transformer

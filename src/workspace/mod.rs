@@ -9,13 +9,14 @@
 //! Built once at startup, passed by reference to all commands.
 
 pub mod cargo_state;
-pub mod change_impact;
+pub mod change_analyzer;
 pub mod context;
 pub mod files;
 pub mod git_state;
 
+// Re-export change analysis types
+pub use change_analyzer::ChangeImpact;
+
 pub use cargo_state::CargoState;
-#[allow(unused_imports)] // Public API exports
-pub use change_impact::{ChangeCategories, ChangeImpact, ImpactReport};
 pub use context::WorkspaceContext;
 pub use git_state::GitState;

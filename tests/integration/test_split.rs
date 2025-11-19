@@ -32,7 +32,7 @@ paths = [{{ crate = "crates/mylib" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform split
-  run_cargo_rail(&ws.path, &["rail", "split", "mylib", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "mylib"])?;
 
   // Verify split structure
   assert!(split_path.join("Cargo.toml").exists(), "Cargo.toml should exist");
@@ -82,7 +82,7 @@ paths = [{{ crate = "crates/mylib" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "mylib", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "mylib"])?;
 
   // Check git history in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -126,7 +126,7 @@ paths = [{{ crate = "crates/lib-a" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "lib-a", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "lib-a"])?;
 
   // Check that only lib-a commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -166,7 +166,7 @@ paths = [{{ crate = "crates/lib-core" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "lib-core", "--apply"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "lib-core"])?;
 
   // Check that path dependency was transformed to version dependency
   let cargo_toml = std::fs::read_to_string(split_dir.path().join("Cargo.toml"))?;

@@ -1,5 +1,5 @@
 use crate::error::RailResult;
-use cargo_metadata::{Dependency, DependencyKind, MetadataCommand, Package, Resolve, Target};
+use cargo_metadata::{Dependency, DependencyKind, MetadataCommand, Package, Resolve, Target, TargetKind};
 use semver::Version;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -69,6 +69,32 @@ impl WorkspaceMetadata {
 
   pub fn workspace_root(&self) -> &std::path::Path {
     self.metadata.workspace_root.as_std_path()
+  }
+
+  /// Get workspace root as UTF-8 path (for use with cargo_metadata types)
+  ///
+  /// cargo_metadata uses UTF-8 paths internally, so this avoids unnecessary conversions
+  /// when working with path dependencies and workspace members.
+  pub fn workspace_root_utf8(&self) -> &cargo_metadata::camino::Utf8Path {
+    &self.metadata.workspace_root
+  }
+
+  /// Check if a package is a procedural macro crate
+  ///
+  /// Proc-macro crates have special semantics:
+  /// - Must be compiled for the host platform, not target
+  /// - Changes affect dependents at compile-time
+  /// - Require rebuilding all dependents when modified
+  pub fn is_proc_macro_crate(&self, name: &str) -> bool {
+    self
+      .get_package(name)
+      .map(|pkg| {
+        pkg
+          .targets
+          .iter()
+          .any(|target| target.kind.iter().any(|k| matches!(k, TargetKind::ProcMacro)))
+      })
+      .unwrap_or(false)
   }
 
   // ============================================================================

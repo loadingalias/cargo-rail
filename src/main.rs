@@ -1,4 +1,5 @@
 mod cargo;
+mod change_detection;
 mod commands;
 mod config;
 mod error;
@@ -6,6 +7,7 @@ mod git;
 mod graph;
 mod split;
 mod sync;
+mod test;
 mod utils;
 mod workspace;
 
@@ -60,9 +62,9 @@ enum Commands {
     /// Override remote repository path
     #[arg(long)]
     remote: Option<String>,
-    /// Actually perform the split (default: dry-run)
+    /// Show plan without executing (default: execute with confirmation)
     #[arg(long)]
-    apply: bool,
+    dry_run: bool,
     /// Output plan in JSON format
     #[arg(long)]
     json: bool,
@@ -87,9 +89,12 @@ enum Commands {
     /// Conflict resolution strategy: ours, theirs, manual, union
     #[arg(long, default_value = "manual")]
     strategy: String,
-    /// Actually perform the sync (default: dry-run)
+    /// Disable protected branch checks (allow direct commits to main/master)
     #[arg(long)]
-    apply: bool,
+    no_protected_branches: bool,
+    /// Show plan without executing (default: execute with confirmation)
+    #[arg(long)]
+    dry_run: bool,
     /// Output plan in JSON format
     #[arg(long)]
     json: bool,
@@ -133,10 +138,25 @@ enum GraphCommands {
 
   /// Run tests only for affected crates (smart test runner)
   Test {
-    /// Git ref to compare against (default: origin/main)
-    #[arg(long, default_value = "origin/main")]
-    since: String,
-    /// Pass additional arguments to cargo test
+    /// Git ref to compare against (auto-detects origin/main, origin/master, or HEAD~1)
+    #[arg(long)]
+    since: Option<String>,
+    /// Use cargo-nextest if available
+    #[arg(long)]
+    nextest: bool,
+    /// Show what would be tested without running tests
+    #[arg(long)]
+    dry_run: bool,
+    /// Explain why tests are being run
+    #[arg(long)]
+    explain: bool,
+    /// Watch for file changes and re-run tests automatically
+    #[arg(long)]
+    watch: bool,
+    /// Watch mode backend: bacon, cargo-watch, auto (default: auto)
+    #[arg(long, default_value = "auto")]
+    watch_mode: String,
+    /// Pass additional arguments to the test runner
     #[arg(last = true)]
     test_args: Vec<String>,
   },
@@ -155,6 +175,9 @@ enum UnifyCommands {
     /// Only unify normal dependencies (exclude dev and build dependencies)
     #[arg(long)]
     normal_only: bool,
+    /// Pin transitive-only crates with fragmented features
+    #[arg(long)]
+    pin_transitives: bool,
   },
 
   /// Apply workspace dependency unification (modifies Cargo.toml files)
@@ -171,6 +194,9 @@ enum UnifyCommands {
     /// Only unify normal dependencies (exclude dev and build dependencies)
     #[arg(long)]
     normal_only: bool,
+    /// Pin transitive-only crates with fragmented features
+    #[arg(long)]
+    pin_transitives: bool,
   },
 
   /// Check workspace dependencies are properly unified (for CI)
@@ -229,7 +255,36 @@ fn main() {
         to,
         format,
       } => commands::run_affected(&ctx, since, from, to, format, false),
-      GraphCommands::Test { since, test_args } => commands::run_test(&ctx, since, test_args),
+      GraphCommands::Test {
+        since,
+        nextest,
+        dry_run,
+        explain,
+        watch,
+        watch_mode,
+        test_args,
+      } => {
+        let config = commands::test::TestConfig {
+          since,
+          dry_run,
+          explain,
+          prefer_nextest: nextest,
+          test_args,
+        };
+
+        if watch {
+          // Parse watch mode
+          let mode = match watch_mode.as_str() {
+            "bacon" => commands::watch::WatchMode::Bacon,
+            "cargo-watch" => commands::watch::WatchMode::CargoWatch,
+            "auto" => commands::watch::WatchMode::Auto,
+            _ => commands::watch::WatchMode::Auto,
+          };
+          commands::run_test_watch(&ctx, config, mode)
+        } else {
+          commands::run_test(&ctx, config)
+        }
+      }
     },
 
     // Dependency Unification
@@ -238,13 +293,15 @@ fn main() {
         exclude,
         include,
         normal_only,
-      } => commands::run_unify_analyze(&ctx, exclude, include, normal_only),
+        pin_transitives,
+      } => commands::run_unify_analyze(&ctx, exclude, include, normal_only, pin_transitives),
       UnifyCommands::Apply {
         exclude,
         include,
         backup,
         normal_only,
-      } => commands::run_unify_apply(&ctx, exclude, include, backup, normal_only),
+        pin_transitives,
+      } => commands::run_unify_apply(&ctx, exclude, include, backup, normal_only, pin_transitives),
       UnifyCommands::Check {
         exclude,
         normal_only,
@@ -262,9 +319,9 @@ fn main() {
       crate_name,
       all,
       remote,
-      apply,
+      dry_run,
       json,
-    } => commands::run_split(&ctx, crate_name, all, remote, apply, json),
+    } => commands::run_split(&ctx, crate_name, all, remote, dry_run, json),
     Commands::Sync {
       crate_name,
       all,
@@ -272,7 +329,8 @@ fn main() {
       from_remote,
       to_remote,
       strategy,
-      apply,
+      no_protected_branches,
+      dry_run,
       json,
     } => commands::run_sync(
       &ctx,
@@ -282,8 +340,8 @@ fn main() {
       from_remote,
       to_remote,
       strategy,
-      false, // no_protected_branches
-      apply,
+      no_protected_branches,
+      dry_run,
       json,
     ),
 

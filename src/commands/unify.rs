@@ -36,6 +36,11 @@ fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<WorkspaceMetadata> {
 
 /// Run config sync if configured
 fn maybe_sync_config(ctx: &WorkspaceContext) -> RailResult<()> {
+  // Only run if config exists
+  if ctx.config.is_none() {
+    return Ok(());
+  }
+
   // Check if sync_on_unify is enabled (default: true)
   let sync_enabled = ctx.config.as_ref().map(|cfg| cfg.unify.sync_on_unify).unwrap_or(true);
 
@@ -115,6 +120,7 @@ pub fn run_unify_analyze(
   exclude: Vec<String>,
   include: Vec<String>,
   normal_only: bool,
+  pin_transitives_flag: bool,
 ) -> RailResult<()> {
   // Sync config if enabled
   maybe_sync_config(ctx)?;
@@ -146,20 +152,33 @@ pub fn run_unify_analyze(
   // Display summary
   println!("{}", plan.summary());
 
-  // Show issues if any
-  if !plan.issues.is_empty() {
-    println!("\n⚠️  Issues found:");
-    for issue in &plan.issues {
-      println!("  {}", issue.format_message());
-    }
-    println!("\nResolve these issues before running 'cargo rail unify apply'");
-    return Err(RailError::message("Unification has blocking issues"));
-  }
-
   // Run optional validation if configured
   maybe_run_validation(ctx)?;
 
-  println!("\n✅ Analysis complete. Run 'cargo rail unify apply' to make changes.");
+  // Final message
+  if !plan.issues.is_empty() {
+    println!("⚠️  Note: Some issues were detected that will prevent 'cargo rail unify apply'.");
+    println!("Resolve these issues before attempting to apply changes.\n");
+  }
+
+  // Show transitive fragmentation info if pin_transitives is enabled
+  if !plan.transitive_fragmentations.is_empty()
+    && (pin_transitives_flag || ctx.config.as_ref().map(|c| c.unify.pin_transitives).unwrap_or(false))
+  {
+    println!("📌 Transitive pinning is ENABLED - these crates will be pinned when you run 'apply'.\n");
+  }
+
+  println!(
+    "✅ Analysis complete{}",
+    if plan.workspace_deps.is_empty() && plan.issues.is_empty() {
+      ". No unification opportunities found."
+    } else if !plan.workspace_deps.is_empty() {
+      ". Run 'cargo rail unify apply' to make changes."
+    } else {
+      "."
+    }
+  );
+
   Ok(())
 }
 
@@ -170,6 +189,7 @@ pub fn run_unify_apply(
   include: Vec<String>,
   backup: bool,
   normal_only: bool,
+  pin_transitives_flag: bool,
 ) -> RailResult<()> {
   // Sync config if enabled
   maybe_sync_config(ctx)?;
@@ -182,7 +202,6 @@ pub fn run_unify_apply(
   // Build config
   let mut config = UnifyConfig {
     strategy: UnifyStrategy::All,
-    backup,
     normal_only,
     ..Default::default()
   };
@@ -207,6 +226,74 @@ pub fn run_unify_apply(
     return Err(RailError::message("Fix issues before applying"));
   }
 
+  // Determine if we should pin transitives
+  let should_pin_transitives =
+    pin_transitives_flag || ctx.config.as_ref().map(|c| c.unify.pin_transitives).unwrap_or(false);
+
+  // Handle transitive fragmentations if pinning is enabled
+  let mut transitive_deps_to_add = Vec::new();
+  let mut transitive_pin_hosts = Vec::new();
+
+  if should_pin_transitives && !plan.transitive_fragmentations.is_empty() {
+    println!(
+      "📌 Pinning {} transitive-only crate(s) with fragmented features...\n",
+      plan.transitive_fragmentations.len()
+    );
+
+    // Get pin_hosts from config or use default
+    let pin_hosts = ctx
+      .config
+      .as_ref()
+      .and_then(|c| {
+        if c.unify.pin_hosts.is_empty() {
+          None
+        } else {
+          Some(c.unify.pin_hosts.clone())
+        }
+      })
+      .unwrap_or_else(|| {
+        // Default: use the first workspace member or create a list
+        vec![
+          ctx
+            .cargo
+            .metadata()
+            .list_crates()
+            .first()
+            .map(|p| p.name.to_string())
+            .unwrap_or_else(|| "cargo-rail".to_string()),
+        ]
+      });
+
+    transitive_pin_hosts = pin_hosts;
+
+    // Convert transitive fragmentations to UnifiedDep format
+    for frag in &plan.transitive_fragmentations {
+      println!(
+        "  📦 {} v{} ({} feature sets)",
+        frag.name,
+        frag.version,
+        frag.feature_sets.len()
+      );
+
+      // Parse version
+      let version_req = semver::VersionReq::parse(&format!("={}", frag.version))
+        .unwrap_or_else(|_| semver::VersionReq::parse(&frag.version).unwrap());
+
+      transitive_deps_to_add.push(crate::cargo::UnifiedDep {
+        name: frag.name.clone(),
+        version_req,
+        features: frag.unified_features.clone(),
+        default_features: true,
+        used_by: vec!["<transitive>".to_string()],
+        dep_kinds: vec![cargo_metadata::DependencyKind::Development].into_iter().collect(),
+        fragmentation_count: frag.feature_sets.len(),
+        path: None,
+      });
+    }
+
+    println!();
+  }
+
   // Run optional validation if configured (before applying changes)
   maybe_run_validation(ctx)?;
 
@@ -222,8 +309,18 @@ pub fn run_unify_apply(
     backup_file(&workspace_toml)?;
   }
 
-  transformer.write_workspace_dependencies(&workspace_toml, &plan.workspace_deps)?;
-  println!("  ✓ Wrote {} unified dependencies", plan.workspace_deps.len());
+  // Combine regular deps and transitive deps
+  let mut all_workspace_deps = plan.workspace_deps.clone();
+  all_workspace_deps.extend(transitive_deps_to_add.clone());
+
+  transformer.write_workspace_dependencies(&workspace_toml, &all_workspace_deps)?;
+  println!("  ✓ Wrote {} unified dependencies", all_workspace_deps.len());
+  if !transitive_deps_to_add.is_empty() {
+    println!(
+      "    (including {} pinned transitive deps)",
+      transitive_deps_to_add.len()
+    );
+  }
 
   // 2. Convert member dependencies to workspace inheritance
   println!("\n📝 Converting member dependencies to workspace inheritance...");
@@ -253,6 +350,60 @@ pub fn run_unify_apply(
     }
 
     println!("  ✓ {} ({} dependencies)", member_name, edits.len());
+  }
+
+  // 3. Add dev-dependencies for pinned transitives to pin_hosts
+  if !transitive_deps_to_add.is_empty() && !transitive_pin_hosts.is_empty() {
+    println!("\n📝 Adding dev-dependencies for pinned transitives to pin_hosts...");
+
+    for host_name in &transitive_pin_hosts {
+      let host_pkg = ctx.cargo.get_package(host_name).ok_or_else(|| {
+        RailError::message(format!(
+          "Pin host '{}' not found in workspace. Check unify.pin_hosts in rail.toml",
+          host_name
+        ))
+      })?;
+
+      let host_toml = host_pkg.manifest_path.as_std_path();
+
+      if backup {
+        backup_file(host_toml)?;
+      }
+
+      // Read and parse the host's Cargo.toml
+      let content = std::fs::read_to_string(host_toml)?;
+      let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| RailError::message(format!("Failed to parse {}: {}", host_toml.display(), e)))?;
+
+      // Ensure [dev-dependencies] section exists
+      if !doc.contains_key("dev-dependencies") {
+        doc["dev-dependencies"] = toml_edit::table();
+      }
+
+      let dev_deps = doc["dev-dependencies"]
+        .as_table_mut()
+        .ok_or_else(|| RailError::message("[dev-dependencies] is not a table"))?;
+
+      // Add each transitive dep as { workspace = true }
+      for transitive_dep in &transitive_deps_to_add {
+        let mut dep_table = toml_edit::InlineTable::new();
+        dep_table.insert("workspace", toml_edit::Value::Boolean(toml_edit::Formatted::new(true)));
+        dev_deps.insert(
+          &transitive_dep.name,
+          toml_edit::Item::Value(toml_edit::Value::InlineTable(dep_table)),
+        );
+      }
+
+      // Write back
+      std::fs::write(host_toml, doc.to_string())?;
+
+      println!(
+        "  ✓ {} ({} transitive dev-dependencies)",
+        host_name,
+        transitive_deps_to_add.len()
+      );
+    }
   }
 
   println!("\n✅ Unification complete!");

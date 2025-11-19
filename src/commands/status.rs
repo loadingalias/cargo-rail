@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::error::{RailError, RailResult};
-use crate::utils;
 use crate::workspace::WorkspaceContext;
 
 /// Status of a crate
@@ -65,17 +64,7 @@ pub fn run_status(ctx: &WorkspaceContext, json: bool) -> RailResult<()> {
   let mut statuses = Vec::new();
 
   for split_config in &config.splits {
-    let target_repo_path = if utils::is_local_path(&split_config.remote) {
-      std::path::PathBuf::from(&split_config.remote)
-    } else {
-      let remote_name = split_config
-        .remote
-        .rsplit('/')
-        .next()
-        .unwrap_or(&split_config.name)
-        .trim_end_matches(".git");
-      workspace_root.join("..").join(remote_name)
-    };
+    let target_repo_path = split_config.target_repo_path(workspace_root);
 
     let target_exists = target_repo_path.exists();
 

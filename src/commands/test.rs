@@ -1,15 +1,38 @@
 //! Smart test runner - only test affected crates
 
 use crate::error::RailResult;
+use crate::git::detect_default_base_ref;
+use crate::test::runner::select_runner;
 use crate::workspace::{ChangeImpact, WorkspaceContext};
-use std::process::Command;
+
+/// Configuration for test command
+#[derive(Clone)]
+pub struct TestConfig {
+  /// Git ref to compare against (if None, auto-detect)
+  pub since: Option<String>,
+  /// Show what would be tested without running tests
+  pub dry_run: bool,
+  /// Explain why tests are being run
+  pub explain: bool,
+  /// Prefer cargo-nextest if available
+  pub prefer_nextest: bool,
+  /// Additional arguments to pass to the test runner
+  pub test_args: Vec<String>,
+}
 
 /// Run tests only for crates affected by changes since a given ref
-pub fn run_test(ctx: &WorkspaceContext, since: String, test_args: Vec<String>) -> RailResult<()> {
+pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
   let analyzer = ChangeImpact::new(ctx);
 
-  // Analyze changes since the given ref
-  let impact = analyzer.analyze_changes(&since, "HEAD")?;
+  // Auto-detect base ref if not provided
+  let base_ref = if let Some(ref s) = config.since {
+    s.clone()
+  } else {
+    detect_default_base_ref(ctx.git.git())?
+  };
+
+  // Analyze changes since the base ref
+  let impact = analyzer.analyze_changes(&base_ref, "HEAD")?;
 
   // Get minimal test set
   let test_targets = impact.minimal_test_set();
@@ -19,31 +42,80 @@ pub fn run_test(ctx: &WorkspaceContext, since: String, test_args: Vec<String>) -
     return Ok(());
   }
 
-  println!("Running tests for {} affected crate(s):", test_targets.len());
+  // Dry run mode - just show what would be tested
+  if config.dry_run {
+    println!("Would test {} affected crate(s):", test_targets.len());
+    for target in &test_targets {
+      println!("  • {}", target);
+    }
+
+    if config.explain {
+      println!("\nChange Impact Analysis:");
+      println!("  Total files changed: {}", impact.changed_files.len());
+      println!(
+        "  Requires rebuild: {}",
+        if impact.requires_rebuild { "yes" } else { "no" }
+      );
+      println!(
+        "  Requires retest: {}",
+        if impact.requires_retest { "yes" } else { "no" }
+      );
+
+      println!("\nFile Breakdown:");
+      if impact.categories.has_source_changes() {
+        println!("  - Source code: {} file(s)", impact.categories.source_files.len());
+      }
+      if impact.categories.has_test_changes() {
+        println!("  - Tests: {} file(s)", impact.categories.test_files.len());
+      }
+      if impact.categories.has_example_changes() {
+        println!("  - Examples: {} file(s)", impact.categories.example_files.len());
+      }
+      if impact.categories.has_config_changes() {
+        println!("  - Config: {} file(s)", impact.categories.config_files.len());
+      }
+      if !impact.categories.build_scripts.is_empty() {
+        println!("  - Build scripts: {} file(s)", impact.categories.build_scripts.len());
+      }
+      if !impact.categories.doc_files.is_empty() {
+        println!("  - Documentation: {} file(s)", impact.categories.doc_files.len());
+      }
+
+      println!("\nAffected Crates:");
+      println!("  - Direct: {} crate(s)", impact.direct_crates.len());
+      if !impact.direct_crates.is_empty() {
+        for crate_name in &impact.direct_crates {
+          println!("    • {}", crate_name);
+        }
+      }
+      println!("  - Transitive: {} crate(s)", impact.transitive_crates.len());
+      if !impact.transitive_crates.is_empty() {
+        for crate_name in &impact.transitive_crates {
+          println!("    • {}", crate_name);
+        }
+      }
+    }
+    return Ok(());
+  }
+
+  // Select test runner
+  let runner = select_runner(config.prefer_nextest);
+
+  println!(
+    "Running tests for {} affected crate(s) using {}:",
+    test_targets.len(),
+    runner.name()
+  );
   for target in &test_targets {
     println!("  • {}", target);
   }
   println!();
 
-  // Build cargo test command with package filters
-  let mut cmd = Command::new("cargo");
-  cmd.arg("test");
-
-  // Add package filters for each affected crate
-  for target in &test_targets {
-    cmd.arg("-p").arg(target);
-  }
-
-  // Add user-provided test arguments
-  if !test_args.is_empty() {
-    cmd.arg("--");
-    cmd.args(&test_args);
-  }
-
-  // Run the test command
+  // Build and run command
+  let mut cmd = runner.build_command(&test_targets, &config.test_args);
   let status = cmd
     .status()
-    .map_err(|e| crate::error::RailError::message(format!("Failed to run cargo test: {}", e)))?;
+    .map_err(|e| crate::error::RailError::message(format!("Failed to run {}: {}", runner.name(), e)))?;
 
   if !status.success() {
     std::process::exit(status.code().unwrap_or(1));

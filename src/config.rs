@@ -274,6 +274,16 @@ pub struct UnifyConfig {
   /// Maximum parallel jobs for validation (0 = auto-detect CPUs, >0 = explicit limit)
   #[serde(default)]
   pub max_parallel_jobs: usize,
+
+  /// Automatically pin transitive-only crates with fragmented features (default: false)
+  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
+  #[serde(default)]
+  pub pin_transitives: bool,
+
+  /// Crates to add dev-dependencies to when pinning transitives (default: empty = auto-select)
+  /// Examples: ["workspace-root"], ["meta-crate"], ["crate-a", "crate-b"]
+  #[serde(default)]
+  pub pin_hosts: Vec<String>,
 }
 
 fn default_use_all_features() -> bool {
@@ -291,6 +301,8 @@ impl Default for UnifyConfig {
       sync_on_unify: default_sync_on_unify(),
       validate_targets: vec![],
       max_parallel_jobs: 0, // Auto-detect
+      pin_transitives: false,
+      pin_hosts: vec![],
     }
   }
 }
@@ -400,6 +412,29 @@ impl SplitConfig {
   /// Get the path(s) for this split configuration
   pub fn get_paths(&self) -> Vec<&PathBuf> {
     self.paths.iter().map(|cp| &cp.path).collect()
+  }
+
+  /// Determine the target repository path for this split configuration
+  ///
+  /// For local paths (testing), returns the path as-is.
+  /// For remote URLs, extracts the repo name and places it adjacent to workspace root.
+  pub fn target_repo_path(&self, workspace_root: &Path) -> PathBuf {
+    if crate::utils::is_local_path(&self.remote) {
+      PathBuf::from(&self.remote)
+    } else {
+      let remote_name = self
+        .remote
+        .rsplit('/')
+        .next()
+        .unwrap_or(&self.name)
+        .trim_end_matches(".git");
+      workspace_root.join("..").join(remote_name)
+    }
+  }
+
+  /// Check if this split is using a local path (testing mode)
+  pub fn is_local_testing(&self) -> bool {
+    crate::utils::is_local_path(&self.remote)
   }
 
   /// Validate the split configuration
@@ -628,6 +663,8 @@ mod tests {
       sync_on_unify: false,
       validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       max_parallel_jobs: 2,
+      pin_transitives: false,
+      pin_hosts: vec![],
     };
 
     // Serialize to TOML

@@ -1,25 +1,17 @@
-use std::io::{self, Write};
+use std::io::IsTerminal;
 use std::sync::Arc;
 
-use crate::error::{ConfigError, RailError, RailResult};
-use crate::sync::{ConflictStrategy, SyncConfig, SyncDirection, SyncEngine};
+use crate::commands::common::SplitSyncConfigBuilder;
+use crate::error::RailResult;
+use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
-/// Prompt user for confirmation
-fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
-  print!("\n{}: ", message);
-  io::stdout().flush()?;
-
-  let mut input = String::new();
-  io::stdin().read_line(&mut input)?;
-
-  // If user just presses Enter (empty line), that's a confirmation
-  Ok(input.trim().is_empty())
-}
-
 /// Run the sync command
+///
+/// By default, executes the sync operation (with confirmation prompt in interactive mode).
+/// Use --dry-run to show the plan without executing.
 #[allow(clippy::too_many_arguments)]
 pub fn run_sync(
   ctx: &WorkspaceContext,
@@ -30,7 +22,7 @@ pub fn run_sync(
   to_remote: bool,
   strategy_str: String,
   no_protected_branches: bool,
-  apply: bool,
+  dry_run: bool,
   json: bool,
 ) -> RailResult<()> {
   // Parse conflict strategy
@@ -44,43 +36,26 @@ pub fn run_sync(
     config.security.protected_branches.clear();
   }
 
-  println!("📦 Loaded configuration from .rail/config.toml");
+  println!("📦 Loaded configuration");
 
-  // Determine which crates to sync
-  let mut crates_to_sync_check: Vec<_> = if all {
-    config.splits.clone()
-  } else if let Some(ref name) = crate_name {
-    let split_config = config
-      .splits
-      .iter()
-      .find(|s| s.name == *name)
-      .ok_or_else(|| RailError::Config(ConfigError::CrateNotFound { name: name.clone() }))?;
-    vec![split_config.clone()]
-  } else {
-    return Err(RailError::with_help(
-      "Must specify a crate name or use --all",
-      "Try: cargo rail sync --all OR cargo rail sync <crate-name>",
-    ));
-  };
+  // Build configurations using the centralized builder
+  let builder = SplitSyncConfigBuilder::new(ctx)?
+    .with_crate_or_all(crate_name.clone(), all)?
+    .with_remote_override(remote)
+    // Note: sync doesn't validate like split does
+    ;
 
-  // Apply remote override if provided
-  if let Some(ref remote_override) = remote {
-    for split_config in &mut crates_to_sync_check {
-      split_config.remote = remote_override.clone();
-    }
-  }
+  let all_local = builder.all_local();
+  let config_count = builder.count();
 
-  // Check if all remotes are local paths (skip SSH checks for local testing)
-  let all_local = crates_to_sync_check.iter().all(|s| utils::is_local_path(&s.remote));
-
-  if all_local && apply {
+  if all_local && !dry_run {
     println!("   Local testing mode\n");
   }
 
   // Determine sync direction
   let direction = match (from_remote, to_remote) {
     (true, true) => {
-      return Err(RailError::with_help(
+      return Err(crate::error::RailError::with_help(
         "Cannot use both --from-remote and --to-remote",
         "Choose one direction: use --from-remote OR --to-remote (or neither for bidirectional sync)",
       ));
@@ -99,47 +74,14 @@ pub fn run_sync(
     }
   };
 
-  let crates_to_sync = crates_to_sync_check;
   if all {
-    println!("   Syncing all {} configured crates", crates_to_sync.len());
+    println!("   Syncing all {} configured crates", config_count);
   }
 
-  // Build SyncConfig for each crate
-  let mut configs = Vec::new();
-
-  for split_config in &crates_to_sync {
-    let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
-
-    // Determine target repo path
-    let target_repo_path = if utils::is_local_path(&split_config.remote) {
-      std::path::PathBuf::from(&split_config.remote)
-    } else {
-      let remote_name = split_config
-        .remote
-        .rsplit('/')
-        .next()
-        .unwrap_or(&split_config.name)
-        .trim_end_matches(".git");
-      ctx.workspace_root().join("..").join(remote_name)
-    };
-
-    // Check if target repo exists
-    let target_exists = target_repo_path.exists();
-
-    let sync_config = SyncConfig {
-      crate_name: split_config.name.clone(),
-      crate_paths,
-      mode: split_config.mode.clone(),
-      target_repo_path: target_repo_path.clone(),
-      branch: split_config.branch.clone(),
-      remote_url: split_config.remote.clone(),
-    };
-
-    configs.push((sync_config, target_exists));
-  }
+  let configs = builder.build_sync_configs()?;
 
   // Dry-run mode: show what would be done
-  if !apply {
+  if dry_run {
     if json {
       // JSON output for CI/automation
       for (sync_config, target_exists) in &configs {
@@ -167,8 +109,7 @@ pub fn run_sync(
       return Ok(());
     } else {
       // Human-readable plan
-      println!("\n🔍 DRY-RUN MODE - No changes will be made");
-      println!("   Add --apply to actually perform the sync\n");
+      println!("\n🔍 DRY-RUN MODE - Showing plan only\n");
 
       let dir_display = match direction {
         SyncDirection::MonoToRemote => "monorepo → remote",
@@ -209,7 +150,7 @@ pub fn run_sync(
       println!("✋ To execute this plan, run:");
       if all {
         println!(
-          "   cargo rail sync --all {} --apply",
+          "   cargo rail sync --all {}",
           if from_remote {
             "--from-remote"
           } else if to_remote {
@@ -220,7 +161,7 @@ pub fn run_sync(
         );
       } else if let Some(ref name) = crate_name {
         println!(
-          "   cargo rail sync {} {} --apply",
+          "   cargo rail sync {} {}",
           name,
           if from_remote {
             "--from-remote"
@@ -233,23 +174,42 @@ pub fn run_sync(
       }
       println!();
 
-      // Interactive confirmation
-      if prompt_for_confirmation("Press Enter to apply this plan, or Ctrl+C to cancel")? {
-        println!("\n🚀 APPLY MODE - Executing sync operations\n");
-        // Fall through to apply mode
-      } else {
-        return Ok(());
-      }
+      return Ok(());
     }
-  } else {
+  }
+
+  // Apply mode - interactive confirmation if TTY
+  if std::io::stdin().is_terminal() && !json {
+    println!("\n🚀 APPLY MODE - About to execute sync operations\n");
+
+    let dir_display = match direction {
+      SyncDirection::MonoToRemote => "→",
+      SyncDirection::RemoteToMono => "←",
+      SyncDirection::Both => "↔",
+      SyncDirection::None => "-",
+    };
+
+    for (sync_config, target_exists) in &configs {
+      let status = if !target_exists {
+        " [⚠️  target missing]"
+      } else {
+        ""
+      };
+      println!("📦 {} (mono {} remote){}", sync_config.crate_name, dir_display, status);
+    }
+
+    if !utils::prompt_for_confirmation("Press Enter to proceed, or Ctrl+C to cancel")? {
+      println!("Operation cancelled.");
+      return Ok(());
+    }
+    println!();
+  } else if !json {
     println!("\n🚀 APPLY MODE - Executing sync operations\n");
   }
 
-  // Apply mode - execute the syncs
-  let config_count = configs.len();
+  // Execute the syncs
   let security_config = Arc::new(config.security.clone());
 
-  // Use parallel processing for multiple crates
   if config_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", config_count);
 
