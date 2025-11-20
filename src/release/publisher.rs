@@ -121,8 +121,13 @@ impl<'a> ReleasePublisher<'a> {
 
   /// Update or create CHANGELOG.md
   fn update_changelog(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    if !plan.generate_changelog {
+      println!("   🧹 Skipping changelog (disabled for {})", plan.name);
+      return Ok(());
+    }
+
     // Find previous tag for this crate
-    let previous_tag = self.find_previous_tag(&plan.name)?;
+    let previous_tag = self.find_previous_tag(plan)?;
 
     // Get crate directory for path filtering
     let crate_dir = plan
@@ -132,6 +137,7 @@ impl<'a> ReleasePublisher<'a> {
 
     // Generate changelog
     let generator = ChangelogGenerator::new(self.ctx.workspace_root());
+    let github_repo = generator.github_repo().cloned();
     let new_entries = generator.generate(previous_tag.as_deref(), "HEAD", Some(&[crate_dir]))?;
 
     // Read existing changelog or create new
@@ -156,9 +162,24 @@ impl<'a> ReleasePublisher<'a> {
 
     // Add new version with current date (get from git commit date or system)
     let date = self.get_current_date()?;
-    updated.push_str(&format!("## [{}] - {}\n\n", plan.new_version, date));
+    updated.push_str(&self.format_version_header(plan, previous_tag.as_deref(), &date, github_repo.as_ref()));
     updated.push_str(&new_entries);
     updated.push('\n');
+
+    if new_entries.trim().is_empty() {
+      if self.release_config.require_changelog_entries {
+        return Err(RailError::message(format!(
+          "No changelog entries found for {} (enable commits or disable changelog generation)",
+          plan.name
+        )));
+      } else {
+        println!(
+          "   ℹ️  No changelog entries for {}, skipping changelog write",
+          plan.name
+        );
+        return Ok(());
+      }
+    }
 
     // Add rest of existing changelog
     if lines.len() > 1 {
@@ -323,11 +344,47 @@ impl<'a> ReleasePublisher<'a> {
     Ok(date)
   }
 
+  fn format_version_header(
+    &self,
+    plan: &CrateReleasePlan,
+    previous_tag: Option<&str>,
+    date: &str,
+    github_repo: Option<&(String, String)>,
+  ) -> String {
+    if let Some((org, repo)) = github_repo {
+      let url = if let Some(prev) = previous_tag {
+        format!(
+          "https://github.com/{}/{}/compare/{}...{}",
+          org, repo, prev, plan.tag_name
+        )
+      } else {
+        format!("https://github.com/{}/{}/releases/tag/{}", org, repo, plan.tag_name)
+      };
+
+      return format!("## [{}]({}) - {}\n\n", plan.new_version, url, date);
+    }
+
+    format!("## [{}] - {}\n\n", plan.new_version, date)
+  }
+
   /// Find previous tag for a crate
-  fn find_previous_tag(&self, crate_name: &str) -> RailResult<Option<String>> {
+  fn find_previous_tag(&self, plan: &CrateReleasePlan) -> RailResult<Option<String>> {
+    let workspace_members = self.ctx.graph.workspace_members();
+    let is_single_crate = workspace_members.len() == 1;
+
+    let pattern = if is_single_crate {
+      format!("{}*", self.release_config.tag_prefix)
+    } else {
+      self
+        .release_config
+        .tag_format
+        .replace("{crate}", &plan.name)
+        .replace("{version}", "*")
+    };
+
     let output = Command::new("git")
       .current_dir(self.ctx.workspace_root())
-      .args(["tag", "--list", &format!("*{}*", crate_name), "--sort=-version:refname"])
+      .args(["tag", "--list", &pattern, "--sort=-version:refname"])
       .output()
       .map_err(|e| RailError::message(format!("Failed to run git tag: {}", e)))?;
 

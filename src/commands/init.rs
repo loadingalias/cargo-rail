@@ -616,7 +616,9 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str("#   publish_delay        - Seconds between crate publishes\n");
   output.push_str("#   create_github_release - Auto-create GitHub releases via gh CLI\n");
   output.push_str("#   sign_tags            - Sign git tags with GPG/SSH\n");
-  output.push_str("#   changelog_path       - Default changelog filename\n\n");
+  output.push_str("#   changelog_path       - Default changelog filename\n");
+  output.push_str("#   skip_changelog_for   - Crates to skip changelog generation for\n");
+  output.push_str("#   require_changelog_entries - Error if no entries are found\n\n");
 
   output.push_str("[release]\n");
   output.push_str(&format!(
@@ -646,6 +648,27 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str(&format!(
     "changelog_path = \"{}\"  # Default changelog file\n",
     config.release.changelog_path
+  ));
+  output.push_str(&format!(
+    "skip_changelog_for = {}  # e.g., [\"internal-tooling\"]\n",
+    if config.release.skip_changelog_for.is_empty() {
+      "[]".to_string()
+    } else {
+      format!(
+        "[{}]",
+        config
+          .release
+          .skip_changelog_for
+          .iter()
+          .map(|s| format!("\"{}\"", s))
+          .collect::<Vec<_>>()
+          .join(", ")
+      )
+    }
+  ));
+  output.push_str(&format!(
+    "require_changelog_entries = {}  # Fail if no commits for a release\n",
+    config.release.require_changelog_entries
   ));
 
   output.push('\n');

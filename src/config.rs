@@ -357,6 +357,14 @@ pub struct ReleaseConfig {
   /// Default changelog path for all crates (default: "CHANGELOG.md")
   #[serde(default = "default_changelog_path")]
   pub changelog_path: String,
+
+  /// Crates that should not generate changelog entries
+  #[serde(default)]
+  pub skip_changelog_for: Vec<String>,
+
+  /// If true, error when there are no changelog entries for a crate
+  #[serde(default)]
+  pub require_changelog_entries: bool,
 }
 
 impl Default for ReleaseConfig {
@@ -369,6 +377,8 @@ impl Default for ReleaseConfig {
       create_github_release: false,
       sign_tags: false,
       changelog_path: default_changelog_path(),
+      skip_changelog_for: Vec::new(),
+      require_changelog_entries: false,
     }
   }
 }

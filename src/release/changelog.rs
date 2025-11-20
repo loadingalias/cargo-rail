@@ -94,6 +94,43 @@ impl CommitType {
   }
 }
 
+/// Parse a GitHub remote URL into (org, repo)
+fn parse_github_remote(url: &str) -> Option<(String, String)> {
+  let trimmed = url.trim().trim_end_matches(".git").trim_end_matches('/');
+
+  let repo_part = if let Some(ssh) = trimmed.strip_prefix("git@github.com:") {
+    ssh
+  } else if let Some(ssh) = trimmed.strip_prefix("ssh://git@github.com/") {
+    ssh
+  } else if let Some(https) = trimmed.strip_prefix("https://github.com/") {
+    https
+  } else {
+    return None;
+  };
+
+  let mut parts = repo_part.split('/');
+  let org = parts.next()?;
+  let repo = parts.next()?;
+
+  Some((org.to_string(), repo.to_string()))
+}
+
+/// Detect GitHub repository from the git remote
+pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
+  let output = Command::new("git")
+    .current_dir(workspace_root)
+    .args(["config", "--get", "remote.origin.url"])
+    .output()
+    .ok()?;
+
+  if !output.status.success() {
+    return None;
+  }
+
+  let url = String::from_utf8_lossy(&output.stdout);
+  parse_github_remote(&url)
+}
+
 /// Parse commit type from string
 fn parse_commit_type(input: &mut &str) -> PResult<CommitType> {
   alt((
@@ -124,6 +161,30 @@ fn parse_breaking(input: &mut &str) -> PResult<bool> {
 /// Parse the description after colon
 fn parse_description<'a>(input: &mut &'a str) -> PResult<&'a str> {
   preceded((':', space0), till_line_ending).parse_next(input)
+}
+
+/// Extract PR references (#123) from text
+fn extract_pr_numbers(text: &str) -> Vec<u32> {
+  let mut prs = Vec::new();
+
+  for word in text.split_whitespace() {
+    if let Some(num_str) = word.strip_prefix("(#").and_then(|s| s.strip_suffix(')'))
+      && let Ok(num) = num_str.parse::<u32>() {
+        prs.push(num);
+        continue;
+      }
+
+    if let Some(num_str) = word.strip_prefix('#') {
+      let numeric = num_str.trim_end_matches(|c: char| !c.is_ascii_digit());
+      if let Ok(num) = numeric.parse::<u32>() {
+        prs.push(num);
+      }
+    }
+  }
+
+  prs.sort_unstable();
+  prs.dedup();
+  prs
 }
 
 /// Parse a conventional commit message
@@ -179,12 +240,83 @@ pub fn parse_conventional_commit<'a>(sha: &'a str, subject: &'a str, body: Optio
 /// Changelog generator
 pub struct ChangelogGenerator {
   workspace_root: std::path::PathBuf,
+  github_repo: Option<(String, String)>,
 }
 
 impl ChangelogGenerator {
   pub fn new(workspace_root: &Path) -> Self {
     Self {
       workspace_root: workspace_root.to_path_buf(),
+      github_repo: detect_github_repo(workspace_root),
+    }
+  }
+
+  pub fn github_repo(&self) -> Option<&(String, String)> {
+    self.github_repo.as_ref()
+  }
+
+  fn short_sha<'a>(&self, sha: &'a str) -> &'a str {
+    sha.get(..7).unwrap_or(sha)
+  }
+
+  fn format_sha(&self, sha: &str) -> String {
+    if let Some((org, repo)) = &self.github_repo {
+      return format!(
+        "[{}](https://github.com/{}/{}/commit/{})",
+        self.short_sha(sha),
+        org,
+        repo,
+        sha
+      );
+    }
+
+    self.short_sha(sha).to_string()
+  }
+
+  fn format_pr_links(&self, commit: &ConventionalCommit) -> Option<String> {
+    let mut text = commit.description.to_string();
+    if let Some(body) = commit.body {
+      text.push(' ');
+      text.push_str(body);
+    }
+
+    let prs = extract_pr_numbers(&text);
+    if prs.is_empty() {
+      return None;
+    }
+
+    if let Some((org, repo)) = &self.github_repo {
+      let links = prs
+        .iter()
+        .map(|n| format!("[#{}](https://github.com/{}/{}/pull/{})", n, org, repo, n))
+        .collect::<Vec<_>>()
+        .join(" ");
+      Some(links)
+    } else {
+      let refs = prs.iter().map(|n| format!("#{}", n)).collect::<Vec<_>>().join(" ");
+      Some(refs)
+    }
+  }
+
+  fn format_description(&self, commit: &ConventionalCommit) -> String {
+    let mut desc = commit.description.trim().to_string();
+
+    if commit.breaking {
+      desc = format!("[**breaking**] {}", desc);
+    }
+
+    desc
+  }
+
+  fn format_entry(&self, commit: &ConventionalCommit) -> String {
+    let scope_prefix = commit.scope.map(|s| format!("**{}**: ", s)).unwrap_or_default();
+    let sha = self.format_sha(commit.sha);
+    let desc = self.format_description(commit);
+
+    if let Some(prs) = self.format_pr_links(commit) {
+      format!("- {}{} {} ({})\n", scope_prefix, desc, prs, sha)
+    } else {
+      format!("- {}{} ({})\n", scope_prefix, desc, sha)
     }
   }
 
@@ -233,7 +365,7 @@ impl ChangelogGenerator {
         CommitType::Breaking.section_title()
       ));
       for commit in breaking {
-        changelog.push_str(&format!("- {} ({})\n", commit.description.trim(), &commit.sha[..7]));
+        changelog.push_str(&self.format_entry(commit));
       }
       changelog.push('\n');
     }
@@ -246,13 +378,7 @@ impl ChangelogGenerator {
         CommitType::Feature.section_title()
       ));
       for commit in features {
-        let scope_prefix = commit.scope.map(|s| format!("**{}**: ", s)).unwrap_or_default();
-        changelog.push_str(&format!(
-          "- {}{} ({})\n",
-          scope_prefix,
-          commit.description.trim(),
-          &commit.sha[..7]
-        ));
+        changelog.push_str(&self.format_entry(commit));
       }
       changelog.push('\n');
     }
@@ -265,13 +391,7 @@ impl ChangelogGenerator {
         CommitType::Fix.section_title()
       ));
       for commit in fixes {
-        let scope_prefix = commit.scope.map(|s| format!("**{}**: ", s)).unwrap_or_default();
-        changelog.push_str(&format!(
-          "- {}{} ({})\n",
-          scope_prefix,
-          commit.description.trim(),
-          &commit.sha[..7]
-        ));
+        changelog.push_str(&self.format_entry(commit));
       }
       changelog.push('\n');
     }
@@ -288,13 +408,7 @@ impl ChangelogGenerator {
         commit_type.section_title()
       ));
       for commit in commits {
-        let scope_prefix = commit.scope.map(|s| format!("**{}**: ", s)).unwrap_or_default();
-        changelog.push_str(&format!(
-          "- {}{} ({})\n",
-          scope_prefix,
-          commit.description.trim(),
-          &commit.sha[..7]
-        ));
+        changelog.push_str(&self.format_entry(commit));
       }
       changelog.push('\n');
     }
@@ -419,5 +533,78 @@ mod tests {
     let commit = parse_conventional_commit("abc123", "Update README", None);
     assert_eq!(commit.commit_type, CommitType::Other);
     assert_eq!(commit.description, "Update README");
+  }
+
+  #[test]
+  fn parse_github_remote_supports_common_patterns() {
+    assert_eq!(
+      parse_github_remote("git@github.com:org/repo.git"),
+      Some(("org".to_string(), "repo".to_string()))
+    );
+
+    assert_eq!(
+      parse_github_remote("https://github.com/org/repo"),
+      Some(("org".to_string(), "repo".to_string()))
+    );
+
+    assert_eq!(
+      parse_github_remote("ssh://git@github.com/org/repo"),
+      Some(("org".to_string(), "repo".to_string()))
+    );
+  }
+
+  #[test]
+  fn parse_github_remote_non_github_returns_none() {
+    assert_eq!(parse_github_remote("git@gitlab.com:org/repo.git"), None);
+  }
+
+  #[test]
+  fn extract_pr_numbers_supports_common_patterns() {
+    let prs = extract_pr_numbers("feat(auth): add login (#12) closes #34 and refs #34");
+    assert_eq!(prs, vec![12, 34]);
+  }
+
+  #[test]
+  fn format_entry_includes_pr_and_links_when_available() {
+    let commit = ConventionalCommit {
+      commit_type: CommitType::Feature,
+      scope: Some("api"),
+      breaking: false,
+      description: "redesign REST endpoints (#123)",
+      body: Some("closes #456"),
+      sha: "abcdef1234567890",
+    };
+
+    let generator = ChangelogGenerator {
+      workspace_root: std::path::PathBuf::new(),
+      github_repo: Some(("org".to_string(), "repo".to_string())),
+    };
+
+    let line = generator.format_entry(&commit);
+
+    assert!(line.contains("[#123](https://github.com/org/repo/pull/123)"));
+    assert!(line.contains("[#456](https://github.com/org/repo/pull/456)"));
+    assert!(line.contains("**api**: redesign REST endpoints (#123)"));
+    assert!(line.contains("[abcdef1](https://github.com/org/repo/commit/abcdef1234567890)"));
+  }
+
+  #[test]
+  fn format_entry_marks_breaking_inline() {
+    let commit = ConventionalCommit {
+      commit_type: CommitType::Breaking,
+      scope: None,
+      breaking: true,
+      description: "change API",
+      body: None,
+      sha: "1234567",
+    };
+
+    let generator = ChangelogGenerator {
+      workspace_root: std::path::PathBuf::new(),
+      github_repo: None,
+    };
+
+    let line = generator.format_entry(&commit);
+    assert!(line.contains("[**breaking**] change API"));
   }
 }

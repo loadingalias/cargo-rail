@@ -27,6 +27,7 @@ pub struct CrateReleasePlan {
   pub changelog_path: PathBuf,
   pub tag_name: String,
   pub publish: bool,
+  pub generate_changelog: bool,
   /// Dependents that will need version updates
   pub affected_dependents: Vec<String>,
 }
@@ -123,6 +124,8 @@ impl<'a> ReleasePlanner<'a> {
       .ok_or_else(|| RailError::message("Invalid manifest path"))?
       .join(&self.release_config.changelog_path);
 
+    let generate_changelog = !self.release_config.skip_changelog_for.iter().any(|c| c == crate_name);
+
     // Check if should publish
     let publish = package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
 
@@ -137,6 +140,7 @@ impl<'a> ReleasePlanner<'a> {
       changelog_path,
       tag_name,
       publish,
+      generate_changelog,
       affected_dependents,
     })
   }
