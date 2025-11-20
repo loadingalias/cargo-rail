@@ -10,8 +10,6 @@ use crate::workspace::{ChangeImpact, WorkspaceContext};
 pub struct TestConfig {
   /// Git ref to compare against (if None, auto-detect)
   pub since: Option<String>,
-  /// Show what would be tested without running tests
-  pub dry_run: bool,
   /// Explain why tests are being run
   pub explain: bool,
   /// Prefer cargo-nextest if available
@@ -42,60 +40,52 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
     return Ok(());
   }
 
-  // Dry run mode - just show what would be tested
-  if config.dry_run {
-    println!("Would test {} affected crate(s):", test_targets.len());
-    for target in &test_targets {
-      println!("  • {}", target);
+  if config.explain {
+    println!("Change Impact Analysis:");
+    println!("  Total files changed: {}", impact.changed_files.len());
+    println!(
+      "  Requires rebuild: {}",
+      if impact.requires_rebuild { "yes" } else { "no" }
+    );
+    println!(
+      "  Requires retest: {}",
+      if impact.requires_retest { "yes" } else { "no" }
+    );
+
+    println!("\nFile Breakdown:");
+    if impact.categories.has_source_changes() {
+      println!("  - Source code: {} file(s)", impact.categories.source_files.len());
+    }
+    if impact.categories.has_test_changes() {
+      println!("  - Tests: {} file(s)", impact.categories.test_files.len());
+    }
+    if impact.categories.has_example_changes() {
+      println!("  - Examples: {} file(s)", impact.categories.example_files.len());
+    }
+    if impact.categories.has_config_changes() {
+      println!("  - Config: {} file(s)", impact.categories.config_files.len());
+    }
+    if !impact.categories.build_scripts.is_empty() {
+      println!("  - Build scripts: {} file(s)", impact.categories.build_scripts.len());
+    }
+    if !impact.categories.doc_files.is_empty() {
+      println!("  - Documentation: {} file(s)", impact.categories.doc_files.len());
     }
 
-    if config.explain {
-      println!("\nChange Impact Analysis:");
-      println!("  Total files changed: {}", impact.changed_files.len());
-      println!(
-        "  Requires rebuild: {}",
-        if impact.requires_rebuild { "yes" } else { "no" }
-      );
-      println!(
-        "  Requires retest: {}",
-        if impact.requires_retest { "yes" } else { "no" }
-      );
-
-      println!("\nFile Breakdown:");
-      if impact.categories.has_source_changes() {
-        println!("  - Source code: {} file(s)", impact.categories.source_files.len());
-      }
-      if impact.categories.has_test_changes() {
-        println!("  - Tests: {} file(s)", impact.categories.test_files.len());
-      }
-      if impact.categories.has_example_changes() {
-        println!("  - Examples: {} file(s)", impact.categories.example_files.len());
-      }
-      if impact.categories.has_config_changes() {
-        println!("  - Config: {} file(s)", impact.categories.config_files.len());
-      }
-      if !impact.categories.build_scripts.is_empty() {
-        println!("  - Build scripts: {} file(s)", impact.categories.build_scripts.len());
-      }
-      if !impact.categories.doc_files.is_empty() {
-        println!("  - Documentation: {} file(s)", impact.categories.doc_files.len());
-      }
-
-      println!("\nAffected Crates:");
-      println!("  - Direct: {} crate(s)", impact.direct_crates.len());
-      if !impact.direct_crates.is_empty() {
-        for crate_name in &impact.direct_crates {
-          println!("    • {}", crate_name);
-        }
-      }
-      println!("  - Transitive: {} crate(s)", impact.transitive_crates.len());
-      if !impact.transitive_crates.is_empty() {
-        for crate_name in &impact.transitive_crates {
-          println!("    • {}", crate_name);
-        }
+    println!("\nAffected Crates:");
+    println!("  - Direct: {} crate(s)", impact.direct_crates.len());
+    if !impact.direct_crates.is_empty() {
+      for crate_name in &impact.direct_crates {
+        println!("    • {}", crate_name);
       }
     }
-    return Ok(());
+    println!("  - Transitive: {} crate(s)", impact.transitive_crates.len());
+    if !impact.transitive_crates.is_empty() {
+      for crate_name in &impact.transitive_crates {
+        println!("    • {}", crate_name);
+      }
+    }
+    println!();
   }
 
   // Select test runner

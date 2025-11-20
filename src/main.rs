@@ -51,9 +51,6 @@ enum Commands {
     /// Use cargo-nextest if available
     #[arg(long)]
     nextest: bool,
-    /// Show what would be tested without running tests
-    #[arg(long)]
-    dry_run: bool,
     /// Explain why tests are being run
     #[arg(long)]
     explain: bool,
@@ -329,7 +326,6 @@ fn main() {
     Commands::Test {
       since,
       nextest,
-      dry_run,
       explain,
       watch,
       watch_mode,
@@ -337,7 +333,6 @@ fn main() {
     } => {
       let config = commands::test::TestConfig {
         since,
-        dry_run,
         explain,
         prefer_nextest: nextest,
         test_args,

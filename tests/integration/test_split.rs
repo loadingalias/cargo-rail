@@ -179,3 +179,91 @@ paths = [{{ crate = "crates/lib-core" }}]
 
   Ok(())
 }
+
+#[test]
+fn test_split_release_flow_creates_tag_and_changelog() -> Result<()> {
+  // Split a crate, then run release in the split repo to ensure tagging/changelog works.
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("lib-release", "0.1.0", &[])?;
+  ws.commit("Add lib-release")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[[splits]]
+name = "lib-release"
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/lib-release" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // Perform split
+  run_cargo_rail(&ws.path, &["rail", "split", "lib-release"])?;
+
+  // Prepare release config inside split repo
+  let split_root = split_dir.path();
+  // Configure git user to allow tagging/commits in split repo
+  git(split_root, &["config", "user.name", "Test Split"])?;
+  git(split_root, &["config", "user.email", "split@example.com"])?;
+
+  std::fs::create_dir_all(split_root.join(".config"))?;
+  std::fs::write(
+    split_root.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+tag_prefix = "v"
+tag_format = "v{version}"
+changelog_path = "CHANGELOG.md"
+require_clean = false
+"#,
+  )?;
+
+  // Tag current version
+  git(split_root, &["tag", "-a", "v0.1.0", "-m", "Initial split tag"])?;
+
+  // Make a change to release
+  std::fs::write(split_root.join("src/lib.rs"), "// bumped")?;
+  git(split_root, &["add", "."])?;
+  git(split_root, &["commit", "-m", "feat: prepare release"])?;
+
+  // Run release publish in split repo (skip crates.io)
+  let output = run_cargo_rail(
+    split_root,
+    &[
+      "rail",
+      "release",
+      "publish",
+      "--all",
+      "--bump",
+      "patch",
+      "--execute",
+      "--skip-publish",
+    ],
+  )?;
+  assert!(output.status.success(), "Split release should succeed");
+
+  // Verify tag and changelog
+  let tags = git(split_root, &["tag", "--list"])?;
+  let tag_list = String::from_utf8_lossy(&tags.stdout);
+  assert!(
+    tag_list.contains("v0.1.1"),
+    "Release should create new tag v0.1.1. Tags:\n{}",
+    tag_list
+  );
+
+  let changelog = std::fs::read_to_string(split_root.join("CHANGELOG.md"))?;
+  assert!(
+    changelog.contains("## [0.1.1]"),
+    "Changelog should include new version header"
+  );
+
+  Ok(())
+}

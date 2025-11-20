@@ -133,7 +133,22 @@ fn run_with_cargo_watch(ctx: &WorkspaceContext, config: TestConfig) -> RailResul
   let mut cmd = Command::new("cargo-watch");
   cmd.current_dir(ctx.workspace_root());
 
-  // cargo-watch -x "rail test --since HEAD~1"
+  let rail_cmd = format_watch_test_command(&config);
+  cmd.arg("-x").arg(rail_cmd);
+
+  let status = cmd
+    .status()
+    .map_err(|e| crate::error::RailError::message(format!("Failed to run cargo-watch: {}", e)))?;
+
+  if !status.success() {
+    std::process::exit(status.code().unwrap_or(1));
+  }
+
+  Ok(())
+}
+
+/// Build the inner `cargo rail test ...` command string for watch integrations.
+fn format_watch_test_command(config: &TestConfig) -> String {
   let mut rail_cmd = String::from("rail test");
 
   if let Some(ref since) = config.since {
@@ -149,17 +164,7 @@ fn run_with_cargo_watch(ctx: &WorkspaceContext, config: TestConfig) -> RailResul
     rail_cmd.push_str(&config.test_args.join(" "));
   }
 
-  cmd.arg("-x").arg(rail_cmd);
-
-  let status = cmd
-    .status()
-    .map_err(|e| crate::error::RailError::message(format!("Failed to run cargo-watch: {}", e)))?;
-
-  if !status.success() {
-    std::process::exit(status.code().unwrap_or(1));
-  }
-
-  Ok(())
+  rail_cmd
 }
 
 #[cfg(test)]
@@ -196,5 +201,21 @@ mod tests {
         assert!(!WatchMode::CargoWatch.is_available());
       }
     }
+  }
+
+  #[test]
+  fn test_format_watch_test_command_includes_flags_and_args() {
+    let cfg = TestConfig {
+      since: Some("main".to_string()),
+      explain: false,
+      prefer_nextest: true,
+      test_args: vec!["--nocapture".into(), "some::test".into()],
+    };
+
+    let cmd = format_watch_test_command(&cfg);
+    assert!(cmd.starts_with("rail test"));
+    assert!(cmd.contains("--since main"));
+    assert!(cmd.contains("--nextest"));
+    assert!(cmd.contains("-- --nocapture some::test"));
   }
 }

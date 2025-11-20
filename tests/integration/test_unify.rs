@@ -347,3 +347,26 @@ fn test_unify_exclude_option() -> Result<()> {
 
   Ok(())
 }
+
+#[test]
+fn test_unify_apply_conflict_fails() -> Result<()> {
+  // Incompatible versions should make apply fail (no rewrite performed)
+  let workspace = TestWorkspace::new()?;
+
+  workspace.add_crate("crate-a", "0.1.0", &[("syn", r#""1.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("syn", r#""2.0""#)])?;
+  workspace.commit("Add crates with conflicting syn versions")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+
+  assert!(
+    !output.status.success(),
+    "apply should fail on true conflicts (syn 1.x vs 2.x)"
+  );
+
+  // Ensure manifests not rewritten on failure
+  let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
+  assert!(crate_a_toml.contains("syn"), "crate-a manifest should remain unchanged");
+
+  Ok(())
+}

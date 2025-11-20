@@ -134,6 +134,35 @@ mod tests {{
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
+  /// Set origin remote (useful for link generation)
+  pub fn set_remote(&self, url: &str) -> Result<()> {
+    git(&self.path, &["remote", "remove", "origin"]).ok();
+    git(&self.path, &["remote", "add", "origin", url])?;
+    Ok(())
+  }
+
+  /// Create an annotated tag
+  pub fn tag(&self, name: &str, message: &str) -> Result<()> {
+    git(&self.path, &["tag", "-a", name, "-m", message])?;
+    Ok(())
+  }
+
+  /// Overwrite or create the release config block in .config/rail.toml
+  pub fn write_release_config(&self, content: &str) -> Result<()> {
+    let config_path = self.path.join(".config/rail.toml");
+    let mut existing = std::fs::read_to_string(&config_path)?;
+
+    if let Some(idx) = existing.find("[release]") {
+      existing.truncate(idx);
+    }
+
+    existing.push_str("\n[release]\n");
+    existing.push_str(content);
+
+    std::fs::write(&config_path, existing)?;
+    Ok(())
+  }
+
   /// Modify a file in a crate
   pub fn modify_file(&self, crate_name: &str, file: &str, content: &str) -> Result<()> {
     let file_path = self.path.join("crates").join(crate_name).join(file);

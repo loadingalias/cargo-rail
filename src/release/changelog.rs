@@ -169,10 +169,11 @@ fn extract_pr_numbers(text: &str) -> Vec<u32> {
 
   for word in text.split_whitespace() {
     if let Some(num_str) = word.strip_prefix("(#").and_then(|s| s.strip_suffix(')'))
-      && let Ok(num) = num_str.parse::<u32>() {
-        prs.push(num);
-        continue;
-      }
+      && let Ok(num) = num_str.parse::<u32>()
+    {
+      prs.push(num);
+      continue;
+    }
 
     if let Some(num_str) = word.strip_prefix('#') {
       let numeric = num_str.trim_end_matches(|c: char| !c.is_ascii_digit());
