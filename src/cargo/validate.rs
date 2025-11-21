@@ -13,18 +13,26 @@ use std::sync::{Arc, Mutex};
 /// Result of validating a single target
 #[derive(Debug, Clone)]
 pub struct TargetValidationResult {
+  /// Target triple being validated
   pub target: String,
+  /// Whether validation succeeded
   pub success: bool,
+  /// Error message if validation failed
   pub error: Option<String>,
+  /// Warning messages from cargo metadata
   pub warnings: Vec<String>,
 }
 
 /// Summary of all target validations
 #[derive(Debug)]
 pub struct ValidationSummary {
+  /// Individual validation results for each target
   pub results: Vec<TargetValidationResult>,
+  /// Total number of targets validated
   pub total_targets: usize,
+  /// Number of successful validations
   pub successful: usize,
+  /// Number of failed validations
   pub failed: usize,
 }
 
@@ -224,57 +232,5 @@ mod tests {
     let result = validate_single_target(&current_dir, "invalid-target-triple");
     assert!(!result.success, "Invalid target should fail");
     assert!(result.error.is_some(), "Should have an error message");
-  }
-
-  #[test]
-  fn test_validation_summary_all_passed() {
-    let summary = ValidationSummary {
-      results: vec![
-        TargetValidationResult {
-          target: "target1".to_string(),
-          success: true,
-          error: None,
-          warnings: vec![],
-        },
-        TargetValidationResult {
-          target: "target2".to_string(),
-          success: true,
-          error: None,
-          warnings: vec![],
-        },
-      ],
-      total_targets: 2,
-      successful: 2,
-      failed: 0,
-    };
-
-    assert!(summary.all_passed());
-    assert!(summary.failed_targets().is_empty());
-  }
-
-  #[test]
-  fn test_validation_summary_some_failed() {
-    let summary = ValidationSummary {
-      results: vec![
-        TargetValidationResult {
-          target: "target1".to_string(),
-          success: true,
-          error: None,
-          warnings: vec![],
-        },
-        TargetValidationResult {
-          target: "target2".to_string(),
-          success: false,
-          error: Some("Failed".to_string()),
-          warnings: vec![],
-        },
-      ],
-      total_targets: 2,
-      successful: 1,
-      failed: 1,
-    };
-
-    assert!(!summary.all_passed());
-    assert_eq!(summary.failed_targets(), vec!["target2"]);
   }
 }

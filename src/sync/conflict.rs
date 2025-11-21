@@ -40,6 +40,7 @@ impl std::str::FromStr for ConflictStrategy {
 /// Information about a conflict
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
+  /// Path to the conflicted file
   pub file_path: PathBuf,
   /// Conflict description (used by SyncEngine, may be logged in future)
   #[allow(dead_code)]

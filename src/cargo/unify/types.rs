@@ -96,7 +96,12 @@ pub struct UnificationPlan {
 #[derive(Debug, Clone)]
 pub enum MemberEdit {
   /// Convert dependency to workspace = true
-  UseWorkspace { dep_name: String, kind: DependencyKind },
+  UseWorkspace {
+    /// Dependency name
+    dep_name: String,
+    /// Dependency kind
+    kind: DependencyKind,
+  },
 }
 
 /// Severity of a unification issue

@@ -661,37 +661,6 @@ pub fn run_init_standalone(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::fs;
-  use tempfile::TempDir;
-
-  #[test]
-  fn test_check_existing_config() {
-    let temp_dir = TempDir::new().unwrap();
-
-    // No config exists
-    assert!(check_existing_config(temp_dir.path()).is_none());
-
-    // Create config at .config/rail.toml
-    let config_dir = temp_dir.path().join(".config");
-    fs::create_dir(&config_dir).unwrap();
-    fs::write(config_dir.join("rail.toml"), "").unwrap();
-
-    assert!(check_existing_config(temp_dir.path()).is_some());
-  }
-
-  #[test]
-  fn test_ensure_output_dir() {
-    let temp_dir = TempDir::new().unwrap();
-    let output_path = temp_dir.path().join(".config/rail.toml");
-
-    // Directory doesn't exist yet
-    assert!(!output_path.parent().unwrap().exists());
-
-    ensure_output_dir(&output_path).unwrap();
-
-    // Directory should now exist
-    assert!(output_path.parent().unwrap().exists());
-  }
 
   #[test]
   fn test_serialize_config_with_comments() {

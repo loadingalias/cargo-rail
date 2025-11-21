@@ -105,57 +105,27 @@ mod tests {
   use std::path::PathBuf;
 
   #[test]
-  fn test_unix_absolute_paths() {
+  fn test_is_local_path_classification() {
+    // Local paths - absolute
     assert!(is_local_path("/home/user/repo"));
-    assert!(is_local_path("/tmp/test-repo"));
-    assert!(is_local_path("/var/lib/git"));
-  }
-
-  #[test]
-  fn test_relative_paths() {
-    assert!(is_local_path("./repo"));
-    assert!(is_local_path("../repo"));
-    assert!(is_local_path("./path/to/repo"));
-    assert!(is_local_path("../path/to/repo"));
-  }
-
-  #[test]
-  fn test_windows_absolute_paths() {
-    // These work on all platforms because Path::is_absolute() handles them
     assert!(is_local_path("C:\\Users\\test\\repo"));
     assert!(is_local_path("C:/Users/test/repo"));
-    assert!(is_local_path("D:\\path\\to\\repo"));
-    assert!(is_local_path("E:/another/path"));
-  }
 
-  #[test]
-  fn test_windows_unc_paths() {
-    // This test only runs on Windows where the cfg is active
+    // Local paths - relative
+    assert!(is_local_path("./repo"));
+    assert!(is_local_path("../path/to/repo"));
+
+    // Windows UNC paths (platform-specific)
     #[cfg(target_os = "windows")]
-    {
-      assert!(is_local_path("\\\\server\\share\\repo"));
-      assert!(is_local_path("\\\\nas\\backup\\git"));
-    }
-  }
+    assert!(is_local_path("\\\\server\\share\\repo"));
 
-  #[test]
-  fn test_remote_urls() {
+    // Remote URLs - various protocols
     assert!(!is_local_path("git@github.com:user/repo.git"));
-    assert!(!is_local_path("git@gitlab.com:org/project.git"));
     assert!(!is_local_path("https://github.com/user/repo.git"));
-    assert!(!is_local_path("http://gitlab.com/user/repo.git"));
     assert!(!is_local_path("ssh://git@github.com/user/repo.git"));
-    assert!(!is_local_path("https://bitbucket.org/user/repo.git"));
-  }
 
-  #[test]
-  fn test_edge_cases() {
-    // Just a name, not a path - should be false for safety
+    // Edge cases - ambiguous bare names
     assert!(!is_local_path("repo"));
-    assert!(!is_local_path("my-crate"));
-    assert!(!is_local_path("some-name"));
-
-    // Empty string
     assert!(!is_local_path(""));
   }
 

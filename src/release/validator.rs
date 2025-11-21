@@ -6,10 +6,12 @@ use std::process::Command;
 
 /// Pre-release validator
 pub struct ReleaseValidator<'a> {
+  /// Workspace context
   ctx: &'a WorkspaceContext,
 }
 
 impl<'a> ReleaseValidator<'a> {
+  /// Create a new release validator
   pub fn new(ctx: &'a WorkspaceContext) -> Self {
     Self { ctx }
   }

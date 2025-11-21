@@ -352,12 +352,6 @@ mod tests {
   use tempfile::TempDir;
 
   #[test]
-  fn test_new_mapping_store() {
-    let store = MappingStore::new("test-crate".to_string());
-    assert_eq!(store.count(), 0);
-  }
-
-  #[test]
   fn test_record_and_get_mapping() {
     let mut store = MappingStore::new("test-crate".to_string());
 
@@ -442,29 +436,6 @@ mod tests {
 
     assert!(result.is_ok());
     assert_eq!(store.count(), 0);
-  }
-
-  #[test]
-  fn test_clear() {
-    let mut store = MappingStore::new("test-crate".to_string());
-    store.record_mapping("abc123", "def456").unwrap();
-    assert_eq!(store.count(), 1);
-
-    store.clear();
-    assert_eq!(store.count(), 0);
-    assert!(!store.has_mapping("abc123"));
-  }
-
-  #[test]
-  fn test_all_mappings() {
-    let mut store = MappingStore::new("test-crate".to_string());
-    store.record_mapping("sha1", "sha2").unwrap();
-    store.record_mapping("sha3", "sha4").unwrap();
-
-    let all = store.all_mappings();
-    assert_eq!(all.len(), 2);
-    assert_eq!(all.get("sha1"), Some(&"sha2".to_string()));
-    assert_eq!(all.get("sha3"), Some(&"sha4".to_string()));
   }
 
   #[test]

@@ -5,7 +5,9 @@
 //! - Conflict detection and resolution strategies
 //! - Merge strategies (ours, theirs, manual, union)
 
+/// Conflict detection and resolution strategies
 pub mod conflict;
+/// Sync engine implementation
 pub mod engine;
 
 pub use conflict::ConflictStrategy;

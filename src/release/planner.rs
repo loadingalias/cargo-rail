@@ -18,34 +18,50 @@ pub struct ReleasePlan {
   pub summary: ReleaseSummary,
 }
 
+/// Release plan for a single crate
 #[derive(Debug, Clone, Serialize)]
 pub struct CrateReleasePlan {
+  /// Crate name
   pub name: String,
+  /// Current version
   pub current_version: Version,
+  /// New version after bump
   pub new_version: Version,
+  /// Path to Cargo.toml
   pub manifest_path: PathBuf,
+  /// Path to CHANGELOG.md
   pub changelog_path: PathBuf,
+  /// Git tag name for this release
   pub tag_name: String,
+  /// Whether to publish to crates.io
   pub publish: bool,
+  /// Whether to generate changelog
   pub generate_changelog: bool,
   /// Dependents that will need version updates
   pub affected_dependents: Vec<String>,
 }
 
+/// Summary statistics for a release plan
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleaseSummary {
+  /// Total number of crates in the plan
   pub total_crates: usize,
+  /// Number of crates that will be published
   pub crates_to_publish: usize,
+  /// Number of crates that will be tagged
   pub crates_to_tag: usize,
 }
 
 /// Release planner
 pub struct ReleasePlanner<'a> {
+  /// Workspace context
   ctx: &'a WorkspaceContext,
+  /// Release configuration
   release_config: &'a ReleaseConfig,
 }
 
 impl<'a> ReleasePlanner<'a> {
+  /// Create a new release planner
   pub fn new(ctx: &'a WorkspaceContext, release_config: &'a ReleaseConfig) -> Self {
     Self { ctx, release_config }
   }

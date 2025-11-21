@@ -11,28 +11,41 @@ use std::path::{Path, PathBuf};
 
 /// Configuration for sync operation
 pub struct SyncConfig {
+  /// Name of the crate being synced
   pub crate_name: String,
+  /// Paths to crate directories
   pub crate_paths: Vec<PathBuf>,
+  /// Split mode (single or combined)
   pub mode: SplitMode,
+  /// Path to target repository
   pub target_repo_path: PathBuf,
+  /// Branch name
   pub branch: String,
+  /// Remote repository URL
   pub remote_url: String,
 }
 
 /// Result of a sync operation
 pub struct SyncResult {
+  /// Number of commits synced
   pub commits_synced: usize,
   /// Direction of sync operation - public API field for logging/auditing
   #[allow(dead_code)]
   pub direction: SyncDirection,
+  /// Conflicts encountered during sync
   pub conflicts: Vec<ConflictInfo>,
 }
 
+/// Direction of synchronization
 #[derive(Debug, Clone)]
 pub enum SyncDirection {
+  /// Monorepo to remote
   MonoToRemote,
+  /// Remote to monorepo
   RemoteToMono,
+  /// Both directions
   Both,
+  /// No sync needed
   None,
 }
 
@@ -42,17 +55,22 @@ type ConflictResolutionResult = (Vec<ConflictInfo>, Vec<(PathBuf, char)>);
 
 /// Bidirectional sync engine
 pub struct SyncEngine<'a> {
+  /// Workspace context
   ctx: &'a WorkspaceContext,
+  /// Sync configuration
   config: SyncConfig,
+  /// Commit mapping store
   mapping_store: MappingStore,
+  /// Cargo.toml transformer
   transform: CargoTransform,
-
+  /// Conflict resolver
   conflict_resolver: ConflictResolver,
   /// Track which repos we've loaded mappings from (to avoid redundant loads)
   loaded_repos: std::collections::HashSet<PathBuf>,
 }
 
 impl<'a> SyncEngine<'a> {
+  /// Create a new sync engine
   pub fn new(ctx: &'a WorkspaceContext, config: SyncConfig, conflict_strategy: ConflictStrategy) -> RailResult<Self> {
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let transform = CargoTransform::new(ctx.cargo.metadata().clone());
@@ -99,6 +117,7 @@ impl<'a> SyncEngine<'a> {
     }
   }
 
+  /// Sync changes from monorepo to remote repository
   pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
     println!("   Syncing monorepo → remote...");
 
@@ -201,6 +220,7 @@ impl<'a> SyncEngine<'a> {
     })
   }
 
+  /// Sync changes from remote repository to monorepo
   pub fn sync_from_remote(&mut self) -> RailResult<SyncResult> {
     println!("   Syncing remote → monorepo...");
 
@@ -297,6 +317,7 @@ impl<'a> SyncEngine<'a> {
     })
   }
 
+  /// Sync changes bidirectionally between monorepo and remote
   pub fn sync_bidirectional(&mut self) -> RailResult<SyncResult> {
     println!("   Detecting changes...");
 

@@ -10,11 +10,17 @@ use std::path::{Path, PathBuf};
 
 /// Configuration for a split operation
 pub struct SplitConfig {
+  /// Name of the crate being split
   pub crate_name: String,
+  /// Paths to crate directories in monorepo
   pub crate_paths: Vec<PathBuf>,
+  /// Split mode (single or combined)
   pub mode: SplitMode,
+  /// Target repository path
   pub target_repo_path: PathBuf,
+  /// Branch name for split repo
   pub branch: String,
+  /// Remote repository URL
   pub remote_url: Option<String>,
 }
 

@@ -13,11 +13,14 @@ use std::time::Duration;
 
 /// Release publisher
 pub struct ReleasePublisher<'a> {
+  /// Workspace context
   ctx: &'a WorkspaceContext,
+  /// Release configuration
   release_config: &'a ReleaseConfig,
 }
 
 impl<'a> ReleasePublisher<'a> {
+  /// Create a new release publisher
   pub fn new(ctx: &'a WorkspaceContext, release_config: &'a ReleaseConfig) -> Self {
     Self { ctx, release_config }
   }

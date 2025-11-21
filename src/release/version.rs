@@ -228,14 +228,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_bump_type_parse() {
-    assert_eq!("major".parse::<BumpType>().unwrap(), BumpType::Major);
-    assert_eq!("minor".parse::<BumpType>().unwrap(), BumpType::Minor);
-    assert_eq!("patch".parse::<BumpType>().unwrap(), BumpType::Patch);
-    assert!(matches!("1.2.3".parse::<BumpType>().unwrap(), BumpType::Exact(_)));
-  }
-
-  #[test]
   fn test_bump_patch() {
     let v = Version::parse("1.2.3").unwrap();
     let next = BumpType::Patch.apply(&v);

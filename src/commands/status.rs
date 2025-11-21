@@ -24,11 +24,22 @@ pub enum SyncStatus {
   /// Up to date
   UpToDate,
   /// Ahead of remote (N commits)
-  Ahead { commits: u64 },
+  Ahead {
+    /// Number of commits ahead
+    commits: u64,
+  },
   /// Behind remote (N commits)
-  Behind { commits: u64 },
+  Behind {
+    /// Number of commits behind
+    commits: u64,
+  },
   /// Diverged (ahead and behind)
-  Diverged { ahead: u64, behind: u64 },
+  Diverged {
+    /// Number of commits ahead
+    ahead: u64,
+    /// Number of commits behind
+    behind: u64,
+  },
 }
 
 /// Status information for a single crate

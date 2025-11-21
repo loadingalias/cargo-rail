@@ -1,8 +1,22 @@
-//! Error types for cargo-rail with contextual messages and exit codes
+//! Error types with contextual messages and exit codes.
 //!
-//! This module provides a unified error type that categorizes errors and provides
-//! contextual help messages to users. Every error includes a helpful suggestion
-//! to guide users toward resolution.
+//! Provides [`RailError`] with categorized variants, help text, and process exit codes.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use cargo_rail::error::{RailError, ResultExt};
+//!
+//! fn parse_number(s: &str) -> Result<u32, RailError> {
+//!     s.parse().context("Invalid number format")
+//! }
+//!
+//! let result = parse_number("42");
+//! assert!(result.is_ok());
+//!
+//! let result = parse_number("invalid");
+//! assert!(result.is_err());
+//! ```
 
 use std::fmt;
 use std::io;
@@ -38,8 +52,11 @@ pub enum RailError {
 
   /// Generic error with message and optional context
   Message {
+    /// Error message
     message: String,
+    /// Additional context about the error
     context: Option<String>,
+    /// Help text to guide the user
     help: Option<String>,
   },
 }
@@ -205,13 +222,22 @@ impl From<std::env::VarError> for RailError {
 #[derive(Debug)]
 pub enum ConfigError {
   /// rail.toml not found
-  NotFound { workspace_root: PathBuf },
+  NotFound {
+    /// Workspace root where config was searched
+    workspace_root: PathBuf,
+  },
 
   /// Missing required field
-  MissingField { field: String },
+  MissingField {
+    /// Name of the missing field
+    field: String,
+  },
 
   /// Crate not found in configuration
-  CrateNotFound { name: String },
+  CrateNotFound {
+    /// Name of the crate that wasn't found
+    name: String,
+  },
 }
 
 impl ConfigError {
@@ -251,18 +277,32 @@ impl fmt::Display for ConfigError {
 #[derive(Debug)]
 pub enum GitError {
   /// Git command failed
-  CommandFailed { command: String, stderr: String },
+  CommandFailed {
+    /// Command that was executed
+    command: String,
+    /// Standard error output
+    stderr: String,
+  },
 
   /// Repository not found
-  RepoNotFound { path: PathBuf },
+  RepoNotFound {
+    /// Path where repository was expected
+    path: PathBuf,
+  },
 
   /// Commit not found
-  CommitNotFound { sha: String },
+  CommitNotFound {
+    /// SHA of the missing commit
+    sha: String,
+  },
 
   /// Push failed
   PushFailed {
+    /// Remote name
     remote: String,
+    /// Branch name
     branch: String,
+    /// Failure reason
     reason: String,
   },
 }

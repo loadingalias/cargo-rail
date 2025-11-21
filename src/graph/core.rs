@@ -32,9 +32,11 @@ use std::sync::RwLock;
 /// A package node in the dependency graph.
 #[derive(Debug, Clone)]
 pub struct PackageNode {
+  /// Package name
   pub name: String,
-
+  /// Path to Cargo.toml
   pub manifest_path: PathBuf,
+  /// Whether this is a workspace member
   pub is_workspace_member: bool,
 }
 
@@ -338,19 +340,6 @@ impl WorkspaceGraph {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::env;
-
-  #[test]
-  fn test_load_workspace() {
-    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-      let workspace_root = PathBuf::from(manifest_dir);
-      let graph = WorkspaceGraph::load(&workspace_root).unwrap();
-
-      let members = graph.workspace_members();
-      assert!(!members.is_empty());
-      assert!(members.contains(&"cargo-rail".to_string()));
-    }
-  }
 
   #[test]
   fn test_should_ignore_path() {

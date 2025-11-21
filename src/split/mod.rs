@@ -6,6 +6,7 @@
 //! - Cargo.toml transformations for split repos
 //! - Git-notes based commit mapping
 
+/// Split engine implementation
 pub mod engine;
 
 pub use engine::{SplitConfig, SplitEngine};

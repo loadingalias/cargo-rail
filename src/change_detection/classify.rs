@@ -17,7 +17,10 @@ pub enum ChangeKind {
   },
 
   /// Test code (does not affect downstream crates)
-  Test { kind: TestKind },
+  Test {
+    /// Type of test
+    kind: TestKind,
+  },
 
   /// Examples (compile but don't affect dependencies)
   Example,
@@ -26,7 +29,10 @@ pub enum ChangeKind {
   BuildScript,
 
   /// Configuration files
-  Config { kind: ConfigKind },
+  Config {
+    /// Type of configuration file
+    kind: ConfigKind,
+  },
 
   /// Documentation only (no rebuild/retest needed)
   Documentation,

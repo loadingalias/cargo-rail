@@ -13,13 +13,21 @@ use std::process::Command;
 /// Information about a git commit
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
+  /// Full SHA-1 hash of the commit
   pub sha: String,
+  /// Author name
   pub author: String,
+  /// Author email address
   pub author_email: String,
+  /// Committer name
   pub committer: String,
+  /// Committer email address
   pub committer_email: String,
+  /// Commit message
   pub message: String,
+  /// Commit timestamp (seconds since Unix epoch)
   pub timestamp: i64,
+  /// Parent commit SHAs
   pub parent_shas: Vec<String>,
 }
 
@@ -133,31 +141,4 @@ impl SystemGit {
 }
 
 #[cfg(test)]
-mod tests {
-  /// Parse git timestamp (seconds since epoch)
-  fn parse_timestamp(ts_str: &str) -> i64 {
-    ts_str
-      .split_whitespace()
-      .next()
-      .and_then(|s| s.parse().ok())
-      .unwrap_or(0)
-  }
-
-  /// Validate SHA format (40 hex chars)
-  fn is_valid_sha(sha: &str) -> bool {
-    sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
-  }
-
-  #[test]
-  fn test_parse_timestamp() {
-    assert_eq!(parse_timestamp("1699999999 -0800"), 1699999999);
-    assert_eq!(parse_timestamp("invalid"), 0);
-  }
-
-  #[test]
-  fn test_is_valid_sha() {
-    assert!(is_valid_sha("a".repeat(40).as_str()));
-    assert!(!is_valid_sha("z".repeat(40).as_str()));
-    assert!(!is_valid_sha("a".repeat(39).as_str()));
-  }
-}
+mod tests {}

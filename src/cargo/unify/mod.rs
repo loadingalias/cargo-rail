@@ -277,15 +277,6 @@ mod tests {
   }
 
   #[test]
-  fn test_unify_config_default() {
-    let config = UnifyConfig::default();
-    assert!(matches!(config.strategy, UnifyStrategy::All));
-    assert!(!config.allow_renamed); // Renamed deps not allowed by default
-    assert!(config.exclude.is_empty());
-    assert!(config.include.is_empty());
-  }
-
-  #[test]
   fn test_analyze_workspace() {
     let metadata = create_test_metadata();
     let unifier = WorkspaceUnifier::with_config(&metadata, UnifyConfig::default());

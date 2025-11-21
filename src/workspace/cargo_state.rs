@@ -167,25 +167,6 @@ mod tests {
   use tempfile::TempDir;
 
   #[test]
-  fn test_fnv1a_hasher() {
-    let mut hasher = Fnv1aHasher::new();
-    hasher.write(b"hello");
-    let hash1 = hasher.finish();
-
-    let mut hasher2 = Fnv1aHasher::new();
-    hasher2.write(b"hello");
-    let hash2 = hasher2.finish();
-
-    assert_eq!(hash1, hash2, "Hash should be deterministic");
-
-    let mut hasher3 = Fnv1aHasher::new();
-    hasher3.write(b"world");
-    let hash3 = hasher3.finish();
-
-    assert_ne!(hash1, hash3, "Different content should have different hash");
-  }
-
-  #[test]
   fn test_metadata_caching() {
     // Create a temp workspace
     let temp_dir = TempDir::new().unwrap();

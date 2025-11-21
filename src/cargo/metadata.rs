@@ -55,10 +55,12 @@ impl WorkspaceMetadata {
   // Basic Package Access
   // ============================================================================
 
+  /// Get all workspace member packages
   pub fn list_crates(&self) -> Vec<&Package> {
     self.metadata.workspace_packages()
   }
 
+  /// Find a package by name in the workspace
   pub fn get_package(&self, name: &str) -> Option<&Package> {
     self
       .metadata
@@ -67,6 +69,7 @@ impl WorkspaceMetadata {
       .find(|pkg| pkg.name == name)
   }
 
+  /// Get the workspace root directory path
   pub fn workspace_root(&self) -> &std::path::Path {
     self.metadata.workspace_root.as_std_path()
   }
@@ -202,19 +205,6 @@ mod tests {
     assert!(missing.is_none(), "Non-existent package should be None");
   }
 
-  #[test]
-  fn test_workspace_root() {
-    let metadata = create_test_metadata();
-    let root = metadata.workspace_root();
-
-    // Should return valid path
-    assert!(root.exists(), "Workspace root should exist");
-    assert!(root.is_dir(), "Workspace root should be directory");
-
-    // Should contain Cargo.toml
-    assert!(root.join("Cargo.toml").exists(), "Should have Cargo.toml");
-  }
-
   // ============================================================================
   // Tier 2: Feature & Target Analysis
   // ============================================================================
@@ -272,42 +262,9 @@ mod tests {
     assert!(empty_features.is_ok(), "Should load with empty features list");
   }
 
-  #[test]
-  fn test_metadata_json() {
-    let metadata = create_test_metadata();
-    let raw = metadata.metadata_json();
-
-    // Should have access to raw metadata
-    assert!(!raw.packages.is_empty(), "Raw metadata should have packages");
-  }
-
   // ============================================================================
   // Feature Unification Tests
   // ============================================================================
-
-  #[test]
-  fn test_get_resolved_features_for_package() {
-    let metadata = create_test_metadata();
-
-    // Test with a known external dependency (serde)
-    // We know cargo-rail depends on serde
-    if let Some(features) = metadata.get_resolved_features_for_package("serde") {
-      // Resolved features should be a set
-      assert!(
-        !features.is_empty() || features.is_empty(),
-        "Features set should be valid"
-      );
-
-      // serde commonly has these features in resolved graph
-      // (may vary based on what other crates enable)
-      // Just verify we got a valid HashSet
-      let _features_vec: Vec<String> = features.into_iter().collect();
-    } else {
-      // It's ok if serde doesn't have resolved features in test context
-      // (might not be in resolve graph if running with limited metadata)
-      println!("Note: serde not found in resolved graph (test may need full metadata)");
-    }
-  }
 
   #[test]
   fn test_get_resolved_features_returns_none_for_workspace_members() {

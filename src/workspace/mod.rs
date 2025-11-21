@@ -8,10 +8,15 @@
 //!
 //! Built once at startup, passed by reference to all commands.
 
+/// Cargo workspace state management
 pub mod cargo_state;
+/// Change impact analysis
 pub mod change_analyzer;
+/// Unified workspace context
 pub mod context;
+/// File path utilities
 pub mod files;
+/// Git repository state management
 pub mod git_state;
 
 // Re-export change analysis types

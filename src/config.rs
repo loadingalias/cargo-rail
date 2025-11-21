@@ -7,17 +7,23 @@ use std::path::{Path, PathBuf};
 /// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RailConfig {
+  /// Workspace configuration
   pub workspace: WorkspaceConfig,
+  /// Dependency unification settings
   #[serde(default)]
   pub unify: UnifyConfig,
+  /// Release management settings
   #[serde(default)]
   pub release: ReleaseConfig,
+  /// Split/sync configurations for crates
   #[serde(default)]
   pub splits: Vec<SplitConfig>,
 }
 
+/// Workspace location configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
+  /// Path to workspace root
   pub root: PathBuf,
 }
 
@@ -216,19 +222,27 @@ fn default_true() -> bool {
   true
 }
 
+/// Configuration for splitting/syncing a crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitConfig {
+  /// Crate name
   pub name: String,
+  /// Remote repository URL or local path
   pub remote: String,
+  /// Git branch to use
   pub branch: String,
+  /// Split mode (single or combined)
   pub mode: SplitMode,
   /// For combined mode: how to structure the split repo
   #[serde(default)]
   pub workspace_mode: WorkspaceMode,
+  /// Crate paths to include in the split
   #[serde(default)]
   pub paths: Vec<CratePath>,
+  /// Additional files/directories to include
   #[serde(default)]
   pub include: Vec<String>,
+  /// Files/directories to exclude
   #[serde(default)]
   pub exclude: Vec<String>,
 
@@ -241,17 +255,22 @@ pub struct SplitConfig {
   pub changelog_path: Option<PathBuf>,
 }
 
+/// Path to a crate in the workspace
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CratePath {
+  /// Path to the crate directory
   #[serde(rename = "crate")]
   pub path: PathBuf,
 }
 
+/// Split mode: single crate or combined multi-crate
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitMode {
+  /// Single crate per repository
   #[default]
   Single,
+  /// Multiple crates in one repository
   Combined,
 }
 
@@ -477,42 +496,124 @@ mod tests {
     assert_eq!(unify.effective_parallelism(), 4);
   }
 
+  // ============================================================================
+  // Split Config Validation Tests
+  // ============================================================================
+
   #[test]
-  fn test_unify_config_serialization() {
-    let unify = UnifyConfig {
-      use_all_features: true,
-      validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
-      max_parallel_jobs: 2,
-      pin_transitives: false,
-      pin_hosts: vec![],
-      auto_resolve_version_conflicts: true,
-      conflict_resolution: "permissive".to_string(),
-      add_conflict_comments: true,
-      generate_report: true,
-      allow_renamed: false,
-      exclude: vec![],
+  fn test_split_config_validate_empty_paths() {
+    let config = SplitConfig {
+      name: "test-crate".to_string(),
+      remote: "git@github.com:user/test.git".to_string(),
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![],
       include: vec![],
+      exclude: vec![],
+      publish: true,
+      changelog_path: None,
     };
 
-    // Serialize to TOML
-    let toml = toml_edit::ser::to_string(&unify).unwrap();
-    assert!(toml.contains("use_all_features = true"));
-    assert!(toml.contains("x86_64-unknown-linux-gnu"));
-    assert!(toml.contains("max_parallel_jobs = 2"));
-    assert!(toml.contains("auto_resolve_version_conflicts = true"));
-    assert!(toml.contains("conflict_resolution = \"permissive\""));
+    let result = config.validate();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("at least one crate path"));
+  }
 
-    // Deserialize back
-    let parsed: UnifyConfig = toml_edit::de::from_str(&toml).unwrap();
-    assert_eq!(parsed.use_all_features, unify.use_all_features);
-    assert_eq!(
-      parsed.auto_resolve_version_conflicts,
-      unify.auto_resolve_version_conflicts
-    );
-    assert_eq!(parsed.conflict_resolution, unify.conflict_resolution);
-    assert_eq!(parsed.add_conflict_comments, unify.add_conflict_comments);
-    assert_eq!(parsed.generate_report, unify.generate_report);
-    assert_eq!(parsed.validate_targets, unify.validate_targets);
-    assert_eq!(parsed.max_parallel_jobs, unify.max_parallel_jobs);
+  #[test]
+  fn test_split_config_validate_empty_remote() {
+    let config = SplitConfig {
+      name: "test-crate".to_string(),
+      remote: "".to_string(),
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![CratePath {
+        path: PathBuf::from("crates/test"),
+      }],
+      include: vec![],
+      exclude: vec![],
+      publish: true,
+      changelog_path: None,
+    };
+
+    let result = config.validate();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("remote"));
+  }
+
+  #[test]
+  fn test_split_config_validate_single_mode_multiple_paths() {
+    let config = SplitConfig {
+      name: "test-crate".to_string(),
+      remote: "git@github.com:user/test.git".to_string(),
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![
+        CratePath {
+          path: PathBuf::from("crates/a"),
+        },
+        CratePath {
+          path: PathBuf::from("crates/b"),
+        },
+      ],
+      include: vec![],
+      exclude: vec![],
+      publish: true,
+      changelog_path: None,
+    };
+
+    let result = config.validate();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("Single mode"));
+    assert!(err_msg.contains("exactly one path"));
+  }
+
+  #[test]
+  fn test_split_config_validate_combined_mode_single_path() {
+    let config = SplitConfig {
+      name: "test-crate".to_string(),
+      remote: "git@github.com:user/test.git".to_string(),
+      branch: "main".to_string(),
+      mode: SplitMode::Combined,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![CratePath {
+        path: PathBuf::from("crates/a"),
+      }],
+      include: vec![],
+      exclude: vec![],
+      publish: true,
+      changelog_path: None,
+    };
+
+    let result = config.validate();
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("Combined mode"));
+    assert!(err_msg.contains("multiple paths"));
+  }
+
+  #[test]
+  fn test_split_config_validate_valid() {
+    let config = SplitConfig {
+      name: "test-crate".to_string(),
+      remote: "git@github.com:user/test.git".to_string(),
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![CratePath {
+        path: PathBuf::from("crates/test"),
+      }],
+      include: vec![],
+      exclude: vec![],
+      publish: true,
+      changelog_path: None,
+    };
+
+    assert!(config.validate().is_ok());
   }
 }

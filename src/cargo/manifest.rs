@@ -26,6 +26,7 @@ pub struct CargoTransform {
 }
 
 impl CargoTransform {
+  /// Create a new CargoTransform from workspace metadata
   pub fn new(workspace_metadata: WorkspaceMetadata) -> Self {
     let mut workspace_versions = HashMap::new();
     let mut workspace_paths = HashMap::new();
@@ -205,6 +206,9 @@ impl CargoTransform {
 }
 
 impl CargoTransform {
+  /// Transform a Cargo.toml for split repository
+  ///
+  /// Converts workspace inheritance and path dependencies to standalone format
   pub fn transform_to_split(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 
@@ -220,6 +224,9 @@ impl CargoTransform {
     Ok(doc.to_string())
   }
 
+  /// Transform a Cargo.toml back to monorepo format
+  ///
+  /// Converts version dependencies to path dependencies for workspace members
   pub fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content.parse().context("Failed to parse Cargo.toml")?;
 

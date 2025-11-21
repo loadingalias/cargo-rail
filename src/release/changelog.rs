@@ -17,31 +17,51 @@ type PResult<T> = winnow::error::Result<T>;
 /// A parsed commit message following conventional commits format
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConventionalCommit<'a> {
+  /// Type of commit (feat, fix, etc.)
   pub commit_type: CommitType,
+  /// Optional scope
   pub scope: Option<&'a str>,
+  /// Whether this is a breaking change
   pub breaking: bool,
+  /// Commit description
   pub description: &'a str,
+  /// Optional commit body
   pub body: Option<&'a str>,
+  /// Commit SHA
   pub sha: &'a str,
 }
 
+/// Type of conventional commit
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommitType {
+  /// New feature
   Feature,
+  /// Bug fix
   Fix,
+  /// Breaking change
   Breaking,
+  /// Maintenance tasks
   Chore,
+  /// Documentation changes
   Docs,
+  /// Code style changes
   Style,
+  /// Code refactoring
   Refactor,
+  /// Performance improvements
   Perf,
+  /// Test additions or changes
   Test,
+  /// Build system changes
   Build,
+  /// CI configuration changes
   Ci,
+  /// Uncategorized changes
   Other,
 }
 
 impl CommitType {
+  /// Get string representation of commit type
   pub fn as_str(&self) -> &'static str {
     match self {
       Self::Feature => "feat",
@@ -59,6 +79,7 @@ impl CommitType {
     }
   }
 
+  /// Get emoji representation for this commit type
   pub fn emoji(&self) -> &'static str {
     match self {
       Self::Feature => "✨",
@@ -76,6 +97,7 @@ impl CommitType {
     }
   }
 
+  /// Get section title for changelog output
   pub fn section_title(&self) -> &'static str {
     match self {
       Self::Feature => "Features",
@@ -240,11 +262,14 @@ pub fn parse_conventional_commit<'a>(sha: &'a str, subject: &'a str, body: Optio
 
 /// Changelog generator
 pub struct ChangelogGenerator {
+  /// Workspace root directory
   workspace_root: std::path::PathBuf,
+  /// GitHub repository (org, repo) if detected
   github_repo: Option<(String, String)>,
 }
 
 impl ChangelogGenerator {
+  /// Create a new changelog generator
   pub fn new(workspace_root: &Path) -> Self {
     Self {
       workspace_root: workspace_root.to_path_buf(),
@@ -252,6 +277,7 @@ impl ChangelogGenerator {
     }
   }
 
+  /// Get the detected GitHub repository (org, repo)
   pub fn github_repo(&self) -> Option<&(String, String)> {
     self.github_repo.as_ref()
   }

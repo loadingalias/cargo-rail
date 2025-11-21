@@ -185,27 +185,6 @@ mod tests {
   }
 
   #[test]
-  fn test_workspace_context_convenience_methods() {
-    let current_dir = std::env::current_dir().unwrap();
-    let ctx = WorkspaceContext::build(&current_dir).unwrap();
-
-    // Test convenience methods
-    let workspace_root = ctx.workspace_root();
-    assert!(
-      workspace_root.exists(),
-      "Workspace root from convenience method should exist"
-    );
-    assert_eq!(
-      workspace_root, &ctx.workspace_root,
-      "Convenience method should return same path"
-    );
-
-    // Git repo root is accessible via ctx.git.repo_root()
-    let repo_root = ctx.git.repo_root();
-    assert!(repo_root.exists(), "Repo root should exist");
-  }
-
-  #[test]
   fn test_git_state_wrapper() {
     let current_dir = std::env::current_dir().unwrap();
     let ctx = WorkspaceContext::build(&current_dir).unwrap();

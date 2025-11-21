@@ -16,12 +16,19 @@ use crate::change_detection::classify::{ChangeKind, classify_file};
 /// Categorization of changed files by type
 #[derive(Debug, Default)]
 pub struct ChangeCategories {
+  /// Source code files
   pub source_files: Vec<PathBuf>,
+  /// Test files
   pub test_files: Vec<PathBuf>,
+  /// Example files
   pub example_files: Vec<PathBuf>,
+  /// Documentation files
   pub doc_files: Vec<PathBuf>,
+  /// Configuration files
   pub config_files: Vec<PathBuf>,
+  /// Build scripts
   pub build_scripts: Vec<PathBuf>,
+  /// Other files
   pub other_files: Vec<PathBuf>,
 }
 
@@ -235,12 +242,6 @@ mod tests {
 
     assert!(!cat.is_docs_only());
     assert!(cat.has_example_changes());
-  }
-
-  #[test]
-  fn test_change_impact_analyzer_creation() {
-    let ctx = create_test_context();
-    let _analyzer = ChangeImpact::new(&ctx);
   }
 
   #[test]
