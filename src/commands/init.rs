@@ -48,7 +48,18 @@ pub fn run_init(
   println!("🔍 Detecting workspace configuration...\n");
 
   let workspace_patterns = detect_workspace_patterns(ctx);
-  let unify = default_unify_config();
+  let mut unify = default_unify_config();
+
+  // Auto-detect targets from rust-toolchain.toml and .cargo/config.toml
+  let detected_targets = detect_targets(workspace_root);
+  if !detected_targets.is_empty() {
+    println!(
+      "  📍 Detected {} target triple(s) from rust-toolchain.toml/.cargo/config.toml",
+      detected_targets.len()
+    );
+    unify.validate_targets = detected_targets;
+  }
+
   let splits = detect_workspace_splits(ctx);
 
   // 3. Display summary
@@ -93,7 +104,7 @@ pub fn run_init(
     println!("Next steps:");
     println!("  1. Review {} and adjust settings", output_path);
 
-    println!("  3. Run 'cargo rail unify analyze' to check dependency unification");
+    println!("  3. Run 'cargo rail unify --dry-run' to preview dependency unification");
   }
 
   Ok(())
@@ -166,6 +177,60 @@ fn detect_workspace_patterns(ctx: &WorkspaceContext) -> WorkspacePatternInfo {
 /// Auto-detect reasonable unify defaults
 fn default_unify_config() -> UnifyConfig {
   UnifyConfig::default()
+}
+
+/// Detect target triples from rust-toolchain.toml and .cargo/config.toml
+///
+/// Intelligently merges targets from both sources:
+/// 1. rust-toolchain.toml: [toolchain].targets array
+/// 2. .cargo/config.toml: [target.<triple>] sections
+///
+/// Returns deduplicated list preserving order (rust-toolchain first, then cargo config additions)
+fn detect_targets(workspace_root: &Path) -> Vec<String> {
+  let mut targets = Vec::new();
+  let mut seen = std::collections::HashSet::new();
+
+  // 1. Check rust-toolchain.toml (or rust-toolchain)
+  for toolchain_file in ["rust-toolchain.toml", "rust-toolchain"] {
+    let toolchain_path = workspace_root.join(toolchain_file);
+    if let Ok(content) = std::fs::read_to_string(&toolchain_path) {
+      // Parse using toml_edit
+      if let Ok(parsed) = content.parse::<toml_edit::DocumentMut>()
+        && let Some(toolchain) = parsed.get("toolchain")
+        && let Some(targets_item) = toolchain.get("targets")
+        && let Some(targets_array) = targets_item.as_array()
+      {
+        for target in targets_array.iter() {
+          if let Some(target_str) = target.as_str()
+            && seen.insert(target_str.to_string())
+          {
+            targets.push(target_str.to_string());
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Check .cargo/config.toml (or .cargo/config)
+  for config_file in [".cargo/config.toml", ".cargo/config"] {
+    let config_path = workspace_root.join(config_file);
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+      // Parse using toml_edit
+      if let Ok(parsed) = content.parse::<toml_edit::DocumentMut>() {
+        // Look for [target.<triple>] sections
+        for (key, _value) in parsed.iter() {
+          if let Some(triple) = key.strip_prefix("target.") {
+            // Skip non-triple keys like target.dir
+            if triple.contains('-') && seen.insert(triple.to_string()) {
+              targets.push(triple.to_string());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  targets
 }
 
 /// Auto-detect workspace members and create split configs
@@ -290,8 +355,8 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str("# │ Dependency Unification (Workspace-Hack Elimination)                     │\n");
   output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
   output.push_str("# Automatically unify workspace dependencies using native Cargo features.\n");
-  output.push_str("# Run: cargo rail unify analyze  (to preview changes)\n");
-  output.push_str("#      cargo rail unify apply    (to apply unification)\n");
+  output.push_str("# Run: cargo rail unify --dry-run  (to preview changes)\n");
+  output.push_str("#      cargo rail unify            (to apply unification)\n");
   output.push_str("#\n");
   output.push_str("# Fields:\n");
   output.push_str("#   use_all_features           - Use --all-features for accurate analysis\n");
@@ -301,7 +366,8 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str("#   pin_hosts                     - Crates to host transitive pins\n");
   output.push_str("#   auto_resolve_version_conflicts - Auto-resolve version conflicts (pick highest)\n");
   output.push_str("#   add_conflict_comments         - Add conflict markers to Cargo.toml\n");
-  output.push_str("#   generate_report               - Generate unify-report.md\n\n");
+  output.push_str("#   generate_report               - Generate unify-report.md\n");
+  output.push_str("#   allow_renamed                 - Allow renamed dependencies (package = \"...\")\n\n");
 
   output.push_str("[unify]\n");
   output.push_str(&format!(
@@ -355,6 +421,10 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str(&format!(
     "generate_report = {}  # Create unify-report.md\n",
     config.unify.generate_report
+  ));
+  output.push_str(&format!(
+    "allow_renamed = {}  # Allow renamed dependencies (package = \"actual-name\")\n",
+    config.unify.allow_renamed
   ));
 
   output.push('\n');
@@ -585,6 +655,15 @@ pub fn run_init_standalone(
   // 2. Detection phase
   println!("🔍 Detecting workspace configuration...\n");
 
+  // Auto-detect targets from rust-toolchain.toml and .cargo/config.toml
+  let detected_targets = detect_targets(workspace_root);
+  if !detected_targets.is_empty() {
+    println!(
+      "  📍 Detected {} target triple(s) from rust-toolchain.toml/.cargo/config.toml",
+      detected_targets.len()
+    );
+  }
+
   // 3. Build config
   let config = RailConfig {
     workspace: WorkspaceConfig {
@@ -592,7 +671,7 @@ pub fn run_init_standalone(
     },
     unify: UnifyConfig {
       use_all_features: true,
-      validate_targets: vec![],
+      validate_targets: detected_targets,
       max_parallel_jobs: 0,
       pin_transitives: false,
       pin_hosts: vec![],

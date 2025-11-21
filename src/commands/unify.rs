@@ -156,13 +156,13 @@ pub fn run_unify_analyze(
 
   if blocking_issues > 0 {
     println!(
-      "⚠️  Note: {} BLOCKING issues detected that will prevent 'cargo rail unify apply'.",
+      "⚠️  Note: {} BLOCKING issues detected that will prevent 'cargo rail unify'.",
       blocking_issues
     );
     println!("Resolve these issues before attempting to apply changes.\n");
   } else if warning_issues > 0 {
     println!("⚠️  Note: {} non-blocking issues detected.", warning_issues);
-    println!("'cargo rail unify apply' will proceed with warnings for these issues.\n");
+    println!("'cargo rail unify' will proceed with warnings for these issues.\n");
   }
 
   // Show transitive fragmentation info if pin_transitives is enabled
@@ -177,7 +177,7 @@ pub fn run_unify_analyze(
     if plan.workspace_deps.is_empty() && plan.issues.is_empty() {
       ". No unification opportunities found."
     } else if !plan.workspace_deps.is_empty() {
-      ". Run 'cargo rail unify apply' to make changes."
+      ". Run 'cargo rail unify' to apply changes."
     } else {
       "."
     }

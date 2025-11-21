@@ -53,11 +53,11 @@ cargo rail test --explain
 ### 2. Dependency Unification (replaces cargo-hakari)
 
 ```bash
-# Unify dependencies to workspace.dependencies
-cargo rail unify apply
+# Preview unification changes
+cargo rail unify --dry-run
 
-# CI validation
-cargo rail unify check
+# Apply unification to workspace.dependencies
+cargo rail unify
 ```
 
 **What it does:**
@@ -207,9 +207,8 @@ cargo rail test --nextest --watch      # Watch mode with nextest
 ### Dependency Unification
 
 ```bash
-cargo rail unify analyze               # Preview changes
-cargo rail unify apply                 # Apply unification
-cargo rail unify check                 # CI validation
+cargo rail unify --dry-run             # Preview changes
+cargo rail unify                       # Apply unification
 ```
 
 ### Crate Distribution
@@ -257,7 +256,7 @@ cargo rail release publish --execute   # Publish to crates.io
 
 ```bash
 # CI takes 1-2 minutes testing only affected crates
-# cargo rail unify apply (one command)
+# cargo rail unify (one command)
 # cargo rail split my-crate (one command, full history)
 ```
 

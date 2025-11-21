@@ -187,7 +187,7 @@ impl UnificationPlan {
       }
 
       output.push_str("  To pin these crates under workspace control:\n");
-      output.push_str("    cargo rail unify apply --pin-transitives\n\n");
+      output.push_str("    cargo rail unify --pin-transitives\n\n");
       output.push_str("  Or configure in .config/rust/rail.toml:\n");
       output.push_str("    [unify]\n");
       output.push_str("    pin_transitives = true\n");
