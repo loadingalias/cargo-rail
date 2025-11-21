@@ -98,10 +98,16 @@ impl UnificationPlan {
       }
     }
 
-    // Issues
-    if !self.issues.is_empty() {
+    // Separate issues by severity
+    let (info_issues, warning_issues): (Vec<_>, Vec<_>) = self
+      .issues
+      .iter()
+      .partition(|i| matches!(i.severity, super::types::IssueSeverity::Info));
+
+    // Display non-info issues (warnings and hard blockers)
+    if !warning_issues.is_empty() {
       output.push_str("⚠️  Issues requiring attention:\n\n");
-      for issue in &self.issues {
+      for issue in &warning_issues {
         output.push_str(&format!("  {} - ", issue.dep_name));
         match &issue.issue_type {
           IssueType::IncompatibleVersionRequirements { requirements } => {
@@ -141,6 +147,24 @@ impl UnificationPlan {
           }
         }
         output.push_str(&format!("    Suggestion: {}\n\n", issue.suggestion));
+      }
+    }
+
+    // Display info-level issues separately (FYI only)
+    if !info_issues.is_empty() {
+      output.push_str("ℹ️  Informational (not blockers):\n\n");
+      for issue in &info_issues {
+        output.push_str(&format!("  {} - ", issue.dep_name));
+        match &issue.issue_type {
+          IssueType::AllTargetSpecific { targets } => {
+            output.push_str(&format!("All uses are target-specific: {}\n", targets.join(", ")));
+          }
+          _ => {
+            // Should not happen, but handle gracefully
+            output.push_str("Info issue\n");
+          }
+        }
+        output.push_str(&format!("    Note: {}\n\n", issue.suggestion));
       }
     }
 

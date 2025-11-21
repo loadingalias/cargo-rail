@@ -148,17 +148,21 @@ pub fn run_unify_analyze(
 
   // Final message
   let blocking_issues = plan.issues.iter().filter(|i| i.severity == IssueSeverity::Hard).count();
-  if !plan.issues.is_empty() {
-    if blocking_issues > 0 {
-      println!(
-        "⚠️  Note: {} BLOCKING issues detected that will prevent 'cargo rail unify apply'.",
-        blocking_issues
-      );
-      println!("Resolve these issues before attempting to apply changes.\n");
-    } else {
-      println!("⚠️  Note: {} non-blocking issues detected.", plan.issues.len());
-      println!("'cargo rail unify apply' will proceed with warnings for these issues.\n");
-    }
+  let warning_issues = plan
+    .issues
+    .iter()
+    .filter(|i| matches!(i.severity, IssueSeverity::Soft))
+    .count();
+
+  if blocking_issues > 0 {
+    println!(
+      "⚠️  Note: {} BLOCKING issues detected that will prevent 'cargo rail unify apply'.",
+      blocking_issues
+    );
+    println!("Resolve these issues before attempting to apply changes.\n");
+  } else if warning_issues > 0 {
+    println!("⚠️  Note: {} non-blocking issues detected.", warning_issues);
+    println!("'cargo rail unify apply' will proceed with warnings for these issues.\n");
   }
 
   // Show transitive fragmentation info if pin_transitives is enabled

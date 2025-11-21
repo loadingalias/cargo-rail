@@ -69,8 +69,23 @@ enum Commands {
   // Dependency Unification
   // ============================================================================
   /// Workspace dependency unification (eliminates workspace-hack crates)
-  #[command(subcommand)]
-  Unify(UnifyCommands),
+  Unify {
+    /// Show plan without executing (analyze mode)
+    #[arg(long, short = 'd')]
+    dry_run: bool,
+    /// Exclude specific dependencies from unification
+    #[arg(long)]
+    exclude: Vec<String>,
+    /// Force include specific dependencies
+    #[arg(long)]
+    include: Vec<String>,
+    /// Create .bak backups of all modified files
+    #[arg(long)]
+    backup: bool,
+    /// Pin transitive-only crates with fragmented features
+    #[arg(long)]
+    pin_transitives: bool,
+  },
 
   // ============================================================================
   // Configuration Management
@@ -87,7 +102,7 @@ enum Commands {
     #[arg(long)]
     non_interactive: bool,
     /// Output the generated config to stdout instead of writing to file
-    #[arg(long)]
+    #[arg(long, visible_alias = "dr", short = 'd')]
     dry_run: bool,
   },
 
@@ -105,7 +120,7 @@ enum Commands {
     #[arg(long)]
     remote: Option<String>,
     /// Show plan without executing (default: execute with confirmation)
-    #[arg(long)]
+    #[arg(long, visible_alias = "dr", short = 'd')]
     dry_run: bool,
     /// Output plan in JSON format
     #[arg(long)]
@@ -135,7 +150,7 @@ enum Commands {
     #[arg(long)]
     no_protected_branches: bool,
     /// Show plan without executing (default: execute with confirmation)
-    #[arg(long)]
+    #[arg(long, visible_alias = "dr", short = 'd')]
     dry_run: bool,
     /// Output plan in JSON format
     #[arg(long)]
@@ -146,71 +161,7 @@ enum Commands {
   // Release & Publishing
   // ============================================================================
   /// Release automation (version bumping, changelog, publishing)
-  #[command(subcommand)]
-  Release(ReleaseCommands),
-
-  // ============================================================================
-  // Workspace Inspection
-  // ============================================================================
-  /// Show status of all configured crates
-  Status {
-    /// Output status in JSON format
-    #[arg(long)]
-    json: bool,
-  },
-}
-
-#[derive(Subcommand)]
-enum UnifyCommands {
-  /// Analyze dependencies and show unification plan (dry-run)
-  Analyze {
-    /// Exclude specific dependencies from unification
-    #[arg(long)]
-    exclude: Vec<String>,
-    /// Force include specific dependencies
-    #[arg(long)]
-    include: Vec<String>,
-    /// Pin transitive-only crates with fragmented features
-    #[arg(long)]
-    pin_transitives: bool,
-  },
-
-  /// Apply workspace dependency unification (modifies Cargo.toml files)
-  Apply {
-    /// Exclude specific dependencies from unification
-    #[arg(long)]
-    exclude: Vec<String>,
-    /// Force include specific dependencies
-    #[arg(long)]
-    include: Vec<String>,
-    /// Create .bak backups of all modified files
-    #[arg(long)]
-    backup: bool,
-    /// Pin transitive-only crates with fragmented features
-    #[arg(long)]
-    pin_transitives: bool,
-  },
-}
-
-#[derive(Subcommand)]
-enum ReleaseCommands {
-  /// Plan a release (version bumping, changelog, validation) - dry-run mode
-  Plan {
-    /// Crate name(s) to release (omit for --all)
-    crate_names: Vec<String>,
-    /// Release all workspace crates
-    #[arg(short, long)]
-    all: bool,
-    /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
-    #[arg(long, default_value = "patch")]
-    bump: String,
-    /// Output plan in JSON format
-    #[arg(long)]
-    json: bool,
-  },
-
-  /// Execute a release (publish to crates.io, create git tags, update changelogs)
-  Publish {
+  Release {
     /// Crate name(s) to release (omit for --all)
     crate_names: Vec<String>,
     /// Release all workspace crates in dependency order
@@ -219,15 +170,18 @@ enum ReleaseCommands {
     /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
     #[arg(long, default_value = "patch")]
     bump: String,
-    /// Execute the release (default is dry-run, requires this flag)
-    #[arg(long, short = 'x')]
-    execute: bool,
+    /// Show plan without executing (dry-run mode)
+    #[arg(long, visible_alias = "dr", short = 'd')]
+    dry_run: bool,
     /// Skip publishing to crates.io (only create tags and update changelogs)
     #[arg(long)]
     skip_publish: bool,
     /// Skip git tag creation
     #[arg(long)]
     skip_tag: bool,
+    /// Output plan in JSON format
+    #[arg(long)]
+    json: bool,
   },
 
   /// Validate release readiness (for CI)
@@ -237,6 +191,16 @@ enum ReleaseCommands {
     /// Check all workspace crates
     #[arg(short, long)]
     all: bool,
+  },
+
+  // ============================================================================
+  // Workspace Inspection
+  // ============================================================================
+  /// Show status of all configured crates
+  Status {
+    /// Output status in JSON format
+    #[arg(long)]
+    json: bool,
   },
 }
 
@@ -320,19 +284,19 @@ fn main() {
     Commands::Init { .. } => unreachable!("Init command should be handled earlier"),
 
     // Dependency Unification
-    Commands::Unify(unify_cmd) => match unify_cmd {
-      UnifyCommands::Analyze {
-        exclude,
-        include,
-        pin_transitives,
-      } => commands::run_unify_analyze(&ctx, exclude, include, pin_transitives),
-      UnifyCommands::Apply {
-        exclude,
-        include,
-        backup,
-        pin_transitives,
-      } => commands::run_unify_apply(&ctx, exclude, include, backup, pin_transitives),
-    },
+    Commands::Unify {
+      dry_run,
+      exclude,
+      include,
+      backup,
+      pin_transitives,
+    } => {
+      if dry_run {
+        commands::run_unify_analyze(&ctx, exclude, include, pin_transitives)
+      } else {
+        commands::run_unify_apply(&ctx, exclude, include, backup, pin_transitives)
+      }
+    }
 
     // Split/Sync
     Commands::Split {
@@ -366,48 +330,40 @@ fn main() {
     ),
 
     // Release
-    Commands::Release(release_cmd) => match release_cmd {
-      ReleaseCommands::Plan {
-        crate_names,
-        all,
-        bump,
-        json,
-      } => {
-        // If --all is specified OR no crate names provided, use None (all crates)
-        // This handles both explicit --all and implicit all for single-crate repos
-        let names = if all || crate_names.is_empty() {
-          None
-        } else {
-          Some(crate_names)
-        };
+    Commands::Release {
+      crate_names,
+      all,
+      bump,
+      dry_run,
+      skip_publish,
+      skip_tag,
+      json,
+    } => {
+      // If --all is specified OR no crate names provided, use None (all crates)
+      let names = if all || crate_names.is_empty() {
+        None
+      } else {
+        Some(crate_names)
+      };
+
+      if dry_run {
+        // Dry-run mode: show plan
         commands::run_release_plan(&ctx, names, bump, json)
+      } else {
+        // Execute mode: perform the release
+        commands::run_release_publish(&ctx, names, all, bump, true, skip_publish, skip_tag)
       }
-      ReleaseCommands::Publish {
-        crate_names,
-        all,
-        bump,
-        execute,
-        skip_publish,
-        skip_tag,
-      } => {
-        // If --all is specified OR no crate names provided, use None (all crates)
-        let names = if all || crate_names.is_empty() {
-          None
-        } else {
-          Some(crate_names)
-        };
-        commands::run_release_publish(&ctx, names, all, bump, execute, skip_publish, skip_tag)
-      }
-      ReleaseCommands::Check { crate_names, all } => {
-        // If --all is specified OR no crate names provided, use None (all crates)
-        let names = if all || crate_names.is_empty() {
-          None
-        } else {
-          Some(crate_names)
-        };
-        commands::run_release_check(&ctx, names, all)
-      }
-    },
+    }
+
+    Commands::Check { crate_names, all } => {
+      // If --all is specified OR no crate names provided, use None (all crates)
+      let names = if all || crate_names.is_empty() {
+        None
+      } else {
+        Some(crate_names)
+      };
+      commands::run_release_check(&ctx, names, all)
+    }
 
     // Status
     Commands::Status { json } => commands::run_status(&ctx, json),

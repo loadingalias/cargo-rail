@@ -211,15 +211,23 @@ impl<'a> WorkspaceUnifier<'a> {
     // 4. Detect multi-version conflicts for REMAINING unresolved dependencies
     // This runs AFTER we've attempted unification, so it only reports true conflicts
     // that couldn't be resolved through resolution-based or syntactic merging.
-    let multi_version_issues = issue_detection::detect_multi_version_conflicts(self.metadata)?;
+    //
+    // IMPORTANT: Only report these issues if auto_resolve_version_conflicts is disabled.
+    // When auto_resolve is enabled, Cargo's resolution is the source of truth - if multiple
+    // versions exist in the resolved graph, that's because Cargo legitimately needs them
+    // (e.g., for different dependency paths with incompatible requirements). These are
+    // transitive dependencies we don't control directly.
+    if !self.config.auto_resolve_version_conflicts {
+      let multi_version_issues = issue_detection::detect_multi_version_conflicts(self.metadata)?;
 
-    // Only add multi-version issues for deps that weren't successfully unified
-    let unified_names: HashSet<_> = workspace_deps.iter().map(|d| &d.name).collect();
-    for issue in multi_version_issues {
-      // Skip if we successfully unified this dependency
-      if !unified_names.contains(&issue.dep_name) {
-        issues.push(issue);
-        stats.issue_count += 1;
+      // Only add multi-version issues for deps that weren't successfully unified
+      let unified_names: HashSet<_> = workspace_deps.iter().map(|d| &d.name).collect();
+      for issue in multi_version_issues {
+        // Skip if we successfully unified this dependency
+        if !unified_names.contains(&issue.dep_name) {
+          issues.push(issue);
+          stats.issue_count += 1;
+        }
       }
     }
 

@@ -325,7 +325,6 @@ require_clean = false
       "--all",
       "--bump",
       "patch",
-      "--execute",
       "--skip-publish",
     ],
   )?;

@@ -31,7 +31,7 @@ auto_resolve_version_conflicts = true
   )?;
 
   // Run analyze - should show Soft warning
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   // Should mention version conflict
@@ -49,7 +49,7 @@ auto_resolve_version_conflicts = true
   );
 
   // Run apply - should SUCCEED
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
   assert!(
@@ -137,7 +137,7 @@ root = "."
   )?;
 
   // Run analyze - should show Soft warning
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -147,7 +147,7 @@ root = "."
   );
 
   // Run apply - should SUCCEED
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     apply_output.status.success(),
     "Apply should succeed.\nOutput:\n{}",
@@ -222,7 +222,7 @@ allow_renamed = false
   )?;
 
   // Run analyze - should show Hard blocker
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -232,7 +232,7 @@ allow_renamed = false
   );
 
   // Run apply - should FAIL
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
   let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
 
@@ -300,7 +300,7 @@ generate_report = true
   )?;
 
   // Run apply
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     apply_output.status.success(),
     "Apply should succeed.\nOutput:\n{}",
@@ -356,7 +356,7 @@ exclude = ["serde"]
   )?;
 
   // Run analyze
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   // Should show anyhow, but not serde
@@ -367,7 +367,7 @@ exclude = ["serde"]
   );
 
   // Run apply
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(apply_output.status.success(), "Apply should succeed");
 
   // Workspace should have anyhow but not serde
@@ -428,7 +428,7 @@ add_conflict_comments = true
   )?;
 
   // Run apply
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(apply_output.status.success(), "Apply should succeed");
 
   // Check workspace Cargo.toml has comments
@@ -479,7 +479,7 @@ root = "."
   )?;
 
   // Run apply with --backup
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
   assert!(

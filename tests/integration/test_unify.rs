@@ -42,7 +42,7 @@ fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
   workspace.commit("Add crates with compatible version requirements")?;
 
   // Run unify analyze
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should NOT report multi-version conflicts for serde or anyhow
@@ -91,7 +91,7 @@ fn test_unify_syntactic_version_merging() -> Result<()> {
 
   workspace.commit("Add crates with mergeable versions")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should successfully merge ^1.2.0 and ^1.3.0 to ^1.3.0
@@ -124,7 +124,7 @@ fn test_unify_true_multi_version_conflict() -> Result<()> {
 
   workspace.commit("Add crates with incompatible versions")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // SHOULD report version conflict for syn (1.x vs 2.x are incompatible)
@@ -164,7 +164,7 @@ fn test_unify_feature_union() -> Result<()> {
 
   workspace.commit("Add crates with different features")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show serde with union of all features
@@ -222,7 +222,7 @@ tempfile = "3.0"
 
   workspace.commit("Add crates with different dep kinds")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show tempfile can be unified
@@ -260,7 +260,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   workspace.commit("Add crates before unification")?;
 
   // Step 1: Analyze (should succeed)
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -269,7 +269,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   );
 
   // Step 2: Apply unification
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
   assert!(
@@ -301,7 +301,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   );
 
   // Step 5: Run analyze again - should show no unifiable deps
-  let final_analyze = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze"])?;
+  let final_analyze = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
   let final_stdout = String::from_utf8_lossy(&final_analyze.stdout);
 
   assert!(
@@ -328,7 +328,7 @@ fn test_unify_exclude_option() -> Result<()> {
   workspace.commit("Add crates")?;
 
   // Analyze with serde excluded
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "analyze", "--exclude", "serde"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run", "--exclude", "serde"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should NOT show serde (excluded)
@@ -368,7 +368,7 @@ auto_resolve_version_conflicts = false
 "#,
   )?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
 
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);

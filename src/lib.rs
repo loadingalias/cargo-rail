@@ -7,10 +7,11 @@
 //!
 //! ```rust,no_run
 //! use cargo_rail::{RailResult, workspace::WorkspaceContext};
+//! use std::path::Path;
 //!
 //! # fn main() -> RailResult<()> {
 //! // Load workspace context
-//! let ctx = WorkspaceContext::new(".")?;
+//! let ctx = WorkspaceContext::build(Path::new("."))?;
 //!
 //! // Analyze workspace structure
 //! let crates = ctx.cargo().packages();

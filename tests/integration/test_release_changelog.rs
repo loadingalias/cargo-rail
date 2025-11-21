@@ -37,7 +37,7 @@ require_clean = false
   )?;
 
   // Run release plan
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "plan", "--bump", "patch"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "--bump", "patch"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show the crate in the plan
@@ -76,19 +76,10 @@ fn release_changelog_generates_links_and_prs() -> Result<()> {
   ws.modify_file("lib-a", "src/lib.rs", "pub fn api_v2() {}")?;
   let feature_sha = ws.commit("feat(api)!: redesign REST endpoints (#123)\n\ncloses #456")?;
 
-  // Run release publish (skip crates.io but create tag/changelog)
+  // Run release (skip crates.io but create tag/changelog)
   let output = run_cargo_rail(
     &ws.path,
-    &[
-      "rail",
-      "release",
-      "publish",
-      "lib-a",
-      "--bump",
-      "patch",
-      "--execute",
-      "--skip-publish",
-    ],
+    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -170,7 +161,6 @@ fn release_respects_skip_and_require_flags() -> Result<()> {
       "--all",
       "--bump",
       "patch",
-      "--execute",
       "--skip-publish",
     ],
   )?;
