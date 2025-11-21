@@ -71,7 +71,7 @@ enum Commands {
   /// Workspace dependency unification (eliminates workspace-hack crates)
   Unify {
     /// Show plan without executing (analyze mode)
-    #[arg(long, short = 'd')]
+    #[arg(long, visible_alias = "dr", short = 'd')]
     dry_run: bool,
     /// Exclude specific dependencies from unification
     #[arg(long)]
