@@ -21,11 +21,11 @@
 
 use crate::cargo::WorkspaceMetadata;
 use crate::error::{RailError, RailResult};
-use cargo_metadata::{DependencyKind, PackageId};
+use cargo_metadata::DependencyKind;
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -33,14 +33,6 @@ use std::sync::RwLock;
 #[derive(Debug, Clone)]
 pub struct PackageNode {
   pub name: String,
-
-  /// Package version from Cargo.toml.
-  ///
-  /// # Future Use
-  /// - Version conflict detection: Find crates with mismatched versions
-  /// - MSRV analysis: Detect minimum Rust version requirements across workspace
-  #[allow(dead_code)]
-  pub version: String,
 
   pub manifest_path: PathBuf,
   pub is_workspace_member: bool,
@@ -58,17 +50,6 @@ pub struct WorkspaceGraph {
   /// Index: package name → node index
   name_to_node: HashMap<String, NodeIndex>,
 
-  /// Index: PackageId → node index (for resolve graph traversal).
-  ///
-  /// # Future Use
-  /// - Resolve graph traversal: Map resolved dependencies to graph nodes
-  /// - Feature analysis: Cross-reference cargo metadata with dependency graph
-  /// - External dependency queries: Look up non-workspace packages efficiently
-  ///
-  /// TODO: Expose this via a public method when implementing `cargo rail resolve` or similar advanced analysis.
-  #[allow(dead_code)]
-  id_to_node: HashMap<PackageId, NodeIndex>,
-
   /// Workspace members only (subset of graph nodes)
   workspace_members: HashSet<String>,
 
@@ -76,15 +57,6 @@ pub struct WorkspaceGraph {
   /// Built lazily on first file lookup (thread-safe interior mutability)
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
   path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
-
-  /// Original cargo metadata for advanced queries.
-  ///
-  /// # Future Use
-  /// - Feature analysis: Query feature flags and their dependencies
-  /// - Target analysis: Find packages with specific build targets (bins, libs, tests)
-  /// - Edition/MSRV queries: Validate compatibility across workspace
-  #[allow(dead_code)]
-  metadata: WorkspaceMetadata,
 }
 
 impl WorkspaceGraph {
@@ -112,7 +84,6 @@ impl WorkspaceGraph {
 
       let node = PackageNode {
         name: crate_name.clone(),
-        version: package.version.to_string(),
         manifest_path: package.manifest_path.clone().into_std_path_buf(),
         is_workspace_member: workspace_pkg_ids.contains(&package.id),
       };
@@ -141,10 +112,8 @@ impl WorkspaceGraph {
     Ok(Self {
       graph,
       name_to_node,
-      id_to_node,
       workspace_members,
       path_cache: RwLock::new(None),
-      metadata,
     })
   }
 
@@ -153,61 +122,6 @@ impl WorkspaceGraph {
     let mut members: Vec<_> = self.workspace_members.iter().cloned().collect();
     members.sort();
     members
-  }
-
-  /// Get direct dependencies of a crate (what it uses).
-  ///
-  /// # Future Use
-  /// Will power `cargo rail graph --crate X` to display:
-  /// - Direct dependencies: "lib-core depends on: serde, tokio, anyhow"
-  /// - Dependency analysis: Find immediate dependencies for auditing
-  /// - Visualization: Generate dependency tree for a specific crate
-  ///
-  /// TODO: Use this for `cargo rail inspect` CLI command.
-  #[allow(dead_code)]
-  pub fn direct_dependencies(&self, crate_name: &str) -> RailResult<Vec<String>> {
-    let node_idx = self.find_node(crate_name)?;
-
-    let mut deps: Vec<String> = self
-      .graph
-      .neighbors_directed(node_idx, Direction::Outgoing)
-      .map(|idx| self.graph[idx].name.clone())
-      .collect();
-
-    deps.sort();
-    deps.dedup();
-    Ok(deps)
-  }
-
-  /// Get direct dependents of a crate (what uses it).
-  ///
-  /// # Future Use
-  /// Will power `cargo rail graph --crate X` to display:
-  /// - Direct dependents: "lib-core is used by: bin-cli, lib-api, lib-web"
-  /// - Impact analysis: See what breaks when modifying this crate
-  /// - Reverse dependency tree: Understand crate usage across workspace
-  ///
-  /// TODO: Use this for `cargo rail inspect` or `cargo rail affected` CLI commands.
-  #[allow(dead_code)]
-  pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
-    let node_idx = self.find_node(crate_name)?;
-
-    let mut dependents: Vec<String> = self
-      .graph
-      .neighbors_directed(node_idx, Direction::Incoming)
-      .filter_map(|idx| {
-        let node = &self.graph[idx];
-        if node.is_workspace_member {
-          Some(node.name.clone())
-        } else {
-          None
-        }
-      })
-      .collect();
-
-    dependents.sort();
-    dependents.dedup();
-    Ok(dependents)
   }
 
   /// Get transitive reverse dependencies (all workspace crates that depend on this one).
@@ -419,131 +333,6 @@ impl WorkspaceGraph {
 
     *self.path_cache.write().unwrap() = Some(cache);
   }
-
-  /// Access raw cargo metadata for advanced queries.
-  ///
-  /// # Future Use
-  /// - Feature analysis: Query and validate feature flags
-  /// - Package metadata: Access detailed package information
-  /// - Custom graph algorithms: Build domain-specific graph queries
-  ///
-  /// # Example
-  /// ```ignore
-  /// let graph = WorkspaceGraph::load(root)?;
-  /// let metadata = graph.metadata();
-  /// let features = metadata.package_features("lib-core");
-  /// ```
-  #[allow(dead_code)]
-  pub fn metadata(&self) -> &WorkspaceMetadata {
-    &self.metadata
-  }
-
-  /// Find dependency path: why does `from` depend on `to`?
-  ///
-  /// Returns the shortest dependency chain, or None if no dependency exists.
-  ///
-  /// Uses BFS to find the shortest path in the dependency graph.
-  ///
-  /// # Future Use
-  /// Will power `cargo rail graph --why <from> <to>` for dependency debugging:
-  /// - Understand transitive dependencies: "Why does bin-cli pull in tokio?"
-  /// - Audit dependency chains: Trace the path from app to vulnerable dependency
-  /// - Refactoring decisions: Identify dependency paths to break or preserve
-  ///
-  /// TODO: Implement `cargo rail why` command using this method.
-  ///
-  /// # Example
-  /// ```ignore
-  /// // If bin-cli → lib-core → lib-util:
-  /// let path = graph.why_depends_on("bin-cli", "lib-util")?;
-  /// assert_eq!(path, Some(vec!["bin-cli", "lib-core", "lib-util"]));
-  /// ```
-  #[allow(dead_code)]
-  pub fn why_depends_on(&self, from: &str, to: &str) -> RailResult<Option<Vec<String>>> {
-    let from_idx = self.find_node(from)?;
-    let to_idx = self.find_node(to)?;
-
-    // BFS to find shortest path
-    let mut queue = VecDeque::new();
-    let mut visited = HashMap::new();
-
-    queue.push_back(from_idx);
-    visited.insert(from_idx, None);
-
-    while let Some(current) = queue.pop_front() {
-      if current == to_idx {
-        // Reconstruct path
-        let mut path = vec![];
-        let mut node = Some(current);
-
-        while let Some(idx) = node {
-          path.push(self.graph[idx].name.clone());
-          node = visited[&idx];
-        }
-
-        path.reverse();
-        return Ok(Some(path));
-      }
-
-      // Explore dependencies (outgoing edges)
-      for neighbor in self.graph.neighbors_directed(current, Direction::Outgoing) {
-        if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(neighbor) {
-          e.insert(Some(current));
-          queue.push_back(neighbor);
-        }
-      }
-    }
-
-    Ok(None)
-  }
-
-  /// Export graph to DOT format (Graphviz) for visualization.
-  ///
-  /// Outputs workspace dependency graph in DOT format with:
-  /// - Workspace members: Blue boxes
-  /// - External dependencies: Ellipses
-  /// - Dev dependencies: Blue edges
-  /// - Build dependencies: Orange edges
-  /// - Normal dependencies: Black edges
-  ///
-  /// # Future Use
-  /// Will power `cargo rail graph --dot` for visualization:
-  /// - Generate dependency diagrams for documentation
-  /// - Visual debugging: See complex dependency relationships at a glance
-  /// - Architecture analysis: Understand workspace structure visually
-  ///
-  /// TODO: Implement `cargo rail graph` command (as a top-level visualization command) using this method.
-  ///
-  /// # Example
-  /// ```bash
-  /// cargo rail graph --dot > graph.dot
-  /// dot -Tpng graph.dot -o graph.png
-  /// open graph.png
-  /// ```
-  #[allow(dead_code)]
-  pub fn to_dot(&self) -> String {
-    use petgraph::dot::{Config, Dot};
-
-    let dot = Dot::with_attr_getters(
-      &self.graph,
-      &[Config::EdgeNoLabel],
-      &|_, edge_ref| match edge_ref.weight() {
-        DependencyKind::Normal => String::new(),
-        DependencyKind::Development => "color=blue".to_string(),
-        DependencyKind::Build => "color=orange".to_string(),
-        _ => String::new(),
-      },
-      &|_, (_idx, node)| {
-        if node.is_workspace_member {
-          format!("label=\"{}\" shape=box style=filled fillcolor=lightblue", node.name)
-        } else {
-          format!("label=\"{}\" shape=ellipse", node.name)
-        }
-      },
-    );
-
-    format!("{:?}", dot)
-  }
 }
 
 #[cfg(test)]
@@ -560,18 +349,6 @@ mod tests {
       let members = graph.workspace_members();
       assert!(!members.is_empty());
       assert!(members.contains(&"cargo-rail".to_string()));
-    }
-  }
-
-  #[test]
-  fn test_dependencies() {
-    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-      let workspace_root = PathBuf::from(manifest_dir);
-      let graph = WorkspaceGraph::load(&workspace_root).unwrap();
-
-      // cargo-rail depends on clap, serde, etc.
-      let deps = graph.direct_dependencies("cargo-rail").unwrap();
-      assert!(!deps.is_empty());
     }
   }
 

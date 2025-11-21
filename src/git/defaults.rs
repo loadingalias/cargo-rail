@@ -16,8 +16,11 @@ use crate::git::SystemGit;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// let base_ref = detect_default_base_ref(ctx.git.git())?;
+/// ```rust,no_run
+/// # use cargo_rail::git::defaults::detect_default_base_ref;
+/// # use cargo_rail::git::SystemGit;
+/// # let git = SystemGit::open(std::path::Path::new(".")).unwrap();
+/// let base_ref = detect_default_base_ref(&git);
 /// // Returns: "origin/main", "origin/master", or "HEAD~1"
 /// ```
 pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {

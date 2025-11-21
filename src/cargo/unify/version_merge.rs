@@ -15,11 +15,13 @@ use semver::VersionReq;
 /// - Otherwise → None (incompatible)
 ///
 /// # Examples
-/// ```ignore
-/// try_merge_version_reqs("^1.2.0", "^1.3.0") => Some("^1.3.0")  // Pick higher minor
-/// try_merge_version_reqs("^1.0.0", "^2.0.0") => None  // Different major - incompatible
-/// try_merge_version_reqs("^0.2.0", "^0.3.0") => None  // 0.x requires exact minor match
-/// try_merge_version_reqs("^0.2.1", "^0.2.3") => Some("^0.2.3")  // Same 0.x minor - pick higher patch
+/// ```rust,ignore
+/// use semver::VersionReq;
+/// use cargo_rail::cargo::unify::version_merge::try_merge_version_reqs;
+///
+/// let v1 = VersionReq::parse("^1.2.0").unwrap();
+/// let v2 = VersionReq::parse("^1.3.0").unwrap();
+/// assert_eq!(try_merge_version_reqs(&v1, &v2), Some(v2));
 /// ```
 pub fn try_merge_version_reqs(v1: &VersionReq, v2: &VersionReq) -> Option<VersionReq> {
   // Fast path: identical requirements

@@ -52,28 +52,6 @@ impl SystemGit {
     self.get_commits_bulk(&shas)
   }
 
-  /// Check if a commit touches any of the given paths
-  ///
-  /// Returns true if the commit modified any of the specified paths.
-  #[allow(dead_code)]
-  pub fn commit_touches_paths(&self, sha: &str, paths: &[PathBuf]) -> RailResult<bool> {
-    // Get changed files in this commit
-    let changed_files = self.get_changed_files(sha)?;
-
-    // Check if any changed file is under any of our target paths
-    for (changed_path, _) in changed_files {
-      for target_path in paths {
-        let relative_target = self.normalize_path(target_path);
-
-        if changed_path.starts_with(relative_target) {
-          return Ok(true);
-        }
-      }
-    }
-
-    Ok(false)
-  }
-
   /// Get files changed in a specific commit
   ///
   /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted).
@@ -149,34 +127,6 @@ impl SystemGit {
     }
 
     Ok(files)
-  }
-
-  /// Get file content at a specific commit
-  ///
-  /// Returns None if file doesn't exist at that commit.
-  ///
-  /// NOTE: This is a convenience API kept for single-file reads. For multiple files,
-  /// use `read_files_bulk()` which is significantly more efficient (single subprocess call).
-  /// Currently unused but maintained as a tested public API for future use cases.
-  #[allow(dead_code)]
-  pub fn get_file_at_commit(&self, commit_sha: &str, path: &Path) -> RailResult<Option<Vec<u8>>> {
-    let relative_path = self.normalize_path(path);
-    let git_path = utils::path_to_git_format(relative_path);
-
-    let spec = format!("{}:{}", commit_sha, git_path);
-
-    let output = self
-      .git_cmd()
-      .args(["show", &spec])
-      .output()
-      .context("Failed to get file content")?;
-
-    if !output.status.success() {
-      // File doesn't exist at this commit
-      return Ok(None);
-    }
-
-    Ok(Some(output.stdout))
   }
 
   /// Get commits touching a specific path in a range
@@ -459,13 +409,6 @@ impl SystemGit {
     Ok(remotes.iter().any(|(n, _)| n == name))
   }
 
-  /// Get remote URL
-  #[allow(dead_code)]
-  pub fn get_remote_url(&self, name: &str) -> RailResult<Option<String>> {
-    let remotes = self.list_remotes()?;
-    Ok(remotes.iter().find(|(n, _)| n == name).map(|(_, url)| url.clone()))
-  }
-
   /// Create a branch
   pub fn create_branch(&self, branch_name: &str) -> RailResult<()> {
     let output = self
@@ -586,100 +529,6 @@ impl SystemGit {
       .context("Failed to update HEAD")?;
 
     Ok(commit_sha)
-  }
-
-  /// List all tags in the repository
-  #[allow(dead_code)]
-  pub fn list_tags(&self) -> RailResult<Vec<String>> {
-    let output = self
-      .git_cmd()
-      .args(["tag", "--list"])
-      .output()
-      .context("Failed to list tags")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git tag --list".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    let tags = String::from_utf8_lossy(&output.stdout)
-      .lines()
-      .map(|s| s.trim().to_string())
-      .filter(|s| !s.is_empty())
-      .collect();
-
-    Ok(tags)
-  }
-
-  /// Resolve a git reference (tag, branch) to a commit SHA
-  #[allow(dead_code)]
-  pub fn resolve_reference(&self, ref_name: &str) -> RailResult<String> {
-    let output = self
-      .git_cmd()
-      .args(["rev-parse", ref_name])
-      .output()
-      .context("Failed to resolve reference")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::message(format!(
-        "Failed to resolve reference '{}': {}",
-        ref_name, stderr
-      )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-  }
-
-  /// Get all commits since a given commit SHA
-  ///
-  /// Returns commit SHAs in reverse chronological order (newest first).
-  #[allow(dead_code)]
-  pub fn get_commits_since(&self, since_sha: &str) -> RailResult<Vec<String>> {
-    let output = self
-      .git_cmd()
-      .args(["log", "--format=%H", &format!("{}..HEAD", since_sha)])
-      .output()
-      .context("Failed to get commits since")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    let commits = String::from_utf8_lossy(&output.stdout)
-      .lines()
-      .map(|s| s.trim().to_string())
-      .filter(|s| !s.is_empty())
-      .collect();
-
-    Ok(commits)
-  }
-
-  /// Get commit message for a given commit SHA
-  #[allow(dead_code)]
-  pub fn get_commit_message(&self, commit_sha: &str) -> RailResult<String> {
-    let output = self
-      .git_cmd()
-      .args(["log", "-1", "--format=%B", commit_sha])
-      .output()
-      .context("Failed to get commit message")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
   /// Read multiple files in bulk using git cat-file --batch
@@ -822,6 +671,25 @@ impl SystemGit {
 
     commits
   }
+
+  /// Resolve a git reference (tag, branch) to a commit SHA
+  pub fn resolve_reference(&self, ref_name: &str) -> RailResult<String> {
+    let output = self
+      .git_cmd()
+      .args(["rev-parse", ref_name])
+      .output()
+      .context("Failed to resolve reference")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::message(format!(
+        "Failed to resolve reference '{}': {}",
+        ref_name, stderr
+      )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+  }
 }
 
 /// Parse git log output into CommitInfo
@@ -924,110 +792,6 @@ mod tests {
       assert!(!path.as_os_str().is_empty());
       assert!(['A', 'M', 'D', 'R', 'C'].contains(&change_type));
     }
-  }
-
-  #[test]
-  fn test_get_file_at_commit() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-    let head = git.head_commit().unwrap();
-
-    // Try to read Cargo.toml at HEAD (should exist)
-    let content = git.get_file_at_commit(&head, Path::new("Cargo.toml")).unwrap();
-    assert!(content.is_some());
-    let content = content.unwrap();
-    assert!(!content.is_empty());
-
-    // Verify it contains "[package]" or similar
-    let text = String::from_utf8_lossy(&content);
-    assert!(text.contains("package") || text.contains("dependencies"));
-
-    // Try to read non-existent file
-    let missing = git
-      .get_file_at_commit(&head, Path::new("this-file-does-not-exist-12345.txt"))
-      .unwrap();
-    assert!(missing.is_none());
-  }
-
-  #[test]
-  fn test_commit_touches_paths() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-    let head = git.head_commit().unwrap();
-
-    // Get actual changed files to test with
-    let changed_files = git.get_changed_files(&head).unwrap();
-
-    if !changed_files.is_empty() {
-      let (changed_path, _) = &changed_files[0];
-
-      // This path should be touched
-      let touches = git
-        .commit_touches_paths(&head, std::slice::from_ref(changed_path))
-        .unwrap();
-      assert!(touches, "Commit should touch path that was changed");
-    }
-
-    // Random non-existent path should not be touched
-    let fake_path = PathBuf::from("this/path/does/not/exist/at/all/12345.txt");
-    let touches = git.commit_touches_paths(&head, &[fake_path]).unwrap();
-    assert!(!touches, "Commit should not touch non-existent path");
-  }
-
-  #[test]
-  fn test_list_tags() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-
-    // Just verify the call succeeds
-    let tags = git.list_tags().unwrap();
-
-    // Tags may or may not exist in the repo
-    // Just verify we got a valid list
-    for tag in tags {
-      assert!(!tag.is_empty());
-    }
-  }
-
-  #[test]
-  fn test_resolve_reference() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-
-    // Resolve HEAD
-    let sha = git.resolve_reference("HEAD").unwrap();
-    assert_eq!(sha.len(), 40);
-
-    // Should match head_commit()
-    let head = git.head_commit().unwrap();
-    assert_eq!(sha, head);
-  }
-
-  #[test]
-  fn test_get_commits_since() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-
-    // Get recent commits
-    let history = git.commit_history(Path::new("."), Some(10)).unwrap();
-
-    if history.len() >= 2 {
-      // Get commits since the 2nd-to-last commit
-      let since_sha = &history[history.len() - 2].sha;
-      let commits = git.get_commits_since(since_sha).unwrap();
-
-      // Should get at least 1 commit (the HEAD)
-      assert!(!commits.is_empty());
-
-      // Verify commits are valid SHAs
-      for sha in commits {
-        assert_eq!(sha.len(), 40);
-      }
-    }
-  }
-
-  #[test]
-  fn test_get_commit_message() {
-    let git = SystemGit::open(&find_git_root()).unwrap();
-    let head = git.head_commit().unwrap();
-
-    let message = git.get_commit_message(&head).unwrap();
-    assert!(!message.is_empty());
   }
 
   #[test]

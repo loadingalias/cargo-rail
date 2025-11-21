@@ -14,7 +14,7 @@ keywords = ["monorepo", "cargo", "workspace", "git", "split", "sync"]
 readme = "README.md"
 
 [dependencies]
-clap = { version = "4.5.52", features = ["derive", "cargo"] }
+clap = { version = "4.5.53", features = ["derive", "cargo"] }
 
 # Workspace introspection
 cargo_metadata = "0.23.1"
