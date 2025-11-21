@@ -143,13 +143,6 @@ enum Commands {
   },
 
   // ============================================================================
-  // Configuration Management
-  // ============================================================================
-  /// Configuration management (sync rust-toolchain.toml, etc.)
-  #[command(subcommand)]
-  Config(ConfigCommands),
-
-  // ============================================================================
   // Release & Publishing
   // ============================================================================
   /// Release automation (version bumping, changelog, publishing)
@@ -196,16 +189,6 @@ enum UnifyCommands {
     /// Pin transitive-only crates with fragmented features
     #[arg(long)]
     pin_transitives: bool,
-  },
-}
-
-#[derive(Subcommand)]
-enum ConfigCommands {
-  /// Sync rust-toolchain.toml from rail.toml configuration
-  Sync {
-    /// Check if rust-toolchain.toml matches config (don't modify)
-    #[arg(long)]
-    check: bool,
   },
 }
 
@@ -349,11 +332,6 @@ fn main() {
         backup,
         pin_transitives,
       } => commands::run_unify_apply(&ctx, exclude, include, backup, pin_transitives),
-    },
-
-    // Configuration Management
-    Commands::Config(config_cmd) => match config_cmd {
-      ConfigCommands::Sync { check } => commands::run_config_sync(&ctx, check),
     },
 
     // Split/Sync

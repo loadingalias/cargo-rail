@@ -1,6 +1,5 @@
 use std::io::IsTerminal;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use crate::commands::common::SplitSyncConfigBuilder;
 use crate::error::RailResult;
@@ -22,20 +21,12 @@ pub fn run_sync(
   from_remote: bool,
   to_remote: bool,
   strategy_str: String,
-  no_protected_branches: bool,
+  _no_protected_branches: bool,
   dry_run: bool,
   json: bool,
 ) -> RailResult<()> {
   // Parse conflict strategy
   let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
-
-  // Load configuration
-  let mut config = ctx.require_config()?.as_ref().clone();
-
-  // Apply CLI overrides to security config if provided
-  if no_protected_branches {
-    config.security.protected_branches.clear();
-  }
 
   println!("📦 Loaded configuration");
 
@@ -137,14 +128,7 @@ pub fn run_sync(
             sync_config.crate_name
           );
         }
-        if matches!(direction, SyncDirection::RemoteToMono | SyncDirection::Both)
-          && !config.security.protected_branches.is_empty()
-        {
-          println!(
-            "   🛡️  Will create PR branch if target is protected ({})",
-            config.security.protected_branches.join(", ")
-          );
-        }
+
         println!();
       }
 
@@ -209,7 +193,7 @@ pub fn run_sync(
   }
 
   // Execute the syncs
-  let security_config = Arc::new(config.security.clone());
+  // Execute the syncs
 
   if config_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", config_count);
@@ -232,7 +216,7 @@ pub fn run_sync(
 
         // Build workspace context for this thread
         let thread_context = WorkspaceContext::build(&workspace_root)?;
-        let mut engine = SyncEngine::new(&thread_context, sync_config, security_config.clone(), conflict_strategy)?;
+        let mut engine = SyncEngine::new(&thread_context, sync_config, conflict_strategy)?;
 
         // Execute sync based on direction
         let _result = match direction {
@@ -263,7 +247,7 @@ pub fn run_sync(
       }
 
       println!("🔄 Syncing crate '{}'...", sync_config.crate_name);
-      let mut engine = SyncEngine::new(ctx, sync_config, security_config.clone(), conflict_strategy)?;
+      let mut engine = SyncEngine::new(ctx, sync_config, conflict_strategy)?;
 
       // Execute sync based on direction
       let _result = match direction {

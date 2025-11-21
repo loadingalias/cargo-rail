@@ -21,7 +21,6 @@
 
 pub mod affected;
 pub mod common;
-pub mod config_sync;
 pub mod init;
 pub mod release;
 pub mod split;
@@ -32,7 +31,6 @@ pub mod unify;
 pub mod watch;
 
 pub use affected::run_affected;
-pub use config_sync::run_config_sync;
 pub use init::{run_init, run_init_standalone};
 pub use release::{run_release_check, run_release_plan, run_release_publish};
 pub use split::run_split;

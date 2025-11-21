@@ -1,5 +1,5 @@
 use crate::cargo::{CargoTransform, TransformContext};
-use crate::config::{SecurityConfig, SplitMode};
+use crate::config::SplitMode;
 use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
@@ -8,7 +8,6 @@ use crate::utils;
 use crate::workspace::WorkspaceContext;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Configuration for sync operation
 pub struct SyncConfig {
@@ -47,20 +46,14 @@ pub struct SyncEngine<'a> {
   config: SyncConfig,
   mapping_store: MappingStore,
   transform: CargoTransform,
-  /// Wrapped in Arc for cheap cloning in parallel execution
-  security_config: Arc<SecurityConfig>,
+
   conflict_resolver: ConflictResolver,
   /// Track which repos we've loaded mappings from (to avoid redundant loads)
   loaded_repos: std::collections::HashSet<PathBuf>,
 }
 
 impl<'a> SyncEngine<'a> {
-  pub fn new(
-    ctx: &'a WorkspaceContext,
-    config: SyncConfig,
-    security_config: Arc<SecurityConfig>,
-    conflict_strategy: ConflictStrategy,
-  ) -> RailResult<Self> {
+  pub fn new(ctx: &'a WorkspaceContext, config: SyncConfig, conflict_strategy: ConflictStrategy) -> RailResult<Self> {
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let transform = CargoTransform::new(ctx.cargo.metadata().clone());
 
@@ -82,7 +75,7 @@ impl<'a> SyncEngine<'a> {
       config,
       mapping_store,
       transform,
-      security_config,
+
       conflict_resolver,
       loaded_repos: std::collections::HashSet::new(),
     })
@@ -212,21 +205,7 @@ impl<'a> SyncEngine<'a> {
     println!("   Syncing remote → monorepo...");
 
     // Check current branch - NEVER commit directly to protected branches
-    let current_branch = self.ctx.git.git().current_branch()?;
-    let needs_pr_branch = self.security_config.protected_branches.contains(&current_branch);
-
-    let pr_branch_name: Option<String> = if needs_pr_branch {
-      let pr_branch = format!("rail/sync-{}", self.config.crate_name);
-      println!("   ⚠️  Current branch '{}' is protected", current_branch);
-      println!("   📝 Creating PR branch: {}", pr_branch);
-
-      // Create and checkout the PR branch
-      self.ctx.git.git().create_and_checkout_branch(&pr_branch)?;
-
-      Some(pr_branch)
-    } else {
-      None
-    };
+    let _current_branch = self.ctx.git.git().current_branch()?;
 
     // Load mappings (cached - only loads if not already loaded)
 
@@ -310,41 +289,6 @@ impl<'a> SyncEngine<'a> {
     self.mapping_store.save(self.ctx.workspace_root())?;
 
     // If we created a PR branch, push it to remote and remind user to create PR
-    if let Some(ref pr_branch) = pr_branch_name {
-      println!("\n   🎯 Changes synced to PR branch: {}", pr_branch);
-
-      // Push PR branch to remote (skip for local testing)
-      if !utils::is_local_path(&self.config.remote_url) && synced_count > 0 {
-        println!("   📤 Pushing PR branch to remote...");
-        self.ctx.git.git().push_to_remote("origin", pr_branch)?;
-        println!("   ✅ PR branch pushed to origin/{}", pr_branch);
-
-        println!("\n   📝 Next step:");
-        println!("      • Create a pull request on GitHub/GitLab:");
-        println!("        {} → {}", pr_branch, current_branch);
-        println!("      • Or visit your repository's PR creation page");
-      } else if synced_count == 0 {
-        println!("   ℹ️  No new commits to sync - PR branch not pushed");
-        println!("   📝 To review: git diff {}..{}", current_branch, pr_branch);
-      } else {
-        // Local testing mode
-        println!("   📝 Next steps:");
-        println!(
-          "      1. Review the changes: git diff {}..{}",
-          current_branch, pr_branch
-        );
-        println!("      2. Push the branch: git push origin {}", pr_branch);
-        println!(
-          "      3. Create a pull request from {} to {}",
-          pr_branch, current_branch
-        );
-      }
-
-      println!(
-        "\n   ⚠️  Protected branch '{}' was NOT modified directly",
-        current_branch
-      );
-    }
 
     Ok(SyncResult {
       commits_synced: synced_count,
