@@ -188,10 +188,21 @@ pub struct ToolchainConfig {
   pub components: Vec<String>,
 
   /// Target triples for cross-compilation
-  /// Used by unify for optional validation and by config sync for rust-toolchain.toml
+  /// Used by config sync for rust-toolchain.toml
   /// The host platform is automatically included. No effect if `path` is set.
   #[serde(default)]
   pub targets: Vec<String>,
+
+  /// Whether rust-toolchain.toml is managed by rail
+  ///
+  /// When true, cargo-rail will sync rail.toml `[toolchain]` → rust-toolchain.toml
+  /// When false, rust-toolchain.toml is assumed to be managed externally
+  ///
+  /// Set automatically during `cargo rail init` based on whether rust-toolchain.toml exists:
+  /// - If exists: imports values and sets to true
+  /// - If doesn't exist: creates it and sets to true
+  #[serde(default)]
+  pub managed_by_rail: bool,
 }
 
 fn default_channel() -> String {
@@ -210,6 +221,7 @@ impl Default for ToolchainConfig {
       profile: default_profile(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false, // Default to false for safety
     }
   }
 }
@@ -702,6 +714,7 @@ mod tests {
       profile: "minimal".to_string(),
       components: vec!["clippy".to_string(), "rustfmt".to_string()],
       targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+      managed_by_rail: false,
     };
     assert!(toolchain.validate().is_ok());
   }
@@ -714,6 +727,7 @@ mod tests {
       profile: "default".to_string(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false,
     };
     assert!(toolchain.validate().is_ok());
   }
@@ -726,6 +740,7 @@ mod tests {
       profile: "default".to_string(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false,
     };
     assert!(toolchain.validate().is_err());
   }
@@ -738,6 +753,7 @@ mod tests {
       profile: "invalid".to_string(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false,
     };
     assert!(toolchain.validate().is_err());
   }
@@ -750,6 +766,7 @@ mod tests {
       profile: "default".to_string(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false,
     };
     assert!(toolchain.validate().is_err());
   }

@@ -73,10 +73,10 @@ fn get_changed_files(
   // Determine git range
   let changes = if let (Some(from_ref), Some(to_ref)) = (from, to) {
     // SHA pair mode: from..to
-    ctx.git.git().get_changed_files_between(from_ref, to_ref)?
+    ctx.git.git().get_changed_files_between(from_ref, Some(to_ref))?
   } else {
-    // Single ref mode: since..HEAD
-    ctx.git.git().get_changed_files_between(since, "HEAD")?
+    // Single ref mode: since..working tree
+    ctx.git.git().get_changed_files_between(since, None)?
   };
 
   // Extract just the file paths (ignore status char)

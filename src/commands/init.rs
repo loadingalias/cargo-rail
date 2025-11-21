@@ -199,6 +199,10 @@ fn detect_workspace_patterns(ctx: &WorkspaceContext) -> WorkspacePatternInfo {
 }
 
 /// Detect toolchain configuration from existing rust-toolchain.toml
+///
+/// If rust-toolchain.toml exists, imports it and sets managed_by_rail = true.
+/// This enables bidirectional sync: rail.toml becomes the source of truth,
+/// and future syncs will update rust-toolchain.toml from rail.toml.
 fn detect_toolchain_config(workspace_root: &Path) -> RailResult<ToolchainConfig> {
   let toolchain_path = workspace_root.join("rust-toolchain.toml");
 
@@ -206,6 +210,8 @@ fn detect_toolchain_config(workspace_root: &Path) -> RailResult<ToolchainConfig>
     // Try rust-toolchain without .toml extension
     let alt_path = workspace_root.join("rust-toolchain");
     if !alt_path.exists() {
+      // No existing toolchain file - use default and don't enable management yet
+      // User can enable managed_by_rail = true manually if they want rail to create it
       return Ok(ToolchainConfig::default());
     }
 
@@ -216,6 +222,7 @@ fn detect_toolchain_config(workspace_root: &Path) -> RailResult<ToolchainConfig>
 
     return Ok(ToolchainConfig {
       channel,
+      managed_by_rail: true, // Imported from existing file
       ..ToolchainConfig::default()
     });
   }
@@ -251,6 +258,7 @@ fn detect_toolchain_config(workspace_root: &Path) -> RailResult<ToolchainConfig>
     profile: parsed.toolchain.profile.unwrap_or_else(|| "default".to_string()),
     components: parsed.toolchain.components.unwrap_or_default(),
     targets: parsed.toolchain.targets.unwrap_or_default(),
+    managed_by_rail: true, // Imported from existing file - rail now manages it
   })
 }
 
@@ -397,11 +405,12 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str("# rust-toolchain.toml automatically.\n");
   output.push_str("#\n");
   output.push_str("# Fields:\n");
-  output.push_str("#   channel    - Rust release channel (stable, beta, nightly, or version)\n");
-  output.push_str("#   path       - Path to custom toolchain (mutually exclusive with channel)\n");
-  output.push_str("#   profile    - Toolchain profile (minimal, default, complete)\n");
-  output.push_str("#   components - Additional components (clippy, rustfmt, rust-src, etc.)\n");
-  output.push_str("#   targets    - Cross-compilation targets\n\n");
+  output.push_str("#   channel         - Rust release channel (stable, beta, nightly, or version)\n");
+  output.push_str("#   path            - Path to custom toolchain (mutually exclusive with channel)\n");
+  output.push_str("#   profile         - Toolchain profile (minimal, default, complete)\n");
+  output.push_str("#   components      - Additional components (clippy, rustfmt, rust-src, etc.)\n");
+  output.push_str("#   targets         - Cross-compilation targets\n");
+  output.push_str("#   managed_by_rail - Enable rust-toolchain.toml sync (true if imported)\n\n");
 
   output.push_str("[toolchain]\n");
   if let Some(ref path) = config.toolchain.path {
@@ -441,6 +450,13 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
     output.push_str("]\n");
   } else {
     output.push_str("targets = []  # e.g., [\"x86_64-unknown-linux-gnu\", \"aarch64-apple-darwin\"]\n");
+  }
+
+  // Add managed_by_rail field
+  if config.toolchain.managed_by_rail {
+    output.push_str("managed_by_rail = true  # rust-toolchain.toml imported - rail now manages it\n");
+  } else {
+    output.push_str("managed_by_rail = false  # Set to true to enable rust-toolchain.toml sync\n");
   }
 
   output.push('\n');

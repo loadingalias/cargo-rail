@@ -68,6 +68,83 @@ use_all_features = true
     Ok(Self { _root: root, path })
   }
 
+  /// Create a single-crate repo (non-workspace, like a split repo)
+  ///
+  /// This creates a standalone crate without a [workspace] section,
+  /// simulating what a split repository looks like.
+  pub fn new_single_crate(crate_name: &str, version: &str) -> Result<Self> {
+    let root = TempDir::new_in(std::env::temp_dir())
+      .with_context(|| format!("Failed to create temp dir for single crate '{}'", crate_name))?;
+    let path = root.path().to_path_buf();
+
+    // Initialize git repo with main as default branch
+    git(&path, &["init", "--initial-branch=main"])?;
+    git(&path, &["config", "user.name", "Test User"])?;
+    git(&path, &["config", "user.email", "test@example.com"])?;
+
+    // Create package Cargo.toml (NO [workspace] section)
+    std::fs::write(
+      path.join("Cargo.toml"),
+      format!(
+        r#"[package]
+name = "{}"
+version = "{}"
+edition = "2021"
+license = "MIT"
+authors = ["Test Author"]
+
+[dependencies]
+"#,
+        crate_name, version
+      ),
+    )?;
+
+    // Create src/lib.rs
+    std::fs::create_dir_all(path.join("src"))?;
+    std::fs::write(
+      path.join("src/lib.rs"),
+      format!(
+        r#"//! {} crate
+
+pub fn hello() -> &'static str {{
+    "Hello from {}"
+}}
+
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[test]
+    fn test_hello() {{
+        assert_eq!(hello(), "Hello from {}");
+    }}
+}}
+"#,
+        crate_name, crate_name, crate_name
+      ),
+    )?;
+
+    // Create README
+    std::fs::write(path.join("README.md"), format!("# {}\n\nA test crate.\n", crate_name))?;
+
+    // Create .config/rail.toml
+    std::fs::create_dir_all(path.join(".config"))?;
+    std::fs::write(
+      path.join(".config/rail.toml"),
+      r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
+"#,
+    )?;
+
+    git(&path, &["add", "."])?;
+    git(&path, &["commit", "-m", "Initial single-crate setup"])?;
+
+    Ok(Self { _root: root, path })
+  }
+
   /// Add a crate to the workspace
   pub fn add_crate(&self, name: &str, version: &str, deps: &[(&str, &str)]) -> Result<PathBuf> {
     let crate_path = self.path.join("crates").join(name);
@@ -150,7 +227,24 @@ mod tests {{
   /// Overwrite or create the release config block in .config/rail.toml
   pub fn write_release_config(&self, content: &str) -> Result<()> {
     let config_path = self.path.join(".config/rail.toml");
-    let mut existing = std::fs::read_to_string(&config_path)?;
+
+    // Create directory if it doesn't exist
+    if let Some(parent) = config_path.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
+
+    // Read existing config or create default
+    let mut existing = if config_path.exists() {
+      std::fs::read_to_string(&config_path)?
+    } else {
+      r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
+"#
+      .to_string()
+    };
 
     if let Some(idx) = existing.find("[release]") {
       existing.truncate(idx);

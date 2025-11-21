@@ -659,7 +659,7 @@ impl<'a> SyncEngine<'a> {
         .ctx
         .git
         .git()
-        .get_changed_files_between(last, "HEAD")?
+        .get_changed_files_between(last, Some("HEAD"))?
         .into_iter()
         .map(|(path, _)| path)
         .collect()

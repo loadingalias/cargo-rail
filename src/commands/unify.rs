@@ -501,17 +501,18 @@ pub fn run_unify_check(
 
   // Run optional per-target validation if CLI flag is set
   if validate_targets_flag {
-    // Get targets from config
+    // Get targets from config - use [unify].validate_targets which is the source of truth
     let targets = if let Some(cfg) = ctx.config.as_ref() {
-      if cfg.toolchain.targets.is_empty() {
-        println!("\n⚠️  --validate-targets flag set but no targets configured in rail.toml [toolchain.targets]");
-        println!("Add targets to .config/rail.toml to enable validation.");
+      if cfg.unify.validate_targets.is_empty() {
+        println!("\n⚠️  --validate-targets flag set but no targets configured in rail.toml [unify.validate_targets]");
+        println!("Add targets to .config/rail.toml under [unify] section to enable validation.");
+        println!("Example: validate_targets = [\"x86_64-unknown-linux-gnu\", \"wasm32-unknown-unknown\"]");
         return Ok(());
       }
-      cfg.toolchain.targets.clone()
+      cfg.unify.validate_targets.clone()
     } else {
       println!("\n⚠️  --validate-targets flag set but no rail.toml found");
-      println!("Run 'cargo rail init' to create a configuration file with [toolchain.targets].");
+      println!("Run 'cargo rail init' to create a configuration file with [unify.validate_targets].");
       return Ok(());
     };
 

@@ -114,17 +114,24 @@ impl SystemGit {
   /// # Performance
   /// Uses `git diff --name-status` which is optimized for listing changes.
   /// Typically <100ms even for large diffs with 1000s of files.
-  pub fn get_changed_files_between(&self, base_ref: &str, head_ref: &str) -> RailResult<Vec<(PathBuf, char)>> {
-    let output = self
-      .git_cmd()
-      .args(["diff", "--name-status", base_ref, head_ref])
-      .output()
-      .context("Failed to get changed files between refs")?;
+  pub fn get_changed_files_between(&self, base_ref: &str, head_ref: Option<&str>) -> RailResult<Vec<(PathBuf, char)>> {
+    let mut cmd = self.git_cmd();
+    cmd.args(["diff", "--name-status", base_ref]);
+
+    if let Some(head) = head_ref {
+      cmd.arg(head);
+    }
+
+    let output = cmd.output().context("Failed to get changed files between refs")?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
-        command: format!("git diff --name-status {} {}", base_ref, head_ref),
+        command: format!(
+          "git diff --name-status {} {}",
+          base_ref,
+          head_ref.unwrap_or("working tree")
+        ),
         stderr: stderr.to_string(),
       }));
     }
@@ -346,8 +353,9 @@ impl SystemGit {
     // Read all files in one batch (100x+ faster than loop)
     let contents = self.read_files_bulk(&items)?;
 
-    // Combine paths with contents
-    let results: Vec<(PathBuf, Vec<u8>)> = files.into_iter().zip(contents).collect();
+    // Combine full paths (with crate prefix) with contents
+    // Use paths from items (which include the crate prefix) not files (which are relative)
+    let results: Vec<(PathBuf, Vec<u8>)> = items.into_iter().map(|(_, path)| path).zip(contents).collect();
 
     Ok(results)
   }

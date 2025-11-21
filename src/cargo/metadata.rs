@@ -1,6 +1,7 @@
 use crate::error::RailResult;
 use cargo_metadata::{Dependency, DependencyKind, MetadataCommand, Package, Resolve, Target, TargetKind};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -11,7 +12,7 @@ use std::path::Path;
 /// - Resolved dependency graph with actual enabled features
 /// - MSRV and edition information
 /// - Platform-specific and optional dependencies
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
   metadata: cargo_metadata::Metadata,
 }

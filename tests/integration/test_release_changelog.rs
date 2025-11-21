@@ -24,6 +24,43 @@ require_clean = false
 }
 
 #[test]
+fn release_plan_works_on_single_crate_repo() -> Result<()> {
+  // Test that release plan works on a split repo (single-crate, non-workspace)
+  let ws = TestWorkspace::new_single_crate("private-tool", "0.1.0")?;
+
+  // Add release config (what a split repo would have)
+  ws.write_release_config(
+    r#"tag_prefix = "v"
+tag_format = "v{version}"
+require_clean = false
+"#,
+  )?;
+
+  // Run release plan
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "plan", "--bump", "patch"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should show the crate in the plan
+  assert!(
+    stdout.contains("private-tool"),
+    "Plan should include private-tool. Output:\n{}",
+    stdout
+  );
+  assert!(
+    stdout.contains("0.1.0 → 0.1.1") || stdout.contains("0.1.0") && stdout.contains("0.1.1"),
+    "Plan should show version bump. Output:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains("0 crate(s)"),
+    "Plan should not show 0 crates. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
 fn release_changelog_generates_links_and_prs() -> Result<()> {
   let ws = TestWorkspace::new_named("release-links")?;
   ws.set_remote("git@github.com:org/repo.git")?;

@@ -114,7 +114,7 @@ impl<'a> ChangeImpact<'a> {
   /// Analyze changes between two git refs with full graph awareness
   pub fn analyze_changes(&self, from: &str, to: &str) -> RailResult<ImpactReport> {
     // 1. Get changed files from git
-    let changed_files = self.ctx.git.git().get_changed_files_between(from, to)?;
+    let changed_files = self.ctx.git.git().get_changed_files_between(from, Some(to))?;
 
     // 2. Categorize changes by file type using new classification system
     let categories = self.categorize_changes(&changed_files);

@@ -139,6 +139,19 @@ impl ConfigSyncer for ToolchainSyncer {
   fn check(&self, workspace_root: &Path, config: &crate::config::RailConfig) -> RailResult<SyncStatus> {
     let toolchain_path = workspace_root.join("rust-toolchain.toml");
 
+    // If not managed by rail, skip sync
+    if !config.toolchain.managed_by_rail {
+      if toolchain_path.exists() {
+        return Ok(SyncStatus::InSync(
+          "rust-toolchain.toml exists but not managed by rail (managed_by_rail = false)".to_string(),
+        ));
+      } else {
+        return Ok(SyncStatus::OutOfSync(
+          "rust-toolchain.toml missing (set managed_by_rail = true to enable sync)".to_string(),
+        ));
+      }
+    }
+
     // If rust-toolchain.toml doesn't exist, it's out of sync
     if !toolchain_path.exists() {
       return Ok(SyncStatus::OutOfSync(
@@ -166,6 +179,19 @@ impl ConfigSyncer for ToolchainSyncer {
   fn sync(&self, workspace_root: &Path, config: &crate::config::RailConfig) -> RailResult<SyncStatus> {
     let toolchain_path = workspace_root.join("rust-toolchain.toml");
 
+    // If not managed by rail, skip sync
+    if !config.toolchain.managed_by_rail {
+      if toolchain_path.exists() {
+        return Ok(SyncStatus::InSync(
+          "rust-toolchain.toml not managed by rail (skipping sync)".to_string(),
+        ));
+      } else {
+        return Ok(SyncStatus::InSync(
+          "rust-toolchain.toml sync disabled (set managed_by_rail = true to enable)".to_string(),
+        ));
+      }
+    }
+
     // Check if already in sync
     let check_status = self.check(workspace_root, config)?;
     if matches!(check_status, SyncStatus::InSync(_)) {
@@ -181,6 +207,62 @@ impl ConfigSyncer for ToolchainSyncer {
       "rust-toolchain.toml synced from rail.toml [toolchain]".to_string(),
     ))
   }
+}
+
+/// Parse existing rust-toolchain.toml and import into ToolchainConfig
+///
+/// Returns None if file doesn't exist or can't be parsed
+pub fn import_rust_toolchain_toml(workspace_root: &Path) -> Option<crate::config::ToolchainConfig> {
+  let toolchain_path = workspace_root.join("rust-toolchain.toml");
+
+  if !toolchain_path.exists() {
+    return None;
+  }
+
+  let content = std::fs::read_to_string(&toolchain_path).ok()?;
+
+  // Parse TOML using toml_edit which is already a dependency
+  let parsed: toml_edit::DocumentMut = content.parse().ok()?;
+  let toolchain_table = parsed.get("toolchain")?.as_table()?;
+
+  // Extract fields
+  let channel = toolchain_table
+    .get("channel")
+    .and_then(|v| v.as_str())
+    .unwrap_or("stable")
+    .to_string();
+
+  let path = toolchain_table
+    .get("path")
+    .and_then(|v| v.as_str())
+    .map(|s| s.to_string());
+
+  let profile = toolchain_table
+    .get("profile")
+    .and_then(|v| v.as_str())
+    .unwrap_or("default")
+    .to_string();
+
+  let components = toolchain_table
+    .get("components")
+    .and_then(|v| v.as_array())
+    .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+    .unwrap_or_default();
+
+  let targets = toolchain_table
+    .get("targets")
+    .and_then(|v| v.as_array())
+    .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+    .unwrap_or_default();
+
+  Some(crate::config::ToolchainConfig {
+    channel,
+    path,
+    profile,
+    components,
+    targets,
+    managed_by_rail: true, // Set to true when importing
+  })
 }
 
 /// Generate rust-toolchain.toml content from ToolchainConfig
@@ -245,6 +327,7 @@ mod tests {
       profile: "default".to_string(),
       components: vec![],
       targets: vec![],
+      managed_by_rail: false,
     };
 
     let content = generate_rust_toolchain_toml(&config);
@@ -266,6 +349,7 @@ mod tests {
         "x86_64-unknown-linux-gnu".to_string(),
         "aarch64-apple-darwin".to_string(),
       ],
+      managed_by_rail: false,
     };
 
     let content = generate_rust_toolchain_toml(&config);
@@ -285,6 +369,7 @@ mod tests {
       profile: "default".to_string(),                        // Ignored in path mode
       components: vec!["clippy".to_string()],                // Ignored in path mode
       targets: vec!["x86_64-unknown-linux-gnu".to_string()], // Ignored in path mode
+      managed_by_rail: false,
     };
 
     let content = generate_rust_toolchain_toml(&config);

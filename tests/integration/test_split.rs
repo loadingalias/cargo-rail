@@ -181,6 +181,87 @@ paths = [{{ crate = "crates/lib-core" }}]
 }
 
 #[test]
+fn test_split_combined_mode_multiple_crates() -> Result<()> {
+  // Test combined mode: multiple crates split to one repo, preserving structure
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("lib-core", "0.1.0", &[])?;
+  ws.add_crate("service-api", "0.2.0", &[])?;
+  ws.commit("Add lib-core and service-api")?;
+
+  // Make changes to both crates
+  ws.modify_file("lib-core", "src/lib.rs", "// Core functionality")?;
+  ws.commit("Update lib-core")?;
+
+  ws.modify_file("service-api", "src/lib.rs", "// API service")?;
+  ws.commit("Update service-api")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[[splits]]
+name = "combined"
+remote = "{}"
+branch = "main"
+mode = "combined"
+paths = [
+  {{ crate = "crates/lib-core" }},
+  {{ crate = "crates/service-api" }}
+]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  run_cargo_rail(&ws.path, &["rail", "split", "combined"])?;
+
+  // Verify both crates exist with preserved structure
+  let split_path = split_dir.path();
+  assert!(
+    split_path.join("crates/lib-core/Cargo.toml").exists(),
+    "lib-core Cargo.toml should exist at crates/lib-core/Cargo.toml"
+  );
+  assert!(
+    split_path.join("crates/lib-core/src/lib.rs").exists(),
+    "lib-core lib.rs should exist at crates/lib-core/src/lib.rs"
+  );
+  assert!(
+    split_path.join("crates/service-api/Cargo.toml").exists(),
+    "service-api Cargo.toml should exist at crates/service-api/Cargo.toml"
+  );
+  assert!(
+    split_path.join("crates/service-api/src/lib.rs").exists(),
+    "service-api lib.rs should exist at crates/service-api/src/lib.rs"
+  );
+
+  // Verify content was copied correctly
+  let core_content = std::fs::read_to_string(split_path.join("crates/lib-core/src/lib.rs"))?;
+  assert!(
+    core_content.contains("// Core functionality"),
+    "lib-core should have correct content"
+  );
+
+  let api_content = std::fs::read_to_string(split_path.join("crates/service-api/src/lib.rs"))?;
+  assert!(
+    api_content.contains("// API service"),
+    "service-api should have correct content"
+  );
+
+  // Verify git history includes commits for both crates
+  let log_output = git(split_path, &["log", "--oneline"])?;
+  let log = String::from_utf8_lossy(&log_output.stdout);
+  assert!(
+    log.contains("Add lib-core and service-api"),
+    "Should contain initial commit"
+  );
+  assert!(log.contains("Update lib-core"), "Should contain lib-core update");
+  assert!(log.contains("Update service-api"), "Should contain service-api update");
+
+  Ok(())
+}
+
+#[test]
 fn test_split_release_flow_creates_tag_and_changelog() -> Result<()> {
   // Split a crate, then run release in the split repo to ensure tagging/changelog works.
   let ws = TestWorkspace::new()?;

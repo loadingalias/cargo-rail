@@ -421,7 +421,13 @@ fn main() {
         bump,
         json,
       } => {
-        let names = if all { None } else { Some(crate_names) };
+        // If --all is specified OR no crate names provided, use None (all crates)
+        // This handles both explicit --all and implicit all for single-crate repos
+        let names = if all || crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names)
+        };
         commands::run_release_plan(&ctx, names, bump, json)
       }
       ReleaseCommands::Publish {
@@ -432,11 +438,21 @@ fn main() {
         skip_publish,
         skip_tag,
       } => {
-        let names = if all { None } else { Some(crate_names) };
+        // If --all is specified OR no crate names provided, use None (all crates)
+        let names = if all || crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names)
+        };
         commands::run_release_publish(&ctx, names, all, bump, execute, skip_publish, skip_tag)
       }
       ReleaseCommands::Check { crate_names, all } => {
-        let names = if all { None } else { Some(crate_names) };
+        // If --all is specified OR no crate names provided, use None (all crates)
+        let names = if all || crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names)
+        };
         commands::run_release_check(&ctx, names, all)
       }
     },
