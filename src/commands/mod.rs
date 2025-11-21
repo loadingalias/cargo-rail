@@ -39,5 +39,5 @@ pub use split::run_split;
 pub use status::run_status;
 pub use sync::run_sync;
 pub use test::run_test;
-pub use unify::{run_unify_analyze, run_unify_apply, run_unify_check};
+pub use unify::{run_unify_analyze, run_unify_apply};
 pub use watch::run_test_watch;

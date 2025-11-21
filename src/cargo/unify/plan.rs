@@ -104,8 +104,8 @@ impl UnificationPlan {
       for issue in &self.issues {
         output.push_str(&format!("  {} - ", issue.dep_name));
         match &issue.issue_type {
-          IssueType::VersionConflict { requirements } => {
-            output.push_str("Version conflict\n");
+          IssueType::IncompatibleVersionRequirements { requirements } => {
+            output.push_str("Incompatible version requirements\n");
             for (member, version) in requirements {
               output.push_str(&format!("    {} requires {}\n", member, version));
             }
@@ -125,7 +125,7 @@ impl UnificationPlan {
           IssueType::AllTargetSpecific { targets } => {
             output.push_str(&format!("All uses are target-specific: {}\n", targets.join(", ")));
           }
-          IssueType::MultipleVersions { versions } => {
+          IssueType::MultipleResolvedVersions { versions } => {
             output.push_str(&format!("Multiple versions resolved: {}\n", versions.join(", ")));
           }
           IssueType::InconsistentDefaultFeatures {

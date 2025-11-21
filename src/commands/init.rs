@@ -324,6 +324,9 @@ fn detect_workspace_splits(ctx: &WorkspaceContext) -> Vec<SplitConfig> {
     // Check if crate has publish = false in Cargo.toml
     let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
 
+    // Detect per-crate CHANGELOG file
+    let changelog_path = detect_crate_changelog(crate_dir);
+
     splits.push(SplitConfig {
       name: pkg.name.to_string(),
       remote,
@@ -334,11 +337,44 @@ fn detect_workspace_splits(ctx: &WorkspaceContext) -> Vec<SplitConfig> {
       include: vec![],
       exclude: vec![],
       publish,
-      changelog_path: None, // Use default from ReleaseConfig
+      changelog_path,
     });
   }
 
   splits
+}
+
+/// Detect CHANGELOG file in a crate directory
+///
+/// Looks for common CHANGELOG file patterns:
+/// - CHANGELOG.md
+/// - CHANGELOG.txt
+/// - CHANGELOG
+/// - CHANGES.md
+/// - CHANGES
+fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<PathBuf> {
+  let changelog_patterns = [
+    "CHANGELOG.md",
+    "CHANGELOG.txt",
+    "CHANGELOG",
+    "Changelog.md",
+    "changelog.md",
+    "CHANGES.md",
+    "CHANGES.txt",
+    "CHANGES",
+    "Changes.md",
+    "changes.md",
+  ];
+
+  for pattern in &changelog_patterns {
+    let changelog = crate_dir.join(pattern);
+    if changelog.exists() {
+      // Return relative path from crate root
+      return Some(PathBuf::from(pattern));
+    }
+  }
+
+  None
 }
 
 /// Build a complete RailConfig from detected/default values
@@ -468,24 +504,21 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   output.push_str("# Automatically unify workspace dependencies using native Cargo features.\n");
   output.push_str("# Run: cargo rail unify analyze  (to preview changes)\n");
   output.push_str("#      cargo rail unify apply    (to apply unification)\n");
-  output.push_str("#      cargo rail unify check    (for CI validation)\n");
   output.push_str("#\n");
   output.push_str("# Fields:\n");
   output.push_str("#   use_all_features           - Use --all-features for accurate analysis\n");
-  output.push_str("#   sync_on_unify              - Auto-sync rust-toolchain.toml before unify\n");
   output.push_str("#   validate_targets           - Per-target validation (catches platform issues)\n");
   output.push_str("#   max_parallel_jobs          - Parallelism (0 = auto-detect)\n");
-  output.push_str("#   pin_transitives            - Pin transitive deps with fragmented features\n");
-  output.push_str("#   pin_hosts                  - Crates to host transitive pins\n\n");
+  output.push_str("#   pin_transitives               - Pin transitive deps with fragmented features\n");
+  output.push_str("#   pin_hosts                     - Crates to host transitive pins\n");
+  output.push_str("#   auto_resolve_version_conflicts - Auto-resolve version conflicts (pick highest)\n");
+  output.push_str("#   add_conflict_comments         - Add conflict markers to Cargo.toml\n");
+  output.push_str("#   generate_report               - Generate unify-report.md\n\n");
 
   output.push_str("[unify]\n");
   output.push_str(&format!(
     "use_all_features = {}  # Ensure complete feature union analysis\n",
     config.unify.use_all_features
-  ));
-  output.push_str(&format!(
-    "sync_on_unify = {}  # Keep toolchain in sync\n",
-    config.unify.sync_on_unify
   ));
 
   if !config.unify.validate_targets.is_empty() {
@@ -522,6 +555,19 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   } else {
     output.push_str("pin_hosts = []  # Optional: [\"workspace-root\"] (auto-selects if empty)\n");
   }
+
+  output.push_str(&format!(
+    "auto_resolve_version_conflicts = {}  # Pick highest version on conflicts\n",
+    config.unify.auto_resolve_version_conflicts
+  ));
+  output.push_str(&format!(
+    "add_conflict_comments = {}  # Add # ⚠️ markers to Cargo.toml\n",
+    config.unify.add_conflict_comments
+  ));
+  output.push_str(&format!(
+    "generate_report = {}  # Create unify-report.md\n",
+    config.unify.generate_report
+  ));
 
   output.push('\n');
 
@@ -867,11 +913,17 @@ pub fn run_init_standalone(
     policy: policy_config,
     unify: UnifyConfig {
       use_all_features: true,
-      sync_on_unify: true,
       validate_targets: vec![],
       max_parallel_jobs: 0,
       pin_transitives: false,
       pin_hosts: vec![],
+      auto_resolve_version_conflicts: true,
+      conflict_resolution: "permissive".to_string(),
+      add_conflict_comments: true,
+      generate_report: true,
+      allow_renamed: false,
+      exclude: vec![],
+      include: vec![],
     },
     security: SecurityConfig {
       ssh_key_path: None,
@@ -884,10 +936,30 @@ pub fn run_init_standalone(
     splits: vec![],
   };
 
-  // 4. Serialize with rich comments
+  // 4. Try to load workspace context to detect splits
+  //    If this fails (e.g., invalid workspace), we'll just use an empty splits list
+  let splits = match WorkspaceContext::build(workspace_root) {
+    Ok(ctx) => {
+      let detected_splits = detect_workspace_splits(&ctx);
+      if !detected_splits.is_empty() {
+        println!("  Detected {} workspace member(s)", detected_splits.len());
+      }
+      detected_splits
+    }
+    Err(_) => {
+      // Failed to load workspace - maybe not a cargo workspace yet
+      // This is OK for init - just use empty splits
+      vec![]
+    }
+  };
+
+  // Update config with detected splits
+  let config = RailConfig { splits, ..config };
+
+  // 5. Serialize with comments
   let config_toml = serialize_config_with_comments(&config)?;
 
-  // 5. Output
+  // 6. Output
   if dry_run {
     println!("--- {} ---", output_path);
     println!("{}", config_toml);

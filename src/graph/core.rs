@@ -261,29 +261,51 @@ impl WorkspaceGraph {
   /// # Performance
   /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
   pub fn publish_order(&self) -> RailResult<Vec<String>> {
-    // Topological sort gives us the order (roots first)
-    let sorted = toposort(&self.graph, None).map_err(|cycle| {
-      let node = &self.graph[cycle.node_id()];
+    // Build a subgraph with only workspace members
+    // This is critical: external dependencies can have cycles (e.g., serde/serde_derive in dev deps),
+    // but workspace members should never have cycles (Cargo enforces this)
+    let mut subgraph = DiGraph::<&PackageNode, DependencyKind>::new();
+    let mut name_to_subgraph_idx = HashMap::new();
+
+    // Add only workspace member nodes
+    for (name, &idx) in &self.name_to_node {
+      let node = &self.graph[idx];
+      if node.is_workspace_member {
+        let subgraph_idx = subgraph.add_node(node);
+        name_to_subgraph_idx.insert(name.clone(), subgraph_idx);
+      }
+    }
+
+    // Add edges between workspace members only
+    for (from_name, &from_subgraph_idx) in &name_to_subgraph_idx {
+      let from_graph_idx = self.name_to_node[from_name];
+
+      // Check all outgoing edges from this workspace member
+      for neighbor_graph_idx in self.graph.neighbors_directed(from_graph_idx, Direction::Outgoing) {
+        let neighbor_node = &self.graph[neighbor_graph_idx];
+
+        // Only add edge if the neighbor is also a workspace member
+        if neighbor_node.is_workspace_member
+          && let Some(&to_subgraph_idx) = name_to_subgraph_idx.get(&neighbor_node.name)
+          && let Some(edge) = self.graph.find_edge(from_graph_idx, neighbor_graph_idx)
+        {
+          let kind = *self.graph.edge_weight(edge).unwrap();
+          subgraph.add_edge(from_subgraph_idx, to_subgraph_idx, kind);
+        }
+      }
+    }
+
+    // Now run toposort on the workspace-only subgraph
+    let sorted = toposort(&subgraph, None).map_err(|cycle| {
+      let node = subgraph[cycle.node_id()];
       RailError::message(format!(
-        "Circular dependency detected involving crate: '{}'. This should not happen in a valid Cargo workspace.",
+        "Circular dependency detected involving workspace crate: '{}'. This should not happen in a valid Cargo workspace.",
         node.name
       ))
     })?;
 
-    // Filter to workspace members only and collect names
-    // toposort returns in "dependency order" - roots (no deps) first, leaves (most deps) last
-    // For publishing, we want dependencies before dependents, so this order is correct
-    let result: Vec<String> = sorted
-      .into_iter()
-      .filter_map(|idx| {
-        let node = &self.graph[idx];
-        if node.is_workspace_member {
-          Some(node.name.clone())
-        } else {
-          None
-        }
-      })
-      .collect();
+    // Collect names in dependency order
+    let result: Vec<String> = sorted.into_iter().map(|idx| subgraph[idx].name.clone()).collect();
 
     Ok(result)
   }

@@ -7,7 +7,10 @@
 //!
 //! Replaces cargo-hakari with native Cargo workspace dependency unification.
 
-use crate::cargo::{CargoTransform, UnifyConfig, UnifyStrategy, WorkspaceMetadata, WorkspaceUnifier, validate_targets};
+use crate::cargo::{
+  CargoTransform, IssueSeverity, UnifyConfig, UnifyReport, UnifyStrategy, WorkspaceMetadata, WorkspaceUnifier,
+  validate_targets,
+};
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 use std::path::Path;
@@ -32,25 +35,6 @@ fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<WorkspaceMetadata> {
     // Use existing metadata from context
     Ok(ctx.cargo.metadata().clone())
   }
-}
-
-/// Run config sync if configured
-fn maybe_sync_config(ctx: &WorkspaceContext) -> RailResult<()> {
-  // Only run if config exists
-  if ctx.config.is_none() {
-    return Ok(());
-  }
-
-  // Check if sync_on_unify is enabled (default: true)
-  let sync_enabled = ctx.config.as_ref().map(|cfg| cfg.unify.sync_on_unify).unwrap_or(true);
-
-  if sync_enabled {
-    // Run config sync (non-check mode)
-    crate::commands::run_config_sync(ctx, false)?;
-    println!(); // Add newline separator
-  }
-
-  Ok(())
 }
 
 /// Run optional per-target validation if configured
@@ -119,22 +103,29 @@ pub fn run_unify_analyze(
   ctx: &WorkspaceContext,
   exclude: Vec<String>,
   include: Vec<String>,
-  normal_only: bool,
   pin_transitives_flag: bool,
 ) -> RailResult<()> {
-  // Sync config if enabled
-  maybe_sync_config(ctx)?;
-
   println!("🔍 Analyzing workspace dependencies...\n");
 
   // Get metadata (with --all-features if configured)
   let metadata = get_unify_metadata(ctx)?;
 
-  // Build config from CLI args (or load from rail.toml if we want)
-  let mut config = UnifyConfig {
-    strategy: UnifyStrategy::All, // Unify all duplicated dependencies
-    normal_only,
-    ..Default::default()
+  // Build config from CLI args and rail.toml
+  let mut config = if let Some(rail_config) = &ctx.config {
+    UnifyConfig {
+      strategy: UnifyStrategy::All,
+      allow_renamed: rail_config.unify.allow_renamed,
+      exclude: rail_config.unify.exclude.iter().cloned().collect(),
+      include: rail_config.unify.include.iter().cloned().collect(),
+      auto_resolve_version_conflicts: rail_config.unify.auto_resolve_version_conflicts,
+      add_conflict_comments: rail_config.unify.add_conflict_comments,
+      generate_report: rail_config.unify.generate_report,
+    }
+  } else {
+    UnifyConfig {
+      strategy: UnifyStrategy::All,
+      ..Default::default()
+    }
   };
 
   // Apply excludes/includes from CLI
@@ -156,9 +147,18 @@ pub fn run_unify_analyze(
   maybe_run_validation(ctx)?;
 
   // Final message
+  let blocking_issues = plan.issues.iter().filter(|i| i.severity == IssueSeverity::Hard).count();
   if !plan.issues.is_empty() {
-    println!("⚠️  Note: Some issues were detected that will prevent 'cargo rail unify apply'.");
-    println!("Resolve these issues before attempting to apply changes.\n");
+    if blocking_issues > 0 {
+      println!(
+        "⚠️  Note: {} BLOCKING issues detected that will prevent 'cargo rail unify apply'.",
+        blocking_issues
+      );
+      println!("Resolve these issues before attempting to apply changes.\n");
+    } else {
+      println!("⚠️  Note: {} non-blocking issues detected.", plan.issues.len());
+      println!("'cargo rail unify apply' will proceed with warnings for these issues.\n");
+    }
   }
 
   // Show transitive fragmentation info if pin_transitives is enabled
@@ -188,22 +188,29 @@ pub fn run_unify_apply(
   exclude: Vec<String>,
   include: Vec<String>,
   backup: bool,
-  normal_only: bool,
   pin_transitives_flag: bool,
 ) -> RailResult<()> {
-  // Sync config if enabled
-  maybe_sync_config(ctx)?;
-
   println!("🔧 Applying workspace dependency unification...\n");
 
   // Get metadata (with --all-features if configured)
   let metadata = get_unify_metadata(ctx)?;
 
   // Build config
-  let mut config = UnifyConfig {
-    strategy: UnifyStrategy::All,
-    normal_only,
-    ..Default::default()
+  let mut config = if let Some(rail_config) = &ctx.config {
+    UnifyConfig {
+      strategy: UnifyStrategy::All,
+      allow_renamed: rail_config.unify.allow_renamed,
+      exclude: rail_config.unify.exclude.iter().cloned().collect(),
+      include: rail_config.unify.include.iter().cloned().collect(),
+      auto_resolve_version_conflicts: rail_config.unify.auto_resolve_version_conflicts,
+      add_conflict_comments: rail_config.unify.add_conflict_comments,
+      generate_report: rail_config.unify.generate_report,
+    }
+  } else {
+    UnifyConfig {
+      strategy: UnifyStrategy::All,
+      ..Default::default()
+    }
   };
 
   for dep in exclude {
@@ -214,16 +221,27 @@ pub fn run_unify_apply(
   }
 
   // Run analysis first
-  let unifier = WorkspaceUnifier::with_config(&metadata, config);
+  let unifier = WorkspaceUnifier::with_config(&metadata, config.clone());
   let plan = unifier.analyze()?;
 
   // Check for issues
-  if !plan.issues.is_empty() {
-    println!("⚠️  Cannot apply: unification has blocking issues:");
-    for issue in &plan.issues {
+  let (hard_issues, soft_issues): (Vec<_>, Vec<_>) =
+    plan.issues.iter().partition(|i| i.severity == IssueSeverity::Hard);
+
+  if !hard_issues.is_empty() {
+    println!("⚠️  Cannot apply: unification has BLOCKING issues:");
+    for issue in hard_issues {
       println!("  {}", issue.format_message());
     }
-    return Err(RailError::message("Fix issues before applying"));
+    return Err(RailError::message("Fix blocking issues before applying"));
+  }
+
+  if !soft_issues.is_empty() {
+    println!("⚠️  Proceeding with warnings (these issues will be handled via workspace.dependencies):");
+    for issue in soft_issues {
+      println!("  {}", issue.format_message());
+    }
+    println!();
   }
 
   // Determine if we should pin transitives
@@ -294,6 +312,7 @@ pub fn run_unify_apply(
         dep_kinds: vec![cargo_metadata::DependencyKind::Development].into_iter().collect(),
         fragmentation_count: frag.feature_sets.len(),
         path: None,
+        comments: Vec::new(),
       });
     }
 
@@ -304,7 +323,7 @@ pub fn run_unify_apply(
   maybe_run_validation(ctx)?;
 
   // Create transformer (use the same metadata we used for analysis)
-  let transformer = CargoTransform::new(metadata);
+  let transformer = CargoTransform::new(metadata.clone());
 
   // 1. Write [workspace.dependencies]
   let workspace_toml = ctx.workspace_root().join("Cargo.toml");
@@ -319,7 +338,7 @@ pub fn run_unify_apply(
   let mut all_workspace_deps = plan.workspace_deps.clone();
   all_workspace_deps.extend(transitive_deps_to_add.clone());
 
-  transformer.write_workspace_dependencies(&workspace_toml, &all_workspace_deps)?;
+  transformer.write_workspace_dependencies(&workspace_toml, &all_workspace_deps, config.add_conflict_comments)?;
   println!("  ✓ Wrote {} unified dependencies", all_workspace_deps.len());
   if !transitive_deps_to_add.is_empty() {
     println!(
@@ -330,6 +349,8 @@ pub fn run_unify_apply(
 
   // 2. Convert member dependencies to workspace inheritance
   println!("\n📝 Converting member dependencies to workspace inheritance...");
+
+  let mut all_skipped_deps: Vec<(String, String, cargo_metadata::DependencyKind)> = Vec::new();
 
   for (member_name, edits) in &plan.member_edits {
     if edits.is_empty() {
@@ -347,15 +368,73 @@ pub fn run_unify_apply(
       backup_file(member_toml)?;
     }
 
+    let mut successful_edits = 0;
+    let mut skipped_edits = Vec::new();
+
     for edit in edits {
       match edit {
         crate::cargo::unify::MemberEdit::UseWorkspace { dep_name, kind } => {
-          transformer.convert_to_workspace_inheritance(member_toml, dep_name, kind)?;
+          match transformer.convert_to_workspace_inheritance(member_toml, dep_name, kind) {
+            Ok(_) => successful_edits += 1,
+            Err(_) => {
+              // This happens when we detect a dep via --all-features metadata resolution,
+              // but it doesn't exist in this member's Cargo.toml (it's a transitive dep
+              // pulled in by cargo's feature resolution, not directly declared).
+              skipped_edits.push((dep_name.clone(), *kind));
+              all_skipped_deps.push((member_name.clone(), dep_name.clone(), *kind));
+            }
+          }
         }
       }
     }
 
-    println!("  ✓ {} ({} dependencies)", member_name, edits.len());
+    if successful_edits > 0 {
+      println!("  ✓ {} ({} dependencies)", member_name, successful_edits);
+    }
+    if !skipped_edits.is_empty() {
+      println!(
+        "    ⚠️  {} transitive deps detected via --all-features (see note below)",
+        skipped_edits.len()
+      );
+    }
+  }
+
+  // Show explanation for skipped transitive deps
+  if !all_skipped_deps.is_empty() {
+    println!("\nℹ️  About transitive dependencies detected via --all-features:");
+    println!(
+      "   cargo-rail found {} transitive dependencies that cargo resolves automatically",
+      all_skipped_deps.len()
+    );
+    println!("   but aren't directly declared in member Cargo.toml files.");
+    println!();
+    println!("   Why this happens:");
+    println!("   - Using --all-features captures the complete dependency graph");
+    println!("   - Cargo automatically pulls in transitive deps based on enabled features");
+    println!("   - These deps don't exist in your Cargo.toml, so we can't convert them");
+    println!();
+    println!("   Options:");
+    println!("   A) Do nothing - cargo will continue to resolve these automatically (RECOMMENDED)");
+    println!("   B) Explicitly add them to [workspace.dependencies] + [dev-dependencies] in affected members");
+    println!("      (useful if you want explicit control over transitive dep versions)");
+    println!();
+
+    // Group by dep name for clarity
+    let mut by_dep: std::collections::HashMap<String, Vec<(String, cargo_metadata::DependencyKind)>> =
+      std::collections::HashMap::new();
+    for (member, dep, kind) in &all_skipped_deps {
+      by_dep.entry(dep.clone()).or_default().push((member.clone(), *kind));
+    }
+
+    println!("   Affected dependencies:");
+    for (dep_name, members) in by_dep.iter().take(5) {
+      let member_names: Vec<_> = members.iter().map(|(m, _)| m.as_str()).collect();
+      println!("   - {}: {}", dep_name, member_names.join(", "));
+    }
+    if by_dep.len() > 5 {
+      println!("   ... and {} more", by_dep.len() - 5);
+    }
+    println!();
   }
 
   // 3. Add dev-dependencies for pinned transitives to pin_hosts
@@ -425,143 +504,17 @@ pub fn run_unify_apply(
     println!("\n💾 Backups created with .bak extension");
   }
 
+  // Generate report if configured
+  if config.generate_report {
+    let report_path = ctx.workspace_root().join("unify-report.md");
+    UnifyReport::write_to_file(&plan, &metadata, &report_path)?;
+    println!("\n📄 Unification report generated at {}", report_path.display());
+  }
+
   println!("\nNext steps:");
   println!("  1. Run 'cargo check' to verify everything compiles");
   println!("  2. Test your workspace thoroughly");
   println!("  3. Commit the changes");
-
-  Ok(())
-}
-
-/// Check workspace dependencies are properly unified (for CI)
-pub fn run_unify_check(
-  ctx: &WorkspaceContext,
-  exclude: Vec<String>,
-  normal_only: bool,
-  validate_targets_flag: bool,
-) -> RailResult<()> {
-  // Sync config check (don't modify, just validate)
-  let sync_enabled = ctx.config.as_ref().map(|cfg| cfg.unify.sync_on_unify).unwrap_or(true);
-
-  if sync_enabled {
-    crate::commands::run_config_sync(ctx, true)?; // check=true
-    println!();
-  }
-
-  println!("🔍 Checking workspace dependency unification...\n");
-
-  // Get metadata (with --all-features if configured)
-  let metadata = get_unify_metadata(ctx)?;
-
-  // Build config
-  let mut config = UnifyConfig {
-    strategy: UnifyStrategy::All,
-    normal_only,
-    ..Default::default()
-  };
-
-  for dep in exclude {
-    config.exclude.insert(dep);
-  }
-
-  // Run analysis
-  let unifier = WorkspaceUnifier::with_config(&metadata, config);
-  let plan = unifier.analyze()?;
-
-  // Check for issues
-  if !plan.issues.is_empty() {
-    println!("❌ Unification check FAILED - issues detected:\n");
-    for issue in &plan.issues {
-      println!("  {}", issue.format_message());
-    }
-    println!("\nRun 'cargo rail unify analyze' for full details.");
-    return Err(RailError::message("Workspace dependencies have unification issues"));
-  }
-
-  // Check if there are unifiable dependencies
-  if !plan.workspace_deps.is_empty() {
-    println!(
-      "❌ Unification check FAILED - {} dependencies can be unified:\n",
-      plan.workspace_deps.len()
-    );
-    for dep in plan.workspace_deps.iter().take(10) {
-      println!("  {} (used by {} members)", dep.name, dep.used_by.len());
-    }
-    if plan.workspace_deps.len() > 10 {
-      println!("  ... and {} more", plan.workspace_deps.len() - 10);
-    }
-    println!("\nRun 'cargo rail unify apply' to fix.");
-    return Err(RailError::message("Workspace dependencies are not fully unified"));
-  }
-
-  println!("✅ Workspace dependencies are properly unified!");
-  println!("\nStats:");
-  println!("  - {} dependencies analyzed", plan.stats.total_deps);
-  println!("  - No unification opportunities found");
-
-  // Run optional per-target validation if CLI flag is set
-  if validate_targets_flag {
-    // Get targets from config - use [unify].validate_targets which is the source of truth
-    let targets = if let Some(cfg) = ctx.config.as_ref() {
-      if cfg.unify.validate_targets.is_empty() {
-        println!("\n⚠️  --validate-targets flag set but no targets configured in rail.toml [unify.validate_targets]");
-        println!("Add targets to .config/rail.toml under [unify] section to enable validation.");
-        println!("Example: validate_targets = [\"x86_64-unknown-linux-gnu\", \"wasm32-unknown-unknown\"]");
-        return Ok(());
-      }
-      cfg.unify.validate_targets.clone()
-    } else {
-      println!("\n⚠️  --validate-targets flag set but no rail.toml found");
-      println!("Run 'cargo rail init' to create a configuration file with [unify.validate_targets].");
-      return Ok(());
-    };
-
-    println!("\n🔍 Running per-target validation for {} targets...\n", targets.len());
-
-    // Use configured parallelism or auto-detect
-    let max_parallel_jobs = ctx
-      .config
-      .as_ref()
-      .map(|cfg| cfg.unify.effective_parallelism())
-      .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-
-    let summary = validate_targets(ctx.workspace_root(), &targets, max_parallel_jobs)?;
-
-    // Print summary
-    println!("📊 Validation Summary:");
-    println!("  Total targets: {}", summary.total_targets);
-    println!("  Successful: {}", summary.successful);
-    println!("  Failed: {}", summary.failed);
-    println!();
-
-    // Print results
-    for result in &summary.results {
-      if result.success {
-        println!("  ✓ {} - OK", result.target);
-        if !result.warnings.is_empty() {
-          for warning in &result.warnings {
-            println!("    ⚠️  {}", warning);
-          }
-        }
-      } else {
-        println!("  ✗ {} - FAILED", result.target);
-        if let Some(ref error) = result.error {
-          println!("    Error: {}", error);
-        }
-      }
-    }
-
-    if !summary.all_passed() {
-      println!("\n❌ Target validation FAILED");
-      return Err(RailError::message(format!(
-        "Validation failed for {} target(s): {}",
-        summary.failed,
-        summary.failed_targets().join(", ")
-      )));
-    }
-
-    println!("\n✅ All target validations passed!");
-  }
 
   Ok(())
 }

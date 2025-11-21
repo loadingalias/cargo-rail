@@ -357,11 +357,27 @@ fn test_unify_apply_conflict_fails() -> Result<()> {
   workspace.add_crate("crate-b", "0.1.0", &[("syn", r#""2.0""#)])?;
   workspace.commit("Add crates with conflicting syn versions")?;
 
+  // Disable auto-resolution to ensure it fails
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+auto_resolve_version_conflicts = false
+"#,
+  )?;
+
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   assert!(
     !output.status.success(),
-    "apply should fail on true conflicts (syn 1.x vs 2.x)"
+    "apply should fail on true conflicts (syn 1.x vs 2.x)\nstdout: {}\nstderr: {}",
+    stdout,
+    stderr
   );
 
   // Ensure manifests not rewritten on failure

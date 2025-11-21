@@ -66,6 +66,21 @@ pub fn unify_instances(
     None
   };
 
+  // Generate standard comment showing which members use this dep
+  let member_count = used_by.len();
+  let comment = if fragmentation_count > 1 {
+    format!(
+      "Unified from {} members ({} feature combinations)",
+      member_count, fragmentation_count
+    )
+  } else {
+    format!(
+      "Unified from {} member{}",
+      member_count,
+      if member_count == 1 { "" } else { "s" }
+    )
+  };
+
   Ok(UnifiedDep {
     name: dep_name.to_string(),
     version_req,
@@ -75,5 +90,6 @@ pub fn unify_instances(
     dep_kinds,
     fragmentation_count,
     path,
+    comments: vec![comment],
   })
 }

@@ -1,7 +1,7 @@
 //! Issue detection for dependency unification
 
 use super::path_handling::are_all_identical_workspace_paths;
-use super::types::{DependencyInstance, IssueType, UnificationIssue};
+use super::types::{DependencyInstance, IssueSeverity, IssueType, UnificationIssue};
 use crate::cargo::WorkspaceMetadata;
 use crate::error::RailResult;
 use std::collections::HashMap;
@@ -50,9 +50,10 @@ pub fn detect_multi_version_conflicts(metadata: &WorkspaceMetadata) -> RailResul
     if versions.len() > 1 {
       issues.push(UnificationIssue {
         dep_name: pkg_name.clone(),
-        issue_type: IssueType::MultipleVersions {
+        issue_type: IssueType::MultipleResolvedVersions {
           versions: versions.clone(),
         },
+        severity: IssueSeverity::Soft, // Can be resolved via workspace.dependencies
         affected_members: vec![],
         suggestion: format!(
           "Multiple versions of '{}' found: {}. Standardize to a single version across the workspace.",
@@ -86,6 +87,7 @@ pub fn detect_issues(
         original: dep_name.to_string(),
         renames,
       },
+      severity: IssueSeverity::Hard, // Renames block unification
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
       suggestion: "Standardize dependency name across all workspace members".to_string(),
     });
@@ -97,12 +99,13 @@ pub fn detect_issues(
   if versions.len() > 1 {
     return Some(UnificationIssue {
       dep_name: dep_name.to_string(),
-      issue_type: IssueType::VersionConflict {
+      issue_type: IssueType::IncompatibleVersionRequirements {
         requirements: instances
           .iter()
           .map(|i| (i.member.clone(), i.version_req.to_string()))
           .collect(),
       },
+      severity: IssueSeverity::Soft, // Can be resolved via workspace.dependencies
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
       suggestion: "Standardize version requirement across all workspace members".to_string(),
     });
@@ -124,6 +127,7 @@ pub fn detect_issues(
     return Some(UnificationIssue {
       dep_name: dep_name.to_string(),
       issue_type: IssueType::PathDependency { paths },
+      severity: IssueSeverity::Hard, // Incompatible paths block unification
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
       suggestion:
         "Convert external path dependencies to version dependencies, or ensure all workspace members use the same path"
@@ -139,6 +143,7 @@ pub fn detect_issues(
       issue_type: IssueType::AllTargetSpecific {
         targets: targets.clone(),
       },
+      severity: IssueSeverity::Info, // Just informational, not a blocker
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
       suggestion: "Target-specific dependencies cannot be unified at workspace level".to_string(),
     });
@@ -163,10 +168,138 @@ pub fn detect_issues(
         members_with_default: with_default.clone(),
         members_without_default: without_default.clone(),
       },
+      severity: IssueSeverity::Soft, // Can be resolved via workspace.dependencies
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
       suggestion: "Standardize default-features setting. Consider setting default-features = false and explicitly enabling needed features".to_string(),
     });
   }
 
   None
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use cargo_metadata::{DependencyKind, camino::Utf8PathBuf};
+  use semver::VersionReq;
+
+  fn create_test_metadata() -> WorkspaceMetadata {
+    let current_dir = std::env::current_dir().unwrap();
+    WorkspaceMetadata::load(&current_dir).unwrap()
+  }
+
+  fn create_instance(member: &str, version: &str) -> DependencyInstance {
+    DependencyInstance {
+      member: member.to_string(),
+      name: "test-dep".to_string(),
+      version_req: VersionReq::parse(version).unwrap(),
+      features: vec![],
+      default_features: true,
+      optional: false,
+      kind: DependencyKind::Normal,
+      target: None,
+      rename: None,
+      path: None,
+    }
+  }
+
+  #[test]
+  fn test_detect_renamed_dependency_hard() {
+    let metadata = create_test_metadata();
+    let mut instance1 = create_instance("member1", "1.0.0");
+    instance1.rename = Some("renamed-dep".to_string());
+
+    let instance2 = create_instance("member2", "1.0.0");
+
+    let instances = vec![instance1, instance2];
+
+    let issue = detect_issues("test-dep", &instances, false, &metadata).unwrap();
+
+    assert_eq!(issue.severity, IssueSeverity::Hard);
+    if let IssueType::Renamed { .. } = issue.issue_type {
+      // OK
+    } else {
+      panic!("Expected Renamed issue type");
+    }
+  }
+
+  #[test]
+  fn test_detect_version_conflict_soft() {
+    let metadata = create_test_metadata();
+    let instance1 = create_instance("member1", "1.0.0");
+    let instance2 = create_instance("member2", "2.0.0");
+
+    let instances = vec![instance1, instance2];
+
+    let issue = detect_issues("test-dep", &instances, false, &metadata).unwrap();
+
+    assert_eq!(issue.severity, IssueSeverity::Soft);
+    if let IssueType::IncompatibleVersionRequirements { .. } = issue.issue_type {
+      // OK
+    } else {
+      panic!("Expected IncompatibleVersionRequirements issue type");
+    }
+  }
+
+  #[test]
+  fn test_detect_inconsistent_default_features_soft() {
+    let metadata = create_test_metadata();
+    let mut instance1 = create_instance("member1", "1.0.0");
+    instance1.default_features = true;
+
+    let mut instance2 = create_instance("member2", "1.0.0");
+    instance2.default_features = false;
+
+    let instances = vec![instance1, instance2];
+
+    let issue = detect_issues("test-dep", &instances, false, &metadata).unwrap();
+
+    assert_eq!(issue.severity, IssueSeverity::Soft);
+    if let IssueType::InconsistentDefaultFeatures { .. } = issue.issue_type {
+      // OK
+    } else {
+      panic!("Expected InconsistentDefaultFeatures issue type");
+    }
+  }
+
+  #[test]
+  fn test_detect_path_dependency_hard() {
+    let metadata = create_test_metadata();
+    let mut instance1 = create_instance("member1", "1.0.0");
+    instance1.path = Some(Utf8PathBuf::from("/some/external/path"));
+
+    let instance2 = create_instance("member2", "1.0.0");
+
+    let instances = vec![instance1, instance2];
+
+    let issue = detect_issues("test-dep", &instances, false, &metadata).unwrap();
+
+    assert_eq!(issue.severity, IssueSeverity::Hard);
+    if let IssueType::PathDependency { .. } = issue.issue_type {
+      // OK
+    } else {
+      panic!("Expected PathDependency issue type");
+    }
+  }
+
+  #[test]
+  fn test_detect_target_specific_info() {
+    let metadata = create_test_metadata();
+    let mut instance1 = create_instance("member1", "1.0.0");
+    instance1.target = Some("cfg(unix)".to_string());
+
+    let mut instance2 = create_instance("member2", "1.0.0");
+    instance2.target = Some("cfg(windows)".to_string());
+
+    let instances = vec![instance1, instance2];
+
+    let issue = detect_issues("test-dep", &instances, false, &metadata).unwrap();
+
+    assert_eq!(issue.severity, IssueSeverity::Info);
+    if let IssueType::AllTargetSpecific { .. } = issue.issue_type {
+      // OK
+    } else {
+      panic!("Expected AllTargetSpecific issue type");
+    }
+  }
 }

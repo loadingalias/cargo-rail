@@ -68,6 +68,9 @@ pub struct UnifiedDep {
 
   /// Path dependency (workspace-relative path for workspace member deps)
   pub path: Option<Utf8PathBuf>,
+
+  /// Comments to add to the TOML output (e.g. for auto-resolution)
+  pub comments: Vec<String>,
 }
 
 /// Plan for unifying workspace dependencies
@@ -96,6 +99,18 @@ pub enum MemberEdit {
   UseWorkspace { dep_name: String, kind: DependencyKind },
 }
 
+/// Severity of a unification issue
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSeverity {
+  /// Hard blocker - cannot auto-unify, manual intervention required
+  Hard,
+  /// Soft warning - can express in workspace.dependencies
+  /// User must manually resolve or accept duplicates
+  Soft,
+  /// Informational - not a blocker, just FYI
+  Info,
+}
+
 /// Issue preventing automatic unification
 #[derive(Debug, Clone)]
 pub struct UnificationIssue {
@@ -104,6 +119,9 @@ pub struct UnificationIssue {
 
   /// Issue type
   pub issue_type: IssueType,
+
+  /// Severity of the issue
+  pub severity: IssueSeverity,
 
   /// Affected workspace members
   pub affected_members: Vec<String>,
@@ -126,9 +144,9 @@ impl UnificationIssue {
 
   fn issue_description(&self) -> String {
     match &self.issue_type {
-      IssueType::VersionConflict { requirements } => {
+      IssueType::IncompatibleVersionRequirements { requirements } => {
         let versions: Vec<String> = requirements.iter().map(|(m, v)| format!("{}: {}", m, v)).collect();
-        format!("Version conflict ({})", versions.join(", "))
+        format!("Incompatible version requirements ({})", versions.join(", "))
       }
       IssueType::Renamed { original, renames } => {
         format!(
@@ -147,7 +165,7 @@ impl UnificationIssue {
       IssueType::AllTargetSpecific { targets } => {
         format!("All uses are target-specific: {}", targets.join(", "))
       }
-      IssueType::MultipleVersions { versions } => {
+      IssueType::MultipleResolvedVersions { versions } => {
         format!(
           "Multiple resolved versions in dependency graph: {}",
           versions.join(", ")
@@ -170,12 +188,13 @@ impl UnificationIssue {
 /// Type of unification issue
 #[derive(Debug, Clone)]
 pub enum IssueType {
-  /// Incompatible version requirements
-  VersionConflict {
-    requirements: Vec<(String, String)>, // member -> version
+  /// Incompatible version requirements in Cargo.toml files
+  /// (e.g., one member wants "1.0", another wants "2.0")
+  IncompatibleVersionRequirements {
+    requirements: Vec<(String, String)>, // member -> version requirement
   },
 
-  /// Renamed in some members
+  /// Renamed in some members (package = "foo" but different names)
   Renamed {
     original: String,
     renames: Vec<(String, String)>, // member -> renamed_to
@@ -189,9 +208,10 @@ pub enum IssueType {
   /// All uses are target-specific (can't unify at workspace level)
   AllTargetSpecific { targets: Vec<String> },
 
-  /// Multiple resolved versions of the same package name
-  MultipleVersions {
-    versions: Vec<String>, // Resolved versions
+  /// Multiple resolved versions in the dependency graph
+  /// (e.g., lockfile has both 1.5.0 and 2.3.0 of the same package)
+  MultipleResolvedVersions {
+    versions: Vec<String>, // Resolved versions from lockfile
   },
 
   /// Inconsistent default-features settings across members

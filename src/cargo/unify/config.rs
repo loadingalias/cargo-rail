@@ -21,8 +21,14 @@ pub struct UnifyConfig {
   /// Dependencies to force-include in unification
   pub include: HashSet<String>,
 
-  /// Only unify normal dependencies (exclude dev/build)
-  pub normal_only: bool,
+  /// Auto-resolve version conflicts by picking the highest version (default: true)
+  pub auto_resolve_version_conflicts: bool,
+
+  /// Add conflict comments to workspace.dependencies (default: true)
+  pub add_conflict_comments: bool,
+
+  /// Generate a detailed unification report (default: true)
+  pub generate_report: bool,
 }
 
 /// Strategy for selecting which dependencies to unify
@@ -39,7 +45,9 @@ impl Default for UnifyConfig {
       allow_renamed: false,
       exclude: HashSet::new(),
       include: HashSet::new(),
-      normal_only: false,
+      auto_resolve_version_conflicts: true,
+      add_conflict_comments: true,
+      generate_report: true,
     }
   }
 }

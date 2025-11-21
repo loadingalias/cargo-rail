@@ -275,9 +275,17 @@ pub struct UnifyConfig {
   #[serde(default = "default_use_all_features")]
   pub use_all_features: bool,
 
-  /// Automatically sync rust-toolchain.toml before unify runs (default: true)
-  #[serde(default = "default_sync_on_unify")]
-  pub sync_on_unify: bool,
+  /// Allow renamed dependencies to be unified (default: false)
+  #[serde(default)]
+  pub allow_renamed: bool,
+
+  /// Dependencies to exclude from unification
+  #[serde(default)]
+  pub exclude: Vec<String>,
+
+  /// Dependencies to force-include in unification
+  #[serde(default)]
+  pub include: Vec<String>,
 
   /// Optional: validate unification against specific target triples
   /// When enabled, runs parallel metadata checks per target to catch platform-specific issues
@@ -298,13 +306,46 @@ pub struct UnifyConfig {
   /// Examples: ["workspace-root"], ["meta-crate"], ["crate-a", "crate-b"]
   #[serde(default)]
   pub pin_hosts: Vec<String>,
+
+  /// Automatically resolve version conflicts by picking the highest version (default: true)
+  /// When enabled, unify will proceed with highest version and add warning comments
+  /// When disabled, version conflicts are hard blockers
+  #[serde(default = "default_auto_resolve_version_conflicts")]
+  pub auto_resolve_version_conflicts: bool,
+
+  /// Conflict resolution mode (default: "permissive")
+  /// - "permissive": Soft warnings don't block unification (recommended)
+  /// - "strict": All conflicts block unification
+  #[serde(default = "default_conflict_resolution")]
+  pub conflict_resolution: String,
+
+  /// Add conflict marker comments to Cargo.toml files (default: true)
+  /// Adds # ⚠️ markers to help identify manual resolution needs
+  #[serde(default = "default_add_conflict_comments")]
+  pub add_conflict_comments: bool,
+
+  /// Generate .cargo-rail/unify-report.md after apply (default: true)
+  #[serde(default = "default_generate_report")]
+  pub generate_report: bool,
 }
 
 fn default_use_all_features() -> bool {
   true
 }
 
-fn default_sync_on_unify() -> bool {
+fn default_auto_resolve_version_conflicts() -> bool {
+  true
+}
+
+fn default_conflict_resolution() -> String {
+  "permissive".to_string()
+}
+
+fn default_add_conflict_comments() -> bool {
+  true
+}
+
+fn default_generate_report() -> bool {
   true
 }
 
@@ -312,11 +353,17 @@ impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
       use_all_features: default_use_all_features(),
-      sync_on_unify: default_sync_on_unify(),
       validate_targets: vec![],
       max_parallel_jobs: 0, // Auto-detect
       pin_transitives: false,
       pin_hosts: vec![],
+      auto_resolve_version_conflicts: default_auto_resolve_version_conflicts(),
+      conflict_resolution: default_conflict_resolution(),
+      add_conflict_comments: default_add_conflict_comments(),
+      generate_report: default_generate_report(),
+      allow_renamed: false,
+      exclude: Vec::new(),
+      include: Vec::new(),
     }
   }
 }
@@ -779,7 +826,6 @@ mod tests {
   fn test_unify_config_default() {
     let unify = UnifyConfig::default();
     assert!(unify.use_all_features);
-    assert!(unify.sync_on_unify);
     assert!(unify.validate_targets.is_empty());
     assert_eq!(unify.max_parallel_jobs, 0); // Auto-detect
   }
@@ -819,24 +865,37 @@ mod tests {
   fn test_unify_config_serialization() {
     let unify = UnifyConfig {
       use_all_features: true,
-      sync_on_unify: false,
       validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       max_parallel_jobs: 2,
       pin_transitives: false,
       pin_hosts: vec![],
+      auto_resolve_version_conflicts: true,
+      conflict_resolution: "permissive".to_string(),
+      add_conflict_comments: true,
+      generate_report: true,
+      allow_renamed: false,
+      exclude: vec![],
+      include: vec![],
     };
 
     // Serialize to TOML
     let toml = toml_edit::ser::to_string(&unify).unwrap();
     assert!(toml.contains("use_all_features = true"));
-    assert!(toml.contains("sync_on_unify = false"));
     assert!(toml.contains("x86_64-unknown-linux-gnu"));
     assert!(toml.contains("max_parallel_jobs = 2"));
+    assert!(toml.contains("auto_resolve_version_conflicts = true"));
+    assert!(toml.contains("conflict_resolution = \"permissive\""));
 
     // Deserialize back
     let parsed: UnifyConfig = toml_edit::de::from_str(&toml).unwrap();
     assert_eq!(parsed.use_all_features, unify.use_all_features);
-    assert_eq!(parsed.sync_on_unify, unify.sync_on_unify);
+    assert_eq!(
+      parsed.auto_resolve_version_conflicts,
+      unify.auto_resolve_version_conflicts
+    );
+    assert_eq!(parsed.conflict_resolution, unify.conflict_resolution);
+    assert_eq!(parsed.add_conflict_comments, unify.add_conflict_comments);
+    assert_eq!(parsed.generate_report, unify.generate_report);
     assert_eq!(parsed.validate_targets, unify.validate_targets);
     assert_eq!(parsed.max_parallel_jobs, unify.max_parallel_jobs);
   }

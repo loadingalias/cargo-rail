@@ -177,9 +177,6 @@ enum UnifyCommands {
     /// Force include specific dependencies
     #[arg(long)]
     include: Vec<String>,
-    /// Only unify normal dependencies (exclude dev and build dependencies)
-    #[arg(long)]
-    normal_only: bool,
     /// Pin transitive-only crates with fragmented features
     #[arg(long)]
     pin_transitives: bool,
@@ -196,25 +193,9 @@ enum UnifyCommands {
     /// Create .bak backups of all modified files
     #[arg(long)]
     backup: bool,
-    /// Only unify normal dependencies (exclude dev and build dependencies)
-    #[arg(long)]
-    normal_only: bool,
     /// Pin transitive-only crates with fragmented features
     #[arg(long)]
     pin_transitives: bool,
-  },
-
-  /// Check workspace dependencies are properly unified (for CI)
-  Check {
-    /// Exclude specific dependencies from check
-    #[arg(long)]
-    exclude: Vec<String>,
-    /// Only check normal dependencies
-    #[arg(long)]
-    normal_only: bool,
-    /// Enable per-target validation (runs cargo metadata for each target)
-    #[arg(long)]
-    validate_targets: bool,
   },
 }
 
@@ -360,21 +341,14 @@ fn main() {
       UnifyCommands::Analyze {
         exclude,
         include,
-        normal_only,
         pin_transitives,
-      } => commands::run_unify_analyze(&ctx, exclude, include, normal_only, pin_transitives),
+      } => commands::run_unify_analyze(&ctx, exclude, include, pin_transitives),
       UnifyCommands::Apply {
         exclude,
         include,
         backup,
-        normal_only,
         pin_transitives,
-      } => commands::run_unify_apply(&ctx, exclude, include, backup, normal_only, pin_transitives),
-      UnifyCommands::Check {
-        exclude,
-        normal_only,
-        validate_targets,
-      } => commands::run_unify_check(&ctx, exclude, normal_only, validate_targets),
+      } => commands::run_unify_apply(&ctx, exclude, include, backup, pin_transitives),
     },
 
     // Configuration Management

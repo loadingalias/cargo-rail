@@ -40,6 +40,7 @@ mod config;
 mod issue_detection;
 mod path_handling;
 mod plan;
+mod report;
 mod resolution;
 mod strategy;
 mod transitive;
@@ -49,7 +50,8 @@ mod version_merge;
 
 // Re-export public types
 pub use config::{UnifyConfig, UnifyStrategy};
-pub use types::{MemberEdit, UnificationPlan, UnificationStats, UnifiedDep};
+pub use report::UnifyReport;
+pub use types::{IssueSeverity, MemberEdit, UnificationPlan, UnificationStats, UnifiedDep};
 
 /// Workspace dependency unifier
 ///
@@ -124,16 +126,67 @@ impl<'a> WorkspaceUnifier<'a> {
       }
 
       // Detect issues (will naturally pass if versions were successfully merged)
+      // Detect issues (will naturally pass if versions were successfully merged)
+      let mut resolution_comment = None;
       if let Some(issue) =
         issue_detection::detect_issues(&dep_name, &instances, self.config.allow_renamed, self.metadata)
       {
-        issues.push(issue);
-        stats.issue_count += 1;
-        continue;
+        let mut resolved = false;
+
+        // Attempt auto-resolution if enabled
+        if self.config.auto_resolve_version_conflicts {
+          match &issue.issue_type {
+            types::IssueType::IncompatibleVersionRequirements { .. } => {
+              // Auto-resolve: Pick the "highest" version requirement
+              // Heuristic: Sort by string representation and pick the last one
+              // This is a simple heuristic but effective for standard caret requirements
+              let mut versions: Vec<_> = instances.iter().map(|i| i.version_req.clone()).collect();
+              versions.sort_by_key(|a| a.to_string());
+
+              if let Some(highest) = versions.last() {
+                let highest_clone = highest.clone();
+                // Apply to all instances
+                for instance in &mut instances {
+                  instance.version_req = highest_clone.clone();
+                }
+                resolution_comment = Some(format!("Auto-resolved version conflict to {}", highest));
+                resolved = true;
+              }
+            }
+            types::IssueType::InconsistentDefaultFeatures { .. } => {
+              // Auto-resolve: Enable default features (already done by unify_instances logic)
+              // We just need to suppress the issue
+              resolution_comment = Some("Auto-resolved inconsistent default-features (enabled)".to_string());
+              resolved = true;
+            }
+            _ => {}
+          }
+        }
+
+        if !resolved {
+          // If auto-resolution is disabled, version conflicts should block the apply
+          let mut issue = issue;
+          if !self.config.auto_resolve_version_conflicts
+            && matches!(
+              issue.issue_type,
+              types::IssueType::IncompatibleVersionRequirements { .. }
+            )
+          {
+            issue.severity = types::IssueSeverity::Hard;
+          }
+          issues.push(issue);
+          stats.issue_count += 1;
+          continue;
+        }
       }
 
       // Compute unified dependency
-      let unified = unifier::unify_instances(&dep_name, &instances, self.metadata)?;
+      let mut unified = unifier::unify_instances(&dep_name, &instances, self.metadata)?;
+
+      // Add resolution comment if any
+      if let Some(comment) = resolution_comment {
+        unified.comments.push(comment);
+      }
 
       // Track fragmentation savings
       if unified.fragmentation_count > 1 {

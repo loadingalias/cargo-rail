@@ -219,7 +219,6 @@ fn test_init_generated_config_is_valid() -> Result<()> {
   assert_eq!(config.toolchain.channel, "stable");
   assert_eq!(config.toolchain.profile, "default");
   assert!(config.unify.use_all_features);
-  assert!(config.unify.sync_on_unify);
   assert!(!config.security.require_signed_commits);
   assert_eq!(config.security.protected_branches, vec!["main", "master"]);
 
@@ -270,7 +269,6 @@ fn test_init_all_fields_present() -> Result<()> {
 
   // Unify
   assert!(config_content.contains("use_all_features = "));
-  assert!(config_content.contains("sync_on_unify = "));
   assert!(config_content.contains("validate_targets = "));
   assert!(config_content.contains("max_parallel_jobs = "));
   assert!(config_content.contains("pin_transitives = "));

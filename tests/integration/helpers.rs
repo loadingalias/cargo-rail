@@ -57,7 +57,6 @@ root = "."
 channel = "stable"
 
 [unify]
-sync_on_unify = false
 use_all_features = true
 "#,
     )?;

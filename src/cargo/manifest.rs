@@ -267,6 +267,7 @@ impl CargoTransform {
     &self,
     workspace_toml_path: &std::path::Path,
     unified_deps: &[crate::cargo::unify::UnifiedDep],
+    add_comments: bool,
   ) -> RailResult<()> {
     use toml_edit::{Array, InlineTable, table};
 
@@ -322,6 +323,19 @@ impl CargoTransform {
 
       // Insert the dependency
       workspace_deps.insert(&unified.name, toml_edit::Item::Value(dep_table.into()));
+
+      // Add comments if enabled and any exist
+      if add_comments
+        && !unified.comments.is_empty()
+        && let Some(item) = workspace_deps.get_mut(&unified.name)
+      {
+        let comment_str = unified.comments.join(", ");
+        item
+          .as_value_mut()
+          .unwrap()
+          .decor_mut()
+          .set_suffix(format!(" # {}", comment_str));
+      }
     }
 
     // Write back to file
@@ -614,10 +628,11 @@ members = ["crate-a", "crate-b"]
       dep_kinds: HashSet::new(),
       fragmentation_count: 2,
       path: None,
+      comments: Vec::new(),
     }];
 
     // Write workspace dependencies
-    let result = transformer.write_workspace_dependencies(temp_file.path(), &unified_deps);
+    let result = transformer.write_workspace_dependencies(temp_file.path(), &unified_deps, true);
     assert!(result.is_ok(), "Should successfully write workspace dependencies");
 
     // Read back and verify
@@ -669,10 +684,11 @@ members = ["crate-a"]
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
       path: None,
+      comments: Vec::new(),
     }];
 
     transformer
-      .write_workspace_dependencies(temp_file.path(), &unified_deps)
+      .write_workspace_dependencies(temp_file.path(), &unified_deps, true)
       .unwrap();
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
@@ -706,10 +722,11 @@ members = ["crate-a"]
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
       path: None,
+      comments: Vec::new(),
     }];
 
     transformer
-      .write_workspace_dependencies(temp_file.path(), &unified_deps)
+      .write_workspace_dependencies(temp_file.path(), &unified_deps, true)
       .unwrap();
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
