@@ -302,11 +302,12 @@ impl CargoTransform {
 
     // Write each unified dependency
     for unified in unified_deps {
-      // Use inline table for simple deps, regular table for complex ones (with features)
-      let use_inline_table = unified.features.is_empty();
+      // Use inline table for simple deps and deps with few features
+      // Use regular table format only for deps with many features (>10) to avoid long lines
+      let use_inline_table = unified.features.len() <= 10;
 
       if use_inline_table {
-        // Simple dependency - use inline table format
+        // Simple dependency or dependency with few features - use inline table format
         let mut dep_table = InlineTable::new();
 
         // INVISIBLE FEATURE: Support workspace member path dependencies
@@ -322,6 +323,15 @@ impl CargoTransform {
         // Add default-features if false (true is the default, so we only specify false)
         if !unified.default_features {
           dep_table.insert("default-features", Value::from(false));
+        }
+
+        // Add features if any (inline arrays for <10 features)
+        if !unified.features.is_empty() {
+          let mut features_array = Array::new();
+          for feature in &unified.features {
+            features_array.push(feature.as_str());
+          }
+          dep_table.insert("features", Value::from(features_array));
         }
 
         // Insert the dependency
@@ -683,10 +693,10 @@ members = ["crate-a", "crate-b"]
 
     // Verify serde entry structure
     let serde_dep = workspace_deps.get("serde").unwrap();
-    // Dependencies with features use regular table format (not inline)
-    assert!(serde_dep.is_table(), "Should be regular table (has features)");
+    // Dependencies with few features (≤10) use inline table format
+    assert!(serde_dep.is_inline_table(), "Should be inline table (has ≤10 features)");
 
-    let serde_table = serde_dep.as_table().unwrap();
+    let serde_table = serde_dep.as_inline_table().unwrap();
     assert_eq!(
       serde_table.get("version").and_then(|v| v.as_str()),
       Some("^1.0"),
@@ -771,8 +781,8 @@ members = ["crate-a"]
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
     let doc: DocumentMut = content.parse().unwrap();
 
-    // Dependencies with features use regular table format
-    let tokio_dep = doc["workspace"]["dependencies"]["tokio"].as_table().unwrap();
+    // Dependencies with ≤10 features use inline table format
+    let tokio_dep = doc["workspace"]["dependencies"]["tokio"].as_inline_table().unwrap();
     assert_eq!(
       tokio_dep.get("default-features").and_then(|v| v.as_bool()),
       Some(false),

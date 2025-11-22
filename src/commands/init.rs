@@ -50,11 +50,11 @@ pub fn run_init(
   let workspace_patterns = detect_workspace_patterns(ctx);
   let mut unify = default_unify_config();
 
-  // Auto-detect targets from rust-toolchain.toml and .cargo/config.toml
+  // Auto-detect targets from all TOML files in workspace
   let detected_targets = detect_targets(workspace_root);
   if !detected_targets.is_empty() {
     println!(
-      "  📍 Detected {} target triple(s) from rust-toolchain.toml/.cargo/config.toml",
+      "  📍 Detected {} target triple(s) across workspace TOML files",
       detected_targets.len()
     );
     unify.validate_targets = detected_targets;
@@ -179,58 +179,16 @@ fn default_unify_config() -> UnifyConfig {
   UnifyConfig::default()
 }
 
-/// Detect target triples from rust-toolchain.toml and .cargo/config.toml
+/// Detect target triples across all TOML files in workspace
 ///
-/// Intelligently merges targets from both sources:
-/// 1. rust-toolchain.toml: [toolchain].targets array
-/// 2. .cargo/config.toml: [target.<triple>] sections
+/// Uses fuzzy matching against rustc's canonical target list to find targets
+/// regardless of where they're defined (rust-toolchain.toml, .cargo/config.toml,
+/// Cross.toml, dist-workspace.toml, etc.).
 ///
-/// Returns deduplicated list preserving order (rust-toolchain first, then cargo config additions)
+/// Returns sorted list of detected targets.
 fn detect_targets(workspace_root: &Path) -> Vec<String> {
-  let mut targets = Vec::new();
-  let mut seen = std::collections::HashSet::new();
-
-  // 1. Check rust-toolchain.toml (or rust-toolchain)
-  for toolchain_file in ["rust-toolchain.toml", "rust-toolchain"] {
-    let toolchain_path = workspace_root.join(toolchain_file);
-    if let Ok(content) = std::fs::read_to_string(&toolchain_path) {
-      // Parse using toml_edit
-      if let Ok(parsed) = content.parse::<toml_edit::DocumentMut>()
-        && let Some(toolchain) = parsed.get("toolchain")
-        && let Some(targets_item) = toolchain.get("targets")
-        && let Some(targets_array) = targets_item.as_array()
-      {
-        for target in targets_array.iter() {
-          if let Some(target_str) = target.as_str()
-            && seen.insert(target_str.to_string())
-          {
-            targets.push(target_str.to_string());
-          }
-        }
-      }
-    }
-  }
-
-  // 2. Check .cargo/config.toml (or .cargo/config)
-  for config_file in [".cargo/config.toml", ".cargo/config"] {
-    let config_path = workspace_root.join(config_file);
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-      // Parse using toml_edit
-      if let Ok(parsed) = content.parse::<toml_edit::DocumentMut>() {
-        // Look for [target.<triple>] sections
-        for (key, _value) in parsed.iter() {
-          if let Some(triple) = key.strip_prefix("target.") {
-            // Skip non-triple keys like target.dir
-            if triple.contains('-') && seen.insert(triple.to_string()) {
-              targets.push(triple.to_string());
-            }
-          }
-        }
-      }
-    }
-  }
-
-  targets
+  // Use the new comprehensive target detection
+  crate::targets::detect_targets(workspace_root).unwrap_or_default()
 }
 
 /// Auto-detect workspace members and create split configs
@@ -655,11 +613,11 @@ pub fn run_init_standalone(
   // 2. Detection phase
   println!("🔍 Detecting workspace configuration...\n");
 
-  // Auto-detect targets from rust-toolchain.toml and .cargo/config.toml
+  // Auto-detect targets from all TOML files in workspace
   let detected_targets = detect_targets(workspace_root);
   if !detected_targets.is_empty() {
     println!(
-      "  📍 Detected {} target triple(s) from rust-toolchain.toml/.cargo/config.toml",
+      "  📍 Detected {} target triple(s) across workspace TOML files",
       detected_targets.len()
     );
   }

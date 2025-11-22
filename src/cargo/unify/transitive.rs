@@ -25,6 +25,7 @@
 
 use crate::cargo::WorkspaceMetadata;
 use crate::error::RailResult;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 /// A transitive-only crate that has fragmented feature sets
@@ -91,25 +92,32 @@ pub fn detect_transitive_fragmentation(metadata: &WorkspaceMetadata) -> RailResu
     }
   }
 
-  // Step 3: Find transitive-only crates with multiple distinct feature sets
-  let mut fragmentations = Vec::new();
+  // Step 3: Find transitive-only crates with multiple distinct feature sets IN PARALLEL
+  //
+  // Convert to Vec for parallel processing
+  let crate_features_vec: Vec<_> = crate_features.into_iter().collect();
 
-  for (crate_name, feature_sets_list) in crate_features {
-    // Skip if this crate appears in any manifest (not transitive-only)
-    if manifest_crates.contains(&crate_name) {
-      continue;
-    }
-
-    // Deduplicate feature sets
-    let mut unique_feature_sets: Vec<HashSet<String>> = Vec::new();
-    for features in feature_sets_list {
-      if !unique_feature_sets.contains(&features) {
-        unique_feature_sets.push(features);
+  let mut fragmentations: Vec<TransitiveFragmentation> = crate_features_vec
+    .into_par_iter()
+    .filter_map(|(crate_name, feature_sets_list)| {
+      // Skip if this crate appears in any manifest (not transitive-only)
+      if manifest_crates.contains(&crate_name) {
+        return None;
       }
-    }
 
-    // Only report if we have more than one distinct feature set
-    if unique_feature_sets.len() > 1 {
+      // Deduplicate feature sets
+      let mut unique_feature_sets: Vec<HashSet<String>> = Vec::new();
+      for features in feature_sets_list {
+        if !unique_feature_sets.contains(&features) {
+          unique_feature_sets.push(features);
+        }
+      }
+
+      // Only report if we have more than one distinct feature set
+      if unique_feature_sets.len() <= 1 {
+        return None;
+      }
+
       // Compute union of all features
       let mut unified_features: HashSet<String> = HashSet::new();
       for feature_set in &unique_feature_sets {
@@ -125,14 +133,14 @@ pub fn detect_transitive_fragmentation(metadata: &WorkspaceMetadata) -> RailResu
         .map(|p| p.version.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-      fragmentations.push(TransitiveFragmentation {
+      Some(TransitiveFragmentation {
         name: crate_name,
         version,
         feature_sets: unique_feature_sets,
         unified_features: unified_features.into_iter().collect(),
-      });
-    }
-  }
+      })
+    })
+    .collect();
 
   // Sort by name for consistent output
   fragmentations.sort_by(|a, b| a.name.cmp(&b.name));

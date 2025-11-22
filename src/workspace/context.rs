@@ -22,12 +22,13 @@
 //!   fn execute(ctx: &WorkspaceContext)
 //! ```
 
+use crate::cargo::WorkspaceMetadata;
 use crate::config::RailConfig;
 use crate::error::RailResult;
 use crate::graph::WorkspaceGraph;
 use crate::workspace::{CargoState, GitState};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Unified workspace context containing all shared workspace-level data.
 ///
@@ -36,6 +37,7 @@ use std::sync::Arc;
 /// workspace state.
 ///
 /// Uses Arc for efficient sharing of graph data without expensive clones.
+/// Uses OnceLock for lazy-loaded metadata variants (e.g., --all-features).
 #[derive(Clone)]
 pub struct WorkspaceContext {
   /// Cargo workspace root (Cargo.toml location)
@@ -45,8 +47,13 @@ pub struct WorkspaceContext {
   /// Git state and operations
   pub git: GitState,
 
-  /// Cargo metadata and workspace info
+  /// Cargo metadata and workspace info (default features)
   pub cargo: CargoState,
+
+  /// Cargo metadata with --all-features (lazy-loaded, cached)
+  /// Used by unify and other commands that need complete feature resolution.
+  /// Loads on first access, then cached for the lifetime of the context.
+  cargo_all_features: Arc<OnceLock<WorkspaceMetadata>>,
 
   /// Dependency graph (built from cargo metadata)
   /// Wrapped in Arc for efficient sharing across threads/commands
@@ -105,9 +112,50 @@ impl WorkspaceContext {
       workspace_root,
       git,
       cargo,
+      cargo_all_features: Arc::new(OnceLock::new()),
       graph,
       config,
     })
+  }
+
+  /// Get metadata with --all-features (lazy-loaded, cached)
+  ///
+  /// This is used by unify and other commands that need complete feature resolution
+  /// across the workspace. The metadata is loaded once on first access and then
+  /// cached for the lifetime of the WorkspaceContext.
+  ///
+  /// # Performance
+  ///
+  /// - First call: 50-200ms (runs `cargo metadata --all-features`)
+  /// - Subsequent calls: <1ms (returns cached reference)
+  ///
+  /// # Example
+  ///
+  /// ```ignore
+  /// let metadata = ctx.metadata_all_features()?;
+  /// // metadata is &WorkspaceMetadata, no clone needed
+  /// ```
+  pub fn metadata_all_features(&self) -> RailResult<&WorkspaceMetadata> {
+    // Check if already loaded
+    if let Some(metadata) = self.cargo_all_features.get() {
+      return Ok(metadata);
+    }
+
+    // Not loaded yet - load it
+    let metadata = WorkspaceMetadata::load_with_features(&self.workspace_root, true, false, vec![])?;
+
+    // Try to store it (may fail if another thread beat us, that's OK)
+    match self.cargo_all_features.set(metadata) {
+      Ok(()) => {
+        // We successfully stored it, return the reference
+        Ok(self.cargo_all_features.get().expect("just set"))
+      }
+      Err(_) => {
+        // Another thread beat us to storing - that's fine, return their value
+        // (The metadata we loaded will be dropped)
+        Ok(self.cargo_all_features.get().expect("another thread set this"))
+      }
+    }
   }
 
   /// Get config or error if not found.
@@ -235,5 +283,51 @@ mod tests {
         member
       );
     }
+  }
+
+  #[test]
+  fn test_metadata_all_features_lazy_loading() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // First access should load and cache
+    let metadata1 = ctx.metadata_all_features();
+    assert!(metadata1.is_ok(), "Should successfully load all-features metadata");
+
+    // Second access should return cached reference (same pointer)
+    let metadata2 = ctx.metadata_all_features();
+    assert!(metadata2.is_ok(), "Should successfully get cached metadata");
+
+    // Verify they're the same reference (pointer equality)
+    let ptr1 = metadata1.unwrap() as *const _;
+    let ptr2 = metadata2.unwrap() as *const _;
+    assert_eq!(ptr1, ptr2, "Should return same cached instance");
+  }
+
+  #[test]
+  fn test_metadata_all_features_vs_default() {
+    let current_dir = std::env::current_dir().unwrap();
+    let ctx = WorkspaceContext::build(&current_dir).unwrap();
+
+    // Get default metadata
+    let default_metadata = ctx.cargo.metadata();
+
+    // Get all-features metadata
+    let all_features_metadata = ctx.metadata_all_features().unwrap();
+
+    // They should be different objects (different pointers)
+    let ptr_default = default_metadata as *const _;
+    let ptr_all_features = all_features_metadata as *const _;
+    assert_ne!(
+      ptr_default, ptr_all_features,
+      "Default and all-features metadata should be separate instances"
+    );
+
+    // Both should have the same workspace root
+    assert_eq!(
+      default_metadata.workspace_root(),
+      all_features_metadata.workspace_root(),
+      "Both metadata instances should have same workspace root"
+    );
   }
 }

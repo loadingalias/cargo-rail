@@ -46,6 +46,8 @@ pub mod graph;
 pub mod release;
 pub mod split;
 pub mod sync;
+/// Target triple detection for workspace validation
+pub mod targets;
 pub mod test;
 pub mod utils;
 pub mod workspace;

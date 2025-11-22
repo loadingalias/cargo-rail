@@ -18,10 +18,13 @@ use std::path::Path;
 /// Get workspace metadata for unify operations
 ///
 /// Checks rail.toml `[unify]` configuration to determine if --all-features should be used.
-/// If use_all_features=true (default), reloads metadata with --all-features for accurate
-/// feature union across the workspace.
-fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<WorkspaceMetadata> {
-  // Try to load rail config (optional)
+/// If use_all_features=true (default), returns cached --all-features metadata from context.
+/// If false, returns default metadata from context.
+///
+/// This function now uses the lazy-loaded cache in WorkspaceContext, eliminating
+/// the expensive metadata reload that previously happened on every unify command.
+fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<&WorkspaceMetadata> {
+  // Check rail config for use_all_features setting
   let use_all_features = ctx
     .config
     .as_ref()
@@ -29,11 +32,50 @@ fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<WorkspaceMetadata> {
     .unwrap_or(true); // Default to true if no config
 
   if use_all_features {
-    // Reload metadata with --all-features for accurate feature resolution
-    WorkspaceMetadata::load_with_features(ctx.workspace_root(), true, false, vec![])
+    // Use cached --all-features metadata (lazy-loaded on first access)
+    ctx.metadata_all_features()
   } else {
-    // Use existing metadata from context
-    Ok(ctx.cargo.metadata().clone())
+    // Use default metadata from context (no clone needed!)
+    Ok(ctx.cargo.metadata())
+  }
+}
+
+/// Check if targets have changed since last init and notify user
+///
+/// Compares current target detection against config. If targets changed,
+/// shows a helpful message but doesn't auto-update the config.
+/// This keeps users in control while ensuring they're aware of changes.
+fn check_target_updates(ctx: &WorkspaceContext) {
+  // Only check if we have a config with targets
+  let config_targets = if let Some(cfg) = ctx.config.as_ref() {
+    if cfg.unify.validate_targets.is_empty() {
+      return; // No targets configured, nothing to check
+    }
+    &cfg.unify.validate_targets
+  } else {
+    return; // No config, nothing to check
+  };
+
+  // Re-detect current targets
+  let Ok(current_targets) = crate::targets::detect_targets(ctx.workspace_root()) else {
+    return; // Detection failed, silently skip
+  };
+
+  // Compare: are they different?
+  if current_targets != *config_targets {
+    let added = current_targets.iter().filter(|t| !config_targets.contains(t)).count();
+    let removed = config_targets.iter().filter(|t| !current_targets.contains(t)).count();
+
+    if added > 0 || removed > 0 {
+      println!("📍 Note: Target configuration has changed since last init:");
+      if added > 0 {
+        println!("  • {} new target(s) detected", added);
+      }
+      if removed > 0 {
+        println!("  • {} target(s) removed", removed);
+      }
+      println!("  Run 'cargo rail init --force' to update validate_targets in rail.toml\n");
+    }
   }
 }
 
@@ -107,6 +149,9 @@ pub fn run_unify_analyze(
 ) -> RailResult<()> {
   println!("🔍 Analyzing workspace dependencies...\n");
 
+  // Check if targets have changed (lazy update notification)
+  check_target_updates(ctx);
+
   // Get metadata (with --all-features if configured)
   let metadata = get_unify_metadata(ctx)?;
 
@@ -137,7 +182,7 @@ pub fn run_unify_analyze(
   }
 
   // Run analysis
-  let unifier = WorkspaceUnifier::with_config(&metadata, config);
+  let unifier = WorkspaceUnifier::with_config(metadata, config);
   let plan = unifier.analyze()?;
 
   // Display summary
@@ -194,6 +239,8 @@ pub fn run_unify_apply(
   backup: bool,
   pin_transitives_flag: bool,
 ) -> RailResult<()> {
+  // Check if targets have changed (lazy update notification)
+  check_target_updates(ctx);
   println!("🔧 Applying workspace dependency unification...\n");
 
   // Get metadata (with --all-features if configured)
@@ -225,7 +272,7 @@ pub fn run_unify_apply(
   }
 
   // Run analysis first
-  let unifier = WorkspaceUnifier::with_config(&metadata, config.clone());
+  let unifier = WorkspaceUnifier::with_config(metadata, config.clone());
   let plan = unifier.analyze()?;
 
   // Check for issues
@@ -511,7 +558,7 @@ pub fn run_unify_apply(
   // Generate report if configured
   if config.generate_report {
     let report_path = ctx.workspace_root().join("unify-report.md");
-    UnifyReport::write_to_file(&plan, &metadata, &report_path)?;
+    UnifyReport::write_to_file(&plan, metadata, &report_path)?;
     println!("\n📄 Unification report generated at {}", report_path.display());
   }
 
