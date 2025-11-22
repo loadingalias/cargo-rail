@@ -3,7 +3,7 @@
 use super::path_handling::is_workspace_member_path;
 use super::types::{DependencyInstance, FeatureSource};
 use crate::cargo::WorkspaceMetadata;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Collect all dependency instances from workspace members
 ///
@@ -17,14 +17,7 @@ pub fn collect_dependencies(metadata: &WorkspaceMetadata, use_all_features: bool
   let mut instances = Vec::new();
 
   for pkg in metadata.list_crates() {
-    // Check which dependencies in this member use workspace = true
-    let workspace_inherited = get_member_workspace_deps(&pkg.manifest_path);
-
     for dep in &pkg.dependencies {
-      // Skip dependencies that are already using workspace inheritance in THIS member
-      if workspace_inherited.contains(&dep.name) {
-        continue;
-      }
       // Get RESOLVED features if available, fallback to declared features
       // Resolved features include:
       // 1. Features declared in this member's Cargo.toml
@@ -90,37 +83,6 @@ pub fn group_by_name(
   }
 
   grouped
-}
-
-/// Get dependencies that use workspace = true in a member's Cargo.toml
-fn get_member_workspace_deps(manifest_path: &cargo_metadata::camino::Utf8Path) -> HashSet<String> {
-  let mut workspace_deps = HashSet::new();
-
-  if let Ok(content) = std::fs::read_to_string(manifest_path.as_std_path())
-    && let Ok(doc) = content.parse::<toml_edit::DocumentMut>()
-  {
-    // Check all dependency sections
-    for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
-      if let Some(deps) = doc.get(section).and_then(|d| d.as_table()) {
-        for (key, value) in deps.iter() {
-          // Check if this dep uses workspace = true
-          let uses_workspace = if let Some(inline_table) = value.as_inline_table() {
-            inline_table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
-          } else if let Some(table) = value.as_table() {
-            table.get("workspace").and_then(|w| w.as_bool()) == Some(true)
-          } else {
-            false
-          };
-
-          if uses_workspace {
-            workspace_deps.insert(key.to_string());
-          }
-        }
-      }
-    }
-  }
-
-  workspace_deps
 }
 
 /// Determine WHY each feature is enabled for a dependency

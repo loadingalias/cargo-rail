@@ -138,20 +138,123 @@ impl WorkspaceMetadata {
   /// For external packages that appear in multiple versions, returns features
   /// for the first resolved version found.
   pub fn get_resolved_features_for_package(&self, pkg_name: &str) -> Option<HashSet<String>> {
+    if pkg_name == "reqwest" {
+      println!("\n\n=== REQWEST DEBUG START ===");
+      println!("[ENTRY] get_resolved_features_for_package called for reqwest");
+    }
+
     let resolve = self.resolve()?;
+
+    if pkg_name == "reqwest" {
+      println!("[RESOLVE] Got resolve graph with {} nodes", resolve.nodes.len());
+    }
 
     // Find all resolved nodes for this package name
     for node in &resolve.nodes {
-      if let Some(pkg) = self.find_package_by_id(&node.id) {
+      // Debug log to see if we're iterating nodes for reqwest
+      if pkg_name == "reqwest" && node.id.repr.contains("reqwest") {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+          .create(true)
+          .append(true)
+          .open("/tmp/rail-get-resolved.log")
+          .and_then(|mut f| writeln!(f, "[LOOP] Found node with id: {}", node.id.repr));
+      }
+
+      let found_pkg = self.find_package_by_id(&node.id);
+      if pkg_name == "reqwest" && node.id.repr.contains("reqwest") {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+          .create(true)
+          .append(true)
+          .open("/tmp/rail-get-resolved.log")
+          .and_then(|mut f| {
+            writeln!(
+              f,
+              "[FIND] find_package_by_id for {} returned: {}",
+              node.id.repr,
+              found_pkg.is_some()
+            )
+          });
+      }
+
+      if let Some(pkg) = found_pkg {
         // Skip workspace members - we only want external packages
         if self.get_package(&pkg.name).is_some() {
+          if pkg_name == "reqwest" {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new()
+              .create(true)
+              .append(true)
+              .open("/tmp/rail-get-resolved.log")
+              .and_then(|mut f| writeln!(f, "[SKIP] Skipping workspace member: {}", pkg.name));
+          }
           continue;
         }
 
         // Check if this is the package we're looking for
         if pkg.name == pkg_name {
-          // Return the resolved features for this package
-          return Some(node.features.iter().map(|f| f.to_string()).collect());
+          // IMPORTANT: Filter node.features to only include features that actually exist
+          // in the package's features table. Cargo's resolve graph includes activated
+          // optional dependencies in node.features, but these aren't always user-facing
+          // features (especially with the new "dep:" syntax in Cargo features).
+          //
+          // For example, reqwest 0.12 has `__rustls = ["dep:hyper-rustls", ...]`
+          // Cargo will list "hyper-rustls" in node.features when that dep is activated,
+          // but "hyper-rustls" is NOT in reqwest's features table, so it can't be
+          // specified in a Cargo.toml features array.
+
+          if pkg_name == "reqwest" {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new()
+              .create(true)
+              .append(true)
+              .open("/tmp/rail-get-resolved.log")
+              .and_then(|mut f| {
+                writeln!(f, "\n[get_resolved_features_for_package] Processing reqwest")?;
+                writeln!(f, "  node.features (raw): {:?}", node.features)?;
+                writeln!(
+                  f,
+                  "  pkg.features.keys(): {:?}",
+                  pkg.features.keys().collect::<Vec<_>>()
+                )
+              });
+          }
+
+          let valid_features: HashSet<String> = node
+            .features
+            .iter()
+            .filter(|feature_name| {
+              let is_valid = pkg.features.contains_key(feature_name.as_str());
+              if pkg_name == "reqwest" {
+                use std::io::Write;
+                let _ = std::fs::OpenOptions::new()
+                  .create(true)
+                  .append(true)
+                  .open("/tmp/rail-get-resolved.log")
+                  .and_then(|mut file| {
+                    if !is_valid {
+                      writeln!(file, "  [FILTER] Removing '{}' - not in features table", feature_name)
+                    } else {
+                      writeln!(file, "  [KEEP] '{}' - in features table", feature_name)
+                    }
+                  });
+              }
+              is_valid
+            })
+            .map(|f| f.to_string())
+            .collect();
+
+          if pkg_name == "reqwest" {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new()
+              .create(true)
+              .append(true)
+              .open("/tmp/rail-get-resolved.log")
+              .and_then(|mut f| writeln!(f, "  valid_features (after filter): {:?}\n", valid_features));
+          }
+
+          return Some(valid_features);
         }
       }
     }

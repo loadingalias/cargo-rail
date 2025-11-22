@@ -290,6 +290,23 @@ impl CargoTransform {
     // Write each unified dependency
     // Group by target (None for regular deps, Some(target) for platform-specific)
     for unified in unified_deps {
+      if unified.name == "reqwest" {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+          .create(true)
+          .write(true)
+          .truncate(true)
+          .open("/tmp/rail-write-ws.log")
+          .and_then(|mut f| {
+            writeln!(
+              f,
+              "[write_workspace_dependencies] Processing reqwest with {} features: {:?}",
+              unified.features.len(),
+              unified.features
+            )
+          });
+      }
+
       // Determine which table to write to based on target
       let deps_table = if let Some(ref target) = unified.target {
         // Platform-specific dependency: write to [workspace.target.'<target>'.dependencies]
@@ -363,6 +380,21 @@ impl CargoTransform {
 
         // Add features if any (inline arrays for <10 features)
         if !unified.features.is_empty() {
+          if unified.name == "reqwest" {
+            use std::io::Write;
+            let _ = std::fs::OpenOptions::new()
+              .create(true)
+              .write(true)
+              .truncate(true)
+              .open("/tmp/rail-manifest.log")
+              .and_then(|mut f| {
+                writeln!(
+                  f,
+                  "[manifest write] reqwest features being written: {:?}",
+                  unified.features
+                )
+              });
+          }
           let mut features_array = Array::new();
           for feature in &unified.features {
             features_array.push(feature.as_str());
@@ -388,6 +420,22 @@ impl CargoTransform {
       } else {
         // Complex dependency with features - use regular table format
         let mut dep_table = table();
+
+        if unified.name == "reqwest" {
+          use std::io::Write;
+          let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("/tmp/rail-manifest.log")
+            .and_then(|mut f| {
+              writeln!(
+                f,
+                "[manifest write REGULAR TABLE] reqwest features being written: {:?}",
+                unified.features
+              )
+            });
+        }
 
         // INVISIBLE FEATURE: Support workspace member path dependencies
         if let Some(ref path) = unified.path {

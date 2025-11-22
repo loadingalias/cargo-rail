@@ -20,7 +20,55 @@ pub fn unify_instances(
   for instance in instances {
     all_features.extend(instance.features.iter().cloned());
   }
-  let mut features: Vec<_> = all_features.into_iter().collect();
+
+  if dep_name == "reqwest" {
+    println!("\n==== REQWEST DEBUG ====");
+    println!("all_features from instances: {:?}", all_features);
+  }
+
+  // Get package info to determine which features are explicitly defined
+  let pkg_info = metadata
+    .metadata_json()
+    .packages
+    .iter()
+    .find(|pkg| pkg.name == dep_name);
+
+  let (explicit_features, optional_deps): (HashSet<String>, HashSet<String>) = if let Some(pkg) = pkg_info {
+    let explicit = pkg.features.keys().cloned().collect();
+    let optional = pkg
+      .dependencies
+      .iter()
+      .filter(|dep| dep.optional)
+      .map(|dep| dep.name.clone())
+      .collect();
+    (explicit, optional)
+  } else {
+    (HashSet::new(), HashSet::new())
+  };
+
+  if dep_name == "reqwest" {
+    println!("explicit_features: {:?}", explicit_features);
+    println!("optional_deps: {:?}", optional_deps);
+  }
+
+  // Filter out:
+  // 1. Internal/private features (starting with __)
+  // 2. Names that are ONLY optional dependencies (not explicitly defined as features)
+  //    Example: "hyper-rustls" is an optional dep without a matching feature
+  //    Counter-example: "tokio" is both an optional dep AND an explicit feature (keep it)
+  let mut features: Vec<_> = all_features
+    .into_iter()
+    .filter(|f| {
+      if f.starts_with("__") {
+        return false; // Filter out internal features
+      }
+      // If it's an optional dependency name, only keep it if it's also an explicit feature
+      if optional_deps.contains(f) {
+        return explicit_features.contains(f);
+      }
+      true // Keep all other features
+    })
+    .collect();
   features.sort();
 
   // Feature provenance: collect ALL sources for each feature across instances
