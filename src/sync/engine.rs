@@ -747,7 +747,7 @@ impl<'a> SyncEngine<'a> {
     let analyzer = ChangeImpact::new(self.ctx);
 
     // Check if this specific crate has changes
-    if let Some(impact) = analyzer.analyze_crate_changes(&self.config.crate_name, from, "HEAD")? {
+    if let Some(impact) = analyzer.analyze_crate_changes(&self.config.crate_name, from, Some("HEAD"))? {
       // Filter out commits from remote
       let crate_path = &self.config.crate_paths[0];
       let new_commits = self

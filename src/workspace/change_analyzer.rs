@@ -119,9 +119,11 @@ impl<'a> ChangeImpact<'a> {
   }
 
   /// Analyze changes between two git refs with full graph awareness
-  pub fn analyze_changes(&self, from: &str, to: &str) -> RailResult<ImpactReport> {
+  ///
+  /// If `to` is None, compares against the working tree (uncommitted changes).
+  pub fn analyze_changes(&self, from: &str, to: Option<&str>) -> RailResult<ImpactReport> {
     // 1. Get changed files from git
-    let changed_files = self.ctx.git.git().get_changed_files_between(from, Some(to))?;
+    let changed_files = self.ctx.git.git().get_changed_files_between(from, to)?;
 
     // 2. Categorize changes by file type using new classification system
     let categories = self.categorize_changes(&changed_files);
@@ -152,7 +154,12 @@ impl<'a> ChangeImpact<'a> {
   }
 
   /// Analyze changes for a specific crate only
-  pub fn analyze_crate_changes(&self, crate_name: &str, from: &str, to: &str) -> RailResult<Option<ImpactReport>> {
+  pub fn analyze_crate_changes(
+    &self,
+    crate_name: &str,
+    from: &str,
+    to: Option<&str>,
+  ) -> RailResult<Option<ImpactReport>> {
     let full_report = self.analyze_changes(from, to)?;
 
     // Filter to only this crate

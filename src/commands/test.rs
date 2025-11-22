@@ -29,8 +29,8 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
     detect_default_base_ref(ctx.git.git())?
   };
 
-  // Analyze changes since the base ref
-  let impact = analyzer.analyze_changes(&base_ref, "HEAD")?;
+  // Analyze changes since the base ref (to working tree)
+  let impact = analyzer.analyze_changes(&base_ref, None)?;
 
   // Get minimal test set
   let test_targets = impact.minimal_test_set();
