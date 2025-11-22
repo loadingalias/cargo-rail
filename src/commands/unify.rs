@@ -8,8 +8,7 @@
 //! Replaces cargo-hakari with native Cargo workspace dependency unification.
 
 use crate::cargo::{
-  CargoTransform, IssueSeverity, UnifyConfig, UnifyReport, UnifyStrategy, WorkspaceMetadata, WorkspaceUnifier,
-  validate_targets,
+  CargoTransform, IssueSeverity, UnifyConfig, UnifyReport, WorkspaceMetadata, WorkspaceUnifier, validate_targets,
 };
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
@@ -48,10 +47,10 @@ fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<&WorkspaceMetadata> 
 fn check_target_updates(ctx: &WorkspaceContext) {
   // Only check if we have a config with targets
   let config_targets = if let Some(cfg) = ctx.config.as_ref() {
-    if cfg.unify.validate_targets.is_empty() {
+    if cfg.unify.validation.targets.is_empty() {
       return; // No targets configured, nothing to check
     }
-    &cfg.unify.validate_targets
+    &cfg.unify.validation.targets
   } else {
     return; // No config, nothing to check
   };
@@ -86,7 +85,7 @@ fn maybe_run_validation(ctx: &WorkspaceContext) -> RailResult<()> {
     if !cfg.unify.validation_enabled() {
       return Ok(()); // Validation not enabled
     }
-    (cfg.unify.validate_targets.clone(), cfg.unify.effective_parallelism())
+    (cfg.unify.validation.targets.clone(), cfg.unify.effective_parallelism())
   } else {
     return Ok(()); // No config, validation not enabled
   };
@@ -157,20 +156,9 @@ pub fn run_unify_analyze(
 
   // Build config from CLI args and rail.toml
   let mut config = if let Some(rail_config) = &ctx.config {
-    UnifyConfig {
-      strategy: UnifyStrategy::All,
-      allow_renamed: rail_config.unify.allow_renamed,
-      exclude: rail_config.unify.exclude.iter().cloned().collect(),
-      include: rail_config.unify.include.iter().cloned().collect(),
-      auto_resolve_version_conflicts: rail_config.unify.auto_resolve_version_conflicts,
-      add_conflict_comments: rail_config.unify.add_conflict_comments,
-      generate_report: rail_config.unify.generate_report,
-    }
+    UnifyConfig::from(rail_config.as_ref())
   } else {
-    UnifyConfig {
-      strategy: UnifyStrategy::All,
-      ..Default::default()
-    }
+    UnifyConfig::default()
   };
 
   // Apply excludes/includes from CLI
@@ -210,11 +198,16 @@ pub fn run_unify_analyze(
     println!("'cargo rail unify' will proceed with warnings for these issues.\n");
   }
 
-  // Show transitive fragmentation info if pin_transitives is enabled
+  // Show transitive fragmentation info if consolidate_transitive_features is enabled
   if !plan.transitive_fragmentations.is_empty()
-    && (pin_transitives_flag || ctx.config.as_ref().map(|c| c.unify.pin_transitives).unwrap_or(false))
+    && (pin_transitives_flag
+      || ctx
+        .config
+        .as_ref()
+        .map(|c| c.unify.transitives.consolidate_features)
+        .unwrap_or(false))
   {
-    println!("📌 Transitive pinning is ENABLED - these crates will be pinned when you run 'apply'.\n");
+    println!("📌 Transitive feature consolidation is ENABLED - these crates will be added when you run 'apply'.\n");
   }
 
   println!(
@@ -248,20 +241,9 @@ pub fn run_unify_apply(
 
   // Build config
   let mut config = if let Some(rail_config) = &ctx.config {
-    UnifyConfig {
-      strategy: UnifyStrategy::All,
-      allow_renamed: rail_config.unify.allow_renamed,
-      exclude: rail_config.unify.exclude.iter().cloned().collect(),
-      include: rail_config.unify.include.iter().cloned().collect(),
-      auto_resolve_version_conflicts: rail_config.unify.auto_resolve_version_conflicts,
-      add_conflict_comments: rail_config.unify.add_conflict_comments,
-      generate_report: rail_config.unify.generate_report,
-    }
+    UnifyConfig::from(rail_config.as_ref())
   } else {
-    UnifyConfig {
-      strategy: UnifyStrategy::All,
-      ..Default::default()
-    }
+    UnifyConfig::default()
   };
 
   for dep in exclude {
@@ -295,45 +277,36 @@ pub fn run_unify_apply(
     println!();
   }
 
-  // Determine if we should pin transitives
-  let should_pin_transitives =
-    pin_transitives_flag || ctx.config.as_ref().map(|c| c.unify.pin_transitives).unwrap_or(false);
+  // Determine if we should consolidate transitive features
+  let should_consolidate_transitives = pin_transitives_flag
+    || ctx
+      .config
+      .as_ref()
+      .map(|c| c.unify.transitives.consolidate_features)
+      .unwrap_or(false);
 
-  // Handle transitive fragmentations if pinning is enabled
+  // Handle transitive fragmentations if consolidation is enabled
   let mut transitive_deps_to_add = Vec::new();
-  let mut transitive_pin_hosts = Vec::new();
+  let mut transitive_feature_hosts = Vec::new();
 
-  if should_pin_transitives && !plan.transitive_fragmentations.is_empty() {
+  if should_consolidate_transitives && !plan.transitive_fragmentations.is_empty() {
     println!(
-      "📌 Pinning {} transitive-only crate(s) with fragmented features...\n",
+      "📌 Consolidating {} transitive-only crate(s) with fragmented features...\n",
       plan.transitive_fragmentations.len()
     );
 
-    // Get pin_hosts from config or use default
-    let pin_hosts = ctx
+    // Get transitive_feature_host from config and resolve to actual crate names
+    let host_crates = ctx
       .config
       .as_ref()
-      .and_then(|c| {
-        if c.unify.pin_hosts.is_empty() {
-          None
-        } else {
-          Some(c.unify.pin_hosts.clone())
-        }
-      })
+      .map(|c| c.unify.transitives.host_selection.resolve(ctx.cargo.metadata()))
       .unwrap_or_else(|| {
-        // Default: use the first workspace member or create a list
-        vec![
-          ctx
-            .cargo
-            .metadata()
-            .list_crates()
-            .first()
-            .map(|p| p.name.to_string())
-            .unwrap_or_else(|| "cargo-rail".to_string()),
-        ]
+        // Fallback to auto-selection if no config
+        use crate::config::TransitiveFeatureHost;
+        TransitiveFeatureHost::Auto.resolve(ctx.cargo.metadata())
       });
 
-    transitive_pin_hosts = pin_hosts;
+    transitive_feature_hosts = host_crates;
 
     // Convert transitive fragmentations to UnifiedDep format
     for frag in &plan.transitive_fragmentations {
@@ -358,12 +331,15 @@ pub fn run_unify_apply(
         name: frag.name.clone(),
         version_req,
         features: frag.unified_features.clone(),
+        feature_provenance: std::collections::HashMap::new(), // Transitive deps don't have member-level provenance
         default_features: true,
         used_by: vec!["<transitive>".to_string()],
         dep_kinds: vec![cargo_metadata::DependencyKind::Development].into_iter().collect(),
         fragmentation_count: frag.feature_sets.len(),
         path: None,
+        target: None, // Transitive deps are not target-specific
         comments: Vec::new(),
+        is_proc_macro: false, // Will be detected when processing direct deps
       });
     }
 
@@ -488,14 +464,14 @@ pub fn run_unify_apply(
     println!();
   }
 
-  // 3. Add dev-dependencies for pinned transitives to pin_hosts
-  if !transitive_deps_to_add.is_empty() && !transitive_pin_hosts.is_empty() {
-    println!("\n📝 Adding dev-dependencies for pinned transitives to pin_hosts...");
+  // 3. Add dev-dependencies for consolidated transitives to host crates
+  if !transitive_deps_to_add.is_empty() && !transitive_feature_hosts.is_empty() {
+    println!("\n📝 Adding dev-dependencies for consolidated transitives to host crates...");
 
-    for host_name in &transitive_pin_hosts {
+    for host_name in &transitive_feature_hosts {
       let host_pkg = ctx.cargo.get_package(host_name).ok_or_else(|| {
         RailError::message(format!(
-          "Pin host '{}' not found in workspace. Check unify.pin_hosts in rail.toml",
+          "Transitive feature host '{}' not found in workspace. Check unify.transitive_feature_host in rail.toml",
           host_name
         ))
       })?;

@@ -1,6 +1,6 @@
 //! Unification plan display
 
-use super::types::{IssueType, UnificationPlan};
+use super::types::{FeatureSource, IssueType, UnificationPlan};
 
 impl UnificationPlan {
   /// Generate human-readable summary of the unification plan
@@ -11,25 +11,44 @@ impl UnificationPlan {
 
     // Statistics
     output.push_str("📊 Statistics:\n");
-    output.push_str(&format!("  Total dependencies: {}\n", self.stats.total_deps));
-    output.push_str(&format!("  To unify: {}\n", self.stats.unified_count));
-    output.push_str(&format!("  Issues: {}\n", self.stats.issue_count));
-    output.push_str(&format!("  Compilations saved: {}\n\n", self.stats.compilations_saved));
+    output.push_str(&format!("  Total dependencies analyzed: {}\n", self.stats.total_deps));
+    output.push_str(&format!("  ✅ Ready to unify: {}\n", self.stats.unified_count));
+    if self.stats.issue_count > 0 {
+      output.push_str(&format!("  ⚠️  Issues found: {}\n", self.stats.issue_count));
+    }
+    if self.stats.compilations_saved > 0 {
+      output.push_str(&format!(
+        "  🚀 Estimated compilations eliminated: {}\n",
+        self.stats.compilations_saved
+      ));
+    }
+    output.push('\n');
 
-    // Workspace dependencies
+    // Workspace dependencies - Cargo.toml-centric view
     if !self.workspace_deps.is_empty() {
-      output.push_str("✅ Dependencies to unify:\n\n");
-      for dep in &self.workspace_deps {
-        output.push_str(&format!("  {} = ", dep.name));
+      output.push_str("✅ Dependencies to add to workspace.dependencies:\n\n");
 
-        // Check if this is a path dependency
+      for dep in &self.workspace_deps {
+        // Header with package name and proc-macro indicator
+        if dep.is_proc_macro {
+          output.push_str(&format!("  📦 {} (proc-macro)\n", dep.name));
+        } else {
+          output.push_str(&format!("  📦 {}\n", dep.name));
+        }
+
+        // Show target-specific info if applicable
+        if let Some(ref target) = dep.target {
+          output.push_str(&format!("     Platform-specific: {}\n", target));
+        }
+
+        // TOML representation
+        output.push_str("     ");
         if let Some(ref path) = dep.path {
           // Workspace member path dependency
           if dep.features.is_empty() && dep.default_features {
-            output.push_str(&format!("{{ path = \"{}\" }}", path));
+            output.push_str(&format!("{} = {{ path = \"{}\" }}", dep.name, path));
           } else {
-            output.push_str("{ ");
-            output.push_str(&format!("path = \"{}\"", path));
+            output.push_str(&format!("{} = {{ path = \"{}\"", dep.name, path));
             if !dep.features.is_empty() {
               output.push_str(&format!(
                 ", features = [{}]",
@@ -49,10 +68,9 @@ impl UnificationPlan {
         } else {
           // Version dependency
           if dep.features.is_empty() && dep.default_features {
-            output.push_str(&format!("\"{}\"", dep.version_req));
+            output.push_str(&format!("{} = \"{}\"", dep.name, dep.version_req));
           } else {
-            output.push_str("{ ");
-            output.push_str(&format!("version = \"{}\"", dep.version_req));
+            output.push_str(&format!("{} = {{ version = \"{}\"", dep.name, dep.version_req));
             if !dep.features.is_empty() {
               output.push_str(&format!(
                 ", features = [{}]",
@@ -70,11 +88,13 @@ impl UnificationPlan {
             output.push_str(" }");
           }
         }
+        output.push('\n');
 
-        output.push_str(&format!("\n    Used by: {}\n", dep.used_by.join(", ")));
+        // Workspace members using this dependency
+        output.push_str(&format!("     Used by: {}\n", dep.used_by.join(", ")));
 
-        // Show dependency kinds (normal, dev, build)
-        if !dep.dep_kinds.is_empty() {
+        // Show dependency kinds if multiple
+        if dep.dep_kinds.len() > 1 {
           let kinds: Vec<String> = dep
             .dep_kinds
             .iter()
@@ -85,15 +105,66 @@ impl UnificationPlan {
               cargo_metadata::DependencyKind::Unknown => "unknown".to_string(),
             })
             .collect();
-          output.push_str(&format!("    Used as: {}\n", kinds.join(", ")));
+          output.push_str(&format!("     Sections: {}\n", kinds.join(", ")));
         }
 
+        // Feature provenance - show WHY features are enabled
+        if !dep.features.is_empty() && !dep.feature_provenance.is_empty() {
+          output.push_str("\n     Features (why enabled):\n");
+
+          for feature in &dep.features {
+            if let Some(sources) = dep.feature_provenance.get(feature) {
+              // Classify the sources
+              let direct_members: Vec<_> = sources
+                .iter()
+                .filter_map(|s| match s {
+                  FeatureSource::Direct { member } => Some(member.as_str()),
+                  _ => None,
+                })
+                .collect();
+
+              let has_default = sources.iter().any(|s| matches!(s, FeatureSource::Default));
+              let has_all_features = sources.iter().any(|s| matches!(s, FeatureSource::AllFeatures));
+
+              let transitive_chains: Vec<_> = sources
+                .iter()
+                .filter_map(|s| match s {
+                  FeatureSource::Transitive { through } => Some(through.join(" → ")),
+                  _ => None,
+                })
+                .collect();
+
+              // Format the provenance
+              if !direct_members.is_empty() {
+                output.push_str(&format!(
+                  "       ✓ \"{}\" - Direct ({})\n",
+                  feature,
+                  direct_members.join(", ")
+                ));
+              } else if has_default {
+                output.push_str(&format!("       ✓ \"{}\" - Default features\n", feature));
+              } else if !transitive_chains.is_empty() {
+                output.push_str(&format!(
+                  "       ⚠ \"{}\" - Transitive (via {})\n",
+                  feature,
+                  transitive_chains.first().unwrap()
+                ));
+              } else if has_all_features {
+                output.push_str(&format!("       ⚠ \"{}\" - From --all-features flag\n", feature));
+              }
+            }
+          }
+        }
+
+        // Fragmentation savings
         if dep.fragmentation_count > 1 {
           output.push_str(&format!(
-            "    Eliminates {} duplicate compilations\n",
-            dep.fragmentation_count - 1
+            "\n     💡 Eliminates {} duplicate compilation{}\n",
+            dep.fragmentation_count - 1,
+            if dep.fragmentation_count > 2 { "s" } else { "" }
           ));
         }
+
         output.push('\n');
       }
     }
@@ -168,30 +239,41 @@ impl UnificationPlan {
       }
     }
 
-    // Transitive fragmentations (informational)
+    // Transitive fragmentations (optimization opportunity)
     if !self.transitive_fragmentations.is_empty() {
-      output.push_str("ℹ️  Transitive-only crates with fragmented features:\n\n");
+      output.push_str("🔍 Optimization Opportunity: Transitive Feature Consolidation\n\n");
+
+      let total_count = self.transitive_fragmentations.len();
+      let workspace_count = if total_count > 10 { 10 } else { total_count };
+
       output.push_str(&format!(
-        "  Found {} transitive-only crate(s) with multiple feature sets.\n",
-        self.transitive_fragmentations.len()
+        "  Found {} transitive-only crate{} with fragmented feature sets.\n\n",
+        total_count,
+        if total_count == 1 { "" } else { "s" }
       ));
-      output.push_str("  These crates:\n");
-      output.push_str("    • Don't appear in any Cargo.toml [dependencies]\n");
-      output.push_str("    • Resolve with different features in different contexts\n");
-      output.push_str("    • Cargo's model can't enforce a single feature set without explicit deps\n\n");
-      output.push_str("  Current state: ~95% unified (this is the remaining ~5%)\n\n");
+
+      output.push_str("  What this means:\n");
+      output.push_str("    • These crates don't appear in any Cargo.toml [dependencies]\n");
+      output.push_str("    • They're pulled in transitively by your direct dependencies\n");
+      output.push_str("    • Cargo compiles them multiple times with different features\n");
+      output.push_str("    • This is the ~5% that workspace.dependencies can't automatically unify\n\n");
 
       for frag in &self.transitive_fragmentations {
         output.push_str(&frag.format_explanation());
         output.push('\n');
       }
 
-      output.push_str("  To pin these crates under workspace control:\n");
-      output.push_str("    cargo rail unify --pin-transitives\n\n");
-      output.push_str("  Or configure in .config/rust/rail.toml:\n");
+      output.push_str(&format!(
+        "  💡 Recommended for workspaces with >{} crates\n\n",
+        workspace_count
+      ));
+
+      output.push_str("  To consolidate (optional):\n");
+      output.push_str("    cargo rail unify --consolidate-transitives\n\n");
+      output.push_str("  Or configure in rail.toml:\n");
       output.push_str("    [unify]\n");
-      output.push_str("    pin_transitives = true\n");
-      output.push_str("    pin_hosts = [\"my-meta-crate\"]  # optional\n\n");
+      output.push_str("    consolidate_transitive_features = true\n");
+      output.push_str("    transitive_feature_host = \"auto\"  # Smart selection of host crate\n\n");
     }
 
     output

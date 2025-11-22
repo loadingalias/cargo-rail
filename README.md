@@ -179,7 +179,8 @@ components = ["clippy", "rustfmt"]
 
 # Dependency unification
 [unify]
-pin_transitives = false
+consolidate_transitive_features = false  # Consolidate transitive deps
+transitive_feature_host = "auto"         # Smart auto-selection
 validate_targets = []
 
 # Split/sync (optional)

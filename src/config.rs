@@ -47,43 +47,80 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub include: Vec<String>,
 
-  /// Optional: validate unification against specific target triples
-  /// When enabled, runs parallel metadata checks per target to catch platform-specific issues
-  /// Examples: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+  /// Conflict handling configuration
   #[serde(default)]
-  pub validate_targets: Vec<String>,
+  pub conflicts: UnifyConflictsConfig,
 
-  /// Maximum parallel jobs for validation (0 = auto-detect CPUs, >0 = explicit limit)
+  /// Transitive optimization configuration
   #[serde(default)]
-  pub max_parallel_jobs: usize,
+  pub transitives: UnifyTransitivesConfig,
 
-  /// Automatically pin transitive-only crates with fragmented features (default: false)
-  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
+  /// Validation configuration
   #[serde(default)]
-  pub pin_transitives: bool,
+  pub validation: UnifyValidationConfig,
 
-  /// Crates to add dev-dependencies to when pinning transitives (default: empty = auto-select)
-  /// Examples: ["workspace-root"], ["meta-crate"], ["crate-a", "crate-b"]
+  /// Output configuration
   #[serde(default)]
-  pub pin_hosts: Vec<String>,
+  pub output: UnifyOutputConfig,
+}
 
+/// Conflict handling configuration for unification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifyConflictsConfig {
   /// Automatically resolve version conflicts by picking the highest version (default: true)
   /// When enabled, unify will proceed with highest version and add warning comments
   /// When disabled, version conflicts are hard blockers
-  #[serde(default = "default_auto_resolve_version_conflicts")]
-  pub auto_resolve_version_conflicts: bool,
+  #[serde(default = "default_auto_resolve")]
+  pub auto_resolve: bool,
 
   /// Conflict resolution mode (default: "permissive")
   /// - "permissive": Soft warnings don't block unification (recommended)
   /// - "strict": All conflicts block unification
-  #[serde(default = "default_conflict_resolution")]
-  pub conflict_resolution: String,
+  #[serde(default = "default_resolution_mode")]
+  pub resolution_mode: String,
 
   /// Add conflict marker comments to Cargo.toml files (default: true)
   /// Adds # ⚠️ markers to help identify manual resolution needs
-  #[serde(default = "default_add_conflict_comments")]
-  pub add_conflict_comments: bool,
+  #[serde(default = "default_add_markers")]
+  pub add_markers: bool,
+}
 
+/// Transitive optimization configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifyTransitivesConfig {
+  /// Consolidate transitive-only crates with fragmented features (default: false)
+  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
+  /// This is cargo-rail's version of workspace-hack without requiring an extra crate
+  #[serde(default)]
+  pub consolidate_features: bool,
+
+  /// Where to add dev-dependencies when consolidating transitive features
+  /// Options:
+  /// - "auto" (default) = Smart selection: root package, meta crate, or largest member
+  /// - "root" = Use workspace root package (errors if virtual workspace)
+  /// - "largest" = Use member with most dependencies
+  /// - ["crate-a"] = Explicit crate name(s)
+  #[serde(default = "default_host_selection")]
+  pub host_selection: TransitiveFeatureHost,
+}
+
+/// Validation configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UnifyValidationConfig {
+  /// Optional: validate unification against specific target triples
+  /// When enabled, runs parallel metadata checks per target to catch platform-specific issues
+  /// Examples: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+  #[serde(default)]
+  pub targets: Vec<String>,
+
+  /// Maximum parallel jobs for validation (0 = auto-detect CPUs, >0 = explicit limit)
+  #[serde(default)]
+  pub max_parallel_jobs: usize,
+}
+
+/// Output configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifyOutputConfig {
   /// Generate .cargo-rail/unify-report.md after apply (default: true)
   #[serde(default = "default_generate_report")]
   pub generate_report: bool,
@@ -93,15 +130,15 @@ fn default_use_all_features() -> bool {
   true
 }
 
-fn default_auto_resolve_version_conflicts() -> bool {
+fn default_auto_resolve() -> bool {
   true
 }
 
-fn default_conflict_resolution() -> String {
+fn default_resolution_mode() -> String {
   "permissive".to_string()
 }
 
-fn default_add_conflict_comments() -> bool {
+fn default_add_markers() -> bool {
   true
 }
 
@@ -109,21 +146,187 @@ fn default_generate_report() -> bool {
   true
 }
 
+fn default_host_selection() -> TransitiveFeatureHost {
+  TransitiveFeatureHost::Auto
+}
+
+/// Configuration for where to add dev-dependencies when consolidating transitive features
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransitiveFeatureHost {
+  /// Auto-select: root package, meta crate, or largest member
+  Auto,
+  /// Use workspace root package
+  Root,
+  /// Use member with most dependencies
+  Largest,
+  /// Explicit list of crate names
+  Explicit(Vec<String>),
+}
+
+// Custom serialization/deserialization
+impl Serialize for TransitiveFeatureHost {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      TransitiveFeatureHost::Auto => serializer.serialize_str("auto"),
+      TransitiveFeatureHost::Root => serializer.serialize_str("root"),
+      TransitiveFeatureHost::Largest => serializer.serialize_str("largest"),
+      TransitiveFeatureHost::Explicit(names) => names.serialize(serializer),
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for TransitiveFeatureHost {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    struct TransitiveFeatureHostVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for TransitiveFeatureHostVisitor {
+      type Value = TransitiveFeatureHost;
+
+      fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a string (auto/root/largest) or array of crate names")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<TransitiveFeatureHost, E>
+      where
+        E: serde::de::Error,
+      {
+        Ok(match value {
+          "auto" => TransitiveFeatureHost::Auto,
+          "root" => TransitiveFeatureHost::Root,
+          "largest" => TransitiveFeatureHost::Largest,
+          name => TransitiveFeatureHost::Explicit(vec![name.to_string()]),
+        })
+      }
+
+      fn visit_seq<A>(self, mut seq: A) -> Result<TransitiveFeatureHost, A::Error>
+      where
+        A: serde::de::SeqAccess<'de>,
+      {
+        let mut names = Vec::new();
+        while let Some(name) = seq.next_element::<String>()? {
+          names.push(name);
+        }
+        Ok(TransitiveFeatureHost::Explicit(names))
+      }
+    }
+
+    deserializer.deserialize_any(TransitiveFeatureHostVisitor)
+  }
+}
+
+impl TransitiveFeatureHost {
+  /// Resolve to actual crate names based on workspace metadata
+  pub fn resolve(&self, metadata: &crate::cargo::WorkspaceMetadata) -> Vec<String> {
+    match self {
+      TransitiveFeatureHost::Auto => auto_select_transitive_host(metadata),
+      TransitiveFeatureHost::Root => {
+        // Find root package (non-virtual workspace)
+        metadata
+          .list_crates()
+          .iter()
+          .find(|pkg| {
+            // Root package is the one at workspace_root/Cargo.toml
+            pkg.manifest_path.as_std_path().parent() == Some(metadata.workspace_root())
+          })
+          .map(|pkg| vec![pkg.name.to_string()])
+          .unwrap_or_else(|| {
+            // Fallback if no root package (virtual workspace)
+            eprintln!("⚠️  Warning: Virtual workspace has no root package, using auto-selection");
+            auto_select_transitive_host(metadata)
+          })
+      }
+      TransitiveFeatureHost::Largest => {
+        // Use member with most dependencies
+        let mut members: Vec<_> = metadata.list_crates();
+        members.sort_by_key(|pkg| std::cmp::Reverse(pkg.dependencies.len()));
+        members
+          .first()
+          .map(|pkg| vec![pkg.name.to_string()])
+          .unwrap_or_default()
+      }
+      TransitiveFeatureHost::Explicit(names) => names.clone(),
+    }
+  }
+}
+
+/// Auto-select the best crate(s) to host transitive dev-dependencies
+fn auto_select_transitive_host(metadata: &crate::cargo::WorkspaceMetadata) -> Vec<String> {
+  // 1. If workspace has root package (non-virtual) → use it
+  if let Some(root_pkg) = metadata
+    .list_crates()
+    .iter()
+    .find(|pkg| pkg.manifest_path.as_std_path().parent() == Some(metadata.workspace_root()))
+  {
+    return vec![root_pkg.name.to_string()];
+  }
+
+  // 2. Look for conventional "meta" crates
+  let crates = metadata.list_crates();
+  let meta_candidate = crates.iter().find(|pkg| {
+    let name = pkg.name.to_lowercase();
+    name.contains("meta") || name.ends_with("-workspace") || name == "workspace"
+  });
+
+  if let Some(pkg) = meta_candidate {
+    return vec![pkg.name.to_string()];
+  }
+
+  // 3. Use member with most dependencies (likely the "main" crate)
+  let mut members = crates;
+  members.sort_by_key(|pkg| std::cmp::Reverse(pkg.dependencies.len()));
+
+  if let Some(largest) = members.first() {
+    return vec![largest.name.to_string()];
+  }
+
+  // 4. Fallback: empty (shouldn't happen)
+  vec![]
+}
+
+impl Default for UnifyConflictsConfig {
+  fn default() -> Self {
+    Self {
+      auto_resolve: default_auto_resolve(),
+      resolution_mode: default_resolution_mode(),
+      add_markers: default_add_markers(),
+    }
+  }
+}
+
+impl Default for UnifyTransitivesConfig {
+  fn default() -> Self {
+    Self {
+      consolidate_features: false,
+      host_selection: default_host_selection(),
+    }
+  }
+}
+
+impl Default for UnifyOutputConfig {
+  fn default() -> Self {
+    Self {
+      generate_report: default_generate_report(),
+    }
+  }
+}
+
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
       use_all_features: default_use_all_features(),
-      validate_targets: vec![],
-      max_parallel_jobs: 0, // Auto-detect
-      pin_transitives: false,
-      pin_hosts: vec![],
-      auto_resolve_version_conflicts: default_auto_resolve_version_conflicts(),
-      conflict_resolution: default_conflict_resolution(),
-      add_conflict_comments: default_add_conflict_comments(),
-      generate_report: default_generate_report(),
       allow_renamed: false,
       exclude: Vec::new(),
       include: Vec::new(),
+      conflicts: UnifyConflictsConfig::default(),
+      transitives: UnifyTransitivesConfig::default(),
+      validation: UnifyValidationConfig::default(),
+      output: UnifyOutputConfig::default(),
     }
   }
 }
@@ -131,16 +334,16 @@ impl Default for UnifyConfig {
 impl UnifyConfig {
   /// Check if target validation is enabled
   pub fn validation_enabled(&self) -> bool {
-    !self.validate_targets.is_empty()
+    !self.validation.targets.is_empty()
   }
 
   /// Get effective parallel job count (auto-detect if 0)
   pub fn effective_parallelism(&self) -> usize {
-    if self.max_parallel_jobs == 0 {
+    if self.validation.max_parallel_jobs == 0 {
       // Auto-detect: use number of logical CPUs
       std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     } else {
-      self.max_parallel_jobs
+      self.validation.max_parallel_jobs
     }
   }
 }
@@ -461,8 +664,8 @@ mod tests {
   fn test_unify_config_default() {
     let unify = UnifyConfig::default();
     assert!(unify.use_all_features);
-    assert!(unify.validate_targets.is_empty());
-    assert_eq!(unify.max_parallel_jobs, 0); // Auto-detect
+    assert!(unify.validation.targets.is_empty());
+    assert_eq!(unify.validation.max_parallel_jobs, 0); // Auto-detect
   }
 
   #[test]
@@ -471,7 +674,10 @@ mod tests {
     assert!(!unify_disabled.validation_enabled());
 
     let unify_enabled = UnifyConfig {
-      validate_targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+      validation: UnifyValidationConfig {
+        targets: vec!["x86_64-unknown-linux-gnu".to_string()],
+        max_parallel_jobs: 0,
+      },
       ..Default::default()
     };
     assert!(unify_enabled.validation_enabled());
@@ -480,7 +686,10 @@ mod tests {
   #[test]
   fn test_unify_config_effective_parallelism_auto() {
     let unify = UnifyConfig {
-      max_parallel_jobs: 0, // Auto-detect
+      validation: UnifyValidationConfig {
+        targets: vec![],
+        max_parallel_jobs: 0, // Auto-detect
+      },
       ..Default::default()
     };
     let parallelism = unify.effective_parallelism();
@@ -490,10 +699,113 @@ mod tests {
   #[test]
   fn test_unify_config_effective_parallelism_explicit() {
     let unify = UnifyConfig {
-      max_parallel_jobs: 4,
+      validation: UnifyValidationConfig {
+        targets: vec![],
+        max_parallel_jobs: 4,
+      },
       ..Default::default()
     };
     assert_eq!(unify.effective_parallelism(), 4);
+  }
+
+  // ============================================================================
+  // TransitiveFeatureHost Tests
+  // ============================================================================
+  // Note: Detailed TOML serialization tests will be added during TOML formatting overhaul
+
+  #[test]
+  fn test_transitive_feature_host_in_full_config_auto() {
+    // Test that "auto" works in the new nested config
+    let toml = r#"
+      use_all_features = true
+      allow_renamed = false
+      exclude = []
+      include = []
+
+      [conflicts]
+      auto_resolve = true
+      resolution_mode = "permissive"
+      add_markers = true
+
+      [transitives]
+      consolidate_features = false
+      host_selection = "auto"
+
+      [validation]
+      targets = []
+      max_parallel_jobs = 0
+
+      [output]
+      generate_report = true
+    "#;
+
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.transitives.host_selection, TransitiveFeatureHost::Auto);
+  }
+
+  #[test]
+  fn test_transitive_feature_host_in_full_config_array() {
+    // Test that array format works in the new nested config
+    let toml = r#"
+      use_all_features = true
+      allow_renamed = false
+      exclude = []
+      include = []
+
+      [conflicts]
+      auto_resolve = true
+      resolution_mode = "permissive"
+      add_markers = true
+
+      [transitives]
+      consolidate_features = false
+      host_selection = ["crate-a", "crate-b"]
+
+      [validation]
+      targets = []
+      max_parallel_jobs = 0
+
+      [output]
+      generate_report = true
+    "#;
+
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(
+      config.transitives.host_selection,
+      TransitiveFeatureHost::Explicit(vec!["crate-a".to_string(), "crate-b".to_string()])
+    );
+  }
+
+  #[test]
+  fn test_transitive_feature_host_resolve_explicit() {
+    // Create a test metadata instance
+    let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
+
+    let host = TransitiveFeatureHost::Explicit(vec!["cargo-rail".to_string()]);
+    let resolved = host.resolve(&metadata);
+    assert_eq!(resolved, vec!["cargo-rail"]);
+  }
+
+  #[test]
+  fn test_transitive_feature_host_resolve_auto() {
+    // Create a test metadata instance
+    let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
+
+    let host = TransitiveFeatureHost::Auto;
+    let resolved = host.resolve(&metadata);
+
+    // Should return at least one crate name
+    assert!(!resolved.is_empty());
+
+    // Should return "cargo-rail" since this workspace has a root package
+    assert_eq!(resolved, vec!["cargo-rail"]);
+  }
+
+  #[test]
+  fn test_unify_config_default_uses_auto() {
+    let config = UnifyConfig::default();
+    assert_eq!(config.transitives.host_selection, TransitiveFeatureHost::Auto);
+    assert!(!config.transitives.consolidate_features);
   }
 
   // ============================================================================

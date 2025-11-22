@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 
 use crate::commands::common::SplitSyncConfigBuilder;
+use crate::config::RailConfig;
 use crate::error::RailResult;
 use crate::split::SplitEngine;
 use crate::utils;
@@ -148,4 +149,177 @@ pub fn run_split(
 
   println!("✅ Split operation completed successfully");
   Ok(())
+}
+
+/// Initialize split configuration for one or more crates
+///
+/// Detects workspace members and adds split configuration to rail.toml.
+/// Can configure specific crates or all workspace members.
+pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: bool) -> RailResult<()> {
+  use crate::config::RailConfig;
+  use std::fs;
+
+  // Parse crate names if provided
+  let requested_crates: Option<Vec<String>> = crates.map(|s| {
+    s.split(',')
+      .map(|name| name.trim().to_string())
+      .filter(|name| !name.is_empty())
+      .collect()
+  });
+
+  // Detect splits based on requested crates or all workspace members
+  let splits = detect_workspace_splits(ctx, requested_crates.as_deref())?;
+
+  if splits.is_empty() {
+    if let Some(requested) = requested_crates {
+      return Err(crate::error::RailError::message(format!(
+        "No matching crates found for: {}",
+        requested.join(", ")
+      )));
+    } else {
+      return Err(crate::error::RailError::message("No workspace members found"));
+    }
+  }
+
+  // Load existing config or create new one
+  let workspace_root = ctx.workspace_root();
+  let existing_config = RailConfig::load(workspace_root).ok();
+
+  let mut config = existing_config.unwrap_or_else(|| RailConfig {
+    workspace: crate::config::WorkspaceConfig {
+      root: std::path::PathBuf::from("."),
+    },
+    unify: crate::config::UnifyConfig::default(),
+    release: crate::config::ReleaseConfig::default(),
+    splits: vec![],
+  });
+
+  // Add new splits (avoid duplicates)
+  let existing_names: std::collections::HashSet<_> = config.splits.iter().map(|s| s.name.clone()).collect();
+  let new_splits: Vec<_> = splits
+    .into_iter()
+    .filter(|s| !existing_names.contains(&s.name))
+    .collect();
+
+  if new_splits.is_empty() {
+    println!("✅ All requested crates are already configured");
+    return Ok(());
+  }
+
+  println!("Adding {} split configuration(s):", new_splits.len());
+  for split in &new_splits {
+    println!("  • {}", split.name);
+  }
+  println!();
+
+  config.splits.extend(new_splits);
+
+  // Serialize config
+  let config_toml = serialize_splits_config(&config)?;
+
+  if dry_run {
+    println!("{}", config_toml);
+  } else {
+    // Find or create config file
+    let config_path =
+      RailConfig::find_config_path(workspace_root).unwrap_or_else(|| workspace_root.join(".config/rail.toml"));
+
+    // Write config
+    if let Some(parent) = config_path.parent() {
+      fs::create_dir_all(parent)?;
+    }
+
+    fs::write(&config_path, config_toml)?;
+    println!("✅ Updated {}", config_path.display());
+  }
+
+  Ok(())
+}
+
+/// Detect workspace members and create split configs
+///
+/// If `requested_crates` is provided, only creates configs for those crates.
+/// Otherwise, creates configs for all workspace members.
+fn detect_workspace_splits(
+  ctx: &WorkspaceContext,
+  requested_crates: Option<&[String]>,
+) -> RailResult<Vec<crate::config::SplitConfig>> {
+  use crate::config::{CratePath, SplitConfig, SplitMode, WorkspaceMode};
+
+  let workspace_root = ctx.workspace_root();
+  let members = ctx.cargo.metadata().list_crates();
+
+  let mut splits = Vec::new();
+
+  for pkg in members {
+    // Filter by requested crates if specified
+    if let Some(requested) = requested_crates
+      && !requested.contains(&pkg.name)
+    {
+      continue;
+    }
+
+    // Get relative path from workspace root to crate directory
+    let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
+    let rel_path = match crate_dir.strip_prefix(workspace_root) {
+      Ok(p) => p.to_path_buf(),
+      Err(_) => continue, // Skip if not under workspace root
+    };
+
+    // Generate a reasonable remote URL placeholder (GitHub org/repo pattern)
+    let remote = format!("git@github.com:org/{}.git", pkg.name);
+
+    // Check if crate has publish = false in Cargo.toml
+    let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+
+    // Detect per-crate CHANGELOG file
+    let changelog_path = detect_crate_changelog(crate_dir);
+
+    splits.push(SplitConfig {
+      name: pkg.name.to_string(),
+      remote,
+      branch: "main".to_string(),
+      mode: SplitMode::Single,
+      workspace_mode: WorkspaceMode::default(),
+      paths: vec![CratePath { path: rel_path.into() }],
+      include: vec![],
+      exclude: vec![],
+      publish,
+      changelog_path,
+    });
+  }
+
+  Ok(splits)
+}
+
+/// Detect CHANGELOG file in a crate directory
+fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<std::path::PathBuf> {
+  let changelog_patterns = [
+    "CHANGELOG.md",
+    "CHANGELOG.txt",
+    "CHANGELOG",
+    "Changelog.md",
+    "changelog.md",
+    "CHANGES.md",
+    "CHANGES.txt",
+    "CHANGES",
+    "Changes.md",
+    "changes.md",
+  ];
+
+  for pattern in &changelog_patterns {
+    let changelog = crate_dir.join(pattern);
+    if changelog.exists() {
+      // Return relative path from crate root
+      return Some(std::path::PathBuf::from(pattern));
+    }
+  }
+
+  None
+}
+
+/// Serialize RailConfig to TOML - used for split init
+fn serialize_splits_config(config: &RailConfig) -> RailResult<String> {
+  toml_edit::ser::to_string_pretty(config)
+    .map_err(|e| crate::error::RailError::message(format!("Failed to serialize config: {}", e)))
 }

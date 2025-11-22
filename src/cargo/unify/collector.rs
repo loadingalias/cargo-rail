@@ -1,7 +1,7 @@
 //! Dependency collection from workspace members
 
 use super::path_handling::is_workspace_member_path;
-use super::types::DependencyInstance;
+use super::types::{DependencyInstance, FeatureSource};
 use crate::cargo::WorkspaceMetadata;
 use std::collections::{HashMap, HashSet};
 
@@ -39,17 +39,25 @@ pub fn collect_dependencies(metadata: &WorkspaceMetadata) -> Vec<DependencyInsta
         dep.features.clone()
       };
 
+      // Track feature provenance: WHY is each feature enabled?
+      let feature_provenance = determine_feature_provenance(&features, dep, &pkg.name, metadata);
+
+      // Detect if this is a proc-macro crate
+      // Proc-macros are build-time only and have different optimization strategies
+      let is_proc_macro = metadata.is_proc_macro_crate(&dep.name);
+
       instances.push(DependencyInstance {
         member: pkg.name.to_string(),
         name: dep.name.clone(),
         version_req: dep.req.clone(),
         features,
+        feature_provenance,
         default_features: dep.uses_default_features,
-        optional: dep.optional,
         kind: dep.kind,
         target: dep.target.as_ref().map(|t| t.to_string()),
         rename: dep.rename.clone(),
         path: dep.path.clone(),
+        is_proc_macro,
       });
     }
   }
@@ -110,4 +118,69 @@ fn get_member_workspace_deps(manifest_path: &cargo_metadata::camino::Utf8Path) -
   }
 
   workspace_deps
+}
+
+/// Determine WHY each feature is enabled for a dependency
+///
+/// This is the key to showing users Cargo.toml-level information about their dependencies.
+/// We check multiple sources in order of specificity:
+/// 1. Direct declaration in member's Cargo.toml
+/// 2. Default features
+/// 3. Target-specific
+/// 4. Transitive or --all-features
+fn determine_feature_provenance(
+  resolved_features: &[String],
+  dep: &cargo_metadata::Dependency,
+  member_name: &str,
+  metadata: &WorkspaceMetadata,
+) -> HashMap<String, FeatureSource> {
+  let mut provenance = HashMap::new();
+
+  // Get the actual package metadata for this dependency
+  let dep_pkg = metadata.get_package(&dep.name);
+
+  for feature in resolved_features {
+    let source = determine_single_feature_source(feature, dep, member_name, dep_pkg);
+    provenance.insert(feature.clone(), source);
+  }
+
+  provenance
+}
+
+/// Determine the source of a single feature
+fn determine_single_feature_source(
+  feature: &str,
+  dep: &cargo_metadata::Dependency,
+  member_name: &str,
+  dep_pkg: Option<&cargo_metadata::Package>,
+) -> FeatureSource {
+  // 1. Check if declared directly in this member's Cargo.toml
+  if dep.features.contains(&feature.to_string()) {
+    return FeatureSource::Direct {
+      member: member_name.to_string(),
+    };
+  }
+
+  // 2. Check if it's a default feature (and default features are enabled)
+  if dep.uses_default_features
+    && let Some(pkg) = dep_pkg
+    && let Some(default_features) = pkg.features.get("default")
+  {
+    // Default features can reference other features
+    if default_features.iter().any(|f| f.trim_start_matches("dep:") == feature) {
+      return FeatureSource::Default;
+    }
+  }
+
+  // 3. Check if target-specific
+  if let Some(ref target) = dep.target {
+    return FeatureSource::TargetSpecific {
+      target: target.to_string(),
+    };
+  }
+
+  // 4. Otherwise it's either transitive or from --all-features
+  // For now, we classify it as AllFeatures since we're using --all-features metadata
+  // In a future enhancement, we could trace the actual dependency chain
+  FeatureSource::AllFeatures
 }

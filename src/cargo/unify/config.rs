@@ -1,17 +1,11 @@
 //! Configuration for workspace dependency unification
 
+use crate::config::RailConfig;
 use std::collections::HashSet;
 
 /// Configuration for workspace unification
 #[derive(Debug, Clone)]
 pub struct UnifyConfig {
-  /// Strategy for selecting dependencies to unify
-  ///
-  /// Currently only UnifyStrategy::All is supported. This field is kept for
-  /// future extensibility (e.g., threshold-based unification, fragmentation-only).
-  #[allow(dead_code)]
-  pub strategy: UnifyStrategy,
-
   /// Allow renamed dependencies to be unified (default: false)
   pub allow_renamed: bool,
 
@@ -31,23 +25,28 @@ pub struct UnifyConfig {
   pub generate_report: bool,
 }
 
-/// Strategy for selecting which dependencies to unify
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnifyStrategy {
-  /// Unify all possible dependencies
-  All,
-}
-
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
-      strategy: UnifyStrategy::All,
       allow_renamed: false,
       exclude: HashSet::new(),
       include: HashSet::new(),
       auto_resolve_version_conflicts: true,
       add_conflict_comments: true,
       generate_report: true,
+    }
+  }
+}
+
+impl From<&RailConfig> for UnifyConfig {
+  fn from(rail_config: &RailConfig) -> Self {
+    Self {
+      allow_renamed: rail_config.unify.allow_renamed,
+      exclude: rail_config.unify.exclude.iter().cloned().collect(),
+      include: rail_config.unify.include.iter().cloned().collect(),
+      auto_resolve_version_conflicts: rail_config.unify.conflicts.auto_resolve,
+      add_conflict_comments: rail_config.unify.conflicts.add_markers,
+      generate_report: rail_config.unify.output.generate_report,
     }
   }
 }

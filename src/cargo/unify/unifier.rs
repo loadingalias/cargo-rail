@@ -4,7 +4,7 @@ use super::path_handling::normalize_workspace_path;
 use super::types::{DependencyInstance, UnifiedDep};
 use crate::cargo::WorkspaceMetadata;
 use crate::error::RailResult;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Unify dependency instances into a single workspace dependency
 pub fn unify_instances(
@@ -22,6 +22,17 @@ pub fn unify_instances(
   }
   let mut features: Vec<_> = all_features.into_iter().collect();
   features.sort();
+
+  // Feature provenance: collect ALL sources for each feature across instances
+  let mut feature_provenance: HashMap<String, Vec<super::types::FeatureSource>> = HashMap::new();
+  for instance in instances {
+    for (feature, source) in &instance.feature_provenance {
+      feature_provenance
+        .entry(feature.clone())
+        .or_default()
+        .push(source.clone());
+    }
+  }
 
   // Default features: true if ANY instance uses them
   let default_features = instances.iter().any(|i| i.default_features);
@@ -66,6 +77,28 @@ pub fn unify_instances(
     None
   };
 
+  // Target: if all instances have the SAME target, preserve it for workspace-level unification
+  let target = if instances.iter().all(|i| i.target.is_some()) {
+    let targets: Vec<_> = instances.iter().filter_map(|i| i.target.as_ref()).collect();
+    if !targets.is_empty() {
+      let first = targets[0];
+      if targets.iter().all(|t| t == &first) {
+        // All targets are identical - we can unify with target specifier!
+        Some(first.clone())
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  } else {
+    None
+  };
+
+  // Proc-macro detection: if ANY instance is a proc-macro, mark the unified dep
+  // (all instances SHOULD have the same value since they're the same package)
+  let is_proc_macro = instances.iter().any(|i| i.is_proc_macro);
+
   // Generate standard comment showing which members use this dep
   let member_count = used_by.len();
   let comment = if fragmentation_count > 1 {
@@ -85,11 +118,14 @@ pub fn unify_instances(
     name: dep_name.to_string(),
     version_req,
     features,
+    feature_provenance,
     default_features,
     used_by,
     dep_kinds,
     fragmentation_count,
     path,
+    target,
     comments: vec![comment],
+    is_proc_macro,
   })
 }

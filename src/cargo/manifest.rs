@@ -287,21 +287,48 @@ impl CargoTransform {
       doc["workspace"] = table();
     }
 
-    // Ensure [workspace.dependencies] section exists
-    let workspace = doc["workspace"]
-      .as_table_mut()
-      .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
-
-    if !workspace.contains_key("dependencies") {
-      workspace["dependencies"] = table();
-    }
-
-    let workspace_deps = workspace["dependencies"]
-      .as_table_mut()
-      .ok_or_else(|| RailError::message("[workspace.dependencies] is not a table"))?;
-
     // Write each unified dependency
+    // Group by target (None for regular deps, Some(target) for platform-specific)
     for unified in unified_deps {
+      // Determine which table to write to based on target
+      let deps_table = if let Some(ref target) = unified.target {
+        // Platform-specific dependency: write to [target.'<target>'.dependencies]
+        let target_key = format!("target.'{}'", target);
+
+        // Ensure target section exists in workspace
+        let workspace = doc["workspace"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
+
+        if !workspace.contains_key(&target_key) {
+          workspace[&target_key] = table();
+        }
+
+        let target_section = workspace[&target_key]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message(format!("[workspace.{}] is not a table", target_key)))?;
+
+        if !target_section.contains_key("dependencies") {
+          target_section["dependencies"] = table();
+        }
+
+        target_section["dependencies"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message(format!("[workspace.{}.dependencies] is not a table", target_key)))?
+      } else {
+        // Regular dependency: write to [workspace.dependencies]
+        let workspace = doc["workspace"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
+
+        if !workspace.contains_key("dependencies") {
+          workspace["dependencies"] = table();
+        }
+
+        workspace["dependencies"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message("[workspace.dependencies] is not a table"))?
+      };
       // Use inline table for simple deps and deps with few features
       // Use regular table format only for deps with many features (>10) to avoid long lines
       let use_inline_table = unified.features.len() <= 10;
@@ -335,12 +362,12 @@ impl CargoTransform {
         }
 
         // Insert the dependency
-        workspace_deps.insert(&unified.name, toml_edit::Item::Value(dep_table.into()));
+        deps_table.insert(&unified.name, toml_edit::Item::Value(dep_table.into()));
 
         // Add comments if enabled and any exist
         if add_comments
           && !unified.comments.is_empty()
-          && let Some(item) = workspace_deps.get_mut(&unified.name)
+          && let Some(item) = deps_table.get_mut(&unified.name)
         {
           let comment_str = unified.comments.join(", ");
           item
@@ -373,7 +400,7 @@ impl CargoTransform {
         dep_table["features"] = toml_edit::value(Value::Array(features_array));
 
         // Insert the dependency
-        workspace_deps.insert(&unified.name, dep_table);
+        deps_table.insert(&unified.name, dep_table);
 
         // Add comments if enabled and any exist
         // Note: Comments for regular tables are more complex - for now we skip them
@@ -671,12 +698,15 @@ members = ["crate-a", "crate-b"]
       name: "serde".to_string(),
       version_req: VersionReq::parse("1.0").unwrap(),
       features: vec!["derive".to_string()],
+      feature_provenance: HashMap::new(),
       default_features: true,
       used_by: vec!["crate-a".to_string(), "crate-b".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 2,
       path: None,
+      target: None,
       comments: Vec::new(),
+      is_proc_macro: false,
     }];
 
     // Write workspace dependencies
@@ -728,12 +758,15 @@ members = ["crate-a"]
       name: "anyhow".to_string(),
       version_req: VersionReq::parse("1.0").unwrap(),
       features: vec![], // No features
+      feature_provenance: HashMap::new(),
       default_features: true,
       used_by: vec!["crate-a".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
       path: None,
+      target: None,
       comments: Vec::new(),
+      is_proc_macro: false,
     }];
 
     transformer
@@ -766,12 +799,15 @@ members = ["crate-a"]
       name: "tokio".to_string(),
       version_req: VersionReq::parse("1.0").unwrap(),
       features: vec!["fs".to_string(), "net".to_string()],
+      feature_provenance: HashMap::new(),
       default_features: false, // Explicitly disabled
       used_by: vec!["crate-a".to_string()],
       dep_kinds: HashSet::new(),
       fragmentation_count: 1,
       path: None,
+      target: None,
       comments: Vec::new(),
+      is_proc_macro: false,
     }];
 
     transformer

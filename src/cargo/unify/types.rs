@@ -4,6 +4,35 @@ use cargo_metadata::{DependencyKind, camino::Utf8PathBuf};
 use semver::VersionReq;
 use std::collections::{HashMap, HashSet};
 
+/// Why a feature is enabled for a dependency
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureSource {
+  /// Declared directly in member's Cargo.toml
+  Direct {
+    /// The workspace member that declared this feature
+    member: String,
+  },
+
+  /// Enabled transitively through another dependency chain
+  Transitive {
+    /// The dependency chain that enabled this feature
+    /// Example: ["tokio", "bytes"] means tokio depends on bytes with this feature
+    through: Vec<String>,
+  },
+
+  /// Enabled by default-features = true
+  Default,
+
+  /// Enabled by --all-features flag during metadata collection
+  AllFeatures,
+
+  /// Enabled for specific target triple (e.g., cfg(unix))
+  TargetSpecific {
+    /// The target configuration (e.g., "cfg(unix)")
+    target: String,
+  },
+}
+
 /// A single instance of a dependency in a workspace member
 #[derive(Debug, Clone)]
 pub struct DependencyInstance {
@@ -19,15 +48,12 @@ pub struct DependencyInstance {
   /// Enabled features (uses resolved features from dependency graph)
   pub features: Vec<String>,
 
+  /// Feature provenance: tracks WHY each feature is enabled
+  /// Maps feature name -> source of that feature
+  pub feature_provenance: HashMap<String, FeatureSource>,
+
   /// Uses default features
   pub default_features: bool,
-
-  /// Optional dependency
-  ///
-  /// Note: Collected for completeness. The `optional` flag is preserved during
-  /// conversion to workspace inheritance (see manifest.rs convert_to_workspace_inheritance).
-  #[allow(dead_code)]
-  pub optional: bool,
 
   /// Dependency kind (normal, dev, build)
   pub kind: DependencyKind,
@@ -40,6 +66,10 @@ pub struct DependencyInstance {
 
   /// Path dependency (if any)
   pub path: Option<Utf8PathBuf>,
+
+  /// Is this a proc-macro crate?
+  /// Proc-macros are build-time only and have different dependency semantics
+  pub is_proc_macro: bool,
 }
 
 /// A dependency suitable for [workspace.dependencies]
@@ -53,6 +83,10 @@ pub struct UnifiedDep {
 
   /// Unified feature set (union of all features)
   pub features: Vec<String>,
+
+  /// Feature provenance for the unified dependency
+  /// Maps each feature to ALL sources that enabled it across the workspace
+  pub feature_provenance: HashMap<String, Vec<FeatureSource>>,
 
   /// Whether to enable default features
   pub default_features: bool,
@@ -69,8 +103,17 @@ pub struct UnifiedDep {
   /// Path dependency (workspace-relative path for workspace member deps)
   pub path: Option<Utf8PathBuf>,
 
+  /// Target specifier for platform-specific dependencies
+  /// If Some, this should be written under `[target.'<target>'.dependencies]`
+  /// Example: `Some("cfg(unix)")` writes to `[target.'cfg(unix)'.dependencies]`
+  pub target: Option<String>,
+
   /// Comments to add to the TOML output (e.g. for auto-resolution)
   pub comments: Vec<String>,
+
+  /// Is this a proc-macro crate?
+  /// Displayed in plan output and useful for optimization decisions
+  pub is_proc_macro: bool,
 }
 
 /// Plan for unifying workspace dependencies

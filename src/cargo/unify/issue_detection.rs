@@ -4,7 +4,7 @@ use super::path_handling::are_all_identical_workspace_paths;
 use super::types::{DependencyInstance, IssueSeverity, IssueType, UnificationIssue};
 use crate::cargo::WorkspaceMetadata;
 use crate::error::RailResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Detect dependencies that exist in multiple resolved versions
 ///
@@ -138,14 +138,34 @@ pub fn detect_issues(
   // Check if all are target-specific
   if instances.iter().all(|i| i.target.is_some()) {
     let targets: Vec<_> = instances.iter().filter_map(|i| i.target.clone()).collect();
+
+    // Check if all instances use the SAME target
+    let unique_targets: HashSet<_> = targets.iter().collect();
+
+    if unique_targets.len() == 1 {
+      // All instances use the same target - we CAN unify this!
+      // This is NOT an issue, it's a unification opportunity
+      // Don't return an issue here - let the normal unification flow handle it
+      // The unified dep can use [target.'cfg(...)'.dependencies]
+      return None;
+    }
+
+    // Multiple different targets - this is more complex
     return Some(UnificationIssue {
       dep_name: dep_name.to_string(),
       issue_type: IssueType::AllTargetSpecific {
         targets: targets.clone(),
       },
-      severity: IssueSeverity::Info, // Just informational, not a blocker
+      severity: IssueSeverity::Info, // Just informational
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
-      suggestion: "Target-specific dependencies cannot be unified at workspace level".to_string(),
+      suggestion: format!(
+        "Multiple platform-specific targets detected: {}. Consider per-platform unification.",
+        unique_targets
+          .iter()
+          .map(|t| format!("'{}'", t))
+          .collect::<Vec<_>>()
+          .join(", ")
+      ),
     });
   }
 
@@ -194,12 +214,13 @@ mod tests {
       name: "test-dep".to_string(),
       version_req: VersionReq::parse(version).unwrap(),
       features: vec![],
+      feature_provenance: std::collections::HashMap::new(),
       default_features: true,
-      optional: false,
       kind: DependencyKind::Normal,
       target: None,
       rename: None,
       path: None,
+      is_proc_macro: false,
     }
   }
 

@@ -50,7 +50,7 @@ mod unifier;
 mod version_merge;
 
 // Re-export public types
-pub use config::{UnifyConfig, UnifyStrategy};
+pub use config::UnifyConfig;
 pub use report::UnifyReport;
 pub use types::{IssueSeverity, MemberEdit, UnificationPlan, UnificationStats, UnifiedDep};
 

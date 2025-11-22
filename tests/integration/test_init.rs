@@ -72,8 +72,8 @@ fn test_init_dry_run() -> Result<()> {
 
   // Verify output shows config
   let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.contains("--- .config/rail.toml ---"));
   assert!(stdout.contains("[workspace]"));
+  assert!(stdout.contains("[unify]"));
 
   Ok(())
 }

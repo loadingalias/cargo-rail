@@ -48,16 +48,53 @@ impl TransitiveFragmentation {
   /// Format a user-friendly explanation
   pub fn format_explanation(&self) -> String {
     let mut msg = String::new();
-    msg.push_str(&format!("  {} (v{})\n", self.name, self.version));
-    msg.push_str("    • Only used transitively (not in any Cargo.toml)\n");
+
+    // Header with package name and version
     msg.push_str(&format!(
-      "    • Resolves with {} distinct feature sets\n",
+      "  {} v{} (transitive-only, not in any Cargo.toml)\n",
+      self.name, self.version
+    ));
+
+    // Show that it's compiled multiple times
+    msg.push_str(&format!(
+      "    Currently compiled {} times with different feature sets:\n\n",
       self.feature_sets.len()
     ));
-    msg.push_str("    • Cargo's model can't enforce a single feature set without explicit deps\n");
-    msg.push_str("    • Options:\n");
-    msg.push_str("      - Leave as-is (accept ~5% fragmentation)\n");
-    msg.push_str("      - Pin with --pin-transitives (adds explicit workspace control)\n");
+
+    // Show each distinct compilation
+    for (idx, feature_set) in self.feature_sets.iter().enumerate() {
+      let mut features: Vec<_> = feature_set.iter().cloned().collect();
+      features.sort();
+
+      msg.push_str(&format!("    Compilation {} features:\n", idx + 1));
+      if features.is_empty() {
+        msg.push_str("      [no features]\n");
+      } else {
+        msg.push_str(&format!("      [{}]\n", features.join(", ")));
+      }
+    }
+
+    // Calculate impact
+    let overhead_percent = ((self.feature_sets.len() - 1) * 100) / self.feature_sets.len().max(1);
+    msg.push_str(&format!(
+      "\n    Impact: ~{}% compilation overhead ({} built {} times)\n",
+      overhead_percent,
+      self.name,
+      self.feature_sets.len()
+    ));
+
+    // Show the fix
+    msg.push_str("\n    Fix: Enable 'consolidate_transitive_features = true'\n");
+    msg.push_str("         This adds to workspace.dependencies with unified features\n");
+
+    // Show trade-off
+    msg.push_str("\n    Trade-off:\n");
+    msg.push_str(&format!(
+      "      ✓ Single compilation of {} (faster builds)\n",
+      self.name
+    ));
+    msg.push_str("      ✗ Slightly more features in some contexts\n");
+
     msg
   }
 }
@@ -148,7 +185,7 @@ pub fn detect_transitive_fragmentation(metadata: &WorkspaceMetadata) -> RailResu
   Ok(fragmentations)
 }
 
-// Note: Pinning configuration is in config::UnifyConfig (pin_transitives, pin_hosts fields)
+// Note: Consolidation configuration is in config::UnifyConfig (consolidate_transitive_features, transitive_feature_host fields)
 
 #[cfg(test)]
 mod tests {
@@ -170,7 +207,7 @@ mod tests {
 
     let explanation = frag.format_explanation();
     assert!(explanation.contains("windows-sys"));
-    assert!(explanation.contains("Only used transitively"));
-    assert!(explanation.contains("2 distinct feature sets"));
+    assert!(explanation.contains("transitive-only, not in any Cargo.toml"));
+    assert!(explanation.contains("compiled 2 times"));
   }
 }

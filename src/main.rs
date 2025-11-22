@@ -82,9 +82,9 @@ enum Commands {
     /// Create .bak backups of all modified files
     #[arg(long)]
     backup: bool,
-    /// Pin transitive-only crates with fragmented features
+    /// Consolidate transitive-only crates with fragmented features
     #[arg(long)]
-    pin_transitives: bool,
+    consolidate_transitives: bool,
   },
 
   // ============================================================================
@@ -110,8 +110,14 @@ enum Commands {
   // Split/Sync Orchestration
   // ============================================================================
   /// Split a crate from monorepo to separate repo with history
+  ///
+  /// Usage:
+  ///   cargo rail split init <crate>     - Initialize split config for crate(s)
+  ///   cargo rail split <crate>          - Execute split for a crate
+  ///   cargo rail split --all            - Execute split for all configured crates
+  ///   cargo rail split --dry-run        - Preview split operations
   Split {
-    /// Name of the crate to split
+    /// Crate name to split, or 'init' to configure splits
     crate_name: Option<String>,
     /// Split all configured crates
     #[arg(short, long)]
@@ -289,12 +295,12 @@ fn main() {
       exclude,
       include,
       backup,
-      pin_transitives,
+      consolidate_transitives,
     } => {
       if dry_run {
-        commands::run_unify_analyze(&ctx, exclude, include, pin_transitives)
+        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
       } else {
-        commands::run_unify_apply(&ctx, exclude, include, backup, pin_transitives)
+        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives)
       }
     }
 
@@ -305,7 +311,29 @@ fn main() {
       remote,
       dry_run,
       json,
-    } => commands::run_split(&ctx, crate_name, all, remote, dry_run, json),
+    } => {
+      // Check if this is 'split init <crates>'
+      if let Some(name) = crate_name {
+        if name == "init" {
+          // cargo rail split init (all crates)
+          commands::run_split_init(&ctx, None, dry_run)
+        } else if name.starts_with("init,") || name.starts_with("init ") {
+          // cargo rail split "init,crate1,crate2" (specific crates)
+          let crates = name
+            .strip_prefix("init,")
+            .or_else(|| name.strip_prefix("init "))
+            .unwrap()
+            .trim();
+          commands::run_split_init(&ctx, Some(crates), dry_run)
+        } else {
+          // cargo rail split mycrate (regular split)
+          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), dry_run, json)
+        }
+      } else {
+        // cargo rail split --all or cargo rail split --dry-run
+        commands::run_split(&ctx, None, all, remote.clone(), dry_run, json)
+      }
+    }
     Commands::Sync {
       crate_name,
       all,

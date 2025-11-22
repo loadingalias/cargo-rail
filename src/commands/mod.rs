@@ -43,7 +43,7 @@ pub mod watch;
 pub use affected::run_affected;
 pub use init::{run_init, run_init_standalone};
 pub use release::{run_release_check, run_release_plan, run_release_publish};
-pub use split::run_split;
+pub use split::{run_split, run_split_init};
 pub use status::run_status;
 pub use sync::run_sync;
 pub use test::run_test;

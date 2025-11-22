@@ -24,5 +24,5 @@ pub mod validate;
 
 pub use manifest::{CargoTransform, TransformContext};
 pub use metadata::WorkspaceMetadata;
-pub use unify::{IssueSeverity, UnifiedDep, UnifyConfig, UnifyReport, UnifyStrategy, WorkspaceUnifier};
+pub use unify::{IssueSeverity, UnifiedDep, UnifyConfig, UnifyReport, WorkspaceUnifier};
 pub use validate::validate_targets;

@@ -3,7 +3,7 @@
 //! Auto-detects workspace structure, toolchain settings, and generates
 //! a sensible .config/rail.toml with smart defaults.
 
-use crate::config::{CratePath, RailConfig, SplitConfig, SplitMode, UnifyConfig, WorkspaceConfig, WorkspaceMode};
+use crate::config::{RailConfig, UnifyConfig, WorkspaceConfig};
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 use std::fs;
@@ -45,29 +45,13 @@ pub fn run_init(
   }
 
   // 2. Detection phase
-  println!("🔍 Detecting workspace configuration...\n");
-
-  let workspace_patterns = detect_workspace_patterns(ctx);
   let mut unify = default_unify_config();
 
-  // Auto-detect targets from all TOML files in workspace
+  // Auto-detect targets from all TOML files in workspace (silent detection)
   let detected_targets = detect_targets(workspace_root);
-  if !detected_targets.is_empty() {
-    println!(
-      "  📍 Detected {} target triple(s) across workspace TOML files",
-      detected_targets.len()
-    );
-    unify.validate_targets = detected_targets;
-  }
+  unify.validation.targets = detected_targets;
 
-  let splits = detect_workspace_splits(ctx);
-
-  // 3. Display summary
-  println!("Workspace Analysis:");
-  println!("  Root: {}", workspace_root.display());
-  println!("{}", workspace_patterns.format_summary());
-
-  // 4. Interactive confirmation (unless non-interactive or dry-run)
+  // 3. Interactive confirmation (unless non-interactive or dry-run)
   if !non_interactive && !dry_run {
     print!("\nGenerate rail.toml with these settings? [Y/n]: ");
     io::stdout().flush()?;
@@ -82,96 +66,25 @@ pub fn run_init(
     }
   }
 
-  // 5. Build config
-  println!("\n✅ Generated configuration with smart defaults\n");
-
-  let config = build_rail_config(workspace_root.to_path_buf(), unify, splits);
+  // 4. Build config
+  let config = build_rail_config(workspace_root.to_path_buf(), unify);
 
   // 6. Serialize with comments
   let toml_content = serialize_config_with_comments(&config)?;
 
-  // 7. Write or print
+  // 5. Write or print
   if dry_run {
-    println!("--- .config/rail.toml ---");
     println!("{}", toml_content);
-    println!("--- End of config ---");
   } else {
-    println!("📝 Writing to {}...", config_path.display());
     ensure_output_dir(&config_path)?;
     write_config_file(&config_path, &toml_content)?;
 
-    println!("\n✅ Configuration initialized successfully!\n");
-    println!("Next steps:");
-    println!("  1. Review {} and adjust settings", output_path);
-
-    println!("  3. Run 'cargo rail unify --dry-run' to preview dependency unification");
+    println!("✅ Created {}", config_path.display());
+    println!("\nNext steps:");
+    println!("  cargo rail unify --dry-run  # Preview dependency unification");
   }
 
   Ok(())
-}
-
-/// Information about detected workspace organization patterns
-#[derive(Debug)]
-pub struct WorkspacePatternInfo {
-  /// Total number of workspace members
-  pub member_count: usize,
-
-  /// Common subdirectory patterns detected
-  pub subdirectories: Vec<String>,
-
-  /// Whether workspace is single-crate (at root)
-  pub is_single_crate: bool,
-
-  /// Human-readable summary for display
-  pub summary: String,
-}
-
-impl WorkspacePatternInfo {
-  /// Format for display to user
-  pub fn format_summary(&self) -> String {
-    format!("  Members: {} crate(s)\n  Pattern: {}", self.member_count, self.summary)
-  }
-}
-
-/// Detect workspace organization patterns
-fn detect_workspace_patterns(ctx: &WorkspaceContext) -> WorkspacePatternInfo {
-  let workspace_root = ctx.workspace_root();
-  let members = ctx.cargo.metadata().list_crates();
-
-  let member_count = members.len();
-  let is_single_crate = member_count == 1;
-
-  // Detect common subdirectory patterns
-  let mut subdirs = std::collections::HashSet::new();
-  for pkg in &members {
-    if let Ok(rel_path) = pkg.manifest_path.strip_prefix(workspace_root)
-      && let Some(first_component) = rel_path.components().next()
-      && let Some(dir_name) = first_component.as_os_str().to_str()
-      && dir_name != "Cargo.toml"
-      && !dir_name.starts_with('.')
-    {
-      subdirs.insert(dir_name.to_string());
-    }
-  }
-
-  let subdirectories: Vec<_> = subdirs.into_iter().collect();
-
-  let summary = if is_single_crate {
-    "Single crate at workspace root".to_string()
-  } else if subdirectories.is_empty() {
-    "Multiple crates at workspace root".to_string()
-  } else if subdirectories.len() == 1 {
-    format!("Organized in {}/ subdirectory", subdirectories[0])
-  } else {
-    format!("Organized in multiple subdirectories ({})", subdirectories.join(", "))
-  };
-
-  WorkspacePatternInfo {
-    member_count,
-    subdirectories,
-    is_single_crate,
-    summary,
-  }
 }
 
 /// Auto-detect reasonable unify defaults
@@ -191,151 +104,113 @@ fn detect_targets(workspace_root: &Path) -> Vec<String> {
   crate::targets::detect_targets(workspace_root).unwrap_or_default()
 }
 
-/// Auto-detect workspace members and create split configs
-fn detect_workspace_splits(ctx: &WorkspaceContext) -> Vec<SplitConfig> {
-  let workspace_root = ctx.workspace_root();
-  let members = ctx.cargo.metadata().list_crates();
-
-  let mut splits = Vec::new();
-
-  for pkg in members {
-    // Get relative path from workspace root to crate directory
-    let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
-    let rel_path = match crate_dir.strip_prefix(workspace_root) {
-      Ok(p) => p.to_path_buf(),
-      Err(_) => continue, // Skip if not under workspace root
-    };
-
-    // Generate a reasonable remote URL placeholder (GitHub org/repo pattern)
-    let remote = format!("git@github.com:org/{}.git", pkg.name);
-
-    // Check if crate has publish = false in Cargo.toml
-    let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
-
-    // Detect per-crate CHANGELOG file
-    let changelog_path = detect_crate_changelog(crate_dir);
-
-    splits.push(SplitConfig {
-      name: pkg.name.to_string(),
-      remote,
-      branch: "main".to_string(),
-      mode: SplitMode::Single,
-      workspace_mode: WorkspaceMode::default(),
-      paths: vec![CratePath { path: rel_path.into() }],
-      include: vec![],
-      exclude: vec![],
-      publish,
-      changelog_path,
-    });
-  }
-
-  splits
-}
-
-/// Detect CHANGELOG file in a crate directory
-///
-/// Looks for common CHANGELOG file patterns:
-/// - CHANGELOG.md
-/// - CHANGELOG.txt
-/// - CHANGELOG
-/// - CHANGES.md
-/// - CHANGES
-fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<PathBuf> {
-  let changelog_patterns = [
-    "CHANGELOG.md",
-    "CHANGELOG.txt",
-    "CHANGELOG",
-    "Changelog.md",
-    "changelog.md",
-    "CHANGES.md",
-    "CHANGES.txt",
-    "CHANGES",
-    "Changes.md",
-    "changes.md",
-  ];
-
-  for pattern in &changelog_patterns {
-    let changelog = crate_dir.join(pattern);
-    if changelog.exists() {
-      // Return relative path from crate root
-      return Some(PathBuf::from(pattern));
-    }
-  }
-
-  None
-}
-
-fn build_rail_config(_workspace_root: PathBuf, unify: UnifyConfig, splits: Vec<SplitConfig>) -> RailConfig {
+fn build_rail_config(_workspace_root: PathBuf, unify: UnifyConfig) -> RailConfig {
   RailConfig {
     workspace: WorkspaceConfig {
       root: PathBuf::from("."),
     },
     unify,
     release: crate::config::ReleaseConfig::default(),
-    splits,
+    splits: vec![], // Empty by default - use 'cargo rail split init' to configure
   }
 }
 
-/// Serialize RailConfig to TOML string with helpful comments
-///
-/// Generates a comprehensive, self-documenting configuration file with:
-/// - All available fields (active and commented)
-/// - Explanatory comments for each section
-/// - Smart grouping for better UX
-/// - Detected values highlighted
+/// Serialize RailConfig to TOML string with minimal, clean comments
 fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
   let mut output = String::new();
 
   // Header
-  output.push_str("# ═══════════════════════════════════════════════════════════════════════════\n");
   output.push_str("# cargo-rail configuration\n");
-  output.push_str("# ═══════════════════════════════════════════════════════════════════════════\n");
-  output.push_str("#\n");
   output.push_str("# Generated by: cargo rail init\n");
-  output.push_str("# Documentation: https://github.com/loadingalias/cargo-rail\n");
-  output.push_str("#\n");
-  output.push_str("# This file controls cargo-rail's behavior for:\n");
-  output.push_str("#  • Dependency unification (workspace-hack elimination)\n");
-  output.push_str("#  • Monorepo↔split-repo synchronization\n");
-  output.push_str("#\n");
-  output.push_str("# ═══════════════════════════════════════════════════════════════════════════\n\n");
+  output.push_str("# Documentation: https://github.com/loadingalias/cargo-rail\n\n");
 
   // Workspace
-  output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
-  output.push_str("# │ Workspace Root                                                          │\n");
-  output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
-  output.push_str("# Relative path to workspace root (usually \".\")\n\n");
   output.push_str("[workspace]\n");
   output.push_str(&format!("root = \"{}\"\n\n", config.workspace.root.display()));
 
   // Dependency Unification
-  output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
-  output.push_str("# │ Dependency Unification (Workspace-Hack Elimination)                     │\n");
-  output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
-  output.push_str("# Automatically unify workspace dependencies using native Cargo features.\n");
-  output.push_str("# Run: cargo rail unify --dry-run  (to preview changes)\n");
-  output.push_str("#      cargo rail unify            (to apply unification)\n");
-  output.push_str("#\n");
-  output.push_str("# Fields:\n");
-  output.push_str("#   use_all_features           - Use --all-features for accurate analysis\n");
-  output.push_str("#   validate_targets           - Per-target validation (catches platform issues)\n");
-  output.push_str("#   max_parallel_jobs          - Parallelism (0 = auto-detect)\n");
-  output.push_str("#   pin_transitives               - Pin transitive deps with fragmented features\n");
-  output.push_str("#   pin_hosts                     - Crates to host transitive pins\n");
-  output.push_str("#   auto_resolve_version_conflicts - Auto-resolve version conflicts (pick highest)\n");
-  output.push_str("#   add_conflict_comments         - Add conflict markers to Cargo.toml\n");
-  output.push_str("#   generate_report               - Generate unify-report.md\n");
-  output.push_str("#   allow_renamed                 - Allow renamed dependencies (package = \"...\")\n\n");
-
   output.push_str("[unify]\n");
+  output.push_str(&format!("use_all_features = {}\n", config.unify.use_all_features));
+  output.push_str(&format!("allow_renamed = {}\n", config.unify.allow_renamed));
+
+  if !config.unify.exclude.is_empty() {
+    output.push_str("exclude = [");
+    for (i, dep) in config.unify.exclude.iter().enumerate() {
+      if i > 0 {
+        output.push_str(", ");
+      }
+      output.push_str(&format!("\"{}\"", dep));
+    }
+    output.push_str("]\n");
+  } else {
+    output.push_str("exclude = []  # Dependencies to skip unification\n");
+  }
+
+  if !config.unify.include.is_empty() {
+    output.push_str("include = [");
+    for (i, dep) in config.unify.include.iter().enumerate() {
+      if i > 0 {
+        output.push_str(", ");
+      }
+      output.push_str(&format!("\"{}\"", dep));
+    }
+    output.push_str("]\n");
+  } else {
+    output.push_str("include = []  # Dependencies to force unification\n");
+  }
+
+  output.push('\n');
+
+  // Conflict handling
+  output.push_str("[unify.conflicts]\n");
   output.push_str(&format!(
-    "use_all_features = {}  # Ensure complete feature union analysis\n",
-    config.unify.use_all_features
+    "auto_resolve = {}  # Pick highest version automatically\n",
+    config.unify.conflicts.auto_resolve
+  ));
+  output.push_str(&format!(
+    "resolution_mode = \"{}\"  # \"permissive\" or \"strict\"\n",
+    config.unify.conflicts.resolution_mode
+  ));
+  output.push_str(&format!(
+    "add_markers = {}  # Add # ⚠️ comments to Cargo.toml\n\n",
+    config.unify.conflicts.add_markers
   ));
 
-  if !config.unify.validate_targets.is_empty() {
-    output.push_str("validate_targets = [");
-    for (i, target) in config.unify.validate_targets.iter().enumerate() {
+  // Transitive optimization
+  output.push_str("[unify.transitives]\n");
+  output.push_str(&format!(
+    "consolidate_features = {}  # Add fragmented transitive deps to workspace\n",
+    config.unify.transitives.consolidate_features
+  ));
+
+  // Serialize host_selection
+  match &config.unify.transitives.host_selection {
+    crate::config::TransitiveFeatureHost::Auto => {
+      output.push_str("host_selection = \"auto\"  # \"auto\", \"root\", \"largest\", or [\"crate-name\"]\n\n");
+    }
+    crate::config::TransitiveFeatureHost::Root => {
+      output.push_str("host_selection = \"root\"\n\n");
+    }
+    crate::config::TransitiveFeatureHost::Largest => {
+      output.push_str("host_selection = \"largest\"\n\n");
+    }
+    crate::config::TransitiveFeatureHost::Explicit(names) => {
+      output.push_str("host_selection = [");
+      for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+          output.push_str(", ");
+        }
+        output.push_str(&format!("\"{}\"", name));
+      }
+      output.push_str("]\n\n");
+    }
+  }
+
+  // Validation
+  output.push_str("[unify.validation]\n");
+  if !config.unify.validation.targets.is_empty() {
+    output.push_str("targets = [");
+    for (i, target) in config.unify.validation.targets.iter().enumerate() {
       if i > 0 {
         output.push_str(", ");
       }
@@ -343,104 +218,37 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
     }
     output.push_str("]\n");
   } else {
-    output.push_str("validate_targets = []  # Optional: [\"x86_64-unknown-linux-gnu\", \"wasm32-unknown-unknown\"]\n");
+    output.push_str("targets = []  # Platform-specific validation (e.g., [\"x86_64-unknown-linux-gnu\"])\n");
   }
-
   output.push_str(&format!(
-    "max_parallel_jobs = {}  # 0 = auto-detect CPU count\n",
-    config.unify.max_parallel_jobs
-  ));
-  output.push_str(&format!(
-    "pin_transitives = {}  # Auto-pin transitive deps with feature fragmentation\n",
-    config.unify.pin_transitives
+    "max_parallel_jobs = {}  # 0 = auto-detect\n\n",
+    config.unify.validation.max_parallel_jobs
   ));
 
-  if !config.unify.pin_hosts.is_empty() {
-    output.push_str("pin_hosts = [");
-    for (i, host) in config.unify.pin_hosts.iter().enumerate() {
-      if i > 0 {
-        output.push_str(", ");
-      }
-      output.push_str(&format!("\"{}\"", host));
-    }
-    output.push_str("]\n");
-  } else {
-    output.push_str("pin_hosts = []  # Optional: [\"workspace-root\"] (auto-selects if empty)\n");
-  }
-
+  // Output
+  output.push_str("[unify.output]\n");
   output.push_str(&format!(
-    "auto_resolve_version_conflicts = {}  # Pick highest version on conflicts\n",
-    config.unify.auto_resolve_version_conflicts
+    "generate_report = {}\n\n",
+    config.unify.output.generate_report
   ));
-  output.push_str(&format!(
-    "add_conflict_comments = {}  # Add # ⚠️ markers to Cargo.toml\n",
-    config.unify.add_conflict_comments
-  ));
-  output.push_str(&format!(
-    "generate_report = {}  # Create unify-report.md\n",
-    config.unify.generate_report
-  ));
-  output.push_str(&format!(
-    "allow_renamed = {}  # Allow renamed dependencies (package = \"actual-name\")\n",
-    config.unify.allow_renamed
-  ));
-
-  output.push('\n');
 
   // Release
-  output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
-  output.push_str("# │ Release & Publishing                                                    │\n");
-  output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
-  output.push_str("# Workspace-wide release defaults for version bumping and publishing.\n");
-  output.push_str("# Per-crate settings are configured in [[splits]] below.\n");
-  output.push_str("#\n");
-  output.push_str("# Commands:\n");
-  output.push_str("#   cargo rail release plan             - Preview release changes (dry-run)\n");
-  output.push_str("#   cargo rail release publish --execute - Execute release\n");
-  output.push_str("#   cargo rail release check            - Validate release readiness (CI)\n");
-  output.push_str("#\n");
-  output.push_str("# Fields:\n");
-  output.push_str("#   tag_prefix           - Prefix for git tags (default: \"v\")\n");
-  output.push_str("#   tag_format           - Tag template: {crate}-v{version} for monorepos\n");
-  output.push_str("#   require_clean        - Require clean working directory\n");
-  output.push_str("#   publish_delay        - Seconds between crate publishes\n");
-  output.push_str("#   create_github_release - Auto-create GitHub releases via gh CLI\n");
-  output.push_str("#   sign_tags            - Sign git tags with GPG/SSH\n");
-  output.push_str("#   changelog_path       - Default changelog filename\n");
-  output.push_str("#   skip_changelog_for   - Crates to skip changelog generation for\n");
-  output.push_str("#   require_changelog_entries - Error if no entries are found\n\n");
-
   output.push_str("[release]\n");
-  output.push_str(&format!(
-    "tag_prefix = \"{}\"  # Prefix for version tags\n",
-    config.release.tag_prefix
-  ));
+  output.push_str(&format!("tag_prefix = \"{}\"\n", config.release.tag_prefix));
   output.push_str(&format!(
     "tag_format = \"{}\"  # Variables: {{crate}}, {{version}}\n",
     config.release.tag_format
   ));
+  output.push_str(&format!("require_clean = {}\n", config.release.require_clean));
+  output.push_str(&format!("publish_delay = {}\n", config.release.publish_delay));
   output.push_str(&format!(
-    "require_clean = {}  # Require clean working directory\n",
-    config.release.require_clean
-  ));
-  output.push_str(&format!(
-    "publish_delay = {}  # Seconds between publishes\n",
-    config.release.publish_delay
-  ));
-  output.push_str(&format!(
-    "create_github_release = {}  # Create GitHub releases\n",
+    "create_github_release = {}\n",
     config.release.create_github_release
   ));
+  output.push_str(&format!("sign_tags = {}\n", config.release.sign_tags));
+  output.push_str(&format!("changelog_path = \"{}\"\n", config.release.changelog_path));
   output.push_str(&format!(
-    "sign_tags = {}  # Sign tags with GPG/SSH\n",
-    config.release.sign_tags
-  ));
-  output.push_str(&format!(
-    "changelog_path = \"{}\"  # Default changelog file\n",
-    config.release.changelog_path
-  ));
-  output.push_str(&format!(
-    "skip_changelog_for = {}  # e.g., [\"internal-tooling\"]\n",
+    "skip_changelog_for = {}\n",
     if config.release.skip_changelog_for.is_empty() {
       "[]".to_string()
     } else {
@@ -457,91 +265,21 @@ fn serialize_config_with_comments(config: &RailConfig) -> RailResult<String> {
     }
   ));
   output.push_str(&format!(
-    "require_changelog_entries = {}  # Fail if no commits for a release\n",
+    "require_changelog_entries = {}\n\n",
     config.release.require_changelog_entries
   ));
 
-  output.push('\n');
-
-  // Split/Sync
-  output.push_str("# ┌─────────────────────────────────────────────────────────────────────────┐\n");
-  output.push_str("# │ Split/Sync Configuration (Monorepo ↔ Separate Repos)                   │\n");
-  output.push_str("# └─────────────────────────────────────────────────────────────────────────┘\n");
-  output.push_str("# Each workspace member is auto-detected and configured for split/sync.\n");
-  output.push_str("# Update 'remote' URLs and 'publish' flags as needed.\n");
+  // Splits - Don't include in default init
+  output.push_str("# Split/Sync: Use 'cargo rail split init <crate>' to configure individual crates\n");
+  output.push_str("# [[splits]]\n");
+  output.push_str("# name = \"my-crate\"\n");
+  output.push_str("# remote = \"git@github.com:org/my-crate.git\"\n");
+  output.push_str("# branch = \"main\"\n");
+  output.push_str("# mode = \"single\"\n");
+  output.push_str("# publish = true\n");
   output.push_str("#\n");
-  output.push_str("# Commands:\n");
-  output.push_str("#   cargo rail split <crate>   - Extract crate to separate repo\n");
-  output.push_str("#   cargo rail sync <crate>    - Bidirectional sync\n");
-  output.push_str("#   cargo rail status          - Show split/sync status\n");
-  output.push_str("#\n");
-  output.push_str("# Fields per [[splits]] entry:\n");
-  output.push_str("#   name           - Crate name\n");
-  output.push_str("#   remote         - Target repository URL (update this!)\n");
-  output.push_str("#   branch         - Branch to sync (default: main)\n");
-  output.push_str("#   mode           - \"single\" or \"combined\" layout\n");
-  output.push_str("#   publish        - Enable publishing to crates.io (default: true)\n");
-  output.push_str("#   changelog_path - Per-crate changelog override (optional)\n");
-  output.push_str("#\n");
-
-  // Serialize detected splits
-  if config.splits.is_empty() {
-    output.push_str("# No workspace members detected. Example:\n");
-    output.push_str("#\n");
-    output.push_str("# [[splits]]\n");
-    output.push_str("# name = \"my-crate\"\n");
-    output.push_str("# remote = \"git@github.com:org/my-crate.git\"\n");
-    output.push_str("# branch = \"main\"\n");
-    output.push_str("# mode = \"single\"\n");
-    output.push_str("# publish = true\n");
-    output.push_str("#\n");
-    output.push_str("# [[splits.paths]]\n");
-    output.push_str("# crate = \"crates/my-crate\"\n");
-  } else {
-    output.push_str(&format!(
-      "# Auto-detected {} workspace member(s):\n\n",
-      config.splits.len()
-    ));
-
-    for split in &config.splits {
-      output.push_str("[[splits]]\n");
-      output.push_str(&format!("name = \"{}\"\n", split.name));
-      output.push_str(&format!(
-        "remote = \"{}\"  # TODO: Update with actual repository URL\n",
-        split.remote
-      ));
-      output.push_str(&format!("branch = \"{}\"\n", split.branch));
-      output.push_str(&format!(
-        "mode = \"{}\"\n",
-        match split.mode {
-          SplitMode::Single => "single",
-          SplitMode::Combined => "combined",
-        }
-      ));
-      output.push_str(&format!(
-        "publish = {}  # {}\n",
-        split.publish,
-        if split.publish {
-          "Enable crates.io publishing"
-        } else {
-          "Skip publishing (publish = false in Cargo.toml)"
-        }
-      ));
-
-      if let Some(ref changelog) = split.changelog_path {
-        output.push_str(&format!("changelog_path = \"{}\"\n", changelog.display()));
-      }
-
-      output.push('\n');
-
-      for path in &split.paths {
-        output.push_str("[[splits.paths]]\n");
-        output.push_str(&format!("crate = \"{}\"\n", path.path.display()));
-      }
-
-      output.push('\n');
-    }
-  }
+  output.push_str("# [[splits.paths]]\n");
+  output.push_str("# crate = \"crates/my-crate\"\n");
 
   Ok(output)
 }
@@ -610,17 +348,8 @@ pub fn run_init_standalone(
     }
   }
 
-  // 2. Detection phase
-  println!("🔍 Detecting workspace configuration...\n");
-
-  // Auto-detect targets from all TOML files in workspace
+  // 2. Detection phase - silent target detection
   let detected_targets = detect_targets(workspace_root);
-  if !detected_targets.is_empty() {
-    println!(
-      "  📍 Detected {} target triple(s) across workspace TOML files",
-      detected_targets.len()
-    );
-  }
 
   // 3. Build config
   let config = RailConfig {
@@ -629,50 +358,27 @@ pub fn run_init_standalone(
     },
     unify: UnifyConfig {
       use_all_features: true,
-      validate_targets: detected_targets,
-      max_parallel_jobs: 0,
-      pin_transitives: false,
-      pin_hosts: vec![],
-      auto_resolve_version_conflicts: true,
-      conflict_resolution: "permissive".to_string(),
-      add_conflict_comments: true,
-      generate_report: true,
       allow_renamed: false,
       exclude: vec![],
       include: vec![],
+      conflicts: crate::config::UnifyConflictsConfig::default(),
+      transitives: crate::config::UnifyTransitivesConfig::default(),
+      validation: crate::config::UnifyValidationConfig {
+        targets: detected_targets,
+        max_parallel_jobs: 0,
+      },
+      output: crate::config::UnifyOutputConfig::default(),
     },
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],
   };
 
-  // 4. Try to load workspace context to detect splits
-  //    If this fails (e.g., invalid workspace), we'll just use an empty splits list
-  let splits = match WorkspaceContext::build(workspace_root) {
-    Ok(ctx) => {
-      let detected_splits = detect_workspace_splits(&ctx);
-      if !detected_splits.is_empty() {
-        println!("  Detected {} workspace member(s)", detected_splits.len());
-      }
-      detected_splits
-    }
-    Err(_) => {
-      // Failed to load workspace - maybe not a cargo workspace yet
-      // This is OK for init - just use empty splits
-      vec![]
-    }
-  };
-
-  // Update config with detected splits
-  let config = RailConfig { splits, ..config };
-
   // 5. Serialize with comments
   let config_toml = serialize_config_with_comments(&config)?;
 
-  // 6. Output
+  // 4. Output
   if dry_run {
-    println!("--- {} ---", output_path);
     println!("{}", config_toml);
-    println!("\n✅ Dry-run complete (no files written)");
   } else {
     // Create parent directory if needed
     if let Some(parent) = config_path.parent() {
@@ -687,9 +393,7 @@ pub fn run_init_standalone(
     write_config_file(&config_path, &config_toml)?;
     println!("✅ Created {}", config_path.display());
     println!("\nNext steps:");
-    println!("  1. Review and customize {}", output_path);
-    println!("  2. Run `cargo rail unify` to normalize dependencies");
-    println!("  3. Run `cargo rail test` for change-based testing");
+    println!("  cargo rail unify --dry-run  # Preview dependency unification");
   }
 
   Ok(())
