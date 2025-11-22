@@ -10,7 +10,10 @@ use std::collections::{HashMap, HashSet};
 /// Uses RESOLVED features from the dependency graph, not declared features.
 /// This ensures we capture features enabled transitively and provides the
 /// TRUE feature union across the workspace.
-pub fn collect_dependencies(metadata: &WorkspaceMetadata) -> Vec<DependencyInstance> {
+///
+/// The `use_all_features` parameter indicates whether metadata was collected with --all-features,
+/// which affects how we classify unidentified feature sources.
+pub fn collect_dependencies(metadata: &WorkspaceMetadata, use_all_features: bool) -> Vec<DependencyInstance> {
   let mut instances = Vec::new();
 
   for pkg in metadata.list_crates() {
@@ -40,7 +43,7 @@ pub fn collect_dependencies(metadata: &WorkspaceMetadata) -> Vec<DependencyInsta
       };
 
       // Track feature provenance: WHY is each feature enabled?
-      let feature_provenance = determine_feature_provenance(&features, dep, &pkg.name, metadata);
+      let feature_provenance = determine_feature_provenance(&features, dep, &pkg.name, metadata, use_all_features);
 
       // Detect if this is a proc-macro crate
       // Proc-macros are build-time only and have different optimization strategies
@@ -127,20 +130,29 @@ fn get_member_workspace_deps(manifest_path: &cargo_metadata::camino::Utf8Path) -
 /// 1. Direct declaration in member's Cargo.toml
 /// 2. Default features
 /// 3. Target-specific
-/// 4. Transitive or --all-features
+/// 4. Transitive or --all-features (depending on use_all_features parameter)
 fn determine_feature_provenance(
   resolved_features: &[String],
   dep: &cargo_metadata::Dependency,
   member_name: &str,
   metadata: &WorkspaceMetadata,
+  use_all_features: bool,
 ) -> HashMap<String, FeatureSource> {
   let mut provenance = HashMap::new();
 
   // Get the actual package metadata for this dependency
   let dep_pkg = metadata.get_package(&dep.name);
 
+  // Build a set of "root" features that could transitively enable other features:
+  // 1. Features explicitly declared in Cargo.toml
+  // 2. Default features (if enabled)
+  let mut root_features = dep.features.to_vec();
+  if dep.uses_default_features {
+    root_features.push("default".to_string());
+  }
+
   for feature in resolved_features {
-    let source = determine_single_feature_source(feature, dep, member_name, dep_pkg);
+    let source = determine_single_feature_source(feature, dep, member_name, dep_pkg, &root_features, use_all_features);
     provenance.insert(feature.clone(), source);
   }
 
@@ -148,11 +160,15 @@ fn determine_feature_provenance(
 }
 
 /// Determine the source of a single feature
+///
+/// `root_features` are the features that were explicitly enabled (from Cargo.toml + default if enabled)
 fn determine_single_feature_source(
   feature: &str,
   dep: &cargo_metadata::Dependency,
   member_name: &str,
   dep_pkg: Option<&cargo_metadata::Package>,
+  root_features: &[String],
+  use_all_features: bool,
 ) -> FeatureSource {
   // 1. Check if declared directly in this member's Cargo.toml
   if dep.features.contains(&feature.to_string()) {
@@ -166,7 +182,7 @@ fn determine_single_feature_source(
     && let Some(pkg) = dep_pkg
     && let Some(default_features) = pkg.features.get("default")
   {
-    // Default features can reference other features
+    // Default features can reference other features directly
     if default_features.iter().any(|f| f.trim_start_matches("dep:") == feature) {
       return FeatureSource::Default;
     }
@@ -179,8 +195,52 @@ fn determine_single_feature_source(
     };
   }
 
-  // 4. Otherwise it's either transitive or from --all-features
-  // For now, we classify it as AllFeatures since we're using --all-features metadata
-  // In a future enhancement, we could trace the actual dependency chain
-  FeatureSource::AllFeatures
+  // 4. Check if it's enabled transitively through a feature dependency chain
+  // We need to trace from root_features (explicitly enabled) to this feature
+  if let Some(pkg) = dep_pkg {
+    // Try to find a path from any root feature to this feature
+    for root_feature in root_features {
+      if let Some(chain) = find_feature_chain(root_feature, feature, pkg) {
+        return FeatureSource::Transitive { through: chain };
+      }
+    }
+  }
+
+  // 5. If metadata was collected with --all-features, classify as such
+  // Otherwise, it's transitive but we couldn't trace the exact chain
+  if use_all_features {
+    FeatureSource::AllFeatures
+  } else {
+    // Transitive dependency - exact chain couldn't be determined
+    FeatureSource::Transitive { through: vec![] }
+  }
+}
+
+/// Find a chain of features from `start` to `target`
+///
+/// Returns the feature chain if found (e.g., ["perf", "perf-inline"])
+fn find_feature_chain(start: &str, target: &str, pkg: &cargo_metadata::Package) -> Option<Vec<String>> {
+  // Check if start directly enables target
+  if let Some(feature_deps) = pkg.features.get(start) {
+    for dep_feature in feature_deps {
+      let clean_name = dep_feature.trim_start_matches("dep:");
+      if clean_name == target {
+        return Some(vec![start.to_string()]);
+      }
+    }
+
+    // Check if start enables something that enables target (one level deep)
+    for dep_feature in feature_deps {
+      let intermediate = dep_feature.trim_start_matches("dep:");
+      if let Some(intermediate_deps) = pkg.features.get(intermediate) {
+        for sub_dep in intermediate_deps {
+          if sub_dep.trim_start_matches("dep:") == target {
+            return Some(vec![start.to_string(), intermediate.to_string()]);
+          }
+        }
+      }
+    }
+  }
+
+  None
 }

@@ -6,6 +6,9 @@ use std::collections::HashSet;
 /// Configuration for workspace unification
 #[derive(Debug, Clone)]
 pub struct UnifyConfig {
+  /// Whether metadata was collected with --all-features (default: true)
+  pub use_all_features: bool,
+
   /// Allow renamed dependencies to be unified (default: false)
   pub allow_renamed: bool,
 
@@ -28,6 +31,7 @@ pub struct UnifyConfig {
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
+      use_all_features: true,
       allow_renamed: false,
       exclude: HashSet::new(),
       include: HashSet::new(),
@@ -41,6 +45,7 @@ impl Default for UnifyConfig {
 impl From<&RailConfig> for UnifyConfig {
   fn from(rail_config: &RailConfig) -> Self {
     Self {
+      use_all_features: rail_config.unify.use_all_features,
       allow_renamed: rail_config.unify.allow_renamed,
       exclude: rail_config.unify.exclude.iter().cloned().collect(),
       include: rail_config.unify.include.iter().cloned().collect(),

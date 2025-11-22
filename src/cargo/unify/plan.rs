@@ -129,10 +129,15 @@ impl UnificationPlan {
               let transitive_chains: Vec<_> = sources
                 .iter()
                 .filter_map(|s| match s {
-                  FeatureSource::Transitive { through } => Some(through.join(" → ")),
+                  FeatureSource::Transitive { through } if !through.is_empty() => Some(through.join(" → ")),
                   _ => None,
                 })
                 .collect();
+
+              let has_transitive_unknown = sources.iter().any(|s| match s {
+                FeatureSource::Transitive { through } => through.is_empty(),
+                _ => false,
+              });
 
               // Format the provenance
               if !direct_members.is_empty() {
@@ -148,6 +153,11 @@ impl UnificationPlan {
                   "       ⚠ \"{}\" - Transitive (via {})\n",
                   feature,
                   transitive_chains.first().unwrap()
+                ));
+              } else if has_transitive_unknown {
+                output.push_str(&format!(
+                  "       ⚠ \"{}\" - Enabled transitively (chain unknown)\n",
+                  feature
                 ));
               } else if has_all_features {
                 output.push_str(&format!("       ⚠ \"{}\" - From --all-features flag\n", feature));

@@ -79,7 +79,7 @@ impl<'a> WorkspaceUnifier<'a> {
   /// Analyze workspace and generate unification plan
   pub fn analyze(&self) -> RailResult<UnificationPlan> {
     // 1. Collect all dependency instances from workspace members
-    let dep_instances = collector::collect_dependencies(self.metadata);
+    let dep_instances = collector::collect_dependencies(self.metadata, self.config.use_all_features);
 
     // 2. Group by dependency name
     let grouped = collector::group_by_name(dep_instances, self.metadata);

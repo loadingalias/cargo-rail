@@ -292,29 +292,38 @@ impl CargoTransform {
     for unified in unified_deps {
       // Determine which table to write to based on target
       let deps_table = if let Some(ref target) = unified.target {
-        // Platform-specific dependency: write to [target.'<target>'.dependencies]
-        let target_key = format!("target.'{}'", target);
-
-        // Ensure target section exists in workspace
+        // Platform-specific dependency: write to [workspace.target.'<target>'.dependencies]
+        // IMPORTANT: We need to create workspace.target (as a table), then target.'cfg(...)' as a subtable
         let workspace = doc["workspace"]
           .as_table_mut()
           .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
 
-        if !workspace.contains_key(&target_key) {
-          workspace[&target_key] = table();
+        // Ensure [workspace.target] table exists
+        if !workspace.contains_key("target") {
+          workspace["target"] = table();
         }
 
-        let target_section = workspace[&target_key]
+        let target_table = workspace["target"]
           .as_table_mut()
-          .ok_or_else(|| RailError::message(format!("[workspace.{}] is not a table", target_key)))?;
+          .ok_or_else(|| RailError::message("[workspace.target] is not a table"))?;
 
-        if !target_section.contains_key("dependencies") {
-          target_section["dependencies"] = table();
+        // Create the cfg-specific section within target: [workspace.target.'cfg(...)']
+        if !target_table.contains_key(target) {
+          target_table[target] = table();
         }
 
-        target_section["dependencies"]
+        let cfg_section = target_table[target]
           .as_table_mut()
-          .ok_or_else(|| RailError::message(format!("[workspace.{}.dependencies] is not a table", target_key)))?
+          .ok_or_else(|| RailError::message(format!("[workspace.target.'{}'] is not a table", target)))?;
+
+        // Create dependencies section: [workspace.target.'cfg(...)'.dependencies]
+        if !cfg_section.contains_key("dependencies") {
+          cfg_section["dependencies"] = table();
+        }
+
+        cfg_section["dependencies"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message(format!("[workspace.target.'{}'.dependencies] is not a table", target)))?
       } else {
         // Regular dependency: write to [workspace.dependencies]
         let workspace = doc["workspace"]

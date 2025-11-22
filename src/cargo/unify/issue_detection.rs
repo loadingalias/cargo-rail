@@ -136,21 +136,14 @@ pub fn detect_issues(
   }
 
   // Check if all are target-specific
+  // IMPORTANT: Cargo does NOT support target-specific dependencies in [workspace.dependencies]
+  // or [workspace.target.'cfg(...)'] sections. Platform-specific deps must stay in member crates.
+  // See: https://doc.rust-lang.org/cargo/reference/workspaces.html
   if instances.iter().all(|i| i.target.is_some()) {
     let targets: Vec<_> = instances.iter().filter_map(|i| i.target.clone()).collect();
-
-    // Check if all instances use the SAME target
     let unique_targets: HashSet<_> = targets.iter().collect();
 
-    if unique_targets.len() == 1 {
-      // All instances use the same target - we CAN unify this!
-      // This is NOT an issue, it's a unification opportunity
-      // Don't return an issue here - let the normal unification flow handle it
-      // The unified dep can use [target.'cfg(...)'.dependencies]
-      return None;
-    }
-
-    // Multiple different targets - this is more complex
+    // Return Info-level issue to inform user that platform-specific deps can't be unified
     return Some(UnificationIssue {
       dep_name: dep_name.to_string(),
       issue_type: IssueType::AllTargetSpecific {
@@ -158,14 +151,21 @@ pub fn detect_issues(
       },
       severity: IssueSeverity::Info, // Just informational
       affected_members: instances.iter().map(|i| i.member.clone()).collect(),
-      suggestion: format!(
-        "Multiple platform-specific targets detected: {}. Consider per-platform unification.",
-        unique_targets
-          .iter()
-          .map(|t| format!("'{}'", t))
-          .collect::<Vec<_>>()
-          .join(", ")
-      ),
+      suggestion: if unique_targets.len() == 1 {
+        format!(
+          "All uses are platform-specific for target {}. Cargo does not support target-specific dependencies in workspace.dependencies - these will remain in member crates.",
+          unique_targets.iter().next().unwrap()
+        )
+      } else {
+        format!(
+          "Multiple platform-specific targets detected: {}. Cargo does not support target-specific dependencies in workspace.dependencies - these will remain in member crates.",
+          unique_targets
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+        )
+      },
     });
   }
 
