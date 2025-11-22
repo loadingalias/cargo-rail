@@ -258,6 +258,26 @@ impl<'a> SyncEngine<'a> {
       remote_git.get_commits_touching_path(Path::new("."), None, &branch_ref)?
     };
 
+    // Always create a PR branch for safety when syncing from remote
+    // This prevents direct commits to protected branches (main, master, develop)
+    let pr_branch = if !new_commits.is_empty() {
+      // Create timestamped branch name
+      let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
+
+      // Format: cargo-rail-sync-CRATE-TIMESTAMP
+      let branch_name = format!("cargo-rail-sync-{}-{}", self.config.crate_name, timestamp);
+
+      println!("   Creating PR branch: {}", branch_name);
+      self.ctx.git.git().create_and_checkout_branch(&branch_name)?;
+
+      Some(branch_name)
+    } else {
+      None
+    };
+
     let mut conflicts = Vec::new();
 
     let synced_count = if new_commits.is_empty() {
@@ -308,7 +328,36 @@ impl<'a> SyncEngine<'a> {
     // Save mappings
     self.mapping_store.save(self.ctx.workspace_root())?;
 
-    // If we created a PR branch, push it to remote and remind user to create PR
+    // Print PR creation instructions if we created a branch with synced commits
+    if let Some(branch_name) = pr_branch
+      && synced_count > 0
+    {
+      println!(
+        "\n✅ Synced {} commit{} to branch: {}",
+        synced_count,
+        if synced_count == 1 { "" } else { "s" },
+        branch_name
+      );
+      println!("\n📋 To create a pull request:");
+      println!("   git push origin {}", branch_name);
+
+      // Try to detect GitHub URL and suggest gh CLI command
+      if let Ok(output) = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(self.ctx.workspace_root())
+        .output()
+        && let Ok(url) = String::from_utf8(output.stdout)
+      {
+        let url = url.trim();
+        if url.contains("github.com") {
+          println!(
+            "   gh pr create --title \"Sync {} from remote\"",
+            self.config.crate_name
+          );
+        }
+      }
+      println!();
+    }
 
     Ok(SyncResult {
       commits_synced: synced_count,

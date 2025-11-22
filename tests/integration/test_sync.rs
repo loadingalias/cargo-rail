@@ -72,7 +72,7 @@ fn test_sync_from_remote_basic() -> Result<()> {
   // Sync from remote
   run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
 
-  // Verify change in monorepo
+  // Verify change in monorepo (on PR branch, not original branch)
   let mono_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
   assert!(
     mono_content.contains("// Changed in split"),
@@ -83,6 +83,60 @@ fn test_sync_from_remote_basic() -> Result<()> {
   let log_output = git(&ws.path, &["log", "-1", "--format=%B"])?;
   let log = String::from_utf8_lossy(&log_output.stdout);
   assert!(log.contains("Rail-Origin: remote@"), "Should have Rail-Origin trailer");
+
+  Ok(())
+}
+
+#[test]
+fn test_sync_from_remote_creates_pr_branch() -> Result<()> {
+  let (ws, split_dir) = setup_split_scenario("mylib")?;
+
+  // Get original branch name
+  let original_branch_output = git(&ws.path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+  let original_branch = String::from_utf8_lossy(&original_branch_output.stdout)
+    .trim()
+    .to_string();
+
+  // Make change in split repo
+  std::fs::write(split_dir.path().join("src/lib.rs"), "// Changed in split")?;
+  git(split_dir.path(), &["add", "."])?;
+  git(split_dir.path(), &["commit", "-m", "Test change in split"])?;
+
+  // Sync from remote - should create PR branch
+  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
+
+  // Verify we're on a PR branch (not the original branch)
+  let current_branch_output = git(&ws.path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+  let current_branch = String::from_utf8_lossy(&current_branch_output.stdout)
+    .trim()
+    .to_string();
+
+  assert!(
+    current_branch.starts_with("cargo-rail-sync-mylib-"),
+    "Should be on a PR branch starting with cargo-rail-sync-mylib-, but got: {}",
+    current_branch
+  );
+  assert_ne!(current_branch, original_branch, "Should not be on the original branch");
+
+  // Verify the change is on the PR branch
+  let mono_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
+  assert!(
+    mono_content.contains("// Changed in split"),
+    "Change should be on PR branch"
+  );
+
+  // Verify commit has Rail-Origin trailer
+  let log_output = git(&ws.path, &["log", "-1", "--format=%B"])?;
+  let log = String::from_utf8_lossy(&log_output.stdout);
+  assert!(log.contains("Rail-Origin: remote@"), "Should have Rail-Origin trailer");
+
+  // Switch back to original branch and verify it's unchanged
+  git(&ws.path, &["checkout", &original_branch])?;
+  let original_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
+  assert!(
+    !original_content.contains("// Changed in split"),
+    "Original branch should not have the change"
+  );
 
   Ok(())
 }
@@ -104,10 +158,10 @@ fn test_sync_roundtrip_preserves_content() -> Result<()> {
   let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
   assert_eq!(split_content, original, "Split should have original content");
 
-  // Sync back from split (should be no-op)
+  // Sync back from split (should be no-op, but creates PR branch)
   run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
 
-  // Verify still matches
+  // Verify still matches (on PR branch)
   let final_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
   assert_eq!(final_content, original, "Content should be preserved after roundtrip");
 
