@@ -1,5 +1,5 @@
 use crate::cargo::{CargoTransform, TransformContext};
-use crate::config::SplitMode;
+use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use crate::git::mappings::MappingStore;
 use crate::git::{CommitInfo, SystemGit};
@@ -16,6 +16,8 @@ pub struct SplitConfig {
   pub crate_paths: Vec<PathBuf>,
   /// Split mode (single or combined)
   pub mode: SplitMode,
+  /// Workspace mode (standalone or workspace)
+  pub workspace_mode: WorkspaceMode,
   /// Target repository path
   pub target_repo_path: PathBuf,
   /// Branch name for split repo
@@ -363,6 +365,12 @@ impl<'a> SplitEngine<'a> {
         last_recreated_sha = Some(new_sha);
       }
 
+      // Create workspace Cargo.toml if in workspace mode
+      if config.mode == SplitMode::Combined && config.workspace_mode == WorkspaceMode::Workspace {
+        println!("   Creating workspace Cargo.toml...");
+        self.create_workspace_cargo_toml(&config.crate_paths, &config.target_repo_path)?;
+      }
+
       // Copy workspace config files and project files to the final state
       let has_files = !aux_files.is_empty() || project_files.count() > 0;
       if has_files {
@@ -604,6 +612,55 @@ impl<'a> SplitEngine<'a> {
       println!("   Copying auxiliary files");
       aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
     }
+
+    Ok(())
+  }
+
+  /// Create a workspace Cargo.toml for combined mode with workspace_mode = Workspace
+  fn create_workspace_cargo_toml(&self, crate_paths: &[PathBuf], target_repo_path: &Path) -> RailResult<()> {
+    // Extract workspace members from crate paths
+    let members: Vec<String> = crate_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+
+    // Read workspace Cargo.toml from source monorepo
+    let source_workspace_toml = self.ctx.workspace_root().join("Cargo.toml");
+    let source_content = std::fs::read_to_string(&source_workspace_toml).with_context(|| {
+      format!(
+        "Failed to read workspace Cargo.toml from {}",
+        source_workspace_toml.display()
+      )
+    })?;
+
+    // Parse the source Cargo.toml
+    let mut doc: toml_edit::DocumentMut = source_content
+      .parse()
+      .map_err(|e| RailError::message(format!("Failed to parse workspace Cargo.toml: {}", e)))?;
+
+    // Update workspace members
+    if let Some(workspace) = doc.get_mut("workspace")
+      && let Some(table) = workspace.as_table_mut()
+    {
+      // Set members to only the split crates
+      let mut members_array = toml_edit::Array::new();
+      for member in &members {
+        members_array.push(member.as_str());
+      }
+      table.insert("members", toml_edit::value(members_array));
+
+      // Remove exclude if present (not needed for split repo)
+      table.remove("exclude");
+    }
+
+    // Remove package section if present (virtual workspace)
+    doc.remove("package");
+    doc.remove("dependencies");
+    doc.remove("dev-dependencies");
+    doc.remove("build-dependencies");
+
+    // Write to target repo
+    let target_toml = target_repo_path.join("Cargo.toml");
+    std::fs::write(&target_toml, doc.to_string())?;
+
+    println!("   Created workspace Cargo.toml with {} members", members.len());
 
     Ok(())
   }

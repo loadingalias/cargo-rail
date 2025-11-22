@@ -467,7 +467,7 @@ pub struct CratePath {
 }
 
 /// Split mode: single crate or combined multi-crate
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitMode {
   /// Single crate per repository
@@ -478,7 +478,7 @@ pub enum SplitMode {
 }
 
 /// How to structure a combined split repository
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceMode {
   /// Multiple standalone crates in one repo (no workspace structure)
