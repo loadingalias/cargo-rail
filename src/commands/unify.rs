@@ -7,12 +7,12 @@
 //!
 //! Replaces cargo-hakari with native Cargo workspace dependency unification.
 
+use crate::backup::{BackupManager, BackupMetadata};
 use crate::cargo::{
   CargoTransform, IssueSeverity, UnifyConfig, UnifyReport, WorkspaceMetadata, WorkspaceUnifier, validate_targets,
 };
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
-use std::path::Path;
 
 /// Get workspace metadata for unify operations
 ///
@@ -198,16 +198,16 @@ pub fn run_unify_analyze(
     println!("'cargo rail unify' will proceed with warnings for these issues.\n");
   }
 
-  // Show transitive fragmentation info if consolidate_transitive_features is enabled
-  if !plan.transitive_fragmentations.is_empty()
-    && (pin_transitives_flag
+  // Show transitive fragmentation impact comparison
+  if !plan.transitive_fragmentations.is_empty() {
+    let consolidate_enabled = pin_transitives_flag
       || ctx
         .config
         .as_ref()
         .map(|c| c.unify.transitives.consolidate_features)
-        .unwrap_or(false))
-  {
-    println!("📌 Transitive feature consolidation is ENABLED - these crates will be added when you run 'apply'.\n");
+        .unwrap_or(false);
+
+    display_transitive_impact(&plan, consolidate_enabled);
   }
 
   println!(
@@ -349,17 +349,106 @@ pub fn run_unify_apply(
   // Run optional validation if configured (before applying changes)
   maybe_run_validation(ctx)?;
 
+  // ============================================================================
+  // BACKUP: Determine if we should create a backup before modifications
+  // ============================================================================
+
+  let backup_manager = BackupManager::new(ctx.workspace_root());
+
+  // First run detection: no previous backups exist
+  let is_first_run = !backup_manager.has_backups();
+
+  let should_backup = {
+    // Check if backup is enabled via config
+    let backup_enabled_in_config = ctx.config.as_ref().map(|c| c.unify.backup.enabled).unwrap_or(true); // Default to true if no config
+
+    // Backup if: first run OR --backup flag OR config enabled
+    is_first_run || backup || backup_enabled_in_config
+  };
+
+  if should_backup {
+    // Collect all files that will be modified
+    let mut files_to_backup = Vec::new();
+
+    // 1. Workspace root Cargo.toml
+    let workspace_toml = ctx.workspace_root().join("Cargo.toml");
+    files_to_backup.push(workspace_toml.strip_prefix(ctx.workspace_root()).unwrap().to_path_buf());
+
+    // 2. All member Cargo.toml files that will be modified
+    for (member_name, edits) in &plan.member_edits {
+      if !edits.is_empty()
+        && let Some(member_pkg) = ctx.cargo.get_package(member_name)
+      {
+        let member_toml = member_pkg.manifest_path.as_std_path();
+        if let Ok(relative) = member_toml.strip_prefix(ctx.workspace_root()) {
+          files_to_backup.push(relative.to_path_buf());
+        }
+      }
+    }
+
+    // 3. Transitive feature host crates (if applicable)
+    if !transitive_deps_to_add.is_empty() && !transitive_feature_hosts.is_empty() {
+      for host_name in &transitive_feature_hosts {
+        if let Some(host_pkg) = ctx.cargo.get_package(host_name) {
+          let host_toml = host_pkg.manifest_path.as_std_path();
+          if let Ok(relative) = host_toml.strip_prefix(ctx.workspace_root())
+            && !files_to_backup.contains(&relative.to_path_buf())
+          {
+            files_to_backup.push(relative.to_path_buf());
+          }
+        }
+      }
+    }
+
+    // Create backup with metadata
+    let mut backup_metadata = BackupMetadata::new("cargo rail unify apply");
+
+    // Add config snapshot if available
+    if let Some(ref rail_config) = ctx.config {
+      backup_metadata = backup_metadata.with_config(rail_config.as_ref().clone());
+    }
+
+    // Add description
+    let description = if is_first_run {
+      format!(
+        "Initial unify backup: {} dependencies unified across {} members",
+        plan.stats.unified_count,
+        plan.member_edits.len()
+      )
+    } else {
+      format!(
+        "Unify backup: {} dependencies unified across {} members",
+        plan.stats.unified_count,
+        plan.member_edits.len()
+      )
+    };
+    backup_metadata = backup_metadata.with_description(description);
+
+    println!("💾 Creating backup of {} file(s)...", files_to_backup.len());
+    let backup_id = backup_manager.create_backup(&files_to_backup, backup_metadata)?;
+    println!("  ✓ Backup created: {}", backup_id);
+    println!("  💡 To restore: cargo rail unify undo\n");
+
+    // Clean up old backups if configured
+    if let Some(ref rail_config) = ctx.config {
+      let keep_count = rail_config.unify.backup.keep_count;
+      if let Ok(deleted) = backup_manager.cleanup_old_backups(keep_count)
+        && deleted > 0
+      {
+        println!(
+          "  🧹 Cleaned up {} old backup(s) (keeping {} most recent)\n",
+          deleted, keep_count
+        );
+      }
+    }
+  }
+
   // Create transformer (use the same metadata we used for analysis)
   let transformer = CargoTransform::new(metadata.clone());
 
   // 1. Write [workspace.dependencies]
   let workspace_toml = ctx.workspace_root().join("Cargo.toml");
   println!("📝 Writing [workspace.dependencies] to {}", workspace_toml.display());
-
-  // Backup if requested
-  if backup {
-    backup_file(&workspace_toml)?;
-  }
 
   // Combine regular deps and transitive deps
   let mut all_workspace_deps = plan.workspace_deps.clone();
@@ -390,10 +479,6 @@ pub fn run_unify_apply(
       .ok_or_else(|| RailError::message(format!("Package {} not found", member_name)))?;
 
     let member_toml = member_pkg.manifest_path.as_std_path();
-
-    if backup {
-      backup_file(member_toml)?;
-    }
 
     let mut successful_edits = 0;
     let mut skipped_edits = Vec::new();
@@ -478,10 +563,6 @@ pub fn run_unify_apply(
 
       let host_toml = host_pkg.manifest_path.as_std_path();
 
-      if backup {
-        backup_file(host_toml)?;
-      }
-
       // Read and parse the host's Cargo.toml
       let content = std::fs::read_to_string(host_toml)?;
       let mut doc: toml_edit::DocumentMut = content
@@ -527,9 +608,8 @@ pub fn run_unify_apply(
     plan.stats.compilations_saved
   );
 
-  if backup {
-    println!("\n💾 Backups created with .bak extension");
-  }
+  // Note: Backup handling is done earlier in the function
+  // No need to print additional messages here
 
   // Generate report if configured
   if config.generate_report {
@@ -546,10 +626,152 @@ pub fn run_unify_apply(
   Ok(())
 }
 
-/// Create a backup of a file
-fn backup_file(path: &Path) -> RailResult<()> {
-  let backup_path = path.with_extension("toml.bak");
-  std::fs::copy(path, &backup_path)
-    .map_err(|e| RailError::message(format!("Failed to backup {}: {}", path.display(), e)))?;
+/// Display transitive feature consolidation impact comparison
+///
+/// Shows the difference between ignoring transitive fragmentations (Option A)
+/// and consolidating them (Option B), with a reference to the decision guide.
+fn display_transitive_impact(plan: &crate::cargo::unify::UnificationPlan, consolidate_enabled: bool) {
+  println!("\n📊 Transitive Feature Consolidation Impact:\n");
+
+  let total_fragmentations = plan.transitive_fragmentations.len();
+
+  // Calculate total duplicate compilations
+  let total_duplicates: usize = plan
+    .transitive_fragmentations
+    .iter()
+    .map(|f| f.feature_sets.len().saturating_sub(1))
+    .sum();
+
+  // Calculate how many extra features would be enabled
+  let extra_features: usize = plan
+    .transitive_fragmentations
+    .iter()
+    .map(|f| {
+      // Union of all features - features in largest set = extras
+      let all_features: std::collections::HashSet<_> = f.feature_sets.iter().flat_map(|set| set.iter()).collect();
+
+      let largest_set_size = f.feature_sets.iter().map(|s| s.len()).max().unwrap_or(0);
+
+      all_features.len().saturating_sub(largest_set_size)
+    })
+    .sum();
+
+  println!(
+    "  Detected: {} transitive-only crate(s) with fragmented features",
+    total_fragmentations
+  );
+  println!("  Duplicate compilations: {}\n", total_duplicates);
+
+  println!("  Option A (Ignore):");
+  println!("    • No changes to Cargo.toml files");
+  println!("    • {} duplicate compilations remain", total_duplicates);
+  println!("    • Cargo manages transitives automatically");
+  println!("    • Simpler configuration\n");
+
+  println!("  Option B (Consolidate):");
+  println!(
+    "    • Add {} transitive deps to [workspace.dependencies]",
+    total_fragmentations
+  );
+  println!("    • Compilations saved: {}", total_duplicates);
+  println!("    • Extra features enabled: ~{}", extra_features);
+  println!("    • Explicit version control");
+  println!("    • Faster builds (especially incremental)\n");
+
+  if consolidate_enabled {
+    println!("  ✅ Currently using: Option B (Consolidate)");
+    println!("     Transitive deps will be added when you run 'cargo rail unify'\n");
+  } else {
+    println!("  ✅ Currently using: Option A (Ignore)");
+    println!("     To enable consolidation:");
+    println!("       • Run: cargo rail unify --consolidate-transitives");
+    println!("       • Or add to .config/rail.toml:");
+    println!("         [unify.transitives]");
+    println!("         consolidate_features = true\n");
+  }
+
+  println!("  💡 Learn more: docs/src/guides/transitive-consolidation.md");
+  println!(
+    "     Or online: https://github.com/loadingalias/cargo-rail/blob/main/docs/src/guides/transitive-consolidation.md\n"
+  );
+}
+
+/// Restore a unify backup (undo functionality)
+///
+/// This function handles the `cargo rail unify undo` command.
+///
+/// # Arguments
+///
+/// * `ctx` - Workspace context
+/// * `list` - If true, list available backups instead of restoring
+/// * `backup_id` - Optional specific backup ID to restore (if None, restores most recent)
+pub fn run_unify_undo(ctx: &WorkspaceContext, list: bool, backup_id: Option<String>) -> RailResult<()> {
+  let backup_manager = BackupManager::new(ctx.workspace_root());
+
+  // Handle --list flag
+  if list {
+    println!("📋 Available backups:\n");
+
+    let backups = backup_manager.list_backups()?;
+
+    if backups.is_empty() {
+      println!("  No backups found.");
+      println!("\n  💡 Backups are created automatically when running 'cargo rail unify apply'");
+      println!("     or explicitly with the --backup flag.");
+      return Ok(());
+    }
+
+    for (idx, backup) in backups.iter().enumerate() {
+      let is_latest = idx == 0;
+      let marker = if is_latest { " (latest)" } else { "" };
+
+      println!("{}. {}{}", idx + 1, backup.id, marker);
+      println!("   Timestamp: {}", backup.timestamp_display());
+      println!("   Command:   {}", backup.metadata.command);
+      println!("   Files:     {} modified", backup.file_count());
+
+      if let Some(desc) = &backup.metadata.description {
+        println!("   Description: {}", desc);
+      }
+
+      println!();
+    }
+
+    println!("  To restore a backup:");
+    println!("    cargo rail unify undo              # Restore latest");
+    println!("    cargo rail unify undo --backup-id <id>  # Restore specific");
+
+    return Ok(());
+  }
+
+  // Determine which backup to restore
+  let backup_to_restore = if let Some(id) = backup_id {
+    // User specified a backup ID
+    id
+  } else {
+    // Use the latest backup
+    let latest = backup_manager.get_latest_backup()?;
+
+    match latest {
+      Some(backup) => {
+        println!("🔄 Restoring latest backup: {}\n", backup.id);
+        backup.id
+      }
+      None => {
+        println!("⚠️  No backups found.");
+        println!("\n  💡 Backups are created automatically when running 'cargo rail unify apply'");
+        println!("     or explicitly with the --backup flag.");
+        return Ok(());
+      }
+    }
+  };
+
+  // Restore the backup
+  backup_manager.restore_backup(&backup_to_restore)?;
+
+  println!("\n  💡 Next steps:");
+  println!("     1. Run 'cargo check' to verify everything compiles");
+  println!("     2. Review the restored files");
+
   Ok(())
 }

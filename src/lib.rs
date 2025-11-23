@@ -28,12 +28,15 @@
 //! - [`split`] — Split crates into standalone repositories
 //! - [`sync`] — Bidirectional sync between monorepo and split repos
 //! - [`release`] — Coordinated release planning and publishing
+//! - [`backup`] — Backup and restore functionality for safe undo operations
 //! - [`change_detection`] — Git-based change classification and impact analysis
 //! - [`error`] — Error types with contextual help messages
 
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Backup and restore functionality
+pub mod backup;
 /// Cargo workspace integration and transformations
 pub mod cargo;
 pub mod change_detection;

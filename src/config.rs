@@ -62,6 +62,10 @@ pub struct UnifyConfig {
   /// Output configuration
   #[serde(default)]
   pub output: UnifyOutputConfig,
+
+  /// Backup configuration
+  #[serde(default)]
+  pub backup: UnifyBackupConfig,
 }
 
 /// Conflict handling configuration for unification
@@ -126,6 +130,20 @@ pub struct UnifyOutputConfig {
   pub generate_report: bool,
 }
 
+/// Backup configuration for unify operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifyBackupConfig {
+  /// Automatically create backups on every apply (default: true)
+  /// Backups are stored in target/.cargo-rail/backups/ to keep them out of version control
+  #[serde(default = "default_backup_enabled")]
+  pub enabled: bool,
+
+  /// Number of backups to keep (default: 5)
+  /// Older backups are automatically deleted
+  #[serde(default = "default_backup_keep_count")]
+  pub keep_count: usize,
+}
+
 fn default_use_all_features() -> bool {
   true
 }
@@ -144,6 +162,14 @@ fn default_add_markers() -> bool {
 
 fn default_generate_report() -> bool {
   true
+}
+
+fn default_backup_enabled() -> bool {
+  true
+}
+
+fn default_backup_keep_count() -> usize {
+  5
 }
 
 fn default_host_selection() -> TransitiveFeatureHost {
@@ -316,6 +342,15 @@ impl Default for UnifyOutputConfig {
   }
 }
 
+impl Default for UnifyBackupConfig {
+  fn default() -> Self {
+    Self {
+      enabled: default_backup_enabled(),
+      keep_count: default_backup_keep_count(),
+    }
+  }
+}
+
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
@@ -327,6 +362,7 @@ impl Default for UnifyConfig {
       transitives: UnifyTransitivesConfig::default(),
       validation: UnifyValidationConfig::default(),
       output: UnifyOutputConfig::default(),
+      backup: UnifyBackupConfig::default(),
     }
   }
 }

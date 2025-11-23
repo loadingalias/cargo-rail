@@ -368,6 +368,7 @@ pub fn run_init_standalone(
         max_parallel_jobs: 0,
       },
       output: crate::config::UnifyOutputConfig::default(),
+      backup: crate::config::UnifyBackupConfig::default(),
     },
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],

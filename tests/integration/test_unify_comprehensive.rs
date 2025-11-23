@@ -487,23 +487,47 @@ root = "."
     apply_stdout
   );
 
-  // Check backup files were created
+  // Check that backup was created in target/.cargo-rail/backups/
+  let backup_root = workspace.path.join("target/.cargo-rail/backups");
   assert!(
-    workspace.path.join("Cargo.toml.bak").exists(),
-    "Workspace Cargo.toml.bak should exist"
+    backup_root.exists(),
+    "Backup directory should exist at target/.cargo-rail/backups"
+  );
+
+  // Find the backup directory (should be a timestamp-based folder)
+  let backup_entries: Vec<_> = std::fs::read_dir(&backup_root)
+    .expect("Should read backup directory")
+    .filter_map(|e| e.ok())
+    .filter(|e| e.path().is_dir())
+    .collect();
+
+  assert!(!backup_entries.is_empty(), "At least one backup should exist");
+
+  let backup_dir = backup_entries.first().unwrap().path();
+
+  // Check that backup contains the expected files
+  assert!(
+    backup_dir.join("Cargo.toml").exists(),
+    "Backup should contain workspace Cargo.toml"
   );
   assert!(
-    workspace.path.join("crates/crate-a/Cargo.toml.bak").exists(),
-    "crate-a Cargo.toml.bak should exist"
+    backup_dir.join("crates/crate-a/Cargo.toml").exists() || backup_dir.join("crate-a/Cargo.toml").exists(),
+    "Backup should contain crate-a Cargo.toml"
   );
   assert!(
-    workspace.path.join("crates/crate-b/Cargo.toml.bak").exists(),
-    "crate-b Cargo.toml.bak should exist"
+    backup_dir.join("crates/crate-b/Cargo.toml").exists() || backup_dir.join("crate-b/Cargo.toml").exists(),
+    "Backup should contain crate-b Cargo.toml"
+  );
+
+  // Check that metadata.json exists
+  assert!(
+    backup_dir.join("metadata.json").exists(),
+    "Backup should contain metadata.json"
   );
 
   // Check backup message in output
   assert!(
-    apply_stdout.contains("Backups created") || apply_stdout.contains(".bak"),
+    apply_stdout.contains("Creating backup") || apply_stdout.contains("Backup created"),
     "Should mention backups in output.\nOutput:\n{}",
     apply_stdout
   );

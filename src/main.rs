@@ -69,8 +69,17 @@ enum Commands {
   // Dependency Unification
   // ============================================================================
   /// Workspace dependency unification (eliminates workspace-hack crates)
+  ///
+  /// Usage:
+  ///   cargo rail unify                 - Analyze and apply unification
+  ///   cargo rail unify --dry-run       - Preview unification plan
+  ///   cargo rail unify undo            - Restore most recent backup
+  ///   cargo rail unify undo --list     - List available backups
+  ///   cargo rail unify undo --backup <id> - Restore specific backup
   Unify {
-    /// Show plan without executing (analyze mode)
+    /// Action: 'undo' to restore a backup
+    action: Option<String>,
+    /// Show plan without executing (dry-run mode)
     #[arg(long, visible_alias = "dr", short = 'd')]
     dry_run: bool,
     /// Exclude specific dependencies from unification
@@ -79,12 +88,18 @@ enum Commands {
     /// Force include specific dependencies
     #[arg(long)]
     include: Vec<String>,
-    /// Create .bak backups of all modified files
+    /// Create backups of all modified files
     #[arg(long)]
     backup: bool,
     /// Consolidate transitive-only crates with fragmented features
     #[arg(long)]
     consolidate_transitives: bool,
+    /// List available backups (for undo action)
+    #[arg(long)]
+    list: bool,
+    /// Specific backup ID to restore (for undo action)
+    #[arg(long = "backup-id")]
+    backup_id: Option<String>,
   },
 
   // ============================================================================
@@ -291,13 +306,26 @@ fn main() {
 
     // Dependency Unification
     Commands::Unify {
+      action,
       dry_run,
       exclude,
       include,
       backup,
       consolidate_transitives,
+      list,
+      backup_id,
     } => {
-      if dry_run {
+      // Check if this is an undo action
+      if let Some(act) = action {
+        if act == "undo" {
+          commands::run_unify_undo(&ctx, list, backup_id)
+        } else {
+          Err(RailError::message(format!(
+            "Unknown unify action '{}'. Valid actions: undo",
+            act
+          )))
+        }
+      } else if dry_run {
         commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
       } else {
         commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives)
