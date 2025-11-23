@@ -427,13 +427,13 @@ fn test_with_features(
   // Write modified TOML
   std::fs::write(workspace_toml_path, doc.to_string())?;
 
-  // OPTIMIZATION: Check only affected members instead of whole workspace
-  let check_passed = run_cargo_check_targeted(used_by_members, ctx.workspace_root())?;
+  // OPTIMIZATION: Build + test only affected members instead of whole workspace
+  let build_and_test_passed = run_cargo_build_and_test_targeted(used_by_members, ctx.workspace_root())?;
 
   // Always restore original content
   std::fs::write(workspace_toml_path, original_content)?;
 
-  Ok(check_passed)
+  Ok(build_and_test_passed)
 }
 
 /// Set dependency features in workspace.dependencies to exact list
@@ -480,38 +480,72 @@ fn set_dependency_features(doc: &mut toml_edit::DocumentMut, dep_name: &str, fea
   Ok(false)
 }
 
-/// Run cargo check for SPECIFIC workspace members (graph-aware optimization)
+/// Run cargo build + test for SPECIFIC workspace members (graph-aware optimization)
 ///
 /// **HUGE PERFORMANCE WIN:**
-/// Instead of `cargo check --workspace` (checks all 50+ crates),
+/// Instead of `cargo build --workspace` (checks all 50+ crates),
 /// we check only the 2-3 crates that actually use this dependency.
-fn run_cargo_check_targeted(members: &[String], workspace_root: &Path) -> RailResult<bool> {
-  let mut cmd = Command::new("cargo");
-  cmd.arg("check");
+///
+/// **Why build instead of check:**
+/// - `cargo check` allows some code that fails during actual compilation/linking
+/// - Features may affect codegen, proc-macros, or linking behavior
+/// - More accurate validation at slight performance cost
+///
+/// **Why also run tests:**
+/// - Some features only affect runtime behavior (e.g., serde's preserve_order)
+/// - Tests catch functional regressions that compilation doesn't
+fn run_cargo_build_and_test_targeted(members: &[String], workspace_root: &Path) -> RailResult<bool> {
+  // Step 1: Build with all targets
+  let mut build_cmd = Command::new("cargo");
+  build_cmd.arg("build");
 
-  // OPTIMIZATION: Check only affected members
+  // OPTIMIZATION: Build only affected members
   if members.len() <= 5 {
-    // Small number of members - check them explicitly
+    // Small number of members - build them explicitly
     for member in members {
-      cmd.arg("-p").arg(member);
+      build_cmd.arg("-p").arg(member);
     }
   } else {
-    // Many members use this dep - check whole workspace (rare case)
-    cmd.arg("--workspace");
+    // Many members use this dep - build whole workspace (rare case)
+    build_cmd.arg("--workspace");
   }
 
-  // CRITICAL FIX: Check all targets (tests, examples, benches)
+  // CRITICAL: Build all targets (tests, examples, benches)
   // This prevents removing features that are only used in tests/examples
-  cmd.arg("--all-targets");
+  build_cmd.arg("--all-targets");
 
-  cmd.current_dir(workspace_root);
+  build_cmd.current_dir(workspace_root);
 
   // Suppress output - we only care about exit status
-  cmd.stdout(std::process::Stdio::null());
-  cmd.stderr(std::process::Stdio::null());
+  build_cmd.stdout(std::process::Stdio::null());
+  build_cmd.stderr(std::process::Stdio::null());
 
-  let output = cmd.output()?;
-  Ok(output.status.success())
+  let build_output = build_cmd.output()?;
+  if !build_output.status.success() {
+    return Ok(false);
+  }
+
+  // Step 2: Run tests to ensure functionality
+  let mut test_cmd = Command::new("cargo");
+  test_cmd.arg("test");
+
+  // Test same members
+  if members.len() <= 5 {
+    for member in members {
+      test_cmd.arg("-p").arg(member);
+    }
+  } else {
+    test_cmd.arg("--workspace");
+  }
+
+  test_cmd.current_dir(workspace_root);
+
+  // Suppress output
+  test_cmd.stdout(std::process::Stdio::null());
+  test_cmd.stderr(std::process::Stdio::null());
+
+  let test_output = test_cmd.output()?;
+  Ok(test_output.status.success())
 }
 
 #[cfg(test)]

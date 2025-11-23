@@ -75,6 +75,15 @@ pub struct UnifyConfig {
   /// This is the "killer feature" - automated feature pruning integrated into unify
   #[serde(default)]
   pub minimize_features: bool,
+
+  /// Features to always keep during minimization (optional user whitelist)
+  /// Format: dependency_name = ["feature1", "feature2"]
+  /// Example:
+  /// [unify.keep_features]
+  /// serde_json = ["preserve_order"]
+  /// clap = ["default"]
+  #[serde(default)]
+  pub keep_features: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Conflict handling configuration for unification
@@ -373,6 +382,7 @@ impl Default for UnifyConfig {
       output: UnifyOutputConfig::default(),
       backup: UnifyBackupConfig::default(),
       minimize_features: false,
+      keep_features: std::collections::HashMap::new(),
     }
   }
 }

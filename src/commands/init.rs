@@ -209,6 +209,7 @@ pub fn run_init_standalone(
       output: crate::config::UnifyOutputConfig::default(),
       backup: crate::config::UnifyBackupConfig::default(),
       minimize_features: false,
+      keep_features: std::collections::HashMap::new(),
     },
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],
