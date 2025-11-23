@@ -38,9 +38,7 @@ use std::collections::{HashMap, HashSet};
 
 mod collector;
 mod config;
-mod feature_cache;
 mod issue_detection;
-mod minimize;
 mod path_handling;
 mod plan;
 mod report;
@@ -53,7 +51,6 @@ mod version_merge;
 
 // Re-export public types
 pub use config::UnifyConfig;
-pub use minimize::{MinimizationReport, minimize_workspace_features};
 pub use report::UnifyReport;
 pub use types::{IssueSeverity, MemberEdit, UnificationPlan, UnificationStats, UnifiedDep};
 
@@ -82,12 +79,18 @@ impl<'a> WorkspaceUnifier<'a> {
   /// Analyze workspace and generate unification plan
   pub fn analyze(&self) -> RailResult<UnificationPlan> {
     // 1. Collect all dependency instances from workspace members
-    let dep_instances = collector::collect_dependencies(self.metadata, self.config.use_all_features);
+    let dep_instances = collector::collect_dependencies(self.metadata, true);
 
     // 2. Group by dependency name
     let grouped = collector::group_by_name(dep_instances, self.metadata);
 
-    // 3. Analyze each dependency group IN PARALLEL using rayon
+    // 3. Check for multi-version conflicts (global check)
+    // These dependencies cannot be unified safely because they have incompatible versions in the graph
+    let multi_version_issues = issue_detection::detect_multi_version_conflicts(self.metadata);
+    let multi_version_deps: std::collections::HashSet<_> =
+      multi_version_issues.iter().map(|i| i.dep_name.clone()).collect();
+
+    // 4. Analyze each dependency group IN PARALLEL using rayon
     let total_deps = grouped.len();
 
     // Convert HashMap to Vec for parallel iteration
@@ -97,6 +100,10 @@ impl<'a> WorkspaceUnifier<'a> {
     let results: Vec<DependencyAnalysisResult> = dep_groups
       .into_par_iter()
       .filter_map(|(dep_name, instances)| {
+        // Skip dependencies with multi-version conflicts
+        if multi_version_deps.contains(&dep_name) {
+          return None;
+        }
         // Analyze this dependency (returns None if excluded/skipped)
         self.analyze_dependency(dep_name, instances).transpose()
       })
@@ -105,7 +112,7 @@ impl<'a> WorkspaceUnifier<'a> {
     // 4. Aggregate results from parallel analysis
     let mut workspace_deps = Vec::new();
     let mut member_edits: HashMap<String, Vec<MemberEdit>> = HashMap::new();
-    let mut issues = Vec::new();
+    let mut issues = multi_version_issues;
     let mut compilations_saved = 0;
 
     for result in results {
@@ -128,29 +135,7 @@ impl<'a> WorkspaceUnifier<'a> {
       compilations_saved,
     };
 
-    // 5. Detect multi-version conflicts for REMAINING unresolved dependencies
-    // This runs AFTER we've attempted unification, so it only reports true conflicts
-    // that couldn't be resolved through resolution-based or syntactic merging.
-    //
-    // IMPORTANT: Only report these issues if auto_resolve_version_conflicts is disabled.
-    // When auto_resolve is enabled, Cargo's resolution is the source of truth - if multiple
-    // versions exist in the resolved graph, that's because Cargo legitimately needs them
-    // (e.g., for different dependency paths with incompatible requirements). These are
-    // transitive dependencies we don't control directly.
-    if !self.config.auto_resolve_version_conflicts {
-      let multi_version_issues = issue_detection::detect_multi_version_conflicts(self.metadata)?;
-
-      // Only add multi-version issues for deps that weren't successfully unified
-      let unified_names: HashSet<_> = workspace_deps.iter().map(|d| &d.name).collect();
-      for issue in multi_version_issues {
-        // Skip if we successfully unified this dependency
-        if !unified_names.contains(&issue.dep_name) {
-          issues.push(issue);
-        }
-      }
-    }
-
-    // 6. Detect transitive-only crates with fragmented feature sets
+    // 5. Detect transitive-only crates with fragmented feature sets
     let transitive_fragmentations = transitive::detect_transitive_fragmentation(self.metadata)?;
 
     Ok(UnificationPlan {
@@ -219,47 +204,35 @@ impl<'a> WorkspaceUnifier<'a> {
     {
       let mut resolved = false;
 
-      // Attempt auto-resolution if enabled
-      if self.config.auto_resolve_version_conflicts {
-        match &issue.issue_type {
-          types::IssueType::IncompatibleVersionRequirements { .. } => {
-            // Auto-resolve: Pick the "highest" version requirement
-            // Heuristic: Sort by string representation and pick the last one
-            // This is a simple heuristic but effective for standard caret requirements
-            let mut versions: Vec<_> = instances.iter().map(|i| i.version_req.clone()).collect();
-            versions.sort_by_key(|a| a.to_string());
+      // Attempt auto-resolution
+      match &issue.issue_type {
+        types::IssueType::IncompatibleVersionRequirements { .. } => {
+          // Auto-resolve: Pick the "highest" version requirement
+          // Heuristic: Sort by string representation and pick the last one
+          // This is a simple heuristic but effective for standard caret requirements
+          let mut versions: Vec<_> = instances.iter().map(|i| i.version_req.clone()).collect();
+          versions.sort_by_key(|a| a.to_string());
 
-            if let Some(highest) = versions.last() {
-              let highest_clone = highest.clone();
-              // Apply to all instances
-              for instance in &mut instances {
-                instance.version_req = highest_clone.clone();
-              }
-              resolution_comment = Some(format!("Auto-resolved version conflict to {}", highest));
-              resolved = true;
+          if let Some(highest) = versions.last() {
+            let highest_clone = highest.clone();
+            // Apply to all instances
+            for instance in &mut instances {
+              instance.version_req = highest_clone.clone();
             }
-          }
-          types::IssueType::InconsistentDefaultFeatures { .. } => {
-            // Auto-resolve: Enable default features (already done by unify_instances logic)
-            // We just need to suppress the issue
-            resolution_comment = Some("Auto-resolved inconsistent default-features (enabled)".to_string());
+            resolution_comment = Some(format!("Auto-resolved version conflict to {}", highest));
             resolved = true;
           }
-          _ => {}
         }
+        types::IssueType::InconsistentDefaultFeatures { .. } => {
+          // Auto-resolve: Enable default features (already done by unify_instances logic)
+          // We just need to suppress the issue
+          resolution_comment = Some("Auto-resolved inconsistent default-features (enabled)".to_string());
+          resolved = true;
+        }
+        _ => {}
       }
 
       if !resolved {
-        // If auto-resolution is disabled, version conflicts should block the apply
-        let mut issue = issue;
-        if !self.config.auto_resolve_version_conflicts
-          && matches!(
-            issue.issue_type,
-            types::IssueType::IncompatibleVersionRequirements { .. }
-          )
-        {
-          issue.severity = types::IssueSeverity::Hard;
-        }
         issues.push(issue);
         // Return early - this dependency has unresolved issues
         return Ok(Some(DependencyAnalysisResult {

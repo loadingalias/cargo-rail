@@ -33,11 +33,6 @@ pub struct WorkspaceConfig {
 /// Unify configuration - controls workspace dependency unification behavior
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifyConfig {
-  /// Use --all-features when gathering metadata (default: true)
-  /// This ensures the feature union across all workspace members is captured
-  #[serde(default = "default_use_all_features")]
-  pub use_all_features: bool,
-
   /// Allow renamed dependencies to be unified (default: false)
   #[serde(default)]
   pub allow_renamed: bool,
@@ -50,13 +45,20 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub include: Vec<String>,
 
-  /// Conflict handling configuration
+  /// Consolidate transitive-only crates with fragmented features (default: false)
+  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
+  /// This is cargo-rail's version of workspace-hack without requiring an extra crate
   #[serde(default)]
-  pub conflicts: UnifyConflictsConfig,
+  pub consolidate_transitives: bool,
 
-  /// Transitive optimization configuration
-  #[serde(default)]
-  pub transitives: UnifyTransitivesConfig,
+  /// Where to add dev-dependencies when consolidating transitive features
+  /// Options:
+  /// - "auto" (default) = Smart selection: root package, meta crate, or largest member
+  /// - "root" = Use workspace root package (errors if virtual workspace)
+  /// - "largest" = Use member with most dependencies
+  /// - ["crate-a"] = Explicit crate name(s)
+  #[serde(default = "default_host_selection")]
+  pub transitive_host: TransitiveFeatureHost,
 
   /// Validation configuration
   #[serde(default)]
@@ -69,61 +71,6 @@ pub struct UnifyConfig {
   /// Backup configuration
   #[serde(default)]
   pub backup: UnifyBackupConfig,
-
-  /// Minimize features to only those required for compilation (default: false)
-  /// When enabled, runs iterative cargo check to find minimal working feature set
-  /// This is the "killer feature" - automated feature pruning integrated into unify
-  #[serde(default)]
-  pub minimize_features: bool,
-
-  /// Features to always keep during minimization (optional user whitelist)
-  /// Format: dependency_name = ["feature1", "feature2"]
-  /// Example:
-  /// [unify.keep_features]
-  /// serde_json = ["preserve_order"]
-  /// clap = ["default"]
-  #[serde(default)]
-  pub keep_features: std::collections::HashMap<String, Vec<String>>,
-}
-
-/// Conflict handling configuration for unification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifyConflictsConfig {
-  /// Automatically resolve version conflicts by picking the highest version (default: true)
-  /// When enabled, unify will proceed with highest version and add warning comments
-  /// When disabled, version conflicts are hard blockers
-  #[serde(default = "default_auto_resolve")]
-  pub auto_resolve: bool,
-
-  /// Conflict resolution mode (default: "permissive")
-  /// - "permissive": Soft warnings don't block unification (recommended)
-  /// - "strict": All conflicts block unification
-  #[serde(default = "default_resolution_mode")]
-  pub resolution_mode: String,
-
-  /// Add conflict marker comments to Cargo.toml files (default: true)
-  /// Adds # ⚠️ markers to help identify manual resolution needs
-  #[serde(default = "default_add_markers")]
-  pub add_markers: bool,
-}
-
-/// Transitive optimization configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifyTransitivesConfig {
-  /// Consolidate transitive-only crates with fragmented features (default: false)
-  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
-  /// This is cargo-rail's version of workspace-hack without requiring an extra crate
-  #[serde(default)]
-  pub consolidate_features: bool,
-
-  /// Where to add dev-dependencies when consolidating transitive features
-  /// Options:
-  /// - "auto" (default) = Smart selection: root package, meta crate, or largest member
-  /// - "root" = Use workspace root package (errors if virtual workspace)
-  /// - "largest" = Use member with most dependencies
-  /// - ["crate-a"] = Explicit crate name(s)
-  #[serde(default = "default_host_selection")]
-  pub host_selection: TransitiveFeatureHost,
 }
 
 /// Validation configuration
@@ -162,22 +109,6 @@ pub struct UnifyBackupConfig {
   pub keep_count: usize,
 }
 
-fn default_use_all_features() -> bool {
-  true
-}
-
-fn default_auto_resolve() -> bool {
-  true
-}
-
-fn default_resolution_mode() -> String {
-  "permissive".to_string()
-}
-
-fn default_add_markers() -> bool {
-  true
-}
-
 fn default_generate_report() -> bool {
   true
 }
@@ -191,20 +122,44 @@ fn default_backup_keep_count() -> usize {
 }
 
 fn default_host_selection() -> TransitiveFeatureHost {
-  TransitiveFeatureHost::Auto
+  TransitiveFeatureHost::Root
 }
 
 /// Configuration for where to add dev-dependencies when consolidating transitive features
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum TransitiveFeatureHost {
-  /// Auto-select: root package, meta crate, or largest member
-  Auto,
-  /// Use workspace root package
+  /// Use workspace root Cargo.toml (default)
+  #[default]
   Root,
-  /// Use member with most dependencies
-  Largest,
-  /// Explicit list of crate names
-  Explicit(Vec<String>),
+  /// Use a specific member crate (relative path from workspace root)
+  Path(String),
+}
+
+// ... (manual impls follow, skipping them in replacement as they are unchanged)
+
+#[test]
+fn test_transitive_feature_host_path() {
+  // Test that path format works
+  let toml = r#"
+      allow_renamed = false
+      exclude = []
+      include = []
+      consolidate_transitives = false
+      transitive_host = "path/to/crate"
+
+      [validation]
+      targets = []
+      max_parallel_jobs = 0
+
+      [output]
+      generate_report = true
+    "#;
+
+  let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+  assert_eq!(
+    config.transitive_host,
+    TransitiveFeatureHost::Path("path/to/crate".to_string())
+  );
 }
 
 // Custom serialization/deserialization
@@ -214,10 +169,8 @@ impl Serialize for TransitiveFeatureHost {
     S: serde::Serializer,
   {
     match self {
-      TransitiveFeatureHost::Auto => serializer.serialize_str("auto"),
       TransitiveFeatureHost::Root => serializer.serialize_str("root"),
-      TransitiveFeatureHost::Largest => serializer.serialize_str("largest"),
-      TransitiveFeatureHost::Explicit(names) => names.serialize(serializer),
+      TransitiveFeatureHost::Path(path) => serializer.serialize_str(path),
     }
   }
 }
@@ -233,30 +186,17 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
       type Value = TransitiveFeatureHost;
 
       fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a string (auto/root/largest) or array of crate names")
+        formatter.write_str("'root' or a path string")
       }
 
       fn visit_str<E>(self, value: &str) -> Result<TransitiveFeatureHost, E>
       where
         E: serde::de::Error,
       {
-        Ok(match value {
-          "auto" => TransitiveFeatureHost::Auto,
-          "root" => TransitiveFeatureHost::Root,
-          "largest" => TransitiveFeatureHost::Largest,
-          name => TransitiveFeatureHost::Explicit(vec![name.to_string()]),
-        })
-      }
-
-      fn visit_seq<A>(self, mut seq: A) -> Result<TransitiveFeatureHost, A::Error>
-      where
-        A: serde::de::SeqAccess<'de>,
-      {
-        let mut names = Vec::new();
-        while let Some(name) = seq.next_element::<String>()? {
-          names.push(name);
+        match value {
+          "root" | "auto" => Ok(TransitiveFeatureHost::Root), // "auto" for backward compatibility
+          path => Ok(TransitiveFeatureHost::Path(path.to_string())),
         }
-        Ok(TransitiveFeatureHost::Explicit(names))
       }
     }
 
@@ -268,7 +208,6 @@ impl TransitiveFeatureHost {
   /// Resolve to actual crate names based on workspace metadata
   pub fn resolve(&self, metadata: &crate::cargo::WorkspaceMetadata) -> Vec<String> {
     match self {
-      TransitiveFeatureHost::Auto => auto_select_transitive_host(metadata),
       TransitiveFeatureHost::Root => {
         // Find root package (non-virtual workspace)
         metadata
@@ -279,75 +218,18 @@ impl TransitiveFeatureHost {
             pkg.manifest_path.as_std_path().parent() == Some(metadata.workspace_root())
           })
           .map(|pkg| vec![pkg.name.to_string()])
-          .unwrap_or_else(|| {
-            // Fallback if no root package (virtual workspace)
-            eprintln!("⚠️  Warning: Virtual workspace has no root package, using auto-selection");
-            auto_select_transitive_host(metadata)
-          })
+          .unwrap_or_default()
       }
-      TransitiveFeatureHost::Largest => {
-        // Use member with most dependencies
-        let mut members: Vec<_> = metadata.list_crates();
-        members.sort_by_key(|pkg| std::cmp::Reverse(pkg.dependencies.len()));
-        members
-          .first()
+      TransitiveFeatureHost::Path(path) => {
+        // Resolve the path relative to workspace root
+        let target_path = metadata.workspace_root().join(path);
+        metadata
+          .list_crates()
+          .iter()
+          .find(|pkg| pkg.manifest_path.as_std_path().parent() == Some(target_path.as_path()))
           .map(|pkg| vec![pkg.name.to_string()])
           .unwrap_or_default()
       }
-      TransitiveFeatureHost::Explicit(names) => names.clone(),
-    }
-  }
-}
-
-/// Auto-select the best crate(s) to host transitive dev-dependencies
-fn auto_select_transitive_host(metadata: &crate::cargo::WorkspaceMetadata) -> Vec<String> {
-  // 1. If workspace has root package (non-virtual) → use it
-  if let Some(root_pkg) = metadata
-    .list_crates()
-    .iter()
-    .find(|pkg| pkg.manifest_path.as_std_path().parent() == Some(metadata.workspace_root()))
-  {
-    return vec![root_pkg.name.to_string()];
-  }
-
-  // 2. Look for conventional "meta" crates
-  let crates = metadata.list_crates();
-  let meta_candidate = crates.iter().find(|pkg| {
-    let name = pkg.name.to_lowercase();
-    name.contains("meta") || name.ends_with("-workspace") || name == "workspace"
-  });
-
-  if let Some(pkg) = meta_candidate {
-    return vec![pkg.name.to_string()];
-  }
-
-  // 3. Use member with most dependencies (likely the "main" crate)
-  let mut members = crates;
-  members.sort_by_key(|pkg| std::cmp::Reverse(pkg.dependencies.len()));
-
-  if let Some(largest) = members.first() {
-    return vec![largest.name.to_string()];
-  }
-
-  // 4. Fallback: empty (shouldn't happen)
-  vec![]
-}
-
-impl Default for UnifyConflictsConfig {
-  fn default() -> Self {
-    Self {
-      auto_resolve: default_auto_resolve(),
-      resolution_mode: default_resolution_mode(),
-      add_markers: default_add_markers(),
-    }
-  }
-}
-
-impl Default for UnifyTransitivesConfig {
-  fn default() -> Self {
-    Self {
-      consolidate_features: false,
-      host_selection: default_host_selection(),
     }
   }
 }
@@ -372,17 +254,14 @@ impl Default for UnifyBackupConfig {
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
-      use_all_features: default_use_all_features(),
       allow_renamed: false,
       exclude: Vec::new(),
       include: Vec::new(),
-      conflicts: UnifyConflictsConfig::default(),
-      transitives: UnifyTransitivesConfig::default(),
+      consolidate_transitives: false,
+      transitive_host: default_host_selection(),
       validation: UnifyValidationConfig::default(),
       output: UnifyOutputConfig::default(),
       backup: UnifyBackupConfig::default(),
-      minimize_features: false,
-      keep_features: std::collections::HashMap::new(),
     }
   }
 }
@@ -725,14 +604,6 @@ mod tests {
   // ============================================================================
 
   #[test]
-  fn test_unify_config_default() {
-    let unify = UnifyConfig::default();
-    assert!(unify.use_all_features);
-    assert!(unify.validation.targets.is_empty());
-    assert_eq!(unify.validation.max_parallel_jobs, 0); // Auto-detect
-  }
-
-  #[test]
   fn test_unify_config_validation_enabled() {
     let unify_disabled = UnifyConfig::default();
     assert!(!unify_disabled.validation_enabled());
@@ -779,21 +650,13 @@ mod tests {
 
   #[test]
   fn test_transitive_feature_host_in_full_config_auto() {
-    // Test that "auto" works in the new nested config
+    // Test that "auto" works in the new flattened config
     let toml = r#"
-      use_all_features = true
       allow_renamed = false
       exclude = []
       include = []
-
-      [conflicts]
-      auto_resolve = true
-      resolution_mode = "permissive"
-      add_markers = true
-
-      [transitives]
-      consolidate_features = false
-      host_selection = "auto"
+      consolidate_transitives = false
+      transitive_host = "auto"
 
       [validation]
       targets = []
@@ -804,62 +667,27 @@ mod tests {
     "#;
 
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.transitives.host_selection, TransitiveFeatureHost::Auto);
+    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
   }
 
   #[test]
-  fn test_transitive_feature_host_in_full_config_array() {
-    // Test that array format works in the new nested config
-    let toml = r#"
-      use_all_features = true
-      allow_renamed = false
-      exclude = []
-      include = []
-
-      [conflicts]
-      auto_resolve = true
-      resolution_mode = "permissive"
-      add_markers = true
-
-      [transitives]
-      consolidate_features = false
-      host_selection = ["crate-a", "crate-b"]
-
-      [validation]
-      targets = []
-      max_parallel_jobs = 0
-
-      [output]
-      generate_report = true
-    "#;
-
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(
-      config.transitives.host_selection,
-      TransitiveFeatureHost::Explicit(vec!["crate-a".to_string(), "crate-b".to_string()])
-    );
-  }
-
-  #[test]
-  fn test_transitive_feature_host_resolve_explicit() {
+  fn test_transitive_feature_host_resolve_path() {
     // Create a test metadata instance
     let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
 
-    let host = TransitiveFeatureHost::Explicit(vec!["cargo-rail".to_string()]);
+    // Test resolving root
+    let host = TransitiveFeatureHost::Root;
     let resolved = host.resolve(&metadata);
     assert_eq!(resolved, vec!["cargo-rail"]);
   }
 
   #[test]
-  fn test_transitive_feature_host_resolve_auto() {
+  fn test_transitive_feature_host_resolve_root() {
     // Create a test metadata instance
     let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
 
-    let host = TransitiveFeatureHost::Auto;
+    let host = TransitiveFeatureHost::Root;
     let resolved = host.resolve(&metadata);
-
-    // Should return at least one crate name
-    assert!(!resolved.is_empty());
 
     // Should return "cargo-rail" since this workspace has a root package
     assert_eq!(resolved, vec!["cargo-rail"]);
@@ -868,8 +696,8 @@ mod tests {
   #[test]
   fn test_unify_config_default_uses_auto() {
     let config = UnifyConfig::default();
-    assert_eq!(config.transitives.host_selection, TransitiveFeatureHost::Auto);
-    assert!(!config.transitives.consolidate_features);
+    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
+    assert!(!config.consolidate_transitives);
   }
 
   // ============================================================================

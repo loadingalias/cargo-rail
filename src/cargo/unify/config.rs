@@ -1,14 +1,11 @@
 //! Configuration for workspace dependency unification
 
-use crate::config::RailConfig;
+use crate::config::{RailConfig, TransitiveFeatureHost, UnifyBackupConfig, UnifyOutputConfig};
 use std::collections::HashSet;
 
 /// Configuration for workspace unification
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UnifyConfig {
-  /// Whether metadata was collected with --all-features (default: true)
-  pub use_all_features: bool,
-
   /// Allow renamed dependencies to be unified (default: false)
   pub allow_renamed: bool,
 
@@ -18,40 +15,29 @@ pub struct UnifyConfig {
   /// Dependencies to force-include in unification
   pub include: HashSet<String>,
 
-  /// Auto-resolve version conflicts by picking the highest version (default: true)
-  pub auto_resolve_version_conflicts: bool,
+  /// Consolidate transitive-only crates with fragmented features (default: false)
+  pub consolidate_transitives: bool,
 
-  /// Add conflict comments to workspace.dependencies (default: true)
-  pub add_conflict_comments: bool,
+  /// Where to add dev-dependencies when consolidating transitive features
+  pub transitive_host: TransitiveFeatureHost,
 
-  /// Generate a detailed unification report (default: true)
-  pub generate_report: bool,
-}
+  /// Output configuration
+  pub output: UnifyOutputConfig,
 
-impl Default for UnifyConfig {
-  fn default() -> Self {
-    Self {
-      use_all_features: true,
-      allow_renamed: false,
-      exclude: HashSet::new(),
-      include: HashSet::new(),
-      auto_resolve_version_conflicts: true,
-      add_conflict_comments: true,
-      generate_report: true,
-    }
-  }
+  /// Backup configuration
+  pub backup: UnifyBackupConfig,
 }
 
 impl From<&RailConfig> for UnifyConfig {
   fn from(rail_config: &RailConfig) -> Self {
     Self {
-      use_all_features: rail_config.unify.use_all_features,
       allow_renamed: rail_config.unify.allow_renamed,
       exclude: rail_config.unify.exclude.iter().cloned().collect(),
       include: rail_config.unify.include.iter().cloned().collect(),
-      auto_resolve_version_conflicts: rail_config.unify.conflicts.auto_resolve,
-      add_conflict_comments: rail_config.unify.conflicts.add_markers,
-      generate_report: rail_config.unify.output.generate_report,
+      consolidate_transitives: rail_config.unify.consolidate_transitives,
+      transitive_host: rail_config.unify.transitive_host.clone(),
+      output: rail_config.unify.output.clone(),
+      backup: rail_config.unify.backup.clone(),
     }
   }
 }

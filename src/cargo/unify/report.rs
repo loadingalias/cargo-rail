@@ -6,11 +6,29 @@ use crate::error::{RailError, RailResult};
 use std::path::Path;
 
 /// Generates a detailed markdown report of the unification process
-pub struct UnifyReport;
+pub struct UnifyReport<'a> {
+  plan: &'a UnificationPlan,
+}
 
-impl UnifyReport {
+impl<'a> UnifyReport<'a> {
+  /// Create a new report generator
+  pub fn new(plan: &'a UnificationPlan) -> Self {
+    Self { plan }
+  }
+
+  /// Print a summary to stdout
+  pub fn print_summary(&self) {
+    println!("\n📊 Unification Summary:");
+    println!("   - Total dependencies: {}", self.plan.stats.total_deps);
+    println!("   - Unified: {}", self.plan.stats.unified_count);
+    println!("   - Issues: {}", self.plan.stats.issue_count);
+    println!("   - Compilations saved: {}", self.plan.stats.compilations_saved);
+    println!();
+  }
+
   /// Generate markdown report content
-  pub fn generate(plan: &UnificationPlan, _metadata: &WorkspaceMetadata) -> String {
+  pub fn generate(&self, _metadata: &WorkspaceMetadata) -> String {
+    let plan = self.plan;
     let mut md = String::new();
 
     // Title and Header
@@ -105,8 +123,15 @@ impl UnifyReport {
   }
 
   /// Write report to file
-  pub fn write_to_file(plan: &UnificationPlan, metadata: &WorkspaceMetadata, path: &Path) -> RailResult<()> {
-    let content = Self::generate(plan, metadata);
+  pub fn write_to_file(plan: &'a UnificationPlan, metadata: &WorkspaceMetadata, path: &Path) -> RailResult<()> {
+    let report = Self::new(plan);
+    let content = report.generate(metadata);
+
+    if let Some(parent) = path.parent() {
+      std::fs::create_dir_all(parent)
+        .map_err(|e| RailError::message(format!("Failed to create directory {}: {}", parent.display(), e)))?;
+    }
+
     std::fs::write(path, content)
       .map_err(|e| RailError::message(format!("Failed to write report to {}: {}", path.display(), e)))?;
     Ok(())

@@ -20,7 +20,7 @@ fn test_unify_undo_restores_latest_backup() -> Result<()> {
 root = "."
 
 [unify]
-use_all_features = true
+# use_all_features is now implicit
 [unify.backup]
 enabled = true
 keep_count = 5

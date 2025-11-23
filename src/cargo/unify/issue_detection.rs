@@ -3,23 +3,28 @@
 use super::path_handling::are_all_identical_workspace_paths;
 use super::types::{DependencyInstance, IssueSeverity, IssueType, UnificationIssue};
 use crate::cargo::WorkspaceMetadata;
-use crate::error::RailResult;
+
 use std::collections::{HashMap, HashSet};
 
 /// Detect dependencies that exist in multiple resolved versions
 ///
 /// Checks the actual dependency resolution graph to find packages with
 /// multiple versions. These cannot be safely unified at workspace level.
-pub fn detect_multi_version_conflicts(metadata: &WorkspaceMetadata) -> RailResult<Vec<UnificationIssue>> {
+#[allow(dead_code)]
+pub fn detect_multi_version_conflicts(
+  metadata: &WorkspaceMetadata,
+) -> Vec<crate::cargo::unify::issue_detection::UnificationIssue> {
   let mut issues = Vec::new();
 
   let resolve = match metadata.resolve() {
     Some(r) => r,
-    None => return Ok(issues), // No resolution available, skip check
+    None => return issues, // No resolution available, skip check
   };
 
   // Group resolved packages by name
   let mut by_name: HashMap<String, Vec<&cargo_metadata::PackageId>> = HashMap::new();
+  let mut package_versions: HashMap<&str, Vec<&semver::Version>> = HashMap::new();
+
   for node in &resolve.nodes {
     if let Some(pkg) = metadata.find_package_by_id(&node.id) {
       // Skip workspace members
@@ -28,6 +33,7 @@ pub fn detect_multi_version_conflicts(metadata: &WorkspaceMetadata) -> RailResul
       }
 
       by_name.entry(pkg.name.to_string()).or_default().push(&node.id);
+      package_versions.entry(&pkg.name).or_default().push(&pkg.version);
     }
   }
 
@@ -64,7 +70,7 @@ pub fn detect_multi_version_conflicts(metadata: &WorkspaceMetadata) -> RailResul
     }
   }
 
-  Ok(issues)
+  issues
 }
 
 /// Detect issues preventing unification for a specific dependency

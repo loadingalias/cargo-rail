@@ -44,12 +44,7 @@ impl RailConfigBuilder {
   pub fn unify(&mut self, config: &UnifyConfig) -> &mut Self {
     let mut content = String::new();
 
-    content.push_str(&format!("use_all_features = {}\n", config.use_all_features));
     content.push_str(&format!("allow_renamed = {}\n", config.allow_renamed));
-    content.push_str(&format!(
-      "minimize_features = {}  # Minimize features to only those required for compilation\n",
-      config.minimize_features
-    ));
 
     // Exclude
     if config.exclude.is_empty() {
@@ -71,62 +66,27 @@ impl RailConfigBuilder {
       ));
     }
 
+    content.push_str(&format!(
+      "consolidate_transitives = {}\n",
+      config.consolidate_transitives
+    ));
+
+    match &config.transitive_host {
+      crate::config::TransitiveFeatureHost::Root => {
+        content.push_str("transitive_host = \"root\"  # \"root\" or relative path to workspace member\n");
+      }
+      crate::config::TransitiveFeatureHost::Path(path) => {
+        content.push_str(&format!("transitive_host = \"{}\"\n", path));
+      }
+    }
+
     self.sections.push(format!("[unify]\n{}\n", content));
 
-    // Subsections
-    self.unify_conflicts(config);
-    self.unify_transitives(config);
     self.unify_validation(config);
     self.unify_output(config);
     self.unify_backup(config);
 
     self
-  }
-
-  fn unify_conflicts(&mut self, config: &UnifyConfig) {
-    let mut content = String::new();
-    content.push_str(&format!(
-      "auto_resolve = {}  # Pick highest version automatically\n",
-      config.conflicts.auto_resolve
-    ));
-    content.push_str(&format!(
-      "resolution_mode = \"{}\"  # \"permissive\" or \"strict\"\n",
-      config.conflicts.resolution_mode
-    ));
-    content.push_str(&format!(
-      "add_markers = {}  # Add # ⚠️ comments to Cargo.toml\n",
-      config.conflicts.add_markers
-    ));
-
-    self.sections.push(format!("[unify.conflicts]\n{}\n", content));
-  }
-
-  fn unify_transitives(&mut self, config: &UnifyConfig) {
-    let mut content = String::new();
-    content.push_str(&format!(
-      "consolidate_features = {}  # Add fragmented transitive deps to workspace\n",
-      config.transitives.consolidate_features
-    ));
-
-    match &config.transitives.host_selection {
-      crate::config::TransitiveFeatureHost::Auto => {
-        content.push_str("host_selection = \"auto\"  # \"auto\", \"root\", \"largest\", or [\"crate-name\"]\n");
-      }
-      crate::config::TransitiveFeatureHost::Root => {
-        content.push_str("host_selection = \"root\"\n");
-      }
-      crate::config::TransitiveFeatureHost::Largest => {
-        content.push_str("host_selection = \"largest\"\n");
-      }
-      crate::config::TransitiveFeatureHost::Explicit(names) => {
-        content.push_str(&format!(
-          "host_selection = {}\n",
-          self.formatter.array_string(names, None)
-        ));
-      }
-    }
-
-    self.sections.push(format!("[unify.transitives]\n{}\n", content));
   }
 
   fn unify_validation(&mut self, config: &UnifyConfig) {

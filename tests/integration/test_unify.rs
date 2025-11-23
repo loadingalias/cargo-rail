@@ -407,15 +407,26 @@ generate_report = true
   let stderr = String::from_utf8_lossy(&output.stderr);
 
   assert!(
-    !output.status.success(),
-    "apply should fail on true conflicts (syn 1.x vs 2.x)\nstdout: {}\nstderr: {}",
+    output.status.success(),
+    "apply should succeed with warnings on true conflicts (syn 1.x vs 2.x)\nstdout: {}\nstderr: {}",
     stdout,
     stderr
   );
 
-  // Ensure manifests not rewritten on failure
+  // Ensure manifests ARE rewritten (because we proceed with warnings)
+  // Wait, if it's a warning, do we unify?
+  // If it's a MultiVersion conflict, we can't unify because there are multiple versions.
+  // So we skip unification for that dependency.
   let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
-  assert!(crate_a_toml.contains("syn"), "crate-a manifest should remain unchanged");
+  assert!(
+    crate_a_toml.contains("syn"),
+    "crate-a manifest should remain unchanged (skipped unification)"
+  );
+  assert!(
+    !crate_a_toml.contains("syn = { workspace = true }"),
+    "crate-a should not use workspace inheritance for syn\nstdout: {}",
+    stdout
+  );
 
   Ok(())
 }

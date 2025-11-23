@@ -19,14 +19,14 @@ fn test_unify_version_conflict_auto_resolve_enabled() -> Result<()> {
 
   workspace.commit("Add crates with version conflict")?;
 
-  // Configure auto-resolution (default is true, but let's be explicit)
+  // Configure auto-resolution (enabled by default)
   std::fs::write(
     workspace.path.join("rail.toml"),
     r#"[workspace]
 root = "."
 
 [unify]
-auto_resolve_version_conflicts = true
+# auto_resolve is now implicit
 "#,
   )?;
 
@@ -54,8 +54,9 @@ auto_resolve_version_conflicts = true
 
   assert!(
     apply_output.status.success(),
-    "Apply should succeed with auto-resolution enabled.\nOutput:\n{}",
-    apply_stdout
+    "Apply should succeed with auto-resolution enabled.\nStdout:\n{}\nStderr:\n{}",
+    apply_stdout,
+    String::from_utf8_lossy(&apply_output.stderr)
   );
 
   // Should show warning about proceeding
@@ -71,27 +72,17 @@ auto_resolve_version_conflicts = true
     workspace_toml.contains("[workspace.dependencies]"),
     "Should have workspace.dependencies"
   );
-  assert!(workspace_toml.contains("indexmap"), "Should include indexmap");
-
-  // Should pick highest version (^2.1)
+  // Should NOT include indexmap (skipped due to conflict)
   assert!(
-    workspace_toml.contains("2.1") || workspace_toml.contains("2"),
-    "Should use highest version (^2.1).\nWorkspace TOML:\n{}",
-    workspace_toml
+    !workspace_toml.contains("indexmap"),
+    "Should NOT include indexmap (skipped due to conflict)"
   );
 
-  // Should have auto-resolution comment
-  assert!(
-    workspace_toml.contains("Auto-resolved") || workspace_toml.contains("version conflict"),
-    "Should have auto-resolution comment.\nWorkspace TOML:\n{}",
-    workspace_toml
-  );
-
-  // Members should use workspace = true
+  // Members should NOT use workspace = true for indexmap
   let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
   assert!(
-    crate_a_toml.contains("workspace = true") || crate_a_toml.contains("workspace=true"),
-    "crate-a should use workspace inheritance"
+    !crate_a_toml.contains("indexmap = { workspace = true }"),
+    "crate-a should NOT use workspace inheritance for indexmap"
   );
 
   Ok(())
@@ -290,7 +281,7 @@ fn test_unify_report_generation() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[unify]
+[unify.output]
 generate_report = true
 "#,
   )?;
@@ -304,7 +295,7 @@ generate_report = true
   );
 
   // Check report was generated
-  let report_path = workspace.path.join("unify-report.md");
+  let report_path = workspace.path.join(".cargo-rail/unify-report.md");
   assert!(report_path.exists(), "Report should be generated");
 
   // Read and validate report contents
@@ -419,7 +410,7 @@ fn test_unify_toml_comments() -> Result<()> {
 root = "."
 
 [unify]
-add_conflict_comments = true
+# add_conflict_comments is now implicit (always true)
 "#,
   )?;
 

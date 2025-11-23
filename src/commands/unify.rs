@@ -23,20 +23,8 @@ use crate::workspace::WorkspaceContext;
 /// This function now uses the lazy-loaded cache in WorkspaceContext, eliminating
 /// the expensive metadata reload that previously happened on every unify command.
 fn get_unify_metadata(ctx: &WorkspaceContext) -> RailResult<&WorkspaceMetadata> {
-  // Check rail config for use_all_features setting
-  let use_all_features = ctx
-    .config
-    .as_ref()
-    .map(|cfg| cfg.unify.use_all_features)
-    .unwrap_or(true); // Default to true if no config
-
-  if use_all_features {
-    // Use cached --all-features metadata (lazy-loaded on first access)
-    ctx.metadata_all_features()
-  } else {
-    // Use default metadata from context (no clone needed!)
-    Ok(ctx.cargo.metadata())
-  }
+  // Always use all features for unification
+  ctx.metadata_all_features()
 }
 
 /// Check if targets have changed since last init and notify user
@@ -145,7 +133,6 @@ pub fn run_unify_analyze(
   exclude: Vec<String>,
   include: Vec<String>,
   pin_transitives_flag: bool,
-  minimal_flag: bool,
 ) -> RailResult<()> {
   println!("🔍 Analyzing workspace dependencies...\n");
 
@@ -205,24 +192,10 @@ pub fn run_unify_analyze(
       || ctx
         .config
         .as_ref()
-        .map(|c| c.unify.transitives.consolidate_features)
+        .map(|c| c.unify.consolidate_transitives)
         .unwrap_or(false);
 
     display_transitive_impact(&plan, consolidate_enabled);
-  }
-
-  // Show minimize_features status (configuration preview)
-  let should_minimize = minimal_flag || ctx.config.as_ref().map(|c| c.unify.minimize_features).unwrap_or(false);
-
-  if should_minimize {
-    println!("\n🎯 Feature minimization enabled:");
-    println!("   When you run 'cargo rail unify apply', features will be minimized");
-    println!("   to only those required for compilation.\n");
-  } else {
-    println!("\n💡 Feature minimization:");
-    println!("   Currently disabled. To enable:");
-    println!("     • Run: cargo rail unify apply --minimal");
-    println!("     • Or set in rail.toml: minimize_features = true\n");
   }
 
   println!(
@@ -246,7 +219,6 @@ pub fn run_unify_apply(
   include: Vec<String>,
   backup: bool,
   pin_transitives_flag: bool,
-  minimal_flag: bool,
 ) -> RailResult<()> {
   // Check if targets have changed (lazy update notification)
   check_target_updates(ctx);
@@ -277,6 +249,7 @@ pub fn run_unify_apply(
   let (hard_issues, soft_issues): (Vec<_>, Vec<_>) =
     plan.issues.iter().partition(|i| i.severity == IssueSeverity::Hard);
 
+  // Hard issues always block
   if !hard_issues.is_empty() {
     println!("⚠️  Cannot apply: unification has BLOCKING issues:");
     for issue in hard_issues {
@@ -285,6 +258,7 @@ pub fn run_unify_apply(
     return Err(RailError::message("Fix blocking issues before applying"));
   }
 
+  // Soft issues are just warnings now (auto-resolved or permissive)
   if !soft_issues.is_empty() {
     println!("⚠️  Proceeding with warnings (these issues will be handled via workspace.dependencies):");
     for issue in soft_issues {
@@ -292,16 +266,40 @@ pub fn run_unify_apply(
     }
     println!();
   }
+  // Generate report if requested
+  if config.output.generate_report {
+    let report = UnifyReport::new(&plan);
+    report.print_summary();
+  }
+
+  // Check for issues that should block application
+  // Note: Version conflicts are now auto-resolved by default, so they appear as warnings
+  // unless they are truly unresolvable.
+  let has_blockers = plan.issues.iter().any(|i| i.severity == IssueSeverity::Hard);
+
+  if has_blockers {
+    println!("❌ Unification analysis found blocking issues. Please resolve them before applying.");
+    return Ok(());
+  }
+
+  // Check for transitive consolidation opportunities
+  if !config.consolidate_transitives && !plan.transitive_fragmentations.is_empty() {
+    println!(
+      "\n💡 Tip: Found {} transitive-only crates with fragmented features.",
+      plan.transitive_fragmentations.len()
+    );
+    println!("   Run with 'consolidate_transitives = true' in rail.toml to fix this automatically.");
+  }
 
   // Determine if we should consolidate transitive features
   let should_consolidate_transitives = pin_transitives_flag
     || ctx
       .config
       .as_ref()
-      .map(|c| c.unify.transitives.consolidate_features)
+      .map(|c| c.unify.consolidate_transitives)
       .unwrap_or(false);
 
-  // Handle transitive fragmentations if consolidation is enabled
+  // Handle transitive fragmentation impact comparison
   let mut transitive_deps_to_add = Vec::new();
   let mut transitive_feature_hosts = Vec::new();
 
@@ -315,11 +313,11 @@ pub fn run_unify_apply(
     let host_crates = ctx
       .config
       .as_ref()
-      .map(|c| c.unify.transitives.host_selection.resolve(ctx.cargo.metadata()))
+      .map(|c| c.unify.transitive_host.resolve(ctx.cargo.metadata()))
       .unwrap_or_else(|| {
         // Fallback to auto-selection if no config
         use crate::config::TransitiveFeatureHost;
-        TransitiveFeatureHost::Auto.resolve(ctx.cargo.metadata())
+        TransitiveFeatureHost::Root.resolve(ctx.cargo.metadata())
       });
 
     transitive_feature_hosts = host_crates;
@@ -470,7 +468,7 @@ pub fn run_unify_apply(
   let mut all_workspace_deps = plan.workspace_deps.clone();
   all_workspace_deps.extend(transitive_deps_to_add.clone());
 
-  transformer.write_workspace_dependencies(&workspace_toml, &all_workspace_deps, config.add_conflict_comments)?;
+  transformer.write_workspace_dependencies(&workspace_toml, &all_workspace_deps, true)?;
   println!("  ✓ Wrote {} unified dependencies", all_workspace_deps.len());
   if !transitive_deps_to_add.is_empty() {
     println!(
@@ -478,38 +476,6 @@ pub fn run_unify_apply(
       transitive_deps_to_add.len()
     );
   }
-
-  // 1.5. Minimize features if enabled (via config or CLI flag)
-  // This is the "killer feature" - automated feature pruning
-  let should_minimize = minimal_flag || ctx.config.as_ref().map(|c| c.unify.minimize_features).unwrap_or(false);
-
-  let _final_workspace_deps = if should_minimize {
-    use crate::cargo::unify::minimize_workspace_features;
-
-    // Get keep_features from config
-    let keep_features = ctx
-      .config
-      .as_ref()
-      .map(|c| &c.unify.keep_features)
-      .cloned()
-      .unwrap_or_default();
-
-    let (minimized_deps, min_report) =
-      minimize_workspace_features(ctx, &all_workspace_deps, &workspace_toml, &keep_features)?;
-
-    // Re-write workspace.dependencies with minimal features
-    println!("\n📝 Updating [workspace.dependencies] with minimal features...");
-    transformer.write_workspace_dependencies(&workspace_toml, &minimized_deps, config.add_conflict_comments)?;
-    println!("  ✓ Updated with minimal feature sets");
-
-    // Print report
-    println!("{}", min_report.summary());
-
-    minimized_deps
-  } else {
-    // No minimization - use original deps
-    all_workspace_deps
-  };
 
   // 2. Convert member dependencies to workspace inheritance
   println!("\n📝 Converting member dependencies to workspace inheritance...");
@@ -663,9 +629,9 @@ pub fn run_unify_apply(
   // Note: Backup handling is done earlier in the function
   // No need to print additional messages here
 
-  // Generate report if configured
-  if config.generate_report {
-    let report_path = ctx.workspace_root().join("unify-report.md");
+  // Generate report if requested (and not already done)
+  if config.output.generate_report {
+    let report_path = ctx.workspace_root().join(".cargo-rail").join("unify-report.md");
     UnifyReport::write_to_file(&plan, metadata, &report_path)?;
     println!("\n📄 Unification report generated at {}", report_path.display());
   }

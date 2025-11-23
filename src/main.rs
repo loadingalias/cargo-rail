@@ -97,9 +97,6 @@ enum Commands {
     /// Consolidate transitive-only crates with fragmented features
     #[arg(long)]
     consolidate_transitives: bool,
-    /// Minimize features to only those required for compilation
-    #[arg(long)]
-    minimal: bool,
     /// List available backups (for undo action)
     #[arg(long)]
     list: bool,
@@ -338,7 +335,6 @@ fn main() {
       include,
       backup,
       consolidate_transitives,
-      minimal,
       list,
       backup_id,
     } => {
@@ -353,9 +349,9 @@ fn main() {
           )))
         }
       } else if dry_run {
-        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives, minimal)
+        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
       } else {
-        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives, minimal)
+        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives)
       }
     }
 
