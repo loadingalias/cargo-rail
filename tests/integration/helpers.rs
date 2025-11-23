@@ -61,6 +61,24 @@ use_all_features = true
 "#,
     )?;
 
+    // Create .config/nextest.toml with commit profile for CI compatibility
+    std::fs::write(
+      path.join(".config/nextest.toml"),
+      r#"[profile.default]
+status-level = "pass"
+success-output = "never"
+failure-output = "immediate"
+fail-fast = false
+
+[profile.commit]
+status-level = "fail"
+success-output = "never"
+failure-output = "immediate-final"
+fail-fast = false
+retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
+"#,
+    )?;
+
     git(&path, &["add", "."])?;
     git(&path, &["commit", "-m", "Initial workspace setup"])?;
 
