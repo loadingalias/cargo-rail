@@ -122,12 +122,10 @@ impl VersionBumper {
   ///
   /// Uses lossless TOML editing to preserve comments and formatting.
   pub fn bump_version(manifest_path: &Path, bump_type: BumpType) -> RailResult<Version> {
-    let content = fs::read_to_string(manifest_path)
-      .map_err(|e| RailError::message(format!("Failed to read {}: {}", manifest_path.display(), e)))?;
+    use crate::toml::editor::TomlEditor;
 
-    let mut doc: DocumentMut = content
-      .parse()
-      .map_err(|e| RailError::message(format!("Failed to parse {} as TOML: {}", manifest_path.display(), e)))?;
+    let mut editor = TomlEditor::open(manifest_path)?;
+    let doc = editor.doc();
 
     // Get current version
     let current_str = doc
@@ -154,20 +152,10 @@ impl VersionBumper {
     let new_version = bump_type.apply(&current);
 
     // Update in document
-    if let Some(package) = doc.get_mut("package").and_then(|p| p.as_table_mut()) {
-      package["version"] = toml_edit::value(new_version.to_string());
-    }
+    editor.set("package.version", new_version.to_string())?;
 
-    // Write back (atomic write via temp file)
-    let temp_path = manifest_path.with_extension("toml.tmp");
-    fs::write(&temp_path, doc.to_string())
-      .map_err(|e| RailError::message(format!("Failed to write temporary file {}: {}", temp_path.display(), e)))?;
-
-    fs::rename(&temp_path, manifest_path).map_err(|e| {
-      // Try to clean up temp file
-      let _ = fs::remove_file(&temp_path);
-      RailError::message(format!("Failed to update {}: {}", manifest_path.display(), e))
-    })?;
+    // Write back (atomic write handled by editor)
+    editor.write()?;
 
     Ok(new_version)
   }
@@ -178,13 +166,10 @@ impl VersionBumper {
   /// This is needed when bumping versions in a workspace - dependent crates
   /// need to update their dependency declarations.
   pub fn update_dependency_version(manifest_path: &Path, dep_name: &str, new_version: &Version) -> RailResult<bool> {
-    let content = fs::read_to_string(manifest_path)
-      .map_err(|e| RailError::message(format!("Failed to read {}: {}", manifest_path.display(), e)))?;
+    use crate::toml::editor::TomlEditor;
 
-    let mut doc: DocumentMut = content
-      .parse()
-      .map_err(|e| RailError::message(format!("Failed to parse {} as TOML: {}", manifest_path.display(), e)))?;
-
+    let mut editor = TomlEditor::open(manifest_path)?;
+    let doc = editor.doc_mut();
     let mut updated = false;
 
     // Check all dependency sections
@@ -209,14 +194,7 @@ impl VersionBumper {
 
     if updated {
       // Write back
-      let temp_path = manifest_path.with_extension("toml.tmp");
-      fs::write(&temp_path, doc.to_string())
-        .map_err(|e| RailError::message(format!("Failed to write temporary file {}: {}", temp_path.display(), e)))?;
-
-      fs::rename(&temp_path, manifest_path).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        RailError::message(format!("Failed to update {}: {}", manifest_path.display(), e))
-      })?;
+      editor.write()?;
     }
 
     Ok(updated)

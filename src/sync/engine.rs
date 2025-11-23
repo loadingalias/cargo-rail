@@ -73,7 +73,7 @@ impl<'a> SyncEngine<'a> {
   /// Create a new sync engine
   pub fn new(ctx: &'a WorkspaceContext, config: SyncConfig, conflict_strategy: ConflictStrategy) -> RailResult<Self> {
     let mapping_store = MappingStore::new(config.crate_name.clone());
-    let transform = CargoTransform::new(ctx.cargo.metadata().clone());
+    let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
     let temp_dir = std::env::temp_dir().join(format!(
@@ -92,7 +92,7 @@ impl<'a> SyncEngine<'a> {
       ctx,
       config,
       mapping_store,
-      transform,
+      transform: transformer,
 
       conflict_resolver,
       loaded_repos: std::collections::HashSet::new(),

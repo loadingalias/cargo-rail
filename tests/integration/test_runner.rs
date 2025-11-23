@@ -195,7 +195,20 @@ fn test_runner_auto_detect_base_ref() -> Result<()> {
   let _ = git(&ws.path, &["branch", "base-branch"]);
   git(&ws.path, &["checkout", "-b", "feature-branch"])?;
 
-  ws.modify_file("lib-a", "src/lib.rs", "pub fn feature_work() {}")?;
+  ws.modify_file(
+    "lib-a",
+    "src/lib.rs",
+    r#"
+    pub fn feature_work() {}
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn test_feature_work() {
+            super::feature_work();
+        }
+    }
+    "#,
+  )?;
   ws.commit("Feature work")?;
 
   // Run without --since (should auto-detect base ref or use HEAD)
@@ -205,8 +218,9 @@ fn test_runner_auto_detect_base_ref() -> Result<()> {
   // Should successfully run (whether it detects changes or not is okay)
   assert!(
     output.status.success(),
-    "Should successfully handle auto-detect. Output:\n{}",
-    stdout
+    "Should successfully handle auto-detect. Output:\n{}\nStderr:\n{}",
+    stdout,
+    String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())

@@ -444,7 +444,7 @@ pub fn run_unify_apply(
   }
 
   // Create transformer (use the same metadata we used for analysis)
-  let transformer = CargoTransform::new(metadata.clone());
+  let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
 
   // 1. Write [workspace.dependencies]
   let workspace_toml = ctx.workspace_root().join("Cargo.toml");

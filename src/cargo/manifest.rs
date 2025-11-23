@@ -1,5 +1,6 @@
 use crate::cargo::WorkspaceMetadata;
 use crate::error::{RailError, RailResult, ResultExt};
+use crate::toml::format::TomlFormatter;
 use cargo_metadata::DependencyKind;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ pub struct CargoTransform {
   workspace_versions: HashMap<String, String>,
   /// Map of crate name -> relative path from workspace root
   workspace_paths: HashMap<String, String>,
+  /// Manifest formatter
+  formatter: TomlFormatter,
 }
 
 impl CargoTransform {
@@ -47,6 +50,7 @@ impl CargoTransform {
       workspace_metadata,
       workspace_versions,
       workspace_paths,
+      formatter: TomlFormatter::new(),
     }
   }
 
@@ -221,6 +225,9 @@ impl CargoTransform {
     // 3. Remove workspace section if it exists (not needed in split repo)
     doc.remove("workspace");
 
+    // 4. Format the manifest
+    self.formatter.format_manifest(&mut doc)?;
+
     Ok(doc.to_string())
   }
 
@@ -263,6 +270,9 @@ impl CargoTransform {
       package.insert("version", Item::Value(Value::from("workspace = true")));
     }
 
+    // Format the manifest
+    self.formatter.format_manifest(&mut doc)?;
+
     Ok(doc.to_string())
   }
 
@@ -274,9 +284,11 @@ impl CargoTransform {
     &self,
     workspace_toml_path: &std::path::Path,
     unified_deps: &[crate::cargo::unify::UnifiedDep],
-    add_comments: bool,
+    _add_comments: bool,
   ) -> RailResult<()> {
-    use toml_edit::{Array, InlineTable, table};
+    use crate::toml::builder::WorkspaceDepsBuilder;
+    use crate::toml::format::TomlValue;
+    use toml_edit::table;
 
     // Read workspace Cargo.toml
     let content = std::fs::read_to_string(workspace_toml_path).context("Failed to read workspace Cargo.toml")?;
@@ -287,188 +299,149 @@ impl CargoTransform {
       doc["workspace"] = table();
     }
 
-    // Write each unified dependency
-    // Group by target (None for regular deps, Some(target) for platform-specific)
-    for unified in unified_deps {
-      if unified.name == "reqwest" {
-        use std::io::Write;
-        let _ = std::fs::OpenOptions::new()
-          .create(true)
-          .write(true)
-          .truncate(true)
-          .open("/tmp/rail-write-ws.log")
-          .and_then(|mut f| {
-            writeln!(
-              f,
-              "[write_workspace_dependencies] Processing reqwest with {} features: {:?}",
-              unified.features.len(),
-              unified.features
-            )
-          });
+    // Group by target
+    // None -> regular dependencies
+    // Some(target) -> platform specific
+    let mut regular_deps = Vec::new();
+    let mut target_deps: HashMap<String, Vec<&crate::cargo::unify::UnifiedDep>> = HashMap::new();
+
+    for dep in unified_deps {
+      if let Some(ref target) = dep.target {
+        target_deps.entry(target.clone()).or_default().push(dep);
+      } else {
+        regular_deps.push(dep);
+      }
+    }
+
+    // 1. Write regular dependencies using Builder
+    if !regular_deps.is_empty() {
+      let mut builder = WorkspaceDepsBuilder::new();
+
+      for dep in regular_deps {
+        // Determine if we should add a comment
+        let comment = if _add_comments && !dep.comments.is_empty() {
+          Some(dep.comments.join("; "))
+        } else {
+          None
+        };
+
+        if dep.features.is_empty() && dep.default_features && dep.path.is_none() {
+          // Simple string version: dep = "1.0"
+          if let Some(c) = comment {
+            builder.add_with_comment(&dep.name, &format!("\"{}\"", dep.version_req), &c);
+          } else {
+            builder.add(&dep.name, &format!("\"{}\"", dep.version_req));
+          }
+        } else {
+          // Complex table version
+          let mut pairs = Vec::new();
+
+          if let Some(ref path) = dep.path {
+            pairs.push(("path".to_string(), TomlValue::String(path.to_string())));
+          } else {
+            pairs.push(("version".to_string(), TomlValue::String(dep.version_req.to_string())));
+          }
+
+          if !dep.default_features {
+            pairs.push(("default-features".to_string(), TomlValue::Bool(false)));
+          }
+
+          if !dep.features.is_empty() {
+            pairs.push(("features".to_string(), TomlValue::Array(dep.features.clone())));
+          }
+
+          if let Some(c) = comment {
+            builder.add_table_with_comment(&dep.name, &pairs, &c);
+          } else {
+            builder.add_table(&dep.name, &pairs);
+          }
+        }
       }
 
-      // Determine which table to write to based on target
-      let deps_table = if let Some(ref target) = unified.target {
-        // Platform-specific dependency: write to [workspace.target.'<target>'.dependencies]
-        // IMPORTANT: We need to create workspace.target (as a table), then target.'cfg(...)' as a subtable
+      // The builder generates a full [workspace.dependencies] string.
+      // We need to parse it and merge it into the document.
+      // This is a bit inefficient (generate string -> parse -> merge), but it ensures consistency.
+      // Alternatively, we could make the builder operate on DocumentMut, but that breaks the pattern.
+      // For now, let's parse the builder output.
+      let deps_toml = builder.build()?;
+      let deps_doc: DocumentMut = deps_toml
+        .parse()
+        .map_err(|e| RailError::message(format!("Failed to parse generated dependencies: {}", e)))?;
+
+      if let Some(generated_deps) = deps_doc.get("workspace").and_then(|w| w.get("dependencies")) {
+        // Replace or merge [workspace.dependencies]
+        // We want to replace the entries we generated, but maybe preserve others?
+        // The unification plan should be comprehensive, so replacing is likely correct for managed deps.
+        // However, existing implementation seemed to overwrite.
+        // Let's overwrite [workspace.dependencies] with our generated table.
+
+        // Ensure workspace is a table
         let workspace = doc["workspace"]
           .as_table_mut()
           .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
+        workspace.insert("dependencies", generated_deps.clone());
+      }
+    }
 
-        // Ensure [workspace.target] table exists
-        if !workspace.contains_key("target") {
-          workspace["target"] = table();
-        }
+    // 2. Write target-specific dependencies
+    // The Builder currently only supports [workspace.dependencies].
+    // For target dependencies, we might need to extend the builder or handle them manually here using the same logic.
+    // Given the complexity, let's handle them manually but using the cleaner logic pattern.
+    for (target, deps) in target_deps {
+      // ... (Target specific logic remains similar but cleaner if possible)
+      // For now, I will keep the existing logic for targets or adapt it.
+      // The existing logic was very verbose.
+      // Let's implement a mini-builder logic here or just use toml_edit directly but cleanly.
 
-        let target_table = workspace["target"]
-          .as_table_mut()
-          .ok_or_else(|| RailError::message("[workspace.target] is not a table"))?;
+      let workspace = doc["workspace"]
+        .as_table_mut()
+        .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
 
-        // Create the cfg-specific section within target: [workspace.target.'cfg(...)']
-        if !target_table.contains_key(target) {
-          target_table[target] = table();
-        }
+      // Ensure [workspace.target] table exists
+      if !workspace.contains_key("target") {
+        workspace["target"] = table();
+      }
+      let target_table = workspace["target"].as_table_mut().unwrap();
 
-        let cfg_section = target_table[target]
-          .as_table_mut()
-          .ok_or_else(|| RailError::message(format!("[workspace.target.'{}'] is not a table", target)))?;
+      if !target_table.contains_key(&target) {
+        target_table[&target] = table();
+      }
+      let cfg_section = target_table[&target].as_table_mut().unwrap();
 
-        // Create dependencies section: [workspace.target.'cfg(...)'.dependencies]
-        if !cfg_section.contains_key("dependencies") {
-          cfg_section["dependencies"] = table();
-        }
+      if !cfg_section.contains_key("dependencies") {
+        cfg_section["dependencies"] = table();
+      }
+      let deps_section = cfg_section["dependencies"].as_table_mut().unwrap();
 
-        cfg_section["dependencies"]
-          .as_table_mut()
-          .ok_or_else(|| RailError::message(format!("[workspace.target.'{}'.dependencies] is not a table", target)))?
-      } else {
-        // Regular dependency: write to [workspace.dependencies]
-        let workspace = doc["workspace"]
-          .as_table_mut()
-          .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
-
-        if !workspace.contains_key("dependencies") {
-          workspace["dependencies"] = table();
-        }
-
-        workspace["dependencies"]
-          .as_table_mut()
-          .ok_or_else(|| RailError::message("[workspace.dependencies] is not a table"))?
-      };
-      // Use inline table for simple deps and deps with few features
-      // Use regular table format only for deps with many features (>10) to avoid long lines
-      let use_inline_table = unified.features.len() <= 10;
-
-      if use_inline_table {
-        // Simple dependency or dependency with few features - use inline table format
+      for dep in deps {
+        // Use inline table for consistency
+        use toml_edit::{InlineTable, Value};
         let mut dep_table = InlineTable::new();
 
-        // INVISIBLE FEATURE: Support workspace member path dependencies
-        // If this dependency has a path (workspace member), use path instead of version
-        if let Some(ref path) = unified.path {
-          // This is a workspace member - use path
+        if let Some(ref path) = dep.path {
           dep_table.insert("path", Value::from(path.to_string()));
         } else {
-          // External dependency - use version
-          dep_table.insert("version", Value::from(unified.version_req.to_string()));
+          dep_table.insert("version", Value::from(dep.version_req.to_string()));
         }
 
-        // Add default-features if false (true is the default, so we only specify false)
-        if !unified.default_features {
+        if !dep.default_features {
           dep_table.insert("default-features", Value::from(false));
         }
 
-        // Add features if any (inline arrays for <10 features)
-        if !unified.features.is_empty() {
-          if unified.name == "reqwest" {
-            use std::io::Write;
-            let _ = std::fs::OpenOptions::new()
-              .create(true)
-              .write(true)
-              .truncate(true)
-              .open("/tmp/rail-manifest.log")
-              .and_then(|mut f| {
-                writeln!(
-                  f,
-                  "[manifest write] reqwest features being written: {:?}",
-                  unified.features
-                )
-              });
-          }
-          let mut features_array = Array::new();
-          for feature in &unified.features {
+        if !dep.features.is_empty() {
+          let mut features_array = toml_edit::Array::new();
+          for feature in &dep.features {
             features_array.push(feature.as_str());
           }
           dep_table.insert("features", Value::from(features_array));
         }
 
-        // Insert the dependency
-        deps_table.insert(&unified.name, toml_edit::Item::Value(dep_table.into()));
-
-        // Add comments if enabled and any exist
-        if add_comments
-          && !unified.comments.is_empty()
-          && let Some(item) = deps_table.get_mut(&unified.name)
-        {
-          let comment_str = unified.comments.join(", ");
-          item
-            .as_value_mut()
-            .unwrap()
-            .decor_mut()
-            .set_suffix(format!(" # {}", comment_str));
-        }
-      } else {
-        // Complex dependency with features - use regular table format
-        let mut dep_table = table();
-
-        if unified.name == "reqwest" {
-          use std::io::Write;
-          let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open("/tmp/rail-manifest.log")
-            .and_then(|mut f| {
-              writeln!(
-                f,
-                "[manifest write REGULAR TABLE] reqwest features being written: {:?}",
-                unified.features
-              )
-            });
-        }
-
-        // INVISIBLE FEATURE: Support workspace member path dependencies
-        if let Some(ref path) = unified.path {
-          dep_table["path"] = toml_edit::value(path.to_string());
-        } else {
-          dep_table["version"] = toml_edit::value(unified.version_req.to_string());
-        }
-
-        // Add default-features if false
-        if !unified.default_features {
-          dep_table["default-features"] = toml_edit::value(false);
-        }
-
-        // Add features as multiline array
-        let mut features_array = Array::new();
-        for feature in &unified.features {
-          features_array.push(feature.as_str());
-        }
-        dep_table["features"] = toml_edit::value(Value::Array(features_array));
-
-        // Insert the dependency
-        deps_table.insert(&unified.name, dep_table);
-
-        // Add comments if enabled and any exist
-        // Note: Comments for regular tables are more complex - for now we skip them
-        // The comment is only applied to inline tables above
-        if add_comments && !unified.comments.is_empty() {
-          // Regular table entries don't support trailing comments in the same way
-          // We could add them as a separate comment line above the entry, but that's complex
-          // For now, we just skip comments for regular table format (with features)
-        }
+        deps_section.insert(&dep.name, Item::Value(Value::InlineTable(dep_table)));
       }
     }
+
+    // Format the manifest
+    self.formatter.format_manifest(&mut doc)?;
 
     // Write back to file
     std::fs::write(workspace_toml_path, doc.to_string()).context("Failed to write workspace Cargo.toml")?;
@@ -487,11 +460,11 @@ impl CargoTransform {
     dep_name: &str,
     dep_kind: &DependencyKind,
   ) -> RailResult<()> {
-    use toml_edit::InlineTable;
+    use crate::toml::builder::MemberManifestBuilder;
+    use crate::toml::editor::TomlEditor;
 
-    // Read member Cargo.toml
-    let content = std::fs::read_to_string(member_toml_path).context("Failed to read member Cargo.toml")?;
-    let mut doc: DocumentMut = content.parse().context("Failed to parse member Cargo.toml")?;
+    // Use TomlEditor for safe editing
+    let mut editor = TomlEditor::open(member_toml_path)?;
 
     // Determine which section to modify
     let section_name = match dep_kind {
@@ -503,13 +476,16 @@ impl CargoTransform {
       }
     };
 
-    // Get the dependencies section
+    // Check if dependency exists
+    // We need to navigate manually first to check existence and get current values
+    // because TomlEditor doesn't expose full read access to everything easily yet
+    // but we can use editor.doc()
+    let doc = editor.doc();
     let deps = doc
-      .get_mut(section_name)
-      .and_then(|d| d.as_table_mut())
+      .get(section_name)
+      .and_then(|d| d.as_table_like())
       .ok_or_else(|| RailError::message(format!("[{}] section not found or not a table", section_name)))?;
 
-    // Check if dependency exists
     if !deps.contains_key(dep_name) {
       return Err(RailError::message(format!(
         "Dependency '{}' not found in [{}]",
@@ -517,47 +493,64 @@ impl CargoTransform {
       )));
     }
 
-    // Get current dependency value
     let current_dep = deps.get(dep_name).unwrap();
 
-    // Build new dependency value with workspace = true
-    let mut new_dep = InlineTable::new();
-    new_dep.insert("workspace", Value::from(true));
+    // Check for optional
+    let is_optional = if let Some(dep_table) = current_dep.as_inline_table() {
+      dep_table.get("optional").and_then(|v| v.as_bool()).unwrap_or(false)
+    } else if let Some(dep_table) = current_dep.as_table() {
+      dep_table.get("optional").and_then(|v| v.as_bool()).unwrap_or(false)
+    } else {
+      false
+    };
 
-    // Preserve certain fields that can be specified alongside workspace = true:
-    // - optional: can be different per member
-    // - features: can ADD to workspace features
-    if let Some(dep_table) = current_dep.as_inline_table() {
-      if let Some(optional) = dep_table.get("optional")
-        && let Some(optional_bool) = optional.as_bool()
-        && optional_bool
-      {
-        new_dep.insert("optional", Value::from(true));
-      }
+    // We don't preserve features here because the unification plan
+    // already computed the union. If we wanted to support per-member feature
+    // additions, we'd handle that differently.
 
-      // Note: We don't preserve features here because the unification plan
-      // already computed the union. If we wanted to support per-member feature
-      // additions, we'd handle that differently.
-    } else if let Some(dep_table) = current_dep.as_table()
-      && let Some(optional) = dep_table.get("optional")
-      && let Some(optional_bool) = optional.as_bool()
-      && optional_bool
-    {
-      new_dep.insert("optional", Value::from(true));
+    // Build new dependency value using Builder
+    let builder = MemberManifestBuilder::new();
+    // We pass None for features to just get { workspace = true }
+    // If we wanted to add features, we'd pass Some(vec![...])
+    let new_dep_str = builder.workspace_dep(dep_name, None);
+
+    // Parse the string back to a Value (a bit round-about but uses the builder)
+    // Or we can manually construct the inline table if we want to add 'optional'
+    // The builder currently returns a String.
+    // Let's use the string and parse it.
+    let mut new_dep_value = new_dep_str
+      .parse::<Value>()
+      .map_err(|e| RailError::message(format!("Failed to parse built dependency: {}", e)))?;
+
+    // Add optional if needed
+    if is_optional && let Some(inline) = new_dep_value.as_inline_table_mut() {
+      inline.insert("optional", Value::from(true));
     }
 
-    // Replace dependency with workspace inheritance
-    deps.insert(dep_name, toml_edit::Item::Value(new_dep.into()));
+    // Update using Editor
+    // Path is "section.dep_name"
+    let path = format!("{}.{}", section_name, dep_name);
+    editor.set(&path, new_dep_value)?;
 
-    // Add trailing comment to mark this as unified
-    if let Some(item) = deps.get_mut(dep_name)
+    // Add trailing comment (TomlEditor doesn't support comments on set yet easily)
+    // So we might need to access doc_mut directly for comments
+    if let Some(deps) = editor
+      .doc_mut()
+      .get_mut(section_name)
+      .and_then(|d| d.as_table_like_mut())
+      && let Some(item) = deps.get_mut(dep_name)
       && let Some(value) = item.as_value_mut()
     {
       value.decor_mut().set_suffix(" # unified by cargo-rail\n");
     }
 
-    // Write back to file
-    std::fs::write(member_toml_path, doc.to_string()).context("Failed to write member Cargo.toml")?;
+    // Format (TomlEditor validates on write, but we can also format explicitly if needed)
+    // The editor preserves format mostly.
+    // But we might want to run the formatter.
+    self.formatter.format_manifest(editor.doc_mut())?;
+
+    // Write
+    editor.write()?;
 
     Ok(())
   }
@@ -833,9 +826,16 @@ members = ["crate-a"]
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
     let doc: DocumentMut = content.parse().unwrap();
 
-    let anyhow_dep = doc["workspace"]["dependencies"]["anyhow"].as_inline_table().unwrap();
-    assert_eq!(anyhow_dep.get("version").and_then(|v| v.as_str()), Some("^1.0"));
-    assert!(!anyhow_dep.contains_key("features"), "Should not have features field");
+    let anyhow_dep = &doc["workspace"]["dependencies"]["anyhow"];
+
+    if let Some(version) = anyhow_dep.as_str() {
+      assert_eq!(version, "^1.0");
+    } else if let Some(table) = anyhow_dep.as_inline_table() {
+      assert_eq!(table.get("version").and_then(|v| v.as_str()), Some("^1.0"));
+      assert!(!table.contains_key("features"), "Should not have features field");
+    } else {
+      panic!("Dependency is neither string nor inline table");
+    }
   }
 
   #[test]

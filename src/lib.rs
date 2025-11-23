@@ -14,7 +14,7 @@
 //! let ctx = WorkspaceContext::build(Path::new("."))?;
 //!
 //! // Analyze workspace structure
-//! let crates = ctx.cargo().packages();
+//! let crates = ctx.cargo.metadata().list_crates();
 //! assert!(!crates.is_empty());
 //! # Ok(())
 //! # }
@@ -52,6 +52,7 @@ pub mod sync;
 /// Target triple detection for workspace validation
 pub mod targets;
 pub mod test;
+pub mod toml;
 pub mod utils;
 pub mod workspace;
 

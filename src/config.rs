@@ -18,6 +18,9 @@ pub struct RailConfig {
   /// Split/sync configurations for crates
   #[serde(default)]
   pub splits: Vec<SplitConfig>,
+  /// TOML formatting settings
+  #[serde(default)]
+  pub formatting: FormattingConfig,
 }
 
 /// Workspace location configuration
@@ -439,6 +442,14 @@ impl Default for ReleaseConfig {
       require_changelog_entries: false,
     }
   }
+}
+
+/// Configuration for TOML formatting
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FormattingConfig {
+  /// Add "Managed by cargo-rail" header (default: false)
+  #[serde(default)]
+  pub add_header: bool,
 }
 
 fn default_tag_prefix() -> String {

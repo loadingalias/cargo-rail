@@ -155,8 +155,12 @@ fn format_watch_test_command(config: &TestConfig) -> String {
     rail_cmd.push_str(&format!(" --since {}", since));
   }
 
-  if config.prefer_nextest {
-    rail_cmd.push_str(" --nextest");
+  if config.full {
+    rail_cmd.push_str(" --full");
+  }
+
+  if !config.prefer_nextest {
+    rail_cmd.push_str(" --no-nextest");
   }
 
   if !config.test_args.is_empty() {
@@ -207,6 +211,7 @@ mod tests {
   fn test_format_watch_test_command_includes_flags_and_args() {
     let cfg = TestConfig {
       since: Some("main".to_string()),
+      full: false,
       explain: false,
       prefer_nextest: true,
       test_args: vec!["--nocapture".into(), "some::test".into()],
@@ -215,7 +220,22 @@ mod tests {
     let cmd = format_watch_test_command(&cfg);
     assert!(cmd.starts_with("rail test"));
     assert!(cmd.contains("--since main"));
-    assert!(cmd.contains("--nextest"));
+    assert!(!cmd.contains("--no-nextest"));
     assert!(cmd.contains("-- --nocapture some::test"));
+  }
+
+  #[test]
+  fn test_format_watch_test_command_no_nextest() {
+    let cfg = TestConfig {
+      since: None,
+      full: true,
+      explain: false,
+      prefer_nextest: false,
+      test_args: vec![],
+    };
+
+    let cmd = format_watch_test_command(&cfg);
+    assert!(cmd.contains("--full"));
+    assert!(cmd.contains("--no-nextest"));
   }
 }

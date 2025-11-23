@@ -10,6 +10,8 @@ use crate::workspace::{ChangeImpact, WorkspaceContext};
 pub struct TestConfig {
   /// Git ref to compare against (if None, auto-detect)
   pub since: Option<String>,
+  /// Skip change detection and run all tests
+  pub full: bool,
   /// Explain why tests are being run
   pub explain: bool,
   /// Prefer cargo-nextest if available
@@ -33,7 +35,18 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
   let impact = analyzer.analyze_changes(&base_ref, None)?;
 
   // Get minimal test set
-  let test_targets = impact.minimal_test_set();
+  let test_targets = if config.full {
+    println!("⚡ Full mode active - running all tests");
+    ctx
+      .cargo
+      .metadata()
+      .list_crates()
+      .iter()
+      .map(|p| p.name.to_string())
+      .collect()
+  } else {
+    impact.minimal_test_set()
+  };
 
   if test_targets.is_empty() {
     println!("✓ No affected crates - all tests skipped");

@@ -12,12 +12,10 @@
 //! - `manifest` - Lossless Cargo.toml transformation
 //! - `unify` - Workspace dependency unification engine (replaces cargo-hakari)
 //! - `validate` - Optional per-target validation with Rayon parallelism
-
-/// Lossless Cargo.toml transformation
+/// Workspace dependency unification engine
 pub mod manifest;
 /// Comprehensive cargo_metadata wrapper
 pub mod metadata;
-/// Workspace dependency unification engine
 pub mod unify;
 /// Per-target validation with parallel execution
 pub mod validate;

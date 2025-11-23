@@ -48,9 +48,12 @@ enum Commands {
     /// Git ref to compare against (auto-detects origin/main, origin/master, or HEAD~1)
     #[arg(long)]
     since: Option<String>,
-    /// Use cargo-nextest if available
+    /// Skip change detection and run all tests
+    #[arg(long, short = 'f')]
+    full: bool,
+    /// Disable automatic use of cargo-nextest
     #[arg(long)]
-    nextest: bool,
+    no_nextest: bool,
     /// Explain why tests are being run
     #[arg(long)]
     explain: bool,
@@ -274,7 +277,8 @@ fn main() {
     } => commands::run_affected(&ctx, since, from, to, format, false),
     Commands::Test {
       since,
-      nextest,
+      full,
+      no_nextest,
       explain,
       watch,
       watch_mode,
@@ -282,8 +286,9 @@ fn main() {
     } => {
       let config = commands::test::TestConfig {
         since,
+        full,
         explain,
-        prefer_nextest: nextest,
+        prefer_nextest: !no_nextest,
         test_args,
       };
 

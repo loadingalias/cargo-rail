@@ -192,6 +192,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],
+    formatting: crate::config::FormattingConfig::default(),
   });
 
   // Add new splits (avoid duplicates)
