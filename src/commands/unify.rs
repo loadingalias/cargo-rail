@@ -145,6 +145,7 @@ pub fn run_unify_analyze(
   exclude: Vec<String>,
   include: Vec<String>,
   pin_transitives_flag: bool,
+  minimal_flag: bool,
 ) -> RailResult<()> {
   println!("🔍 Analyzing workspace dependencies...\n");
 
@@ -210,6 +211,20 @@ pub fn run_unify_analyze(
     display_transitive_impact(&plan, consolidate_enabled);
   }
 
+  // Show minimize_features status (configuration preview)
+  let should_minimize = minimal_flag || ctx.config.as_ref().map(|c| c.unify.minimize_features).unwrap_or(false);
+
+  if should_minimize {
+    println!("\n🎯 Feature minimization enabled:");
+    println!("   When you run 'cargo rail unify apply', features will be minimized");
+    println!("   to only those required for compilation.\n");
+  } else {
+    println!("\n💡 Feature minimization:");
+    println!("   Currently disabled. To enable:");
+    println!("     • Run: cargo rail unify apply --minimal");
+    println!("     • Or set in rail.toml: minimize_features = true\n");
+  }
+
   println!(
     "✅ Analysis complete{}",
     if plan.workspace_deps.is_empty() && plan.issues.is_empty() {
@@ -231,6 +246,7 @@ pub fn run_unify_apply(
   include: Vec<String>,
   backup: bool,
   pin_transitives_flag: bool,
+  minimal_flag: bool,
 ) -> RailResult<()> {
   // Check if targets have changed (lazy update notification)
   check_target_updates(ctx);
@@ -463,6 +479,29 @@ pub fn run_unify_apply(
     );
   }
 
+  // 1.5. Minimize features if enabled (via config or CLI flag)
+  // This is the "killer feature" - automated feature pruning
+  let should_minimize = minimal_flag || ctx.config.as_ref().map(|c| c.unify.minimize_features).unwrap_or(false);
+
+  let _final_workspace_deps = if should_minimize {
+    use crate::cargo::unify::minimize_workspace_features;
+
+    let (minimized_deps, min_report) = minimize_workspace_features(ctx, &all_workspace_deps, &workspace_toml)?;
+
+    // Re-write workspace.dependencies with minimal features
+    println!("\n📝 Updating [workspace.dependencies] with minimal features...");
+    transformer.write_workspace_dependencies(&workspace_toml, &minimized_deps, config.add_conflict_comments)?;
+    println!("  ✓ Updated with minimal feature sets");
+
+    // Print report
+    println!("{}", min_report.summary());
+
+    minimized_deps
+  } else {
+    // No minimization - use original deps
+    all_workspace_deps
+  };
+
   // 2. Convert member dependencies to workspace inheritance
   println!("\n📝 Converting member dependencies to workspace inheritance...");
 
@@ -485,8 +524,12 @@ pub fn run_unify_apply(
 
     for edit in edits {
       match edit {
-        crate::cargo::unify::MemberEdit::UseWorkspace { dep_name, kind } => {
-          match transformer.convert_to_workspace_inheritance(member_toml, dep_name, kind) {
+        crate::cargo::unify::MemberEdit::UseWorkspace {
+          dep_name,
+          kind,
+          add_features,
+        } => {
+          match transformer.convert_to_workspace_inheritance(member_toml, dep_name, kind, add_features.clone()) {
             Ok(_) => successful_edits += 1,
             Err(_) => {
               // This happens when we detect a dep via --all-features metadata resolution,
@@ -760,6 +803,94 @@ pub fn run_unify_undo(ctx: &WorkspaceContext, list: bool, backup_id: Option<Stri
       None => {
         println!("⚠️  No backups found.");
         println!("\n  💡 Backups are created automatically when running 'cargo rail unify apply'");
+        println!("     or explicitly with the --backup flag.");
+        return Ok(());
+      }
+    }
+  };
+
+  // Restore the backup
+  backup_manager.restore_backup(&backup_to_restore)?;
+
+  println!("\n  💡 Next steps:");
+  println!("     1. Run 'cargo check' to verify everything compiles");
+  println!("     2. Review the restored files");
+
+  Ok(())
+}
+
+/// Restore a unify backup (undo functionality) - standalone version
+///
+/// This is a standalone version that doesn't require WorkspaceContext,
+/// allowing it to work even when Cargo.toml files are corrupted.
+/// This is critical for the undo functionality - if files are corrupted,
+/// we can't load metadata, but we still need to be able to restore from backup.
+///
+/// # Arguments
+///
+/// * `workspace_root` - Path to workspace root
+/// * `list` - If true, list available backups instead of restoring
+/// * `backup_id` - Optional specific backup ID to restore (if None, restores most recent)
+pub fn run_unify_undo_standalone(
+  workspace_root: impl Into<std::path::PathBuf>,
+  list: bool,
+  backup_id: Option<String>,
+) -> RailResult<()> {
+  let workspace_root = workspace_root.into();
+  let backup_manager = BackupManager::new(&workspace_root);
+
+  // Handle --list flag
+  if list {
+    println!("📋 Available backups:\n");
+
+    let backups = backup_manager.list_backups()?;
+
+    if backups.is_empty() {
+      println!("  No backups found.");
+      println!("\n  💡 Backups are created automatically when running 'cargo rail unify'");
+      println!("     or explicitly with the --backup flag.");
+      return Ok(());
+    }
+
+    for (idx, backup) in backups.iter().enumerate() {
+      let is_latest = idx == 0;
+      let marker = if is_latest { " (latest)" } else { "" };
+
+      println!("{}. {}{}", idx + 1, backup.id, marker);
+      println!("   Timestamp: {}", backup.timestamp_display());
+      println!("   Command:   {}", backup.metadata.command);
+      println!("   Files:     {} modified", backup.file_count());
+
+      if let Some(desc) = &backup.metadata.description {
+        println!("   Description: {}", desc);
+      }
+
+      println!();
+    }
+
+    println!("  To restore a backup:");
+    println!("    cargo rail unify undo              # Restore latest");
+    println!("    cargo rail unify undo --backup-id <id>  # Restore specific");
+
+    return Ok(());
+  }
+
+  // Determine which backup to restore
+  let backup_to_restore = if let Some(id) = backup_id {
+    // User specified a backup ID
+    id
+  } else {
+    // Use the latest backup
+    let latest = backup_manager.get_latest_backup()?;
+
+    match latest {
+      Some(backup) => {
+        println!("🔄 Restoring latest backup: {}\n", backup.id);
+        backup.id
+      }
+      None => {
+        println!("⚠️  No backups found.");
+        println!("\n  💡 Backups are created automatically when running 'cargo rail unify'");
         println!("     or explicitly with the --backup flag.");
         return Ok(());
       }

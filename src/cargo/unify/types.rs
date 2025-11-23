@@ -144,6 +144,9 @@ pub enum MemberEdit {
     dep_name: String,
     /// Dependency kind
     kind: DependencyKind,
+    /// Features to explicitly add to the member dependency
+    /// (e.g. "default" if workspace has default-features = false but member needs it)
+    add_features: Option<Vec<String>>,
   },
 }
 

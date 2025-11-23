@@ -369,17 +369,31 @@ impl CargoTransform {
         .map_err(|e| RailError::message(format!("Failed to parse generated dependencies: {}", e)))?;
 
       if let Some(generated_deps) = deps_doc.get("workspace").and_then(|w| w.get("dependencies")) {
-        // Replace or merge [workspace.dependencies]
-        // We want to replace the entries we generated, but maybe preserve others?
-        // The unification plan should be comprehensive, so replacing is likely correct for managed deps.
-        // However, existing implementation seemed to overwrite.
-        // Let's overwrite [workspace.dependencies] with our generated table.
+        // MERGE (not replace) [workspace.dependencies]
+        // We need to preserve existing workspace dependencies that aren't being unified
+        // This is critical for repos that already use [workspace.dependencies]
 
         // Ensure workspace is a table
         let workspace = doc["workspace"]
           .as_table_mut()
           .ok_or_else(|| RailError::message("[workspace] is not a table"))?;
-        workspace.insert("dependencies", generated_deps.clone());
+
+        // Get or create [workspace.dependencies]
+        if !workspace.contains_key("dependencies") {
+          workspace["dependencies"] = table();
+        }
+
+        let existing_deps = workspace["dependencies"]
+          .as_table_mut()
+          .ok_or_else(|| RailError::message("[workspace.dependencies] is not a table"))?;
+
+        // Merge: insert/update each generated dep into existing table
+        if let Some(generated_table) = generated_deps.as_table() {
+          for (dep_name, dep_value) in generated_table.iter() {
+            // Insert or overwrite the dependency
+            existing_deps.insert(dep_name, dep_value.clone());
+          }
+        }
       }
     }
 
@@ -459,6 +473,7 @@ impl CargoTransform {
     member_toml_path: &std::path::Path,
     dep_name: &str,
     dep_kind: &DependencyKind,
+    add_features: Option<Vec<String>>,
   ) -> RailResult<()> {
     use crate::toml::builder::MemberManifestBuilder;
     use crate::toml::editor::TomlEditor;
@@ -510,9 +525,8 @@ impl CargoTransform {
 
     // Build new dependency value using Builder
     let builder = MemberManifestBuilder::new();
-    // We pass None for features to just get { workspace = true }
-    // If we wanted to add features, we'd pass Some(vec![...])
-    let new_dep_str = builder.workspace_dep(dep_name, None);
+    // Pass add_features (e.g. ["default"] if needed)
+    let new_dep_str = builder.workspace_dep(dep_name, add_features);
 
     // Parse the string back to a Value (a bit round-about but uses the builder)
     // Or we can manually construct the inline table if we want to add 'optional'
@@ -901,7 +915,7 @@ serde = { version = "1.0", features = ["derive"] }
 "#;
     std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
 
-    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "serde", &DependencyKind::Normal);
+    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "serde", &DependencyKind::Normal, None);
     assert!(result.is_ok(), "Should successfully convert to workspace inheritance");
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
@@ -936,7 +950,7 @@ tokio = { version = "1.0", optional = true, features = ["fs"] }
     std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
 
     transformer
-      .convert_to_workspace_inheritance(temp_file.path(), "tokio", &DependencyKind::Normal)
+      .convert_to_workspace_inheritance(temp_file.path(), "tokio", &DependencyKind::Normal, None)
       .unwrap();
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
@@ -970,7 +984,7 @@ tempfile = "3.0"
     std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
 
     let result =
-      transformer.convert_to_workspace_inheritance(temp_file.path(), "tempfile", &DependencyKind::Development);
+      transformer.convert_to_workspace_inheritance(temp_file.path(), "tempfile", &DependencyKind::Development, None);
     assert!(result.is_ok(), "Should handle dev-dependencies");
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
@@ -998,7 +1012,7 @@ cc = "1.0"
 "#;
     std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
 
-    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "cc", &DependencyKind::Build);
+    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "cc", &DependencyKind::Build, None);
     assert!(result.is_ok(), "Should handle build-dependencies");
 
     let content = std::fs::read_to_string(temp_file.path()).unwrap();
@@ -1027,7 +1041,8 @@ serde = "1.0"
     std::io::Write::write_all(&mut temp_file, member_toml.as_bytes()).unwrap();
 
     // Try to convert non-existent dependency
-    let result = transformer.convert_to_workspace_inheritance(temp_file.path(), "nonexistent", &DependencyKind::Normal);
+    let result =
+      transformer.convert_to_workspace_inheritance(temp_file.path(), "nonexistent", &DependencyKind::Normal, None);
     assert!(result.is_err(), "Should error on missing dependency");
   }
 }

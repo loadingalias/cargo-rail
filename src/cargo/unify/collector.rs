@@ -16,22 +16,42 @@ use std::collections::HashMap;
 pub fn collect_dependencies(metadata: &WorkspaceMetadata, use_all_features: bool) -> Vec<DependencyInstance> {
   let mut instances = Vec::new();
 
+  // PHASE 1: Collect all explicitly declared features across all members
+  // This gives us a whitelist of features that are safe to write to workspace.dependencies
+  let mut declared_features_per_dep: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+
   for pkg in metadata.list_crates() {
     for dep in &pkg.dependencies {
-      // Get RESOLVED features if available, fallback to declared features
-      // Resolved features include:
-      // 1. Features declared in this member's Cargo.toml
-      // 2. Default features (if enabled)
-      // 3. Features activated by other workspace members
-      // 4. Features activated transitively through dependency chains
+      declared_features_per_dep
+        .entry(dep.name.clone())
+        .or_default()
+        .extend(dep.features.iter().cloned());
+    }
+  }
+
+  // PHASE 2: Collect dependency instances using resolved features (for union)
+  // but filter to only declared features (for safety)
+  for pkg in metadata.list_crates() {
+    for dep in &pkg.dependencies {
+      // Strategy: Use RESOLVED features to get the automatic union across members,
+      // but FILTER to only include features that were explicitly declared in at least
+      // one member's Cargo.toml. This combines the benefits:
+      //
+      // ✅ Automatic union from cargo's resolver (don't need manual merging)
+      // ✅ Only features that developers explicitly wrote (guaranteed valid)
+      // ✅ No phantom features from --all-features (filtered out)
+      //
+      // Example: If Member A has features=["async-await"] and Member B has features=["std"],
+      // resolved will give us both, and both are in our declared whitelist, so we keep both.
+      // But if cargo resolves "use_std" (from sub-crate), it's not in our whitelist, so we drop it.
       let features = if let Some(resolved_features) = metadata.get_resolved_features_for_package(&dep.name) {
-        // Use resolved features - this is the ACTUAL set Cargo enables
-        resolved_features.into_iter().collect()
+        // Get the whitelist of declared features for this dependency
+        let declared = declared_features_per_dep.get(&dep.name).cloned().unwrap_or_default();
+
+        // Filter resolved features to only those that were explicitly declared
+        resolved_features.into_iter().filter(|f| declared.contains(f)).collect()
       } else {
-        // Fallback to declared features if:
-        // - No resolve graph available
-        // - Package is a workspace member
-        // - Package not found in resolved graph (e.g., optional dep not enabled)
+        // Fallback: use declared features if no resolution available
         dep.features.clone()
       };
 

@@ -97,6 +97,9 @@ enum Commands {
     /// Consolidate transitive-only crates with fragmented features
     #[arg(long)]
     consolidate_transitives: bool,
+    /// Minimize features to only those required for compilation
+    #[arg(long)]
+    minimal: bool,
     /// List available backups (for undo action)
     #[arg(long)]
     list: bool,
@@ -259,6 +262,24 @@ fn main() {
     return;
   }
 
+  // Handle unify undo command specially - it needs to work even with corrupted Cargo.toml files
+  // (since that's exactly what it's trying to fix). This must be done BEFORE building
+  // WorkspaceContext, which would fail if metadata can't be loaded.
+  if let Commands::Unify {
+    action: Some(ref act),
+    ref list,
+    ref backup_id,
+    ..
+  } = cli.command
+    && act == "undo"
+  {
+    let result = commands::run_unify_undo_standalone(&workspace_root, *list, backup_id.clone());
+    if let Err(e) = result {
+      handle_error(e);
+    }
+    return;
+  }
+
   // Build workspace context once (single-load pattern) for all other commands
   let ctx = match workspace::WorkspaceContext::build(&workspace_root) {
     Ok(ctx) => ctx,
@@ -317,6 +338,7 @@ fn main() {
       include,
       backup,
       consolidate_transitives,
+      minimal,
       list,
       backup_id,
     } => {
@@ -331,9 +353,9 @@ fn main() {
           )))
         }
       } else if dry_run {
-        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
+        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives, minimal)
       } else {
-        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives)
+        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives, minimal)
       }
     }
 

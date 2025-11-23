@@ -69,6 +69,12 @@ pub struct UnifyConfig {
   /// Backup configuration
   #[serde(default)]
   pub backup: UnifyBackupConfig,
+
+  /// Minimize features to only those required for compilation (default: false)
+  /// When enabled, runs iterative cargo check to find minimal working feature set
+  /// This is the "killer feature" - automated feature pruning integrated into unify
+  #[serde(default)]
+  pub minimize_features: bool,
 }
 
 /// Conflict handling configuration for unification
@@ -366,6 +372,7 @@ impl Default for UnifyConfig {
       validation: UnifyValidationConfig::default(),
       output: UnifyOutputConfig::default(),
       backup: UnifyBackupConfig::default(),
+      minimize_features: false,
     }
   }
 }

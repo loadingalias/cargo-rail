@@ -82,7 +82,9 @@ pub fn unify_instances(
     }
   }
 
-  // Default features: true if ANY instance uses them
+  // Default features: use union strategy (true if ANY instance needs them)
+  // This is safer because Cargo's feature resolution is additive.
+  // Members that don't want defaults can explicitly use workspace = { default-features = false }
   let default_features = instances.iter().any(|i| i.default_features);
 
   // Used by

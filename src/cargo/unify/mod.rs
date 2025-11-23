@@ -38,7 +38,9 @@ use std::collections::{HashMap, HashSet};
 
 mod collector;
 mod config;
+mod feature_cache;
 mod issue_detection;
+mod minimize;
 mod path_handling;
 mod plan;
 mod report;
@@ -51,6 +53,7 @@ mod version_merge;
 
 // Re-export public types
 pub use config::UnifyConfig;
+pub use minimize::{MinimizationReport, minimize_workspace_features};
 pub use report::UnifyReport;
 pub use types::{IssueSeverity, MemberEdit, UnificationPlan, UnificationStats, UnifiedDep};
 
@@ -288,6 +291,11 @@ impl<'a> WorkspaceUnifier<'a> {
           MemberEdit::UseWorkspace {
             dep_name: dep_name.clone(),
             kind: instance.kind,
+            add_features: if instance.default_features && !unified.default_features {
+              Some(vec!["default".to_string()])
+            } else {
+              None
+            },
           },
         )
       })

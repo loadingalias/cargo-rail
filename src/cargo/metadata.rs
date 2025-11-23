@@ -262,6 +262,27 @@ impl WorkspaceMetadata {
     None
   }
 
+  /// Get the actual feature names defined in a package's Cargo.toml
+  ///
+  /// Returns a HashSet of feature names that can be written explicitly in
+  /// [workspace.dependencies]. This filters out phantom features that cargo
+  /// resolves internally but aren't actual features.
+  ///
+  /// For example, `futures` crate defines features like "async-await", "executor",
+  /// but NOT "use_std" (which comes from sub-crate `futures-util`).
+  pub fn get_actual_package_features(&self, pkg_name: &str) -> HashSet<String> {
+    // Search all packages (not just workspace members) for the dependency
+    for pkg in &self.metadata.packages {
+      if pkg.name == pkg_name {
+        // Return the keys from the features table
+        return pkg.features.keys().map(|k| k.to_string()).collect();
+      }
+    }
+
+    // If package not found, return empty set
+    HashSet::new()
+  }
+
   // ============================================================================
   // Raw Access
   // ============================================================================

@@ -46,6 +46,10 @@ impl RailConfigBuilder {
 
     content.push_str(&format!("use_all_features = {}\n", config.use_all_features));
     content.push_str(&format!("allow_renamed = {}\n", config.allow_renamed));
+    content.push_str(&format!(
+      "minimize_features = {}  # Minimize features to only those required for compilation\n",
+      config.minimize_features
+    ));
 
     // Exclude
     if config.exclude.is_empty() {
@@ -74,6 +78,7 @@ impl RailConfigBuilder {
     self.unify_transitives(config);
     self.unify_validation(config);
     self.unify_output(config);
+    self.unify_backup(config);
 
     self
   }
@@ -147,6 +152,20 @@ impl RailConfigBuilder {
   fn unify_output(&mut self, config: &UnifyConfig) {
     let content = format!("generate_report = {}\n", config.output.generate_report);
     self.sections.push(format!("[unify.output]\n{}\n", content));
+  }
+
+  fn unify_backup(&mut self, config: &UnifyConfig) {
+    let mut content = String::new();
+    content.push_str(&format!(
+      "enabled = {}  # Automatically create backups on every apply\n",
+      config.backup.enabled
+    ));
+    content.push_str(&format!(
+      "keep_count = {}  # Number of backups to keep\n",
+      config.backup.keep_count
+    ));
+
+    self.sections.push(format!("[unify.backup]\n{}\n", content));
   }
 
   /// Add release section
