@@ -26,10 +26,32 @@ use crate::cargo::unify::UnifiedDep;
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
-use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+
+/// Compute hash of keep_features config for cache invalidation
+fn compute_config_hash(keep_features: &std::collections::HashMap<String, Vec<String>>) -> u64 {
+  use std::collections::hash_map::DefaultHasher;
+  use std::hash::{Hash, Hasher};
+
+  let mut hasher = DefaultHasher::new();
+
+  // Sort keys for deterministic hashing
+  let mut keys: Vec<_> = keep_features.keys().cloned().collect();
+  keys.sort();
+
+  for key in keys {
+    key.hash(&mut hasher);
+    if let Some(features) = keep_features.get(&key) {
+      let mut sorted_features = features.clone();
+      sorted_features.sort();
+      sorted_features.hash(&mut hasher);
+    }
+  }
+
+  hasher.finish()
+}
 
 /// Result of feature minimization for the entire workspace
 #[derive(Debug)]
@@ -97,11 +119,19 @@ impl MinimizationReport {
 /// - Uses workspace graph to check only affected members
 /// - Batch-tests removable features
 /// - Provides real-time progress feedback
+/// - Passes -j flag to cargo for parallel compilation
 pub fn minimize_workspace_features(
   ctx: &WorkspaceContext,
   unified_deps: &[UnifiedDep],
   workspace_toml_path: &Path,
+  keep_features: &std::collections::HashMap<String, Vec<String>>,
 ) -> RailResult<(Vec<UnifiedDep>, MinimizationReport)> {
+  // Get parallelism setting from config (for cargo -j flag)
+  let cargo_jobs = ctx
+    .config
+    .as_ref()
+    .map(|c| c.unify.effective_parallelism())
+    .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
   println!(
     "\n🧪 Testing minimal feature sets ({} dependencies)...",
     unified_deps.len()
@@ -112,8 +142,15 @@ pub fn minimize_workspace_features(
   let cache = FeatureCache::load(ctx.workspace_root())?;
   let cache = Arc::new(Mutex::new(cache));
 
+  // Compute config hash for cache invalidation
+  let config_hash = compute_config_hash(keep_features);
+
   // Progress tracking (thread-safe)
   let progress = Arc::new(Mutex::new(ProgressTracker::new(unified_deps.len())));
+
+  // CRITICAL: Mutex for workspace Cargo.toml file access
+  // Prevents race conditions when multiple threads try to modify/test simultaneously
+  let toml_lock = Arc::new(Mutex::new(()));
 
   // Filter: Skip deps with 0 or 1 features (nothing to minimize)
   let (testable, skippable): (Vec<_>, Vec<_>) = unified_deps.iter().partition(|dep| dep.features.len() >= 2);
@@ -124,7 +161,7 @@ pub fn minimize_workspace_features(
 
   for dep in &testable {
     let cache_lock = cache.lock().unwrap();
-    if let Some(cached_entry) = cache_lock.get(dep) {
+    if let Some(cached_entry) = cache_lock.get_with_config(dep, config_hash) {
       // Cache hit!
       cached_deps.push((*dep, cached_entry.minimal_features.clone()));
     } else {
@@ -137,13 +174,21 @@ pub fn minimize_workspace_features(
   println!("  Needs testing: {}", needs_testing.len());
   println!("  Skipped (0-1 features): {}\n", skippable.len());
 
+  // Create minimization context
+  let min_ctx = MinimizationContext {
+    ctx,
+    workspace_toml_path,
+    keep_features,
+    cargo_jobs,
+    toml_lock: &toml_lock,
+  };
+
   // PARALLEL PROCESSING: Test only uncached dependencies
   let results: Vec<RailResult<(UnifiedDep, Option<MinimizedDependency>)>> = needs_testing
     .par_iter()
     .map(|dep| {
       // Clone for parallel processing
       let dep = (*dep).clone();
-      let workspace_toml = workspace_toml_path.to_path_buf();
 
       // Update progress
       {
@@ -152,13 +197,12 @@ pub fn minimize_workspace_features(
       }
 
       // Find minimal feature set for this dependency
-      let minimal_features =
-        find_minimal_features_optimized(&dep.name, &dep.features, &dep.used_by, ctx, &workspace_toml, &progress)?;
+      let minimal_features = find_minimal_features_optimized(&dep.name, &dep.features, &dep.used_by, &min_ctx)?;
 
       // Update cache with result
       {
         let mut c = cache.lock().unwrap();
-        c.insert(&dep, minimal_features.clone());
+        c.insert(&dep, minimal_features.clone(), config_hash);
       }
 
       // Update progress
@@ -282,6 +326,15 @@ struct ProgressTracker {
   current_dep: Option<String>,
 }
 
+/// Context for feature minimization (reduces parameter count)
+struct MinimizationContext<'a> {
+  ctx: &'a WorkspaceContext,
+  workspace_toml_path: &'a Path,
+  keep_features: &'a std::collections::HashMap<String, Vec<String>>,
+  cargo_jobs: usize,
+  toml_lock: &'a Arc<Mutex<()>>,
+}
+
 impl ProgressTracker {
   fn new(total: usize) -> Self {
     Self {
@@ -308,47 +361,60 @@ impl ProgressTracker {
 /// 1. Batch removal: Try removing multiple "likely optional" features at once
 /// 2. Graph-aware checking: Only check affected workspace members
 /// 3. Early termination: Stop if all features are required
+/// 4. Parallel cargo jobs: Uses -j flag for faster compilation
 fn find_minimal_features_optimized(
   dep_name: &str,
   current_features: &[String],
   used_by_members: &[String],
-  ctx: &WorkspaceContext,
-  workspace_toml_path: &Path,
-  _progress: &Arc<Mutex<ProgressTracker>>,
+  min_ctx: &MinimizationContext,
 ) -> RailResult<Vec<String>> {
-  // OPTIMIZATION 1: Try batch removal of likely-optional features
-  let (likely_optional, likely_required) = categorize_features(current_features);
+  // OPTIMIZATION 0: Apply whitelist - never remove features in keep_features
+  let features_to_keep = min_ctx.keep_features.get(dep_name).cloned().unwrap_or_default();
+
+  // Split features into whitelisted (always keep) and testable
+  let mut whitelisted = Vec::new();
+  let mut testable = Vec::new();
+
+  for feature in current_features {
+    if features_to_keep.contains(feature) {
+      whitelisted.push(feature.clone());
+    } else {
+      testable.push(feature.clone());
+    }
+  }
+
+  if testable.is_empty() {
+    // All features are whitelisted - return as-is
+    return Ok(current_features.to_vec());
+  }
+
+  // OPTIMIZATION 1: Try batch removal of likely-optional features (from testable only)
+  let (likely_optional, likely_required) = categorize_features(&testable);
+
+  // Combine whitelisted + likely_required as the base
+  let mut base_features = whitelisted.clone();
+  base_features.extend(likely_required.clone());
 
   // Try removing ALL likely-optional features at once
-  if !likely_optional.is_empty()
-    && test_with_features(dep_name, &likely_required, used_by_members, ctx, workspace_toml_path)?
-  {
+  if !likely_optional.is_empty() && test_with_features(dep_name, &base_features, used_by_members, min_ctx)? {
     // Success! All optional features can be removed
     println!(" ✓ {} (removed {} optional features)", dep_name, likely_optional.len());
-    return Ok(likely_required);
+    return Ok(base_features);
   }
 
   // OPTIMIZATION 2: Fallback to individual feature testing
-  let mut required_features = HashSet::new();
+  let mut required_features = whitelisted; // Start with whitelisted
 
-  // Start with likely required features
-  for feature in &likely_required {
-    required_features.insert(feature.clone());
-  }
+  // Add likely required features
+  required_features.extend(likely_required);
 
   // Test each likely-optional feature individually
   for feature in &likely_optional {
     // Test if workspace compiles WITHOUT this feature
-    let needs_feature = !test_with_features(
-      dep_name,
-      &required_features.iter().cloned().collect::<Vec<_>>(),
-      used_by_members,
-      ctx,
-      workspace_toml_path,
-    )?;
+    let needs_feature = !test_with_features(dep_name, &required_features, used_by_members, min_ctx)?;
 
     if needs_feature {
-      required_features.insert(feature.clone());
+      required_features.push(feature.clone());
     }
   }
 
@@ -405,15 +471,21 @@ fn categorize_features(features: &[String]) -> (Vec<String>, Vec<String>) {
 /// **OPTIMIZATION: Graph-aware checking**
 /// Instead of `cargo check --workspace`, we only check the members that actually
 /// use this dependency (using the workspace graph we already built).
+///
+/// **CRITICAL: Thread-safe Cargo.toml access**
+/// Uses a mutex to prevent race conditions when multiple threads test different deps
 fn test_with_features(
   dep_name: &str,
   features_to_keep: &[String],
   used_by_members: &[String],
-  ctx: &WorkspaceContext,
-  workspace_toml_path: &Path,
+  min_ctx: &MinimizationContext,
 ) -> RailResult<bool> {
+  // CRITICAL: Acquire lock to prevent race conditions
+  // Only one thread can modify Cargo.toml + run cargo at a time
+  let _lock_guard = min_ctx.toml_lock.lock().unwrap();
+
   // Read current workspace Cargo.toml
-  let original_content = std::fs::read_to_string(workspace_toml_path)?;
+  let original_content = std::fs::read_to_string(min_ctx.workspace_toml_path)?;
   let mut doc: toml_edit::DocumentMut = original_content.parse()?;
 
   // Modify the dependency to only have the specified features
@@ -425,13 +497,16 @@ fn test_with_features(
   }
 
   // Write modified TOML
-  std::fs::write(workspace_toml_path, doc.to_string())?;
+  std::fs::write(min_ctx.workspace_toml_path, doc.to_string())?;
 
   // OPTIMIZATION: Build + test only affected members instead of whole workspace
-  let build_and_test_passed = run_cargo_build_and_test_targeted(used_by_members, ctx.workspace_root())?;
+  let build_and_test_passed =
+    run_cargo_build_and_test_targeted(used_by_members, min_ctx.ctx.workspace_root(), min_ctx.cargo_jobs)?;
 
   // Always restore original content
-  std::fs::write(workspace_toml_path, original_content)?;
+  std::fs::write(min_ctx.workspace_toml_path, original_content)?;
+
+  // Lock is automatically released when _lock_guard goes out of scope
 
   Ok(build_and_test_passed)
 }
@@ -494,7 +569,10 @@ fn set_dependency_features(doc: &mut toml_edit::DocumentMut, dep_name: &str, fea
 /// **Why also run tests:**
 /// - Some features only affect runtime behavior (e.g., serde's preserve_order)
 /// - Tests catch functional regressions that compilation doesn't
-fn run_cargo_build_and_test_targeted(members: &[String], workspace_root: &Path) -> RailResult<bool> {
+///
+/// **Parallelism:**
+/// - Uses -j flag to allow cargo to parallelize builds across multiple cores
+fn run_cargo_build_and_test_targeted(members: &[String], workspace_root: &Path, cargo_jobs: usize) -> RailResult<bool> {
   // Step 1: Build with all targets
   let mut build_cmd = Command::new("cargo");
   build_cmd.arg("build");
@@ -513,6 +591,9 @@ fn run_cargo_build_and_test_targeted(members: &[String], workspace_root: &Path) 
   // CRITICAL: Build all targets (tests, examples, benches)
   // This prevents removing features that are only used in tests/examples
   build_cmd.arg("--all-targets");
+
+  // OPTIMIZATION: Parallel compilation
+  build_cmd.arg("-j").arg(cargo_jobs.to_string());
 
   build_cmd.current_dir(workspace_root);
 
@@ -537,6 +618,9 @@ fn run_cargo_build_and_test_targeted(members: &[String], workspace_root: &Path) 
   } else {
     test_cmd.arg("--workspace");
   }
+
+  // OPTIMIZATION: Parallel test execution
+  test_cmd.arg("-j").arg(cargo_jobs.to_string());
 
   test_cmd.current_dir(workspace_root);
 

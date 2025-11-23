@@ -486,7 +486,16 @@ pub fn run_unify_apply(
   let _final_workspace_deps = if should_minimize {
     use crate::cargo::unify::minimize_workspace_features;
 
-    let (minimized_deps, min_report) = minimize_workspace_features(ctx, &all_workspace_deps, &workspace_toml)?;
+    // Get keep_features from config
+    let keep_features = ctx
+      .config
+      .as_ref()
+      .map(|c| &c.unify.keep_features)
+      .cloned()
+      .unwrap_or_default();
+
+    let (minimized_deps, min_report) =
+      minimize_workspace_features(ctx, &all_workspace_deps, &workspace_toml, &keep_features)?;
 
     // Re-write workspace.dependencies with minimal features
     println!("\n📝 Updating [workspace.dependencies] with minimal features...");

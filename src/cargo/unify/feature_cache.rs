@@ -40,6 +40,10 @@ pub struct CacheEntry {
 
   /// Timestamp when cached
   pub cached_at: String,
+
+  /// Hash of minimization config (for invalidation when config changes)
+  #[serde(default)]
+  pub config_hash: u64,
 }
 
 /// Feature minimization cache
@@ -131,8 +135,21 @@ impl FeatureCache {
     Some(entry)
   }
 
+  /// Check if cache entry is valid for given config
+  pub fn get_with_config(&self, dep: &UnifiedDep, config_hash: u64) -> Option<&CacheEntry> {
+    let entry = self.get(dep)?;
+
+    // Also check config hash
+    if entry.config_hash != config_hash {
+      // Config changed - cache invalid
+      return None;
+    }
+
+    Some(entry)
+  }
+
   /// Insert or update cache entry
-  pub fn insert(&mut self, dep: &UnifiedDep, minimal_features: Vec<String>) {
+  pub fn insert(&mut self, dep: &UnifiedDep, minimal_features: Vec<String>, config_hash: u64) {
     let entry = CacheEntry {
       dep_name: dep.name.clone(),
       version_req: dep.version_req.to_string(),
@@ -140,6 +157,7 @@ impl FeatureCache {
       minimal_features,
       original_feature_count: dep.features.len(),
       cached_at: chrono::Utc::now().to_rfc3339(),
+      config_hash,
     };
 
     self.entries.insert(dep.name.clone(), entry);
@@ -225,7 +243,7 @@ mod tests {
       is_proc_macro: false,
     };
 
-    cache.insert(&dep, vec!["derive".to_string()]);
+    cache.insert(&dep, vec!["derive".to_string()], 0);
 
     // Same version -> cache hit
     assert!(cache.get(&dep).is_some());
@@ -255,7 +273,7 @@ mod tests {
       is_proc_macro: false,
     };
 
-    cache.insert(&dep, vec!["runtime".to_string()]);
+    cache.insert(&dep, vec!["runtime".to_string()], 0);
 
     // Same features -> cache hit
     assert!(cache.get(&dep).is_some());
