@@ -264,13 +264,13 @@ fn main() {
   // WorkspaceContext, which would fail if metadata can't be loaded.
   if let Commands::Unify {
     action: Some(ref act),
-    ref list,
+    list,
     ref backup_id,
     ..
   } = cli.command
     && act == "undo"
   {
-    let result = commands::run_unify_undo_standalone(&workspace_root, *list, backup_id.clone());
+    let result = commands::run_unify_undo(&workspace_root, list, backup_id.clone());
     if let Err(e) = result {
       handle_error(e);
     }
@@ -335,13 +335,14 @@ fn main() {
       include,
       backup,
       consolidate_transitives,
-      list,
-      backup_id,
+      list: _,
+      backup_id: _,
     } => {
-      // Check if this is an undo action
+      // Check if this is an undo action (should have been handled earlier)
       if let Some(act) = action {
         if act == "undo" {
-          commands::run_unify_undo(&ctx, list, backup_id)
+          // This should have been handled earlier, before WorkspaceContext was built
+          unreachable!("Undo command should be handled before workspace context creation")
         } else {
           Err(RailError::message(format!(
             "Unknown unify action '{}'. Valid actions: undo",
@@ -351,7 +352,7 @@ fn main() {
       } else if dry_run {
         commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
       } else {
-        commands::run_unify_apply(&ctx, exclude, include, backup, consolidate_transitives)
+        commands::run_unify_apply(&ctx, exclude, include, backup)
       }
     }
 

@@ -120,15 +120,13 @@ pub fn run_split(
   if config_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", config_count);
 
-    // For parallel execution, we need to build contexts per-thread
-    let workspace_root = ctx.workspace_root().to_path_buf();
+    // Clone context for parallel execution (very cheap - just Arc increments)
+    let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|config| {
         println!("🔨 Splitting crate '{}'...", config.crate_name);
-        // Build workspace context for this thread
-        let thread_context = WorkspaceContext::build(&workspace_root)?;
-        let engine = SplitEngine::new(&thread_context)?;
+        let engine = SplitEngine::new(&ctx)?;
         engine.split(&config)
       })
       .collect();
@@ -189,6 +187,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     workspace: crate::config::WorkspaceConfig {
       root: std::path::PathBuf::from("."),
     },
+    targets: vec![], // No targets by default
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],
@@ -248,7 +247,7 @@ fn detect_workspace_splits(
   use crate::config::{CratePath, SplitConfig, SplitMode, WorkspaceMode};
 
   let workspace_root = ctx.workspace_root();
-  let members = ctx.cargo.metadata().list_crates();
+  let members = ctx.cargo.metadata().workspace_packages();
 
   let mut splits = Vec::new();
 

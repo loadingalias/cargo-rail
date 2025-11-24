@@ -46,11 +46,10 @@ pub fn run_init(
   }
 
   // 2. Detection phase
-  let mut unify = default_unify_config();
+  let unify = default_unify_config();
 
   // Auto-detect targets from all TOML files in workspace (silent detection)
   let detected_targets = detect_targets(workspace_root);
-  unify.validation.targets = detected_targets;
 
   // 3. Interactive confirmation (unless non-interactive or dry-run)
   if !non_interactive && !dry_run {
@@ -68,12 +67,13 @@ pub fn run_init(
   }
 
   // 4. Build config
-  let config = build_rail_config(workspace_root.to_path_buf(), unify);
+  let config = build_rail_config(workspace_root.to_path_buf(), detected_targets, unify);
 
   // 6. Serialize with comments using Builder
   let toml_content = RailConfigBuilder::new()
     .header()
     .workspace(&config.workspace.root)
+    .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
     .splits_template()
@@ -111,11 +111,12 @@ fn detect_targets(workspace_root: &Path) -> Vec<String> {
   crate::targets::detect_targets(workspace_root).unwrap_or_default()
 }
 
-fn build_rail_config(_workspace_root: PathBuf, unify: UnifyConfig) -> RailConfig {
+fn build_rail_config(_workspace_root: PathBuf, targets: Vec<String>, unify: UnifyConfig) -> RailConfig {
   RailConfig {
     workspace: WorkspaceConfig {
       root: PathBuf::from("."),
     },
+    targets, // TOP-LEVEL: targets are workspace-wide
     unify,
     release: crate::config::ReleaseConfig::default(),
     splits: vec![], // Empty by default - use 'cargo rail split init' to configure
@@ -195,19 +196,8 @@ pub fn run_init_standalone(
     workspace: WorkspaceConfig {
       root: PathBuf::from("."),
     },
-    unify: UnifyConfig {
-      allow_renamed: false,
-      exclude: Vec::new(),
-      include: Vec::new(),
-      consolidate_transitives: false,
-      transitive_host: Default::default(),
-      validation: crate::config::UnifyValidationConfig {
-        targets: detected_targets,
-        max_parallel_jobs: 0,
-      },
-      output: crate::config::UnifyOutputConfig::default(),
-      backup: crate::config::UnifyBackupConfig::default(),
-    },
+    targets: detected_targets,     // TOP-LEVEL: workspace-wide targets
+    unify: UnifyConfig::default(), // Use simplified config with defaults
     release: crate::config::ReleaseConfig::default(),
     splits: vec![],
     formatting: crate::config::FormattingConfig::default(),
@@ -217,6 +207,7 @@ pub fn run_init_standalone(
   let config_toml = RailConfigBuilder::new()
     .header()
     .workspace(&config.workspace.root)
+    .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
     .splits_template()
@@ -256,6 +247,7 @@ mod tests {
       workspace: WorkspaceConfig {
         root: PathBuf::from("."),
       },
+      targets: vec![],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
       splits: vec![],

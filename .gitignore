@@ -22,9 +22,7 @@ AGENTS.md
 
 # Documentation
 docs/*
-AUDIT_SUMMARY.md
-unify.md
-CONFIG_AUDIT.md
+audit.md
 
 # Cargo-Rail (Testing)
 *rail.toml

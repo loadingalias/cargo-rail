@@ -8,20 +8,15 @@
 //!
 //! Built once at startup, passed by reference to all commands.
 
-/// Cargo workspace state management
-pub mod cargo_state;
 /// Change impact analysis
 pub mod change_analyzer;
-/// Unified workspace context
+/// Unified workspace context (includes GitState and CargoState)
 pub mod context;
 /// File path utilities
 pub mod files;
-/// Git repository state management
-pub mod git_state;
 
 // Re-export change analysis types
 pub use change_analyzer::ChangeImpact;
 
-pub use cargo_state::CargoState;
-pub use context::WorkspaceContext;
-pub use git_state::GitState;
+// Re-export workspace types from context module
+pub use context::{CargoState, GitState, WorkspaceContext};

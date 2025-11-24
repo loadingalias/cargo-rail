@@ -198,8 +198,8 @@ pub fn run_sync(
   if config_count > 1 && all {
     println!("🚀 Processing {} crates in parallel...\n", config_count);
 
-    // For parallel execution, we need to build contexts per-thread
-    let workspace_root = ctx.workspace_root().to_path_buf();
+    // Clone context for parallel execution (very cheap - just Arc increments)
+    let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|(sync_config, target_exists)| {
@@ -214,9 +214,7 @@ pub fn run_sync(
 
         println!("🔄 Syncing crate '{}'...", sync_config.crate_name);
 
-        // Build workspace context for this thread
-        let thread_context = WorkspaceContext::build(&workspace_root)?;
-        let mut engine = SyncEngine::new(&thread_context, sync_config, conflict_strategy)?;
+        let mut engine = SyncEngine::new(&ctx, sync_config, conflict_strategy)?;
 
         // Execute sync based on direction
         let _result = match direction {

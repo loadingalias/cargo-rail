@@ -25,23 +25,14 @@ impl SystemGit {
   /// Uses parallel batch processing for optimal performance.
   /// The _path parameter is kept for API compatibility but currently unused.
   pub fn commit_history(&self, _path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
-    let mut cmd = self.git_cmd();
-    cmd.args(["log", "--format=%H"]);
-
+    let mut args = vec!["log", "--format=%H"];
+    let limit_str;
     if let Some(max) = limit {
-      cmd.arg(format!("-{}", max));
+      limit_str = format!("-{}", max);
+      args.push(&limit_str);
     }
 
-    let output = cmd.output().context("Failed to run git log")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let output = self.run_git(&args)?;
     let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
       .lines()
       .map(|s| s.trim().to_string())
@@ -56,20 +47,7 @@ impl SystemGit {
   ///
   /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted).
   pub fn get_changed_files(&self, commit_sha: &str) -> RailResult<Vec<(PathBuf, char)>> {
-    let output = self
-      .git_cmd()
-      .args(["diff-tree", "--no-commit-id", "--name-status", "-r", commit_sha])
-      .output()
-      .context("Failed to get changed files")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git diff-tree".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let output = self.run_git(&["diff-tree", "--no-commit-id", "--name-status", "-r", commit_sha])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut files = Vec::new();
 
@@ -93,27 +71,14 @@ impl SystemGit {
   /// Uses `git diff --name-status` which is optimized for listing changes.
   /// Typically <100ms even for large diffs with 1000s of files.
   pub fn get_changed_files_between(&self, base_ref: &str, head_ref: Option<&str>) -> RailResult<Vec<(PathBuf, char)>> {
-    let mut cmd = self.git_cmd();
-    cmd.args(["diff", "--name-status", base_ref]);
-
+    let mut args = vec!["diff", "--name-status", base_ref];
+    let head_owned;
     if let Some(head) = head_ref {
-      cmd.arg(head);
+      head_owned = head.to_string();
+      args.push(&head_owned);
     }
 
-    let output = cmd.output().context("Failed to get changed files between refs")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: format!(
-          "git diff --name-status {} {}",
-          base_ref,
-          head_ref.unwrap_or("working tree")
-        ),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let output = self.run_git(&args)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut files = Vec::new();
 
@@ -139,31 +104,24 @@ impl SystemGit {
     until_ref: &str,
   ) -> RailResult<Vec<CommitInfo>> {
     let relative_path = self.normalize_path(path);
+    let git_path = relative_path.to_str().unwrap_or("");
 
-    let mut cmd = self.git_cmd();
-    cmd.args(["log", "--reverse", "--format=%H"]);
+    let mut args = vec!["log", "--reverse", "--format=%H"];
+    let range_arg;
 
     // Add range
     if let Some(since) = since_sha {
-      cmd.arg(format!("{}..{}", since, until_ref));
+      range_arg = format!("{}..{}", since, until_ref);
+      args.push(&range_arg);
     } else {
-      cmd.arg(until_ref);
+      args.push(until_ref);
     }
 
     // Add path filter
-    cmd.arg("--");
-    cmd.arg(relative_path);
+    args.push("--");
+    args.push(git_path);
 
-    let output = cmd.output().context("Failed to get commits touching path")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let output = self.run_git(&args)?;
     let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
       .lines()
       .map(|s| s.trim().to_string())
@@ -192,34 +150,28 @@ impl SystemGit {
     }
 
     // Normalize all paths
-    let relative_paths: Vec<&Path> = paths.iter().map(|path| self.normalize_path(path)).collect();
+    let relative_paths: Vec<String> = paths
+      .iter()
+      .map(|path| self.normalize_path(path).to_str().unwrap_or("").to_string())
+      .collect();
 
-    let mut cmd = self.git_cmd();
-    cmd.args(["log", "--reverse", "--format=%H"]);
+    let mut args = vec!["log", "--reverse", "--format=%H"];
+    let range_arg;
 
     // Add range
     if let Some(since) = since_sha {
-      cmd.arg(format!("{}..{}", since, until_ref));
+      range_arg = format!("{}..{}", since, until_ref);
+      args.push(&range_arg);
     } else {
-      cmd.arg(until_ref);
+      args.push(until_ref);
     }
 
-    // Add all path filters in a single command
-    cmd.arg("--");
-    for path in relative_paths {
-      cmd.arg(path);
-    }
+    // Add all path filters
+    args.push("--");
+    let path_refs: Vec<&str> = relative_paths.iter().map(|s| s.as_str()).collect();
+    args.extend(path_refs);
 
-    let output = cmd.output().context("Failed to get commits touching paths")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git log".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let output = self.run_git(&args)?;
     let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
       .lines()
       .map(|s| s.trim().to_string())
@@ -243,16 +195,11 @@ impl SystemGit {
     //         %cn (committer name) %ce (committer email) %ct (committer time)
     //         %P (parent hashes) %B (body)
     let format = "%H%n%an%n%ae%n%at%n%cn%n%ce%n%ct%n%P%n%B";
+    let format_arg = format!("--format={}", format);
 
-    let output = self
-      .git_cmd()
-      .args(["log", "-1", &format!("--format={}", format), sha])
-      .output()
-      .context("Failed to get commit info")?;
-
-    if !output.status.success() {
-      return Err(RailError::Git(GitError::CommitNotFound { sha: sha.to_string() }));
-    }
+    let output = self.run_git_with_error(&["log", "-1", &format_arg, sha], |_| {
+      RailError::Git(GitError::CommitNotFound { sha: sha.to_string() })
+    })?;
 
     parse_commit_output(&output.stdout)
   }
@@ -266,16 +213,13 @@ impl SystemGit {
       format!("{}:{}", commit_sha, git_path)
     };
 
-    let output = self
-      .git_cmd()
-      .args(["ls-tree", "-r", "--name-only", &spec])
-      .output()
-      .context("Failed to list files")?;
-
-    if !output.status.success() {
+    // Use run_git_check since failure is not an error (empty result)
+    if !self.run_git_check(&["ls-tree", "-r", "--name-only", &spec]) {
       return Ok(vec![]);
     }
 
+    // If successful, get the output
+    let output = self.run_git(&["ls-tree", "-r", "--name-only", &spec])?;
     let files = String::from_utf8_lossy(&output.stdout)
       .lines()
       .map(PathBuf::from)
@@ -312,38 +256,28 @@ impl SystemGit {
 
   /// Add a remote repository
   pub fn add_remote(&self, name: &str, url: &str) -> RailResult<()> {
-    let output = self
-      .git_cmd()
-      .args(["remote", "add", name, url])
-      .output()
-      .context("Failed to add remote")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      if stderr.contains("already exists") {
-        return Ok(()); // Remote exists, not an error
+    match self.run_git(&["remote", "add", name, url]) {
+      Ok(_) => Ok(()),
+      Err(e) => {
+        // Check if error is because remote already exists
+        if let RailError::Git(GitError::CommandFailed { stderr, .. }) = &e
+          && stderr.contains("already exists")
+        {
+          return Ok(());
+        }
+        Err(e)
       }
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git remote add".to_string(),
-        stderr: stderr.to_string(),
-      }));
     }
-
-    Ok(())
   }
 
   /// List all remotes
   pub fn list_remotes(&self) -> RailResult<Vec<(String, String)>> {
-    let output = self
-      .git_cmd()
-      .args(["remote", "-v"])
-      .output()
-      .context("Failed to list remotes")?;
-
-    if !output.status.success() {
+    // Use run_git_check since failure returns empty list
+    if !self.run_git_check(&["remote", "-v"]) {
       return Ok(vec![]);
     }
 
+    let output = self.run_git(&["remote", "-v"])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut remotes = Vec::new();
 
@@ -362,20 +296,13 @@ impl SystemGit {
   pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> RailResult<()> {
     println!("   Pushing to remote '{}'...", remote_name);
 
-    let output = self
-      .git_cmd()
-      .args(["push", "-u", remote_name, branch])
-      .output()
-      .context("Failed to push")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::PushFailed {
+    self.run_git_with_error(&["push", "-u", remote_name, branch], |stderr| {
+      RailError::Git(GitError::PushFailed {
         remote: remote_name.to_string(),
         branch: branch.to_string(),
         reason: stderr.to_string(),
-      }));
-    }
+      })
+    })?;
 
     println!("   ✅ Pushed to {}/{}", remote_name, branch);
     Ok(())
@@ -385,19 +312,7 @@ impl SystemGit {
   pub fn fetch_from_remote(&self, remote_name: &str) -> RailResult<()> {
     println!("   Fetching from remote '{}'...", remote_name);
 
-    let output = self
-      .git_cmd()
-      .args(["fetch", remote_name])
-      .output()
-      .context("Failed to fetch")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git fetch".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
+    self.run_git(&["fetch", remote_name])?;
 
     println!("   ✅ Fetched from {}", remote_name);
     Ok(())
@@ -411,39 +326,13 @@ impl SystemGit {
 
   /// Create a branch
   pub fn create_branch(&self, branch_name: &str) -> RailResult<()> {
-    let output = self
-      .git_cmd()
-      .args(["branch", branch_name])
-      .output()
-      .context("Failed to create branch")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git branch".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    self.run_git(&["branch", branch_name])?;
     Ok(())
   }
 
   /// Checkout a branch
   pub fn checkout_branch(&self, branch_name: &str) -> RailResult<()> {
-    let output = self
-      .git_cmd()
-      .args(["checkout", branch_name])
-      .output()
-      .context("Failed to checkout branch")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git checkout".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    self.run_git(&["checkout", branch_name])?;
     Ok(())
   }
 
@@ -466,30 +355,13 @@ impl SystemGit {
     parent_shas: &[String],
   ) -> RailResult<String> {
     // Stage all changes
-    self
-      .git_cmd()
-      .args(["add", "-A"])
-      .output()
-      .context("Failed to stage changes")?;
+    self.run_git(&["add", "-A"])?;
 
     // Write tree
-    let tree_output = self
-      .git_cmd()
-      .args(["write-tree"])
-      .output()
-      .context("Failed to write tree")?;
-
-    if !tree_output.status.success() {
-      let stderr = String::from_utf8_lossy(&tree_output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git write-tree".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
+    let tree_output = self.run_git(&["write-tree"])?;
     let tree_sha = String::from_utf8_lossy(&tree_output.stdout).trim().to_string();
 
-    // Build commit-tree command
+    // Build commit-tree command (needs custom env vars, so we use git_cmd directly)
     let author_date = format!("{} +0000", timestamp);
     let mut cmd = self.git_cmd();
     cmd
@@ -522,11 +394,7 @@ impl SystemGit {
     let commit_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     // Update HEAD
-    self
-      .git_cmd()
-      .args(["reset", "--soft", &commit_sha])
-      .output()
-      .context("Failed to update HEAD")?;
+    self.run_git(&["reset", "--soft", &commit_sha])?;
 
     Ok(commit_sha)
   }
@@ -674,21 +542,7 @@ impl SystemGit {
 
   /// Resolve a git reference (tag, branch) to a commit SHA
   pub fn resolve_reference(&self, ref_name: &str) -> RailResult<String> {
-    let output = self
-      .git_cmd()
-      .args(["rev-parse", ref_name])
-      .output()
-      .context("Failed to resolve reference")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::message(format!(
-        "Failed to resolve reference '{}': {}",
-        ref_name, stderr
-      )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    self.run_git_stdout(&["rev-parse", ref_name])
   }
 }
 

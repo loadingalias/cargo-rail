@@ -183,7 +183,21 @@ impl<'a> ChangeImpact<'a> {
       {
         // Check if this file belongs to a proc-macro crate
         if let Some(crate_name) = self.ctx.graph.file_to_crate(path) {
-          let is_proc_macro = self.ctx.cargo.metadata().is_proc_macro_crate(&crate_name);
+          let is_proc_macro = self
+            .ctx
+            .cargo
+            .metadata()
+            .workspace_packages()
+            .into_iter()
+            .find(|pkg| pkg.name == crate_name)
+            .map(|pkg| {
+              pkg.targets.iter().any(|t| {
+                t.kind
+                  .iter()
+                  .any(|k| matches!(k, cargo_metadata::TargetKind::ProcMacro))
+              })
+            })
+            .unwrap_or(false);
           kind = ChangeKind::Source { is_proc_macro };
         }
       }
@@ -217,10 +231,17 @@ mod tests {
     let ctx = create_test_context();
 
     // cargo-rail is not a proc-macro crate
-    assert!(
-      !ctx.cargo.metadata().is_proc_macro_crate("cargo-rail"),
-      "cargo-rail should not be detected as proc-macro crate"
-    );
+    // Check by looking at the targets
+    let cargo_rail = ctx.cargo.get_package("cargo-rail");
+    assert!(cargo_rail.is_some(), "Should find cargo-rail package");
+
+    let is_proc_macro = cargo_rail.unwrap().targets.iter().any(|t| {
+      t.kind
+        .iter()
+        .any(|k| matches!(k, cargo_metadata::TargetKind::ProcMacro))
+    });
+
+    assert!(!is_proc_macro, "cargo-rail should not be detected as proc-macro crate");
   }
 
   #[test]

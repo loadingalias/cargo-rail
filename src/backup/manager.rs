@@ -31,7 +31,13 @@ impl BackupManager {
   ///
   /// * `files` - Files to backup (relative to workspace root)
   /// * `metadata` - Metadata describing this backup
-  pub fn create_backup(&self, files: &[PathBuf], mut metadata: BackupMetadata) -> RailResult<BackupId> {
+  /// * `max_backups` - Maximum number of backups to keep (0 = unlimited)
+  pub fn create_backup(
+    &self,
+    files: &[PathBuf],
+    mut metadata: BackupMetadata,
+    max_backups: usize,
+  ) -> RailResult<BackupId> {
     // Generate backup ID
     let backup_id = create_backup_id();
     let backup_dir = get_backup_dir(&self.workspace_root, &backup_id);
@@ -82,6 +88,11 @@ impl BackupManager {
 
     // Save metadata
     metadata.save(&backup_dir)?;
+
+    // Clean up old backups if max_backups > 0
+    if max_backups > 0 {
+      let _deleted = self.cleanup_old_backups(max_backups)?;
+    }
 
     Ok(backup_id)
   }
@@ -273,7 +284,7 @@ mod tests {
 
     // Create backup
     let metadata = BackupMetadata::new("test command");
-    let backup_id = manager.create_backup(&files, metadata)?;
+    let backup_id = manager.create_backup(&files, metadata, 0)?;
 
     // Verify backup was created
     let backup_dir = get_backup_dir(workspace.path(), &backup_id);
@@ -308,7 +319,7 @@ mod tests {
     // Create a backup
     let files = vec![PathBuf::from("Cargo.toml")];
     let metadata = BackupMetadata::new("test 1");
-    manager.create_backup(&files, metadata)?;
+    manager.create_backup(&files, metadata, 0)?;
 
     // Should now have 1 backup
     assert!(manager.has_backups());
@@ -321,7 +332,7 @@ mod tests {
 
     // Create another backup
     let metadata2 = BackupMetadata::new("test 2");
-    manager.create_backup(&files, metadata2)?;
+    manager.create_backup(&files, metadata2, 0)?;
 
     // Should have 2 backups
     let backups = manager.list_backups()?;
@@ -339,7 +350,7 @@ mod tests {
     let files = vec![PathBuf::from("Cargo.toml")];
     for i in 1..=5 {
       let metadata = BackupMetadata::new(format!("test {}", i));
-      manager.create_backup(&files, metadata)?;
+      manager.create_backup(&files, metadata, 0)?;
       // Sleep 1 second to ensure different timestamps (format is YYYY-MM-DD-HHMMSS)
       std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -369,9 +380,9 @@ mod tests {
 
     // Create backups with sufficient delay
     let files = vec![PathBuf::from("Cargo.toml")];
-    manager.create_backup(&files, BackupMetadata::new("first"))?;
+    manager.create_backup(&files, BackupMetadata::new("first"), 0)?;
     std::thread::sleep(std::time::Duration::from_secs(1));
-    manager.create_backup(&files, BackupMetadata::new("second"))?;
+    manager.create_backup(&files, BackupMetadata::new("second"), 0)?;
 
     // Latest should be "second"
     let latest = manager.get_latest_backup()?.unwrap();

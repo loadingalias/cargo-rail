@@ -113,7 +113,11 @@ impl<'a> ReleasePublisher<'a> {
     let metadata = self.ctx.cargo.metadata();
 
     for dependent_name in &plan.affected_dependents {
-      if let Some(pkg) = metadata.get_package(dependent_name) {
+      if let Some(pkg) = metadata
+        .workspace_packages()
+        .into_iter()
+        .find(|p| p.name == *dependent_name)
+      {
         let manifest_path = pkg.manifest_path.clone().into_std_path_buf();
         VersionBumper::update_dependency_version(&manifest_path, &plan.name, &plan.new_version)?;
       }

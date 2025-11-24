@@ -40,92 +40,73 @@ impl RailConfigBuilder {
     self
   }
 
-  /// Add unify section
+  /// Add targets (workspace-wide, top-level field)
+  pub fn targets(&mut self, targets: &[String]) -> &mut Self {
+    let mut content = String::new();
+    if targets.is_empty() {
+      content.push_str("# targets = []  # Detected platform targets (run 'cargo rail init' to detect)\n");
+    } else {
+      content.push_str("# Detected platform targets for multi-platform validation\n");
+      content.push_str(&format!("targets = {}\n", self.formatter.array_targets(targets)));
+    }
+    self.sections.push(content);
+    self
+  }
+
+  /// Add unify section (simplified to 6 essential options)
   pub fn unify(&mut self, config: &UnifyConfig) -> &mut Self {
     let mut content = String::new();
 
-    content.push_str(&format!("allow_renamed = {}\n", config.allow_renamed));
-
-    // Exclude
-    if config.exclude.is_empty() {
-      content.push_str("exclude = []  # Dependencies to skip unification\n");
-    } else {
-      content.push_str(&format!(
-        "exclude = {}\n",
-        self.formatter.array_string(&config.exclude, None)
-      ));
-    }
-
-    // Include
-    if config.include.is_empty() {
-      content.push_str("include = []  # Dependencies to force unification\n");
-    } else {
-      content.push_str(&format!(
-        "include = {}\n",
-        self.formatter.array_string(&config.include, None)
-      ));
-    }
+    content.push_str(&format!(
+      "include_paths = {}  # Handle path dependencies (default: true)\n",
+      config.include_paths
+    ));
 
     content.push_str(&format!(
-      "consolidate_transitives = {}\n",
-      config.consolidate_transitives
+      "include_renamed = {}  # Handle renamed dependencies (package = \"...\") (default: false)\n",
+      config.include_renamed
+    ));
+
+    content.push_str(&format!(
+      "pin_transitives = {}  # Pin transitive-only deps with fragmented features (workspace-hack replacement) (default: true)\n",
+      config.pin_transitives
     ));
 
     match &config.transitive_host {
       crate::config::TransitiveFeatureHost::Root => {
-        content.push_str("transitive_host = \"root\"  # \"root\" or relative path to workspace member\n");
+        content.push_str("transitive_host = \"root\"  # Where to put pinned transitive dev-deps: \"root\" or path like \"crates/foo\"\n");
       }
       crate::config::TransitiveFeatureHost::Path(path) => {
-        content.push_str(&format!("transitive_host = \"{}\"\n", path));
+        content.push_str(&format!(
+          "transitive_host = \"{}\"  # Custom path for transitive dev-deps\n",
+          path
+        ));
       }
+    }
+
+    // Exclude (safety hatch)
+    if config.exclude.is_empty() {
+      content.push_str("exclude = []  # Dependencies to skip unification (safety hatch)\n");
+    } else {
+      content.push_str(&format!(
+        "exclude = {}  # Dependencies to skip unification\n",
+        self.formatter.array_string(&config.exclude, None)
+      ));
+    }
+
+    // Include (safety hatch)
+    if config.include.is_empty() {
+      content.push_str("include = []  # Dependencies to force unification (safety hatch)\n");
+    } else {
+      content.push_str(&format!(
+        "include = {}  # Dependencies to force unification\n",
+        self.formatter.array_string(&config.include, None)
+      ));
     }
 
     self.sections.push(format!("[unify]\n{}\n", content));
 
-    self.unify_validation(config);
-    self.unify_output(config);
-    self.unify_backup(config);
-
     self
-  }
-
-  fn unify_validation(&mut self, config: &UnifyConfig) {
-    let mut content = String::new();
-
-    if config.validation.targets.is_empty() {
-      content.push_str("targets = []  # Platform-specific validation (e.g., [\"x86_64-unknown-linux-gnu\"])\n");
-    } else {
-      content.push_str(&format!(
-        "targets = {}\n",
-        self.formatter.array_targets(&config.validation.targets)
-      ));
-    }
-
-    content.push_str(&format!(
-      "max_parallel_jobs = {}  # 0 = auto-detect\n",
-      config.validation.max_parallel_jobs
-    ));
-
-    self.sections.push(format!("[unify.validation]\n{}\n", content));
-  }
-
-  fn unify_output(&mut self, config: &UnifyConfig) {
-    let content = format!("generate_report = {}\n", config.output.generate_report);
-    self.sections.push(format!("[unify.output]\n{}\n", content));
-  }
-
-  fn unify_backup(&mut self, config: &UnifyConfig) {
-    let mut content = String::new();
-    content.push_str(&format!(
-      "enabled = {}  # Automatically create backups on every apply\n",
-      config.backup.enabled
-    ));
-    content.push_str(&format!(
-      "keep_count = {}  # Number of backups to keep\n",
-      config.backup.keep_count
-    ));
-
-    self.sections.push(format!("[unify.backup]\n{}\n", content));
   }
 
   /// Add release section
@@ -301,6 +282,7 @@ mod tests {
       workspace: crate::config::WorkspaceConfig {
         root: std::path::PathBuf::from("."),
       },
+      targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
       splits: vec![],
@@ -310,6 +292,7 @@ mod tests {
     let output = builder
       .header()
       .workspace(&config.workspace.root)
+      .targets(&config.targets)
       .unify(&config.unify)
       .release(&config.release)
       .splits_template()
@@ -317,6 +300,7 @@ mod tests {
       .unwrap();
 
     assert!(output.contains("[workspace]"));
+    assert!(output.contains("targets"));
     assert!(output.contains("[unify]"));
     assert!(output.contains("[release]"));
     assert!(output.contains("# [[splits]]"));

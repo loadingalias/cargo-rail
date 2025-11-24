@@ -78,36 +78,15 @@ impl SystemGit {
   /// Note: We don't cache this anymore to avoid interior mutability.
   /// The performance difference is negligible (1-2ms per call).
   pub fn head_commit(&self) -> RailResult<String> {
-    let output = self
-      .git_cmd()
-      .args(["rev-parse", "HEAD"])
-      .output()
-      .context("Failed to get HEAD commit")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git rev-parse HEAD".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    self.run_git_stdout(&["rev-parse", "HEAD"])
   }
 
   /// Get current branch name
   pub fn current_branch(&self) -> RailResult<String> {
-    let output = self
-      .git_cmd()
-      .args(["rev-parse", "--abbrev-ref", "HEAD"])
-      .output()
-      .context("Failed to get current branch")?;
-
-    if !output.status.success() {
-      return Ok("HEAD".to_string()); // Detached HEAD
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    // Try to get branch name, fallback to "HEAD" if detached
+    self
+      .run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
+      .or(Ok("HEAD".to_string()))
   }
 
   /// Create a safe git command with isolated environment
@@ -137,6 +116,92 @@ impl SystemGit {
     cmd.arg("-c").arg("core.quotePath=false"); // Don't escape non-ASCII
 
     cmd
+  }
+
+  /// Run a git command and return the output or error
+  ///
+  /// This helper eliminates 200+ lines of boilerplate by handling:
+  /// - Command execution
+  /// - Success checking
+  /// - Error formatting
+  ///
+  /// # Example
+  /// ```ignore
+  /// let output = git.run_git(&["status", "--short"])?;
+  /// ```
+  pub(crate) fn run_git(&self, args: &[&str]) -> RailResult<std::process::Output> {
+    let mut cmd = self.git_cmd();
+    cmd.args(args);
+
+    let output = cmd
+      .output()
+      .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: format!("git {}", args.join(" ")),
+        stderr: stderr.to_string(),
+      }));
+    }
+
+    Ok(output)
+  }
+
+  /// Run a git command and return stdout as a String
+  ///
+  /// Convenience wrapper around `run_git` that returns trimmed stdout.
+  pub(crate) fn run_git_stdout(&self, args: &[&str]) -> RailResult<String> {
+    let output = self.run_git(args)?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+  }
+
+  /// Run a git command, returning true if successful, false otherwise
+  ///
+  /// Used for operations that should silently fail (e.g., checking if remote exists).
+  pub(crate) fn run_git_check(&self, args: &[&str]) -> bool {
+    let mut cmd = self.git_cmd();
+    cmd.args(args);
+
+    if let Ok(output) = cmd.output() {
+      output.status.success()
+    } else {
+      false
+    }
+  }
+
+  /// Run a git command with a custom error builder
+  ///
+  /// This allows using specific GitError variants while still getting
+  /// the boilerplate reduction benefits.
+  ///
+  /// # Example
+  /// ```ignore
+  /// git.run_git_with_error(&["push", "-u", "origin", "main"], |stderr| {
+  ///   RailError::Git(GitError::PushFailed {
+  ///     remote: "origin".to_string(),
+  ///     branch: "main".to_string(),
+  ///     reason: stderr.to_string(),
+  ///   })
+  /// })?;
+  /// ```
+  pub(crate) fn run_git_with_error<F>(&self, args: &[&str], error_fn: F) -> RailResult<std::process::Output>
+  where
+    F: FnOnce(&str) -> RailError,
+  {
+    let mut cmd = self.git_cmd();
+    cmd.args(args);
+
+    let output = cmd
+      .output()
+      .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(error_fn(&stderr));
+    }
+
+    Ok(output)
   }
 }
 

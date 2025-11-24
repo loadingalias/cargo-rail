@@ -12,26 +12,11 @@ fn test_unify_undo_restores_latest_backup() -> Result<()> {
   workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
   workspace.commit("Add test crates")?;
 
-  // Add rail.toml with backup enabled
-  std::fs::write(
-    workspace.path.join(".config/rail.toml"),
-    r#"
-[workspace]
-root = "."
-
-[unify]
-# use_all_features is now implicit
-[unify.backup]
-enabled = true
-keep_count = 5
-"#,
-  )?;
-
   // Create initial state
   let original_workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
 
-  // Run unify apply (creates backup automatically)
-  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  // Run unify apply with --backup flag to create a backup
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
   assert!(apply_output.status.success(), "Unify apply should succeed");
 
   // Verify files were modified
@@ -125,11 +110,12 @@ fn test_unify_undo_specific_backup_id() -> Result<()> {
   workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
   workspace.commit("Add test crates")?;
 
+  // Save the original content before any modifications
+  let original_content = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
   // Create two backups by running unify twice
   run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
   std::thread::sleep(std::time::Duration::from_secs(1)); // Ensure different timestamp
-
-  let original_content = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
   run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
 
   // Get list of backups

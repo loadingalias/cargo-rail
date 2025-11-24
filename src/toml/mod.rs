@@ -8,7 +8,6 @@
 pub mod builder;
 pub mod editor;
 pub mod format;
-pub mod validation;
 
 // Re-exports
 pub use builder::{RailConfigBuilder, WorkspaceDepsBuilder};

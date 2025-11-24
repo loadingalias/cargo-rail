@@ -47,5 +47,5 @@ pub use split::{run_split, run_split_init};
 pub use status::run_status;
 pub use sync::run_sync;
 pub use test::run_test;
-pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo, run_unify_undo_standalone};
+pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
 pub use watch::run_test_watch;

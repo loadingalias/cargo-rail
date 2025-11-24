@@ -40,7 +40,7 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
     ctx
       .cargo
       .metadata()
-      .list_crates()
+      .workspace_packages()
       .iter()
       .map(|p| p.name.to_string())
       .collect()

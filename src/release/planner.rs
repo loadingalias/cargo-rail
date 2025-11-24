@@ -120,7 +120,9 @@ impl<'a> ReleasePlanner<'a> {
     // Get crate metadata
     let metadata = self.ctx.cargo.metadata();
     let package = metadata
-      .get_package(crate_name)
+      .workspace_packages()
+      .into_iter()
+      .find(|pkg| pkg.name == crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     let manifest_path = package.manifest_path.clone().into_std_path_buf();

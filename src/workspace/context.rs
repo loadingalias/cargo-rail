@@ -22,13 +22,214 @@
 //!   fn execute(ctx: &WorkspaceContext)
 //! ```
 
-use crate::cargo::WorkspaceMetadata;
+use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::config::RailConfig;
 use crate::error::RailResult;
+use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
-use crate::workspace::{CargoState, GitState};
+use cargo_metadata::{Metadata, MetadataCommand, Package};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+// ============================================================================
+// Cargo State (merged from cargo_state.rs)
+// ============================================================================
+
+/// Cargo state for the workspace
+///
+/// Provides cargo metadata and workspace information.
+/// This is built once and shared across all commands via WorkspaceContext.
+#[derive(Clone)]
+pub struct CargoState {
+  /// Underlying cargo metadata
+  metadata: Metadata,
+
+  /// Cached workspace root
+  workspace_root: PathBuf,
+}
+
+/// Metadata cache structure
+#[derive(Serialize, Deserialize)]
+struct MetadataCache {
+  /// FNV-1a hash of Cargo.toml + Cargo.lock
+  hash: u64,
+  /// Cached metadata
+  metadata: Metadata,
+}
+
+impl CargoState {
+  /// Load cargo metadata from workspace root
+  ///
+  /// Uses a content-based cache (FNV-1a hash of Cargo.toml + Cargo.lock)
+  /// stored in `target/rail/metadata.json` to speed up subsequent loads.
+  fn load(workspace_root: &Path) -> RailResult<Self> {
+    let cache_dir = workspace_root.join("target").join("rail");
+    let cache_file = cache_dir.join("metadata.json");
+
+    // Compute current hash
+    let current_hash = compute_workspace_hash(workspace_root);
+
+    // Try to load from cache
+    if let Some(cache) = fs::read_to_string(&cache_file)
+      .ok()
+      .and_then(|s| serde_json::from_str::<MetadataCache>(&s).ok())
+      && cache.hash == current_hash
+    {
+      // Cache hit - use cached metadata
+      return Ok(Self {
+        workspace_root: cache.metadata.workspace_root.as_std_path().to_path_buf(),
+        metadata: cache.metadata,
+      });
+    }
+
+    // Cache miss or mismatch - load fresh metadata
+    let metadata = MetadataCommand::new()
+      .manifest_path(workspace_root.join("Cargo.toml"))
+      .exec()?;
+
+    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
+
+    // Save to cache
+    if let Ok(()) = fs::create_dir_all(&cache_dir) {
+      let cache = MetadataCache {
+        hash: current_hash,
+        metadata: metadata.clone(),
+      };
+      let _ = fs::write(&cache_file, serde_json::to_string(&cache).unwrap_or_default());
+    }
+
+    Ok(Self {
+      metadata,
+      workspace_root,
+    })
+  }
+
+  /// Get workspace root path
+  pub fn workspace_root(&self) -> &Path {
+    &self.workspace_root
+  }
+
+  /// Get all workspace members
+  pub fn workspace_members(&self) -> Vec<&Package> {
+    self.metadata.workspace_packages()
+  }
+
+  /// Get a specific workspace package by name
+  pub fn get_package(&self, name: &str) -> Option<&Package> {
+    self
+      .metadata
+      .workspace_packages()
+      .into_iter()
+      .find(|pkg| pkg.name == name)
+  }
+
+  /// Get the underlying metadata (for compatibility)
+  pub fn metadata(&self) -> &Metadata {
+    &self.metadata
+  }
+}
+
+/// Compute a content-based hash of workspace manifests
+///
+/// Uses FNV-1a hash of Cargo.toml + Cargo.lock to detect changes
+fn compute_workspace_hash(workspace_root: &Path) -> u64 {
+  const FNV_PRIME: u64 = 0x100000001b3;
+  const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+
+  let mut hash = FNV_OFFSET_BASIS;
+
+  // Hash Cargo.toml
+  if let Ok(mut file) = fs::File::open(workspace_root.join("Cargo.toml")) {
+    let mut buffer = [0; 8192];
+    while let Ok(n) = file.read(&mut buffer) {
+      if n == 0 {
+        break;
+      }
+      for byte in &buffer[..n] {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+      }
+    }
+  }
+
+  // Hash Cargo.lock if it exists
+  if let Ok(mut file) = fs::File::open(workspace_root.join("Cargo.lock")) {
+    let mut buffer = [0; 8192];
+    while let Ok(n) = file.read(&mut buffer) {
+      if n == 0 {
+        break;
+      }
+      for byte in &buffer[..n] {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+      }
+    }
+  }
+
+  hash
+}
+
+// ============================================================================
+// Git State (merged from git_state.rs)
+// ============================================================================
+
+/// Git state for the workspace
+///
+/// Provides git operations scoped to the workspace repository.
+/// This is built once and shared across all commands via WorkspaceContext.
+#[derive(Clone)]
+pub struct GitState {
+  /// Underlying git backend
+  git: SystemGit,
+
+  /// Cached repository root (git working tree)
+  repo_root: PathBuf,
+}
+
+impl GitState {
+  /// Open git repository at the given path
+  fn open(path: &Path) -> RailResult<Self> {
+    let git = SystemGit::open(path)?;
+    let repo_root = git.work_tree.clone();
+
+    Ok(Self { git, repo_root })
+  }
+
+  /// Get repository root path
+  pub fn repo_root(&self) -> &Path {
+    &self.repo_root
+  }
+
+  /// Access underlying SystemGit for advanced operations
+  ///
+  /// Use this when you need direct access to SystemGit methods.
+  pub fn git(&self) -> &SystemGit {
+    &self.git
+  }
+
+  /// Get current HEAD commit SHA
+  ///
+  /// Part of git backbone - will be used for sync/split operations
+  #[allow(dead_code)]
+  pub fn head_commit(&self) -> RailResult<String> {
+    self.git.head_commit()
+  }
+
+  /// Get current branch name
+  ///
+  /// Part of git backbone - will be used for git operations
+  #[allow(dead_code)]
+  pub fn current_branch(&self) -> RailResult<String> {
+    self.git.current_branch()
+  }
+}
+
+// ============================================================================
+// Workspace Context
+// ============================================================================
 
 /// Unified workspace context containing all shared workspace-level data.
 ///
@@ -36,24 +237,19 @@ use std::sync::{Arc, OnceLock};
 /// This eliminates redundant loads and provides a single source of truth for
 /// workspace state.
 ///
-/// Uses Arc for efficient sharing of graph data without expensive clones.
-/// Uses OnceLock for lazy-loaded metadata variants (e.g., --all-features).
+/// Uses Arc for efficient sharing across threads and parallel operations.
+/// Cloning is extremely cheap (just increments Arc refcounts).
 #[derive(Clone)]
 pub struct WorkspaceContext {
   /// Cargo workspace root (Cargo.toml location)
   /// Note: In most cases, git repo root == workspace root. Access git root via ctx.git.repo_root() if needed.
   pub workspace_root: PathBuf,
 
-  /// Git state and operations
-  pub git: GitState,
+  /// Git state and operations (Arc for cheap cloning across threads)
+  pub git: Arc<GitState>,
 
-  /// Cargo metadata and workspace info (default features)
-  pub cargo: CargoState,
-
-  /// Cargo metadata with --all-features (lazy-loaded, cached)
-  /// Used by unify and other commands that need complete feature resolution.
-  /// Loads on first access, then cached for the lifetime of the context.
-  cargo_all_features: Arc<OnceLock<WorkspaceMetadata>>,
+  /// Cargo metadata and workspace info (Arc for cheap cloning across threads)
+  pub cargo: Arc<CargoState>,
 
   /// Dependency graph (built from cargo metadata)
   /// Wrapped in Arc for efficient sharing across threads/commands
@@ -63,6 +259,10 @@ pub struct WorkspaceContext {
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
   pub config: Option<Arc<RailConfig>>,
+
+  /// Multi-target metadata (pre-loaded if targets configured)
+  /// This saves 150-600ms for unify operations by loading once
+  pub multi_target_metadata: Option<Arc<MultiTargetMetadata>>,
 }
 
 impl WorkspaceContext {
@@ -80,10 +280,10 @@ impl WorkspaceContext {
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
     // Load git state
-    let git = GitState::open(workspace_root)?;
+    let git = Arc::new(GitState::open(workspace_root)?);
 
     // Load cargo state
-    let cargo = CargoState::load(workspace_root)?;
+    let cargo = Arc::new(CargoState::load(workspace_root)?);
     let workspace_root = cargo.workspace_root().to_path_buf();
 
     // Validate git repo root and workspace_root match (or warn if they differ)
@@ -102,60 +302,34 @@ impl WorkspaceContext {
       );
     }
 
-    // Build dependency graph
-    let graph = Arc::new(WorkspaceGraph::load(&workspace_root)?);
+    // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
+    let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
     // Load optional config
     let config = RailConfig::load(&workspace_root).ok().map(Arc::new);
+
+    // Pre-load multi-target metadata if targets are configured
+    // This saves 150-600ms for unify operations
+    let multi_target_metadata = if let Some(ref cfg) = config
+      && !cfg.targets.is_empty()
+    {
+      println!("Pre-loading metadata for {} target(s)...", cfg.targets.len());
+      Some(Arc::new(MultiTargetMetadata::load_parallel(
+        &workspace_root,
+        &cfg.targets,
+      )?))
+    } else {
+      None
+    };
 
     Ok(Self {
       workspace_root,
       git,
       cargo,
-      cargo_all_features: Arc::new(OnceLock::new()),
       graph,
       config,
+      multi_target_metadata,
     })
-  }
-
-  /// Get metadata with --all-features (lazy-loaded, cached)
-  ///
-  /// This is used by unify and other commands that need complete feature resolution
-  /// across the workspace. The metadata is loaded once on first access and then
-  /// cached for the lifetime of the WorkspaceContext.
-  ///
-  /// # Performance
-  ///
-  /// - First call: 50-200ms (runs `cargo metadata --all-features`)
-  /// - Subsequent calls: <1ms (returns cached reference)
-  ///
-  /// # Example
-  ///
-  /// ```ignore
-  /// let metadata = ctx.metadata_all_features()?;
-  /// // metadata is &WorkspaceMetadata, no clone needed
-  /// ```
-  pub fn metadata_all_features(&self) -> RailResult<&WorkspaceMetadata> {
-    // Check if already loaded
-    if let Some(metadata) = self.cargo_all_features.get() {
-      return Ok(metadata);
-    }
-
-    // Not loaded yet - load it
-    let metadata = WorkspaceMetadata::load_with_features(&self.workspace_root, true, false, vec![])?;
-
-    // Try to store it (may fail if another thread beat us, that's OK)
-    match self.cargo_all_features.set(metadata) {
-      Ok(()) => {
-        // We successfully stored it, return the reference
-        Ok(self.cargo_all_features.get().expect("just set"))
-      }
-      Err(_) => {
-        // Another thread beat us to storing - that's fine, return their value
-        // (The metadata we loaded will be dropped)
-        Ok(self.cargo_all_features.get().expect("another thread set this"))
-      }
-    }
   }
 
   /// Get config or error if not found.
@@ -212,7 +386,7 @@ mod tests {
     );
 
     // Should find cargo-rail in workspace
-    let packages = ctx.cargo.workspace_packages();
+    let packages = ctx.cargo.workspace_members();
     assert!(!packages.is_empty(), "Should have workspace packages");
     assert!(
       packages.iter().any(|p| p.name == "cargo-rail"),
@@ -256,7 +430,7 @@ mod tests {
 
     // Should be able to access cargo metadata
     let metadata = ctx.cargo.metadata();
-    let packages = metadata.list_crates();
+    let packages = metadata.workspace_packages();
     assert!(!packages.is_empty(), "Should have packages");
 
     // Should be able to get specific package
@@ -274,7 +448,7 @@ mod tests {
 
     // Graph should be consistent with cargo metadata
     let graph_members = ctx.graph.workspace_members();
-    let cargo_packages: Vec<_> = ctx.cargo.workspace_packages().iter().map(|p| p.name.as_str()).collect();
+    let cargo_packages: Vec<_> = ctx.cargo.workspace_members().iter().map(|p| p.name.as_str()).collect();
 
     for member in &graph_members {
       assert!(
@@ -283,51 +457,5 @@ mod tests {
         member
       );
     }
-  }
-
-  #[test]
-  fn test_metadata_all_features_lazy_loading() {
-    let current_dir = std::env::current_dir().unwrap();
-    let ctx = WorkspaceContext::build(&current_dir).unwrap();
-
-    // First access should load and cache
-    let metadata1 = ctx.metadata_all_features();
-    assert!(metadata1.is_ok(), "Should successfully load all-features metadata");
-
-    // Second access should return cached reference (same pointer)
-    let metadata2 = ctx.metadata_all_features();
-    assert!(metadata2.is_ok(), "Should successfully get cached metadata");
-
-    // Verify they're the same reference (pointer equality)
-    let ptr1 = metadata1.unwrap() as *const _;
-    let ptr2 = metadata2.unwrap() as *const _;
-    assert_eq!(ptr1, ptr2, "Should return same cached instance");
-  }
-
-  #[test]
-  fn test_metadata_all_features_vs_default() {
-    let current_dir = std::env::current_dir().unwrap();
-    let ctx = WorkspaceContext::build(&current_dir).unwrap();
-
-    // Get default metadata
-    let default_metadata = ctx.cargo.metadata();
-
-    // Get all-features metadata
-    let all_features_metadata = ctx.metadata_all_features().unwrap();
-
-    // They should be different objects (different pointers)
-    let ptr_default = default_metadata as *const _;
-    let ptr_all_features = all_features_metadata as *const _;
-    assert_ne!(
-      ptr_default, ptr_all_features,
-      "Default and all-features metadata should be separate instances"
-    );
-
-    // Both should have the same workspace root
-    assert_eq!(
-      default_metadata.workspace_root(),
-      all_features_metadata.workspace_root(),
-      "Both metadata instances should have same workspace root"
-    );
   }
 }

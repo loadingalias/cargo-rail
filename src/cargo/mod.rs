@@ -1,26 +1,23 @@
-//! Cargo workspace integration
+//! Cargo workspace operations - CLEAN implementation
 //!
-//! This module provides:
-//! - Workspace metadata loading via cargo_metadata
-//! - Cargo.toml manifest transformation (workspace flattening, path→version deps)
-//! - Workspace dependency unification (eliminates workspace-hack crates)
-//! - Optional per-target validation with parallel execution
-//!
-//! # Architecture
-//!
-//! - `metadata` - Comprehensive cargo_metadata wrapper with resolved feature analysis
-//! - `manifest` - Lossless Cargo.toml transformation
-//! - `unify` - Workspace dependency unification engine (replaces cargo-hakari)
-//! - `validate` - Optional per-target validation with Rayon parallelism
-/// Workspace dependency unification engine
-pub mod manifest;
-/// Comprehensive cargo_metadata wrapper
-pub mod metadata;
-pub mod unify;
-/// Per-target validation with parallel execution
-pub mod validate;
+//! This module provides all cargo-related functionality using the HYBRID approach:
+//! - Multi-target metadata loading (parallel, cached)
+//! - Manifest analysis for feature classification
+//! - Clean unification with minimal features
 
-pub use manifest::{CargoTransform, TransformContext};
-pub use metadata::WorkspaceMetadata;
-pub use unify::{IssueSeverity, UnifiedDep, UnifyConfig, UnifyReport, WorkspaceUnifier};
-pub use validate::validate_targets;
+// Core modules
+pub mod cargo_transform;
+pub mod manifest_analyzer;
+pub mod manifest_ops;
+pub mod manifest_writer;
+pub mod multi_target_metadata;
+pub mod unify_analyzer;
+
+// Re-export main types for convenience
+pub use cargo_transform::{CargoTransform, TransformContext};
+pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
+pub use manifest_writer::ManifestWriter;
+pub use multi_target_metadata::{FragmentedTransitive, MultiTargetMetadata};
+pub use unify_analyzer::{
+  IssueSeverity, MemberEdit, UnificationPlan, UnifiedDep, UnifyAnalyzer, UnifyIssue, UnifyReport, ValidationResult,
+};

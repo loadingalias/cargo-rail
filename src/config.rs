@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 pub struct RailConfig {
   /// Workspace configuration
   pub workspace: WorkspaceConfig,
+  /// Target triples for multi-platform validation (workspace-wide)
+  /// Detected via `cargo rail init`, used by multiple commands
+  #[serde(default)]
+  pub targets: Vec<String>,
   /// Dependency unification settings
   #[serde(default)]
   pub unify: UnifyConfig,
@@ -31,97 +35,57 @@ pub struct WorkspaceConfig {
 }
 
 /// Unify configuration - controls workspace dependency unification behavior
+/// Simplified to 6 essential options (4 core + 2 safety hatches)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifyConfig {
-  /// Allow renamed dependencies to be unified (default: false)
-  #[serde(default)]
-  pub allow_renamed: bool,
+  /// Handle path dependencies? (default: true)
+  /// If false, path dependencies are excluded from unification
+  #[serde(default = "default_include_paths")]
+  pub include_paths: bool,
 
-  /// Dependencies to exclude from unification
+  /// Handle renamed dependencies (package = "...")? (default: false)
+  /// Renamed deps are tricky to unify correctly, opt-in only
+  #[serde(default, alias = "allow_renamed")]
+  pub include_renamed: bool,
+
+  /// Pin transitive-only deps with fragmented features? (default: true)
+  /// This is cargo-rail's workspace-hack replacement
+  /// When enabled, transitive deps with multiple feature sets are pinned in workspace.dependencies
+  #[serde(default = "default_pin_transitives")]
+  pub pin_transitives: bool,
+
+  /// Where to put pinned transitive dev-deps? (default: "root")
+  /// Options: "root" or a path like "crates/foo"
+  #[serde(default = "default_transitive_host")]
+  pub transitive_host: TransitiveFeatureHost,
+
+  /// Dependencies to exclude from unification (safety hatch)
   #[serde(default)]
   pub exclude: Vec<String>,
 
-  /// Dependencies to force-include in unification
+  /// Dependencies to force-include in unification (safety hatch)
   #[serde(default)]
   pub include: Vec<String>,
 
-  /// Consolidate transitive-only crates with fragmented features (default: false)
-  /// When enabled, transitive deps with multiple feature sets are added to workspace.dependencies
-  /// This is cargo-rail's version of workspace-hack without requiring an extra crate
-  #[serde(default)]
-  pub consolidate_transitives: bool,
-
-  /// Where to add dev-dependencies when consolidating transitive features
-  /// Options:
-  /// - "auto" (default) = Smart selection: root package, meta crate, or largest member
-  /// - "root" = Use workspace root package (errors if virtual workspace)
-  /// - "largest" = Use member with most dependencies
-  /// - ["crate-a"] = Explicit crate name(s)
-  #[serde(default = "default_host_selection")]
-  pub transitive_host: TransitiveFeatureHost,
-
-  /// Validation configuration
-  #[serde(default)]
-  pub validation: UnifyValidationConfig,
-
-  /// Output configuration
-  #[serde(default)]
-  pub output: UnifyOutputConfig,
-
-  /// Backup configuration
-  #[serde(default)]
-  pub backup: UnifyBackupConfig,
+  /// Maximum number of backups to keep (default: 3)
+  /// Older backups are automatically cleaned up after successful unify operations
+  #[serde(default = "default_max_backups")]
+  pub max_backups: usize,
 }
 
-/// Validation configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UnifyValidationConfig {
-  /// Optional: validate unification against specific target triples
-  /// When enabled, runs parallel metadata checks per target to catch platform-specific issues
-  /// Examples: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
-  #[serde(default)]
-  pub targets: Vec<String>,
-
-  /// Maximum parallel jobs for validation (0 = auto-detect CPUs, >0 = explicit limit)
-  #[serde(default)]
-  pub max_parallel_jobs: usize,
+fn default_max_backups() -> usize {
+  3
 }
 
-/// Output configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifyOutputConfig {
-  /// Generate .cargo-rail/unify-report.md after apply (default: true)
-  #[serde(default = "default_generate_report")]
-  pub generate_report: bool,
-}
-
-/// Backup configuration for unify operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifyBackupConfig {
-  /// Automatically create backups on every apply (default: true)
-  /// Backups are stored in target/.cargo-rail/backups/ to keep them out of version control
-  #[serde(default = "default_backup_enabled")]
-  pub enabled: bool,
-
-  /// Number of backups to keep (default: 5)
-  /// Older backups are automatically deleted
-  #[serde(default = "default_backup_keep_count")]
-  pub keep_count: usize,
-}
-
-fn default_generate_report() -> bool {
+fn default_include_paths() -> bool {
   true
 }
 
-fn default_backup_enabled() -> bool {
+fn default_pin_transitives() -> bool {
   true
 }
 
-fn default_backup_keep_count() -> usize {
-  5
-}
-
-fn default_host_selection() -> TransitiveFeatureHost {
+fn default_transitive_host() -> TransitiveFeatureHost {
   TransitiveFeatureHost::Root
 }
 
@@ -135,24 +99,16 @@ pub enum TransitiveFeatureHost {
   Path(String),
 }
 
-// ... (manual impls follow, skipping them in replacement as they are unchanged)
-
 #[test]
 fn test_transitive_feature_host_path() {
-  // Test that path format works
+  // Test that path format works with simplified config
   let toml = r#"
-      allow_renamed = false
+      include_paths = true
+      include_renamed = false
+      pin_transitives = false
+      transitive_host = "path/to/crate"
       exclude = []
       include = []
-      consolidate_transitives = false
-      transitive_host = "path/to/crate"
-
-      [validation]
-      targets = []
-      max_parallel_jobs = 0
-
-      [output]
-      generate_report = true
     "#;
 
   let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
@@ -204,82 +160,32 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
   }
 }
 
-impl TransitiveFeatureHost {
-  /// Resolve to actual crate names based on workspace metadata
-  pub fn resolve(&self, metadata: &crate::cargo::WorkspaceMetadata) -> Vec<String> {
-    match self {
-      TransitiveFeatureHost::Root => {
-        // Find root package (non-virtual workspace)
-        metadata
-          .list_crates()
-          .iter()
-          .find(|pkg| {
-            // Root package is the one at workspace_root/Cargo.toml
-            pkg.manifest_path.as_std_path().parent() == Some(metadata.workspace_root())
-          })
-          .map(|pkg| vec![pkg.name.to_string()])
-          .unwrap_or_default()
-      }
-      TransitiveFeatureHost::Path(path) => {
-        // Resolve the path relative to workspace root
-        let target_path = metadata.workspace_root().join(path);
-        metadata
-          .list_crates()
-          .iter()
-          .find(|pkg| pkg.manifest_path.as_std_path().parent() == Some(target_path.as_path()))
-          .map(|pkg| vec![pkg.name.to_string()])
-          .unwrap_or_default()
-      }
-    }
-  }
-}
-
-impl Default for UnifyOutputConfig {
-  fn default() -> Self {
-    Self {
-      generate_report: default_generate_report(),
-    }
-  }
-}
-
-impl Default for UnifyBackupConfig {
-  fn default() -> Self {
-    Self {
-      enabled: default_backup_enabled(),
-      keep_count: default_backup_keep_count(),
-    }
-  }
-}
+// TransitiveFeatureHost doesn't need a resolve method anymore
+// The unify command handles path resolution directly
 
 impl Default for UnifyConfig {
   fn default() -> Self {
     Self {
-      allow_renamed: false,
+      include_paths: default_include_paths(),
+      include_renamed: false,
+      pin_transitives: default_pin_transitives(),
+      transitive_host: default_transitive_host(),
       exclude: Vec::new(),
       include: Vec::new(),
-      consolidate_transitives: false,
-      transitive_host: default_host_selection(),
-      validation: UnifyValidationConfig::default(),
-      output: UnifyOutputConfig::default(),
-      backup: UnifyBackupConfig::default(),
+      max_backups: default_max_backups(),
     }
   }
 }
 
 impl UnifyConfig {
-  /// Check if target validation is enabled
-  pub fn validation_enabled(&self) -> bool {
-    !self.validation.targets.is_empty()
+  /// Check if a dependency should be excluded from unification
+  pub fn should_exclude(&self, dep_name: &str) -> bool {
+    self.exclude.iter().any(|e| e == dep_name)
   }
 
-  /// Get effective parallel job count (auto-detect if 0)
-  pub fn effective_parallelism(&self) -> usize {
-    if self.validation.max_parallel_jobs == 0 {
-      // Auto-detect: use number of logical CPUs
-      std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-    } else {
-      self.validation.max_parallel_jobs
-    }
+  /// Check if a dependency should be force-included in unification
+  pub fn should_include(&self, dep_name: &str) -> bool {
+    self.include.iter().any(|i| i == dep_name)
   }
 }
 
@@ -604,43 +510,35 @@ mod tests {
   // ============================================================================
 
   #[test]
-  fn test_unify_config_validation_enabled() {
-    let unify_disabled = UnifyConfig::default();
-    assert!(!unify_disabled.validation_enabled());
-
-    let unify_enabled = UnifyConfig {
-      validation: UnifyValidationConfig {
-        targets: vec!["x86_64-unknown-linux-gnu".to_string()],
-        max_parallel_jobs: 0,
-      },
-      ..Default::default()
-    };
-    assert!(unify_enabled.validation_enabled());
+  fn test_unify_config_defaults() {
+    let config = UnifyConfig::default();
+    assert!(config.include_paths); // Default: true
+    assert!(!config.include_renamed); // Default: false
+    assert!(config.pin_transitives); // Default: true
+    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
+    assert!(config.exclude.is_empty());
+    assert!(config.include.is_empty());
   }
 
   #[test]
-  fn test_unify_config_effective_parallelism_auto() {
-    let unify = UnifyConfig {
-      validation: UnifyValidationConfig {
-        targets: vec![],
-        max_parallel_jobs: 0, // Auto-detect
-      },
+  fn test_unify_config_should_exclude() {
+    let config = UnifyConfig {
+      exclude: vec!["tokio".to_string(), "serde".to_string()],
       ..Default::default()
     };
-    let parallelism = unify.effective_parallelism();
-    assert!(parallelism >= 1, "Should detect at least 1 CPU");
+    assert!(config.should_exclude("tokio"));
+    assert!(config.should_exclude("serde"));
+    assert!(!config.should_exclude("regex"));
   }
 
   #[test]
-  fn test_unify_config_effective_parallelism_explicit() {
-    let unify = UnifyConfig {
-      validation: UnifyValidationConfig {
-        targets: vec![],
-        max_parallel_jobs: 4,
-      },
+  fn test_unify_config_should_include() {
+    let config = UnifyConfig {
+      include: vec!["special-dep".to_string()],
       ..Default::default()
     };
-    assert_eq!(unify.effective_parallelism(), 4);
+    assert!(config.should_include("special-dep"));
+    assert!(!config.should_include("normal-dep"));
   }
 
   // ============================================================================
@@ -649,55 +547,28 @@ mod tests {
   // Note: Detailed TOML serialization tests will be added during TOML formatting overhaul
 
   #[test]
-  fn test_transitive_feature_host_in_full_config_auto() {
-    // Test that "auto" works in the new flattened config
+  fn test_transitive_feature_host_in_full_config() {
+    // Test that the simplified config works with TOML
     let toml = r#"
-      allow_renamed = false
+      include_paths = true
+      include_renamed = false
+      pin_transitives = true
+      transitive_host = "root"
       exclude = []
       include = []
-      consolidate_transitives = false
-      transitive_host = "auto"
-
-      [validation]
-      targets = []
-      max_parallel_jobs = 0
-
-      [output]
-      generate_report = true
     "#;
 
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
+    assert!(config.include_paths);
+    assert!(config.pin_transitives);
   }
 
   #[test]
-  fn test_transitive_feature_host_resolve_path() {
-    // Create a test metadata instance
-    let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
-
-    // Test resolving root
-    let host = TransitiveFeatureHost::Root;
-    let resolved = host.resolve(&metadata);
-    assert_eq!(resolved, vec!["cargo-rail"]);
-  }
-
-  #[test]
-  fn test_transitive_feature_host_resolve_root() {
-    // Create a test metadata instance
-    let metadata = crate::cargo::WorkspaceMetadata::load(&std::env::current_dir().unwrap()).unwrap();
-
-    let host = TransitiveFeatureHost::Root;
-    let resolved = host.resolve(&metadata);
-
-    // Should return "cargo-rail" since this workspace has a root package
-    assert_eq!(resolved, vec!["cargo-rail"]);
-  }
-
-  #[test]
-  fn test_unify_config_default_uses_auto() {
+  fn test_unify_config_default_transitive_host() {
     let config = UnifyConfig::default();
     assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
-    assert!(!config.consolidate_transitives);
+    assert!(config.pin_transitives); // Default is true (workspace-hack replacement)
   }
 
   // ============================================================================

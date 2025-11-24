@@ -72,7 +72,9 @@ impl<'a> ReleaseValidator<'a> {
     // Get crate manifest path
     let metadata = self.ctx.cargo.metadata();
     let package = metadata
-      .get_package(crate_name)
+      .workspace_packages()
+      .into_iter()
+      .find(|pkg| pkg.name == crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     let crate_dir = package
@@ -103,7 +105,9 @@ impl<'a> ReleaseValidator<'a> {
   pub fn validate_publishable(&self, crate_name: &str) -> RailResult<()> {
     let metadata = self.ctx.cargo.metadata();
     let package = metadata
-      .get_package(crate_name)
+      .workspace_packages()
+      .into_iter()
+      .find(|pkg| pkg.name == crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     // Check if publish = false

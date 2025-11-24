@@ -19,7 +19,6 @@
 //! - **Algorithms**: Shortest paths, reachability, transitive closure
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
-use crate::cargo::WorkspaceMetadata;
 use crate::error::{RailError, RailResult};
 use cargo_metadata::DependencyKind;
 use petgraph::Direction;
@@ -56,21 +55,19 @@ pub struct WorkspaceGraph {
   workspace_members: HashSet<String>,
 
   /// Path cache: directory → owning crate name
-  /// Built lazily on first file lookup (thread-safe interior mutability)
+  /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
   path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
 }
 
 impl WorkspaceGraph {
-  /// Load workspace graph from root directory.
+  /// Load workspace graph from cargo metadata.
   ///
   /// # Performance
-  /// - cargo_metadata: 50-200ms for large workspaces
   /// - Graph construction: 10-50ms
-  /// - Path cache: deferred until first file lookup
-  pub fn load(workspace_root: &Path) -> RailResult<Self> {
-    let metadata = WorkspaceMetadata::load(workspace_root)?;
-
+  /// - Path cache: built eagerly (10-50ms)
+  /// - **Does not reload metadata** (use existing from CargoState)
+  pub fn from_metadata(metadata: &cargo_metadata::Metadata) -> RailResult<Self> {
     // Build petgraph
     let mut graph = DiGraph::new();
     let mut name_to_node = HashMap::new();
@@ -78,10 +75,10 @@ impl WorkspaceGraph {
     let mut workspace_members = HashSet::new();
 
     // Get workspace member IDs
-    let workspace_pkg_ids: HashSet<_> = metadata.list_crates().iter().map(|pkg| pkg.id.clone()).collect();
+    let workspace_pkg_ids: HashSet<_> = metadata.workspace_packages().iter().map(|pkg| pkg.id.clone()).collect();
 
     // Add all packages as nodes (workspace + dependencies)
-    for package in &metadata.metadata_json().packages {
+    for package in &metadata.packages {
       let crate_name = package.name.as_ref().to_string();
 
       let node = PackageNode {
@@ -100,7 +97,7 @@ impl WorkspaceGraph {
     }
 
     // Add dependency edges
-    for package in &metadata.metadata_json().packages {
+    for package in &metadata.packages {
       let from_idx = id_to_node[&package.id];
 
       for dep in &package.dependencies {
@@ -111,12 +108,17 @@ impl WorkspaceGraph {
       }
     }
 
-    Ok(Self {
+    let graph = Self {
       graph,
       name_to_node,
       workspace_members,
       path_cache: RwLock::new(None),
-    })
+    };
+
+    // Build path cache eagerly instead of lazily (saves 10-50ms on first file lookup)
+    graph.build_path_cache();
+
+    Ok(graph)
   }
 
   /// Get all workspace member crate names.
@@ -228,24 +230,12 @@ impl WorkspaceGraph {
 
   /// Map a file path to its owning crate.
   ///
-  /// Builds path cache on first call, then O(1) lookups.
+  /// O(1) lookups using pre-built path cache.
   /// Filters out VCS directories (.git, .jj) and other non-source paths.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
     // Filter out VCS directories (git, jj, etc.)
     if Self::should_ignore_path(file_path) {
       return None;
-    }
-
-    // Build cache if needed (interior mutability with RwLock)
-    {
-      let cache = self
-        .path_cache
-        .read()
-        .expect("RwLock poisoned: another thread panicked while holding the lock");
-      if cache.is_none() {
-        drop(cache); // Release read lock before acquiring write lock
-        self.build_path_cache();
-      }
     }
 
     // Normalize path
