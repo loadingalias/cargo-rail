@@ -37,8 +37,6 @@ pub mod sync;
 pub mod test;
 /// Workspace dependency unification commands
 pub mod unify;
-/// Watch mode for continuous testing
-pub mod watch;
 
 pub use affected::run_affected;
 pub use init::{run_init, run_init_standalone};
@@ -48,4 +46,3 @@ pub use status::run_status;
 pub use sync::run_sync;
 pub use test::run_test;
 pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
-pub use watch::run_test_watch;

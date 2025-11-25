@@ -73,16 +73,30 @@ impl CargoState {
     let current_hash = compute_workspace_hash(workspace_root);
 
     // Try to load from cache
+    // Cache is valid only if:
+    // 1. Hash matches (Cargo.toml + Cargo.lock unchanged)
+    // 2. Workspace root path matches (repo hasn't been moved/copied)
     if let Some(cache) = fs::read_to_string(&cache_file)
       .ok()
       .and_then(|s| serde_json::from_str::<MetadataCache>(&s).ok())
       && cache.hash == current_hash
     {
-      // Cache hit - use cached metadata
-      return Ok(Self {
-        workspace_root: cache.metadata.workspace_root.as_std_path().to_path_buf(),
-        metadata: cache.metadata,
-      });
+      // Validate workspace root path matches current location
+      // This handles the case where a repo is copied/moved to a different path
+      let cached_root = cache.metadata.workspace_root.as_std_path();
+      let current_root_canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+      let cached_root_canonical = cached_root.canonicalize().unwrap_or_else(|_| cached_root.to_path_buf());
+
+      if current_root_canonical == cached_root_canonical {
+        // Cache hit - use cached metadata
+        return Ok(Self {
+          workspace_root: cache.metadata.workspace_root.as_std_path().to_path_buf(),
+          metadata: cache.metadata,
+        });
+      }
+      // Path mismatch - cache is stale, will reload below
     }
 
     // Cache miss or mismatch - load fresh metadata

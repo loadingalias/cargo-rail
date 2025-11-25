@@ -29,6 +29,9 @@ impl ManifestWriter {
   }
 
   /// Write unified dependencies to workspace Cargo.toml
+  ///
+  /// IMPORTANT: This MERGES new deps with existing workspace.dependencies.
+  /// It does NOT replace the entire section.
   pub fn write_workspace_deps(&self, workspace_toml_path: &Path, deps: &[UnifiedDep]) -> RailResult<()> {
     // Read workspace Cargo.toml
     let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
@@ -36,10 +39,11 @@ impl ManifestWriter {
     // Ensure [workspace] section exists
     manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
 
-    // Create or clear [workspace.dependencies]
+    // Get or create [workspace.dependencies] - DO NOT CLEAR IT
+    // We merge new deps with existing ones, not replace them
     let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
       .context("Failed to create [workspace.dependencies]")?;
-    deps_table.clear();
+    // NOTE: Removed deps_table.clear() - BUG FIX: preserve existing deps
 
     // Group dependencies by target
     let (regular_deps, target_deps) = self.group_dependencies(deps);
@@ -86,11 +90,21 @@ impl ManifestWriter {
   }
 
   /// Update a member's Cargo.toml to use workspace inheritance
+  ///
+  /// # Arguments
+  ///
+  /// * `member_toml_path` - Path to the member's Cargo.toml
+  /// * `dep_name` - Name of the dependency to update
+  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
+  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
+  /// * `local_features` - Additional features to enable locally
+  /// * `is_optional` - Whether the dependency is optional
   pub fn update_member(
     &self,
     member_toml_path: &Path,
     dep_name: &str,
     dep_kind: DepKind,
+    target: Option<&str>,
     local_features: Option<Vec<String>>,
     is_optional: bool,
   ) -> RailResult<()> {
@@ -98,17 +112,22 @@ impl ManifestWriter {
     let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
 
     // Get section name from kind
-    let section_name = self.dep_kind_to_section(dep_kind);
-
-    // Get deps section (create if needed)
-    let deps =
-      manifest_ops::get_or_create_table(&mut doc, section_name).context("Failed to get dependencies section")?;
+    let kind_section = self.dep_kind_to_section(dep_kind);
 
     // Build workspace-inherited entry
     let entry = manifest_ops::build_workspace_dep_entry(local_features, is_optional);
 
-    // Insert dependency
-    manifest_ops::insert_dependency(deps, dep_name, entry).context("Failed to insert workspace dependency")?;
+    // Handle target-specific vs regular sections
+    if let Some(target_cfg) = target {
+      // Target-specific: write to [target.'cfg(...)'.dependencies]
+      manifest_ops::insert_target_dependency(&mut doc, target_cfg, kind_section, dep_name, entry)
+        .context("Failed to insert target-specific workspace dependency")?;
+    } else {
+      // Regular section: write to [dependencies], [dev-dependencies], or [build-dependencies]
+      let deps =
+        manifest_ops::get_or_create_table(&mut doc, kind_section).context("Failed to get dependencies section")?;
+      manifest_ops::insert_dependency(deps, dep_name, entry).context("Failed to insert workspace dependency")?;
+    }
 
     // Format and write
     self.formatter.format_manifest(&mut doc)?;

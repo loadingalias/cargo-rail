@@ -99,8 +99,9 @@ impl MultiTargetMetadata {
     self.any().map(|m| m.workspace_packages()).unwrap_or_default()
   }
 
-  /// Get all versions of a dependency across targets
+  /// Get all versions of a dependency across targets (includes transitive deps)
   /// Returns map of target -> version
+  /// NOTE: This includes transitive dependencies - use direct_dep_versions() for direct deps only
   pub fn all_versions(&self, dep_name: &str) -> HashMap<String, Version> {
     let mut versions = HashMap::new();
 
@@ -113,6 +114,45 @@ impl MultiTargetMetadata {
           {
             versions.insert(target.clone(), pkg.version.clone());
             break; // Found it for this target
+          }
+        }
+      }
+    }
+
+    versions
+  }
+
+  /// Get versions of a dependency that are DIRECT dependencies of workspace members only
+  /// This filters out transitive dependencies, ensuring we only unify versions
+  /// that workspace members explicitly depend on.
+  /// Returns map of target -> version
+  pub fn direct_dep_versions(&self, dep_name: &str) -> HashMap<String, Version> {
+    let mut versions = HashMap::new();
+
+    for (target, metadata) in &self.cache {
+      // Get workspace member package IDs
+      let workspace_member_ids: HashSet<_> = metadata.workspace_packages().iter().map(|p| &p.id).collect();
+
+      if let Some(resolve) = &metadata.resolve {
+        // Look at direct dependencies of workspace members only
+        for node in &resolve.nodes {
+          // Skip if not a workspace member
+          if !workspace_member_ids.contains(&node.id) {
+            continue;
+          }
+
+          // Check if this workspace member has dep_name as a direct dependency
+          for dep in &node.deps {
+            if dep.name == dep_name {
+              // Found a direct dependency - get its version from packages
+              if let Some(pkg) = metadata.packages.iter().find(|p| p.id == dep.pkg) {
+                // Use the highest version if multiple workspace members depend on different versions
+                let existing = versions.get(target);
+                if existing.is_none() || pkg.version > *existing.unwrap() {
+                  versions.insert(target.clone(), pkg.version.clone());
+                }
+              }
+            }
           }
         }
       }

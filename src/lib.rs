@@ -1,59 +1,39 @@
-//! Split Rust crates from Cargo workspaces into standalone repos with bidirectional sync.
-//!
-//! cargo-rail manages monorepo workflows: split crates into standalone repositories,
-//! maintain bidirectional sync, unify dependencies, and coordinate releases.
-//!
-//! # Quick Start
-//!
-//! ```rust,no_run
-//! use cargo_rail::{RailResult, workspace::WorkspaceContext};
-//! use std::path::Path;
-//!
-//! # fn main() -> RailResult<()> {
-//! // Load workspace context
-//! let ctx = WorkspaceContext::build(Path::new("."))?;
-//!
-//! // Analyze workspace structure
-//! let crates = ctx.cargo.metadata().list_crates();
-//! assert!(!crates.is_empty());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Modules
-//!
-//! - [`cargo`] — Workspace metadata, manifest transformation, dependency unification
-//! - [`graph`] — Dependency graph analysis and affected crate detection
-//! - [`workspace`] — Unified workspace context (Git + Cargo + Graph)
-//! - [`split`] — Split crates into standalone repositories
-//! - [`sync`] — Bidirectional sync between monorepo and split repos
-//! - [`release`] — Coordinated release planning and publishing
-//! - [`backup`] — Backup and restore functionality for safe undo operations
-//! - [`change_detection`] — Git-based change classification and impact analysis
-//! - [`error`] — Error types with contextual help messages
+//! Rust monorepo orchestration: CI optimization, dependency unification, release automation.
 
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// Backup and restore functionality
+/// Backup and restore for undo operations.
 pub mod backup;
-/// Cargo workspace integration and transformations
+/// Cargo workspace metadata and manifest operations.
 pub mod cargo;
+/// Git-based change classification.
 pub mod change_detection;
+/// CLI command implementations.
 pub mod commands;
-/// Configuration file parsing and types
+/// Configuration file parsing.
 pub mod config;
+/// Error types and result aliases.
 pub mod error;
+/// Git operations via system git.
 pub mod git;
+/// Dependency graph analysis.
 pub mod graph;
+/// Release planning and publishing.
 pub mod release;
+/// Crate extraction to standalone repos.
 pub mod split;
+/// Bidirectional monorepo sync.
 pub mod sync;
-/// Target triple detection for workspace validation
+/// Target triple detection.
 pub mod targets;
+/// Test runner integration.
 pub mod test;
+/// TOML editing utilities.
 pub mod toml;
+/// Shared utilities.
 pub mod utils;
+/// Unified workspace context.
 pub mod workspace;
 
 // Re-export commonly used types

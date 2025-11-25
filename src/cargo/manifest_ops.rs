@@ -96,9 +96,14 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
   // Complex case: use inline table
   let mut table = InlineTable::new();
 
-  // Add version or path
+  // Add path if present (for workspace member deps)
   if let Some(ref path) = dep.path {
     table.insert("path", Value::from(path.display().to_string()));
+    // Also include version for publishable workspace members
+    // This allows `cargo publish` to work while using paths for local dev
+    if dep.version_req.to_string() != "*" {
+      table.insert("version", Value::from(dep.version_req.to_string()));
+    }
   } else {
     table.insert("version", Value::from(dep.version_req.to_string()));
   }

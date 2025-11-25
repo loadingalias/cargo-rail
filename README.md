@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust Version](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 
 Stop wasting CI time. Stop fighting workspace dependencies. Stop copy-pasting git history.
 
@@ -20,9 +20,19 @@ cargo install cargo-rail
 
 | Problem | Solution | Impact |
 |---------|----------|--------|
-| 🔥 **Testing everything on every PR** | Graph-aware change detection | **10x faster CI** |
-| 💥 **Dependency fragmentation** | Resolution-based unification | **Zero workspace-hack crates** |
-| 🔨 **Distributing crates** | History-preserving split/sync | **One command, full git history** |
+| **Testing everything on every PR** | Graph-aware change detection | **10x faster CI** |
+| **Dependency fragmentation** | Resolution-based unification | **Zero workspace-hack crates** |
+| **Distributing crates** | History-preserving split/sync | **One command, full git history** |
+
+### Replaces
+
+| Tool | What cargo-rail does instead |
+|------|------------------------------|
+| **cargo-hakari** | Native `workspace.dependencies` unification—no workspace-hack crate |
+| **cargo-release / release-plz** | Dependency-ordered releases with native changelog generation |
+| **git-cliff** | Built-in conventional commit parsing (zero-copy, no external dep) |
+| **Copybara** | Deterministic split/sync with git-notes mapping |
+| **CI shell scripts** | Graph-aware `cargo rail affected` with nextest/bacon integration |
 
 ---
 
@@ -156,7 +166,7 @@ def456 fix: critical bug      # Same SHA!
 
 - **System git only** – No libgit2/gitoxide dependency overhead
 - **Direct graph construction** – `cargo_metadata` + `petgraph` (no guppy)
-- **8 core dependencies** – Minimal, auditable supply chain
+- **11 core dependencies** – Minimal, auditable supply chain
 
 ### Design Principles
 
@@ -220,26 +230,80 @@ cargo rail sync my-crate               # Bidirectional sync
 cargo rail status                      # Show sync status
 ```
 
-### Release Automation
+### Release Automation (replaces cargo-release + git-cliff)
 
 ```bash
-cargo rail release plan --all          # Plan release
-cargo rail release publish --execute   # Publish to crates.io
+# Plan releases with dependency-aware ordering
+cargo rail release --all --bump minor --dry-run
+
+# Execute: bump versions, generate changelogs, tag, publish
+cargo rail release --all --bump patch --execute
+```
+
+**What it does:**
+
+- Native changelog generation from conventional commits (no git-cliff dependency)
+- Dependency-ordered publishing (deps before dependents)
+- Configurable delays between publishes (avoids registry race conditions)
+- GitHub release creation via `gh` CLI (optional)
+- GPG/SSH tag signing support
+
+### Watch Mode (bacon/cargo-watch integration)
+
+```bash
+# Auto-detect best watcher and run smart tests
+cargo rail test --watch
+
+# Explicit watcher selection
+cargo rail test --watch --watch-mode bacon
 ```
 
 ---
 
 ## Comparison
 
-| Feature | cargo-rail | cargo-hakari | Copybara |
-|---------|-----------|-------------|----------|
-| Dependency unification | ✅ Resolution-based | ✅ Syntax-only | ❌ |
-| Workspace-hack crate | ❌ Not needed | ✅ Required | ❌ |
-| Git history preservation | ✅ Full | ❌ | ⚠️ Partial |
-| Bidirectional sync | ✅ | ❌ | ✅ |
-| Deterministic | ✅ Same SHAs | N/A | ❌ |
-| Smart testing | ✅ Graph-aware | ❌ | ❌ |
-| Dependencies | 8 core | ~40+ (via guppy) | Go ecosystem |
+### vs Dependency Management
+
+| Feature | cargo-rail | cargo-hakari |
+|---------|-----------|-------------|
+| Dependency unification | ✅ Resolution-based | ✅ Syntax-only |
+| Feature selection | Intersection (minimal) | Union (maximal) |
+| Workspace-hack crate | ❌ Not needed | ✅ Required |
+| TOML preservation | ✅ Lossless | ⚠️ Regenerates |
+| Dependencies | 10 core | ~40+ (via guppy) |
+
+### vs Release Automation
+
+| Feature | cargo-rail | cargo-release | release-plz |
+|---------|-----------|--------------|-------------|
+| Version bumping | ✅ | ✅ | ✅ |
+| Changelog generation | ✅ Native | ❌ External | ✅ |
+| Dependency ordering | ✅ Graph-aware | ⚠️ Manual | ✅ |
+| GitHub releases | ✅ via gh | ❌ | ✅ |
+| Publish delay | ✅ Configurable | ❌ | ✅ |
+| Tag signing | ✅ | ✅ | ✅ |
+| Dependencies | 90 |-| 600+|
+
+### vs Monorepo Sync
+
+| Feature | cargo-rail | Copybara | git-filter-repo |
+|---------|-----------|----------|-----------------|
+| Git history preservation | ✅ Full | ⚠️ Partial | ✅ Full |
+| Bidirectional sync | ✅ | ✅ | ❌ One-way |
+| Deterministic SHAs | ✅ | ❌ | ✅ |
+| Conflict resolution | ✅ 3-way merge | ✅ | ❌ |
+| Commit mapping | ✅ git-notes | Custom DB | ❌ |
+| Language | Rust | Go | Python |
+
+### vs CI Optimization
+
+| Feature | cargo-rail | Custom scripts | nx/turborepo |
+|---------|-----------|---------------|--------------|
+| Change detection | ✅ Graph-aware | ⚠️ Path-based | ✅ Graph-aware |
+| Rust-native | ✅ | ⚠️ Shell | ❌ JS ecosystem |
+| Nextest integration | ✅ Auto-detect | Manual | ❌ |
+| Watch mode | ✅ bacon/cargo-watch | Manual | ✅ |
+| Dependency resolution | ✅ Cargo's resolver | ❌ | ❌ |
 
 ---
 

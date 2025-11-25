@@ -24,9 +24,6 @@ struct RailCli {
 
 #[derive(Subcommand)]
 enum Commands {
-  // ============================================================================
-  // Graph-Aware CI Optimization
-  // ============================================================================
   /// Show which crates are affected by changes
   Affected {
     /// Git ref to compare against (default: origin/main)
@@ -57,20 +54,11 @@ enum Commands {
     /// Explain why tests are being run
     #[arg(long)]
     explain: bool,
-    /// Watch for file changes and re-run tests automatically
-    #[arg(long)]
-    watch: bool,
-    /// Watch mode backend: bacon, cargo-watch, auto (default: auto)
-    #[arg(long, default_value = "auto")]
-    watch_mode: String,
     /// Pass additional arguments to the test runner
     #[arg(last = true)]
     test_args: Vec<String>,
   },
 
-  // ============================================================================
-  // Dependency Unification
-  // ============================================================================
   /// Workspace dependency unification (eliminates workspace-hack crates)
   ///
   /// Usage:
@@ -105,9 +93,6 @@ enum Commands {
     backup_id: Option<String>,
   },
 
-  // ============================================================================
-  // Configuration Management
-  // ============================================================================
   /// Initialize cargo-rail configuration (rail.toml)
   Init {
     /// Output path for rail.toml (default: .config/rail.toml)
@@ -124,9 +109,6 @@ enum Commands {
     dry_run: bool,
   },
 
-  // ============================================================================
-  // Split/Sync Orchestration
-  // ============================================================================
   /// Split a crate from monorepo to separate repo with history
   ///
   /// Usage:
@@ -181,9 +163,6 @@ enum Commands {
     json: bool,
   },
 
-  // ============================================================================
-  // Release & Publishing
-  // ============================================================================
   /// Release automation (version bumping, changelog, publishing)
   Release {
     /// Crate name(s) to release (omit for --all)
@@ -217,9 +196,6 @@ enum Commands {
     all: bool,
   },
 
-  // ============================================================================
-  // Workspace Inspection
-  // ============================================================================
   /// Show status of all configured crates
   Status {
     /// Output status in JSON format
@@ -298,8 +274,6 @@ fn main() {
       full,
       no_nextest,
       explain,
-      watch,
-      watch_mode,
       test_args,
     } => {
       let config = commands::test::TestConfig {
@@ -309,19 +283,7 @@ fn main() {
         prefer_nextest: !no_nextest,
         test_args,
       };
-
-      if watch {
-        // Parse watch mode
-        let mode = match watch_mode.as_str() {
-          "bacon" => commands::watch::WatchMode::Bacon,
-          "cargo-watch" => commands::watch::WatchMode::CargoWatch,
-          "auto" => commands::watch::WatchMode::Auto,
-          _ => commands::watch::WatchMode::Auto,
-        };
-        commands::run_test_watch(&ctx, config, mode)
-      } else {
-        commands::run_test(&ctx, config)
-      }
+      commands::run_test(&ctx, config)
     }
 
     // Configuration Management (Init is handled above before building WorkspaceContext)

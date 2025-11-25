@@ -4,7 +4,7 @@
 //! with WorkspaceContext and uses multi-target metadata + manifest analysis.
 
 use crate::cargo::{
-  manifest_analyzer::{DepKind, ManifestAnalyzer},
+  manifest_analyzer::{DepKind, ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
   multi_target_metadata::MultiTargetMetadata,
 };
 use crate::config::UnifyConfig;
@@ -46,6 +46,8 @@ pub enum MemberEdit {
     dep_name: String,
     /// Type of dependency (normal, dev, build)
     dep_kind: DepKind,
+    /// Target platform constraint (e.g., "cfg(unix)") - preserves which section to edit
+    target: Option<String>,
     /// Additional features to enable locally (beyond workspace features)
     local_features: Vec<String>,
     /// Whether the dependency is optional
@@ -112,7 +114,7 @@ impl UnificationPlan {
     let mut s = String::new();
     s.push_str("=== Unification Plan ===\n\n");
 
-    // Show dependencies to unify
+    // Show dependencies to unify (new workspace deps)
     if !self.workspace_deps.is_empty() {
       s.push_str(&format!("Dependencies to unify: {}\n", self.workspace_deps.len()));
       for dep in &self.workspace_deps {
@@ -129,6 +131,36 @@ impl UnificationPlan {
         s.push_str(&format!(" (used by {} crates)\n", dep.used_by.len()));
       }
       s.push('\n');
+    }
+
+    // Show member edits (deps being converted to workspace = true)
+    if !self.member_edits.is_empty() {
+      // Collect unique dep names being converted
+      let mut converted_deps: HashSet<String> = HashSet::new();
+      for edits in self.member_edits.values() {
+        for edit in edits {
+          match edit {
+            MemberEdit::UseWorkspace { dep_name, .. } => {
+              converted_deps.insert(dep_name.clone());
+            }
+          }
+        }
+      }
+
+      // Only show if there are deps being converted that aren't already in workspace_deps
+      let workspace_dep_names: HashSet<_> = self.workspace_deps.iter().map(|d| d.name.clone()).collect();
+      let conversion_only: Vec<_> = converted_deps.difference(&workspace_dep_names).collect();
+
+      if !conversion_only.is_empty() {
+        s.push_str(&format!(
+          "Dependencies to convert to workspace inheritance: {}\n",
+          conversion_only.len()
+        ));
+        for dep_name in conversion_only {
+          s.push_str(&format!("  - {} (already in workspace.dependencies)\n", dep_name));
+        }
+        s.push('\n');
+      }
     }
 
     s.push_str(&format!("Member edits: {}\n", self.member_edits.len()));
@@ -171,6 +203,10 @@ pub struct UnifyAnalyzer {
   manifests: ManifestAnalyzer,
   /// Configuration for unification behavior (can be overridden at runtime)
   pub config: UnifyConfig,
+  /// Existing workspace dependencies (already in [workspace.dependencies])
+  existing_workspace_deps: HashMap<String, ExistingWorkspaceDep>,
+  /// Workspace root path (for path normalization)
+  workspace_root: PathBuf,
 }
 
 impl UnifyAnalyzer {
@@ -199,6 +235,15 @@ impl UnifyAnalyzer {
     let workspace_packages = metadata.workspace_packages();
     let manifests = ManifestAnalyzer::parse_workspace(ctx.workspace_root(), &workspace_packages)?;
 
+    // Parse existing workspace.dependencies to avoid duplicates
+    let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;
+    if !existing_workspace_deps.is_empty() {
+      println!(
+        "Found {} existing workspace dependencies",
+        existing_workspace_deps.len()
+      );
+    }
+
     // Build config from context
     let config = ctx.config.as_ref().map(|c| c.unify.clone()).unwrap_or_default();
 
@@ -206,6 +251,8 @@ impl UnifyAnalyzer {
       metadata,
       manifests,
       config,
+      existing_workspace_deps,
+      workspace_root: ctx.workspace_root().to_path_buf(),
     })
   }
 
@@ -251,13 +298,14 @@ impl UnifyAnalyzer {
         continue;
       }
 
-      // Get version from metadata
-      let versions = self.metadata.all_versions(&dep_key.name);
+      // Get version from metadata - but ONLY from direct dependencies of workspace members
+      // This uses direct_dep_versions() which filters out transitive dependencies
+      let versions = self.metadata.direct_dep_versions(&dep_key.name);
       if versions.is_empty() {
-        continue; // Not in resolved graph
+        continue; // Not a direct dependency of any workspace member
       }
 
-      // Check version compatibility
+      // Check version compatibility across workspace members
       let unique_versions: HashSet<_> = versions.values().collect();
       if unique_versions.len() > 1 {
         issues.push(UnifyIssue {
@@ -312,42 +360,120 @@ impl UnifyAnalyzer {
       let usage_sites = self.manifests.get_usage_sites(dep_key);
       let users: HashSet<_> = usage_sites.iter().map(|u| u.used_by.clone()).collect();
 
-      // Create unified dep
-      let unified = UnifiedDep {
-        name: dep_key.name.clone(),
-        version_req,
-        features: features.into_iter().collect(),
-        default_features,
-        used_by: users.into_iter().collect(),
-        target,
-        path: None, // Path deps handled separately
+      // Check if any usage has a path (path dependencies)
+      // If so, check if the dep is a workspace member to include path in workspace.dependencies
+      let dep_path: Option<PathBuf> = usage_sites.iter().find_map(|u| {
+        u.path.as_ref().and_then(|p| {
+          // Check if this dep name matches a workspace member
+          let workspace_members: HashSet<String> = self
+            .metadata
+            .workspace_packages()
+            .iter()
+            .map(|pkg| pkg.name.to_string())
+            .collect();
+          if workspace_members.contains(&dep_key.name) {
+            // Normalize path relative to workspace root
+            // The path in usage (p) is relative to the member's Cargo.toml
+            // We need to make it relative to the workspace root
+            if let Some(ref manifest_path) = u.manifest_path {
+              // Get the member's directory (parent of Cargo.toml)
+              let member_dir = manifest_path.parent().unwrap_or(manifest_path);
+              // Resolve the dep path relative to the member's directory
+              let absolute_dep_path = member_dir.join(p);
+              // Canonicalize to resolve .. and symlinks (if path exists)
+              let canonical_workspace = self
+                .workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace_root.clone());
+              let absolute_dep_path = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path);
+              // Make relative to workspace root
+              if let Ok(relative) = absolute_dep_path.strip_prefix(&canonical_workspace) {
+                Some(relative.to_path_buf())
+              } else {
+                // Fallback: if canonicalization moved outside workspace, use the original resolved path
+                // Try strip_prefix on non-canonicalized path
+                let resolved = member_dir.join(p);
+                if let Ok(relative) = resolved.strip_prefix(&self.workspace_root) {
+                  Some(relative.to_path_buf())
+                } else {
+                  // Last resort: just use the path as-is
+                  Some(PathBuf::from(p))
+                }
+              }
+            } else {
+              // No manifest_path available - just use as-is (shouldn't happen)
+              Some(PathBuf::from(p))
+            }
+          } else {
+            None
+          }
+        })
+      });
+
+      // Compute the unified features (this is what workspace.dependencies should have)
+      let computed_features: Vec<String> = features.into_iter().collect();
+
+      // Check if this dep already exists in workspace.dependencies
+      let existing_dep = self.existing_workspace_deps.get(&dep_key.name);
+
+      // Determine if we need to update workspace.dependencies
+      // Update if: dep doesn't exist, OR features differ, OR default-features differs, OR has path
+      let needs_workspace_update = match existing_dep {
+        None => true, // Doesn't exist, need to add
+        Some(existing) => {
+          // Check if features are different
+          let mut existing_features: Vec<String> = existing.features.clone();
+          let mut computed: Vec<String> = computed_features.clone();
+          existing_features.sort();
+          computed.sort();
+
+          // Also check if existing has path but we found one now
+          let path_differs = dep_path.is_some() && existing.path.is_none();
+
+          existing_features != computed || existing.default_features != default_features || path_differs
+        }
       };
 
-      // Compute member edits
-      for usage in usage_sites {
-        if usage.kind != DepKind::Normal {
-          continue; // Only edit normal deps
-        }
+      // The features to use for local feature calculation
+      // Use computed features (which will be what goes in workspace.dependencies)
+      let workspace_features = computed_features.clone();
 
+      // Create unified dep if workspace needs update
+      if needs_workspace_update {
+        let unified = UnifiedDep {
+          name: dep_key.name.clone(),
+          version_req,
+          features: workspace_features.clone(),
+          default_features,
+          used_by: users.into_iter().collect(),
+          target,
+          path: dep_path, // Include path for workspace member deps
+        };
+        workspace_deps.push(unified);
+      }
+
+      // Compute member edits for ALL dep kinds (normal, dev, build)
+      // Per design doc: all dep kinds should be unified, not just Normal
+      // This happens whether or not the dep already exists in workspace.dependencies
+      for usage in usage_sites {
         // Compute local features (member features - workspace features)
         let local_features: Vec<_> = usage
           .unconditional_features
           .iter()
-          .filter(|f| !unified.features.contains(*f))
+          .filter(|f| !workspace_features.contains(f))
           .cloned()
           .collect();
 
         let edit = MemberEdit::UseWorkspace {
           dep_name: dep_key.name.clone(),
           dep_kind: usage.kind,
+          target: usage.target.clone(), // Preserve target for correct section
           local_features,
           is_optional: usage.optional,
         };
 
         member_edits.entry(usage.used_by.clone()).or_default().push(edit);
       }
-
-      workspace_deps.push(unified);
     }
 
     // Handle transitive fragmentation

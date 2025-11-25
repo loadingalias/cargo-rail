@@ -55,11 +55,22 @@ pub fn run_unify_analyze(
   // Final message
   if plan.has_blocking_issues() {
     println!("\n❌ Cannot proceed with unification due to blocking issues.");
-  } else if !plan.workspace_deps.is_empty() {
-    println!(
-      "\n✅ Ready to unify {} dependencies. Run 'cargo rail unify apply' to apply changes.",
-      plan.workspace_deps.len()
-    );
+  } else if !plan.workspace_deps.is_empty() || !plan.member_edits.is_empty() {
+    // Count total member edit operations
+    let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
+    if !plan.workspace_deps.is_empty() {
+      println!(
+        "\n✅ Ready to unify {} dependencies ({} member edits). Run 'cargo rail unify apply' to apply changes.",
+        plan.workspace_deps.len(),
+        total_edits
+      );
+    } else {
+      println!(
+        "\n✅ Ready to convert {} members to use workspace inheritance ({} edits). Run 'cargo rail unify apply' to apply changes.",
+        plan.member_edits.len(),
+        total_edits
+      );
+    }
   } else {
     println!("\n📊 No unification opportunities found.");
   }
@@ -104,7 +115,8 @@ pub fn run_unify_apply(
     return Err(crate::error::RailError::message("Blocking issues prevent unification"));
   }
 
-  if plan.workspace_deps.is_empty() {
+  // Check if there's any work to do (either new workspace deps or member edits)
+  if plan.workspace_deps.is_empty() && plan.member_edits.is_empty() {
     println!("📊 No dependencies to unify.");
     return Ok(());
   }
@@ -115,7 +127,13 @@ pub fn run_unify_apply(
     let backup_manager = BackupManager::new(ctx.workspace_root());
 
     // Collect all files that will be modified
-    let mut files_to_backup = vec![PathBuf::from("Cargo.toml")];
+    let mut files_to_backup = Vec::new();
+
+    // Only include workspace Cargo.toml if we're adding new workspace deps
+    if !plan.workspace_deps.is_empty() {
+      files_to_backup.push(PathBuf::from("Cargo.toml"));
+    }
+
     for member_name in plan.member_edits.keys() {
       if let Some(manifest_path) = plan.member_paths.get(member_name) {
         // Convert absolute path to relative path from workspace root
@@ -135,9 +153,11 @@ pub fn run_unify_apply(
   // Apply changes
   let writer = ManifestWriter::new();
 
-  // Write workspace dependencies
-  println!("📝 Writing [workspace.dependencies]...");
-  writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
+  // Write workspace dependencies only if there are new deps to add
+  if !plan.workspace_deps.is_empty() {
+    println!("📝 Writing [workspace.dependencies]...");
+    writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
+  }
 
   // Update members
   println!("📝 Updating {} member manifests...", plan.member_edits.len());
@@ -153,6 +173,7 @@ pub fn run_unify_apply(
         crate::cargo::MemberEdit::UseWorkspace {
           dep_name,
           dep_kind,
+          target,
           local_features,
           is_optional,
         } => {
@@ -160,6 +181,7 @@ pub fn run_unify_apply(
             member_path,
             dep_name,
             *dep_kind,
+            target.as_deref(), // Pass target for correct section
             if local_features.is_empty() {
               None
             } else {

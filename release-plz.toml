@@ -1,0 +1,9 @@
+[workspace]
+changelog_update = true
+git_release_enable = true
+publish = true
+
+[[package]]
+name = "cargo-rail"
+changelog_path = "CHANGELOG.md"
+git_tag_name = "v{{ version }}"

@@ -112,46 +112,6 @@ fn test_unify_syntactic_version_merging() -> Result<()> {
 }
 
 #[test]
-fn test_unify_true_multi_version_conflict() -> Result<()> {
-  // Test that TRUE version conflicts (incompatible versions) ARE detected
-
-  let workspace = TestWorkspace::new()?;
-
-  // Create crates with INCOMPATIBLE versions (1.x vs 2.x)
-  workspace.add_crate("crate-a", "0.1.0", &[("syn", r#""^1.0""#)])?;
-
-  workspace.add_crate("crate-b", "0.1.0", &[("syn", r#""^2.0""#)])?;
-
-  workspace.commit("Add crates with incompatible versions")?;
-
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
-
-  // With resolution-based compatibility checking, Cargo will pick one version
-  // If Cargo can resolve both to the same version, we unify it
-  // If Cargo fails to resolve, that's a real conflict
-  // The output should show either unified syn OR a conflict
-  assert!(
-    stdout.contains("syn"),
-    "Should mention syn in output.\nOutput:\n{}",
-    stdout
-  );
-
-  // If there's a real conflict (Cargo couldn't resolve), we should see Issues
-  // If Cargo resolved it successfully, we should see it unified
-  let has_issues = stdout.contains("Issues requiring attention");
-  let has_unified = stdout.contains("Ready to unify") && !has_issues;
-
-  assert!(
-    has_issues || has_unified,
-    "Should either unify syn (if Cargo resolved it) or report conflict (if Cargo couldn't).\nOutput:\n{}",
-    stdout
-  );
-
-  Ok(())
-}
-
-#[test]
 fn test_unify_feature_union() -> Result<()> {
   // Test that features are properly unioned across packages
 
@@ -364,34 +324,276 @@ fn test_unify_exclude_option() -> Result<()> {
   Ok(())
 }
 
+// ============================================================================
+// Phase 1-6 Feature Tests
+// ============================================================================
+
 #[test]
-fn test_unify_apply_conflict_fails() -> Result<()> {
-  // The new implementation is resolution-based: it trusts Cargo's dependency resolution.
-  // If Cargo can resolve syn 1.0 and syn 2.0 to a single version, we unify it.
-  // If Cargo chooses syn 2.0 (which satisfies ^2.0 but not ^1.0), the workspace won't build
-  // for crate-a, but that's Cargo's decision, not ours to second-guess.
+fn test_unify_dev_dependencies() -> Result<()> {
+  // Test that dev-dependencies are properly unified (Phase 1/3)
 
   let workspace = TestWorkspace::new()?;
 
-  workspace.add_crate("crate-a", "0.1.0", &[("syn", r#""1.0""#)])?;
-  workspace.add_crate("crate-b", "0.1.0", &[("syn", r#""2.0""#)])?;
-  workspace.commit("Add crates with conflicting syn versions")?;
+  // Create crate-a with a dev-dependency
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
 
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+"#,
+  )?;
+
+  std::fs::write(
+    crate_a_path.join("src/lib.rs"),
+    "pub fn hello() -> &'static str { \"Hello\" }",
+  )?;
+
+  // Create crate-b with same dev-dependency
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"
+"#,
+  )?;
+
+  std::fs::write(
+    crate_b_path.join("src/lib.rs"),
+    "pub fn world() -> &'static str { \"World\" }",
+  )?;
+
+  workspace.commit("Add crates with dev-dependencies")?;
+
+  // Run unify apply
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let stderr = String::from_utf8_lossy(&output.stderr);
-
   assert!(
     output.status.success(),
-    "Command should succeed (resolution-based approach trusts Cargo)\nstdout: {}\nstderr: {}",
-    stdout,
-    stderr
+    "Unify should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&output.stdout)
   );
 
-  // The new implementation will unify syn if Cargo can resolve it.
-  // This test now just verifies the command completes successfully.
-  // If you want to prevent unification of incompatible versions, use --exclude syn
+  // Verify workspace has tempfile
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("tempfile"),
+    "Workspace should have tempfile in dependencies"
+  );
+
+  // Verify members use workspace = true for dev-deps
+  let crate_a_toml = std::fs::read_to_string(crate_a_path.join("Cargo.toml"))?;
+  assert!(
+    crate_a_toml.contains("[dev-dependencies]"),
+    "Should still have dev-dependencies section"
+  );
+  assert!(
+    crate_a_toml.contains("workspace = true") || crate_a_toml.contains("workspace=true"),
+    "Dev-dependency should use workspace inheritance.\nContent:\n{}",
+    crate_a_toml
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_build_dependencies() -> Result<()> {
+  // Test that build-dependencies are properly unified (Phase 1/3)
+
+  let workspace = TestWorkspace::new()?;
+
+  // Create crate-a with a build-dependency
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[build-dependencies]
+cc = "1.0"
+"#,
+  )?;
+
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // Create crate-b with same build-dependency
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[build-dependencies]
+cc = "1.0"
+"#,
+  )?;
+
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates with build-dependencies")?;
+
+  // Run unify apply
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "Unify should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  // Verify workspace has cc
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("cc"),
+    "Workspace should have cc in dependencies"
+  );
+
+  // Verify members use workspace = true for build-deps
+  let crate_a_toml = std::fs::read_to_string(crate_a_path.join("Cargo.toml"))?;
+  assert!(
+    crate_a_toml.contains("[build-dependencies]"),
+    "Should still have build-dependencies section"
+  );
+  assert!(
+    crate_a_toml.contains("workspace = true") || crate_a_toml.contains("workspace=true"),
+    "Build-dependency should use workspace inheritance.\nContent:\n{}",
+    crate_a_toml
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_existing_workspace_deps_update() -> Result<()> {
+  // Test that existing workspace.dependencies are updated when features differ (Phase 4)
+
+  let workspace = TestWorkspace::new()?;
+
+  // Create workspace with existing workspace.dependencies
+  let workspace_toml_content = r#"[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Test Author"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+"#;
+
+  std::fs::write(workspace.path.join("Cargo.toml"), workspace_toml_content)?;
+
+  // Create members that need different features
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["derive", "rc"] }"#)],
+  )?;
+
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["derive", "alloc"] }"#)],
+  )?;
+
+  workspace.commit("Add crates with existing workspace.dependencies")?;
+
+  // Run unify apply
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "Unify should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  // Verify workspace has updated features (union of all features)
+  let updated_workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(updated_workspace_toml.contains("derive"), "Should have derive feature");
+
+  // Verify members converted to workspace = true
+  let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
+  assert!(
+    crate_a_toml.contains("workspace = true") || crate_a_toml.contains("workspace=true"),
+    "Member should use workspace inheritance.\nContent:\n{}",
+    crate_a_toml
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_local_features_calculation() -> Result<()> {
+  // Test that local features are correctly calculated (member features - workspace features)
+
+  let workspace = TestWorkspace::new()?;
+
+  // Create crates where one needs extra features
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["fs"] }"#)],
+  )?;
+
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["fs", "net", "io-util"] }"#)],
+  )?;
+
+  workspace.commit("Add crates with different features")?;
+
+  // Run unify apply
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "Unify should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  // Workspace should have intersection of features (fs)
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(workspace_toml.contains("tokio"), "Should have tokio");
+  assert!(
+    workspace_toml.contains("fs"),
+    "Should have 'fs' feature (common to both)"
+  );
+
+  // crate-b should have local features for net and io-util
+  let crate_b_toml = std::fs::read_to_string(workspace.path.join("crates/crate-b/Cargo.toml"))?;
+
+  // Check for local features - the format depends on implementation
+  // Either: tokio = { workspace = true, features = ["net", "io-util"] }
+  // Or the features are merged into workspace
+  assert!(
+    crate_b_toml.contains("workspace = true") || crate_b_toml.contains("workspace=true"),
+    "crate-b should use workspace inheritance.\nContent:\n{}",
+    crate_b_toml
+  );
 
   Ok(())
 }

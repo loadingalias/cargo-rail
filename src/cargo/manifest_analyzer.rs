@@ -77,6 +77,25 @@ pub struct DepUsage {
   pub used_by: String,
   /// Whether the dependency is optional
   pub optional: bool,
+  /// Path for path dependencies (if specified)
+  pub path: Option<String>,
+  /// Declared version requirement from Cargo.toml (e.g., "1.0", "^2.0", ">=1.5,<2")
+  /// This is the version declared by the user, NOT the resolved version from cargo metadata
+  pub declared_version: Option<String>,
+  /// Path to the manifest that declared this dependency (for path normalization)
+  pub manifest_path: Option<PathBuf>,
+}
+
+/// Parsed dependency table info (used internally during manifest parsing)
+#[derive(Debug, Default)]
+struct ParsedDepTable {
+  renamed_from: Option<String>,
+  actual_name: Option<String>,
+  unconditional_features: BTreeSet<String>,
+  default_features: bool,
+  optional: bool,
+  path: Option<String>,
+  declared_version: Option<String>,
 }
 
 /// Type of dependency (normal, dev, or build)
@@ -204,6 +223,7 @@ impl ManifestAnalyzer {
       DepKind::Normal,
       None,
       package_name,
+      manifest_path,
       &mut dependencies,
     )?;
 
@@ -214,6 +234,7 @@ impl ManifestAnalyzer {
       DepKind::Dev,
       None,
       package_name,
+      manifest_path,
       &mut dependencies,
     )?;
 
@@ -224,6 +245,7 @@ impl ManifestAnalyzer {
       DepKind::Build,
       None,
       package_name,
+      manifest_path,
       &mut dependencies,
     )?;
 
@@ -247,6 +269,7 @@ impl ManifestAnalyzer {
                 kind,
                 Some(target_cfg.to_string()),
                 package_name,
+                manifest_path,
                 &mut dependencies,
               )?;
             }
@@ -288,6 +311,7 @@ impl ManifestAnalyzer {
     kind: DepKind,
     target: Option<String>,
     package_name: &str,
+    manifest_path: &Path,
     out: &mut HashMap<DepKey, DepUsage>,
   ) -> RailResult<()> {
     let Some(deps_table) = parent.get(section).and_then(|d| d.as_table_like()) else {
@@ -295,51 +319,42 @@ impl ManifestAnalyzer {
     };
 
     for (dep_name, dep_value) in deps_table.iter() {
-      let mut dep_key = DepKey::new(dep_name);
-      let mut unconditional_features = BTreeSet::new();
-      let mut default_features = true;
-      let mut optional = false;
-
       // Parse the dependency value
-      let should_include = match dep_value {
-        Item::Value(Value::String(_)) => {
-          // Simple version string, defaults apply
-          true
+      let parsed = match dep_value {
+        Item::Value(Value::String(version_str)) => {
+          // Simple version string: dep = "1.0"
+          Some(ParsedDepTable {
+            declared_version: Some(version_str.value().to_string()),
+            default_features: true,
+            ..Default::default()
+          })
         }
-        Item::Value(Value::InlineTable(inline_table)) => {
-          // Complex inline table dependency with options
-          Self::parse_dep_table(
-            inline_table,
-            &mut dep_key,
-            dep_name,
-            &mut unconditional_features,
-            &mut default_features,
-            &mut optional,
-          )
-        }
-        Item::Table(table) => {
-          // Complex table dependency with options
-          Self::parse_dep_table(
-            table,
-            &mut dep_key,
-            dep_name,
-            &mut unconditional_features,
-            &mut default_features,
-            &mut optional,
-          )
-        }
-        _ => false, // Ignore other types
+        Item::Value(Value::InlineTable(inline_table)) => Self::parse_dep_table(inline_table, dep_name),
+        Item::Table(table) => Self::parse_dep_table(table, dep_name),
+        _ => None,
       };
 
-      if should_include {
+      if let Some(p) = parsed {
+        let dep_key = if let Some(actual) = p.actual_name {
+          DepKey {
+            name: actual,
+            renamed_from: p.renamed_from,
+          }
+        } else {
+          DepKey::new(dep_name)
+        };
+
         let usage = DepUsage {
-          unconditional_features,
+          unconditional_features: p.unconditional_features,
           conditional_features: BTreeSet::new(), // Filled in later
-          default_features,
+          default_features: p.default_features,
           kind,
           target: target.clone(),
           used_by: package_name.to_string(),
-          optional,
+          optional: p.optional,
+          path: p.path,
+          declared_version: p.declared_version,
+          manifest_path: Some(manifest_path.to_path_buf()),
         };
 
         out.insert(dep_key, usage);
@@ -350,70 +365,69 @@ impl ManifestAnalyzer {
   }
 
   /// Parse a dependency table (either InlineTable or Table)
-  /// Returns true if the dependency should be included (not using workspace inheritance)
-  fn parse_dep_table<T: toml_edit::TableLike>(
-    table: &T,
-    dep_key: &mut DepKey,
-    dep_name: &str,
-    unconditional_features: &mut BTreeSet<String>,
-    default_features: &mut bool,
-    optional: &mut bool,
-  ) -> bool {
+  /// Returns None if the dependency should be skipped (uses workspace inheritance)
+  fn parse_dep_table<T: toml_edit::TableLike>(table: &T, dep_name: &str) -> Option<ParsedDepTable> {
     // Skip dependencies that already use workspace inheritance
-    if let Some(workspace) = table.get("workspace").and_then(|v| v.as_bool())
-      && workspace
-    {
-      return false; // Skip this dependency
+    if table.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
+      return None;
     }
+
+    let mut parsed = ParsedDepTable {
+      default_features: true, // Cargo default
+      ..Default::default()
+    };
 
     // Check for renamed package
     if let Some(pkg) = table.get("package").and_then(|v| v.as_str()) {
-      dep_key.renamed_from = Some(dep_name.to_string());
-      dep_key.name = pkg.to_string();
+      parsed.renamed_from = Some(dep_name.to_string());
+      parsed.actual_name = Some(pkg.to_string());
     }
+
+    // Parse version - this is the DECLARED version from the manifest
+    parsed.declared_version = table.get("version").and_then(|v| v.as_str()).map(String::from);
+
+    // Parse path for path dependencies
+    parsed.path = table.get("path").and_then(|v| v.as_str()).map(String::from);
 
     // Parse features
     if let Some(features) = table.get("features").and_then(|f| f.as_array()) {
       for feat in features {
         if let Some(s) = feat.as_str() {
-          unconditional_features.insert(s.to_string());
+          parsed.unconditional_features.insert(s.to_string());
         }
       }
     }
 
     // Parse default-features
     if let Some(df) = table.get("default-features").and_then(|v| v.as_bool()) {
-      *default_features = df;
+      parsed.default_features = df;
     }
 
     // Parse optional
     if let Some(opt) = table.get("optional").and_then(|v| v.as_bool()) {
-      *optional = opt;
+      parsed.optional = opt;
     }
 
-    true // Include this dependency
+    Some(parsed)
   }
 
-  /// Compute the intersection of unconditional features for a dependency
-  ///
-  /// This is the CORE of the minimal feature approach:
-  /// Only features that are ALWAYS enabled go into [workspace.dependencies]
   /// Compute the union of all features used across all usage sites
+  ///
+  /// Used when mixed default-features are detected or intersection is empty.
+  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
   pub fn compute_union(&self, dep: &DepKey) -> BTreeSet<String> {
     let Some(usages) = self.usage_index.get(dep) else {
       return BTreeSet::new();
     };
 
-    // Filter to only Normal dependencies (not dev/build)
-    let normal_usages: Vec<_> = usages.iter().filter(|u| u.kind == DepKind::Normal).collect();
-
-    if normal_usages.is_empty() {
+    // Include ALL dep kinds - workspace deps serve all usage contexts
+    if usages.is_empty() {
       return BTreeSet::new();
     }
 
-    // Union all features
+    // Union all features from all usage sites
     let mut union = BTreeSet::new();
-    for usage in &normal_usages {
+    for usage in usages {
       union.extend(usage.unconditional_features.iter().cloned());
     }
 
@@ -421,23 +435,26 @@ impl ManifestAnalyzer {
   }
 
   /// Compute the intersection of features used by all packages that depend on this dependency
+  ///
+  /// This is the CORE of the minimal feature approach:
+  /// Only features that are ALWAYS enabled go into [workspace.dependencies].
+  /// Members that need more can add local features.
+  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
   pub fn compute_intersection(&self, dep: &DepKey) -> BTreeSet<String> {
     let Some(usages) = self.usage_index.get(dep) else {
       return BTreeSet::new();
     };
 
-    // Filter to only Normal dependencies (not dev/build)
-    let normal_usages: Vec<_> = usages.iter().filter(|u| u.kind == DepKind::Normal).collect();
-
-    if normal_usages.len() < 2 {
+    // Include ALL dep kinds - workspace deps serve all usage contexts
+    if usages.len() < 2 {
       return BTreeSet::new(); // Not enough uses to unify
     }
 
     // Start with the first usage's features
-    let mut intersection = normal_usages[0].unconditional_features.clone();
+    let mut intersection = usages[0].unconditional_features.clone();
 
     // Intersect with all other usages
-    for usage in &normal_usages[1..] {
+    for usage in &usages[1..] {
       intersection = intersection
         .intersection(&usage.unconditional_features)
         .cloned()
@@ -462,34 +479,36 @@ impl ManifestAnalyzer {
   }
 
   /// Check if a dependency has mixed default-features settings
+  ///
+  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
   pub fn has_mixed_defaults(&self, dep: &DepKey) -> bool {
     let Some(usages) = self.usage_index.get(dep) else {
       return false;
     };
 
-    let normal_usages: Vec<_> = usages.iter().filter(|u| u.kind == DepKind::Normal).collect();
-
-    if normal_usages.len() < 2 {
+    // Include ALL dep kinds - workspace deps serve all usage contexts
+    if usages.len() < 2 {
       return false;
     }
 
     // Check if all have the same default-features setting
-    let first_default = normal_usages[0].default_features;
-    !normal_usages.iter().all(|u| u.default_features == first_default)
+    let first_default = usages[0].default_features;
+    !usages.iter().all(|u| u.default_features == first_default)
   }
 
   /// Determine the default-features policy for a dependency
+  ///
+  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
   pub fn default_features_policy(&self, dep: &DepKey) -> Option<bool> {
     let usages = self.usage_index.get(dep)?;
 
-    let normal_usages: Vec<_> = usages.iter().filter(|u| u.kind == DepKind::Normal).collect();
-
-    if normal_usages.is_empty() {
+    // Include ALL dep kinds - workspace deps serve all usage contexts
+    if usages.is_empty() {
       return None;
     }
 
     // If any usage has default-features = false, we must use false at root
-    if normal_usages.iter().any(|u| !u.default_features) {
+    if usages.iter().any(|u| !u.default_features) {
       Some(false)
     } else {
       Some(true)
@@ -499,5 +518,225 @@ impl ManifestAnalyzer {
   /// Count how many crates use a dependency (O(1) lookup from pre-computed cache)
   pub fn usage_count(&self, dep: &DepKey) -> usize {
     self.usage_counts.get(dep).copied().unwrap_or(0)
+  }
+}
+
+// ============================================================================
+// Workspace Dependencies Parser
+// ============================================================================
+
+/// Information about an existing workspace dependency
+#[derive(Debug, Clone)]
+pub struct ExistingWorkspaceDep {
+  /// Dependency name
+  pub name: String,
+  /// Version requirement (if specified)
+  pub version: Option<String>,
+  /// Features enabled
+  pub features: Vec<String>,
+  /// Whether default features are enabled
+  pub default_features: bool,
+  /// Path for path dependencies
+  pub path: Option<String>,
+}
+
+/// Parse existing [workspace.dependencies] from the workspace root Cargo.toml
+///
+/// Returns a map of dependency name to its current configuration.
+/// This is used to detect deps that already exist in workspace.dependencies
+/// so we don't add duplicates.
+pub fn parse_existing_workspace_deps(workspace_root: &Path) -> RailResult<HashMap<String, ExistingWorkspaceDep>> {
+  let workspace_toml = workspace_root.join("Cargo.toml");
+  let content = match std::fs::read_to_string(&workspace_toml) {
+    Ok(c) => c,
+    Err(_) => return Ok(HashMap::new()), // No workspace Cargo.toml
+  };
+
+  let doc: DocumentMut = content
+    .parse()
+    .with_context(|| format!("Failed to parse {}", workspace_toml.display()))?;
+
+  let mut existing = HashMap::new();
+
+  // Check for [workspace.dependencies] section
+  let Some(workspace) = doc.get("workspace").and_then(|w| w.as_table()) else {
+    return Ok(existing); // No [workspace] section
+  };
+
+  let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table_like()) else {
+    return Ok(existing); // No [workspace.dependencies] section
+  };
+
+  for (name, value) in deps.iter() {
+    let dep = parse_workspace_dep_entry(name, value);
+    existing.insert(name.to_string(), dep);
+  }
+
+  Ok(existing)
+}
+
+/// Parse a single workspace dependency entry
+fn parse_workspace_dep_entry(name: &str, value: &Item) -> ExistingWorkspaceDep {
+  let mut dep = ExistingWorkspaceDep {
+    name: name.to_string(),
+    version: None,
+    features: Vec::new(),
+    default_features: true,
+    path: None,
+  };
+
+  // Simple version string: dep = "1.0"
+  if let Some(version) = value.as_str() {
+    dep.version = Some(version.to_string());
+    return dep;
+  }
+
+  // Inline table: dep = { version = "1.0", features = [...] }
+  if let Some(table) = value.as_inline_table() {
+    if let Some(v) = table.get("version").and_then(|v| v.as_str()) {
+      dep.version = Some(v.to_string());
+    }
+    if let Some(p) = table.get("path").and_then(|v| v.as_str()) {
+      dep.path = Some(p.to_string());
+    }
+    if let Some(df) = table.get("default-features").and_then(|v| v.as_bool()) {
+      dep.default_features = df;
+    }
+    if let Some(features) = table.get("features").and_then(|f| f.as_array()) {
+      dep.features = features.iter().filter_map(|v| v.as_str()).map(String::from).collect();
+    }
+    return dep;
+  }
+
+  // Full table: [workspace.dependencies.dep]
+  if let Some(table) = value.as_table() {
+    if let Some(v) = table.get("version").and_then(|i| i.as_value()).and_then(|v| v.as_str()) {
+      dep.version = Some(v.to_string());
+    }
+    if let Some(p) = table.get("path").and_then(|i| i.as_value()).and_then(|v| v.as_str()) {
+      dep.path = Some(p.to_string());
+    }
+    if let Some(df) = table
+      .get("default-features")
+      .and_then(|i| i.as_value())
+      .and_then(|v| v.as_bool())
+    {
+      dep.default_features = df;
+    }
+    if let Some(features) = table
+      .get("features")
+      .and_then(|i| i.as_value())
+      .and_then(|v| v.as_array())
+    {
+      dep.features = features.iter().filter_map(|v| v.as_str()).map(String::from).collect();
+    }
+  }
+
+  dep
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::io::Write;
+  use tempfile::TempDir;
+
+  fn create_test_workspace(workspace_toml_content: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let mut file = std::fs::File::create(dir.path().join("Cargo.toml")).unwrap();
+    file.write_all(workspace_toml_content.as_bytes()).unwrap();
+    dir
+  }
+
+  #[test]
+  fn test_parse_existing_workspace_deps_empty() {
+    let dir = create_test_workspace(
+      r#"
+[workspace]
+members = ["crate-a"]
+"#,
+    );
+
+    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    assert!(
+      result.is_empty(),
+      "Should return empty map when no workspace.dependencies"
+    );
+  }
+
+  #[test]
+  fn test_parse_existing_workspace_deps_simple_version() {
+    let dir = create_test_workspace(
+      r#"
+[workspace]
+members = ["crate-a"]
+
+[workspace.dependencies]
+serde = "1.0"
+anyhow = "1.0.50"
+"#,
+    );
+
+    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result["serde"].version.as_ref().unwrap(), "1.0");
+    assert_eq!(result["anyhow"].version.as_ref().unwrap(), "1.0.50");
+    assert!(result["serde"].features.is_empty());
+    assert!(result["serde"].default_features);
+  }
+
+  #[test]
+  fn test_parse_existing_workspace_deps_inline_table() {
+    let dir = create_test_workspace(
+      r#"
+[workspace]
+members = ["crate-a"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive", "rc"], default-features = false }
+tokio = { version = "1.0", features = ["full"] }
+"#,
+    );
+
+    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    assert_eq!(result.len(), 2);
+
+    let serde = &result["serde"];
+    assert_eq!(serde.version.as_ref().unwrap(), "1.0");
+    assert_eq!(serde.features, vec!["derive", "rc"]);
+    assert!(!serde.default_features);
+
+    let tokio = &result["tokio"];
+    assert_eq!(tokio.version.as_ref().unwrap(), "1.0");
+    assert_eq!(tokio.features, vec!["full"]);
+    assert!(tokio.default_features);
+  }
+
+  #[test]
+  fn test_parse_existing_workspace_deps_with_path() {
+    let dir = create_test_workspace(
+      r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.dependencies]
+crate-a = { path = "crate-a", version = "0.1.0" }
+external = "1.0"
+"#,
+    );
+
+    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    assert_eq!(result.len(), 2);
+
+    let crate_a = &result["crate-a"];
+    assert_eq!(crate_a.path.as_ref().unwrap(), "crate-a");
+    assert_eq!(crate_a.version.as_ref().unwrap(), "0.1.0");
+
+    let external = &result["external"];
+    assert!(external.path.is_none());
   }
 }

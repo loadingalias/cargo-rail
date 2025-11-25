@@ -1,46 +1,35 @@
 [package]
 name = "cargo-rail"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.89.0"
 license = "MIT"
 authors = ["loadingalias"]
-description = "Split Rust crates from Cargo workspaces into standalone repos with bidirectional sync"
+description = "Zero-waste Rust monorepo orchestration: graph-aware CI, dependency unification, release automation, and history-preserving crate distribution"
 repository = "https://github.com/loadingalias/cargo-rail"
 homepage = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
-categories = ["command-line-utilities", "development-tools", "git", "cargo", "monorepo-tools"]
-keywords = ["monorepo", "cargo", "workspace", "git", "split", "sync"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "development-tools::cargo-plugins",
+    "development-tools::build-utils",
+]
+keywords = ["monorepo", "cargo", "workspace", "ci", "release"]
 readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }
-
-# Workspace introspection
 cargo_metadata = "0.23.1"
-
-# Graph analysis
 petgraph = "0.8.3"
-
-# Lossless TOML editing (preserves formatting)
 toml_edit = { version = "0.23.7", features = ["serde"] }
-
-# Error handling
 anyhow = "1.0.100"
-
-# Serialization for config
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 semver = "1.0.27"
-
-# Parallelism and concurrency
 rayon = "1.11.0"
-
-# Parsing (zero-copy, minimal deps)
 winnow = "0.7.13"
-
-# Date/time handling for backup timestamps
-chrono = "0.4"
+chrono = "0.4.42"
 
 [dev-dependencies]
 tempfile = "3.23.0"
