@@ -377,10 +377,13 @@ impl ManifestAnalyzer {
       ..Default::default()
     };
 
-    // Check for renamed package
+    // Check for renamed package (only when package name differs from dependency key)
     if let Some(pkg) = table.get("package").and_then(|v| v.as_str()) {
-      parsed.renamed_from = Some(dep_name.to_string());
-      parsed.actual_name = Some(pkg.to_string());
+      // Only flag as renamed when there's actual renaming, not redundant package fields
+      if pkg != dep_name {
+        parsed.renamed_from = Some(dep_name.to_string());
+        parsed.actual_name = Some(pkg.to_string());
+      }
     }
 
     // Parse version - this is the DECLARED version from the manifest

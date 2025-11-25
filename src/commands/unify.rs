@@ -121,10 +121,17 @@ pub fn run_unify_apply(
     return Ok(());
   }
 
-  // Create backup if requested
-  if backup {
-    println!("📦 Creating backup...");
-    let backup_manager = BackupManager::new(ctx.workspace_root());
+  // Create backup if requested OR if this is the first unify run (safety feature)
+  let backup_manager = BackupManager::new(ctx.workspace_root());
+  let is_first_run = !backup_manager.has_backups();
+  let should_backup = backup || is_first_run;
+
+  if should_backup {
+    if is_first_run && !backup {
+      println!("📦 Creating safety backup (first unify run in this workspace)...");
+    } else {
+      println!("📦 Creating backup...");
+    }
 
     // Collect all files that will be modified
     let mut files_to_backup = Vec::new();
@@ -207,9 +214,22 @@ pub fn run_unify_apply(
     writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
   }
 
+  // Write computed MSRV to workspace manifest if enabled
+  if let Some(ref msrv) = plan.computed_msrv {
+    println!(
+      "📋 Writing rust-version = \"{}.{}\" to [workspace.package]...",
+      msrv.version.major, msrv.version.minor
+    );
+    writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
+  }
+
   // Generate report
   println!("📄 Generating report...");
-  let report_path = ctx.workspace_root().join(".cargo-rail").join("unify-report.md");
+  let report_path = ctx
+    .workspace_root()
+    .join("target")
+    .join("cargo-rail")
+    .join("unify-report.md");
   UnifyReport::write_to_file(&plan, &report_path)?;
   println!("   Report saved to: {}", report_path.display());
 
@@ -219,6 +239,14 @@ pub fn run_unify_apply(
   println!("   - {} members updated", plan.member_edits.len());
   if !plan.transitive_pins.is_empty() {
     println!("   - {} transitives pinned", plan.transitive_pins.len());
+  }
+  if let Some(ref msrv) = plan.computed_msrv {
+    println!(
+      "   - MSRV set to {}.{} (from {})",
+      msrv.version.major,
+      msrv.version.minor,
+      msrv.contributors.first().unwrap_or(&"unknown".to_string())
+    );
   }
 
   println!("\nNext steps:");

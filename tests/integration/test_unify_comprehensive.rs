@@ -212,7 +212,7 @@ generate_report = true
   );
 
   // Check report was generated
-  let report_path = workspace.path.join(".cargo-rail/unify-report.md");
+  let report_path = workspace.path.join("target/cargo-rail/unify-report.md");
   assert!(report_path.exists(), "Report should be generated");
 
   // Read and validate report contents

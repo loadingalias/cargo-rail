@@ -104,6 +104,12 @@ impl RailConfigBuilder {
       ));
     }
 
+    // MSRV computation
+    content.push_str(&format!(
+      "msrv = {}  # Compute and write rust-version to workspace manifest (default: false)\n",
+      config.msrv
+    ));
+
     self.sections.push(format!("[unify]\n{}\n", content));
 
     self

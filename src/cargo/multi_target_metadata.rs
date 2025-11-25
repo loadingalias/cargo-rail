@@ -285,6 +285,57 @@ impl MultiTargetMetadata {
 
     transitives
   }
+
+  /// Compute the workspace MSRV from all resolved dependencies
+  ///
+  /// The MSRV is the maximum `rust-version` across all dependencies in the
+  /// resolved graph. This ensures the workspace can build all its deps.
+  ///
+  /// Returns `None` if no dependencies specify rust-version.
+  pub fn compute_msrv(&self) -> Option<ComputedMsrv> {
+    let mut max_version: Option<Version> = None;
+    let mut contributors: Vec<String> = Vec::new();
+    let mut deps_with_msrv = 0;
+    let mut seen_packages: HashSet<String> = HashSet::new();
+
+    // Iterate through all packages in the resolved graph
+    for metadata in self.cache.values() {
+      for pkg in &metadata.packages {
+        // Skip if we've already processed this package (may appear in multiple targets)
+        let pkg_key = format!("{}@{}", pkg.name, pkg.version);
+        if seen_packages.contains(&pkg_key) {
+          continue;
+        }
+        seen_packages.insert(pkg_key);
+
+        // Check if this package has rust-version specified
+        if let Some(ref rust_version) = pkg.rust_version {
+          deps_with_msrv += 1;
+
+          match &max_version {
+            None => {
+              max_version = Some(rust_version.clone());
+              contributors = vec![pkg.name.to_string()];
+            }
+            Some(current_max) => {
+              if rust_version > current_max {
+                max_version = Some(rust_version.clone());
+                contributors = vec![pkg.name.to_string()];
+              } else if rust_version == current_max {
+                contributors.push(pkg.name.to_string());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    max_version.map(|version| ComputedMsrv {
+      version,
+      contributors,
+      deps_with_msrv,
+    })
+  }
 }
 
 /// A transitive dependency with fragmented features across targets
@@ -303,4 +354,15 @@ impl FragmentedTransitive {
   pub fn overhead_factor(&self) -> usize {
     self.feature_sets.len()
   }
+}
+
+/// Result of MSRV computation from dependency graph
+#[derive(Debug, Clone)]
+pub struct ComputedMsrv {
+  /// The computed MSRV (maximum of all deps' rust-version)
+  pub version: Version,
+  /// Dependencies that contributed to the MSRV (those with the highest rust-version)
+  pub contributors: Vec<String>,
+  /// Total number of deps with rust-version specified
+  pub deps_with_msrv: usize,
 }

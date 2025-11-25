@@ -22,10 +22,7 @@ AGENTS.md
 
 # Documentation
 docs/*
-audit.md
-fixes.md
-fixes_split.md
-fixes_cdtwm.md
+TODO.md
 
 # Cargo-Rail (Testing)
 *rail.toml

@@ -195,6 +195,8 @@ impl WorkspaceGraph {
     }
 
     // Add edges between workspace members only
+    // IMPORTANT: Skip dev-dependencies as they don't affect publish order
+    // (dev-deps can have cycles, including self-references for feature-gated test utils)
     for (from_name, &from_subgraph_idx) in &name_to_subgraph_idx {
       let from_graph_idx = self.name_to_node[from_name];
 
@@ -208,7 +210,11 @@ impl WorkspaceGraph {
           && let Some(edge) = self.graph.find_edge(from_graph_idx, neighbor_graph_idx)
         {
           let kind = *self.graph.edge_weight(edge).unwrap();
-          subgraph.add_edge(from_subgraph_idx, to_subgraph_idx, kind);
+          // Skip dev-dependencies - they don't affect publish order and can have cycles
+          // Also skip self-references (crate depending on itself for test features)
+          if kind != DependencyKind::Development && from_name != &neighbor_node.name {
+            subgraph.add_edge(from_subgraph_idx, to_subgraph_idx, kind);
+          }
         }
       }
     }

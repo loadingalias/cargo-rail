@@ -5,7 +5,7 @@
 
 use crate::cargo::{
   manifest_analyzer::{DepKind, ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
-  multi_target_metadata::MultiTargetMetadata,
+  multi_target_metadata::{ComputedMsrv, MultiTargetMetadata},
 };
 use crate::config::UnifyConfig;
 use crate::error::RailResult;
@@ -101,6 +101,8 @@ pub struct UnificationPlan {
   pub validation_results: Vec<ValidationResult>,
   /// Issues detected during analysis
   pub issues: Vec<UnifyIssue>,
+  /// Computed MSRV from dependency graph (if msrv = true in config)
+  pub computed_msrv: Option<ComputedMsrv>,
 }
 
 impl UnificationPlan {
@@ -186,6 +188,26 @@ impl UnificationPlan {
       let failed = self.validation_results.iter().filter(|v| !v.success).count();
       if failed > 0 {
         s.push_str(&format!("\n⚠️  {} target validations failed\n", failed));
+      }
+    }
+
+    // Show computed MSRV if available
+    if let Some(ref msrv) = self.computed_msrv {
+      s.push_str(&format!(
+        "\nComputed MSRV: {} (from {} deps with rust-version)\n",
+        msrv.version, msrv.deps_with_msrv
+      ));
+      if !msrv.contributors.is_empty() {
+        let contributors_str = if msrv.contributors.len() > 3 {
+          format!(
+            "{}, ... ({} total)",
+            msrv.contributors[..3].join(", "),
+            msrv.contributors.len()
+          )
+        } else {
+          msrv.contributors.join(", ")
+        };
+        s.push_str(&format!("  Contributors: {}\n", contributors_str));
       }
     }
 
@@ -486,6 +508,14 @@ impl UnifyAnalyzer {
       Vec::new()
     };
 
+    // Compute MSRV if enabled
+    let computed_msrv = if self.config.msrv {
+      println!("Computing MSRV from dependency graph...");
+      self.metadata.compute_msrv()
+    } else {
+      None
+    };
+
     // Run validation
     let validation_results = self.validate_targets()?;
 
@@ -496,6 +526,7 @@ impl UnifyAnalyzer {
       transitive_pins,
       validation_results,
       issues,
+      computed_msrv,
     })
   }
 

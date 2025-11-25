@@ -71,6 +71,12 @@ pub struct UnifyConfig {
   /// Older backups are automatically cleaned up after successful unify operations
   #[serde(default = "default_max_backups")]
   pub max_backups: usize,
+
+  /// Compute and write MSRV to workspace manifest? (default: false)
+  /// When enabled, cargo-rail computes the maximum rust-version from all
+  /// resolved dependencies and writes it to [workspace.package].rust-version
+  #[serde(default)]
+  pub msrv: bool,
 }
 
 fn default_max_backups() -> usize {
@@ -173,6 +179,7 @@ impl Default for UnifyConfig {
       exclude: Vec::new(),
       include: Vec::new(),
       max_backups: default_max_backups(),
+      msrv: false,
     }
   }
 }

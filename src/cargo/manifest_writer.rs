@@ -166,4 +166,32 @@ impl ManifestWriter {
   fn dep_kind_to_section(&self, dep_kind: DepKind) -> &'static str {
     manifest_ops::dep_kind_to_section(dep_kind)
   }
+
+  /// Write MSRV (rust-version) to workspace manifest
+  ///
+  /// Writes to [workspace.package].rust-version so that members can inherit it
+  /// via `rust-version.workspace = true`
+  pub fn write_workspace_msrv(&self, workspace_toml_path: &Path, msrv: &semver::Version) -> RailResult<()> {
+    // Read workspace Cargo.toml
+    let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
+
+    // Ensure [workspace] section exists
+    manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
+
+    // Get or create [workspace.package] section
+    let ws_package = manifest_ops::get_or_create_table(&mut doc, "workspace.package")
+      .context("Failed to create [workspace.package]")?;
+
+    // Format MSRV as "major.minor" (standard rust-version format)
+    let msrv_str = format!("{}.{}", msrv.major, msrv.minor);
+
+    // Insert or update rust-version
+    ws_package.insert("rust-version", toml_edit::value(&msrv_str));
+
+    // Format and write
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
+
+    Ok(())
+  }
 }

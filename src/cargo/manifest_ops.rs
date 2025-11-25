@@ -90,7 +90,9 @@ pub fn write_toml_file(path: &Path, doc: &DocumentMut) -> RailResult<()> {
 pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
   // Simple case: just version, no features, defaults enabled, no path
   if dep.features.is_empty() && dep.default_features && dep.path.is_none() {
-    return Item::Value(Value::from(dep.version_req.to_string()));
+    let mut value = Value::from(dep.version_req.to_string());
+    value.decor_mut().set_suffix(" #unified");
+    return Item::Value(value);
   }
 
   // Complex case: use inline table
@@ -118,7 +120,11 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
     table.insert("features", build_feature_array(&dep.features));
   }
 
-  Item::Value(Value::InlineTable(table))
+  // Add #unified comment marker
+  let mut value = Value::InlineTable(table);
+  value.decor_mut().set_suffix(" #unified");
+
+  Item::Value(value)
 }
 
 /// Build a workspace-inherited dependency entry
@@ -132,7 +138,7 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
 ///
 /// # Returns
 ///
-/// `{ workspace = true }` with optional fields
+/// `{ workspace = true }` with optional fields and `#unified` comment marker
 pub fn build_workspace_dep_entry(local_features: Option<Vec<String>>, is_optional: bool) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
@@ -149,7 +155,11 @@ pub fn build_workspace_dep_entry(local_features: Option<Vec<String>>, is_optiona
     table.insert("optional", Value::from(true));
   }
 
-  Item::Value(Value::InlineTable(table))
+  // Add #unified comment marker to track what was modified by unify
+  let mut value = Value::InlineTable(table);
+  value.decor_mut().set_suffix(" #unified");
+
+  Item::Value(value)
 }
 
 /// Build a transitive dependency entry for pinning
@@ -167,7 +177,11 @@ pub fn build_transitive_entry(features: &[String]) -> Item {
     table.insert("features", build_feature_array(features));
   }
 
-  Item::Value(Value::InlineTable(table))
+  // Add #unified comment marker
+  let mut value = Value::InlineTable(table);
+  value.decor_mut().set_suffix(" #unified");
+
+  Item::Value(value)
 }
 
 // ============================================================================

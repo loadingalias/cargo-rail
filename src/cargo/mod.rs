@@ -17,7 +17,7 @@ pub mod unify_analyzer;
 pub use cargo_transform::{CargoTransform, TransformContext};
 pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;
-pub use multi_target_metadata::{FragmentedTransitive, MultiTargetMetadata};
+pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MultiTargetMetadata};
 pub use unify_analyzer::{
   IssueSeverity, MemberEdit, UnificationPlan, UnifiedDep, UnifyAnalyzer, UnifyIssue, UnifyReport, ValidationResult,
 };
