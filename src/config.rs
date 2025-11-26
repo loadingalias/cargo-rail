@@ -169,7 +169,7 @@ pub struct UnifyConfig {
 
   /// Automatically remove unused dependencies when applying (default: false)
   /// Requires detect_unused = true. When enabled, unused deps are removed
-  /// from member Cargo.toml files during unify apply.
+  /// from member Cargo.toml files during unify.
   #[serde(default)]
   pub remove_unused: bool,
 }

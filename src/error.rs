@@ -317,7 +317,7 @@ impl GitError {
         if reason.contains("non-fast-forward") {
           Some("The remote has commits you don't have. Pull first or use --force (dangerous).".to_string())
         } else if reason.contains("permission denied") || reason.contains("403") {
-          Some("Check your SSH key permissions and GitHub access. Run `cargo rail doctor` to diagnose.".to_string())
+          Some("Check your SSH key permissions and GitHub access.".to_string())
         } else {
           None
         }

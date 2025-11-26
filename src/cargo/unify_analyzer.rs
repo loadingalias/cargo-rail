@@ -430,6 +430,26 @@ impl UnifyAnalyzer {
       // Get usage sites early - needed for version checks
       let usage_sites = self.manifests.get_usage_sites(dep_key);
 
+      // === CRITICAL: Check for major version conflicts ===
+      // Different major versions should NEVER be merged - this is an anti-pattern
+      // that users must fix manually. Merging features across major versions
+      // produces invalid configurations (e.g., features that don't exist in the selected version).
+      let major_versions = find_major_version_conflicts(&usage_sites);
+      if major_versions.len() > 1 {
+        let versions_str: Vec<_> = major_versions.iter().map(|v| v.to_string()).collect();
+        issues.push(UnifyIssue {
+          dep_name: dep_key.name.clone(),
+          severity: IssueSeverity::Error,
+          message: format!(
+            "Multiple major versions detected (majors: {}) - cannot unify safely. \
+             This is an anti-pattern in Rust workspaces that causes duplicate compilation \
+             and wasted build resources. Please consolidate to a single major version.",
+            versions_str.join(", ")
+          ),
+        });
+        continue; // Skip this dependency entirely
+      }
+
       // === Issue B: Check for exact version pins ===
       let has_exact_pin = usage_sites
         .iter()
@@ -886,6 +906,32 @@ fn is_exact_pin(version: &str) -> bool {
   version.starts_with('=') && !version.starts_with(">=")
 }
 
+/// Extract major version from a declared version string
+///
+/// Returns the major version number, handling various version formats:
+/// - "1.0" -> Some(1)
+/// - "^2.3.0" -> Some(2)
+/// - ">=0.5" -> Some(0)
+fn extract_major_version(version: &str) -> Option<u32> {
+  let cleaned = strip_version_op(version);
+  let parts: Vec<&str> = cleaned.split('.').collect();
+  parts.first().and_then(|s| s.parse().ok())
+}
+
+/// Check for major version conflicts in declared versions
+///
+/// Returns the set of unique major versions found. If the set has more than
+/// one element, there's a conflict that cannot be safely unified.
+fn find_major_version_conflicts(
+  usages: &[&crate::cargo::manifest_analyzer::DepUsage],
+) -> std::collections::HashSet<u32> {
+  usages
+    .iter()
+    .filter_map(|u| u.declared_version.as_ref())
+    .filter_map(|v| extract_major_version(v))
+    .collect()
+}
+
 /// Check if two version requirements are compatible
 ///
 /// This is a heuristic check - it compares the major.minor portions
@@ -1090,6 +1136,24 @@ impl UnifyReport {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_extract_major_version() {
+    // Simple versions
+    assert_eq!(extract_major_version("1.0"), Some(1));
+    assert_eq!(extract_major_version("2.3.4"), Some(2));
+    assert_eq!(extract_major_version("0.99.3"), Some(0));
+
+    // With operators
+    assert_eq!(extract_major_version("^1.0"), Some(1));
+    assert_eq!(extract_major_version("~2.0"), Some(2));
+    assert_eq!(extract_major_version(">=3.0"), Some(3));
+    assert_eq!(extract_major_version("=4.0.0"), Some(4));
+
+    // Edge cases
+    assert_eq!(extract_major_version(""), None);
+    assert_eq!(extract_major_version("invalid"), None);
+  }
 
   #[test]
   fn test_is_exact_pin() {

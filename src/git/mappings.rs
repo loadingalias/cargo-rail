@@ -132,12 +132,6 @@ impl MappingStore {
     self.reverse_mappings.contains_key(sha)
   }
 
-  /// Get all mappings
-  #[allow(dead_code)]
-  pub fn all_mappings(&self) -> &HashMap<String, String> {
-    &self.mappings
-  }
-
   /// Clear all mappings (only used in tests)
   #[cfg(test)]
   pub fn clear(&mut self) {

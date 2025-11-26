@@ -29,9 +29,6 @@ pub struct SyncConfig {
 pub struct SyncResult {
   /// Number of commits synced
   pub commits_synced: usize,
-  /// Direction of sync operation - public API field for logging/auditing
-  #[allow(dead_code)]
-  pub direction: SyncDirection,
   /// Conflicts encountered during sync
   pub conflicts: Vec<ConflictInfo>,
 }
@@ -192,7 +189,6 @@ impl<'a> SyncEngine<'a> {
 
       return Ok(SyncResult {
         commits_synced: synced_count,
-        direction: SyncDirection::MonoToRemote,
         conflicts: Vec::new(),
       });
     }
@@ -215,7 +211,6 @@ impl<'a> SyncEngine<'a> {
 
     Ok(SyncResult {
       commits_synced: synced_count,
-      direction: SyncDirection::MonoToRemote,
       conflicts: Vec::new(),
     })
   }
@@ -361,7 +356,6 @@ impl<'a> SyncEngine<'a> {
 
     Ok(SyncResult {
       commits_synced: synced_count,
-      direction: SyncDirection::RemoteToMono,
       conflicts,
     })
   }
@@ -390,7 +384,6 @@ impl<'a> SyncEngine<'a> {
 
         Ok(SyncResult {
           commits_synced: to_remote.commits_synced + from_remote.commits_synced,
-          direction: SyncDirection::Both,
           conflicts: from_remote.conflicts,
         })
       }
@@ -398,7 +391,6 @@ impl<'a> SyncEngine<'a> {
         println!("   No changes on either side");
         Ok(SyncResult {
           commits_synced: 0,
-          direction: SyncDirection::None,
           conflicts: Vec::new(),
         })
       }
@@ -746,38 +738,21 @@ impl<'a> SyncEngine<'a> {
           println!("      ✅ Auto-merged {}", mono_path.display());
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
-            message: format!(
-              "Auto-merged {} using {:?} strategy",
-              mono_path.display(),
-              self.conflict_resolver.strategy()
-            ),
-            resolved: true,
           });
         }
         Ok(crate::sync::conflict::MergeResult::Conflicts(_paths)) => {
-          // Check if using auto-resolve strategy
-          let is_auto_resolved = matches!(
-            self.conflict_resolver.strategy(),
-            ConflictStrategy::Ours | ConflictStrategy::Theirs | ConflictStrategy::Union
-          );
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
-            message: format!("Conflict in {}", mono_path.display()),
-            resolved: is_auto_resolved,
           });
         }
-        Ok(crate::sync::conflict::MergeResult::Failed(msg)) => {
+        Ok(crate::sync::conflict::MergeResult::Failed(_msg)) => {
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
-            message: format!("Merge failed: {}", msg),
-            resolved: false,
           });
         }
-        Err(e) => {
+        Err(_e) => {
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
-            message: format!("Merge error: {}", e),
-            resolved: false,
           });
         }
       }

@@ -88,7 +88,7 @@ pub fn run_init(
 
     println!("✅ Created {}", config_path.display());
     println!("\nNext steps:");
-    println!("  cargo rail unify --dry-run  # Preview dependency unification");
+    println!("  cargo rail unify --check  # Preview dependency unification");
   }
 
   Ok(())
@@ -232,7 +232,7 @@ pub fn run_init_standalone(
     write_config_file(&config_path, &config_toml)?;
     println!("✅ Created {}", config_path.display());
     println!("\nNext steps:");
-    println!("  cargo rail unify --dry-run  # Preview dependency unification");
+    println!("  cargo rail unify --check  # Preview dependency unification");
   }
 
   Ok(())

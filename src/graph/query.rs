@@ -23,32 +23,6 @@ pub struct AffectedSet {
   pub test_targets: HashSet<String>,
 }
 
-impl AffectedSet {
-  /// Check if any crates were affected by the changes.
-  ///
-  /// # Future Use
-  /// Will be used by `cargo rail test --since` to:
-  /// - Skip running tests when no crates are affected
-  /// - Optimize CI by avoiding unnecessary test runs
-  /// - Provide early exit for empty change sets
-  #[allow(dead_code)]
-  pub fn is_empty(&self) -> bool {
-    self.direct.is_empty()
-  }
-
-  /// Get the total count of affected crates (direct + transitive dependents).
-  ///
-  /// # Future Use
-  /// Will be used for:
-  /// - CI summary output: "5 crates affected by this PR"
-  /// - `--dry-run` mode: show impact without running tests
-  /// - Cost estimation: predict CI runtime based on affected count
-  #[allow(dead_code)]
-  pub fn total_affected(&self) -> usize {
-    self.test_targets.len()
-  }
-}
-
 /// Complete affected analysis.
 #[derive(Debug, Clone)]
 pub struct AffectedAnalysis {
@@ -115,36 +89,4 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
       test_targets,
     },
   })
-}
-
-/// Compute minimal test set from changed files.
-///
-/// Convenience function that returns just the crate names in sorted order.
-///
-/// # Future Use
-/// Will power smart testing commands:
-/// - `cargo rail test --since <commit>`: Only test affected crates
-/// - `cargo rail check --since <commit>`: Only check affected crates
-/// - `cargo rail build --since <commit>`: Incremental workspace builds
-///
-/// # Example
-/// ```rust,ignore
-/// use cargo_rail::graph::core::WorkspaceGraph;
-/// use cargo_rail::graph::query::minimal_test_set;
-/// use std::path::Path;
-/// use cargo_metadata::MetadataCommand;
-///
-/// let metadata = MetadataCommand::new().exec().unwrap();
-/// let graph = WorkspaceGraph::from_metadata(&metadata).unwrap();
-/// // Get crates affected by changes since main branch
-/// let changed_files = vec!["src/lib.rs"];
-/// let test_set = minimal_test_set(&graph, &changed_files);
-/// // test_set = ["lib-core", "lib-util", "bin-cli"]
-/// ```
-#[allow(dead_code)]
-pub fn minimal_test_set(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> RailResult<Vec<String>> {
-  let analysis = analyze(graph, changed_files)?;
-  let mut targets: Vec<_> = analysis.impact.test_targets.into_iter().collect();
-  targets.sort();
-  Ok(targets)
 }

@@ -19,7 +19,7 @@
 //! let manager = BackupManager::new(workspace_root);
 //!
 //! // Create backup before modifications
-//! let metadata = BackupMetadata::new("cargo rail unify apply");
+//! let metadata = BackupMetadata::new("cargo rail unify");
 //! let backup_id = manager.create_backup(&files_to_backup, metadata)?;
 //!
 //! // Restore if needed

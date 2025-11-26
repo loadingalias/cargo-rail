@@ -23,6 +23,7 @@ AGENTS.md
 # Documentation
 docs/*
 TODO.md
+CLI_AND_CONFIG_AUDIT.md
 
 # Cargo-Rail (Testing)
 *rail.toml

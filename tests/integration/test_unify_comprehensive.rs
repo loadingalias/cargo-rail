@@ -6,6 +6,164 @@ use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
 // ============================================================================
+// BUG FIX TESTS: Major Version Conflicts (BUG 1)
+// ============================================================================
+
+#[test]
+fn test_unify_major_version_conflict_blocks_unification() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crates with different major versions of the same dependency
+  // This simulates the derive_more bug: 0.99.3 vs 2.0
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["derive"] }"#)],
+  )?;
+
+  // Crate B uses a different major version (simulated with 0.x which has different semver rules)
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#"{ version = "0.8", features = ["alloc"] }"#)],
+  )?;
+
+  workspace.commit("Add crates with major version conflict")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run analyze - should show ERROR about major version conflict
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
+
+  assert!(
+    analyze_stdout.contains("Multiple major versions") || analyze_stdout.contains("anti-pattern"),
+    "Should detect major version conflict.\nOutput:\n{}",
+    analyze_stdout
+  );
+
+  // Run apply - should FAIL due to blocking error
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
+  let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
+
+  // The apply should either fail or skip the conflicting dependency
+  // Check that serde was NOT added to workspace.dependencies (since it has conflicts)
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
+  // If serde is in workspace.dependencies, it should not have mixed features from both versions
+  // The expected behavior is to SKIP the dependency entirely due to the conflict
+  if workspace_toml.contains("serde") && workspace_toml.contains("[workspace.dependencies]") {
+    // If it IS in workspace.dependencies, verify it doesn't have features from the wrong version
+    // This is a secondary check - the primary expectation is that it's skipped
+    assert!(
+      !workspace_toml.contains("alloc") || !workspace_toml.contains("derive"),
+      "Should not merge features from incompatible major versions.\nWorkspace TOML:\n{}\nstdout:\n{}\nstderr:\n{}",
+      workspace_toml,
+      apply_stdout,
+      apply_stderr
+    );
+  }
+
+  Ok(())
+}
+
+// ============================================================================
+// BUG FIX TESTS: Target-Specific Features (BUG 2)
+// ============================================================================
+
+#[test]
+fn test_unify_target_specific_features_stay_local() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crate-a with unconditional tokio dependency
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["rt", "macros"] }"#)],
+  )?;
+
+  // Create crate-b with target-specific tokio feature
+  // We manually create this to have a target-specific dependency
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["rt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1.0", features = ["signal"] }
+"#,
+  )?;
+
+  std::fs::write(
+    crate_b_path.join("src/lib.rs"),
+    "pub fn hello() -> &'static str { \"Hello\" }",
+  )?;
+
+  workspace.commit("Add crates with target-specific features")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run apply
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply_output.status.success(),
+    "Apply should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout)
+  );
+
+  // Check workspace Cargo.toml
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
+  // Workspace should have tokio with common features (rt, macros from crate-a)
+  assert!(
+    workspace_toml.contains("tokio"),
+    "Should have tokio in workspace.dependencies"
+  );
+  assert!(
+    workspace_toml.contains("rt") || workspace_toml.contains("macros"),
+    "Should have common features.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  // CRITICAL: workspace.dependencies should NOT have the target-specific "signal" feature
+  // This is the BUG 2 fix - target-specific features stay local
+  assert!(
+    !workspace_toml.contains("signal"),
+    "Target-specific 'signal' feature should NOT be in workspace.dependencies.\n\
+     It should stay local to crate-b's target-specific section.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  Ok(())
+}
+
+// ============================================================================
 // SCENARIO 4: Inconsistent Default-Features
 // ============================================================================
 

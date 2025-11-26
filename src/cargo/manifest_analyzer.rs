@@ -418,6 +418,10 @@ impl ManifestAnalyzer {
   ///
   /// Used when mixed default-features are detected or intersection is empty.
   /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
+  ///
+  /// **IMPORTANT**: Only includes features from UNCONDITIONAL usages (no target constraint).
+  /// Features from target-specific usages (e.g., `[target.'cfg(linux)'.dependencies]`)
+  /// are excluded because they may not be valid on all platforms and should stay local.
   pub fn compute_union(&self, dep: &DepKey) -> BTreeSet<String> {
     let Some(usages) = self.usage_index.get(dep) else {
       return BTreeSet::new();
@@ -428,13 +432,39 @@ impl ManifestAnalyzer {
       return BTreeSet::new();
     }
 
-    // Union all features from all usage sites
+    // Union features from UNCONDITIONAL usages only
+    // Target-specific features stay local to avoid platform incompatibilities
     let mut union = BTreeSet::new();
     for usage in usages {
-      union.extend(usage.unconditional_features.iter().cloned());
+      if usage.target.is_none() {
+        union.extend(usage.unconditional_features.iter().cloned());
+      }
     }
 
     union
+  }
+
+  /// Compute features that are ONLY declared with target constraints
+  ///
+  /// These features should stay local (in member Cargo.toml) because they may
+  /// have platform-specific requirements (like cfg flags or OS restrictions).
+  /// Returns the set of features that appear only in target-constrained usages.
+  pub fn compute_target_local_features(&self, dep: &DepKey) -> BTreeSet<String> {
+    let Some(usages) = self.usage_index.get(dep) else {
+      return BTreeSet::new();
+    };
+
+    // Collect features from target-constrained usages
+    let mut target_features = BTreeSet::new();
+    for usage in usages {
+      if usage.target.is_some() {
+        target_features.extend(usage.unconditional_features.iter().cloned());
+      }
+    }
+
+    // Subtract features that also appear unconditionally
+    let unconditional = self.compute_union(dep);
+    target_features.difference(&unconditional).cloned().collect()
   }
 
   /// Compute the intersection of features used by all packages that depend on this dependency
@@ -443,21 +473,28 @@ impl ManifestAnalyzer {
   /// Only features that are ALWAYS enabled go into [workspace.dependencies].
   /// Members that need more can add local features.
   /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
+  ///
+  /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
+  /// Target-specific usages are excluded because their features may have
+  /// platform-specific requirements.
   pub fn compute_intersection(&self, dep: &DepKey) -> BTreeSet<String> {
     let Some(usages) = self.usage_index.get(dep) else {
       return BTreeSet::new();
     };
 
+    // Filter to unconditional usages only
+    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+
     // Include ALL dep kinds - workspace deps serve all usage contexts
-    if usages.len() < 2 {
-      return BTreeSet::new(); // Not enough uses to unify
+    if unconditional_usages.len() < 2 {
+      return BTreeSet::new(); // Not enough unconditional uses to unify
     }
 
-    // Start with the first usage's features
-    let mut intersection = usages[0].unconditional_features.clone();
+    // Start with the first unconditional usage's features
+    let mut intersection = unconditional_usages[0].unconditional_features.clone();
 
-    // Intersect with all other usages
-    for usage in &usages[1..] {
+    // Intersect with all other unconditional usages
+    for usage in &unconditional_usages[1..] {
       intersection = intersection
         .intersection(&usage.unconditional_features)
         .cloned()
@@ -484,34 +521,44 @@ impl ManifestAnalyzer {
   /// Check if a dependency has mixed default-features settings
   ///
   /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
+  ///
+  /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
   pub fn has_mixed_defaults(&self, dep: &DepKey) -> bool {
     let Some(usages) = self.usage_index.get(dep) else {
       return false;
     };
 
+    // Filter to unconditional usages only
+    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+
     // Include ALL dep kinds - workspace deps serve all usage contexts
-    if usages.len() < 2 {
+    if unconditional_usages.len() < 2 {
       return false;
     }
 
-    // Check if all have the same default-features setting
-    let first_default = usages[0].default_features;
-    !usages.iter().all(|u| u.default_features == first_default)
+    // Check if all unconditional usages have the same default-features setting
+    let first_default = unconditional_usages[0].default_features;
+    !unconditional_usages.iter().all(|u| u.default_features == first_default)
   }
 
   /// Determine the default-features policy for a dependency
   ///
   /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
+  ///
+  /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
   pub fn default_features_policy(&self, dep: &DepKey) -> Option<bool> {
     let usages = self.usage_index.get(dep)?;
 
+    // Filter to unconditional usages only
+    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+
     // Include ALL dep kinds - workspace deps serve all usage contexts
-    if usages.is_empty() {
+    if unconditional_usages.is_empty() {
       return None;
     }
 
-    // If any usage has default-features = false, we must use false at root
-    if usages.iter().any(|u| !u.default_features) {
+    // If any unconditional usage has default-features = false, we must use false at root
+    if unconditional_usages.iter().any(|u| !u.default_features) {
       Some(false)
     } else {
       Some(true)

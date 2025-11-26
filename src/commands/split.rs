@@ -11,7 +11,7 @@ use rayon::prelude::*;
 /// Run the split command
 ///
 /// By default, executes the split operation (with confirmation prompt in interactive mode).
-/// Use --dry-run to show the plan without executing.
+/// Use --check to show the plan without executing.
 pub fn run_split(
   ctx: &WorkspaceContext,
   crate_name: Option<String>,

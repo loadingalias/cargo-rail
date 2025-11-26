@@ -16,7 +16,7 @@ pub struct BackupMetadata {
   /// When the backup was created (ISO 8601 format)
   pub timestamp: String,
 
-  /// Command that created this backup (e.g., "cargo rail unify apply")
+  /// Command that created this backup (e.g., "cargo rail unify")
   pub command: String,
 
   /// Files that were backed up (relative to workspace root)
@@ -140,8 +140,8 @@ mod tests {
 
   #[test]
   fn test_backup_metadata_creation() {
-    let mut metadata = BackupMetadata::new("cargo rail unify apply");
-    assert_eq!(metadata.command, "cargo rail unify apply");
+    let mut metadata = BackupMetadata::new("cargo rail unify");
+    assert_eq!(metadata.command, "cargo rail unify");
     assert!(metadata.files_modified.is_empty());
     assert!(metadata.config_snapshot.is_none());
 
@@ -162,7 +162,7 @@ mod tests {
     let backup_dir = temp_dir.path();
 
     // Create and save metadata
-    let mut original = BackupMetadata::new("cargo rail unify apply");
+    let mut original = BackupMetadata::new("cargo rail unify");
     original.add_file("Cargo.toml");
     original.add_file("crates/foo/Cargo.toml");
     original = original.with_description("Test backup");

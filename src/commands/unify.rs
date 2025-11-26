@@ -131,13 +131,13 @@ pub fn run_unify_analyze(
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
     if !plan.workspace_deps.is_empty() {
       println!(
-        "\n✅ Ready to unify {} dependencies ({} member edits). Run 'cargo rail unify apply' to apply changes.",
+        "\n✅ Ready to unify {} dependencies ({} member edits). Run 'cargo rail unify' to apply changes.",
         plan.workspace_deps.len(),
         total_edits
       );
     } else {
       println!(
-        "\n✅ Ready to convert {} members to use workspace inheritance ({} edits). Run 'cargo rail unify apply' to apply changes.",
+        "\n✅ Ready to convert {} members to use workspace inheritance ({} edits). Run 'cargo rail unify' to apply changes.",
         plan.member_edits.len(),
         total_edits
       );
@@ -227,7 +227,7 @@ pub fn run_unify_apply(
       }
     }
 
-    let metadata = BackupMetadata::new("cargo rail unify apply");
+    let metadata = BackupMetadata::new("cargo rail unify");
     let max_backups = ctx.config.as_ref().map(|c| c.unify.max_backups).unwrap_or(3);
     let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
     println!("   Backup created: {}", backup_id);

@@ -223,22 +223,6 @@ impl GitState {
   pub fn git(&self) -> &SystemGit {
     &self.git
   }
-
-  /// Get current HEAD commit SHA
-  ///
-  /// Part of git backbone - will be used for sync/split operations
-  #[allow(dead_code)]
-  pub fn head_commit(&self) -> RailResult<String> {
-    self.git.head_commit()
-  }
-
-  /// Get current branch name
-  ///
-  /// Part of git backbone - will be used for git operations
-  #[allow(dead_code)]
-  pub fn current_branch(&self) -> RailResult<String> {
-    self.git.current_branch()
-  }
 }
 
 // ============================================================================
@@ -425,15 +409,15 @@ mod tests {
     let current_dir = std::env::current_dir().unwrap();
     let ctx = WorkspaceContext::build(&current_dir).unwrap();
 
-    // Should be able to access git operations
-    let head = ctx.git.head_commit();
+    // Should be able to access git operations via git() accessor
+    let head = ctx.git.git().head_commit();
     assert!(head.is_ok(), "Should get HEAD commit");
 
     let head_sha = head.unwrap();
     assert_eq!(head_sha.len(), 40, "HEAD SHA should be 40 characters");
 
     // Should be able to get current branch
-    let branch = ctx.git.current_branch();
+    let branch = ctx.git.git().current_branch();
     assert!(branch.is_ok(), "Should get current branch");
   }
 

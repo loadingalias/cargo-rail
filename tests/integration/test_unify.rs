@@ -380,7 +380,7 @@ tempfile = "3.0"
 
   workspace.commit("Add crates with dev-dependencies")?;
 
-  // Run unify apply
+  // Run unify
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     output.status.success(),
@@ -456,7 +456,7 @@ cc = "1.0"
 
   workspace.commit("Add crates with build-dependencies")?;
 
-  // Run unify apply
+  // Run unify
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     output.status.success(),
@@ -523,7 +523,7 @@ serde = { version = "1.0", features = ["derive"] }
 
   workspace.commit("Add crates with existing workspace.dependencies")?;
 
-  // Run unify apply
+  // Run unify
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     output.status.success(),
@@ -567,7 +567,7 @@ fn test_unify_local_features_calculation() -> Result<()> {
 
   workspace.commit("Add crates with different features")?;
 
-  // Run unify apply
+  // Run unify
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     output.status.success(),

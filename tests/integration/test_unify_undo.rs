@@ -15,7 +15,7 @@ fn test_unify_undo_restores_latest_backup() -> Result<()> {
   // Create initial state
   let original_workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
 
-  // Run unify apply with --backup flag to create a backup
+  // Run unify with --backup flag to create a backup
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
   assert!(apply_output.status.success(), "Unify apply should succeed");
 
@@ -74,7 +74,7 @@ fn test_unify_undo_list() -> Result<()> {
     list_stdout
   );
   assert!(list_stdout.contains("latest"), "Should mark latest backup");
-  assert!(list_stdout.contains("cargo rail unify apply"), "Should show command");
+  assert!(list_stdout.contains("cargo rail unify"), "Should show command");
 
   Ok(())
 }

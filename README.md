@@ -64,7 +64,7 @@ cargo rail test --explain
 
 ```bash
 # Preview unification changes
-cargo rail unify --dry-run
+cargo rail unify --check
 
 # Apply unification to workspace.dependencies
 cargo rail unify
@@ -218,7 +218,7 @@ cargo rail test --nextest --watch      # Watch mode with nextest
 ### Dependency Unification
 
 ```bash
-cargo rail unify --dry-run             # Preview changes
+cargo rail unify --check             # Preview changes
 cargo rail unify                       # Apply unification
 ```
 
@@ -234,7 +234,7 @@ cargo rail status                      # Show sync status
 
 ```bash
 # Plan releases with dependency-aware ordering
-cargo rail release --all --bump minor --dry-run
+cargo rail release --all --bump minor --check
 
 # Execute: bump versions, generate changelogs, tag, publish
 cargo rail release --all --bump patch --execute

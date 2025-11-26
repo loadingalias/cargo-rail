@@ -11,7 +11,7 @@ use rayon::prelude::*;
 /// Run the sync command
 ///
 /// By default, executes the sync operation (with confirmation prompt in interactive mode).
-/// Use --dry-run to show the plan without executing.
+/// Use --check to show the plan without executing.
 #[allow(clippy::too_many_arguments)]
 pub fn run_sync(
   ctx: &WorkspaceContext,
