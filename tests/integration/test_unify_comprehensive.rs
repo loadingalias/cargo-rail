@@ -242,7 +242,7 @@ root = "."
 }
 
 // ============================================================================
-// SCENARIO 7: Renamed Dependencies (Hard Blocker)
+// SCENARIO 7: Renamed Dependencies (Treated Separately)
 // ============================================================================
 
 #[test]
@@ -250,6 +250,8 @@ fn test_unify_renamed_dependencies_hard_blocker() -> Result<()> {
   let workspace = TestWorkspace::new()?;
 
   // Create crates with renamed dependency
+  // With the bug fix, renamed deps (package = "...") are now properly separated
+  // from direct deps of the same package. This prevents feature confusion.
   workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
 
   // Manually create crate-b with renamed serde
@@ -276,37 +278,39 @@ serde_crate = { package = "serde", version = "1.0" }
 
   workspace.commit("Add crates with renamed dependency")?;
 
-  // Configure rail.toml (allow_renamed = false by default)
+  // Configure rail.toml (include_renamed = false by default)
   std::fs::write(
     workspace.path.join("rail.toml"),
     r#"[workspace]
 root = "."
 
 [unify]
-allow_renamed = false
+include_renamed = false
 "#,
   )?;
 
-  // Run analyze - should show Hard blocker
+  // Run analyze - with the fix, renamed deps are now treated separately
+  // Since each version of serde (direct vs renamed) only has 1 user,
+  // neither qualifies for unification (needs 2+ users)
   let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
+  // Should show no unification opportunities since each has only 1 user
   assert!(
-    analyze_stdout.contains("BLOCKING") || analyze_stdout.contains("Renamed"),
-    "Should show blocking issue for renamed dependency.\nOutput:\n{}",
+    analyze_stdout.contains("No unification opportunities") || analyze_stdout.contains("No dependencies to unify"),
+    "Should show no unification opportunities when deps are properly separated.\nOutput:\n{}",
     analyze_stdout
   );
 
-  // Run apply - should FAIL
+  // Run apply - should succeed (no changes needed)
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
-  let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
 
+  // Should indicate no changes
   assert!(
-    !apply_output.status.success(),
-    "Apply should fail with renamed dependency.\nstdout:\n{}\nstderr:\n{}",
-    apply_stdout,
-    apply_stderr
+    apply_stdout.contains("No unification opportunities") || apply_stdout.contains("No dependencies to unify"),
+    "Apply should indicate no changes needed.\nstdout:\n{}",
+    apply_stdout
   );
 
   // Check that members were NOT converted to workspace inheritance
@@ -322,7 +326,7 @@ allow_renamed = false
   // Should NOT have "serde = { workspace = true }"
   assert!(
     !crate_a_member.contains("serde = { workspace = true }") && !crate_a_member.contains("serde = {workspace=true}"),
-    "crate-a should not use workspace = true for serde (apply failed, so no conversion).\ncrate-a Cargo.toml:\n{}",
+    "crate-a should not use workspace = true for serde.\ncrate-a Cargo.toml:\n{}",
     crate_a_member
   );
 

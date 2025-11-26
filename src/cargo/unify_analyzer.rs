@@ -688,8 +688,12 @@ impl UnifyAnalyzer {
           .cloned()
           .collect();
 
+        // For renamed dependencies (package = "..."), use the ALIAS name for manifest editing
+        // e.g., for `old_getrandom = { package = "getrandom", ... }`, use "old_getrandom"
+        let manifest_dep_name = dep_key.renamed_from.clone().unwrap_or_else(|| dep_key.name.clone());
+
         let edit = MemberEdit::UseWorkspace {
-          dep_name: dep_key.name.clone(),
+          dep_name: manifest_dep_name,
           dep_kind: usage.kind,
           target: usage.target.clone(), // Preserve target for correct section
           local_features,

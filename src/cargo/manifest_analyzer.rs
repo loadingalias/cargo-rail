@@ -33,10 +33,13 @@ impl DepKey {
   }
 }
 
-// Only compare by name, not renamed_from
+// Compare by both name AND renamed_from to distinguish:
+// - getrandom (direct dependency)
+// - old_getrandom (renamed from getrandom, i.e., package = "getrandom")
+// These are different dependencies that should NOT have their features merged.
 impl PartialEq for DepKey {
   fn eq(&self, other: &Self) -> bool {
-    self.name == other.name
+    self.name == other.name && self.renamed_from == other.renamed_from
   }
 }
 
@@ -45,6 +48,7 @@ impl Eq for DepKey {}
 impl std::hash::Hash for DepKey {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
     self.name.hash(state);
+    self.renamed_from.hash(state);
   }
 }
 
@@ -56,7 +60,10 @@ impl PartialOrd for DepKey {
 
 impl Ord for DepKey {
   fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-    self.name.cmp(&other.name)
+    match self.name.cmp(&other.name) {
+      std::cmp::Ordering::Equal => self.renamed_from.cmp(&other.renamed_from),
+      other => other,
+    }
   }
 }
 
@@ -164,30 +171,16 @@ impl ManifestAnalyzer {
     }
 
     // Build usage index
-    // When merging dependencies with same name, preserve renamed_from if any
+    // DepKey now includes renamed_from in equality, so:
+    // - `getrandom` (direct) and `old_getrandom` (package = "getrandom") are separate keys
+    // - This prevents feature confusion between renamed and non-renamed deps
     let mut usage_index: HashMap<DepKey, Vec<DepUsage>> = HashMap::new();
-    let mut renamed_info: HashMap<String, Option<String>> = HashMap::new();
 
     for member in &parsed_members {
       for (dep_key, usage) in &member.dependencies {
-        // Track if any usage of this dep is renamed
-        if dep_key.renamed_from.is_some() {
-          renamed_info.insert(dep_key.name.clone(), dep_key.renamed_from.clone());
-        }
         usage_index.entry(dep_key.clone()).or_default().push(usage.clone());
       }
     }
-
-    // Update keys with renamed_from info if any usage was renamed
-    let usage_index: HashMap<DepKey, Vec<DepUsage>> = usage_index
-      .into_iter()
-      .map(|(mut key, usages)| {
-        if let Some(renamed_from) = renamed_info.get(&key.name) {
-          key.renamed_from = renamed_from.clone();
-        }
-        (key, usages)
-      })
-      .collect();
 
     // Pre-compute usage counts for O(1) lookup (20-30% speedup)
     let usage_counts: HashMap<DepKey, usize> = usage_index
