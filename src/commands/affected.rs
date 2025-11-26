@@ -8,6 +8,7 @@
 use crate::change_detection::classify::{ChangeKind, classify_file};
 use crate::config::ChangeDetectionConfig;
 use crate::error::{RailError, RailResult};
+use crate::git::detect_default_base_ref;
 use crate::graph::AffectedAnalysis;
 use crate::workspace::WorkspaceContext;
 use glob::Pattern;
@@ -48,22 +49,28 @@ impl OutputFormat {
 /// Run the affected command
 pub fn run_affected(
   ctx: &WorkspaceContext,
-  since: String,
+  since: Option<String>,
   from: Option<String>,
   to: Option<String>,
   format: String,
   all: bool,
-  output_file: Option<PathBuf>,
+  output: Option<PathBuf>,
 ) -> RailResult<()> {
   let output_format = OutputFormat::from_str(&format)?;
 
   // If --all flag is set, show all workspace crates regardless of changes
   if all {
-    return display_all_crates(ctx, output_format, output_file.as_ref());
+    return display_all_crates(ctx, output_format, output.as_ref());
   }
 
+  // Auto-detect default branch if --since not specified
+  let since_ref = match since {
+    Some(s) => s,
+    None => detect_default_base_ref(ctx.git.git())?,
+  };
+
   // Get changed files from git
-  let changed_files = get_changed_files(ctx, &since, from.as_deref(), to.as_deref())?;
+  let changed_files = get_changed_files(ctx, &since_ref, from.as_deref(), to.as_deref())?;
 
   // Get change-detection config (from rail.toml or defaults)
   let cd_config = ctx
@@ -79,7 +86,7 @@ pub fn run_affected(
   let analysis = crate::graph::analyze(&ctx.graph, &changed_files)?;
 
   // Output results
-  display_results(&analysis, &classification, output_format, output_file.as_ref())?;
+  display_results(&analysis, &classification, output_format, output.as_ref())?;
 
   Ok(())
 }

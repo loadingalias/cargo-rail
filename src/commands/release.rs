@@ -1,5 +1,6 @@
 //! `cargo rail release` - Release automation commands
 
+use crate::commands::common::OutputFormat;
 use crate::error::{RailError, RailResult};
 use crate::release::planner::ReleasePlanner;
 use crate::release::publisher::ReleasePublisher;
@@ -17,8 +18,11 @@ pub fn run_release_plan(
   bump: String,
   skip_publish: bool,
   skip_tag: bool,
-  json: bool,
+  format: String,
 ) -> RailResult<()> {
+  let output_format: OutputFormat = format.parse()?;
+  let json = output_format.is_json();
+
   if !json {
     eprintln!("🔍 Planning release...\n");
   }
@@ -151,8 +155,18 @@ pub fn run_release_publish(
 /// Run release check command (CI validation)
 ///
 /// Validates that crates are ready for release without making changes.
-pub fn run_release_check(ctx: &WorkspaceContext, crate_names: Option<Vec<String>>, all: bool) -> RailResult<()> {
-  println!("🔍 Checking release readiness...\n");
+pub fn run_release_check(
+  ctx: &WorkspaceContext,
+  crate_names: Option<Vec<String>>,
+  all: bool,
+  format: String,
+) -> RailResult<()> {
+  let output_format: OutputFormat = format.parse()?;
+  let json = output_format.is_json();
+
+  if !json {
+    println!("🔍 Checking release readiness...\n");
+  }
 
   // Get release config
   let config = ctx.config.as_ref().map(|c| &c.release);
@@ -179,13 +193,30 @@ pub fn run_release_check(ctx: &WorkspaceContext, crate_names: Option<Vec<String>
   let validator = ReleaseValidator::new(ctx);
   validator.validate(&target_crates, release_config.require_clean)?;
 
-  // Check publishability
+  // Check publishability and collect results
+  let mut results = Vec::new();
   for crate_name in &target_crates {
     validator.validate_publishable(crate_name)?;
-    println!("✅ {} is ready for release", crate_name);
+    results.push(crate_name.clone());
+    if !json {
+      println!("✅ {} is ready for release", crate_name);
+    }
   }
 
-  println!("\n✅ All release checks passed!");
+  if json {
+    let output = serde_json::json!({
+      "status": "passed",
+      "crates": results,
+      "count": results.len()
+    });
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
+    );
+  } else {
+    println!("\n✅ All release checks passed!");
+  }
+
   Ok(())
 }
 

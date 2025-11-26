@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::str::FromStr;
 
-use crate::commands::common::SplitSyncConfigBuilder;
+use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::error::RailResult;
 use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine};
 use crate::utils;
@@ -23,8 +23,11 @@ pub fn run_sync(
   strategy_str: String,
   _no_protected_branches: bool,
   dry_run: bool,
-  json: bool,
+  format: String,
 ) -> RailResult<()> {
+  let output_format: OutputFormat = format.parse()?;
+  let json = output_format.is_json();
+
   // Parse conflict strategy
   let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
 

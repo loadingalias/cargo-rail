@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use crate::commands::common::SplitSyncConfigBuilder;
+use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::config::RailConfig;
 use crate::error::RailResult;
 use crate::split::SplitEngine;
@@ -18,8 +18,11 @@ pub fn run_split(
   all: bool,
   remote: Option<String>,
   dry_run: bool,
-  json: bool,
+  format: String,
 ) -> RailResult<()> {
+  let output_format: OutputFormat = format.parse()?;
+  let json = output_format.is_json();
+
   if !json {
     eprintln!("📦 Loaded configuration");
   }

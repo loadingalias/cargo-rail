@@ -5,9 +5,7 @@ use crate::workspace::WorkspaceContext;
 use std::fs;
 
 /// Run the clean command
-pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bool) -> RailResult<()> {
-  let mut cleaned_any = false;
-
+pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bool, check: bool) -> RailResult<()> {
   // If no flags provided, clean everything (cache, reports, and ALL backups)
   let clean_all = !cache && !backups && !reports;
 
@@ -16,6 +14,78 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
   // If specific backup flag provided, prune. If cleaning all, delete all.
   let prune_backups = backups && !clean_all;
   let delete_all_backups = clean_all;
+
+  // Dry-run mode: show what would be cleaned
+  if check {
+    println!("🔍 DRY-RUN MODE - Showing what would be cleaned:\n");
+    let mut would_clean = false;
+
+    if clean_cache {
+      let cache_path = ctx
+        .workspace_root
+        .join("target")
+        .join("cargo-rail")
+        .join("metadata.json");
+      let old_cache = ctx.workspace_root.join("target").join("rail");
+
+      if cache_path.exists() {
+        println!("  📄 {}", cache_path.display());
+        would_clean = true;
+      }
+      if old_cache.exists() {
+        println!("  📁 {} (legacy)", old_cache.display());
+        would_clean = true;
+      }
+    }
+
+    if clean_reports {
+      let report_dir = ctx.workspace_root.join("target").join("cargo-rail");
+      if report_dir.exists() {
+        for entry in fs::read_dir(&report_dir).ok().into_iter().flatten().flatten() {
+          let path = entry.path();
+          if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+            println!("  📄 {}", path.display());
+            would_clean = true;
+          }
+        }
+      }
+    }
+
+    if prune_backups || delete_all_backups {
+      let backup_manager = BackupManager::new(&ctx.workspace_root);
+      if backup_manager.has_backups() {
+        let backup_list = backup_manager.list_backups()?;
+        if delete_all_backups {
+          for backup in &backup_list {
+            println!("  📦 backup: {}", backup.id);
+            would_clean = true;
+          }
+        } else {
+          let max_backups = ctx
+            .config
+            .as_ref()
+            .map(|c| c.unify.max_backups)
+            .unwrap_or_else(|| UnifyConfig::default().max_backups);
+          if backup_list.len() > max_backups {
+            for backup in backup_list.iter().skip(max_backups) {
+              println!("  📦 backup (prune): {}", backup.id);
+              would_clean = true;
+            }
+          }
+        }
+      }
+    }
+
+    if would_clean {
+      println!("\n✋ To execute cleanup, run: cargo rail clean");
+    } else {
+      println!("Nothing to clean");
+    }
+    return Ok(());
+  }
+
+  // Execute cleanup
+  let mut cleaned_any = false;
 
   if clean_cache {
     clean_metadata_cache(ctx)?;

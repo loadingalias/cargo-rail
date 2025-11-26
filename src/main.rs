@@ -26,29 +26,29 @@ struct RailCli {
 enum Commands {
   /// Show which crates are affected by changes
   Affected {
-    /// Git ref to compare against (default: origin/main)
-    #[arg(long, default_value = "origin/main")]
-    since: String,
+    /// Git ref to compare against (auto-detects origin/main or origin/master)
+    #[arg(long)]
+    since: Option<String>,
     /// Start ref (for SHA pair mode)
     #[arg(long, conflicts_with = "since")]
     from: Option<String>,
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
     to: Option<String>,
-    /// Output format: text, json, names-only, github, github-matrix, jsonl
-    #[arg(long, default_value = "text")]
+    /// Output format [text, json, names-only, github, github-matrix, jsonl]
+    #[arg(long, short = 'f', default_value = "text")]
     format: String,
     /// Show all workspace crates (ignore changes)
     #[arg(long, short = 'a')]
     all: bool,
     /// Write output to file (e.g., $GITHUB_OUTPUT)
     #[arg(long, short = 'o')]
-    output_file: Option<std::path::PathBuf>,
+    output: Option<std::path::PathBuf>,
   },
 
   /// Run tests only for affected crates (smart test runner)
   Test {
-    /// Git ref to compare against (auto-detects origin/main, origin/master, or HEAD~1)
+    /// Git ref to compare against (auto-detects origin/main or origin/master)
     #[arg(long)]
     since: Option<String>,
     /// Skip change detection and run all tests
@@ -79,6 +79,9 @@ enum Commands {
     /// Show plan without executing (check mode)
     #[arg(long, short = 'c')]
     check: bool,
+    /// Output format [text, json]
+    #[arg(long, short = 'f', default_value = "text")]
+    format: String,
     /// Exclude specific dependencies from unification
     #[arg(long)]
     exclude: Vec<String>,
@@ -146,9 +149,9 @@ enum Commands {
     /// Show plan without executing (default: execute with confirmation)
     #[arg(long, short = 'c')]
     check: bool,
-    /// Output plan in JSON format
-    #[arg(long)]
-    json: bool,
+    /// Output format [text, json]
+    #[arg(long, short = 'f', default_value = "text")]
+    format: String,
   },
 
   /// Sync changes between monorepo and split repos
@@ -167,7 +170,7 @@ enum Commands {
     /// Only sync from monorepo to remote
     #[arg(long)]
     to_remote: bool,
-    /// Conflict resolution strategy: ours, theirs, manual, union
+    /// Conflict resolution strategy [ours, theirs, manual, union]
     #[arg(long, default_value = "manual")]
     strategy: String,
     /// Disable protected branch checks (allow direct commits to main/master)
@@ -176,9 +179,9 @@ enum Commands {
     /// Show plan without executing (default: execute with confirmation)
     #[arg(long, short = 'c')]
     check: bool,
-    /// Output plan in JSON format
-    #[arg(long)]
-    json: bool,
+    /// Output format [text, json]
+    #[arg(long, short = 'f', default_value = "text")]
+    format: String,
   },
 
   /// Release automation (version bumping, changelog, publishing)
@@ -190,7 +193,7 @@ enum Commands {
     /// Release all workspace crates in dependency order
     #[arg(short, long)]
     all: bool,
-    /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
+    /// Version bump strategy [major, minor, patch, or explicit e.g. "1.2.3"]
     #[arg(long, default_value = "patch")]
     bump: String,
     /// Show plan without executing (check mode)
@@ -202,9 +205,9 @@ enum Commands {
     /// Skip git tag creation
     #[arg(long)]
     skip_tag: bool,
-    /// Output plan in JSON format
-    #[arg(long)]
-    json: bool,
+    /// Output format [text, json]
+    #[arg(long, short = 'f', default_value = "text")]
+    format: String,
   },
 
   /// Validate release readiness (for CI)
@@ -214,6 +217,9 @@ enum Commands {
     /// Check all workspace crates
     #[arg(short, long)]
     all: bool,
+    /// Output format [text, json]
+    #[arg(long, short = 'f', default_value = "text")]
+    format: String,
   },
 
   /// Clean workspace artifacts (cache, backups, reports)
@@ -227,6 +233,9 @@ enum Commands {
     /// Clean generated reports
     #[arg(long)]
     reports: bool,
+    /// Show what would be cleaned without deleting
+    #[arg(long, short = 'c')]
+    check: bool,
   },
 }
 
@@ -295,8 +304,8 @@ fn main() {
       to,
       format,
       all,
-      output_file,
-    } => commands::run_affected(&ctx, since, from, to, format, all, output_file),
+      output,
+    } => commands::run_affected(&ctx, since, from, to, format, all, output),
     Commands::Test {
       since,
       all,
@@ -321,6 +330,7 @@ fn main() {
     Commands::Unify {
       action,
       check,
+      format,
       exclude,
       include,
       backup,
@@ -351,6 +361,7 @@ fn main() {
           consolidate_transitives,
           include_renamed,
           show_diff,
+          format,
         )
       } else {
         commands::run_unify_apply(&ctx, exclude, include, backup, include_renamed, no_report, report_path)
@@ -363,7 +374,7 @@ fn main() {
       all,
       remote,
       check,
-      json,
+      format,
     } => {
       // Check if this is 'split init <crates>'
       if let Some(name) = crate_name {
@@ -380,11 +391,11 @@ fn main() {
           commands::run_split_init(&ctx, Some(crates), check)
         } else {
           // cargo rail split mycrate (regular split)
-          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), check, json)
+          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), check, format)
         }
       } else {
         // cargo rail split --all or cargo rail split --check
-        commands::run_split(&ctx, None, all, remote.clone(), check, json)
+        commands::run_split(&ctx, None, all, remote.clone(), check, format)
       }
     }
     Commands::Sync {
@@ -396,7 +407,7 @@ fn main() {
       strategy,
       no_protected_branches,
       check,
-      json,
+      format,
     } => commands::run_sync(
       &ctx,
       crate_name,
@@ -407,7 +418,7 @@ fn main() {
       strategy,
       no_protected_branches,
       check,
-      json,
+      format,
     ),
 
     // Release
@@ -419,7 +430,7 @@ fn main() {
       check,
       skip_publish,
       skip_tag,
-      json,
+      format,
     } => {
       // Handle init subcommand
       if action.as_deref() == Some("init") {
@@ -446,7 +457,7 @@ fn main() {
         };
 
         if check {
-          commands::run_release_plan(&ctx, names, bump, skip_publish, skip_tag, json)
+          commands::run_release_plan(&ctx, names, bump, skip_publish, skip_tag, format)
         } else {
           // Execute mode: perform the release
           commands::run_release_publish(&ctx, names, all, bump, skip_publish, skip_tag)
@@ -454,14 +465,18 @@ fn main() {
       }
     }
 
-    Commands::Check { crate_names, all } => {
+    Commands::Check {
+      crate_names,
+      all,
+      format,
+    } => {
       // If --all is specified OR no crate names provided, use None (all crates)
       let names = if all || crate_names.is_empty() {
         None
       } else {
         Some(crate_names)
       };
-      commands::run_release_check(&ctx, names, all)
+      commands::run_release_check(&ctx, names, all, format)
     }
 
     // Clean
@@ -469,7 +484,8 @@ fn main() {
       cache,
       backups,
       reports,
-    } => commands::run_clean(&ctx, cache, backups, reports),
+      check,
+    } => commands::run_clean(&ctx, cache, backups, reports, check),
   };
 
   if let Err(err) = result {

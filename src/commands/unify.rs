@@ -6,7 +6,8 @@
 //! 3. Clean unification with intersection-based features
 
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
-use crate::error::RailResult;
+use crate::commands::common::OutputFormat;
+use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 
 /// Run dependency unification analysis (dry-run)
@@ -17,8 +18,14 @@ pub fn run_unify_analyze(
   pin_transitives_flag: bool,
   include_renamed_flag: bool,
   show_diff: bool,
+  format: String,
 ) -> RailResult<()> {
-  eprintln!("🔍 Analyzing workspace dependencies...\n");
+  let output_format: OutputFormat = format.parse()?;
+  let json = output_format.is_json();
+
+  if !json {
+    eprintln!("🔍 Analyzing workspace dependencies...\n");
+  }
 
   // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
@@ -39,6 +46,31 @@ pub fn run_unify_analyze(
 
   // Run analysis
   let plan = analyzer.analyze()?;
+
+  // JSON output mode
+  if json {
+    let output = serde_json::json!({
+      "workspace_deps": plan.workspace_deps.iter().map(|d| serde_json::json!({
+        "name": d.name,
+        "version": d.version_req,
+        "features": d.features,
+      })).collect::<Vec<_>>(),
+      "member_edits_count": plan.member_edits.values().map(|v| v.len()).sum::<usize>(),
+      "members_affected": plan.member_edits.len(),
+      "transitive_pins": plan.transitive_pins.len(),
+      "has_blocking_issues": plan.has_blocking_issues(),
+      "issues": plan.issues.iter().map(|i| serde_json::json!({
+        "dep_name": i.dep_name,
+        "severity": format!("{:?}", i.severity),
+        "message": i.message,
+      })).collect::<Vec<_>>(),
+    });
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
+    );
+    return Ok(());
+  }
 
   // Display summary
   println!("{}", plan.summary());

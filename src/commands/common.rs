@@ -6,6 +6,51 @@ use crate::split::SplitConfig;
 use crate::sync::SyncConfig;
 use crate::workspace::WorkspaceContext;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// Standard output format for most commands
+///
+/// Use this for commands that just need text/json output.
+/// For commands with more formats (like `affected`), define a specialized enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+}
+
+impl OutputFormat {
+  /// Check if this format is JSON
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+}
+
+impl FromStr for OutputFormat {
+  type Err = RailError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s.to_lowercase().as_str() {
+      "text" => Ok(Self::Text),
+      "json" => Ok(Self::Json),
+      _ => Err(RailError::message(format!(
+        "Unknown format '{}'. Valid formats: text, json",
+        s
+      ))),
+    }
+  }
+}
+
+impl std::fmt::Display for OutputFormat {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Text => write!(f, "text"),
+      Self::Json => write!(f, "json"),
+    }
+  }
+}
 
 /// Builder for split/sync configurations
 ///
