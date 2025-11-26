@@ -82,6 +82,34 @@ pub fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
   Ok(input.trim().is_empty())
 }
 
+/// Detect CHANGELOG file in a crate directory
+///
+/// Searches for common changelog file patterns and returns the first match found.
+pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<std::path::PathBuf> {
+  let changelog_patterns = [
+    "CHANGELOG.md",
+    "CHANGELOG.txt",
+    "CHANGELOG",
+    "Changelog.md",
+    "changelog.md",
+    "CHANGES.md",
+    "CHANGES.txt",
+    "CHANGES",
+    "Changes.md",
+    "changes.md",
+  ];
+
+  for pattern in &changelog_patterns {
+    let changelog = crate_dir.join(pattern);
+    if changelog.exists() {
+      // Return relative path from crate root
+      return Some(std::path::PathBuf::from(pattern));
+    }
+  }
+
+  None
+}
+
 /// Convert a path to Git format (always forward slashes)
 ///
 /// Git expects paths with forward slashes, even on Windows.

@@ -395,11 +395,11 @@ root = "."
     apply_stdout
   );
 
-  // Check that backup was created in target/.cargo-rail/backups/
-  let backup_root = workspace.path.join("target/.cargo-rail/backups");
+  // Check that backup was created in target/cargo-rail/backups/
+  let backup_root = workspace.path.join("target/cargo-rail/backups");
   assert!(
     backup_root.exists(),
-    "Backup directory should exist at target/.cargo-rail/backups"
+    "Backup directory should exist at target/cargo-rail/backups"
   );
 
   // Find the backup directory (should be a timestamp-based folder)

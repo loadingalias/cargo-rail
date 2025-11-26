@@ -3,7 +3,7 @@
 //! This replaces the old WorkspaceMetadata that was confused about --all-features.
 //! We load metadata per target (in parallel) and cache it for reuse.
 
-use crate::error::{RailResult, ResultExt};
+use crate::error::RailResult;
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use rayon::prelude::*;
 use semver::Version;
@@ -68,11 +68,30 @@ impl MultiTargetMetadata {
     // IMPORTANT: NO --all-features! We want cargo's default resolution
     // Features come from manifest analysis (intersection of unconditional)
 
-    let metadata = cmd.exec().with_context(|| {
+    let metadata = cmd.exec().map_err(|e| {
       if let Some(t) = target {
-        format!("Failed to load cargo metadata for target '{}'", t)
+        let err_str = e.to_string();
+        // Detect missing target scenario
+        if err_str.contains("error[E0463]")
+          || err_str.contains("can't find crate")
+          || err_str.contains("target may not be installed")
+        {
+          crate::error::RailError::with_help(
+            format!("Target '{}' is not installed on this machine", t),
+            format!(
+              "Install the target with: rustup target add {}\n\
+               Or remove it from rail.toml [targets] if not needed for this workspace.",
+              t
+            ),
+          )
+        } else {
+          crate::error::RailError::with_help(
+            format!("Failed to load cargo metadata for target '{}'", t),
+            format!("Error: {}\n\nCheck that the target is valid and installed.", e),
+          )
+        }
       } else {
-        "Failed to load cargo metadata".to_string()
+        crate::error::RailError::with_help("Failed to load cargo metadata".to_string(), format!("Error: {}", e))
       }
     })?;
 
@@ -123,9 +142,12 @@ impl MultiTargetMetadata {
   }
 
   /// Get versions of a dependency that are DIRECT dependencies of workspace members only
+  ///
   /// This filters out transitive dependencies, ensuring we only unify versions
-  /// that workspace members explicitly depend on.
-  /// Returns map of target -> version
+  /// that workspace members explicitly depend on. Returns map of target -> version.
+  ///
+  /// Note: Within each target, cargo's resolver produces exactly ONE version per crate.
+  /// We return that resolved version for each target where the dep is a direct dependency.
   pub fn direct_dep_versions(&self, dep_name: &str) -> HashMap<String, Version> {
     let mut versions = HashMap::new();
 
@@ -144,13 +166,11 @@ impl MultiTargetMetadata {
           // Check if this workspace member has dep_name as a direct dependency
           for dep in &node.deps {
             if dep.name == dep_name {
-              // Found a direct dependency - get its version from packages
+              // Found a direct dependency - get its resolved version
               if let Some(pkg) = metadata.packages.iter().find(|p| p.id == dep.pkg) {
-                // Use the highest version if multiple workspace members depend on different versions
-                let existing = versions.get(target);
-                if existing.is_none() || pkg.version > *existing.unwrap() {
-                  versions.insert(target.clone(), pkg.version.clone());
-                }
+                // Cargo resolves to exactly one version per target - just record it
+                versions.insert(target.clone(), pkg.version.clone());
+                break; // Found for this workspace member, move on
               }
             }
           }

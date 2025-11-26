@@ -33,16 +33,13 @@ impl<'a> SplitSyncConfigBuilder<'a> {
 
   /// Select a single crate by name
   pub fn with_crate(mut self, crate_name: &str) -> RailResult<Self> {
-    let split_config = self
-      .config
-      .splits
-      .iter()
-      .find(|s| s.name == crate_name)
-      .ok_or_else(|| {
-        RailError::Config(ConfigError::CrateNotFound {
-          name: crate_name.to_string(),
-        })
-      })?;
+    // Use the helper method to get all splits from unified config
+    let all_splits = self.config.build_split_configs();
+    let split_config = all_splits.iter().find(|s| s.name == crate_name).ok_or_else(|| {
+      RailError::Config(ConfigError::CrateNotFound {
+        name: crate_name.to_string(),
+      })
+    })?;
 
     self.split_configs = vec![split_config.clone()];
     Ok(self)
@@ -50,7 +47,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
 
   /// Select all configured crates
   pub fn with_all_crates(mut self) -> Self {
-    self.split_configs = self.config.splits.clone();
+    self.split_configs = self.config.build_split_configs();
     self
   }
 

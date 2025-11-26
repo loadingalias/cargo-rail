@@ -271,7 +271,7 @@ mod tests {
     let manager = BackupManager::new(workspace.path());
 
     assert_eq!(manager.workspace_root, workspace.path());
-    assert!(manager.backup_root.ends_with("target/.cargo-rail/backups"));
+    assert!(manager.backup_root.ends_with("target/cargo-rail/backups"));
   }
 
   #[test]

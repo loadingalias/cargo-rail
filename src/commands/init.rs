@@ -119,7 +119,7 @@ fn build_rail_config(_workspace_root: PathBuf, targets: Vec<String>, unify: Unif
     targets, // TOP-LEVEL: targets are workspace-wide
     unify,
     release: crate::config::ReleaseConfig::default(),
-    splits: vec![], // Empty by default - use 'cargo rail split init' to configure
+    crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   }
 }
@@ -199,7 +199,7 @@ pub fn run_init_standalone(
     targets: detected_targets,     // TOP-LEVEL: workspace-wide targets
     unify: UnifyConfig::default(), // Use simplified config with defaults
     release: crate::config::ReleaseConfig::default(),
-    splits: vec![],
+    crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   };
 
@@ -250,7 +250,7 @@ mod tests {
       targets: vec![],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
-      splits: vec![],
+      crates: Default::default(),
       formatting: FormattingConfig::default(),
     };
 

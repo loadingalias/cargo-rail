@@ -20,8 +20,7 @@ fn test_split_single_crate_basic() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "mylib"
+[crates.mylib.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -71,8 +70,7 @@ fn test_split_preserves_git_history() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "mylib"
+[crates.mylib.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -115,8 +113,7 @@ fn test_split_filters_unrelated_commits() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "lib-a"
+[crates.lib-a.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -155,8 +152,7 @@ fn test_split_transforms_path_dependencies() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "lib-core"
+[crates.lib-core.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -200,8 +196,7 @@ fn test_split_combined_mode_multiple_crates() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "combined"
+[crates.combined.split]
 remote = "{}"
 branch = "main"
 mode = "combined"
@@ -273,8 +268,7 @@ fn test_split_release_flow_creates_tag_and_changelog() -> Result<()> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "lib-release"
+[crates.lib-release.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -318,15 +312,7 @@ require_clean = false
   // Run release publish in split repo (skip crates.io)
   let output = run_cargo_rail(
     split_root,
-    &[
-      "rail",
-      "release",
-      "publish",
-      "--all",
-      "--bump",
-      "patch",
-      "--skip-publish",
-    ],
+    &["rail", "release", "--all", "--bump", "patch", "--skip-publish"],
   )?;
   assert!(output.status.success(), "Split release should succeed");
 

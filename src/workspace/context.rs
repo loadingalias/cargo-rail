@@ -66,7 +66,7 @@ impl CargoState {
   /// Uses a content-based cache (FNV-1a hash of Cargo.toml + Cargo.lock)
   /// stored in `target/rail/metadata.json` to speed up subsequent loads.
   fn load(workspace_root: &Path) -> RailResult<Self> {
-    let cache_dir = workspace_root.join("target").join("rail");
+    let cache_dir = workspace_root.join("target").join("cargo-rail");
     let cache_file = cache_dir.join("metadata.json");
 
     // Compute current hash

@@ -190,12 +190,12 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     targets: vec![], // No targets by default
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
-    splits: vec![],
+    crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   });
 
-  // Add new splits (avoid duplicates)
-  let existing_names: std::collections::HashSet<_> = config.splits.iter().map(|s| s.name.clone()).collect();
+  // Add new splits to crates config (avoid duplicates)
+  let existing_names: std::collections::HashSet<_> = config.crates.keys().cloned().collect();
   let new_splits: Vec<_> = splits
     .into_iter()
     .filter(|s| !existing_names.contains(&s.name))
@@ -212,7 +212,30 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
   }
   println!();
 
-  config.splits.extend(new_splits);
+  // Convert SplitConfig to unified CrateConfig structure
+  use crate::config::{ChangelogConfig, CrateConfig, CrateReleaseConfig, CrateSplitConfig};
+
+  for split in new_splits {
+    let crate_config = CrateConfig {
+      split: Some(CrateSplitConfig {
+        remote: split.remote,
+        branch: split.branch,
+        mode: split.mode,
+        workspace_mode: split.workspace_mode,
+        paths: split.paths,
+        include: split.include,
+        exclude: split.exclude,
+      }),
+      release: Some(CrateReleaseConfig { publish: split.publish }),
+      changelog: split.changelog_path.map(|path| ChangelogConfig {
+        path: Some(path),
+        skip: false,
+      }),
+      sync: None,
+    };
+
+    config.crates.insert(split.name, crate_config);
+  }
 
   // Serialize config
   let config_toml = serialize_splits_config(&config)?;
@@ -261,6 +284,8 @@ fn detect_workspace_splits(
 
     // Get relative path from workspace root to crate directory
     let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
+    // Detect per-crate CHANGELOG file
+    let changelog_path = crate::utils::detect_crate_changelog(crate_dir);
     let rel_path = match crate_dir.strip_prefix(workspace_root) {
       Ok(p) => p.to_path_buf(),
       Err(_) => continue, // Skip if not under workspace root
@@ -271,9 +296,6 @@ fn detect_workspace_splits(
 
     // Check if crate has publish = false in Cargo.toml
     let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
-
-    // Detect per-crate CHANGELOG file
-    let changelog_path = detect_crate_changelog(crate_dir);
 
     splits.push(SplitConfig {
       name: pkg.name.to_string(),
@@ -290,32 +312,6 @@ fn detect_workspace_splits(
   }
 
   Ok(splits)
-}
-
-/// Detect CHANGELOG file in a crate directory
-fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<std::path::PathBuf> {
-  let changelog_patterns = [
-    "CHANGELOG.md",
-    "CHANGELOG.txt",
-    "CHANGELOG",
-    "Changelog.md",
-    "changelog.md",
-    "CHANGES.md",
-    "CHANGES.txt",
-    "CHANGES",
-    "Changes.md",
-    "changes.md",
-  ];
-
-  for pattern in &changelog_patterns {
-    let changelog = crate_dir.join(pattern);
-    if changelog.exists() {
-      // Return relative path from crate root
-      return Some(std::path::PathBuf::from(pattern));
-    }
-  }
-
-  None
 }
 
 /// Serialize RailConfig to TOML - used for split init

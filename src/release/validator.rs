@@ -41,6 +41,12 @@ impl<'a> ReleaseValidator<'a> {
       }
     }
 
+    // 4. Check for path dependencies and config restrictions
+    for crate_name in crate_names {
+      self.check_path_dependencies(crate_name)?;
+      self.check_config_restrictions(crate_name)?;
+    }
+
     Ok(())
   }
 
@@ -120,6 +126,48 @@ impl<'a> ReleaseValidator<'a> {
       ));
     }
 
+    Ok(())
+  }
+
+  /// Check for path dependencies (which block publishing)
+  fn check_path_dependencies(&self, crate_name: &str) -> RailResult<()> {
+    let metadata = self.ctx.cargo.metadata();
+    let package = metadata
+      .workspace_packages()
+      .into_iter()
+      .find(|pkg| pkg.name == crate_name)
+      .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
+
+    for dep in &package.dependencies {
+      if dep.path.is_some() {
+        // Allow path dependencies if they are dev-dependencies (usually fine for tests)
+        // But for normal/build deps, they block publishing unless they are also workspace deps
+        // that will be replaced by version deps on publish.
+        // For now, we'll be strict: no path deps in published crates.
+        if dep.kind != cargo_metadata::DependencyKind::Development {
+          return Err(RailError::with_help(
+            format!("Crate '{}' has path dependency '{}'", crate_name, dep.name),
+            "Path dependencies cannot be published. Use version dependencies or workspace inheritance.",
+          ));
+        }
+      }
+    }
+
+    Ok(())
+  }
+
+  /// Check rail.toml config restrictions
+  fn check_config_restrictions(&self, crate_name: &str) -> RailResult<()> {
+    if let Some(config) = &self.ctx.config
+      && let Some(crate_config) = config.crates.get(crate_name)
+      && let Some(release_config) = &crate_config.release
+      && !release_config.publish
+    {
+      return Err(RailError::with_help(
+        format!("Crate '{}' is configured as non-publishable in rail.toml", crate_name),
+        "Update rail.toml [crates.NAME.release] section to allow publishing",
+      ));
+    }
     Ok(())
   }
 }

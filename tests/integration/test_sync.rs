@@ -15,16 +15,14 @@ fn setup_split_scenario(crate_name: &str) -> Result<(TestWorkspace, TempDir)> {
     r#"[workspace]
 root = "."
 
-[[splits]]
-name = "{}"
-remote = "{}"
+[crates.{0}.split]
+remote = "{1}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/{}" }}]
+paths = [{{ crate = "crates/{0}" }}]
 "#,
     crate_name,
-    split_dir.path().display().to_string().replace('\\', "\\\\"),
-    crate_name
+    split_dir.path().display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 

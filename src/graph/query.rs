@@ -128,13 +128,16 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
 /// - `cargo rail build --since <commit>`: Incremental workspace builds
 ///
 /// # Example
-/// ```rust,no_run
-/// # use cargo_rail::graph::core::WorkspaceGraph;
-/// # use cargo_rail::graph::query::minimal_test_set;
-/// # use std::path::Path;
-/// # let graph = WorkspaceGraph::load(Path::new(".")).unwrap();
+/// ```rust,ignore
+/// use cargo_rail::graph::core::WorkspaceGraph;
+/// use cargo_rail::graph::query::minimal_test_set;
+/// use std::path::Path;
+/// use cargo_metadata::MetadataCommand;
+///
+/// let metadata = MetadataCommand::new().exec().unwrap();
+/// let graph = WorkspaceGraph::from_metadata(&metadata).unwrap();
 /// // Get crates affected by changes since main branch
-/// let changed_files = vec!["src/lib.rs"]; // Mock changed files
+/// let changed_files = vec!["src/lib.rs"];
 /// let test_set = minimal_test_set(&graph, &changed_files);
 /// // test_set = ["lib-core", "lib-util", "bin-cli"]
 /// ```

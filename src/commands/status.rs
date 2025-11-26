@@ -74,7 +74,7 @@ pub fn run_status(ctx: &WorkspaceContext, json: bool) -> RailResult<()> {
   // Gather status for all crates
   let mut statuses = Vec::new();
 
-  for split_config in &config.splits {
+  for split_config in &config.build_split_configs() {
     let target_repo_path = split_config.target_repo_path(workspace_root);
 
     let target_exists = target_repo_path.exists();

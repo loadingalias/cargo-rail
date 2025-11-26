@@ -21,6 +21,8 @@
 
 /// Find crates affected by changes
 pub mod affected;
+/// Clean up workspace artifacts
+pub mod clean;
 /// Common utilities for command implementations
 pub mod common;
 /// Initialize cargo-rail configuration
@@ -39,8 +41,9 @@ pub mod test;
 pub mod unify;
 
 pub use affected::run_affected;
+pub use clean::run_clean;
 pub use init::{run_init, run_init_standalone};
-pub use release::{run_release_check, run_release_plan, run_release_publish};
+pub use release::{run_release_check, run_release_init, run_release_plan, run_release_publish};
 pub use split::{run_split, run_split_init};
 pub use status::run_status;
 pub use sync::run_sync;

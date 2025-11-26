@@ -19,12 +19,72 @@ pub struct RailConfig {
   /// Release management settings
   #[serde(default)]
   pub release: ReleaseConfig,
-  /// Split/sync configurations for crates
+  /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
-  pub splits: Vec<SplitConfig>,
+  pub crates: std::collections::HashMap<String, CrateConfig>,
   /// TOML formatting settings
   #[serde(default)]
   pub formatting: FormattingConfig,
+}
+
+/// Per-crate configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrateConfig {
+  /// Split/sync configuration for this crate
+  pub split: Option<CrateSplitConfig>,
+  /// Release configuration for this crate
+  pub release: Option<CrateReleaseConfig>,
+  /// Changelog configuration for this crate
+  pub changelog: Option<ChangelogConfig>,
+  /// Sync configuration for this crate (future use)
+  pub sync: Option<CrateSyncConfig>,
+}
+
+/// Split configuration for a crate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrateSplitConfig {
+  /// Remote repository URL or local path
+  pub remote: String,
+  /// Git branch to use
+  pub branch: String,
+  /// Split mode (single or combined)
+  pub mode: SplitMode,
+  /// For combined mode: how to structure the split repo
+  #[serde(default)]
+  pub workspace_mode: WorkspaceMode,
+  /// Crate paths to include in the split
+  #[serde(default)]
+  pub paths: Vec<CratePath>,
+  /// Additional files/directories to include
+  #[serde(default)]
+  pub include: Vec<String>,
+  /// Files/directories to exclude
+  #[serde(default)]
+  pub exclude: Vec<String>,
+}
+
+/// Release configuration for a crate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrateReleaseConfig {
+  /// Enable/disable publishing for this crate (overrides Cargo.toml)
+  #[serde(default = "default_true")]
+  pub publish: bool,
+}
+
+/// Changelog configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogConfig {
+  /// Path to changelog file (relative to crate root)
+  pub path: Option<PathBuf>,
+  /// Exclude this crate from changelog generation?
+  #[serde(default)]
+  pub skip: bool,
+}
+
+/// Sync configuration for a crate (future use)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CrateSyncConfig {
+  // Future sync-specific settings
 }
 
 /// Workspace location configuration
@@ -35,7 +95,6 @@ pub struct WorkspaceConfig {
 }
 
 /// Unify configuration - controls workspace dependency unification behavior
-/// Simplified to 6 essential options (4 core + 2 safety hatches)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifyConfig {
   /// Handle path dependencies? (default: true)
@@ -77,6 +136,39 @@ pub struct UnifyConfig {
   /// resolved dependencies and writes it to [workspace.package].rust-version
   #[serde(default)]
   pub msrv: bool,
+
+  /// Prune features not referenced in source code? (default: false)
+  /// When enabled, analyzes the resolved dependency graph to detect features
+  /// that are declared but never enabled by any consumer across all targets.
+  /// This produces the absolute leanest feature set for the workspace.
+  #[serde(default)]
+  pub prune_dead_features: bool,
+
+  /// Strict version compatibility checking (default: true)
+  /// When true, version mismatches between member manifests and existing
+  /// workspace.dependencies are reported as blocking errors.
+  /// When false, they are warnings only.
+  #[serde(default = "default_true")]
+  pub strict_version_compat: bool,
+
+  /// How to handle exact version pins like "=0.8.0" (default: "warn")
+  /// - "skip": Exclude exact-pinned deps from unification
+  /// - "preserve": Keep the exact pin operator in workspace.dependencies
+  /// - "warn": Convert to caret but emit a warning
+  #[serde(default)]
+  pub exact_pin_handling: ExactPinHandling,
+
+  /// Detect unused dependencies in workspace members (default: false)
+  /// When enabled, compares declared deps against the resolved cargo graph
+  /// to find deps that are declared but never actually used.
+  #[serde(default)]
+  pub detect_unused: bool,
+
+  /// Automatically remove unused dependencies when applying (default: false)
+  /// Requires detect_unused = true. When enabled, unused deps are removed
+  /// from member Cargo.toml files during unify apply.
+  #[serde(default)]
+  pub remove_unused: bool,
 }
 
 fn default_max_backups() -> usize {
@@ -93,6 +185,19 @@ fn default_pin_transitives() -> bool {
 
 fn default_transitive_host() -> TransitiveFeatureHost {
   TransitiveFeatureHost::Root
+}
+
+/// How to handle exact version pins ("=x.y.z") during unification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExactPinHandling {
+  /// Exclude exact-pinned deps from unification entirely
+  Skip,
+  /// Preserve the exact pin operator in workspace.dependencies
+  Preserve,
+  /// Convert to caret (^) but emit a warning (default)
+  #[default]
+  Warn,
 }
 
 /// Configuration for where to add dev-dependencies when consolidating transitive features
@@ -180,6 +285,11 @@ impl Default for UnifyConfig {
       include: Vec::new(),
       max_backups: default_max_backups(),
       msrv: false,
+      prune_dead_features: false,
+      strict_version_compat: true,
+      exact_pin_handling: ExactPinHandling::default(),
+      detect_unused: false,
+      remove_unused: false,
     }
   }
 }
@@ -426,6 +536,38 @@ impl RailConfig {
       .with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
 
     Ok(config)
+  }
+
+  /// Get all crates that have split configuration
+  pub fn get_split_crates(&self) -> Vec<(&str, &CrateSplitConfig)> {
+    self
+      .crates
+      .iter()
+      .filter_map(|(name, config)| config.split.as_ref().map(|split| (name.as_str(), split)))
+      .collect()
+  }
+
+  /// Helper to build all SplitConfigs from unified crate config
+  /// Used for backward compatibility with commands expecting `Vec<SplitConfig>`
+  pub fn build_split_configs(&self) -> Vec<SplitConfig> {
+    self
+      .crates
+      .iter()
+      .filter_map(|(name, config)| {
+        config.split.as_ref().map(|split| SplitConfig {
+          name: name.clone(),
+          remote: split.remote.clone(),
+          branch: split.branch.clone(),
+          mode: split.mode.clone(),
+          workspace_mode: split.workspace_mode.clone(),
+          paths: split.paths.clone(),
+          include: split.include.clone(),
+          exclude: split.exclude.clone(),
+          publish: config.release.as_ref().map(|r| r.publish).unwrap_or(true),
+          changelog_path: config.changelog.as_ref().and_then(|c| c.path.clone()),
+        })
+      })
+      .collect()
   }
 }
 
@@ -697,5 +839,75 @@ mod tests {
     };
 
     assert!(config.validate().is_ok());
+  }
+
+  #[test]
+  fn test_prune_dead_features_default() {
+    let config = UnifyConfig::default();
+    assert!(!config.prune_dead_features);
+  }
+
+  #[test]
+  fn test_prune_dead_features_parsing() {
+    let toml = r#"prune_dead_features = true"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.prune_dead_features);
+
+    let toml = r#"prune_dead_features = false"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.prune_dead_features);
+  }
+
+  // ============================================================================
+  // New Config Options Tests
+  // ============================================================================
+
+  #[test]
+  fn test_strict_version_compat_default() {
+    let config = UnifyConfig::default();
+    assert!(config.strict_version_compat); // Default is true
+  }
+
+  #[test]
+  fn test_exact_pin_handling_default() {
+    let config = UnifyConfig::default();
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Warn);
+  }
+
+  #[test]
+  fn test_exact_pin_handling_parsing() {
+    let toml = r#"exact_pin_handling = "skip""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Skip);
+
+    let toml = r#"exact_pin_handling = "preserve""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
+
+    let toml = r#"exact_pin_handling = "warn""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Warn);
+  }
+
+  #[test]
+  fn test_detect_unused_default() {
+    let config = UnifyConfig::default();
+    assert!(!config.detect_unused);
+    assert!(!config.remove_unused);
+  }
+
+  #[test]
+  fn test_new_config_options_parsing() {
+    let toml = r#"
+      strict_version_compat = false
+      exact_pin_handling = "preserve"
+      detect_unused = true
+      remove_unused = true
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.strict_version_compat);
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
+    assert!(config.detect_unused);
+    assert!(config.remove_unused);
   }
 }

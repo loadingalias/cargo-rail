@@ -240,6 +240,12 @@ pub fn run_unify_apply(
   if !plan.transitive_pins.is_empty() {
     println!("   - {} transitives pinned", plan.transitive_pins.len());
   }
+  if !plan.duplicates_cleaned.is_empty() {
+    println!("   - {} duplicate versions cleaned", plan.duplicates_cleaned.len());
+  }
+  if !plan.pruned_features.is_empty() {
+    println!("   - {} dead features pruned", plan.pruned_features.len());
+  }
   if let Some(ref msrv) = plan.computed_msrv {
     println!(
       "   - MSRV set to {}.{} (from {})",

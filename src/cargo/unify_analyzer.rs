@@ -4,10 +4,11 @@
 //! with WorkspaceContext and uses multi-target metadata + manifest analysis.
 
 use crate::cargo::{
+  feature_scanner::FeatureScanner,
   manifest_analyzer::{DepKind, ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
   multi_target_metadata::{ComputedMsrv, MultiTargetMetadata},
 };
-use crate::config::UnifyConfig;
+use crate::config::{ExactPinHandling, UnifyConfig};
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 use semver::VersionReq;
@@ -86,6 +87,50 @@ pub struct ValidationResult {
   pub error: Option<String>,
 }
 
+/// Record of a duplicate version that was cleaned up
+#[derive(Debug, Clone)]
+pub struct DuplicateCleanup {
+  /// Dependency name
+  pub dep_name: String,
+  /// Versions that were found across different targets
+  pub versions_found: Vec<String>,
+  /// Version that was selected (always highest)
+  pub selected_version: String,
+}
+
+/// Record of a feature that was pruned because it's not used in source code
+#[derive(Debug, Clone)]
+pub struct PrunedFeature {
+  /// Crate that declared the feature
+  pub crate_name: String,
+  /// Feature name that was pruned
+  pub feature_name: String,
+}
+
+/// Record of a version mismatch between member manifest and workspace.dependencies
+#[derive(Debug, Clone)]
+pub struct VersionMismatch {
+  /// Member that has the mismatched version
+  pub member: String,
+  /// Dependency name
+  pub dep_name: String,
+  /// Version declared in the member's Cargo.toml
+  pub member_version: String,
+  /// Version in workspace.dependencies
+  pub workspace_version: String,
+}
+
+/// Record of an unused dependency (declared but not in resolved graph)
+#[derive(Debug, Clone)]
+pub struct UnusedDep {
+  /// Member that has the unused dependency
+  pub member: String,
+  /// Dependency name
+  pub dep_name: String,
+  /// Kind of dependency (normal, dev, build)
+  pub kind: DepKind,
+}
+
 /// Complete unification plan
 #[derive(Debug)]
 pub struct UnificationPlan {
@@ -103,6 +148,14 @@ pub struct UnificationPlan {
   pub issues: Vec<UnifyIssue>,
   /// Computed MSRV from dependency graph (if msrv = true in config)
   pub computed_msrv: Option<ComputedMsrv>,
+  /// Duplicate versions that were silently cleaned up
+  pub duplicates_cleaned: Vec<DuplicateCleanup>,
+  /// Features that were pruned because they're not used in source code
+  pub pruned_features: Vec<PrunedFeature>,
+  /// Version mismatches between member manifests and existing workspace.dependencies
+  pub version_mismatches: Vec<VersionMismatch>,
+  /// Unused dependencies detected in workspace members
+  pub unused_deps: Vec<UnusedDep>,
 }
 
 impl UnificationPlan {
@@ -211,6 +264,65 @@ impl UnificationPlan {
       }
     }
 
+    // Show duplicates that were cleaned up
+    if !self.duplicates_cleaned.is_empty() {
+      s.push_str(&format!(
+        "\nDuplicate versions unified: {}\n",
+        self.duplicates_cleaned.len()
+      ));
+      for dup in &self.duplicates_cleaned {
+        s.push_str(&format!(
+          "  - {} -> {} (was: {})\n",
+          dup.dep_name,
+          dup.selected_version,
+          dup.versions_found.join(", ")
+        ));
+      }
+    }
+
+    // Show pruned dead features
+    if !self.pruned_features.is_empty() {
+      s.push_str(&format!("\nDead features pruned: {}\n", self.pruned_features.len()));
+      // Group by crate
+      let mut by_crate: HashMap<&str, Vec<&str>> = HashMap::new();
+      for pf in &self.pruned_features {
+        by_crate.entry(&pf.crate_name).or_default().push(&pf.feature_name);
+      }
+      for (crate_name, features) in by_crate {
+        s.push_str(&format!("  - {}: {}\n", crate_name, features.join(", ")));
+      }
+    }
+
+    // Show version mismatches
+    if !self.version_mismatches.is_empty() {
+      s.push_str(&format!(
+        "\n⚠️  Version mismatches with workspace.dependencies: {}\n",
+        self.version_mismatches.len()
+      ));
+      for mismatch in &self.version_mismatches {
+        s.push_str(&format!(
+          "  - {} in {}: declares \"{}\" but workspace has \"{}\"\n",
+          mismatch.dep_name, mismatch.member, mismatch.member_version, mismatch.workspace_version
+        ));
+      }
+    }
+
+    // Show unused dependencies
+    if !self.unused_deps.is_empty() {
+      s.push_str(&format!(
+        "\n🗑️  Unused dependencies detected: {}\n",
+        self.unused_deps.len()
+      ));
+      // Group by member
+      let mut by_member: HashMap<&str, Vec<&str>> = HashMap::new();
+      for ud in &self.unused_deps {
+        by_member.entry(&ud.member).or_default().push(&ud.dep_name);
+      }
+      for (member, deps) in by_member {
+        s.push_str(&format!("  - {}: {}\n", member, deps.join(", ")));
+      }
+    }
+
     s
   }
 }
@@ -284,6 +396,16 @@ impl UnifyAnalyzer {
     let mut member_edits: HashMap<String, Vec<MemberEdit>> = HashMap::new();
     let mut member_paths: HashMap<String, PathBuf> = HashMap::new();
     let mut issues = Vec::new();
+    let mut duplicates_cleaned = Vec::new();
+    let mut version_mismatches = Vec::new();
+
+    // Pre-compute workspace member names for reuse
+    let workspace_member_names: HashSet<String> = self
+      .metadata
+      .workspace_packages()
+      .iter()
+      .map(|pkg| pkg.name.to_string())
+      .collect();
 
     // Build member_paths mapping from metadata
     for pkg in self.metadata.workspace_packages() {
@@ -320,6 +442,35 @@ impl UnifyAnalyzer {
         continue;
       }
 
+      // Get usage sites early - needed for version checks
+      let usage_sites = self.manifests.get_usage_sites(dep_key);
+
+      // === Issue B: Check for exact version pins ===
+      let has_exact_pin = usage_sites
+        .iter()
+        .any(|u| u.declared_version.as_ref().map(|v| is_exact_pin(v)).unwrap_or(false));
+
+      if has_exact_pin {
+        match self.config.exact_pin_handling {
+          ExactPinHandling::Skip => {
+            // Skip this dep entirely - don't unify exact pins
+            continue;
+          }
+          ExactPinHandling::Warn => {
+            issues.push(UnifyIssue {
+              dep_name: dep_key.name.clone(),
+              severity: IssueSeverity::Warning,
+              message: "Has exact version pin (=x.y.z) - converting to caret (^). \
+                        Consider adding to unify.exclude or setting exact_pin_handling = \"skip\""
+                .to_string(),
+            });
+          }
+          ExactPinHandling::Preserve => {
+            // Will be handled below when constructing version_req
+          }
+        }
+      }
+
       // Get version from metadata - but ONLY from direct dependencies of workspace members
       // This uses direct_dep_versions() which filters out transitive dependencies
       let versions = self.metadata.direct_dep_versions(&dep_key.name);
@@ -327,27 +478,76 @@ impl UnifyAnalyzer {
         continue; // Not a direct dependency of any workspace member
       }
 
-      // Check version compatibility across workspace members
+      // Get unique versions across all targets
       let unique_versions: HashSet<_> = versions.values().collect();
-      if unique_versions.len() > 1 {
-        issues.push(UnifyIssue {
-          dep_name: dep_key.name.clone(),
-          severity: IssueSeverity::Warning,
-          message: format!(
-            "Version conflict - skipping (found versions: {})",
-            unique_versions
-              .iter()
-              .map(|v| v.to_string())
-              .collect::<Vec<_>>()
-              .join(", ")
-          ),
-        });
-        continue;
-      }
 
-      let version = unique_versions.into_iter().next().unwrap();
-      let version_req = VersionReq::parse(&format!("^{}", version))
-        .unwrap_or_else(|_| VersionReq::parse(&version.to_string()).unwrap());
+      // Always use highest version (cargo's resolver already picks highest compatible)
+      // When targets resolve to different versions, we unify to highest
+      let version = if unique_versions.len() > 1 {
+        // Multiple versions found across targets - use highest
+        // This is the "silent win" - we unify duplicates automatically
+        let selected = unique_versions.iter().max().unwrap();
+
+        // Track the cleanup for reporting
+        let mut versions_found: Vec<_> = unique_versions.iter().map(|v| v.to_string()).collect();
+        versions_found.sort();
+        duplicates_cleaned.push(DuplicateCleanup {
+          dep_name: dep_key.name.clone(),
+          versions_found,
+          selected_version: selected.to_string(),
+        });
+
+        selected
+      } else {
+        unique_versions.iter().next().unwrap()
+      };
+
+      // Construct version requirement - preserve exact pins if configured
+      let version_req = if has_exact_pin && self.config.exact_pin_handling == ExactPinHandling::Preserve {
+        // Find the exact pin version from declared_version
+        let exact_version = usage_sites
+          .iter()
+          .find_map(|u| u.declared_version.as_ref().filter(|v| is_exact_pin(v)))
+          .cloned()
+          .unwrap_or_else(|| format!("={}", version));
+        VersionReq::parse(&exact_version).unwrap_or_else(|_| VersionReq::parse(&format!("^{}", version)).unwrap())
+      } else {
+        VersionReq::parse(&format!("^{}", version)).unwrap_or_else(|_| VersionReq::parse(&version.to_string()).unwrap())
+      };
+
+      // === Issue A: Check for version mismatches with existing workspace.dependencies ===
+      if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&dep_key.name)
+        && let Some(ref ws_version) = existing_ws_dep.version
+      {
+        for usage in &usage_sites {
+          if let Some(ref declared) = usage.declared_version
+            && !versions_compatible(declared, ws_version)
+          {
+            version_mismatches.push(VersionMismatch {
+              member: usage.used_by.clone(),
+              dep_name: dep_key.name.clone(),
+              member_version: declared.clone(),
+              workspace_version: ws_version.clone(),
+            });
+
+            // Add as issue based on strictness config
+            let severity = if self.config.strict_version_compat {
+              IssueSeverity::Error
+            } else {
+              IssueSeverity::Warning
+            };
+            issues.push(UnifyIssue {
+              dep_name: dep_key.name.clone(),
+              severity,
+              message: format!(
+                "{} declares \"{}\" but workspace.dependencies has \"{}\". \
+                 Converting to workspace = true may break this crate.",
+                usage.used_by, declared, ws_version
+              ),
+            });
+          }
+        }
+      }
 
       // Check for mixed defaults - use union strategy if present
       let has_mixed_defaults = self.manifests.has_mixed_defaults(dep_key);
@@ -379,58 +579,55 @@ impl UnifyAnalyzer {
       };
 
       // Get users
-      let usage_sites = self.manifests.get_usage_sites(dep_key);
       let users: HashSet<_> = usage_sites.iter().map(|u| u.used_by.clone()).collect();
 
-      // Check if any usage has a path (path dependencies)
-      // If so, check if the dep is a workspace member to include path in workspace.dependencies
-      let dep_path: Option<PathBuf> = usage_sites.iter().find_map(|u| {
-        u.path.as_ref().and_then(|p| {
-          // Check if this dep name matches a workspace member
-          let workspace_members: HashSet<String> = self
-            .metadata
-            .workspace_packages()
-            .iter()
-            .map(|pkg| pkg.name.to_string())
-            .collect();
-          if workspace_members.contains(&dep_key.name) {
-            // Normalize path relative to workspace root
-            // The path in usage (p) is relative to the member's Cargo.toml
-            // We need to make it relative to the workspace root
-            if let Some(ref manifest_path) = u.manifest_path {
-              // Get the member's directory (parent of Cargo.toml)
-              let member_dir = manifest_path.parent().unwrap_or(manifest_path);
-              // Resolve the dep path relative to the member's directory
-              let absolute_dep_path = member_dir.join(p);
-              // Canonicalize to resolve .. and symlinks (if path exists)
-              let canonical_workspace = self
-                .workspace_root
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace_root.clone());
-              let absolute_dep_path = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path);
-              // Make relative to workspace root
-              if let Ok(relative) = absolute_dep_path.strip_prefix(&canonical_workspace) {
-                Some(relative.to_path_buf())
-              } else {
-                // Fallback: if canonicalization moved outside workspace, use the original resolved path
-                // Try strip_prefix on non-canonicalized path
-                let resolved = member_dir.join(p);
-                if let Ok(relative) = resolved.strip_prefix(&self.workspace_root) {
+      // === Issue C: Check include_paths config before processing path dependencies ===
+      let dep_path: Option<PathBuf> = if self.config.include_paths {
+        // Check if any usage has a path (path dependencies)
+        // If so, check if the dep is a workspace member to include path in workspace.dependencies
+        usage_sites.iter().find_map(|u| {
+          u.path.as_ref().and_then(|p| {
+            if workspace_member_names.contains(&dep_key.name) {
+              // Normalize path relative to workspace root
+              // The path in usage (p) is relative to the member's Cargo.toml
+              // We need to make it relative to the workspace root
+              if let Some(ref manifest_path) = u.manifest_path {
+                // Get the member's directory (parent of Cargo.toml)
+                let member_dir = manifest_path.parent().unwrap_or(manifest_path);
+                // Resolve the dep path relative to the member's directory
+                let absolute_dep_path = member_dir.join(p);
+                // Canonicalize to resolve .. and symlinks (if path exists)
+                let canonical_workspace = self
+                  .workspace_root
+                  .canonicalize()
+                  .unwrap_or_else(|_| self.workspace_root.clone());
+                let absolute_dep_path = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path);
+                // Make relative to workspace root
+                if let Ok(relative) = absolute_dep_path.strip_prefix(&canonical_workspace) {
                   Some(relative.to_path_buf())
                 } else {
-                  // Last resort: just use the path as-is
-                  Some(PathBuf::from(p))
+                  // Fallback: if canonicalization moved outside workspace, use the original resolved path
+                  // Try strip_prefix on non-canonicalized path
+                  let resolved = member_dir.join(p);
+                  if let Ok(relative) = resolved.strip_prefix(&self.workspace_root) {
+                    Some(relative.to_path_buf())
+                  } else {
+                    // Last resort: just use the path as-is
+                    Some(PathBuf::from(p))
+                  }
                 }
+              } else {
+                // No manifest_path available - just use as-is (shouldn't happen)
+                Some(PathBuf::from(p))
               }
             } else {
-              // No manifest_path available - just use as-is (shouldn't happen)
-              Some(PathBuf::from(p))
+              None
             }
-          } else {
-            None
-          }
+          })
         })
-      });
+      } else {
+        None // include_paths = false, skip all path deps
+      };
 
       // Compute the unified features (this is what workspace.dependencies should have)
       let computed_features: Vec<String> = features.into_iter().collect();
@@ -516,6 +713,22 @@ impl UnifyAnalyzer {
       None
     };
 
+    // Scan for dead features if enabled
+    let pruned_features = if self.config.prune_dead_features {
+      println!("Scanning for dead features in resolved graph...");
+      self.scan_dead_features()
+    } else {
+      Vec::new()
+    };
+
+    // === Issue D: Detect unused dependencies ===
+    let unused_deps = if self.config.detect_unused {
+      println!("Detecting unused dependencies...");
+      self.find_unused_deps()
+    } else {
+      Vec::new()
+    };
+
     // Run validation
     let validation_results = self.validate_targets()?;
 
@@ -527,6 +740,10 @@ impl UnifyAnalyzer {
       validation_results,
       issues,
       computed_msrv,
+      duplicates_cleaned,
+      pruned_features,
+      version_mismatches,
+      unused_deps,
     })
   }
 
@@ -572,6 +789,167 @@ impl UnifyAnalyzer {
       )
     }
   }
+
+  /// Detect dead features using resolved cargo metadata
+  ///
+  /// Returns a list of features that are declared in workspace crates but never
+  /// enabled by any consumer in the resolved dependency graph across all targets.
+  fn scan_dead_features(&self) -> Vec<PrunedFeature> {
+    let mut pruned = Vec::new();
+
+    // Analyze workspace using resolved metadata
+    let results = FeatureScanner::analyze_workspace(&self.metadata);
+
+    // Collect dead features
+    for result in results {
+      for feature_name in result.dead_features {
+        pruned.push(PrunedFeature {
+          crate_name: result.crate_name.clone(),
+          feature_name,
+        });
+      }
+    }
+
+    if !pruned.is_empty() {
+      let crate_count = self.metadata.workspace_packages().len();
+      println!("  Found {} dead features across {} crates", pruned.len(), crate_count);
+    }
+
+    pruned
+  }
+
+  /// Detect unused dependencies in workspace members
+  ///
+  /// Compares declared dependencies (from Cargo.toml) against the resolved
+  /// cargo graph to find deps that are declared but never actually used.
+  /// This uses the resolved metadata as the source of truth.
+  fn find_unused_deps(&self) -> Vec<UnusedDep> {
+    let mut unused = Vec::new();
+
+    // Pre-compute workspace member names (these are never "unused")
+    let workspace_member_names: HashSet<String> = self
+      .metadata
+      .workspace_packages()
+      .iter()
+      .map(|pkg| pkg.name.to_string())
+      .collect();
+
+    // For each workspace member, check declared deps against resolved
+    for member in &self.manifests.members {
+      // Get resolved deps for this member from the metadata
+      let resolved_deps = self.get_resolved_deps_for_member(&member.package_name);
+
+      // Check each declared dependency
+      for (dep_key, usage) in &member.dependencies {
+        // Skip workspace member deps - they're always structurally "used"
+        if workspace_member_names.contains(&dep_key.name) {
+          continue;
+        }
+
+        // Check if this dep appears in the resolved graph for this member
+        if !resolved_deps.contains(&dep_key.name) {
+          unused.push(UnusedDep {
+            member: member.package_name.clone(),
+            dep_name: dep_key.name.clone(),
+            kind: usage.kind,
+          });
+        }
+      }
+    }
+
+    if !unused.is_empty() {
+      println!("  Found {} unused dependencies", unused.len());
+    }
+
+    unused
+  }
+
+  /// Get all resolved direct dependencies for a workspace member
+  ///
+  /// Uses the resolved cargo metadata graph to find what deps are actually
+  /// used by a member. This is the source of truth for dependency usage.
+  fn get_resolved_deps_for_member(&self, member_name: &str) -> HashSet<String> {
+    let mut deps = HashSet::new();
+
+    // Check across all targets to ensure we catch platform-specific deps
+    for metadata in self.metadata.targets().iter().filter_map(|t| self.metadata.get(t)) {
+      if let Some(resolve) = &metadata.resolve {
+        // Find the node for this member
+        for node in &resolve.nodes {
+          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
+            && pkg.name == member_name
+          {
+            // Collect all direct dependencies from this node
+            for dep in &node.deps {
+              deps.insert(dep.name.clone());
+            }
+          }
+        }
+      }
+    }
+
+    deps
+  }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Check if a version string is an exact pin ("=x.y.z")
+fn is_exact_pin(version: &str) -> bool {
+  version.starts_with('=') && !version.starts_with(">=")
+}
+
+/// Check if two version requirements are compatible
+///
+/// This is a heuristic check - it compares the major.minor portions
+/// to detect obvious incompatibilities like "0.11" vs "0.13".
+fn versions_compatible(member_version: &str, workspace_version: &str) -> bool {
+  // Strip leading operators for comparison
+  let member_ver = strip_version_op(member_version);
+  let workspace_ver = strip_version_op(workspace_version);
+
+  // Parse into parts
+  let member_parts: Vec<&str> = member_ver.split('.').collect();
+  let workspace_parts: Vec<&str> = workspace_ver.split('.').collect();
+
+  // For semver compatibility, major must match (or be 0)
+  // For 0.x versions, minor must also match
+  if member_parts.is_empty() || workspace_parts.is_empty() {
+    return true; // Can't determine, assume compatible
+  }
+
+  let member_major = member_parts[0].parse::<u32>().unwrap_or(0);
+  let workspace_major = workspace_parts[0].parse::<u32>().unwrap_or(0);
+
+  if member_major != workspace_major {
+    return false;
+  }
+
+  // For 0.x versions, minor must match
+  if member_major == 0 {
+    let member_minor = member_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let workspace_minor = workspace_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    if member_minor != workspace_minor {
+      return false;
+    }
+  }
+
+  true
+}
+
+/// Strip version operators from a version string
+fn strip_version_op(version: &str) -> &str {
+  version
+    .trim_start_matches(">=")
+    .trim_start_matches("<=")
+    .trim_start_matches('>')
+    .trim_start_matches('<')
+    .trim_start_matches('=')
+    .trim_start_matches('^')
+    .trim_start_matches('~')
+    .trim()
 }
 
 // ============================================================================
@@ -596,6 +974,16 @@ impl UnifyReport {
     md.push_str(&format!("- **Dependencies Unified:** {}\n", plan.workspace_deps.len()));
     md.push_str(&format!("- **Members Updated:** {}\n", plan.member_edits.len()));
     md.push_str(&format!("- **Transitive Pins:** {}\n", plan.transitive_pins.len()));
+    md.push_str(&format!(
+      "- **Duplicates Cleaned:** {}\n",
+      plan.duplicates_cleaned.len()
+    ));
+    md.push_str(&format!("- **Dead Features Pruned:** {}\n", plan.pruned_features.len()));
+    md.push_str(&format!(
+      "- **Version Mismatches:** {}\n",
+      plan.version_mismatches.len()
+    ));
+    md.push_str(&format!("- **Unused Dependencies:** {}\n", plan.unused_deps.len()));
     md.push_str(&format!("- **Issues:** {}\n\n", plan.issues.len()));
 
     if !plan.workspace_deps.is_empty() {
@@ -620,6 +1008,63 @@ impl UnifyReport {
           "| {} | {} | {} | {} |\n",
           dep.name, dep.version_req, features, users
         ));
+      }
+      md.push('\n');
+    }
+
+    if !plan.duplicates_cleaned.is_empty() {
+      md.push_str("## Duplicates Unified\n\n");
+      md.push_str("| Dependency | Selected Version | Previous Versions |\n");
+      md.push_str("|------------|------------------|-------------------|\n");
+
+      for dup in &plan.duplicates_cleaned {
+        md.push_str(&format!(
+          "| {} | {} | {} |\n",
+          dup.dep_name,
+          dup.selected_version,
+          dup.versions_found.join(", ")
+        ));
+      }
+      md.push('\n');
+    }
+
+    if !plan.pruned_features.is_empty() {
+      md.push_str("## Dead Features Pruned\n\n");
+      md.push_str("| Crate | Feature |\n");
+      md.push_str("|-------|----------|\n");
+
+      for pf in &plan.pruned_features {
+        md.push_str(&format!("| {} | {} |\n", pf.crate_name, pf.feature_name));
+      }
+      md.push('\n');
+    }
+
+    if !plan.version_mismatches.is_empty() {
+      md.push_str("## Version Mismatches\n\n");
+      md.push_str("| Member | Dependency | Declared | Workspace |\n");
+      md.push_str("|--------|------------|----------|------------|\n");
+
+      for mismatch in &plan.version_mismatches {
+        md.push_str(&format!(
+          "| {} | {} | {} | {} |\n",
+          mismatch.member, mismatch.dep_name, mismatch.member_version, mismatch.workspace_version
+        ));
+      }
+      md.push('\n');
+    }
+
+    if !plan.unused_deps.is_empty() {
+      md.push_str("## Unused Dependencies\n\n");
+      md.push_str("| Member | Dependency | Kind |\n");
+      md.push_str("|--------|------------|------|\n");
+
+      for ud in &plan.unused_deps {
+        let kind_str = match ud.kind {
+          DepKind::Normal => "normal",
+          DepKind::Dev => "dev",
+          DepKind::Build => "build",
+        };
+        md.push_str(&format!("| {} | {} | {} |\n", ud.member, ud.dep_name, kind_str));
       }
       md.push('\n');
     }
@@ -650,5 +1095,68 @@ impl UnifyReport {
 
     std::fs::write(path, content)?;
     Ok(())
+  }
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_is_exact_pin() {
+    assert!(is_exact_pin("=1.0.0"));
+    assert!(is_exact_pin("=0.8.0"));
+    assert!(!is_exact_pin(">=1.0.0"));
+    assert!(!is_exact_pin("^1.0.0"));
+    assert!(!is_exact_pin("1.0.0"));
+    assert!(!is_exact_pin("~1.0.0"));
+  }
+
+  #[test]
+  fn test_strip_version_op() {
+    assert_eq!(strip_version_op("=1.0.0"), "1.0.0");
+    assert_eq!(strip_version_op("^1.0.0"), "1.0.0");
+    assert_eq!(strip_version_op(">=1.0.0"), "1.0.0");
+    assert_eq!(strip_version_op("~1.0.0"), "1.0.0");
+    assert_eq!(strip_version_op("1.0.0"), "1.0.0");
+    assert_eq!(strip_version_op("<=2.0"), "2.0");
+    assert_eq!(strip_version_op(">0.5"), "0.5");
+  }
+
+  #[test]
+  fn test_versions_compatible_major_match() {
+    // Same major version (>=1.0) should be compatible
+    assert!(versions_compatible("1.0", "1.5"));
+    assert!(versions_compatible("^1.0", "1.5"));
+    assert!(versions_compatible("2.0", "2.3.1"));
+  }
+
+  #[test]
+  fn test_versions_compatible_major_mismatch() {
+    // Different major versions are incompatible
+    assert!(!versions_compatible("1.0", "2.0"));
+    assert!(!versions_compatible("^2.0", "3.0"));
+  }
+
+  #[test]
+  fn test_versions_compatible_zero_major() {
+    // For 0.x versions, minor must also match
+    assert!(versions_compatible("0.11", "0.11.5"));
+    assert!(versions_compatible("^0.11", "0.11"));
+    assert!(!versions_compatible("0.11", "0.13"));
+    assert!(!versions_compatible("^0.8", "0.9"));
+  }
+
+  #[test]
+  fn test_versions_compatible_exact_pins() {
+    // Exact pins with same version are compatible
+    assert!(versions_compatible("=1.0.0", "1.0.0"));
+    assert!(versions_compatible("=0.8.0", "0.8"));
+    // Different versions are incompatible
+    assert!(!versions_compatible("=1.0.0", "2.0.0"));
   }
 }

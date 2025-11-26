@@ -110,6 +110,29 @@ impl RailConfigBuilder {
       config.msrv
     ));
 
+    // Strict version compatibility
+    content.push_str(&format!(
+      "strict_version_compat = {}  # Treat version mismatches as errors (default: true)\n",
+      config.strict_version_compat
+    ));
+
+    // Exact pin handling
+    let exact_pin_str = match config.exact_pin_handling {
+      crate::config::ExactPinHandling::Skip => "skip",
+      crate::config::ExactPinHandling::Preserve => "preserve",
+      crate::config::ExactPinHandling::Warn => "warn",
+    };
+    content.push_str(&format!(
+      "exact_pin_handling = \"{}\"  # How to handle =x.y.z pins: skip, preserve, warn (default: warn)\n",
+      exact_pin_str
+    ));
+
+    // Unused dependency detection
+    content.push_str(&format!(
+      "detect_unused = {}  # Detect unused dependencies (default: false)\n",
+      config.detect_unused
+    ));
+
     self.sections.push(format!("[unify]\n{}\n", content));
 
     self
@@ -291,7 +314,7 @@ mod tests {
       targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
-      splits: vec![],
+      crates: Default::default(),
       formatting: crate::config::FormattingConfig::default(),
     };
 

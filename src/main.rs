@@ -165,6 +165,8 @@ enum Commands {
 
   /// Release automation (version bumping, changelog, publishing)
   Release {
+    /// Optional action: init (configure release settings for crates)
+    action: Option<String>,
     /// Crate name(s) to release (omit for --all)
     crate_names: Vec<String>,
     /// Release all workspace crates in dependency order
@@ -201,6 +203,19 @@ enum Commands {
     /// Output status in JSON format
     #[arg(long)]
     json: bool,
+  },
+
+  /// Clean workspace artifacts (cache, backups, reports)
+  Clean {
+    /// Clean only metadata cache
+    #[arg(long)]
+    cache: bool,
+    /// Clean/prune backups (default: prune, --all: delete all)
+    #[arg(long)]
+    backups: bool,
+    /// Clean generated reports
+    #[arg(long)]
+    reports: bool,
   },
 }
 
@@ -373,6 +388,7 @@ fn main() {
 
     // Release
     Commands::Release {
+      action,
       crate_names,
       all,
       bump,
@@ -381,19 +397,36 @@ fn main() {
       skip_tag,
       json,
     } => {
-      // If --all is specified OR no crate names provided, use None (all crates)
-      let names = if all || crate_names.is_empty() {
-        None
+      // Handle init subcommand
+      if action.as_deref() == Some("init") {
+        // cargo rail release init <crates>
+        let crates_str = if crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names.join(","))
+        };
+        commands::run_release_init(&ctx, crates_str.as_deref(), dry_run)
       } else {
-        Some(crate_names)
-      };
+        // Regular release command
+        // If action is provided and not "init", treat it as the first crate name
+        let mut all_crate_names = crate_names;
+        if let Some(first_crate) = action {
+          all_crate_names.insert(0, first_crate);
+        }
 
-      if dry_run {
-        // Dry-run mode: show plan
-        commands::run_release_plan(&ctx, names, bump, json)
-      } else {
-        // Execute mode: perform the release
-        commands::run_release_publish(&ctx, names, all, bump, true, skip_publish, skip_tag)
+        // If --all is specified OR no crate names provided, use None (all crates)
+        let names = if all || all_crate_names.is_empty() {
+          None
+        } else {
+          Some(all_crate_names)
+        };
+
+        if dry_run {
+          commands::run_release_plan(&ctx, names, bump, json)
+        } else {
+          // Execute mode: perform the release
+          commands::run_release_publish(&ctx, names, all, bump, true, skip_publish, skip_tag)
+        }
       }
     }
 
@@ -409,6 +442,13 @@ fn main() {
 
     // Status
     Commands::Status { json } => commands::run_status(&ctx, json),
+
+    // Clean
+    Commands::Clean {
+      cache,
+      backups,
+      reports,
+    } => commands::run_clean(&ctx, cache, backups, reports),
   };
 
   if let Err(err) = result {
