@@ -1,6 +1,8 @@
 mod helpers;
 mod test_affected;
+mod test_check;
 mod test_classification;
+mod test_error_handling;
 mod test_git_notes;
 mod test_init;
 mod test_release_changelog;

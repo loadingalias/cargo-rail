@@ -45,7 +45,7 @@ root = "."
   )?;
 
   // Run analyze - should show Soft warning
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -130,7 +130,7 @@ allow_renamed = false
   )?;
 
   // Run analyze - should show Hard blocker
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -260,7 +260,7 @@ exclude = ["serde"]
   )?;
 
   // Run analyze
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   // Should show anyhow, but not serde

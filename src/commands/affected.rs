@@ -5,17 +5,27 @@
 //! - Which crates transitively depend on those changed crates
 //! - The minimal set of crates that need testing/building
 
+use crate::change_detection::classify::{ChangeKind, classify_file};
+use crate::config::ChangeDetectionConfig;
 use crate::error::{RailError, RailResult};
 use crate::graph::AffectedAnalysis;
 use crate::workspace::WorkspaceContext;
+use glob::Pattern;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Output format for affected command
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum OutputFormat {
   Text,
   Json,
   NamesOnly,
+  /// GitHub Actions output format for $GITHUB_OUTPUT
+  GitHub,
+  /// GitHub Actions matrix format for strategy.matrix
+  GitHubMatrix,
+  /// JSON Lines format (one object per line)
+  JsonLines,
 }
 
 impl OutputFormat {
@@ -24,8 +34,11 @@ impl OutputFormat {
       "text" => Ok(Self::Text),
       "json" => Ok(Self::Json),
       "names" | "names-only" => Ok(Self::NamesOnly),
+      "github" => Ok(Self::GitHub),
+      "github-matrix" => Ok(Self::GitHubMatrix),
+      "jsonl" | "json-lines" => Ok(Self::JsonLines),
       _ => Err(RailError::message(format!(
-        "Unknown format '{}'. Valid formats: text, json, names-only",
+        "Unknown format '{}'. Valid formats: text, json, names-only, github, github-matrix, jsonl",
         s
       ))),
     }
@@ -39,27 +52,188 @@ pub fn run_affected(
   from: Option<String>,
   to: Option<String>,
   format: String,
-  dry_run: bool,
+  all: bool,
+  output_file: Option<PathBuf>,
 ) -> RailResult<()> {
   let output_format = OutputFormat::from_str(&format)?;
+
+  // If --all flag is set, show all workspace crates regardless of changes
+  if all {
+    return display_all_crates(ctx, output_format, output_file.as_ref());
+  }
 
   // Get changed files from git
   let changed_files = get_changed_files(ctx, &since, from.as_deref(), to.as_deref())?;
 
-  if dry_run {
-    println!("DRY RUN: Would analyze {} changed files", changed_files.len());
-    for file in &changed_files {
-      println!("  - {}", file.display());
-    }
-    return Ok(());
-  }
+  // Get change-detection config (from rail.toml or defaults)
+  let cd_config = ctx
+    .config
+    .as_ref()
+    .map(|c| c.change_detection.clone())
+    .unwrap_or_default();
+
+  // Classify files to detect infrastructure changes
+  let classification = classify_changed_files(&changed_files, &cd_config);
 
   // Analyze affected crates
   let analysis = crate::graph::analyze(&ctx.graph, &changed_files)?;
 
   // Output results
-  display_results(&analysis, output_format)?;
+  display_results(&analysis, &classification, output_format, output_file.as_ref())?;
 
+  Ok(())
+}
+
+/// File classification results for change detection
+#[derive(Debug, Clone)]
+struct ChangeClassification {
+  /// True if only documentation files changed
+  docs_only: bool,
+  /// True if infrastructure files changed (requires full rebuild)
+  rebuild_all: bool,
+  /// Infrastructure files that triggered rebuild_all
+  infrastructure_files: Vec<String>,
+}
+
+/// Classify changed files to detect special cases
+fn classify_changed_files(changed_files: &[PathBuf], config: &ChangeDetectionConfig) -> ChangeClassification {
+  let mut docs_only = true;
+  let mut rebuild_all = false;
+  let mut infrastructure_files = Vec::new();
+
+  // Compile infrastructure patterns (with glob support)
+  let infra_patterns: Vec<Pattern> = config
+    .infrastructure
+    .iter()
+    .filter_map(|p| Pattern::new(p).ok())
+    .collect();
+
+  for file in changed_files {
+    let path_str = file.to_string_lossy();
+
+    // Check for infrastructure files that trigger rebuild_all
+    if is_infrastructure_file(&path_str, &infra_patterns) {
+      rebuild_all = true;
+      infrastructure_files.push(path_str.to_string());
+      docs_only = false;
+      continue;
+    }
+
+    // Check file classification
+    let kind = classify_file(file);
+    match kind {
+      ChangeKind::Documentation => {
+        // Still docs_only if all files so far are docs
+      }
+      _ => {
+        docs_only = false;
+      }
+    }
+  }
+
+  // If no files changed, docs_only should be false
+  if changed_files.is_empty() {
+    docs_only = false;
+  }
+
+  ChangeClassification {
+    docs_only,
+    rebuild_all,
+    infrastructure_files,
+  }
+}
+
+/// Check if a file path is an infrastructure file that should trigger rebuild_all
+fn is_infrastructure_file(path_str: &str, patterns: &[Pattern]) -> bool {
+  for pattern in patterns {
+    if pattern.matches(path_str) {
+      return true;
+    }
+  }
+  false
+}
+
+/// Display all workspace crates (--all mode)
+fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file: Option<&PathBuf>) -> RailResult<()> {
+  let mut all_crates: Vec<String> = ctx.graph.workspace_members();
+  all_crates.sort();
+
+  let output = match format {
+    OutputFormat::Text => {
+      let mut out = String::new();
+      out.push_str("All Workspace Crates\n");
+      out.push_str("====================\n");
+      out.push('\n');
+      out.push_str(&format!("Total: {} crates\n", all_crates.len()));
+      for crate_name in &all_crates {
+        out.push_str(&format!("  📦 {}\n", crate_name));
+      }
+      out
+    }
+    OutputFormat::Json => {
+      use serde_json::json;
+      let output = json!({
+          "crates": all_crates,
+          "count": all_crates.len()
+      });
+      serde_json::to_string_pretty(&output)
+        .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))?
+    }
+    OutputFormat::NamesOnly => all_crates.join("\n"),
+    OutputFormat::GitHub => {
+      // GitHub Actions output format
+      let test_matrix = serde_json::to_string(&all_crates)
+        .map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?;
+      format!(
+        "docs_only=false\nrebuild_all=false\ntest_matrix={}\naffected_count={}\ncrates={}",
+        test_matrix,
+        all_crates.len(),
+        all_crates.join(" ")
+      )
+    }
+    OutputFormat::GitHubMatrix => {
+      // GitHub Actions strategy.matrix format
+      use serde_json::json;
+      let matrix = json!({
+          "include": all_crates.iter().map(|c| json!({"crate": c})).collect::<Vec<_>>()
+      });
+      serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?
+    }
+    OutputFormat::JsonLines => {
+      // JSON Lines format - one object per crate
+      all_crates
+        .iter()
+        .map(|c| {
+          serde_json::to_string(&serde_json::json!({"crate": c}))
+            .map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))
+        })
+        .collect::<RailResult<Vec<_>>>()?
+        .join("\n")
+    }
+  };
+
+  write_output(&output, output_file)?;
+  Ok(())
+}
+
+/// Write output to stdout or file
+fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> {
+  match output_file {
+    Some(path) => {
+      // Write to file (append mode for GITHUB_OUTPUT compatibility)
+      let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| RailError::message(format!("Failed to open output file '{}': {}", path.display(), e)))?;
+      writeln!(file, "{}", content)
+        .map_err(|e| RailError::message(format!("Failed to write to '{}': {}", path.display(), e)))?;
+      eprintln!("📝 Output written to: {}", path.display());
+    }
+    None => {
+      println!("{}", content);
+    }
+  }
   Ok(())
 }
 
@@ -86,87 +260,101 @@ fn get_changed_files(
 }
 
 /// Display affected analysis results
-fn display_results(analysis: &AffectedAnalysis, format: OutputFormat) -> RailResult<()> {
-  match format {
-    OutputFormat::Text => display_text(analysis),
-    OutputFormat::Json => display_json(analysis),
-    OutputFormat::NamesOnly => display_names_only(analysis),
-  }
+fn display_results(
+  analysis: &AffectedAnalysis,
+  classification: &ChangeClassification,
+  format: OutputFormat,
+  output_file: Option<&PathBuf>,
+) -> RailResult<()> {
+  let output = match format {
+    OutputFormat::Text => format_text(analysis, classification),
+    OutputFormat::Json => format_json(analysis, classification)?,
+    OutputFormat::NamesOnly => format_names_only(analysis),
+    OutputFormat::GitHub => format_github(analysis, classification)?,
+    OutputFormat::GitHubMatrix => format_github_matrix(analysis)?,
+    OutputFormat::JsonLines => format_jsonl(analysis, classification)?,
+  };
+
+  write_output(&output, output_file)
 }
 
-/// Display results in human-readable text format
-fn display_text(analysis: &AffectedAnalysis) -> RailResult<()> {
-  println!("Affected Analysis");
-  println!("=================");
-  println!();
+/// Helper to get sorted vectors from analysis
+fn get_sorted_analysis(analysis: &AffectedAnalysis) -> (Vec<String>, Vec<String>, Vec<String>) {
+  let direct = {
+    let mut v: Vec<_> = analysis.impact.direct.iter().cloned().collect();
+    v.sort();
+    v
+  };
+  let dependents = {
+    let mut v: Vec<_> = analysis.impact.dependents.iter().cloned().collect();
+    v.sort();
+    v
+  };
+  let test_targets = {
+    let mut v: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
+    v.sort();
+    v
+  };
+  (direct, dependents, test_targets)
+}
 
-  println!("Changed files: {}", analysis.changed_files.len());
+/// Format results in human-readable text format
+fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> String {
+  let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
+
+  let mut out = String::new();
+  out.push_str("Affected Analysis\n");
+  out.push_str("=================\n");
+  out.push('\n');
+
+  // Show classification info
+  if classification.docs_only {
+    out.push_str("📚 Documentation-only changes detected\n\n");
+  }
+  if classification.rebuild_all {
+    out.push_str("⚠️  Infrastructure changes detected (rebuild all recommended):\n");
+    for file in &classification.infrastructure_files {
+      out.push_str(&format!("   - {}\n", file));
+    }
+    out.push('\n');
+  }
+
+  out.push_str(&format!("Changed files: {}\n", analysis.changed_files.len()));
   if !analysis.changed_files.is_empty() && analysis.changed_files.len() <= 20 {
     for file in &analysis.changed_files {
-      println!("  {}", file);
+      out.push_str(&format!("  {}\n", file));
     }
-    println!();
+    out.push('\n');
   }
 
-  let direct: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.direct.iter().cloned().collect();
-    v.sort();
-    v
-  };
-
-  let dependents: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.dependents.iter().cloned().collect();
-    v.sort();
-    v
-  };
-
-  let test_targets: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
-    v.sort();
-    v
-  };
-
-  println!("Direct impact: {} crates", direct.len());
+  out.push_str(&format!("Direct impact: {} crates\n", direct.len()));
   for crate_name in &direct {
-    println!("  📦 {}", crate_name);
+    out.push_str(&format!("  📦 {}\n", crate_name));
   }
-  println!();
+  out.push('\n');
 
-  println!("Transitive dependents: {} crates", dependents.len());
+  out.push_str(&format!("Transitive dependents: {} crates\n", dependents.len()));
   for crate_name in &dependents {
-    println!("  ⬆  {}", crate_name);
+    out.push_str(&format!("  ⬆  {}\n", crate_name));
   }
-  println!();
+  out.push('\n');
 
-  println!("Test targets (direct + dependents): {} crates", test_targets.len());
+  out.push_str(&format!(
+    "Test targets (direct + dependents): {} crates\n",
+    test_targets.len()
+  ));
   for crate_name in &test_targets {
-    println!("  🎯 {}", crate_name);
+    out.push_str(&format!("  🎯 {}\n", crate_name));
   }
 
-  Ok(())
+  out
 }
 
-/// Display results in JSON format
-fn display_json(analysis: &AffectedAnalysis) -> RailResult<()> {
+/// Format results in JSON format
+fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
   use serde_json::json;
 
-  let direct: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.direct.iter().cloned().collect();
-    v.sort();
-    v
-  };
-
-  let dependents: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.dependents.iter().cloned().collect();
-    v.sort();
-    v
-  };
-
-  let test_targets: Vec<_> = {
-    let mut v: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
-    v.sort();
-    v
-  };
+  let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
   let output = json!({
       "changed_files": analysis.changed_files,
@@ -174,6 +362,11 @@ fn display_json(analysis: &AffectedAnalysis) -> RailResult<()> {
           "direct": direct,
           "dependents": dependents,
           "test_targets": test_targets
+      },
+      "classification": {
+          "docs_only": classification.docs_only,
+          "rebuild_all": classification.rebuild_all,
+          "infrastructure_files": classification.infrastructure_files
       },
       "summary": {
           "changed_files_count": analysis.changed_files.len(),
@@ -183,21 +376,78 @@ fn display_json(analysis: &AffectedAnalysis) -> RailResult<()> {
       }
   });
 
-  let json_output = serde_json::to_string_pretty(&output)
-    .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))?;
-  println!("{}", json_output);
-
-  Ok(())
+  serde_json::to_string_pretty(&output)
+    .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))
 }
 
-/// Display only crate names (test targets)
-fn display_names_only(analysis: &AffectedAnalysis) -> RailResult<()> {
+/// Format only crate names (test targets)
+fn format_names_only(analysis: &AffectedAnalysis) -> String {
   let mut test_targets: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
   test_targets.sort();
+  test_targets.join("\n")
+}
 
-  for crate_name in test_targets {
-    println!("{}", crate_name);
+/// Format GitHub Actions output for $GITHUB_OUTPUT
+fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
+  let (_, _, test_targets) = get_sorted_analysis(analysis);
+
+  let test_matrix = serde_json::to_string(&test_targets)
+    .map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?;
+
+  Ok(format!(
+    "docs_only={}\nrebuild_all={}\ntest_matrix={}\naffected_count={}\ncrates={}",
+    classification.docs_only,
+    classification.rebuild_all,
+    test_matrix,
+    test_targets.len(),
+    test_targets.join(" ")
+  ))
+}
+
+/// Format GitHub Actions strategy.matrix output
+fn format_github_matrix(analysis: &AffectedAnalysis) -> RailResult<String> {
+  use serde_json::json;
+
+  let (_, _, test_targets) = get_sorted_analysis(analysis);
+
+  let matrix = json!({
+      "include": test_targets.iter().map(|c| json!({"crate": c})).collect::<Vec<_>>()
+  });
+
+  serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))
+}
+
+/// Format JSON Lines output (one JSON object per line)
+fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
+  use serde_json::json;
+
+  let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
+
+  // First line: metadata
+  let meta = json!({
+      "type": "metadata",
+      "docs_only": classification.docs_only,
+      "rebuild_all": classification.rebuild_all,
+      "changed_files_count": analysis.changed_files.len(),
+      "affected_count": test_targets.len()
+  });
+
+  let mut lines =
+    vec![serde_json::to_string(&meta).map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))?];
+
+  // One line per affected crate
+  for crate_name in &test_targets {
+    let is_direct = direct.contains(crate_name);
+    let is_dependent = dependents.contains(crate_name);
+    let crate_obj = json!({
+        "type": "crate",
+        "name": crate_name,
+        "direct": is_direct,
+        "transitive": is_dependent && !is_direct
+    });
+    lines
+      .push(serde_json::to_string(&crate_obj).map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))?);
   }
 
-  Ok(())
+  Ok(lines.join("\n"))
 }

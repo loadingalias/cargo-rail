@@ -56,19 +56,19 @@ fn test_init_respects_force_flag() -> Result<()> {
 }
 
 #[test]
-fn test_init_dry_run() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-dry-run")?;
+fn test_init_check_mode() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-check")?;
   ws.remove_config()?; // Remove default config for init test
 
-  // Run init with --dry-run
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--dry-run", "--non-interactive"])?;
+  // Run init with --check
+  let output = run_cargo_rail(&ws.path, &["rail", "init", "--check", "--non-interactive"])?;
 
   // Verify success
-  assert!(output.status.success(), "dry-run should succeed");
+  assert!(output.status.success(), "check mode should succeed");
 
   // Verify config was NOT created
   let config_path = &ws.path.join(".config/rail.toml");
-  assert!(!config_path.exists(), "config file should NOT be created in dry-run");
+  assert!(!config_path.exists(), "config file should NOT be created in check mode");
 
   // Verify output shows config
   let stdout = String::from_utf8_lossy(&output.stdout);

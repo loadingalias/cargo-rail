@@ -15,8 +15,10 @@ pub fn run_unify_analyze(
   exclude: Vec<String>,
   include: Vec<String>,
   pin_transitives_flag: bool,
+  include_renamed_flag: bool,
+  show_diff: bool,
 ) -> RailResult<()> {
-  println!("🔍 Analyzing workspace dependencies...\n");
+  eprintln!("🔍 Analyzing workspace dependencies...\n");
 
   // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
@@ -31,12 +33,81 @@ pub fn run_unify_analyze(
   if pin_transitives_flag {
     analyzer.config.pin_transitives = true;
   }
+  if include_renamed_flag {
+    analyzer.config.include_renamed = true;
+  }
 
   // Run analysis
   let plan = analyzer.analyze()?;
 
   // Display summary
   println!("{}", plan.summary());
+
+  // Show diff if requested
+  if show_diff && (!plan.member_edits.is_empty() || !plan.workspace_deps.is_empty()) {
+    println!("\n=== Planned Changes ===\n");
+
+    // Show workspace deps that will be added
+    if !plan.workspace_deps.is_empty() {
+      println!("📝 [workspace.dependencies] additions:");
+      for dep in &plan.workspace_deps {
+        println!("  + {} = \"{}\"", dep.name, dep.version_req);
+        if !dep.features.is_empty() {
+          let mut features = dep.features.clone();
+          features.sort(); // Sort alphabetically
+          println!("      features = {:?}", features);
+        }
+      }
+      println!();
+    }
+
+    // Show member edits
+    let mut members: Vec<_> = plan.member_edits.keys().collect();
+    members.sort();
+    for member in members {
+      let edits = &plan.member_edits[member];
+      if edits.is_empty() {
+        continue;
+      }
+      let path = plan
+        .member_paths
+        .get(member)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| member.clone());
+      println!("📝 {}:", path);
+      for edit in edits {
+        match edit {
+          crate::cargo::MemberEdit::UseWorkspace {
+            dep_name,
+            dep_kind,
+            target,
+            local_features,
+            is_optional,
+          } => {
+            let section = match (dep_kind, target) {
+              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
+              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
+              (_, None) => "[dependencies]".to_string(),
+              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
+              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
+              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
+            };
+            let mut line = format!("  {} {} → workspace = true", section, dep_name);
+            if !local_features.is_empty() {
+              let mut features = local_features.clone();
+              features.sort();
+              line.push_str(&format!(", features = {:?}", features));
+            }
+            if *is_optional {
+              line.push_str(", optional = true");
+            }
+            println!("{}", line);
+          }
+        }
+      }
+      println!();
+    }
+  }
 
   // Show validation results if any failed
   let failed_validations: Vec<_> = plan.validation_results.iter().filter(|v| !v.success).collect();
@@ -84,11 +155,14 @@ pub fn run_unify_apply(
   exclude: Vec<String>,
   include: Vec<String>,
   backup: bool,
+  include_renamed_flag: bool,
+  no_report: bool,
+  report_path: Option<std::path::PathBuf>,
 ) -> RailResult<()> {
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
 
-  println!("🔧 Applying workspace dependency unification...\n");
+  eprintln!("🔧 Applying workspace dependency unification...\n");
 
   // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
@@ -99,6 +173,9 @@ pub fn run_unify_apply(
   }
   if !include.is_empty() {
     analyzer.config.include.extend(include);
+  }
+  if include_renamed_flag {
+    analyzer.config.include_renamed = true;
   }
 
   // Run analysis
@@ -223,15 +300,19 @@ pub fn run_unify_apply(
     writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
   }
 
-  // Generate report
-  println!("📄 Generating report...");
-  let report_path = ctx
-    .workspace_root()
-    .join("target")
-    .join("cargo-rail")
-    .join("unify-report.md");
-  UnifyReport::write_to_file(&plan, &report_path)?;
-  println!("   Report saved to: {}", report_path.display());
+  // Generate report (unless --no-report)
+  if !no_report {
+    println!("📄 Generating report...");
+    let actual_report_path = report_path.unwrap_or_else(|| {
+      ctx
+        .workspace_root()
+        .join("target")
+        .join("cargo-rail")
+        .join("unify-report.md")
+    });
+    UnifyReport::write_to_file(&plan, &actual_report_path)?;
+    println!("   Report saved to: {}", actual_report_path.display());
+  }
 
   // Summary
   println!("\n✅ Unification complete!");
@@ -304,8 +385,10 @@ pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: O
     match backup_manager.get_latest_backup()? {
       Some(backup) => backup.id,
       None => {
-        println!("No backups found.");
-        return Ok(());
+        return Err(crate::error::RailError::with_help(
+          "No backups found to restore",
+          "Run 'cargo rail unify undo --list' to see available backups",
+        ));
       }
     }
   };

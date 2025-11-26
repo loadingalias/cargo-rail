@@ -349,21 +349,12 @@ impl UnifyAnalyzer {
     // Use pre-loaded multi-target metadata if available, otherwise load it
     let metadata = if let Some(ref cached) = ctx.multi_target_metadata {
       // Already loaded in WorkspaceContext - just clone Arc (cheap)
-      println!("Using pre-loaded multi-target metadata");
       (**cached).clone()
     } else {
       // Not pre-loaded (no targets configured) - load default
       let targets = ctx.config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
-
-      println!(
-        "Loading metadata for {} target(s)...",
-        if targets.is_empty() { 1 } else { targets.len() }
-      );
-
       MultiTargetMetadata::load_parallel(ctx.workspace_root(), &targets)?
     };
-
-    println!("Parsing workspace manifests...");
 
     // Parse all manifests once
     let workspace_packages = metadata.workspace_packages();
@@ -371,12 +362,6 @@ impl UnifyAnalyzer {
 
     // Parse existing workspace.dependencies to avoid duplicates
     let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;
-    if !existing_workspace_deps.is_empty() {
-      println!(
-        "Found {} existing workspace dependencies",
-        existing_workspace_deps.len()
-      );
-    }
 
     // Build config from context
     let config = ctx.config.as_ref().map(|c| c.unify.clone()).unwrap_or_default();

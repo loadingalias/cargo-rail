@@ -19,6 +19,9 @@ pub struct RailConfig {
   /// Release management settings
   #[serde(default)]
   pub release: ReleaseConfig,
+  /// Change detection settings (for `affected` command)
+  #[serde(default, rename = "change-detection")]
+  pub change_detection: ChangeDetectionConfig,
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
   pub crates: std::collections::HashMap<String, CrateConfig>,
@@ -369,6 +372,48 @@ pub struct FormattingConfig {
   /// Add "Managed by cargo-rail" header (default: false)
   #[serde(default)]
   pub add_header: bool,
+}
+
+/// Configuration for change detection (`cargo rail affected`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeDetectionConfig {
+  /// Glob patterns for infrastructure files that trigger rebuild_all (default: [".github/**", "scripts/**", "justfile", "Makefile"])
+  #[serde(default = "default_infrastructure_patterns")]
+  pub infrastructure: Vec<String>,
+
+  /// Custom path patterns and their categories
+  /// Example: verify = ["verify/**/*.rs"] for Stateright verification models
+  #[serde(default)]
+  pub custom: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Default for ChangeDetectionConfig {
+  fn default() -> Self {
+    Self {
+      infrastructure: default_infrastructure_patterns(),
+      custom: std::collections::HashMap::new(),
+    }
+  }
+}
+
+fn default_infrastructure_patterns() -> Vec<String> {
+  vec![
+    ".github/**".to_string(),
+    "scripts/**".to_string(),
+    "justfile".to_string(),
+    "Justfile".to_string(),
+    "Makefile".to_string(),
+    "makefile".to_string(),
+    "GNUmakefile".to_string(),
+    "*.sh".to_string(),
+    "Taskfile.yml".to_string(),
+    "Taskfile.yaml".to_string(),
+    ".pre-commit-config.yaml".to_string(),
+    "deny.toml".to_string(),
+    "cliff.toml".to_string(),
+    "release.toml".to_string(),
+    "release-plz.toml".to_string(),
+  ]
 }
 
 fn default_tag_prefix() -> String {

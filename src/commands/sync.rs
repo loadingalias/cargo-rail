@@ -42,6 +42,14 @@ pub fn run_sync(
   let all_local = builder.all_local();
   let config_count = builder.count();
 
+  // Fail if no crates are configured when --all is used
+  if config_count == 0 && all {
+    return Err(crate::error::RailError::with_help(
+      "No crates configured for sync",
+      "Run 'cargo rail split init' to configure crates for splitting/syncing",
+    ));
+  }
+
   if all_local && !dry_run && !json {
     eprintln!("   Local testing mode\n");
   }

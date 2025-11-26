@@ -15,6 +15,8 @@ pub fn run_release_plan(
   ctx: &WorkspaceContext,
   crate_names: Option<Vec<String>>,
   bump: String,
+  skip_publish: bool,
+  skip_tag: bool,
   json: bool,
 ) -> RailResult<()> {
   if !json {
@@ -56,7 +58,7 @@ pub fn run_release_plan(
       .map_err(|e| RailError::message(format!("Failed to serialize plan: {}", e)))?;
     println!("{}", json_output);
   } else {
-    println!("{}", plan.format_summary());
+    println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
     eprintln!("\n📝 This is a dry-run. To execute this release, run:");
     if let Some(names) = crate_names {
@@ -239,6 +241,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: b
     targets: vec![],
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
+    change_detection: crate::config::ChangeDetectionConfig::default(),
     crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   });

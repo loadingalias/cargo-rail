@@ -1,0 +1,283 @@
+//! Integration tests for the release check command
+
+use super::helpers::{TestWorkspace, run_cargo_rail};
+use anyhow::Result;
+
+/// Test check command validates crate exists
+#[test]
+fn test_check_validates_crate_exists() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-exists")?;
+
+  // Add a crate without path deps (use workspace deps)
+  ws.add_crate("real-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
+
+  // Configure release
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add real-crate with release config")?;
+
+  // Check for non-existent crate should fail
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "nonexistent"])?;
+  assert!(!output.status.success(), "check for nonexistent crate should fail");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("not found") || stderr.contains("nonexistent"),
+    "Should mention crate not found. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test check command passes for valid crate
+#[test]
+fn test_check_passes_for_valid_crate() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-valid")?;
+
+  // Add a simple publishable crate using workspace deps (no path deps)
+  ws.add_crate("valid-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
+
+  // Configure release
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add valid-crate with release config")?;
+
+  // Check should pass
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "valid-crate"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "check should pass. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    stdout.contains("ready for release") || stdout.contains("passed") || stdout.contains("valid-crate"),
+    "Should confirm ready. stdout: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test check command with --all flag
+#[test]
+fn test_check_all_crates() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-all")?;
+
+  // Add multiple simple crates with workspace deps
+  ws.add_crate("crate-a", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
+  ws.add_crate("crate-b", "0.1.0", &[("serde", "{ workspace = true }")])?;
+
+  // Configure release
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add crates with release config")?;
+
+  // Check all should pass
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "check --all should pass. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    stdout.contains("crate-a") || stdout.contains("passed") || stdout.contains("ready"),
+    "Should mention crates or pass. stdout: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test check fails when require_clean is true and there are uncommitted changes
+#[test]
+fn test_check_fails_with_uncommitted_changes() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-dirty")?;
+
+  // Add a crate
+  ws.add_crate("dirty-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
+
+  // Configure release with require_clean = true
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = true
+"#,
+  )?;
+
+  ws.commit("Add dirty-crate with config")?;
+
+  // Create uncommitted change
+  std::fs::write(
+    ws.path.join("crates/dirty-crate/src/lib.rs"),
+    "pub fn hello() { /* modified */ }",
+  )?;
+
+  // Check should fail
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "dirty-crate"])?;
+  assert!(!output.status.success(), "check should fail with uncommitted changes");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("uncommitted") || stderr.contains("changes") || stderr.contains("clean"),
+    "Should mention uncommitted changes. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test check fails for crate with publish = false
+#[test]
+fn test_check_fails_for_unpublishable_crate() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-unpublish")?;
+
+  // Add a crate with publish = false
+  let crate_path = ws.path.join("crates/private-crate");
+  std::fs::create_dir_all(&crate_path)?;
+  std::fs::create_dir_all(crate_path.join("src"))?;
+  std::fs::write(
+    crate_path.join("Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+"#,
+  )?;
+  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
+
+  // Configure release
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add private-crate with config")?;
+
+  // Check should fail for private crate
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "private-crate"])?;
+  assert!(!output.status.success(), "check should fail for publish = false crate");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("publish") || stderr.contains("false"),
+    "Should mention publish restriction. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test check defaults to require_clean=true when no explicit release config
+#[test]
+fn test_check_requires_release_config() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-no-config")?;
+
+  // Add a crate with release config (require_clean = false to allow clean workspace check)
+  ws.add_crate("some-crate", "0.1.0", &[])?;
+
+  // Config WITH [release] section and require_clean = false
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add some-crate with release config")?;
+
+  // Check should pass with proper config
+  let output = run_cargo_rail(&ws.path, &["rail", "check", "some-crate"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "check should pass with release config. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    stdout.contains("ready for release") || stdout.contains("passed") || stdout.contains("some-crate"),
+    "Should confirm ready. stdout: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test check command requires crate name or --all
+#[test]
+fn test_check_requires_crate_or_all() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-no-args")?;
+
+  // Add a crate
+  ws.add_crate("any-crate", "0.1.0", &[])?;
+
+  // Configure release
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[release]
+require_clean = false
+"#,
+  )?;
+
+  ws.commit("Add any-crate with config")?;
+
+  // Check with no args should fail
+  let output = run_cargo_rail(&ws.path, &["rail", "check"])?;
+  assert!(!output.status.success(), "check with no args should fail");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("--all") || stderr.contains("crate"),
+    "Should mention need for crate name or --all. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}

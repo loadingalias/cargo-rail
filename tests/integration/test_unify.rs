@@ -42,7 +42,7 @@ fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
   workspace.commit("Add crates with compatible version requirements")?;
 
   // Run unify analyze
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should NOT report multi-version conflicts for serde or anyhow
@@ -91,7 +91,7 @@ fn test_unify_syntactic_version_merging() -> Result<()> {
 
   workspace.commit("Add crates with mergeable versions")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should successfully merge ^1.2.0 and ^1.3.0 to ^1.3.0
@@ -138,7 +138,7 @@ fn test_unify_feature_union() -> Result<()> {
 
   workspace.commit("Add crates with different features")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show serde with union of all features
@@ -198,7 +198,7 @@ tempfile = "3.0"
 
   workspace.commit("Add crates with different dep kinds")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show tempfile can be unified
@@ -236,7 +236,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   workspace.commit("Add crates before unification")?;
 
   // Step 1: Analyze (should succeed)
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -277,7 +277,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   );
 
   // Step 5: Run analyze again - should show no unifiable deps
-  let final_analyze = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run"])?;
+  let final_analyze = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let final_stdout = String::from_utf8_lossy(&final_analyze.stdout);
 
   assert!(
@@ -304,7 +304,7 @@ fn test_unify_exclude_option() -> Result<()> {
   workspace.commit("Add crates")?;
 
   // Analyze with serde excluded
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--dry-run", "--exclude", "serde"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--exclude", "serde"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should NOT show serde (excluded)
@@ -593,6 +593,135 @@ fn test_unify_local_features_calculation() -> Result<()> {
     crate_b_toml.contains("workspace = true") || crate_b_toml.contains("workspace=true"),
     "crate-b should use workspace inheritance.\nContent:\n{}",
     crate_b_toml
+  );
+
+  Ok(())
+}
+
+/// Test --include flag forces specific dependencies to be included
+#[test]
+fn test_unify_include_flag() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-include")?;
+
+  // Create two crates with shared dependency to trigger unification
+  let crate_a_path = workspace.path.join("crates/include-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "include-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn hello() {}")?;
+
+  let crate_b_path = workspace.path.join("crates/include-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "include-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn world() {}")?;
+
+  workspace.commit("Add crates with shared deps")?;
+
+  // Run unify with --include
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include", "serde"])?;
+
+  assert!(
+    output.status.success(),
+    "unify --include should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+/// Test --consolidate-transitives flag
+#[test]
+fn test_unify_consolidate_transitives() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-consolidate")?;
+
+  // Create a crate with a transitive-only dependency scenario
+  let crate_path = workspace.path.join("crates/transitive-crate");
+  std::fs::create_dir_all(&crate_path)?;
+  std::fs::create_dir_all(crate_path.join("src"))?;
+
+  std::fs::write(
+    crate_path.join("Cargo.toml"),
+    r#"[package]
+name = "transitive-crate"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
+  workspace.commit("Add crate")?;
+
+  // Run unify with --consolidate-transitives
+  let output = run_cargo_rail(
+    &workspace.path,
+    &["rail", "unify", "--check", "--consolidate-transitives"],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "unify --consolidate-transitives should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+/// Test --include-renamed flag
+#[test]
+fn test_unify_include_renamed_flag() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-include-renamed")?;
+
+  // Create a crate
+  let crate_path = workspace.path.join("crates/renamed-crate");
+  std::fs::create_dir_all(&crate_path)?;
+  std::fs::create_dir_all(crate_path.join("src"))?;
+
+  std::fs::write(
+    crate_path.join("Cargo.toml"),
+    r#"[package]
+name = "renamed-crate"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
+  workspace.commit("Add crate")?;
+
+  // Run unify with --include-renamed
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include-renamed"])?;
+
+  assert!(
+    output.status.success(),
+    "unify --include-renamed should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())

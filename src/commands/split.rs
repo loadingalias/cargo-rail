@@ -192,6 +192,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     targets: vec![], // No targets by default
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
+    change_detection: crate::config::ChangeDetectionConfig::default(),
     crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   });

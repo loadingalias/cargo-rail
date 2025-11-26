@@ -23,12 +23,19 @@ use std::io;
 use std::path::PathBuf;
 
 /// Exit codes for cargo-rail
+///
+/// Exit codes follow CI-friendly semantics:
+/// - 0 = Success (or check passed with no changes needed)
+/// - 1 = Check mode found changes would be made (not an error, but actionable)
+/// - 2 = Error occurred (actual failure)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
-  /// User error (config, invalid args, missing files)
-  User = 1,
-  /// System error (git, network, I/O)
-  System = 2,
+  /// Success - everything is good
+  Success = 0,
+  /// Check failed - changes would be made (use in --check mode)
+  CheckFailed = 1,
+  /// Error occurred (user or system error)
+  Error = 2,
 }
 
 impl ExitCode {
@@ -95,12 +102,8 @@ impl RailError {
 
   /// Get the appropriate exit code for this error
   pub fn exit_code(&self) -> ExitCode {
-    match self {
-      RailError::Config(_) => ExitCode::User,
-      RailError::Git(_) => ExitCode::System,
-      RailError::Io(_) => ExitCode::System,
-      RailError::Message { .. } => ExitCode::User,
-    }
+    // All errors use exit code 2
+    ExitCode::Error
   }
 
   /// Get contextual help message for this error
@@ -245,7 +248,7 @@ impl ConfigError {
     match self {
       ConfigError::NotFound { .. } => Some("Run `cargo rail init` to create a configuration file.".to_string()),
       ConfigError::CrateNotFound { name } => Some(format!(
-        "Available crates can be listed with `cargo rail status`. Did you mean to run `cargo rail init` for '{}'?",
+        "Use `cargo rail split --check --all` to see configured splits. Did you mean '{}'?",
         name
       )),
       _ => None,

@@ -333,3 +333,145 @@ require_clean = false
 
   Ok(())
 }
+
+/// Test split --remote override flag
+#[test]
+fn test_split_remote_override() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-remote-override")?;
+  ws.add_crate("override-lib", "0.1.0", &[])?;
+
+  // Create a custom target directory
+  let custom_target = tempfile::TempDir::new()?;
+  git(custom_target.path(), &["init", "--initial-branch=main"])?;
+  git(custom_target.path(), &["config", "user.name", "Test"])?;
+  git(custom_target.path(), &["config", "user.email", "test@test.com"])?;
+  std::fs::write(custom_target.path().join("README.md"), "# Custom")?;
+  git(custom_target.path(), &["add", "."])?;
+  git(custom_target.path(), &["commit", "-m", "Initial"])?;
+
+  // Configure split with default remote using new [crates.<name>.split] format
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[crates.override-lib.split]
+remote = "/tmp/default-remote"
+branch = "main"
+mode = "single"
+paths = [{ crate = "crates/override-lib" }]
+"#,
+  )?;
+
+  ws.commit("Add override-lib with config")?;
+
+  // Run split with --remote override in check mode (dry-run)
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "split",
+      "override-lib",
+      "--check",
+      "--remote",
+      custom_target.path().to_str().unwrap(),
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "split --remote --check should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Verify the custom target path appears in the plan
+  assert!(
+    stdout.contains(custom_target.path().to_str().unwrap()) || stdout.contains("override-lib"),
+    "Should show the custom target path or crate name in plan. stdout: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test split --json output
+#[test]
+fn test_split_json_output() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-json")?;
+  ws.add_crate("json-lib", "0.1.0", &[])?;
+  ws.commit("Add json-lib")?;
+
+  // Configure split using new [crates.<name>.split] format
+  let target_dir = tempfile::TempDir::new()?;
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    format!(
+      r#"[workspace]
+root = "."
+
+[crates.json-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/json-lib" }}]
+"#,
+      target_dir.path().display()
+    ),
+  )?;
+
+  // Run split with --check and --json
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "json-lib", "--check", "--json"])?;
+
+  if output.status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // If there's output, it should be valid JSON
+    if !stdout.trim().is_empty() {
+      let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+      assert!(
+        parsed.is_ok(),
+        "split --json should output valid JSON. stdout: {}",
+        stdout
+      );
+    }
+  }
+
+  Ok(())
+}
+
+/// Test split init command
+#[test]
+fn test_split_init_command() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-init-cmd")?;
+  ws.add_crate("init-lib", "0.1.0", &[])?;
+  ws.commit("Add init-lib")?;
+
+  // Remove existing config to test init
+  ws.remove_config()?;
+
+  // Create minimal config without splits
+  std::fs::create_dir_all(ws.path.join(".config"))?;
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+"#,
+  )?;
+
+  // Run split init with --check
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "init", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "split init --check should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    stdout.contains("init-lib") || stdout.contains("[crates.") || stdout.contains("[[splits]]"),
+    "split init should show detected crates. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}

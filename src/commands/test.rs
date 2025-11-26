@@ -11,7 +11,7 @@ pub struct TestConfig {
   /// Git ref to compare against (if None, auto-detect)
   pub since: Option<String>,
   /// Skip change detection and run all tests
-  pub full: bool,
+  pub all: bool,
   /// Explain why tests are being run
   pub explain: bool,
   /// Prefer cargo-nextest if available
@@ -35,8 +35,8 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
   let impact = analyzer.analyze_changes(&base_ref, None)?;
 
   // Get minimal test set
-  let test_targets = if config.full {
-    println!("⚡ Full mode active - running all tests");
+  let test_targets = if config.all {
+    eprintln!("⚡ Running all tests (--all mode)");
     ctx
       .cargo
       .metadata()

@@ -314,6 +314,7 @@ mod tests {
       targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
+      change_detection: crate::config::ChangeDetectionConfig::default(),
       crates: Default::default(),
       formatting: crate::config::FormattingConfig::default(),
     };

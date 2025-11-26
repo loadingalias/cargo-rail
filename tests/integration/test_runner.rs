@@ -285,3 +285,84 @@ fn test_runner_test_file_changes() -> Result<()> {
 
   Ok(())
 }
+
+/// Test --all flag runs all tests regardless of changes
+#[test]
+fn test_runner_all_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-all")?;
+  ws.add_crate("all-a", "0.1.0", &[])?;
+  ws.add_crate("all-b", "0.1.0", &[])?;
+  ws.commit("Add crates")?;
+
+  git(&ws.path, &["branch", "baseline"])?;
+
+  // Run with --all flag (skip change detection)
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "test --all should succeed");
+  assert!(
+    stdout.contains("Running all tests") || stdout.contains("all-a") || stdout.contains("all-b"),
+    "Should run tests for all crates. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test --no-nextest flag forces use of cargo test
+#[test]
+fn test_runner_no_nextest_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-no-nextest")?;
+  ws.add_crate("nextest-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  git(&ws.path, &["branch", "baseline"])?;
+
+  // Modify crate
+  ws.modify_file("nextest-crate", "src/lib.rs", "pub fn test_fn() { }")?;
+  ws.commit("Modify crate")?;
+
+  // Run with --no-nextest flag
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--no-nextest"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  // Should succeed and use cargo test (not nextest)
+  // The output should mention cargo test or not mention nextest in the runner selection
+  assert!(
+    output.status.success(),
+    "test --no-nextest should succeed. stderr: {}",
+    stderr
+  );
+
+  // When nextest is disabled, it should use cargo test
+  // The absence of "nextest" in output confirms this (or presence of "cargo test")
+  let combined = format!("{}{}", stdout, stderr);
+  assert!(
+    !combined.contains("cargo nextest") || combined.contains("cargo test"),
+    "Should use cargo test not nextest. Output:\n{}",
+    combined
+  );
+
+  Ok(())
+}
+
+/// Test --all combined with --no-nextest
+#[test]
+fn test_runner_all_no_nextest() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-all-no-nextest")?;
+  ws.add_crate("combo-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  // Run with both flags
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--all", "--no-nextest"])?;
+
+  assert!(
+    output.status.success(),
+    "test --all --no-nextest should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}

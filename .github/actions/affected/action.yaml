@@ -1,0 +1,79 @@
+name: 'cargo-rail affected'
+description: 'Detect affected crates in a Rust monorepo using cargo-rail'
+author: 'cargo-rail'
+
+inputs:
+  since:
+    description: 'Git ref to compare against (auto-detects if not specified)'
+    required: false
+  from:
+    description: 'Start ref for SHA pair mode (use with `to`)'
+    required: false
+  to:
+    description: 'End ref for SHA pair mode (use with `from`)'
+    required: false
+  format:
+    description: 'Output format: github (default), github-matrix, json, jsonl, names-only'
+    required: false
+    default: 'github'
+  cargo-rail-version:
+    description: 'Version of cargo-rail to install (default: latest)'
+    required: false
+    default: 'latest'
+
+outputs:
+  crates:
+    description: 'Space-separated list of affected crates'
+    value: ${{ steps.affected.outputs.crates }}
+  count:
+    description: 'Number of affected crates'
+    value: ${{ steps.affected.outputs.affected_count }}
+  matrix:
+    description: 'JSON array of affected crates for strategy.matrix'
+    value: ${{ steps.affected.outputs.test_matrix }}
+  rebuild_all:
+    description: 'True if infrastructure files changed (rebuild all recommended)'
+    value: ${{ steps.affected.outputs.rebuild_all }}
+  docs_only:
+    description: 'True if only documentation files changed'
+    value: ${{ steps.affected.outputs.docs_only }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install cargo-rail
+      shell: bash
+      run: |
+        if [ "${{ inputs.cargo-rail-version }}" = "latest" ]; then
+          cargo install cargo-rail
+        else
+          cargo install cargo-rail --version "${{ inputs.cargo-rail-version }}"
+        fi
+
+    - name: Detect affected crates
+      id: affected
+      shell: bash
+      run: |
+        # Determine the ref to compare against
+        if [ -n "${{ inputs.from }}" ] && [ -n "${{ inputs.to }}" ]; then
+          # SHA pair mode
+          ARGS="--from ${{ inputs.from }} --to ${{ inputs.to }}"
+        elif [ -n "${{ inputs.since }}" ]; then
+          ARGS="--since ${{ inputs.since }}"
+        else
+          # Auto-detect: use origin/main, origin/master, or HEAD~1
+          if git rev-parse --verify origin/main >/dev/null 2>&1; then
+            ARGS="--since origin/main"
+          elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+            ARGS="--since origin/master"
+          else
+            ARGS="--since HEAD~1"
+          fi
+        fi
+
+        # Run cargo-rail affected with github format and output to $GITHUB_OUTPUT
+        cargo rail affected $ARGS --format "${{ inputs.format }}" --output-file "$GITHUB_OUTPUT"
+
+branding:
+  icon: 'package'
+  color: 'orange'

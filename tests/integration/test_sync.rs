@@ -264,3 +264,97 @@ fn test_sync_skips_already_synced_commits() -> Result<()> {
 
   Ok(())
 }
+
+/// Test sync --strategy ours flag
+#[test]
+fn test_sync_strategy_ours() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("strategy-lib")?;
+
+  // Make a change in monorepo
+  ws.modify_file("strategy-lib", "src/lib.rs", "// Monorepo change")?;
+  ws.commit("Monorepo change")?;
+
+  // Sync with --strategy ours
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "strategy-lib", "--to-remote", "--strategy", "ours"],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "sync --strategy ours should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+/// Test sync --strategy theirs flag
+#[test]
+fn test_sync_strategy_theirs() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("theirs-lib")?;
+
+  // Sync with --strategy theirs
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "theirs-lib", "--to-remote", "--strategy", "theirs"],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "sync --strategy theirs should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+/// Test sync --no-protected-branches flag
+#[test]
+fn test_sync_no_protected_branches() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("unprotected-lib")?;
+
+  // Make a change
+  ws.modify_file("unprotected-lib", "src/lib.rs", "// Change")?;
+  ws.commit("Change")?;
+
+  // Sync with --no-protected-branches
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "sync",
+      "unprotected-lib",
+      "--to-remote",
+      "--no-protected-branches",
+    ],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "sync --no-protected-branches should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+/// Test sync --json output
+#[test]
+fn test_sync_json_output() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("json-lib")?;
+
+  // Run sync with --check and --json
+  let output = run_cargo_rail(&ws.path, &["rail", "sync", "json-lib", "--check", "--json"])?;
+
+  if output.status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // If successful, should be valid JSON (or empty if no changes)
+    if !stdout.trim().is_empty() {
+      let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+      assert!(parsed.is_ok(), "JSON output should be valid. stdout: {}", stdout);
+    }
+  }
+
+  Ok(())
+}

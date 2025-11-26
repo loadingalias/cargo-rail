@@ -87,15 +87,15 @@ fn test_unify_undo_no_backups() -> Result<()> {
   workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
   workspace.commit("Add test crates")?;
 
-  // Run undo without any backups
+  // Run undo without any backups - should fail
   let undo_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo"])?;
-  let undo_stdout = String::from_utf8_lossy(&undo_output.stdout);
+  let undo_stderr = String::from_utf8_lossy(&undo_output.stderr);
 
-  assert!(undo_output.status.success(), "Should succeed even with no backups");
+  assert!(!undo_output.status.success(), "Should fail when no backups exist");
   assert!(
-    undo_stdout.contains("No backups"),
-    "Should mention no backups found.\nOutput:\n{}",
-    undo_stdout
+    undo_stderr.contains("No backups") || undo_stderr.contains("no backups"),
+    "Should mention no backups found.\nStderr:\n{}",
+    undo_stderr
   );
 
   Ok(())

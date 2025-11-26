@@ -128,3 +128,75 @@ fn test_affected_sha_pair_mode() -> Result<()> {
 
   Ok(())
 }
+
+/// Test affected --all flag shows all workspace crates regardless of changes
+#[test]
+fn test_affected_all_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-all")?;
+  ws.add_crate("crate-a", "0.1.0", &[])?;
+  ws.add_crate("crate-b", "0.2.0", &[])?;
+  ws.add_crate("crate-c", "0.3.0", &[])?;
+  ws.commit("Add three crates")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Run with --all flag (ignore changes, show all crates)
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected --all should succeed");
+  assert!(stdout.contains("crate-a"), "Should show crate-a");
+  assert!(stdout.contains("crate-b"), "Should show crate-b");
+  assert!(stdout.contains("crate-c"), "Should show crate-c");
+
+  Ok(())
+}
+
+/// Test affected --all with --format json
+#[test]
+fn test_affected_all_json() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-all-json")?;
+  ws.add_crate("json-a", "0.1.0", &[])?;
+  ws.add_crate("json-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Run with --all and --format json
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all", "--format", "json"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected --all --format json should succeed");
+
+  // Parse JSON
+  let json: serde_json::Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+  assert!(json.get("crates").is_some(), "Should have crates array");
+  assert!(json.get("count").is_some(), "Should have count");
+
+  let count = json["count"].as_u64().unwrap();
+  assert_eq!(count, 2, "Should have 2 crates");
+
+  Ok(())
+}
+
+/// Test affected --all with --format names-only
+#[test]
+fn test_affected_all_names_only() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-all-names")?;
+  ws.add_crate("names-a", "0.1.0", &[])?;
+  ws.add_crate("names-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Run with --all and --format names-only
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all", "--format", "names-only"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "affected --all --format names-only should succeed"
+  );
+
+  let lines: Vec<&str> = stdout.trim().lines().collect();
+  assert!(lines.contains(&"names-a"), "Should contain names-a");
+  assert!(lines.contains(&"names-b"), "Should contain names-b");
+
+  Ok(())
+}

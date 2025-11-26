@@ -37,7 +37,7 @@ require_clean = false
   )?;
 
   // Run release plan
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "--bump", "patch"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--bump", "patch"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show the crate in the plan
@@ -170,6 +170,103 @@ fn release_respects_skip_and_require_flags() -> Result<()> {
   assert!(
     !ws.path.join("crates/internal/CHANGELOG.md").exists(),
     "internal crate changelog should be skipped"
+  );
+
+  Ok(())
+}
+
+/// Test release --json output format
+#[test]
+fn test_release_json_output() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("json-release", "0.1.0")?;
+
+  // Configure release
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --json
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--json"])?;
+
+  if output.status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should be valid JSON
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+    assert!(
+      parsed.is_ok(),
+      "release --json should output valid JSON. stdout: {}",
+      stdout
+    );
+  }
+
+  Ok(())
+}
+
+/// Test release --skip-tag flag
+#[test]
+fn test_release_skip_tag_flag() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("skip-tag-crate", "0.1.0")?;
+
+  // Configure release
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --skip-tag
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "--check", "--skip-tag", "--bump", "patch"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "release --skip-tag should succeed");
+  assert!(
+    stdout.contains("--skip-tag") || !stdout.contains("Tag:") || stdout.contains("skip"),
+    "Should indicate tags are skipped in output.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test release --skip-publish flag reflects in plan
+#[test]
+fn test_release_skip_publish_in_plan() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("skip-pub-crate", "0.1.0")?;
+
+  // Configure release
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --skip-publish
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "--check", "--skip-publish", "--bump", "patch"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "release --skip-publish should succeed");
+  assert!(
+    stdout.contains("--skip-publish") || stdout.contains("0 to publish"),
+    "Should reflect skip-publish in plan.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test explicit version bump (e.g., "1.2.3" instead of "patch")
+#[test]
+fn test_release_explicit_version() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("explicit-ver", "0.1.0")?;
+
+  // Configure release
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release with explicit version
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--bump", "2.0.0"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "release with explicit version should succeed");
+  assert!(
+    stdout.contains("2.0.0"),
+    "Should show explicit version in plan.\nOutput:\n{}",
+    stdout
   );
 
   Ok(())

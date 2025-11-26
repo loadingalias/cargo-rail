@@ -35,9 +35,15 @@ enum Commands {
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
     to: Option<String>,
-    /// Output format: text, json, names-only
+    /// Output format: text, json, names-only, github, github-matrix, jsonl
     #[arg(long, default_value = "text")]
     format: String,
+    /// Show all workspace crates (ignore changes)
+    #[arg(long, short = 'a')]
+    all: bool,
+    /// Write output to file (e.g., $GITHUB_OUTPUT)
+    #[arg(long, short = 'o')]
+    output_file: Option<std::path::PathBuf>,
   },
 
   /// Run tests only for affected crates (smart test runner)
@@ -46,8 +52,8 @@ enum Commands {
     #[arg(long)]
     since: Option<String>,
     /// Skip change detection and run all tests
-    #[arg(long, short = 'f')]
-    full: bool,
+    #[arg(long, short = 'a')]
+    all: bool,
     /// Disable automatic use of cargo-nextest
     #[arg(long)]
     no_nextest: bool,
@@ -63,16 +69,16 @@ enum Commands {
   ///
   /// Usage:
   ///   cargo rail unify                 - Analyze and apply unification
-  ///   cargo rail unify --dry-run       - Preview unification plan
+  ///   cargo rail unify --check         - Preview unification plan (no changes)
   ///   cargo rail unify undo            - Restore most recent backup
   ///   cargo rail unify undo --list     - List available backups
   ///   cargo rail unify undo --backup <id> - Restore specific backup
   Unify {
     /// Action: 'undo' to restore a backup
     action: Option<String>,
-    /// Show plan without executing (dry-run mode)
-    #[arg(long, visible_alias = "dr", short = 'd')]
-    dry_run: bool,
+    /// Show plan without executing (check mode)
+    #[arg(long, short = 'c')]
+    check: bool,
     /// Exclude specific dependencies from unification
     #[arg(long)]
     exclude: Vec<String>,
@@ -85,12 +91,24 @@ enum Commands {
     /// Consolidate transitive-only crates with fragmented features
     #[arg(long)]
     consolidate_transitives: bool,
+    /// Include renamed dependencies (package = "...") in unification
+    #[arg(long)]
+    include_renamed: bool,
     /// List available backups (for undo action)
     #[arg(long)]
     list: bool,
     /// Specific backup ID to restore (for undo action)
     #[arg(long = "backup-id")]
     backup_id: Option<String>,
+    /// Skip generating the unify report
+    #[arg(long)]
+    no_report: bool,
+    /// Custom path for the unify report (default: target/cargo-rail/unify-report.md)
+    #[arg(long)]
+    report_path: Option<std::path::PathBuf>,
+    /// Show diff of changes to each manifest (in check mode)
+    #[arg(long)]
+    show_diff: bool,
   },
 
   /// Initialize cargo-rail configuration (rail.toml)
@@ -105,8 +123,8 @@ enum Commands {
     #[arg(long)]
     non_interactive: bool,
     /// Output the generated config to stdout instead of writing to file
-    #[arg(long, visible_alias = "dr", short = 'd')]
-    dry_run: bool,
+    #[arg(long, short = 'c')]
+    check: bool,
   },
 
   /// Split a crate from monorepo to separate repo with history
@@ -115,7 +133,7 @@ enum Commands {
   ///   cargo rail split init             - Initialize split config for all workspace crates
   ///   cargo rail split <crate>          - Execute split for a crate
   ///   cargo rail split --all            - Execute split for all configured crates
-  ///   cargo rail split --dry-run        - Preview split operations
+  ///   cargo rail split --check          - Preview split operations
   Split {
     /// Crate name to split, or 'init' to configure splits
     crate_name: Option<String>,
@@ -126,8 +144,8 @@ enum Commands {
     #[arg(long)]
     remote: Option<String>,
     /// Show plan without executing (default: execute with confirmation)
-    #[arg(long, visible_alias = "dr", short = 'd')]
-    dry_run: bool,
+    #[arg(long, short = 'c')]
+    check: bool,
     /// Output plan in JSON format
     #[arg(long)]
     json: bool,
@@ -156,8 +174,8 @@ enum Commands {
     #[arg(long)]
     no_protected_branches: bool,
     /// Show plan without executing (default: execute with confirmation)
-    #[arg(long, visible_alias = "dr", short = 'd')]
-    dry_run: bool,
+    #[arg(long, short = 'c')]
+    check: bool,
     /// Output plan in JSON format
     #[arg(long)]
     json: bool,
@@ -175,9 +193,9 @@ enum Commands {
     /// Version bump strategy: major, minor, patch, or explicit version (e.g., "1.2.3")
     #[arg(long, default_value = "patch")]
     bump: String,
-    /// Show plan without executing (dry-run mode)
-    #[arg(long, visible_alias = "dr", short = 'd')]
-    dry_run: bool,
+    /// Show plan without executing (check mode)
+    #[arg(long, short = 'c')]
+    check: bool,
     /// Skip publishing to crates.io (only create tags and update changelogs)
     #[arg(long)]
     skip_publish: bool,
@@ -196,13 +214,6 @@ enum Commands {
     /// Check all workspace crates
     #[arg(short, long)]
     all: bool,
-  },
-
-  /// Show status of all configured crates
-  Status {
-    /// Output status in JSON format
-    #[arg(long)]
-    json: bool,
   },
 
   /// Clean workspace artifacts (cache, backups, reports)
@@ -240,10 +251,10 @@ fn main() {
     output,
     force,
     non_interactive,
-    dry_run,
+    check,
   } = cli.command
   {
-    let result = commands::run_init_standalone(&workspace_root, &output, force, non_interactive, dry_run);
+    let result = commands::run_init_standalone(&workspace_root, &output, force, non_interactive, check);
     if let Err(e) = result {
       handle_error(e);
     }
@@ -283,17 +294,19 @@ fn main() {
       from,
       to,
       format,
-    } => commands::run_affected(&ctx, since, from, to, format, false),
+      all,
+      output_file,
+    } => commands::run_affected(&ctx, since, from, to, format, all, output_file),
     Commands::Test {
       since,
-      full,
+      all,
       no_nextest,
       explain,
       test_args,
     } => {
       let config = commands::test::TestConfig {
         since,
-        full,
+        all,
         explain,
         prefer_nextest: !no_nextest,
         test_args,
@@ -307,13 +320,17 @@ fn main() {
     // Dependency Unification
     Commands::Unify {
       action,
-      dry_run,
+      check,
       exclude,
       include,
       backup,
       consolidate_transitives,
+      include_renamed,
       list: _,
       backup_id: _,
+      no_report,
+      report_path,
+      show_diff,
     } => {
       // Check if this is an undo action (should have been handled earlier)
       if let Some(act) = action {
@@ -326,10 +343,17 @@ fn main() {
             act
           )))
         }
-      } else if dry_run {
-        commands::run_unify_analyze(&ctx, exclude, include, consolidate_transitives)
+      } else if check {
+        commands::run_unify_analyze(
+          &ctx,
+          exclude,
+          include,
+          consolidate_transitives,
+          include_renamed,
+          show_diff,
+        )
       } else {
-        commands::run_unify_apply(&ctx, exclude, include, backup)
+        commands::run_unify_apply(&ctx, exclude, include, backup, include_renamed, no_report, report_path)
       }
     }
 
@@ -338,14 +362,14 @@ fn main() {
       crate_name,
       all,
       remote,
-      dry_run,
+      check,
       json,
     } => {
       // Check if this is 'split init <crates>'
       if let Some(name) = crate_name {
         if name == "init" {
           // cargo rail split init (all crates)
-          commands::run_split_init(&ctx, None, dry_run)
+          commands::run_split_init(&ctx, None, check)
         } else if name.starts_with("init,") || name.starts_with("init ") {
           // cargo rail split "init,crate1,crate2" (specific crates)
           let crates = name
@@ -353,14 +377,14 @@ fn main() {
             .or_else(|| name.strip_prefix("init "))
             .unwrap()
             .trim();
-          commands::run_split_init(&ctx, Some(crates), dry_run)
+          commands::run_split_init(&ctx, Some(crates), check)
         } else {
           // cargo rail split mycrate (regular split)
-          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), dry_run, json)
+          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), check, json)
         }
       } else {
-        // cargo rail split --all or cargo rail split --dry-run
-        commands::run_split(&ctx, None, all, remote.clone(), dry_run, json)
+        // cargo rail split --all or cargo rail split --check
+        commands::run_split(&ctx, None, all, remote.clone(), check, json)
       }
     }
     Commands::Sync {
@@ -371,7 +395,7 @@ fn main() {
       to_remote,
       strategy,
       no_protected_branches,
-      dry_run,
+      check,
       json,
     } => commands::run_sync(
       &ctx,
@@ -382,7 +406,7 @@ fn main() {
       to_remote,
       strategy,
       no_protected_branches,
-      dry_run,
+      check,
       json,
     ),
 
@@ -392,7 +416,7 @@ fn main() {
       crate_names,
       all,
       bump,
-      dry_run,
+      check,
       skip_publish,
       skip_tag,
       json,
@@ -405,7 +429,7 @@ fn main() {
         } else {
           Some(crate_names.join(","))
         };
-        commands::run_release_init(&ctx, crates_str.as_deref(), dry_run)
+        commands::run_release_init(&ctx, crates_str.as_deref(), check)
       } else {
         // Regular release command
         // If action is provided and not "init", treat it as the first crate name
@@ -421,8 +445,8 @@ fn main() {
           Some(all_crate_names)
         };
 
-        if dry_run {
-          commands::run_release_plan(&ctx, names, bump, json)
+        if check {
+          commands::run_release_plan(&ctx, names, bump, skip_publish, skip_tag, json)
         } else {
           // Execute mode: perform the release
           commands::run_release_publish(&ctx, names, all, bump, skip_publish, skip_tag)
@@ -439,9 +463,6 @@ fn main() {
       };
       commands::run_release_check(&ctx, names, all)
     }
-
-    // Status
-    Commands::Status { json } => commands::run_status(&ctx, json),
 
     // Clean
     Commands::Clean {
