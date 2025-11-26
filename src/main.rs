@@ -112,7 +112,7 @@ enum Commands {
   /// Split a crate from monorepo to separate repo with history
   ///
   /// Usage:
-  ///   cargo rail split init <crate>     - Initialize split config for crate(s)
+  ///   cargo rail split init             - Initialize split config for all workspace crates
   ///   cargo rail split <crate>          - Execute split for a crate
   ///   cargo rail split --all            - Execute split for all configured crates
   ///   cargo rail split --dry-run        - Preview split operations
@@ -425,7 +425,7 @@ fn main() {
           commands::run_release_plan(&ctx, names, bump, json)
         } else {
           // Execute mode: perform the release
-          commands::run_release_publish(&ctx, names, all, bump, true, skip_publish, skip_tag)
+          commands::run_release_publish(&ctx, names, all, bump, skip_publish, skip_tag)
         }
       }
     }

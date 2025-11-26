@@ -184,7 +184,11 @@ impl<'a> ReleasePlanner<'a> {
 
 impl ReleasePlan {
   /// Format summary for display
-  pub fn format_summary(&self) -> String {
+  ///
+  /// # Arguments
+  /// * `skip_publish` - If true, show publishing as skipped for all crates
+  /// * `skip_tag` - If true, show tagging as skipped for all crates
+  pub fn format_summary_with_flags(&self, skip_publish: bool, skip_tag: bool) -> String {
     let mut output = String::new();
 
     output.push_str("📦 Release Plan\n\n");
@@ -195,11 +199,24 @@ impl ReleasePlan {
         "   Version: {} → {}\n",
         crate_plan.current_version, crate_plan.new_version
       ));
-      output.push_str(&format!("   Tag: {}\n", crate_plan.tag_name));
-      output.push_str(&format!(
-        "   Publish: {}\n",
-        if crate_plan.publish { "✓" } else { "✗ (skipped)" }
-      ));
+
+      // Show tag status
+      let tag_status = if skip_tag {
+        "✗ (--skip-tag)"
+      } else {
+        &crate_plan.tag_name
+      };
+      output.push_str(&format!("   Tag: {}\n", tag_status));
+
+      // Show publish status
+      let publish_status = if skip_publish {
+        "✗ (--skip-publish)".to_string()
+      } else if crate_plan.publish {
+        "✓".to_string()
+      } else {
+        "✗ (publish = false)".to_string()
+      };
+      output.push_str(&format!("   Publish: {}\n", publish_status));
 
       if !crate_plan.affected_dependents.is_empty() {
         output.push_str(&format!("   Affects: {}\n", crate_plan.affected_dependents.join(", ")));
@@ -207,11 +224,24 @@ impl ReleasePlan {
       output.push('\n');
     }
 
+    // Adjust summary counts based on flags
+    let effective_publish_count = if skip_publish {
+      0
+    } else {
+      self.summary.crates_to_publish
+    };
+    let effective_tag_count = if skip_tag { 0 } else { self.summary.crates_to_tag };
+
     output.push_str(&format!(
       "Summary: {} crate(s), {} to publish, {} tag(s)\n",
-      self.summary.total_crates, self.summary.crates_to_publish, self.summary.crates_to_tag
+      self.summary.total_crates, effective_publish_count, effective_tag_count
     ));
 
     output
+  }
+
+  /// Format summary for display (default: no skip flags)
+  pub fn format_summary(&self) -> String {
+    self.format_summary_with_flags(false, false)
   }
 }

@@ -20,7 +20,9 @@ pub fn run_split(
   dry_run: bool,
   json: bool,
 ) -> RailResult<()> {
-  println!("📦 Loaded configuration");
+  if !json {
+    eprintln!("📦 Loaded configuration");
+  }
 
   // Build configurations using the centralized builder
   let builder = SplitSyncConfigBuilder::new(ctx)?
@@ -31,12 +33,12 @@ pub fn run_split(
   let all_local = builder.all_local();
   let config_count = builder.count();
 
-  if all_local && !dry_run {
-    println!("   Local testing mode\n");
+  if all_local && !dry_run && !json {
+    eprintln!("   Local testing mode\n");
   }
 
-  if all {
-    println!("   Splitting all {} configured crates", config_count);
+  if all && !json {
+    eprintln!("   Splitting all {} configured crates", config_count);
   }
 
   let configs = builder.build_split_configs()?;

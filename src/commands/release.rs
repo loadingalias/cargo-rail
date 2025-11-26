@@ -17,10 +17,25 @@ pub fn run_release_plan(
   bump: String,
   json: bool,
 ) -> RailResult<()> {
-  println!("🔍 Planning release...\n");
+  if !json {
+    eprintln!("🔍 Planning release...\n");
+  }
 
   // Parse bump type
   let bump_type = bump.parse::<BumpType>()?;
+
+  // Validate crate names exist before planning
+  if let Some(ref names) = crate_names {
+    let workspace_members = ctx.graph.workspace_members();
+    for name in names {
+      if !workspace_members.contains(name) {
+        return Err(RailError::with_help(
+          format!("Crate '{}' not found in workspace", name),
+          format!("Available crates: {}", workspace_members.join(", ")),
+        ));
+      }
+    }
+  }
 
   // Get release config
   let config = ctx.config.as_ref().map(|c| &c.release);
@@ -43,13 +58,13 @@ pub fn run_release_plan(
   } else {
     println!("{}", plan.format_summary());
 
-    println!("📝 This is a dry-run. To execute this release, run:");
+    eprintln!("\n📝 This is a dry-run. To execute this release, run:");
     if let Some(names) = crate_names {
       for name in names {
-        println!("   cargo rail release {} --execute", name);
+        eprintln!("   cargo rail release {}", name);
       }
     } else {
-      println!("   cargo rail release --all --execute");
+      eprintln!("   cargo rail release --all");
     }
   }
 
@@ -64,7 +79,6 @@ pub fn run_release_publish(
   crate_names: Option<Vec<String>>,
   all: bool,
   bump: String,
-  execute: bool,
   skip_publish: bool,
   skip_tag: bool,
 ) -> RailResult<()> {
@@ -98,25 +112,12 @@ pub fn run_release_publish(
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Build release plan
-  println!("🔍 Building release plan...\n");
+  eprintln!("🔍 Building release plan...\n");
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(targets, &bump_type)?;
 
-  // Display plan
-  println!("{}", plan.format_summary());
-
-  // Dry-run check
-  if !execute {
-    println!("\n🔍 DRY-RUN MODE - No changes will be made\n");
-    println!("To execute this release, add --execute flag:");
-    let target_str = if all {
-      "--all".to_string()
-    } else {
-      target_crates.join(" ")
-    };
-    println!("   cargo rail release {} --execute", target_str);
-    return Ok(());
-  }
+  // Display plan with skip flags reflected
+  println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
   // Interactive confirmation (if terminal)
   if io::stdin().is_terminal() {

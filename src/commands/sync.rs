@@ -28,7 +28,9 @@ pub fn run_sync(
   // Parse conflict strategy
   let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
 
-  println!("📦 Loaded configuration");
+  if !json {
+    eprintln!("📦 Loaded configuration");
+  }
 
   // Build configurations using the centralized builder
   let builder = SplitSyncConfigBuilder::new(ctx)?
@@ -40,8 +42,8 @@ pub fn run_sync(
   let all_local = builder.all_local();
   let config_count = builder.count();
 
-  if all_local && !dry_run {
-    println!("   Local testing mode\n");
+  if all_local && !dry_run && !json {
+    eprintln!("   Local testing mode\n");
   }
 
   // Determine sync direction
@@ -53,21 +55,27 @@ pub fn run_sync(
       ));
     }
     (true, false) => {
-      println!("   Direction: remote → monorepo");
+      if !json {
+        eprintln!("   Direction: remote → monorepo");
+      }
       SyncDirection::RemoteToMono
     }
     (false, true) => {
-      println!("   Direction: monorepo → remote");
+      if !json {
+        eprintln!("   Direction: monorepo → remote");
+      }
       SyncDirection::MonoToRemote
     }
     (false, false) => {
-      println!("   Direction: bidirectional");
+      if !json {
+        eprintln!("   Direction: bidirectional");
+      }
       SyncDirection::Both
     }
   };
 
-  if all {
-    println!("   Syncing all {} configured crates", config_count);
+  if all && !json {
+    eprintln!("   Syncing all {} configured crates", config_count);
   }
 
   let configs = builder.build_sync_configs()?;
