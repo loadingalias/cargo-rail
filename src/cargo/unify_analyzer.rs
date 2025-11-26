@@ -413,17 +413,10 @@ impl UnifyAnalyzer {
         continue;
       }
 
-      // Skip renamed dependencies unless configured - BLOCKING ERROR
+      // Skip renamed dependencies unless configured
+      // When include_renamed = false, we silently skip renamed deps (they're separate from
+      // non-renamed deps now, so skipping them doesn't affect direct dep unification)
       if dep_key.renamed_from.is_some() && !self.config.include_renamed {
-        issues.push(UnifyIssue {
-          dep_name: format!(
-            "{} (renamed from {})",
-            dep_key.name,
-            dep_key.renamed_from.as_ref().unwrap()
-          ),
-          severity: IssueSeverity::Error,
-          message: "Renamed dependency detected - BLOCKING (enable with include_renamed = true)".to_string(),
-        });
         continue;
       }
 
