@@ -726,3 +726,383 @@ serde = "1.0"
 
   Ok(())
 }
+
+// ============================================================================
+// Issue #6: include_renamed merges renamed + non-renamed deps for threshold
+// ============================================================================
+
+/// Test that include_renamed = true allows renamed + non-renamed deps to count together
+/// for the >=2 usage threshold
+#[test]
+fn test_unify_include_renamed_merges_usage_count() -> Result<()> {
+  let workspace = TestWorkspace::new_named("include-renamed-merge")?;
+
+  // crate-a uses serde directly (non-renamed)
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // crate-b uses serde renamed as "my_serde"
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+my_serde = { package = "serde", version = "1.0", features = ["rc"] }
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates with renamed dep")?;
+
+  // Without --include-renamed, serde should NOT be unified (each variant has only 1 user)
+  let output_without = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout_without = String::from_utf8_lossy(&output_without.stdout);
+  assert!(
+    !stdout_without.contains("Dependencies to unify:") || stdout_without.contains("Dependencies to unify: 0"),
+    "Without --include-renamed, serde shouldn't qualify (each variant has 1 user).\nOutput:\n{}",
+    stdout_without
+  );
+
+  // With --include-renamed, serde SHOULD be unified (2 users total for the package)
+  let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include-renamed"])?;
+  let stdout_with = String::from_utf8_lossy(&output_with.stdout);
+  assert!(
+    stdout_with.contains("serde") && stdout_with.contains("Dependencies to unify"),
+    "With --include-renamed, serde should qualify (2 users total).\nOutput:\n{}",
+    stdout_with
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// Issue #8: include option forces single-user deps into unification
+// ============================================================================
+
+/// Test that the `include` config option forces a dependency with only 1 user
+/// to be included in workspace.dependencies
+#[test]
+fn test_unify_include_forces_single_user_dep() -> Result<()> {
+  let workspace = TestWorkspace::new_named("include-single-user")?;
+
+  // Create rail.toml with include = ["anyhow"]
+  std::fs::create_dir_all(workspace.path.join(".config"))?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"
+[unify]
+include = ["anyhow"]
+"#,
+  )?;
+
+  // crate-a uses both serde and anyhow
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+anyhow = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // crate-b uses only serde (not anyhow)
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates")?;
+
+  // Run unify analyze
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // serde should be unified (2 users)
+  assert!(
+    stdout.contains("serde"),
+    "serde should be unified (2 users).\nOutput:\n{}",
+    stdout
+  );
+
+  // anyhow should ALSO be unified because it's in the `include` list,
+  // even though it only has 1 user
+  assert!(
+    stdout.contains("anyhow"),
+    "anyhow should be unified due to `include` config.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// Issue #10: exact_pin_handling = "preserve" keeps exact version pins
+// ============================================================================
+
+/// Test that exact_pin_handling = "preserve" keeps the =x.y.z format
+/// in workspace.dependencies instead of converting to ^x.y.z
+#[test]
+fn test_unify_exact_pin_handling_preserve() -> Result<()> {
+  let workspace = TestWorkspace::new_named("exact-pin-preserve")?;
+
+  // Create rail.toml with exact_pin_handling = "preserve"
+  std::fs::create_dir_all(workspace.path.join(".config"))?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"
+[unify]
+exact_pin_handling = "preserve"
+"#,
+  )?;
+
+  // crate-a uses serde with exact pin
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // crate-b also uses serde with exact pin
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates with exact pins")?;
+
+  // Run unify apply
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "Unify should succeed.\nstderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Check workspace Cargo.toml - should have exact pin preserved
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("serde"),
+    "Workspace should have serde.\nContent:\n{}",
+    workspace_toml
+  );
+
+  // The version should start with = (exact pin preserved)
+  // Format: serde = { version = "=1.0.200", ... } or serde = "=1.0.200"
+  assert!(
+    workspace_toml.contains("=1.0") || workspace_toml.contains("\"="),
+    "Exact pin should be preserved in workspace.dependencies.\nContent:\n{}",
+    workspace_toml
+  );
+
+  Ok(())
+}
+
+/// Test that exact_pin_handling = "skip" excludes exact-pinned deps from unification
+#[test]
+fn test_unify_exact_pin_handling_skip() -> Result<()> {
+  let workspace = TestWorkspace::new_named("exact-pin-skip")?;
+
+  // Create rail.toml with exact_pin_handling = "skip"
+  std::fs::create_dir_all(workspace.path.join(".config"))?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"
+[unify]
+exact_pin_handling = "skip"
+"#,
+  )?;
+
+  // crate-a uses serde with exact pin
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+anyhow = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // crate-b also uses both deps
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+anyhow = "1.0"
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates with exact pins")?;
+
+  // Run unify check
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // anyhow should be unified (no exact pin)
+  assert!(
+    stdout.contains("anyhow"),
+    "anyhow should be unified (no exact pin).\nOutput:\n{}",
+    stdout
+  );
+
+  // serde should NOT appear in unification plan (has exact pin, skip mode)
+  // Check that serde is not in the "Dependencies to unify" section
+  // (it may appear in other messages like "Analyzing X dependencies")
+  let unify_section = stdout.split("Dependencies to unify").nth(1).unwrap_or("");
+  assert!(
+    !unify_section.contains("serde =") && !unify_section.contains("serde:"),
+    "serde should be skipped due to exact pin.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test that exact_pin_handling = "warn" (default) converts to caret but warns
+#[test]
+fn test_unify_exact_pin_handling_warn() -> Result<()> {
+  let workspace = TestWorkspace::new_named("exact-pin-warn")?;
+
+  // No rail.toml - use default (warn mode)
+
+  // crate-a uses serde with exact pin
+  let crate_a_path = workspace.path.join("crates/crate-a");
+  std::fs::create_dir_all(&crate_a_path)?;
+  std::fs::create_dir_all(crate_a_path.join("src"))?;
+
+  std::fs::write(
+    crate_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+"#,
+  )?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // crate-b also uses serde with exact pin
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "=1.0.200"
+"#,
+  )?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  workspace.commit("Add crates with exact pins")?;
+
+  // Run unify check
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // serde should be in the plan (warn mode converts but still unifies)
+  assert!(
+    stdout.contains("serde"),
+    "serde should be in unification plan (warn mode).\nOutput:\n{}",
+    stdout
+  );
+
+  // Should show a warning about exact pin
+  assert!(
+    stdout.contains("[WARN]") && stdout.contains("exact"),
+    "Should warn about exact version pin.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}

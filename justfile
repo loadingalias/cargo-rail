@@ -37,15 +37,3 @@ pin-actions:
 # Verify all GitHub Actions are properly pinned
 verify-actions:
     @scripts/ci/pin-actions.sh --verify-only
-
-# Create/update release PR via release-plz
-release-pr:
-    @scripts/release/release_plz.sh release-pr
-
-# Publish release (after PR merge)
-release:
-    @scripts/release/release_plz.sh release
-
-# Update changelog + versions locally (no PR)
-release-update:
-    @scripts/release/release_plz.sh update

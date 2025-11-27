@@ -271,3 +271,217 @@ fn test_release_explicit_version() -> Result<()> {
 
   Ok(())
 }
+
+// ============================================================================
+// changelog_relative_to Tests (Issue #19)
+// ============================================================================
+
+/// Test default changelog_relative_to behavior (crate-relative, backward compatible)
+#[test]
+fn test_changelog_relative_to_crate_default() -> Result<()> {
+  let ws = TestWorkspace::new_named("changelog-crate-rel")?;
+  ws.set_remote("git@github.com:org/repo.git")?;
+
+  // Don't set changelog_relative_to - should default to "crate"
+  ws.write_release_config(
+    r#"require_clean = false
+changelog_path = "CHANGELOG.md"
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
+  ws.commit("feat: add v2 function")?;
+
+  // Run release
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success(),
+    "release should succeed\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Changelog should be at crates/lib-a/CHANGELOG.md (crate-relative)
+  let crate_changelog = ws.path.join("crates/lib-a/CHANGELOG.md");
+  let workspace_changelog = ws.path.join("CHANGELOG.md");
+
+  assert!(
+    crate_changelog.exists(),
+    "Changelog should exist at crate-relative path: {}",
+    crate_changelog.display()
+  );
+  assert!(
+    !workspace_changelog.exists(),
+    "Changelog should NOT exist at workspace root when using crate-relative"
+  );
+
+  Ok(())
+}
+
+/// Test changelog_relative_to = "workspace" creates changelog at workspace root
+#[test]
+fn test_changelog_relative_to_workspace() -> Result<()> {
+  let ws = TestWorkspace::new_named("changelog-ws-rel")?;
+  ws.set_remote("git@github.com:org/repo.git")?;
+
+  // Explicitly set changelog_relative_to = "workspace"
+  ws.write_release_config(
+    r#"require_clean = false
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "workspace"
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
+  ws.commit("feat: add v2 function")?;
+
+  // Run release
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success(),
+    "release should succeed\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Changelog should be at workspace root (workspace-relative)
+  let workspace_changelog = ws.path.join("CHANGELOG.md");
+  let crate_changelog = ws.path.join("crates/lib-a/CHANGELOG.md");
+
+  assert!(
+    workspace_changelog.exists(),
+    "Changelog should exist at workspace root: {}",
+    workspace_changelog.display()
+  );
+  assert!(
+    !crate_changelog.exists(),
+    "Changelog should NOT exist at crate directory when using workspace-relative"
+  );
+
+  // Verify changelog content
+  let content = std::fs::read_to_string(&workspace_changelog)?;
+  assert!(
+    content.contains("lib-a") || content.contains("0.1.1"),
+    "Changelog should contain release info. Content:\n{}",
+    content
+  );
+
+  Ok(())
+}
+
+/// Test that parent directories are auto-created for changelog paths
+#[test]
+fn test_changelog_parent_directories_auto_created() -> Result<()> {
+  let ws = TestWorkspace::new_named("changelog-auto-mkdir")?;
+  ws.set_remote("git@github.com:org/repo.git")?;
+
+  // Use a nested path that doesn't exist
+  ws.write_release_config(
+    r#"require_clean = false
+changelog_path = "docs/changelogs/CHANGELOG.md"
+changelog_relative_to = "workspace"
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
+  ws.commit("feat: add v2 function")?;
+
+  // docs/changelogs/ doesn't exist yet - should be auto-created
+  assert!(!ws.path.join("docs/changelogs").exists());
+
+  // Run release
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success(),
+    "release should succeed with auto-created directories\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Verify directory and changelog were created
+  let changelog_path = ws.path.join("docs/changelogs/CHANGELOG.md");
+  assert!(
+    changelog_path.exists(),
+    "Changelog should exist at nested path: {}",
+    changelog_path.display()
+  );
+  assert!(
+    ws.path.join("docs/changelogs").is_dir(),
+    "Parent directories should be auto-created"
+  );
+
+  Ok(())
+}
+
+/// Test changelog_relative_to = "crate" with custom path creates in crate subdir
+#[test]
+fn test_changelog_relative_to_crate_custom_path() -> Result<()> {
+  let ws = TestWorkspace::new_named("changelog-crate-custom")?;
+  ws.set_remote("git@github.com:org/repo.git")?;
+
+  // Use custom path with crate-relative
+  ws.write_release_config(
+    r#"require_clean = false
+changelog_path = "docs/CHANGES.md"
+changelog_relative_to = "crate"
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
+  ws.commit("feat: add v2 function")?;
+
+  // Run release
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success(),
+    "release should succeed\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Changelog should be at crates/lib-a/docs/CHANGES.md
+  let changelog_path = ws.path.join("crates/lib-a/docs/CHANGES.md");
+  assert!(
+    changelog_path.exists(),
+    "Changelog should exist at custom crate-relative path: {}",
+    changelog_path.display()
+  );
+
+  Ok(())
+}

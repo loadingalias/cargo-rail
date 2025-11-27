@@ -2,7 +2,7 @@
 name = "cargo-rail"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.89.0"
+rust-version = "1.91.1"
 license = "MIT"
 authors = ["loadingalias"]
 description = "Monorepo tooling for Rust workspaces"
@@ -28,7 +28,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 semver = "1.0.27"
 rayon = "1.11.0"
-winnow = "0.7.13"
+winnow = "0.7.14"
 chrono = "0.4.42"
 glob = "0.3.3"
 

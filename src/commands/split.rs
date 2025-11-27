@@ -135,9 +135,6 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, check: bool)
   let existing_config = RailConfig::load(workspace_root).ok();
 
   let mut config = existing_config.unwrap_or_else(|| RailConfig {
-    workspace: crate::config::WorkspaceConfig {
-      root: std::path::PathBuf::from("."),
-    },
     targets: vec![],
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),

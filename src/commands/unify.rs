@@ -293,11 +293,48 @@ pub fn run_unify_apply(
 
   if !plan.transitive_pins.is_empty() {
     eprintln!("pinning {} transitives...", plan.transitive_pins.len());
-    let host_path = match &ctx.config.as_ref().map(|c| &c.unify.transitive_host) {
-      Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
-      _ => ctx.workspace_root().join("Cargo.toml"),
-    };
-    writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
+    let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
+    let is_root_host = matches!(
+      transitive_host_setting,
+      None | Some(crate::config::TransitiveFeatureHost::Root)
+    );
+
+    // For virtual workspaces (no [package] section), we can't use the root as the transitive host
+    // because virtual manifests can't have [dev-dependencies]
+    if is_root_host && is_virtual_workspace(ctx.workspace_root()) {
+      // Auto-select first workspace member as the host
+      let members = ctx.graph.workspace_members();
+      if members.is_empty() {
+        return Err(RailError::with_help(
+          "transitive_host = \"root\" is incompatible with virtual workspaces".to_string(),
+          "Virtual workspaces cannot have [dev-dependencies]. Set transitive_host to a workspace member path in your rail.toml:\n  \
+           [unify]\n  \
+           transitive_host = \"crates/some-crate\"".to_string(),
+        ));
+      }
+
+      // Find a suitable member's path
+      let first_member = &members[0];
+      let metadata = ctx.cargo.metadata();
+      if let Some(pkg) = metadata.workspace_packages().iter().find(|p| p.name == *first_member) {
+        let member_path = pkg.manifest_path.parent().unwrap();
+        let relative_path = member_path.strip_prefix(ctx.workspace_root()).unwrap_or(member_path);
+        eprintln!(
+          "  note: using '{}' as transitive host (virtual workspace detected)",
+          relative_path
+        );
+        let host_path = member_path.join("Cargo.toml");
+        writer.add_transitive_pins(&host_path.into_std_path_buf(), &plan.transitive_pins)?;
+      } else {
+        return Err(RailError::message("Failed to find a suitable transitive host member"));
+      }
+    } else {
+      let host_path = match transitive_host_setting {
+        Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
+        _ => ctx.workspace_root().join("Cargo.toml"),
+      };
+      writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
+    }
   }
 
   if let Some(ref msrv) = plan.computed_msrv {
@@ -392,4 +429,24 @@ pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: O
   backup_manager.restore_backup(&target_backup_id)?;
 
   Ok(())
+}
+
+/// Check if a workspace is a "virtual" workspace (has [workspace] but no [package])
+///
+/// Virtual workspaces cannot have [dev-dependencies] directly in their manifest,
+/// which affects transitive dependency pinning.
+fn is_virtual_workspace(workspace_root: &std::path::Path) -> bool {
+  use std::fs;
+
+  let root_manifest = workspace_root.join("Cargo.toml");
+  let Ok(content) = fs::read_to_string(&root_manifest) else {
+    return false;
+  };
+
+  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+    return false;
+  };
+
+  // A virtual workspace has [workspace] but no [package]
+  doc.contains_key("workspace") && !doc.contains_key("package")
 }

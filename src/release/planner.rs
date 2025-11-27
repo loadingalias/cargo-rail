@@ -1,6 +1,6 @@
 //! Release planning and dry-run analysis
 
-use crate::config::ReleaseConfig;
+use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
 use crate::release::version::{BumpType, VersionBumper};
 use crate::workspace::WorkspaceContext;
@@ -136,16 +136,46 @@ impl<'a> ReleasePlanner<'a> {
     // Determine tag name
     let tag_name = self.format_tag(crate_name, &new_version);
 
-    // Get changelog path
-    let changelog_path = manifest_path
-      .parent()
-      .ok_or_else(|| RailError::message("Invalid manifest path"))?
-      .join(&self.release_config.changelog_path);
+    // Get per-crate config (if any)
+    let crate_config = self.ctx.config.as_ref().and_then(|c| c.crates.get(crate_name));
 
-    let generate_changelog = !self.release_config.skip_changelog_for.iter().any(|c| c == crate_name);
+    // Get changelog path - check per-crate config first, then fall back to global
+    let changelog_relative_path = crate_config
+      .and_then(|c| c.changelog.as_ref())
+      .and_then(|ch| ch.path.as_ref())
+      .map(|p| p.to_string_lossy().to_string())
+      .unwrap_or_else(|| self.release_config.changelog_path.clone());
 
-    // Check if should publish
-    let publish = package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+    // Resolve the path based on changelog_relative_to setting
+    let changelog_path = match self.release_config.changelog_relative_to {
+      ChangelogRelativeTo::Crate => {
+        // Relative to crate directory (default, backward compatible)
+        manifest_path
+          .parent()
+          .ok_or_else(|| RailError::message("Invalid manifest path"))?
+          .join(&changelog_relative_path)
+      }
+      ChangelogRelativeTo::Workspace => {
+        // Relative to workspace root
+        self.ctx.workspace_root().join(&changelog_relative_path)
+      }
+    };
+
+    // Check if changelog should be generated - per-crate config takes priority
+    let generate_changelog = if let Some(changelog_cfg) = crate_config.and_then(|c| c.changelog.as_ref()) {
+      // Per-crate config exists - use its skip value
+      !changelog_cfg.skip
+    } else {
+      // Fall back to global skip_changelog_for list
+      !self.release_config.skip_changelog_for.iter().any(|c| c == crate_name)
+    };
+
+    // Check if should publish - per-crate config takes priority, then Cargo.toml
+    let publish_from_cargo = package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+    let publish = crate_config
+      .and_then(|c| c.release.as_ref())
+      .map(|r| r.publish)
+      .unwrap_or(publish_from_cargo);
 
     // Find affected dependents
     let affected_dependents = self.ctx.graph.transitive_dependents(crate_name)?;
@@ -164,18 +194,25 @@ impl<'a> ReleasePlanner<'a> {
   }
 
   /// Format git tag name for a crate
+  ///
+  /// Supports placeholders:
+  /// - {prefix} - the tag_prefix config value (default: "v")
+  /// - {crate} - the crate name
+  /// - {version} - the version number
   fn format_tag(&self, crate_name: &str, version: &Version) -> String {
     let workspace_members = self.ctx.graph.workspace_members();
     let is_single_crate = workspace_members.len() == 1;
 
-    // For single-crate repos, use simple "v{version}" format
-    // For monorepos, use "{crate}-v{version}" format
+    // For single-crate repos, use simple "{prefix}{version}" format
+    // For monorepos, use tag_format with all placeholders
     if is_single_crate {
       format!("{}{}", self.release_config.tag_prefix, version)
     } else {
+      // Apply all placeholders including {prefix}
       self
         .release_config
         .tag_format
+        .replace("{prefix}", &self.release_config.tag_prefix)
         .replace("{crate}", crate_name)
         .replace("{version}", &version.to_string())
     }

@@ -23,8 +23,8 @@
 //! ```
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
-use crate::config::RailConfig;
-use crate::error::RailResult;
+use crate::config::{ConfigLoadResult, RailConfig};
+use crate::error::{ConfigError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use cargo_metadata::{Metadata, MetadataCommand, Package};
@@ -303,8 +303,22 @@ impl WorkspaceContext {
     // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
-    // Load optional config
-    let config = RailConfig::load(&workspace_root).ok().map(Arc::new);
+    // Load optional config - but ERROR on parse failures
+    // If a config file exists but is broken, that's a user error we must report
+    let config = match RailConfig::try_load(&workspace_root) {
+      ConfigLoadResult::Loaded(cfg) => Some(Arc::new(*cfg)),
+      ConfigLoadResult::NotFound => None,
+      ConfigLoadResult::ParseError { path, message } => {
+        return Err(RailError::Config(ConfigError::ParseError { path, message }));
+      }
+    };
+
+    // Validate configured targets against rustc's canonical target list
+    if let Some(ref cfg) = config
+      && !cfg.targets.is_empty()
+    {
+      crate::targets::validate_targets(&cfg.targets)?;
+    }
 
     // Pre-load multi-target metadata if targets are configured
     // This saves 150-600ms for unify operations

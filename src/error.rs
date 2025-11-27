@@ -230,6 +230,14 @@ pub enum ConfigError {
     workspace_root: PathBuf,
   },
 
+  /// Config file exists but failed to parse
+  ParseError {
+    /// Path to the config file
+    path: PathBuf,
+    /// Parse error message
+    message: String,
+  },
+
   /// Missing required field
   MissingField {
     /// Name of the missing field
@@ -241,17 +249,47 @@ pub enum ConfigError {
     /// Name of the crate that wasn't found
     name: String,
   },
+
+  /// Invalid configuration value
+  InvalidValue {
+    /// Field name
+    field: String,
+    /// Error message
+    message: String,
+  },
+
+  /// Invalid field configuration
+  InvalidField {
+    /// Field name
+    field: String,
+    /// Reason why it's invalid
+    reason: String,
+  },
+
+  /// Invalid glob pattern
+  InvalidGlobPattern {
+    /// The invalid pattern
+    pattern: String,
+    /// Error message
+    message: String,
+  },
 }
 
 impl ConfigError {
   fn help_message(&self) -> Option<String> {
     match self {
       ConfigError::NotFound { .. } => Some("run 'cargo rail init' to create configuration".to_string()),
+      ConfigError::ParseError { .. } => Some("check the config file syntax and fix the error".to_string()),
       ConfigError::CrateNotFound { name } => Some(format!(
         "run 'cargo rail split --check' to list configured crates (did you mean '{}'?)",
         name
       )),
-      _ => None,
+      ConfigError::InvalidValue { field, .. } => Some(format!("check the '{}' field in your config file", field)),
+      ConfigError::InvalidField { field, .. } => Some(format!("check the '{}' field in your config file", field)),
+      ConfigError::InvalidGlobPattern { pattern, .. } => {
+        Some(format!("fix or remove the invalid glob pattern: '{}'", pattern))
+      }
+      ConfigError::MissingField { field } => Some(format!("add the required '{}' field to your config file", field)),
     }
   }
 }
@@ -266,11 +304,23 @@ impl fmt::Display for ConfigError {
           workspace_root.display()
         )
       }
+      ConfigError::ParseError { path, message } => {
+        write!(f, "failed to parse config file {}: {}", path.display(), message)
+      }
       ConfigError::MissingField { field } => {
         write!(f, "missing required field: {}", field)
       }
       ConfigError::CrateNotFound { name } => {
         write!(f, "crate '{}' not found in configuration", name)
+      }
+      ConfigError::InvalidValue { field, message } => {
+        write!(f, "invalid value for '{}': {}", field, message)
+      }
+      ConfigError::InvalidField { field, reason } => {
+        write!(f, "invalid configuration for '{}': {}", field, reason)
+      }
+      ConfigError::InvalidGlobPattern { pattern, message } => {
+        write!(f, "invalid glob pattern '{}': {}", pattern, message)
       }
     }
   }

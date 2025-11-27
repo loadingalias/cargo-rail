@@ -58,11 +58,49 @@ pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
   Ok(targets)
 }
 
+/// Validate that the given targets are valid Rust target triples
+///
+/// Returns an error if any of the targets are not in rustc's canonical target list.
+///
+/// # Arguments
+/// * `targets` - List of target triples to validate
+///
+/// # Returns
+/// Ok(()) if all targets are valid, or an error listing invalid targets
+pub fn validate_targets(targets: &[String]) -> RailResult<()> {
+  if targets.is_empty() {
+    return Ok(());
+  }
+
+  let canonical_targets = get_rust_target_list()?;
+  let mut invalid = Vec::new();
+
+  for target in targets {
+    if !canonical_targets.contains(target) {
+      invalid.push(target.clone());
+    }
+  }
+
+  if !invalid.is_empty() {
+    return Err(RailError::with_help(
+      format!("invalid target triple(s) in config: {}", invalid.join(", ")),
+      "check spelling against `rustc --print target-list`. Common targets:\n  \
+         - x86_64-unknown-linux-gnu\n  \
+         - aarch64-apple-darwin\n  \
+         - x86_64-pc-windows-msvc\n  \
+         - wasm32-unknown-unknown"
+        .to_string(),
+    ));
+  }
+
+  Ok(())
+}
+
 /// Get canonical list of Rust target triples from rustc
 ///
 /// Caches the result using OnceLock for efficiency (rustc call is ~5ms).
 /// Returns ~285 target triples as of Rust 1.91.
-fn get_rust_target_list() -> RailResult<Vec<String>> {
+pub fn get_rust_target_list() -> RailResult<Vec<String>> {
   static TARGETS: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
   let targets = TARGETS.get_or_init(|| {
@@ -145,6 +183,41 @@ mod tests {
   use super::*;
   use std::fs;
   use tempfile::TempDir;
+
+  #[test]
+  fn test_validate_targets_valid() {
+    let valid_targets = vec![
+      "x86_64-unknown-linux-gnu".to_string(),
+      "wasm32-unknown-unknown".to_string(),
+    ];
+    assert!(validate_targets(&valid_targets).is_ok());
+  }
+
+  #[test]
+  fn test_validate_targets_invalid() {
+    let invalid_targets = vec!["invalid-target-triple".to_string()];
+    let result = validate_targets(&invalid_targets);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("invalid-target-triple"));
+  }
+
+  #[test]
+  fn test_validate_targets_mixed() {
+    let mixed_targets = vec!["x86_64-unknown-linux-gnu".to_string(), "not-a-real-target".to_string()];
+    let result = validate_targets(&mixed_targets);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("not-a-real-target"));
+    // Should NOT mention the valid target
+    assert!(!err.contains("x86_64-unknown-linux-gnu"));
+  }
+
+  #[test]
+  fn test_validate_targets_empty() {
+    let empty: Vec<String> = vec![];
+    assert!(validate_targets(&empty).is_ok());
+  }
 
   #[test]
   fn test_get_rust_target_list() {

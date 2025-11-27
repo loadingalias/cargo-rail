@@ -59,11 +59,12 @@ fn create_test_workspace() -> TempDir {
     .unwrap();
 
   // Create backups
+  // Note: max_backups=0 means NO backups (Issue #9 fix), so we use a large number
   let manager = BackupManager::new(workspace);
   let files = vec![]; // Empty files list is fine for testing backup creation logic
   for i in 1..=5 {
     let metadata = BackupMetadata::new(format!("test {}", i));
-    manager.create_backup(&files, metadata, 0).unwrap();
+    manager.create_backup(&files, metadata, 100).unwrap(); // 100 = allow up to 100 backups
     std::thread::sleep(std::time::Duration::from_millis(10));
   }
 

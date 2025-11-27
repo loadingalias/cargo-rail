@@ -25,8 +25,66 @@ impl<'a> ReleasePublisher<'a> {
     Self { ctx, release_config }
   }
 
+  /// Pre-flight validation: check all prerequisites before starting release
+  ///
+  /// This catches issues early rather than failing mid-release.
+  pub fn preflight_check(&self, skip_tag: bool) -> RailResult<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    // Issue #17: Check gh CLI availability if GitHub releases are enabled
+    if self.release_config.create_github_release && !skip_tag {
+      let check = Command::new("gh").args(["--version"]).output();
+      if check.is_err() || !check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        warnings.push(
+          "GitHub releases enabled but 'gh' CLI not found. \
+                    Install from https://cli.github.com/ or set create_github_release = false"
+            .to_string(),
+        );
+      } else {
+        // Check gh auth status
+        let auth_check = Command::new("gh").args(["auth", "status"]).output();
+        if auth_check.is_err() || !auth_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+          warnings.push("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
+        }
+      }
+
+      // Check for git remote
+      let remote_check = Command::new("git")
+        .current_dir(self.ctx.workspace_root())
+        .args(["remote", "get-url", "origin"])
+        .output();
+      if remote_check.is_err() || !remote_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        warnings.push("No git remote 'origin' found. GitHub releases require a remote.".to_string());
+      }
+    }
+
+    // Check sign_tags prerequisites if enabled
+    if self.release_config.sign_tags && !skip_tag {
+      // Check if user has GPG/SSH key configured
+      let signing_check = Command::new("git")
+        .current_dir(self.ctx.workspace_root())
+        .args(["config", "--get", "user.signingkey"])
+        .output();
+      if signing_check.is_err() || !signing_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        warnings.push(
+          "Tag signing enabled but no signing key configured. \
+                    Run 'git config user.signingkey <KEY_ID>'"
+            .to_string(),
+        );
+      }
+    }
+
+    Ok(warnings)
+  }
+
   /// Execute a release plan
   pub fn execute(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<()> {
+    // Run pre-flight checks
+    let warnings = self.preflight_check(skip_tag)?;
+    for warning in &warnings {
+      eprintln!("warning: {}", warning);
+    }
+
     for (i, crate_plan) in plan.crates.iter().enumerate() {
       eprintln!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
 
@@ -172,6 +230,14 @@ impl<'a> ReleasePublisher<'a> {
       }
     }
 
+    // Auto-create parent directories if they don't exist
+    if let Some(parent) = plan.changelog_path.parent()
+      && !parent.exists()
+    {
+      fs::create_dir_all(parent)
+        .map_err(|e| RailError::message(format!("failed to create directory {}: {}", parent.display(), e)))?;
+    }
+
     fs::write(&plan.changelog_path, updated)
       .map_err(|e| RailError::message(format!("failed to write {}: {}", plan.changelog_path.display(), e)))?;
 
@@ -209,12 +275,15 @@ impl<'a> ReleasePublisher<'a> {
   /// Create git tag
   fn create_tag(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(self.ctx.workspace_root()).args(["tag"]);
+    cmd.current_dir(self.ctx.workspace_root());
 
+    // When sign_tags=false, explicitly disable signing to override user's git config
+    // This ensures the user's tag.gpgsign=true doesn't interfere
     if self.release_config.sign_tags {
-      cmd.arg("-s");
+      cmd.args(["tag", "-s"]);
     } else {
-      cmd.arg("-a");
+      // Use -c to override any user git config that enables signing
+      cmd.args(["-c", "tag.gpgsign=false", "tag", "-a"]);
     }
 
     cmd.args([

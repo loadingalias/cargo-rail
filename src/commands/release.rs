@@ -23,8 +23,9 @@ pub fn run_release_plan(
 
   let bump_type = bump.parse::<BumpType>()?;
 
+  let workspace_members = ctx.graph.workspace_members();
+
   if let Some(ref names) = crate_names {
-    let workspace_members = ctx.graph.workspace_members();
     for name in names {
       if !workspace_members.contains(name) {
         return Err(RailError::with_help(
@@ -39,6 +40,21 @@ pub fn run_release_plan(
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
+  // Validate release config (Issue #14: tag_format, Issue #20: skip_changelog_for)
+  let warnings = release_config.validate(&workspace_members).map_err(RailError::Config)?;
+
+  // Print warnings
+  for warning in &warnings {
+    eprintln!("warning: {}", warning);
+  }
+
+  // Issue #15: Run require_clean check in --check mode too (early feedback)
+  if release_config.require_clean {
+    let validator = ReleaseValidator::new(ctx);
+    let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.clone());
+    validator.validate(&target_crates, true)?;
+  }
+
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(crate_names.clone(), &bump_type)?;
 
@@ -47,7 +63,20 @@ pub fn run_release_plan(
       .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json_output);
   } else {
+    // Issue #16: Show publish_delay in the plan output
     println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
+
+    // Show additional config info
+    if !skip_publish && plan.summary.crates_to_publish > 1 {
+      println!("Publish delay: {}s between crates", release_config.publish_delay);
+    }
+    if release_config.create_github_release && !skip_tag {
+      println!("GitHub releases: enabled");
+    }
+    if release_config.sign_tags && !skip_tag {
+      println!("Tag signing: enabled");
+    }
+
     println!("\nrun without --check to execute");
   }
 
@@ -206,9 +235,6 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<&str>, check: boo
   let existing_config = RailConfig::load(workspace_root).ok();
 
   let mut config = existing_config.unwrap_or_else(|| RailConfig {
-    workspace: crate::config::WorkspaceConfig {
-      root: std::path::PathBuf::from("."),
-    },
     targets: vec![],
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),

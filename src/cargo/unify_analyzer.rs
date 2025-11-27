@@ -400,6 +400,9 @@ impl UnifyAnalyzer {
 
     println!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
 
+    // Track which packages we've already processed (for include_renamed deduplication)
+    let mut processed_packages: HashSet<String> = HashSet::new();
+
     // Process each dependency
     for dep_key in self.manifests.all_dependencies() {
       // Skip if excluded
@@ -407,8 +410,21 @@ impl UnifyAnalyzer {
         continue;
       }
 
-      // Skip if not enough usage
-      let usage_count = self.manifests.usage_count(dep_key);
+      // === Issue #6 fix: When include_renamed = true, use package-level aggregation ===
+      // This ensures that `serde` and `old_serde = { package = "serde" }` count together
+      // toward the usage threshold.
+      let usage_count = if self.config.include_renamed {
+        // Skip if we've already processed this package (via another dep_key variant)
+        if processed_packages.contains(&dep_key.name) {
+          continue;
+        }
+        // Use package-level count (aggregates all renamed + non-renamed variants)
+        self.manifests.package_usage_count(&dep_key.name)
+      } else {
+        // Standard per-dep_key count
+        self.manifests.usage_count(dep_key)
+      };
+
       if usage_count < 2 && !self.config.include.contains(&dep_key.name) {
         continue;
       }
@@ -420,8 +436,17 @@ impl UnifyAnalyzer {
         continue;
       }
 
-      // Get usage sites early - needed for version checks
-      let usage_sites = self.manifests.get_usage_sites(dep_key);
+      // Mark this package as processed (for include_renamed deduplication)
+      if self.config.include_renamed {
+        processed_packages.insert(dep_key.name.clone());
+      }
+
+      // Get usage sites - when include_renamed = true, aggregate across all variants
+      let usage_sites: Vec<_> = if self.config.include_renamed {
+        self.manifests.get_package_usage_sites(&dep_key.name)
+      } else {
+        self.manifests.get_usage_sites(dep_key)
+      };
 
       // === CRITICAL: Check for major version conflicts ===
       // Different major versions should NEVER be merged - this is an anti-pattern
@@ -548,22 +573,41 @@ impl UnifyAnalyzer {
       }
 
       // Check for mixed defaults - use union strategy if present
-      let has_mixed_defaults = self.manifests.has_mixed_defaults(dep_key);
-
-      // First try intersection strategy
-      let intersection = self.manifests.compute_intersection(dep_key);
-
-      let (features, default_features) = if has_mixed_defaults || intersection.is_empty() {
-        // Use union strategy for:
-        // 1. Mixed default-features settings
-        // 2. No common features (empty intersection)
-        // Set default-features = true (max/union strategy)
-        (self.manifests.compute_union(dep_key), true)
+      // When include_renamed = true, check across all package variants
+      let has_mixed_defaults = if self.config.include_renamed {
+        self.manifests.package_has_mixed_defaults(&dep_key.name)
       } else {
-        // Use intersection (minimal) strategy
-        // Use conservative default-features policy
-        let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
-        (intersection, df)
+        self.manifests.has_mixed_defaults(dep_key)
+      };
+
+      // Compute features - when include_renamed = true, aggregate across all variants
+      // Note: intersection doesn't make sense across renamed deps (they're separate usages)
+      // so we use union to ensure all needed features are included
+      let (features, default_features) = if self.config.include_renamed {
+        // For package-level aggregation, always use union strategy
+        // (renamed deps typically have distinct feature needs)
+        let features = self.manifests.compute_package_union(&dep_key.name);
+        let df = self
+          .manifests
+          .package_default_features_policy(&dep_key.name)
+          .unwrap_or(true);
+        (features, df)
+      } else {
+        // Standard per-dep_key logic
+        let intersection = self.manifests.compute_intersection(dep_key);
+
+        if has_mixed_defaults || intersection.is_empty() {
+          // Use union strategy for:
+          // 1. Mixed default-features settings
+          // 2. No common features (empty intersection)
+          // Set default-features = true (max/union strategy)
+          (self.manifests.compute_union(dep_key), true)
+        } else {
+          // Use intersection (minimal) strategy
+          // Use conservative default-features policy
+          let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
+          (intersection, df)
+        }
       };
 
       // Check if target-specific
@@ -681,12 +725,12 @@ impl UnifyAnalyzer {
           .cloned()
           .collect();
 
-        // For renamed dependencies (package = "..."), use the ALIAS name for manifest editing
-        // e.g., for `old_getrandom = { package = "getrandom", ... }`, use "old_getrandom"
-        let manifest_dep_name = dep_key.renamed_from.clone().unwrap_or_else(|| dep_key.name.clone());
-
+        // Use the cargo_toml_key from the usage - this is the actual key in Cargo.toml
+        // For renamed deps like `old_serde = { package = "serde" }`, this is "old_serde"
+        // This is critical for include_renamed mode where usage_sites are aggregated
+        // across multiple dep_keys for the same package
         let edit = MemberEdit::UseWorkspace {
-          dep_name: manifest_dep_name,
+          dep_name: usage.cargo_toml_key.clone(),
           dep_kind: usage.kind,
           target: usage.target.clone(), // Preserve target for correct section
           local_features,

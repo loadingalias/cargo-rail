@@ -33,20 +33,13 @@ impl RailConfigBuilder {
     self
   }
 
-  /// Add workspace section
-  pub fn workspace(&mut self, root: &std::path::Path) -> &mut Self {
-    let content = format!("root = \"{}\"", root.display());
-    self.sections.push(format!("[workspace]\n{}\n", content));
-    self
-  }
-
-  /// Add targets (workspace-wide, top-level field)
+  /// Add targets (workspace-wide, top-level field - must be FIRST after header)
   pub fn targets(&mut self, targets: &[String]) -> &mut Self {
     let mut content = String::new();
     if targets.is_empty() {
-      content.push_str("# targets = []  # Detected platform targets (run 'cargo rail init' to detect)\n");
+      content.push_str("# targets = []  # Platform targets for multi-target validation\n");
     } else {
-      content.push_str("# Detected platform targets for multi-platform validation\n");
+      content.push_str("# Platform targets for multi-target validation\n");
       content.push_str(&format!("targets = {}\n", self.formatter.array_targets(targets)));
     }
     self.sections.push(content);
@@ -142,9 +135,12 @@ impl RailConfigBuilder {
   pub fn release(&mut self, config: &ReleaseConfig) -> &mut Self {
     let mut content = String::new();
 
-    content.push_str(&format!("tag_prefix = \"{}\"\n", config.tag_prefix));
     content.push_str(&format!(
-      "tag_format = \"{}\"  # Variables: {{crate}}, {{version}}\n",
+      "tag_prefix = \"{}\"  # Prefix for all tags (used via {{prefix}} in tag_format)\n",
+      config.tag_prefix
+    ));
+    content.push_str(&format!(
+      "tag_format = \"{}\"  # Variables: {{prefix}}, {{crate}}, {{version}}\n",
       config.tag_format
     ));
     content.push_str(&format!("require_clean = {}\n", config.require_clean));
@@ -308,9 +304,6 @@ mod tests {
   fn test_rail_config_builder() {
     let mut builder = RailConfigBuilder::new();
     let config = RailConfig {
-      workspace: crate::config::WorkspaceConfig {
-        root: std::path::PathBuf::from("."),
-      },
       targets: vec!["x86_64-unknown-linux-gnu".to_string()],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
@@ -321,7 +314,6 @@ mod tests {
 
     let output = builder
       .header()
-      .workspace(&config.workspace.root)
       .targets(&config.targets)
       .unify(&config.unify)
       .release(&config.release)
@@ -329,7 +321,6 @@ mod tests {
       .build()
       .unwrap();
 
-    assert!(output.contains("[workspace]"));
     assert!(output.contains("targets"));
     assert!(output.contains("[unify]"));
     assert!(output.contains("[release]"));

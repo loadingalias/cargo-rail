@@ -6,6 +6,7 @@ use crate::git::{CommitInfo, SystemGit};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
+use glob::Pattern;
 use std::path::{Path, PathBuf};
 
 /// Configuration for a split operation
@@ -24,6 +25,10 @@ pub struct SplitConfig {
   pub branch: String,
   /// Remote repository URL
   pub remote_url: Option<String>,
+  /// Additional files/directories to include (glob patterns)
+  pub include: Vec<String>,
+  /// Files/directories to exclude (glob patterns)
+  pub exclude: Vec<String>,
 }
 
 /// Parameters for recreating a commit in the target repository
@@ -68,6 +73,56 @@ impl<'a> SplitEngine<'a> {
       ctx,
       transform: transformer,
     })
+  }
+
+  /// Check if a file path should be excluded based on glob patterns (Issue #26)
+  fn should_exclude(path: &str, exclude_patterns: &[Pattern]) -> bool {
+    for pattern in exclude_patterns {
+      if pattern.matches(path) {
+        return true;
+      }
+    }
+    false
+  }
+
+  /// Compile glob patterns from string slices
+  fn compile_patterns(patterns: &[String]) -> Vec<Pattern> {
+    patterns.iter().filter_map(|p| Pattern::new(p).ok()).collect()
+  }
+
+  /// Find additional files to include based on include patterns (Issue #25)
+  fn find_included_files(workspace_root: &Path, include_patterns: &[String]) -> RailResult<Vec<PathBuf>> {
+    use std::collections::HashSet;
+    let mut included = HashSet::new();
+
+    if include_patterns.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    // Use glob to find files matching include patterns
+    for pattern_str in include_patterns {
+      let full_pattern = workspace_root.join(pattern_str);
+      let glob_pattern = full_pattern.to_string_lossy();
+
+      if let Ok(paths) = glob::glob(&glob_pattern) {
+        for path_result in paths.flatten() {
+          if path_result.is_file() {
+            // Skip .git directory contents
+            let path_str = path_result.to_string_lossy();
+            if path_str.contains("/.git/") || path_str.contains("\\.git\\") {
+              continue;
+            }
+
+            // Get relative path
+            if let Ok(rel) = path_result.strip_prefix(workspace_root) {
+              included.insert(rel.to_path_buf());
+            }
+          }
+        }
+      }
+    }
+
+    Ok(included.into_iter().collect())
   }
 
   /// Walk commit history and filter commits that touch the given paths
@@ -287,6 +342,16 @@ impl<'a> SplitEngine<'a> {
     println!("   Mode: {:?}", config.mode);
     println!("   Target: {}", config.target_repo_path.display());
 
+    // Issue #25/#26: Compile exclude patterns (include uses glob directly)
+    let exclude_patterns = Self::compile_patterns(&config.exclude);
+
+    if !config.include.is_empty() {
+      println!("   Include patterns: {} configured", config.include.len());
+    }
+    if !config.exclude.is_empty() {
+      println!("   Exclude patterns: {} configured", config.exclude.len());
+    }
+
     // Check if remote already exists - if so, error with helpful message
     if let Some(ref remote_url) = config.remote_url {
       let remote_exists = self.check_remote_exists(remote_url)?;
@@ -314,6 +379,15 @@ impl<'a> SplitEngine<'a> {
     let crate_path = &config.crate_paths[0]; // Use first crate path for project files
     let project_files = ProjectFiles::discover(self.ctx.workspace_root(), crate_path)?;
     println!("   Found {} project files (README, LICENSE)", project_files.count());
+
+    // Issue #25: Find additional files to include based on include patterns
+    let additional_files = Self::find_included_files(self.ctx.workspace_root(), &config.include)?;
+    if !additional_files.is_empty() {
+      println!(
+        "   Found {} additional files from include patterns",
+        additional_files.len()
+      );
+    }
 
     // Create mapping store
     let mut mapping_store = MappingStore::new(config.crate_name.clone());
@@ -375,11 +449,37 @@ impl<'a> SplitEngine<'a> {
       }
 
       // Copy workspace config files and project files to the final state
-      let has_files = !aux_files.is_empty() || project_files.count() > 0;
+      let has_files = !aux_files.is_empty() || project_files.count() > 0 || !additional_files.is_empty();
       if has_files {
         println!("   Copying workspace configs and project files...");
         aux_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
         project_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
+
+        // Issue #25: Copy additional files from include patterns
+        if !additional_files.is_empty() {
+          println!(
+            "   Copying {} additional files from include patterns...",
+            additional_files.len()
+          );
+          for rel_path in &additional_files {
+            let source = self.ctx.workspace_root().join(rel_path);
+            let target = config.target_repo_path.join(rel_path);
+
+            // Skip files that match exclude patterns
+            let path_str = rel_path.to_string_lossy();
+            if Self::should_exclude(&path_str, &exclude_patterns) {
+              continue;
+            }
+
+            // Create parent directories and copy
+            if let Some(parent) = target.parent() {
+              std::fs::create_dir_all(parent)?;
+            }
+            if source.exists() && source.is_file() {
+              std::fs::copy(&source, &target)?;
+            }
+          }
+        }
 
         // Create a final commit if any files were added
         // git add -A is safe to run unconditionally (no-op if no changes)

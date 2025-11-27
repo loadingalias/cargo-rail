@@ -100,6 +100,8 @@ struct ChangeClassification {
   rebuild_all: bool,
   /// Infrastructure files that triggered rebuild_all
   infrastructure_files: Vec<String>,
+  /// Custom category matches: category name -> matched files
+  custom_categories: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Classify changed files to detect special cases
@@ -107,12 +109,23 @@ fn classify_changed_files(changed_files: &[PathBuf], config: &ChangeDetectionCon
   let mut docs_only = true;
   let mut rebuild_all = false;
   let mut infrastructure_files = Vec::new();
+  let mut custom_categories: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
   // Compile infrastructure patterns (with glob support)
   let infra_patterns: Vec<Pattern> = config
     .infrastructure
     .iter()
     .filter_map(|p| Pattern::new(p).ok())
+    .collect();
+
+  // Issue #22: Compile custom category patterns
+  let custom_patterns: Vec<(String, Vec<Pattern>)> = config
+    .custom
+    .iter()
+    .map(|(category, patterns)| {
+      let compiled: Vec<Pattern> = patterns.iter().filter_map(|p| Pattern::new(p).ok()).collect();
+      (category.clone(), compiled)
+    })
     .collect();
 
   for file in changed_files {
@@ -124,6 +137,19 @@ fn classify_changed_files(changed_files: &[PathBuf], config: &ChangeDetectionCon
       infrastructure_files.push(path_str.to_string());
       docs_only = false;
       continue;
+    }
+
+    // Issue #22: Check custom categories
+    for (category, patterns) in &custom_patterns {
+      for pattern in patterns {
+        if pattern.matches(&path_str) {
+          custom_categories
+            .entry(category.clone())
+            .or_default()
+            .push(path_str.to_string());
+          break; // Only match once per category per file
+        }
+      }
     }
 
     // Check file classification
@@ -147,6 +173,7 @@ fn classify_changed_files(changed_files: &[PathBuf], config: &ChangeDetectionCon
     docs_only,
     rebuild_all,
     infrastructure_files,
+    custom_categories,
   }
 }
 
@@ -316,6 +343,24 @@ fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
     out.push('\n');
   }
 
+  // Issue #22: Show custom category matches
+  if !classification.custom_categories.is_empty() {
+    out.push_str("custom categories:\n");
+    let mut categories: Vec<_> = classification.custom_categories.keys().collect();
+    categories.sort();
+    for category in categories {
+      let files = &classification.custom_categories[category];
+      out.push_str(&format!("  {} ({} files):\n", category, files.len()));
+      for file in files.iter().take(5) {
+        out.push_str(&format!("    {}\n", file));
+      }
+      if files.len() > 5 {
+        out.push_str(&format!("    ... and {} more\n", files.len() - 5));
+      }
+    }
+    out.push('\n');
+  }
+
   out.push_str(&format!("changed files: {}\n", analysis.changed_files.len()));
   if !analysis.changed_files.is_empty() && analysis.changed_files.len() <= 20 {
     for file in &analysis.changed_files {
@@ -354,6 +399,7 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
 
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
+  // Issue #22: Include custom categories in JSON output
   let output = json!({
       "changed_files": analysis.changed_files,
       "impact": {
@@ -364,7 +410,8 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
       "classification": {
           "docs_only": classification.docs_only,
           "rebuild_all": classification.rebuild_all,
-          "infrastructure_files": classification.infrastructure_files
+          "infrastructure_files": classification.infrastructure_files,
+          "custom_categories": classification.custom_categories
       },
       "summary": {
           "changed_files_count": analysis.changed_files.len(),

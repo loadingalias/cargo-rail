@@ -31,6 +31,26 @@ impl DepKey {
       renamed_from: None,
     }
   }
+
+  /// Get the canonical key (package name only, ignoring rename)
+  ///
+  /// Used when `include_renamed = true` to group renamed and non-renamed deps together
+  pub fn canonical(&self) -> Self {
+    Self {
+      name: self.name.clone(),
+      renamed_from: None,
+    }
+  }
+
+  /// Check if this is a renamed dependency
+  pub fn is_renamed(&self) -> bool {
+    self.renamed_from.is_some()
+  }
+
+  /// Get the alias (key used in Cargo.toml) - either renamed_from or name
+  pub fn alias(&self) -> &str {
+    self.renamed_from.as_ref().unwrap_or(&self.name)
+  }
 }
 
 // Compare by both name AND renamed_from to distinguish:
@@ -91,6 +111,9 @@ pub struct DepUsage {
   pub declared_version: Option<String>,
   /// Path to the manifest that declared this dependency (for path normalization)
   pub manifest_path: Option<PathBuf>,
+  /// The key name used in Cargo.toml (alias if renamed, otherwise package name)
+  /// Used when generating manifest edits to target the correct dependency entry
+  pub cargo_toml_key: String,
 }
 
 /// Parsed dependency table info (used internally during manifest parsing)
@@ -337,6 +360,8 @@ impl ManifestAnalyzer {
           DepKey::new(dep_name)
         };
 
+        // cargo_toml_key is always the key used in Cargo.toml (dep_name),
+        // which is the alias if renamed, or the package name otherwise
         let usage = DepUsage {
           unconditional_features: p.unconditional_features,
           conditional_features: BTreeSet::new(), // Filled in later
@@ -348,6 +373,7 @@ impl ManifestAnalyzer {
           path: p.path,
           declared_version: p.declared_version,
           manifest_path: Some(manifest_path.to_path_buf()),
+          cargo_toml_key: dep_name.to_string(),
         };
 
         out.insert(dep_key, usage);
@@ -561,6 +587,107 @@ impl ManifestAnalyzer {
   /// Count how many crates use a dependency (O(1) lookup from pre-computed cache)
   pub fn usage_count(&self, dep: &DepKey) -> usize {
     self.usage_counts.get(dep).copied().unwrap_or(0)
+  }
+
+  /// Count how many crates use a package (aggregated across renamed and non-renamed deps)
+  ///
+  /// Issue #6: When include_renamed = true, count all usages of the package
+  pub fn package_usage_count(&self, package_name: &str) -> usize {
+    let mut unique_users: HashSet<&String> = HashSet::new();
+
+    for (dep_key, usages) in &self.usage_index {
+      if dep_key.name == package_name {
+        for usage in usages {
+          unique_users.insert(&usage.used_by);
+        }
+      }
+    }
+
+    unique_users.len()
+  }
+
+  /// Get all dep keys that refer to a specific package (including renamed)
+  ///
+  /// Issue #6: Used to find all renamed variants of a package
+  pub fn dep_keys_for_package(&self, package_name: &str) -> Vec<&DepKey> {
+    self.usage_index.keys().filter(|k| k.name == package_name).collect()
+  }
+
+  /// Get aggregated usage sites for a package (all renamed and non-renamed usages)
+  ///
+  /// Issue #6: Used when include_renamed = true to merge features across all usages
+  pub fn get_package_usage_sites(&self, package_name: &str) -> Vec<&DepUsage> {
+    let mut all_usages = Vec::new();
+
+    for (dep_key, usages) in &self.usage_index {
+      if dep_key.name == package_name {
+        all_usages.extend(usages.iter());
+      }
+    }
+
+    all_usages
+  }
+
+  /// Compute union of features across all usages of a package (including renamed)
+  ///
+  /// Issue #6: When include_renamed = true, aggregate features from all variants
+  pub fn compute_package_union(&self, package_name: &str) -> BTreeSet<String> {
+    let mut union = BTreeSet::new();
+
+    for usage in self.get_package_usage_sites(package_name) {
+      if usage.target.is_none() {
+        union.extend(usage.unconditional_features.iter().cloned());
+      }
+    }
+
+    union
+  }
+
+  /// Check if a package has mixed default-features across all usages (including renamed)
+  ///
+  /// Issue #6: When include_renamed = true, check across all variants
+  pub fn package_has_mixed_defaults(&self, package_name: &str) -> bool {
+    let usages: Vec<_> = self
+      .get_package_usage_sites(package_name)
+      .into_iter()
+      .filter(|u| u.target.is_none())
+      .collect();
+
+    if usages.len() < 2 {
+      return false;
+    }
+
+    let first_default = usages[0].default_features;
+    !usages.iter().all(|u| u.default_features == first_default)
+  }
+
+  /// Get default-features policy across all usages of a package (including renamed)
+  ///
+  /// Issue #6: When include_renamed = true, use conservative policy across all variants
+  pub fn package_default_features_policy(&self, package_name: &str) -> Option<bool> {
+    let usages: Vec<_> = self
+      .get_package_usage_sites(package_name)
+      .into_iter()
+      .filter(|u| u.target.is_none())
+      .collect();
+
+    if usages.is_empty() {
+      return None;
+    }
+
+    // If any unconditional usage has default-features = false, we must use false
+    if usages.iter().any(|u| !u.default_features) {
+      Some(false)
+    } else {
+      Some(true)
+    }
+  }
+
+  /// Get unique package names from all dependencies
+  ///
+  /// Issue #6: Used to iterate by package rather than by dep key
+  pub fn unique_packages(&self) -> HashSet<String> {
+    self.usage_index.keys().map(|k| k.name.clone()).collect()
   }
 }
 

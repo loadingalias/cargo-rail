@@ -167,6 +167,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         target_repo_path,
         branch: split_config.branch.clone(),
         remote_url: Some(remote),
+        include: split_config.include.clone(),
+        exclude: split_config.exclude.clone(),
       });
     }
 

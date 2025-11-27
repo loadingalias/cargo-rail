@@ -3,7 +3,7 @@
 //! Auto-detects workspace structure, toolchain settings, and generates
 //! a sensible .config/rail.toml with smart defaults.
 
-use crate::config::{RailConfig, UnifyConfig, WorkspaceConfig};
+use crate::config::{RailConfig, UnifyConfig};
 use crate::error::{RailError, RailResult};
 use crate::toml::builder::RailConfigBuilder;
 use crate::workspace::WorkspaceContext;
@@ -51,11 +51,10 @@ pub fn run_init(
     }
   }
 
-  let config = build_rail_config(workspace_root.to_path_buf(), detected_targets, unify);
+  let config = build_rail_config(detected_targets, unify);
 
   let toml_content = RailConfigBuilder::new()
     .header()
-    .workspace(&config.workspace.root)
     .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
@@ -91,12 +90,9 @@ fn detect_targets(workspace_root: &Path) -> Vec<String> {
   crate::targets::detect_targets(workspace_root).unwrap_or_default()
 }
 
-fn build_rail_config(_workspace_root: PathBuf, targets: Vec<String>, unify: UnifyConfig) -> RailConfig {
+fn build_rail_config(targets: Vec<String>, unify: UnifyConfig) -> RailConfig {
   RailConfig {
-    workspace: WorkspaceConfig {
-      root: PathBuf::from("."),
-    },
-    targets, // TOP-LEVEL: targets are workspace-wide
+    targets,
     unify,
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
@@ -162,9 +158,6 @@ pub fn run_init_standalone(
   let detected_targets = detect_targets(workspace_root);
 
   let config = RailConfig {
-    workspace: WorkspaceConfig {
-      root: PathBuf::from("."),
-    },
     targets: detected_targets,
     unify: UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
@@ -175,7 +168,6 @@ pub fn run_init_standalone(
 
   let config_toml = RailConfigBuilder::new()
     .header()
-    .workspace(&config.workspace.root)
     .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
@@ -210,9 +202,6 @@ mod tests {
   #[test]
   fn test_serialize_config_with_builder() {
     let config = RailConfig {
-      workspace: WorkspaceConfig {
-        root: PathBuf::from("."),
-      },
       targets: vec![],
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
@@ -223,7 +212,7 @@ mod tests {
 
     let toml = RailConfigBuilder::new()
       .header()
-      .workspace(&config.workspace.root)
+      .targets(&config.targets)
       .unify(&config.unify)
       .release(&config.release)
       .splits_template()
@@ -231,7 +220,6 @@ mod tests {
       .unwrap();
 
     // Should contain section headers
-    assert!(toml.contains("[workspace]"));
     assert!(toml.contains("[unify]"));
 
     // Should contain helpful comments

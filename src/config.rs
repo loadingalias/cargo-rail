@@ -1,4 +1,4 @@
-use crate::error::{ConfigError, RailError, RailResult, ResultExt};
+use crate::error::{ConfigError, RailError, RailResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 /// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RailConfig {
-  /// Workspace configuration
-  pub workspace: WorkspaceConfig,
   /// Target triples for multi-platform validation (workspace-wide)
   /// Detected via `cargo rail init`, used by multiple commands
   #[serde(default)]
@@ -77,24 +75,31 @@ pub struct CrateReleaseConfig {
 /// Changelog configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangelogConfig {
-  /// Path to changelog file (relative to crate root)
+  /// Path to changelog file
+  /// Relative to crate directory (default) or workspace root depending on `relative_to`
   pub path: Option<PathBuf>,
   /// Exclude this crate from changelog generation?
   #[serde(default)]
   pub skip: bool,
 }
 
+/// What the changelog_path is relative to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangelogRelativeTo {
+  /// Relative to each crate's directory (default, backward compatible)
+  /// With this, `changelog_path = "CHANGELOG.md"` creates `crates/foo/CHANGELOG.md`
+  #[default]
+  Crate,
+  /// Relative to workspace root
+  /// With this, `changelog_path = "CHANGELOG.md"` creates `./CHANGELOG.md`
+  Workspace,
+}
+
 /// Sync configuration for a crate (future use)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CrateSyncConfig {
   // Future sync-specific settings
-}
-
-/// Workspace location configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceConfig {
-  /// Path to workspace root
-  pub root: PathBuf,
 }
 
 /// Unify configuration - controls workspace dependency unification behavior
@@ -341,6 +346,12 @@ pub struct ReleaseConfig {
   #[serde(default = "default_changelog_path")]
   pub changelog_path: String,
 
+  /// What changelog paths are relative to (default: "crate")
+  /// - "crate": Paths are relative to each crate's directory
+  /// - "workspace": Paths are relative to workspace root
+  #[serde(default)]
+  pub changelog_relative_to: ChangelogRelativeTo,
+
   /// Crates that should not generate changelog entries
   #[serde(default)]
   pub skip_changelog_for: Vec<String>,
@@ -360,6 +371,7 @@ impl Default for ReleaseConfig {
       create_github_release: false,
       sign_tags: false,
       changelog_path: default_changelog_path(),
+      changelog_relative_to: ChangelogRelativeTo::default(),
       skip_changelog_for: Vec::new(),
       require_changelog_entries: false,
     }
@@ -367,11 +379,13 @@ impl Default for ReleaseConfig {
 }
 
 /// Configuration for TOML formatting
+///
+/// Reserved for future formatting options. Currently empty.
+/// Previously had `add_header` which was never implemented - removed as dead code.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FormattingConfig {
-  /// Add "Managed by cargo-rail" header (default: false)
-  #[serde(default)]
-  pub add_header: bool,
+  // Reserved for future use
+  // Potential options: indentation style, inline table preferences, etc.
 }
 
 /// Configuration for change detection (`cargo rail affected`)
@@ -393,6 +407,35 @@ impl Default for ChangeDetectionConfig {
       infrastructure: default_infrastructure_patterns(),
       custom: std::collections::HashMap::new(),
     }
+  }
+}
+
+impl ChangeDetectionConfig {
+  /// Validate all glob patterns in the configuration
+  pub fn validate(&self) -> Result<(), ConfigError> {
+    // Validate infrastructure patterns
+    for pattern in &self.infrastructure {
+      if let Err(e) = glob::Pattern::new(pattern) {
+        return Err(ConfigError::InvalidGlobPattern {
+          pattern: pattern.clone(),
+          message: e.to_string(),
+        });
+      }
+    }
+
+    // Validate custom category patterns
+    for (category, patterns) in &self.custom {
+      for pattern in patterns {
+        if let Err(e) = glob::Pattern::new(pattern) {
+          return Err(ConfigError::InvalidGlobPattern {
+            pattern: format!("{}: {}", category, pattern),
+            message: e.to_string(),
+          });
+        }
+      }
+    }
+
+    Ok(())
   }
 }
 
@@ -421,7 +464,9 @@ fn default_tag_prefix() -> String {
 }
 
 fn default_tag_format() -> String {
-  "{crate}-v{version}".to_string()
+  // Use {prefix} placeholder so tag_prefix is respected
+  // With default tag_prefix="v", this produces: crate-name-v1.0.0
+  "{crate}-{prefix}{version}".to_string()
 }
 
 fn default_publish_delay() -> u64 {
@@ -499,6 +544,68 @@ pub enum WorkspaceMode {
   Workspace,
 }
 
+/// Result of attempting to load configuration
+pub enum ConfigLoadResult {
+  /// Config loaded successfully
+  Loaded(Box<RailConfig>),
+  /// Config file found but failed to parse
+  ParseError {
+    /// Path to the config file that failed to parse
+    path: PathBuf,
+    /// Error message describing the parse failure
+    message: String,
+  },
+  /// No config file found
+  NotFound,
+}
+
+impl ReleaseConfig {
+  /// Validate the release configuration
+  pub fn validate(&self, workspace_members: &[String]) -> Result<Vec<String>, ConfigError> {
+    let mut warnings = Vec::new();
+
+    // Validate tag_format
+    if self.tag_format.trim().is_empty() {
+      return Err(ConfigError::InvalidField {
+        field: "release.tag_format".to_string(),
+        reason: "tag_format cannot be empty".to_string(),
+      });
+    }
+
+    // Check for recommended placeholders in monorepo context
+    let is_monorepo = workspace_members.len() > 1;
+    if is_monorepo && !self.tag_format.contains("{crate}") {
+      warnings.push(
+        "release.tag_format does not contain {crate} placeholder. \
+                In monorepos, this may cause tag collisions between crates."
+          .to_string(),
+      );
+    }
+
+    if !self.tag_format.contains("{version}") && !self.tag_format.contains("{prefix}") {
+      warnings.push(
+        "release.tag_format does not contain {version} or {prefix} placeholder. \
+                Tags may not be identifiable."
+          .to_string(),
+      );
+    }
+
+    // Validate skip_changelog_for - check that all crate names exist
+    for crate_name in &self.skip_changelog_for {
+      if !workspace_members.contains(crate_name) {
+        warnings.push(format!(
+          "release.skip_changelog_for contains unknown crate '{}'. \
+                    Available crates: {}",
+          crate_name,
+          workspace_members.join(", ")
+        ));
+      }
+    }
+
+    Ok(warnings)
+  }
+}
+
 impl RailConfig {
   /// Find config file in search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
   ///
@@ -569,18 +676,43 @@ impl RailConfig {
 
   /// Load config from rail.toml (searches multiple locations)
   pub fn load(path: &Path) -> RailResult<Self> {
-    let config_path = Self::find_config_path(path).ok_or_else(|| {
-      RailError::Config(ConfigError::NotFound {
+    match Self::try_load(path) {
+      ConfigLoadResult::Loaded(config) => Ok(*config),
+      ConfigLoadResult::ParseError { path, message } => {
+        Err(RailError::Config(ConfigError::ParseError { path, message }))
+      }
+      ConfigLoadResult::NotFound => Err(RailError::Config(ConfigError::NotFound {
         workspace_root: path.to_path_buf(),
-      })
-    })?;
+      })),
+    }
+  }
 
-    let content = fs::read_to_string(&config_path)
-      .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
-    let config: RailConfig = toml_edit::de::from_str(&content)
-      .with_context(|| format!("Failed to parse config from {}", config_path.display()))?;
+  /// Try to load config, returning a result that distinguishes between
+  /// "not found" and "parse error". This is used by WorkspaceContext to
+  /// properly report parse errors instead of silently falling back to defaults.
+  pub fn try_load(path: &Path) -> ConfigLoadResult {
+    let config_path = match Self::find_config_path(path) {
+      Some(p) => p,
+      None => return ConfigLoadResult::NotFound,
+    };
 
-    Ok(config)
+    let content = match fs::read_to_string(&config_path) {
+      Ok(c) => c,
+      Err(e) => {
+        return ConfigLoadResult::ParseError {
+          path: config_path,
+          message: format!("failed to read file: {}", e),
+        };
+      }
+    };
+
+    match toml_edit::de::from_str(&content) {
+      Ok(config) => ConfigLoadResult::Loaded(Box::new(config)),
+      Err(e) => ConfigLoadResult::ParseError {
+        path: config_path,
+        message: e.to_string(),
+      },
+    }
   }
 
   /// Get all crates that have split configuration
@@ -954,5 +1086,49 @@ mod tests {
     assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
     assert!(config.detect_unused);
     assert!(config.remove_unused);
+  }
+
+  // ============================================================================
+  // ChangelogRelativeTo Tests
+  // ============================================================================
+
+  #[test]
+  fn test_changelog_relative_to_default() {
+    let config = ReleaseConfig::default();
+    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
+  }
+
+  #[test]
+  fn test_changelog_relative_to_parsing() {
+    // Test "crate" value
+    let toml = r#"changelog_relative_to = "crate""#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
+
+    // Test "workspace" value
+    let toml = r#"changelog_relative_to = "workspace""#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Workspace);
+  }
+
+  #[test]
+  fn test_changelog_relative_to_full_config() {
+    let toml = r#"
+      changelog_path = "docs/CHANGELOG.md"
+      changelog_relative_to = "workspace"
+    "#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.changelog_path, "docs/CHANGELOG.md");
+    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Workspace);
+  }
+
+  #[test]
+  fn test_changelog_relative_to_defaults_to_crate() {
+    // When not specified, should default to "crate" for backward compatibility
+    let toml = r#"
+      changelog_path = "CHANGELOG.md"
+    "#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
   }
 }

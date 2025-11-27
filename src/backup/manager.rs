@@ -24,12 +24,25 @@ impl BackupManager {
   }
 
   /// Create a backup of specified files
+  ///
+  /// # Arguments
+  /// * `files` - Files to backup (relative to workspace root)
+  /// * `metadata` - Metadata about the backup
+  /// * `max_backups` - Maximum backups to keep. 0 means skip backup entirely.
+  ///
+  /// # Returns
+  /// Backup ID if backup was created, or a placeholder if max_backups is 0
   pub fn create_backup(
     &self,
     files: &[PathBuf],
     mut metadata: BackupMetadata,
     max_backups: usize,
   ) -> RailResult<BackupId> {
+    // max_backups = 0 means no backups
+    if max_backups == 0 {
+      return Ok("none".to_string());
+    }
+
     let backup_id = create_backup_id();
     let backup_dir = get_backup_dir(&self.workspace_root, &backup_id);
 
@@ -56,9 +69,8 @@ impl BackupManager {
 
     metadata.save(&backup_dir)?;
 
-    if max_backups > 0 {
-      let _deleted = self.cleanup_old_backups(max_backups)?;
-    }
+    // Cleanup old backups (max_backups is guaranteed > 0 here)
+    let _deleted = self.cleanup_old_backups(max_backups)?;
 
     Ok(backup_id)
   }
@@ -207,9 +219,9 @@ mod tests {
     // Files to backup
     let files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("crates/foo/Cargo.toml")];
 
-    // Create backup
+    // Create backup (use max_backups=10 to keep multiple backups)
     let metadata = BackupMetadata::new("test command");
-    let backup_id = manager.create_backup(&files, metadata, 0)?;
+    let backup_id = manager.create_backup(&files, metadata, 10)?;
 
     // Verify backup was created
     let backup_dir = get_backup_dir(workspace.path(), &backup_id);
@@ -241,10 +253,10 @@ mod tests {
     let backups = manager.list_backups()?;
     assert_eq!(backups.len(), 0);
 
-    // Create a backup
+    // Create a backup (use max_backups=10 to keep multiple backups)
     let files = vec![PathBuf::from("Cargo.toml")];
     let metadata = BackupMetadata::new("test 1");
-    manager.create_backup(&files, metadata, 0)?;
+    manager.create_backup(&files, metadata, 10)?;
 
     // Should now have 1 backup
     assert!(manager.has_backups());
@@ -257,7 +269,7 @@ mod tests {
 
     // Create another backup
     let metadata2 = BackupMetadata::new("test 2");
-    manager.create_backup(&files, metadata2, 0)?;
+    manager.create_backup(&files, metadata2, 10)?;
 
     // Should have 2 backups
     let backups = manager.list_backups()?;
@@ -272,10 +284,11 @@ mod tests {
     let manager = BackupManager::new(workspace.path());
 
     // Create 5 backups with sufficient delay for unique timestamps
+    // Use max_backups=100 so all 5 are kept initially
     let files = vec![PathBuf::from("Cargo.toml")];
     for i in 1..=5 {
       let metadata = BackupMetadata::new(format!("test {}", i));
-      manager.create_backup(&files, metadata, 0)?;
+      manager.create_backup(&files, metadata, 100)?;
       // Sleep 1 second to ensure different timestamps (format is YYYY-MM-DD-HHMMSS)
       std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -303,15 +316,34 @@ mod tests {
     // Initially no backups
     assert!(manager.get_latest_backup()?.is_none());
 
-    // Create backups with sufficient delay
+    // Create backups with sufficient delay (use max_backups=10 to keep them)
     let files = vec![PathBuf::from("Cargo.toml")];
-    manager.create_backup(&files, BackupMetadata::new("first"), 0)?;
+    manager.create_backup(&files, BackupMetadata::new("first"), 10)?;
     std::thread::sleep(std::time::Duration::from_secs(1));
-    manager.create_backup(&files, BackupMetadata::new("second"), 0)?;
+    manager.create_backup(&files, BackupMetadata::new("second"), 10)?;
 
     // Latest should be "second"
     let latest = manager.get_latest_backup()?.unwrap();
     assert_eq!(latest.metadata.command, "second");
+
+    Ok(())
+  }
+
+  #[test]
+  fn test_max_backups_zero_disables_backup() -> RailResult<()> {
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+
+    let files = vec![PathBuf::from("Cargo.toml")];
+
+    // With max_backups = 0, no backup should be created
+    let backup_id = manager.create_backup(&files, BackupMetadata::new("test"), 0)?;
+    assert_eq!(backup_id, "none");
+
+    // Should have no backups
+    assert!(!manager.has_backups());
+    let backups = manager.list_backups()?;
+    assert_eq!(backups.len(), 0);
 
     Ok(())
   }
