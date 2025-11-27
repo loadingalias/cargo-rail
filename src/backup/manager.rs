@@ -24,72 +24,38 @@ impl BackupManager {
   }
 
   /// Create a backup of specified files
-  ///
-  /// Returns the backup ID on success.
-  ///
-  /// # Arguments
-  ///
-  /// * `files` - Files to backup (relative to workspace root)
-  /// * `metadata` - Metadata describing this backup
-  /// * `max_backups` - Maximum number of backups to keep (0 = unlimited)
   pub fn create_backup(
     &self,
     files: &[PathBuf],
     mut metadata: BackupMetadata,
     max_backups: usize,
   ) -> RailResult<BackupId> {
-    // Generate backup ID
     let backup_id = create_backup_id();
     let backup_dir = get_backup_dir(&self.workspace_root, &backup_id);
 
-    // Create backup directory
-    fs::create_dir_all(&backup_dir).map_err(|e| {
-      RailError::message(format!(
-        "Failed to create backup directory {}: {}",
-        backup_dir.display(),
-        e
-      ))
-    })?;
+    fs::create_dir_all(&backup_dir)
+      .map_err(|e| RailError::message(format!("failed to create {}: {}", backup_dir.display(), e)))?;
 
-    // Backup each file
     for file in files {
       let src = self.workspace_root.join(file);
       let dest = backup_dir.join(file);
 
-      // Skip if source doesn't exist (might have been deleted)
       if !src.exists() {
         continue;
       }
 
-      // Create parent directory in backup
       if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-          RailError::message(format!(
-            "Failed to create backup subdirectory {}: {}",
-            parent.display(),
-            e
-          ))
-        })?;
+        fs::create_dir_all(parent)
+          .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
       }
 
-      // Copy file
-      fs::copy(&src, &dest).map_err(|e| {
-        RailError::message(format!(
-          "Failed to backup {} to {}: {}",
-          src.display(),
-          dest.display(),
-          e
-        ))
-      })?;
+      fs::copy(&src, &dest).map_err(|e| RailError::message(format!("failed to backup {}: {}", src.display(), e)))?;
 
-      // Track in metadata
       metadata.add_file(file.clone());
     }
 
-    // Save metadata
     metadata.save(&backup_dir)?;
 
-    // Clean up old backups if max_backups > 0
     if max_backups > 0 {
       let _deleted = self.cleanup_old_backups(max_backups)?;
     }
@@ -98,73 +64,43 @@ impl BackupManager {
   }
 
   /// Restore a backup
-  ///
-  /// Restores all files from the specified backup to their original locations.
-  ///
-  /// # Safety
-  ///
-  /// This WILL overwrite existing files. Use with caution.
   pub fn restore_backup(&self, backup_id: &str) -> RailResult<()> {
     let backup_dir = get_backup_dir(&self.workspace_root, backup_id);
 
     if !backup_dir.exists() {
-      return Err(RailError::message(format!(
-        "Backup '{}' not found at {}",
-        backup_id,
-        backup_dir.display()
-      )));
+      return Err(RailError::message(format!("backup '{}' not found", backup_id)));
     }
 
-    // Load metadata to know what files to restore
     let metadata = BackupMetadata::load(&backup_dir)?;
 
-    println!("🔄 Restoring backup from {}", metadata.timestamp);
-    println!("   Command: {}", metadata.command);
-    println!("   Files: {}", metadata.files_modified.len());
-    println!();
+    eprintln!("restoring backup: {}", metadata.timestamp);
+    eprintln!("  {} files", metadata.files_modified.len());
 
-    // Restore each file
     for file in &metadata.files_modified {
       let src = backup_dir.join(file);
       let dest = self.workspace_root.join(file);
 
-      // Skip if backup file doesn't exist (shouldn't happen, but be safe)
       if !src.exists() {
-        eprintln!("⚠️  Warning: Backup file {} not found, skipping", src.display());
+        eprintln!("  skipped (missing): {}", file.display());
         continue;
       }
 
-      // Create parent directory if needed
       if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-          RailError::message(format!(
-            "Failed to create directory {} for restore: {}",
-            parent.display(),
-            e
-          ))
-        })?;
+        fs::create_dir_all(parent)
+          .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
       }
 
-      // Restore file
-      fs::copy(&src, &dest).map_err(|e| {
-        RailError::message(format!(
-          "Failed to restore {} to {}: {}",
-          src.display(),
-          dest.display(),
-          e
-        ))
-      })?;
+      fs::copy(&src, &dest).map_err(|e| RailError::message(format!("failed to restore {}: {}", file.display(), e)))?;
 
-      println!("  ✓ Restored {}", file.display());
+      eprintln!("  restored: {}", file.display());
     }
 
-    println!();
-    println!("✅ Backup restored successfully");
+    println!("backup restored");
 
     Ok(())
   }
 
-  /// List all available backups (sorted by timestamp, newest first)
+  /// List all backups (newest first)
   pub fn list_backups(&self) -> RailResult<Vec<BackupRecord>> {
     if !self.backup_root.exists() {
       return Ok(Vec::new());
@@ -172,41 +108,30 @@ impl BackupManager {
 
     let mut backups = Vec::new();
 
-    let entries = fs::read_dir(&self.backup_root).map_err(|e| {
-      RailError::message(format!(
-        "Failed to read backup directory {}: {}",
-        self.backup_root.display(),
-        e
-      ))
-    })?;
+    let entries = fs::read_dir(&self.backup_root)
+      .map_err(|e| RailError::message(format!("failed to read {}: {}", self.backup_root.display(), e)))?;
 
     for entry in entries {
-      let entry = entry.map_err(|e| RailError::message(format!("Failed to read backup entry: {}", e)))?;
+      let entry = entry.map_err(|e| RailError::message(format!("failed to read entry: {}", e)))?;
 
       let path = entry.path();
       if !path.is_dir() {
         continue;
       }
 
-      // Get backup ID from directory name
       let backup_id = match path.file_name() {
         Some(name) => name.to_string_lossy().to_string(),
         None => continue,
       };
 
-      // Load metadata
       match BackupMetadata::load(&path) {
         Ok(metadata) => {
           backups.push(BackupRecord::new(backup_id, metadata, path));
         }
-        Err(e) => {
-          eprintln!("⚠️  Warning: Failed to load metadata for backup {}: {}", backup_id, e);
-          continue;
-        }
+        Err(_) => continue,
       }
     }
 
-    // Sort by timestamp (newest first)
     backups.sort_by(|a, b| b.metadata.timestamp.cmp(&a.metadata.timestamp));
 
     Ok(backups)
@@ -231,7 +156,7 @@ impl BackupManager {
 
     for backup in to_delete {
       fs::remove_dir_all(&backup.path)
-        .map_err(|e| RailError::message(format!("Failed to delete backup {}: {}", backup.id, e)))?;
+        .map_err(|e| RailError::message(format!("failed to delete {}: {}", backup.id, e)))?;
     }
 
     Ok(deleted_count)

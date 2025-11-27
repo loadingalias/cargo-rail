@@ -22,12 +22,15 @@ fn test_runner_basic_change_detection() -> Result<()> {
 
   // Run test with change detection
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   assert!(output.status.success(), "Test command should succeed");
-  assert!(stdout.contains("Running tests for"), "Should invoke runner");
   assert!(
-    stdout.contains("lib-a") && stdout.contains("lib-b"),
+    stderr.contains("testing") && stderr.contains("crates"),
+    "Should invoke runner"
+  );
+  assert!(
+    stderr.contains("lib-a") && stderr.contains("lib-b"),
     "Should include dependent crates"
   );
 
@@ -50,7 +53,7 @@ fn test_runner_no_changes() -> Result<()> {
 
   // Should skip all tests
   assert!(
-    stdout.contains("No affected crates") || stdout.contains("all tests skipped"),
+    stdout.contains("no affected crates"),
     "Should skip tests when no changes. Output:\n{}",
     stdout
   );
@@ -103,23 +106,23 @@ fn test_runner_transitive_dependencies() -> Result<()> {
 
   // Run test
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   // All three should be tested (lib-a changed, lib-b and lib-c depend on it)
   assert!(
-    stdout.contains("lib-a"),
+    stderr.contains("lib-a"),
     "Should test lib-a (directly changed). Output:\n{}",
-    stdout
+    stderr
   );
   assert!(
-    stdout.contains("lib-b"),
+    stderr.contains("lib-b"),
     "Should test lib-b (depends on lib-a). Output:\n{}",
-    stdout
+    stderr
   );
   assert!(
-    stdout.contains("lib-c"),
+    stderr.contains("lib-c"),
     "Should test lib-c (transitive dependent). Output:\n{}",
-    stdout
+    stderr
   );
 
   Ok(())
@@ -141,18 +144,18 @@ fn test_runner_isolated_change() -> Result<()> {
 
   // Run test
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   // Should test only lib-a, not lib-b
   assert!(
-    stdout.contains("lib-a"),
+    stderr.contains("lib-a"),
     "Should test lib-a (changed). Output:\n{}",
-    stdout
+    stderr
   );
   assert!(
-    !stdout.contains("• lib-b"),
+    !stderr.contains("lib-b"),
     "Should NOT list lib-b as affected. Output:\n{}",
-    stdout
+    stderr
   );
 
   Ok(())
@@ -176,7 +179,7 @@ fn test_runner_with_explain() -> Result<()> {
 
   // Should show detailed explanation
   assert!(
-    stdout.contains("Change Impact Analysis") || stdout.contains("File Breakdown"),
+    stdout.contains("changed files:") || stdout.contains("direct:") || stdout.contains("source:"),
     "Should show detailed explanation with --explain. Output:\n{}",
     stdout
   );
@@ -244,13 +247,13 @@ fn test_runner_config_file_changes() -> Result<()> {
   ws.commit("Modify Cargo.toml")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   // Config changes should trigger testing
   assert!(
-    stdout.contains("lib-a"),
+    stderr.contains("lib-a"),
     "Cargo.toml changes should trigger testing. Output:\n{}",
-    stdout
+    stderr
   );
 
   Ok(())
@@ -274,13 +277,13 @@ fn test_runner_test_file_changes() -> Result<()> {
   ws.commit("Add integration test")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   // Test file changes should trigger testing
   assert!(
-    stdout.contains("lib-a"),
+    stderr.contains("lib-a"),
     "Test file changes should trigger testing. Output:\n{}",
-    stdout
+    stderr
   );
 
   Ok(())
@@ -298,13 +301,13 @@ fn test_runner_all_flag() -> Result<()> {
 
   // Run with --all flag (skip change detection)
   let output = run_cargo_rail(&ws.path, &["rail", "test", "--all"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
 
   assert!(output.status.success(), "test --all should succeed");
   assert!(
-    stdout.contains("Running all tests") || stdout.contains("all-a") || stdout.contains("all-b"),
+    stderr.contains("testing") || stderr.contains("all-a") || stderr.contains("all-b"),
     "Should run tests for all crates. Output:\n{}",
-    stdout
+    stderr
   );
 
   Ok(())

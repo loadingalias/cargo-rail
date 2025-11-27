@@ -3,7 +3,7 @@ use cargo_rail::{commands, error, workspace};
 use clap::{Parser, Subcommand};
 use error::{RailError, print_error};
 
-/// Graph-aware workspace orchestration for Rust monorepos
+/// Monorepo tooling for Rust workspaces
 #[derive(Parser)]
 #[command(name = "cargo")]
 #[command(bin_name = "cargo")]
@@ -46,7 +46,7 @@ enum Commands {
     output: Option<std::path::PathBuf>,
   },
 
-  /// Run tests only for affected crates (smart test runner)
+  /// Run tests for affected crates only
   Test {
     /// Git ref to compare against (auto-detects origin/main or origin/master)
     #[arg(long)]
@@ -65,24 +65,17 @@ enum Commands {
     test_args: Vec<String>,
   },
 
-  /// Workspace dependency unification (eliminates workspace-hack crates)
-  ///
-  /// Usage:
-  ///   cargo rail unify                 - Analyze and apply unification
-  ///   cargo rail unify --check         - Preview unification plan (no changes)
-  ///   cargo rail unify undo            - Restore most recent backup
-  ///   cargo rail unify undo --list     - List available backups
-  ///   cargo rail unify undo --backup <id> - Restore specific backup
+  /// Unify workspace dependencies (replaces workspace-hack crates)
   Unify {
     /// Action: 'undo' to restore a backup
     action: Option<String>,
-    /// Show plan without executing (check mode)
+    /// Preview changes without modifying files
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
     #[arg(long, short = 'f', default_value = "text")]
     format: String,
-    /// Exclude specific dependencies from unification
+    /// Exclude dependencies from unification
     #[arg(long)]
     exclude: Vec<String>,
     /// Force include specific dependencies
@@ -109,44 +102,38 @@ enum Commands {
     /// Custom path for the unify report (default: target/cargo-rail/unify-report.md)
     #[arg(long)]
     report_path: Option<std::path::PathBuf>,
-    /// Show diff of changes to each manifest (in check mode)
+    /// Show diff of changes to each manifest
     #[arg(long)]
     show_diff: bool,
   },
 
-  /// Initialize cargo-rail configuration (rail.toml)
+  /// Initialize configuration (rail.toml)
   Init {
-    /// Output path for rail.toml (default: .config/rail.toml)
+    /// Output path for rail.toml
     #[arg(long, short, default_value = ".config/rail.toml")]
     output: String,
-    /// Overwrite existing rail.toml
+    /// Overwrite existing configuration
     #[arg(long)]
     force: bool,
-    /// Skip interactive prompts and use all defaults
+    /// Skip interactive prompts
     #[arg(long)]
     non_interactive: bool,
-    /// Output the generated config to stdout instead of writing to file
+    /// Preview generated config without writing
     #[arg(long, short = 'c')]
     check: bool,
   },
 
-  /// Split a crate from monorepo to separate repo with history
-  ///
-  /// Usage:
-  ///   cargo rail split init             - Initialize split config for all workspace crates
-  ///   cargo rail split <crate>          - Execute split for a crate
-  ///   cargo rail split --all            - Execute split for all configured crates
-  ///   cargo rail split --check          - Preview split operations
+  /// Split a crate to a standalone repository with git history
   Split {
-    /// Crate name to split, or 'init' to configure splits
+    /// Crate name, or 'init' to configure
     crate_name: Option<String>,
     /// Split all configured crates
     #[arg(short, long)]
     all: bool,
-    /// Override remote repository path
+    /// Override remote repository
     #[arg(long)]
     remote: Option<String>,
-    /// Show plan without executing (default: execute with confirmation)
+    /// Preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
@@ -156,27 +143,27 @@ enum Commands {
 
   /// Sync changes between monorepo and split repos
   Sync {
-    /// Name of the crate to sync
+    /// Crate name to sync
     crate_name: Option<String>,
     /// Sync all configured crates
     #[arg(short, long)]
     all: bool,
-    /// Override remote repository path
+    /// Override remote repository
     #[arg(long)]
     remote: Option<String>,
-    /// Only sync from remote to monorepo
+    /// Sync from remote to monorepo only
     #[arg(long)]
     from_remote: bool,
-    /// Only sync from monorepo to remote
+    /// Sync from monorepo to remote only
     #[arg(long)]
     to_remote: bool,
-    /// Conflict resolution strategy [ours, theirs, manual, union]
+    /// Conflict resolution [ours, theirs, manual, union]
     #[arg(long, default_value = "manual")]
     strategy: String,
-    /// Disable protected branch checks (allow direct commits to main/master)
+    /// Allow direct commits to protected branches
     #[arg(long)]
     no_protected_branches: bool,
-    /// Show plan without executing (default: execute with confirmation)
+    /// Preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
@@ -184,22 +171,22 @@ enum Commands {
     format: String,
   },
 
-  /// Release automation (version bumping, changelog, publishing)
+  /// Publish releases (version bump, changelog, tag, publish)
   Release {
-    /// Optional action: init (configure release settings for crates)
+    /// Action: 'init' to configure release settings
     action: Option<String>,
-    /// Crate name(s) to release (omit for --all)
+    /// Crate name(s) to release
     crate_names: Vec<String>,
-    /// Release all workspace crates in dependency order
+    /// Release all workspace crates
     #[arg(short, long)]
     all: bool,
-    /// Version bump strategy [major, minor, patch, or explicit e.g. "1.2.3"]
+    /// Version bump [major, minor, patch, or "x.y.z"]
     #[arg(long, default_value = "patch")]
     bump: String,
-    /// Show plan without executing (check mode)
+    /// Preview release plan without executing
     #[arg(long, short = 'c')]
     check: bool,
-    /// Skip publishing to crates.io (only create tags and update changelogs)
+    /// Skip publishing to crates.io
     #[arg(long)]
     skip_publish: bool,
     /// Skip git tag creation
@@ -210,9 +197,9 @@ enum Commands {
     format: String,
   },
 
-  /// Validate release readiness (for CI)
+  /// Validate release readiness
   Check {
-    /// Crate name(s) to check (omit for --all)
+    /// Crate name(s) to check
     crate_names: Vec<String>,
     /// Check all workspace crates
     #[arg(short, long)]
@@ -222,18 +209,18 @@ enum Commands {
     format: String,
   },
 
-  /// Clean workspace artifacts (cache, backups, reports)
+  /// Clean generated artifacts (cache, backups, reports)
   Clean {
-    /// Clean only metadata cache
+    /// Clean metadata cache only
     #[arg(long)]
     cache: bool,
-    /// Clean/prune backups (default: prune, --all: delete all)
+    /// Prune old backups
     #[arg(long)]
     backups: bool,
     /// Clean generated reports
     #[arg(long)]
     reports: bool,
-    /// Show what would be cleaned without deleting
+    /// Preview what would be cleaned
     #[arg(long, short = 'c')]
     check: bool,
   },

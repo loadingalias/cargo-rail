@@ -45,7 +45,7 @@ fn test_affected_no_changes() -> Result<()> {
 
   // Should indicate no changes
   assert!(
-    stdout.contains("Changed files: 0") || stdout.contains("Direct impact: 0"),
+    stdout.contains("changed files: 0") || stdout.contains("test targets: 0"),
     "Should indicate no changes, got: {}",
     stdout
   );
@@ -116,8 +116,12 @@ fn test_affected_sha_pair_mode() -> Result<()> {
   ws.add_crate("lib-a", "0.1.0", &[])?;
   let sha1 = ws.commit("Add lib-a")?;
 
-  // Make a change
-  ws.modify_file("lib-a", "README.md", "# Updated\n")?;
+  // Make a change (source file, not docs-only)
+  ws.modify_file(
+    "lib-a",
+    "src/lib.rs",
+    "pub fn updated() -> &'static str { \"updated\" }",
+  )?;
   let sha2 = ws.commit("Update lib-a")?;
 
   // Run with --from/--to

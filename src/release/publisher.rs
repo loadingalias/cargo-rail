@@ -26,73 +26,55 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   /// Execute a release plan
-  ///
-  /// # Arguments
-  /// * `plan` - The release plan to execute
-  /// * `skip_publish` - Skip publishing to crates.io (only tag)
-  /// * `skip_tag` - Skip git tag creation
   pub fn execute(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<()> {
-    println!("🚀 Executing release plan...\n");
-
     for (i, crate_plan) in plan.crates.iter().enumerate() {
-      println!("[{}/{}] Processing {}...", i + 1, plan.crates.len(), crate_plan.name);
+      eprintln!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
 
-      // 1. Bump version in Cargo.toml
-      println!(
-        "   📝 Bumping version {} → {}",
+      eprintln!(
+        "  version: {} -> {}",
         crate_plan.current_version, crate_plan.new_version
       );
       self.bump_crate_version(crate_plan)?;
 
-      // 2. Update dependent crates
       if !crate_plan.affected_dependents.is_empty() {
-        println!("   🔗 Updating {} dependent(s)", crate_plan.affected_dependents.len());
+        eprintln!("  updating {} dependents", crate_plan.affected_dependents.len());
         self.update_dependents(crate_plan)?;
       }
 
-      // 3. Generate/update changelog
-      println!("   📜 Updating changelog");
+      eprintln!("  changelog");
       self.update_changelog(crate_plan)?;
 
-      // 4. Commit changes
-      println!("   💾 Committing changes");
+      eprintln!("  commit");
       self.commit_version_bump(crate_plan)?;
 
-      // 5. Create git tag
       if !skip_tag {
-        println!("   🏷️  Creating tag {}", crate_plan.tag_name);
+        eprintln!("  tag: {}", crate_plan.tag_name);
         self.create_tag(crate_plan)?;
       }
 
-      // 6. Publish to crates.io
       if !skip_publish && crate_plan.publish {
-        println!("   📤 Publishing to crates.io");
+        eprintln!("  publishing...");
         self.publish_crate(crate_plan)?;
 
-        // Delay between publishes to avoid registry race conditions
         if i + 1 < plan.crates.len() {
           let delay = self.release_config.publish_delay;
-          println!("   ⏳ Waiting {}s before next publish", delay);
+          eprintln!("  waiting {}s...", delay);
           thread::sleep(Duration::from_secs(delay));
         }
       } else if !crate_plan.publish {
-        println!("   ⏭️  Skipping publish (publish = false)");
+        eprintln!("  skipped publish (publish = false)");
       }
 
-      // 7. Create GitHub release
       if self.release_config.create_github_release && !skip_tag {
-        println!("   🌐 Creating GitHub release");
+        eprintln!("  github release");
         self.create_github_release(crate_plan)?;
       }
-
-      println!("   ✅ Completed\n");
     }
 
-    println!("🎉 All releases completed successfully!\n");
+    println!("\nrelease complete");
 
-    // Print next steps
     if !skip_tag {
-      println!("Next steps:");
+      println!("\nnext:");
       println!("  git push origin main");
       println!("  git push origin --tags");
     }
@@ -129,7 +111,6 @@ impl<'a> ReleasePublisher<'a> {
   /// Update or create CHANGELOG.md
   fn update_changelog(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     if !plan.generate_changelog {
-      println!("   🧹 Skipping changelog (disabled for {})", plan.name);
       return Ok(());
     }
 
@@ -176,16 +157,11 @@ impl<'a> ReleasePublisher<'a> {
     if new_entries.trim().is_empty() {
       if self.release_config.require_changelog_entries {
         return Err(RailError::message(format!(
-          "No changelog entries found for {} (enable commits or disable changelog generation)",
+          "no changelog entries for {} (enable commits or disable changelog)",
           plan.name
         )));
-      } else {
-        println!(
-          "   ℹ️  No changelog entries for {}, skipping changelog write",
-          plan.name
-        );
-        return Ok(());
       }
+      return Ok(());
     }
 
     // Add rest of existing changelog
@@ -196,9 +172,8 @@ impl<'a> ReleasePublisher<'a> {
       }
     }
 
-    // Write updated changelog
     fs::write(&plan.changelog_path, updated)
-      .map_err(|e| RailError::message(format!("Failed to write {}: {}", plan.changelog_path.display(), e)))?;
+      .map_err(|e| RailError::message(format!("failed to write {}: {}", plan.changelog_path.display(), e)))?;
 
     Ok(())
   }
@@ -286,15 +261,13 @@ impl<'a> ReleasePublisher<'a> {
 
   /// Create GitHub release using gh CLI
   fn create_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    // Check if gh CLI is available
     let check = Command::new("gh").args(["--version"]).output();
 
     if check.is_err() || !check.unwrap().status.success() {
-      println!("   ⚠️  gh CLI not found, skipping GitHub release");
+      eprintln!("  skipped github release (gh CLI not found)");
       return Ok(());
     }
 
-    // Read changelog for release notes
     let notes = if plan.changelog_path.exists() {
       fs::read_to_string(&plan.changelog_path)
         .unwrap_or_else(|_| format!("Release {} v{}", plan.name, plan.new_version))
@@ -314,12 +287,11 @@ impl<'a> ReleasePublisher<'a> {
         &notes,
       ])
       .output()
-      .map_err(|e| RailError::message(format!("Failed to run gh release: {}", e)))?;
+      .map_err(|e| RailError::message(format!("gh release failed: {}", e)))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      println!("   ⚠️  GitHub release creation failed: {}", stderr);
-      // Don't error out - this is optional
+      eprintln!("  github release failed: {}", stderr.trim());
     }
 
     Ok(())

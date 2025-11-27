@@ -6,18 +6,15 @@ use std::fs;
 
 /// Run the clean command
 pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bool, check: bool) -> RailResult<()> {
-  // If no flags provided, clean everything (cache, reports, and ALL backups)
   let clean_all = !cache && !backups && !reports;
 
   let clean_cache = cache || clean_all;
   let clean_reports = reports || clean_all;
-  // If specific backup flag provided, prune. If cleaning all, delete all.
   let prune_backups = backups && !clean_all;
   let delete_all_backups = clean_all;
 
-  // Dry-run mode: show what would be cleaned
   if check {
-    println!("🔍 DRY-RUN MODE - Showing what would be cleaned:\n");
+    println!("would clean:\n");
     let mut would_clean = false;
 
     if clean_cache {
@@ -29,11 +26,11 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
       let old_cache = ctx.workspace_root.join("target").join("rail");
 
       if cache_path.exists() {
-        println!("  📄 {}", cache_path.display());
+        println!("  {}", cache_path.display());
         would_clean = true;
       }
       if old_cache.exists() {
-        println!("  📁 {} (legacy)", old_cache.display());
+        println!("  {} (legacy)", old_cache.display());
         would_clean = true;
       }
     }
@@ -44,7 +41,7 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
         for entry in fs::read_dir(&report_dir).ok().into_iter().flatten().flatten() {
           let path = entry.path();
           if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            println!("  📄 {}", path.display());
+            println!("  {}", path.display());
             would_clean = true;
           }
         }
@@ -57,7 +54,7 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
         let backup_list = backup_manager.list_backups()?;
         if delete_all_backups {
           for backup in &backup_list {
-            println!("  📦 backup: {}", backup.id);
+            println!("  backup: {}", backup.id);
             would_clean = true;
           }
         } else {
@@ -68,7 +65,7 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
             .unwrap_or_else(|| UnifyConfig::default().max_backups);
           if backup_list.len() > max_backups {
             for backup in backup_list.iter().skip(max_backups) {
-              println!("  📦 backup (prune): {}", backup.id);
+              println!("  backup (prune): {}", backup.id);
               would_clean = true;
             }
           }
@@ -77,14 +74,13 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
     }
 
     if would_clean {
-      println!("\n✋ To execute cleanup, run: cargo rail clean");
+      println!("\nrun without --check to execute");
     } else {
-      println!("Nothing to clean");
+      println!("nothing to clean");
     }
     return Ok(());
   }
 
-  // Execute cleanup
   let mut cleaned_any = false;
 
   if clean_cache {
@@ -103,9 +99,9 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
   }
 
   if cleaned_any {
-    println!("✨ Clean complete");
+    println!("clean complete");
   } else {
-    println!("Nothing to clean");
+    println!("nothing to clean");
   }
 
   Ok(())
@@ -117,29 +113,18 @@ fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<()> {
     .join("target")
     .join("cargo-rail")
     .join("metadata.json");
-  // Also clean old path if it exists
   let old_rail_target = ctx.workspace_root.join("target").join("rail");
 
   if rail_target.exists() {
-    println!("🗑️  Cleaning metadata cache...");
-    fs::remove_file(&rail_target).map_err(|e| {
-      RailError::message(format!(
-        "Failed to remove metadata cache at {}: {}",
-        rail_target.display(),
-        e
-      ))
-    })?;
+    eprintln!("removing cache...");
+    fs::remove_file(&rail_target)
+      .map_err(|e| RailError::message(format!("failed to remove {}: {}", rail_target.display(), e)))?;
   }
 
   if old_rail_target.exists() {
-    println!("🗑️  Cleaning legacy metadata cache...");
-    fs::remove_dir_all(&old_rail_target).map_err(|e| {
-      RailError::message(format!(
-        "Failed to remove legacy metadata cache at {}: {}",
-        old_rail_target.display(),
-        e
-      ))
-    })?;
+    eprintln!("removing legacy cache...");
+    fs::remove_dir_all(&old_rail_target)
+      .map_err(|e| RailError::message(format!("failed to remove {}: {}", old_rail_target.display(), e)))?;
   }
 
   Ok(())
@@ -148,20 +133,14 @@ fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<()> {
 fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<()> {
   let report_dir = ctx.workspace_root.join("target").join("cargo-rail");
 
-  // We need to be careful not to delete the whole directory if it contains backups or metadata
-  // But wait, now everything is in target/cargo-rail/
-  // So we should only delete *.md files or specific report files?
-  // Or maybe we just clean everything EXCEPT backups and metadata.json if we are only cleaning reports?
-  // Actually, reports are likely just markdown files in that dir.
-
   if report_dir.exists() {
-    println!("🗑️  Cleaning generated reports...");
-    for entry in fs::read_dir(&report_dir).map_err(|e| RailError::message(format!("Failed to read dir: {}", e)))? {
-      let entry = entry.map_err(|e| RailError::message(format!("Failed to read entry: {}", e)))?;
+    eprintln!("removing reports...");
+    for entry in fs::read_dir(&report_dir).map_err(|e| RailError::message(format!("failed to read dir: {}", e)))? {
+      let entry = entry.map_err(|e| RailError::message(format!("failed to read entry: {}", e)))?;
       let path = entry.path();
       if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
         fs::remove_file(&path)
-          .map_err(|e| RailError::message(format!("Failed to remove report {}: {}", path.display(), e)))?;
+          .map_err(|e| RailError::message(format!("failed to remove {}: {}", path.display(), e)))?;
       }
     }
   }
@@ -176,24 +155,21 @@ fn clean_backups_handler(ctx: &WorkspaceContext, delete_all: bool) -> RailResult
   }
 
   if delete_all {
-    println!("🗑️  Removing ALL backups...");
-    // BackupManager doesn't have a "delete all" method exposed directly other than cleanup_old_backups(0)
-    // which we verified does exactly that.
+    eprintln!("removing all backups...");
     let count = backup_manager.cleanup_old_backups(0)?;
-    println!("   Removed {} backups", count);
+    eprintln!("  removed {} backups", count);
   } else {
-    // Prune to max_backups
     let max_backups = ctx
       .config
       .as_ref()
       .map(|c| c.unify.max_backups)
       .unwrap_or_else(|| UnifyConfig::default().max_backups);
-    println!("🧹 Pruning backups (keeping latest {})...", max_backups);
+    eprintln!("pruning backups (keeping {})...", max_backups);
     let count = backup_manager.cleanup_old_backups(max_backups)?;
     if count > 0 {
-      println!("   Removed {} old backups", count);
+      eprintln!("  removed {} old backups", count);
     } else {
-      println!("   No backups to prune");
+      eprintln!("  no backups to prune");
     }
   }
 

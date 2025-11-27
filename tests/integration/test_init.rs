@@ -44,7 +44,7 @@ fn test_init_respects_force_flag() -> Result<()> {
   let output = run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
   assert!(!output.status.success(), "init should fail when config exists");
   assert!(
-    String::from_utf8_lossy(&output.stderr).contains("already exists"),
+    String::from_utf8_lossy(&output.stderr).contains("configuration exists"),
     "error should mention config already exists"
   );
 

@@ -62,7 +62,7 @@ fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
 
   // Should show success
   assert!(
-    stdout.contains("Analysis complete") || stdout.contains("✅"),
+    stdout.contains("ready:") || stdout.contains("Unification Plan"),
     "Should complete analysis successfully.\nOutput:\n{}",
     stdout
   );
@@ -249,7 +249,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
   assert!(
-    apply_stdout.contains("complete") || apply_stdout.contains("✅"),
+    apply_stdout.contains("unified") || apply_stdout.contains("next:"),
     "Apply should complete successfully.\nOutput:\n{}",
     apply_stdout
   );

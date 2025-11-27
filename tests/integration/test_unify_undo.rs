@@ -123,11 +123,11 @@ fn test_unify_undo_specific_backup_id() -> Result<()> {
   let list_stdout = String::from_utf8_lossy(&list_output.stdout);
 
   // Extract the first (latest) backup ID from the output
-  // Format is: "1. 2024-01-15-143022 (latest)"
+  // Format is: "  <backup_id> (latest)"
   let backup_id = list_stdout
     .lines()
     .find(|line| line.contains("(latest)"))
-    .and_then(|line| line.split_whitespace().nth(1))
+    .and_then(|line| line.split_whitespace().next())
     .expect("Should find latest backup ID");
 
   // Restore specific backup

@@ -122,7 +122,7 @@ impl fmt::Display for RailError {
     match self {
       RailError::Config(e) => write!(f, "{}", e),
       RailError::Git(e) => write!(f, "{}", e),
-      RailError::Io(e) => write!(f, "I/O error: {}", e),
+      RailError::Io(e) => write!(f, "{}", e),
       RailError::Message { message, context, .. } => {
         write!(f, "{}", message)?;
         if let Some(ctx) = context {
@@ -163,61 +163,61 @@ impl From<&str> for RailError {
 
 impl From<toml_edit::TomlError> for RailError {
   fn from(err: toml_edit::TomlError) -> Self {
-    RailError::message(format!("TOML parse error: {}", err))
+    RailError::message(format!("invalid TOML: {}", err))
   }
 }
 
 impl From<cargo_metadata::Error> for RailError {
   fn from(err: cargo_metadata::Error) -> Self {
-    RailError::message(format!("Cargo metadata error: {}", err))
+    RailError::message(format!("cargo metadata failed: {}", err))
   }
 }
 
 impl From<std::num::ParseIntError> for RailError {
   fn from(err: std::num::ParseIntError) -> Self {
-    RailError::message(format!("Parse error: {}", err))
+    RailError::message(format!("invalid number: {}", err))
   }
 }
 
 impl From<toml_edit::de::Error> for RailError {
   fn from(err: toml_edit::de::Error) -> Self {
-    RailError::message(format!("TOML deserialization error: {}", err))
+    RailError::message(format!("invalid TOML: {}", err))
   }
 }
 
 impl From<toml_edit::ser::Error> for RailError {
   fn from(err: toml_edit::ser::Error) -> Self {
-    RailError::message(format!("TOML serialization error: {}", err))
+    RailError::message(format!("TOML serialization failed: {}", err))
   }
 }
 
 impl From<serde_json::Error> for RailError {
   fn from(err: serde_json::Error) -> Self {
-    RailError::message(format!("JSON error: {}", err))
+    RailError::message(format!("invalid JSON: {}", err))
   }
 }
 
 impl From<std::str::Utf8Error> for RailError {
   fn from(err: std::str::Utf8Error) -> Self {
-    RailError::message(format!("UTF-8 error: {}", err))
+    RailError::message(format!("invalid UTF-8: {}", err))
   }
 }
 
 impl From<std::string::FromUtf8Error> for RailError {
   fn from(err: std::string::FromUtf8Error) -> Self {
-    RailError::message(format!("UTF-8 conversion error: {}", err))
+    RailError::message(format!("invalid UTF-8: {}", err))
   }
 }
 
 impl From<std::path::StripPrefixError> for RailError {
   fn from(err: std::path::StripPrefixError) -> Self {
-    RailError::message(format!("Path strip prefix error: {}", err))
+    RailError::message(format!("path error: {}", err))
   }
 }
 
 impl From<std::env::VarError> for RailError {
   fn from(err: std::env::VarError) -> Self {
-    RailError::message(format!("Environment variable error: {}", err))
+    RailError::message(format!("environment variable error: {}", err))
   }
 }
 
@@ -246,9 +246,9 @@ pub enum ConfigError {
 impl ConfigError {
   fn help_message(&self) -> Option<String> {
     match self {
-      ConfigError::NotFound { .. } => Some("Run `cargo rail init` to create a configuration file.".to_string()),
+      ConfigError::NotFound { .. } => Some("run 'cargo rail init' to create configuration".to_string()),
       ConfigError::CrateNotFound { name } => Some(format!(
-        "Use `cargo rail split --check --all` to see configured splits. Did you mean '{}'?",
+        "run 'cargo rail split --check' to list configured crates (did you mean '{}'?)",
         name
       )),
       _ => None,
@@ -262,15 +262,15 @@ impl fmt::Display for ConfigError {
       ConfigError::NotFound { workspace_root } => {
         write!(
           f,
-          "No cargo-rail configuration found in: {}\nSearched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\nRun 'cargo rail init' to create one.",
+          "no configuration found in {}\n       searched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml",
           workspace_root.display()
         )
       }
       ConfigError::MissingField { field } => {
-        write!(f, "Missing required field in config: {}", field)
+        write!(f, "missing required field: {}", field)
       }
       ConfigError::CrateNotFound { name } => {
-        write!(f, "Crate '{}' not found in configuration", name)
+        write!(f, "crate '{}' not found in configuration", name)
       }
     }
   }
@@ -315,17 +315,14 @@ impl GitError {
     match self {
       GitError::PushFailed { reason, .. } => {
         if reason.contains("non-fast-forward") {
-          Some("The remote has commits you don't have. Pull first or use --force (dangerous).".to_string())
+          Some("pull first, or use --force".to_string())
         } else if reason.contains("permission denied") || reason.contains("403") {
-          Some("Check your SSH key permissions and GitHub access.".to_string())
+          Some("check SSH key and repository permissions".to_string())
         } else {
           None
         }
       }
-      GitError::RepoNotFound { path } => Some(format!(
-        "Initialize the repository first or check the path: {}",
-        path.display()
-      )),
+      GitError::RepoNotFound { path } => Some(format!("run 'git init {}' or verify the path", path.display())),
       _ => None,
     }
   }
@@ -335,16 +332,21 @@ impl fmt::Display for GitError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       GitError::CommandFailed { command, stderr } => {
-        write!(f, "Git command failed: {}\n{}", command, stderr)
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+          write!(f, "git {} failed", command)
+        } else {
+          write!(f, "git {} failed: {}", command, stderr)
+        }
       }
       GitError::RepoNotFound { path } => {
-        write!(f, "Git repository not found at: {}", path.display())
+        write!(f, "not a git repository: {}", path.display())
       }
       GitError::CommitNotFound { sha } => {
-        write!(f, "Commit not found: {}", sha)
+        write!(f, "commit not found: {}", sha)
       }
       GitError::PushFailed { remote, branch, reason } => {
-        write!(f, "Push to {}/{} failed: {}", remote, branch, reason)
+        write!(f, "push to {}/{} failed: {}", remote, branch, reason.trim())
       }
     }
   }
@@ -380,12 +382,12 @@ where
   }
 }
 
-/// Pretty-print an error to stderr with colors and help text
+/// Print an error to stderr with optional help text
 pub fn print_error(error: &RailError) {
-  eprintln!("\n❌ {}\n", error);
+  eprintln!("error: {}", error);
 
   if let Some(help) = error.help_message() {
-    eprintln!("💡 Help: {}\n", help);
+    eprintln!("help: {}", help);
   }
 }
 

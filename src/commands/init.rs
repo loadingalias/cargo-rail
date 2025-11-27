@@ -11,49 +11,34 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-/// Run the init command to bootstrap rail.toml configuration
-///
-/// # Arguments
-/// * `ctx` - Workspace context (already loaded, contains cargo metadata)
-/// * `output_path` - Where to write rail.toml (relative to workspace root)
-/// * `force` - Overwrite existing config file
-/// * `non_interactive` - Skip all prompts, use defaults
-/// * `dry_run` - Print config to stdout instead of writing
+/// Generate rail.toml configuration
 pub fn run_init(
   ctx: &WorkspaceContext,
   output_path: &str,
   force: bool,
   non_interactive: bool,
-  dry_run: bool,
+  check: bool,
 ) -> RailResult<()> {
   let workspace_root = ctx.workspace_root();
   let config_path = workspace_root.join(output_path);
 
-  // 1. Check for existing config
   if let Some(existing) = check_existing_config(workspace_root) {
     if !force {
       return Err(RailError::with_help(
-        format!(
-          "Configuration already exists at: {}\nUse --force to overwrite or --output to specify a different location",
-          existing.display()
-        ),
-        "Example: cargo rail init --force",
+        format!("configuration exists: {}", existing.display()),
+        "use --force to overwrite",
       ));
     }
-    if !dry_run {
-      println!("⚠️  Overwriting existing config at: {}", existing.display());
+    if !check {
+      eprintln!("overwriting: {}", existing.display());
     }
   }
 
-  // 2. Detection phase
   let unify = default_unify_config();
-
-  // Auto-detect targets from all TOML files in workspace (silent detection)
   let detected_targets = detect_targets(workspace_root);
 
-  // 3. Interactive confirmation (unless non-interactive or dry-run)
-  if !non_interactive && !dry_run {
-    print!("\nGenerate rail.toml with these settings? [Y/n]: ");
+  if !non_interactive && !check {
+    print!("generate rail.toml? [Y/n]: ");
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -61,15 +46,13 @@ pub fn run_init(
     let input = input.trim().to_lowercase();
 
     if input == "n" || input == "no" {
-      println!("Cancelled.");
+      println!("cancelled");
       return Ok(());
     }
   }
 
-  // 4. Build config
   let config = build_rail_config(workspace_root.to_path_buf(), detected_targets, unify);
 
-  // 6. Serialize with comments using Builder
   let toml_content = RailConfigBuilder::new()
     .header()
     .workspace(&config.workspace.root)
@@ -79,16 +62,13 @@ pub fn run_init(
     .splits_template()
     .build()?;
 
-  // 5. Write or print
-  if dry_run {
+  if check {
     println!("{}", toml_content);
   } else {
     ensure_output_dir(&config_path)?;
     write_config_file(&config_path, &toml_content)?;
-
-    println!("✅ Created {}", config_path.display());
-    println!("\nNext steps:");
-    println!("  cargo rail unify --check  # Preview dependency unification");
+    println!("created: {}", config_path.display());
+    println!("\nnext: cargo rail unify --check");
   }
 
   Ok(())
@@ -130,82 +110,69 @@ fn check_existing_config(workspace_root: &Path) -> Option<PathBuf> {
   crate::config::RailConfig::find_config_path(workspace_root)
 }
 
-/// Ensure output directory exists (create if needed)
+/// Ensure output directory exists
 fn ensure_output_dir(output_path: &Path) -> RailResult<()> {
   if let Some(parent) = output_path.parent()
     && !parent.exists()
   {
-    println!("📁 Creating directory: {}", parent.display());
     fs::create_dir_all(parent)
-      .map_err(|e| RailError::message(format!("Failed to create directory {}: {}", parent.display(), e)))?;
+      .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
   }
   Ok(())
 }
 
-/// Write config to file with atomic write (write to temp, then rename)
+/// Write config file atomically
 fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
-  // Use atomic write pattern (write to temp, then rename)
   let temp_path = config_path.with_extension("toml.tmp");
 
   fs::write(&temp_path, content).map_err(|e| {
     RailError::with_help(
-      format!("Failed to write config to {}: {}", temp_path.display(), e),
-      "Check file permissions and ensure the directory is writable",
+      format!("failed to write {}: {}", temp_path.display(), e),
+      "check file permissions",
     )
   })?;
 
-  fs::rename(&temp_path, config_path)
-    .map_err(|e| RailError::message(format!("Failed to finalize config file: {}", e)))?;
+  fs::rename(&temp_path, config_path).map_err(|e| RailError::message(format!("failed to finalize config: {}", e)))?;
 
   Ok(())
 }
 
-/// Standalone init that doesn't require WorkspaceContext
-///
-/// This is used when init is called on a directory that may not have
-/// a valid Cargo workspace yet (e.g., empty workspace or invalid state).
+/// Standalone init (without WorkspaceContext)
 pub fn run_init_standalone(
   workspace_root: &Path,
   output_path: &str,
   force: bool,
   _non_interactive: bool,
-  dry_run: bool,
+  check: bool,
 ) -> RailResult<()> {
   let config_path = workspace_root.join(output_path);
 
-  // 1. Check for existing config
   if let Some(existing) = check_existing_config(workspace_root) {
     if !force {
       return Err(RailError::with_help(
-        format!(
-          "Configuration already exists at: {}\nUse --force to overwrite or --output to specify a different location",
-          existing.display()
-        ),
-        "Example: cargo rail init --force",
+        format!("configuration exists: {}", existing.display()),
+        "use --force to overwrite",
       ));
     }
-    if !dry_run {
-      println!("⚠️  Overwriting existing config at: {}", existing.display());
+    if !check {
+      eprintln!("overwriting: {}", existing.display());
     }
   }
 
-  // 2. Detection phase - silent target detection
   let detected_targets = detect_targets(workspace_root);
 
-  // 3. Build config
   let config = RailConfig {
     workspace: WorkspaceConfig {
       root: PathBuf::from("."),
     },
-    targets: detected_targets,     // TOP-LEVEL: workspace-wide targets
-    unify: UnifyConfig::default(), // Use simplified config with defaults
+    targets: detected_targets,
+    unify: UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
     crates: Default::default(),
     formatting: crate::config::FormattingConfig::default(),
   };
 
-  // 5. Serialize with comments using Builder
   let config_toml = RailConfigBuilder::new()
     .header()
     .workspace(&config.workspace.root)
@@ -215,24 +182,21 @@ pub fn run_init_standalone(
     .splits_template()
     .build()?;
 
-  // 4. Output
-  if dry_run {
+  if check {
     println!("{}", config_toml);
   } else {
-    // Create parent directory if needed
     if let Some(parent) = config_path.parent() {
       fs::create_dir_all(parent).map_err(|e| {
         RailError::with_help(
-          format!("Failed to create directory {}: {}", parent.display(), e),
-          "Check file permissions",
+          format!("failed to create {}: {}", parent.display(), e),
+          "check file permissions",
         )
       })?;
     }
 
     write_config_file(&config_path, &config_toml)?;
-    println!("✅ Created {}", config_path.display());
-    println!("\nNext steps:");
-    println!("  cargo rail unify --check  # Preview dependency unification");
+    println!("created: {}", config_path.display());
+    println!("\nnext: cargo rail unify --check");
   }
 
   Ok(())

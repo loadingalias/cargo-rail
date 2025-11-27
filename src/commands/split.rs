@@ -9,47 +9,28 @@ use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
 /// Run the split command
-///
-/// By default, executes the split operation (with confirmation prompt in interactive mode).
-/// Use --check to show the plan without executing.
 pub fn run_split(
   ctx: &WorkspaceContext,
   crate_name: Option<String>,
   all: bool,
   remote: Option<String>,
-  dry_run: bool,
+  check: bool,
   format: String,
 ) -> RailResult<()> {
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
 
-  if !json {
-    eprintln!("📦 Loaded configuration");
-  }
-
-  // Build configurations using the centralized builder
   let builder = SplitSyncConfigBuilder::new(ctx)?
     .with_crate_or_all(crate_name.clone(), all)?
     .with_remote_override(remote)
     .validate()?;
 
-  let all_local = builder.all_local();
   let config_count = builder.count();
-
-  if all_local && !dry_run && !json {
-    eprintln!("   Local testing mode\n");
-  }
-
-  if all && !json {
-    eprintln!("   Splitting all {} configured crates", config_count);
-  }
-
   let configs = builder.build_split_configs()?;
 
-  // Dry-run mode: show what would be done
-  if dry_run {
+  // Check mode: show plan
+  if check {
     if json {
-      // JSON output for CI/automation
       for config in &configs {
         println!(
           "{}",
@@ -63,106 +44,73 @@ pub fn run_split(
         );
       }
       return Ok(());
-    } else {
-      // Human-readable plan
-      println!("\n🔍 DRY-RUN MODE - Showing plan only\n");
-
-      for config in &configs {
-        println!("📦 Crate: {}", config.crate_name);
-        println!("   Mode: {:?}", config.mode);
-        println!("   Source paths:");
-        for path in &config.crate_paths {
-          println!("     • {}", path.display());
-        }
-        println!("   Target: {}", config.target_repo_path.display());
-        if let Some(ref remote) = config.remote_url {
-          println!("   Remote: {}", remote);
-        }
-        println!("   Branch: {}", config.branch);
-        println!();
-      }
-
-      println!("✋ To execute this plan, run:");
-      if all {
-        println!("   cargo rail split --all");
-      } else if let Some(ref name) = crate_name {
-        println!("   cargo rail split {}", name);
-      }
-      println!();
-
-      return Ok(());
     }
-  }
 
-  // Apply mode - interactive confirmation if TTY
-  if std::io::stdin().is_terminal() && !json {
-    println!("\n🚀 APPLY MODE - About to execute split operations\n");
-
+    println!("split plan:\n");
     for config in &configs {
-      println!(
-        "📦 {}: {} → {}",
-        config.crate_name,
-        config
-          .crate_paths
-          .iter()
-          .map(|p| p.display().to_string())
-          .collect::<Vec<_>>()
-          .join(", "),
-        config.target_repo_path.display()
-      );
+      println!("  {}", config.crate_name);
+      println!("    mode: {:?}", config.mode);
+      println!("    paths:");
+      for path in &config.crate_paths {
+        println!("      {}", path.display());
+      }
+      println!("    target: {}", config.target_repo_path.display());
+      if let Some(ref remote) = config.remote_url {
+        println!("    remote: {}", remote);
+      }
+      println!("    branch: {}", config.branch);
     }
 
-    if !utils::prompt_for_confirmation("Press Enter to proceed, or Ctrl+C to cancel")? {
-      println!("Operation cancelled.");
-      return Ok(());
-    }
-    println!();
-  } else if !json {
-    println!("\n🚀 APPLY MODE - Executing split operations\n");
+    println!("\nrun without --check to execute");
+    return Ok(());
   }
 
-  // Execute the splits
-  if config_count > 1 && all {
-    println!("🚀 Processing {} crates in parallel...\n", config_count);
+  // Interactive confirmation
+  if std::io::stdin().is_terminal() && !json {
+    println!("splitting {} crate(s):\n", config_count);
+    for config in &configs {
+      println!("  {} -> {}", config.crate_name, config.target_repo_path.display());
+    }
 
-    // Clone context for parallel execution (very cheap - just Arc increments)
+    if !utils::prompt_for_confirmation("\nproceed? [Enter/Ctrl+C]")? {
+      println!("cancelled");
+      return Ok(());
+    }
+  }
+
+  // Execute splits
+  if config_count > 1 && all {
+    eprintln!("splitting {} crates...", config_count);
     let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|config| {
-        println!("🔨 Splitting crate '{}'...", config.crate_name);
+        eprintln!("  {}", config.crate_name);
         let engine = SplitEngine::new(&ctx)?;
         engine.split(&config)
       })
       .collect();
 
-    // Check for errors
     for result in results {
       result?;
     }
   } else {
-    // Sequential processing for single crate or when not using --all
     for config in configs {
-      println!("🔨 Splitting crate '{}'...", config.crate_name);
+      eprintln!("splitting {}...", config.crate_name);
       let engine = SplitEngine::new(ctx)?;
       engine.split(&config)?;
-      println!();
     }
   }
 
-  println!("✅ Split operation completed successfully");
+  println!("split complete");
   Ok(())
 }
 
-/// Initialize split configuration for one or more crates
-///
-/// Detects workspace members and adds split configuration to rail.toml.
-/// Can configure specific crates or all workspace members.
-pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: bool) -> RailResult<()> {
+/// Initialize split configuration for crates
+pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, check: bool) -> RailResult<()> {
   use crate::config::RailConfig;
   use std::fs;
 
-  // Parse crate names if provided
   let requested_crates: Option<Vec<String>> = crates.map(|s| {
     s.split(',')
       .map(|name| name.trim().to_string())
@@ -170,21 +118,19 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
       .collect()
   });
 
-  // Detect splits based on requested crates or all workspace members
   let splits = detect_workspace_splits(ctx, requested_crates.as_deref())?;
 
   if splits.is_empty() {
     if let Some(requested) = requested_crates {
       return Err(crate::error::RailError::message(format!(
-        "No matching crates found for: {}",
+        "no matching crates: {}",
         requested.join(", ")
       )));
     } else {
-      return Err(crate::error::RailError::message("No workspace members found"));
+      return Err(crate::error::RailError::message("no workspace members found"));
     }
   }
 
-  // Load existing config or create new one
   let workspace_root = ctx.workspace_root();
   let existing_config = RailConfig::load(workspace_root).ok();
 
@@ -192,7 +138,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     workspace: crate::config::WorkspaceConfig {
       root: std::path::PathBuf::from("."),
     },
-    targets: vec![], // No targets by default
+    targets: vec![],
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
@@ -200,7 +146,6 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     formatting: crate::config::FormattingConfig::default(),
   });
 
-  // Add new splits to crates config (avoid duplicates)
   let existing_names: std::collections::HashSet<_> = config.crates.keys().cloned().collect();
   let new_splits: Vec<_> = splits
     .into_iter()
@@ -208,17 +153,15 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     .collect();
 
   if new_splits.is_empty() {
-    println!("✅ All requested crates are already configured");
+    println!("all crates already configured");
     return Ok(());
   }
 
-  println!("Adding {} split configuration(s):", new_splits.len());
+  println!("adding {} split config(s):", new_splits.len());
   for split in &new_splits {
-    println!("  • {}", split.name);
+    println!("  {}", split.name);
   }
-  println!();
 
-  // Convert SplitConfig to unified CrateConfig structure
   use crate::config::{ChangelogConfig, CrateConfig, CrateReleaseConfig, CrateSplitConfig};
 
   for split in new_splits {
@@ -243,23 +186,20 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, dry_run: boo
     config.crates.insert(split.name, crate_config);
   }
 
-  // Serialize config
   let config_toml = serialize_splits_config(&config)?;
 
-  if dry_run {
+  if check {
     println!("{}", config_toml);
   } else {
-    // Find or create config file
     let config_path =
       RailConfig::find_config_path(workspace_root).unwrap_or_else(|| workspace_root.join(".config/rail.toml"));
 
-    // Write config
     if let Some(parent) = config_path.parent() {
       fs::create_dir_all(parent)?;
     }
 
     fs::write(&config_path, config_toml)?;
-    println!("✅ Updated {}", config_path.display());
+    println!("updated: {}", config_path.display());
   }
 
   Ok(())
@@ -320,8 +260,8 @@ fn detect_workspace_splits(
   Ok(splits)
 }
 
-/// Serialize RailConfig to TOML - used for split init
+/// Serialize RailConfig to TOML
 fn serialize_splits_config(config: &RailConfig) -> RailResult<String> {
   toml_edit::ser::to_string_pretty(config)
-    .map_err(|e| crate::error::RailError::message(format!("Failed to serialize config: {}", e)))
+    .map_err(|e| crate::error::RailError::message(format!("config serialization failed: {}", e)))
 }

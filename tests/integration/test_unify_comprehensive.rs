@@ -297,7 +297,7 @@ include_renamed = false
 
   // Should show no unification opportunities since each has only 1 user
   assert!(
-    analyze_stdout.contains("No unification opportunities") || analyze_stdout.contains("No dependencies to unify"),
+    analyze_stdout.contains("no unification opportunities") || analyze_stdout.contains("nothing to unify"),
     "Should show no unification opportunities when deps are properly separated.\nOutput:\n{}",
     analyze_stdout
   );
@@ -308,7 +308,7 @@ include_renamed = false
 
   // Should indicate no changes
   assert!(
-    apply_stdout.contains("No unification opportunities") || apply_stdout.contains("No dependencies to unify"),
+    apply_stdout.contains("nothing to unify") || apply_stdout.contains("no unification opportunities"),
     "Apply should indicate no changes needed.\nstdout:\n{}",
     apply_stdout
   );
@@ -595,11 +595,12 @@ root = "."
     "Backup should contain metadata.json"
   );
 
-  // Check backup message in output
+  // Check backup message in output (check stderr for status messages)
+  let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
   assert!(
-    apply_stdout.contains("Creating backup") || apply_stdout.contains("Backup created"),
+    apply_stderr.contains("creating backup") || apply_stderr.contains("backup:"),
     "Should mention backups in output.\nOutput:\n{}",
-    apply_stdout
+    apply_stderr
   );
 
   Ok(())

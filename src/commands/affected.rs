@@ -168,12 +168,9 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
   let output = match format {
     OutputFormat::Text => {
       let mut out = String::new();
-      out.push_str("All Workspace Crates\n");
-      out.push_str("====================\n");
-      out.push('\n');
-      out.push_str(&format!("Total: {} crates\n", all_crates.len()));
+      out.push_str(&format!("workspace crates: {}\n\n", all_crates.len()));
       for crate_name in &all_crates {
-        out.push_str(&format!("  📦 {}\n", crate_name));
+        out.push_str(&format!("  {}\n", crate_name));
       }
       out
     }
@@ -184,13 +181,12 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
           "count": all_crates.len()
       });
       serde_json::to_string_pretty(&output)
-        .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))?
+        .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?
     }
     OutputFormat::NamesOnly => all_crates.join("\n"),
     OutputFormat::GitHub => {
-      // GitHub Actions output format
       let test_matrix = serde_json::to_string(&all_crates)
-        .map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?;
+        .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
       format!(
         "docs_only=false\nrebuild_all=false\ntest_matrix={}\naffected_count={}\ncrates={}",
         test_matrix,
@@ -199,24 +195,20 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
       )
     }
     OutputFormat::GitHubMatrix => {
-      // GitHub Actions strategy.matrix format
       use serde_json::json;
       let matrix = json!({
           "include": all_crates.iter().map(|c| json!({"crate": c})).collect::<Vec<_>>()
       });
-      serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?
+      serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?
     }
-    OutputFormat::JsonLines => {
-      // JSON Lines format - one object per crate
-      all_crates
-        .iter()
-        .map(|c| {
-          serde_json::to_string(&serde_json::json!({"crate": c}))
-            .map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))
-        })
-        .collect::<RailResult<Vec<_>>>()?
-        .join("\n")
-    }
+    OutputFormat::JsonLines => all_crates
+      .iter()
+      .map(|c| {
+        serde_json::to_string(&serde_json::json!({"crate": c}))
+          .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))
+      })
+      .collect::<RailResult<Vec<_>>>()?
+      .join("\n"),
   };
 
   write_output(&output, output_file)?;
@@ -232,10 +224,10 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| RailError::message(format!("Failed to open output file '{}': {}", path.display(), e)))?;
+        .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
       writeln!(file, "{}", content)
-        .map_err(|e| RailError::message(format!("Failed to write to '{}': {}", path.display(), e)))?;
-      eprintln!("📝 Output written to: {}", path.display());
+        .map_err(|e| RailError::message(format!("failed to write '{}': {}", path.display(), e)))?;
+      eprintln!("output: {}", path.display());
     }
     None => {
       println!("{}", content);
@@ -310,23 +302,21 @@ fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
   let mut out = String::new();
-  out.push_str("Affected Analysis\n");
-  out.push_str("=================\n");
-  out.push('\n');
 
   // Show classification info
   if classification.docs_only {
-    out.push_str("📚 Documentation-only changes detected\n\n");
+    out.push_str("docs-only changes (no tests required)\n\n");
+    return out;
   }
   if classification.rebuild_all {
-    out.push_str("⚠️  Infrastructure changes detected (rebuild all recommended):\n");
+    out.push_str("infrastructure changes (full rebuild recommended):\n");
     for file in &classification.infrastructure_files {
-      out.push_str(&format!("   - {}\n", file));
+      out.push_str(&format!("  {}\n", file));
     }
     out.push('\n');
   }
 
-  out.push_str(&format!("Changed files: {}\n", analysis.changed_files.len()));
+  out.push_str(&format!("changed files: {}\n", analysis.changed_files.len()));
   if !analysis.changed_files.is_empty() && analysis.changed_files.len() <= 20 {
     for file in &analysis.changed_files {
       out.push_str(&format!("  {}\n", file));
@@ -334,24 +324,25 @@ fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
     out.push('\n');
   }
 
-  out.push_str(&format!("Direct impact: {} crates\n", direct.len()));
-  for crate_name in &direct {
-    out.push_str(&format!("  📦 {}\n", crate_name));
+  if !direct.is_empty() {
+    out.push_str(&format!("direct: {}\n", direct.len()));
+    for crate_name in &direct {
+      out.push_str(&format!("  {}\n", crate_name));
+    }
+    out.push('\n');
   }
-  out.push('\n');
 
-  out.push_str(&format!("Transitive dependents: {} crates\n", dependents.len()));
-  for crate_name in &dependents {
-    out.push_str(&format!("  ⬆  {}\n", crate_name));
+  if !dependents.is_empty() {
+    out.push_str(&format!("transitive: {}\n", dependents.len()));
+    for crate_name in &dependents {
+      out.push_str(&format!("  {}\n", crate_name));
+    }
+    out.push('\n');
   }
-  out.push('\n');
 
-  out.push_str(&format!(
-    "Test targets (direct + dependents): {} crates\n",
-    test_targets.len()
-  ));
+  out.push_str(&format!("test targets: {}\n", test_targets.len()));
   for crate_name in &test_targets {
-    out.push_str(&format!("  🎯 {}\n", crate_name));
+    out.push_str(&format!("  {}\n", crate_name));
   }
 
   out
@@ -383,8 +374,7 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
       }
   });
 
-  serde_json::to_string_pretty(&output)
-    .map_err(|e| RailError::message(format!("Failed to serialize JSON output: {}", e)))
+  serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))
 }
 
 /// Format only crate names (test targets)
@@ -399,7 +389,7 @@ fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassificat
   let (_, _, test_targets) = get_sorted_analysis(analysis);
 
   let test_matrix = serde_json::to_string(&test_targets)
-    .map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))?;
+    .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
 
   Ok(format!(
     "docs_only={}\nrebuild_all={}\ntest_matrix={}\naffected_count={}\ncrates={}",
@@ -421,7 +411,7 @@ fn format_github_matrix(analysis: &AffectedAnalysis) -> RailResult<String> {
       "include": test_targets.iter().map(|c| json!({"crate": c})).collect::<Vec<_>>()
   });
 
-  serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("Failed to serialize matrix: {}", e)))
+  serde_json::to_string(&matrix).map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))
 }
 
 /// Format JSON Lines output (one JSON object per line)
@@ -430,7 +420,6 @@ fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassificati
 
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
-  // First line: metadata
   let meta = json!({
       "type": "metadata",
       "docs_only": classification.docs_only,
@@ -440,9 +429,8 @@ fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassificati
   });
 
   let mut lines =
-    vec![serde_json::to_string(&meta).map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))?];
+    vec![serde_json::to_string(&meta).map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?];
 
-  // One line per affected crate
   for crate_name in &test_targets {
     let is_direct = direct.contains(crate_name);
     let is_dependent = dependents.contains(crate_name);
@@ -452,8 +440,9 @@ fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassificati
         "direct": is_direct,
         "transitive": is_dependent && !is_direct
     });
-    lines
-      .push(serde_json::to_string(&crate_obj).map_err(|e| RailError::message(format!("Failed to serialize: {}", e)))?);
+    lines.push(
+      serde_json::to_string(&crate_obj).map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?,
+    );
   }
 
   Ok(lines.join("\n"))

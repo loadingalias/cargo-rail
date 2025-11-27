@@ -1,16 +1,16 @@
-//! `cargo rail unify` - Workspace dependency unification (CLEAN implementation)
+//! `cargo rail unify` - Workspace dependency unification
 //!
-//! This command implements the HYBRID approach:
+//! Implements resolution-based unification:
 //! 1. Multi-target metadata for versions
 //! 2. Manifest parsing for minimal features
-//! 3. Clean unification with intersection-based features
+//! 3. Intersection-based feature unification
 
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
 use crate::commands::common::OutputFormat;
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 
-/// Run dependency unification analysis (dry-run)
+/// Analyze workspace dependencies (check mode)
 pub fn run_unify_analyze(
   ctx: &WorkspaceContext,
   exclude: Vec<String>,
@@ -22,10 +22,6 @@ pub fn run_unify_analyze(
 ) -> RailResult<()> {
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
-
-  if !json {
-    eprintln!("🔍 Analyzing workspace dependencies...\n");
-  }
 
   // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
@@ -77,16 +73,16 @@ pub fn run_unify_analyze(
 
   // Show diff if requested
   if show_diff && (!plan.member_edits.is_empty() || !plan.workspace_deps.is_empty()) {
-    println!("\n=== Planned Changes ===\n");
+    println!("\nplanned changes:\n");
 
     // Show workspace deps that will be added
     if !plan.workspace_deps.is_empty() {
-      println!("📝 [workspace.dependencies] additions:");
+      println!("[workspace.dependencies]:");
       for dep in &plan.workspace_deps {
         println!("  + {} = \"{}\"", dep.name, dep.version_req);
         if !dep.features.is_empty() {
           let mut features = dep.features.clone();
-          features.sort(); // Sort alphabetically
+          features.sort();
           println!("      features = {:?}", features);
         }
       }
@@ -106,7 +102,7 @@ pub fn run_unify_analyze(
         .get(member)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| member.clone());
-      println!("📝 {}:", path);
+      println!("{}:", path);
       for edit in edits {
         match edit {
           crate::cargo::MemberEdit::UseWorkspace {
@@ -124,7 +120,7 @@ pub fn run_unify_analyze(
               (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
               (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
             };
-            let mut line = format!("  {} {} → workspace = true", section, dep_name);
+            let mut line = format!("  {} {} -> workspace = true", section, dep_name);
             if !local_features.is_empty() {
               let mut features = local_features.clone();
               features.sort();
@@ -145,43 +141,42 @@ pub fn run_unify_analyze(
   let failed_validations: Vec<_> = plan.validation_results.iter().filter(|v| !v.success).collect();
 
   if !failed_validations.is_empty() {
-    println!("\n⚠️  Validation Issues:");
+    eprintln!("\nvalidation errors:");
     for val in failed_validations {
-      println!(
-        "  - {}: {}",
+      eprintln!(
+        "  {}: {}",
         val.target,
-        val.error.as_ref().unwrap_or(&"Unknown error".to_string())
+        val.error.as_ref().unwrap_or(&"unknown".to_string())
       );
     }
   }
 
   // Final message
   if plan.has_blocking_issues() {
-    println!("\n❌ Cannot proceed with unification due to blocking issues.");
+    eprintln!("\nerror: blocking issues prevent unification");
   } else if !plan.workspace_deps.is_empty() || !plan.member_edits.is_empty() {
-    // Count total member edit operations
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
     if !plan.workspace_deps.is_empty() {
       println!(
-        "\n✅ Ready to unify {} dependencies ({} member edits). Run 'cargo rail unify' to apply changes.",
+        "\nready: {} dependencies, {} member edits\nrun 'cargo rail unify' to apply",
         plan.workspace_deps.len(),
         total_edits
       );
     } else {
       println!(
-        "\n✅ Ready to convert {} members to use workspace inheritance ({} edits). Run 'cargo rail unify' to apply changes.",
+        "\nready: {} members, {} edits\nrun 'cargo rail unify' to apply",
         plan.member_edits.len(),
         total_edits
       );
     }
   } else {
-    println!("\n📊 No unification opportunities found.");
+    println!("\nno unification opportunities found");
   }
 
   Ok(())
 }
 
-/// Apply dependency unification (modify files)
+/// Execute dependency unification
 pub fn run_unify_apply(
   ctx: &WorkspaceContext,
   exclude: Vec<String>,
@@ -194,12 +189,9 @@ pub fn run_unify_apply(
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
 
-  eprintln!("🔧 Applying workspace dependency unification...\n");
-
-  // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
 
-  // Apply CLI overrides to config
+  // Apply CLI overrides
   if !exclude.is_empty() {
     analyzer.config.exclude.extend(exclude);
   }
@@ -210,79 +202,68 @@ pub fn run_unify_apply(
     analyzer.config.include_renamed = true;
   }
 
-  // Run analysis
   let plan = analyzer.analyze()?;
 
   // Check for blockers
   if plan.has_blocking_issues() {
-    println!("❌ Cannot apply unification due to blocking issues:");
+    eprintln!("error: blocking issues prevent unification:");
     for issue in &plan.issues {
       if issue.severity == crate::cargo::IssueSeverity::Error {
-        println!("  - {}: {}", issue.dep_name, issue.message);
+        eprintln!("  {}: {}", issue.dep_name, issue.message);
       }
     }
-    return Err(crate::error::RailError::message("Blocking issues prevent unification"));
+    return Err(crate::error::RailError::message("blocking issues prevent unification"));
   }
 
-  // Check if there's any work to do (either new workspace deps or member edits)
   if plan.workspace_deps.is_empty() && plan.member_edits.is_empty() {
-    println!("📊 No dependencies to unify.");
+    println!("nothing to unify");
     return Ok(());
   }
 
-  // Create backup if requested OR if this is the first unify run (safety feature)
+  // Create backup if requested or first run
   let backup_manager = BackupManager::new(ctx.workspace_root());
   let is_first_run = !backup_manager.has_backups();
   let should_backup = backup || is_first_run;
 
   if should_backup {
     if is_first_run && !backup {
-      println!("📦 Creating safety backup (first unify run in this workspace)...");
+      eprintln!("creating backup (first run)...");
     } else {
-      println!("📦 Creating backup...");
+      eprintln!("creating backup...");
     }
 
-    // Collect all files that will be modified
     let mut files_to_backup = Vec::new();
-
-    // Only include workspace Cargo.toml if we're adding new workspace deps
     if !plan.workspace_deps.is_empty() {
       files_to_backup.push(PathBuf::from("Cargo.toml"));
     }
 
     for member_name in plan.member_edits.keys() {
-      if let Some(manifest_path) = plan.member_paths.get(member_name) {
-        // Convert absolute path to relative path from workspace root
-        if let Ok(rel_path) = manifest_path.strip_prefix(ctx.workspace_root()) {
-          files_to_backup.push(rel_path.to_path_buf());
-        }
+      if let Some(manifest_path) = plan.member_paths.get(member_name)
+        && let Ok(rel_path) = manifest_path.strip_prefix(ctx.workspace_root())
+      {
+        files_to_backup.push(rel_path.to_path_buf());
       }
     }
 
     let metadata = BackupMetadata::new("cargo rail unify");
     let max_backups = ctx.config.as_ref().map(|c| c.unify.max_backups).unwrap_or(3);
     let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
-    println!("   Backup created: {}", backup_id);
-    println!();
+    eprintln!("backup: {}", backup_id);
   }
 
-  // Apply changes
   let writer = ManifestWriter::new();
 
-  // Write workspace dependencies only if there are new deps to add
   if !plan.workspace_deps.is_empty() {
-    println!("📝 Writing [workspace.dependencies]...");
+    eprintln!("writing [workspace.dependencies]...");
     writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
   }
 
-  // Update members
-  println!("📝 Updating {} member manifests...", plan.member_edits.len());
+  eprintln!("updating {} members...", plan.member_edits.len());
   for (member_name, edits) in &plan.member_edits {
-    // Get member path from the plan's mapping
     let member_path = plan
       .member_paths
       .get(member_name)
-      .ok_or_else(|| crate::error::RailError::message(format!("Member path not found for {}", member_name)))?;
+      .ok_or_else(|| crate::error::RailError::message(format!("member path not found: {}", member_name)))?;
 
     for edit in edits {
       match edit {
@@ -297,7 +278,7 @@ pub fn run_unify_apply(
             member_path,
             dep_name,
             *dep_kind,
-            target.as_deref(), // Pass target for correct section
+            target.as_deref(),
             if local_features.is_empty() {
               None
             } else {
@@ -310,31 +291,24 @@ pub fn run_unify_apply(
     }
   }
 
-  // Handle transitive pins
   if !plan.transitive_pins.is_empty() {
-    println!("📌 Pinning {} transitive dependencies...", plan.transitive_pins.len());
-
-    // Determine host path based on config
+    eprintln!("pinning {} transitives...", plan.transitive_pins.len());
     let host_path = match &ctx.config.as_ref().map(|c| &c.unify.transitive_host) {
       Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
       _ => ctx.workspace_root().join("Cargo.toml"),
     };
-
     writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
   }
 
-  // Write computed MSRV to workspace manifest if enabled
   if let Some(ref msrv) = plan.computed_msrv {
-    println!(
-      "📋 Writing rust-version = \"{}.{}\" to [workspace.package]...",
+    eprintln!(
+      "writing rust-version = \"{}.{}\"...",
       msrv.version.major, msrv.version.minor
     );
     writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
   }
 
-  // Generate report (unless --no-report)
   if !no_report {
-    println!("📄 Generating report...");
     let actual_report_path = report_path.unwrap_or_else(|| {
       ctx
         .workspace_root()
@@ -343,89 +317,78 @@ pub fn run_unify_apply(
         .join("unify-report.md")
     });
     UnifyReport::write_to_file(&plan, &actual_report_path)?;
-    println!("   Report saved to: {}", actual_report_path.display());
+    eprintln!("report: {}", actual_report_path.display());
   }
 
   // Summary
-  println!("\n✅ Unification complete!");
-  println!("   - {} dependencies unified", plan.workspace_deps.len());
-  println!("   - {} members updated", plan.member_edits.len());
+  println!(
+    "\nunified {} dependencies across {} members",
+    plan.workspace_deps.len(),
+    plan.member_edits.len()
+  );
   if !plan.transitive_pins.is_empty() {
-    println!("   - {} transitives pinned", plan.transitive_pins.len());
+    println!("  {} transitives pinned", plan.transitive_pins.len());
   }
   if !plan.duplicates_cleaned.is_empty() {
-    println!("   - {} duplicate versions cleaned", plan.duplicates_cleaned.len());
+    println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
   }
   if !plan.pruned_features.is_empty() {
-    println!("   - {} dead features pruned", plan.pruned_features.len());
+    println!("  {} dead features pruned", plan.pruned_features.len());
   }
   if let Some(ref msrv) = plan.computed_msrv {
     println!(
-      "   - MSRV set to {}.{} (from {})",
+      "  rust-version = {}.{} (from {})",
       msrv.version.major,
       msrv.version.minor,
       msrv.contributors.first().unwrap_or(&"unknown".to_string())
     );
   }
 
-  println!("\nNext steps:");
-  println!("  1. Run 'cargo check' to verify everything compiles");
-  println!("  2. Test your workspace thoroughly");
-  println!("  3. Commit the changes");
+  println!("\nnext: cargo check && cargo test");
 
   Ok(())
 }
 
-/// Undo a unify operation by restoring a backup
+/// Restore a previous state from backup
 pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: Option<String>) -> RailResult<()> {
   use crate::backup::BackupManager;
 
   let backup_manager = BackupManager::new(workspace_root);
 
-  // Handle --list flag
   if list {
-    println!("📋 Available backups:\n");
-
     let backups = backup_manager.list_backups()?;
 
     if backups.is_empty() {
-      println!("No backups found.");
+      println!("no backups found");
       return Ok(());
     }
 
+    println!("backups:\n");
     for (i, backup) in backups.iter().enumerate() {
       let marker = if i == 0 { " (latest)" } else { "" };
-      println!("{}. {}{}", i + 1, backup.id, marker);
-      println!("   Date: {}", backup.metadata.timestamp);
-      println!("   Command: {}", backup.metadata.command);
-      println!("   Files: {}", backup.metadata.files_modified.len());
-      println!();
+      println!("  {}{}", backup.id, marker);
+      println!("    {}", backup.metadata.timestamp);
+      println!("    {} files", backup.metadata.files_modified.len());
     }
 
-    println!("To restore a backup, run:");
-    println!("  cargo rail unify undo");
-    println!("  cargo rail unify undo --backup-id <id>");
-
+    println!("\nrestore with: cargo rail unify undo [--backup-id <id>]");
     return Ok(());
   }
 
-  // Determine which backup to restore
   let target_backup_id = if let Some(id) = backup_id {
     id
   } else {
-    // Use latest backup
     match backup_manager.get_latest_backup()? {
       Some(backup) => backup.id,
       None => {
         return Err(crate::error::RailError::with_help(
-          "No backups found to restore",
-          "Run 'cargo rail unify undo --list' to see available backups",
+          "no backups found",
+          "run 'cargo rail unify undo --list' to see available backups",
         ));
       }
     }
   };
 
-  // Restore the backup
   backup_manager.restore_backup(&target_backup_id)?;
 
   Ok(())
