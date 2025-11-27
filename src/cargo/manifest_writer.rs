@@ -194,4 +194,44 @@ impl ManifestWriter {
 
     Ok(())
   }
+
+  /// Remove an unused dependency from a member's Cargo.toml
+  ///
+  /// # Arguments
+  ///
+  /// * `member_toml_path` - Path to the member's Cargo.toml
+  /// * `dep_name` - Name of the dependency to remove
+  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
+  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
+  pub fn remove_dep(
+    &self,
+    member_toml_path: &Path,
+    dep_name: &str,
+    dep_kind: DepKind,
+    target: Option<&str>,
+  ) -> RailResult<()> {
+    // Read member Cargo.toml
+    let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
+
+    // Get section name from kind
+    let kind_section = self.dep_kind_to_section(dep_kind);
+
+    // Handle target-specific vs regular sections
+    if let Some(target_cfg) = target {
+      // Target-specific: remove from [target.'cfg(...)'.dependencies]
+      manifest_ops::remove_target_dependency(&mut doc, target_cfg, kind_section, dep_name)
+        .context("Failed to remove target-specific dependency")?;
+    } else {
+      // Regular section: remove from [dependencies], [dev-dependencies], or [build-dependencies]
+      if let Some(deps) = doc.get_mut(kind_section).and_then(|d| d.as_table_like_mut()) {
+        deps.remove(dep_name);
+      }
+    }
+
+    // Format and write
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(member_toml_path, &doc)?;
+
+    Ok(())
+  }
 }

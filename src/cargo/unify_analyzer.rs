@@ -54,6 +54,15 @@ pub enum MemberEdit {
     /// Whether the dependency is optional
     is_optional: bool,
   },
+  /// Remove an unused dependency
+  RemoveDep {
+    /// Name of the dependency to remove
+    dep_name: String,
+    /// Type of dependency (normal, dev, build)
+    dep_kind: DepKind,
+    /// Target platform constraint (if in target-specific section)
+    target: Option<String>,
+  },
 }
 
 /// Issue that prevents or warns about unification
@@ -129,6 +138,21 @@ pub struct UnusedDep {
   pub dep_name: String,
   /// Kind of dependency (normal, dev, build)
   pub kind: DepKind,
+  /// Why this dependency was flagged as unused
+  pub reason: UnusedReason,
+}
+
+/// Reason a dependency was flagged as unused
+#[derive(Debug, Clone)]
+pub enum UnusedReason {
+  /// Not found in resolved dependency graph for any configured target
+  NotInResolvedGraph,
+  /// Target-specific dep where the target IS configured but dep still not resolved
+  /// (e.g., `[target.'cfg(windows)'.dependencies]` when windows target is configured)
+  TargetConfiguredButNotResolved {
+    /// The target cfg expression from the manifest
+    target_cfg: String,
+  },
 }
 
 /// Complete unification plan
@@ -190,13 +214,17 @@ impl UnificationPlan {
 
     // Show member edits (deps being converted to workspace = true)
     if !self.member_edits.is_empty() {
-      // Collect unique dep names being converted
+      // Collect unique dep names being converted and removed
       let mut converted_deps: HashSet<String> = HashSet::new();
+      let mut removed_deps: HashSet<String> = HashSet::new();
       for edits in self.member_edits.values() {
         for edit in edits {
           match edit {
             MemberEdit::UseWorkspace { dep_name, .. } => {
               converted_deps.insert(dep_name.clone());
+            }
+            MemberEdit::RemoveDep { dep_name, .. } => {
+              removed_deps.insert(dep_name.clone());
             }
           }
         }
@@ -213,6 +241,15 @@ impl UnificationPlan {
         ));
         for dep_name in conversion_only {
           s.push_str(&format!("  - {} (already in workspace.dependencies)\n", dep_name));
+        }
+        s.push('\n');
+      }
+
+      // Show deps being removed
+      if !removed_deps.is_empty() {
+        s.push_str(&format!("Dependencies to remove (unused): {}\n", removed_deps.len()));
+        for dep_name in &removed_deps {
+          s.push_str(&format!("  - {}\n", dep_name));
         }
         s.push('\n');
       }
@@ -775,6 +812,40 @@ impl UnifyAnalyzer {
       Vec::new()
     };
 
+    // Generate removal edits if remove_unused is enabled
+    if self.config.remove_unused && !unused_deps.is_empty() {
+      println!(
+        "Generating removal edits for {} unused dependencies...",
+        unused_deps.len()
+      );
+      for unused in &unused_deps {
+        // Find the target constraint for this dep (needed for correct section)
+        let target = self
+          .manifests
+          .members
+          .iter()
+          .find(|m| m.package_name == unused.member)
+          .and_then(|m| {
+            m.dependencies.iter().find_map(|(key, usage)| {
+              if key.name == unused.dep_name && usage.kind == unused.kind {
+                usage.target.clone()
+              } else {
+                None
+              }
+            })
+          });
+
+        member_edits
+          .entry(unused.member.clone())
+          .or_default()
+          .push(MemberEdit::RemoveDep {
+            dep_name: unused.dep_name.clone(),
+            dep_kind: unused.kind,
+            target,
+          });
+      }
+    }
+
     // Run validation
     let validation_results = self.validate_targets()?;
 
@@ -868,7 +939,11 @@ impl UnifyAnalyzer {
   ///
   /// Compares declared dependencies (from Cargo.toml) against the resolved
   /// cargo graph to find deps that are declared but never actually used.
-  /// This uses the resolved metadata as the source of truth.
+  ///
+  /// This implements smart filtering to avoid false positives:
+  /// - Optional deps referenced in [features] are feature-gated, not unused
+  /// - Target-specific deps for unconfigured targets can't be verified
+  /// - Only truly unreferenced deps are flagged
   fn find_unused_deps(&self) -> Vec<UnusedDep> {
     let mut unused = Vec::new();
 
@@ -879,6 +954,9 @@ impl UnifyAnalyzer {
       .iter()
       .map(|pkg| pkg.name.to_string())
       .collect();
+
+    // Get configured targets for target constraint checking
+    let configured_targets: Vec<&str> = self.metadata.targets();
 
     // For each workspace member, check declared deps against resolved
     for member in &self.manifests.members {
@@ -893,27 +971,131 @@ impl UnifyAnalyzer {
         }
 
         // Check if this dep appears in the resolved graph for this member
-        if !resolved_deps.contains(&dep_key.name) {
+        // Normalize name (hyphens -> underscores) to match cargo's internal format
+        let normalized_name = dep_key.name.replace('-', "_");
+        if resolved_deps.contains(&normalized_name) {
+          continue; // Dep is resolved, definitely used
+        }
+
+        // === Smart filtering to avoid false positives ===
+
+        // Filter 1: Optional deps referenced in features are feature-gated, not unused
+        // They're only activated when the feature is enabled, so they won't be in the
+        // resolved graph unless someone enables that feature.
+        if usage.optional && usage.referenced_in_features {
+          continue;
+        }
+
+        // Filter 2: Target-specific deps for unconfigured targets
+        // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
+        // that target configured, we can't verify if it's used or not.
+        if let Some(ref target_cfg) = usage.target {
+          if !self.target_constraint_matches_any(target_cfg, &configured_targets) {
+            // Target not configured - can't verify, assume it's valid
+            continue;
+          }
+
+          // Target IS configured but dep still not in resolved graph
+          // This is genuinely suspicious - flag it with context
           unused.push(UnusedDep {
             member: member.package_name.clone(),
             dep_name: dep_key.name.clone(),
             kind: usage.kind,
+            reason: UnusedReason::TargetConfiguredButNotResolved {
+              target_cfg: target_cfg.clone(),
+            },
           });
+          continue;
         }
+
+        // This is a non-conditional, non-optional dep that's not in the resolved graph
+        // This is genuinely unused
+        unused.push(UnusedDep {
+          member: member.package_name.clone(),
+          dep_name: dep_key.name.clone(),
+          kind: usage.kind,
+          reason: UnusedReason::NotInResolvedGraph,
+        });
       }
     }
 
     if !unused.is_empty() {
-      println!("  Found {} unused dependencies", unused.len());
+      println!("  Found {} potentially unused dependencies", unused.len());
     }
 
     unused
+  }
+
+  /// Check if a target constraint (cfg expression) matches any configured target
+  ///
+  /// This is a heuristic check - we look for common patterns in the cfg string
+  /// and match against the target triples we have configured.
+  fn target_constraint_matches_any(&self, cfg: &str, configured_targets: &[&str]) -> bool {
+    // Normalize the cfg string for matching
+    let cfg_lower = cfg.to_lowercase();
+
+    for target in configured_targets {
+      let target_lower = target.to_lowercase();
+
+      // Check common cfg patterns against target triple components
+      // cfg(windows) matches x86_64-pc-windows-msvc
+      if cfg_lower.contains("windows") && target_lower.contains("windows") {
+        return true;
+      }
+      // cfg(unix) matches linux, darwin, freebsd, etc.
+      if cfg_lower.contains("unix")
+        && (target_lower.contains("linux")
+          || target_lower.contains("darwin")
+          || target_lower.contains("freebsd")
+          || target_lower.contains("netbsd")
+          || target_lower.contains("openbsd"))
+      {
+        return true;
+      }
+      // cfg(target_os = "linux") matches *-linux-*
+      if cfg_lower.contains("linux") && target_lower.contains("linux") {
+        return true;
+      }
+      // cfg(target_os = "macos") or cfg(target_os = "darwin")
+      if (cfg_lower.contains("macos") || cfg_lower.contains("darwin")) && target_lower.contains("darwin") {
+        return true;
+      }
+      // cfg(target_arch = "wasm32") matches wasm32-*
+      if cfg_lower.contains("wasm32") && target_lower.contains("wasm32") {
+        return true;
+      }
+      // cfg(target_arch = "x86_64")
+      if cfg_lower.contains("x86_64") && target_lower.contains("x86_64") {
+        return true;
+      }
+      // cfg(target_arch = "aarch64")
+      if cfg_lower.contains("aarch64") && target_lower.contains("aarch64") {
+        return true;
+      }
+      // cfg(target_os = "android")
+      if cfg_lower.contains("android") && target_lower.contains("android") {
+        return true;
+      }
+      // cfg(target_os = "ios")
+      if cfg_lower.contains("ios") && target_lower.contains("ios") {
+        return true;
+      }
+      // Exact target match: cfg(target = "x86_64-unknown-linux-gnu")
+      if cfg_lower.contains(&target_lower) {
+        return true;
+      }
+    }
+
+    false
   }
 
   /// Get all resolved direct dependencies for a workspace member
   ///
   /// Uses the resolved cargo metadata graph to find what deps are actually
   /// used by a member. This is the source of truth for dependency usage.
+  ///
+  /// Returns normalized names (hyphens converted to underscores) to match
+  /// cargo's internal crate name format.
   fn get_resolved_deps_for_member(&self, member_name: &str) -> HashSet<String> {
     let mut deps = HashSet::new();
 
@@ -926,6 +1108,7 @@ impl UnifyAnalyzer {
             && pkg.name == member_name
           {
             // Collect all direct dependencies from this node
+            // Note: cargo metadata uses normalized names (underscores)
             for dep in &node.deps {
               deps.insert(dep.name.clone());
             }
@@ -1127,8 +1310,8 @@ impl UnifyReport {
 
     if !plan.unused_deps.is_empty() {
       md.push_str("## Unused Dependencies\n\n");
-      md.push_str("| Member | Dependency | Kind |\n");
-      md.push_str("|--------|------------|------|\n");
+      md.push_str("| Member | Dependency | Kind | Reason |\n");
+      md.push_str("|--------|------------|------|--------|\n");
 
       for ud in &plan.unused_deps {
         let kind_str = match ud.kind {
@@ -1136,7 +1319,16 @@ impl UnifyReport {
           DepKind::Dev => "dev",
           DepKind::Build => "build",
         };
-        md.push_str(&format!("| {} | {} | {} |\n", ud.member, ud.dep_name, kind_str));
+        let reason_str = match &ud.reason {
+          UnusedReason::NotInResolvedGraph => "not in resolved graph".to_string(),
+          UnusedReason::TargetConfiguredButNotResolved { target_cfg } => {
+            format!("target `{}` configured but not resolved", target_cfg)
+          }
+        };
+        md.push_str(&format!(
+          "| {} | {} | {} | {} |\n",
+          ud.member, ud.dep_name, kind_str, reason_str
+        ));
       }
       md.push('\n');
     }

@@ -385,10 +385,38 @@ pub fn insert_target_dependency(
   Ok(())
 }
 
+/// Remove a dependency from target-specific section
+///
+/// # Arguments
+///
+/// * `doc` - TOML document to modify
+/// * `target` - Target triple or cfg expression (e.g., "cfg(windows)")
+/// * `section` - Section name ("dependencies", "dev-dependencies", "build-dependencies")
+/// * `name` - Dependency name to remove
+pub fn remove_target_dependency(doc: &mut DocumentMut, target: &str, section: &str, name: &str) -> RailResult<()> {
+  let path = format!("target.{}.{}", target, section);
+  if let Some(target_section) = get_table_mut(doc, &path) {
+    target_section.remove(name);
+  }
+  Ok(())
+}
+
 /// Get target-specific dependencies section (mutable)
 fn get_target_section_mut<'a>(doc: &'a mut DocumentMut, target: &str, section: &str) -> RailResult<&'a mut Table> {
   let path = format!("target.{}.{}", target, section);
   get_or_create_table(doc, &path)
+}
+
+/// Get a mutable reference to a table by path (returns None if not found)
+fn get_table_mut<'a>(doc: &'a mut DocumentMut, path: &str) -> Option<&'a mut Table> {
+  let parts: Vec<&str> = path.split('.').collect();
+  let mut current: &mut Item = doc.as_item_mut();
+
+  for part in parts {
+    current = current.get_mut(part)?;
+  }
+
+  current.as_table_mut()
 }
 
 // ============================================================================

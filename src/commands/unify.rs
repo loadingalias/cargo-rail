@@ -131,6 +131,21 @@ pub fn run_unify_analyze(
             }
             println!("{}", line);
           }
+          crate::cargo::MemberEdit::RemoveDep {
+            dep_name,
+            dep_kind,
+            target,
+          } => {
+            let section = match (dep_kind, target) {
+              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
+              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
+              (_, None) => "[dependencies]".to_string(),
+              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
+              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
+              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
+            };
+            println!("  {} {} -> REMOVE (unused)", section, dep_name);
+          }
         }
       }
       println!();
@@ -286,6 +301,13 @@ pub fn run_unify_apply(
             },
             *is_optional,
           )?;
+        }
+        crate::cargo::MemberEdit::RemoveDep {
+          dep_name,
+          dep_kind,
+          target,
+        } => {
+          writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
         }
       }
     }

@@ -114,6 +114,10 @@ pub struct DepUsage {
   /// The key name used in Cargo.toml (alias if renamed, otherwise package name)
   /// Used when generating manifest edits to target the correct dependency entry
   pub cargo_toml_key: String,
+  /// Whether this optional dep is referenced in the `[features]` table
+  /// True if the dep appears as: `dep:name`, `name` (for optional deps), or `name/feat`
+  /// Used to distinguish truly unused optional deps from feature-gated ones
+  pub referenced_in_features: bool,
 }
 
 /// Parsed dependency table info (used internally during manifest parsing)
@@ -294,17 +298,42 @@ impl ManifestAnalyzer {
       }
     }
 
-    // Parse [features] table to find conditional feature references
+    // Parse [features] table to find conditional feature references and dep activations
+    // This detects three patterns that reference dependencies:
+    // 1. "dep:name" - explicit dep activation (Rust 2021+)
+    // 2. "name" - implicit optional dep activation (when name matches an optional dep)
+    // 3. "name/feat" - dep with specific feature enabled
     if let Some(features_table) = doc.get("features").and_then(|f| f.as_table()) {
       for (_feature_name, feature_value) in features_table {
         if let Some(feature_list) = feature_value.as_array() {
           for item in feature_list {
             if let Some(s) = item.as_str() {
-              // Check for dep/feature syntax
-              if let Some((dep, feat)) = s.split_once('/') {
-                let dep_key = DepKey::new(dep);
+              // Pattern 1: "dep:name" - explicit dep reference (Rust 2021+)
+              if let Some(dep_name) = s.strip_prefix("dep:") {
+                let dep_key = DepKey::new(dep_name);
+                if let Some(usage) = dependencies.get_mut(&dep_key) {
+                  usage.referenced_in_features = true;
+                }
+              }
+              // Pattern 2: "name/feat" - dep with feature
+              else if let Some((dep, feat)) = s.split_once('/') {
+                // Strip optional "dep:" prefix from the dep part
+                let dep_name = dep.strip_prefix("dep:").unwrap_or(dep);
+                let dep_key = DepKey::new(dep_name);
                 if let Some(usage) = dependencies.get_mut(&dep_key) {
                   usage.conditional_features.insert(feat.to_string());
+                  usage.referenced_in_features = true;
+                }
+              }
+              // Pattern 3: bare "name" - check if it matches an optional dep
+              else {
+                let dep_key = DepKey::new(s);
+                if let Some(usage) = dependencies.get_mut(&dep_key) {
+                  // Only count as referenced if the dep is optional
+                  // (non-optional deps with same name as features are already resolved)
+                  if usage.optional {
+                    usage.referenced_in_features = true;
+                  }
                 }
               }
             }
@@ -364,7 +393,7 @@ impl ManifestAnalyzer {
         // which is the alias if renamed, or the package name otherwise
         let usage = DepUsage {
           unconditional_features: p.unconditional_features,
-          conditional_features: BTreeSet::new(), // Filled in later
+          conditional_features: BTreeSet::new(), // Filled in later by features parsing
           default_features: p.default_features,
           kind,
           target: target.clone(),
@@ -374,6 +403,7 @@ impl ManifestAnalyzer {
           declared_version: p.declared_version,
           manifest_path: Some(manifest_path.to_path_buf()),
           cargo_toml_key: dep_name.to_string(),
+          referenced_in_features: false, // Filled in later by features parsing
         };
 
         out.insert(dep_key, usage);
