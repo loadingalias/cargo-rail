@@ -197,16 +197,11 @@ pub fn run_release_check(
 }
 
 /// Initialize release configuration
-pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<&str>, check: bool) -> RailResult<()> {
+pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
   use crate::config::{ChangelogConfig, CrateReleaseConfig, RailConfig};
   use std::fs;
 
-  let requested_crates: Option<Vec<String>> = crates.map(|s| {
-    s.split(',')
-      .map(|name| name.trim().to_string())
-      .filter(|name| !name.is_empty())
-      .collect()
-  });
+  let requested_crates = crates;
 
   let members = ctx.cargo.metadata().workspace_packages();
   let workspace_root = ctx.workspace_root();

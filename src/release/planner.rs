@@ -2,7 +2,7 @@
 
 use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
-use crate::release::version::{BumpType, VersionBumper};
+use crate::release::version::BumpType;
 use crate::workspace::WorkspaceContext;
 use semver::Version;
 use serde::Serialize;
@@ -127,8 +127,8 @@ impl<'a> ReleasePlanner<'a> {
 
     let manifest_path = package.manifest_path.clone().into_std_path_buf();
 
-    // Get current version
-    let current_version = VersionBumper::get_version(&manifest_path)?;
+    // Get current version from cargo_metadata (already resolves workspace inheritance)
+    let current_version = package.version.clone();
 
     // Calculate new version
     let new_version = bump_type.apply(&current_version);

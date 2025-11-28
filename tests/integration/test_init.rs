@@ -165,3 +165,49 @@ fn test_init_all_fields_present() -> Result<()> {
 
   Ok(())
 }
+
+/// Test that --output to a different path works when default config exists
+#[test]
+fn test_init_output_different_path_with_existing_config() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-output-diff")?;
+
+  // Create config at default location
+  let default_config = ws.path.join(".config/rail.toml");
+  std::fs::create_dir_all(ws.path.join(".config"))?;
+  std::fs::write(&default_config, "# existing config\n[unify]\n")?;
+  assert!(default_config.exists(), "default config should exist");
+
+  // Run init with different output path - should succeed without --force
+  let custom_path = "custom-rail.toml";
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "init", "--non-interactive", "--output", custom_path],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "init with different --output should succeed even with existing config"
+  );
+
+  // Verify custom config was created
+  let custom_config = ws.path.join(custom_path);
+  assert!(custom_config.exists(), "custom config should be created");
+
+  // Verify default config still exists (unchanged)
+  assert!(default_config.exists(), "default config should still exist");
+  let default_content = std::fs::read_to_string(&default_config)?;
+  assert!(
+    default_content.contains("# existing config"),
+    "default config should be unchanged"
+  );
+
+  // Verify stderr warns about existing config
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("note:") && stderr.contains("existing config"),
+    "should warn about existing config, got: {}",
+    stderr
+  );
+
+  Ok(())
+}

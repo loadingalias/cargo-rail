@@ -107,16 +107,11 @@ pub fn run_split(
 }
 
 /// Initialize split configuration for crates
-pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<&str>, check: bool) -> RailResult<()> {
+pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
   use crate::config::RailConfig;
   use std::fs;
 
-  let requested_crates: Option<Vec<String>> = crates.map(|s| {
-    s.split(',')
-      .map(|name| name.trim().to_string())
-      .filter(|name| !name.is_empty())
-      .collect()
-  });
+  let requested_crates = crates;
 
   let splits = detect_workspace_splits(ctx, requested_crates.as_deref())?;
 

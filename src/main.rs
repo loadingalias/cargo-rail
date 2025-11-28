@@ -30,7 +30,7 @@ enum Commands {
     #[arg(long)]
     since: Option<String>,
     /// Start ref (for SHA pair mode)
-    #[arg(long, conflicts_with = "since")]
+    #[arg(long, conflicts_with = "since", requires = "to")]
     from: Option<String>,
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
@@ -125,8 +125,10 @@ enum Commands {
 
   /// Split a crate to a standalone repository with git history
   Split {
-    /// Crate name, or 'init' to configure
-    crate_name: Option<String>,
+    /// Action: 'init' to configure splits, or crate name to split
+    action: Option<String>,
+    /// Additional crate name(s) for init
+    crate_names: Vec<String>,
     /// Split all configured crates
     #[arg(short, long)]
     all: bool,
@@ -357,32 +359,26 @@ fn main() {
 
     // Split/Sync
     Commands::Split {
-      crate_name,
+      action,
+      crate_names,
       all,
       remote,
       check,
       format,
     } => {
-      // Check if this is 'split init <crates>'
-      if let Some(name) = crate_name {
-        if name == "init" {
-          // cargo rail split init (all crates)
-          commands::run_split_init(&ctx, None, check)
-        } else if name.starts_with("init,") || name.starts_with("init ") {
-          // cargo rail split "init,crate1,crate2" (specific crates)
-          let crates = name
-            .strip_prefix("init,")
-            .or_else(|| name.strip_prefix("init "))
-            .unwrap()
-            .trim();
-          commands::run_split_init(&ctx, Some(crates), check)
+      // Handle init subcommand: cargo rail split init [crate1 crate2 ...]
+      if action.as_deref() == Some("init") {
+        let crates = if crate_names.is_empty() {
+          None
         } else {
-          // cargo rail split mycrate (regular split)
-          commands::run_split(&ctx, Some(name.clone()), all, remote.clone(), check, format)
-        }
+          Some(crate_names)
+        };
+        commands::run_split_init(&ctx, crates, check)
       } else {
-        // cargo rail split --all or cargo rail split --check
-        commands::run_split(&ctx, None, all, remote.clone(), check, format)
+        // Regular split command
+        // If action is provided and not "init", treat it as the crate name
+        let crate_name = action;
+        commands::run_split(&ctx, crate_name, all, remote.clone(), check, format)
       }
     }
     Commands::Sync {
@@ -422,12 +418,12 @@ fn main() {
       // Handle init subcommand
       if action.as_deref() == Some("init") {
         // cargo rail release init <crates>
-        let crates_str = if crate_names.is_empty() {
+        let crates = if crate_names.is_empty() {
           None
         } else {
-          Some(crate_names.join(","))
+          Some(crate_names)
         };
-        commands::run_release_init(&ctx, crates_str.as_deref(), check)
+        commands::run_release_init(&ctx, crates, check)
       } else {
         // Regular release command
         // If action is provided and not "init", treat it as the first crate name

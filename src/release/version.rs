@@ -121,23 +121,52 @@ impl VersionBumper {
   /// Bump version in Cargo.toml
   ///
   /// Uses lossless TOML editing to preserve comments and formatting.
+  ///
+  /// # Errors
+  /// Returns an error if the crate uses workspace version inheritance.
   pub fn bump_version(manifest_path: &Path, bump_type: BumpType) -> RailResult<Version> {
     use crate::toml::editor::TomlEditor;
 
     let mut editor = TomlEditor::open(manifest_path)?;
     let doc = editor.doc();
 
-    // Get current version
-    let current_str = doc
-      .get("package")
-      .and_then(|p| p.get("version"))
-      .and_then(|v| v.as_str())
-      .ok_or_else(|| {
-        RailError::with_help(
-          format!("No version field in {}", manifest_path.display()),
-          "Ensure [package.version] is set",
-        )
-      })?;
+    // Get current version - check for workspace inheritance
+    let version_item = doc.get("package").and_then(|p| p.get("version"));
+
+    // Check if using workspace inheritance
+    if let Some(item) = version_item
+      && (item.is_inline_table() || item.is_table())
+    {
+      // Check for { workspace = true }
+      if let Some(tbl) = item.as_inline_table() {
+        if tbl.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
+          return Err(RailError::with_help(
+            format!(
+              "Cannot bump version in {}: uses workspace inheritance",
+              manifest_path.display()
+            ),
+            "Set a specific version in this crate's Cargo.toml, or update [workspace.package.version] in the root Cargo.toml",
+          ));
+        }
+      } else if let Some(tbl) = item.as_table()
+        && tbl.get("workspace").and_then(|v| v.as_bool()) == Some(true)
+      {
+        return Err(RailError::with_help(
+          format!(
+            "Cannot bump version in {}: uses workspace inheritance",
+            manifest_path.display()
+          ),
+          "Set a specific version in this crate's Cargo.toml, or update [workspace.package.version] in the root Cargo.toml",
+        ));
+      }
+    }
+
+    let current_str = version_item.and_then(|v| v.as_str()).ok_or_else(|| {
+      RailError::with_help(
+        format!("No version field in {}", manifest_path.display()),
+        "Ensure [package.version] is set",
+      )
+    })?;
 
     let current = Version::parse(current_str).map_err(|e| {
       RailError::message(format!(

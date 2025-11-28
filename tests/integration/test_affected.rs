@@ -204,3 +204,147 @@ fn test_affected_all_names_only() -> Result<()> {
 
   Ok(())
 }
+
+/// Test affected --output flag writes to file
+#[test]
+fn test_affected_output_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-output")?;
+  ws.add_crate("out-a", "0.1.0", &[])?;
+  ws.add_crate("out-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  let output_file = ws.path.join("affected-output.txt");
+
+  // Run with --all and --output
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "affected",
+      "--all",
+      "--format",
+      "names-only",
+      "--output",
+      output_file.to_str().unwrap(),
+    ],
+  )?;
+
+  assert!(output.status.success(), "affected --output should succeed");
+  assert!(output_file.exists(), "Output file should be created");
+
+  let content = std::fs::read_to_string(&output_file)?;
+  assert!(content.contains("out-a"), "File should contain out-a");
+  assert!(content.contains("out-b"), "File should contain out-b");
+
+  Ok(())
+}
+
+/// Test affected --format github (GitHub Actions output format)
+#[test]
+fn test_affected_format_github() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-github")?;
+  ws.add_crate("gh-a", "0.1.0", &[])?;
+  ws.add_crate("gh-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Run with --all and --format github
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all", "--format", "github"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected --format github should succeed");
+
+  // GitHub Actions format uses key=value pairs
+  assert!(
+    stdout.contains("affected=") || stdout.contains("crates="),
+    "Should have GitHub Actions output format, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected --format github-matrix (GitHub Actions matrix format)
+#[test]
+fn test_affected_format_github_matrix() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-ghmatrix")?;
+  ws.add_crate("mx-a", "0.1.0", &[])?;
+  ws.add_crate("mx-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Run with --all and --format github-matrix
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all", "--format", "github-matrix"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "affected --format github-matrix should succeed"
+  );
+
+  // GitHub matrix format should be JSON with matrix structure
+  assert!(
+    stdout.contains("matrix=") || stdout.contains("["),
+    "Should have GitHub Actions matrix format, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected --format jsonl (JSON Lines format)
+#[test]
+fn test_affected_format_jsonl() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-jsonl")?;
+  ws.add_crate("jl-a", "0.1.0", &[])?;
+  ws.add_crate("jl-b", "0.2.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Run with --all and --format jsonl
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--all", "--format", "jsonl"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected --format jsonl should succeed");
+
+  // JSONL format should have one JSON object per line
+  let lines: Vec<&str> = stdout.trim().lines().collect();
+  assert!(lines.len() >= 2, "Should have at least 2 lines for 2 crates");
+
+  // Each line should be valid JSON
+  for line in &lines {
+    let _: serde_json::Value =
+      serde_json::from_str(line).unwrap_or_else(|_| panic!("Each line should be valid JSON, got: {}", line));
+  }
+
+  Ok(())
+}
+
+/// Test affected with short flags (-a, -f, -o)
+#[test]
+fn test_affected_short_flags() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-short")?;
+  ws.add_crate("short-a", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  let output_file = ws.path.join("short-output.txt");
+
+  // Run with short flags: -a (all), -f (format), -o (output)
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "affected",
+      "-a",
+      "-f",
+      "names-only",
+      "-o",
+      output_file.to_str().unwrap(),
+    ],
+  )?;
+
+  assert!(output.status.success(), "affected with short flags should succeed");
+  assert!(output_file.exists(), "Output file should be created");
+
+  let content = std::fs::read_to_string(&output_file)?;
+  assert!(content.contains("short-a"), "File should contain short-a");
+
+  Ok(())
+}
