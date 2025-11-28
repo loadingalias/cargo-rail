@@ -184,6 +184,35 @@ pub fn build_transitive_entry(features: &[String]) -> Item {
   Item::Value(value)
 }
 
+/// Build a versioned dependency entry for [workspace.dependencies]
+///
+/// Used when adding transitive dependencies to workspace.dependencies.
+/// Creates entries like: `dep = { version = "1.0", features = ["foo"] }`
+///
+/// # Arguments
+///
+/// * `version` - The semver version to use
+/// * `features` - Features to enable
+pub fn build_versioned_dep_entry(version: &semver::Version, features: &[String]) -> Item {
+  // Simple case: just version, no features
+  if features.is_empty() {
+    let mut value = Value::from(format!("^{}", version));
+    value.decor_mut().set_suffix(" #unified");
+    return Item::Value(value);
+  }
+
+  // Complex case: version + features
+  let mut table = InlineTable::new();
+  table.insert("version", Value::from(format!("^{}", version)));
+  table.insert("features", build_feature_array(features));
+
+  // Add #unified comment marker
+  let mut value = Value::InlineTable(table);
+  value.decor_mut().set_suffix(" #unified");
+
+  Item::Value(value)
+}
+
 // ============================================================================
 // SECTION 2: Workspace Reference Detection
 // ============================================================================

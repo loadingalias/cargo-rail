@@ -295,8 +295,16 @@ impl MultiTargetMetadata {
         // This dep has different features across builds = fragmented
         let all_features: HashSet<String> = features.values().flat_map(|s| s.iter().cloned()).collect();
 
+        // Get the resolved version (use highest across all targets)
+        let versions = self.all_versions(&dep_name);
+        let version = match versions.values().max() {
+          Some(v) => v.clone(),
+          None => continue, // Skip if we can't determine version
+        };
+
         transitives.push(FragmentedTransitive {
           name: dep_name.to_string(),
+          version,
           feature_sets: features,
           unified_features: all_features.into_iter().collect(),
         });
@@ -363,6 +371,8 @@ impl MultiTargetMetadata {
 pub struct FragmentedTransitive {
   /// Dependency name
   pub name: String,
+  /// Resolved version (highest across all targets)
+  pub version: Version,
   /// Features per target
   pub feature_sets: HashMap<String, HashSet<String>>,
   /// Union of all features (for pinning)

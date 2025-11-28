@@ -22,9 +22,9 @@ AGENTS.md
 
 # Documentation
 docs/*
-commands.md
-config.md
+final_testing.md
 rules.md
+
 
 # Cargo-Rail (Testing)
 *rail.toml

@@ -23,16 +23,15 @@ pub fn run_init(
   let config_path = workspace_root.join(output_path);
 
   // Check if target path already exists
-  if config_path.exists() {
+  // In --check mode, we just preview - so existence doesn't matter
+  if config_path.exists() && !check {
     if !force {
       return Err(RailError::with_help(
         format!("configuration exists: {}", config_path.display()),
-        "use --force to overwrite",
+        "use --force to overwrite, or use --check to preview what would be generated",
       ));
     }
-    if !check {
-      eprintln!("overwriting: {}", config_path.display());
-    }
+    eprintln!("overwriting: {}", config_path.display());
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {
@@ -150,16 +149,15 @@ pub fn run_init_standalone(
   let config_path = workspace_root.join(output_path);
 
   // Check if target path already exists
-  if config_path.exists() {
+  // In --check mode, we just preview - so existence doesn't matter
+  if config_path.exists() && !check {
     if !force {
       return Err(RailError::with_help(
         format!("configuration exists: {}", config_path.display()),
-        "use --force to overwrite",
+        "use --force to overwrite, or use --check to preview what would be generated",
       ));
     }
-    if !check {
-      eprintln!("overwriting: {}", config_path.display());
-    }
+    eprintln!("overwriting: {}", config_path.display());
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {

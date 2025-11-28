@@ -21,6 +21,6 @@ pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;
 pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MultiTargetMetadata};
 pub use unify_analyzer::{
-  DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, UnificationPlan, UnifiedDep, UnifyAnalyzer, UnifyIssue,
-  UnifyReport, ValidationResult,
+  DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, TransitivePin, UnificationPlan, UnifiedDep,
+  UnifyAnalyzer, UnifyIssue, UnifyReport, ValidationResult,
 };

@@ -170,15 +170,15 @@ impl RailConfigBuilder {
   /// Add splits template
   pub fn splits_template(&mut self) -> &mut Self {
     let content = r#"# Split/Sync: Use 'cargo rail split init <crate>' to configure individual crates
-# [[splits]]
-# name = "my-crate"
+# Per-crate configuration uses [crates.<name>] sections:
+#
+# [crates.my-crate.split]
 # remote = "git@github.com:org/my-crate.git"
 # branch = "main"
-# mode = "single"
-# publish = true
+# mode = "single"  # or "combined" for multi-crate repos
 #
-# [[splits.paths]]
-# crate = "crates/my-crate"
+# [crates.my-crate.release]
+# publish = true
 "#;
     self.sections.push(content.to_string());
     self
@@ -324,7 +324,7 @@ mod tests {
     assert!(output.contains("targets"));
     assert!(output.contains("[unify]"));
     assert!(output.contains("[release]"));
-    assert!(output.contains("# [[splits]]"));
+    assert!(output.contains("# [crates.my-crate.split]"));
   }
 
   #[test]

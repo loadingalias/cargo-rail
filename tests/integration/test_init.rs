@@ -156,9 +156,8 @@ fn test_init_all_fields_present() -> Result<()> {
   // Unify section (must be present)
   assert!(config_content.contains("[unify]"));
 
-  // Split/Sync - example should be present
-  assert!(config_content.contains("# [[splits]]"));
-  assert!(config_content.contains("# name = "));
+  // Split/Sync - example should use [crates.<name>.split] format
+  assert!(config_content.contains("# [crates.my-crate.split]"));
   assert!(config_content.contains("# remote = "));
   assert!(config_content.contains("# branch = "));
   assert!(config_content.contains("# mode = "));

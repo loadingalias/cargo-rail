@@ -66,15 +66,11 @@ impl BumpType {
       }
       Self::Major => {
         let mut next = current.clone();
-        // For 0.x versions, bump minor instead (Cargo convention)
-        if current.major == 0 {
-          next.minor += 1;
-          next.patch = 0;
-        } else {
-          next.major += 1;
-          next.minor = 0;
-          next.patch = 0;
-        }
+        // Always bump major version - including 0.x -> 1.0.0
+        // Users who want semver-compatible "breaking change" on 0.x can use --bump minor
+        next.major += 1;
+        next.minor = 0;
+        next.patch = 0;
         next.pre = semver::Prerelease::EMPTY;
         next.build = semver::BuildMetadata::EMPTY;
         next
@@ -257,10 +253,10 @@ mod tests {
 
   #[test]
   fn test_bump_major_pre_1() {
-    // For 0.x versions, major bump increments minor
+    // For 0.x versions, major bump goes to 1.0.0
     let v = Version::parse("0.2.3").unwrap();
     let next = BumpType::Major.apply(&v);
-    assert_eq!(next, Version::parse("0.3.0").unwrap());
+    assert_eq!(next, Version::parse("1.0.0").unwrap());
   }
 
   #[test]

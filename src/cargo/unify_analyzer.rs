@@ -155,6 +155,17 @@ pub enum UnusedReason {
   },
 }
 
+/// A transitive dependency to pin for workspace-hack replacement
+#[derive(Debug, Clone)]
+pub struct TransitivePin {
+  /// Dependency name
+  pub name: String,
+  /// Resolved version
+  pub version: semver::Version,
+  /// Features to enable
+  pub features: Vec<String>,
+}
+
 /// Complete unification plan
 #[derive(Debug)]
 pub struct UnificationPlan {
@@ -164,8 +175,8 @@ pub struct UnificationPlan {
   pub member_edits: HashMap<String, Vec<MemberEdit>>,
   /// Mapping from package name to manifest path (relative to workspace root)
   pub member_paths: HashMap<String, PathBuf>,
-  /// Transitive dependencies to pin (dep_name, features)
-  pub transitive_pins: Vec<(String, Vec<String>)>,
+  /// Transitive dependencies to pin (with version info)
+  pub transitive_pins: Vec<TransitivePin>,
   /// Results from validating across target platforms
   pub validation_results: Vec<ValidationResult>,
   /// Issues detected during analysis
@@ -783,7 +794,14 @@ impl UnifyAnalyzer {
       println!("Analyzing transitive dependencies...");
       let fragmented = self.metadata.find_fragmented_transitives();
 
-      fragmented.into_iter().map(|f| (f.name, f.unified_features)).collect()
+      fragmented
+        .into_iter()
+        .map(|f| TransitivePin {
+          name: f.name,
+          version: f.version,
+          features: f.unified_features,
+        })
+        .collect()
     } else {
       Vec::new()
     };

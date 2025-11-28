@@ -315,6 +315,13 @@ pub fn run_unify_apply(
 
   if !plan.transitive_pins.is_empty() {
     eprintln!("pinning {} transitives...", plan.transitive_pins.len());
+
+    // STEP 1: Add transitive deps to [workspace.dependencies] first
+    // This is required before we can reference them with `workspace = true`
+    eprintln!("  adding to [workspace.dependencies]...");
+    writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
+
+    // STEP 2: Add to host's [dev-dependencies] with workspace = true
     let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
     let is_root_host = matches!(
       transitive_host_setting,

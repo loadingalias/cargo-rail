@@ -4,7 +4,7 @@
 
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::manifest_ops;
-use crate::cargo::unify_analyzer::UnifiedDep;
+use crate::cargo::unify_analyzer::{TransitivePin, UnifiedDep};
 use crate::error::{RailResult, ResultExt};
 use crate::toml::format::TomlFormatter;
 use std::path::Path;
@@ -137,11 +137,11 @@ impl ManifestWriter {
   }
 
   /// Add transitive dependencies for pinning (workspace-hack replacement)
-  pub fn add_transitive_pins(
-    &self,
-    host_toml_path: &Path,
-    transitives: &[(String, Vec<String>)], // (dep_name, features)
-  ) -> RailResult<()> {
+  ///
+  /// This adds entries with `workspace = true` to the host's dev-dependencies.
+  /// IMPORTANT: The caller must ensure these deps are already in [workspace.dependencies]
+  /// before calling this function. Use `write_transitive_workspace_deps` first.
+  pub fn add_transitive_pins(&self, host_toml_path: &Path, transitives: &[TransitivePin]) -> RailResult<()> {
     // Read host Cargo.toml (usually workspace root)
     let mut doc = manifest_ops::read_toml_file(host_toml_path)?;
 
@@ -149,15 +149,46 @@ impl ManifestWriter {
     let dev_deps =
       manifest_ops::get_or_create_table(&mut doc, "dev-dependencies").context("Failed to create [dev-dependencies]")?;
 
-    // Add each transitive as a dev dependency
-    for (dep_name, features) in transitives {
-      let entry = manifest_ops::build_transitive_entry(features);
-      manifest_ops::insert_dependency(dev_deps, dep_name, entry).context("Failed to insert transitive dependency")?;
+    // Add each transitive as a dev dependency with workspace = true
+    for pin in transitives {
+      let entry = manifest_ops::build_transitive_entry(&pin.features);
+      manifest_ops::insert_dependency(dev_deps, &pin.name, entry).context("Failed to insert transitive dependency")?;
     }
 
     // Format and write
     self.formatter.format_manifest(&mut doc)?;
     manifest_ops::write_toml_file(host_toml_path, &doc)?;
+
+    Ok(())
+  }
+
+  /// Write transitive dependencies to [workspace.dependencies]
+  ///
+  /// This must be called BEFORE `add_transitive_pins` so that the deps exist
+  /// in workspace.dependencies when referenced with `workspace = true`.
+  pub fn write_transitive_workspace_deps(
+    &self,
+    workspace_toml_path: &Path,
+    transitives: &[TransitivePin],
+  ) -> RailResult<()> {
+    // Read workspace Cargo.toml
+    let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
+
+    // Ensure [workspace.dependencies] exists
+    manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
+    let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
+      .context("Failed to create [workspace.dependencies]")?;
+
+    // Add each transitive dependency with version and features
+    for pin in transitives {
+      let entry = manifest_ops::build_versioned_dep_entry(&pin.version, &pin.features);
+      manifest_ops::insert_dependency(deps_table, &pin.name, entry)
+        .context("Failed to insert transitive to workspace.dependencies")?;
+    }
+
+    // Format and write
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
     Ok(())
   }
