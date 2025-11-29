@@ -13,6 +13,8 @@ pub mod manifest_ops;
 pub mod manifest_writer;
 pub mod multi_target_metadata;
 pub mod unify_analyzer;
+pub mod unify_report;
+pub mod unify_types;
 
 // Re-export main types for convenience
 pub use cargo_transform::{CargoTransform, TransformContext};
@@ -20,7 +22,9 @@ pub use feature_scanner::{FeatureScanResult, FeatureScanner};
 pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;
 pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MultiTargetMetadata};
-pub use unify_analyzer::{
-  DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, TransitivePin, UnificationPlan, UnifiedDep,
-  UnifyAnalyzer, UnifyIssue, UnifyReport, ValidationResult,
+pub use unify_analyzer::UnifyAnalyzer;
+pub use unify_report::UnifyReport;
+pub use unify_types::{
+  DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, TransitivePin, UnificationPlan, UnifiedDep, UnifyIssue,
+  UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
 };

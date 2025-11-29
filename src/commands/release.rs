@@ -21,6 +21,11 @@ pub fn run_release_plan(
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
 
+  // JSON mode enables structured error output and suppresses progress
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
   let bump_type = bump.parse::<BumpType>()?;
 
   let workspace_members = ctx.graph.workspace_members();
@@ -78,6 +83,8 @@ pub fn run_release_plan(
     }
 
     println!("\nrun without --check to execute");
+    // Exit 1 to signal CI that release is pending
+    return Err(RailError::CheckHasPendingChanges);
   }
 
   Ok(())
@@ -152,6 +159,11 @@ pub fn run_release_check(
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
 
+  // JSON mode enables structured error output and suppresses progress
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
@@ -181,6 +193,7 @@ pub fn run_release_check(
 
   if json {
     let output = serde_json::json!({
+      "command": "check",
       "status": "passed",
       "crates": results,
       "count": results.len()

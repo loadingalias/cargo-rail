@@ -1,6 +1,7 @@
 use crate::backup::BackupManager;
 use crate::config::UnifyConfig;
 use crate::error::{RailError, RailResult};
+use crate::progress;
 use crate::workspace::WorkspaceContext;
 use std::fs;
 
@@ -75,6 +76,8 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
 
     if would_clean {
       println!("\nrun without --check to execute");
+      // Exit 1 to signal CI that cleanup is pending
+      return Err(RailError::CheckHasPendingChanges);
     } else {
       println!("nothing to clean");
     }
@@ -116,13 +119,13 @@ fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<()> {
   let old_rail_target = ctx.workspace_root.join("target").join("rail");
 
   if rail_target.exists() {
-    eprintln!("removing cache...");
+    progress!("removing cache...");
     fs::remove_file(&rail_target)
       .map_err(|e| RailError::message(format!("failed to remove {}: {}", rail_target.display(), e)))?;
   }
 
   if old_rail_target.exists() {
-    eprintln!("removing legacy cache...");
+    progress!("removing legacy cache...");
     fs::remove_dir_all(&old_rail_target)
       .map_err(|e| RailError::message(format!("failed to remove {}: {}", old_rail_target.display(), e)))?;
   }
@@ -134,7 +137,7 @@ fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<()> {
   let report_dir = ctx.workspace_root.join("target").join("cargo-rail");
 
   if report_dir.exists() {
-    eprintln!("removing reports...");
+    progress!("removing reports...");
     for entry in fs::read_dir(&report_dir).map_err(|e| RailError::message(format!("failed to read dir: {}", e)))? {
       let entry = entry.map_err(|e| RailError::message(format!("failed to read entry: {}", e)))?;
       let path = entry.path();
@@ -155,21 +158,21 @@ fn clean_backups_handler(ctx: &WorkspaceContext, delete_all: bool) -> RailResult
   }
 
   if delete_all {
-    eprintln!("removing all backups...");
+    progress!("removing all backups...");
     let count = backup_manager.cleanup_old_backups(0)?;
-    eprintln!("  removed {} backups", count);
+    progress!("  removed {} backups", count);
   } else {
     let max_backups = ctx
       .config
       .as_ref()
       .map(|c| c.unify.max_backups)
       .unwrap_or_else(|| UnifyConfig::default().max_backups);
-    eprintln!("pruning backups (keeping {})...", max_backups);
+    progress!("pruning backups (keeping {})...", max_backups);
     let count = backup_manager.cleanup_old_backups(max_backups)?;
     if count > 0 {
-      eprintln!("  removed {} old backups", count);
+      progress!("  removed {} old backups", count);
     } else {
-      eprintln!("  no backups to prune");
+      progress!("  no backups to prune");
     }
   }
 

@@ -5,6 +5,7 @@
 
 use crate::config::{RailConfig, UnifyConfig};
 use crate::error::{RailError, RailResult};
+use crate::progress;
 use crate::toml::builder::RailConfigBuilder;
 use crate::workspace::WorkspaceContext;
 use std::fs;
@@ -31,11 +32,11 @@ pub fn run_init(
         "use --force to overwrite, or use --check to preview what would be generated",
       ));
     }
-    eprintln!("overwriting: {}", config_path.display());
+    progress!("overwriting: {}", config_path.display());
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {
-      eprintln!("note: existing config at {}", existing.display());
+      progress!("note: existing config at {}", existing.display());
     }
   }
 
@@ -157,11 +158,11 @@ pub fn run_init_standalone(
         "use --force to overwrite, or use --check to preview what would be generated",
       ));
     }
-    eprintln!("overwriting: {}", config_path.display());
+    progress!("overwriting: {}", config_path.display());
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {
-      eprintln!("note: existing config at {}", existing.display());
+      progress!("note: existing config at {}", existing.display());
     }
   }
 

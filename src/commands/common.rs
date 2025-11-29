@@ -52,6 +52,15 @@ impl std::fmt::Display for OutputFormat {
   }
 }
 
+/// Check if a format string indicates JSON output mode
+///
+/// Returns true for any format that produces structured output (json, jsonl, github, github-matrix).
+/// Used for early JSON mode detection to suppress progress messages.
+pub fn is_json_output(format: &str) -> bool {
+  let f = format.to_lowercase();
+  matches!(f.as_str(), "json" | "jsonl" | "json-lines" | "github" | "github-matrix")
+}
+
 /// Builder for split/sync configurations
 ///
 /// Centralizes the logic for selecting crates (by name, --all, etc.)

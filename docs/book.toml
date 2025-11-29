@@ -1,0 +1,34 @@
+[book]
+title = "cargo-rail Documentation"
+authors = ["loadingalias"]
+description = "Graph-aware workspace orchestration for Rust monorepos"
+language = "en"
+multilingual = false
+src = "src"
+
+[rust]
+edition = "2024"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[preprocessor.open-on-gh]
+command = "mdbook-open-on-gh"
+renderer = ["html"]
+
+[preprocessor.alerts]
+# Adds GitHub Flavored Markdown alerts support
+# Syntax: > [!NOTE], > [!TIP], > [!IMPORTANT], > [!WARNING], > [!CAUTION]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+git-repository-url = "https://github.com/loadingalias/cargo-rail"
+edit-url-template = "https://github.com/loadingalias/cargo-rail/edit/main/docs/src/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 0

@@ -66,6 +66,12 @@ pub enum RailError {
     /// Help text to guide the user
     help: Option<String>,
   },
+
+  /// Check mode found pending changes (not an error, but exits with code 1)
+  ///
+  /// Used by --check commands to signal that changes would be made.
+  /// This is not a failure, but CI should treat it as "action needed".
+  CheckHasPendingChanges,
 }
 
 impl RailError {
@@ -102,8 +108,10 @@ impl RailError {
 
   /// Get the appropriate exit code for this error
   pub fn exit_code(&self) -> ExitCode {
-    // All errors use exit code 2
-    ExitCode::Error
+    match self {
+      RailError::CheckHasPendingChanges => ExitCode::CheckFailed,
+      _ => ExitCode::Error,
+    }
   }
 
   /// Get contextual help message for this error
@@ -130,6 +138,7 @@ impl fmt::Display for RailError {
         }
         Ok(())
       }
+      RailError::CheckHasPendingChanges => Ok(()), // Silent - no message
     }
   }
 }
@@ -432,12 +441,61 @@ where
   }
 }
 
-/// Print an error to stderr with optional help text
-pub fn print_error(error: &RailError) {
-  eprintln!("error: {}", error);
+/// Structured JSON error for machine-readable output
+#[derive(serde::Serialize)]
+struct JsonError {
+  error: bool,
+  code: i32,
+  message: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  context: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  help: Option<String>,
+}
 
-  if let Some(help) = error.help_message() {
-    eprintln!("help: {}", help);
+/// Print an error to stderr with optional help text
+///
+/// In JSON mode, outputs a structured JSON error object instead of text.
+pub fn print_error(error: &RailError) {
+  // CheckHasPendingChanges is not an error - it's a signal for CI
+  // Don't print "error:" prefix for it
+  if matches!(error, RailError::CheckHasPendingChanges) {
+    return;
+  }
+
+  if crate::output::is_json_mode() {
+    print_error_json(error);
+  } else {
+    eprintln!("error: {}", error);
+
+    if let Some(help) = error.help_message() {
+      eprintln!("help: {}", help);
+    }
+  }
+}
+
+/// Print error as structured JSON to stdout
+fn print_error_json(error: &RailError) {
+  let (message, context) = match error {
+    RailError::Message { message, context, .. } => (message.clone(), context.clone()),
+    _ => (error.to_string(), None),
+  };
+
+  let json_error = JsonError {
+    error: true,
+    code: error.exit_code().as_i32(),
+    message,
+    context,
+    help: error.help_message(),
+  };
+
+  // JSON errors go to stdout for consistent machine parsing
+  // (stderr may have other output mixed in)
+  if let Ok(json) = serde_json::to_string_pretty(&json_error) {
+    println!("{}", json);
+  } else {
+    // Fallback to text if JSON serialization fails
+    eprintln!("error: {}", error);
   }
 }
 

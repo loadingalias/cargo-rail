@@ -8,6 +8,7 @@
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
 use crate::commands::common::OutputFormat;
 use crate::error::{RailError, RailResult};
+use crate::progress;
 use crate::workspace::WorkspaceContext;
 
 /// Analyze workspace dependencies (check mode)
@@ -22,6 +23,11 @@ pub fn run_unify_analyze(
 ) -> RailResult<()> {
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
+
+  // JSON mode enables structured error output and suppresses progress
+  if json {
+    crate::output::set_json_mode(true);
+  }
 
   // Create analyzer
   let mut analyzer = UnifyAnalyzer::new(ctx)?;
@@ -46,14 +52,19 @@ pub fn run_unify_analyze(
   // JSON output mode
   if json {
     let output = serde_json::json!({
+      "command": "unify",
+      "check": true,
       "workspace_deps": plan.workspace_deps.iter().map(|d| serde_json::json!({
         "name": d.name,
         "version": d.version_req,
         "features": d.features,
       })).collect::<Vec<_>>(),
-      "member_edits_count": plan.member_edits.values().map(|v| v.len()).sum::<usize>(),
-      "members_affected": plan.member_edits.len(),
-      "transitive_pins": plan.transitive_pins.len(),
+      "summary": {
+        "workspace_deps_count": plan.workspace_deps.len(),
+        "member_edits_count": plan.member_edits.values().map(|v| v.len()).sum::<usize>(),
+        "members_affected": plan.member_edits.len(),
+        "transitive_pins_count": plan.transitive_pins.len(),
+      },
       "has_blocking_issues": plan.has_blocking_issues(),
       "issues": plan.issues.iter().map(|i| serde_json::json!({
         "dep_name": i.dep_name,
@@ -166,9 +177,10 @@ pub fn run_unify_analyze(
     }
   }
 
-  // Final message
+  // Final message and exit code
   if plan.has_blocking_issues() {
     eprintln!("\nerror: blocking issues prevent unification");
+    return Err(RailError::message("blocking issues prevent unification"));
   } else if !plan.workspace_deps.is_empty() || !plan.member_edits.is_empty() {
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
     if !plan.workspace_deps.is_empty() {
@@ -184,6 +196,8 @@ pub fn run_unify_analyze(
         total_edits
       );
     }
+    // Exit 1 to signal CI that changes are pending
+    return Err(RailError::CheckHasPendingChanges);
   } else {
     println!("\nno unification opportunities found");
   }
@@ -242,9 +256,9 @@ pub fn run_unify_apply(
 
   if should_backup {
     if is_first_run && !backup {
-      eprintln!("creating backup (first run)...");
+      progress!("creating backup (first run)...");
     } else {
-      eprintln!("creating backup...");
+      progress!("creating backup...");
     }
 
     let mut files_to_backup = Vec::new();
@@ -263,17 +277,17 @@ pub fn run_unify_apply(
     let metadata = BackupMetadata::new("cargo rail unify");
     let max_backups = ctx.config.as_ref().map(|c| c.unify.max_backups).unwrap_or(3);
     let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
-    eprintln!("backup: {}", backup_id);
+    progress!("backup: {}", backup_id);
   }
 
   let writer = ManifestWriter::new();
 
   if !plan.workspace_deps.is_empty() {
-    eprintln!("writing [workspace.dependencies]...");
+    progress!("writing [workspace.dependencies]...");
     writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
   }
 
-  eprintln!("updating {} members...", plan.member_edits.len());
+  progress!("updating {} members...", plan.member_edits.len());
   for (member_name, edits) in &plan.member_edits {
     let member_path = plan
       .member_paths
@@ -314,11 +328,11 @@ pub fn run_unify_apply(
   }
 
   if !plan.transitive_pins.is_empty() {
-    eprintln!("pinning {} transitives...", plan.transitive_pins.len());
+    progress!("pinning {} transitives...", plan.transitive_pins.len());
 
     // STEP 1: Add transitive deps to [workspace.dependencies] first
     // This is required before we can reference them with `workspace = true`
-    eprintln!("  adding to [workspace.dependencies]...");
+    progress!("  adding to [workspace.dependencies]...");
     writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
 
     // STEP 2: Add to host's [dev-dependencies] with workspace = true
@@ -348,7 +362,7 @@ pub fn run_unify_apply(
       if let Some(pkg) = metadata.workspace_packages().iter().find(|p| p.name == *first_member) {
         let member_path = pkg.manifest_path.parent().unwrap();
         let relative_path = member_path.strip_prefix(ctx.workspace_root()).unwrap_or(member_path);
-        eprintln!(
+        progress!(
           "  note: using '{}' as transitive host (virtual workspace detected)",
           relative_path
         );
@@ -367,9 +381,10 @@ pub fn run_unify_apply(
   }
 
   if let Some(ref msrv) = plan.computed_msrv {
-    eprintln!(
+    progress!(
       "writing rust-version = \"{}.{}\"...",
-      msrv.version.major, msrv.version.minor
+      msrv.version.major,
+      msrv.version.minor
     );
     writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
   }
@@ -383,7 +398,7 @@ pub fn run_unify_apply(
         .join("unify-report.md")
     });
     UnifyReport::write_to_file(&plan, &actual_report_path)?;
-    eprintln!("report: {}", actual_report_path.display());
+    progress!("report: {}", actual_report_path.display());
   }
 
   // Summary

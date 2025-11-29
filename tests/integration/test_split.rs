@@ -379,9 +379,10 @@ paths = [{ crate = "crates/override-lib" }]
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
+  // Exit code 1 = check found pending changes (correct behavior)
   assert!(
-    output.status.success(),
-    "split --remote --check should succeed. stderr: {}",
+    output.status.code() == Some(1),
+    "split --remote --check should exit 1 when split pending. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
@@ -468,7 +469,7 @@ root = "."
     String::from_utf8_lossy(&output.stderr)
   );
   assert!(
-    stdout.contains("init-lib") || stdout.contains("[crates.") || stdout.contains("[[splits]]"),
+    stdout.contains("init-lib") || stdout.contains("[crates."),
     "split init should show detected crates. Output:\n{}",
     stdout
   );

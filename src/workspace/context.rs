@@ -27,6 +27,7 @@ use crate::config::{ConfigLoadResult, RailConfig};
 use crate::error::{ConfigError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
+use crate::progress;
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -325,7 +326,7 @@ impl WorkspaceContext {
     let multi_target_metadata = if let Some(ref cfg) = config
       && !cfg.targets.is_empty()
     {
-      println!("Pre-loading metadata for {} target(s)...", cfg.targets.len());
+      progress!("Pre-loading metadata for {} target(s)...", cfg.targets.len());
       Some(Arc::new(MultiTargetMetadata::load_parallel(
         &workspace_root,
         &cfg.targets,

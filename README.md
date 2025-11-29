@@ -179,28 +179,29 @@ def456 fix: critical bug      # Same SHA!
 
 ## Configuration
 
-Create `.config/rail.toml`:
+Create `.config/rail.toml` (or use `cargo rail init`):
 
 ```toml
-# Toolchain management
-[toolchain]
-channel = "stable"
-components = ["clippy", "rustfmt"]
+# Target platforms for multi-target analysis (auto-detected by init)
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 # Dependency unification
 [unify]
-consolidate_transitive_features = false  # Consolidate transitive deps
-transitive_feature_host = "auto"         # Smart auto-selection
-validate_targets = []
+pin_transitives = true       # Pin transitive-only deps (workspace-hack replacement)
+transitive_host = "root"     # Where to put pinned dev-deps: "root" or "crates/foo"
+include_renamed = false      # Include package = "..." renamed deps
+exclude = ["openssl"]        # Deps to exclude from unification
 
-# Split/sync (optional)
-[[splits]]
-name = "my-crate"
+# Per-crate configuration (optional)
+[crates.my-crate.split]
 remote = "git@github.com:org/my-crate.git"
 mode = "single"
+
+[crates.my-crate.release]
+publish = true
 ```
 
-See [`.config/rail.toml.example`](.config/rail.toml.example) for all options.
+Run `cargo rail init --check` to preview generated config.
 
 ---
 

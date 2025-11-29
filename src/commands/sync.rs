@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::error::RailResult;
+use crate::progress;
 use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
@@ -24,6 +25,11 @@ pub fn run_sync(
 ) -> RailResult<()> {
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
+
+  // JSON mode enables structured error output and suppresses progress
+  if json {
+    crate::output::set_json_mode(true);
+  }
 
   let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
 
@@ -57,28 +63,36 @@ pub fn run_sync(
   // Check mode
   if check {
     if json {
-      for (sync_config, target_exists) in &configs {
-        let dir_str = match direction {
-          SyncDirection::MonoToRemote => "to_remote",
-          SyncDirection::RemoteToMono => "from_remote",
-          SyncDirection::Both => "bidirectional",
-          SyncDirection::None => "none",
-        };
+      let dir_str = match direction {
+        SyncDirection::MonoToRemote => "to_remote",
+        SyncDirection::RemoteToMono => "from_remote",
+        SyncDirection::Both => "bidirectional",
+        SyncDirection::None => "none",
+      };
 
-        println!(
-          "{}",
-          serde_json::to_string_pretty(&serde_json::json!({
+      let crates: Vec<_> = configs
+        .iter()
+        .map(|(sync_config, target_exists)| {
+          serde_json::json!({
             "crate_name": sync_config.crate_name,
             "mode": format!("{:?}", sync_config.mode),
             "target_repo": sync_config.target_repo_path,
             "branch": sync_config.branch,
             "remote_url": sync_config.remote_url,
-            "direction": dir_str,
-            "conflict_strategy": strategy_str,
             "target_exists": target_exists,
-          }))?
-        );
-      }
+          })
+        })
+        .collect();
+
+      let output = serde_json::json!({
+        "command": "sync",
+        "check": true,
+        "direction": dir_str,
+        "conflict_strategy": &strategy_str,
+        "crates": crates,
+        "count": configs.len()
+      });
+      println!("{}", serde_json::to_string_pretty(&output)?);
       return Ok(());
     }
 
@@ -102,7 +116,8 @@ pub fn run_sync(
     }
 
     println!("\nrun without --check to execute");
-    return Ok(());
+    // Exit 1 to signal CI that sync is pending
+    return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
   // Interactive confirmation
@@ -138,18 +153,18 @@ pub fn run_sync(
 
   // Execute syncs
   if config_count > 1 && all {
-    eprintln!("syncing {} crates...", config_count);
+    progress!("syncing {} crates...", config_count);
 
     let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|(sync_config, target_exists)| {
         if !target_exists {
-          eprintln!("  {} skipped (run split first)", sync_config.crate_name);
+          progress!("  {} skipped (run split first)", sync_config.crate_name);
           return Ok(());
         }
 
-        eprintln!("  {}", sync_config.crate_name);
+        progress!("  {}", sync_config.crate_name);
         let mut engine = SyncEngine::new(&ctx, sync_config, conflict_strategy)?;
 
         match direction {
@@ -169,11 +184,11 @@ pub fn run_sync(
   } else {
     for (sync_config, target_exists) in configs {
       if !target_exists {
-        eprintln!("{} skipped (run split first)", sync_config.crate_name);
+        progress!("{} skipped (run split first)", sync_config.crate_name);
         continue;
       }
 
-      eprintln!("syncing {}...", sync_config.crate_name);
+      progress!("syncing {}...", sync_config.crate_name);
       let mut engine = SyncEngine::new(ctx, sync_config, conflict_strategy)?;
 
       match direction {

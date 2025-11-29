@@ -215,7 +215,11 @@ fn test_release_skip_tag_flag() -> Result<()> {
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  assert!(output.status.success(), "release --skip-tag should succeed");
+  // Exit code 1 = check found pending changes (correct behavior)
+  assert!(
+    output.status.code() == Some(1),
+    "release --check should exit 1 when release pending"
+  );
   assert!(
     stdout.contains("--skip-tag") || !stdout.contains("Tag:") || stdout.contains("skip"),
     "Should indicate tags are skipped in output.\nOutput:\n{}",
@@ -240,7 +244,11 @@ fn test_release_skip_publish_in_plan() -> Result<()> {
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  assert!(output.status.success(), "release --skip-publish should succeed");
+  // Exit code 1 = check found pending changes (correct behavior)
+  assert!(
+    output.status.code() == Some(1),
+    "release --check should exit 1 when release pending"
+  );
   assert!(
     stdout.contains("--skip-publish") || stdout.contains("0 to publish"),
     "Should reflect skip-publish in plan.\nOutput:\n{}",
@@ -262,7 +270,11 @@ fn test_release_explicit_version() -> Result<()> {
   let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--bump", "2.0.0"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  assert!(output.status.success(), "release with explicit version should succeed");
+  // Exit code 1 = check found pending changes (correct behavior)
+  assert!(
+    output.status.code() == Some(1),
+    "release --check should exit 1 when release pending"
+  );
   assert!(
     stdout.contains("2.0.0"),
     "Should show explicit version in plan.\nOutput:\n{}",

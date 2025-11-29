@@ -313,10 +313,10 @@ fn test_runner_all_flag() -> Result<()> {
   Ok(())
 }
 
-/// Test --no-nextest flag forces use of cargo test
+/// Test --skip-nextest flag forces use of cargo test
 #[test]
-fn test_runner_no_nextest_flag() -> Result<()> {
-  let ws = TestWorkspace::new_named("test-no-nextest")?;
+fn test_runner_skip_nextest_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-skip-nextest")?;
   ws.add_crate("nextest-crate", "0.1.0", &[])?;
   ws.commit("Add crate")?;
 
@@ -326,8 +326,8 @@ fn test_runner_no_nextest_flag() -> Result<()> {
   ws.modify_file("nextest-crate", "src/lib.rs", "pub fn test_fn() { }")?;
   ws.commit("Modify crate")?;
 
-  // Run with --no-nextest flag
-  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--no-nextest"])?;
+  // Run with --skip-nextest flag
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "baseline", "--skip-nextest"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -335,7 +335,7 @@ fn test_runner_no_nextest_flag() -> Result<()> {
   // The output should mention cargo test or not mention nextest in the runner selection
   assert!(
     output.status.success(),
-    "test --no-nextest should succeed. stderr: {}",
+    "test --skip-nextest should succeed. stderr: {}",
     stderr
   );
 
@@ -351,19 +351,19 @@ fn test_runner_no_nextest_flag() -> Result<()> {
   Ok(())
 }
 
-/// Test --all combined with --no-nextest
+/// Test --all combined with --skip-nextest
 #[test]
-fn test_runner_all_no_nextest() -> Result<()> {
-  let ws = TestWorkspace::new_named("test-all-no-nextest")?;
+fn test_runner_all_skip_nextest() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-all-skip-nextest")?;
   ws.add_crate("combo-crate", "0.1.0", &[])?;
   ws.commit("Add crate")?;
 
   // Run with both flags
-  let output = run_cargo_rail(&ws.path, &["rail", "test", "--all", "--no-nextest"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "test", "--all", "--skip-nextest"])?;
 
   assert!(
     output.status.success(),
-    "test --all --no-nextest should succeed. stderr: {}",
+    "test --all --skip-nextest should succeed. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 

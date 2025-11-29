@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::config::RailConfig;
 use crate::error::RailResult;
+use crate::progress;
 use crate::split::SplitEngine;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
@@ -20,6 +21,11 @@ pub fn run_split(
   let output_format: OutputFormat = format.parse()?;
   let json = output_format.is_json();
 
+  // JSON mode enables structured error output and suppresses progress
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
   let builder = SplitSyncConfigBuilder::new(ctx)?
     .with_crate_or_all(crate_name.clone(), all)?
     .with_remote_override(remote)
@@ -31,18 +37,25 @@ pub fn run_split(
   // Check mode: show plan
   if check {
     if json {
-      for config in &configs {
-        println!(
-          "{}",
-          serde_json::to_string_pretty(&serde_json::json!({
+      let crates: Vec<_> = configs
+        .iter()
+        .map(|config| {
+          serde_json::json!({
             "crate_name": config.crate_name,
             "mode": format!("{:?}", config.mode),
             "target_repo": config.target_repo_path,
             "branch": config.branch,
             "remote_url": config.remote_url,
-          }))?
-        );
-      }
+          })
+        })
+        .collect();
+      let output = serde_json::json!({
+        "command": "split",
+        "check": true,
+        "crates": crates,
+        "count": configs.len()
+      });
+      println!("{}", serde_json::to_string_pretty(&output)?);
       return Ok(());
     }
 
@@ -62,7 +75,8 @@ pub fn run_split(
     }
 
     println!("\nrun without --check to execute");
-    return Ok(());
+    // Exit 1 to signal CI that split is pending
+    return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
   // Interactive confirmation
@@ -80,12 +94,12 @@ pub fn run_split(
 
   // Execute splits
   if config_count > 1 && all {
-    eprintln!("splitting {} crates...", config_count);
+    progress!("splitting {} crates...", config_count);
     let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|config| {
-        eprintln!("  {}", config.crate_name);
+        progress!("  {}", config.crate_name);
         let engine = SplitEngine::new(&ctx)?;
         engine.split(&config)
       })
@@ -96,7 +110,7 @@ pub fn run_split(
     }
   } else {
     for config in configs {
-      eprintln!("splitting {}...", config.crate_name);
+      progress!("splitting {}...", config.crate_name);
       let engine = SplitEngine::new(ctx)?;
       engine.split(&config)?;
     }

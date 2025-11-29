@@ -14,7 +14,7 @@
 //! - **Bulk Operations** - transform multiple dependencies at once
 
 use crate::cargo::manifest_analyzer::DepKind;
-use crate::cargo::unify_analyzer::UnifiedDep;
+use crate::cargo::unify_types::UnifiedDep;
 use crate::error::{RailError, RailResult, ResultExt};
 use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};

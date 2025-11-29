@@ -10,6 +10,7 @@ use crate::config::ChangeDetectionConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::graph::AffectedAnalysis;
+use crate::progress;
 use crate::workspace::WorkspaceContext;
 use glob::Pattern;
 use std::io::Write;
@@ -57,6 +58,14 @@ pub fn run_affected(
   output: Option<PathBuf>,
 ) -> RailResult<()> {
   let output_format = OutputFormat::from_str(&format)?;
+
+  // JSON-like formats enable structured error output and suppress progress
+  if matches!(
+    output_format,
+    OutputFormat::Json | OutputFormat::JsonLines | OutputFormat::GitHub | OutputFormat::GitHubMatrix
+  ) {
+    crate::output::set_json_mode(true);
+  }
 
   // If --all flag is set, show all workspace crates regardless of changes
   if all {
@@ -204,6 +213,8 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
     OutputFormat::Json => {
       use serde_json::json;
       let output = json!({
+          "command": "affected",
+          "all": true,
           "crates": all_crates,
           "count": all_crates.len()
       });
@@ -254,7 +265,7 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
         .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
       writeln!(file, "{}", content)
         .map_err(|e| RailError::message(format!("failed to write '{}': {}", path.display(), e)))?;
-      eprintln!("output: {}", path.display());
+      progress!("output: {}", path.display());
     }
     None => {
       println!("{}", content);
@@ -401,6 +412,7 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
 
   // Issue #22: Include custom categories in JSON output
   let output = json!({
+      "command": "affected",
       "changed_files": analysis.changed_files,
       "impact": {
           "direct": direct,

@@ -2,6 +2,7 @@
 
 use crate::error::RailResult;
 use crate::git::detect_default_base_ref;
+use crate::progress;
 use crate::test::runner::select_runner;
 use crate::workspace::{ChangeImpact, WorkspaceContext};
 
@@ -92,9 +93,9 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
 
   let runner = select_runner(config.prefer_nextest);
 
-  eprintln!("testing {} crates ({}):", test_targets.len(), runner.name());
+  progress!("testing {} crates ({}):", test_targets.len(), runner.name());
   for target in &test_targets {
-    eprintln!("  {}", target);
+    progress!("  {}", target);
   }
 
   let mut cmd = runner.build_command(&test_targets, &config.test_args);

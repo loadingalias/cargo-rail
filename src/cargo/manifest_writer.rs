@@ -4,7 +4,7 @@
 
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::manifest_ops;
-use crate::cargo::unify_analyzer::{TransitivePin, UnifiedDep};
+use crate::cargo::unify_types::{TransitivePin, UnifiedDep};
 use crate::error::{RailResult, ResultExt};
 use crate::toml::format::TomlFormatter;
 use std::path::Path;

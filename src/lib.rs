@@ -19,6 +19,8 @@ pub mod error;
 pub mod git;
 /// Dependency graph analysis.
 pub mod graph;
+/// Centralized output control (quiet mode, progress messages).
+pub mod output;
 /// Release planning and publishing.
 pub mod release;
 /// Crate extraction to standalone repos.

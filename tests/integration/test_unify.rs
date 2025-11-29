@@ -643,19 +643,20 @@ serde = "1.0"
   // Run unify with --include
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include", "serde"])?;
 
+  // Exit code 1 = check found pending changes (correct behavior)
   assert!(
-    output.status.success(),
-    "unify --include should succeed. stderr: {}",
+    output.status.code() == Some(1),
+    "unify --include --check should exit 1 when changes pending. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())
 }
 
-/// Test --consolidate-transitives flag
+/// Test --pin-transitives flag
 #[test]
-fn test_unify_consolidate_transitives() -> Result<()> {
-  let workspace = TestWorkspace::new_named("unify-consolidate")?;
+fn test_unify_pin_transitives() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-pin-trans")?;
 
   // Create a crate with a transitive-only dependency scenario
   let crate_path = workspace.path.join("crates/transitive-crate");
@@ -676,15 +677,13 @@ serde = "1.0"
   std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
   workspace.commit("Add crate")?;
 
-  // Run unify with --consolidate-transitives
-  let output = run_cargo_rail(
-    &workspace.path,
-    &["rail", "unify", "--check", "--consolidate-transitives"],
-  )?;
+  // Run unify with --pin-transitives (single crate = no unification needed)
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--pin-transitives"])?;
 
+  // No unification opportunities with single crate, so exit 0
   assert!(
     output.status.success(),
-    "unify --consolidate-transitives should succeed. stderr: {}",
+    "unify --pin-transitives with no changes should exit 0. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
