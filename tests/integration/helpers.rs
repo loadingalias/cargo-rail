@@ -281,33 +281,6 @@ channel = "stable"
     Ok(())
   }
 
-  /// Get git log
-  #[cfg(test)]
-  #[allow(dead_code)]
-  pub fn git_log(&self, n: usize) -> Result<Vec<String>> {
-    let output = git(&self.path, &["log", &format!("-{}", n), "--oneline"])?;
-    Ok(
-      String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(String::from)
-        .collect(),
-    )
-  }
-
-  /// Check if a file exists
-  #[cfg(test)]
-  #[allow(dead_code)]
-  pub fn file_exists(&self, path: &str) -> bool {
-    self.path.join(path).exists()
-  }
-
-  /// Read a file
-  #[cfg(test)]
-  #[allow(dead_code)]
-  pub fn read_file(&self, path: &str) -> Result<String> {
-    Ok(std::fs::read_to_string(self.path.join(path))?)
-  }
-
   /// Remove the rail.toml config file (useful for init tests)
   pub fn remove_config(&self) -> Result<()> {
     let config_path = self.path.join(".config/rail.toml");

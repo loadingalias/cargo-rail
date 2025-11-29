@@ -139,7 +139,7 @@ pub struct ChangelogConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangelogRelativeTo {
-  /// Relative to each crate's directory (default, backward compatible)
+  /// Relative to each crate's directory (default)
   /// With this, `changelog_path = "CHANGELOG.md"` creates `crates/foo/CHANGELOG.md`
   #[default]
   Crate,
@@ -210,7 +210,7 @@ mod tests {
 
   #[test]
   fn test_changelog_relative_to_defaults_to_crate() {
-    // When not specified, should default to "crate" for backward compatibility
+    // When not specified, should default to "crate"
     let toml = r#"
       changelog_path = "CHANGELOG.md"
     "#;

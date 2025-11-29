@@ -201,8 +201,7 @@ impl RailConfig {
       .collect()
   }
 
-  /// Helper to build all SplitConfigs from unified crate config
-  /// Used for backward compatibility with commands expecting `Vec<SplitConfig>`
+  /// Build all SplitConfigs from unified crate config
   pub fn build_split_configs(&self) -> Vec<SplitConfig> {
     self
       .crates

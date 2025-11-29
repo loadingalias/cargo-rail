@@ -12,7 +12,7 @@ pub struct UnifyConfig {
 
   /// Handle renamed dependencies (package = "...")? (default: false)
   /// Renamed deps are tricky to unify correctly, opt-in only
-  #[serde(default, alias = "allow_renamed")]
+  #[serde(default)]
   pub include_renamed: bool,
 
   /// Pin transitive-only deps with fragmented features? (default: true)
@@ -170,7 +170,7 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
         E: serde::de::Error,
       {
         match value {
-          "root" | "auto" => Ok(TransitiveFeatureHost::Root), // "auto" for backward compatibility
+          "root" => Ok(TransitiveFeatureHost::Root),
           path => Ok(TransitiveFeatureHost::Path(path.to_string())),
         }
       }

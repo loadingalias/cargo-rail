@@ -157,7 +157,7 @@ pub fn set_version(item: &mut Item, version: &str) -> RailResult<()> {
     Ok(())
   } else {
     Err(RailError::message(
-      "Cannot set version: item is not a valid dependency format",
+      "cannot set version: item is not a valid dependency format",
     ))
   }
 }
@@ -186,7 +186,7 @@ pub fn set_optional(item: &mut Item, optional: bool) -> RailResult<()> {
     table.insert("optional", Item::Value(Value::from(optional)));
     Ok(())
   } else {
-    Err(RailError::message("Cannot set optional: item is not a table"))
+    Err(RailError::message("cannot set optional: item is not a table"))
   }
 }
 

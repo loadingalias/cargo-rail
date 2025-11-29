@@ -23,8 +23,7 @@ impl SystemGit {
   ///
   /// Returns commits in reverse chronological order (newest first).
   /// Uses parallel batch processing for optimal performance.
-  /// The _path parameter is kept for API compatibility but currently unused.
-  pub fn commit_history(&self, _path: &Path, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
+  pub fn commit_history(&self, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
     let mut args = vec!["log", "--format=%H"];
     let limit_str;
     if let Some(max) = limit {
@@ -619,7 +618,7 @@ mod tests {
     let git = SystemGit::open(&find_git_root()).unwrap();
 
     // Test with limit
-    let commits = git.commit_history(Path::new("."), Some(5)).unwrap();
+    let commits = git.commit_history(Some(5)).unwrap();
     assert!(!commits.is_empty());
     assert!(commits.len() <= 5);
 
@@ -653,7 +652,7 @@ mod tests {
     let git = SystemGit::open(&find_git_root()).unwrap();
 
     // Get some commit SHAs
-    let history = git.commit_history(Path::new("."), Some(5)).unwrap();
+    let history = git.commit_history(Some(5)).unwrap();
     let shas: Vec<String> = history.iter().map(|c| c.sha.clone()).collect();
 
     // Fetch them in bulk

@@ -35,7 +35,7 @@ pub fn ensure_section(doc: &mut DocumentMut, path: &str) -> RailResult<()> {
         .ok_or_else(|| RailError::message(format!("Failed to access {}", part)))?;
     } else {
       return Err(RailError::message(
-        "Cannot create section: expected table but found non-table",
+        "cannot create section: expected table but found non-table",
       ));
     }
   }
@@ -77,7 +77,7 @@ pub fn get_or_create_table<'a>(doc: &'a mut DocumentMut, path: &str) -> RailResu
         .ok_or_else(|| RailError::message(format!("Failed to access {}", part)))?;
     } else {
       return Err(RailError::message(format!(
-        "Cannot navigate to {}: parent is not a table",
+        "cannot navigate to {}: parent is not a table",
         part
       )));
     }

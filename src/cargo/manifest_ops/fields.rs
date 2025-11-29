@@ -63,7 +63,7 @@ pub fn set_features(item: &mut Item, features: Vec<String>) -> RailResult<()> {
     table.insert("features", Item::Value(build_feature_array(&features)));
     Ok(())
   } else {
-    Err(RailError::message("Cannot set features: item is not a table"))
+    Err(RailError::message("cannot set features: item is not a table"))
   }
 }
 
@@ -136,7 +136,7 @@ pub fn set_path(item: &mut Item, path: &str) -> RailResult<()> {
     table.insert("path", Item::Value(Value::from(path)));
     Ok(())
   } else {
-    Err(RailError::message("Cannot set path: item is not a table"))
+    Err(RailError::message("cannot set path: item is not a table"))
   }
 }
 
@@ -170,7 +170,7 @@ pub fn set_default_features(item: &mut Item, enabled: bool) -> RailResult<()> {
     table.insert("default-features", Item::Value(Value::from(enabled)));
     Ok(())
   } else {
-    Err(RailError::message("Cannot set default-features: item is not a table"))
+    Err(RailError::message("cannot set default-features: item is not a table"))
   }
 }
 

@@ -149,7 +149,7 @@ impl<'a> ReleasePlanner<'a> {
     // Resolve the path based on changelog_relative_to setting
     let changelog_path = match self.release_config.changelog_relative_to {
       ChangelogRelativeTo::Crate => {
-        // Relative to crate directory (default, backward compatible)
+        // Relative to crate directory (default)
         manifest_path
           .parent()
           .ok_or_else(|| RailError::message("Invalid manifest path"))?

@@ -58,7 +58,7 @@ impl TomlEditor {
           table.insert(*part, value.into());
         } else {
           return Err(RailError::message(format!(
-            "Cannot set value at path '{}': parent is not a table",
+            "cannot set value at path '{}': parent is not a table",
             path
           )));
         }
@@ -69,7 +69,7 @@ impl TomlEditor {
           current = table.entry(part).or_insert(Item::Table(Table::new()));
         } else {
           return Err(RailError::message(format!(
-            "Cannot navigate path '{}': '{}' is not a table",
+            "cannot navigate path '{}': '{}' is not a table",
             path, part
           )));
         }

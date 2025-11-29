@@ -136,7 +136,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
       self.with_crate(&name)
     } else {
       Err(RailError::with_help(
-        "Must specify a crate name or use --all",
+        "must specify a crate name or use --all",
         "Try: cargo rail <command> --all OR cargo rail <command> <crate-name>",
       ))
     }

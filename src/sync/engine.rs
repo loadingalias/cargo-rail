@@ -401,7 +401,7 @@ impl<'a> SyncEngine<'a> {
 
   fn find_last_synced_mono_commit(&self) -> RailResult<Option<String>> {
     // Find the most recent mono commit that has a mapping
-    let commits = self.ctx.git.git().commit_history(Path::new("."), Some(100))?;
+    let commits = self.ctx.git.git().commit_history(Some(100))?;
 
     for commit in commits {
       if self.mapping_store.has_mapping(&commit.sha) {
@@ -414,7 +414,7 @@ impl<'a> SyncEngine<'a> {
 
   fn find_last_synced_remote_commit(&self, remote_git: &SystemGit) -> RailResult<Option<String>> {
     // Find the most recent remote commit that has a reverse mapping (O(1) lookups)
-    let commits = remote_git.commit_history(Path::new("."), Some(100))?;
+    let commits = remote_git.commit_history(Some(100))?;
 
     for commit in commits {
       // Check if this remote commit has been mapped (O(1) reverse lookup)

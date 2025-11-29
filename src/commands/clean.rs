@@ -24,14 +24,9 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
         .join("target")
         .join("cargo-rail")
         .join("metadata.json");
-      let old_cache = ctx.workspace_root.join("target").join("rail");
 
       if cache_path.exists() {
         println!("  {}", cache_path.display());
-        would_clean = true;
-      }
-      if old_cache.exists() {
-        println!("  {} (legacy)", old_cache.display());
         would_clean = true;
       }
     }
@@ -111,23 +106,20 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
 }
 
 fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<()> {
-  let rail_target = ctx
+  let cache_path = ctx
     .workspace_root
     .join("target")
     .join("cargo-rail")
     .join("metadata.json");
-  let old_rail_target = ctx.workspace_root.join("target").join("rail");
 
-  if rail_target.exists() {
+  if cache_path.exists() {
     progress!("removing cache...");
-    fs::remove_file(&rail_target)
-      .map_err(|e| RailError::message(format!("failed to remove {}: {}", rail_target.display(), e)))?;
-  }
-
-  if old_rail_target.exists() {
-    progress!("removing legacy cache...");
-    fs::remove_dir_all(&old_rail_target)
-      .map_err(|e| RailError::message(format!("failed to remove {}: {}", old_rail_target.display(), e)))?;
+    fs::remove_file(&cache_path).map_err(|e| {
+      RailError::with_help(
+        format!("failed to remove {}: {}", cache_path.display(), e),
+        "check file permissions or if the file is in use",
+      )
+    })?;
   }
 
   Ok(())
@@ -138,12 +130,26 @@ fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<()> {
 
   if report_dir.exists() {
     progress!("removing reports...");
-    for entry in fs::read_dir(&report_dir).map_err(|e| RailError::message(format!("failed to read dir: {}", e)))? {
-      let entry = entry.map_err(|e| RailError::message(format!("failed to read entry: {}", e)))?;
+    for entry in fs::read_dir(&report_dir).map_err(|e| {
+      RailError::with_help(
+        format!("failed to read {}: {}", report_dir.display(), e),
+        "check directory permissions",
+      )
+    })? {
+      let entry = entry.map_err(|e| {
+        RailError::with_help(
+          format!("failed to read directory entry: {}", e),
+          "check directory permissions",
+        )
+      })?;
       let path = entry.path();
       if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-        fs::remove_file(&path)
-          .map_err(|e| RailError::message(format!("failed to remove {}: {}", path.display(), e)))?;
+        fs::remove_file(&path).map_err(|e| {
+          RailError::with_help(
+            format!("failed to remove {}: {}", path.display(), e),
+            "check file permissions or if the file is in use",
+          )
+        })?;
       }
     }
   }

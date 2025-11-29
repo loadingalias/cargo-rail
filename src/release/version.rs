@@ -138,7 +138,7 @@ impl VersionBumper {
         if tbl.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
           return Err(RailError::with_help(
             format!(
-              "Cannot bump version in {}: uses workspace inheritance",
+              "cannot bump version in {}: uses workspace inheritance",
               manifest_path.display()
             ),
             "Set a specific version in this crate's Cargo.toml, or update [workspace.package.version] in the root Cargo.toml",
@@ -149,7 +149,7 @@ impl VersionBumper {
       {
         return Err(RailError::with_help(
           format!(
-            "Cannot bump version in {}: uses workspace inheritance",
+            "cannot bump version in {}: uses workspace inheritance",
             manifest_path.display()
           ),
           "Set a specific version in this crate's Cargo.toml, or update [workspace.package.version] in the root Cargo.toml",

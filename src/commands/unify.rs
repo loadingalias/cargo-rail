@@ -94,7 +94,14 @@ pub fn run_unify_analyze(
         if !dep.features.is_empty() {
           let mut features = dep.features.clone();
           features.sort();
-          println!("      features = {:?}", features);
+          println!(
+            "      features = [{}]",
+            features
+              .iter()
+              .map(|f| format!("\"{}\"", f))
+              .collect::<Vec<_>>()
+              .join(", ")
+          );
         }
       }
       println!();
@@ -135,7 +142,14 @@ pub fn run_unify_analyze(
             if !local_features.is_empty() {
               let mut features = local_features.clone();
               features.sort();
-              line.push_str(&format!(", features = {:?}", features));
+              line.push_str(&format!(
+                ", features = [{}]",
+                features
+                  .iter()
+                  .map(|f| format!("\"{}\"", f))
+                  .collect::<Vec<_>>()
+                  .join(", ")
+              ));
             }
             if *is_optional {
               line.push_str(", optional = true");
