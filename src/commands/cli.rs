@@ -84,7 +84,7 @@ pub enum Commands {
   Unify {
     /// Action: 'undo' to restore a backup
     action: Option<String>,
-    /// Preview changes without modifying files
+    /// Dry-run mode: preview changes without modifying files
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
@@ -133,7 +133,7 @@ pub enum Commands {
     /// Skip interactive prompts
     #[arg(long)]
     non_interactive: bool,
-    /// Preview generated config without writing
+    /// Dry-run mode: preview generated config without writing
     #[arg(long, short = 'c')]
     check: bool,
   },
@@ -143,14 +143,15 @@ pub enum Commands {
     /// Action: 'init' to configure splits, or crate name to split
     action: Option<String>,
     /// Additional crate name(s) for init
+    #[arg(conflicts_with = "all")]
     crate_names: Vec<String>,
-    /// Split all configured crates
-    #[arg(short, long)]
+    /// Split all configured crates (mutually exclusive with crate names)
+    #[arg(short, long, conflicts_with = "action")]
     all: bool,
     /// Override remote repository
     #[arg(long)]
     remote: Option<String>,
-    /// Preview changes without executing
+    /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
@@ -160,9 +161,10 @@ pub enum Commands {
 
   /// Sync changes between monorepo and split repos
   Sync {
-    /// Crate name to sync
+    /// Crate name to sync (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
     crate_name: Option<String>,
-    /// Sync all configured crates
+    /// Sync all configured crates (mutually exclusive with crate name)
     #[arg(short, long)]
     all: bool,
     /// Override remote repository
@@ -180,7 +182,7 @@ pub enum Commands {
     /// Allow direct commits to protected branches
     #[arg(long)]
     no_protected_branches: bool,
-    /// Preview changes without executing
+    /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format [text, json]
@@ -192,15 +194,16 @@ pub enum Commands {
   Release {
     /// Action: 'init' to configure release settings
     action: Option<String>,
-    /// Crate name(s) to release
+    /// Crate name(s) to release (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
     crate_names: Vec<String>,
-    /// Release all workspace crates
-    #[arg(short, long)]
+    /// Release all workspace crates (mutually exclusive with crate names)
+    #[arg(short, long, conflicts_with = "action")]
     all: bool,
     /// Version bump [major, minor, patch, or "x.y.z"]
     #[arg(long, default_value = "patch")]
     bump: String,
-    /// Preview release plan without executing
+    /// Dry-run mode: preview release plan without executing
     #[arg(long, short = 'c')]
     check: bool,
     /// Skip publishing to crates.io
@@ -216,9 +219,10 @@ pub enum Commands {
 
   /// Validate release readiness
   Check {
-    /// Crate name(s) to check
+    /// Crate name(s) to check (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
     crate_names: Vec<String>,
-    /// Check all workspace crates
+    /// Check all workspace crates (mutually exclusive with crate names)
     #[arg(short, long)]
     all: bool,
     /// Output format [text, json]
@@ -237,7 +241,7 @@ pub enum Commands {
     /// Clean generated reports
     #[arg(long)]
     reports: bool,
-    /// Preview what would be cleaned
+    /// Dry-run mode: preview what would be cleaned
     #[arg(long, short = 'c')]
     check: bool,
   },
