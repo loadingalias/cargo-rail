@@ -57,7 +57,7 @@ cargo rail test --explain
 **After:**
 
 ```yaml
-- run: cargo rail test --nextest  # Tests only affected crates (1 minute)
+- run: cargo rail test            # Tests only affected crates (1 minute)
 ```
 
 ### 2. Dependency Unification (replaces cargo-hakari)
@@ -213,7 +213,7 @@ Run `cargo rail init --check` to preview generated config.
 cargo rail affected                    # Show affected crates
 cargo rail affected --since main       # Compare against branch
 cargo rail test                        # Test affected crates
-cargo rail test --nextest --watch      # Watch mode with nextest
+cargo rail test --explain              # Explain why each crate is tested
 ```
 
 ### Dependency Unification
@@ -228,7 +228,6 @@ cargo rail unify                       # Apply unification
 ```bash
 cargo rail split my-crate              # Split to standalone repo
 cargo rail sync my-crate               # Bidirectional sync
-cargo rail status                      # Show sync status
 ```
 
 ### Release Automation (replaces cargo-release + git-cliff)
@@ -248,18 +247,6 @@ cargo rail release --all --bump patch --execute
 - Configurable delays between publishes (avoids registry race conditions)
 - GitHub release creation via `gh` CLI (optional)
 - GPG/SSH tag signing support
-
-### Watch Mode (bacon/cargo-watch integration)
-
-```bash
-# Auto-detect best watcher and run smart tests
-cargo rail test --watch
-
-# Explicit watcher selection
-cargo rail test --watch --watch-mode bacon
-```
-
----
 
 ## Comparison
 
@@ -303,7 +290,6 @@ cargo rail test --watch --watch-mode bacon
 | Change detection | ✅ Graph-aware | ⚠️ Path-based | ✅ Graph-aware |
 | Rust-native | ✅ | ⚠️ Shell | ❌ JS ecosystem |
 | Nextest integration | ✅ Auto-detect | Manual | ❌ |
-| Watch mode | ✅ bacon/cargo-watch | Manual | ✅ |
 | Dependency resolution | ✅ Cargo's resolver | ❌ | ❌ |
 
 ---

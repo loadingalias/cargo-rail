@@ -7,8 +7,9 @@
 use crate::cargo::manifest_ops;
 use crate::error::{RailError, RailResult};
 use cargo_metadata::Metadata;
+use std::cell::RefCell;
 use std::path::PathBuf;
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, Table};
 
 /// Context for Cargo.toml transformations
 pub struct TransformContext {
@@ -19,26 +20,71 @@ pub struct TransformContext {
 }
 
 /// Cargo.toml transformer for split/sync operations
+///
+/// Caches the workspace document to avoid repeated I/O when transforming multiple manifests.
+/// Uses interior mutability (`RefCell`) so the public API remains `&self`.
 pub struct CargoTransform {
   metadata: Metadata,
+  /// Cached workspace document (loaded lazily via RefCell for interior mutability)
+  cached_workspace_doc: RefCell<Option<DocumentMut>>,
+  /// Workspace root for lazy loading
+  workspace_root: PathBuf,
 }
 
 impl CargoTransform {
   /// Create a new transformer with workspace metadata
   pub fn new(metadata: Metadata) -> Self {
-    Self { metadata }
+    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
+    Self {
+      metadata,
+      cached_workspace_doc: RefCell::new(None),
+      workspace_root,
+    }
+  }
+
+  /// Get workspace.package table, loading and caching the workspace doc if needed
+  ///
+  /// Uses `RefCell` for interior mutability - loads once, caches for reuse.
+  fn get_workspace_package(&self) -> RailResult<Option<Table>> {
+    // Check if already cached
+    {
+      let cache = self.cached_workspace_doc.borrow();
+      if let Some(ref doc) = *cache {
+        return Ok(
+          doc
+            .get("workspace")
+            .and_then(|w| w.as_table())
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.as_table())
+            .cloned(),
+        );
+      }
+    }
+
+    // Load and cache
+    let workspace_toml_path = self.workspace_root.join("Cargo.toml");
+    let doc = manifest_ops::read_toml_file(&workspace_toml_path)?;
+    let result = doc
+      .get("workspace")
+      .and_then(|w| w.as_table())
+      .and_then(|w| w.get("package"))
+      .and_then(|p| p.as_table())
+      .cloned();
+
+    *self.cached_workspace_doc.borrow_mut() = Some(doc);
+    Ok(result)
   }
 
   /// Transform a Cargo.toml from workspace format to split (standalone) format
   ///
   /// This replaces workspace dependency references with concrete version requirements.
-  pub fn transform_to_split(&self, content: &str, context: &TransformContext) -> RailResult<String> {
+  pub fn transform_to_split(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
     let mut doc: DocumentMut = content
       .parse()
       .map_err(|e| RailError::message(format!("Failed to parse Cargo.toml: {}", e)))?;
 
     // Remove workspace inheritance markers and resolve to actual values
-    self.resolve_workspace_inheritance(&mut doc, &context.workspace_root)?;
+    self.resolve_workspace_inheritance(&mut doc)?;
 
     // Transform workspace dependencies to standalone format
     self.transform_dependencies_to_standalone(&mut doc)?;
@@ -57,21 +103,12 @@ impl CargoTransform {
   }
 
   /// Resolve workspace inheritance (workspace = true fields) to actual values
-  fn resolve_workspace_inheritance(&self, doc: &mut DocumentMut, workspace_root: &std::path::Path) -> RailResult<()> {
-    // Load workspace Cargo.toml to get [workspace.package] values
-    let workspace_toml_path = workspace_root.join("Cargo.toml");
-    let workspace_doc = manifest_ops::read_toml_file(&workspace_toml_path)?;
-
-    // Get workspace.package table if it exists
-    let workspace_package = workspace_doc
-      .get("workspace")
-      .and_then(|w| w.as_table())
-      .and_then(|w| w.get("package"))
-      .and_then(|p| p.as_table());
-
-    // Use manifest_ops to resolve package inheritance
-    if let Some(workspace_pkg) = workspace_package {
-      manifest_ops::resolve_package_workspace_inheritance(doc, workspace_pkg)?;
+  ///
+  /// Uses cached workspace document to avoid repeated I/O.
+  fn resolve_workspace_inheritance(&self, doc: &mut DocumentMut) -> RailResult<()> {
+    // Get workspace.package table from cache (loads workspace doc if needed)
+    if let Some(workspace_pkg) = self.get_workspace_package()? {
+      manifest_ops::resolve_package_workspace_inheritance(doc, &workspace_pkg)?;
     }
 
     Ok(())

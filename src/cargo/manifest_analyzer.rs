@@ -177,6 +177,9 @@ pub struct ManifestAnalyzer {
   usage_index: HashMap<DepKey, Vec<DepUsage>>,
   /// Pre-computed usage counts for O(1) lookup
   usage_counts: HashMap<DepKey, usize>,
+  /// Package name index for O(1) lookup of dep keys by package name
+  /// Maps package_name -> list of DepKeys that refer to that package
+  package_index: HashMap<String, Vec<DepKey>>,
 }
 
 impl ManifestAnalyzer {
@@ -218,10 +221,20 @@ impl ManifestAnalyzer {
       })
       .collect();
 
+    // Build package name index for O(1) lookup of dep keys by package name
+    let mut package_index: HashMap<String, Vec<DepKey>> = HashMap::new();
+    for dep_key in usage_index.keys() {
+      package_index
+        .entry(dep_key.name.clone())
+        .or_default()
+        .push(dep_key.clone());
+    }
+
     Ok(Self {
       members: parsed_members,
       usage_index,
       usage_counts,
+      package_index,
     })
   }
 
@@ -622,11 +635,15 @@ impl ManifestAnalyzer {
   /// Count how many crates use a package (aggregated across renamed and non-renamed deps)
   ///
   /// Issue #6: When include_renamed = true, count all usages of the package
+  /// Uses package_index for O(1) key lookup instead of O(n) scan.
   pub fn package_usage_count(&self, package_name: &str) -> usize {
-    let mut unique_users: HashSet<&String> = HashSet::new();
+    let Some(dep_keys) = self.package_index.get(package_name) else {
+      return 0;
+    };
 
-    for (dep_key, usages) in &self.usage_index {
-      if dep_key.name == package_name {
+    let mut unique_users: HashSet<&String> = HashSet::new();
+    for dep_key in dep_keys {
+      if let Some(usages) = self.usage_index.get(dep_key) {
         for usage in usages {
           unique_users.insert(&usage.used_by);
         }
@@ -639,18 +656,27 @@ impl ManifestAnalyzer {
   /// Get all dep keys that refer to a specific package (including renamed)
   ///
   /// Issue #6: Used to find all renamed variants of a package
+  /// Uses package_index for O(1) lookup instead of O(n) scan.
   pub fn dep_keys_for_package(&self, package_name: &str) -> Vec<&DepKey> {
-    self.usage_index.keys().filter(|k| k.name == package_name).collect()
+    self
+      .package_index
+      .get(package_name)
+      .map(|keys| keys.iter().collect())
+      .unwrap_or_default()
   }
 
   /// Get aggregated usage sites for a package (all renamed and non-renamed usages)
   ///
   /// Issue #6: Used when include_renamed = true to merge features across all usages
+  /// Uses package_index for O(1) key lookup instead of O(n) scan.
   pub fn get_package_usage_sites(&self, package_name: &str) -> Vec<&DepUsage> {
-    let mut all_usages = Vec::new();
+    let Some(dep_keys) = self.package_index.get(package_name) else {
+      return Vec::new();
+    };
 
-    for (dep_key, usages) in &self.usage_index {
-      if dep_key.name == package_name {
+    let mut all_usages = Vec::new();
+    for dep_key in dep_keys {
+      if let Some(usages) = self.usage_index.get(dep_key) {
         all_usages.extend(usages.iter());
       }
     }

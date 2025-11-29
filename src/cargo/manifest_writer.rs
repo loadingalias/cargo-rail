@@ -39,28 +39,24 @@ impl ManifestWriter {
     // Ensure [workspace] section exists
     manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
 
-    // Get or create [workspace.dependencies] - DO NOT CLEAR IT
-    // We merge new deps with existing ones, not replace them
-    let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
-      .context("Failed to create [workspace.dependencies]")?;
-    // NOTE: Removed deps_table.clear() - BUG FIX: preserve existing deps
+    // First pass: write regular dependencies (no target)
+    // This scope ensures deps_table reference is released before we handle target deps
+    {
+      let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
+        .context("Failed to create [workspace.dependencies]")?;
 
-    // Group dependencies by target
-    let (regular_deps, target_deps) = self.group_dependencies(deps);
-
-    // Write regular dependencies
-    for dep in regular_deps {
-      let entry = manifest_ops::build_dep_entry(&dep);
-      manifest_ops::insert_dependency(deps_table, &dep.name, entry).context("Failed to insert regular dependency")?;
+      for dep in deps.iter().filter(|d| d.target.is_none()) {
+        let entry = manifest_ops::build_dep_entry(dep);
+        manifest_ops::insert_dependency(deps_table, &dep.name, entry).context("Failed to insert regular dependency")?;
+      }
     }
 
-    // Write target-specific dependencies
-    for (target, deps) in target_deps {
-      for dep in deps {
-        let entry = manifest_ops::build_dep_entry(&dep);
-        manifest_ops::insert_target_dependency(&mut doc, &target, "dependencies", &dep.name, entry)
-          .context("Failed to insert target dependency")?;
-      }
+    // Second pass: write target-specific dependencies
+    for dep in deps.iter().filter(|d| d.target.is_some()) {
+      let entry = manifest_ops::build_dep_entry(dep);
+      let target = dep.target.as_ref().unwrap();
+      manifest_ops::insert_target_dependency(&mut doc, target, "dependencies", &dep.name, entry)
+        .context("Failed to insert target dependency")?;
     }
 
     // Format and write
@@ -68,25 +64,6 @@ impl ManifestWriter {
     manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
     Ok(())
-  }
-
-  /// Group dependencies into regular and target-specific
-  fn group_dependencies(
-    &self,
-    deps: &[UnifiedDep],
-  ) -> (Vec<UnifiedDep>, std::collections::HashMap<String, Vec<UnifiedDep>>) {
-    let mut regular_deps = Vec::new();
-    let mut target_deps: std::collections::HashMap<String, Vec<UnifiedDep>> = std::collections::HashMap::new();
-
-    for dep in deps {
-      if let Some(ref target) = dep.target {
-        target_deps.entry(target.clone()).or_default().push(dep.clone());
-      } else {
-        regular_deps.push(dep.clone());
-      }
-    }
-
-    (regular_deps, target_deps)
   }
 
   /// Update a member's Cargo.toml to use workspace inheritance
