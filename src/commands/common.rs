@@ -8,10 +8,9 @@ use crate::workspace::WorkspaceContext;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// Standard output format for most commands
+/// Standard output format for all commands
 ///
-/// Use this for commands that just need text/json output.
-/// For commands with more formats (like `affected`), define a specialized enum.
+/// Supports both simple (text/json) and specialized formats (GitHub Actions, JSONL, etc.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputFormat {
   /// Human-readable text output (default)
@@ -19,12 +18,28 @@ pub enum OutputFormat {
   Text,
   /// Machine-readable JSON output
   Json,
+  /// Names only (one per line)
+  NamesOnly,
+  /// GitHub Actions output format for $GITHUB_OUTPUT
+  GitHub,
+  /// GitHub Actions matrix format for strategy.matrix
+  GitHubMatrix,
+  /// JSON Lines format (one object per line)
+  JsonLines,
 }
 
 impl OutputFormat {
   /// Check if this format is JSON
   pub fn is_json(&self) -> bool {
     matches!(self, Self::Json)
+  }
+
+  /// Check if this format is a JSON-like structured format
+  ///
+  /// Returns true for any format that produces structured output (json, jsonl, github, github-matrix).
+  /// Used to enable JSON mode which suppresses progress messages.
+  pub fn is_json_like(&self) -> bool {
+    matches!(self, Self::Json | Self::JsonLines | Self::GitHub | Self::GitHubMatrix)
   }
 }
 
@@ -35,8 +50,12 @@ impl FromStr for OutputFormat {
     match s.to_lowercase().as_str() {
       "text" => Ok(Self::Text),
       "json" => Ok(Self::Json),
+      "names" | "names-only" => Ok(Self::NamesOnly),
+      "github" => Ok(Self::GitHub),
+      "github-matrix" => Ok(Self::GitHubMatrix),
+      "jsonl" | "json-lines" => Ok(Self::JsonLines),
       _ => Err(RailError::message(format!(
-        "Unknown format '{}'. Valid formats: text, json",
+        "Unknown format '{}'. Valid formats: text, json, names-only, github, github-matrix, jsonl",
         s
       ))),
     }
@@ -48,6 +67,10 @@ impl std::fmt::Display for OutputFormat {
     match self {
       Self::Text => write!(f, "text"),
       Self::Json => write!(f, "json"),
+      Self::NamesOnly => write!(f, "names-only"),
+      Self::GitHub => write!(f, "github"),
+      Self::GitHubMatrix => write!(f, "github-matrix"),
+      Self::JsonLines => write!(f, "jsonl"),
     }
   }
 }

@@ -6,6 +6,7 @@
 //! - The minimal set of crates that need testing/building
 
 use crate::change_detection::classify::{ChangeKind, classify_file};
+use crate::commands::common::OutputFormat;
 use crate::config::ChangeDetectionConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
@@ -15,37 +16,6 @@ use crate::workspace::WorkspaceContext;
 use glob::Pattern;
 use std::io::Write;
 use std::path::PathBuf;
-
-/// Output format for affected command
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum OutputFormat {
-  Text,
-  Json,
-  NamesOnly,
-  /// GitHub Actions output format for $GITHUB_OUTPUT
-  GitHub,
-  /// GitHub Actions matrix format for strategy.matrix
-  GitHubMatrix,
-  /// JSON Lines format (one object per line)
-  JsonLines,
-}
-
-impl OutputFormat {
-  fn from_str(s: &str) -> RailResult<Self> {
-    match s.to_lowercase().as_str() {
-      "text" => Ok(Self::Text),
-      "json" => Ok(Self::Json),
-      "names" | "names-only" => Ok(Self::NamesOnly),
-      "github" => Ok(Self::GitHub),
-      "github-matrix" => Ok(Self::GitHubMatrix),
-      "jsonl" | "json-lines" => Ok(Self::JsonLines),
-      _ => Err(RailError::message(format!(
-        "Unknown format '{}'. Valid formats: text, json, names-only, github, github-matrix, jsonl",
-        s
-      ))),
-    }
-  }
-}
 
 /// Run the affected command
 pub fn run_affected(
@@ -57,13 +27,10 @@ pub fn run_affected(
   all: bool,
   output: Option<PathBuf>,
 ) -> RailResult<()> {
-  let output_format = OutputFormat::from_str(&format)?;
+  let output_format: OutputFormat = format.parse()?;
 
   // JSON-like formats enable structured error output and suppress progress
-  if matches!(
-    output_format,
-    OutputFormat::Json | OutputFormat::JsonLines | OutputFormat::GitHub | OutputFormat::GitHubMatrix
-  ) {
+  if output_format.is_json_like() {
     crate::output::set_json_mode(true);
   }
 

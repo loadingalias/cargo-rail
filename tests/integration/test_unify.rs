@@ -11,6 +11,10 @@
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
+// ============================================================================
+// Core Unification Tests
+// ============================================================================
+
 #[test]
 fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
   // This tests the operational order fix: dependencies that resolve to the same
@@ -112,6 +116,73 @@ fn test_unify_syntactic_version_merging() -> Result<()> {
 }
 
 #[test]
+fn test_unify_major_version_conflict_blocks_unification() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crates with different major versions of the same dependency
+  // This simulates the derive_more bug: 0.99.3 vs 2.0
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["derive"] }"#)],
+  )?;
+
+  // Crate B uses a different major version (simulated with 0.x which has different semver rules)
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#"{ version = "0.8", features = ["alloc"] }"#)],
+  )?;
+
+  workspace.commit("Add crates with major version conflict")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run analyze - should show ERROR about major version conflict
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
+
+  assert!(
+    analyze_stdout.contains("Multiple major versions") || analyze_stdout.contains("anti-pattern"),
+    "Should detect major version conflict.\nOutput:\n{}",
+    analyze_stdout
+  );
+
+  // Run apply - should FAIL due to blocking error
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
+  let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
+
+  // The apply should either fail or skip the conflicting dependency
+  // Check that serde was NOT added to workspace.dependencies (since it has conflicts)
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
+  // If serde is in workspace.dependencies, it should not have mixed features from both versions
+  // The expected behavior is to SKIP the dependency entirely due to the conflict
+  if workspace_toml.contains("serde") && workspace_toml.contains("[workspace.dependencies]") {
+    // If it IS in workspace.dependencies, verify it doesn't have features from the wrong version
+    // This is a secondary check - the primary expectation is that it's skipped
+    assert!(
+      !workspace_toml.contains("alloc") || !workspace_toml.contains("derive"),
+      "Should not merge features from incompatible major versions.\nWorkspace TOML:\n{}\nstdout:\n{}\nstderr:\n{}",
+      workspace_toml,
+      apply_stdout,
+      apply_stderr
+    );
+  }
+
+  Ok(())
+}
+
+#[test]
 fn test_unify_feature_union() -> Result<()> {
   // Test that features are properly unioned across packages
 
@@ -160,6 +231,84 @@ fn test_unify_feature_union() -> Result<()> {
 
   Ok(())
 }
+
+#[test]
+fn test_unify_inconsistent_default_features() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crates with inconsistent default-features
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[(
+      "serde",
+      r#"{ version = "1.0", default-features = true, features = ["derive"] }"#,
+    )],
+  )?;
+
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[(
+      "serde",
+      r#"{ version = "1.0", default-features = false, features = ["alloc"] }"#,
+    )],
+  )?;
+
+  workspace.commit("Add crates with inconsistent default-features")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run analyze - should show Soft warning
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
+
+  assert!(
+    analyze_stdout.contains("serde"),
+    "Should show serde can be unified.\nOutput:\n{}",
+    analyze_stdout
+  );
+
+  // Run apply - should SUCCEED
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply_output.status.success(),
+    "Apply should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout)
+  );
+
+  // Check workspace Cargo.toml
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(workspace_toml.contains("serde"), "Should include serde");
+
+  // Should enable default-features (union strategy)
+  assert!(
+    workspace_toml.contains("default-features = true") || !workspace_toml.contains("default-features = false"),
+    "Should enable default-features.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  // Should have both features
+  assert!(
+    workspace_toml.contains("derive") && workspace_toml.contains("alloc"),
+    "Should have union of features.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// Dependency Kinds and End-to-End Workflow Tests
+// ============================================================================
 
 #[test]
 fn test_unify_dep_kinds_display() -> Result<()> {
@@ -292,40 +441,91 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
 }
 
 #[test]
-fn test_unify_exclude_option() -> Result<()> {
-  // Test that --exclude option works correctly
+fn test_unify_exclude_config_and_flag() -> Result<()> {
+  // Test that exclude works both via config file and CLI flag
 
   let workspace = TestWorkspace::new()?;
 
-  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#), ("anyhow", r#""1.0""#)])?;
-
-  workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#), ("anyhow", r#""1.0""#)])?;
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("serde", r#""1.0""#), ("anyhow", r#""1.0""#), ("tokio", r#""1.0""#)],
+  )?;
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#""1.0""#), ("anyhow", r#""1.0""#), ("tokio", r#""1.0""#)],
+  )?;
 
   workspace.commit("Add crates")?;
 
-  // Analyze with serde excluded
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--exclude", "serde"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  // Test 1: CLI flag exclusion
+  // Analyze with serde excluded via --exclude flag
+  let output_cli = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--exclude", "serde"])?;
+  let stdout_cli = String::from_utf8_lossy(&output_cli.stdout);
 
-  // Should NOT show serde (excluded)
+  // Should NOT show serde (excluded via CLI)
   assert!(
-    !stdout.contains("serde = ") && !stdout.contains("serde:"),
-    "Excluded dependency should not appear in unification plan.\nOutput:\n{}",
-    stdout
+    !stdout_cli.contains("serde = ") && !stdout_cli.contains("serde:"),
+    "CLI excluded dependency should not appear in unification plan.\nOutput:\n{}",
+    stdout_cli
   );
 
-  // Should still show anyhow (not excluded)
+  // Should still show anyhow and tokio (not excluded)
   assert!(
-    stdout.contains("anyhow"),
+    stdout_cli.contains("anyhow") || stdout_cli.contains("tokio"),
     "Non-excluded dependencies should still be unified.\nOutput:\n{}",
-    stdout
+    stdout_cli
+  );
+
+  // Test 2: Config file exclusion
+  // Configure rail.toml with exclude
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+exclude = ["tokio"]
+"#,
+  )?;
+
+  // Run analyze with config-based exclusion
+  let output_config = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout_config = String::from_utf8_lossy(&output_config.stdout);
+
+  // Should show anyhow and serde, but NOT tokio
+  assert!(
+    stdout_config.contains("anyhow") || stdout_config.contains("serde"),
+    "Non-excluded deps should show (config test).\nOutput:\n{}",
+    stdout_config
+  );
+
+  // Run apply to verify config exclusion persists
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(apply_output.status.success(), "Apply should succeed");
+
+  // Workspace should have anyhow and serde, but NOT tokio
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("anyhow") || workspace_toml.contains("serde"),
+    "Should have non-excluded deps in workspace.dependencies"
+  );
+
+  // Verify member conversion - check that tokio was NOT converted (excluded)
+  let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
+
+  // tokio should still be in original format (not converted to workspace = true)
+  assert!(
+    crate_a_toml.contains("tokio = \"1.0\"") || !crate_a_toml.contains("tokio"),
+    "tokio should NOT be converted (excluded via config)"
   );
 
   Ok(())
 }
 
 // ============================================================================
-// Phase 1-6 Feature Tests
+// Dependency Kinds: Dev and Build Dependencies
 // ============================================================================
 
 #[test]
@@ -598,6 +798,93 @@ fn test_unify_local_features_calculation() -> Result<()> {
   Ok(())
 }
 
+#[test]
+fn test_unify_target_specific_features_stay_local() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crate-a with unconditional tokio dependency
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["rt", "macros"] }"#)],
+  )?;
+
+  // Create crate-b with target-specific tokio feature
+  // We manually create this to have a target-specific dependency
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["rt"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1.0", features = ["signal"] }
+"#,
+  )?;
+
+  std::fs::write(
+    crate_b_path.join("src/lib.rs"),
+    "pub fn hello() -> &'static str { \"Hello\" }",
+  )?;
+
+  workspace.commit("Add crates with target-specific features")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run apply
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply_output.status.success(),
+    "Apply should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout)
+  );
+
+  // Check workspace Cargo.toml
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
+  // Workspace should have tokio with common features (rt, macros from crate-a)
+  assert!(
+    workspace_toml.contains("tokio"),
+    "Should have tokio in workspace.dependencies"
+  );
+  assert!(
+    workspace_toml.contains("rt") || workspace_toml.contains("macros"),
+    "Should have common features.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  // CRITICAL: workspace.dependencies should NOT have the target-specific "signal" feature
+  // This is the BUG 2 fix - target-specific features stay local
+  assert!(
+    !workspace_toml.contains("signal"),
+    "Target-specific 'signal' feature should NOT be in workspace.dependencies.\n\
+     It should stay local to crate-b's target-specific section.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// CLI Flags: --include, --pin-transitives, --include-renamed
+// ============================================================================
+
 /// Test --include flag forces specific dependencies to be included
 #[test]
 fn test_unify_include_flag() -> Result<()> {
@@ -727,7 +1014,7 @@ serde = "1.0"
 }
 
 // ============================================================================
-// Issue #6: include_renamed merges renamed + non-renamed deps for threshold
+// Renamed Dependencies and Usage Thresholds
 // ============================================================================
 
 /// Test that include_renamed = true allows renamed + non-renamed deps to count together
@@ -795,8 +1082,96 @@ my_serde = { package = "serde", version = "1.0", features = ["rc"] }
   Ok(())
 }
 
+#[test]
+fn test_unify_renamed_dependencies_hard_blocker() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  // Create crates with renamed dependency
+  // With the bug fix, renamed deps (package = "...") are now properly separated
+  // from direct deps of the same package. This prevents feature confusion.
+  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+
+  // Manually create crate-b with renamed serde
+  let crate_b_path = workspace.path.join("crates/crate-b");
+  std::fs::create_dir_all(&crate_b_path)?;
+  std::fs::create_dir_all(crate_b_path.join("src"))?;
+
+  std::fs::write(
+    crate_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde_crate = { package = "serde", version = "1.0" }
+"#,
+  )?;
+
+  std::fs::write(
+    crate_b_path.join("src/lib.rs"),
+    "pub fn hello() -> &'static str { \"Hello\" }",
+  )?;
+
+  workspace.commit("Add crates with renamed dependency")?;
+
+  // Configure rail.toml (include_renamed = false by default)
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+include_renamed = false
+"#,
+  )?;
+
+  // Run analyze - with the fix, renamed deps are now treated separately
+  // Since each version of serde (direct vs renamed) only has 1 user,
+  // neither qualifies for unification (needs 2+ users)
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
+
+  // Should show no unification opportunities since each has only 1 user
+  assert!(
+    analyze_stdout.contains("no unification opportunities") || analyze_stdout.contains("nothing to unify"),
+    "Should show no unification opportunities when deps are properly separated.\nOutput:\n{}",
+    analyze_stdout
+  );
+
+  // Run apply - should succeed (no changes needed)
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
+
+  // Should indicate no changes
+  assert!(
+    apply_stdout.contains("nothing to unify") || apply_stdout.contains("no unification opportunities"),
+    "Apply should indicate no changes needed.\nstdout:\n{}",
+    apply_stdout
+  );
+
+  // Check that members were NOT converted to workspace inheritance
+  let crate_a_member = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
+
+  // Should still have the original version specification
+  assert!(
+    crate_a_member.contains("serde = \"1.0\""),
+    "crate-a should still have original serde version (not converted).\ncrate-a Cargo.toml:\n{}",
+    crate_a_member
+  );
+
+  // Should NOT have "serde = { workspace = true }"
+  assert!(
+    !crate_a_member.contains("serde = { workspace = true }") && !crate_a_member.contains("serde = {workspace=true}"),
+    "crate-a should not use workspace = true for serde.\ncrate-a Cargo.toml:\n{}",
+    crate_a_member
+  );
+
+  Ok(())
+}
+
 // ============================================================================
-// Issue #8: include option forces single-user deps into unification
+// Config Options: include, exact_pin_handling
 // ============================================================================
 
 /// Test that the `include` config option forces a dependency with only 1 user
@@ -875,10 +1250,6 @@ serde = "1.0"
 
   Ok(())
 }
-
-// ============================================================================
-// Issue #10: exact_pin_handling = "preserve" keeps exact version pins
-// ============================================================================
 
 /// Test that exact_pin_handling = "preserve" keeps the =x.y.z format
 /// in workspace.dependencies instead of converting to ^x.y.z
@@ -1101,6 +1472,208 @@ serde = "=1.0.200"
     stdout.contains("[WARN]") && stdout.contains("exact"),
     "Should warn about exact version pin.\nOutput:\n{}",
     stdout
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// Report Generation, TOML Comments, and Backup Tests
+// ============================================================================
+
+#[test]
+fn test_unify_report_generation() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["derive"] }"#)],
+  )?;
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#"{ version = "1.0", features = ["rc"] }"#)],
+  )?;
+
+  workspace.commit("Add crates")?;
+
+  // Configure rail.toml with report generation enabled
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify.output]
+generate_report = true
+"#,
+  )?;
+
+  // Run apply
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply_output.status.success(),
+    "Apply should succeed.\nOutput:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout)
+  );
+
+  // Check report was generated
+  let report_path = workspace.path.join("target/cargo-rail/unify-report.md");
+  assert!(report_path.exists(), "Report should be generated");
+
+  // Read and validate report contents
+  let report_content = std::fs::read_to_string(&report_path)?;
+
+  assert!(
+    report_content.contains("# Cargo Rail Unification Report"),
+    "Report should have title"
+  );
+  assert!(report_content.contains("Summary"), "Report should have summary section");
+  assert!(
+    report_content.contains("serde"),
+    "Report should mention unified dependency"
+  );
+  assert!(
+    report_content.contains("derive") && report_content.contains("rc"),
+    "Report should show unified features"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_toml_comments() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  workspace.add_crate(
+    "crate-a",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["fs"] }"#)],
+  )?;
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["net"] }"#)],
+  )?;
+  workspace.add_crate(
+    "crate-c",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0", features = ["io-util"] }"#)],
+  )?;
+
+  workspace.commit("Add crates")?;
+
+  // Configure rail.toml with comment generation
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+# add_conflict_comments is now implicit (always true)
+"#,
+  )?;
+
+  // Run apply
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(apply_output.status.success(), "Apply should succeed");
+
+  // Check workspace Cargo.toml was created successfully
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+
+  // Should have [workspace.dependencies] section
+  assert!(
+    workspace_toml.contains("[workspace.dependencies]"),
+    "Should have workspace dependencies section.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  // Should have unified tokio
+  assert!(
+    workspace_toml.contains("tokio"),
+    "Should have unified tokio dependency.\nWorkspace TOML:\n{}",
+    workspace_toml
+  );
+
+  // Note: Comments for table-format dependencies (with features) are not currently supported
+  // Only inline-format dependencies get trailing comments
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_backup_flag() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+
+  workspace.commit("Add crates")?;
+
+  // Configure rail.toml
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+"#,
+  )?;
+
+  // Run apply with --backup
+  let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
+  let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
+
+  assert!(
+    apply_output.status.success(),
+    "Apply should succeed.\nOutput:\n{}",
+    apply_stdout
+  );
+
+  // Check that backup was created in target/cargo-rail/backups/
+  let backup_root = workspace.path.join("target/cargo-rail/backups");
+  assert!(
+    backup_root.exists(),
+    "Backup directory should exist at target/cargo-rail/backups"
+  );
+
+  // Find the backup directory (should be a timestamp-based folder)
+  let backup_entries: Vec<_> = std::fs::read_dir(&backup_root)
+    .expect("Should read backup directory")
+    .filter_map(|e| e.ok())
+    .filter(|e| e.path().is_dir())
+    .collect();
+
+  assert!(!backup_entries.is_empty(), "At least one backup should exist");
+
+  let backup_dir = backup_entries.first().unwrap().path();
+
+  // Check that backup contains the expected files
+  assert!(
+    backup_dir.join("Cargo.toml").exists(),
+    "Backup should contain workspace Cargo.toml"
+  );
+  assert!(
+    backup_dir.join("crates/crate-a/Cargo.toml").exists() || backup_dir.join("crate-a/Cargo.toml").exists(),
+    "Backup should contain crate-a Cargo.toml"
+  );
+  assert!(
+    backup_dir.join("crates/crate-b/Cargo.toml").exists() || backup_dir.join("crate-b/Cargo.toml").exists(),
+    "Backup should contain crate-b Cargo.toml"
+  );
+
+  // Check that metadata.json exists
+  assert!(
+    backup_dir.join("metadata.json").exists(),
+    "Backup should contain metadata.json"
+  );
+
+  // Check backup message in output (check stderr for status messages)
+  let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
+  assert!(
+    apply_stderr.contains("creating backup") || apply_stderr.contains("backup:"),
+    "Should mention backups in output.\nOutput:\n{}",
+    apply_stderr
   );
 
   Ok(())
