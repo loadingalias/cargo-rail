@@ -206,6 +206,13 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
 
     fs::write(&config_path, config_toml)?;
     println!("updated: {}", config_path.display());
+
+    println!("\nnext: review and customize the generated config");
+    println!("      - edit 'remote' URLs to match your repositories");
+    println!("      - for combined splits (multiple crates in one repo):");
+    println!("        1. set mode = \"combined\" on one crate");
+    println!("        2. add other crate paths to its 'paths' array");
+    println!("        3. remove the other crate entries");
   }
 
   Ok(())

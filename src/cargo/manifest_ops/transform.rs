@@ -45,6 +45,7 @@ pub fn resolve_package_workspace_inheritance(doc: &mut DocumentMut, workspace_pa
     "version",
     "authors",
     "edition",
+    "rust-version",
     "license",
     "repository",
     "description",

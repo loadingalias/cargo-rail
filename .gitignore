@@ -27,6 +27,7 @@ rules.md
 cmd_cfg.md
 v1_precheck.md
 ARCHITECTURE.md
+final_testing.md
 
 # Cargo-Rail (Testing)
 *rail.toml

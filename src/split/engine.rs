@@ -751,6 +751,52 @@ impl<'a> SplitEngine<'a> {
 
       // Remove exclude if present (not needed for split repo)
       table.remove("exclude");
+
+      // Filter default-members to only include split crates (Issue #2)
+      let members_set: std::collections::HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
+      if let Some(default_members) = table.get_mut("default-members")
+        && let Some(arr) = default_members.as_array_mut()
+      {
+        arr.retain(|item| item.as_str().map(|s| members_set.contains(s)).unwrap_or(false));
+      }
+      // Remove default-members if empty
+      if table
+        .get("default-members")
+        .and_then(|d| d.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+      {
+        table.remove("default-members");
+      }
+
+      // Remove workspace.dependencies - split crates have inlined deps (Issue #4)
+      table.remove("dependencies");
+    }
+
+    // Filter profile package specs to only include split crates (Issue #3)
+    let members_set: std::collections::HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
+    if let Some(profile) = doc.get_mut("profile").and_then(|p| p.as_table_mut()) {
+      for (_, profile_section) in profile.iter_mut() {
+        if let Some(profile_table) = profile_section.as_table_mut() {
+          if let Some(pkg) = profile_table.get_mut("package").and_then(|p| p.as_table_mut()) {
+            let pkg_names: Vec<String> = pkg.iter().map(|(k, _)| k.to_string()).collect();
+            for pkg_name in pkg_names {
+              if !members_set.contains(pkg_name.as_str()) {
+                pkg.remove(&pkg_name);
+              }
+            }
+          }
+          // Remove empty package table
+          if profile_table
+            .get("package")
+            .and_then(|p| p.as_table())
+            .map(|t| t.is_empty())
+            .unwrap_or(false)
+          {
+            profile_table.remove("package");
+          }
+        }
+      }
     }
 
     // Remove package section if present (virtual workspace)
