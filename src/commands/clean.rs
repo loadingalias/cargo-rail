@@ -1,3 +1,5 @@
+//! `cargo rail clean` - Remove generated artifacts (cache, backups, reports).
+
 use crate::backup::BackupManager;
 use crate::config::UnifyConfig;
 use crate::error::{RailError, RailResult};

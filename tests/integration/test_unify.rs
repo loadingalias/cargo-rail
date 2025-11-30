@@ -116,7 +116,7 @@ fn test_unify_syntactic_version_merging() -> Result<()> {
 }
 
 #[test]
-fn test_unify_major_version_conflict_blocks_unification() -> Result<()> {
+fn test_unify_major_version_conflict_warns_and_skips() -> Result<()> {
   let workspace = TestWorkspace::new()?;
 
   // Create crates with different major versions of the same dependency
@@ -146,17 +146,17 @@ root = "."
 "#,
   )?;
 
-  // Run analyze - should show ERROR about major version conflict
+  // Run analyze - should show WARNING about major version conflict
   let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
-    analyze_stdout.contains("Multiple major versions") || analyze_stdout.contains("anti-pattern"),
+    analyze_stdout.contains("Multiple major versions") || analyze_stdout.contains("skipping"),
     "Should detect major version conflict.\nOutput:\n{}",
     analyze_stdout
   );
 
-  // Run apply - should FAIL due to blocking error
+  // Run apply - should SUCCEED but skip the conflicting dependency
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
   let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);

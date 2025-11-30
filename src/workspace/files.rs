@@ -1,3 +1,8 @@
+//! Auxiliary file handling for split repositories.
+//!
+//! Copies workspace-level config files (rust-toolchain.toml, rustfmt.toml, .cargo/config.toml)
+//! and project files (README, LICENSE) into split repositories with appropriate fallback logic.
+
 use crate::error::{RailResult, ResultExt};
 use std::fs;
 use std::path::{Path, PathBuf};

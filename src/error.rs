@@ -1,22 +1,7 @@
-//! Error types with contextual messages and exit codes.
+//! Error handling with contextual messages and CI-friendly exit codes.
 //!
-//! Provides [`RailError`] with categorized variants, help text, and process exit codes.
-//!
-//! # Examples
-//!
-//! ```rust
-//! use cargo_rail::error::{RailError, ResultExt};
-//!
-//! fn parse_number(s: &str) -> Result<u32, RailError> {
-//!     s.parse().context("Invalid number format")
-//! }
-//!
-//! let result = parse_number("42");
-//! assert!(result.is_ok());
-//!
-//! let result = parse_number("invalid");
-//! assert!(result.is_err());
-//! ```
+//! Exit code semantics: 0 = success, 1 = check mode found changes, 2 = error.
+//! Errors carry optional help text that guides users toward resolution.
 
 use std::fmt;
 use std::io;

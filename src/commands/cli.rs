@@ -6,6 +6,17 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+const MAIN_HELP: &str = "\
+Monorepo orchestration for Rust workspaces.
+
+Quick start:
+  cargo rail init              # Generate rail.toml
+  cargo rail affected          # See what changed
+  cargo rail test              # Test affected crates only
+  cargo rail unify --check     # Preview dependency unification
+
+Docs: https://github.com/loadingalias/cargo-rail";
+
 /// Root CLI wrapper for cargo subcommand integration
 ///
 /// This wrapper allows cargo-rail to be invoked as `cargo rail <subcommand>`.
@@ -23,7 +34,9 @@ pub enum CargoCli {
 /// Contains global options and the subcommand to execute.
 #[derive(Parser)]
 #[command(name = "rail")]
-#[command(version, about, long_about = None)]
+#[command(version)]
+#[command(about = "Monorepo orchestration for Rust workspaces")]
+#[command(long_about = MAIN_HELP)]
 #[command(propagate_version = true)]
 #[command(styles = get_styles())]
 pub struct RailCli {
@@ -36,10 +49,57 @@ pub struct RailCli {
   pub command: Commands,
 }
 
+const AFFECTED_HELP: &str = "\
+Examples:
+  cargo rail affected                     # Changes since origin/main
+  cargo rail affected --since HEAD~5      # Changes in last 5 commits
+  cargo rail affected --from abc --to def # Changes between two SHAs
+  cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
+  cargo rail affected -f names-only       # Just crate names, one per line";
+
+const TEST_HELP: &str = "\
+Examples:
+  cargo rail test                         # Test affected crates
+  cargo rail test --all                   # Test all crates
+  cargo rail test -- --nocapture          # Pass args to test runner
+  cargo rail test --explain               # Show why each crate is tested";
+
+const UNIFY_HELP: &str = "\
+Examples:
+  cargo rail unify --check                # Preview changes (CI mode)
+  cargo rail unify                        # Apply changes
+  cargo rail unify --backup               # Apply with backup
+  cargo rail unify --pin-transitives      # Pin fragmented deps (hakari replacement)
+  cargo rail unify undo                   # Restore from backup
+  cargo rail unify undo --list            # List available backups";
+
+const SPLIT_HELP: &str = "\
+Examples:
+  cargo rail split init my-crate          # Configure split for my-crate
+  cargo rail split my-crate --check       # Preview the split
+  cargo rail split my-crate               # Execute the split
+  cargo rail split --all                  # Split all configured crates";
+
+const SYNC_HELP: &str = "\
+Examples:
+  cargo rail sync my-crate                # Bidirectional sync
+  cargo rail sync my-crate --to-remote    # Push monorepo -> split repo
+  cargo rail sync my-crate --from-remote  # Pull split repo -> monorepo (PR branch)
+  cargo rail sync --all                   # Sync all configured crates";
+
+const RELEASE_HELP: &str = "\
+Examples:
+  cargo rail release my-crate --check     # Preview release plan
+  cargo rail release my-crate             # Release (patch bump)
+  cargo rail release my-crate --bump minor
+  cargo rail release --all --bump patch   # Release all crates
+  cargo rail release my-crate --skip-publish  # Tag only, no crates.io";
+
 /// Available subcommands
 #[derive(Subcommand)]
 pub enum Commands {
   /// Show which crates are affected by changes
+  #[command(after_long_help = AFFECTED_HELP)]
   Affected {
     /// Git ref to compare against (auto-detects origin/main or origin/master)
     #[arg(long)]
@@ -62,6 +122,7 @@ pub enum Commands {
   },
 
   /// Run tests for affected crates only
+  #[command(after_long_help = TEST_HELP)]
   Test {
     /// Git ref to compare against (auto-detects origin/main or origin/master)
     #[arg(long)]
@@ -81,8 +142,9 @@ pub enum Commands {
   },
 
   /// Unify workspace dependencies (replaces workspace-hack crates)
+  #[command(after_long_help = UNIFY_HELP)]
   Unify {
-    /// Action: 'undo' to restore a backup
+    /// Action: 'undo' to restore from backup (use with --list to see backups)
     action: Option<String>,
     /// Dry-run mode: preview changes without modifying files
     #[arg(long, short = 'c')]
@@ -90,11 +152,11 @@ pub enum Commands {
     /// Output format [text, json]
     #[arg(long, short = 'f', default_value = "text")]
     format: String,
-    /// Exclude dependencies from unification
-    #[arg(long)]
+    /// Exclude dependencies from unification (comma-separated)
+    #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
-    /// Force include specific dependencies
-    #[arg(long)]
+    /// Force include specific dependencies (comma-separated)
+    #[arg(long, value_delimiter = ',')]
     include: Vec<String>,
     /// Create backups of all modified files
     #[arg(long)]
@@ -139,6 +201,7 @@ pub enum Commands {
   },
 
   /// Split a crate to a standalone repository with git history
+  #[command(after_long_help = SPLIT_HELP)]
   Split {
     /// Action: 'init' to configure splits, or crate name to split
     action: Option<String>,
@@ -160,6 +223,7 @@ pub enum Commands {
   },
 
   /// Sync changes between monorepo and split repos
+  #[command(after_long_help = SYNC_HELP)]
   Sync {
     /// Crate name to sync (mutually exclusive with --all)
     #[arg(conflicts_with = "all")]
@@ -191,6 +255,7 @@ pub enum Commands {
   },
 
   /// Publish releases (version bump, changelog, tag, publish)
+  #[command(after_long_help = RELEASE_HELP)]
   Release {
     /// Action: 'init' to configure release settings
     action: Option<String>,

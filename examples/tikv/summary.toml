@@ -1,0 +1,19 @@
+repo = "tikv/tikv"
+commit = "9f88068b3"
+date = "2025-11-27"
+
+[workspace]
+members = 83
+lock_deps = 758
+rust_loc = 631970
+
+[unify]
+deps_unified = 56
+member_edits = 514
+transitives_pinned = 0
+
+[config]
+special = true
+exclude = ["uuid", "semver", "derive_more", "nom"]
+exact_pin_handling = "skip"
+note = "Multi-version dependencies must be excluded"

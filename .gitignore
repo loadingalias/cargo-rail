@@ -21,13 +21,11 @@ AGENTS.md
 *.key
 
 # Documentation
-docs/design
-docs/src
+docs/design-no_op-experimental
 rules.md
-cmd_cfg.md
-v1_precheck.md
 ARCHITECTURE.md
-final_testing.md
+style.md
+demos/
 
 # Cargo-Rail (Testing)
 *rail.toml

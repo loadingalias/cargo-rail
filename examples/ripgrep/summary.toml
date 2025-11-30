@@ -1,0 +1,18 @@
+repo = "BurntSushi/ripgrep"
+commit = "cd1f981"
+date = "2025-11-29"
+
+[workspace]
+members = 10
+lock_deps = 61
+rust_loc = 52258
+
+[unify]
+deps_unified = 9
+member_edits = 35
+transitives_pinned = 5
+deps = ["serde_json", "regex", "serde", "bstr", "memchr", "termcolor", "globset", "walkdir", "log"]
+
+[config]
+special = false
+note = "Surprise: 10 workspace members, not 1!"

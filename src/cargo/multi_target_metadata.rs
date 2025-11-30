@@ -210,6 +210,24 @@ impl MultiTargetMetadata {
     false // Not in graph at all
   }
 
+  /// Check if a dependency is a path/workspace dependency (not from a registry)
+  ///
+  /// Path dependencies have `source: None` in cargo metadata.
+  /// These cannot be pinned in workspace.dependencies without a registry source,
+  /// so we skip them during transitive pinning.
+  pub fn is_path_dependency(&self, dep_name: &str) -> bool {
+    for metadata in self.cache.values() {
+      for pkg in &metadata.packages {
+        if pkg.name == dep_name {
+          // source is None for path deps and workspace members
+          // source is Some("registry+...") for published deps
+          return pkg.source.is_none();
+        }
+      }
+    }
+    false
+  }
+
   /// Get features enabled for a package across all targets
   /// Returns map of target -> set of features
   pub fn all_features(&self, dep_name: &str) -> HashMap<String, HashSet<String>> {
@@ -283,6 +301,11 @@ impl MultiTargetMetadata {
     for dep_name in all_deps {
       if !self.is_transitive_only(&dep_name) {
         continue; // Skip direct deps
+      }
+
+      // Skip path dependencies - they can't be pinned from a registry
+      if self.is_path_dependency(&dep_name) {
+        continue;
       }
 
       let features = self.all_features(&dep_name);

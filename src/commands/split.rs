@@ -1,3 +1,5 @@
+//! `cargo rail split` - Extract crates to standalone repositories with full git history.
+
 use std::io::IsTerminal;
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};

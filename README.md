@@ -1,12 +1,12 @@
 # cargo-rail
 
-**Zero-waste orchestration for Rust monorepos.**
+**Monorepo orchestration for Rust workspaces. 12 dependencies. Zero workspace-hack crates.**
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 
-Stop wasting CI time. Stop fighting workspace dependencies. Stop copy-pasting git history.
+[Commands](docs/commands.md) · [Config](docs/config.md) · [Recipes](docs/recipes.md) · [Crates.io](https://crates.io/crates/cargo-rail)
 
 ```bash
 cargo install cargo-rail
@@ -14,358 +14,285 @@ cargo install cargo-rail
 
 ---
 
+## The Problem
+
+Rust monorepos are powerful but painful:
+
+- **CI tests everything** on every PR. 50 crates, 12 minutes, every time.
+- **Dependency fragmentation** causes duplicate compilations. You're maintaining a workspace-hack crate or living with the overhead.
+- **Extracting crates** means git-filter-repo scripts, lost commit mappings, and manual coordination.
+- **Releasing** requires juggling cargo-release, git-cliff, and custom scripts.
+
+**cargo-rail** solves all of these with one tool and 12 dependencies.
+
+---
+
 ## What It Does
 
-**cargo-rail** solves the three hardest problems in Rust monorepos:
-
-| Problem | Solution | Impact |
-|---------|----------|--------|
-| **Testing everything on every PR** | Graph-aware change detection | **10x faster CI** |
-| **Dependency fragmentation** | Resolution-based unification | **Zero workspace-hack crates** |
-| **Distributing crates** | History-preserving split/sync | **One command, full git history** |
-
-### Replaces
-
-| Tool | What cargo-rail does instead |
-|------|------------------------------|
-| **cargo-hakari** | Native `workspace.dependencies` unification—no workspace-hack crate |
-| **cargo-release / release-plz** | Dependency-ordered releases with native changelog generation |
-| **git-cliff** | Built-in conventional commit parsing (zero-copy, no external dep) |
-| **Copybara** | Deterministic split/sync with git-notes mapping |
-| **CI shell scripts** | Graph-aware `cargo rail affected` with nextest/bacon integration |
-
----
-
-## Quick Start
-
-### 1. Smart Testing (10x faster CI)
+### Test only what changed
 
 ```bash
-# Only test what changed
-cargo rail test
+$ cargo rail test
 
-# Explain why each crate is tested
-cargo rail test --explain
-```
-
-**Before:**
-
-```yaml
-- run: cargo test --workspace  # Tests everything (12 minutes)
-```
-
-**After:**
-
-```yaml
-- run: cargo rail test            # Tests only affected crates (1 minute)
-```
-
-### 2. Dependency Unification (replaces cargo-hakari)
-
-```bash
-# Preview unification changes
-cargo rail unify --check
-
-# Apply unification to workspace.dependencies
-cargo rail unify
-```
-
-**What it does:**
-
-- Uses Cargo's actual dependency **resolution**, not just syntax
-- Merges feature sets intelligently from resolved features
-- No workspace-hack crate needed
-- Lossless TOML editing (preserves comments & formatting)
-
-### 3. Crate Distribution (replaces Copybara)
-
-```bash
-# Split a crate to standalone repo with full git history
-cargo rail split my-crate
-
-# Bidirectional sync
-cargo rail sync my-crate
-```
-
-**What it does:**
-
-- Preserves complete git history (commits, tags, blame)
-- Deterministic: same input = same commit SHAs
-- Uses git-notes for rebase-safe commit mapping
-- No libgit2/gitoxide dependency (pure system git)
-
----
-
-## Why cargo-rail?
-
-### Resolution-Based Unification
-
-Unlike cargo-hakari's syntax-only approach, cargo-rail uses Cargo's actual resolver:
-
-```toml
-# crate-a
-tokio = "1.0"
-
-# crate-b
-tokio = "^1.5"
-
-# Both resolve to tokio 1.5.3 → compatible!
-# cargo-rail merges them intelligently:
-[workspace.dependencies]
-tokio = { version = "1.5", features = ["rt", "net", "sync"] }
-```
-
-**No workspace-hack crate.** Just native `workspace.dependencies`.
-
-### Graph-Aware Change Detection
-
-```bash
-$ cargo rail affected --explain
-
-Changed files:
-  crates/core/src/lib.rs (source)
-  docs/guide.md (docs)
+Changed: crates/core/src/lib.rs
 
 Affected crates:
-  ✓ core (direct change)
-  ✓ api (depends on core)
-  ✓ cli (depends on api)
+  core        (direct change)
+  api         (depends on core)
+  cli         (depends on api)
 
-Skipping:
-  ✗ examples (no dependency path)
-  ✗ docs (docs-only change)
+Skipped (no dependency path):
+  examples
+  benchmarks
 
 Running: cargo nextest run -p core -p api -p cli
 ```
 
-**Real impact:** 70-90% reduction in test time on large workspaces.
+Graph-aware change detection. Auto-detects nextest. **70-90% reduction in CI time.**
 
-### Deterministic Git Operations
-
-Uses system git directly for maximum fidelity:
+### Unify dependencies without workspace-hack
 
 ```bash
-# Split preserves full history
-git log --oneline
-abc123 feat: add new feature
-def456 fix: critical bug
-...
+$ cargo rail unify
 
-# Same commits, same SHAs in split repo
-cd ../my-crate-standalone
-git log --oneline
-abc123 feat: add new feature  # Same SHA!
-def456 fix: critical bug      # Same SHA!
+Analyzed 3 target triples
+Unified 23 dependencies to [workspace.dependencies]
+Pinned 8 transitive-only deps
+Computed MSRV: 1.75.0
+
+Features: minimal set for full functionality
+Versions: resolved from Cargo's actual resolver
+TOML: comments and formatting preserved
 ```
 
----
+- **Multi-target resolution** — Analyzes all your target triples, produces one correct dependency graph
+- **Minimum features** — Intersection of required features, not union. Leaner builds.
+- **Prune dead features** — Removes features declared but never used (`prune_dead_features = true`)
+- **Detect & remove unused deps** — Finds deps declared but not in the resolved graph (`detect_unused = true`, `remove_unused = true`)
+- **Automatic MSRV** — Computes workspace MSRV from dependency requirements (`msrv = true`)
+- **No workspace-hack crate** — Native `[workspace.dependencies]`, nothing extra
 
-## Architecture
-
-### Zero Abstraction
-
-- **System git only** – No libgit2/gitoxide dependency overhead
-- **Direct graph construction** – `cargo_metadata` + `petgraph` (no guppy)
-- **11 core dependencies** – Minimal, auditable supply chain
-
-### Design Principles
-
-1. **Single workspace load** – Build context once, reuse everywhere
-2. **Graph-first** – All operations use the dependency graph
-3. **Lossless editing** – Preserve formatting, comments, structure
-4. **Deterministic** – Same input always produces same output
-
----
-
-## Configuration
-
-Create `.config/rail.toml` (or use `cargo rail init`):
-
-```toml
-# Target platforms for multi-target analysis (auto-detected by init)
-targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
-
-# Dependency unification
-[unify]
-pin_transitives = true       # Pin transitive-only deps (workspace-hack replacement)
-transitive_host = "root"     # Where to put pinned dev-deps: "root" or "crates/foo"
-include_renamed = false      # Include package = "..." renamed deps
-exclude = ["openssl"]        # Deps to exclude from unification
-
-# Per-crate configuration (optional)
-[crates.my-crate.split]
-remote = "git@github.com:org/my-crate.git"
-mode = "single"
-
-[crates.my-crate.release]
-publish = true
-```
-
-Run `cargo rail init --check` to preview generated config.
-
----
-
-## Commands
-
-### Change Analysis
+### Split crates with full git history
 
 ```bash
-cargo rail affected                    # Show affected crates
-cargo rail affected --since main       # Compare against branch
-cargo rail test                        # Test affected crates
-cargo rail test --explain              # Explain why each crate is tested
+$ cargo rail split my-crate
+
+Extracted my-crate to standalone repo
+  347 commits preserved
+  Same commit SHAs (deterministic)
+  Commit mapping stored in git-notes
 ```
 
-### Dependency Unification
+Three modes:
+
+| Mode | Use Case |
+|------|----------|
+| `single` | One crate → one repo |
+| `multi` | Multiple crates → one repo (separate directories) |
+| `workspace` | Multiple crates → one monorepo (with workspace Cargo.toml) |
+
+### Sync with safe defaults
 
 ```bash
-cargo rail unify --check             # Preview changes
-cargo rail unify                       # Apply unification
+$ cargo rail sync my-crate
+
+Monorepo → split: pushes to main
+Split → monorepo: creates PR branch (never direct to main)
 ```
 
-### Crate Distribution
+Bidirectional sync with safety guardrails. Changes from external contributors come in as PRs for review.
+
+### Release with dependency ordering
 
 ```bash
-cargo rail split my-crate              # Split to standalone repo
-cargo rail sync my-crate               # Bidirectional sync
+$ cargo rail release --all --bump minor
+
+Planning release:
+  1. core       0.4.2 → 0.5.0
+  2. api        0.3.1 → 0.4.0  (depends on core)
+  3. cli        0.2.0 → 0.3.0  (depends on api)
+
+Changelog generated from conventional commits
+Tags: core@0.5.0, api@0.4.0, cli@0.3.0
+
+--execute to publish (dry-run by default)
 ```
 
-### Release Automation (replaces cargo-release + git-cliff)
-
-```bash
-# Plan releases with dependency-aware ordering
-cargo rail release --all --bump minor --check
-
-# Execute: bump versions, generate changelogs, tag, publish
-cargo rail release --all --bump patch --execute
-```
-
-**What it does:**
-
-- Native changelog generation from conventional commits (no git-cliff dependency)
-- Dependency-ordered publishing (deps before dependents)
-- Configurable delays between publishes (avoids registry race conditions)
-- GitHub release creation via `gh` CLI (optional)
-- GPG/SSH tag signing support
-
-## Comparison
-
-### vs Dependency Management
-
-| Feature | cargo-rail | cargo-hakari |
-|---------|-----------|-------------|
-| Dependency unification | ✅ Resolution-based | ✅ Syntax-only |
-| Feature selection | Intersection (minimal) | Union (maximal) |
-| Workspace-hack crate | ❌ Not needed | ✅ Required |
-| TOML preservation | ✅ Lossless | ⚠️ Regenerates |
-| Dependencies | 10 core | ~40+ (via guppy) |
-
-### vs Release Automation
-
-| Feature | cargo-rail | cargo-release | release-plz |
-|---------|-----------|--------------|-------------|
-| Version bumping | ✅ | ✅ | ✅ |
-| Changelog generation | ✅ Native | ❌ External | ✅ |
-| Dependency ordering | ✅ Graph-aware | ⚠️ Manual | ✅ |
-| GitHub releases | ✅ via gh | ❌ | ✅ |
-| Publish delay | ✅ Configurable | ❌ | ✅ |
-| Tag signing | ✅ | ✅ | ✅ |
-| Dependencies | 90 |-| 600+|
-
-### vs Monorepo Sync
-
-| Feature | cargo-rail | Copybara | git-filter-repo |
-|---------|-----------|----------|-----------------|
-| Git history preservation | ✅ Full | ⚠️ Partial | ✅ Full |
-| Bidirectional sync | ✅ | ✅ | ❌ One-way |
-| Deterministic SHAs | ✅ | ❌ | ✅ |
-| Conflict resolution | ✅ 3-way merge | ✅ | ❌ |
-| Commit mapping | ✅ git-notes | Custom DB | ❌ |
-| Language | Rust | Go | Python |
-
-### vs CI Optimization
-
-| Feature | cargo-rail | Custom scripts | nx/turborepo |
-|---------|-----------|---------------|--------------|
-| Change detection | ✅ Graph-aware | ⚠️ Path-based | ✅ Graph-aware |
-| Rust-native | ✅ | ⚠️ Shell | ❌ JS ecosystem |
-| Nextest integration | ✅ Auto-detect | Manual | ❌ |
-| Dependency resolution | ✅ Cargo's resolver | ❌ | ❌ |
+Native changelog generation. Configurable publish delays. GitHub releases via `gh`.
 
 ---
 
 ## Real-World Impact
 
-### Before
+`cargo rail affected` on recent commits (HEAD~10):
 
-```bash
-# CI takes 12 minutes testing entire workspace
-# Maintain workspace-hack crate manually
-# Use git-filter-repo scripts for splits
+| Repository | Crates | Affected | Skipped | Reduction |
+|------------|--------|----------|---------|-----------|
+| [helix](https://github.com/helix-editor/helix) | 13 | 5 | 8 | 62% |
+| [ripgrep](https://github.com/BurntSushi/ripgrep) | 10 | 4 | 6 | 60% |
+| [vello](https://github.com/linebender/vello) | 26 | 13 | 13 | 50% |
+| [tikv](https://github.com/tikv/tikv) | 83 | 42 | 41 | 49% |
+| [ruff](https://github.com/astral-sh/ruff) | 43 | 23 | 20 | 47% |
+| [meilisearch](https://github.com/meilisearch/meilisearch) | 19 | 17 | 2 | 11% |
+| [polars](https://github.com/pola-rs/polars) | 33 | 32 | 1 | 3% |
+
+*Results vary by commit range. Monorepos with focused PRs see larger reductions.*
+
+---
+
+## Why cargo-rail
+
+### 12 dependencies, 92 resolved
+
+Compare: cargo-hakari pulls ~40 direct via guppy. release-plz pulls 600+ resolved.
+
+Minimal supply chain. Easy to audit. Fast to compile.
+
+### Correct by construction
+
+cargo-rail queries Cargo's actual resolver across all your target triples:
+
+```toml
+# crate-a: tokio = "1.0"          (needs rt)
+# crate-b: tokio = "^1.5"         (needs net)
+# crate-c: tokio = "1"            (needs sync, linux-only)
+
+# cargo-rail resolves across x86_64-linux, aarch64-darwin, x86_64-windows:
+[workspace.dependencies]
+tokio = { version = "1.5", features = ["rt", "net", "sync"] }
 ```
 
-### After
+- **Versions**: Always the resolved version, not the requested range
+- **Features**: Minimum set required across all targets (intersection, not union)
+- **MSRV**: Auto-computed from dependency requirements when `msrv = true`
+
+### System git, no libgit2
+
+Split and sync use the system `git` binary directly. No libgit2 or gitoxide dependencies:
+
+- Maximum fidelity with your existing git workflows
+- Deterministic: same input → same commit SHAs
+- git-notes for rebase-safe commit mapping
+
+### Lossless TOML editing
+
+Uses `toml_edit` to preserve comments, formatting, and structure:
+
+```toml
+# Your carefully written comments
+tokio = { version = "1.5" }  # ← stays exactly here
+```
+
+---
+
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `affected` | Show crates affected by changes |
+| `test` | Run tests for affected crates only |
+| `unify` | Unify deps to `[workspace.dependencies]` |
+| `split` | Extract crate to standalone repo with history |
+| `sync` | Bidirectional monorepo ↔ split repo sync |
+| `release` | Version bump, changelog, tag, publish |
+| `init` | Generate `rail.toml` configuration |
+| `check` | Validate release readiness |
+| `clean` | Remove generated artifacts |
+
+Run `cargo rail <command> --help` for details, or see [docs/commands.md](docs/commands.md)
+
+---
+
+## Configuration
 
 ```bash
-# CI takes 1-2 minutes testing only affected crates
-# cargo rail unify (one command)
-# cargo rail split my-crate (one command, full history)
+cargo rail init  # Auto-detects targets, generates rail.toml
 ```
+
+```toml
+# .config/rail.toml or rail.toml
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+
+[unify]
+pin_transitives = true      # Pin transitive-only deps (workspace-hack replacement)
+msrv = true                 # Compute and set workspace MSRV
+detect_unused = true        # Find unused dependencies
+remove_unused = true        # Remove them automatically
+prune_dead_features = true  # Remove features never used
+exclude = ["openssl"]       # Skip specific deps
+
+[release]
+publish_delay = 5           # Seconds between crates.io publishes
+create_github_release = true
+
+[crates.my-crate.split]
+remote = "git@github.com:org/my-crate.git"
+mode = "single"             # or "multi", "workspace"
+```
+
+---
+
+## Replaces
+
+| Tool | What cargo-rail does instead |
+|------|------------------------------|
+| cargo-hakari | Resolution-based unification, no workspace-hack crate |
+| cargo-hackerman | Same — workspace-hack replacement via `pin_transitives` |
+| cargo-udeps | Unused dep detection via `detect_unused`, removal via `remove_unused` |
+| cargo-machete | Same — detects deps not in resolved graph |
+| cargo-shear | Same — unused dep detection and removal |
+| cargo-msrv | Auto-compute workspace MSRV via `msrv = true` |
+| cargo-release | Dependency-ordered publishing, native changelog |
+| release-plz | Same, with 600 fewer dependencies |
+| git-cliff | Built-in conventional commit parsing |
+| Copybara | Deterministic split/sync with git-notes |
+| CI shell scripts | Graph-aware `affected` with nextest integration |
+
+### cargo-rail vs cargo-hakari
+
+| Feature | cargo-hakari | cargo-rail |
+|---------|--------------|------------|
+| Requires extra crate | Yes (workspace-hack) | No |
+| Preserves TOML comments | No | Yes |
+| Multi-target aware | No | Yes |
+| Feature computation | Union (all features) | Intersection (minimal) |
+| Dependencies | ~40 via guppy | 12 |
+
+### cargo-rail vs release-plz
+
+| Feature | release-plz | cargo-rail |
+|---------|-------------|------------|
+| Version bumping | Yes | Yes |
+| Changelog generation | Yes | Yes |
+| Dependency ordering | Yes | Yes |
+| GitHub releases | Yes | Yes |
+| Dependencies | ~600 resolved | 12 |
+| Crate splitting | No | Yes |
+| Bidirectional sync | No | Yes |
 
 ---
 
 ## Installation
 
 ```bash
-# From crates.io
 cargo install cargo-rail
-
-# From source
-git clone https://github.com/loadingalias/cargo-rail
-cd cargo-rail
-cargo install --path .
 ```
 
----
-
-## Development
+From source:
 
 ```bash
-# Build
-cargo build --release
-
-# Test
-cargo test
-
-# Quality checks
-just check
+git clone https://github.com/loadingalias/cargo-rail
+cd cargo-rail && cargo install --path .
 ```
 
----
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Open an issue first for major changes
-2. Run `just check` before submitting
-3. Add tests for new features
-4. Update docs as needed
+Requires Rust 1.91+.
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT
 
 ---
 
-## Credits
-
-Built with [cargo_metadata](https://crates.io/crates/cargo_metadata), [petgraph](https://crates.io/crates/petgraph), [toml_edit](https://crates.io/crates/toml_edit), and [clap](https://crates.io/crates/clap).
-
-Inspired by cargo-hakari's unification approach and Copybara's monorepo concepts.
-
----
-
-**Ready to stop wasting time?** `cargo install cargo-rail`
+<sub>Built by [@loadingalias](https://github.com/loadingalias). Contributions welcome.</sub>

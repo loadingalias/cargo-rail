@@ -2,21 +2,22 @@
 name = "cargo-rail"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.91.1"
+rust-version = "1.91"
 license = "MIT"
 authors = ["loadingalias"]
-description = "Monorepo tooling for Rust workspaces"
+description = "Graph-aware testing, dependency unification, and crate extraction for Rust monorepos"
 repository = "https://github.com/loadingalias/cargo-rail"
-homepage = "https://github.com/loadingalias/cargo-rail"
+homepage = "https://loadingalias.github.io/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
-    "command-line-utilities",
-    "development-tools",
     "development-tools::cargo-plugins",
     "development-tools::build-utils",
+    "development-tools::testing",
+    "command-line-utilities",
 ]
-keywords = ["monorepo", "cargo", "workspace", "ci", "release"]
+keywords = ["monorepo", "workspace", "affected", "hakari", "release"]
 readme = "README.md"
+exclude = ["docs/", "tests/", ".github/", ".config/"]
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }

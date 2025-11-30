@@ -1,0 +1,17 @@
+repo = "tokio-rs/tokio"
+commit = "ab3996a6"
+date = "2025-11-29"
+
+[workspace]
+members = 10
+lock_deps = 214
+rust_loc = 166705
+
+[unify]
+deps_unified = 10
+member_edits = 35
+transitives_pinned = 0
+deps = ["loom", "rand", "parking_lot", "bytes", "slab", "tracing", "tempfile", "tokio", "libc", "futures"]
+
+[config]
+special = false

@@ -141,24 +141,22 @@ impl UnifyAnalyzer {
         self.manifests.get_usage_sites(dep_key)
       };
 
-      // === CRITICAL: Check for major version conflicts ===
-      // Different major versions should NEVER be merged - this is an anti-pattern
-      // that users must fix manually. Merging features across major versions
-      // produces invalid configurations (e.g., features that don't exist in the selected version).
+      // === Check for major version conflicts ===
+      // Different major versions cannot be merged - we warn and skip instead of blocking.
+      // Merging features across major versions produces invalid configurations.
       let major_versions = find_major_version_conflicts(&usage_sites);
       if major_versions.len() > 1 {
         let versions_str: Vec<_> = major_versions.iter().map(|v| v.to_string()).collect();
         issues.push(UnifyIssue {
           dep_name: dep_key.name.clone(),
-          severity: IssueSeverity::Error,
+          severity: IssueSeverity::Warning,
           message: format!(
-            "Multiple major versions detected (majors: {}) - cannot unify safely. \
-             This is an anti-pattern in Rust workspaces that causes duplicate compilation \
-             and wasted build resources. Please consolidate to a single major version.",
+            "Multiple major versions detected (majors: {}) - skipping unification. \
+             Consider consolidating to a single major version to reduce duplicate compilation.",
             versions_str.join(", ")
           ),
         });
-        continue; // Skip this dependency entirely
+        continue; // Skip this dependency, continue with others
       }
 
       // === Issue B: Check for exact version pins ===

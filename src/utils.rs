@@ -14,8 +14,8 @@ use crate::error::RailResult;
 /// - UNC paths on Windows: \\server\share
 ///
 /// Returns false for:
-/// - SSH URLs: git@github.com:user/repo.git
-/// - HTTPS URLs: <https://github.com/user/repo.git>
+/// - SSH URLs: `git@github.com:user/repo.git`
+/// - HTTPS URLs: `https://github.com/user/repo.git`
 pub fn is_local_path(path: &str) -> bool {
   let p = Path::new(path);
 

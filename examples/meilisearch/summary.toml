@@ -1,0 +1,23 @@
+repo = "meilisearch/meilisearch"
+commit = "ffd461c80"
+date = "2025-11-27"
+
+[workspace]
+members = 19
+lock_deps = 758
+rust_loc = 209557
+
+[unify]
+deps_unified = 46
+member_edits = 209
+transitives_pinned = 0
+
+[affected]
+changed_files = 34
+direct = 5
+transitive = 9
+test_targets = 10
+ci_reduction_percent = 47
+
+[config]
+special = false

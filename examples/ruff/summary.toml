@@ -1,0 +1,24 @@
+repo = "astral-sh/ruff"
+commit = "69ace0021"
+date = "2025-11-29"
+
+[workspace]
+members = 43
+lock_deps = 514
+rust_loc = 547372
+
+[unify]
+deps_unified = 0
+member_edits = 0
+transitives_pinned = 86
+note = "Already well-maintained"
+
+[affected]
+changed_files = 31
+direct = 9
+transitive = 22
+test_targets = 23
+ci_reduction_percent = 47
+
+[config]
+special = false

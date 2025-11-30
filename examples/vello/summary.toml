@@ -1,0 +1,19 @@
+repo = "linebender/vello"
+commit = "56820883"
+date = "2025-11-29"
+
+[workspace]
+members = 26
+lock_deps = 537
+rust_loc = 66106
+
+[unify]
+deps_unified = 7
+member_edits = 17
+transitives_pinned = 0
+deps = ["guillotiere", "hashbrown", "roxmltree", "env_logger", "naga", "getrandom", "parley"]
+
+[config]
+special = true
+pin_transitives = false
+note = "Virtual workspace with unpublished path dependencies"

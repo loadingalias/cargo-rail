@@ -1,3 +1,5 @@
+//! `cargo rail sync` - Bidirectional sync between monorepo and split repositories.
+
 use std::io::IsTerminal;
 use std::str::FromStr;
 

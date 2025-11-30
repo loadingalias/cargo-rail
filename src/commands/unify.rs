@@ -64,12 +64,25 @@ pub fn run_unify_analyze(
         "member_edits_count": plan.member_edits.values().map(|v| v.len()).sum::<usize>(),
         "members_affected": plan.member_edits.len(),
         "transitive_pins_count": plan.transitive_pins.len(),
+        "duplicates_unified": plan.duplicates_cleaned.len(),
+        "dead_features_pruned": plan.pruned_features.len(),
+        "version_mismatches": plan.version_mismatches.len(),
+        "unused_deps": plan.unused_deps.len(),
       },
       "has_blocking_issues": plan.has_blocking_issues(),
       "issues": plan.issues.iter().map(|i| serde_json::json!({
         "dep_name": i.dep_name,
         "severity": format!("{:?}", i.severity),
         "message": i.message,
+      })).collect::<Vec<_>>(),
+      "duplicates_cleaned": plan.duplicates_cleaned.iter().map(|d| serde_json::json!({
+        "dep_name": d.dep_name,
+        "selected_version": d.selected_version,
+        "previous_versions": d.versions_found,
+      })).collect::<Vec<_>>(),
+      "pruned_features": plan.pruned_features.iter().map(|f| serde_json::json!({
+        "crate_name": f.crate_name,
+        "feature_name": f.feature_name,
       })).collect::<Vec<_>>(),
     });
     println!(
