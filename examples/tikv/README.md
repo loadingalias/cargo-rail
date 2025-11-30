@@ -47,16 +47,11 @@ cargo rail unify
 ```toml
 # .config/rail.toml
 [unify]
-include_paths = true
-include_renamed = false
-pin_transitives = true
-transitive_host = "root"
+pin_transitives = false  # No workspace-hack
+msrv = true
+detect_unused = true
 exclude = ["uuid", "semver", "derive_more", "nom"]  # Multi-version deps
-include = []
-msrv = false
-strict_version_compat = true
-exact_pin_handling = "skip"  # Skip exact pins in this codebase
-detect_unused = false
+exact_pin_handling = "skip"
 ```
 
 ## Notes

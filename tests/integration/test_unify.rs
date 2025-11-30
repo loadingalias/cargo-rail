@@ -1123,6 +1123,7 @@ root = "."
 
 [unify]
 include_renamed = false
+detect_unused = false
 "#,
   )?;
 

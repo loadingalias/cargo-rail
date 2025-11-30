@@ -1,11 +1,10 @@
 repo = "pola-rs/polars"
 commit = "a03ac9595e"
-date = "2025-11-28"
+date = "2025-11-30"
 
 [workspace]
 members = 33
 lock_deps = 579
-rust_loc = 433429
 
 [unify]
 deps_unified = 2
@@ -15,4 +14,7 @@ deps = ["getrandom", "lz4"]
 
 [config]
 special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
 note = "Already well-maintained, minimal unification needed"

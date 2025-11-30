@@ -1,0 +1,36 @@
+repo = "HelixDB/helix-db"
+commit = "5a5c21d8"
+date = "2025-11-30"
+
+[workspace]
+members = 6
+lock_deps = 523
+
+[unify]
+deps_unified = 16
+member_edits = 44
+transitives_pinned = 0
+deps = [
+    "clap",
+    "uuid",
+    "tracing",
+    "tokio",
+    "dotenvy",
+    "inventory",
+    "heed3",
+    "serde_json",
+    "bumpalo",
+    "reqwest",
+    "num_cpus",
+    "tempfile",
+    "rand",
+    "serde",
+    "chrono",
+    "flume",
+]
+
+[config]
+special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true

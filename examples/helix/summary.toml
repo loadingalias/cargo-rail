@@ -1,23 +1,36 @@
 repo = "helix-editor/helix"
 commit = "24f45746c"
-date = "2025-11-25"
+date = "2025-11-30"
 
 [workspace]
 members = 13
 lock_deps = 327
-rust_loc = 125069
 
 [unify]
 deps_unified = 16
 member_edits = 66
 transitives_pinned = 0
-
-[affected]
-changed_files = 13
-direct = 2
-transitive = 4
-test_targets = 5
-ci_reduction_percent = 62
+deps = [
+    "smallvec",
+    "indoc",
+    "termini",
+    "chrono",
+    "etcetera",
+    "crossterm",
+    "log",
+    "libc",
+    "once_cell",
+    "anyhow",
+    "rustix",
+    "serde_json",
+    "fern",
+    "tokio",
+    "url",
+    "serde",
+]
 
 [config]
 special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true

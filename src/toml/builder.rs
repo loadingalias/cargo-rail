@@ -1,7 +1,7 @@
 //! High-level TOML document builders
 
 use super::format::{TomlFormatter, TomlValue};
-use crate::config::{ReleaseConfig, UnifyConfig};
+use crate::config::{ChangeDetectionConfig, ReleaseConfig, UnifyConfig};
 use crate::error::RailResult;
 
 /// Rail config builder
@@ -77,7 +77,7 @@ impl RailConfigBuilder {
     ));
 
     content.push_str(&format!(
-      "pin_transitives = {}  # Pin transitive-only deps with fragmented features (workspace-hack replacement) (default: true)\n",
+      "pin_transitives = {}  # Pin transitive-only deps (workspace-hack replacement, enable for hakari users) (default: false)\n",
       config.pin_transitives
     ));
 
@@ -115,7 +115,7 @@ impl RailConfigBuilder {
 
     // MSRV computation
     content.push_str(&format!(
-      "msrv = {}  # Compute and write rust-version to workspace manifest (default: false)\n",
+      "msrv = {}  # Compute and write rust-version to workspace manifest (default: true)\n",
       config.msrv
     ));
 
@@ -138,8 +138,26 @@ impl RailConfigBuilder {
 
     // Unused dependency detection
     content.push_str(&format!(
-      "detect_unused = {}  # Detect unused dependencies (default: false)\n",
+      "detect_unused = {}  # Detect unused dependencies (default: true)\n",
       config.detect_unused
+    ));
+
+    // Remove unused dependencies
+    content.push_str(&format!(
+      "remove_unused = {}  # Auto-remove unused deps when applying (default: true)\n",
+      config.remove_unused
+    ));
+
+    // Max backups
+    content.push_str(&format!(
+      "max_backups = {}  # Number of backup files to keep (default: 3)\n",
+      config.max_backups
+    ));
+
+    // Prune dead features
+    content.push_str(&format!(
+      "prune_dead_features = {}  # Remove features never enabled in resolved graph (default: true)\n",
+      config.prune_dead_features
     ));
 
     self.sections.push(format!("[unify]\n{}\n", content));
@@ -165,6 +183,16 @@ impl RailConfigBuilder {
     content.push_str(&format!("sign_tags = {}\n", config.sign_tags));
     content.push_str(&format!("changelog_path = \"{}\"\n", config.changelog_path));
 
+    // Changelog relative to
+    let changelog_relative_str = match config.changelog_relative_to {
+      crate::config::ChangelogRelativeTo::Crate => "crate",
+      crate::config::ChangelogRelativeTo::Workspace => "workspace",
+    };
+    content.push_str(&format!(
+      "changelog_relative_to = \"{}\"  # \"crate\" or \"workspace\" (default: crate)\n",
+      changelog_relative_str
+    ));
+
     if config.skip_changelog_for.is_empty() {
       content.push_str("skip_changelog_for = []\n");
     } else {
@@ -180,6 +208,32 @@ impl RailConfigBuilder {
     ));
 
     self.sections.push(format!("[release]\n{}\n", content));
+    self
+  }
+
+  /// Add change-detection section
+  pub fn change_detection(&mut self, config: &ChangeDetectionConfig) -> &mut Self {
+    let mut content = String::new();
+
+    // Infrastructure patterns
+    content.push_str("# Files that trigger full workspace rebuild when changed\n");
+    content.push_str(&format!(
+      "infrastructure = {}\n",
+      self.formatter.array_string(&config.infrastructure, None)
+    ));
+
+    // Custom patterns (only if non-empty)
+    if !config.custom.is_empty() {
+      content.push_str("\n# Custom path categories for change detection\n");
+      for (category, patterns) in &config.custom {
+        content.push_str(&format!("[change-detection.custom.{}]\n", category));
+        content.push_str(&format!("patterns = {}\n", self.formatter.array_string(patterns, None)));
+      }
+    } else {
+      content.push_str("# custom = {}  # Custom path categories (e.g., custom.verify = [\"verify/**/*.rs\"])\n");
+    }
+
+    self.sections.push(format!("[change-detection]\n{}\n", content));
     self
   }
 
@@ -338,6 +392,7 @@ mod tests {
       .targets(&config.targets)
       .unify(&config.unify)
       .release(&config.release)
+      .change_detection(&config.change_detection)
       .splits_template()
       .build()
       .unwrap();
@@ -345,6 +400,7 @@ mod tests {
     assert!(output.contains("targets"));
     assert!(output.contains("[unify]"));
     assert!(output.contains("[release]"));
+    assert!(output.contains("[change-detection]"));
     assert!(output.contains("# [crates.my-crate.split]"));
   }
 

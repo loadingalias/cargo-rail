@@ -64,6 +64,7 @@ pub fn run_init(
     .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
+    .change_detection(&config.change_detection)
     .splits_template()
     .build()?;
 
@@ -182,6 +183,7 @@ pub fn run_init_standalone(
     .targets(&config.targets)
     .unify(&config.unify)
     .release(&config.release)
+    .change_detection(&config.change_detection)
     .splits_template()
     .build()?;
 

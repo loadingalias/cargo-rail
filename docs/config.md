@@ -34,10 +34,7 @@ Dependency unification settings.
 
 ```toml
 [unify]
-pin_transitives = true
-detect_unused = false
-remove_unused = false
-msrv = false
+pin_transitives = true   # Enable for hakari/workspace-hack users
 exclude = ["problem-dep"]
 ```
 
@@ -45,16 +42,17 @@ exclude = ["problem-dep"]
 |--------|------|---------|-------------|
 | `include_paths` | bool | `true` | Unify path dependencies |
 | `include_renamed` | bool | `false` | Include `package = "..."` deps |
-| `pin_transitives` | bool | `true` | Pin fragmented transitives (hakari replacement) |
+| `pin_transitives` | bool | `false` | Pin fragmented transitives (enable for hakari users) |
 | `transitive_host` | string | `"root"` | Where to put pinned dev-deps |
 | `exclude` | string[] | `[]` | Dependencies to skip |
 | `include` | string[] | `[]` | Dependencies to force-unify |
 | `max_backups` | int | `3` | Backups to keep |
-| `msrv` | bool | `false` | Compute and write MSRV |
+| `msrv` | bool | `true` | Compute and write MSRV |
 | `strict_version_compat` | bool | `true` | Error on version conflicts |
 | `exact_pin_handling` | enum | `"warn"` | `"skip"`, `"preserve"`, `"warn"` |
-| `detect_unused` | bool | `false` | Detect unused dependencies |
-| `remove_unused` | bool | `false` | Auto-remove unused (requires detect_unused) |
+| `detect_unused` | bool | `true` | Detect unused dependencies |
+| `remove_unused` | bool | `true` | Auto-remove unused (requires detect_unused) |
+| `prune_dead_features` | bool | `true` | Remove features never enabled in graph |
 
 ---
 
@@ -64,15 +62,15 @@ Release automation settings.
 
 ```toml
 [release]
-tag_format = "{crate}@{version}"
+tag_format = "{crate}-{prefix}{version}"
 create_github_release = true
 publish_delay = 5
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `tag_prefix` | string | `""` | Git tag prefix |
-| `tag_format` | string | `"{crate}@{version}"` | Tag template (`{crate}`, `{version}`, `{prefix}`) |
+| `tag_prefix` | string | `"v"` | Git tag prefix (used via `{prefix}`) |
+| `tag_format` | string | `"{crate}-{prefix}{version}"` | Tag template (`{crate}`, `{version}`, `{prefix}`) |
 | `require_clean` | bool | `true` | Require clean working directory |
 | `publish_delay` | int | `5` | Seconds between publishes |
 | `create_github_release` | bool | `false` | Create GitHub release via `gh` |
@@ -169,19 +167,28 @@ skip = true
 ### Minimal
 
 ```toml
-# Just enable unification with defaults
+# Just run `cargo rail init` - defaults are sensible
+# msrv, detect_unused, remove_unused, prune_dead_features all default to true
+```
+
+### Hakari/workspace-hack users
+
+```toml
 [unify]
+pin_transitives = true  # Enable transitive pinning (replaces workspace-hack)
+```
+
+### With renamed dependencies
+
+```toml
+[unify]
+include_renamed = true  # Handle package = "..." renames
 ```
 
 ### CI-optimized monorepo
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-pin_transitives = true
-detect_unused = true
-remove_unused = true
 
 [release]
 require_changelog_entries = true
@@ -217,7 +224,5 @@ targets = [
 ]
 
 [unify]
-pin_transitives = true
-msrv = true
 exclude = ["openssl"]  # platform-specific, skip
 ```

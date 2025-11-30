@@ -1,18 +1,20 @@
 repo = "BurntSushi/ripgrep"
 commit = "cd1f981"
-date = "2025-11-29"
+date = "2025-11-30"
 
 [workspace]
 members = 10
 lock_deps = 61
-rust_loc = 52258
 
 [unify]
 deps_unified = 9
 member_edits = 35
 transitives_pinned = 5
-deps = ["serde_json", "regex", "serde", "bstr", "memchr", "termcolor", "globset", "walkdir", "log"]
+deps = ["serde", "bstr", "walkdir", "log", "serde_json", "globset", "regex", "termcolor", "memchr"]
 
 [config]
 special = false
-note = "Surprise: 10 workspace members, not 1!"
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
+note = "10 workspace members, not a single crate!"

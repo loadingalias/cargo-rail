@@ -1,19 +1,20 @@
 repo = "linebender/vello"
 commit = "56820883"
-date = "2025-11-29"
+date = "2025-11-30"
 
 [workspace]
 members = 26
 lock_deps = 537
-rust_loc = 66106
 
 [unify]
 deps_unified = 7
 member_edits = 17
-transitives_pinned = 0
-deps = ["guillotiere", "hashbrown", "roxmltree", "env_logger", "naga", "getrandom", "parley"]
+transitives_pinned = 70
+deps = ["getrandom", "env_logger", "guillotiere", "hashbrown", "roxmltree", "naga", "parley"]
 
 [config]
 special = true
-pin_transitives = false
+pin_transitives = false # No workspace-hack, virtual workspace
+msrv = true
+detect_unused = true
 note = "Virtual workspace with unpublished path dependencies"

@@ -30,6 +30,9 @@ update:
     cargo update --workspace
     cargo upgrade --recursive
 
+gen-docs:
+    @scripts/docs/generate.sh
+
 # Pin GitHub Actions to commit SHAs for security
 pin-actions:
     @scripts/ci/pin-actions.sh --update-lock

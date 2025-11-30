@@ -44,16 +44,9 @@ cargo rail unify
 ```toml
 # .config/rail.toml
 [unify]
-include_paths = true
-include_renamed = false
-pin_transitives = false  # REQUIRED - path deps can't be resolved from crates.io
-transitive_host = "root"
-exclude = []
-include = []
-msrv = false
-strict_version_compat = true
-exact_pin_handling = "warn"
-detect_unused = false
+pin_transitives = false  # No workspace-hack, virtual workspace
+msrv = true
+detect_unused = true
 ```
 
 ## Notes

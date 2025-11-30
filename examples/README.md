@@ -14,15 +14,19 @@ Each subdirectory contains:
 
 | Project | Focus | Key Result |
 |---------|-------|------------|
-| [tokio](./tokio/) | Async runtime | 10 deps unified, 35 edits saved |
-| [polars](./polars/) | DataFrame library | Already well-maintained (2 deps) |
-| [ruff](./ruff/) | Python linter | 47% CI reduction with `affected` |
-| [vello](./vello/) | GPU 2D rendering | 7 deps unified (virtual workspace) |
-| [helix](./helix/) | Text editor | 62% CI reduction, 16 deps unified |
-| [tikv](./tikv/) | Distributed KV store | 56 deps unified, 514 edits saved |
-| [iced](./iced/) | GUI framework | 164 transitives pinned |
-| [meilisearch](./meilisearch/) | Search engine | 46 deps unified + 47% CI reduction |
-| [ripgrep](./ripgrep/) | Search tool | 9 deps unified (10 crates, not 1!) |
+| [codex](./codex/) | AI CLI (48 crates) | 2 deps unified, 132 transitives pinned |
+| [helix](./helix/) | Text editor (13 crates) | 16 deps unified, 66 edits saved |
+| [helix-db](./helix-db/) | Graph database (6 crates) | 16 deps unified, 44 edits saved |
+| [iced](./iced/) | GUI framework (71 crates) | 6 deps unified, 161 transitives pinned |
+| [jj](./jj/) | Git-compatible VCS (5 crates) | Well-maintained, 109 transitives |
+| [meilisearch](./meilisearch/) | Search engine (19 crates) | 46 deps unified, 209 edits saved |
+| [neon](./neon/) | Serverless Postgres (49 crates) | Uses hakari, pin_transitives=true |
+| [polars](./polars/) | DataFrame library (33 crates) | Well-maintained, 2 deps unified |
+| [ripgrep](./ripgrep/) | Search tool (10 crates) | 9 deps unified, 35 edits saved |
+| [ruff](./ruff/) | Python linter (43 crates) | Well-maintained, 86 transitives |
+| [tikv](./tikv/) | Distributed KV (83 crates) | 57 deps unified, 516 edits saved |
+| [tokio](./tokio/) | Async runtime (10 crates) | 10 deps unified, 35 edits saved |
+| [vello](./vello/) | GPU 2D rendering (26 crates) | 7 deps unified, 70 transitives |
 
 ## Quick Start
 

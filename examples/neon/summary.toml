@@ -1,0 +1,20 @@
+repo = "neondatabase/neon"
+commit = "015b1c7cb"
+date = "2025-11-30"
+
+[workspace]
+members = 49
+lock_deps = 791
+
+[unify]
+deps_unified = 7
+member_edits = 42
+transitives_pinned = 89
+deps = ["p256", "memchr", "rand_distr", "ecdsa", "signature", "zstd", "bytes"]
+
+[config]
+special = true
+pin_transitives = true # HAS hakari/workspace_hack - MUST be true
+msrv = true
+detect_unused = true
+note = "Uses cargo-hakari, pin_transitives replaces workspace_hack crate"

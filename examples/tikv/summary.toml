@@ -1,19 +1,78 @@
 repo = "tikv/tikv"
 commit = "9f88068b3"
-date = "2025-11-27"
+date = "2025-11-30"
 
 [workspace]
 members = 83
 lock_deps = 758
-rust_loc = 631970
 
 [unify]
-deps_unified = 56
-member_edits = 514
+deps_unified = 57
+member_edits = 516
 transitives_pinned = 0
+deps = [
+    "matches",
+    "criterion",
+    "structopt",
+    "bytes",
+    "tempdir",
+    "libc",
+    "syn",
+    "flate2",
+    "fxhash",
+    "protobuf",
+    "hyper",
+    "http",
+    "crc32fast",
+    "static_assertions",
+    "paste",
+    "itertools",
+    "byteorder",
+    "slog",
+    "atomic",
+    "regex",
+    "toml",
+    "tempfile",
+    "thiserror",
+    "serde_json",
+    "base64",
+    "fs2",
+    "tokio",
+    "lazy_static",
+    "proptest",
+    "serde",
+    "backtrace",
+    "sysinfo",
+    "hex",
+    "url",
+    "dashmap",
+    "num",
+    "strum",
+    "parking_lot",
+    "getset",
+    "slog_derive",
+    "quote",
+    "futures",
+    "bstr",
+    "pprof",
+    "fail",
+    "gag",
+    "cc",
+    "num_cpus",
+    "log",
+    "anyhow",
+    "smallvec",
+    "bitflags",
+    "rand",
+    "walkdir",
+    "prometheus",
+    "crc64fast",
+    "serde_derive",
+]
 
 [config]
-special = true
-exclude = ["uuid", "semver", "derive_more", "nom"]
-exact_pin_handling = "skip"
-note = "Multi-version dependencies must be excluded"
+special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
+note = "Multi-version deps (uuid, semver, etc.) auto-skipped"

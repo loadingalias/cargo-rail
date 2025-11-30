@@ -142,7 +142,7 @@ Native changelog generation. Configurable publish delays. GitHub releases via `g
 
 ## Why cargo-rail
 
-### 12 dependencies, 92 resolved
+### 12 dependencies, 98 resolved
 
 Compare: cargo-hakari pulls ~40 direct via guppy. release-plz pulls 600+ resolved.
 
@@ -206,28 +206,57 @@ Run `cargo rail <command> --help` for details, or see [docs/commands.md](docs/co
 ## Configuration
 
 ```bash
-cargo rail init  # Auto-detects targets, generates rail.toml
+cargo rail init  # Auto-detects targets, generates .config/rail.toml
 ```
 
+Generated config with all options and defaults:
+
 ```toml
-# .config/rail.toml or rail.toml
+# .config/rail.toml (or rail.toml, .rail.toml, .cargo/rail.toml)
+
+# Platform targets for multi-target validation (auto-detected from rust-toolchain.toml, .cargo/config.toml, etc.)
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
 
 [unify]
-pin_transitives = true      # Pin transitive-only deps (workspace-hack replacement)
-msrv = true                 # Compute and set workspace MSRV
-detect_unused = true        # Find unused dependencies
-remove_unused = true        # Remove them automatically
-prune_dead_features = true  # Remove features never used
-exclude = ["openssl"]       # Skip specific deps
+include_paths = true           # Handle path dependencies (default: true)
+include_renamed = false        # Handle renamed deps with package = "..." (default: false)
+pin_transitives = false        # Pin transitive-only deps - enable for hakari users (default: false)
+transitive_host = "root"       # Where to put pinned transitive dev-deps: "root" or "crates/foo"
+exclude = []                   # Dependencies to skip unification
+include = []                   # Dependencies to force-include
+msrv = true                    # Compute workspace MSRV from deps (default: true)
+strict_version_compat = true   # Treat version mismatches as errors (default: true)
+exact_pin_handling = "warn"    # How to handle =x.y.z pins: skip, preserve, warn (default: warn)
+detect_unused = true           # Detect unused dependencies (default: true)
+remove_unused = true           # Auto-remove unused deps (default: true)
+max_backups = 3                # Number of backup files to keep (default: 3)
+prune_dead_features = true     # Remove features never enabled in graph (default: true)
 
 [release]
-publish_delay = 5           # Seconds between crates.io publishes
-create_github_release = true
+tag_prefix = "v"                        # Prefix for tags
+tag_format = "{crate}-{prefix}{version}" # Tag template: {crate}, {prefix}, {version}
+require_clean = true                    # Require clean working directory
+publish_delay = 5                       # Seconds between crates.io publishes
+create_github_release = false           # Create GitHub releases via gh CLI
+sign_tags = false                       # Sign tags with GPG/SSH
+changelog_path = "CHANGELOG.md"         # Path to changelog file
+changelog_relative_to = "crate"         # "crate" or "workspace"
+skip_changelog_for = []                 # Crates to skip changelog generation
+require_changelog_entries = false       # Error if no changelog entries
 
+[change-detection]
+# Files that trigger full workspace rebuild
+infrastructure = [".github/**", "scripts/**", "justfile", "Makefile", "*.sh"]
+# custom.verify = ["verify/**/*.rs"]    # Custom path categories
+
+# Per-crate configuration
 [crates.my-crate.split]
 remote = "git@github.com:org/my-crate.git"
-mode = "single"             # or "multi", "workspace"
+branch = "main"
+mode = "single"  # single, combined, or monorepo
+
+[crates.my-crate.release]
+publish = true
 ```
 
 ---

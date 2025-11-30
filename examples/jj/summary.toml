@@ -1,0 +1,19 @@
+repo = "jj-vcs/jj"
+commit = "711484da7"
+date = "2025-11-30"
+
+[workspace]
+members = 5
+lock_deps = 505
+
+[unify]
+deps_unified = 0
+member_edits = 0
+transitives_pinned = 109
+
+[config]
+special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
+note = "Already well-maintained, no unification needed"

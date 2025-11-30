@@ -1,18 +1,20 @@
 repo = "iced-rs/iced"
 commit = "ba387777"
-date = "2025-11-29"
+date = "2025-11-30"
 
 [workspace]
 members = 71
 lock_deps = 772
-rust_loc = 96619
 
 [unify]
 deps_unified = 6
 member_edits = 20
-transitives_pinned = 164
-deps = ["reqwest", "serde", "rand", "webbrowser", "iced", "serde_json"]
+transitives_pinned = 161
+deps = ["webbrowser", "serde", "rand", "iced", "reqwest", "serde_json"]
 
 [config]
 special = false
-note = "164 transitives pinned - workspace-hack replacement"
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
+note = "Large GUI framework, 161 transitives pinned for build consistency"

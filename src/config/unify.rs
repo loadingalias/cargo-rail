@@ -15,10 +15,11 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub include_renamed: bool,
 
-  /// Pin transitive-only deps with fragmented features? (default: true)
+  /// Pin transitive-only deps with fragmented features? (default: false)
   /// This is cargo-rail's workspace-hack replacement
   /// When enabled, transitive deps with multiple feature sets are pinned in workspace.dependencies
-  #[serde(default = "default_pin_transitives")]
+  /// Only enable if your project uses cargo-hakari or a workspace-hack crate
+  #[serde(default)]
   pub pin_transitives: bool,
 
   /// Where to put pinned transitive dev-deps? (default: "root")
@@ -39,17 +40,17 @@ pub struct UnifyConfig {
   #[serde(default = "default_max_backups")]
   pub max_backups: usize,
 
-  /// Compute and write MSRV to workspace manifest? (default: false)
+  /// Compute and write MSRV to workspace manifest? (default: true)
   /// When enabled, cargo-rail computes the maximum rust-version from all
   /// resolved dependencies and writes it to [workspace.package].rust-version
-  #[serde(default)]
+  #[serde(default = "default_true")]
   pub msrv: bool,
 
-  /// Prune features not referenced in source code? (default: false)
+  /// Prune features not referenced in source code? (default: true)
   /// When enabled, analyzes the resolved dependency graph to detect features
   /// that are declared but never enabled by any consumer across all targets.
   /// This produces the absolute leanest feature set for the workspace.
-  #[serde(default)]
+  #[serde(default = "default_true")]
   pub prune_dead_features: bool,
 
   /// Strict version compatibility checking (default: true)
@@ -66,16 +67,16 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub exact_pin_handling: ExactPinHandling,
 
-  /// Detect unused dependencies in workspace members (default: false)
+  /// Detect unused dependencies in workspace members (default: true)
   /// When enabled, compares declared deps against the resolved cargo graph
   /// to find deps that are declared but never actually used.
-  #[serde(default)]
+  #[serde(default = "default_true")]
   pub detect_unused: bool,
 
-  /// Automatically remove unused dependencies when applying (default: false)
+  /// Automatically remove unused dependencies when applying (default: true)
   /// Requires detect_unused = true. When enabled, unused deps are removed
   /// from member Cargo.toml files during unify.
-  #[serde(default)]
+  #[serde(default = "default_true")]
   pub remove_unused: bool,
 }
 
@@ -84,17 +85,17 @@ impl Default for UnifyConfig {
     Self {
       include_paths: default_include_paths(),
       include_renamed: false,
-      pin_transitives: default_pin_transitives(),
+      pin_transitives: false,
       transitive_host: default_transitive_host(),
       exclude: Vec::new(),
       include: Vec::new(),
       max_backups: default_max_backups(),
-      msrv: false,
-      prune_dead_features: false,
+      msrv: true,
+      prune_dead_features: true,
       strict_version_compat: true,
       exact_pin_handling: ExactPinHandling::default(),
-      detect_unused: false,
-      remove_unused: false,
+      detect_unused: true,
+      remove_unused: true,
     }
   }
 }
@@ -192,10 +193,6 @@ fn default_include_paths() -> bool {
   true
 }
 
-fn default_pin_transitives() -> bool {
-  true
-}
-
 fn default_transitive_host() -> TransitiveFeatureHost {
   TransitiveFeatureHost::Root
 }
@@ -236,10 +233,13 @@ mod tests {
     let config = UnifyConfig::default();
     assert!(config.include_paths); // Default: true
     assert!(!config.include_renamed); // Default: false
-    assert!(config.pin_transitives); // Default: true
+    assert!(!config.pin_transitives); // Default: false (only true for hakari users)
     assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
     assert!(config.exclude.is_empty());
     assert!(config.include.is_empty());
+    assert!(config.msrv); // Default: true
+    assert!(config.detect_unused); // Default: true
+    assert!(config.remove_unused); // Default: true
   }
 
   #[test]
@@ -284,13 +284,13 @@ mod tests {
   fn test_unify_config_default_transitive_host() {
     let config = UnifyConfig::default();
     assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
-    assert!(config.pin_transitives); // Default is true (workspace-hack replacement)
+    assert!(!config.pin_transitives); // Default is false (opt-in for hakari users)
   }
 
   #[test]
   fn test_prune_dead_features_default() {
     let config = UnifyConfig::default();
-    assert!(!config.prune_dead_features);
+    assert!(config.prune_dead_features); // Default: true
   }
 
   #[test]
@@ -334,8 +334,8 @@ mod tests {
   #[test]
   fn test_detect_unused_default() {
     let config = UnifyConfig::default();
-    assert!(!config.detect_unused);
-    assert!(!config.remove_unused);
+    assert!(config.detect_unused); // Default: true
+    assert!(config.remove_unused); // Default: true
   }
 
   #[test]

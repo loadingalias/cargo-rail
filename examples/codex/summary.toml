@@ -1,0 +1,20 @@
+repo = "openai/codex"
+commit = "cbd7d0d54"
+date = "2025-11-30"
+
+[workspace]
+members = 48
+lock_deps = 757
+
+[unify]
+deps_unified = 2
+member_edits = 19
+transitives_pinned = 132
+deps = ["reqwest", "serde"]
+
+[config]
+special = false
+pin_transitives = false # No workspace-hack
+msrv = true
+detect_unused = true
+note = "Mixed TS/Rust repo, workspace in codex-rs/"
