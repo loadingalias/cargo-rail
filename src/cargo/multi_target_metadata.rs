@@ -316,7 +316,19 @@ impl MultiTargetMetadata {
 
       if unique_sets.len() > 1 {
         // This dep has different features across builds = fragmented
-        let all_features: HashSet<String> = features.values().flat_map(|s| s.iter().cloned()).collect();
+        //
+        // IMPORTANT: Use INTERSECTION of features, not union!
+        // Using union can enable features that pull in new transitive deps
+        // that aren't in the current Cargo.lock, breaking resolution.
+        // The intersection approach is safe - it only pins features that
+        // are already enabled everywhere, avoiding new dep introduction.
+        let common_features: HashSet<String> = features
+          .values()
+          .fold(None, |acc: Option<HashSet<String>>, set| match acc {
+            None => Some(set.clone()),
+            Some(existing) => Some(existing.intersection(set).cloned().collect()),
+          })
+          .unwrap_or_default();
 
         // Get the resolved version (use highest across all targets)
         let versions = self.all_versions(&dep_name);
@@ -329,7 +341,7 @@ impl MultiTargetMetadata {
           name: dep_name.to_string(),
           version,
           feature_sets: features,
-          unified_features: all_features.into_iter().collect(),
+          unified_features: common_features.into_iter().collect(),
         });
       }
     }

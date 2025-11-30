@@ -26,6 +26,7 @@ rules.md
 ARCHITECTURE.md
 style.md
 demos/
+setup
 
 # Cargo-Rail (Testing)
 *rail.toml

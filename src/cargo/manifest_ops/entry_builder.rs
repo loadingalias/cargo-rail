@@ -126,23 +126,30 @@ pub fn build_transitive_entry(features: &[String]) -> Item {
 /// Build a versioned dependency entry for [workspace.dependencies]
 ///
 /// Used when adding transitive dependencies to workspace.dependencies.
-/// Creates entries like: `dep = { version = "1.0", features = ["foo"] }`
+/// Creates entries like: `dep = { version = "1.0", default-features = false, features = ["foo"] }`
+///
+/// IMPORTANT: When pinning transitives with explicit features, we MUST set
+/// `default-features = false` to prevent cargo from enabling default features
+/// that might pull in new dependencies not present in the current Cargo.lock.
 ///
 /// # Arguments
 ///
 /// * `version` - The semver version to use
-/// * `features` - Features to enable
+/// * `features` - Features to enable (intersection across all targets)
 pub fn build_versioned_dep_entry(version: &semver::Version, features: &[String]) -> Item {
-  // Simple case: just version, no features
+  // Simple case: just version, no features - let cargo use defaults
+  // This is safe because we're not changing the feature set
   if features.is_empty() {
     let mut value = Value::from(format!("^{}", version));
     value.decor_mut().set_suffix(" #unified");
     return Item::Value(value);
   }
 
-  // Complex case: version + features
+  // Complex case: version + explicit features
+  // MUST disable default-features to avoid pulling in new deps
   let mut table = InlineTable::new();
   table.insert("version", Value::from(format!("^{}", version)));
+  table.insert("default-features", Value::from(false));
   table.insert("features", build_feature_array(features));
 
   // Add #unified comment marker
