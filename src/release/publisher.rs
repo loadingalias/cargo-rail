@@ -6,6 +6,7 @@ use crate::release::changelog::ChangelogGenerator;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
 use crate::release::version::VersionBumper;
 use crate::workspace::WorkspaceContext;
+use chrono::Local;
 use std::fs;
 use std::process::Command;
 use std::thread;
@@ -206,8 +207,8 @@ impl<'a> ReleasePublisher<'a> {
       updated.push_str("\n\n");
     }
 
-    // Add new version with current date (get from git commit date or system)
-    let date = self.get_current_date()?;
+    // Add new version with today's date
+    let date = self.get_current_date();
     updated.push_str(&self.format_version_header(plan, previous_tag.as_deref(), &date, github_repo.as_ref()));
     updated.push_str(&new_entries);
     updated.push('\n');
@@ -366,30 +367,9 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
-  /// Get current date in YYYY-MM-DD format (using system git)
-  fn get_current_date(&self) -> RailResult<String> {
-    // Use git to get current date (portable across platforms)
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["log", "-1", "--format=%cd", "--date=short"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to get date: {}", e)))?;
-
-    if output.status.success() {
-      let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
-      if !date.is_empty() {
-        return Ok(date);
-      }
-    }
-
-    // Fallback: use system date command
-    let output = Command::new("date")
-      .args(["+%Y-%m-%d"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to get system date: {}", e)))?;
-
-    let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(date)
+  /// Get current date in YYYY-MM-DD format
+  fn get_current_date(&self) -> String {
+    Local::now().format("%Y-%m-%d").to_string()
   }
 
   fn format_version_header(

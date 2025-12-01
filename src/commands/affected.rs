@@ -411,19 +411,46 @@ fn format_names_only(analysis: &AffectedAnalysis) -> String {
 }
 
 /// Format GitHub Actions output for $GITHUB_OUTPUT
+///
+/// Outputs all fields that GitHub Actions workflows commonly need:
+/// - Core: crates, affected_count, test_matrix
+/// - Classification: docs_only, rebuild_all
+/// - Details: direct, transitive, changed_files_count
+/// - Infrastructure: infrastructure_files (JSON array)
+/// - Custom: custom_categories (JSON object)
 fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
-  let (_, _, test_targets) = get_sorted_analysis(analysis);
+  let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
   let test_matrix = serde_json::to_string(&test_targets)
     .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
 
+  let infrastructure_files = serde_json::to_string(&classification.infrastructure_files)
+    .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
+
+  let custom_categories = serde_json::to_string(&classification.custom_categories)
+    .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
+
   Ok(format!(
-    "docs_only={}\nrebuild_all={}\ntest_matrix={}\naffected_count={}\ncrates={}",
+    "docs_only={}\n\
+     rebuild_all={}\n\
+     test_matrix={}\n\
+     affected_count={}\n\
+     crates={}\n\
+     direct={}\n\
+     transitive={}\n\
+     changed_files_count={}\n\
+     infrastructure_files={}\n\
+     custom_categories={}",
     classification.docs_only,
     classification.rebuild_all,
     test_matrix,
     test_targets.len(),
-    test_targets.join(" ")
+    test_targets.join(" "),
+    direct.join(" "),
+    dependents.join(" "),
+    analysis.changed_files.len(),
+    infrastructure_files,
+    custom_categories,
   ))
 }
 
