@@ -10,6 +10,7 @@ lock_deps = 523
 deps_unified = 16
 member_edits = 44
 transitives_pinned = 0
+dead_features_pruned = 8
 deps = [
     "clap",
     "uuid",

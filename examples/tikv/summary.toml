@@ -10,6 +10,7 @@ lock_deps = 758
 deps_unified = 57
 member_edits = 516
 transitives_pinned = 0
+dead_features_pruned = 112
 deps = [
     "matches",
     "criterion",
@@ -71,8 +72,9 @@ deps = [
 ]
 
 [config]
-special = false
-pin_transitives = false # No workspace-hack
-msrv = true
+special = true
+pin_transitives = false  # No workspace-hack
+msrv = false  # MSRV breaks git dep resolution for raft-engine
 detect_unused = true
-note = "Multi-version deps (uuid, semver, etc.) auto-skipped"
+prune_dead_features = true
+note = "Multi-version deps (uuid, semver, etc.) auto-skipped. Disable MSRV for git deps compatibility."

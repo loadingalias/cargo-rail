@@ -31,7 +31,7 @@ cargo rail affected --since HEAD~5
 |--------|-------|
 | Workspace members | 5 |
 | Dependencies unified | 0 |
-| Transitives pinned | 107 |
+| Dead features pruned | 1 |
 
 **Note:** Already well-maintained with consistent dependency versions.
 
@@ -57,7 +57,6 @@ detect_unused = true
 - Jujutsu: A Git-compatible VCS
 - Compact, well-organized workspace (5 crates)
 - Already well-maintained, no direct unification needed
-- 107 transitives can be pinned for build consistency
 - MSRV detection enabled
 
 Details in [`summary.toml`](./summary.toml).

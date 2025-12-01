@@ -9,12 +9,14 @@ lock_deps = 772
 [unify]
 deps_unified = 6
 member_edits = 20
-transitives_pinned = 161
+transitives_pinned = 0
+dead_features_pruned = 6
 deps = ["webbrowser", "serde", "rand", "iced", "reqwest", "serde_json"]
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
-note = "Large GUI framework, 161 transitives pinned for build consistency"
+prune_dead_features = true
+note = "Large GUI framework with 71 crates"

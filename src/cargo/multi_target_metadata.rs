@@ -431,3 +431,42 @@ pub struct ComputedMsrv {
   /// Total number of deps with rust-version specified
   pub deps_with_msrv: usize,
 }
+
+impl MultiTargetMetadata {
+  /// Build a mapping from package name to library name
+  ///
+  /// In Rust, a crate's package name (in Cargo.toml) can differ from its
+  /// library name (what you `use` in code). For example:
+  /// - Package: `mopa-maintained`
+  /// - Library: `mopa` (what you write as `use mopa::...`)
+  ///
+  /// The resolved dependency graph uses library names, but Cargo.toml uses
+  /// package names. This mapping allows correct lookup when detecting unused deps.
+  ///
+  /// Returns a map where:
+  /// - Key: package name (e.g., "mopa-maintained")
+  /// - Value: library name normalized with underscores (e.g., "mopa")
+  pub fn package_to_lib_name_map(&self) -> HashMap<String, String> {
+    use cargo_metadata::TargetKind;
+
+    let mut map = HashMap::new();
+
+    for metadata in self.cache.values() {
+      for pkg in &metadata.packages {
+        // Find the lib target to get the actual library name
+        let lib_name = pkg
+          .targets
+          .iter()
+          .find(|t| t.kind.contains(&TargetKind::Lib))
+          .map(|t| t.name.clone())
+          .unwrap_or_else(|| pkg.name.to_string());
+
+        // Normalize to match cargo's internal format (underscores)
+        let normalized_lib = lib_name.replace('-', "_");
+        map.insert(pkg.name.to_string(), normalized_lib);
+      }
+    }
+
+    map
+  }
+}

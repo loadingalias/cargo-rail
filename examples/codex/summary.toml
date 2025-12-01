@@ -9,12 +9,14 @@ lock_deps = 757
 [unify]
 deps_unified = 2
 member_edits = 19
-transitives_pinned = 132
+transitives_pinned = 0
+dead_features_pruned = 2
 deps = ["reqwest", "serde"]
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
+prune_dead_features = true
 note = "Mixed TS/Rust repo, workspace in codex-rs/"

@@ -9,12 +9,15 @@ lock_deps = 61
 [unify]
 deps_unified = 9
 member_edits = 35
-transitives_pinned = 5
+transitives_pinned = 0
+dead_features_pruned = 11
+unused_deps_removed = 1
 deps = ["serde", "bstr", "walkdir", "log", "serde_json", "globset", "regex", "termcolor", "memchr"]
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
+prune_dead_features = true
 note = "10 workspace members, not a single crate!"

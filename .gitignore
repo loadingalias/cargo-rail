@@ -27,6 +27,8 @@ ARCHITECTURE.md
 style.md
 demos/
 test.md
+examples/RECORDING_TEMPLATE.md
+examples/issues.md
 
 # Cargo-Rail (Testing)
 *rail.toml

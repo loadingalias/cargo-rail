@@ -10,6 +10,7 @@ lock_deps = 758
 deps_unified = 46
 member_edits = 209
 transitives_pinned = 0
+dead_features_pruned = 20
 deps = [
     "bstr",
     "anyhow",
@@ -61,6 +62,8 @@ deps = [
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
+prune_dead_features = true
+note = "Search engine with 46 deps unified"

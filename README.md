@@ -198,6 +198,7 @@ tokio = { version = "1.5" }  # ← stays exactly here
 | `init` | Generate `rail.toml` configuration |
 | `check` | Validate release readiness |
 | `clean` | Remove generated artifacts |
+| `config` | Validate configuration file |
 
 Run `cargo rail <command> --help` for details, or see [docs/commands.md](docs/commands.md)
 

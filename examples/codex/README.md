@@ -30,10 +30,11 @@ cargo rail affected --since HEAD~5
 | Metric | Value |
 |--------|-------|
 | Workspace members | 48 |
-| Dependencies unified | 0 |
-| Transitives pinned | 20 |
+| Dependencies unified | 2 |
+| Member edits | 19 |
+| Dead features pruned | 2 |
 
-**Note:** Already well-maintained, no direct unification needed.
+**Note:** Mixed TS/Rust repo, workspace in `codex-rs/`.
 
 ## Configuration
 

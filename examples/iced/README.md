@@ -29,11 +29,9 @@ cargo rail unify
 | Workspace members | 71 |
 | Dependencies unified | 6 |
 | Member edits | 20 |
-| **Transitives pinned** | **164** |
+| Dead features pruned | 6 |
 
 **Dependencies unified:** reqwest, serde, rand, webbrowser, iced, serde_json
-
-**164 transitives pinned = workspace-hack replacement!**
 
 ## Configuration
 
@@ -49,8 +47,7 @@ detect_unused = true
 
 - Cross-platform GUI framework
 - Large workspace (71 crates)
-- **Key demo:** 164 transitives pinned shows workspace-hack replacement
-- Replaces cargo-hakari without adding extra crates
-- Good example of transitive feature unification
+- Good example of dead feature pruning (6 features removed)
+- Shows unification across many example crates
 
 Details in [`summary.toml`](./summary.toml).

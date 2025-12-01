@@ -32,6 +32,7 @@ cargo rail affected --since HEAD~5
 | Workspace members | 6 |
 | Dependencies unified | 16 |
 | Member edits | 44 |
+| Dead features pruned | 8 |
 | Transitives pinned | 0 |
 
 **Dependencies unified:** reqwest, inventory, uuid, heed3, clap, rand, flume, tokio, dotenvy, tempfile, serde_json, chrono, num_cpus, tracing, serde, bumpalo

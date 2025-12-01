@@ -9,12 +9,14 @@ lock_deps = 537
 [unify]
 deps_unified = 7
 member_edits = 17
-transitives_pinned = 70
+transitives_pinned = 0
+dead_features_pruned = 10
 deps = ["getrandom", "env_logger", "guillotiere", "hashbrown", "roxmltree", "naga", "parley"]
 
 [config]
-special = true
-pin_transitives = false # No workspace-hack, virtual workspace
+special = false
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
-note = "Virtual workspace with unpublished path dependencies"
+prune_dead_features = true
+note = "GPU rendering library (26 crates)"

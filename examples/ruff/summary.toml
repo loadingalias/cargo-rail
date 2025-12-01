@@ -9,11 +9,13 @@ lock_deps = 514
 [unify]
 deps_unified = 0
 member_edits = 0
-transitives_pinned = 86
+transitives_pinned = 0
+dead_features_pruned = 4
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
+prune_dead_features = true
 note = "Already well-maintained, no unification needed"

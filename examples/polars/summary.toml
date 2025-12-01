@@ -8,13 +8,16 @@ lock_deps = 579
 
 [unify]
 deps_unified = 2
-member_edits = 4
+member_edits = 6
 transitives_pinned = 0
-deps = ["getrandom", "lz4"]
+dead_features_pruned = 214
+unused_deps_removed = 2
+deps = []
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
-note = "Already well-maintained, minimal unification needed"
+prune_dead_features = true
+note = "Already well-maintained, 214 conditional features pruned"

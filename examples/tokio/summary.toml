@@ -10,6 +10,8 @@ lock_deps = 214
 deps_unified = 10
 member_edits = 35
 transitives_pinned = 0
+dead_features_pruned = 24
+unused_deps_removed = 1
 deps = [
     "bytes",
     "rand",
@@ -25,6 +27,8 @@ deps = [
 
 [config]
 special = false
-pin_transitives = false # No workspace-hack
+pin_transitives = false  # No workspace-hack
 msrv = true
 detect_unused = true
+prune_dead_features = true
+note = "The async runtime"
