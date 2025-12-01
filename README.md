@@ -1,6 +1,6 @@
 # cargo-rail
 
-**Monorepo orchestration for Rust workspaces. 12 dependencies. Zero workspace-hack crates.**
+**Graph-aware monorepo orchestration for Rust workspaces.**
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

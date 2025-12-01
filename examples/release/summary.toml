@@ -1,0 +1,130 @@
+# Release Workflow Example
+#
+# Demonstrates cargo-rail's release management:
+# - cargo rail check: validate release readiness
+# - cargo rail release: version bump, changelog, tag, publish
+
+[example]
+type = "workflow"
+feature = "release"
+commands = ["cargo rail check", "cargo rail release"]
+
+[notes]
+description = """
+The release workflow automates the tedious parts of releasing Rust crates:
+
+1. Validate readiness (clean working directory, deps resolved)
+2. Bump version in Cargo.toml (all workspace members if needed)
+3. Generate/update CHANGELOG.md from conventional commits
+4. Create git tag with configurable format
+5. Run cargo publish with proper dependency ordering
+
+Multi-crate releases happen in topological order with configurable
+delays between publishes to let crates.io index update.
+"""
+
+# ============================================================================
+# Example rail.toml configurations
+# ============================================================================
+
+# Minimal config (single crate or simple workspace)
+[config.minimal]
+note = "Just tag and publish - no changelog"
+toml = """
+[release]
+tag_format = "{prefix}{version}"  # v1.2.3
+"""
+
+# Monorepo with per-crate tags
+[config.monorepo]
+note = "Standard monorepo setup with per-crate changelogs"
+toml = """
+[release]
+tag_prefix = "v"
+tag_format = "{crate}-{prefix}{version}"  # my-crate-v1.2.3
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "crate"           # Per-crate files
+publish_delay = 5
+require_clean = true
+"""
+
+# Unified changelog at workspace root
+[config.unified_changelog]
+note = "Single changelog file for entire workspace"
+toml = """
+[release]
+tag_format = "{crate}-{prefix}{version}"
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "workspace"       # One file at root
+"""
+
+# Per-crate overrides
+[config.per_crate]
+note = "Disable publishing for internal crates, custom paths"
+toml = """
+[release]
+tag_format = "{crate}-{prefix}{version}"
+skip_changelog_for = ["test-utils"]
+
+# Internal tooling - no crates.io
+[crates.internal-tools.release]
+publish = false
+
+# Custom changelog path
+[crates.my-public-crate.changelog]
+path = "docs/CHANGELOG.md"
+
+# Skip changelog entirely
+[crates.benchmarks.changelog]
+skip = true
+"""
+
+# GitHub release integration
+[config.github]
+note = "Create GitHub releases automatically"
+toml = """
+[release]
+tag_format = "{crate}-{prefix}{version}"
+create_github_release = true  # Uses gh CLI
+sign_tags = true              # GPG/SSH signing
+"""
+
+# ============================================================================
+# Command examples with explanations
+# ============================================================================
+
+[[commands]]
+cmd = "cargo rail check"
+desc = "Validate all crates are ready for release"
+
+[[commands]]
+cmd = "cargo rail check my-crate"
+desc = "Check specific crate only"
+
+[[commands]]
+cmd = "cargo rail release my-crate --check"
+desc = "Dry run - preview release plan"
+
+[[commands]]
+cmd = "cargo rail release my-crate"
+desc = "Release with patch bump (default)"
+
+[[commands]]
+cmd = "cargo rail release my-crate --bump minor"
+desc = "Release with minor version bump"
+
+[[commands]]
+cmd = "cargo rail release my-crate --bump 2.0.0"
+desc = "Release with explicit version"
+
+[[commands]]
+cmd = "cargo rail release --all --bump patch"
+desc = "Release all workspace crates (in dependency order)"
+
+[[commands]]
+cmd = "cargo rail release my-crate --skip-publish"
+desc = "Create tag only, don't publish to crates.io"
+
+[[commands]]
+cmd = "cargo rail release my-crate --skip-tag"
+desc = "Publish only, don't create git tag"

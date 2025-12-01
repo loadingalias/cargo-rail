@@ -60,6 +60,11 @@ pub enum MemberEdit {
     /// Target platform constraint (if in target-specific section)
     target: Option<String>,
   },
+  /// Remove a dead feature (empty no-op)
+  RemoveFeature {
+    /// Name of the feature to remove
+    feature_name: String,
+  },
 }
 
 /// Issue that prevents or warns about unification
@@ -104,13 +109,25 @@ pub struct DuplicateCleanup {
   pub selected_version: String,
 }
 
-/// Record of a feature that was pruned because it's not used in source code
+/// Record of a truly dead feature (empty no-op) that can be safely pruned
 #[derive(Debug, Clone)]
 pub struct PrunedFeature {
   /// Crate that declared the feature
   pub crate_name: String,
   /// Feature name that was pruned
   pub feature_name: String,
+}
+
+/// Record of an optional feature that's not currently enabled but enables something
+/// These are user-facing API and should NOT be automatically removed
+#[derive(Debug, Clone)]
+pub struct OptionalFeature {
+  /// Crate that declared the feature
+  pub crate_name: String,
+  /// Feature name
+  pub feature_name: String,
+  /// What this feature enables (for reporting)
+  pub enables: Vec<String>,
 }
 
 /// Record of a version mismatch between member manifest and workspace.dependencies
@@ -186,8 +203,11 @@ pub struct UnificationPlan {
   pub computed_msrv: Option<ComputedMsrv>,
   /// Duplicate versions that were silently cleaned up
   pub duplicates_cleaned: Vec<DuplicateCleanup>,
-  /// Features that were pruned because they're not used in source code
+  /// Truly dead features (empty no-ops) that can be safely pruned
   pub pruned_features: Vec<PrunedFeature>,
+  /// Optional features that are not enabled but provide user-facing functionality
+  /// These should NOT be removed, only reported for awareness
+  pub optional_features: Vec<OptionalFeature>,
   /// Version mismatches between member manifests and existing workspace.dependencies
   pub version_mismatches: Vec<VersionMismatch>,
   /// Unused dependencies detected in workspace members
@@ -226,9 +246,10 @@ impl UnificationPlan {
 
     // Show member edits (deps being converted to workspace = true)
     if !self.member_edits.is_empty() {
-      // Collect unique dep names being converted and removed
+      // Collect unique dep names being converted, removed deps, and removed features
       let mut converted_deps: HashSet<String> = HashSet::new();
       let mut removed_deps: HashSet<String> = HashSet::new();
+      let mut removed_features: HashSet<String> = HashSet::new();
       for edits in self.member_edits.values() {
         for edit in edits {
           match edit {
@@ -237,6 +258,9 @@ impl UnificationPlan {
             }
             MemberEdit::RemoveDep { dep_name, .. } => {
               removed_deps.insert(dep_name.clone());
+            }
+            MemberEdit::RemoveFeature { feature_name } => {
+              removed_features.insert(feature_name.clone());
             }
           }
         }
@@ -329,13 +353,32 @@ impl UnificationPlan {
       }
     }
 
-    // Show pruned dead features
+    // Show pruned dead features (empty no-ops)
     if !self.pruned_features.is_empty() {
-      s.push_str(&format!("\nDead features pruned: {}\n", self.pruned_features.len()));
+      s.push_str(&format!(
+        "\nDead features (empty no-ops, safe to prune): {}\n",
+        self.pruned_features.len()
+      ));
       // Group by crate
       let mut by_crate: HashMap<&str, Vec<&str>> = HashMap::new();
       for pf in &self.pruned_features {
         by_crate.entry(&pf.crate_name).or_default().push(&pf.feature_name);
+      }
+      for (crate_name, features) in by_crate {
+        s.push_str(&format!("  - {}: {}\n", crate_name, features.join(", ")));
+      }
+    }
+
+    // Show optional features (user-facing API, NOT removed)
+    if !self.optional_features.is_empty() {
+      s.push_str(&format!(
+        "\nOptional features (user-facing API, NOT removed): {}\n",
+        self.optional_features.len()
+      ));
+      // Group by crate
+      let mut by_crate: HashMap<&str, Vec<&str>> = HashMap::new();
+      for of in &self.optional_features {
+        by_crate.entry(&of.crate_name).or_default().push(&of.feature_name);
       }
       for (crate_name, features) in by_crate {
         s.push_str(&format!("  - {}: {}\n", crate_name, features.join(", ")));

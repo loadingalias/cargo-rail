@@ -445,7 +445,56 @@ log = "0.4"
 }
 
 // ============================================================================
-// TEST 8: Verify zero false positives with common patterns
+// TEST 8: Renamed deps (package = "...") are NOT false positives
+// ============================================================================
+
+#[test]
+fn test_unused_detection_renamed_package_not_flagged() -> Result<()> {
+  // Renamed deps like `memmap = { package = "memmap2" }` should NOT be flagged
+  // The resolved graph uses the alias ("memmap") not the package name ("memmap2")
+
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Renamed dep: cargo.toml key is "memmap", package is "memmap2"
+memmap = { package = "memmap2", version = "0.9" }
+"#,
+  )?;
+
+  // Add usage to ensure it's in the resolved graph
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! Test crate
+use memmap::Mmap;
+pub fn hello() {}
+"#,
+  )?;
+
+  workspace.commit("Add crate with renamed package dependency")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // memmap2 should NOT be flagged as unused - it's used via the "memmap" alias
+  assert!(
+    !stdout.contains("memmap2") || !stdout.contains("Unused"),
+    "Renamed dep 'memmap2' should NOT be flagged as unused (alias 'memmap' is in resolved graph)\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// TEST 9: Verify zero false positives with common patterns
 // ============================================================================
 
 #[test]

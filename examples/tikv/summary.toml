@@ -73,8 +73,13 @@ deps = [
 
 [config]
 special = true
-pin_transitives = false  # No workspace-hack
+note = "Multi-version deps (uuid, semver, etc.) auto-skipped. Disable MSRV for git deps compatibility."
+
+# Config options used (from rail.toml)
+[rail_config]
+include_paths = true
+include_renamed = true
+pin_transitives = false
 msrv = false  # MSRV breaks git dep resolution for raft-engine
 detect_unused = true
 prune_dead_features = true
-note = "Multi-version deps (uuid, semver, etc.) auto-skipped. Disable MSRV for git deps compatibility."

@@ -15,8 +15,13 @@ deps = ["getrandom", "env_logger", "guillotiere", "hashbrown", "roxmltree", "nag
 
 [config]
 special = false
-pin_transitives = false  # No workspace-hack
+note = "GPU rendering library (26 crates)"
+
+# Config options used (from rail.toml)
+[rail_config]
+include_paths = true
+include_renamed = false
+pin_transitives = false
 msrv = true
 detect_unused = true
 prune_dead_features = true
-note = "GPU rendering library (26 crates)"

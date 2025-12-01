@@ -16,8 +16,13 @@ deps = ["serde", "bstr", "walkdir", "log", "serde_json", "globset", "regex", "te
 
 [config]
 special = false
-pin_transitives = false  # No workspace-hack
+note = "10 workspace members, not a single crate!"
+
+# Config options used (from rail.toml)
+[rail_config]
+include_paths = true
+include_renamed = true
+pin_transitives = false
 msrv = true
 detect_unused = true
 prune_dead_features = true
-note = "10 workspace members, not a single crate!"

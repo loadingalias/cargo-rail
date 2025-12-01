@@ -66,6 +66,7 @@ pub fn run_unify_analyze(
         "transitive_pins_count": plan.transitive_pins.len(),
         "duplicates_unified": plan.duplicates_cleaned.len(),
         "dead_features_pruned": plan.pruned_features.len(),
+        "optional_features_detected": plan.optional_features.len(),
         "version_mismatches": plan.version_mismatches.len(),
         "unused_deps": plan.unused_deps.len(),
       },
@@ -83,6 +84,11 @@ pub fn run_unify_analyze(
       "pruned_features": plan.pruned_features.iter().map(|f| serde_json::json!({
         "crate_name": f.crate_name,
         "feature_name": f.feature_name,
+      })).collect::<Vec<_>>(),
+      "optional_features": plan.optional_features.iter().map(|f| serde_json::json!({
+        "crate_name": f.crate_name,
+        "feature_name": f.feature_name,
+        "enables": f.enables,
       })).collect::<Vec<_>>(),
     });
     println!(
@@ -183,6 +189,9 @@ pub fn run_unify_analyze(
               (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
             };
             println!("  {} {} -> REMOVE (unused)", section, dep_name);
+          }
+          crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
+            println!("  [features] {} -> REMOVE (dead/empty)", feature_name);
           }
         }
       }
@@ -350,6 +359,9 @@ pub fn run_unify_apply(
         } => {
           writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
         }
+        crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
+          writer.remove_feature(member_path, feature_name)?;
+        }
       }
     }
   }
@@ -441,7 +453,13 @@ pub fn run_unify_apply(
     println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
   }
   if !plan.pruned_features.is_empty() {
-    println!("  {} dead features pruned", plan.pruned_features.len());
+    println!("  {} dead features pruned (empty no-ops)", plan.pruned_features.len());
+  }
+  if !plan.optional_features.is_empty() {
+    println!(
+      "  {} optional features detected (user-facing, preserved)",
+      plan.optional_features.len()
+    );
   }
   if let Some(ref msrv) = plan.computed_msrv {
     println!(

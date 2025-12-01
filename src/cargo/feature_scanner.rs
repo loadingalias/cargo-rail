@@ -3,6 +3,10 @@
 //! Detects features declared in workspace crates that are never enabled
 //! by any consumer in the resolved dependency graph across all target triples.
 //!
+//! This module distinguishes between:
+//! - **Truly dead features**: Empty no-ops (`simd-accel = []`) - safe to remove
+//! - **Optional features**: Enable deps/features but not currently used - NOT safe to remove
+//!
 //! This approach is superior to source scanning because:
 //! - Uses mathematically verified resolved metadata
 //! - Accounts for all target triples
@@ -23,25 +27,30 @@ pub struct FeatureScanResult {
   pub declared_features: HashSet<String>,
   /// Features that are actually enabled in the resolved graph
   pub enabled_features: HashSet<String>,
-  /// Features declared but never enabled (dead features)
+  /// Truly dead features: empty no-ops that can be safely removed
+  /// These are features with empty definitions (`feature = []`) that are never enabled
   pub dead_features: HashSet<String>,
+  /// Optional features: not enabled but enable something (deps, other features)
+  /// These are user-facing API and should NOT be removed, only reported
+  pub optional_features: HashSet<String>,
 }
 
 /// Analyzes workspace features using resolved cargo metadata
 pub struct FeatureScanner;
 
 impl FeatureScanner {
-  /// Analyze a single workspace member for dead features
+  /// Analyze a single workspace member for dead and optional features
   ///
   /// Uses the resolved metadata across all targets to determine which
   /// declared features are never enabled.
   ///
-  /// A feature is considered "alive" (not dead) if:
+  /// A feature is considered "alive" (not dead/optional) if:
   /// 1. It's enabled in the resolved graph for any target, OR
   /// 2. It's referenced by any workspace crate's feature definition (e.g., `dep/feature`)
   ///
-  /// The second check is crucial because conditional features like `tikv_alloc/mimalloc`
-  /// are valid parts of the public API even when not currently enabled.
+  /// For features that are NOT alive, we distinguish:
+  /// - **Dead features**: Empty no-ops (`feature = []`) - safe to remove
+  /// - **Optional features**: Enable something (deps, other features) - user-facing API, don't remove
   pub fn analyze_crate(
     pkg: &Package,
     metadata: &MultiTargetMetadata,
@@ -59,26 +68,42 @@ impl FeatureScanner {
     // Get features referenced by other workspace crates (even if not currently enabled)
     let externally_referenced = referenced_features.get(&crate_name).cloned().unwrap_or_default();
 
-    // Dead features = declared - enabled - externally_referenced
-    // "default" is always excluded (it's the entry point)
-    let dead_features: HashSet<String> = declared_features
+    // Find unused features (not enabled, not externally referenced, not "default")
+    let unused_features: HashSet<String> = declared_features
       .difference(&enabled_features)
       .filter(|f| *f != "default")
       .filter(|f| !externally_referenced.contains(*f))
       .cloned()
       .collect();
 
+    // Separate unused features into dead (empty) vs optional (enable something)
+    let mut dead_features = HashSet::new();
+    let mut optional_features = HashSet::new();
+
+    for feature in &unused_features {
+      if let Some(enables) = pkg.features.get(feature) {
+        if enables.is_empty() {
+          // Feature enables nothing - truly dead, safe to remove
+          dead_features.insert(feature.clone());
+        } else {
+          // Feature enables deps/other features - optional user-facing API
+          optional_features.insert(feature.clone());
+        }
+      }
+    }
+
     FeatureScanResult {
       crate_name,
       declared_features,
       enabled_features,
       dead_features,
+      optional_features,
     }
   }
 
-  /// Analyze all workspace members for dead features
+  /// Analyze all workspace members for dead and optional features
   ///
-  /// Returns results for crates that have dead features.
+  /// Returns results for crates that have dead or optional features.
   pub fn analyze_workspace(metadata: &MultiTargetMetadata) -> Vec<FeatureScanResult> {
     // First, build a map of all features referenced by workspace crates
     // This catches conditional features like `dep/feature` in [features] tables
@@ -94,8 +119,8 @@ impl FeatureScanner {
 
       let result = Self::analyze_crate(pkg, metadata, &referenced_features);
 
-      // Only include if there are dead features
-      if !result.dead_features.is_empty() {
+      // Include if there are dead OR optional features
+      if !result.dead_features.is_empty() || !result.optional_features.is_empty() {
         results.push(result);
       }
     }
@@ -155,6 +180,11 @@ impl FeatureScanner {
   /// Get total count of dead features across workspace
   pub fn count_dead_features(results: &[FeatureScanResult]) -> usize {
     results.iter().map(|r| r.dead_features.len()).sum()
+  }
+
+  /// Get total count of optional features across workspace
+  pub fn count_optional_features(results: &[FeatureScanResult]) -> usize {
+    results.iter().map(|r| r.optional_features.len()).sum()
   }
 }
 

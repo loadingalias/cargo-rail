@@ -15,8 +15,13 @@ deps = ["webbrowser", "serde", "rand", "iced", "reqwest", "serde_json"]
 
 [config]
 special = false
-pin_transitives = false  # No workspace-hack
+note = "Large GUI framework with 71 crates"
+
+# Config options used (from rail.toml)
+[rail_config]
+include_paths = true
+include_renamed = false
+pin_transitives = false
 msrv = true
 detect_unused = true
 prune_dead_features = true
-note = "Large GUI framework with 71 crates"

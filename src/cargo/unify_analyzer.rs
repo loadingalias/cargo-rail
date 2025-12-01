@@ -8,8 +8,8 @@ use crate::cargo::{
   manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
   multi_target_metadata::MultiTargetMetadata,
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, TransitivePin, UnificationPlan, UnifiedDep, UnifyIssue,
-    UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
+    DuplicateCleanup, IssueSeverity, MemberEdit, OptionalFeature, PrunedFeature, TransitivePin, UnificationPlan,
+    UnifiedDep, UnifyIssue, UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
   },
 };
 use crate::config::{ExactPinHandling, UnifyConfig};
@@ -457,12 +457,12 @@ impl UnifyAnalyzer {
       None
     };
 
-    // Scan for dead features if enabled
-    let pruned_features = if self.config.prune_dead_features {
+    // Scan for dead and optional features if enabled
+    let (pruned_features, optional_features) = if self.config.prune_dead_features {
       progress!("Scanning for dead features in resolved graph...");
       self.scan_dead_features()
     } else {
-      Vec::new()
+      (Vec::new(), Vec::new())
     };
 
     // === Issue D: Detect unused dependencies ===
@@ -507,6 +507,16 @@ impl UnifyAnalyzer {
       }
     }
 
+    // Generate removal edits for dead features (empty no-ops)
+    for pf in &pruned_features {
+      member_edits
+        .entry(pf.crate_name.clone())
+        .or_default()
+        .push(MemberEdit::RemoveFeature {
+          feature_name: pf.feature_name.clone(),
+        });
+    }
+
     // Run validation
     let validation_results = self.validate_targets()?;
 
@@ -520,6 +530,7 @@ impl UnifyAnalyzer {
       computed_msrv,
       duplicates_cleaned,
       pruned_features,
+      optional_features,
       version_mismatches,
       unused_deps,
     })
@@ -568,32 +579,66 @@ impl UnifyAnalyzer {
     }
   }
 
-  /// Detect dead features using resolved cargo metadata
+  /// Detect dead and optional features using resolved cargo metadata
   ///
-  /// Returns a list of features that are declared in workspace crates but never
-  /// enabled by any consumer in the resolved dependency graph across all targets.
-  fn scan_dead_features(&self) -> Vec<PrunedFeature> {
+  /// Returns two lists:
+  /// - `pruned`: Truly dead features (empty no-ops) that can be safely removed
+  /// - `optional`: Features not enabled but enable something (user-facing API, don't remove)
+  fn scan_dead_features(&self) -> (Vec<PrunedFeature>, Vec<OptionalFeature>) {
     let mut pruned = Vec::new();
+    let mut optional = Vec::new();
 
     // Analyze workspace using resolved metadata
     let results = FeatureScanner::analyze_workspace(&self.metadata);
 
-    // Collect dead features
-    for result in results {
-      for feature_name in result.dead_features {
+    // Collect dead and optional features
+    for result in &results {
+      // Truly dead features (empty no-ops)
+      for feature_name in &result.dead_features {
         pruned.push(PrunedFeature {
           crate_name: result.crate_name.clone(),
-          feature_name,
+          feature_name: feature_name.clone(),
+        });
+      }
+
+      // Optional features (enable something, user-facing API)
+      for feature_name in &result.optional_features {
+        // Get what this feature enables for reporting
+        let enables = self
+          .metadata
+          .workspace_packages()
+          .iter()
+          .find(|p| p.name == result.crate_name)
+          .and_then(|p| p.features.get(feature_name))
+          .cloned()
+          .unwrap_or_default();
+
+        optional.push(OptionalFeature {
+          crate_name: result.crate_name.clone(),
+          feature_name: feature_name.clone(),
+          enables,
         });
       }
     }
 
-    if !pruned.is_empty() {
-      let crate_count = self.metadata.workspace_packages().len();
-      progress!("  Found {} dead features across {} crates", pruned.len(), crate_count);
+    if !pruned.is_empty() || !optional.is_empty() {
+      let crate_count = results.len();
+      if !pruned.is_empty() {
+        progress!(
+          "  Found {} dead features (empty no-ops) across {} crates",
+          pruned.len(),
+          crate_count
+        );
+      }
+      if !optional.is_empty() {
+        progress!(
+          "  Found {} optional features (user-facing, not removed)",
+          optional.len()
+        );
+      }
     }
 
-    pruned
+    (pruned, optional)
   }
 
   /// Detect unused dependencies in workspace members
@@ -644,13 +689,20 @@ impl UnifyAnalyzer {
         }
 
         // Check if this dep appears in the resolved graph for this member
-        // Use the library name (not package name) since that's what cargo metadata uses
-        // Fall back to normalized package name if not in mapping
-        let lib_name = pkg_to_lib
-          .get(&dep_key.name)
-          .cloned()
-          .unwrap_or_else(|| dep_key.name.replace('-', "_"));
-        if resolved_deps.contains(&lib_name) {
+        // For renamed deps (memmap = { package = "memmap2" }), the resolved graph uses
+        // the alias ("memmap") not the package name ("memmap2").
+        // Fall back to pkg_to_lib mapping for non-renamed deps where lib name differs.
+        let resolved_name = if dep_key.is_renamed() {
+          // Renamed deps: use the alias (Cargo.toml key) - normalized to underscores
+          dep_key.alias().replace('-', "_")
+        } else {
+          // Non-renamed: check if package has different lib name, else normalize package name
+          pkg_to_lib
+            .get(&dep_key.name)
+            .cloned()
+            .unwrap_or_else(|| dep_key.name.replace('-', "_"))
+        };
+        if resolved_deps.contains(&resolved_name) {
           continue; // Dep is resolved, definitely used
         }
 

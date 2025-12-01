@@ -242,4 +242,25 @@ impl ManifestWriter {
 
     Ok(())
   }
+
+  /// Remove a dead feature from a member's Cargo.toml
+  ///
+  /// # Arguments
+  /// * `member_toml_path` - Path to the member's Cargo.toml
+  /// * `feature_name` - Name of the feature to remove
+  pub fn remove_feature(&self, member_toml_path: &Path, feature_name: &str) -> RailResult<()> {
+    // Read member Cargo.toml
+    let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
+
+    // Remove from [features] section
+    if let Some(features) = doc.get_mut("features").and_then(|f| f.as_table_like_mut()) {
+      features.remove(feature_name);
+    }
+
+    // Format and write
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(member_toml_path, &doc)?;
+
+    Ok(())
+  }
 }

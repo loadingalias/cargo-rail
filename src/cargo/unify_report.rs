@@ -28,7 +28,14 @@ impl UnifyReport {
       "- **Duplicates Cleaned:** {}\n",
       plan.duplicates_cleaned.len()
     ));
-    md.push_str(&format!("- **Dead Features Pruned:** {}\n", plan.pruned_features.len()));
+    md.push_str(&format!(
+      "- **Dead Features Pruned:** {} (empty no-ops)\n",
+      plan.pruned_features.len()
+    ));
+    md.push_str(&format!(
+      "- **Optional Features:** {} (user-facing, preserved)\n",
+      plan.optional_features.len()
+    ));
     md.push_str(&format!(
       "- **Version Mismatches:** {}\n",
       plan.version_mismatches.len()
@@ -79,12 +86,30 @@ impl UnifyReport {
     }
 
     if !plan.pruned_features.is_empty() {
-      md.push_str("## Dead Features Pruned\n\n");
+      md.push_str("## Dead Features Pruned (Empty No-Ops)\n\n");
+      md.push_str("These features do nothing (`feature = []`) and can be safely removed.\n\n");
       md.push_str("| Crate | Feature |\n");
       md.push_str("|-------|----------|\n");
 
       for pf in &plan.pruned_features {
         md.push_str(&format!("| {} | {} |\n", pf.crate_name, pf.feature_name));
+      }
+      md.push('\n');
+    }
+
+    if !plan.optional_features.is_empty() {
+      md.push_str("## Optional Features (User-Facing API)\n\n");
+      md.push_str("These features are not enabled by default but provide functionality. They are preserved.\n\n");
+      md.push_str("| Crate | Feature | Enables |\n");
+      md.push_str("|-------|----------|----------|\n");
+
+      for of in &plan.optional_features {
+        let enables = if of.enables.is_empty() {
+          "(nothing)".to_string()
+        } else {
+          of.enables.join(", ")
+        };
+        md.push_str(&format!("| {} | {} | {} |\n", of.crate_name, of.feature_name, enables));
       }
       md.push('\n');
     }

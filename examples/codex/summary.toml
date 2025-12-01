@@ -15,8 +15,13 @@ deps = ["reqwest", "serde"]
 
 [config]
 special = false
-pin_transitives = false  # No workspace-hack
+note = "Mixed TS/Rust repo, workspace in codex-rs/"
+
+# Config options used (from rail.toml)
+[rail_config]
+include_paths = true
+include_renamed = false
+pin_transitives = false
 msrv = true
 detect_unused = true
 prune_dead_features = true
-note = "Mixed TS/Rust repo, workspace in codex-rs/"
