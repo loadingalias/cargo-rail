@@ -29,7 +29,7 @@ cargo rail unify
 | Workspace members | **10** (not 1!) |
 | Dependencies unified | 9 |
 | Member edits | 35 |
-| Transitives pinned | 5 |
+| Dead features pruned | 11 |
 
 **Dependencies unified:** serde_json, regex, serde, bstr, memchr, termcolor, globset, walkdir, log
 

@@ -28,10 +28,10 @@ cargo rail unify
 |--------|-------|
 | Workspace members | 83 |
 | Dependencies unified | 57 |
-| Member edits | **520** |
-| Dead features pruned | 156 |
+| Member edits | **516** |
+| Dead features pruned | 112 |
 
-**MASSIVE IMPACT:** 520 manual file edits automated!
+**MASSIVE IMPACT:** 516 manual file edits automated!
 
 ## Configuration
 
@@ -55,7 +55,7 @@ detect_unused = true
 - Distributed transactional key-value store (PingCAP)
 - Largest workspace tested (83 crates)
 - Shows cargo-rail's diagnostic capabilities (auto-detects and skips multi-version conflicts)
-- 520 file edits saved - massive enterprise impact
-- 156 dead features pruned
+- 516 file edits saved - massive enterprise impact
+- 112 dead features pruned
 
 Details in [`summary.toml`](./summary.toml).
