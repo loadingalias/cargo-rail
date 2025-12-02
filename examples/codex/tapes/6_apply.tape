@@ -23,10 +23,10 @@ Show
 Sleep 500ms
 Type "cargo rail unify"
 Enter
-Wait+Screen /next: cargo check/
+Wait+Screen /next: cargo check|nothing to unify/
 Sleep 3s
 
 Type "git diff --stat"
 Enter
-Wait+Screen /file(s)? changed/
+Wait+Screen /file(s)? changed|~/loadingalias/testing/>/
 Sleep 6s

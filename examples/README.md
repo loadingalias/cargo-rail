@@ -1,7 +1,6 @@
 # Examples
 
-cargo-rail has been tested against several large Rust monorepos to validate
-its behavior and performance on non-trivial codebases.
+cargo-rail has been tested against several large, respected Rust monorepos to validate the behavior and performance on non-trivial codebases.
 
 ## Feature Workflows
 
@@ -34,19 +33,6 @@ Each subdirectory contains:
 | [tikv](./tikv/) | Distributed KV (83 crates) | 57 deps unified, 516 edits saved |
 | [tokio](./tokio/) | Async runtime (10 crates) | 10 deps unified, 35 edits saved |
 | [vello](./vello/) | GPU 2D rendering (26 crates) | 7 deps unified, 17 edits saved |
-
-## Quick Start
-
-```bash
-# Clone any example repo
-git clone https://github.com/tokio-rs/tokio
-cd tokio
-
-# Run cargo-rail
-cargo rail init
-cargo rail unify --check
-cargo rail affected --since HEAD~5
-```
 
 ## Note
 

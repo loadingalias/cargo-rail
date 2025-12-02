@@ -85,10 +85,7 @@ fn extract_cfg_features(content: &str, features: &mut HashSet<String>) {
 
 /// Check if a string is a valid Cargo feature name
 fn is_valid_feature_name(s: &str) -> bool {
-  !s.is_empty()
-    && s
-      .chars()
-      .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+  !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Result of analyzing a crate's features
@@ -379,7 +376,10 @@ mod tests {
     }
 
     // api-key is referenced by production
-    assert!(referenced.contains("api-key"), "api-key should be internally referenced");
+    assert!(
+      referenced.contains("api-key"),
+      "api-key should be internally referenced"
+    );
     // server is referenced by production
     assert!(referenced.contains("server"), "server should be internally referenced");
     // build is referenced by server
@@ -454,7 +454,10 @@ mod tests {
       Ok(())
     "#;
     extract_cfg_features(helix_code, &mut features);
-    assert!(features.contains("api-key"), "should detect api-key from helix-db pattern");
+    assert!(
+      features.contains("api-key"),
+      "should detect api-key from helix-db pattern"
+    );
 
     // Real example from polars
     features.clear();
@@ -476,7 +479,10 @@ mod tests {
       fn run_parallel() { }
     "#;
     extract_cfg_features(ruff_code, &mut features);
-    assert!(features.contains("singlethreaded"), "should detect singlethreaded from ruff pattern");
+    assert!(
+      features.contains("singlethreaded"),
+      "should detect singlethreaded from ruff pattern"
+    );
   }
 
   #[test]

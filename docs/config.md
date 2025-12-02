@@ -24,35 +24,59 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `targets` | string[] | auto-detected | Target triples for multi-target resolution |
+| `targets` | string[] | auto-detected | Target triples for multi-target resolution. cargo-rail runs `cargo metadata --filter-platform` for each. |
 
 ---
 
 ## [unify]
 
-Dependency unification settings.
+Dependency unification settings. Controls how `cargo rail unify` analyzes and modifies your workspace.
 
 ```toml
 [unify]
-pin_transitives = true   # Enable for hakari/workspace-hack users
+pin_transitives = true
 exclude = ["problem-dep"]
+major_version_conflict = "warn"
 ```
+
+### Core Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `include_paths` | bool | `true` | Unify path dependencies |
-| `include_renamed` | bool | `false` | Include `package = "..."` deps |
-| `pin_transitives` | bool | `false` | Pin fragmented transitives (enable for hakari users) |
-| `transitive_host` | string | `"root"` | Where to put pinned dev-deps |
-| `exclude` | string[] | `[]` | Dependencies to skip |
-| `include` | string[] | `[]` | Dependencies to force-unify |
-| `max_backups` | int | `3` | Backups to keep |
-| `msrv` | bool | `true` | Compute and write MSRV |
-| `strict_version_compat` | bool | `true` | Error on version conflicts |
-| `exact_pin_handling` | enum | `"warn"` | `"skip"`, `"preserve"`, `"warn"` |
-| `detect_unused` | bool | `true` | Detect unused dependencies |
-| `remove_unused` | bool | `true` | Auto-remove unused (requires detect_unused) |
-| `prune_dead_features` | bool | `true` | Remove features never enabled in graph |
+| `msrv` | bool | `true` | Compute MSRV from resolved graph and write to `[workspace.package].rust-version`. The MSRV is the maximum `rust-version` declared by any package in your dependency tree - your buildable floor. |
+| `detect_unused` | bool | `true` | Detect dependencies declared but absent from resolved graph. |
+| `remove_unused` | bool | `true` | Auto-remove unused deps (requires `detect_unused`). |
+| `prune_dead_features` | bool | `true` | Remove features never enabled in resolved graph. Only prunes empty no-ops (`feature = []`). Features that enable something are preserved. |
+| `pin_transitives` | bool | `false` | Pin transitive-only deps with fragmented features. Replaces workspace-hack crates. Enable if you use cargo-hakari. |
+
+### Version Handling
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `major_version_conflict` | enum | `"warn"` | How to handle multiple major versions of the same dep. `"warn"`: skip unification for that dep. `"bump"`: force unify to highest resolved version (may require code fixes). |
+| `strict_version_compat` | bool | `true` | Treat version mismatches between member manifests and existing `workspace.dependencies` as errors. Set `false` for warnings only. |
+| `exact_pin_handling` | enum | `"warn"` | How to handle `=x.y.z` pins. `"skip"`: exclude from unification. `"preserve"`: keep exact pin. `"warn"`: convert to caret with warning. |
+
+### Dependency Selection
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `include_paths` | bool | `true` | Include path dependencies in unification. |
+| `include_renamed` | bool | `false` | Include renamed deps (`package = "..."`). When enabled, features are aggregated across all variants of the same package using union. |
+| `exclude` | string[] | `[]` | Dependencies to skip from unification. |
+| `include` | string[] | `[]` | Force-include single-use dependencies. |
+
+### Transitive Pinning
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `transitive_host` | string | `"root"` | Where to put pinned transitive dev-deps. `"root"` for workspace root, or a path like `"crates/foo"`. |
+
+### Other
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_backups` | int | `3` | Number of backups to keep. Older backups auto-pruned. |
 
 ---
 
@@ -70,27 +94,26 @@ publish_delay = 5
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `tag_prefix` | string | `"v"` | Git tag prefix (used via `{prefix}`) |
-| `tag_format` | string | `"{crate}-{prefix}{version}"` | Tag template (`{crate}`, `{version}`, `{prefix}`) |
+| `tag_format` | string | `"{crate}-{prefix}{version}"` | Tag template. Variables: `{crate}`, `{version}`, `{prefix}` |
 | `require_clean` | bool | `true` | Require clean working directory |
 | `publish_delay` | int | `5` | Seconds between publishes |
-| `create_github_release` | bool | `false` | Create GitHub release via `gh` |
+| `create_github_release` | bool | `false` | Create GitHub release via `gh` CLI |
 | `sign_tags` | bool | `false` | GPG/SSH sign tags |
 | `changelog_path` | string | `"CHANGELOG.md"` | Default changelog path |
 | `changelog_relative_to` | enum | `"crate"` | `"crate"` or `"workspace"` |
-| `skip_changelog_for` | string[] | `[]` | Crates to skip changelog |
-| `require_changelog_entries` | bool | `false` | Error if no entries |
+| `skip_changelog_for` | string[] | `[]` | Crates to skip changelog generation |
+| `require_changelog_entries` | bool | `false` | Error if no changelog entries |
 
 ---
 
 ## [change-detection]
 
-Settings for the `affected` command.
+Settings for the `affected` and `test` commands.
 
 ```toml
 [change-detection]
 infrastructure = [".github/**", "justfile"]
 
-# Custom categories for specialized file patterns
 [change-detection.custom]
 verify = ["verify/**/*.rs"]
 benchmarks = ["benches/**", "perf/**"]
@@ -98,15 +121,13 @@ benchmarks = ["benches/**", "perf/**"]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `infrastructure` | string[] | see below | Patterns triggering full rebuild |
-| `custom` | table | `{}` | Custom category patterns (name → glob patterns) |
+| `infrastructure` | string[] | see below | Glob patterns triggering full rebuild |
+| `custom` | table | `{}` | Custom category patterns for conditional CI |
 
 Default infrastructure patterns:
 ```
 .github/**, scripts/**, justfile, Makefile, *.sh, deny.toml
 ```
-
-Custom categories appear in the `affected` output and can be used for conditional CI workflows.
 
 ---
 
@@ -130,15 +151,10 @@ include = ["LICENSE"]
 | `remote` | string | yes | Remote repository URL |
 | `branch` | string | yes | Git branch |
 | `mode` | enum | yes | `"single"` or `"combined"` |
-| `workspace_mode` | enum | no | For combined: `"standalone"` (default) or `"workspace"` |
+| `workspace_mode` | enum | no | For combined: `"standalone"` or `"workspace"` |
 | `paths` | array | yes | Crate paths: `[{ crate = "path/to/crate" }]` |
 | `include` | string[] | no | Additional files to include |
 | `exclude` | string[] | no | Files to exclude |
-
-### [crates.NAME.sync]
-
-> **Note:** Reserved for future use. Currently has no effect.
-> Conflict strategy is specified via CLI: `cargo rail sync --strategy <ours|theirs|manual|union>`
 
 ### [crates.NAME.release]
 
@@ -171,54 +187,35 @@ skip = true
 ### Minimal
 
 ```toml
-# Just run `cargo rail init` - defaults are sensible
+# Run `cargo rail init` - defaults are sensible
 # msrv, detect_unused, remove_unused, prune_dead_features all default to true
 ```
 
-### Hakari/workspace-hack users
+### Workspace-hack replacement
 
 ```toml
 [unify]
-pin_transitives = true  # Enable transitive pinning (replaces workspace-hack)
+pin_transitives = true
 ```
 
-### With renamed dependencies
+### Aggressive version unification
 
 ```toml
 [unify]
-include_renamed = true  # Handle package = "..." renames
+major_version_conflict = "bump"  # Force highest version even across majors
+strict_version_compat = false    # Allow version mismatches
 ```
 
-### CI-optimized monorepo
+### Conservative (minimal changes)
 
 ```toml
-targets = ["x86_64-unknown-linux-gnu"]
-
-[release]
-require_changelog_entries = true
-create_github_release = true
-
-[change-detection]
-infrastructure = [".github/**", "justfile", "Cargo.lock"]
+[unify]
+prune_dead_features = false
+remove_unused = false
+msrv = false
 ```
 
-### With split crates
-
-```toml
-[crates.my-lib.split]
-remote = "git@github.com:org/my-lib.git"
-branch = "main"
-mode = "single"
-include = ["LICENSE", "README.md"]
-
-[crates.my-lib.release]
-publish = true
-
-[crates.internal-utils.release]
-publish = false
-```
-
-### Multi-target workspace
+### Multi-target with exclusions
 
 ```toml
 targets = [
@@ -228,5 +225,27 @@ targets = [
 ]
 
 [unify]
-exclude = ["openssl"]  # platform-specific, skip
+exclude = ["openssl"]  # Platform-specific, skip
+```
+
+### Full CI setup
+
+```toml
+targets = ["x86_64-unknown-linux-gnu"]
+
+[unify]
+pin_transitives = true
+
+[release]
+require_changelog_entries = true
+create_github_release = true
+
+[change-detection]
+infrastructure = [".github/**", "justfile", "Cargo.lock"]
+
+[crates.my-lib.split]
+remote = "git@github.com:org/my-lib.git"
+branch = "main"
+mode = "single"
+include = ["LICENSE", "README.md"]
 ```

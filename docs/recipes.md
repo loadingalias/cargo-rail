@@ -4,9 +4,9 @@ Common workflows for cargo-rail.
 
 ---
 
-## CI: Test only affected crates
+## CI: Test affected crates
 
-The simplest setup. Tests only crates affected by the current changes.
+Tests only crates affected by the current changes.
 
 ### GitHub Actions
 
@@ -44,7 +44,7 @@ test:
 
 ## CI: Parallel matrix testing
 
-For larger workspaces, test affected crates in parallel using a matrix.
+For larger workspaces, test affected crates in parallel.
 
 ```yaml
 name: CI
@@ -80,8 +80,6 @@ jobs:
 
 ## CI: Cache cargo-rail
 
-Avoid reinstalling on every run:
-
 ```yaml
 - uses: actions/cache@v4
   with:
@@ -104,7 +102,7 @@ cargo rail unify --check
 # Apply changes
 cargo rail unify
 
-# Apply with backup (can undo later)
+# Apply with backup
 cargo rail unify --backup
 
 # Undo last unification
@@ -114,12 +112,19 @@ cargo rail unify undo
 cargo rail unify undo --list
 ```
 
+What it does:
+- Moves shared deps to `[workspace.dependencies]`
+- Updates members to use `workspace = true`
+- Detects and removes unused deps
+- Prunes dead features (empty no-ops)
+- Computes MSRV from resolved graph
+- Reports version conflicts and issues
+
 ---
 
-## Pin transitive dependencies (hakari replacement)
+## Pin transitive dependencies
 
-cargo-rail can pin transitive-only dependencies to prevent feature fragmentation,
-replacing the need for workspace-hack crates.
+Replaces workspace-hack crates (cargo-hakari). Detects transitive-only deps with fragmented features across targets and pins them.
 
 ```bash
 cargo rail unify --pin-transitives
@@ -134,66 +139,79 @@ pin_transitives = true
 
 ---
 
-## Detect and remove unused dependencies
+## Detect unused dependencies
 
-Find deps declared in Cargo.toml but not in the resolved dependency graph:
+Find deps declared in Cargo.toml but absent from the resolved graph.
 
 ```bash
-# Detect only (reports in output)
-cargo rail unify --check  # with detect_unused = true in config
+# Detect only
+cargo rail unify --check
 
 # Auto-remove
-cargo rail unify  # with remove_unused = true in config
+cargo rail unify
 ```
 
 In `rail.toml`:
 
 ```toml
 [unify]
-detect_unused = true
-remove_unused = true  # auto-remove, or just detect without removing
+detect_unused = true   # Report unused deps
+remove_unused = true   # Auto-remove (or false to just report)
 ```
 
 ---
 
-## Split a crate to its own repo
+## Handle major version conflicts
 
-Extract a crate with full git history preserved:
+When the same dep has multiple major versions across members:
+
+```toml
+[unify]
+major_version_conflict = "warn"  # Skip unification for that dep (safe)
+# or
+major_version_conflict = "bump"  # Force highest version (may require fixes)
+```
+
+---
+
+## Split a crate
+
+Extract a crate with full git history preserved.
 
 ```bash
 # Configure the split
 cargo rail split init my-crate
 
-# Preview what would happen
+# Preview
 cargo rail split run my-crate --check
 
-# Execute the split
+# Execute
 cargo rail split run my-crate
 ```
 
-The split preserves:
+Preserves:
 - Full commit history for the crate's files
 - Deterministic commit SHAs (same input = same output)
-- Commit mapping stored in git-notes for traceability
+- Commit mapping in git-notes for traceability
 
 ---
 
-## Sync between monorepo and split repos
+## Sync monorepo and split repos
 
-After splitting, keep repos in sync:
+After splitting, keep repos in sync.
 
 ```bash
-# Sync changes (bidirectional)
+# Bidirectional sync
 cargo rail sync my-crate
 
-# Push monorepo changes to split repo
+# Push monorepo -> split repo
 cargo rail sync my-crate --to-remote
 
-# Pull split repo changes to monorepo (creates PR branch)
+# Pull split repo -> monorepo (creates PR branch)
 cargo rail sync my-crate --from-remote
 ```
 
-Safety: Changes from `--from-remote` go to a PR branch, never directly to main.
+Changes from `--from-remote` go to a PR branch, never directly to main.
 
 ---
 
@@ -217,8 +235,6 @@ cargo rail release run my-crate --skip-publish
 
 ## Validate before release
 
-Check that crates are ready for release:
-
 ```bash
 cargo rail check my-crate
 cargo rail check --all
@@ -234,10 +250,9 @@ Validates:
 
 ## Multi-target resolution
 
-For cross-platform workspaces, cargo-rail resolves dependencies across all targets:
+For cross-platform workspaces:
 
 ```toml
-# rail.toml
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-apple-darwin",
@@ -245,26 +260,25 @@ targets = [
 ]
 ```
 
-This ensures unified dependencies work on all platforms, computing the intersection
-of required features rather than the union.
+cargo-rail runs `cargo metadata --filter-platform` for each target. Features are computed as intersection across targets - only features needed everywhere go to workspace deps. Members add local features for their specific needs.
 
 ---
 
 ## Local development
 
 ```bash
-# Generate/update config
+# Generate config
 cargo rail init
 
-# Check if deps need unification (useful as pre-commit hook)
+# Check if deps need unification (pre-commit hook)
 cargo rail unify --check
 
-# See what crates are affected by your changes
+# See affected crates
 cargo rail affected
 
-# Run tests for affected crates only
+# Run tests for affected crates
 cargo rail test
 
-# Clean up generated artifacts
+# Clean artifacts
 cargo rail clean
 ```

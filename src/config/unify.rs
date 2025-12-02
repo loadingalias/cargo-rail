@@ -67,6 +67,12 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub exact_pin_handling: ExactPinHandling,
 
+  /// How to handle major version conflicts (default: "warn")
+  /// - "warn": Skip unification and emit a warning (both versions stay in graph)
+  /// - "bump": Force unify to highest resolved version (user accepts breakage risk)
+  #[serde(default)]
+  pub major_version_conflict: MajorVersionConflict,
+
   /// Detect unused dependencies in workspace members (default: true)
   /// When enabled, compares declared deps against the resolved cargo graph
   /// to find deps that are declared but never actually used.
@@ -94,6 +100,7 @@ impl Default for UnifyConfig {
       prune_dead_features: true,
       strict_version_compat: true,
       exact_pin_handling: ExactPinHandling::default(),
+      major_version_conflict: MajorVersionConflict::default(),
       detect_unused: true,
       remove_unused: true,
     }
@@ -127,6 +134,27 @@ pub enum ExactPinHandling {
   /// Convert to caret (^) but emit a warning (default)
   #[default]
   Warn,
+}
+
+/// How to handle major version conflicts during unification
+///
+/// Major version conflicts occur when the same dependency is declared with
+/// different major versions across workspace members (e.g., `serde = "1.0"` and `serde = "2.0"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MajorVersionConflict {
+  /// Skip unification and emit a warning (default)
+  ///
+  /// Both versions remain in the build graph. This is the safe choice when
+  /// you want to avoid breaking changes but may result in duplicate compilation.
+  #[default]
+  Warn,
+  /// Force unify to the highest resolved version
+  ///
+  /// Uses the highest version from the resolved metadata across all target triples.
+  /// This works in ~85% of cases; the remaining ~15% may break the codebase.
+  /// Use when you want the leanest build graph and accept breakage risk.
+  Bump,
 }
 
 /// Configuration for where to add dev-dependencies when consolidating transitive features
@@ -351,5 +379,35 @@ mod tests {
     assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
     assert!(config.detect_unused);
     assert!(config.remove_unused);
+  }
+
+  #[test]
+  fn test_major_version_conflict_default() {
+    let config = UnifyConfig::default();
+    assert_eq!(config.major_version_conflict, MajorVersionConflict::Warn);
+  }
+
+  #[test]
+  fn test_major_version_conflict_parsing() {
+    let toml = r#"major_version_conflict = "warn""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.major_version_conflict, MajorVersionConflict::Warn);
+
+    let toml = r#"major_version_conflict = "bump""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.major_version_conflict, MajorVersionConflict::Bump);
+  }
+
+  #[test]
+  fn test_major_version_conflict_with_other_options() {
+    let toml = r#"
+      strict_version_compat = false
+      exact_pin_handling = "preserve"
+      major_version_conflict = "bump"
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.strict_version_compat);
+    assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
+    assert_eq!(config.major_version_conflict, MajorVersionConflict::Bump);
   }
 }

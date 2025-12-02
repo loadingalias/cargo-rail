@@ -77,6 +77,12 @@ for repo in "${REPOS[@]}"; do
         echo "FAILED: $repo"
     fi
 
+    # Give VHS/ttyd time to clean up between recordings
+    # Kill any lingering VHS processes to prevent resource exhaustion
+    pkill -9 ttyd 2>/dev/null || true
+    pkill -9 chromium 2>/dev/null || true
+    echo "Cooling down (3s)..."
+    sleep 3
     echo ""
 done
 

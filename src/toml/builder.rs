@@ -136,6 +136,16 @@ impl RailConfigBuilder {
       exact_pin_str
     ));
 
+    // Major version conflict handling
+    let major_conflict_str = match config.major_version_conflict {
+      crate::config::MajorVersionConflict::Warn => "warn",
+      crate::config::MajorVersionConflict::Bump => "bump",
+    };
+    content.push_str(&format!(
+      "major_version_conflict = \"{}\"  # How to handle major version conflicts: warn (skip), bump (force highest) (default: warn)\n",
+      major_conflict_str
+    ));
+
     // Unused dependency detection
     content.push_str(&format!(
       "detect_unused = {}  # Detect unused dependencies (default: true)\n",

@@ -20,5 +20,6 @@ Show
 
 Type "cargo build"
 Enter
-Wait+Screen /Finished|error\[/
+Sleep 1s
+Wait+Screen /Compiling|Finished|error\[/
 Sleep 2s

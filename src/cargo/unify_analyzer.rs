@@ -13,7 +13,7 @@ use crate::cargo::{
     VersionMismatch,
   },
 };
-use crate::config::{ExactPinHandling, UnifyConfig};
+use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::RailResult;
 use crate::progress;
 use crate::workspace::WorkspaceContext;
@@ -136,21 +136,39 @@ impl UnifyAnalyzer {
       let usage_sites = candidate.usages;
 
       // === Check for major version conflicts ===
-      // Different major versions cannot be merged - we warn and skip instead of blocking.
-      // Merging features across major versions produces invalid configurations.
+      // Different major versions cannot be safely merged - behavior depends on config.
       let major_versions = find_major_version_conflicts(&usage_sites);
       if major_versions.len() > 1 {
         let versions_str: Vec<_> = major_versions.iter().map(|v| v.to_string()).collect();
-        issues.push(UnifyIssue {
-          dep_name: dep_key.name.to_string(),
-          severity: IssueSeverity::Warning,
-          message: format!(
-            "Multiple major versions detected (majors: {}) - skipping unification. \
-             Consider consolidating to a single major version to reduce duplicate compilation.",
-            versions_str.join(", ")
-          ),
-        });
-        continue; // Skip this dependency, continue with others
+        match self.config.major_version_conflict {
+          MajorVersionConflict::Warn => {
+            // Skip unification, emit warning - both versions stay in the graph
+            issues.push(UnifyIssue {
+              dep_name: dep_key.name.to_string(),
+              severity: IssueSeverity::Warning,
+              message: format!(
+                "Multiple major versions detected (majors: {}) - skipping unification. \
+                 Consider consolidating to a single major version to reduce duplicate compilation, \
+                 or set major_version_conflict = \"bump\" to force unification to highest version.",
+                versions_str.join(", ")
+              ),
+            });
+            continue; // Skip this dependency, continue with others
+          }
+          MajorVersionConflict::Bump => {
+            // Emit warning but continue with unification to highest version
+            issues.push(UnifyIssue {
+              dep_name: dep_key.name.to_string(),
+              severity: IssueSeverity::Warning,
+              message: format!(
+                "Multiple major versions detected (majors: {}) - bumping to highest resolved version. \
+                 This may break crates depending on older major versions.",
+                versions_str.join(", ")
+              ),
+            });
+            // Don't continue - fall through to use highest resolved version
+          }
+        }
       }
 
       // === Issue B: Check for exact version pins ===
