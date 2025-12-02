@@ -19,10 +19,9 @@ pub fn run_unify_analyze(
   pin_transitives_flag: bool,
   include_renamed_flag: bool,
   show_diff: bool,
-  format: String,
+  format: OutputFormat,
 ) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
@@ -221,18 +220,14 @@ pub fn run_unify_analyze(
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
     if !plan.workspace_deps.is_empty() {
       println!(
-        "\nready: {} dependencies, {} member edits\nrun 'cargo rail unify' to apply",
+        "\nready: {} dependencies, {} member edits",
         plan.workspace_deps.len(),
         total_edits
       );
     } else {
-      println!(
-        "\nready: {} members, {} edits\nrun 'cargo rail unify' to apply",
-        plan.member_edits.len(),
-        total_edits
-      );
+      println!("\nready: {} members, {} edits", plan.member_edits.len(), total_edits);
     }
-    // Exit 1 to signal CI that changes are pending
+    println!("Changes detected. Run without --check to apply.");
     return Err(RailError::CheckHasPendingChanges);
   } else {
     println!("\nno unification opportunities found");
@@ -397,8 +392,7 @@ pub fn run_unify_apply(
 
       // Find a suitable member's path
       let first_member = &members[0];
-      let metadata = ctx.cargo.metadata();
-      if let Some(pkg) = metadata.workspace_packages().iter().find(|p| p.name == *first_member) {
+      if let Some(pkg) = ctx.cargo.get_package(first_member) {
         let member_path = pkg.manifest_path.parent().unwrap();
         let relative_path = member_path.strip_prefix(ctx.workspace_root()).unwrap_or(member_path);
         progress!(

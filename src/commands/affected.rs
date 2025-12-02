@@ -5,174 +5,89 @@
 //! - Which crates transitively depend on those changed crates
 //! - The minimal set of crates that need testing/building
 
-use crate::change_detection::classify::{ChangeKind, classify_file};
+use crate::change_detection::{ChangeClassification, ChangeClassifier};
 use crate::commands::common::OutputFormat;
-use crate::config::ChangeDetectionConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::graph::AffectedAnalysis;
 use crate::progress;
 use crate::workspace::WorkspaceContext;
-use glob::Pattern;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Run the affected command
-pub fn run_affected(
-  ctx: &WorkspaceContext,
-  since: Option<String>,
-  from: Option<String>,
-  to: Option<String>,
-  format: String,
-  all: bool,
-  output: Option<PathBuf>,
-) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
+/// Options for the `affected` command
+#[derive(Debug, Default)]
+pub struct AffectedOptions {
+  /// Git ref to compare against (e.g., "main", "HEAD~5")
+  pub since: Option<String>,
+  /// Start of SHA range (used with `to` for SHA pair mode)
+  pub from: Option<String>,
+  /// End of SHA range (used with `from` for SHA pair mode)
+  pub to: Option<String>,
+  /// Output format
+  pub format: OutputFormat,
+  /// Show all workspace crates regardless of changes
+  pub all: bool,
+  /// Write output to file instead of stdout
+  pub output: Option<PathBuf>,
+  /// Show detailed explanation of why crates are affected
+  pub explain: bool,
+}
 
+/// Run the affected command
+pub fn run_affected(ctx: &WorkspaceContext, opts: AffectedOptions) -> RailResult<()> {
   // JSON-like formats enable structured error output and suppress progress
-  if output_format.is_json_like() {
+  if opts.format.is_json_like() {
     crate::output::set_json_mode(true);
   }
 
   // If --all flag is set, show all workspace crates regardless of changes
-  if all {
-    return display_all_crates(ctx, output_format, output.as_ref());
+  if opts.all {
+    return display_all_crates(ctx, opts.format, opts.output.as_ref());
   }
 
   // Auto-detect default branch if --since not specified
-  let since_ref = match since {
+  let since_ref = match opts.since {
     Some(s) => s,
     None => detect_default_base_ref(ctx.git.git())?,
   };
 
   // Get changed files from git
-  let changed_files = get_changed_files(ctx, &since_ref, from.as_deref(), to.as_deref())?;
+  let changed_files = get_changed_files(ctx, &since_ref, opts.from.as_deref(), opts.to.as_deref())?;
 
-  // Get change-detection config (from rail.toml or defaults)
-  let cd_config = ctx
+  // Create classifier from config (or defaults)
+  let classifier = ctx
     .config
     .as_ref()
-    .map(|c| c.change_detection.clone())
-    .unwrap_or_default();
+    .map(|c| ChangeClassifier::new(&c.change_detection))
+    .unwrap_or_else(ChangeClassifier::default_config);
 
   // Classify files to detect infrastructure changes
-  let classification = classify_changed_files(&changed_files, &cd_config);
+  let classification = classifier.classify(&changed_files);
 
   // Analyze affected crates
   let analysis = crate::graph::analyze(&ctx.graph, &changed_files)?;
 
+  // Explain mode: detailed breakdown of why crates are affected
+  if opts.explain {
+    return display_explain(ctx, &changed_files, &analysis, &classification);
+  }
+
   // Output results
-  display_results(&analysis, &classification, output_format, output.as_ref())?;
+  display_results(&analysis, &classification, opts.format, opts.output.as_ref())?;
 
   Ok(())
 }
 
-/// File classification results for change detection
-#[derive(Debug, Clone)]
-struct ChangeClassification {
-  /// True if only documentation files changed
-  docs_only: bool,
-  /// True if infrastructure files changed (requires full rebuild)
-  rebuild_all: bool,
-  /// Infrastructure files that triggered rebuild_all
-  infrastructure_files: Vec<String>,
-  /// Custom category matches: category name -> matched files
-  custom_categories: std::collections::HashMap<String, Vec<String>>,
-}
-
-/// Classify changed files to detect special cases
-fn classify_changed_files(changed_files: &[PathBuf], config: &ChangeDetectionConfig) -> ChangeClassification {
-  let mut docs_only = true;
-  let mut rebuild_all = false;
-  let mut infrastructure_files = Vec::new();
-  let mut custom_categories: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-
-  // Compile infrastructure patterns (with glob support)
-  let infra_patterns: Vec<Pattern> = config
-    .infrastructure
-    .iter()
-    .filter_map(|p| Pattern::new(p).ok())
-    .collect();
-
-  // Issue #22: Compile custom category patterns
-  let custom_patterns: Vec<(String, Vec<Pattern>)> = config
-    .custom
-    .iter()
-    .map(|(category, patterns)| {
-      let compiled: Vec<Pattern> = patterns.iter().filter_map(|p| Pattern::new(p).ok()).collect();
-      (category.clone(), compiled)
-    })
-    .collect();
-
-  for file in changed_files {
-    let path_str = file.to_string_lossy();
-
-    // Check for infrastructure files that trigger rebuild_all
-    if is_infrastructure_file(&path_str, &infra_patterns) {
-      rebuild_all = true;
-      infrastructure_files.push(path_str.to_string());
-      docs_only = false;
-      continue;
-    }
-
-    // Issue #22: Check custom categories
-    for (category, patterns) in &custom_patterns {
-      for pattern in patterns {
-        if pattern.matches(&path_str) {
-          custom_categories
-            .entry(category.clone())
-            .or_default()
-            .push(path_str.to_string());
-          break; // Only match once per category per file
-        }
-      }
-    }
-
-    // Check file classification
-    let kind = classify_file(file);
-    match kind {
-      ChangeKind::Documentation => {
-        // Still docs_only if all files so far are docs
-      }
-      _ => {
-        docs_only = false;
-      }
-    }
-  }
-
-  // If no files changed, docs_only should be false
-  if changed_files.is_empty() {
-    docs_only = false;
-  }
-
-  ChangeClassification {
-    docs_only,
-    rebuild_all,
-    infrastructure_files,
-    custom_categories,
-  }
-}
-
-/// Check if a file path is an infrastructure file that should trigger rebuild_all
-fn is_infrastructure_file(path_str: &str, patterns: &[Pattern]) -> bool {
-  for pattern in patterns {
-    if pattern.matches(path_str) {
-      return true;
-    }
-  }
-  false
-}
-
 /// Display all workspace crates (--all mode)
 fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file: Option<&PathBuf>) -> RailResult<()> {
-  let mut all_crates: Vec<String> = ctx.graph.workspace_members();
-  all_crates.sort();
+  let all_crates = ctx.graph.workspace_members();
 
   let output = match format {
     OutputFormat::Text => {
       let mut out = String::new();
       out.push_str(&format!("workspace crates: {}\n\n", all_crates.len()));
-      for crate_name in &all_crates {
+      for crate_name in all_crates {
         out.push_str(&format!("  {}\n", crate_name));
       }
       out
@@ -217,6 +132,105 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
   };
 
   write_output(&output, output_file)?;
+  Ok(())
+}
+
+/// Display detailed explanation of why crates are affected
+fn display_explain(
+  ctx: &WorkspaceContext,
+  changed_files: &[PathBuf],
+  analysis: &AffectedAnalysis,
+  classification: &ChangeClassification,
+) -> RailResult<()> {
+  use std::collections::HashMap;
+
+  // Special cases first
+  if classification.docs_only {
+    println!("docs-only changes (no tests required)");
+    return Ok(());
+  }
+
+  if classification.rebuild_all {
+    println!("infrastructure changes detected (full rebuild recommended):\n");
+    for file in &classification.infrastructure_files {
+      println!("  {}", file);
+    }
+    println!();
+  }
+
+  // Group changed files by owning crate
+  let mut files_by_crate: HashMap<String, Vec<&PathBuf>> = HashMap::new();
+  let mut unowned_files = Vec::new();
+
+  for file in changed_files {
+    let crates = ctx.graph.files_to_crates(&[file]);
+    if crates.is_empty() {
+      unowned_files.push(file);
+    } else {
+      for crate_name in crates {
+        files_by_crate.entry(crate_name).or_default().push(file);
+      }
+    }
+  }
+
+  // Show changed files summary
+  println!("changed files: {}", changed_files.len());
+  if !unowned_files.is_empty() {
+    println!("  (non-crate): {} files", unowned_files.len());
+  }
+  println!();
+
+  // Show direct crates with their changed files
+  let (direct, dependents, _) = get_sorted_analysis(analysis);
+
+  if !direct.is_empty() {
+    println!("direct ({}):", direct.len());
+    for crate_name in &direct {
+      if let Some(files) = files_by_crate.get(crate_name) {
+        println!("  {} ({} files)", crate_name, files.len());
+        for file in files.iter().take(3) {
+          println!("    {}", file.display());
+        }
+        if files.len() > 3 {
+          println!("    ... {} more", files.len() - 3);
+        }
+      } else {
+        println!("  {}", crate_name);
+      }
+    }
+    println!();
+  }
+
+  // Show transitive dependents with reason
+  if !dependents.is_empty() {
+    println!("transitive ({}):", dependents.len());
+    for crate_name in &dependents {
+      // Find which direct crate(s) this depends on
+      let mut reasons: Vec<&String> = Vec::new();
+      for direct_crate in &direct {
+        if let Ok(deps) = ctx.graph.transitive_dependents(direct_crate)
+          && deps.contains(crate_name)
+        {
+          reasons.push(direct_crate);
+        }
+      }
+
+      if reasons.is_empty() {
+        println!("  {}", crate_name);
+      } else if reasons.len() == 1 {
+        println!("  {} (depends on {})", crate_name, reasons[0]);
+      } else {
+        let reasons_str: Vec<&str> = reasons.iter().map(|s| s.as_str()).collect();
+        println!("  {} (depends on {})", crate_name, reasons_str.join(", "));
+      }
+    }
+    println!();
+  }
+
+  // Summary
+  let test_count = direct.len() + dependents.len();
+  println!("test targets: {}", test_count);
+
   Ok(())
 }
 

@@ -4,12 +4,13 @@
 //! with WorkspaceContext and uses multi-target metadata + manifest analysis.
 
 use crate::cargo::{
-  feature_scanner::FeatureScanner,
   manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
   multi_target_metadata::MultiTargetMetadata,
+  unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
+  unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, OptionalFeature, PrunedFeature, TransitivePin, UnificationPlan,
-    UnifiedDep, UnifyIssue, UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
+    DuplicateCleanup, IssueSeverity, MemberEdit, UnificationPlan, UnifiedDep, UnifyIssue, ValidationResult,
+    VersionMismatch,
   },
 };
 use crate::config::{ExactPinHandling, UnifyConfig};
@@ -18,7 +19,7 @@ use crate::progress;
 use crate::workspace::WorkspaceContext;
 use semver::VersionReq;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // Main Analyzer
@@ -68,6 +69,41 @@ impl UnifyAnalyzer {
     })
   }
 
+  /// Normalize a dependency path relative to the workspace root.
+  ///
+  /// Takes a path that's relative to a member's Cargo.toml and converts it
+  /// to be relative to the workspace root.
+  ///
+  /// # Arguments
+  /// * `member_manifest_path` - Path to the member's Cargo.toml
+  /// * `dep_path` - The dependency path (relative to member's Cargo.toml)
+  fn normalize_dep_path(&self, member_manifest_path: &Path, dep_path: &str) -> PathBuf {
+    // Get the member's directory (parent of Cargo.toml)
+    let member_dir = member_manifest_path.parent().unwrap_or(member_manifest_path);
+    // Resolve the dep path relative to the member's directory
+    let absolute_dep_path = member_dir.join(dep_path);
+
+    // Canonicalize to resolve .. and symlinks (if path exists)
+    let canonical_workspace = self
+      .workspace_root
+      .canonicalize()
+      .unwrap_or_else(|_| self.workspace_root.clone());
+    let canonical_dep = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path.clone());
+
+    // Make relative to workspace root
+    if let Ok(relative) = canonical_dep.strip_prefix(&canonical_workspace) {
+      return relative.to_path_buf();
+    }
+
+    // Fallback: if canonicalization moved outside workspace, try non-canonicalized path
+    if let Ok(relative) = absolute_dep_path.strip_prefix(&self.workspace_root) {
+      return relative.to_path_buf();
+    }
+
+    // Last resort: use the path as-is
+    PathBuf::from(dep_path)
+  }
+
   /// Analyze workspace and generate unification plan
   pub fn analyze(&self) -> RailResult<UnificationPlan> {
     let mut workspace_deps = Vec::new();
@@ -93,53 +129,11 @@ impl UnifyAnalyzer {
 
     progress!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
 
-    // Track which packages we've already processed (for include_renamed deduplication)
-    let mut processed_packages: HashSet<String> = HashSet::new();
-
-    // Process each dependency
-    for dep_key in self.manifests.all_dependencies() {
-      // Skip if excluded
-      if self.config.exclude.contains(&dep_key.name) {
-        continue;
-      }
-
-      // === Issue #6 fix: When include_renamed = true, use package-level aggregation ===
-      // This ensures that `serde` and `old_serde = { package = "serde" }` count together
-      // toward the usage threshold.
-      let usage_count = if self.config.include_renamed {
-        // Skip if we've already processed this package (via another dep_key variant)
-        if processed_packages.contains(&dep_key.name) {
-          continue;
-        }
-        // Use package-level count (aggregates all renamed + non-renamed variants)
-        self.manifests.package_usage_count(&dep_key.name)
-      } else {
-        // Standard per-dep_key count
-        self.manifests.usage_count(dep_key)
-      };
-
-      if usage_count < 2 && !self.config.include.contains(&dep_key.name) {
-        continue;
-      }
-
-      // Skip renamed dependencies unless configured
-      // When include_renamed = false, we silently skip renamed deps (they're separate from
-      // non-renamed deps now, so skipping them doesn't affect direct dep unification)
-      if dep_key.renamed_from.is_some() && !self.config.include_renamed {
-        continue;
-      }
-
-      // Mark this package as processed (for include_renamed deduplication)
-      if self.config.include_renamed {
-        processed_packages.insert(dep_key.name.clone());
-      }
-
-      // Get usage sites - when include_renamed = true, aggregate across all variants
-      let usage_sites: Vec<_> = if self.config.include_renamed {
-        self.manifests.get_package_usage_sites(&dep_key.name)
-      } else {
-        self.manifests.get_usage_sites(dep_key)
-      };
+    // Process each dependency using the CandidateIterator
+    // This encapsulates include_renamed branching and filtering logic
+    for candidate in CandidateIterator::new(&self.manifests, &self.config) {
+      let dep_key = candidate.dep_key;
+      let usage_sites = candidate.usages;
 
       // === Check for major version conflicts ===
       // Different major versions cannot be merged - we warn and skip instead of blocking.
@@ -148,7 +142,7 @@ impl UnifyAnalyzer {
       if major_versions.len() > 1 {
         let versions_str: Vec<_> = major_versions.iter().map(|v| v.to_string()).collect();
         issues.push(UnifyIssue {
-          dep_name: dep_key.name.clone(),
+          dep_name: dep_key.name.to_string(),
           severity: IssueSeverity::Warning,
           message: format!(
             "Multiple major versions detected (majors: {}) - skipping unification. \
@@ -172,7 +166,7 @@ impl UnifyAnalyzer {
           }
           ExactPinHandling::Warn => {
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.clone(),
+              dep_name: dep_key.name.to_string(),
               severity: IssueSeverity::Warning,
               message: "Has exact version pin (=x.y.z) - converting to caret (^). \
                         Consider adding to unify.exclude or setting exact_pin_handling = \"skip\""
@@ -206,7 +200,7 @@ impl UnifyAnalyzer {
         let mut versions_found: Vec<_> = unique_versions.iter().map(|v| v.to_string()).collect();
         versions_found.sort();
         duplicates_cleaned.push(DuplicateCleanup {
-          dep_name: dep_key.name.clone(),
+          dep_name: dep_key.name.to_string(),
           versions_found,
           selected_version: selected.to_string(),
         });
@@ -230,7 +224,7 @@ impl UnifyAnalyzer {
       };
 
       // === Issue A: Check for version mismatches with existing workspace.dependencies ===
-      if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&dep_key.name)
+      if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&*dep_key.name)
         && let Some(ref ws_version) = existing_ws_dep.version
       {
         for usage in &usage_sites {
@@ -238,8 +232,8 @@ impl UnifyAnalyzer {
             && !versions_compatible(declared, ws_version)
           {
             version_mismatches.push(VersionMismatch {
-              member: usage.used_by.clone(),
-              dep_name: dep_key.name.clone(),
+              member: usage.used_by.to_string(),
+              dep_name: dep_key.name.to_string(),
               member_version: declared.clone(),
               workspace_version: ws_version.clone(),
             });
@@ -251,7 +245,7 @@ impl UnifyAnalyzer {
               IssueSeverity::Warning
             };
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.clone(),
+              dep_name: dep_key.name.to_string(),
               severity,
               message: format!(
                 "{} declares \"{}\" but workspace.dependencies has \"{}\". \
@@ -311,8 +305,8 @@ impl UnifyAnalyzer {
         None
       };
 
-      // Get users
-      let users: HashSet<_> = usage_sites.iter().map(|u| u.used_by.clone()).collect();
+      // Get users - convert Arc<str> to String for output
+      let users: HashSet<String> = usage_sites.iter().map(|u| u.used_by.to_string()).collect();
 
       // === Issue C: Check include_paths config before processing path dependencies ===
       let dep_path: Option<PathBuf> = if self.config.include_paths {
@@ -320,41 +314,13 @@ impl UnifyAnalyzer {
         // If so, check if the dep is a workspace member to include path in workspace.dependencies
         usage_sites.iter().find_map(|u| {
           u.path.as_ref().and_then(|p| {
-            if workspace_member_names.contains(&dep_key.name) {
-              // Normalize path relative to workspace root
-              // The path in usage (p) is relative to the member's Cargo.toml
-              // We need to make it relative to the workspace root
-              if let Some(ref manifest_path) = u.manifest_path {
-                // Get the member's directory (parent of Cargo.toml)
-                let member_dir = manifest_path.parent().unwrap_or(manifest_path);
-                // Resolve the dep path relative to the member's directory
-                let absolute_dep_path = member_dir.join(p);
-                // Canonicalize to resolve .. and symlinks (if path exists)
-                let canonical_workspace = self
-                  .workspace_root
-                  .canonicalize()
-                  .unwrap_or_else(|_| self.workspace_root.clone());
-                let absolute_dep_path = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path);
-                // Make relative to workspace root
-                if let Ok(relative) = absolute_dep_path.strip_prefix(&canonical_workspace) {
-                  Some(relative.to_path_buf())
-                } else {
-                  // Fallback: if canonicalization moved outside workspace, use the original resolved path
-                  // Try strip_prefix on non-canonicalized path
-                  let resolved = member_dir.join(p);
-                  if let Ok(relative) = resolved.strip_prefix(&self.workspace_root) {
-                    Some(relative.to_path_buf())
-                  } else {
-                    // Last resort: just use the path as-is
-                    Some(PathBuf::from(p))
-                  }
-                }
-              } else {
-                // No manifest_path available - just use as-is (shouldn't happen)
-                Some(PathBuf::from(p))
-              }
-            } else {
-              None
+            if !workspace_member_names.contains(&*dep_key.name) {
+              return None;
+            }
+            // Normalize path relative to workspace root using helper
+            match &u.manifest_path {
+              Some(manifest_path) => Some(self.normalize_dep_path(manifest_path, p)),
+              None => Some(PathBuf::from(p)), // No manifest_path - use as-is (shouldn't happen)
             }
           })
         })
@@ -366,7 +332,7 @@ impl UnifyAnalyzer {
       let computed_features: Vec<String> = features.into_iter().collect();
 
       // Check if this dep already exists in workspace.dependencies
-      let existing_dep = self.existing_workspace_deps.get(&dep_key.name);
+      let existing_dep = self.existing_workspace_deps.get(&*dep_key.name);
 
       // Determine if we need to update workspace.dependencies
       // Update if: dep doesn't exist, OR features differ, OR default-features differs, OR has path
@@ -393,7 +359,7 @@ impl UnifyAnalyzer {
       // Create unified dep if workspace needs update
       if needs_workspace_update {
         let unified = UnifiedDep {
-          name: dep_key.name.clone(),
+          name: dep_key.name.to_string(),
           version_req,
           features: workspace_features.clone(),
           default_features,
@@ -421,30 +387,20 @@ impl UnifyAnalyzer {
         // This is critical for include_renamed mode where usage_sites are aggregated
         // across multiple dep_keys for the same package
         let edit = MemberEdit::UseWorkspace {
-          dep_name: usage.cargo_toml_key.clone(),
+          dep_name: usage.cargo_toml_key.to_string(),
           dep_kind: usage.kind,
           target: usage.target.clone(), // Preserve target for correct section
           local_features,
           is_optional: usage.optional,
         };
 
-        member_edits.entry(usage.used_by.clone()).or_default().push(edit);
+        member_edits.entry(usage.used_by.to_string()).or_default().push(edit);
       }
     }
 
     // Handle transitive fragmentation
     let transitive_pins = if self.config.pin_transitives {
-      progress!("Analyzing transitive dependencies...");
-      let fragmented = self.metadata.find_fragmented_transitives();
-
-      fragmented
-        .into_iter()
-        .map(|f| TransitivePin {
-          name: f.name,
-          version: f.version,
-          features: f.unified_features,
-        })
-        .collect()
+      TransitivePlanner::new(&self.metadata).find_pins()
     } else {
       Vec::new()
     };
@@ -458,17 +414,19 @@ impl UnifyAnalyzer {
     };
 
     // Scan for dead and optional features if enabled
+    let feature_pruner = FeaturePruner::new(&self.metadata);
     let (pruned_features, optional_features) = if self.config.prune_dead_features {
       progress!("Scanning for dead features in resolved graph...");
-      self.scan_dead_features()
+      feature_pruner.scan()
     } else {
       (Vec::new(), Vec::new())
     };
 
     // === Issue D: Detect unused dependencies ===
+    let unused_finder = UnusedDepFinder::new(&self.metadata, &self.manifests);
     let unused_deps = if self.config.detect_unused {
       progress!("Detecting unused dependencies...");
-      self.find_unused_deps()
+      unused_finder.find()
     } else {
       Vec::new()
     };
@@ -479,42 +437,14 @@ impl UnifyAnalyzer {
         "Generating removal edits for {} unused dependencies...",
         unused_deps.len()
       );
-      for unused in &unused_deps {
-        // Find the target constraint for this dep (needed for correct section)
-        let target = self
-          .manifests
-          .members
-          .iter()
-          .find(|m| m.package_name == unused.member)
-          .and_then(|m| {
-            m.dependencies.iter().find_map(|(key, usage)| {
-              if key.name == unused.dep_name && usage.kind == unused.kind {
-                usage.target.clone()
-              } else {
-                None
-              }
-            })
-          });
-
-        member_edits
-          .entry(unused.member.clone())
-          .or_default()
-          .push(MemberEdit::RemoveDep {
-            dep_name: unused.dep_name.clone(),
-            dep_kind: unused.kind,
-            target,
-          });
+      for (member, edits) in unused_finder.generate_removal_edits(&unused_deps) {
+        member_edits.entry(member).or_default().extend(edits);
       }
     }
 
     // Generate removal edits for dead features (empty no-ops)
-    for pf in &pruned_features {
-      member_edits
-        .entry(pf.crate_name.clone())
-        .or_default()
-        .push(MemberEdit::RemoveFeature {
-          feature_name: pf.feature_name.clone(),
-        });
+    for (crate_name, edits) in feature_pruner.generate_prune_edits(&pruned_features) {
+      member_edits.entry(crate_name).or_default().extend(edits);
     }
 
     // Run validation
@@ -577,494 +507,5 @@ impl UnifyAnalyzer {
           .join(", ")
       )
     }
-  }
-
-  /// Detect dead and optional features using resolved cargo metadata
-  ///
-  /// Returns two lists:
-  /// - `pruned`: Truly dead features (empty no-ops) that can be safely removed
-  /// - `optional`: Features not enabled but enable something (user-facing API, don't remove)
-  fn scan_dead_features(&self) -> (Vec<PrunedFeature>, Vec<OptionalFeature>) {
-    let mut pruned = Vec::new();
-    let mut optional = Vec::new();
-
-    // Analyze workspace using resolved metadata
-    let results = FeatureScanner::analyze_workspace(&self.metadata);
-
-    // Collect dead and optional features
-    for result in &results {
-      // Truly dead features (empty no-ops)
-      for feature_name in &result.dead_features {
-        pruned.push(PrunedFeature {
-          crate_name: result.crate_name.clone(),
-          feature_name: feature_name.clone(),
-        });
-      }
-
-      // Optional features (enable something, user-facing API)
-      for feature_name in &result.optional_features {
-        // Get what this feature enables for reporting
-        let enables = self
-          .metadata
-          .workspace_packages()
-          .iter()
-          .find(|p| p.name == result.crate_name)
-          .and_then(|p| p.features.get(feature_name))
-          .cloned()
-          .unwrap_or_default();
-
-        optional.push(OptionalFeature {
-          crate_name: result.crate_name.clone(),
-          feature_name: feature_name.clone(),
-          enables,
-        });
-      }
-    }
-
-    if !pruned.is_empty() || !optional.is_empty() {
-      let crate_count = results.len();
-      if !pruned.is_empty() {
-        progress!(
-          "  Found {} dead features (empty no-ops) across {} crates",
-          pruned.len(),
-          crate_count
-        );
-      }
-      if !optional.is_empty() {
-        progress!(
-          "  Found {} optional features (user-facing, not removed)",
-          optional.len()
-        );
-      }
-    }
-
-    (pruned, optional)
-  }
-
-  /// Detect unused dependencies in workspace members
-  ///
-  /// Compares declared dependencies (from Cargo.toml) against the resolved
-  /// cargo graph to find deps that are declared but never actually used.
-  ///
-  /// This implements smart filtering to avoid false positives:
-  /// - Optional deps referenced in [features] are feature-gated, not unused
-  /// - Optional deps referenced by OTHER workspace crates' features are not unused
-  /// - Target-specific deps for unconfigured targets can't be verified
-  /// - Only truly unreferenced deps are flagged
-  fn find_unused_deps(&self) -> Vec<UnusedDep> {
-    let mut unused = Vec::new();
-
-    // Pre-compute workspace member names (these are never "unused")
-    let workspace_member_names: HashSet<String> = self
-      .metadata
-      .workspace_packages()
-      .iter()
-      .map(|pkg| pkg.name.to_string())
-      .collect();
-
-    // Get configured targets for target constraint checking
-    let configured_targets: Vec<&str> = self.metadata.targets();
-
-    // Build package name -> library name mapping
-    // This handles crates where the package name differs from the lib name,
-    // e.g., `mopa-maintained` has lib name `mopa`, so Rust code uses `use mopa::...`
-    // but Cargo.toml declares `mopa-maintained = "0.2"`.
-    let pkg_to_lib = self.metadata.package_to_lib_name_map();
-
-    // Build a map of externally referenced features: crate_name -> set of feature names
-    // This detects patterns like `tikv_alloc/mimalloc` in other crates' [features],
-    // which means the optional dep `mimalloc` in `tikv_alloc` is NOT unused.
-    let externally_referenced = self.build_externally_referenced_features();
-
-    // For each workspace member, check declared deps against resolved
-    for member in &self.manifests.members {
-      // Get resolved deps for this member from the metadata
-      let resolved_deps = self.get_resolved_deps_for_member(&member.package_name);
-
-      // Check each declared dependency
-      for (dep_key, usage) in &member.dependencies {
-        // Skip workspace member deps - they're always structurally "used"
-        if workspace_member_names.contains(&dep_key.name) {
-          continue;
-        }
-
-        // Check if this dep appears in the resolved graph for this member
-        // For renamed deps (memmap = { package = "memmap2" }), the resolved graph uses
-        // the alias ("memmap") not the package name ("memmap2").
-        // Fall back to pkg_to_lib mapping for non-renamed deps where lib name differs.
-        let resolved_name = if dep_key.is_renamed() {
-          // Renamed deps: use the alias (Cargo.toml key) - normalized to underscores
-          dep_key.alias().replace('-', "_")
-        } else {
-          // Non-renamed: check if package has different lib name, else normalize package name
-          pkg_to_lib
-            .get(&dep_key.name)
-            .cloned()
-            .unwrap_or_else(|| dep_key.name.replace('-', "_"))
-        };
-        if resolved_deps.contains(&resolved_name) {
-          continue; // Dep is resolved, definitely used
-        }
-
-        // === Smart filtering to avoid false positives ===
-
-        // Filter 1: Optional deps referenced in the same crate's features
-        // They're only activated when the feature is enabled, so they won't be in the
-        // resolved graph unless someone enables that feature.
-        if usage.optional && usage.referenced_in_features {
-          continue;
-        }
-
-        // Filter 2: Optional deps referenced by OTHER workspace crates
-        // e.g., `tikv_alloc` has optional dep `mimalloc`, and `tikv` has feature
-        // `mimalloc = ["tikv_alloc/mimalloc"]`. The dep isn't unused - it's feature-gated.
-        if usage.optional
-          && externally_referenced
-            .get(&member.package_name)
-            .is_some_and(|ref_features| ref_features.contains(&dep_key.name))
-        {
-          continue;
-        }
-
-        // Filter 3: Target-specific deps for unconfigured targets
-        // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
-        // that target configured, we can't verify if it's used or not.
-        if let Some(ref target_cfg) = usage.target {
-          if !self.target_constraint_matches_any(target_cfg, &configured_targets) {
-            // Target not configured - can't verify, assume it's valid
-            continue;
-          }
-
-          // Target IS configured but dep still not in resolved graph
-          // This is genuinely suspicious - flag it with context
-          unused.push(UnusedDep {
-            member: member.package_name.clone(),
-            dep_name: dep_key.name.clone(),
-            kind: usage.kind,
-            reason: UnusedReason::TargetConfiguredButNotResolved {
-              target_cfg: target_cfg.clone(),
-            },
-          });
-          continue;
-        }
-
-        // This is a non-conditional, non-optional dep that's not in the resolved graph
-        // This is genuinely unused
-        unused.push(UnusedDep {
-          member: member.package_name.clone(),
-          dep_name: dep_key.name.clone(),
-          kind: usage.kind,
-          reason: UnusedReason::NotInResolvedGraph,
-        });
-      }
-    }
-
-    if !unused.is_empty() {
-      progress!("  Found {} potentially unused dependencies", unused.len());
-    }
-
-    unused
-  }
-
-  /// Build a map of features that are externally referenced by workspace crates
-  ///
-  /// Scans all workspace packages' `[features]` tables to find references like:
-  /// - `crate_name/feature` - enables `feature` in dependency `crate_name`
-  ///
-  /// Returns: HashMap<crate_name, HashSet<feature_name>>
-  fn build_externally_referenced_features(&self) -> HashMap<String, HashSet<String>> {
-    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for pkg in self.metadata.workspace_packages() {
-      // Scan all feature definitions in this package
-      for feature_deps in pkg.features.values() {
-        for dep_str in feature_deps {
-          // Parse feature references like "dep/feature" or "dep?/feature"
-          if let Some((dep_name, feature_name)) = Self::parse_feature_reference(dep_str) {
-            map.entry(dep_name).or_default().insert(feature_name);
-          }
-        }
-      }
-    }
-
-    map
-  }
-
-  /// Parse a feature reference string to extract dep name and feature
-  ///
-  /// Handles formats:
-  /// - `dep/feature` -> Some(("dep", "feature"))
-  /// - `dep?/feature` -> Some(("dep", "feature"))
-  fn parse_feature_reference(s: &str) -> Option<(String, String)> {
-    if let Some(idx) = s.find('/') {
-      let dep_part = &s[..idx];
-      let feature = &s[idx + 1..];
-      let dep_name = dep_part.trim_end_matches('?');
-      if !feature.is_empty() {
-        return Some((dep_name.to_string(), feature.to_string()));
-      }
-    }
-    None
-  }
-
-  /// Check if a target constraint (cfg expression) matches any configured target
-  ///
-  /// This is a heuristic check - we look for common patterns in the cfg string
-  /// and match against the target triples we have configured.
-  fn target_constraint_matches_any(&self, cfg: &str, configured_targets: &[&str]) -> bool {
-    // Normalize the cfg string for matching
-    let cfg_lower = cfg.to_lowercase();
-
-    for target in configured_targets {
-      let target_lower = target.to_lowercase();
-
-      // Check common cfg patterns against target triple components
-      // cfg(windows) matches x86_64-pc-windows-msvc
-      if cfg_lower.contains("windows") && target_lower.contains("windows") {
-        return true;
-      }
-      // cfg(unix) matches linux, darwin, freebsd, etc.
-      if cfg_lower.contains("unix")
-        && (target_lower.contains("linux")
-          || target_lower.contains("darwin")
-          || target_lower.contains("freebsd")
-          || target_lower.contains("netbsd")
-          || target_lower.contains("openbsd"))
-      {
-        return true;
-      }
-      // cfg(target_os = "linux") matches *-linux-*
-      if cfg_lower.contains("linux") && target_lower.contains("linux") {
-        return true;
-      }
-      // cfg(target_os = "macos") or cfg(target_os = "darwin")
-      if (cfg_lower.contains("macos") || cfg_lower.contains("darwin")) && target_lower.contains("darwin") {
-        return true;
-      }
-      // cfg(target_arch = "wasm32") matches wasm32-*
-      if cfg_lower.contains("wasm32") && target_lower.contains("wasm32") {
-        return true;
-      }
-      // cfg(target_arch = "x86_64")
-      if cfg_lower.contains("x86_64") && target_lower.contains("x86_64") {
-        return true;
-      }
-      // cfg(target_arch = "aarch64")
-      if cfg_lower.contains("aarch64") && target_lower.contains("aarch64") {
-        return true;
-      }
-      // cfg(target_os = "android")
-      if cfg_lower.contains("android") && target_lower.contains("android") {
-        return true;
-      }
-      // cfg(target_os = "ios")
-      if cfg_lower.contains("ios") && target_lower.contains("ios") {
-        return true;
-      }
-      // Exact target match: cfg(target = "x86_64-unknown-linux-gnu")
-      if cfg_lower.contains(&target_lower) {
-        return true;
-      }
-    }
-
-    false
-  }
-
-  /// Get all resolved direct dependencies for a workspace member
-  ///
-  /// Uses the resolved cargo metadata graph to find what deps are actually
-  /// used by a member. This is the source of truth for dependency usage.
-  ///
-  /// Returns normalized names (hyphens converted to underscores) to match
-  /// cargo's internal crate name format.
-  fn get_resolved_deps_for_member(&self, member_name: &str) -> HashSet<String> {
-    let mut deps = HashSet::new();
-
-    // Check across all targets to ensure we catch platform-specific deps
-    for metadata in self.metadata.targets().iter().filter_map(|t| self.metadata.get(t)) {
-      if let Some(resolve) = &metadata.resolve {
-        // Find the node for this member
-        for node in &resolve.nodes {
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
-            && pkg.name == member_name
-          {
-            // Collect all direct dependencies from this node
-            // Note: cargo metadata uses normalized names (underscores)
-            for dep in &node.deps {
-              deps.insert(dep.name.clone());
-            }
-          }
-        }
-      }
-    }
-
-    deps
-  }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Check if a version string is an exact pin ("=x.y.z")
-fn is_exact_pin(version: &str) -> bool {
-  version.starts_with('=') && !version.starts_with(">=")
-}
-
-/// Extract major version from a declared version string
-///
-/// Returns the major version number, handling various version formats:
-/// - "1.0" -> Some(1)
-/// - "^2.3.0" -> Some(2)
-/// - ">=0.5" -> Some(0)
-fn extract_major_version(version: &str) -> Option<u32> {
-  let cleaned = strip_version_op(version);
-  let parts: Vec<&str> = cleaned.split('.').collect();
-  parts.first().and_then(|s| s.parse().ok())
-}
-
-/// Check for major version conflicts in declared versions
-///
-/// Returns the set of unique major versions found. If the set has more than
-/// one element, there's a conflict that cannot be safely unified.
-fn find_major_version_conflicts(
-  usages: &[&crate::cargo::manifest_analyzer::DepUsage],
-) -> std::collections::HashSet<u32> {
-  usages
-    .iter()
-    .filter_map(|u| u.declared_version.as_ref())
-    .filter_map(|v| extract_major_version(v))
-    .collect()
-}
-
-/// Check if two version requirements are compatible
-///
-/// This is a heuristic check - it compares the major.minor portions
-/// to detect obvious incompatibilities like "0.11" vs "0.13".
-fn versions_compatible(member_version: &str, workspace_version: &str) -> bool {
-  // Strip leading operators for comparison
-  let member_ver = strip_version_op(member_version);
-  let workspace_ver = strip_version_op(workspace_version);
-
-  // Parse into parts
-  let member_parts: Vec<&str> = member_ver.split('.').collect();
-  let workspace_parts: Vec<&str> = workspace_ver.split('.').collect();
-
-  // For semver compatibility, major must match (or be 0)
-  // For 0.x versions, minor must also match
-  if member_parts.is_empty() || workspace_parts.is_empty() {
-    return true; // Can't determine, assume compatible
-  }
-
-  let member_major = member_parts[0].parse::<u32>().unwrap_or(0);
-  let workspace_major = workspace_parts[0].parse::<u32>().unwrap_or(0);
-
-  if member_major != workspace_major {
-    return false;
-  }
-
-  // For 0.x versions, minor must match
-  if member_major == 0 {
-    let member_minor = member_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-    let workspace_minor = workspace_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-    if member_minor != workspace_minor {
-      return false;
-    }
-  }
-
-  true
-}
-
-/// Strip version operators from a version string
-fn strip_version_op(version: &str) -> &str {
-  version
-    .trim_start_matches(">=")
-    .trim_start_matches("<=")
-    .trim_start_matches('>')
-    .trim_start_matches('<')
-    .trim_start_matches('=')
-    .trim_start_matches('^')
-    .trim_start_matches('~')
-    .trim()
-}
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_extract_major_version() {
-    // Simple versions
-    assert_eq!(extract_major_version("1.0"), Some(1));
-    assert_eq!(extract_major_version("2.3.4"), Some(2));
-    assert_eq!(extract_major_version("0.99.3"), Some(0));
-
-    // With operators
-    assert_eq!(extract_major_version("^1.0"), Some(1));
-    assert_eq!(extract_major_version("~2.0"), Some(2));
-    assert_eq!(extract_major_version(">=3.0"), Some(3));
-    assert_eq!(extract_major_version("=4.0.0"), Some(4));
-
-    // Edge cases
-    assert_eq!(extract_major_version(""), None);
-    assert_eq!(extract_major_version("invalid"), None);
-  }
-
-  #[test]
-  fn test_is_exact_pin() {
-    assert!(is_exact_pin("=1.0.0"));
-    assert!(is_exact_pin("=0.8.0"));
-    assert!(!is_exact_pin(">=1.0.0"));
-    assert!(!is_exact_pin("^1.0.0"));
-    assert!(!is_exact_pin("1.0.0"));
-    assert!(!is_exact_pin("~1.0.0"));
-  }
-
-  #[test]
-  fn test_strip_version_op() {
-    assert_eq!(strip_version_op("=1.0.0"), "1.0.0");
-    assert_eq!(strip_version_op("^1.0.0"), "1.0.0");
-    assert_eq!(strip_version_op(">=1.0.0"), "1.0.0");
-    assert_eq!(strip_version_op("~1.0.0"), "1.0.0");
-    assert_eq!(strip_version_op("1.0.0"), "1.0.0");
-    assert_eq!(strip_version_op("<=2.0"), "2.0");
-    assert_eq!(strip_version_op(">0.5"), "0.5");
-  }
-
-  #[test]
-  fn test_versions_compatible_major_match() {
-    // Same major version (>=1.0) should be compatible
-    assert!(versions_compatible("1.0", "1.5"));
-    assert!(versions_compatible("^1.0", "1.5"));
-    assert!(versions_compatible("2.0", "2.3.1"));
-  }
-
-  #[test]
-  fn test_versions_compatible_major_mismatch() {
-    // Different major versions are incompatible
-    assert!(!versions_compatible("1.0", "2.0"));
-    assert!(!versions_compatible("^2.0", "3.0"));
-  }
-
-  #[test]
-  fn test_versions_compatible_zero_major() {
-    // For 0.x versions, minor must also match
-    assert!(versions_compatible("0.11", "0.11.5"));
-    assert!(versions_compatible("^0.11", "0.11"));
-    assert!(!versions_compatible("0.11", "0.13"));
-    assert!(!versions_compatible("^0.8", "0.9"));
-  }
-
-  #[test]
-  fn test_versions_compatible_exact_pins() {
-    // Exact pins with same version are compatible
-    assert!(versions_compatible("=1.0.0", "1.0.0"));
-    assert!(versions_compatible("=0.8.0", "0.8"));
-    // Different versions are incompatible
-    assert!(!versions_compatible("=1.0.0", "2.0.0"));
   }
 }

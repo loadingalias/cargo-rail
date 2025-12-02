@@ -5,26 +5,30 @@ use crate::error::{ConfigError, RailError, RailResult};
 use crate::split::SplitConfig;
 use crate::sync::SyncConfig;
 use crate::workspace::WorkspaceContext;
+use clap::ValueEnum;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 /// Standard output format for all commands
 ///
 /// Supports both simple (text/json) and specialized formats (GitHub Actions, JSONL, etc.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum OutputFormat {
   /// Human-readable text output (default)
   #[default]
   Text,
   /// Machine-readable JSON output
   Json,
-  /// Names only (one per line)
+  /// Names only, one per line
+  #[value(name = "names-only", alias = "names")]
   NamesOnly,
   /// GitHub Actions output format for $GITHUB_OUTPUT
+  #[value(name = "github")]
   GitHub,
   /// GitHub Actions matrix format for strategy.matrix
+  #[value(name = "github-matrix")]
   GitHubMatrix,
   /// JSON Lines format (one object per line)
+  #[value(name = "jsonl", alias = "json-lines")]
   JsonLines,
 }
 
@@ -41,47 +45,6 @@ impl OutputFormat {
   pub fn is_json_like(&self) -> bool {
     matches!(self, Self::Json | Self::JsonLines | Self::GitHub | Self::GitHubMatrix)
   }
-}
-
-impl FromStr for OutputFormat {
-  type Err = RailError;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s.to_lowercase().as_str() {
-      "text" => Ok(Self::Text),
-      "json" => Ok(Self::Json),
-      "names" | "names-only" => Ok(Self::NamesOnly),
-      "github" => Ok(Self::GitHub),
-      "github-matrix" => Ok(Self::GitHubMatrix),
-      "jsonl" | "json-lines" => Ok(Self::JsonLines),
-      _ => Err(RailError::message(format!(
-        "Unknown format '{}'. Valid formats: text, json, names-only, github, github-matrix, jsonl",
-        s
-      ))),
-    }
-  }
-}
-
-impl std::fmt::Display for OutputFormat {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::Text => write!(f, "text"),
-      Self::Json => write!(f, "json"),
-      Self::NamesOnly => write!(f, "names-only"),
-      Self::GitHub => write!(f, "github"),
-      Self::GitHubMatrix => write!(f, "github-matrix"),
-      Self::JsonLines => write!(f, "jsonl"),
-    }
-  }
-}
-
-/// Check if a format string indicates JSON output mode
-///
-/// Returns true for any format that produces structured output (json, jsonl, github, github-matrix).
-/// Used for early JSON mode detection to suppress progress messages.
-pub fn is_json_output(format: &str) -> bool {
-  let f = format.to_lowercase();
-  matches!(f.as_str(), "json" | "jsonl" | "json-lines" | "github" | "github-matrix")
 }
 
 /// Builder for split/sync configurations

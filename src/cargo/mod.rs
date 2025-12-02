@@ -12,6 +12,7 @@ pub mod manifest_analyzer;
 pub mod manifest_ops;
 pub mod manifest_writer;
 pub mod multi_target_metadata;
+pub mod unify;
 pub mod unify_analyzer;
 pub mod unify_report;
 pub mod unify_types;

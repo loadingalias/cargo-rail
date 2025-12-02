@@ -165,10 +165,10 @@ Extract a crate with full git history preserved:
 cargo rail split init my-crate
 
 # Preview what would happen
-cargo rail split my-crate --check
+cargo rail split run my-crate --check
 
 # Execute the split
-cargo rail split my-crate
+cargo rail split run my-crate
 ```
 
 The split preserves:
@@ -201,16 +201,16 @@ Safety: Changes from `--from-remote` go to a PR branch, never directly to main.
 
 ```bash
 # Preview release plan
-cargo rail release my-crate --check
+cargo rail release run my-crate --check
 
 # Release with patch bump
-cargo rail release my-crate --bump patch
+cargo rail release run my-crate --bump patch
 
 # Release all crates (dependency order)
-cargo rail release --all --bump minor
+cargo rail release run --all --bump minor
 
 # Skip crates.io publish (just tag)
-cargo rail release my-crate --skip-publish
+cargo rail release run my-crate --skip-publish
 ```
 
 ---

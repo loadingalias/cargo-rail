@@ -23,11 +23,12 @@ Commands:
   release   Publish releases (version bump, changelog, tag, publish)
   check     Validate release readiness
   clean     Clean generated artifacts (cache, backups, reports)
-  config    Validate configuration file
+  config    Configuration management
   help      Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet    Suppress progress messages (for CI/automation)
+      --json     Output in JSON format (shorthand for -f json)
   -h, --help     Print help
   -V, --version  Print version
 ```
@@ -51,11 +52,22 @@ Options:
       --from <FROM>
           Start ref (for SHA pair mode)
 
+      --json
+          Output in JSON format (shorthand for -f json)
+
       --to <TO>
           End ref (for SHA pair mode)
 
   -f, --format <FORMAT>
-          Output format [text, json, names-only, github, github-matrix, jsonl]
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
           
           [default: text]
 
@@ -64,6 +76,9 @@ Options:
 
   -o, --output <OUTPUT>
           Write output to file (e.g., $GITHUB_OUTPUT)
+
+      --explain
+          Explain why each crate is affected
 
   -h, --help
           Print help (see a summary with '-h')
@@ -75,6 +90,7 @@ Examples:
   cargo rail affected                     # Changes since origin/main
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
+  cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
   cargo rail affected -f names-only       # Just crate names, one per line
 ```
@@ -102,6 +118,9 @@ Options:
   -a, --all
           Skip change detection and run all tests
 
+      --json
+          Output in JSON format (shorthand for -f json)
+
       --skip-nextest
           Disable automatic use of cargo-nextest
 
@@ -128,21 +147,32 @@ Examples:
 ```
 Unify workspace dependencies (replaces workspace-hack crates)
 
-Usage: cargo rail unify [OPTIONS] [ACTION]
+Usage: cargo rail unify [OPTIONS] [COMMAND]
 
-Arguments:
-  [ACTION]
-          Action: 'undo' to restore from backup (use with --list to see backups)
+Commands:
+  undo  Restore manifests from a previous backup
+  help  Print this message or the help of the given subcommand(s)
 
 Options:
-  -c, --check
-          Dry-run mode: preview changes without modifying files
-
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
+  -c, --check
+          Dry-run mode: preview changes without modifying files
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
   -f, --format <FORMAT>
-          Output format [text, json]
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
           
           [default: text]
 
@@ -160,12 +190,6 @@ Options:
 
       --include-renamed
           Include renamed dependencies (package = "...") in unification
-
-      --list
-          List available backups (for undo action)
-
-      --backup-id <BACKUP_ID>
-          Specific backup ID to restore (for undo action)
 
       --skip-report
           Skip generating the unify report
@@ -204,6 +228,7 @@ Options:
   -o, --output <OUTPUT>  Output path for rail.toml [default: .config/rail.toml]
   -q, --quiet            Suppress progress messages (for CI/automation)
       --force            Overwrite existing configuration
+      --json             Output in JSON format (shorthand for -f json)
       --non-interactive  Skip interactive prompts
   -c, --check            Dry-run mode: preview generated config without writing
   -h, --help             Print help
@@ -217,32 +242,19 @@ Options:
 ```
 Split a crate to a standalone repository with git history
 
-Usage: cargo rail split [OPTIONS] [ACTION] [CRATE_NAMES]...
+Usage: cargo rail split [OPTIONS] <COMMAND>
 
-Arguments:
-  [ACTION]
-          Action: 'init' to configure splits, or crate name to split
-
-  [CRATE_NAMES]...
-          Additional crate name(s) for init
+Commands:
+  init  Configure split for crate(s)
+  run   Execute split operation
+  help  Print this message or the help of the given subcommand(s)
 
 Options:
-  -a, --all
-          Split all configured crates (mutually exclusive with crate names)
-
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-      --remote <REMOTE>
-          Override remote repository
-
-  -c, --check
-          Dry-run mode: preview changes without executing
-
-  -f, --format <FORMAT>
-          Output format [text, json]
-          
-          [default: text]
+      --json
+          Output in JSON format (shorthand for -f json)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -252,9 +264,10 @@ Options:
 
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
-  cargo rail split my-crate --check       # Preview the split
-  cargo rail split my-crate               # Execute the split
-  cargo rail split --all                  # Split all configured crates
+  cargo rail split init my-crate --check  # Preview generated config
+  cargo rail split run my-crate --check   # Preview the split
+  cargo rail split run my-crate           # Execute the split
+  cargo rail split run --all              # Split all configured crates
 ```
 
 ---
@@ -277,6 +290,9 @@ Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
+      --json
+          Output in JSON format (shorthand for -f json)
+
       --remote <REMOTE>
           Override remote repository
 
@@ -287,7 +303,13 @@ Options:
           Sync from monorepo to remote only
 
       --strategy <STRATEGY>
-          Conflict resolution [ours, theirs, manual, union]
+          Conflict resolution strategy
+
+          Possible values:
+          - ours:   Use the monorepo version (--ours)
+          - theirs: Use the remote/split repo version (--theirs)
+          - manual: Attempt automatic merge; create conflict markers if conflicts exist (default)
+          - union:  Combine both versions line-by-line (union merge)
           
           [default: manual]
 
@@ -298,7 +320,15 @@ Options:
           Dry-run mode: preview changes without executing
 
   -f, --format <FORMAT>
-          Output format [text, json]
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
           
           [default: text]
 
@@ -322,40 +352,19 @@ Examples:
 ```
 Publish releases (version bump, changelog, tag, publish)
 
-Usage: cargo rail release [OPTIONS] [ACTION] [CRATE_NAMES]...
+Usage: cargo rail release [OPTIONS] <COMMAND>
 
-Arguments:
-  [ACTION]
-          Action: 'init' to configure release settings
-
-  [CRATE_NAMES]...
-          Crate name(s) to release (mutually exclusive with --all)
+Commands:
+  init  Configure release settings
+  run   Execute release (plan or publish)
+  help  Print this message or the help of the given subcommand(s)
 
 Options:
-  -a, --all
-          Release all workspace crates (mutually exclusive with crate names)
-
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-      --bump <BUMP>
-          Version bump [major, minor, patch, or "x.y.z"]
-          
-          [default: patch]
-
-  -c, --check
-          Dry-run mode: preview release plan without executing
-
-      --skip-publish
-          Skip publishing to crates.io
-
-      --skip-tag
-          Skip git tag creation
-
-  -f, --format <FORMAT>
-          Output format [text, json]
-          
-          [default: text]
+      --json
+          Output in JSON format (shorthand for -f json)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -364,11 +373,12 @@ Options:
           Print version
 
 Examples:
-  cargo rail release my-crate --check     # Preview release plan
-  cargo rail release my-crate             # Release (patch bump)
-  cargo rail release my-crate --bump minor
-  cargo rail release --all --bump patch   # Release all crates
-  cargo rail release my-crate --skip-publish  # Tag only, no crates.io
+  cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release run my-crate --check       # Preview release plan
+  cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate --bump minor
+  cargo rail release run --all --bump patch     # Release all crates
+  cargo rail release run my-crate --skip-publish  # Tag only, no crates.io
 ```
 
 ---
@@ -381,14 +391,37 @@ Validate release readiness
 Usage: cargo rail check [OPTIONS] [CRATE_NAMES]...
 
 Arguments:
-  [CRATE_NAMES]...  Crate name(s) to check (mutually exclusive with --all)
+  [CRATE_NAMES]...
+          Crate name(s) to check (mutually exclusive with --all)
 
 Options:
-  -a, --all              Check all workspace crates (mutually exclusive with crate names)
-  -q, --quiet            Suppress progress messages (for CI/automation)
-  -f, --format <FORMAT>  Output format [text, json] [default: text]
-  -h, --help             Print help
-  -V, --version          Print version
+  -a, --all
+          Check all workspace crates (mutually exclusive with crate names)
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -404,6 +437,7 @@ Options:
       --cache    Clean metadata cache only
   -q, --quiet    Suppress progress messages (for CI/automation)
       --backups  Prune old backups
+      --json     Output in JSON format (shorthand for -f json)
       --reports  Clean generated reports
   -c, --check    Dry-run mode: preview what would be cleaned
   -h, --help     Print help
@@ -415,16 +449,17 @@ Options:
 ## cargo rail config
 
 ```
-Validate configuration file
+Configuration management
 
-Usage: cargo rail config [OPTIONS] <ACTION>
+Usage: cargo rail config [OPTIONS] <COMMAND>
 
-Arguments:
-  <ACTION>  Action: 'validate' to check configuration
+Commands:
+  validate  Validate the configuration file
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -f, --format <FORMAT>  Output format [text, json] [default: text]
-  -q, --quiet            Suppress progress messages (for CI/automation)
-  -h, --help             Print help
-  -V, --version          Print version
+  -q, --quiet    Suppress progress messages (for CI/automation)
+      --json     Output in JSON format (shorthand for -f json)
+  -h, --help     Print help
+  -V, --version  Print version
 ```

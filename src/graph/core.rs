@@ -51,8 +51,11 @@ pub struct WorkspaceGraph {
   /// Index: package name → node index
   name_to_node: HashMap<String, NodeIndex>,
 
-  /// Workspace members only (subset of graph nodes)
+  /// Workspace members only (subset of graph nodes) - for O(1) membership checks
   workspace_members: HashSet<String>,
+
+  /// Pre-sorted workspace member names - avoids repeated sort on each call
+  sorted_members: Vec<String>,
 
   /// Path cache: directory → owning crate name
   /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
@@ -108,10 +111,15 @@ impl WorkspaceGraph {
       }
     }
 
+    // Pre-sort workspace members once at construction
+    let mut sorted_members: Vec<String> = workspace_members.iter().cloned().collect();
+    sorted_members.sort();
+
     let graph = Self {
       graph,
       name_to_node,
       workspace_members,
+      sorted_members,
       path_cache: RwLock::new(None),
     };
 
@@ -121,11 +129,9 @@ impl WorkspaceGraph {
     Ok(graph)
   }
 
-  /// Get all workspace member crate names.
-  pub fn workspace_members(&self) -> Vec<String> {
-    let mut members: Vec<_> = self.workspace_members.iter().cloned().collect();
-    members.sort();
-    members
+  /// Get all workspace member crate names (pre-sorted).
+  pub fn workspace_members(&self) -> &[String] {
+    &self.sorted_members
   }
 
   /// Get transitive reverse dependencies (all workspace crates that depend on this one).

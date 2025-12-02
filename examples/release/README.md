@@ -41,20 +41,20 @@ cargo rail check                      # All crates
 cargo rail check my-crate             # Specific crate
 
 # Preview release (dry run)
-cargo rail release my-crate --check
+cargo rail release run my-crate --check
 
 # Release with version bump
-cargo rail release my-crate           # Patch bump (default)
-cargo rail release my-crate --bump minor
-cargo rail release my-crate --bump major
-cargo rail release my-crate --bump 2.0.0  # Explicit version
+cargo rail release run my-crate           # Patch bump (default)
+cargo rail release run my-crate --bump minor
+cargo rail release run my-crate --bump major
+cargo rail release run my-crate --bump 2.0.0  # Explicit version
 
 # Release all workspace crates
-cargo rail release --all --bump patch
+cargo rail release run --all --bump patch
 
 # Skip steps
-cargo rail release my-crate --skip-publish  # Tag only, no crates.io
-cargo rail release my-crate --skip-tag      # Publish only, no tag
+cargo rail release run my-crate --skip-publish  # Tag only, no crates.io
+cargo rail release run my-crate --skip-tag      # Publish only, no tag
 ```
 
 ## Configuration
@@ -183,7 +183,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo install cargo-rail
-      - run: cargo rail release --all --skip-tag
+      - run: cargo rail release run --all --skip-tag
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 ```

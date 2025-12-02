@@ -174,32 +174,19 @@ impl<'a> ChangeImpact<'a> {
   fn categorize_changes(&self, files: &[(PathBuf, char)]) -> ChangeCategories {
     let mut categories = ChangeCategories::default();
 
+    // Use pre-computed proc-macro crates from CargoState (O(1) lookup per file)
+    let proc_macro_crates = self.ctx.cargo.proc_macro_crates();
+
     for (path, _change_type) in files {
       let mut kind = classify_file(path);
 
-      // Enhance classification with proc-macro detection
+      // Enhance classification with proc-macro detection (O(1) lookup)
       if let ChangeKind::Source { is_proc_macro } = kind
         && !is_proc_macro
+        && let Some(crate_name) = self.ctx.graph.file_to_crate(path)
+        && proc_macro_crates.contains(&crate_name)
       {
-        // Check if this file belongs to a proc-macro crate
-        if let Some(crate_name) = self.ctx.graph.file_to_crate(path) {
-          let is_proc_macro = self
-            .ctx
-            .cargo
-            .metadata()
-            .workspace_packages()
-            .into_iter()
-            .find(|pkg| pkg.name == crate_name)
-            .map(|pkg| {
-              pkg.targets.iter().any(|t| {
-                t.kind
-                  .iter()
-                  .any(|k| matches!(k, cargo_metadata::TargetKind::ProcMacro))
-              })
-            })
-            .unwrap_or(false);
-          kind = ChangeKind::Source { is_proc_macro };
-        }
+        kind = ChangeKind::Source { is_proc_macro: true };
       }
 
       match kind {
@@ -231,17 +218,18 @@ mod tests {
     let ctx = create_test_context();
 
     // cargo-rail is not a proc-macro crate
-    // Check by looking at the targets
-    let cargo_rail = ctx.cargo.get_package("cargo-rail");
-    assert!(cargo_rail.is_some(), "Should find cargo-rail package");
+    // Use the new cached API for O(1) lookup
+    assert!(
+      !ctx.cargo.is_proc_macro("cargo-rail"),
+      "cargo-rail should not be detected as proc-macro crate"
+    );
 
-    let is_proc_macro = cargo_rail.unwrap().targets.iter().any(|t| {
-      t.kind
-        .iter()
-        .any(|k| matches!(k, cargo_metadata::TargetKind::ProcMacro))
-    });
-
-    assert!(!is_proc_macro, "cargo-rail should not be detected as proc-macro crate");
+    // The proc_macro_crates set should be accessible
+    let proc_macros = ctx.cargo.proc_macro_crates();
+    assert!(
+      !proc_macros.contains("cargo-rail"),
+      "cargo-rail should not be in proc_macro_crates set"
+    );
   }
 
   #[test]

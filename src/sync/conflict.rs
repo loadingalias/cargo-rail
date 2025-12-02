@@ -2,12 +2,13 @@
 ///
 /// Handles file-level conflicts when syncing changes between monorepo and split repos.
 /// Uses Git's battle-tested 3-way merge algorithm via `git merge-file`.
-use crate::error::{RailError, RailResult, ResultExt};
+use crate::error::{RailResult, ResultExt};
+use clap::ValueEnum;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Strategy for resolving conflicts
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum ConflictStrategy {
   /// Use the monorepo version (--ours)
   Ours,
@@ -18,23 +19,6 @@ pub enum ConflictStrategy {
   Manual,
   /// Combine both versions line-by-line (union merge)
   Union,
-}
-
-impl std::str::FromStr for ConflictStrategy {
-  type Err = RailError;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s.to_lowercase().as_str() {
-      "ours" | "use-mono" => Ok(Self::Ours),
-      "theirs" | "use-remote" => Ok(Self::Theirs),
-      "manual" => Ok(Self::Manual),
-      "union" => Ok(Self::Union),
-      _ => Err(RailError::with_help(
-        format!("Invalid conflict strategy '{}'", s),
-        "Valid options: ours, theirs, manual, union",
-      )),
-    }
-  }
 }
 
 /// Information about a conflict
@@ -169,17 +153,29 @@ impl ConflictResolver {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::str::FromStr;
   use tempfile::TempDir;
 
   #[test]
-  fn test_strategy_from_str() {
-    assert_eq!(ConflictStrategy::from_str("ours").unwrap(), ConflictStrategy::Ours);
-    assert_eq!(ConflictStrategy::from_str("theirs").unwrap(), ConflictStrategy::Theirs);
-    assert_eq!(ConflictStrategy::from_str("manual").unwrap(), ConflictStrategy::Manual);
-    assert_eq!(ConflictStrategy::from_str("union").unwrap(), ConflictStrategy::Union);
-
-    assert!(ConflictStrategy::from_str("invalid").is_err());
+  fn test_strategy_value_enum() {
+    // ValueEnum provides from_str via clap
+    use clap::ValueEnum;
+    assert_eq!(
+      ConflictStrategy::from_str("ours", false).unwrap(),
+      ConflictStrategy::Ours
+    );
+    assert_eq!(
+      ConflictStrategy::from_str("theirs", false).unwrap(),
+      ConflictStrategy::Theirs
+    );
+    assert_eq!(
+      ConflictStrategy::from_str("manual", false).unwrap(),
+      ConflictStrategy::Manual
+    );
+    assert_eq!(
+      ConflictStrategy::from_str("union", false).unwrap(),
+      ConflictStrategy::Union
+    );
+    assert!(ConflictStrategy::from_str("invalid", false).is_err());
   }
 
   #[test]

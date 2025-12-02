@@ -14,9 +14,14 @@ pub mod change_analyzer;
 pub mod context;
 /// File path utilities
 pub mod files;
+/// High-level façade for crate information queries
+pub mod view;
 
 // Re-export change analysis types
 pub use change_analyzer::ChangeImpact;
 
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};
+
+// Re-export view types
+pub use view::{CrateInfo, WorkspaceView};

@@ -27,7 +27,7 @@ Type "# Preview split (dry run)"
 Enter
 Sleep 500ms
 
-Type "cargo rail split tokio-util --check"
+Type "cargo rail split run tokio-util --check"
 Enter
 Wait+Screen /would|check|preview|files|commits|error/
 Sleep 4s
@@ -36,7 +36,7 @@ Type "# Execute the split with history"
 Enter
 Sleep 500ms
 
-Type "cargo rail split tokio-util"
+Type "cargo rail split run tokio-util"
 Enter
 Wait+Screen /Created|complete|success|done|error/
 Sleep 4s

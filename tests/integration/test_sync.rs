@@ -27,7 +27,7 @@ paths = [{{ crate = "crates/{0}" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform initial split
-  run_cargo_rail(&ws.path, &["rail", "split", crate_name])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", crate_name])?;
 
   Ok((ws, split_dir))
 }

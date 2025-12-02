@@ -1,15 +1,21 @@
 //! `cargo rail sync` - Bidirectional sync between monorepo and split repositories.
 
 use std::io::IsTerminal;
-use std::str::FromStr;
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::error::RailResult;
 use crate::progress;
-use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine};
+use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine, SyncResult};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
+
+/// Per-crate sync result for structured output
+struct CrateSyncResult {
+  crate_name: String,
+  result: SyncResult,
+  skipped: bool,
+}
 
 /// Run the sync command
 #[allow(clippy::too_many_arguments)]
@@ -20,20 +26,17 @@ pub fn run_sync(
   remote: Option<String>,
   from_remote: bool,
   to_remote: bool,
-  strategy_str: String,
+  strategy: ConflictStrategy,
   _no_protected_branches: bool,
   check: bool,
-  format: String,
+  format: OutputFormat,
 ) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
     crate::output::set_json_mode(true);
   }
-
-  let conflict_strategy = ConflictStrategy::from_str(&strategy_str)?;
 
   let builder = SplitSyncConfigBuilder::new(ctx)?
     .with_crate_or_all(crate_name.clone(), all)?
@@ -90,7 +93,7 @@ pub fn run_sync(
         "command": "sync",
         "check": true,
         "direction": dir_str,
-        "conflict_strategy": &strategy_str,
+        "strategy": format!("{:?}", strategy).to_lowercase(),
         "crates": crates,
         "count": configs.len()
       });
@@ -111,14 +114,13 @@ pub fn run_sync(
       println!("    direction: {}", dir_display);
       println!("    target: {}", sync_config.target_repo_path.display());
       println!("    remote: {}", sync_config.remote_url);
-      println!("    strategy: {}", strategy_str);
+      println!("    strategy: {:?}", strategy);
       if !target_exists {
         println!("    warning: target repo missing (run split first)");
       }
     }
 
-    println!("\nrun without --check to execute");
-    // Exit 1 to signal CI that sync is pending
+    println!("\nChanges detected. Run without --check to apply.");
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
@@ -153,55 +155,172 @@ pub fn run_sync(
     }
   }
 
-  // Execute syncs
-  if config_count > 1 && all {
+  // Execute syncs and collect per-crate results
+  let crate_results: Vec<CrateSyncResult> = if config_count > 1 && all {
     progress!("syncing {} crates...", config_count);
 
     let ctx = ctx.clone();
-    let results: Vec<RailResult<()>> = configs
+    let results: Vec<RailResult<CrateSyncResult>> = configs
       .into_par_iter()
       .map(|(sync_config, target_exists)| {
+        let crate_name = sync_config.crate_name.clone();
+
         if !target_exists {
-          progress!("  {} skipped (run split first)", sync_config.crate_name);
-          return Ok(());
+          progress!("  {} skipped (run split first)", crate_name);
+          return Ok(CrateSyncResult {
+            crate_name,
+            result: SyncResult::default(),
+            skipped: true,
+          });
         }
 
-        progress!("  {}", sync_config.crate_name);
-        let mut engine = SyncEngine::new(&ctx, sync_config, conflict_strategy)?;
+        progress!("  {}", crate_name);
+        let mut engine = SyncEngine::new(&ctx, sync_config, strategy)?;
 
-        match direction {
+        let result = match direction {
           SyncDirection::MonoToRemote => engine.sync_to_remote()?,
           SyncDirection::RemoteToMono => engine.sync_from_remote()?,
           SyncDirection::Both => engine.sync_bidirectional()?,
-          SyncDirection::None => return Ok(()),
+          SyncDirection::None => SyncResult::default(),
         };
 
-        Ok(())
+        Ok(CrateSyncResult {
+          crate_name,
+          result,
+          skipped: false,
+        })
       })
       .collect();
 
-    for result in results {
-      result?;
-    }
+    results.into_iter().collect::<RailResult<Vec<_>>>()?
   } else {
+    let mut results = Vec::new();
     for (sync_config, target_exists) in configs {
+      let crate_name = sync_config.crate_name.clone();
+
       if !target_exists {
-        progress!("{} skipped (run split first)", sync_config.crate_name);
+        progress!("{} skipped (run split first)", crate_name);
+        results.push(CrateSyncResult {
+          crate_name,
+          result: SyncResult::default(),
+          skipped: true,
+        });
         continue;
       }
 
-      progress!("syncing {}...", sync_config.crate_name);
-      let mut engine = SyncEngine::new(ctx, sync_config, conflict_strategy)?;
+      progress!("syncing {}...", crate_name);
+      let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
 
-      match direction {
+      let result = match direction {
         SyncDirection::MonoToRemote => engine.sync_to_remote()?,
         SyncDirection::RemoteToMono => engine.sync_from_remote()?,
         SyncDirection::Both => engine.sync_bidirectional()?,
-        SyncDirection::None => continue,
+        SyncDirection::None => SyncResult::default(),
       };
+
+      results.push(CrateSyncResult {
+        crate_name,
+        result,
+        skipped: false,
+      });
     }
+    results
+  };
+
+  // Print summary
+  print_sync_summary(&crate_results, json)?;
+
+  Ok(())
+}
+
+/// Print sync results summary
+fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()> {
+  if json {
+    let crates: Vec<_> = results
+      .iter()
+      .map(|r| {
+        let conflicts: Vec<_> = r
+          .result
+          .conflicts
+          .iter()
+          .map(|c| c.file_path.display().to_string())
+          .collect();
+
+        serde_json::json!({
+          "crate": r.crate_name,
+          "commits_synced": r.result.commits_synced,
+          "conflicts": conflicts,
+          "skipped": r.skipped
+        })
+      })
+      .collect();
+
+    let total_commits: usize = results.iter().map(|r| r.result.commits_synced).sum();
+    let total_conflicts: usize = results.iter().map(|r| r.result.conflicts.len()).sum();
+
+    let output = serde_json::json!({
+      "command": "sync",
+      "crates": crates,
+      "summary": {
+        "total_commits": total_commits,
+        "total_conflicts": total_conflicts,
+        "crates_synced": results.iter().filter(|r| !r.skipped).count(),
+        "crates_skipped": results.iter().filter(|r| r.skipped).count()
+      }
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    return Ok(());
   }
 
-  println!("sync complete");
+  // Text output
+  let active_results: Vec<_> = results.iter().filter(|r| !r.skipped).collect();
+  let total_commits: usize = active_results.iter().map(|r| r.result.commits_synced).sum();
+  let total_conflicts: usize = active_results.iter().map(|r| r.result.conflicts.len()).sum();
+
+  // Per-crate details (only if multiple crates or conflicts)
+  if active_results.len() > 1 || total_conflicts > 0 {
+    println!();
+    for r in &active_results {
+      let commit_word = if r.result.commits_synced == 1 {
+        "commit"
+      } else {
+        "commits"
+      };
+      if r.result.conflicts.is_empty() {
+        println!("  {}: {} {}", r.crate_name, r.result.commits_synced, commit_word);
+      } else {
+        let conflict_word = if r.result.conflicts.len() == 1 {
+          "conflict"
+        } else {
+          "conflicts"
+        };
+        println!(
+          "  {}: {} {}, {} {}",
+          r.crate_name,
+          r.result.commits_synced,
+          commit_word,
+          r.result.conflicts.len(),
+          conflict_word
+        );
+        for conflict in &r.result.conflicts {
+          println!("    {}", conflict.file_path.display());
+        }
+      }
+    }
+    println!();
+  }
+
+  // Summary line
+  let commit_word = if total_commits == 1 { "commit" } else { "commits" };
+  if total_conflicts > 0 {
+    let conflict_word = if total_conflicts == 1 { "conflict" } else { "conflicts" };
+    println!(
+      "sync complete: {} {}, {} {}",
+      total_commits, commit_word, total_conflicts, conflict_word
+    );
+  } else {
+    println!("sync complete: {} {}", total_commits, commit_word);
+  }
+
   Ok(())
 }

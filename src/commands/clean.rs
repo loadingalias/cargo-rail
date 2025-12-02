@@ -72,8 +72,7 @@ pub fn run_clean(ctx: &WorkspaceContext, cache: bool, backups: bool, reports: bo
     }
 
     if would_clean {
-      println!("\nrun without --check to execute");
-      // Exit 1 to signal CI that cleanup is pending
+      println!("\nChanges detected. Run without --check to apply.");
       return Err(RailError::CheckHasPendingChanges);
     } else {
       println!("nothing to clean");

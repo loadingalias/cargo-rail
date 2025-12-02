@@ -1,4 +1,4 @@
-# Release - Segment 3: cargo rail release (dry run)
+# Release - Segment 3: cargo rail release run (dry run)
 
 Output segments/3_release.mp4
 
@@ -25,7 +25,7 @@ Type "# Preview release plan (dry run)"
 Enter
 Sleep 500ms
 
-Type "cargo rail release ripgrep --check"
+Type "cargo rail release run ripgrep --check"
 Enter
 Wait+Screen /would|version|changelog|tag|skip|bump|error|preview/
 Sleep 5s
@@ -33,7 +33,7 @@ Sleep 5s
 Type "# Different bump types"
 Enter
 Sleep 500ms
-Type "cargo rail release ripgrep --bump minor --check"
+Type "cargo rail release run ripgrep --bump minor --check"
 Enter
 Wait+Screen /would|version|minor|error/
 Sleep 4s

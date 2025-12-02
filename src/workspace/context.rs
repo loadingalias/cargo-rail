@@ -50,6 +50,14 @@ pub struct CargoState {
 
   /// Cached workspace root
   workspace_root: PathBuf,
+
+  /// Index: package name → index in metadata.packages (workspace members only)
+  /// Enables O(1) package lookup instead of O(n) linear scan
+  package_index: std::collections::HashMap<String, usize>,
+
+  /// Cached set of proc-macro crate names for O(1) detection
+  /// Built once during construction, used by change analysis
+  proc_macro_crates: std::collections::HashSet<String>,
 }
 
 /// Metadata cache structure
@@ -92,10 +100,7 @@ impl CargoState {
 
       if current_root_canonical == cached_root_canonical {
         // Cache hit - use cached metadata
-        return Ok(Self {
-          workspace_root: cache.metadata.workspace_root.as_std_path().to_path_buf(),
-          metadata: cache.metadata,
-        });
+        return Ok(Self::from_metadata(cache.metadata));
       }
       // Path mismatch - cache is stale, will reload below
     }
@@ -104,8 +109,6 @@ impl CargoState {
     let metadata = MetadataCommand::new()
       .manifest_path(workspace_root.join("Cargo.toml"))
       .exec()?;
-
-    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
 
     // Save to cache
     if let Ok(()) = fs::create_dir_all(&cache_dir) {
@@ -116,10 +119,46 @@ impl CargoState {
       let _ = fs::write(&cache_file, serde_json::to_string(&cache).unwrap_or_default());
     }
 
-    Ok(Self {
+    Ok(Self::from_metadata(metadata))
+  }
+
+  /// Build CargoState from metadata, constructing the package index and proc-macro cache
+  fn from_metadata(metadata: Metadata) -> Self {
+    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
+
+    // Build O(1) lookup index: package name → index in metadata.packages
+    let workspace_member_ids: std::collections::HashSet<_> = metadata.workspace_members.iter().collect();
+    let workspace_packages: Vec<_> = metadata
+      .packages
+      .iter()
+      .enumerate()
+      .filter(|(_, pkg)| workspace_member_ids.contains(&pkg.id))
+      .collect();
+
+    let package_index = workspace_packages
+      .iter()
+      .map(|(idx, pkg)| (pkg.name.to_string(), *idx))
+      .collect();
+
+    // Build proc-macro crate set for O(1) detection
+    let proc_macro_crates = workspace_packages
+      .iter()
+      .filter(|(_, pkg)| {
+        pkg.targets.iter().any(|t| {
+          t.kind
+            .iter()
+            .any(|k| matches!(k, cargo_metadata::TargetKind::ProcMacro))
+        })
+      })
+      .map(|(_, pkg)| pkg.name.to_string())
+      .collect();
+
+    Self {
       metadata,
       workspace_root,
-    })
+      package_index,
+      proc_macro_crates,
+    }
   }
 
   /// Get workspace root path
@@ -132,18 +171,24 @@ impl CargoState {
     self.metadata.workspace_packages()
   }
 
-  /// Get a specific workspace package by name
+  /// Get a specific workspace package by name (O(1) lookup)
   pub fn get_package(&self, name: &str) -> Option<&Package> {
-    self
-      .metadata
-      .workspace_packages()
-      .into_iter()
-      .find(|pkg| pkg.name == name)
+    self.package_index.get(name).map(|&idx| &self.metadata.packages[idx])
   }
 
   /// Get the underlying metadata (for compatibility)
   pub fn metadata(&self) -> &Metadata {
     &self.metadata
+  }
+
+  /// Check if a crate is a proc-macro crate (O(1) lookup)
+  pub fn is_proc_macro(&self, crate_name: &str) -> bool {
+    self.proc_macro_crates.contains(crate_name)
+  }
+
+  /// Get the set of all proc-macro crate names
+  pub fn proc_macro_crates(&self) -> &std::collections::HashSet<String> {
+    &self.proc_macro_crates
   }
 }
 
@@ -208,7 +253,7 @@ impl GitState {
   /// Open git repository at the given path
   fn open(path: &Path) -> RailResult<Self> {
     let git = SystemGit::open(path)?;
-    let repo_root = git.work_tree.clone();
+    let repo_root = git.worktree_root.clone();
 
     Ok(Self { git, repo_root })
   }
@@ -463,7 +508,7 @@ mod tests {
     let graph_members = ctx.graph.workspace_members();
     let cargo_packages: Vec<_> = ctx.cargo.workspace_members().iter().map(|p| p.name.as_str()).collect();
 
-    for member in &graph_members {
+    for member in graph_members {
       assert!(
         cargo_packages.contains(&member.as_str()),
         "Graph member {} should be in cargo packages",

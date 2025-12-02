@@ -37,8 +37,8 @@ pub struct SystemGit {
   /// Repository working directory
   pub(crate) repo_path: PathBuf,
 
-  /// Working tree root
-  pub(crate) work_tree: PathBuf,
+  /// Root directory of the git working tree
+  pub(crate) worktree_root: PathBuf,
 }
 
 impl SystemGit {
@@ -65,11 +65,11 @@ impl SystemGit {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let work_tree = stdout.trim();
+    let worktree_root = stdout.trim();
 
     Ok(Self {
       repo_path: path.to_path_buf(),
-      work_tree: PathBuf::from(work_tree),
+      worktree_root: PathBuf::from(worktree_root),
     })
   }
 

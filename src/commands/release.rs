@@ -16,10 +16,9 @@ pub fn run_release_plan(
   bump: String,
   skip_publish: bool,
   skip_tag: bool,
-  format: String,
+  format: OutputFormat,
 ) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
@@ -46,7 +45,7 @@ pub fn run_release_plan(
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
   // Validate release config (Issue #14: tag_format, Issue #20: skip_changelog_for)
-  let warnings = release_config.validate(&workspace_members).map_err(RailError::Config)?;
+  let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
 
   // Print warnings
   for warning in &warnings {
@@ -56,7 +55,7 @@ pub fn run_release_plan(
   // Issue #15: Run require_clean check in --check mode too (early feedback)
   if release_config.require_clean {
     let validator = ReleaseValidator::new(ctx);
-    let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.clone());
+    let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.to_vec());
     validator.validate(&target_crates, true)?;
   }
 
@@ -82,8 +81,7 @@ pub fn run_release_plan(
       println!("Tag signing: enabled");
     }
 
-    println!("\nrun without --check to execute");
-    // Exit 1 to signal CI that release is pending
+    println!("\nChanges detected. Run without --check to apply.");
     return Err(RailError::CheckHasPendingChanges);
   }
 
@@ -117,7 +115,9 @@ pub fn run_release_publish(
   let bump_type = bump.parse::<BumpType>()?;
 
   let validator = ReleaseValidator::new(ctx);
-  let target_crates = targets.clone().unwrap_or_else(|| ctx.graph.workspace_members());
+  let target_crates = targets
+    .clone()
+    .unwrap_or_else(|| ctx.graph.workspace_members().to_vec());
   validator.validate(&target_crates, release_config.require_clean)?;
 
   let planner = ReleasePlanner::new(ctx, release_config);
@@ -154,10 +154,9 @@ pub fn run_release_check(
   ctx: &WorkspaceContext,
   crate_names: Option<Vec<String>>,
   all: bool,
-  format: String,
+  format: OutputFormat,
 ) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
@@ -169,7 +168,7 @@ pub fn run_release_check(
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
   let target_crates = if all {
-    ctx.graph.workspace_members()
+    ctx.graph.workspace_members().to_vec()
   } else if let Some(names) = crate_names {
     names
   } else {
@@ -216,7 +215,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
 
   let requested_crates = crates;
 
-  let members = ctx.cargo.metadata().workspace_packages();
+  let members = ctx.cargo.workspace_members();
   let workspace_root = ctx.workspace_root();
 
   let target_crates: Vec<_> = members

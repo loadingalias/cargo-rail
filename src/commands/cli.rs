@@ -3,6 +3,8 @@
 //! This module defines all CLI structures using clap. These are used by main.rs
 //! and the dispatch logic in commands/mod.rs.
 
+use super::common::OutputFormat;
+use crate::sync::ConflictStrategy;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -44,6 +46,10 @@ pub struct RailCli {
   #[arg(long, short, global = true)]
   pub quiet: bool,
 
+  /// Output in JSON format (shorthand for -f json)
+  #[arg(long, global = true)]
+  pub json: bool,
+
   /// The subcommand to execute
   #[command(subcommand)]
   pub command: Commands,
@@ -54,6 +60,7 @@ Examples:
   cargo rail affected                     # Changes since origin/main
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
+  cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
   cargo rail affected -f names-only       # Just crate names, one per line";
 
@@ -76,9 +83,10 @@ Examples:
 const SPLIT_HELP: &str = "\
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
-  cargo rail split my-crate --check       # Preview the split
-  cargo rail split my-crate               # Execute the split
-  cargo rail split --all                  # Split all configured crates";
+  cargo rail split init my-crate --check  # Preview generated config
+  cargo rail split run my-crate --check   # Preview the split
+  cargo rail split run my-crate           # Execute the split
+  cargo rail split run --all              # Split all configured crates";
 
 const SYNC_HELP: &str = "\
 Examples:
@@ -89,11 +97,12 @@ Examples:
 
 const RELEASE_HELP: &str = "\
 Examples:
-  cargo rail release my-crate --check     # Preview release plan
-  cargo rail release my-crate             # Release (patch bump)
-  cargo rail release my-crate --bump minor
-  cargo rail release --all --bump patch   # Release all crates
-  cargo rail release my-crate --skip-publish  # Tag only, no crates.io";
+  cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release run my-crate --check       # Preview release plan
+  cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate --bump minor
+  cargo rail release run --all --bump patch     # Release all crates
+  cargo rail release run my-crate --skip-publish  # Tag only, no crates.io";
 
 /// Available subcommands
 #[derive(Subcommand)]
@@ -110,15 +119,18 @@ pub enum Commands {
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
     to: Option<String>,
-    /// Output format [text, json, names-only, github, github-matrix, jsonl]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
     /// Show all workspace crates (ignore changes)
     #[arg(long, short = 'a')]
     all: bool,
     /// Write output to file (e.g., $GITHUB_OUTPUT)
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
+    /// Explain why each crate is affected
+    #[arg(long)]
+    explain: bool,
   },
 
   /// Run tests for affected crates only
@@ -144,14 +156,15 @@ pub enum Commands {
   /// Unify workspace dependencies (replaces workspace-hack crates)
   #[command(after_long_help = UNIFY_HELP)]
   Unify {
-    /// Action: 'undo' to restore from backup (use with --list to see backups)
-    action: Option<String>,
+    /// Subcommand (undo)
+    #[command(subcommand)]
+    command: Option<UnifyCommand>,
     /// Dry-run mode: preview changes without modifying files
     #[arg(long, short = 'c')]
     check: bool,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
     /// Exclude dependencies from unification (comma-separated)
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
@@ -167,12 +180,6 @@ pub enum Commands {
     /// Include renamed dependencies (package = "...") in unification
     #[arg(long)]
     include_renamed: bool,
-    /// List available backups (for undo action)
-    #[arg(long)]
-    list: bool,
-    /// Specific backup ID to restore (for undo action)
-    #[arg(long = "backup-id")]
-    backup_id: Option<String>,
     /// Skip generating the unify report
     #[arg(long)]
     skip_report: bool,
@@ -203,23 +210,9 @@ pub enum Commands {
   /// Split a crate to a standalone repository with git history
   #[command(after_long_help = SPLIT_HELP)]
   Split {
-    /// Action: 'init' to configure splits, or crate name to split
-    action: Option<String>,
-    /// Additional crate name(s) for init
-    #[arg(conflicts_with = "all")]
-    crate_names: Vec<String>,
-    /// Split all configured crates (mutually exclusive with crate names)
-    #[arg(short, long, conflicts_with = "action")]
-    all: bool,
-    /// Override remote repository
-    #[arg(long)]
-    remote: Option<String>,
-    /// Dry-run mode: preview changes without executing
-    #[arg(long, short = 'c')]
-    check: bool,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Split subcommand
+    #[command(subcommand)]
+    command: SplitCommand,
   },
 
   /// Sync changes between monorepo and split repos
@@ -240,46 +233,26 @@ pub enum Commands {
     /// Sync from monorepo to remote only
     #[arg(long)]
     to_remote: bool,
-    /// Conflict resolution [ours, theirs, manual, union]
-    #[arg(long, default_value = "manual")]
-    strategy: String,
+    /// Conflict resolution strategy
+    #[arg(long, default_value_t, value_enum)]
+    strategy: ConflictStrategy,
     /// Allow direct commits to protected branches
     #[arg(long)]
     no_protected_branches: bool,
     /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
   },
 
   /// Publish releases (version bump, changelog, tag, publish)
   #[command(after_long_help = RELEASE_HELP)]
   Release {
-    /// Action: 'init' to configure release settings
-    action: Option<String>,
-    /// Crate name(s) to release (mutually exclusive with --all)
-    #[arg(conflicts_with = "all")]
-    crate_names: Vec<String>,
-    /// Release all workspace crates (mutually exclusive with crate names)
-    #[arg(short, long, conflicts_with = "action")]
-    all: bool,
-    /// Version bump [major, minor, patch, or "x.y.z"]
-    #[arg(long, default_value = "patch")]
-    bump: String,
-    /// Dry-run mode: preview release plan without executing
-    #[arg(long, short = 'c')]
-    check: bool,
-    /// Skip publishing to crates.io
-    #[arg(long)]
-    skip_publish: bool,
-    /// Skip git tag creation
-    #[arg(long)]
-    skip_tag: bool,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Release subcommand
+    #[command(subcommand)]
+    command: ReleaseCommand,
   },
 
   /// Validate release readiness
@@ -290,9 +263,9 @@ pub enum Commands {
     /// Check all workspace crates (mutually exclusive with crate names)
     #[arg(short, long)]
     all: bool,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
   },
 
   /// Clean generated artifacts (cache, backups, reports)
@@ -311,14 +284,105 @@ pub enum Commands {
     check: bool,
   },
 
-  /// Validate configuration file
+  /// Configuration management
   #[command(name = "config")]
   Config {
-    /// Action: 'validate' to check configuration
-    action: String,
-    /// Output format [text, json]
-    #[arg(long, short = 'f', default_value = "text")]
-    format: String,
+    /// Subcommand
+    #[command(subcommand)]
+    command: ConfigCommand,
+  },
+}
+
+/// Subcommands for `cargo rail config`
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+  /// Validate the configuration file
+  Validate {
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
+}
+
+/// Subcommands for `cargo rail unify`
+#[derive(Subcommand)]
+pub enum UnifyCommand {
+  /// Restore manifests from a previous backup
+  Undo {
+    /// List available backups instead of restoring
+    #[arg(long)]
+    list: bool,
+    /// Specific backup ID to restore (defaults to most recent)
+    #[arg(long = "backup-id")]
+    backup_id: Option<String>,
+  },
+}
+
+/// Subcommands for `cargo rail split`
+#[derive(Subcommand)]
+pub enum SplitCommand {
+  /// Configure split for crate(s)
+  Init {
+    /// Crate name(s) to configure
+    crate_names: Vec<String>,
+    /// Preview generated config without writing
+    #[arg(long, short = 'c')]
+    check: bool,
+  },
+  /// Execute split operation
+  Run {
+    /// Crate name to split (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
+    crate_name: Option<String>,
+    /// Split all configured crates
+    #[arg(short, long)]
+    all: bool,
+    /// Override remote repository
+    #[arg(long)]
+    remote: Option<String>,
+    /// Dry-run mode: preview changes
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
+}
+
+/// Subcommands for `cargo rail release`
+#[derive(Subcommand)]
+pub enum ReleaseCommand {
+  /// Configure release settings
+  Init {
+    /// Crate name(s) to configure (optional)
+    crate_names: Vec<String>,
+    /// Preview generated config without writing
+    #[arg(long, short = 'c')]
+    check: bool,
+  },
+  /// Execute release (plan or publish)
+  Run {
+    /// Crate name(s) to release (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
+    crate_names: Vec<String>,
+    /// Release all workspace crates
+    #[arg(short, long)]
+    all: bool,
+    /// Version bump [major, minor, patch, or "x.y.z"]
+    #[arg(long, default_value = "patch")]
+    bump: String,
+    /// Dry-run mode: preview release plan
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Skip publishing to crates.io
+    #[arg(long)]
+    skip_publish: bool,
+    /// Skip git tag creation
+    #[arg(long)]
+    skip_tag: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
   },
 }
 
@@ -327,23 +391,50 @@ fn get_styles() -> clap::builder::Styles {
 }
 
 impl Commands {
-  /// Check if this command uses JSON output format
+  /// Check if this command uses JSON-like output format
   ///
   /// Returns true for any format that produces structured output.
   /// Used for early JSON mode detection to suppress progress messages.
   pub fn is_json_format(&self) -> bool {
     match self {
-      Commands::Affected { format, .. } => {
-        let f = format.to_lowercase();
-        matches!(f.as_str(), "json" | "jsonl" | "json-lines" | "github" | "github-matrix")
-      }
-      Commands::Unify { format, .. }
-      | Commands::Split { format, .. }
+      Commands::Affected { format, .. }
+      | Commands::Unify { format, .. }
       | Commands::Sync { format, .. }
-      | Commands::Release { format, .. }
-      | Commands::Check { format, .. }
-      | Commands::Config { format, .. } => format.to_lowercase() == "json",
+      | Commands::Check { format, .. } => format.is_json_like(),
+      Commands::Split { command } => match command {
+        SplitCommand::Init { .. } => false,
+        SplitCommand::Run { format, .. } => format.is_json_like(),
+      },
+      Commands::Release { command } => match command {
+        ReleaseCommand::Init { .. } => false,
+        ReleaseCommand::Run { format, .. } => format.is_json_like(),
+      },
+      Commands::Config { command } => match command {
+        ConfigCommand::Validate { format } => format.is_json_like(),
+      },
       _ => false,
+    }
+  }
+
+  /// Apply global --json flag by overriding format to Json
+  pub fn apply_json_override(&mut self) {
+    match self {
+      Commands::Affected { format, .. }
+      | Commands::Unify { format, .. }
+      | Commands::Sync { format, .. }
+      | Commands::Check { format, .. } => *format = OutputFormat::Json,
+      Commands::Split {
+        command: SplitCommand::Run { format, .. },
+      } => *format = OutputFormat::Json,
+      Commands::Split { .. } => {}
+      Commands::Release {
+        command: ReleaseCommand::Run { format, .. },
+      } => *format = OutputFormat::Json,
+      Commands::Release { .. } => {}
+      Commands::Config { command } => match command {
+        ConfigCommand::Validate { format } => *format = OutputFormat::Json,
+      },
+      _ => {}
     }
   }
 }

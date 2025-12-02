@@ -13,7 +13,7 @@ impl SystemGit {
   /// If the path is already relative or stripping fails, returns the path as-is.
   fn normalize_path<'a>(&self, path: &'a Path) -> &'a Path {
     if path.is_absolute() {
-      path.strip_prefix(&self.work_tree).unwrap_or(path)
+      path.strip_prefix(&self.worktree_root).unwrap_or(path)
     } else {
       path
     }

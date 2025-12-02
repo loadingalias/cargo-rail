@@ -111,7 +111,7 @@ fn test_release_invalid_crate_name() -> Result<()> {
   ws.commit("Add crate")?;
 
   // Try to release non-existent crate
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "does-not-exist"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "does-not-exist"])?;
   assert!(!output.status.success(), "release with invalid crate should fail");
 
   Ok(())
@@ -144,7 +144,7 @@ paths = [{ crate = "crates/real-crate" }]
   ws.commit("Add crate with split config")?;
 
   // Try to split non-existent crate
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "nonexistent-crate"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "nonexistent-crate"])?;
   assert!(!output.status.success(), "split with invalid crate should fail");
 
   Ok(())

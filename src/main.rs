@@ -3,6 +3,7 @@
 //! This is intentionally thin - all logic lives in the library.
 //! See rules.md: "Thin main.rs" principle.
 
+use cargo_rail::commands::cli::UnifyCommand;
 use cargo_rail::commands::{self, CargoCli, Commands};
 use cargo_rail::error::{RailError, print_error};
 use cargo_rail::workspace;
@@ -10,14 +11,19 @@ use cargo_rail::workspace;
 use clap::Parser;
 
 fn main() {
-  let CargoCli::Rail(cli) = CargoCli::parse();
+  let CargoCli::Rail(mut cli) = CargoCli::parse();
+
+  // Apply global --json flag to command format fields
+  if cli.json {
+    cli.command.apply_json_override();
+  }
 
   // Initialize output control (quiet mode)
   cargo_rail::output::init(cli.quiet);
 
   // Detect JSON mode early (before building workspace context)
   // This ensures progress messages during metadata loading are suppressed
-  if cli.command.is_json_format() {
+  if cli.json || cli.command.is_json_format() {
     cargo_rail::output::set_json_mode(true);
   }
 
@@ -46,12 +52,9 @@ fn main() {
 
   // Handle unify undo specially - it needs to work even with corrupted Cargo.toml
   if let Commands::Unify {
-    action: Some(ref act),
-    list,
-    ref backup_id,
+    command: Some(UnifyCommand::Undo { list, ref backup_id }),
     ..
   } = cli.command
-    && act == "undo"
   {
     if let Err(e) = commands::run_unify_undo(&workspace_root, list, backup_id.clone()) {
       exit_with_error(e);

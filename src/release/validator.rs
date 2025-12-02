@@ -75,12 +75,10 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Check for uncommitted changes in specific crate directory
   fn check_crate_uncommitted_changes(&self, crate_name: &str) -> RailResult<()> {
-    // Get crate manifest path
-    let metadata = self.ctx.cargo.metadata();
-    let package = metadata
-      .workspace_packages()
-      .into_iter()
-      .find(|pkg| pkg.name == crate_name)
+    let package = self
+      .ctx
+      .cargo
+      .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     let crate_dir = package
@@ -109,11 +107,10 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Validate that crate can be published to crates.io
   pub fn validate_publishable(&self, crate_name: &str) -> RailResult<()> {
-    let metadata = self.ctx.cargo.metadata();
-    let package = metadata
-      .workspace_packages()
-      .into_iter()
-      .find(|pkg| pkg.name == crate_name)
+    let package = self
+      .ctx
+      .cargo
+      .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     // Check if publish = false
@@ -131,11 +128,10 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Check for path dependencies (which block publishing)
   fn check_path_dependencies(&self, crate_name: &str) -> RailResult<()> {
-    let metadata = self.ctx.cargo.metadata();
-    let package = metadata
-      .workspace_packages()
-      .into_iter()
-      .find(|pkg| pkg.name == crate_name)
+    let package = self
+      .ctx
+      .cargo
+      .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     for dep in &package.dependencies {

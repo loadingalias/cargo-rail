@@ -60,13 +60,13 @@ Demonstrates `cargo rail split` and `cargo rail sync` for crate extraction with 
 cargo rail split init my-crate
 
 # Preview split (dry run)
-cargo rail split my-crate --check
+cargo rail split run my-crate --check
 
 # Execute split
-cargo rail split my-crate
+cargo rail split run my-crate
 
 # Split all configured crates
-cargo rail split --all
+cargo rail split run --all
 
 # Bidirectional sync (default)
 cargo rail sync my-crate
@@ -140,10 +140,10 @@ path = "docs/CHANGELOG.md"
 cargo rail split init my-public-crate
 
 # 2. Preview what will be extracted
-cargo rail split my-public-crate --check
+cargo rail split run my-public-crate --check
 
 # 3. Execute the split (creates standalone repo)
-cargo rail split my-public-crate
+cargo rail split run my-public-crate
 
 # 4. Push to GitHub
 cd ../my-public-crate

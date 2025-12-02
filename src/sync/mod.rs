@@ -11,4 +11,4 @@ pub mod conflict;
 pub mod engine;
 
 pub use conflict::ConflictStrategy;
-pub use engine::{SyncConfig, SyncDirection, SyncEngine};
+pub use engine::{SyncConfig, SyncDirection, SyncEngine, SyncResult};

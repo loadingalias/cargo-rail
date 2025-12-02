@@ -8,6 +8,7 @@ use cargo_metadata::DependencyKind as MetadataDepKind;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Value};
 
 // ============================================================================
@@ -15,17 +16,20 @@ use toml_edit::{DocumentMut, Item, Value};
 // ============================================================================
 
 /// Unique identifier for a dependency
+///
+/// Uses `Arc<str>` for the name fields to avoid expensive clones in hot loops.
+/// Cloning a DepKey is cheap (just Arc refcount bumps).
 #[derive(Debug, Clone)]
 pub struct DepKey {
   /// Dependency name (package name)
-  pub name: String,
+  pub name: Arc<str>,
   /// Whether it's renamed (package = "actual-name")
-  pub renamed_from: Option<String>,
+  pub renamed_from: Option<Arc<str>>,
 }
 
 impl DepKey {
   /// Creates a new dependency key with the given name
-  pub fn new(name: impl Into<String>) -> Self {
+  pub fn new(name: impl Into<Arc<str>>) -> Self {
     Self {
       name: name.into(),
       renamed_from: None,
@@ -37,7 +41,7 @@ impl DepKey {
   /// Used when `include_renamed = true` to group renamed and non-renamed deps together
   pub fn canonical(&self) -> Self {
     Self {
-      name: self.name.clone(),
+      name: Arc::clone(&self.name),
       renamed_from: None,
     }
   }
@@ -49,7 +53,7 @@ impl DepKey {
 
   /// Get the alias (key used in Cargo.toml) - either renamed_from or name
   pub fn alias(&self) -> &str {
-    self.renamed_from.as_ref().unwrap_or(&self.name)
+    self.renamed_from.as_deref().unwrap_or(&self.name)
   }
 }
 
@@ -88,6 +92,8 @@ impl Ord for DepKey {
 }
 
 /// How a dependency is used at a specific site
+///
+/// Uses `Arc<str>` for frequently-cloned identifier fields to avoid allocation overhead.
 #[derive(Debug, Clone)]
 pub struct DepUsage {
   /// Features explicitly listed in the dependency entry
@@ -100,8 +106,8 @@ pub struct DepUsage {
   pub kind: DepKind,
   /// Target constraint (e.g., "cfg(unix)")
   pub target: Option<String>,
-  /// The crate that uses this dependency
-  pub used_by: String,
+  /// The crate that uses this dependency (Arc for cheap clones)
+  pub used_by: Arc<str>,
   /// Whether the dependency is optional
   pub optional: bool,
   /// Path for path dependencies (if specified)
@@ -112,8 +118,8 @@ pub struct DepUsage {
   /// Path to the manifest that declared this dependency (for path normalization)
   pub manifest_path: Option<PathBuf>,
   /// The key name used in Cargo.toml (alias if renamed, otherwise package name)
-  /// Used when generating manifest edits to target the correct dependency entry
-  pub cargo_toml_key: String,
+  /// Used when generating manifest edits to target the correct dependency entry (Arc for cheap clones)
+  pub cargo_toml_key: Arc<str>,
   /// Whether this optional dep is referenced in the `[features]` table
   /// True if the dep appears as: `dep:name`, `name` (for optional deps), or `name/feat`
   /// Used to distinguish truly unused optional deps from feature-gated ones
@@ -166,6 +172,21 @@ pub struct ParsedManifest {
 }
 
 // ============================================================================
+// Parse Context
+// ============================================================================
+
+/// Context for parsing dependency sections within a single manifest.
+/// Bundles common parameters to reduce function argument count.
+struct ParseContext<'a> {
+  /// Package name of the crate being parsed
+  package_name: &'a str,
+  /// Path to the Cargo.toml being parsed
+  manifest_path: &'a Path,
+  /// Output map to collect parsed dependencies
+  dependencies: &'a mut HashMap<DepKey, DepUsage>,
+}
+
+// ============================================================================
 // Main Analyzer
 // ============================================================================
 
@@ -179,7 +200,7 @@ pub struct ManifestAnalyzer {
   usage_counts: HashMap<DepKey, usize>,
   /// Package name index for O(1) lookup of dep keys by package name
   /// Maps package_name -> list of DepKeys that refer to that package
-  package_index: HashMap<String, Vec<DepKey>>,
+  package_index: HashMap<Arc<str>, Vec<DepKey>>,
 }
 
 impl ManifestAnalyzer {
@@ -222,10 +243,10 @@ impl ManifestAnalyzer {
       .collect();
 
     // Build package name index for O(1) lookup of dep keys by package name
-    let mut package_index: HashMap<String, Vec<DepKey>> = HashMap::new();
+    let mut package_index: HashMap<Arc<str>, Vec<DepKey>> = HashMap::new();
     for dep_key in usage_index.keys() {
       package_index
-        .entry(dep_key.name.clone())
+        .entry(Arc::clone(&dep_key.name))
         .or_default()
         .push(dep_key.clone());
     }
@@ -248,39 +269,20 @@ impl ManifestAnalyzer {
       .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
 
     let mut dependencies = HashMap::new();
+    let mut ctx = ParseContext {
+      package_name,
+      manifest_path,
+      dependencies: &mut dependencies,
+    };
 
     // Parse [dependencies]
-    Self::parse_dep_section(
-      doc.as_item(),
-      "dependencies",
-      DepKind::Normal,
-      None,
-      package_name,
-      manifest_path,
-      &mut dependencies,
-    )?;
+    Self::parse_dep_section(&mut ctx, doc.as_item(), "dependencies", DepKind::Normal, None)?;
 
     // Parse [dev-dependencies]
-    Self::parse_dep_section(
-      doc.as_item(),
-      "dev-dependencies",
-      DepKind::Dev,
-      None,
-      package_name,
-      manifest_path,
-      &mut dependencies,
-    )?;
+    Self::parse_dep_section(&mut ctx, doc.as_item(), "dev-dependencies", DepKind::Dev, None)?;
 
     // Parse [build-dependencies]
-    Self::parse_dep_section(
-      doc.as_item(),
-      "build-dependencies",
-      DepKind::Build,
-      None,
-      package_name,
-      manifest_path,
-      &mut dependencies,
-    )?;
+    Self::parse_dep_section(&mut ctx, doc.as_item(), "build-dependencies", DepKind::Build, None)?;
 
     // Parse [target.'cfg(...)'.dependencies]
     if let Some(target_table) = doc.get("target").and_then(|t| t.as_table()) {
@@ -296,15 +298,7 @@ impl ManifestAnalyzer {
                 _ => continue,
               };
 
-              Self::parse_dep_section(
-                target_value,
-                section,
-                kind,
-                Some(target_cfg.to_string()),
-                package_name,
-                manifest_path,
-                &mut dependencies,
-              )?;
+              Self::parse_dep_section(&mut ctx, target_value, section, kind, Some(target_cfg))?;
             }
           }
         }
@@ -364,13 +358,11 @@ impl ManifestAnalyzer {
 
   /// Parse a dependency section
   fn parse_dep_section(
+    ctx: &mut ParseContext<'_>,
     parent: &Item,
     section: &str,
     kind: DepKind,
-    target: Option<String>,
-    package_name: &str,
-    manifest_path: &Path,
-    out: &mut HashMap<DepKey, DepUsage>,
+    target: Option<&str>,
   ) -> RailResult<()> {
     let Some(deps_table) = parent.get(section).and_then(|d| d.as_table_like()) else {
       return Ok(()); // Section doesn't exist
@@ -395,8 +387,8 @@ impl ManifestAnalyzer {
       if let Some(p) = parsed {
         let dep_key = if let Some(actual) = p.actual_name {
           DepKey {
-            name: actual,
-            renamed_from: p.renamed_from,
+            name: actual.into(),
+            renamed_from: p.renamed_from.map(Into::into),
           }
         } else {
           DepKey::new(dep_name)
@@ -409,17 +401,17 @@ impl ManifestAnalyzer {
           conditional_features: BTreeSet::new(), // Filled in later by features parsing
           default_features: p.default_features,
           kind,
-          target: target.clone(),
-          used_by: package_name.to_string(),
+          target: target.map(String::from),
+          used_by: Arc::from(ctx.package_name),
           optional: p.optional,
           path: p.path,
           declared_version: p.declared_version,
-          manifest_path: Some(manifest_path.to_path_buf()),
-          cargo_toml_key: dep_name.to_string(),
+          manifest_path: Some(ctx.manifest_path.to_path_buf()),
+          cargo_toml_key: Arc::from(dep_name),
           referenced_in_features: false, // Filled in later by features parsing
         };
 
-        out.insert(dep_key, usage);
+        ctx.dependencies.insert(dep_key, usage);
       }
     }
 
@@ -641,7 +633,7 @@ impl ManifestAnalyzer {
       return 0;
     };
 
-    let mut unique_users: HashSet<&String> = HashSet::new();
+    let mut unique_users: HashSet<&str> = HashSet::new();
     for dep_key in dep_keys {
       if let Some(usages) = self.usage_index.get(dep_key) {
         for usage in usages {
@@ -742,8 +734,8 @@ impl ManifestAnalyzer {
   /// Get unique package names from all dependencies
   ///
   /// Issue #6: Used to iterate by package rather than by dep key
-  pub fn unique_packages(&self) -> HashSet<String> {
-    self.usage_index.keys().map(|k| k.name.clone()).collect()
+  pub fn unique_packages(&self) -> HashSet<Arc<str>> {
+    self.usage_index.keys().map(|k| Arc::clone(&k.name)).collect()
   }
 }
 

@@ -1,7 +1,17 @@
-# Real-World Examples
+# Examples
 
 cargo-rail has been tested against several large Rust monorepos to validate
 its behavior and performance on non-trivial codebases.
+
+## Feature Workflows
+
+| Workflow | Description |
+|----------|-------------|
+| [change-detection](./change-detection/) | Graph-aware CI optimization with `affected` and `test` |
+| [release](./release/) | Versioning, changelog generation, and publishing |
+| [split-sync](./split-sync/) | Crate extraction and bidirectional sync |
+
+## Real-World Monorepos
 
 Each subdirectory contains:
 
@@ -9,8 +19,6 @@ Each subdirectory contains:
 - The exact commands run
 - A short demo recording
 - A machine-readable summary of the impact
-
-## Examples
 
 | Project | Focus | Key Result |
 |---------|-------|------------|

@@ -31,7 +31,7 @@ paths = [{{ crate = "crates/mylib" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform split
-  run_cargo_rail(&ws.path, &["rail", "split", "mylib"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib"])?;
 
   // Verify split structure
   assert!(split_path.join("Cargo.toml").exists(), "Cargo.toml should exist");
@@ -80,7 +80,7 @@ paths = [{{ crate = "crates/mylib" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "mylib"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib"])?;
 
   // Check git history in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -123,7 +123,7 @@ paths = [{{ crate = "crates/lib-a" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "lib-a"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-a"])?;
 
   // Check that only lib-a commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -162,7 +162,7 @@ paths = [{{ crate = "crates/lib-core" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "lib-core"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-core"])?;
 
   // Check that path dependency was transformed to version dependency
   let cargo_toml = std::fs::read_to_string(split_dir.path().join("Cargo.toml"))?;
@@ -209,7 +209,7 @@ paths = [
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "combined"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "combined"])?;
 
   // Verify both crates exist with preserved structure
   let split_path = split_dir.path();
@@ -279,7 +279,7 @@ paths = [{{ crate = "crates/lib-release" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform split
-  run_cargo_rail(&ws.path, &["rail", "split", "lib-release"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-release"])?;
 
   // Prepare release config inside split repo
   let split_root = split_dir.path();
@@ -312,7 +312,7 @@ require_clean = false
   // Run release publish in split repo (skip crates.io)
   let output = run_cargo_rail(
     split_root,
-    &["rail", "release", "--all", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "--all", "--bump", "patch", "--skip-publish"],
   )?;
   assert!(output.status.success(), "Split release should succeed");
 
@@ -371,6 +371,7 @@ paths = [{ crate = "crates/override-lib" }]
     &[
       "rail",
       "split",
+      "run",
       "override-lib",
       "--check",
       "--remote",
@@ -422,7 +423,10 @@ paths = [{{ crate = "crates/json-lib" }}]
   )?;
 
   // Run split with --check and --json
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "json-lib", "--check", "--json"])?;
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "json-lib", "--check", "--format", "json"],
+  )?;
 
   if output.status.success() {
     let stdout = String::from_utf8_lossy(&output.stdout);

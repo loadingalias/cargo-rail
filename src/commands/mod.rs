@@ -41,9 +41,9 @@ pub mod test;
 /// Workspace dependency unification commands
 pub mod unify;
 
-pub use affected::run_affected;
+pub use affected::{AffectedOptions, run_affected};
 pub use clean::run_clean;
-pub use cli::{CargoCli, Commands, RailCli};
+pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand};
 pub use common::OutputFormat;
 pub use config::run_config_validate;
 pub use init::{run_init, run_init_standalone};
@@ -53,7 +53,6 @@ pub use sync::run_sync;
 pub use test::run_test;
 pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
 
-use crate::error::RailError;
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 
@@ -71,7 +70,19 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       format,
       all,
       output,
-    } => run_affected(ctx, since, from, to, format, all, output),
+      explain,
+    } => run_affected(
+      ctx,
+      AffectedOptions {
+        since,
+        from,
+        to,
+        format,
+        all,
+        output,
+        explain,
+      },
+    ),
 
     Commands::Test {
       since,
@@ -95,7 +106,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
 
     // Dependency Unification
     Commands::Unify {
-      action,
+      command,
       check,
       format,
       exclude,
@@ -103,22 +114,13 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       backup,
       pin_transitives,
       include_renamed,
-      list: _,
-      backup_id: _,
       skip_report,
       report_path,
       show_diff,
     } => {
-      // Undo should have been handled before WorkspaceContext was built
-      if let Some(act) = action {
-        if act == "undo" {
-          unreachable!("Undo command should be handled before dispatch")
-        } else {
-          Err(RailError::message(format!(
-            "Unknown unify action '{}'. Valid actions: undo",
-            act
-          )))
-        }
+      // Undo subcommand is handled before WorkspaceContext is built
+      if command.is_some() {
+        unreachable!("Undo subcommand should be handled before dispatch")
       } else if check {
         run_unify_analyze(
           ctx,
@@ -135,26 +137,23 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     }
 
     // Split/Sync
-    Commands::Split {
-      action,
-      crate_names,
-      all,
-      remote,
-      check,
-      format,
-    } => {
-      if action.as_deref() == Some("init") {
+    Commands::Split { command } => match command {
+      cli::SplitCommand::Init { crate_names, check } => {
         let crates = if crate_names.is_empty() {
           None
         } else {
           Some(crate_names)
         };
         run_split_init(ctx, crates, check)
-      } else {
-        let crate_name = action;
-        run_split(ctx, crate_name, all, remote, check, format)
       }
-    }
+      cli::SplitCommand::Run {
+        crate_name,
+        all,
+        remote,
+        check,
+        format,
+      } => run_split(ctx, crate_name, all, remote, check, format),
+    },
 
     Commands::Sync {
       crate_name,
@@ -180,33 +179,28 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     ),
 
     // Release
-    Commands::Release {
-      action,
-      crate_names,
-      all,
-      bump,
-      check,
-      skip_publish,
-      skip_tag,
-      format,
-    } => {
-      if action.as_deref() == Some("init") {
+    Commands::Release { command } => match command {
+      cli::ReleaseCommand::Init { crate_names, check } => {
         let crates = if crate_names.is_empty() {
           None
         } else {
           Some(crate_names)
         };
         run_release_init(ctx, crates, check)
-      } else {
-        let mut all_crate_names = crate_names;
-        if let Some(first_crate) = action {
-          all_crate_names.insert(0, first_crate);
-        }
-
-        let names = if all || all_crate_names.is_empty() {
+      }
+      cli::ReleaseCommand::Run {
+        crate_names,
+        all,
+        bump,
+        check,
+        skip_publish,
+        skip_tag,
+        format,
+      } => {
+        let names = if all || crate_names.is_empty() {
           None
         } else {
-          Some(all_crate_names)
+          Some(crate_names)
         };
 
         if check {
@@ -215,7 +209,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
           run_release_publish(ctx, names, all, bump, skip_publish, skip_tag)
         }
       }
-    }
+    },
 
     Commands::Check {
       crate_names,
@@ -239,15 +233,8 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     } => run_clean(ctx, cache, backups, reports, check),
 
     // Config
-    Commands::Config { action, format } => {
-      if action == "validate" {
-        run_config_validate(ctx, format)
-      } else {
-        Err(RailError::with_help(
-          format!("unknown config action: {}", action),
-          "valid actions: validate",
-        ))
-      }
-    }
+    Commands::Config { command } => match command {
+      cli::ConfigCommand::Validate { format } => run_config_validate(ctx, format),
+    },
   }
 }

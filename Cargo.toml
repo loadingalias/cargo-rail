@@ -24,7 +24,6 @@ clap = { version = "4.5.53", features = ["derive", "cargo"] }
 cargo_metadata = "0.23.1"
 petgraph = "0.8.3"
 toml_edit = { version = "0.23.7", features = ["serde"] }
-anyhow = "1.0.100"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 semver = "1.0.27"
@@ -34,6 +33,7 @@ chrono = "0.4.42"
 glob = "0.3.3"
 
 [dev-dependencies]
+anyhow = "1.0.100"
 tempfile = "3.23.0"
 
 [[test]]

@@ -37,7 +37,7 @@ require_clean = false
   )?;
 
   // Run release plan
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--bump", "patch"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show the crate in the plan
@@ -79,7 +79,7 @@ fn release_changelog_generates_links_and_prs() -> Result<()> {
   // Run release (skip crates.io but create tag/changelog)
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -154,7 +154,7 @@ fn release_respects_skip_and_require_flags() -> Result<()> {
 
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "--all", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "--all", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -184,7 +184,7 @@ fn test_release_json_output() -> Result<()> {
   ws.write_release_config("require_clean = false\n")?;
 
   // Run release plan with --json
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--json"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--json"])?;
 
   if output.status.success() {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -211,7 +211,7 @@ fn test_release_skip_tag_flag() -> Result<()> {
   // Run release plan with --skip-tag
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "--check", "--skip-tag", "--bump", "patch"],
+    &["rail", "release", "run", "--check", "--skip-tag", "--bump", "patch"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -240,7 +240,7 @@ fn test_release_skip_publish_in_plan() -> Result<()> {
   // Run release plan with --skip-publish
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "--check", "--skip-publish", "--bump", "patch"],
+    &["rail", "release", "run", "--check", "--skip-publish", "--bump", "patch"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -267,7 +267,7 @@ fn test_release_explicit_version() -> Result<()> {
   ws.write_release_config("require_clean = false\n")?;
 
   // Run release with explicit version
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "--check", "--bump", "2.0.0"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "2.0.0"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Exit code 1 = check found pending changes (correct behavior)
@@ -311,7 +311,7 @@ changelog_path = "CHANGELOG.md"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -363,7 +363,7 @@ changelog_relative_to = "workspace"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -426,7 +426,7 @@ changelog_relative_to = "workspace"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -476,7 +476,7 @@ changelog_relative_to = "crate"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "lib-a", "--bump", "patch", "--skip-publish"],
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);

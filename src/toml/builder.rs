@@ -225,9 +225,13 @@ impl RailConfigBuilder {
     // Custom patterns (only if non-empty)
     if !config.custom.is_empty() {
       content.push_str("\n# Custom path categories for change detection\n");
+      content.push_str("[change-detection.custom]\n");
       for (category, patterns) in &config.custom {
-        content.push_str(&format!("[change-detection.custom.{}]\n", category));
-        content.push_str(&format!("patterns = {}\n", self.formatter.array_string(patterns, None)));
+        content.push_str(&format!(
+          "{} = {}\n",
+          category,
+          self.formatter.array_string(patterns, None)
+        ));
       }
     } else {
       content.push_str("# custom = {}  # Custom path categories (e.g., custom.verify = [\"verify/**/*.rs\"])\n");
@@ -245,12 +249,13 @@ impl RailConfigBuilder {
 # [crates.my-crate.split]
 # remote = "git@github.com:org/my-crate.git"
 # branch = "main"
-# mode = "single"  # or "combined" or "monorepo"
+# mode = "single"  # "single" or "combined"
+# paths = [{ crate = "crates/my-crate" }]
 #
 # Split modes:
-#   single   - One crate per split repo (repo = crate)
-#   combined - Multiple crates share one split repo (e.g., tokio + tokio-util)
-#   monorepo - Split repo mirrors monorepo structure (maintains paths)
+#   single   - One crate per split repo (default)
+#   combined - Multiple crates share one split repo
+#              Use workspace_mode = "workspace" to mirror monorepo structure
 #
 # [crates.my-crate.release]
 # publish = true

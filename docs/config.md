@@ -89,16 +89,24 @@ Settings for the `affected` command.
 ```toml
 [change-detection]
 infrastructure = [".github/**", "justfile"]
+
+# Custom categories for specialized file patterns
+[change-detection.custom]
+verify = ["verify/**/*.rs"]
+benchmarks = ["benches/**", "perf/**"]
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `infrastructure` | string[] | see below | Patterns triggering full rebuild |
+| `custom` | table | `{}` | Custom category patterns (name → glob patterns) |
 
 Default infrastructure patterns:
 ```
 .github/**, scripts/**, justfile, Makefile, *.sh, deny.toml
 ```
+
+Custom categories appear in the `affected` output and can be used for conditional CI workflows.
 
 ---
 
@@ -113,6 +121,7 @@ Per-crate configuration.
 remote = "git@github.com:org/my-crate.git"
 branch = "main"
 mode = "single"
+paths = [{ crate = "crates/my-crate" }]
 include = ["LICENSE"]
 ```
 
@@ -120,21 +129,16 @@ include = ["LICENSE"]
 |--------|------|----------|-------------|
 | `remote` | string | yes | Remote repository URL |
 | `branch` | string | yes | Git branch |
-| `mode` | enum | yes | `"single"`, `"multi"`, `"workspace"` |
-| `paths` | array | no | Crate paths for combined mode |
+| `mode` | enum | yes | `"single"` or `"combined"` |
+| `workspace_mode` | enum | no | For combined: `"standalone"` (default) or `"workspace"` |
+| `paths` | array | yes | Crate paths: `[{ crate = "path/to/crate" }]` |
 | `include` | string[] | no | Additional files to include |
 | `exclude` | string[] | no | Files to exclude |
 
 ### [crates.NAME.sync]
 
-```toml
-[crates.my-crate.sync]
-conflict_strategy = "manual"
-```
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `conflict_strategy` | enum | `"manual"` | `"ours"`, `"theirs"`, `"manual"`, `"union"` |
+> **Note:** Reserved for future use. Currently has no effect.
+> Conflict strategy is specified via CLI: `cargo rail sync --strategy <ours|theirs|manual|union>`
 
 ### [crates.NAME.release]
 

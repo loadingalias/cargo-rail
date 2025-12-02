@@ -483,10 +483,3 @@ fn print_error_json(error: &RailError) {
     eprintln!("error: {}", error);
   }
 }
-
-/// Convert anyhow::Error to RailError (for transition period)
-impl From<anyhow::Error> for RailError {
-  fn from(err: anyhow::Error) -> Self {
-    RailError::message(err.to_string())
-  }
-}

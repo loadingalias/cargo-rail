@@ -26,6 +26,7 @@ pub struct SyncConfig {
 }
 
 /// Result of a sync operation
+#[derive(Default)]
 pub struct SyncResult {
   /// Number of commits synced
   pub commits_synced: usize,
@@ -48,7 +49,12 @@ pub enum SyncDirection {
 
 /// Result of conflict resolution containing both conflict info and changed files
 /// Changed files are cached for reuse in the apply step to avoid redundant git calls
-type ConflictResolutionResult = (Vec<ConflictInfo>, Vec<(PathBuf, char)>);
+pub struct ConflictResolutionResult {
+  /// Conflict information for files that had merge conflicts
+  pub conflicts: Vec<ConflictInfo>,
+  /// Changed files from the commit (cached to avoid redundant git calls)
+  pub changed_files: Vec<(PathBuf, char)>,
+}
 
 /// Bidirectional sync engine
 pub struct SyncEngine<'a> {
@@ -174,7 +180,7 @@ impl<'a> SyncEngine<'a> {
         // Record mapping
         self.mapping_store.record_mapping(&commit.sha, &remote_sha)?;
         synced_count += 1;
-        current_remote_head = remote_sha.clone(); // Update cached HEAD
+        current_remote_head = remote_sha; // Update cached HEAD (move, not clone)
       }
 
       // Save mappings after processing commits
@@ -296,25 +302,30 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Resolve conflicts using 3-way merge (returns conflicts + changed_files for caching)
-        let (conflict_infos, changed_files) = self.resolve_conflicts_for_commit(commit, &remote_git)?;
+        let resolution = self.resolve_conflicts_for_commit(commit, &remote_git)?;
 
         // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
-        // Using HashSet for O(1) membership testing instead of O(n)
-        let resolved_files: HashSet<PathBuf> = conflict_infos.iter().map(|c| c.file_path.clone()).collect();
-
-        if !conflict_infos.is_empty() {
-          conflicts.extend(conflict_infos);
-          // Continue applying commit - files already merged by conflict resolver
-        }
+        // Using HashSet<&Path> for O(1) membership testing - borrows from resolution.conflicts, no clones
+        let resolved_files: HashSet<&Path> = resolution.conflicts.iter().map(|c| c.file_path.as_path()).collect();
 
         // Apply commit to mono (skipping already-resolved files, reusing cached changed_files)
-        let mono_sha =
-          self.apply_remote_commit_to_mono(commit, &remote_git, &resolved_files, &current_mono_head, &changed_files)?;
+        let mono_sha = self.apply_remote_commit_to_mono(
+          commit,
+          &remote_git,
+          &resolved_files,
+          &current_mono_head,
+          &resolution.changed_files,
+        )?;
+
+        // Extend conflicts AFTER apply (resolved_files borrows from resolution.conflicts)
+        if !resolution.conflicts.is_empty() {
+          conflicts.extend(resolution.conflicts);
+        }
 
         // Record mapping (remote -> mono)
         self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
         count += 1;
-        current_mono_head = mono_sha.clone(); // Update cached HEAD
+        current_mono_head = mono_sha; // Update cached HEAD (move, not clone)
       }
 
       count
@@ -518,7 +529,7 @@ impl<'a> SyncEngine<'a> {
     &self,
     commit: &crate::git::CommitInfo,
     remote_git: &SystemGit,
-    resolved_files: &HashSet<PathBuf>,
+    resolved_files: &HashSet<&Path>,
     current_mono_head: &str,
     changed_files: &[(PathBuf, char)], // Pre-fetched from resolve_conflicts to avoid duplicate subprocess call
   ) -> RailResult<String> {
@@ -538,7 +549,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Skip files that were already resolved by conflict resolution (O(1) HashSet lookup)
-        if resolved_files.contains(&mono_path) {
+        if resolved_files.contains(mono_path.as_path()) {
           println!("      Skipping {} (already resolved)", mono_path.display());
           return None;
         }
@@ -758,7 +769,10 @@ impl<'a> SyncEngine<'a> {
       }
     }
 
-    Ok((conflicts, changed_files))
+    Ok(ConflictResolutionResult {
+      conflicts,
+      changed_files,
+    })
   }
 
   fn check_mono_has_changes(&self) -> RailResult<bool> {

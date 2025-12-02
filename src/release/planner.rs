@@ -76,7 +76,7 @@ impl<'a> ReleasePlanner<'a> {
     let target_crates = if let Some(names) = crate_names {
       names
     } else {
-      self.ctx.graph.workspace_members()
+      self.ctx.graph.workspace_members().to_vec()
     };
 
     // Get crates in dependency order
@@ -118,11 +118,10 @@ impl<'a> ReleasePlanner<'a> {
     _version_map: &HashMap<String, Version>,
   ) -> RailResult<CrateReleasePlan> {
     // Get crate metadata
-    let metadata = self.ctx.cargo.metadata();
-    let package = metadata
-      .workspace_packages()
-      .into_iter()
-      .find(|pkg| pkg.name == crate_name)
+    let package = self
+      .ctx
+      .cargo
+      .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
     let manifest_path = package.manifest_path.clone().into_std_path_buf();

@@ -36,7 +36,8 @@ pub fn run_init(
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {
-      progress!("note: existing config at {}", existing.display());
+      eprintln!("note: existing config found at {}", existing.display());
+      eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
     }
   }
 
@@ -44,15 +45,24 @@ pub fn run_init(
   let detected_targets = detect_targets(workspace_root);
 
   if !non_interactive && !check {
-    print!("generate rail.toml? [Y/n]: ");
-    io::stdout().flush()?;
+    // Show preview before confirmation
+    eprintln!("output: {}", config_path.display());
+    if detected_targets.is_empty() {
+      eprintln!("targets: (none detected, will use host default)");
+    } else {
+      eprintln!("targets: {}", detected_targets.join(", "));
+    }
+    eprintln!();
+
+    eprint!("generate? [Y/n]: ");
+    io::stderr().flush()?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let input = input.trim().to_lowercase();
 
     if input == "n" || input == "no" {
-      println!("cancelled");
+      eprintln!("cancelled");
       return Ok(());
     }
   }
@@ -145,7 +155,7 @@ pub fn run_init_standalone(
   workspace_root: &Path,
   output_path: &str,
   force: bool,
-  _non_interactive: bool,
+  non_interactive: bool,
   check: bool,
 ) -> RailResult<()> {
   let config_path = workspace_root.join(output_path);
@@ -163,11 +173,35 @@ pub fn run_init_standalone(
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check {
-      progress!("note: existing config at {}", existing.display());
+      eprintln!("note: existing config found at {}", existing.display());
+      eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
     }
   }
 
   let detected_targets = detect_targets(workspace_root);
+
+  if !non_interactive && !check {
+    // Show preview before confirmation
+    eprintln!("output: {}", config_path.display());
+    if detected_targets.is_empty() {
+      eprintln!("targets: (none detected, will use host default)");
+    } else {
+      eprintln!("targets: {}", detected_targets.join(", "));
+    }
+    eprintln!();
+
+    eprint!("generate? [Y/n]: ");
+    io::stderr().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    if input == "n" || input == "no" {
+      eprintln!("cancelled");
+      return Ok(());
+    }
+  }
 
   let config = RailConfig {
     targets: detected_targets,

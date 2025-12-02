@@ -140,7 +140,10 @@ impl BackupManager {
         Ok(metadata) => {
           backups.push(BackupRecord::new(backup_id, metadata, path));
         }
-        Err(_) => continue,
+        Err(e) => {
+          eprintln!("warning: skipping corrupted backup '{}': {}", backup_id, e);
+          continue;
+        }
       }
     }
 

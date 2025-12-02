@@ -16,22 +16,22 @@ static JSON_MODE: AtomicBool = AtomicBool::new(false);
 ///
 /// Call this once at startup with the CLI quiet flag value.
 pub fn init(quiet: bool) {
-  QUIET.store(quiet, Ordering::SeqCst);
+  QUIET.store(quiet, Ordering::Relaxed);
 }
 
 /// Check if quiet mode is enabled
 pub fn is_quiet() -> bool {
-  QUIET.load(Ordering::SeqCst)
+  QUIET.load(Ordering::Relaxed)
 }
 
 /// Enable quiet mode (useful for JSON output)
 pub fn set_quiet(quiet: bool) {
-  QUIET.store(quiet, Ordering::SeqCst);
+  QUIET.store(quiet, Ordering::Relaxed);
 }
 
 /// Check if JSON mode is enabled (for structured error output)
 pub fn is_json_mode() -> bool {
-  JSON_MODE.load(Ordering::SeqCst)
+  JSON_MODE.load(Ordering::Relaxed)
 }
 
 /// Enable JSON mode (enables quiet mode automatically)
@@ -40,10 +40,10 @@ pub fn is_json_mode() -> bool {
 /// - Progress messages are suppressed (quiet mode)
 /// - Errors are output as structured JSON
 pub fn set_json_mode(json: bool) {
-  JSON_MODE.store(json, Ordering::SeqCst);
+  JSON_MODE.store(json, Ordering::Relaxed);
   if json {
     // JSON mode implies quiet mode for clean output
-    QUIET.store(true, Ordering::SeqCst);
+    QUIET.store(true, Ordering::Relaxed);
   }
 }
 

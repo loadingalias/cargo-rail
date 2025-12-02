@@ -25,9 +25,8 @@ struct ValidationIssue {
 }
 
 /// Validate the configuration file
-pub fn run_config_validate(ctx: &WorkspaceContext, format: String) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+pub fn run_config_validate(ctx: &WorkspaceContext, format: OutputFormat) -> RailResult<()> {
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
@@ -87,7 +86,7 @@ pub fn run_config_validate(ctx: &WorkspaceContext, format: String) -> RailResult
 
     // Validate release config
     let workspace_members = ctx.graph.workspace_members();
-    match cfg.release.validate(&workspace_members) {
+    match cfg.release.validate(workspace_members) {
       Ok(release_warnings) => {
         for w in release_warnings {
           warnings.push(ValidationIssue {

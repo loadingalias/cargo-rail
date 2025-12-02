@@ -18,10 +18,9 @@ pub fn run_split(
   all: bool,
   remote: Option<String>,
   check: bool,
-  format: String,
+  format: OutputFormat,
 ) -> RailResult<()> {
-  let output_format: OutputFormat = format.parse()?;
-  let json = output_format.is_json();
+  let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
@@ -76,8 +75,7 @@ pub fn run_split(
       println!("    branch: {}", config.branch);
     }
 
-    println!("\nrun without --check to execute");
-    // Exit 1 to signal CI that split is pending
+    println!("\nChanges detected. Run without --check to apply.");
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
@@ -231,7 +229,7 @@ fn detect_workspace_splits(
   use crate::config::{CratePath, SplitConfig, SplitMode, WorkspaceMode};
 
   let workspace_root = ctx.workspace_root();
-  let members = ctx.cargo.metadata().workspace_packages();
+  let members = ctx.cargo.workspace_members();
 
   let mut splits = Vec::new();
 

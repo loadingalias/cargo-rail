@@ -75,7 +75,7 @@ TOML: comments and formatting preserved
 ### Split crates with full git history
 
 ```bash
-$ cargo rail split my-crate
+$ cargo rail split run my-crate
 
 Extracted my-crate to standalone repo
   347 commits preserved
@@ -105,7 +105,7 @@ Bidirectional sync with safety guardrails. Changes from external contributors co
 ### Release with dependency ordering
 
 ```bash
-$ cargo rail release --all --bump minor
+$ cargo rail release run --all --bump minor --check
 
 Planning release:
   1. core       0.4.2 → 0.5.0
@@ -115,7 +115,7 @@ Planning release:
 Changelog generated from conventional commits
 Tags: core@0.5.0, api@0.4.0, cli@0.3.0
 
---execute to publish (dry-run by default)
+Run without --check to apply.
 ```
 
 Native changelog generation. Configurable publish delays. GitHub releases via `gh`.
