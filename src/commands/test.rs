@@ -1,5 +1,6 @@
 //! Smart test runner - only test affected crates
 
+use crate::commands::OutputFormat;
 use crate::error::RailResult;
 use crate::git::detect_default_base_ref;
 use crate::progress;
@@ -15,6 +16,8 @@ pub struct TestConfig {
   pub all: bool,
   /// Explain why tests are being run
   pub explain: bool,
+  /// Output format
+  pub format: OutputFormat,
   /// Prefer cargo-nextest if available
   pub prefer_nextest: bool,
   /// Additional arguments to pass to the test runner
@@ -23,6 +26,10 @@ pub struct TestConfig {
 
 /// Run tests for affected crates
 pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
+  if config.format.is_json_like() {
+    crate::output::set_json_mode(true);
+  }
+
   let analyzer = ChangeImpact::new(ctx);
 
   let base_ref = if let Some(ref s) = config.since {

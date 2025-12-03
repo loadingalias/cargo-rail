@@ -76,7 +76,7 @@ Examples:
   cargo rail unify --check                # Preview changes (CI mode)
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
-  cargo rail unify --pin-transitives      # Pin fragmented deps (hakari replacement)
+  cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups";
 
@@ -103,6 +103,34 @@ Examples:
   cargo rail release run my-crate --bump minor
   cargo rail release run --all --bump patch     # Release all crates
   cargo rail release run my-crate --skip-publish  # Tag only, no crates.io";
+
+const INIT_HELP: &str = "\
+Examples:
+  cargo rail init                       # Generate .config/rail.toml (interactive)
+  cargo rail init --non-interactive     # Generate with defaults (CI mode)
+  cargo rail init --check               # Preview generated config
+  cargo rail init -o rail.toml          # Custom output path
+  cargo rail init --force               # Overwrite existing config";
+
+const CHECK_HELP: &str = "\
+Examples:
+  cargo rail check my-crate             # Check single crate
+  cargo rail check crate-a crate-b      # Check multiple crates
+  cargo rail check --all                # Check all workspace crates
+  cargo rail check --all -f json        # JSON output for CI";
+
+const CLEAN_HELP: &str = "\
+Examples:
+  cargo rail clean                      # Clean all artifacts
+  cargo rail clean --cache              # Clean metadata cache only
+  cargo rail clean --backups            # Prune old backups
+  cargo rail clean --reports            # Clean generated reports
+  cargo rail clean --check              # Preview what would be cleaned";
+
+const CONFIG_HELP: &str = "\
+Examples:
+  cargo rail config validate            # Validate rail.toml
+  cargo rail config validate -f json    # JSON output for CI";
 
 /// Available subcommands
 #[derive(Subcommand)]
@@ -148,6 +176,9 @@ pub enum Commands {
     /// Explain why tests are being run
     #[arg(long)]
     explain: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
     /// Pass additional arguments to the test runner
     #[arg(last = true)]
     test_args: Vec<String>,
@@ -165,21 +196,9 @@ pub enum Commands {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
-    /// Exclude dependencies from unification (comma-separated)
-    #[arg(long, value_delimiter = ',')]
-    exclude: Vec<String>,
-    /// Force include specific dependencies (comma-separated)
-    #[arg(long, value_delimiter = ',')]
-    include: Vec<String>,
     /// Create backups of all modified files
     #[arg(long)]
     backup: bool,
-    /// Pin transitive-only deps with fragmented features to workspace
-    #[arg(long)]
-    pin_transitives: bool,
-    /// Include renamed dependencies (package = "...") in unification
-    #[arg(long)]
-    include_renamed: bool,
     /// Skip generating the unify report
     #[arg(long)]
     skip_report: bool,
@@ -192,6 +211,7 @@ pub enum Commands {
   },
 
   /// Initialize configuration (rail.toml)
+  #[command(after_long_help = INIT_HELP)]
   Init {
     /// Output path for rail.toml
     #[arg(long, short, default_value = ".config/rail.toml")]
@@ -256,6 +276,7 @@ pub enum Commands {
   },
 
   /// Validate release readiness
+  #[command(after_long_help = CHECK_HELP)]
   Check {
     /// Crate name(s) to check (mutually exclusive with --all)
     #[arg(conflicts_with = "all")]
@@ -269,6 +290,7 @@ pub enum Commands {
   },
 
   /// Clean generated artifacts (cache, backups, reports)
+  #[command(after_long_help = CLEAN_HELP)]
   Clean {
     /// Clean metadata cache only
     #[arg(long)]
@@ -286,6 +308,7 @@ pub enum Commands {
 
   /// Configuration management
   #[command(name = "config")]
+  #[command(after_long_help = CONFIG_HELP)]
   Config {
     /// Subcommand
     #[command(subcommand)]
@@ -398,6 +421,7 @@ impl Commands {
   pub fn is_json_format(&self) -> bool {
     match self {
       Commands::Affected { format, .. }
+      | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
       | Commands::Sync { format, .. }
       | Commands::Check { format, .. } => format.is_json_like(),
@@ -420,6 +444,7 @@ impl Commands {
   pub fn apply_json_override(&mut self) {
     match self {
       Commands::Affected { format, .. }
+      | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
       | Commands::Sync { format, .. }
       | Commands::Check { format, .. } => *format = OutputFormat::Json,

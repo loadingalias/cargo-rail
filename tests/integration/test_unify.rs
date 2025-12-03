@@ -442,7 +442,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
 
 #[test]
 fn test_unify_exclude_config_and_flag() -> Result<()> {
-  // Test that exclude works both via config file and CLI flag
+  // Test that exclude works via config file
 
   let workspace = TestWorkspace::new()?;
 
@@ -459,26 +459,7 @@ fn test_unify_exclude_config_and_flag() -> Result<()> {
 
   workspace.commit("Add crates")?;
 
-  // Test 1: CLI flag exclusion
-  // Analyze with serde excluded via --exclude flag
-  let output_cli = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--exclude", "serde"])?;
-  let stdout_cli = String::from_utf8_lossy(&output_cli.stdout);
-
-  // Should NOT show serde (excluded via CLI)
-  assert!(
-    !stdout_cli.contains("serde = ") && !stdout_cli.contains("serde:"),
-    "CLI excluded dependency should not appear in unification plan.\nOutput:\n{}",
-    stdout_cli
-  );
-
-  // Should still show anyhow and tokio (not excluded)
-  assert!(
-    stdout_cli.contains("anyhow") || stdout_cli.contains("tokio"),
-    "Non-excluded dependencies should still be unified.\nOutput:\n{}",
-    stdout_cli
-  );
-
-  // Test 2: Config file exclusion
+  // Test: Config file exclusion
   // Configure rail.toml with exclude
   std::fs::write(
     workspace.path.join("rail.toml"),
@@ -882,10 +863,10 @@ root = "."
 }
 
 // ============================================================================
-// CLI Flags: --include, --pin-transitives, --include-renamed
+// Config Options: include, pin_transitives, include_renamed
 // ============================================================================
 
-/// Test --include flag forces specific dependencies to be included
+/// Test include config forces specific dependencies to be included
 #[test]
 fn test_unify_include_flag() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-include")?;
@@ -927,20 +908,28 @@ serde = "1.0"
 
   workspace.commit("Add crates with shared deps")?;
 
-  // Run unify with --include
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include", "serde"])?;
+  // Configure rail.toml with include
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[unify]
+include = ["serde"]
+"#,
+  )?;
+
+  // Run unify with include config
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
 
   // Exit code 1 = check found pending changes (correct behavior)
   assert!(
     output.status.code() == Some(1),
-    "unify --include --check should exit 1 when changes pending. stderr: {}",
+    "unify --check with include config should exit 1 when changes pending. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())
 }
 
-/// Test --pin-transitives flag
+/// Test pin_transitives config option
 #[test]
 fn test_unify_pin_transitives() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-pin-trans")?;
@@ -964,20 +953,28 @@ serde = "1.0"
   std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
   workspace.commit("Add crate")?;
 
-  // Run unify with --pin-transitives (single crate = no unification needed)
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--pin-transitives"])?;
+  // Configure rail.toml with pin_transitives
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[unify]
+pin_transitives = true
+"#,
+  )?;
+
+  // Run unify with pin_transitives config (single crate = no unification needed)
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
 
   // No unification opportunities with single crate, so exit 0
   assert!(
     output.status.success(),
-    "unify --pin-transitives with no changes should exit 0. stderr: {}",
+    "unify with pin_transitives config and no changes should exit 0. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())
 }
 
-/// Test --include-renamed flag
+/// Test include_renamed config option
 #[test]
 fn test_unify_include_renamed_flag() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-include-renamed")?;
@@ -1001,12 +998,20 @@ serde = "1.0"
   std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
   workspace.commit("Add crate")?;
 
-  // Run unify with --include-renamed
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include-renamed"])?;
+  // Configure rail.toml with include_renamed
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[unify]
+include_renamed = true
+"#,
+  )?;
+
+  // Run unify with include_renamed config
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
 
   assert!(
     output.status.success(),
-    "unify --include-renamed should succeed. stderr: {}",
+    "unify with include_renamed config should succeed. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
@@ -1061,21 +1066,29 @@ my_serde = { package = "serde", version = "1.0", features = ["rc"] }
 
   workspace.commit("Add crates with renamed dep")?;
 
-  // Without --include-renamed, serde should NOT be unified (each variant has only 1 user)
+  // Without include_renamed config, serde should NOT be unified (each variant has only 1 user)
   let output_without = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout_without = String::from_utf8_lossy(&output_without.stdout);
   assert!(
     !stdout_without.contains("Dependencies to unify:") || stdout_without.contains("Dependencies to unify: 0"),
-    "Without --include-renamed, serde shouldn't qualify (each variant has 1 user).\nOutput:\n{}",
+    "Without include_renamed config, serde shouldn't qualify (each variant has 1 user).\nOutput:\n{}",
     stdout_without
   );
 
-  // With --include-renamed, serde SHOULD be unified (2 users total for the package)
-  let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--include-renamed"])?;
+  // Configure rail.toml with include_renamed = true
+  std::fs::write(
+    workspace.path.join("rail.toml"),
+    r#"[unify]
+include_renamed = true
+"#,
+  )?;
+
+  // With include_renamed config, serde SHOULD be unified (2 users total for the package)
+  let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout_with = String::from_utf8_lossy(&output_with.stdout);
   assert!(
     stdout_with.contains("serde") && stdout_with.contains("Dependencies to unify"),
-    "With --include-renamed, serde should qualify (2 users total).\nOutput:\n{}",
+    "With include_renamed config, serde should qualify (2 users total).\nOutput:\n{}",
     stdout_with
   );
 

@@ -149,7 +149,6 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
     crates: Default::default(),
-    formatting: crate::config::FormattingConfig::default(),
   });
 
   let existing_names: std::collections::HashSet<_> = config.crates.keys().cloned().collect();

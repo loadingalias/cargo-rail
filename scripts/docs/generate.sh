@@ -92,6 +92,30 @@ $help_output
 ---
 
 "
+
+    # Check if this command has subcommands
+    if echo "$help_output" | grep -q "^Commands:"; then
+      local subcommands
+      subcommands=$(echo "$help_output" | awk '/^Commands:$/,/^Options:$/' | grep -E '^\s+\w' | awk '{print $1}' | grep -v '^help$')
+
+      for subcmd in $subcommands; do
+        local subcmd_help
+        subcmd_help=$("$BINARY" rail "$cmd" "$subcmd" --help 2>&1 || true)
+
+        # Only add if help was successfully retrieved
+        if [ -n "$subcmd_help" ] && ! echo "$subcmd_help" | grep -q "^error:"; then
+          output+="### cargo rail $cmd $subcmd
+
+\`\`\`
+$subcmd_help
+\`\`\`
+
+---
+
+"
+        fi
+      done
+    fi
   done
 
   # Remove trailing ---

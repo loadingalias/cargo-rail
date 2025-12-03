@@ -1,221 +1,565 @@
-# Configuration
+# Configuration Reference
 
-cargo-rail is configured via `rail.toml`. Generate one with:
+> Complete reference for all rail.toml configuration options. Generated from source code.
+
+## Overview
+
+cargo-rail uses `rail.toml` for workspace-level configuration. This file controls:
+- **Dependency unification** (`cargo rail unify`)
+- **Release automation** (`cargo rail release`)
+- **Change detection** (`cargo rail affected`)
+- **Crate splitting** (`cargo rail split`)
+
+### Configuration File Location
+
+Configuration files are searched in order:
+1. `rail.toml` (workspace root)
+2. `.rail.toml` (workspace root, hidden)
+3. `.cargo/rail.toml` (cargo directory)
+4. `.config/rail.toml` (config directory)
+
+The first file found is used. All paths are relative to the workspace root.
+
+### Generating Configuration
+
+Generate a default configuration file:
 
 ```bash
-cargo rail init
+cargo rail init                    # Creates .config/rail.toml
+cargo rail init -o rail.toml       # Creates rail.toml
+cargo rail init --check            # Preview without writing
+cargo rail init --force            # Overwrite existing config
 ```
 
-## Location
+## Quick Start
 
-Searched in order:
-1. `rail.toml`
-2. `.rail.toml`
-3. `.cargo/rail.toml`
-4. `.config/rail.toml`
+### Minimal Configuration
 
----
-
-## Top-level
+cargo-rail works with sensible defaults. An empty file or minimal config is sufficient:
 
 ```toml
-targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# Minimal config - uses defaults for everything
+targets = ["x86_64-unknown-linux-gnu"]
 ```
+
+### Typical Configuration
+
+```toml
+# Multi-target workspace with unify enabled
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+[unify]
+msrv = true                      # Compute MSRV from dependencies
+prune_dead_features = true       # Remove unused features
+detect_unused = true             # Find unused dependencies
+remove_unused = true             # Auto-remove them
+
+[release]
+tag_format = "{crate}-v{version}"
+create_github_release = false
+
+[change-detection]
+infrastructure = [".github/**", "justfile"]
+```
+
+## Complete Reference
+
+### Top-Level Options
+
+Configuration options at the workspace root level.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `targets` | string[] | auto-detected | Target triples for multi-target resolution. cargo-rail runs `cargo metadata --filter-platform` for each. |
+| `targets` | `string[]` | `[]` | Target triples for multi-platform validation. Used by `unify` and other commands to run `cargo metadata --filter-platform` for each target. Auto-detected by `cargo rail init`. |
+| `unify` | `table` | `{}` | Dependency unification settings (see below) |
+| `release` | `table` | `{}` | Release management settings (see below) |
+| `change-detection` | `table` | `{}` | Change detection settings (see below) |
+| `crates` | `table` | `{}` | Per-crate configuration (see below) |
+
+**Example:**
+```toml
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+```
 
 ---
 
-## [unify]
+### [unify] Configuration
 
-Dependency unification settings. Controls how `cargo rail unify` analyzes and modifies your workspace.
+Controls workspace dependency unification behavior. All options are optional with sensible defaults.
 
+#### Core Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version`. The MSRV is the maximum `rust-version` from all resolved dependencies - your buildable floor. |
+| `detect_unused` | `bool` | `true` | Detect dependencies declared in manifests but absent from the resolved cargo graph. |
+| `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
+| `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
+| `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. |
+
+**Example:**
+```toml
+[unify]
+msrv = true
+detect_unused = true
+remove_unused = true
+prune_dead_features = true
+max_backups = 5
+```
+
+#### Version Handling
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `strict_version_compat` | `bool` | `true` | When `true`, version mismatches between member manifests and existing `workspace.dependencies` are blocking errors. When `false`, they are warnings only. |
+| `exact_pin_handling` | `enum` | `"warn"` | How to handle exact version pins like `=0.8.0`:<br>• `"skip"` - Exclude exact-pinned deps from unification<br>• `"preserve"` - Keep the exact pin operator in workspace.dependencies<br>• `"warn"` - Convert to caret (`^`) but emit a warning |
+| `major_version_conflict` | `enum` | `"warn"` | How to handle major version conflicts (e.g., `serde = "1.0"` and `serde = "2.0"`):<br>• `"warn"` - Skip unification, emit warning (both versions stay in graph)<br>• `"bump"` - Force unify to highest resolved version (may break code) |
+
+**Example:**
+```toml
+[unify]
+strict_version_compat = false
+exact_pin_handling = "preserve"
+major_version_conflict = "bump"
+```
+
+**Notes:**
+- `major_version_conflict = "bump"` works in ~85% of cases; the remaining ~15% may require code fixes
+- Use `"warn"` for safety, `"bump"` for the leanest build graph
+
+#### Dependency Selection
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `include_paths` | `bool` | `true` | Include path dependencies in unification. If `false`, path dependencies are excluded. |
+| `include_renamed` | `bool` | `false` | Include renamed dependencies (`package = "..."`). When enabled, features are aggregated across all variants using union. Opt-in due to complexity. |
+| `exclude` | `string[]` | `[]` | Dependencies to skip from unification (safety hatch). Useful for platform-specific or problematic dependencies. |
+| `include` | `string[]` | `[]` | Force-include specific dependencies in unification, even if they're single-use. |
+
+**Example:**
+```toml
+[unify]
+include_paths = true
+include_renamed = false
+exclude = ["openssl", "windows-sys"]  # Platform-specific
+include = ["my-special-dep"]          # Force include
+```
+
+#### Transitive Pinning
+
+Advanced feature for replacing workspace-hack crates. Only enable if you currently use `cargo-hakari`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pin_transitives` | `bool` | `false` | Pin transitive-only dependencies with fragmented features. This is cargo-rail's workspace-hack replacement. When enabled, transitive deps with multiple feature sets are pinned in `workspace.dependencies`. |
+| `transitive_host` | `string` | `"root"` | Where to put pinned transitive dev-dependencies:<br>• `"root"` - Use workspace root `Cargo.toml`<br>• `"crates/foo"` - Use specific member crate (relative path from workspace root) |
+
+**Example:**
 ```toml
 [unify]
 pin_transitives = true
-exclude = ["problem-dep"]
-major_version_conflict = "warn"
+transitive_host = "root"
 ```
 
-### Core Options
+**Complete Example:**
+```toml
+[unify]
+# Core options (defaults shown)
+msrv = true
+detect_unused = true
+remove_unused = true
+prune_dead_features = true
+max_backups = 3
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `msrv` | bool | `true` | Compute MSRV from resolved graph and write to `[workspace.package].rust-version`. The MSRV is the maximum `rust-version` declared by any package in your dependency tree - your buildable floor. |
-| `detect_unused` | bool | `true` | Detect dependencies declared but absent from resolved graph. |
-| `remove_unused` | bool | `true` | Auto-remove unused deps (requires `detect_unused`). |
-| `prune_dead_features` | bool | `true` | Remove features never enabled in resolved graph. Only prunes empty no-ops (`feature = []`). Features that enable something are preserved. |
-| `pin_transitives` | bool | `false` | Pin transitive-only deps with fragmented features. Replaces workspace-hack crates. Enable if you use cargo-hakari. |
+# Version handling
+strict_version_compat = true
+exact_pin_handling = "warn"
+major_version_conflict = "warn"
 
-### Version Handling
+# Dependency selection
+include_paths = true
+include_renamed = false
+exclude = []
+include = []
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `major_version_conflict` | enum | `"warn"` | How to handle multiple major versions of the same dep. `"warn"`: skip unification for that dep. `"bump"`: force unify to highest resolved version (may require code fixes). |
-| `strict_version_compat` | bool | `true` | Treat version mismatches between member manifests and existing `workspace.dependencies` as errors. Set `false` for warnings only. |
-| `exact_pin_handling` | enum | `"warn"` | How to handle `=x.y.z` pins. `"skip"`: exclude from unification. `"preserve"`: keep exact pin. `"warn"`: convert to caret with warning. |
-
-### Dependency Selection
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `include_paths` | bool | `true` | Include path dependencies in unification. |
-| `include_renamed` | bool | `false` | Include renamed deps (`package = "..."`). When enabled, features are aggregated across all variants of the same package using union. |
-| `exclude` | string[] | `[]` | Dependencies to skip from unification. |
-| `include` | string[] | `[]` | Force-include single-use dependencies. |
-
-### Transitive Pinning
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `transitive_host` | string | `"root"` | Where to put pinned transitive dev-deps. `"root"` for workspace root, or a path like `"crates/foo"`. |
-
-### Other
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `max_backups` | int | `3` | Number of backups to keep. Older backups auto-pruned. |
+# Transitive pinning (workspace-hack replacement)
+pin_transitives = false
+transitive_host = "root"
+```
 
 ---
 
-## [release]
+### [release] Configuration
 
-Release automation settings.
+Release automation settings for versioning, tagging, and publishing.
 
+#### Core Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `tag_prefix` | `string` | `"v"` | Git tag prefix. Used via `{prefix}` placeholder in `tag_format`. |
+| `tag_format` | `string` | `"{crate}-{prefix}{version}"` | Tag template. Available variables:<br>• `{crate}` - Crate name<br>• `{version}` - Version number<br>• `{prefix}` - Value of `tag_prefix` |
+| `require_clean` | `bool` | `true` | Require clean working directory before release operations. |
+| `publish_delay` | `u64` | `5` | Delay between crate publishes in seconds. Allows crates.io to propagate dependencies. |
+| `create_github_release` | `bool` | `false` | Automatically create GitHub releases via `gh` CLI after tagging. Requires `gh` to be installed and authenticated. |
+| `sign_tags` | `bool` | `false` | Sign git tags with GPG or SSH. Requires git signing to be configured. |
+
+**Example:**
 ```toml
 [release]
-tag_format = "{crate}-{prefix}{version}"
+tag_prefix = "v"
+tag_format = "{crate}-v{version}"    # Produces: my-crate-v1.0.0
+require_clean = true
+publish_delay = 10
 create_github_release = true
-publish_delay = 5
+sign_tags = true
 ```
+
+#### Changelog Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `tag_prefix` | string | `"v"` | Git tag prefix (used via `{prefix}`) |
-| `tag_format` | string | `"{crate}-{prefix}{version}"` | Tag template. Variables: `{crate}`, `{version}`, `{prefix}` |
-| `require_clean` | bool | `true` | Require clean working directory |
-| `publish_delay` | int | `5` | Seconds between publishes |
-| `create_github_release` | bool | `false` | Create GitHub release via `gh` CLI |
-| `sign_tags` | bool | `false` | GPG/SSH sign tags |
-| `changelog_path` | string | `"CHANGELOG.md"` | Default changelog path |
-| `changelog_relative_to` | enum | `"crate"` | `"crate"` or `"workspace"` |
-| `skip_changelog_for` | string[] | `[]` | Crates to skip changelog generation |
-| `require_changelog_entries` | bool | `false` | Error if no changelog entries |
+| `changelog_path` | `string` | `"CHANGELOG.md"` | Default changelog filename for all crates. |
+| `changelog_relative_to` | `enum` | `"crate"` | What changelog paths are relative to:<br>• `"crate"` - Relative to each crate's directory<br>• `"workspace"` - Relative to workspace root |
+| `skip_changelog_for` | `string[]` | `[]` | Crate names that should not generate changelog entries. |
+| `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
+
+**Example:**
+```toml
+[release]
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "crate"
+skip_changelog_for = ["internal-utils"]
+require_changelog_entries = true
+```
+
+**Complete Example:**
+```toml
+[release]
+# Core
+tag_prefix = "v"
+tag_format = "{crate}-{prefix}{version}"
+require_clean = true
+publish_delay = 5
+create_github_release = false
+sign_tags = false
+
+# Changelog
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "crate"
+skip_changelog_for = []
+require_changelog_entries = false
+```
+
+**Notes:**
+- In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
+- For single-crate workspaces, use `tag_format = "v{version}"`
+- `changelog_relative_to = "workspace"` is useful for unified changelogs
 
 ---
 
-## [change-detection]
+### [change-detection] Configuration
 
-Settings for the `affected` and `test` commands.
+Settings for the `affected` and `test` commands. Controls how changes are classified and which crates are affected.
 
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `infrastructure` | `string[]` | see below | Glob patterns for infrastructure files that trigger `rebuild_all` when modified. Changes to these files require testing all crates. |
+| `custom` | `table<string, string[]>` | `{}` | Custom path patterns and their categories. Keys are category names, values are glob pattern arrays. Used for conditional CI logic. |
+
+**Default Infrastructure Patterns:**
+```toml
+infrastructure = [
+    ".github/**",
+    "scripts/**",
+    "justfile",
+    "Justfile",
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "*.sh",
+    "Taskfile.yml",
+    "Taskfile.yaml",
+    ".pre-commit-config.yaml",
+    "deny.toml",
+    "cliff.toml",
+    "release.toml",
+    "release-plz.toml",
+]
+```
+
+**Example:**
 ```toml
 [change-detection]
-infrastructure = [".github/**", "justfile"]
+infrastructure = [
+    ".github/**",
+    "justfile",
+    "Cargo.lock",        # Add lock file
+    "rust-toolchain.toml"
+]
 
 [change-detection.custom]
-verify = ["verify/**/*.rs"]
+verify = ["verify/**/*.rs"]           # Stateright models
 benchmarks = ["benches/**", "perf/**"]
+docs = ["docs/**", "*.md"]
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `infrastructure` | string[] | see below | Glob patterns triggering full rebuild |
-| `custom` | table | `{}` | Custom category patterns for conditional CI |
-
-Default infrastructure patterns:
-```
-.github/**, scripts/**, justfile, Makefile, *.sh, deny.toml
+**Use Case:**
+Custom categories enable conditional CI:
+```yaml
+# .github/workflows/ci.yml
+- name: Check if benchmarks changed
+  run: |
+    if cargo rail affected --json | jq -e '.custom.benchmarks'; then
+      cargo bench
+    fi
 ```
 
 ---
 
-## [crates.NAME]
+### [crates.NAME] Configuration
 
-Per-crate configuration.
+Per-crate configuration. Replace `NAME` with the actual crate name from `Cargo.toml`.
 
-### [crates.NAME.split]
+#### [crates.NAME.split]
 
-```toml
-[crates.my-crate.split]
-remote = "git@github.com:org/my-crate.git"
-branch = "main"
-mode = "single"
-paths = [{ crate = "crates/my-crate" }]
-include = ["LICENSE"]
-```
+Crate splitting and syncing configuration. Enables extracting crates to separate repositories.
 
 | Option | Type | Required | Description |
 |--------|------|----------|-------------|
-| `remote` | string | yes | Remote repository URL |
-| `branch` | string | yes | Git branch |
-| `mode` | enum | yes | `"single"` or `"combined"` |
-| `workspace_mode` | enum | no | For combined: `"standalone"` or `"workspace"` |
-| `paths` | array | yes | Crate paths: `[{ crate = "path/to/crate" }]` |
-| `include` | string[] | no | Additional files to include |
-| `exclude` | string[] | no | Files to exclude |
+| `remote` | `string` | yes | Remote repository URL (git) or local path (for testing). |
+| `branch` | `string` | yes | Git branch to sync with. |
+| `mode` | `enum` | yes | Split mode:<br>• `"single"` - One crate per repository<br>• `"combined"` - Multiple crates in one repository |
+| `workspace_mode` | `enum` | no | For `mode = "combined"` only:<br>• `"standalone"` - Multiple standalone crates<br>• `"workspace"` - Workspace structure with root Cargo.toml |
+| `paths` | `CratePath[]` | yes | Crate paths to include. Format: `[{ crate = "path/to/crate" }]`<br>• `mode = "single"` requires exactly 1 path<br>• `mode = "combined"` requires 2+ paths |
+| `include` | `string[]` | no | Additional files/directories to include in the split (e.g., `["LICENSE", "README.md"]`) |
+| `exclude` | `string[]` | no | Files/directories to exclude from the split |
 
-### [crates.NAME.release]
-
+**Single Crate Example:**
 ```toml
-[crates.my-crate.release]
-publish = false
+[crates.my-lib.split]
+remote = "git@github.com:org/my-lib.git"
+branch = "main"
+mode = "single"
+paths = [
+    { crate = "crates/my-lib" }
+]
+include = ["LICENSE", "README.md"]
+exclude = ["*.tmp"]
 ```
+
+**Combined Workspace Example:**
+```toml
+[crates.utils.split]
+remote = "git@github.com:org/utils-mono.git"
+branch = "main"
+mode = "combined"
+workspace_mode = "workspace"
+paths = [
+    { crate = "crates/string-utils" },
+    { crate = "crates/io-utils" },
+    { crate = "crates/math-utils" }
+]
+include = ["LICENSE"]
+```
+
+**Local Testing:**
+```toml
+[crates.test-crate.split]
+remote = "/tmp/test-split-repo"  # Local path for testing
+branch = "main"
+mode = "single"
+paths = [{ crate = "crates/test-crate" }]
+```
+
+#### [crates.NAME.release]
+
+Per-crate release configuration. Overrides workspace-level release defaults.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `publish` | bool | `true` | Enable publishing to crates.io |
+| `publish` | `bool` | `true` | Enable/disable publishing for this crate. Overrides `Cargo.toml` `publish` field. |
 
-### [crates.NAME.changelog]
-
+**Example:**
 ```toml
-[crates.my-crate.changelog]
-path = "CHANGES.md"
-skip = true
+[crates.internal-utils.release]
+publish = false  # Never publish to crates.io
 ```
+
+#### [crates.NAME.changelog]
+
+Per-crate changelog configuration.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `path` | string | | Custom changelog path |
-| `skip` | bool | `false` | Skip changelog generation |
+| `path` | `PathBuf` | | Custom changelog path for this crate. Overrides workspace-level `changelog_path`. Interpreted according to `release.changelog_relative_to`. |
+| `skip` | `bool` | `false` | Exclude this crate from changelog generation entirely. |
+
+**Example:**
+```toml
+[crates.my-lib.changelog]
+path = "CHANGES.md"       # Use CHANGES.md instead of CHANGELOG.md
+skip = false
+
+[crates.private-crate.changelog]
+skip = true               # No changelog for internal crates
+```
+
+#### [crates.NAME.sync]
+
+Reserved for future use. Currently has no effect.
 
 ---
 
-## Examples
-
-### Minimal
+## Complete Configuration Example
 
 ```toml
-# Run `cargo rail init` - defaults are sensible
-# msrv, detect_unused, remove_unused, prune_dead_features all default to true
+# Complete rail.toml showing all available options
+
+# Top-level: Multi-target support
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Dependency unification
+[unify]
+# Core
+msrv = true
+detect_unused = true
+remove_unused = true
+prune_dead_features = true
+max_backups = 3
+
+# Version handling
+strict_version_compat = true
+exact_pin_handling = "warn"
+major_version_conflict = "warn"
+
+# Dependency selection
+include_paths = true
+include_renamed = false
+exclude = ["openssl", "windows-sys"]
+include = []
+
+# Transitive pinning (workspace-hack replacement)
+pin_transitives = false
+transitive_host = "root"
+
+# Release automation
+[release]
+tag_prefix = "v"
+tag_format = "{crate}-{prefix}{version}"
+require_clean = true
+publish_delay = 5
+create_github_release = true
+sign_tags = true
+
+# Changelog
+changelog_path = "CHANGELOG.md"
+changelog_relative_to = "crate"
+skip_changelog_for = []
+require_changelog_entries = true
+
+# Change detection
+[change-detection]
+infrastructure = [
+    ".github/**",
+    "scripts/**",
+    "justfile",
+    "Makefile",
+    "*.sh",
+    "Cargo.lock",
+]
+
+[change-detection.custom]
+verify = ["verify/**/*.rs"]
+benchmarks = ["benches/**"]
+docs = ["docs/**", "*.md"]
+
+# Per-crate configuration
+[crates.my-lib]
+
+[crates.my-lib.split]
+remote = "git@github.com:org/my-lib.git"
+branch = "main"
+mode = "single"
+paths = [
+    { crate = "crates/my-lib" }
+]
+include = ["LICENSE", "README.md"]
+exclude = []
+
+[crates.my-lib.release]
+publish = true
+
+[crates.my-lib.changelog]
+path = "CHANGELOG.md"
+skip = false
+
+[crates.internal-utils]
+
+[crates.internal-utils.release]
+publish = false
+
+[crates.internal-utils.changelog]
+skip = true
 ```
 
-### Workspace-hack replacement
+## Configuration Recipes
+
+### Minimal (Defaults)
+
+Let cargo-rail handle everything with sensible defaults:
+
+```toml
+targets = ["x86_64-unknown-linux-gnu"]
+```
+
+### Workspace-Hack Replacement
+
+Replace `cargo-hakari` with cargo-rail's transitive pinning:
 
 ```toml
 [unify]
 pin_transitives = true
+transitive_host = "root"
 ```
 
-### Aggressive version unification
+### Aggressive Version Unification
+
+Force unification to highest versions, accept breaking changes:
 
 ```toml
 [unify]
-major_version_conflict = "bump"  # Force highest version even across majors
-strict_version_compat = false    # Allow version mismatches
+major_version_conflict = "bump"
+strict_version_compat = false
+exact_pin_handling = "preserve"
 ```
 
-### Conservative (minimal changes)
+### Conservative (Minimal Changes)
+
+Disable automatic cleanup and MSRV management:
 
 ```toml
 [unify]
 prune_dead_features = false
 remove_unused = false
 msrv = false
+detect_unused = true  # Still detect, just don't remove
 ```
 
-### Multi-target with exclusions
+### Multi-Platform with Exclusions
+
+Handle platform-specific dependencies:
 
 ```toml
 targets = [
@@ -225,27 +569,131 @@ targets = [
 ]
 
 [unify]
-exclude = ["openssl"]  # Platform-specific, skip
+exclude = [
+    "openssl",      # Linux-specific
+    "windows-sys",  # Windows-specific
+    "core-foundation"  # macOS-specific
+]
 ```
 
-### Full CI setup
+### Full CI Setup
+
+Complete configuration for automated releases and testing:
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu"]
 
 [unify]
 pin_transitives = true
+msrv = true
+detect_unused = true
+remove_unused = true
+prune_dead_features = true
 
 [release]
+tag_format = "{crate}-v{version}"
+require_clean = true
 require_changelog_entries = true
 create_github_release = true
+sign_tags = true
 
 [change-detection]
 infrastructure = [".github/**", "justfile", "Cargo.lock"]
+
+[change-detection.custom]
+benchmarks = ["benches/**"]
 
 [crates.my-lib.split]
 remote = "git@github.com:org/my-lib.git"
 branch = "main"
 mode = "single"
+paths = [{ crate = "crates/my-lib" }]
 include = ["LICENSE", "README.md"]
 ```
+
+### Split Repository Sync
+
+Bidirectional sync between monorepo and split repositories:
+
+```toml
+[crates.frontend.split]
+remote = "git@github.com:org/frontend.git"
+branch = "main"
+mode = "combined"
+workspace_mode = "workspace"
+paths = [
+    { crate = "crates/ui" },
+    { crate = "crates/components" }
+]
+include = ["assets/**", "LICENSE"]
+exclude = ["*.tmp", ".DS_Store"]
+
+[crates.backend.split]
+remote = "git@github.com:org/backend.git"
+branch = "main"
+mode = "single"
+paths = [{ crate = "crates/server" }]
+```
+
+## Validation
+
+cargo-rail validates configuration on load:
+
+```bash
+# Check configuration validity
+cargo rail init --check
+
+# Commands will error on invalid config
+cargo rail unify  # Validates config before running
+```
+
+Common validation errors:
+- **Invalid glob patterns** in `change-detection`
+- **Single mode with multiple paths** in split config
+- **Combined mode with one path** in split config
+- **Empty remote** in split config
+- **Unknown crate names** in `skip_changelog_for`
+
+## Migration
+
+### From cargo-hakari
+
+Replace `cargo hakari generate` with cargo-rail:
+
+```toml
+# Before (cargo-hakari)
+# [workspace.dependencies]
+# hakari = { version = "0.1.0", path = "hakari" }
+
+# After (cargo-rail)
+[unify]
+pin_transitives = true
+transitive_host = "root"  # or path to your hack crate
+```
+
+Then run:
+```bash
+cargo rail unify
+```
+
+### From release-plz
+
+cargo-rail provides similar functionality with tighter integration:
+
+```toml
+# release-plz.toml → rail.toml
+[release]
+tag_format = "{crate}-v{version}"
+require_changelog_entries = true
+create_github_release = true
+```
+
+## Environment Variables
+
+None. All configuration is file-based for reproducibility.
+
+## See Also
+
+- [Commands Reference](./commands.md) - All cargo-rail commands
+- [Recipes](./recipes.md) - Common workflows and patterns
+- [README](../README.md) - Project overview and quick start

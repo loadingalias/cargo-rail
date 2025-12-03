@@ -12,15 +12,7 @@ use crate::progress;
 use crate::workspace::WorkspaceContext;
 
 /// Analyze workspace dependencies (check mode)
-pub fn run_unify_analyze(
-  ctx: &WorkspaceContext,
-  exclude: Vec<String>,
-  include: Vec<String>,
-  pin_transitives_flag: bool,
-  include_renamed_flag: bool,
-  show_diff: bool,
-  format: OutputFormat,
-) -> RailResult<()> {
+pub fn run_unify_analyze(ctx: &WorkspaceContext, show_diff: bool, format: OutputFormat) -> RailResult<()> {
   let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
@@ -28,22 +20,8 @@ pub fn run_unify_analyze(
     crate::output::set_json_mode(true);
   }
 
-  // Create analyzer
-  let mut analyzer = UnifyAnalyzer::new(ctx)?;
-
-  // Apply CLI overrides to config
-  if !exclude.is_empty() {
-    analyzer.config.exclude.extend(exclude);
-  }
-  if !include.is_empty() {
-    analyzer.config.include.extend(include);
-  }
-  if pin_transitives_flag {
-    analyzer.config.pin_transitives = true;
-  }
-  if include_renamed_flag {
-    analyzer.config.include_renamed = true;
-  }
+  // Create analyzer (config comes from rail.toml via ctx)
+  let analyzer = UnifyAnalyzer::new(ctx)?;
 
   // Run analysis
   let plan = analyzer.analyze()?;
@@ -239,28 +217,15 @@ pub fn run_unify_analyze(
 /// Execute dependency unification
 pub fn run_unify_apply(
   ctx: &WorkspaceContext,
-  exclude: Vec<String>,
-  include: Vec<String>,
   backup: bool,
-  include_renamed_flag: bool,
   no_report: bool,
   report_path: Option<std::path::PathBuf>,
 ) -> RailResult<()> {
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
 
-  let mut analyzer = UnifyAnalyzer::new(ctx)?;
-
-  // Apply CLI overrides
-  if !exclude.is_empty() {
-    analyzer.config.exclude.extend(exclude);
-  }
-  if !include.is_empty() {
-    analyzer.config.include.extend(include);
-  }
-  if include_renamed_flag {
-    analyzer.config.include_renamed = true;
-  }
+  // Create analyzer (config comes from rail.toml via ctx)
+  let analyzer = UnifyAnalyzer::new(ctx)?;
 
   let plan = analyzer.analyze()?;
 

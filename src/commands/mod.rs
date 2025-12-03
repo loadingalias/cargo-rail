@@ -89,12 +89,14 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       all,
       skip_nextest,
       explain,
+      format,
       test_args,
     } => {
       let config = test::TestConfig {
         since,
         all,
         explain,
+        format,
         prefer_nextest: !skip_nextest,
         test_args,
       };
@@ -109,11 +111,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       command,
       check,
       format,
-      exclude,
-      include,
       backup,
-      pin_transitives,
-      include_renamed,
       skip_report,
       report_path,
       show_diff,
@@ -122,17 +120,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       if command.is_some() {
         unreachable!("Undo subcommand should be handled before dispatch")
       } else if check {
-        run_unify_analyze(
-          ctx,
-          exclude,
-          include,
-          pin_transitives,
-          include_renamed,
-          show_diff,
-          format,
-        )
+        run_unify_analyze(ctx, show_diff, format)
       } else {
-        run_unify_apply(ctx, exclude, include, backup, include_renamed, skip_report, report_path)
+        run_unify_apply(ctx, backup, skip_report, report_path)
       }
     }
 

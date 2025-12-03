@@ -127,6 +127,19 @@ Options:
       --explain
           Explain why tests are being run
 
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -176,20 +189,8 @@ Options:
           
           [default: text]
 
-      --exclude <EXCLUDE>
-          Exclude dependencies from unification (comma-separated)
-
-      --include <INCLUDE>
-          Force include specific dependencies (comma-separated)
-
       --backup
           Create backups of all modified files
-
-      --pin-transitives
-          Pin transitive-only deps with fragmented features to workspace
-
-      --include-renamed
-          Include renamed dependencies (package = "...") in unification
 
       --skip-report
           Skip generating the unify report
@@ -217,6 +218,24 @@ Examples:
 
 ---
 
+### cargo rail unify undo
+
+```
+Restore manifests from a previous backup
+
+Usage: cargo rail unify undo [OPTIONS]
+
+Options:
+      --list                   List available backups instead of restoring
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --backup-id <BACKUP_ID>  Specific backup ID to restore (defaults to most recent)
+      --json                   Output in JSON format (shorthand for -f json)
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+---
+
 ## cargo rail init
 
 ```
@@ -225,14 +244,38 @@ Initialize configuration (rail.toml)
 Usage: cargo rail init [OPTIONS]
 
 Options:
-  -o, --output <OUTPUT>  Output path for rail.toml [default: .config/rail.toml]
-  -q, --quiet            Suppress progress messages (for CI/automation)
-      --force            Overwrite existing configuration
-      --json             Output in JSON format (shorthand for -f json)
-      --non-interactive  Skip interactive prompts
-  -c, --check            Dry-run mode: preview generated config without writing
-  -h, --help             Print help
-  -V, --version          Print version
+  -o, --output <OUTPUT>
+          Output path for rail.toml
+          
+          [default: .config/rail.toml]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --force
+          Overwrite existing configuration
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --non-interactive
+          Skip interactive prompts
+
+  -c, --check
+          Dry-run mode: preview generated config without writing
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail init                       # Generate .config/rail.toml (interactive)
+  cargo rail init --non-interactive     # Generate with defaults (CI mode)
+  cargo rail init --check               # Preview generated config
+  cargo rail init -o rail.toml          # Custom output path
+  cargo rail init --force               # Overwrite existing config
 ```
 
 ---
@@ -268,6 +311,75 @@ Examples:
   cargo rail split run my-crate --check   # Preview the split
   cargo rail split run my-crate           # Execute the split
   cargo rail split run --all              # Split all configured crates
+```
+
+---
+
+### cargo rail split init
+
+```
+Configure split for crate(s)
+
+Usage: cargo rail split init [OPTIONS] [CRATE_NAMES]...
+
+Arguments:
+  [CRATE_NAMES]...  Crate name(s) to configure
+
+Options:
+  -c, --check    Preview generated config without writing
+  -q, --quiet    Suppress progress messages (for CI/automation)
+      --json     Output in JSON format (shorthand for -f json)
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+---
+
+### cargo rail split run
+
+```
+Execute split operation
+
+Usage: cargo rail split run [OPTIONS] [CRATE_NAME]
+
+Arguments:
+  [CRATE_NAME]
+          Crate name to split (mutually exclusive with --all)
+
+Options:
+  -a, --all
+          Split all configured crates
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --remote <REMOTE>
+          Override remote repository
+
+  -c, --check
+          Dry-run mode: preview changes
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -383,6 +495,83 @@ Examples:
 
 ---
 
+### cargo rail release init
+
+```
+Configure release settings
+
+Usage: cargo rail release init [OPTIONS] [CRATE_NAMES]...
+
+Arguments:
+  [CRATE_NAMES]...  Crate name(s) to configure (optional)
+
+Options:
+  -c, --check    Preview generated config without writing
+  -q, --quiet    Suppress progress messages (for CI/automation)
+      --json     Output in JSON format (shorthand for -f json)
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+---
+
+### cargo rail release run
+
+```
+Execute release (plan or publish)
+
+Usage: cargo rail release run [OPTIONS] [CRATE_NAMES]...
+
+Arguments:
+  [CRATE_NAMES]...
+          Crate name(s) to release (mutually exclusive with --all)
+
+Options:
+  -a, --all
+          Release all workspace crates
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --bump <BUMP>
+          Version bump [major, minor, patch, or "x.y.z"]
+          
+          [default: patch]
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -c, --check
+          Dry-run mode: preview release plan
+
+      --skip-publish
+          Skip publishing to crates.io
+
+      --skip-tag
+          Skip git tag creation
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
 ## cargo rail check
 
 ```
@@ -422,6 +611,12 @@ Options:
 
   -V, --version
           Print version
+
+Examples:
+  cargo rail check my-crate             # Check single crate
+  cargo rail check crate-a crate-b      # Check multiple crates
+  cargo rail check --all                # Check all workspace crates
+  cargo rail check --all -f json        # JSON output for CI
 ```
 
 ---
@@ -434,14 +629,36 @@ Clean generated artifacts (cache, backups, reports)
 Usage: cargo rail clean [OPTIONS]
 
 Options:
-      --cache    Clean metadata cache only
-  -q, --quiet    Suppress progress messages (for CI/automation)
-      --backups  Prune old backups
-      --json     Output in JSON format (shorthand for -f json)
-      --reports  Clean generated reports
-  -c, --check    Dry-run mode: preview what would be cleaned
-  -h, --help     Print help
-  -V, --version  Print version
+      --cache
+          Clean metadata cache only
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --backups
+          Prune old backups
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --reports
+          Clean generated reports
+
+  -c, --check
+          Dry-run mode: preview what would be cleaned
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail clean                      # Clean all artifacts
+  cargo rail clean --cache              # Clean metadata cache only
+  cargo rail clean --backups            # Prune old backups
+  cargo rail clean --reports            # Clean generated reports
+  cargo rail clean --check              # Preview what would be cleaned
 ```
 
 ---
@@ -462,4 +679,40 @@ Options:
       --json     Output in JSON format (shorthand for -f json)
   -h, --help     Print help
   -V, --version  Print version
+```
+
+---
+
+### cargo rail config validate
+
+```
+Validate the configuration file
+
+Usage: cargo rail config validate [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```

@@ -46,9 +46,6 @@ pub struct RailConfig {
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
   pub crates: HashMap<String, CrateConfig>,
-  /// TOML formatting settings
-  #[serde(default)]
-  pub formatting: FormattingConfig,
 }
 
 /// Per-crate configuration
@@ -63,13 +60,6 @@ pub struct CrateConfig {
   /// Sync configuration for this crate (reserved for future use)
   pub sync: Option<CrateSyncConfig>,
 }
-
-/// Configuration for TOML formatting.
-///
-/// **Note:** Reserved for future use. Currently has no effect.
-/// Potential options: indentation style, inline table preferences, etc.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FormattingConfig {}
 
 /// Result of attempting to load configuration
 pub enum ConfigLoadResult {
