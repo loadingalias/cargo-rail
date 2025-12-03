@@ -21,7 +21,7 @@ Commands:
   split     Split a crate to a standalone repository with git history
   sync      Sync changes between monorepo and split repos
   release   Publish releases (version bump, changelog, tag, publish)
-  check     Validate release readiness
+  check     Reserved for future use
   clean     Clean generated artifacts (cache, backups, reports)
   config    Configuration management
   help      Print this message or the help of the given subcommand(s)
@@ -211,7 +211,7 @@ Examples:
   cargo rail unify --check                # Preview changes (CI mode)
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
-  cargo rail unify --pin-transitives      # Pin fragmented deps (hakari replacement)
+  cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups
 ```
@@ -258,9 +258,6 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
-      --non-interactive
-          Skip interactive prompts
-
   -c, --check
           Dry-run mode: preview generated config without writing
 
@@ -271,8 +268,7 @@ Options:
           Print version
 
 Examples:
-  cargo rail init                       # Generate .config/rail.toml (interactive)
-  cargo rail init --non-interactive     # Generate with defaults (CI mode)
+  cargo rail init                       # Generate .config/rail.toml
   cargo rail init --check               # Preview generated config
   cargo rail init -o rail.toml          # Custom output path
   cargo rail init --force               # Overwrite existing config
@@ -425,9 +421,6 @@ Options:
           
           [default: manual]
 
-      --no-protected-branches
-          Allow direct commits to protected branches
-
   -c, --check
           Dry-run mode: preview changes without executing
 
@@ -467,9 +460,10 @@ Publish releases (version bump, changelog, tag, publish)
 Usage: cargo rail release [OPTIONS] <COMMAND>
 
 Commands:
-  init  Configure release settings
-  run   Execute release (plan or publish)
-  help  Print this message or the help of the given subcommand(s)
+  init   Configure release settings
+  run    Execute release (plan or publish)
+  check  Validate release readiness
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
@@ -486,6 +480,8 @@ Options:
 
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release check my-crate             # Validate release readiness
+  cargo rail release check --all                # Check all workspace crates
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --bump minor
@@ -572,12 +568,12 @@ Options:
 
 ---
 
-## cargo rail check
+### cargo rail release check
 
 ```
 Validate release readiness
 
-Usage: cargo rail check [OPTIONS] [CRATE_NAMES]...
+Usage: cargo rail release check [OPTIONS] [CRATE_NAMES]...
 
 Arguments:
   [CRATE_NAMES]...
@@ -611,12 +607,33 @@ Options:
 
   -V, --version
           Print version
+```
 
-Examples:
-  cargo rail check my-crate             # Check single crate
-  cargo rail check crate-a crate-b      # Check multiple crates
-  cargo rail check --all                # Check all workspace crates
-  cargo rail check --all -f json        # JSON output for CI
+---
+
+## cargo rail check
+
+```
+Reserved for future use
+
+Usage: cargo rail check [OPTIONS]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Reserved for future use.
+
+This command is currently a placeholder. Use 'cargo rail release check' instead.
 ```
 
 ---
@@ -675,10 +692,21 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -q, --quiet    Suppress progress messages (for CI/automation)
-      --json     Output in JSON format (shorthand for -f json)
-  -h, --help     Print help
-  -V, --version  Print version
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail config validate            # Validate rail.toml
+  cargo rail config validate -f json    # JSON output for CI
 ```
 
 ---

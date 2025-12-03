@@ -309,36 +309,6 @@ fn test_sync_strategy_theirs() -> Result<()> {
   Ok(())
 }
 
-/// Test sync --no-protected-branches flag
-#[test]
-fn test_sync_no_protected_branches() -> Result<()> {
-  let (ws, _split_dir) = setup_split_scenario("unprotected-lib")?;
-
-  // Make a change
-  ws.modify_file("unprotected-lib", "src/lib.rs", "// Change")?;
-  ws.commit("Change")?;
-
-  // Sync with --no-protected-branches
-  let output = run_cargo_rail(
-    &ws.path,
-    &[
-      "rail",
-      "sync",
-      "unprotected-lib",
-      "--to-remote",
-      "--no-protected-branches",
-    ],
-  )?;
-
-  assert!(
-    output.status.success(),
-    "sync --no-protected-branches should succeed. stderr: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-
-  Ok(())
-}
-
 /// Test sync --json output
 #[test]
 fn test_sync_json_output() -> Result<()> {

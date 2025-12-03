@@ -29,6 +29,7 @@ demos/
 test.md
 examples/RECORDING_TEMPLATE.md
 examples/issues.md
+commands_check.md
 
 # Cargo-Rail (Testing)
 *rail.toml

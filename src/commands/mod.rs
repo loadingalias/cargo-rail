@@ -152,7 +152,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       from_remote,
       to_remote,
       strategy,
-      no_protected_branches,
       check,
       format,
     } => run_sync(
@@ -163,7 +162,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       from_remote,
       to_remote,
       strategy,
-      no_protected_branches,
       check,
       format,
     ),
@@ -199,19 +197,25 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
           run_release_publish(ctx, names, all, bump, skip_publish, skip_tag)
         }
       }
+      cli::ReleaseCommand::Check {
+        crate_names,
+        all,
+        format,
+      } => {
+        let names = if all || crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names)
+        };
+        run_release_check(ctx, names, all, format)
+      }
     },
 
-    Commands::Check {
-      crate_names,
-      all,
-      format,
-    } => {
-      let names = if all || crate_names.is_empty() {
-        None
-      } else {
-        Some(crate_names)
-      };
-      run_release_check(ctx, names, all, format)
+    // Reserved for future use
+    Commands::Check {} => {
+      println!("cargo rail check is reserved for future use.");
+      println!("\nFor release validation, use: cargo rail release check");
+      Ok(())
     }
 
     // Clean

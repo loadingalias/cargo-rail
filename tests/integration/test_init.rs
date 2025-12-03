@@ -9,7 +9,7 @@ fn test_init_creates_config() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Run init command
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
 
   // Verify success
   assert!(output.status.success(), "init should succeed");
@@ -36,12 +36,12 @@ fn test_init_respects_force_flag() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Create initial config
-  run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  run_cargo_rail(&ws.path, &["rail", "init"])?;
   let config_path = &ws.path.join(".config/rail.toml");
   assert!(config_path.exists());
 
   // Try to init again without --force (should fail)
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
   assert!(!output.status.success(), "init should fail when config exists");
   assert!(
     String::from_utf8_lossy(&output.stderr).contains("configuration exists"),
@@ -49,7 +49,7 @@ fn test_init_respects_force_flag() -> Result<()> {
   );
 
   // Try with --force (should succeed)
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--force", "--non-interactive"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "init", "--force"])?;
   assert!(output.status.success(), "init --force should succeed");
 
   Ok(())
@@ -61,7 +61,7 @@ fn test_init_check_mode() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Run init with --check
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--check", "--non-interactive"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "init", "--check"])?;
 
   // Verify success
   assert!(output.status.success(), "check mode should succeed");
@@ -83,10 +83,7 @@ fn test_init_custom_output_path() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Run init with custom output
-  run_cargo_rail(
-    &ws.path,
-    &["rail", "init", "--non-interactive", "--output", "rail.toml"],
-  )?;
+  run_cargo_rail(&ws.path, &["rail", "init", "--output", "rail.toml"])?;
 
   // Verify config was created at custom path
   let config_path = &ws.path.join("rail.toml");
@@ -112,7 +109,7 @@ fn test_init_creates_directory_if_needed() -> Result<()> {
   assert!(!config_dir.exists(), ".config should not exist initially");
 
   // Run init
-  run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  run_cargo_rail(&ws.path, &["rail", "init"])?;
 
   // Verify .config was created
   assert!(config_dir.exists(), ".config directory should be created");
@@ -130,7 +127,7 @@ fn test_init_generated_config_is_valid() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Run init
-  run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  run_cargo_rail(&ws.path, &["rail", "init"])?;
 
   // Try to load the config using RailConfig
   let config = load_rail_config(&ws.path)?;
@@ -147,7 +144,7 @@ fn test_init_all_fields_present() -> Result<()> {
   ws.remove_config()?; // Remove default config for init test
 
   // Run init
-  run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+  run_cargo_rail(&ws.path, &["rail", "init"])?;
 
   let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
 
@@ -178,10 +175,7 @@ fn test_init_output_different_path_with_existing_config() -> Result<()> {
 
   // Run init with different output path - should succeed without --force
   let custom_path = "custom-rail.toml";
-  let output = run_cargo_rail(
-    &ws.path,
-    &["rail", "init", "--non-interactive", "--output", custom_path],
-  )?;
+  let output = run_cargo_rail(&ws.path, &["rail", "init", "--output", custom_path])?;
 
   assert!(
     output.status.success(),

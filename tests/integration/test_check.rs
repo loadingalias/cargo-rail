@@ -25,7 +25,7 @@ require_clean = false
   ws.commit("Add real-crate with release config")?;
 
   // Check for non-existent crate should fail
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "nonexistent"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "nonexistent"])?;
   assert!(!output.status.success(), "check for nonexistent crate should fail");
 
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -60,7 +60,7 @@ require_clean = false
   ws.commit("Add valid-crate with release config")?;
 
   // Check should pass
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "valid-crate"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "valid-crate"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(
@@ -100,7 +100,7 @@ require_clean = false
   ws.commit("Add crates with release config")?;
 
   // Check all should pass
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "--all"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(
@@ -145,7 +145,7 @@ require_clean = true
   )?;
 
   // Check should fail
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "dirty-crate"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "dirty-crate"])?;
   assert!(!output.status.success(), "check should fail with uncommitted changes");
 
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -195,7 +195,7 @@ require_clean = false
   ws.commit("Add private-crate with config")?;
 
   // Check should fail for private crate
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "private-crate"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "private-crate"])?;
   assert!(!output.status.success(), "check should fail for publish = false crate");
 
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -230,7 +230,7 @@ require_clean = false
   ws.commit("Add some-crate with release config")?;
 
   // Check should pass with proper config
-  let output = run_cargo_rail(&ws.path, &["rail", "check", "some-crate"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "some-crate"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(
@@ -269,7 +269,7 @@ require_clean = false
   ws.commit("Add any-crate with config")?;
 
   // Check with no args should fail
-  let output = run_cargo_rail(&ws.path, &["rail", "check"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check"])?;
   assert!(!output.status.success(), "check with no args should fail");
 
   let stderr = String::from_utf8_lossy(&output.stderr);

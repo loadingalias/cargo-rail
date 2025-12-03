@@ -37,14 +37,8 @@ fn main() {
   };
 
   // Handle init command specially - it doesn't require a valid workspace
-  if let Commands::Init {
-    output,
-    force,
-    non_interactive,
-    check,
-  } = cli.command
-  {
-    if let Err(e) = commands::run_init_standalone(&workspace_root, &output, force, non_interactive, check) {
+  if let Commands::Init { output, force, check } = cli.command {
+    if let Err(e) = commands::run_init_standalone(&workspace_root, &output, force, check) {
       exit_with_error(e);
     }
     return;

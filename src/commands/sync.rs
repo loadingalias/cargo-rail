@@ -27,7 +27,6 @@ pub fn run_sync(
   from_remote: bool,
   to_remote: bool,
   strategy: ConflictStrategy,
-  _no_protected_branches: bool,
   check: bool,
   format: OutputFormat,
 ) -> RailResult<()> {

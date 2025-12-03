@@ -98,6 +98,8 @@ Examples:
 const RELEASE_HELP: &str = "\
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release check my-crate             # Validate release readiness
+  cargo rail release check --all                # Check all workspace crates
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --bump minor
@@ -106,18 +108,15 @@ Examples:
 
 const INIT_HELP: &str = "\
 Examples:
-  cargo rail init                       # Generate .config/rail.toml (interactive)
-  cargo rail init --non-interactive     # Generate with defaults (CI mode)
+  cargo rail init                       # Generate .config/rail.toml
   cargo rail init --check               # Preview generated config
   cargo rail init -o rail.toml          # Custom output path
   cargo rail init --force               # Overwrite existing config";
 
 const CHECK_HELP: &str = "\
-Examples:
-  cargo rail check my-crate             # Check single crate
-  cargo rail check crate-a crate-b      # Check multiple crates
-  cargo rail check --all                # Check all workspace crates
-  cargo rail check --all -f json        # JSON output for CI";
+Reserved for future use.
+
+This command is currently a placeholder. Use 'cargo rail release check' instead.";
 
 const CLEAN_HELP: &str = "\
 Examples:
@@ -219,9 +218,6 @@ pub enum Commands {
     /// Overwrite existing configuration
     #[arg(long)]
     force: bool,
-    /// Skip interactive prompts
-    #[arg(long)]
-    non_interactive: bool,
     /// Dry-run mode: preview generated config without writing
     #[arg(long, short = 'c')]
     check: bool,
@@ -256,9 +252,6 @@ pub enum Commands {
     /// Conflict resolution strategy
     #[arg(long, default_value_t, value_enum)]
     strategy: ConflictStrategy,
-    /// Allow direct commits to protected branches
-    #[arg(long)]
-    no_protected_branches: bool,
     /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
@@ -275,19 +268,9 @@ pub enum Commands {
     command: ReleaseCommand,
   },
 
-  /// Validate release readiness
+  /// Reserved for future use
   #[command(after_long_help = CHECK_HELP)]
-  Check {
-    /// Crate name(s) to check (mutually exclusive with --all)
-    #[arg(conflicts_with = "all")]
-    crate_names: Vec<String>,
-    /// Check all workspace crates (mutually exclusive with crate names)
-    #[arg(short, long)]
-    all: bool,
-    /// Output format
-    #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
-  },
+  Check {},
 
   /// Clean generated artifacts (cache, backups, reports)
   #[command(after_long_help = CLEAN_HELP)]
@@ -407,6 +390,18 @@ pub enum ReleaseCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
   },
+  /// Validate release readiness
+  Check {
+    /// Crate name(s) to check (mutually exclusive with --all)
+    #[arg(conflicts_with = "all")]
+    crate_names: Vec<String>,
+    /// Check all workspace crates (mutually exclusive with crate names)
+    #[arg(short, long)]
+    all: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -423,15 +418,14 @@ impl Commands {
       Commands::Affected { format, .. }
       | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. }
-      | Commands::Check { format, .. } => format.is_json_like(),
+      | Commands::Sync { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
         SplitCommand::Run { format, .. } => format.is_json_like(),
       },
       Commands::Release { command } => match command {
         ReleaseCommand::Init { .. } => false,
-        ReleaseCommand::Run { format, .. } => format.is_json_like(),
+        ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
       },
       Commands::Config { command } => match command {
         ConfigCommand::Validate { format } => format.is_json_like(),
@@ -446,14 +440,13 @@ impl Commands {
       Commands::Affected { format, .. }
       | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. }
-      | Commands::Check { format, .. } => *format = OutputFormat::Json,
+      | Commands::Sync { format, .. } => *format = OutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },
       } => *format = OutputFormat::Json,
       Commands::Split { .. } => {}
       Commands::Release {
-        command: ReleaseCommand::Run { format, .. },
+        command: ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. },
       } => *format = OutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Config { command } => match command {

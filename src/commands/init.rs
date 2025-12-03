@@ -9,18 +9,11 @@ use crate::progress;
 use crate::toml::builder::RailConfigBuilder;
 use crate::workspace::WorkspaceContext;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Generate rail.toml configuration
-pub fn run_init(
-  ctx: &WorkspaceContext,
-  output_path: &str,
-  force: bool,
-  non_interactive: bool,
-  check: bool,
-) -> RailResult<()> {
-  run_init_impl(ctx.workspace_root(), output_path, force, non_interactive, check)
+pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, check: bool) -> RailResult<()> {
+  run_init_impl(ctx.workspace_root(), output_path, force, check)
 }
 
 /// Auto-detect reasonable unify defaults
@@ -83,13 +76,7 @@ fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
 }
 
 /// Shared implementation for both run_init and run_init_standalone
-fn run_init_impl(
-  workspace_root: &Path,
-  output_path: &str,
-  force: bool,
-  non_interactive: bool,
-  check: bool,
-) -> RailResult<()> {
+fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: bool) -> RailResult<()> {
   let config_path = workspace_root.join(output_path);
 
   // Check if target path already exists
@@ -111,30 +98,6 @@ fn run_init_impl(
   }
 
   let detected_targets = detect_targets(workspace_root);
-
-  if !non_interactive && !check {
-    // Show preview before confirmation
-    eprintln!("output: {}", config_path.display());
-    if detected_targets.is_empty() {
-      eprintln!("targets: (none detected, will use host default)");
-    } else {
-      eprintln!("targets: {}", detected_targets.join(", "));
-    }
-    eprintln!();
-
-    eprint!("generate? [Y/n]: ");
-    io::stderr().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_lowercase();
-
-    if input == "n" || input == "no" {
-      eprintln!("cancelled");
-      return Ok(());
-    }
-  }
-
   let config = build_rail_config(detected_targets);
 
   let toml_content = RailConfigBuilder::new()
@@ -159,14 +122,8 @@ fn run_init_impl(
 }
 
 /// Standalone init (without WorkspaceContext)
-pub fn run_init_standalone(
-  workspace_root: &Path,
-  output_path: &str,
-  force: bool,
-  non_interactive: bool,
-  check: bool,
-) -> RailResult<()> {
-  run_init_impl(workspace_root, output_path, force, non_interactive, check)
+pub fn run_init_standalone(workspace_root: &Path, output_path: &str, force: bool, check: bool) -> RailResult<()> {
+  run_init_impl(workspace_root, output_path, force, check)
 }
 
 #[cfg(test)]
