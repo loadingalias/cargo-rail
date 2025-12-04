@@ -171,16 +171,24 @@ impl<'a> ReleaseValidator<'a> {
 
     for dep in &package.dependencies {
       if dep.path.is_some() {
-        // Allow path dependencies if they are dev-dependencies (usually fine for tests)
-        // But for normal/build deps, they block publishing unless they are also workspace deps
-        // that will be replaced by version deps on publish.
-        // For now, we'll be strict: no path deps in published crates.
-        if dep.kind != cargo_metadata::DependencyKind::Development {
-          return Err(RailError::with_help(
-            format!("Crate '{}' has path dependency '{}'", crate_name, dep.name),
-            "Path dependencies cannot be published. Use version dependencies or workspace inheritance.",
-          ));
+        // Allow dev-dependencies with paths (tests can use local crates)
+        if dep.kind == cargo_metadata::DependencyKind::Development {
+          continue;
         }
+
+        // Allow path deps that also have a version requirement
+        // These are workspace path deps: { version = "x.y", path = "../foo" }
+        // Cargo will use the version when publishing, not the path
+        let has_version = !dep.req.comparators.is_empty();
+        if has_version {
+          continue;
+        }
+
+        // Pure path-only dependencies cannot be published
+        return Err(RailError::with_help(
+          format!("Crate '{}' has path-only dependency '{}'", crate_name, dep.name),
+          "Path-only dependencies cannot be published. Add a version: { version = \"x.y\", path = \"...\" }",
+        ));
       }
     }
 

@@ -290,10 +290,16 @@ impl UnifyAnalyzer {
         // For package-level aggregation, always use union strategy
         // (renamed deps typically have distinct feature needs)
         let features = self.manifests.compute_package_union(&dep_key.name);
-        let df = self
-          .manifests
-          .package_default_features_policy(&dep_key.name)
-          .unwrap_or(true);
+        // When mixed defaults detected, use default-features = true to preserve
+        // features for crates that rely on them (same logic as non-include_renamed path)
+        let df = if has_mixed_defaults {
+          true
+        } else {
+          self
+            .manifests
+            .package_default_features_policy(&dep_key.name)
+            .unwrap_or(true)
+        };
         (features, df)
       } else {
         // Standard per-dep_key logic

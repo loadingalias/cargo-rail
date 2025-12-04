@@ -1,19 +1,15 @@
 # Release workflow for cargo-rail
 #
-# Triggered by pushing a version tag (v1.0.0, v1.2.3, etc.)
+# Triggered by pushing a version tag (v0.1.0, v1.0.0, etc.)
 #
-# This workflow:
-# 1. Creates a GitHub Release with CHANGELOG content
-# 2. Builds pre-built binaries for 9 targets
-# 3. Uploads binaries to the release
-#
-# The actual version bump, changelog generation, and tagging is done locally
-# using `cargo rail release run cargo-rail --bump <version>`.
+# This workflow builds pre-built binaries and uploads them to GitHub Releases.
+# The version bump, changelog, tagging, and crates.io publish are done locally
+# via `cargo rail release run cargo-rail --bump <version>`.
 #
 # Workflow:
-#   LOCAL:  cargo rail release run cargo-rail --bump 1.0.0
+#   LOCAL:  cargo rail release run cargo-rail --bump 0.1.0
 #           git push origin main --follow-tags
-#   CI:     This workflow triggers, builds binaries, creates release
+#   CI:     This workflow triggers, builds binaries, attaches to release
 
 name: Release
 
@@ -39,17 +35,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
         with:
           persist-credentials: false
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: taiki-e/create-gh-release-action@b7abb0cf5e72cb5500307b577f9ca3fd4c5be9d2  # v1.8.4
@@ -67,50 +57,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ----------------------------------------------------------------
-          # Linux
-          # ----------------------------------------------------------------
-          # x86_64 glibc - most common Linux target
+          # Linux x86_64 (glibc)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
 
-          # x86_64 musl - static binary, maximum portability
+          # Linux x86_64 (musl) - static, portable
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
 
-          # ARM64 glibc - AWS Graviton, modern ARM servers
+          # Linux ARM64 (glibc)
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
 
-          # ARM64 musl - static binary for ARM
+          # Linux ARM64 (musl) - static, portable
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
 
-          # ----------------------------------------------------------------
-          # macOS
-          # ----------------------------------------------------------------
-          # Intel Macs
-          - target: x86_64-apple-darwin
-            os: macos-14
-
-          # Apple Silicon (M1/M2/M3)
-          - target: aarch64-apple-darwin
-            os: macos-14
-
-          # Universal binary (both architectures)
-          - target: universal-apple-darwin
-            os: macos-14
-
-          # ----------------------------------------------------------------
-          # Windows
-          # ----------------------------------------------------------------
-          # x86_64 Windows
+          # Windows x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-2022
 
-          # ARM64 Windows (Surface Pro X, etc.)
+          # Windows ARM64
           - target: aarch64-pc-windows-msvc
             os: windows-2022
+
+          # macOS ARM64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-14
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -144,13 +117,9 @@ jobs:
         run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "$GITHUB_ENV"
         shell: bash
 
-      # macOS deployment targets for compatibility
-      - name: Set macOS deployment target (Intel)
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: echo "MACOSX_DEPLOYMENT_TARGET=10.12" >> "$GITHUB_ENV"
-
-      - name: Set macOS deployment target (ARM/Universal)
-        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'universal-apple-darwin'
+      # macOS deployment target
+      - name: Set macOS deployment target
+        if: matrix.target == 'aarch64-apple-darwin'
         run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - name: Build and upload binary
@@ -158,28 +127,6 @@ jobs:
         with:
           bin: cargo-rail
           target: ${{ matrix.target }}
-          # tar for all platforms, zip additionally for Windows
           tar: all
           zip: windows
           token: ${{ secrets.GITHUB_TOKEN }}
-
-  # ==========================================================================
-  # Job 3: Publish to crates.io (after binaries are built)
-  # ==========================================================================
-  publish:
-    name: Publish to crates.io
-    needs: [create-release, upload-assets]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e  # master
-        with:
-          toolchain: stable
-
-      - name: Publish to crates.io
-        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"

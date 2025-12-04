@@ -1,5 +1,5 @@
 use crate::cargo::{CargoTransform, TransformContext};
-use crate::config::SplitMode;
+use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
@@ -17,6 +17,8 @@ pub struct SyncConfig {
   pub crate_paths: Vec<PathBuf>,
   /// Split mode (single or combined)
   pub mode: SplitMode,
+  /// Workspace mode (standalone or workspace)
+  pub workspace_mode: WorkspaceMode,
   /// Path to target repository
   pub target_repo_path: PathBuf,
   /// Branch name
@@ -500,9 +502,13 @@ impl<'a> SyncEngine<'a> {
       // Transform Cargo.toml manifest
       if mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
         let content = std::fs::read_to_string(&full_remote_path)?;
+        // Determine if target has workspace based on split mode
+        let target_has_workspace =
+          self.config.mode == SplitMode::Combined && self.config.workspace_mode == WorkspaceMode::Workspace;
         let context = TransformContext {
           crate_name: self.config.crate_name.clone(),
           workspace_root: self.ctx.workspace_root().to_path_buf(),
+          target_has_workspace,
         };
         let transformed = self.transform.transform_to_split(&content, &context)?;
         std::fs::write(&full_remote_path, transformed)?;
@@ -599,9 +605,11 @@ impl<'a> SyncEngine<'a> {
       // Transform Cargo.toml manifest
       if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
         let content = std::fs::read_to_string(&full_mono_path)?;
+        // Monorepo always has a workspace
         let context = TransformContext {
           crate_name: self.config.crate_name.clone(),
           workspace_root: self.ctx.workspace_root().to_path_buf(),
+          target_has_workspace: true,
         };
         let transformed = self.transform.transform_to_mono(&content, &context)?;
         std::fs::write(&full_mono_path, transformed)?;

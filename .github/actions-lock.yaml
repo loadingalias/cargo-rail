@@ -26,12 +26,12 @@
 actions/checkout:
   ref: v5.0.0
   sha: "08c6903cd8c0fde910a37f88322edcfb5dd907a8"
-  updated: "2025-12-04T18:53:24Z"
+  updated: "2025-12-04T20:50:51Z"
   notes: "Repository checkout - used in every workflow"
 actions/upload-artifact:
   ref: v5.0.0
   sha: "330a01c490aca151604b8cf639adc76d48f6c5d4"
-  updated: "2025-12-04T18:53:25Z"
+  updated: "2025-12-04T20:50:52Z"
   notes: "Upload build artifacts and test results"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Testing & Reporting
@@ -39,7 +39,7 @@ actions/upload-artifact:
 mikepenz/action-junit-report:
   ref: v6.0.1
   sha: "e08919a3b1fb83a78393dfb775a9c37f17d8eea6"
-  updated: "2025-12-04T18:53:26Z"
+  updated: "2025-12-04T20:50:53Z"
   notes: "Publish JUnit test reports as GitHub Checks"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Rust Toolchain & Ecosystem
@@ -47,17 +47,17 @@ mikepenz/action-junit-report:
 dtolnay/rust-toolchain:
   ref: master
   sha: "0b1efabc08b657293548b77fb76cc02d26091c7e"
-  updated: "2025-12-04T18:53:26Z"
+  updated: "2025-12-04T20:50:53Z"
   notes: "Rust toolchain installation - always tracks latest nightly"
 taiki-e/install-action:
   ref: v2
   sha: "493d7f216ecab2af0602481ce809ab2c72836fa1"
-  updated: "2025-12-04T18:53:27Z"
+  updated: "2025-12-04T20:50:54Z"
   notes: "Install cargo tools (nextest, just, deny, audit)"
 Swatinem/rust-cache:
   ref: v2.8.1
   sha: "f13886b937689c021905a6b90929199931d60db1"
-  updated: "2025-12-04T18:53:28Z"
+  updated: "2025-12-04T20:50:54Z"
   notes: "GitHub runner Rust cache"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Release Workflow Actions
@@ -65,15 +65,15 @@ Swatinem/rust-cache:
 taiki-e/create-gh-release-action:
   ref: v1.8.4
   sha: "b7abb0cf5e72cb5500307b577f9ca3fd4c5be9d2"
-  updated: "2025-12-04T18:53:29Z"
+  updated: "2025-12-04T20:50:55Z"
   notes: "Create GitHub releases from CHANGELOG.md"
 taiki-e/setup-cross-toolchain-action:
   ref: v1.26.0
   sha: "bdeb9ca6f0f909ea36bb94e1e3ec916b2ceb35fc"
-  updated: "2025-12-04T18:53:29Z"
+  updated: "2025-12-04T20:50:56Z"
   notes: "Cross-compilation toolchain setup for multi-target builds"
 taiki-e/upload-rust-binary-action:
   ref: v1.24.0
   sha: "e7953b6078194a4ae5f5619632e3715db6275561"
-  updated: "2025-12-04T18:53:30Z"
+  updated: "2025-12-04T20:50:56Z"
   notes: "Build and upload pre-built binaries to GitHub Releases"

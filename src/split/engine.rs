@@ -38,6 +38,7 @@ struct RecreateCommitParams<'a> {
   target_repo_path: &'a Path,
   crate_name: &'a str,
   mode: &'a SplitMode,
+  workspace_mode: &'a WorkspaceMode,
   mapping_store: &'a MappingStore,
   last_recreated_sha: Option<&'a str>,
 }
@@ -143,7 +144,19 @@ impl<'a> SplitEngine<'a> {
 
   /// Apply Cargo.toml transformation to a manifest file
   /// Returns Ok(()) if transform succeeded or file doesn't exist
-  fn apply_manifest_transform(&self, manifest_path: &Path, crate_name: &str) -> RailResult<()> {
+  ///
+  /// # Arguments
+  /// * `manifest_path` - Path to the Cargo.toml to transform
+  /// * `crate_name` - Name of the crate being transformed
+  /// * `target_has_workspace` - Whether target repo will have a workspace structure
+  ///   - true: keep `[lints] workspace = true` (Combined + Workspace mode)
+  ///   - false: resolve `[lints]` to actual values (Single or Combined + Standalone mode)
+  fn apply_manifest_transform(
+    &self,
+    manifest_path: &Path,
+    crate_name: &str,
+    target_has_workspace: bool,
+  ) -> RailResult<()> {
     if !manifest_path.exists() {
       return Ok(());
     }
@@ -152,6 +165,7 @@ impl<'a> SplitEngine<'a> {
     let context = TransformContext {
       crate_name: crate_name.to_string(),
       workspace_root: self.ctx.workspace_root().to_path_buf(),
+      target_has_workspace,
     };
     let transformed = self.transform.transform_to_split(&content, &context)?;
     std::fs::write(manifest_path, transformed)?;
@@ -205,7 +219,13 @@ impl<'a> SplitEngine<'a> {
 
       // Apply Cargo.toml transformation if applicable
       if file_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        self.apply_manifest_transform(&target_path, params.crate_name)?;
+        // Determine if target will have a workspace structure:
+        // - Single mode: always standalone (no workspace)
+        // - Combined + Standalone: no workspace
+        // - Combined + Workspace: has workspace
+        let target_has_workspace =
+          *params.mode == SplitMode::Combined && *params.workspace_mode == WorkspaceMode::Workspace;
+        self.apply_manifest_transform(&target_path, params.crate_name, target_has_workspace)?;
       }
     }
 
@@ -412,6 +432,7 @@ impl<'a> SplitEngine<'a> {
             &config.target_repo_path,
             &aux_files,
             &config.crate_name,
+            &config.workspace_mode,
           )?;
         }
       }
@@ -431,6 +452,7 @@ impl<'a> SplitEngine<'a> {
           target_repo_path: &config.target_repo_path,
           crate_name: &config.crate_name,
           mode: &config.mode,
+          workspace_mode: &config.workspace_mode,
           mapping_store: &mapping_store,
           last_recreated_sha: last_recreated_sha.as_deref(),
         })?;
@@ -671,9 +693,10 @@ impl<'a> SplitEngine<'a> {
     self.copy_directory_recursive(&source_path, target_repo_path)?;
 
     // Transform Cargo.toml manifest
+    // Single mode is always standalone (no workspace)
     println!("   Transforming Cargo.toml");
     let manifest_path = target_repo_path.join("Cargo.toml");
-    self.apply_manifest_transform(&manifest_path, crate_name)?;
+    self.apply_manifest_transform(&manifest_path, crate_name, false)?;
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
@@ -691,7 +714,11 @@ impl<'a> SplitEngine<'a> {
     target_repo_path: &Path,
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
+    workspace_mode: &WorkspaceMode,
   ) -> RailResult<()> {
+    // Determine if target will have a workspace structure
+    let target_has_workspace = *workspace_mode == WorkspaceMode::Workspace;
+
     for crate_path in crate_paths {
       let source_path = self.ctx.workspace_root().join(crate_path);
       let target_path = target_repo_path.join(crate_path);
@@ -707,7 +734,7 @@ impl<'a> SplitEngine<'a> {
 
       // Transform Cargo.toml manifest
       let manifest_path = target_path.join("Cargo.toml");
-      self.apply_manifest_transform(&manifest_path, crate_name)?;
+      self.apply_manifest_transform(&manifest_path, crate_name, target_has_workspace)?;
     }
 
     // Copy auxiliary files

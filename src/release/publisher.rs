@@ -151,6 +151,11 @@ impl<'a> ReleasePublisher<'a> {
 
   /// Update dependent crates to use new version
   fn update_dependents(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    // Update [workspace.dependencies] in root Cargo.toml
+    let root_manifest = self.ctx.workspace_root().join("Cargo.toml");
+    VersionBumper::update_workspace_dependency(&root_manifest, &plan.name, &plan.new_version)?;
+
+    // Update dependent crate manifests
     for dependent_name in &plan.affected_dependents {
       if let Some(pkg) = self.ctx.cargo.get_package(dependent_name) {
         let manifest_path = pkg.manifest_path.clone().into_std_path_buf();

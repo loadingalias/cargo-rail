@@ -196,6 +196,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
           crate_name: split_config.name.clone(),
           crate_paths,
           mode: split_config.mode.clone(),
+          workspace_mode: split_config.workspace_mode.clone(),
           target_repo_path,
           branch: split_config.branch.clone(),
           remote_url: remote,

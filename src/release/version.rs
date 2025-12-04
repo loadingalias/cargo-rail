@@ -267,6 +267,43 @@ impl VersionBumper {
 
     Ok(updated)
   }
+
+  /// Update [workspace.dependencies] entry for a crate
+  ///
+  /// When a workspace member is bumped, the workspace.dependencies entry
+  /// needs to be updated too if it has a version field.
+  pub fn update_workspace_dependency(manifest_path: &Path, dep_name: &str, new_version: &Version) -> RailResult<bool> {
+    use crate::toml::editor::TomlEditor;
+
+    let mut editor = TomlEditor::open(manifest_path)?;
+    let doc = editor.doc_mut();
+    let mut updated = false;
+
+    // Check [workspace.dependencies]
+    if let Some(workspace) = doc.get_mut("workspace")
+      && let Some(deps) = workspace.get_mut("dependencies").and_then(|d| d.as_table_like_mut())
+      && let Some(dep) = deps.get_mut(dep_name)
+    {
+      // Update version field if present
+      if let Some(dep_table) = dep.as_inline_table_mut()
+        && dep_table.contains_key("version")
+      {
+        dep_table.insert("version", new_version.to_string().into());
+        updated = true;
+      } else if let Some(dep_table) = dep.as_table_mut()
+        && dep_table.contains_key("version")
+      {
+        dep_table["version"] = toml_edit::value(new_version.to_string());
+        updated = true;
+      }
+    }
+
+    if updated {
+      editor.write()?;
+    }
+
+    Ok(updated)
+  }
 }
 
 #[cfg(test)]
