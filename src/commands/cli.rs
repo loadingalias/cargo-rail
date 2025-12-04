@@ -99,10 +99,12 @@ const RELEASE_HELP: &str = "\
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check --all                # Check all workspace crates
+  cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --bump minor
+  cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
+  cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
   cargo rail release run --all --bump patch     # Release all crates
   cargo rail release run my-crate --skip-publish  # Tag only, no crates.io";
 
@@ -112,11 +114,6 @@ Examples:
   cargo rail init --check               # Preview generated config
   cargo rail init -o rail.toml          # Custom output path
   cargo rail init --force               # Overwrite existing config";
-
-const CHECK_HELP: &str = "\
-Reserved for future use.
-
-This command is currently a placeholder. Use 'cargo rail release check' instead.";
 
 const CLEAN_HELP: &str = "\
 Examples:
@@ -175,9 +172,6 @@ pub enum Commands {
     /// Explain why tests are being run
     #[arg(long)]
     explain: bool,
-    /// Output format
-    #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
     /// Pass additional arguments to the test runner
     #[arg(last = true)]
     test_args: Vec<String>,
@@ -268,10 +262,6 @@ pub enum Commands {
     command: ReleaseCommand,
   },
 
-  /// Reserved for future use
-  #[command(after_long_help = CHECK_HELP)]
-  Check {},
-
   /// Clean generated artifacts (cache, backups, reports)
   #[command(after_long_help = CLEAN_HELP)]
   Clean {
@@ -287,6 +277,9 @@ pub enum Commands {
     /// Dry-run mode: preview what would be cleaned
     #[arg(long, short = 'c')]
     check: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
   },
 
   /// Configuration management
@@ -374,7 +367,7 @@ pub enum ReleaseCommand {
     /// Release all workspace crates
     #[arg(short, long)]
     all: bool,
-    /// Version bump [major, minor, patch, or "x.y.z"]
+    /// Version bump [major, minor, patch, prerelease, release, or "x.y.z"]
     #[arg(long, default_value = "patch")]
     bump: String,
     /// Dry-run mode: preview release plan
@@ -398,6 +391,9 @@ pub enum ReleaseCommand {
     /// Check all workspace crates (mutually exclusive with crate names)
     #[arg(short, long)]
     all: bool,
+    /// Run extended validation (cargo publish --dry-run, MSRV check)
+    #[arg(long, short = 'e')]
+    extended: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
@@ -416,9 +412,9 @@ impl Commands {
   pub fn is_json_format(&self) -> bool {
     match self {
       Commands::Affected { format, .. }
-      | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. } => format.is_json_like(),
+      | Commands::Sync { format, .. }
+      | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
         SplitCommand::Run { format, .. } => format.is_json_like(),
@@ -438,9 +434,9 @@ impl Commands {
   pub fn apply_json_override(&mut self) {
     match self {
       Commands::Affected { format, .. }
-      | Commands::Test { format, .. }
       | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. } => *format = OutputFormat::Json,
+      | Commands::Sync { format, .. }
+      | Commands::Clean { format, .. } => *format = OutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },
       } => *format = OutputFormat::Json,

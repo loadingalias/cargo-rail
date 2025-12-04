@@ -1,28 +1,27 @@
 repo = "BurntSushi/ripgrep"
-commit = "cd1f981"
-date = "2025-11-30"
+commit = "5e0ed45"
+date = "2025-12-03"
 
-[workspace]
+[workspace.before]
 members = 10
 lock_deps = 61
 
+[workspace.after]
+members = 10
+lock_deps = 59
+
 [unify]
-deps_unified = 9
-member_edits = 35
-transitives_pinned = 0
-dead_features_pruned = 11
-unused_deps_removed = 1
-deps = ["serde", "bstr", "walkdir", "log", "serde_json", "globset", "regex", "termcolor", "memchr"]
-
-[config]
-special = false
-note = "10 workspace members, not a single crate!"
-
-# Config options used (from rail.toml)
-[rail_config]
-include_paths = true
-include_renamed = true
-pin_transitives = false
 msrv = true
 detect_unused = true
+remove_unused = true
 prune_dead_features = true
+max_backups = 3
+strict_version_compat = true
+exact_pin_handling = "warn"
+major_version_conflict = "warn"
+include_paths = true
+include_renamed = true
+exclude = []
+include = []
+pin_transitives = false
+transitive_host = "root"

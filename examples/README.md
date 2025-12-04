@@ -1,43 +1,131 @@
 # Examples
 
-cargo-rail has been tested against several large, respected Rust monorepos to validate the behavior and performance on non-trivial codebases.
+Demo videos and configuration examples for cargo-rail workflows.
 
-## Feature Workflows
+## Quick Start
 
-| Workflow | Description |
-|----------|-------------|
-| [change-detection](./change-detection/) | Graph-aware CI optimization with `affected` and `test` |
-| [release](./release/) | Versioning, changelog generation, and publishing |
-| [split-sync](./split-sync/) | Crate extraction and bidirectional sync |
+```bash
+# Record all demo videos
+./examples/record-demos.sh
 
-## Real-World Monorepos
+# Record specific workflow
+./examples/record-demos.sh unify
+./examples/record-demos.sh split
+./examples/record-demos.sh sync
+./examples/record-demos.sh release
+```
 
-Each subdirectory contains:
+Requires: `vhs` and `ffmpeg` (`brew install vhs ffmpeg`)
 
-- The repository tested
-- The exact commands run
-- A short demo recording
-- A machine-readable summary of the impact
+## Demo Videos
 
-| Project | Focus | Key Result |
-|---------|-------|------------|
-| [codex](./codex/) | AI CLI (48 crates) | 2 deps unified, 19 edits saved |
-| [helix](./helix/) | Text editor (13 crates) | 16 deps unified, 66 edits saved |
-| [helix-db](./helix-db/) | Graph database (6 crates) | 16 deps unified, 44 edits saved |
-| [iced](./iced/) | GUI framework (71 crates) | 6 deps unified, 20 edits saved |
-| [jj](./jj/) | Git-compatible VCS (5 crates) | Well-maintained, minimal changes |
-| [meilisearch](./meilisearch/) | Search engine (19 crates) | 46 deps unified, 209 edits saved |
-| [polars](./polars/) | DataFrame library (33 crates) | Well-maintained, 214 dead features pruned |
-| [ripgrep](./ripgrep/) | Search tool (10 crates) | 9 deps unified, 35 edits saved |
-| [ruff](./ruff/) | Python linter (43 crates) | Well-maintained, minimal changes |
-| [tikv](./tikv/) | Distributed KV (83 crates) | 57 deps unified, 516 edits saved |
-| [tokio](./tokio/) | Async runtime (10 crates) | 10 deps unified, 35 edits saved |
-| [vello](./vello/) | GPU 2D rendering (26 crates) | 7 deps unified, 17 edits saved |
+### Unify Workflow
+
+Dependency unification with `[workspace.dependencies]` management.
+
+| Demo | Repository | Highlights |
+|------|------------|------------|
+| [polars.mp4](./unify/polars.mp4) | [pola-rs/polars](https://github.com/pola-rs/polars) (33 crates) | Dead feature pruning, 214 features removed |
+| [tokio.mp4](./unify/tokio.mp4) | [tokio-rs/tokio](https://github.com/tokio-rs/tokio) (10 crates) | MSRV-aware unification |
+| [ripgrep.mp4](./unify/ripgrep.mp4) | [BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep) (10 crates) | Unused dependency detection |
+
+Each demo shows:
+1. Repository baseline
+2. `cargo rail init` - generate config
+3. Configure unify options
+4. `cargo rail unify --check` - preview changes
+5. `cargo rail affected --explain` - see impact
+6. `cargo rail unify` - apply changes
+7. `cargo check` - verify non-breaking
+
+### Split Workflow
+
+Extract crates with preserved git history.
+
+| Demo | Description |
+|------|-------------|
+| [split.mp4](./split/split.mp4) | Extract tokio-util from tokio monorepo |
+
+Shows:
+1. Configure split target
+2. `cargo rail split run --check` - preview
+3. `cargo rail split run` - execute with history
+4. Verify standalone repo has commit history
+
+### Sync Workflow
+
+Bidirectional sync between monorepo and split repos.
+
+| Demo | Description |
+|------|-------------|
+| [sync.mp4](./sync/sync.mp4) | Sync tokio-util between monorepo and split repo |
+
+Shows:
+1. Configure sync target
+2. `cargo rail sync --check` - check sync status
+3. `cargo rail sync --to-remote --check` - preview push
+4. `cargo rail sync --from-remote --check` - preview pull
+
+### Release Workflow
+
+Version bumping, changelog generation, and publishing.
+
+| Demo | Description |
+|------|-------------|
+| [release.mp4](./release/release.mp4) | Release workflow preview on ripgrep |
+
+Shows:
+1. Configure release settings
+2. `cargo rail release check` - validate readiness
+3. `cargo rail release run --check` - preview release
+4. Different bump types (patch, minor, explicit version)
+
+## Test Repository Summary
+
+Full `cargo rail unify` results across tested repositories:
+
+| Repository | Crates | Deps Unified | Member Edits |
+|------------|--------|--------------|--------------|
+| [tikv](https://github.com/tikv/tikv) | 83 | 57 | 516 |
+| [meilisearch](https://github.com/meilisearch/meilisearch) | 19 | 46 | 209 |
+| [polars](https://github.com/pola-rs/polars) | 33 | 0 | 214 dead features |
+| [helix](https://github.com/helix-editor/helix) | 13 | 16 | 66 |
+| [tokio](https://github.com/tokio-rs/tokio) | 10 | 10 | 35 |
+| [ripgrep](https://github.com/BurntSushi/ripgrep) | 10 | 9 | 35 |
+| [iced](https://github.com/iced-rs/iced) | 71 | 6 | 20 |
+| [vello](https://github.com/linebender/vello) | 26 | 7 | 17 |
+| [codex](https://github.com/openai/codex) | 48 | 2 | 19 |
+| [helix-db](https://github.com/helixdb/helix-db) | 6 | 16 | 44 |
+| [jj](https://github.com/martinvonz/jj) | 5 | 0 | minimal |
+| [ruff](https://github.com/astral-sh/ruff) | 43 | 0 | minimal |
+
+## Directory Structure
+
+```
+examples/
+├── unify/                 # Dependency unification demos
+│   ├── polars.tape        # VHS recording script
+│   ├── polars.mp4         # Rendered video
+│   ├── tokio.tape
+│   ├── tokio.mp4
+│   ├── ripgrep.tape
+│   └── ripgrep.mp4
+├── split/                 # Crate extraction demo
+│   ├── split.tape
+│   └── split.mp4
+├── sync/                  # Bidirectional sync demo
+│   ├── sync.tape
+│   └── sync.mp4
+├── release/               # Release workflow demo
+│   ├── release.tape
+│   └── release.mp4
+├── record-demos.sh        # Recording script
+└── README.md
+```
 
 ## Note
 
-No third-party source code is vendored here. Only CLI transcripts, metrics,
-and demo recordings produced by running cargo-rail against public repositories.
+No third-party source code is vendored. Only CLI transcripts and demo recordings
+produced by running cargo-rail against public repositories.
 
-Results may vary as upstream repositories evolve. Each example includes the
-commit hash used for testing.
+Results may vary as upstream repositories evolve.

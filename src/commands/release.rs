@@ -53,11 +53,15 @@ pub fn run_release_plan(
   }
 
   // Issue #15: Run require_clean check in --check mode too (early feedback)
+  let validator = ReleaseValidator::new(ctx);
+  let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.to_vec());
+
   if release_config.require_clean {
-    let validator = ReleaseValidator::new(ctx);
-    let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.to_vec());
     validator.validate(&target_crates, true)?;
   }
+
+  // Validate changelog paths (catches path traversal issues early)
+  validator.validate_changelog_paths(&target_crates, release_config)?;
 
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(crate_names.clone(), &bump_type)?;
@@ -82,10 +86,10 @@ pub fn run_release_plan(
     }
 
     println!("\nChanges detected. Run without --check to apply.");
-    return Err(RailError::CheckHasPendingChanges);
   }
 
-  Ok(())
+  // Exit code 1 in --check mode indicates changes are pending (consistent across text/json)
+  Err(RailError::CheckHasPendingChanges)
 }
 
 /// Execute a release
@@ -119,6 +123,9 @@ pub fn run_release_publish(
     .clone()
     .unwrap_or_else(|| ctx.graph.workspace_members().to_vec());
   validator.validate(&target_crates, release_config.require_clean)?;
+
+  // Validate changelog paths
+  validator.validate_changelog_paths(&target_crates, release_config)?;
 
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(targets, &bump_type)?;
@@ -154,6 +161,7 @@ pub fn run_release_check(
   ctx: &WorkspaceContext,
   crate_names: Option<Vec<String>>,
   all: bool,
+  extended: bool,
   format: OutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
@@ -174,12 +182,15 @@ pub fn run_release_check(
   } else {
     return Err(RailError::with_help(
       "must specify crate name(s) or --all",
-      "cargo rail check my-crate\ncargo rail check --all",
+      "cargo rail release check my-crate\ncargo rail release check --all",
     ));
   };
 
   let validator = ReleaseValidator::new(ctx);
   validator.validate(&target_crates, release_config.require_clean)?;
+
+  // Validate changelog paths
+  validator.validate_changelog_paths(&target_crates, release_config)?;
 
   let mut results = Vec::new();
   for crate_name in &target_crates {
@@ -190,19 +201,81 @@ pub fn run_release_check(
     }
   }
 
+  // Extended validation: cargo publish --dry-run and MSRV check
+  let mut extended_results = Vec::new();
+  let mut has_extended_failures = false;
+
+  if extended {
+    if !json {
+      println!("\nrunning extended checks...");
+    }
+
+    let ext_results = validator.validate_extended(&target_crates);
+
+    for (crate_name, checks) in ext_results {
+      let mut crate_checks = Vec::new();
+
+      for check in checks {
+        if check.passed {
+          if !json {
+            println!(
+              "  {}: {} - {}",
+              crate_name,
+              check.check_name,
+              check.details.as_deref().unwrap_or("ok")
+            );
+          }
+        } else {
+          has_extended_failures = true;
+          if !json {
+            eprintln!(
+              "  {}: {} - FAILED: {}",
+              crate_name,
+              check.check_name,
+              check.error.as_deref().unwrap_or("unknown error")
+            );
+          }
+        }
+
+        crate_checks.push(serde_json::json!({
+          "check": check.check_name,
+          "passed": check.passed,
+          "details": check.details,
+          "error": check.error
+        }));
+      }
+
+      extended_results.push(serde_json::json!({
+        "crate": crate_name,
+        "checks": crate_checks
+      }));
+    }
+  }
+
   if json {
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
       "command": "check",
-      "status": "passed",
+      "status": if has_extended_failures { "failed" } else { "passed" },
       "crates": results,
       "count": results.len()
     });
+
+    if extended {
+      output["extended"] = serde_json::json!(extended_results);
+    }
+
     println!(
       "{}",
       serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
     );
+  } else if has_extended_failures {
+    return Err(RailError::message("extended validation failed"));
   } else {
     println!("\nall checks passed");
+  }
+
+  if has_extended_failures && json {
+    return Err(RailError::CheckHasPendingChanges);
   }
 
   Ok(())

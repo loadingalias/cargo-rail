@@ -5,6 +5,7 @@
 ## Overview
 
 cargo-rail uses `rail.toml` for workspace-level configuration. This file controls:
+
 - **Dependency unification** (`cargo rail unify`)
 - **Release automation** (`cargo rail release`)
 - **Change detection** (`cargo rail affected`)
@@ -13,6 +14,7 @@ cargo-rail uses `rail.toml` for workspace-level configuration. This file control
 ### Configuration File Location
 
 Configuration files are searched in order:
+
 1. `rail.toml` (workspace root)
 2. `.rail.toml` (workspace root, hidden)
 3. `.cargo/rail.toml` (cargo directory)
@@ -80,6 +82,7 @@ Configuration options at the workspace root level.
 | `crates` | `table` | `{}` | Per-crate configuration (see below) |
 
 **Example:**
+
 ```toml
 targets = [
     "x86_64-unknown-linux-gnu",
@@ -102,9 +105,10 @@ Controls workspace dependency unification behavior. All options are optional wit
 | `detect_unused` | `bool` | `true` | Detect dependencies declared in manifests but absent from the resolved cargo graph. |
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
 | `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
-| `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. |
+| `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. Set to `0` to disable backup creation entirely. |
 
 **Example:**
+
 ```toml
 [unify]
 msrv = true
@@ -123,6 +127,7 @@ max_backups = 5
 | `major_version_conflict` | `enum` | `"warn"` | How to handle major version conflicts (e.g., `serde = "1.0"` and `serde = "2.0"`):<br>• `"warn"` - Skip unification, emit warning (both versions stay in graph)<br>• `"bump"` - Force unify to highest resolved version (may break code) |
 
 **Example:**
+
 ```toml
 [unify]
 strict_version_compat = false
@@ -131,6 +136,7 @@ major_version_conflict = "bump"
 ```
 
 **Notes:**
+
 - `major_version_conflict = "bump"` works in ~85% of cases; the remaining ~15% may require code fixes
 - Use `"warn"` for safety, `"bump"` for the leanest build graph
 
@@ -144,6 +150,7 @@ major_version_conflict = "bump"
 | `include` | `string[]` | `[]` | Force-include specific dependencies in unification, even if they're single-use. |
 
 **Example:**
+
 ```toml
 [unify]
 include_paths = true
@@ -162,6 +169,7 @@ Advanced feature for replacing workspace-hack crates. Only enable if you current
 | `transitive_host` | `string` | `"root"` | Where to put pinned transitive dev-dependencies:<br>• `"root"` - Use workspace root `Cargo.toml`<br>• `"crates/foo"` - Use specific member crate (relative path from workspace root) |
 
 **Example:**
+
 ```toml
 [unify]
 pin_transitives = true
@@ -169,6 +177,7 @@ transitive_host = "root"
 ```
 
 **Complete Example:**
+
 ```toml
 [unify]
 # Core options (defaults shown)
@@ -212,6 +221,7 @@ Release automation settings for versioning, tagging, and publishing.
 | `sign_tags` | `bool` | `false` | Sign git tags with GPG or SSH. Requires git signing to be configured. |
 
 **Example:**
+
 ```toml
 [release]
 tag_prefix = "v"
@@ -232,6 +242,7 @@ sign_tags = true
 | `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
 
 **Example:**
+
 ```toml
 [release]
 changelog_path = "CHANGELOG.md"
@@ -241,6 +252,7 @@ require_changelog_entries = true
 ```
 
 **Complete Example:**
+
 ```toml
 [release]
 # Core
@@ -259,6 +271,7 @@ require_changelog_entries = false
 ```
 
 **Notes:**
+
 - In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
 - For single-crate workspaces, use `tag_format = "v{version}"`
 - `changelog_relative_to = "workspace"` is useful for unified changelogs
@@ -275,6 +288,7 @@ Settings for the `affected` and `test` commands. Controls how changes are classi
 | `custom` | `table<string, string[]>` | `{}` | Custom path patterns and their categories. Keys are category names, values are glob pattern arrays. Used for conditional CI logic. |
 
 **Default Infrastructure Patterns:**
+
 ```toml
 infrastructure = [
     ".github/**",
@@ -296,6 +310,7 @@ infrastructure = [
 ```
 
 **Example:**
+
 ```toml
 [change-detection]
 infrastructure = [
@@ -313,6 +328,7 @@ docs = ["docs/**", "*.md"]
 
 **Use Case:**
 Custom categories enable conditional CI:
+
 ```yaml
 # .github/workflows/ci.yml
 - name: Check if benchmarks changed
@@ -343,6 +359,7 @@ Crate splitting and syncing configuration. Enables extracting crates to separate
 | `exclude` | `string[]` | no | Files/directories to exclude from the split |
 
 **Single Crate Example:**
+
 ```toml
 [crates.my-lib.split]
 remote = "git@github.com:org/my-lib.git"
@@ -356,6 +373,7 @@ exclude = ["*.tmp"]
 ```
 
 **Combined Workspace Example:**
+
 ```toml
 [crates.utils.split]
 remote = "git@github.com:org/utils-mono.git"
@@ -371,6 +389,7 @@ include = ["LICENSE"]
 ```
 
 **Local Testing:**
+
 ```toml
 [crates.test-crate.split]
 remote = "/tmp/test-split-repo"  # Local path for testing
@@ -388,6 +407,7 @@ Per-crate release configuration. Overrides workspace-level release defaults.
 | `publish` | `bool` | `true` | Enable/disable publishing for this crate. Overrides `Cargo.toml` `publish` field. |
 
 **Example:**
+
 ```toml
 [crates.internal-utils.release]
 publish = false  # Never publish to crates.io
@@ -403,6 +423,7 @@ Per-crate changelog configuration.
 | `skip` | `bool` | `false` | Exclude this crate from changelog generation entirely. |
 
 **Example:**
+
 ```toml
 [crates.my-lib.changelog]
 path = "CHANGES.md"       # Use CHANGES.md instead of CHANGELOG.md
@@ -648,6 +669,7 @@ cargo rail unify  # Validates config before running
 ```
 
 Common validation errors:
+
 - **Invalid glob patterns** in `change-detection`
 - **Single mode with multiple paths** in split config
 - **Combined mode with one path** in split config
@@ -672,6 +694,7 @@ transitive_host = "root"  # or path to your hack crate
 ```
 
 Then run:
+
 ```bash
 cargo rail unify
 ```

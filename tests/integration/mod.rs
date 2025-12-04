@@ -3,6 +3,7 @@ mod test_affected;
 mod test_check;
 mod test_classification;
 mod test_clean;
+mod test_config;
 mod test_error_handling;
 mod test_git_notes;
 mod test_init;

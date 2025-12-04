@@ -21,7 +21,6 @@ Commands:
   split     Split a crate to a standalone repository with git history
   sync      Sync changes between monorepo and split repos
   release   Publish releases (version bump, changelog, tag, publish)
-  check     Reserved for future use
   clean     Clean generated artifacts (cache, backups, reports)
   config    Configuration management
   help      Print this message or the help of the given subcommand(s)
@@ -126,19 +125,6 @@ Options:
 
       --explain
           Explain why tests are being run
-
-  -f, --format <FORMAT>
-          Output format
-
-          Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
-          
-          [default: text]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -481,10 +467,12 @@ Options:
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check --all                # Check all workspace crates
+  cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --bump minor
+  cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
+  cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
   cargo rail release run --all --bump patch     # Release all crates
   cargo rail release run my-crate --skip-publish  # Tag only, no crates.io
 ```
@@ -530,7 +518,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --bump <BUMP>
-          Version bump [major, minor, patch, or "x.y.z"]
+          Version bump [major, minor, patch, prerelease, release, or "x.y.z"]
           
           [default: patch]
 
@@ -586,6 +574,12 @@ Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
+  -e, --extended
+          Run extended validation (cargo publish --dry-run, MSRV check)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
   -f, --format <FORMAT>
           Output format
 
@@ -599,41 +593,11 @@ Options:
           
           [default: text]
 
-      --json
-          Output in JSON format (shorthand for -f json)
-
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
-```
-
----
-
-## cargo rail check
-
-```
-Reserved for future use
-
-Usage: cargo rail check [OPTIONS]
-
-Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output in JSON format (shorthand for -f json)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Reserved for future use.
-
-This command is currently a placeholder. Use 'cargo rail release check' instead.
 ```
 
 ---
@@ -663,6 +627,19 @@ Options:
 
   -c, --check
           Dry-run mode: preview what would be cleaned
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
 
   -h, --help
           Print help (see a summary with '-h')

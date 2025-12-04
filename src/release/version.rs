@@ -16,6 +16,12 @@ pub enum BumpType {
   Minor,
   /// Increment major version (X.0.0 or 0.Y.0 for 0.x)
   Major,
+  /// Increment prerelease version (1.0.0-rc.1 -> 1.0.0-rc.2)
+  /// If no prerelease exists, adds -rc.1
+  Prerelease,
+  /// Strip prerelease suffix (1.0.0-rc.2 -> 1.0.0)
+  /// If no prerelease exists, this is a no-op
+  Release,
   /// Set exact version
   Exact(Version),
 }
@@ -28,13 +34,15 @@ impl FromStr for BumpType {
       "major" => Ok(Self::Major),
       "minor" => Ok(Self::Minor),
       "patch" => Ok(Self::Patch),
+      "prerelease" | "pre" | "rc" => Ok(Self::Prerelease),
+      "release" => Ok(Self::Release),
       _ => {
         // Try parsing as explicit version
         let version = Version::parse(s).map_err(|e| {
           RailError::with_help(
             format!("Invalid version bump: {}", s),
             format!(
-              "Use 'major', 'minor', 'patch', or a valid semver version (e.g., '1.2.3'). Parse error: {}",
+              "Use 'major', 'minor', 'patch', 'prerelease', 'release', or a valid semver version (e.g., '1.2.3'). Parse error: {}",
               e
             ),
           )
@@ -71,6 +79,41 @@ impl BumpType {
         next.major += 1;
         next.minor = 0;
         next.patch = 0;
+        next.pre = semver::Prerelease::EMPTY;
+        next.build = semver::BuildMetadata::EMPTY;
+        next
+      }
+      Self::Prerelease => {
+        let mut next = current.clone();
+        next.build = semver::BuildMetadata::EMPTY;
+
+        if current.pre.is_empty() {
+          // No prerelease - add rc.1
+          next.pre = semver::Prerelease::new("rc.1").unwrap();
+        } else {
+          // Increment the numeric part of the prerelease
+          // Supports: rc.1 -> rc.2, alpha.3 -> alpha.4, beta.0 -> beta.1
+          let pre_str = current.pre.as_str();
+          if let Some((prefix, num_str)) = pre_str.rsplit_once('.') {
+            if let Ok(num) = num_str.parse::<u64>() {
+              let new_pre = format!("{}.{}", prefix, num + 1);
+              next.pre = semver::Prerelease::new(&new_pre).unwrap_or(current.pre.clone());
+            } else {
+              // Not a number suffix, append .1
+              let new_pre = format!("{}.1", pre_str);
+              next.pre = semver::Prerelease::new(&new_pre).unwrap_or(current.pre.clone());
+            }
+          } else {
+            // No dot in prerelease (e.g., "alpha"), append .1
+            let new_pre = format!("{}.1", pre_str);
+            next.pre = semver::Prerelease::new(&new_pre).unwrap_or(current.pre.clone());
+          }
+        }
+        next
+      }
+      Self::Release => {
+        // Strip prerelease and build metadata
+        let mut next = current.clone();
         next.pre = semver::Prerelease::EMPTY;
         next.build = semver::BuildMetadata::EMPTY;
         next
@@ -264,5 +307,67 @@ mod tests {
     let v = Version::parse("1.2.3-beta.1").unwrap();
     let next = BumpType::Patch.apply(&v);
     assert_eq!(next, Version::parse("1.2.4").unwrap());
+  }
+
+  #[test]
+  fn test_bump_prerelease_from_stable() {
+    // Stable version gets rc.1 added
+    let v = Version::parse("1.0.0").unwrap();
+    let next = BumpType::Prerelease.apply(&v);
+    assert_eq!(next, Version::parse("1.0.0-rc.1").unwrap());
+  }
+
+  #[test]
+  fn test_bump_prerelease_increment_rc() {
+    // rc.1 -> rc.2
+    let v = Version::parse("1.0.0-rc.1").unwrap();
+    let next = BumpType::Prerelease.apply(&v);
+    assert_eq!(next, Version::parse("1.0.0-rc.2").unwrap());
+  }
+
+  #[test]
+  fn test_bump_prerelease_increment_alpha() {
+    // alpha.3 -> alpha.4
+    let v = Version::parse("2.0.0-alpha.3").unwrap();
+    let next = BumpType::Prerelease.apply(&v);
+    assert_eq!(next, Version::parse("2.0.0-alpha.4").unwrap());
+  }
+
+  #[test]
+  fn test_bump_prerelease_increment_beta() {
+    // beta.0 -> beta.1
+    let v = Version::parse("1.5.0-beta.0").unwrap();
+    let next = BumpType::Prerelease.apply(&v);
+    assert_eq!(next, Version::parse("1.5.0-beta.1").unwrap());
+  }
+
+  #[test]
+  fn test_bump_release_strips_prerelease() {
+    // rc.2 -> stable
+    let v = Version::parse("1.0.0-rc.2").unwrap();
+    let next = BumpType::Release.apply(&v);
+    assert_eq!(next, Version::parse("1.0.0").unwrap());
+  }
+
+  #[test]
+  fn test_bump_release_noop_on_stable() {
+    // Stable version stays stable
+    let v = Version::parse("1.0.0").unwrap();
+    let next = BumpType::Release.apply(&v);
+    assert_eq!(next, Version::parse("1.0.0").unwrap());
+  }
+
+  #[test]
+  fn test_parse_bump_prerelease() {
+    assert_eq!(BumpType::from_str("prerelease").unwrap(), BumpType::Prerelease);
+    assert_eq!(BumpType::from_str("pre").unwrap(), BumpType::Prerelease);
+    assert_eq!(BumpType::from_str("rc").unwrap(), BumpType::Prerelease);
+    assert_eq!(BumpType::from_str("PRERELEASE").unwrap(), BumpType::Prerelease);
+  }
+
+  #[test]
+  fn test_parse_bump_release() {
+    assert_eq!(BumpType::from_str("release").unwrap(), BumpType::Release);
+    assert_eq!(BumpType::from_str("RELEASE").unwrap(), BumpType::Release);
   }
 }

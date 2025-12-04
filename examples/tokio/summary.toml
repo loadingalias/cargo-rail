@@ -1,39 +1,27 @@
 repo = "tokio-rs/tokio"
-commit = "ab3996a6"
-date = "2025-11-30"
+commit = "ab3996a"
+date = "2025-12-03"
 
-[workspace]
+[workspace.before]
 members = 10
-lock_deps = 214
+lock_deps = 213
+
+[workspace.after]
+members = 10
+lock_deps = 213 
 
 [unify]
-deps_unified = 10
-member_edits = 35
-transitives_pinned = 0
-dead_features_pruned = 24
-unused_deps_removed = 1
-deps = [
-    "bytes",
-    "rand",
-    "tokio",
-    "parking_lot",
-    "tracing",
-    "slab",
-    "tempfile",
-    "libc",
-    "loom",
-    "futures",
-]
-
-[config]
-special = false
-note = "The async runtime"
-
-# Config options used (from rail.toml)
-[rail_config]
-include_paths = true
-include_renamed = false
-pin_transitives = false
 msrv = true
 detect_unused = true
+remove_unused = true
 prune_dead_features = true
+max_backups = 3
+strict_version_compat = true
+exact_pin_handling = "warn"
+major_version_conflict = "warn"
+include_paths = true
+include_renamed = false
+exclude = []
+include = []
+pin_transitives = false
+transitive_host = "root"

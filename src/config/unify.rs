@@ -117,6 +117,54 @@ impl UnifyConfig {
   pub fn should_include(&self, dep_name: &str) -> bool {
     self.include.iter().any(|i| i == dep_name)
   }
+
+  /// Validate unify configuration against the workspace
+  ///
+  /// Checks:
+  /// - transitive_host path exists if configured as a path (not "root")
+  /// - transitive_host path contains a Cargo.toml (is a valid crate/workspace)
+  pub fn validate(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
+    // Only validate if pin_transitives is enabled and transitive_host is a path
+    if self.pin_transitives
+      && let TransitiveFeatureHost::Path(p) = &self.transitive_host
+    {
+      // Check for path traversal (security/consistency)
+      if p.contains("..") {
+        return Err(crate::error::ConfigError::InvalidValue {
+          field: "unify.transitive_host".to_string(),
+          message: format!("path '{}' contains '..' traversal, which is not allowed", p),
+        });
+      }
+
+      // Check path is not absolute
+      if std::path::Path::new(p).is_absolute() {
+        return Err(crate::error::ConfigError::InvalidValue {
+          field: "unify.transitive_host".to_string(),
+          message: format!("path '{}' is absolute, must be relative to workspace root", p),
+        });
+      }
+
+      // Check directory exists
+      let full_path = workspace_root.join(p);
+      if !full_path.exists() {
+        return Err(crate::error::ConfigError::InvalidValue {
+          field: "unify.transitive_host".to_string(),
+          message: format!("path '{}' does not exist", p),
+        });
+      }
+
+      // Check Cargo.toml exists at that path
+      let cargo_toml = full_path.join("Cargo.toml");
+      if !cargo_toml.exists() {
+        return Err(crate::error::ConfigError::InvalidValue {
+          field: "unify.transitive_host".to_string(),
+          message: format!("path '{}' does not contain a Cargo.toml", p),
+        });
+      }
+    }
+
+    Ok(())
+  }
 }
 
 // ============================================================================
@@ -409,5 +457,61 @@ mod tests {
     assert!(!config.strict_version_compat);
     assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
     assert_eq!(config.major_version_conflict, MajorVersionConflict::Bump);
+  }
+
+  #[test]
+  fn test_transitive_host_validate_root() {
+    // Root should always be valid
+    let config = UnifyConfig {
+      pin_transitives: true,
+      transitive_host: TransitiveFeatureHost::Root,
+      ..Default::default()
+    };
+    let workspace = std::env::current_dir().unwrap();
+    assert!(config.validate(&workspace).is_ok());
+  }
+
+  #[test]
+  fn test_transitive_host_validate_valid_path() {
+    // src/ exists and doesn't have a Cargo.toml - but pin_transitives=false skips validation
+    let config = UnifyConfig {
+      pin_transitives: false,
+      transitive_host: TransitiveFeatureHost::Path("src".to_string()),
+      ..Default::default()
+    };
+    let workspace = std::env::current_dir().unwrap();
+    assert!(config.validate(&workspace).is_ok());
+  }
+
+  #[test]
+  fn test_transitive_host_validate_nonexistent_path() {
+    let config = UnifyConfig {
+      pin_transitives: true,
+      transitive_host: TransitiveFeatureHost::Path("nonexistent/path".to_string()),
+      ..Default::default()
+    };
+    let workspace = std::env::current_dir().unwrap();
+    let result = config.validate(&workspace);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(matches!(err, crate::error::ConfigError::InvalidValue { .. }));
+  }
+
+  #[test]
+  fn test_transitive_host_validate_path_traversal() {
+    let config = UnifyConfig {
+      pin_transitives: true,
+      transitive_host: TransitiveFeatureHost::Path("../somewhere".to_string()),
+      ..Default::default()
+    };
+    let workspace = std::env::current_dir().unwrap();
+    let result = config.validate(&workspace);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    if let crate::error::ConfigError::InvalidValue { message, .. } = err {
+      assert!(message.contains(".."));
+    } else {
+      panic!("Expected InvalidValue error");
+    }
   }
 }

@@ -366,6 +366,15 @@ impl WorkspaceContext {
       crate::targets::validate_targets(&cfg.targets)?;
     }
 
+    // Validate config settings that require workspace context
+    if let Some(ref cfg) = config {
+      // Validate change-detection glob patterns
+      cfg.change_detection.validate().map_err(RailError::Config)?;
+
+      // Validate unify config (e.g., transitive_host path)
+      cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
+    }
+
     // Pre-load multi-target metadata if targets are configured
     // This saves 150-600ms for unify operations
     let multi_target_metadata = if let Some(ref cfg) = config

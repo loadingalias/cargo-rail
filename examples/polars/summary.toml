@@ -1,28 +1,27 @@
 repo = "pola-rs/polars"
-commit = "a03ac9595e"
-date = "2025-11-30"
+commit = "a03ac95"
+date = "2025-12-03"
 
-[workspace]
+[workspace.before]
 members = 33
 lock_deps = 579
 
+[workspace.after]
+members = 33
+lock_deps = 518
+
 [unify]
-deps_unified = 2
-member_edits = 6
-transitives_pinned = 0
-dead_features_pruned = 214
-unused_deps_removed = 2
-deps = []
-
-[config]
-special = false
-note = "Already well-maintained, 214 conditional features pruned"
-
-# Config options used (from rail.toml)
-[rail_config]
-include_paths = true
-include_renamed = true
-pin_transitives = false
 msrv = true
 detect_unused = true
+remove_unused = true
 prune_dead_features = true
+max_backups = 3
+strict_version_compat = true
+exact_pin_handling = "warn"
+major_version_conflict = "warn"
+include_paths = true
+include_renamed = true
+exclude = []
+include = []
+pin_transitives = false
+transitive_host = "root"

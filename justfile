@@ -2,6 +2,10 @@ build:
     cargo build --workspace --all-targets --all-features
     @echo "✅ Success!"
 
+build-release:
+    cargo build --workspace --all-targets --all-features --release
+    @echo "✅ Success!"
+
 test crate="":
     @scripts/test/test.sh "{{crate}}"
 

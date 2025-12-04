@@ -113,7 +113,7 @@ pub fn run_sync(
       println!("    direction: {}", dir_display);
       println!("    target: {}", sync_config.target_repo_path.display());
       println!("    remote: {}", sync_config.remote_url);
-      println!("    strategy: {:?}", strategy);
+      println!("    strategy: {}", format!("{:?}", strategy).to_lowercase());
       if !target_exists {
         println!("    warning: target repo missing (run split first)");
       }

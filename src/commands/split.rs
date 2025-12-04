@@ -37,45 +37,64 @@ pub fn run_split(
 
   // Check mode: show plan
   if check {
-    if json {
-      let crates: Vec<_> = configs
-        .iter()
-        .map(|config| {
-          serde_json::json!({
+    match format {
+      OutputFormat::Json => {
+        let crates: Vec<_> = configs
+          .iter()
+          .map(|config| {
+            serde_json::json!({
+              "crate_name": config.crate_name,
+              "mode": format!("{:?}", config.mode),
+              "target_repo": config.target_repo_path,
+              "branch": config.branch,
+              "remote_url": config.remote_url,
+            })
+          })
+          .collect();
+        let output = serde_json::json!({
+          "command": "split",
+          "check": true,
+          "crates": crates,
+          "count": configs.len()
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+      }
+      OutputFormat::NamesOnly => {
+        for config in &configs {
+          println!("{}", config.crate_name);
+        }
+      }
+      OutputFormat::JsonLines => {
+        for config in &configs {
+          let obj = serde_json::json!({
             "crate_name": config.crate_name,
             "mode": format!("{:?}", config.mode),
-            "target_repo": config.target_repo_path,
+            "target_repo": config.target_repo_path.display().to_string(),
             "branch": config.branch,
             "remote_url": config.remote_url,
-          })
-        })
-        .collect();
-      let output = serde_json::json!({
-        "command": "split",
-        "check": true,
-        "crates": crates,
-        "count": configs.len()
-      });
-      println!("{}", serde_json::to_string_pretty(&output)?);
-      return Ok(());
-    }
-
-    println!("split plan:\n");
-    for config in &configs {
-      println!("  {}", config.crate_name);
-      println!("    mode: {:?}", config.mode);
-      println!("    paths:");
-      for path in &config.crate_paths {
-        println!("      {}", path.display());
+          });
+          println!("{}", serde_json::to_string(&obj)?);
+        }
       }
-      println!("    target: {}", config.target_repo_path.display());
-      if let Some(ref remote) = config.remote_url {
-        println!("    remote: {}", remote);
+      _ => {
+        // Text, GitHub, GitHubMatrix all fall back to text output
+        println!("split plan:\n");
+        for config in &configs {
+          println!("  {}", config.crate_name);
+          println!("    mode: {:?}", config.mode);
+          println!("    paths:");
+          for path in &config.crate_paths {
+            println!("      {}", path.display());
+          }
+          println!("    target: {}", config.target_repo_path.display());
+          if let Some(ref remote) = config.remote_url {
+            println!("    remote: {}", remote);
+          }
+          println!("    branch: {}", config.branch);
+        }
+        println!("\nChanges detected. Run without --check to apply.");
       }
-      println!("    branch: {}", config.branch);
     }
-
-    println!("\nChanges detected. Run without --check to apply.");
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 

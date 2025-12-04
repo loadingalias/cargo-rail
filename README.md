@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 
-[Commands](docs/commands.md) | [Config](docs/config.md) | [Recipes](docs/recipes.md) | [Crates.io](https://crates.io/crates/cargo-rail)
+[Commands](docs/commands.md) | [Config](docs/config.md) | [Examples](examples/) | [Crates.io](https://crates.io/crates/cargo-rail)
 
 ```bash
 cargo install cargo-rail
@@ -67,22 +67,6 @@ One metadata pass per target. No additional cargo invocations. No workspace-hack
 
 ---
 
-## The Unify Algorithm
-
-**Versions**: Uses Cargo's resolved versions across all configured targets. Multiple major versions of the same dep trigger a warning and skip unification for that dep (configurable to force-bump to highest).
-
-**Features**: Workspace deps carry the intersection (common features across all usages). Members declare local additions via `features = ["extra"]`. Target-specific features (`[target.'cfg(...)'.dependencies]`) stay in member manifests.
-
-**MSRV**: Computes the maximum `rust-version` declared by any package in your resolved dependency graph. This is your buildable floor - the minimum Rust version that can compile your workspace. Written to `[workspace.package].rust-version`.
-
-**Unused deps**: Compares declared dependencies against the resolved graph. If a dep isn't in the resolution for any configured target, it's unused. Conservative filters prevent false positives for optional deps, feature-gated deps, and unconfigured targets.
-
-**Dead features**: Features declared but never enabled in the resolved graph. Only empty no-op features (`feature = []`) are pruned. Features that enable something are reported but preserved - they're user-facing API.
-
-**Transitive pinning**: Optional. Detects transitive-only deps with fragmented features across targets and pins them in `[workspace.dependencies]`. Replaces workspace-hack crates without the lockstep maintenance.
-
----
-
 ## Commands
 
 | Command | Purpose |
@@ -94,10 +78,10 @@ One metadata pass per target. No additional cargo invocations. No workspace-hack
 | `sync` | Bidirectional monorepo/split repo sync |
 | `release` | Version bump, changelog, tag, publish |
 | `init` | Generate `rail.toml` |
-| `check` | Validate release readiness |
 | `clean` | Remove generated artifacts |
+| `config` | Configuration management |
 
-Run `cargo rail <command> --help` for details, or see [docs/commands.md](docs/commands.md).
+See [docs/commands.md](docs/commands.md) for full reference.
 
 ---
 
@@ -113,28 +97,19 @@ Searched in order: `rail.toml`, `.rail.toml`, `.cargo/rail.toml`, `.config/rail.
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [unify]
-pin_transitives = false       # Enable for hakari/workspace-hack replacement
-prune_dead_features = true    # Remove empty no-op features
-detect_unused = true          # Find deps not in resolved graph
-remove_unused = true          # Auto-remove unused deps
-msrv = true                   # Compute MSRV from resolved graph
-major_version_conflict = "warn"  # "warn" (skip) or "bump" (force highest)
+msrv = true
+detect_unused = true
+remove_unused = true
+prune_dead_features = true
 
 [release]
-tag_format = "{crate}-{prefix}{version}"
-create_github_release = false
-publish_delay = 5
+tag_format = "{crate}-v{version}"
 
 [change-detection]
 infrastructure = [".github/**", "justfile"]
-
-[crates.my-crate.split]
-remote = "git@github.com:org/my-crate.git"
-branch = "main"
-mode = "single"
 ```
 
-Full reference: [docs/config.md](docs/config.md)
+See [docs/config.md](docs/config.md) for full reference.
 
 ---
 
@@ -150,7 +125,7 @@ Full reference: [docs/config.md](docs/config.md)
 | [tokio](https://github.com/tokio-rs/tokio) | 10 | 10 | 35 |
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | 10 | 9 | 35 |
 
-See [examples/](examples/) for full results across 12 repositories.
+See [examples/](examples/) for demo videos and full results across 12 repositories.
 
 ---
 
@@ -176,23 +151,6 @@ See [examples/](examples/) for full results across 12 repositories.
 **System git.** Uses `git` binary directly. No libgit2/gitoxide. Deterministic SHAs. git-notes for commit mapping.
 
 **Lossless TOML.** Uses `toml_edit` to preserve comments and formatting.
-
----
-
-## Installation
-
-```bash
-cargo install cargo-rail
-```
-
-From source:
-
-```bash
-git clone https://github.com/loadingalias/cargo-rail
-cd cargo-rail && cargo install --path .
-```
-
-Requires Rust 1.91+.
 
 ---
 

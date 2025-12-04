@@ -7,7 +7,7 @@
 [example]
 type = "workflow"
 feature = "release"
-commands = ["cargo rail check", "cargo rail release"]
+commands = ["cargo rail release check", "cargo rail release run"]
 
 [notes]
 description = """
@@ -94,37 +94,37 @@ sign_tags = true              # GPG/SSH signing
 # ============================================================================
 
 [[commands]]
-cmd = "cargo rail check"
+cmd = "cargo rail release check"
 desc = "Validate all crates are ready for release"
 
 [[commands]]
-cmd = "cargo rail check my-crate"
+cmd = "cargo rail release check my-crate"
 desc = "Check specific crate only"
 
 [[commands]]
-cmd = "cargo rail release my-crate --check"
+cmd = "cargo rail release run my-crate --check"
 desc = "Dry run - preview release plan"
 
 [[commands]]
-cmd = "cargo rail release my-crate"
+cmd = "cargo rail release run my-crate"
 desc = "Release with patch bump (default)"
 
 [[commands]]
-cmd = "cargo rail release my-crate --bump minor"
+cmd = "cargo rail release run my-crate --bump minor"
 desc = "Release with minor version bump"
 
 [[commands]]
-cmd = "cargo rail release my-crate --bump 2.0.0"
+cmd = "cargo rail release run my-crate --bump 2.0.0"
 desc = "Release with explicit version"
 
 [[commands]]
-cmd = "cargo rail release --all --bump patch"
+cmd = "cargo rail release run --all --bump patch"
 desc = "Release all workspace crates (in dependency order)"
 
 [[commands]]
-cmd = "cargo rail release my-crate --skip-publish"
+cmd = "cargo rail release run my-crate --skip-publish"
 desc = "Create tag only, don't publish to crates.io"
 
 [[commands]]
-cmd = "cargo rail release my-crate --skip-tag"
+cmd = "cargo rail release run my-crate --skip-tag"
 desc = "Publish only, don't create git tag"

@@ -497,3 +497,122 @@ changelog_relative_to = "crate"
 
   Ok(())
 }
+
+// ============================================================================
+// Prerelease Bump Tests
+// ============================================================================
+
+/// Test --bump prerelease from stable version
+#[test]
+fn test_bump_prerelease_from_stable() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("prerelease-test", "1.0.0")?;
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --bump prerelease
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should show 1.0.0 -> 1.0.0-rc.1
+  assert!(
+    stdout.contains("1.0.0-rc.1"),
+    "Should bump to rc.1 prerelease.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test --bump prerelease increments existing prerelease
+#[test]
+fn test_bump_prerelease_increment() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("prerelease-inc", "2.0.0-rc.1")?;
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --bump prerelease
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should show 2.0.0-rc.1 -> 2.0.0-rc.2
+  assert!(
+    stdout.contains("2.0.0-rc.2"),
+    "Should increment to rc.2.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test --bump release strips prerelease suffix
+#[test]
+fn test_bump_release_strips_prerelease() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("release-strip", "1.5.0-beta.3")?;
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release plan with --bump release
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "release"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should show 1.5.0-beta.3 -> 1.5.0
+  // The output contains both versions in format "1.5.0-beta.3 → 1.5.0"
+  assert!(
+    stdout.contains("1.5.0-beta.3") && stdout.contains("→ 1.5.0"),
+    "Should strip prerelease to 1.5.0.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+// ============================================================================
+// Extended Check Tests
+// ============================================================================
+
+/// Test release check --extended runs dry-run publish validation
+#[test]
+fn test_release_check_extended_validates_publish() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("ext-check", "0.1.0")?;
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release check with --extended --all (single-crate needs explicit crate name or --all)
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--extended", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  // Should run the extended checks
+  assert!(
+    stdout.contains("extended") || stdout.contains("publish-dry-run") || stdout.contains("msrv"),
+    "Extended check should run dry-run and/or msrv checks.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test release check --extended with JSON output
+#[test]
+fn test_release_check_extended_json() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("ext-json", "0.1.0")?;
+  ws.write_release_config("require_clean = false\n")?;
+
+  // Run release check with --extended --json --all
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--extended", "--json", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should be valid JSON with extended field
+  let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+  assert!(
+    parsed.is_ok(),
+    "Extended check --json should output valid JSON.\nstdout:\n{}",
+    stdout
+  );
+
+  let json = parsed.unwrap();
+  assert!(
+    json.get("extended").is_some(),
+    "JSON should contain 'extended' field.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json).unwrap_or_default()
+  );
+
+  Ok(())
+}

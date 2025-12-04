@@ -89,14 +89,12 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       all,
       skip_nextest,
       explain,
-      format,
       test_args,
     } => {
       let config = test::TestConfig {
         since,
         all,
         explain,
-        format,
         prefer_nextest: !skip_nextest,
         test_args,
       };
@@ -200,6 +198,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       cli::ReleaseCommand::Check {
         crate_names,
         all,
+        extended,
         format,
       } => {
         let names = if all || crate_names.is_empty() {
@@ -207,16 +206,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         } else {
           Some(crate_names)
         };
-        run_release_check(ctx, names, all, format)
+        run_release_check(ctx, names, all, extended, format)
       }
     },
-
-    // Reserved for future use
-    Commands::Check {} => {
-      println!("cargo rail check is reserved for future use.");
-      println!("\nFor release validation, use: cargo rail release check");
-      Ok(())
-    }
 
     // Clean
     Commands::Clean {
@@ -224,7 +216,8 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       backups,
       reports,
       check,
-    } => run_clean(ctx, cache, backups, reports, check),
+      format,
+    } => run_clean(ctx, cache, backups, reports, check, format),
 
     // Config
     Commands::Config { command } => match command {

@@ -33,14 +33,14 @@ impl RailConfigBuilder {
 # Documentation: https://github.com/loadingalias/cargo-rail
 #
 # Commands:
-#   cargo rail init        - Generate this config
-#   cargo rail affected    - Show crates affected by changes
-#   cargo rail test        - Run tests for affected crates
-#   cargo rail unify       - Unify workspace dependencies
-#   cargo rail split       - Split crate to standalone repo
-#   cargo rail sync        - Sync monorepo <-> split repos
-#   cargo rail release     - Publish releases
-#   cargo rail check       - Validate release readiness
+#   cargo rail init           - Generate this config
+#   cargo rail affected       - Show crates affected by changes
+#   cargo rail test           - Run tests for affected crates
+#   cargo rail unify          - Unify workspace dependencies
+#   cargo rail split          - Split crate to standalone repo
+#   cargo rail sync           - Sync monorepo <-> split repos
+#   cargo rail release        - Publish releases
+#   cargo rail release check  - Validate release readiness
 #
 # Exit codes: 0 = success, 1 = changes needed (--check), 2 = error
 "#

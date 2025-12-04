@@ -12,8 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Generate rail.toml configuration
-pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, check: bool) -> RailResult<()> {
-  run_init_impl(ctx.workspace_root(), output_path, force, check)
+pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, check: bool, json: bool) -> RailResult<()> {
+  run_init_impl(ctx.workspace_root(), output_path, force, check, json)
 }
 
 /// Auto-detect reasonable unify defaults
@@ -75,9 +75,29 @@ fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
   Ok(())
 }
 
+/// Check if this is a valid Cargo workspace
+fn is_cargo_workspace(workspace_root: &Path) -> bool {
+  let cargo_toml = workspace_root.join("Cargo.toml");
+  if !cargo_toml.exists() {
+    return false;
+  }
+  // Check if it's a workspace (has [workspace] section or is a virtual workspace)
+  if let Ok(content) = fs::read_to_string(&cargo_toml) {
+    content.contains("[workspace]")
+  } else {
+    false
+  }
+}
+
 /// Shared implementation for both run_init and run_init_standalone
-fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: bool) -> RailResult<()> {
+fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: bool, json: bool) -> RailResult<()> {
   let config_path = workspace_root.join(output_path);
+
+  // Warn if not a Cargo workspace (skip warnings in quiet/JSON mode)
+  if !is_cargo_workspace(workspace_root) && !check && !json && !crate::output::is_quiet() {
+    eprintln!("warning: no Cargo workspace detected in {}", workspace_root.display());
+    eprintln!("         cargo-rail works best with Cargo workspaces\n");
+  }
 
   // Check if target path already exists
   // In --check mode, we just preview - so existence doesn't matter
@@ -88,17 +108,19 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
         "use --force to overwrite, or use --check to preview what would be generated",
       ));
     }
-    progress!("overwriting: {}", config_path.display());
+    if !json {
+      progress!("overwriting: {}", config_path.display());
+    }
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
-    if !check {
+    if !check && !json && !crate::output::is_quiet() {
       eprintln!("note: existing config found at {}", existing.display());
       eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
     }
   }
 
   let detected_targets = detect_targets(workspace_root);
-  let config = build_rail_config(detected_targets);
+  let config = build_rail_config(detected_targets.clone());
 
   let toml_content = RailConfigBuilder::new()
     .header()
@@ -110,20 +132,48 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
     .build()?;
 
   if check {
-    println!("{}", toml_content);
+    if json {
+      let output = serde_json::json!({
+        "command": "init",
+        "check": true,
+        "config_path": config_path.display().to_string(),
+        "targets_detected": detected_targets,
+        "content": toml_content
+      });
+      println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    } else {
+      println!("{}", toml_content);
+    }
   } else {
     ensure_output_dir(&config_path)?;
     write_config_file(&config_path, &toml_content)?;
-    println!("created: {}", config_path.display());
-    println!("\nnext: cargo rail unify --check");
+
+    if json {
+      let output = serde_json::json!({
+        "command": "init",
+        "status": "created",
+        "config_path": config_path.display().to_string(),
+        "targets_detected": detected_targets
+      });
+      println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    } else {
+      progress!("created: {}", config_path.display());
+      progress!("\nnext: cargo rail unify --check");
+    }
   }
 
   Ok(())
 }
 
 /// Standalone init (without WorkspaceContext)
-pub fn run_init_standalone(workspace_root: &Path, output_path: &str, force: bool, check: bool) -> RailResult<()> {
-  run_init_impl(workspace_root, output_path, force, check)
+pub fn run_init_standalone(
+  workspace_root: &Path,
+  output_path: &str,
+  force: bool,
+  check: bool,
+  json: bool,
+) -> RailResult<()> {
+  run_init_impl(workspace_root, output_path, force, check, json)
 }
 
 #[cfg(test)]
