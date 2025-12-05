@@ -28,3 +28,7 @@ strict_version_compat = true
 - Basic unification flow on a well-maintained workspace
 - MSRV computation matching existing `rust-version = "1.85"`
 - Fast execution on small workspace
+
+## Demo
+
+https://github.com/user-attachments/assets/93f34633-aa0e-4cde-8723-c81f3f474bac

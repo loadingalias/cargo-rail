@@ -32,3 +32,7 @@ major_version_conflict = "warn"
 - Safe unification on core ecosystem library
 - Conservative version handling (warn, don't break)
 - Multi-crate workspace with internal test crates
+
+## Demo
+
+https://github.com/user-attachments/assets/520abf55-cf45-43af-8dc8-0eed0a58ce72

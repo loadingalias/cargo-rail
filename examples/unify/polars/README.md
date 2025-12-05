@@ -35,3 +35,7 @@ major_version_conflict = "bump"
 - `pin_transitives` as cargo-hakari replacement
 - Aggressive `major_version_conflict = "bump"` for leaner graph
 - polars already uses `[workspace.dependencies]` - cargo-rail enhances it
+
+## Demo
+
+https://github.com/user-attachments/assets/31bf5ff5-7185-4e59-acaa-ea8edd3c6f48

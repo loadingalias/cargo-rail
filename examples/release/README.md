@@ -43,3 +43,7 @@ publish = false
 - `cargo rail release run --check` - Preview release plan
 - `--bump patch/minor/major` - Version bump options
 - `--skip-publish` - Tag-only releases
+
+## Demo
+
+https://github.com/user-attachments/assets/9c0b6df1-8539-44a0-9c82-a9fdca5e075c

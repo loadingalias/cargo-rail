@@ -26,3 +26,7 @@ strict_version_compat = true
 - cargo-rail on a small, actively developed workspace
 - Clean unification for projects heading toward v1
 - Standard workflow: init → check → unify → verify
+
+## Demo
+
+https://github.com/user-attachments/assets/3520d254-e69c-460c-b894-eb126b42a1ea

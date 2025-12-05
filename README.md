@@ -128,25 +128,46 @@ require_clean = true
 Real workspaces, recorded command workflows end-to-end. All assets live under [`examples/`](examples/).
 
 <details>
-<summary><strong>Unify Demo: ripgrep</strong></summary>
+<summary><strong>Unify: ripgrep</strong> - baseline unification in a widely trusted workspace</summary>
 
-Demonstrates baseline unification in a widely trusted workspace.
-
-```bash
-cargo rail init
-cargo rail unify --check
-cargo rail unify
-```
-
-[Watch demo](examples/unify/ripgrep/demo.mp4)
-
-See [`examples/unify/ripgrep`](examples/unify/ripgrep/) for details and the full report.
+https://github.com/user-attachments/assets/93f34633-aa0e-4cde-8723-c81f3f474bac
 
 </details>
 
-- **More Unify Demos**: [`helix-db`](examples/unify/helix-db/), [`polars`](examples/unify/polars/), [`tokio`](examples/unify/tokio/)
-- **Split Demo w/ Ruff**: [`examples/split`](examples/split/)
-- **Release Demo w/ TiKV**: [`examples/release`](examples/release/)
+<details>
+<summary><strong>Unify: tokio</strong> - conservative settings for a core ecosystem library</summary>
+
+https://github.com/user-attachments/assets/520abf55-cf45-43af-8dc8-0eed0a58ce72
+
+</details>
+
+<details>
+<summary><strong>Unify: polars</strong> - large workspace with <code>pin_transitives</code> (cargo-hakari replacement)</summary>
+
+https://github.com/user-attachments/assets/31bf5ff5-7185-4e59-acaa-ea8edd3c6f48
+
+</details>
+
+<details>
+<summary><strong>Unify: helix-db</strong> - unification on a growing project</summary>
+
+https://github.com/user-attachments/assets/3520d254-e69c-460c-b894-eb126b42a1ea
+
+</details>
+
+<details>
+<summary><strong>Split: ruff</strong> - extracting crates with full git history</summary>
+
+https://github.com/user-attachments/assets/b9f56e77-de0a-42c1-b2ef-1a40bb24f5ac
+
+</details>
+
+<details>
+<summary><strong>Release: tikv</strong> - version bumping, changelog, and publishing in dependency order</summary>
+
+https://github.com/user-attachments/assets/9c0b6df1-8539-44a0-9c82-a9fdca5e075c
+
+</details>
 
 ---
 

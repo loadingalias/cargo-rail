@@ -37,3 +37,7 @@ include = ["LICENSE"]
 - `cargo rail split run` - Extract crate with full git history
 - `cargo rail sync --to-remote` - Push monorepo changes to split
 - `cargo rail sync --from-remote` - Pull split repo changes back
+
+## Demo
+
+https://github.com/user-attachments/assets/b9f56e77-de0a-42c1-b2ef-1a40bb24f5ac
