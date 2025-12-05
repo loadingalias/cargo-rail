@@ -17,7 +17,7 @@ categories = [
 ]
 keywords = ["monorepo", "workspace", "affected", "hakari", "release"]
 readme = "README.md"
-exclude = ["docs/", "tests/", ".github/", ".config/"]
+exclude = ["docs/", "tests/", ".github/", ".config/", "examples/"]
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }
