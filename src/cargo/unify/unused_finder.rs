@@ -48,11 +48,6 @@ impl<'a> UnusedDepFinder<'a> {
     // but Cargo.toml declares `mopa-maintained = "0.2"`.
     let pkg_to_lib = self.metadata.package_to_lib_name_map();
 
-    // Build a map of externally referenced features: crate_name -> set of feature names
-    // This detects patterns like `tikv_alloc/mimalloc` in other crates' [features],
-    // which means the optional dep `mimalloc` in `tikv_alloc` is NOT unused.
-    let externally_referenced = self.build_externally_referenced_features();
-
     // For each workspace member, check declared deps against resolved
     for member in &self.manifests.members {
       // Get resolved deps for this member from the metadata
@@ -86,25 +81,16 @@ impl<'a> UnusedDepFinder<'a> {
 
         // === Smart filtering to avoid false positives ===
 
-        // Filter 1: Optional deps referenced in the same crate's features
-        // They're only activated when the feature is enabled, so they won't be in the
-        // resolved graph unless someone enables that feature.
-        if usage.optional && usage.referenced_in_features {
+        // Filter 1: Optional deps are ALWAYS feature-gated
+        // Cargo automatically creates an implicit feature for each optional dependency,
+        // so code can use `#[cfg(feature = "dep_name")]` even without explicit [features] entries.
+        // We cannot safely determine if an optional dep is "unused" without analyzing source code
+        // for cfg attributes, so we conservatively skip all optional deps.
+        if usage.optional {
           continue;
         }
 
-        // Filter 2: Optional deps referenced by OTHER workspace crates
-        // e.g., `tikv_alloc` has optional dep `mimalloc`, and `tikv` has feature
-        // `mimalloc = ["tikv_alloc/mimalloc"]`. The dep isn't unused - it's feature-gated.
-        if usage.optional
-          && externally_referenced
-            .get(&member.package_name)
-            .is_some_and(|ref_features| ref_features.contains(&*dep_key.name))
-        {
-          continue;
-        }
-
-        // Filter 3: Target-specific deps for unconfigured targets
+        // Filter 2: Target-specific deps for unconfigured targets
         // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
         // that target configured, we can't verify if it's used or not.
         if let Some(ref target_cfg) = usage.target {
@@ -176,30 +162,6 @@ impl<'a> UnusedDepFinder<'a> {
     }
 
     edits
-  }
-
-  /// Build a map of features that are externally referenced by workspace crates
-  ///
-  /// Scans all workspace packages' `[features]` tables to find references like:
-  /// - `crate_name/feature` - enables `feature` in dependency `crate_name`
-  ///
-  /// Returns: HashMap<crate_name, HashSet<feature_name>>
-  fn build_externally_referenced_features(&self) -> HashMap<String, HashSet<String>> {
-    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for pkg in self.metadata.workspace_packages() {
-      // Scan all feature definitions in this package
-      for feature_deps in pkg.features.values() {
-        for dep_str in feature_deps {
-          // Parse feature references like "dep/feature" or "dep?/feature"
-          if let Some((dep_name, feature_name)) = parse_feature_reference(dep_str) {
-            map.entry(dep_name).or_default().insert(feature_name);
-          }
-        }
-      }
-    }
-
-    map
   }
 
   /// Get all resolved direct dependencies for a workspace member

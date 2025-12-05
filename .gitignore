@@ -7,26 +7,14 @@ Thumbs.db
 
 # Claude
 .claude
-CLAUDE.md
 
-# Opencode
-AGENTS.md
-
-# Cursor
-.cursor
+# Zed's Dead Baby
 .zed
 
-# Credentials (should never be committed)
+# Keys/Creds
 *.pem
 *.key
 
-# Documentation
+# Docs/Notes/Examples
 rules.md
-style.md
-examples/split-recording-guide.txt
-examples/unify-recording-guide.txt
-examples/release-recording-guide.txt
-
-# Cargo-Rail (Testing)
-*rail.toml
-.config/rail.toml.example
+**/demo.cast

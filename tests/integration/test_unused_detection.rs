@@ -202,13 +202,15 @@ serialization = ["serde/derive"]
 }
 
 // ============================================================================
-// TEST 3: Optional deps NOT referenced in features ARE flagged
+// TEST 3: Optional deps are NEVER flagged (even if not in [features])
 // ============================================================================
 
 #[test]
-fn test_unused_detection_orphaned_optional_dep_is_flagged() -> Result<()> {
-  // Optional deps that are NEVER referenced in any feature should be flagged
-  // This is a TRUE positive - the dep is genuinely unused
+fn test_unused_detection_optional_deps_never_flagged() -> Result<()> {
+  // Optional deps create implicit features in Cargo, so code can use
+  // `#[cfg(feature = "dep_name")]` even without explicit [features] entries.
+  // We cannot safely detect if an optional dep is unused without analyzing
+  // source code for cfg attributes, so we conservatively skip all optional deps.
 
   let workspace = create_workspace_with_unused_detection()?;
 
@@ -226,20 +228,20 @@ log = "0.4"
 
 [features]
 default = []
-# Note: serde is NOT referenced in any feature!
+# Note: serde is NOT referenced in any feature, but may be used via #[cfg(feature = "serde")]
 "#,
   )?;
 
-  workspace.commit("Add crate with orphaned optional dep")?;
+  workspace.commit("Add crate with optional dep not in features")?;
 
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // serde is optional but NOT referenced anywhere - SHOULD be flagged
-  // (This is a TRUE positive - it's genuinely unused)
+  // serde is optional - should NOT be flagged as unused because we can't
+  // verify if it's used via #[cfg(feature = "serde")] in source code
   assert!(
-    stdout.contains("serde") && stdout.contains("Unused"),
-    "Orphaned optional dep 'serde' SHOULD be flagged as unused\nOutput:\n{}",
+    !stdout.contains("Unused"),
+    "Optional dep 'serde' should NOT be flagged as unused\nOutput:\n{}",
     stdout
   );
 
