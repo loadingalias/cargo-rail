@@ -21,15 +21,11 @@ AGENTS.md
 *.key
 
 # Documentation
-docs/design-no_op-experimental
 rules.md
-ARCHITECTURE.md
 style.md
-demos/
-test.md
-examples/RECORDING_TEMPLATE.md
-examples/issues.md
-commands_check.md
+examples/split-recording-guide.txt
+examples/unify-recording-guide.txt
+examples/release-recording-guide.txt
 
 # Cargo-Rail (Testing)
 *rail.toml
