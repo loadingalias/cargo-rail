@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/loadingalias/cargo-rail/compare/v0.1.0...v0.2.0) - 2025-12-05
+
+### 📦 Other Changes
+
+- cargo-rail: feat(unify): add sync subcommand to re-detect and sync targets ([485c65c](https://github.com/loadingalias/cargo-rail/commit/485c65c26a502cd3f67515b69c9f01d460637d3d))
+
+
+
 ## [0.1.0](https://github.com/loadingalias/cargo-rail/releases/tag/v0.1.0) - 2025-12-05
 
 ### ✨ Features
