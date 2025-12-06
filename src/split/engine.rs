@@ -7,7 +7,10 @@ use crate::utils;
 use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
 use glob::Pattern;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Configuration for a split operation
 pub struct SplitConfig {
@@ -31,6 +34,9 @@ pub struct SplitConfig {
   pub exclude: Vec<String>,
 }
 
+/// Pre-fetched files for a commit: (file_path, content)
+type PrefetchedFiles = Vec<(PathBuf, Vec<u8>)>;
+
 /// Parameters for recreating a commit in the target repository
 struct RecreateCommitParams<'a> {
   commit: &'a CommitInfo,
@@ -41,6 +47,8 @@ struct RecreateCommitParams<'a> {
   workspace_mode: &'a WorkspaceMode,
   mapping_store: &'a MappingStore,
   last_recreated_sha: Option<&'a str>,
+  /// Pre-fetched files (if available from parallel prefetch)
+  prefetched_files: Option<&'a PrefetchedFiles>,
 }
 
 /// Parameters for creating a git commit
@@ -142,6 +150,41 @@ impl<'a> SplitEngine<'a> {
     Ok(filtered_commits)
   }
 
+  /// Prefetch files for multiple commits in parallel
+  ///
+  /// This significantly speeds up split operations on large repositories by
+  /// reading file contents for many commits concurrently while the sequential
+  /// commit recreation happens.
+  ///
+  /// Returns a HashMap from commit SHA to its prefetched files.
+  fn prefetch_commit_files(&self, commits: &[CommitInfo], crate_paths: &[PathBuf]) -> HashMap<String, PrefetchedFiles> {
+    // Use rayon to prefetch files in parallel
+    // Each commit's file collection is independent, so this is safe
+    let git = self.ctx.git.git();
+    let paths_arc = Arc::new(crate_paths.to_vec());
+
+    commits
+      .par_iter()
+      .filter_map(|commit| {
+        let paths = Arc::clone(&paths_arc);
+        let mut all_files = Vec::new();
+
+        for crate_path in paths.iter() {
+          match git.collect_tree_files(&commit.sha, crate_path) {
+            Ok(files) => all_files.extend(files),
+            Err(_) => {
+              // If we can't collect files, skip this commit in prefetch
+              // The main loop will handle it appropriately
+              return None;
+            }
+          }
+        }
+
+        Some((commit.sha.clone(), all_files))
+      })
+      .collect()
+  }
+
   /// Apply Cargo.toml transformation to a manifest file
   /// Returns Ok(()) if transform succeeded or file doesn't exist
   ///
@@ -173,20 +216,28 @@ impl<'a> SplitEngine<'a> {
   }
 
   /// Recreate a commit in the target repository with transforms applied
-  /// Returns the new commit SHA
-  fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<String> {
-    // Collect all files for the crate at this commit
-    let mut all_files = Vec::new();
-    for crate_path in params.crate_paths {
-      let files = self.ctx.git.git().collect_tree_files(&params.commit.sha, crate_path)?;
-      all_files.extend(files);
-    }
+  /// Returns the new commit SHA, or None if the commit should be skipped
+  /// (e.g., when files were deleted at this commit - "dirty history")
+  fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<Option<String>> {
+    // Use pre-fetched files if available, otherwise collect them now
+    let all_files: Vec<(PathBuf, Vec<u8>)> = if let Some(prefetched) = params.prefetched_files {
+      prefetched.clone()
+    } else {
+      let mut files = Vec::new();
+      for crate_path in params.crate_paths {
+        let collected = self.ctx.git.git().collect_tree_files(&params.commit.sha, crate_path)?;
+        files.extend(collected);
+      }
+      files
+    };
 
+    // Handle "dirty history" - commits where the path was deleted or didn't exist yet
+    // This commonly happens when:
+    // - A crate was temporarily removed and later restored
+    // - Files were moved/renamed in a way that deleted the old path
+    // - The crate didn't exist at the start of the filtered history
     if all_files.is_empty() {
-      return Err(RailError::message(format!(
-        "No files found for commit {} at paths {:?}",
-        params.commit.sha, params.crate_paths
-      )));
+      return Ok(None);
     }
 
     // Write files to target repo, applying transforms
@@ -249,7 +300,7 @@ impl<'a> SplitEngine<'a> {
       mapped_parents.push(sha.to_string());
     }
 
-    self.create_git_commit(&CommitParams {
+    let sha = self.create_git_commit(&CommitParams {
       repo_path: params.target_repo_path,
       message: &params.commit.message,
       author_name: &params.commit.author,
@@ -258,7 +309,8 @@ impl<'a> SplitEngine<'a> {
       committer_email: &params.commit.committer_email,
       timestamp: params.commit.timestamp,
       parent_shas: &mapped_parents,
-    })
+    })?;
+    Ok(Some(sha))
   }
 
   /// Create a git commit using git commands for determinism
@@ -440,13 +492,29 @@ impl<'a> SplitEngine<'a> {
       // Recreate history in target repo
       println!("   Processing {} commits...", filtered_commits.len());
 
+      // Prefetch file contents in parallel for significant speedup on large repos
+      // This reads all files for all commits concurrently while we process sequentially
+      let use_parallel = filtered_commits.len() > 5; // Only parallelize if worthwhile
+      let prefetched_files = if use_parallel {
+        println!("   Prefetching file contents in parallel...");
+        self.prefetch_commit_files(&filtered_commits, &config.crate_paths)
+      } else {
+        HashMap::new()
+      };
+
       let mut last_recreated_sha: Option<String> = None;
+
+      let mut skipped_commits = 0usize;
 
       for (idx, commit) in filtered_commits.iter().enumerate() {
         if (idx + 1) % 10 == 0 || idx + 1 == filtered_commits.len() {
           println!("   Progress: {}/{} commits", idx + 1, filtered_commits.len());
         }
-        let new_sha = self.recreate_commit_in_target(&RecreateCommitParams {
+
+        // Use prefetched files if available
+        let prefetched = prefetched_files.get(&commit.sha);
+
+        let maybe_sha = self.recreate_commit_in_target(&RecreateCommitParams {
           commit,
           crate_paths: &config.crate_paths,
           target_repo_path: &config.target_repo_path,
@@ -455,13 +523,27 @@ impl<'a> SplitEngine<'a> {
           workspace_mode: &config.workspace_mode,
           mapping_store: &mapping_store,
           last_recreated_sha: last_recreated_sha.as_deref(),
+          prefetched_files: prefetched,
         })?;
+
+        // Handle skipped commits (dirty history - path didn't exist at this commit)
+        let Some(new_sha) = maybe_sha else {
+          skipped_commits += 1;
+          continue;
+        };
 
         // Record mapping
         mapping_store.record_mapping(&commit.sha, &new_sha)?;
 
         // Track last recreated commit
         last_recreated_sha = Some(new_sha);
+      }
+
+      if skipped_commits > 0 {
+        println!(
+          "   Skipped {} commits where path didn't exist (dirty history)",
+          skipped_commits
+        );
       }
 
       // Create workspace Cargo.toml if in workspace mode

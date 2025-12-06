@@ -12,5 +12,6 @@ mod test_runner;
 mod test_split;
 mod test_sync;
 mod test_unify;
+mod test_unify_sync;
 mod test_unify_undo;
 mod test_unused_detection;

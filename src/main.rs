@@ -56,6 +56,18 @@ fn main() {
     return;
   }
 
+  // Handle unify sync specially - it only needs workspace root, not full metadata
+  if let Commands::Unify {
+    command: Some(UnifyCommand::Sync { check }),
+    ..
+  } = cli.command
+  {
+    if let Err(e) = commands::run_unify_sync(&workspace_root, check) {
+      exit_with_error(e);
+    }
+    return;
+  }
+
   // Build workspace context (single-load pattern)
   let ctx = match workspace::WorkspaceContext::build(&workspace_root) {
     Ok(ctx) => ctx,

@@ -31,6 +31,22 @@ use std::sync::OnceLock;
 /// # Returns
 /// Sorted list of detected target triples
 pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
+  detect_targets_excluding(workspace_root, &[])
+}
+
+/// Detect targets excluding specific files
+///
+/// Same as `detect_targets` but allows excluding specific files from scanning.
+/// This is useful for `unify sync` which needs to exclude rail.toml itself
+/// to avoid circular detection.
+///
+/// # Arguments
+/// * `workspace_root` - Path to workspace root directory
+/// * `exclude` - Paths to exclude from scanning
+///
+/// # Returns
+/// Sorted list of detected target triples
+pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> RailResult<Vec<String>> {
   // Get canonical target list from rustc (cached)
   let canonical_targets = get_rust_target_list()?;
 
@@ -42,6 +58,11 @@ pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
 
   // For each TOML file, check if it mentions any canonical target
   for toml_path in toml_files {
+    // Skip excluded files
+    if exclude.iter().any(|e| toml_path == *e) {
+      continue;
+    }
+
     if let Ok(content) = std::fs::read_to_string(&toml_path) {
       for target in &canonical_targets {
         if content.contains(target) {

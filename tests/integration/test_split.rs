@@ -480,3 +480,173 @@ root = "."
 
   Ok(())
 }
+
+/// Test that split uses parallel prefetch for performance on repos with many commits.
+/// This test creates more than 5 commits to trigger the parallel prefetch path.
+#[test]
+fn test_split_parallel_prefetch_many_commits() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-parallel-prefetch")?;
+
+  // Create initial crate
+  ws.add_crate("prefetch-lib", "0.1.0", &[])?;
+  ws.commit("Add prefetch-lib")?;
+
+  // Create more than 5 commits to trigger parallel prefetch (threshold is > 5)
+  for i in 1..=8 {
+    ws.modify_file("prefetch-lib", "src/lib.rs", &format!("// Version {}", i))?;
+    ws.commit(&format!("Update prefetch-lib v{}", i))?;
+  }
+
+  // Configure split
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.prefetch-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/prefetch-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // Run split - should use parallel prefetch
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "prefetch-lib"])?;
+
+  // Verify split succeeded
+  assert!(
+    output.status.success(),
+    "Split with parallel prefetch should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Check stdout mentions parallel prefetch
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("Prefetching file contents in parallel"),
+    "Should use parallel prefetch for 9 commits. stdout: {}",
+    stdout
+  );
+
+  // Verify the split repo has all commits
+  let log_output = git(split_dir.path(), &["log", "--oneline"])?;
+  let log = String::from_utf8_lossy(&log_output.stdout);
+
+  assert!(log.contains("Add prefetch-lib"), "Should have initial commit");
+  assert!(log.contains("Update prefetch-lib v8"), "Should have last commit");
+
+  // Verify final content
+  let lib_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
+  assert!(
+    lib_content.contains("Version 8"),
+    "Final content should be Version 8. Got: {}",
+    lib_content
+  );
+
+  Ok(())
+}
+
+/// Test that split handles "dirty history" gracefully - commits where the crate
+/// was temporarily deleted or didn't exist at certain points in history.
+///
+/// This is a common scenario when:
+/// - A crate is temporarily removed and later restored
+/// - Files are moved/renamed in a way that deleted the old path temporarily
+/// - The crate didn't exist at the start of the filtered history
+#[test]
+fn test_split_handles_dirty_history() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-dirty-history")?;
+
+  // Step 1: Create crate and commit
+  ws.add_crate("dirty-lib", "0.1.0", &[])?;
+  ws.commit("Add dirty-lib")?;
+
+  // Step 2: Make a change
+  ws.modify_file("dirty-lib", "src/lib.rs", "// Version 1")?;
+  ws.commit("Update dirty-lib v1")?;
+
+  // Step 3: DELETE the crate entirely (simulating dirty history)
+  std::fs::remove_dir_all(ws.path.join("crates/dirty-lib"))?;
+  ws.commit("Remove dirty-lib temporarily")?;
+
+  // Step 4: Recreate the crate (restoration)
+  ws.add_crate("dirty-lib", "0.2.0", &[])?;
+  ws.modify_file("dirty-lib", "src/lib.rs", "// Version 2 - restored")?;
+  ws.commit("Restore dirty-lib")?;
+
+  // Step 5: Make another change after restoration
+  ws.modify_file("dirty-lib", "src/lib.rs", "// Version 3 - final")?;
+  ws.commit("Update dirty-lib v3")?;
+
+  // Configure split
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.dirty-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/dirty-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // Run split - should succeed despite dirty history
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "dirty-lib"])?;
+
+  // Verify split succeeded
+  assert!(
+    output.status.success(),
+    "Split should succeed with dirty history. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Check stdout mentions skipped commits
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("Skipped") && stdout.contains("dirty history"),
+    "Should mention skipped commits due to dirty history. stdout: {}",
+    stdout
+  );
+
+  // Verify the split repo exists and has files
+  assert!(
+    split_dir.path().join("Cargo.toml").exists(),
+    "Cargo.toml should exist in split repo"
+  );
+  assert!(
+    split_dir.path().join("src/lib.rs").exists(),
+    "src/lib.rs should exist in split repo"
+  );
+
+  // Verify the final content is correct
+  let lib_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
+  assert!(
+    lib_content.contains("Version 3 - final"),
+    "Final content should be Version 3. Got: {}",
+    lib_content
+  );
+
+  // Verify git history in split repo has the commits that DID have files
+  let log_output = git(split_dir.path(), &["log", "--oneline"])?;
+  let log = String::from_utf8_lossy(&log_output.stdout);
+
+  assert!(log.contains("Add dirty-lib"), "Should contain initial add commit");
+  assert!(log.contains("Update dirty-lib v1"), "Should contain v1 update");
+  // The deletion commit should be skipped (no files at that point)
+  assert!(
+    !log.contains("Remove dirty-lib"),
+    "Should NOT contain deletion commit. Log:\n{}",
+    log
+  );
+  assert!(log.contains("Restore dirty-lib"), "Should contain restore commit");
+  assert!(log.contains("Update dirty-lib v3"), "Should contain v3 update");
+
+  Ok(())
+}

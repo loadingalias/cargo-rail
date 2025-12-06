@@ -51,7 +51,7 @@ pub use release::{run_release_check, run_release_init, run_release_plan, run_rel
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
 pub use test::run_test;
-pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
+pub use unify::{run_unify_analyze, run_unify_apply, run_unify_sync, run_unify_undo};
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;

@@ -150,17 +150,18 @@ Usage: cargo rail unify [OPTIONS] [COMMAND]
 
 Commands:
   undo  Restore manifests from a previous backup
+  sync  Re-detect and sync targets to rail.toml
   help  Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-  -c, --check
-          Dry-run mode: preview changes without modifying files
-
       --json
           Output in JSON format (shorthand for -f json)
+
+  -c, --check
+          Dry-run mode: preview changes without modifying files
 
   -f, --format <FORMAT>
           Output format
@@ -200,6 +201,8 @@ Examples:
   cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups
+  cargo rail unify sync --check           # Preview target sync
+  cargo rail unify sync                   # Re-detect and merge targets into rail.toml
 ```
 
 ---
@@ -218,6 +221,34 @@ Options:
       --json                   Output in JSON format (shorthand for -f json)
   -h, --help                   Print help
   -V, --version                Print version
+```
+
+---
+
+### cargo rail unify sync
+
+```
+Re-detect and sync targets to rail.toml
+
+Scans workspace for target triples (rust-toolchain.toml, .cargo/config.toml, etc.) and merges any new targets into your rail.toml configuration. Preserves existing targets and all other settings.
+
+Usage: cargo rail unify sync [OPTIONS]
+
+Options:
+  -c, --check
+          Preview changes without modifying rail.toml
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---

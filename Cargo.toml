@@ -7,7 +7,6 @@ license = "MIT"
 authors = ["loadingalias"]
 description = "Graph-aware testing, dependency unification, and crate extraction for Rust monorepos"
 repository = "https://github.com/loadingalias/cargo-rail"
-homepage = "https://loadingalias.github.io/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
     "development-tools::cargo-plugins",
@@ -39,3 +38,18 @@ tempfile = "3.23.0"
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+
+# cargo-binstall metadata for pre-built binary downloads
+# See: https://github.com/cargo-bins/cargo-binstall
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+
+# Windows uses .zip instead of .tar.gz
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"

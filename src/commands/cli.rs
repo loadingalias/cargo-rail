@@ -78,7 +78,9 @@ Examples:
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
-  cargo rail unify undo --list            # List available backups";
+  cargo rail unify undo --list            # List available backups
+  cargo rail unify sync --check           # Preview target sync
+  cargo rail unify sync                   # Re-detect and merge targets into rail.toml";
 
 const SPLIT_HELP: &str = "\
 Examples:
@@ -314,6 +316,16 @@ pub enum UnifyCommand {
     /// Specific backup ID to restore (defaults to most recent)
     #[arg(long = "backup-id")]
     backup_id: Option<String>,
+  },
+  /// Re-detect and sync targets to rail.toml
+  ///
+  /// Scans workspace for target triples (rust-toolchain.toml, .cargo/config.toml, etc.)
+  /// and merges any new targets into your rail.toml configuration.
+  /// Preserves existing targets and all other settings.
+  Sync {
+    /// Preview changes without modifying rail.toml
+    #[arg(long, short = 'c')]
+    check: bool,
   },
 }
 
