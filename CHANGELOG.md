@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.2](https://github.com/loadingalias/cargo-rail/compare/v0.2.0...v0.2.2) - 2025-12-10
+
+### 🔧 Chores
+
+- release v0.2.1 ([e54bd94](https://github.com/loadingalias/cargo-rail/commit/e54bd946c2fe8e8e6b882e833287735ab93b0ca1))
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the codex-rs bug for nested workspaces under change detection; updating the readme/docs/etc. ([7374e03](https://github.com/loadingalias/cargo-rail/commit/7374e03f0daf37fd0096aaea56508741d2478a3b))
+- cargo-rail: updating public facing docs, readme, etc. and fully wiring change-detection (dogfooding) ([08ec44a](https://github.com/loadingalias/cargo-rail/commit/08ec44a3e64e9a6036cd621c81b9572bfcf9daf1))
+- cargo-rail: README update ([9130377](https://github.com/loadingalias/cargo-rail/commit/91303772af20d2eb2bdaa9edbeb822da8fe66e18))
+- cargo-rail: added the 'migrate-hakari.md' file ([e17df42](https://github.com/loadingalias/cargo-rail/commit/e17df42df4cfe72a942909f5761f8bb98546c6ac))
+- cargo-rail: update gitignore ([3fbac39](https://github.com/loadingalias/cargo-rail/commit/3fbac397828a11609d1e3811ecae0ccec50a4fb0))
+- cargo-rail: chore: update Cargo.lock for v0.2.0 ([f38bf13](https://github.com/loadingalias/cargo-rail/commit/f38bf13785909427d37d10a91a86171ee3015bb2))
+
+
+
 ## [0.2.0](https://github.com/loadingalias/cargo-rail/compare/v0.1.0...v0.2.0) - 2025-12-05
 
 ### 📦 Other Changes
