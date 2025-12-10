@@ -1,6 +1,6 @@
 # polars unify demo
 
-Large data processing workspace (50+ crates, pyo3 bindings). Aggressive settings.
+Large data processing workspace (33 crates, pyo3 bindings). Aggressive settings.
 
 ## Config choices
 
@@ -31,7 +31,7 @@ major_version_conflict = "bump"
 
 ## What this shows
 
-- Handling large workspace with 50+ crates
+- Handling large workspace with 33 crates
 - `pin_transitives` as cargo-hakari replacement
 - Aggressive `major_version_conflict = "bump"` for leaner graph
 - polars already uses `[workspace.dependencies]` - cargo-rail enhances it

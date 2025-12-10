@@ -255,7 +255,7 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
   Ok(())
 }
 
-/// Get changed files from git
+/// Get changed files from git, normalized to workspace-relative paths
 fn get_changed_files(
   ctx: &WorkspaceContext,
   since: &str,
@@ -263,7 +263,7 @@ fn get_changed_files(
   to: Option<&str>,
 ) -> RailResult<Vec<PathBuf>> {
   // Determine git range
-  let changes = if let (Some(from_ref), Some(to_ref)) = (from, to) {
+  let git_changes = if let (Some(from_ref), Some(to_ref)) = (from, to) {
     // SHA pair mode: from..to
     ctx.git.git().get_changed_files_between(from_ref, Some(to_ref))?
   } else {
@@ -271,8 +271,12 @@ fn get_changed_files(
     ctx.git.git().get_changed_files_between(since, None)?
   };
 
-  // Extract just the file paths (ignore status char)
-  let files = changes.into_iter().map(|(path, _status)| path).collect();
+  // Convert git-relative paths to workspace-relative paths
+  // This handles nested workspaces (e.g., git at /repo, workspace at /repo/rust)
+  let files = git_changes
+    .into_iter()
+    .filter_map(|(git_path, _status)| ctx.to_workspace_path(&git_path))
+    .collect();
 
   Ok(files)
 }

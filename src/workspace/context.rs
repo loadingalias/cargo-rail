@@ -420,6 +420,42 @@ impl WorkspaceContext {
   pub fn workspace_root(&self) -> &Path {
     &self.workspace_root
   }
+
+  /// Get the relative path from git root to workspace root.
+  ///
+  /// Returns `Some(prefix)` if workspace is nested inside git repo (e.g., "codex-rs"),
+  /// or `None` if they're the same directory.
+  ///
+  /// This is used to strip the prefix from git-relative paths so they can be
+  /// matched against workspace-relative paths (e.g., for crate membership).
+  pub fn workspace_prefix(&self) -> Option<PathBuf> {
+    let git_root = self.git.repo_root();
+
+    // If workspace is nested inside git repo, compute the relative prefix
+    if let Ok(prefix) = self.workspace_root.strip_prefix(git_root) {
+      if prefix.as_os_str().is_empty() {
+        None // Same directory
+      } else {
+        Some(prefix.to_path_buf())
+      }
+    } else {
+      None
+    }
+  }
+
+  /// Convert a git-relative path to a workspace-relative path.
+  ///
+  /// If the workspace is nested inside the git repo (e.g., git at `/repo`, workspace at `/repo/rust`),
+  /// git returns paths like `rust/src/lib.rs` but the workspace expects `src/lib.rs`.
+  ///
+  /// Returns `None` if the path doesn't belong to this workspace.
+  pub fn to_workspace_path(&self, git_path: &Path) -> Option<PathBuf> {
+    if let Some(prefix) = self.workspace_prefix() {
+      git_path.strip_prefix(&prefix).ok().map(|p| p.to_path_buf())
+    } else {
+      Some(git_path.to_path_buf())
+    }
+  }
 }
 
 #[cfg(test)]

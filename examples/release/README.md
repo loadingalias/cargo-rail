@@ -1,6 +1,6 @@
 # release demo
 
-Demonstrates release validation and planning using tikv (70+ component workspace).
+Demonstrates release validation and planning using tikv (72 component workspace).
 
 ## Workflow
 

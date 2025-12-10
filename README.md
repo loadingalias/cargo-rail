@@ -37,9 +37,9 @@ cargo-rail is a single tool that replaces a fragmented ecosystem:
 | **MSRV guessing** | `cargo-msrv`, compile-and-fail loops | `cargo rail unify` |
 | **CI waste** | `paths-filter` + 1k LoC shell | `cargo rail test` |
 | **Crate extraction** | `git subtree`, Copybara (Java) | `cargo rail split` |
-| **Release chaos** | `release-plz` (600+ deps), `git-cliff` | `cargo rail release` |
+| **Release chaos** | `release-plz` (hundreds of deps), `git-cliff` | `cargo rail release` |
 
-**11 core dependencies. 77 resolved. One config file.**
+**11 core dependencies. 55 resolved. One config file.**
 
 ---
 
@@ -58,13 +58,15 @@ Pre-built binaries: [Releases](https://github.com/loadingalias/cargo-rail/releas
 Drop into any Rust workspace:
 
 ```bash
-cargo rail init              # Generate .config/rail.toml
-cargo rail unify --check     # Preview dependency unification
-cargo rail unify             # Apply (auto-backups on first run)
-cargo rail test              # Test only affected crates
+cargo install cargo-rail && cargo rail init
+cargo rail unify --check     # See what would change (read-only)
 ```
 
-That's it. Your workspace is now unified, and you're only testing what changed.
+That's it. See what cargo-rail would unify — no changes made until you run `cargo rail unify`.
+
+https://github.com/user-attachments/assets/93f34633-aa0e-4cde-8723-c81f3f474bac
+
+<sub>*`cargo rail unify` on ripgrep — 9 deps unified, 6 dead features pruned*</sub>
 
 ---
 
@@ -102,7 +104,7 @@ cargo rail test --all            # Override: test everything
 **For CI:** Use [`cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action):
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v1
+- uses: loadingalias/cargo-rail-action@latest
   id: rail
   with:
     since: ${{ github.event.before }}
@@ -135,11 +137,11 @@ What it does:
 Extract crates with full git history. Keep them in sync:
 
 ```bash
-cargo rail split init my_crate      # Configure
-cargo rail split run my_crate       # Extract with history
-cargo rail sync my_crate            # Bidirectional sync
-cargo rail sync my_crate --to-remote    # Push to split repo
-cargo rail sync my_crate --from-remote  # Pull (creates PR branch)
+cargo rail split init my-crate      # Configure
+cargo rail split run my-crate       # Extract with history
+cargo rail sync my-crate            # Bidirectional sync
+cargo rail sync my-crate --to-remote    # Push to split repo
+cargo rail sync my-crate --from-remote  # Pull (creates PR branch)
 ```
 
 Three modes: single crate → new repo, multiple crates → new repo, or multiple crates → new workspace.
@@ -168,7 +170,7 @@ Tested on production Rust workspaces:
 | **[helix](https://github.com/loadingalias/helix)** | 12 | 16 | 1 | Editor workspace |
 | **[tokio](https://github.com/loadingalias/tokio)** | 10 | 10 | 0 | Core ecosystem |
 | **[ripgrep](https://github.com/loadingalias/ripgrep)** | 10 | 9 | 6 | CLI baseline |
-| **[polars](https://github.com/loadingalias/polars)** | 8 | 2 | 9 | Already clean |
+| **[polars](https://github.com/loadingalias/polars)** | 33 | 2 | 9 | Already clean |
 | **[ruff](https://github.com/loadingalias/ruff)** | 43 | 0 | 0 | Already unified |
 | **[codex](https://github.com/loadingalias/codex)** | 49 | 0 | 0 | Already unified |
 
@@ -203,7 +205,27 @@ Full guide: [docs/migrate-hakari.md](docs/migrate-hakari.md)
 
 **Lossless TOML** — Uses `toml_edit` to preserve comments and formatting. Your manifests stay readable.
 
-**Supply-Chain Safety** — 11 core dependencies. I built the release workflow specifically because I was uncomfortable with 600+ deps for release automation.
+**Supply-Chain Safety** — 11 core dependencies. I built the release workflow specifically because I was uncomfortable with hundreds of deps for release automation.
+
+---
+
+## FAQ
+
+**How is this different from cargo-hakari?**
+
+cargo-hakari creates a workspace-hack crate. cargo-rail writes unified versions directly to `[workspace.dependencies]` — no extra crate, no `hakari generate` step. Enable `pin_transitives = true` for equivalent behavior. See the [migration guide](docs/migrate-hakari.md).
+
+**Does it work with workspace inheritance?**
+
+Yes. cargo-rail writes to `[workspace.dependencies]` and converts member manifests to `{ workspace = true }`.
+
+**What about virtual workspaces?**
+
+Supported. For `pin_transitives`, cargo-rail auto-selects a workspace member as the transitive host (or set `transitive_host` explicitly).
+
+**Private registries?**
+
+Works via `cargo metadata`, which respects `.cargo/config.toml`. Private registry deps are pinned normally.
 
 ---
 
@@ -220,7 +242,7 @@ Full guide: [docs/migrate-hakari.md](docs/migrate-hakari.md)
 
 Issues, PRs, and feedback welcome. This is built for the Rust community.
 
-If cargo-rail helps your workflow, consider [starring the repo](https://github.com/loadingalias/cargo-rail) — it helps others find it.
+Found this useful? [Star the repo](https://github.com/loadingalias/cargo-rail) to help other Rust teams find it.
 
 ---
 

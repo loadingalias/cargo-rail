@@ -122,13 +122,25 @@ impl<'a> ChangeImpact<'a> {
   ///
   /// If `to` is None, compares against the working tree (uncommitted changes).
   pub fn analyze_changes(&self, from: &str, to: Option<&str>) -> RailResult<ImpactReport> {
-    // 1. Get changed files from git
-    let changed_files = self.ctx.git.git().get_changed_files_between(from, to)?;
+    // 1. Get changed files from git (paths are relative to git root)
+    let git_changed_files = self.ctx.git.git().get_changed_files_between(from, to)?;
 
-    // 2. Categorize changes by file type using new classification system
+    // 2. Convert git-relative paths to workspace-relative paths
+    //    This handles nested workspaces (e.g., git at /repo, workspace at /repo/rust)
+    let changed_files: Vec<(PathBuf, char)> = git_changed_files
+      .into_iter()
+      .filter_map(|(git_path, change_type)| {
+        self
+          .ctx
+          .to_workspace_path(&git_path)
+          .map(|ws_path| (ws_path, change_type))
+      })
+      .collect();
+
+    // 3. Categorize changes by file type using new classification system
     let categories = self.categorize_changes(&changed_files);
 
-    // 3. Use graph to find affected crates
+    // 4. Use graph to find affected crates
     let file_paths: Vec<PathBuf> = changed_files.iter().map(|(p, _)| p.clone()).collect();
     let analysis = crate::graph::analyze(&self.ctx.graph, &file_paths)?;
 

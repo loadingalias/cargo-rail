@@ -1,6 +1,6 @@
 # ripgrep unify demo
 
-Small, focused CLI workspace (9 crates). Demonstrates baseline unification.
+Small, focused CLI workspace (10 crates). Demonstrates baseline unification.
 
 ## Config choices
 
