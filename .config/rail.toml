@@ -62,10 +62,14 @@ infrastructure = [
   "scripts/**",
   "justfile",
   "deny.toml",
+  "rust-toolchain.toml",
+  "rustfmt.toml",
+  ".config/nextest.toml",
   "Cargo.toml",
   "Cargo.lock",
 ]
-# custom = {}  # Custom path categories (e.g., custom.verify = ["verify/**/*.rs"])
+# Custom categories are optional - docs_only is detected automatically
+# custom = {}  # Example: verify = ["verify/**/*.rs"]
 
 
 # Split/Sync: Use 'cargo rail split init <crate>' to configure individual crates

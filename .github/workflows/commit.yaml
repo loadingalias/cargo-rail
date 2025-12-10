@@ -26,8 +26,36 @@ permissions:
   pull-requests: write  # Required for PR comments on test results
 
 jobs:
+  # ==========================================================================
+  # Job 1: Detect what changed (dogfooding cargo-rail-action)
+  # ==========================================================================
+  detect:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs-only: ${{ steps.affected.outputs.docs-only }}
+      rebuild-all: ${{ steps.affected.outputs.rebuild-all }}
+      count: ${{ steps.affected.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          fetch-depth: 0  # Required for change detection
+          persist-credentials: false
+
+      - name: Detect affected crates
+        id: affected
+        uses: loadingalias/cargo-rail-action@88618d12427cee84efbe1ef556dd9f8445acad95  # v1.0.2
+        with:
+          since: ${{ github.event.before }}
+
+  # ==========================================================================
+  # Job 2: CI (skipped if docs-only)
+  # ==========================================================================
   ci:
     name: CI (${{ matrix.target.name }})
+    needs: detect
+    if: needs.detect.outputs.docs-only != 'true'
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30
     strategy:

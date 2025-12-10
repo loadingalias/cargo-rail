@@ -160,17 +160,17 @@ cargo rail release run my_crate --bump minor  # Execute
 
 Tested on production Rust workspaces:
 
-| Repo | Members | Deps Unified | Notes |
-|------|---------|--------------|-------|
-| **[tikv](https://github.com/loadingalias/tikv)** | 72 | 61 | Largest stress test |
-| **[meilisearch](https://github.com/loadingalias/meilisearch)** | 19 | 46 | Significant unification |
-| **[helix-db](https://github.com/loadingalias/helix-db)** | 6 | 18 | Growing project |
-| **[helix](https://github.com/loadingalias/helix)** | 12 | 16 | Editor workspace |
-| **[tokio](https://github.com/loadingalias/tokio)** | 10 | 10 | Core ecosystem |
-| **[ripgrep](https://github.com/loadingalias/ripgrep)** | 10 | 9 | CLI baseline |
-| **[polars](https://github.com/loadingalias/polars)** | 8 | 2 | Already clean |
-| **[ruff](https://github.com/loadingalias/ruff)** | 43 | 0 | Already unified |
-| **[codex](https://github.com/loadingalias/codex)** | 49 | 0 | Already unified |
+| Repo | Members | Deps Unified | Dead Features | Notes |
+|------|---------|--------------|---------------|-------|
+| **[tikv](https://github.com/loadingalias/tikv)** | 72 | 61 | 3 | Largest stress test |
+| **[meilisearch](https://github.com/loadingalias/meilisearch)** | 19 | 46 | 1 | Significant unification |
+| **[helix-db](https://github.com/loadingalias/helix-db)** | 6 | 18 | 0 | Growing project |
+| **[helix](https://github.com/loadingalias/helix)** | 12 | 16 | 1 | Editor workspace |
+| **[tokio](https://github.com/loadingalias/tokio)** | 10 | 10 | 0 | Core ecosystem |
+| **[ripgrep](https://github.com/loadingalias/ripgrep)** | 10 | 9 | 6 | CLI baseline |
+| **[polars](https://github.com/loadingalias/polars)** | 8 | 2 | 9 | Already clean |
+| **[ruff](https://github.com/loadingalias/ruff)** | 43 | 0 | 0 | Already unified |
+| **[codex](https://github.com/loadingalias/codex)** | 49 | 0 | 0 | Already unified |
 
 Each link above points to a fork with cargo-rail configured. Clone and compare.
 

@@ -137,7 +137,7 @@ major_version_conflict = "bump"
 
 **Notes:**
 
-- `major_version_conflict = "bump"` works in ~85% of cases; the remaining ~15% may require code fixes
+- In my experience, `major_version_conflict = "bump"` works in most cases; some may require code fixes
 - Use `"warn"` for safety, `"bump"` for the leanest build graph
 
 #### Dependency Selection
@@ -718,5 +718,5 @@ None. All configuration is file-based for reproducibility.
 ## See Also
 
 - [Commands Reference](./commands.md) - All cargo-rail commands
-- [Recipes](./recipes.md) - Common workflows and patterns
+- [Migration Guide](./migrate-hakari.md) - Migrating from cargo-hakari
 - [README](../README.md) - Project overview and quick start
