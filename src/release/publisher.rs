@@ -248,6 +248,19 @@ impl<'a> ReleasePublisher<'a> {
   fn commit_version_bump(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     let message = format!("chore(release): {} v{}", plan.name, plan.new_version);
 
+    // Update Cargo.lock to reflect the new version
+    // This is necessary because editing Cargo.toml doesn't automatically update the lockfile
+    let output = Command::new("cargo")
+      .current_dir(self.ctx.workspace_root())
+      .args(["update", "--workspace"])
+      .output()
+      .map_err(|e| RailError::message(format!("Failed to run cargo update: {}", e)))?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::message(format!("cargo update failed: {}", stderr)));
+    }
+
     let output = Command::new("git")
       .current_dir(self.ctx.workspace_root())
       .args(["add", "."])
