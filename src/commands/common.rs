@@ -21,6 +21,9 @@ pub enum OutputFormat {
   /// Names only, one per line
   #[value(name = "names-only", alias = "names")]
   NamesOnly,
+  /// Cargo -p flag format: -p crate1 -p crate2
+  #[value(name = "cargo-args", alias = "cargo")]
+  CargoArgs,
   /// GitHub Actions output format for $GITHUB_OUTPUT
   #[value(name = "github")]
   GitHub,

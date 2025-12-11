@@ -64,6 +64,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -170,6 +171,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -382,6 +384,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -448,6 +451,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -572,6 +576,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -618,6 +623,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -666,6 +672,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
@@ -734,6 +741,7 @@ Options:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
           - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)

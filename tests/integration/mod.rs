@@ -7,6 +7,7 @@ mod test_config;
 mod test_error_handling;
 mod test_git_notes;
 mod test_init;
+mod test_msrv;
 mod test_release_changelog;
 mod test_runner;
 mod test_split;

@@ -432,13 +432,15 @@ impl UnifyAnalyzer {
     // Compute MSRV if enabled
     let computed_msrv = if self.config.msrv {
       progress!("Computing MSRV from dependency graph...");
-      self.metadata.compute_msrv()
+      self
+        .metadata
+        .compute_msrv_with_config(&self.workspace_root, self.config.msrv_source)
     } else {
       None
     };
 
     // Scan for dead and optional features if enabled
-    let feature_pruner = FeaturePruner::new(&self.metadata);
+    let feature_pruner = FeaturePruner::new(&self.metadata, &self.config);
     let (pruned_features, optional_features) = if self.config.prune_dead_features {
       progress!("Scanning for dead features in resolved graph...");
       feature_pruner.scan()

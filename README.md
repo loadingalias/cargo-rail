@@ -95,10 +95,11 @@ cargo-rail takes a different approach:
 Graph-aware. Only test what's affected by your changes:
 
 ```bash
-cargo rail affected              # Show affected crates
+cargo rail affected                # Show affected crates
 cargo rail affected -f names-only  # Just names (for scripting)
-cargo rail test                  # Run tests for affected crates only
-cargo rail test --all            # Override: test everything
+cargo rail affected -f cargo-args  # -p crate1 -p crate2 (for cargo commands)
+cargo rail test                    # Run tests for affected crates only
+cargo rail test --all              # Override: test everything
 ```
 
 **For CI:** Use [`cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action):

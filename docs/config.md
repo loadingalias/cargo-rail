@@ -101,10 +101,12 @@ Controls workspace dependency unification behavior. All options are optional wit
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version`. The MSRV is the maximum `rust-version` from all resolved dependencies - your buildable floor. |
+| `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version`. The MSRV is determined by `msrv_source`. |
+| `msrv_source` | `enum` | `"max"` | How to compute the final MSRV:<br>• `"deps"` - Use maximum from dependencies only (original behavior)<br>• `"workspace"` - Preserve existing rust-version, warn if deps need higher<br>• `"max"` - Take max(workspace, deps) - your explicit setting wins if higher |
 | `detect_unused` | `bool` | `true` | Detect dependencies declared in manifests but absent from the resolved cargo graph. |
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
 | `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
+| `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
 | `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. Set to `0` to disable backup creation entirely. |
 
 **Example:**
@@ -112,9 +114,11 @@ Controls workspace dependency unification behavior. All options are optional wit
 ```toml
 [unify]
 msrv = true
+msrv_source = "max"  # "deps" | "workspace" | "max"
 detect_unused = true
 remove_unused = true
 prune_dead_features = true
+preserve_features = ["future-api", "unstable-*"]  # Keep these from pruning
 max_backups = 5
 ```
 
@@ -182,9 +186,11 @@ transitive_host = "root"
 [unify]
 # Core options (defaults shown)
 msrv = true
+msrv_source = "max"  # "deps" | "workspace" | "max"
 detect_unused = true
 remove_unused = true
 prune_dead_features = true
+preserve_features = []  # Glob patterns to preserve from pruning
 max_backups = 3
 
 # Version handling
@@ -455,9 +461,11 @@ targets = [
 [unify]
 # Core
 msrv = true
+msrv_source = "max"  # "deps" | "workspace" | "max"
 detect_unused = true
 remove_unused = true
 prune_dead_features = true
+preserve_features = []  # Glob patterns: ["unstable-*", "future-api"]
 max_backups = 3
 
 # Version handling

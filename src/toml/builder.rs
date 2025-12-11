@@ -118,6 +118,17 @@ impl RailConfigBuilder {
       config.msrv
     ));
 
+    // MSRV source
+    let msrv_source_str = match config.msrv_source {
+      crate::config::MsrvSource::Deps => "deps",
+      crate::config::MsrvSource::Workspace => "workspace",
+      crate::config::MsrvSource::Max => "max",
+    };
+    content.push_str(&format!(
+      "msrv_source = \"{}\"  # How to compute MSRV: deps, workspace, max (default: max)\n",
+      msrv_source_str
+    ));
+
     // Strict version compatibility
     content.push_str(&format!(
       "strict_version_compat = {}  # Treat version mismatches as errors (default: true)\n",
@@ -168,6 +179,16 @@ impl RailConfigBuilder {
       "prune_dead_features = {}  # Remove features never enabled in resolved graph (default: true)\n",
       config.prune_dead_features
     ));
+
+    // Preserve features (glob patterns)
+    if config.preserve_features.is_empty() {
+      content.push_str("preserve_features = []  # Features to preserve from pruning (glob patterns: \"unstable-*\")\n");
+    } else {
+      content.push_str(&format!(
+        "preserve_features = {}  # Features to preserve from pruning\n",
+        self.formatter.array_string(&config.preserve_features, None)
+      ));
+    }
 
     self.sections.push(format!("[unify]\n{}\n", content));
 

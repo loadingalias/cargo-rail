@@ -46,12 +46,25 @@ pub struct UnifyConfig {
   #[serde(default = "default_true")]
   pub msrv: bool,
 
+  /// How to determine the final MSRV value (default: "max")
+  /// - "deps": Use maximum from dependencies only (original behavior)
+  /// - "workspace": Preserve existing rust-version, warn if deps need higher
+  /// - "max": Take max(workspace, deps) - explicit workspace setting wins if higher
+  #[serde(default)]
+  pub msrv_source: MsrvSource,
+
   /// Prune features not referenced in source code? (default: true)
   /// When enabled, analyzes the resolved dependency graph to detect features
   /// that are declared but never enabled by any consumer across all targets.
   /// This produces the absolute leanest feature set for the workspace.
   #[serde(default = "default_true")]
   pub prune_dead_features: bool,
+
+  /// Features to preserve from dead feature pruning (glob patterns supported)
+  /// Use this to keep features intended for future use or external consumers.
+  /// Examples: ["future-api", "unstable-*", "bench*"]
+  #[serde(default)]
+  pub preserve_features: Vec<String>,
 
   /// Strict version compatibility checking (default: true)
   /// When true, version mismatches between member manifests and existing
@@ -97,7 +110,9 @@ impl Default for UnifyConfig {
       include: Vec::new(),
       max_backups: default_max_backups(),
       msrv: true,
+      msrv_source: MsrvSource::default(),
       prune_dead_features: true,
+      preserve_features: Vec::new(),
       strict_version_compat: true,
       exact_pin_handling: ExactPinHandling::default(),
       major_version_conflict: MajorVersionConflict::default(),
@@ -116,6 +131,23 @@ impl UnifyConfig {
   /// Check if a dependency should be force-included in unification
   pub fn should_include(&self, dep_name: &str) -> bool {
     self.include.iter().any(|i| i == dep_name)
+  }
+
+  /// Check if a feature should be preserved from dead feature pruning
+  ///
+  /// Supports glob patterns (e.g., "unstable-*", "bench*")
+  pub fn should_preserve_feature(&self, feature_name: &str) -> bool {
+    self.preserve_features.iter().any(|pattern| {
+      if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        // Use glob matching for patterns with wildcards
+        glob::Pattern::new(pattern)
+          .map(|p| p.matches(feature_name))
+          .unwrap_or(false)
+      } else {
+        // Exact match for literal patterns
+        pattern == feature_name
+      }
+    })
   }
 
   /// Validate unify configuration against the workspace
@@ -170,6 +202,31 @@ impl UnifyConfig {
 // ============================================================================
 // Helper Types
 // ============================================================================
+
+/// How to determine the final MSRV (Minimum Supported Rust Version)
+///
+/// Controls how cargo-rail computes the rust-version to write to [workspace.package].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MsrvSource {
+  /// Use maximum from dependencies only (original behavior)
+  ///
+  /// Computes the highest rust-version from all resolved dependencies.
+  /// Overwrites any existing workspace rust-version.
+  Deps,
+  /// Preserve existing workspace rust-version
+  ///
+  /// Keeps the existing [workspace.package].rust-version unchanged.
+  /// Emits a warning if dependencies require a higher version.
+  Workspace,
+  /// Take max(workspace, deps) - default
+  ///
+  /// Uses the higher of the existing workspace rust-version or the
+  /// maximum from dependencies. Your explicit workspace setting wins
+  /// if it requires a higher Rust version than your dependencies.
+  #[default]
+  Max,
+}
 
 /// How to handle exact version pins ("=x.y.z") during unification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -513,5 +570,142 @@ mod tests {
     } else {
       panic!("Expected InvalidValue error");
     }
+  }
+
+  #[test]
+  fn test_preserve_features_default() {
+    let config = UnifyConfig::default();
+    assert!(config.preserve_features.is_empty());
+  }
+
+  #[test]
+  fn test_preserve_features_parsing() {
+    let toml = r#"
+      preserve_features = ["future-api", "unstable-*", "bench*"]
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.preserve_features.len(), 3);
+    assert!(config.preserve_features.contains(&"future-api".to_string()));
+    assert!(config.preserve_features.contains(&"unstable-*".to_string()));
+    assert!(config.preserve_features.contains(&"bench*".to_string()));
+  }
+
+  #[test]
+  fn test_should_preserve_feature_exact_match() {
+    let config = UnifyConfig {
+      preserve_features: vec!["future-api".to_string(), "experimental".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_preserve_feature("future-api"));
+    assert!(config.should_preserve_feature("experimental"));
+    assert!(!config.should_preserve_feature("other-feature"));
+  }
+
+  #[test]
+  fn test_should_preserve_feature_glob_wildcard() {
+    let config = UnifyConfig {
+      preserve_features: vec!["unstable-*".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_preserve_feature("unstable-api"));
+    assert!(config.should_preserve_feature("unstable-feature"));
+    assert!(config.should_preserve_feature("unstable-"));
+    assert!(!config.should_preserve_feature("unstable")); // No trailing dash
+    assert!(!config.should_preserve_feature("stable-api"));
+  }
+
+  #[test]
+  fn test_should_preserve_feature_glob_suffix() {
+    let config = UnifyConfig {
+      preserve_features: vec!["bench*".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_preserve_feature("bench"));
+    assert!(config.should_preserve_feature("benchmark"));
+    assert!(config.should_preserve_feature("benchmarks"));
+    assert!(!config.should_preserve_feature("prebench"));
+  }
+
+  #[test]
+  fn test_should_preserve_feature_glob_question_mark() {
+    let config = UnifyConfig {
+      preserve_features: vec!["test-?".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_preserve_feature("test-a"));
+    assert!(config.should_preserve_feature("test-1"));
+    assert!(!config.should_preserve_feature("test-ab")); // Two chars
+    assert!(!config.should_preserve_feature("test-")); // No char
+  }
+
+  #[test]
+  fn test_should_preserve_feature_multiple_patterns() {
+    let config = UnifyConfig {
+      preserve_features: vec!["future-api".to_string(), "unstable-*".to_string(), "bench*".to_string()],
+      ..Default::default()
+    };
+    // Exact match
+    assert!(config.should_preserve_feature("future-api"));
+    // Glob matches
+    assert!(config.should_preserve_feature("unstable-feature"));
+    assert!(config.should_preserve_feature("benchmark"));
+    // Non-matches
+    assert!(!config.should_preserve_feature("stable-api"));
+    assert!(!config.should_preserve_feature("other"));
+  }
+
+  #[test]
+  fn test_should_preserve_feature_empty_list() {
+    let config = UnifyConfig::default();
+    assert!(!config.should_preserve_feature("any-feature"));
+  }
+
+  #[test]
+  fn test_msrv_source_default() {
+    let config = UnifyConfig::default();
+    assert_eq!(config.msrv_source, MsrvSource::Max);
+  }
+
+  #[test]
+  fn test_msrv_source_parsing_deps() {
+    let toml = r#"msrv_source = "deps""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.msrv_source, MsrvSource::Deps);
+  }
+
+  #[test]
+  fn test_msrv_source_parsing_workspace() {
+    let toml = r#"msrv_source = "workspace""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.msrv_source, MsrvSource::Workspace);
+  }
+
+  #[test]
+  fn test_msrv_source_parsing_max() {
+    let toml = r#"msrv_source = "max""#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.msrv_source, MsrvSource::Max);
+  }
+
+  #[test]
+  fn test_msrv_source_with_msrv_enabled() {
+    let toml = r#"
+      msrv = true
+      msrv_source = "workspace"
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.msrv);
+    assert_eq!(config.msrv_source, MsrvSource::Workspace);
+  }
+
+  #[test]
+  fn test_msrv_source_with_msrv_disabled() {
+    let toml = r#"
+      msrv = false
+      msrv_source = "deps"
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.msrv);
+    assert_eq!(config.msrv_source, MsrvSource::Deps);
   }
 }

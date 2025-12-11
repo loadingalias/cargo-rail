@@ -1,9 +1,11 @@
 //! Target triple detection for workspace validation
 //!
-//! Detects Rust target triples across all TOML files in the workspace.
+//! Detects Rust target triples across configuration files in the workspace:
+//! - TOML files: rust-toolchain.toml, .cargo/config.toml, Cross.toml, dist-workspace.toml, etc.
+//! - GitHub workflow files: .github/workflows/*.yml and *.yaml
+//!
 //! Uses fuzzy matching against rustc's canonical target list to find targets
-//! regardless of where they're defined (rust-toolchain.toml, .cargo/config.toml,
-//! Cross.toml, dist-workspace.toml, etc.).
+//! regardless of where they're defined.
 
 use crate::error::{RailError, RailResult};
 use std::collections::HashSet;
@@ -50,20 +52,21 @@ pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> Rai
   // Get canonical target list from rustc (cached)
   let canonical_targets = get_rust_target_list()?;
 
-  // Find all TOML files in workspace
-  let toml_files = find_toml_files(workspace_root);
+  // Find all config files (TOML + GitHub workflow YAML)
+  let mut config_files = find_toml_files(workspace_root);
+  config_files.extend(find_github_workflow_files(workspace_root));
 
   // Track found targets (deduplicate)
   let mut found = HashSet::new();
 
-  // For each TOML file, check if it mentions any canonical target
-  for toml_path in toml_files {
+  // For each config file, check if it mentions any canonical target
+  for file_path in config_files {
     // Skip excluded files
-    if exclude.iter().any(|e| toml_path == *e) {
+    if exclude.iter().any(|e| file_path == *e) {
       continue;
     }
 
-    if let Ok(content) = std::fs::read_to_string(&toml_path) {
+    if let Ok(content) = std::fs::read_to_string(&file_path) {
       for target in &canonical_targets {
         if content.contains(target) {
           found.insert(target.clone());
@@ -197,6 +200,70 @@ fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize,
       find_toml_files_recursive(&path, current_depth + 1, max_depth, toml_files);
     }
   }
+}
+
+/// Find GitHub workflow files (.yml and .yaml) in .github/workflows/
+///
+/// Many monorepos define their cross-compilation targets in GitHub Actions
+/// workflow files rather than TOML configuration files. This function
+/// finds all workflow files for target detection.
+///
+/// # Arguments
+/// * `workspace_root` - Path to workspace root directory
+///
+/// # Returns
+/// List of paths to workflow files
+fn find_github_workflow_files(workspace_root: &Path) -> Vec<PathBuf> {
+  let workflows_dir = workspace_root.join(".github").join("workflows");
+
+  // Return empty if .github/workflows doesn't exist
+  if !workflows_dir.is_dir() {
+    return Vec::new();
+  }
+
+  let Ok(entries) = std::fs::read_dir(&workflows_dir) else {
+    return Vec::new();
+  };
+
+  entries
+    .flatten()
+    .filter_map(|entry| {
+      let path = entry.path();
+      if path.is_file() {
+        let ext = path.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("yml") | Some("yaml")) {
+          return Some(path);
+        }
+      }
+      None
+    })
+    .collect()
+}
+
+/// Check if a workspace has GitHub workflow files
+///
+/// Used to provide helpful hints during `cargo rail init` when no targets
+/// are detected from TOML files but workflows exist.
+pub fn has_github_workflows(workspace_root: &Path) -> bool {
+  let workflows_dir = workspace_root.join(".github").join("workflows");
+  if !workflows_dir.is_dir() {
+    return false;
+  }
+
+  // Check if there's at least one .yml or .yaml file
+  if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if path.is_file() {
+        let ext = path.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("yml") | Some("yaml")) {
+          return true;
+        }
+      }
+    }
+  }
+
+  false
 }
 
 #[cfg(test)]
@@ -397,5 +464,161 @@ linker = "clang"
     // Should find valid.toml but not target/should-skip.toml
     assert_eq!(toml_files.len(), 1);
     assert!(toml_files[0].ends_with("valid.toml"));
+  }
+
+  // ============================================================================
+  // GitHub Workflow YAML Tests
+  // ============================================================================
+
+  #[test]
+  fn test_find_github_workflow_files_empty() {
+    let temp = TempDir::new().unwrap();
+    let files = find_github_workflow_files(temp.path());
+    assert!(files.is_empty());
+  }
+
+  #[test]
+  fn test_find_github_workflow_files_finds_yml() {
+    let temp = TempDir::new().unwrap();
+
+    // Create .github/workflows directory
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+
+    // Create workflow files
+    fs::write(workflows_dir.join("ci.yml"), "name: CI").unwrap();
+    fs::write(workflows_dir.join("release.yaml"), "name: Release").unwrap();
+
+    let files = find_github_workflow_files(temp.path());
+    assert_eq!(files.len(), 2);
+  }
+
+  #[test]
+  fn test_find_github_workflow_files_ignores_non_yaml() {
+    let temp = TempDir::new().unwrap();
+
+    // Create .github/workflows directory
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+
+    // Create mixed files
+    fs::write(workflows_dir.join("ci.yml"), "name: CI").unwrap();
+    fs::write(workflows_dir.join("README.md"), "# Workflows").unwrap();
+    fs::write(workflows_dir.join("config.json"), "{}").unwrap();
+
+    let files = find_github_workflow_files(temp.path());
+    assert_eq!(files.len(), 1);
+    assert!(files[0].ends_with("ci.yml"));
+  }
+
+  #[test]
+  fn test_detect_targets_from_github_workflows() {
+    let temp = TempDir::new().unwrap();
+
+    // Create .github/workflows/ci.yml with target matrix
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+
+    fs::write(
+      workflows_dir.join("ci.yml"),
+      r#"
+name: CI
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+"#,
+    )
+    .unwrap();
+
+    let targets = detect_targets(temp.path()).unwrap();
+    assert!(targets.contains(&"x86_64-unknown-linux-gnu".to_string()));
+    assert!(targets.contains(&"aarch64-apple-darwin".to_string()));
+    assert!(targets.contains(&"x86_64-pc-windows-msvc".to_string()));
+  }
+
+  #[test]
+  fn test_detect_targets_combined_toml_and_yaml() {
+    let temp = TempDir::new().unwrap();
+
+    // Create rust-toolchain.toml with one target
+    fs::write(
+      temp.path().join("rust-toolchain.toml"),
+      r#"
+[toolchain]
+targets = ["wasm32-unknown-unknown"]
+"#,
+    )
+    .unwrap();
+
+    // Create .github/workflows/ci.yml with different targets
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+
+    fs::write(
+      workflows_dir.join("ci.yml"),
+      r#"
+name: CI
+jobs:
+  build:
+    strategy:
+      matrix:
+        target: ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+"#,
+    )
+    .unwrap();
+
+    let targets = detect_targets(temp.path()).unwrap();
+
+    // Should find targets from both sources
+    assert!(targets.contains(&"wasm32-unknown-unknown".to_string()));
+    assert!(targets.contains(&"x86_64-unknown-linux-gnu".to_string()));
+    assert!(targets.contains(&"aarch64-apple-darwin".to_string()));
+    assert_eq!(targets.len(), 3);
+  }
+
+  #[test]
+  fn test_has_github_workflows_true() {
+    let temp = TempDir::new().unwrap();
+
+    // Create .github/workflows with a workflow file
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+    fs::write(workflows_dir.join("ci.yml"), "name: CI").unwrap();
+
+    assert!(has_github_workflows(temp.path()));
+  }
+
+  #[test]
+  fn test_has_github_workflows_false_no_dir() {
+    let temp = TempDir::new().unwrap();
+    assert!(!has_github_workflows(temp.path()));
+  }
+
+  #[test]
+  fn test_has_github_workflows_false_empty_dir() {
+    let temp = TempDir::new().unwrap();
+
+    // Create empty .github/workflows directory
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+
+    assert!(!has_github_workflows(temp.path()));
+  }
+
+  #[test]
+  fn test_has_github_workflows_false_no_yaml() {
+    let temp = TempDir::new().unwrap();
+
+    // Create .github/workflows with non-YAML files only
+    let workflows_dir = temp.path().join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir).unwrap();
+    fs::write(workflows_dir.join("README.md"), "# Workflows").unwrap();
+
+    assert!(!has_github_workflows(temp.path()));
   }
 }

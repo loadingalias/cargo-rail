@@ -104,6 +104,7 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
         .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?
     }
     OutputFormat::NamesOnly => all_crates.join("\n"),
+    OutputFormat::CargoArgs => format_cargo_args_list(all_crates),
     OutputFormat::GitHub => {
       let test_matrix = serde_json::to_string(&all_crates)
         .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
@@ -292,6 +293,7 @@ fn display_results(
     OutputFormat::Text => format_text(analysis, classification),
     OutputFormat::Json => format_json(analysis, classification)?,
     OutputFormat::NamesOnly => format_names_only(analysis),
+    OutputFormat::CargoArgs => format_cargo_args(analysis),
     OutputFormat::GitHub => format_github(analysis, classification)?,
     OutputFormat::GitHubMatrix => format_github_matrix(analysis)?,
     OutputFormat::JsonLines => format_jsonl(analysis, classification)?,
@@ -426,6 +428,25 @@ fn format_names_only(analysis: &AffectedAnalysis) -> String {
   let mut test_targets: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
   test_targets.sort();
   test_targets.join("\n")
+}
+
+/// Format cargo -p args for direct use with cargo commands
+///
+/// Output: `-p crate1 -p crate2 -p crate3`
+/// Usage: `cargo test $(cargo rail affected -f cargo-args)`
+fn format_cargo_args(analysis: &AffectedAnalysis) -> String {
+  let mut test_targets: Vec<_> = analysis.impact.test_targets.iter().cloned().collect();
+  test_targets.sort();
+  format_cargo_args_list(&test_targets)
+}
+
+/// Format a list of crate names as cargo -p args
+fn format_cargo_args_list(crates: &[String]) -> String {
+  if crates.is_empty() {
+    String::new()
+  } else {
+    crates.iter().map(|c| format!("-p {}", c)).collect::<Vec<_>>().join(" ")
+  }
 }
 
 /// Format GitHub Actions output for $GITHUB_OUTPUT

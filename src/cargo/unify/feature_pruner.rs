@@ -7,18 +7,20 @@
 use crate::cargo::feature_scanner::FeatureScanner;
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::{MemberEdit, OptionalFeature, PrunedFeature};
+use crate::config::UnifyConfig;
 use crate::progress;
 use std::collections::HashMap;
 
 /// Scans for dead and optional features in workspace crates
 pub struct FeaturePruner<'a> {
   metadata: &'a MultiTargetMetadata,
+  config: &'a UnifyConfig,
 }
 
 impl<'a> FeaturePruner<'a> {
   /// Create a new feature pruner
-  pub fn new(metadata: &'a MultiTargetMetadata) -> Self {
-    Self { metadata }
+  pub fn new(metadata: &'a MultiTargetMetadata, config: &'a UnifyConfig) -> Self {
+    Self { metadata, config }
   }
 
   /// Detect dead and optional features using resolved cargo metadata
@@ -26,6 +28,8 @@ impl<'a> FeaturePruner<'a> {
   /// Returns two lists:
   /// - `pruned`: Truly dead features (empty no-ops) that can be safely removed
   /// - `optional`: Features not enabled but enable something (user-facing API, don't remove)
+  ///
+  /// Features matching `preserve_features` patterns in config are excluded from pruning.
   pub fn scan(&self) -> (Vec<PrunedFeature>, Vec<OptionalFeature>) {
     let mut pruned = Vec::new();
     let mut optional = Vec::new();
@@ -35,8 +39,12 @@ impl<'a> FeaturePruner<'a> {
 
     // Collect dead and optional features
     for result in &results {
-      // Truly dead features (empty no-ops)
+      // Truly dead features (empty no-ops), excluding preserved features
       for feature_name in &result.dead_features {
+        // Skip features that match preserve_features patterns
+        if self.config.should_preserve_feature(feature_name) {
+          continue;
+        }
         pruned.push(PrunedFeature {
           crate_name: result.crate_name.clone(),
           feature_name: feature_name.clone(),

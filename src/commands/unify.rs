@@ -379,6 +379,10 @@ pub fn run_unify_apply(
   }
 
   if let Some(ref msrv) = plan.computed_msrv {
+    // Show warning if workspace mode has compatibility issues
+    if let Some(ref warning) = msrv.warning {
+      eprintln!("warning: {}", warning);
+    }
     progress!(
       "writing rust-version = \"{}.{}\"...",
       msrv.version.major,
@@ -421,11 +425,22 @@ pub fn run_unify_apply(
     );
   }
   if let Some(ref msrv) = plan.computed_msrv {
+    use crate::cargo::MsrvSourceUsed;
+    let source_desc = match msrv.source_used {
+      MsrvSourceUsed::Deps => format!(
+        "from deps: {}",
+        msrv.contributors.first().unwrap_or(&"unknown".to_string())
+      ),
+      MsrvSourceUsed::Workspace => "preserved from workspace".to_string(),
+      MsrvSourceUsed::MaxWorkspace => "from workspace (higher than deps)".to_string(),
+      MsrvSourceUsed::MaxDeps => format!(
+        "from deps: {}",
+        msrv.contributors.first().unwrap_or(&"unknown".to_string())
+      ),
+    };
     println!(
-      "  rust-version = {}.{} (from {})",
-      msrv.version.major,
-      msrv.version.minor,
-      msrv.contributors.first().unwrap_or(&"unknown".to_string())
+      "  rust-version = {}.{} ({})",
+      msrv.version.major, msrv.version.minor, source_desc
     );
   }
 

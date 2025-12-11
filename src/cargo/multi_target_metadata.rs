@@ -349,13 +349,11 @@ impl MultiTargetMetadata {
     transitives
   }
 
-  /// Compute the workspace MSRV from all resolved dependencies
+  /// Compute the MSRV from dependencies only (internal helper)
   ///
-  /// The MSRV is the maximum `rust-version` across all dependencies in the
-  /// resolved graph. This ensures the workspace can build all its deps.
-  ///
-  /// Returns `None` if no dependencies specify rust-version.
-  pub fn compute_msrv(&self) -> Option<ComputedMsrv> {
+  /// Returns the maximum rust-version across all resolved dependencies,
+  /// along with the list of deps that contributed to that maximum.
+  fn compute_deps_msrv(&self) -> Option<(Version, Vec<String>, usize)> {
     let mut max_version: Option<Version> = None;
     let mut contributors: Vec<String> = Vec::new();
     let mut deps_with_msrv = 0;
@@ -393,12 +391,213 @@ impl MultiTargetMetadata {
       }
     }
 
-    max_version.map(|version| ComputedMsrv {
-      version,
-      contributors,
-      deps_with_msrv,
-    })
+    max_version.map(|v| (v, contributors, deps_with_msrv))
   }
+
+  /// Compute the workspace MSRV with config-driven source selection
+  ///
+  /// Takes into account the existing workspace rust-version and the msrv_source
+  /// configuration to determine the final MSRV value.
+  ///
+  /// # Arguments
+  /// * `workspace_root` - Path to workspace root (for reading existing rust-version)
+  /// * `msrv_source` - How to determine the final MSRV (deps, workspace, or max)
+  ///
+  /// # Returns
+  /// * `None` if no MSRV can be determined (no deps have rust-version AND no workspace rust-version)
+  /// * `Some(ComputedMsrv)` with the final MSRV and metadata about the computation
+  pub fn compute_msrv_with_config(
+    &self,
+    workspace_root: &Path,
+    msrv_source: crate::config::MsrvSource,
+  ) -> Option<ComputedMsrv> {
+    use crate::config::MsrvSource;
+
+    // Get MSRV from dependencies
+    let deps_result = self.compute_deps_msrv();
+
+    // Read existing workspace rust-version
+    let workspace_msrv = read_workspace_rust_version(workspace_root);
+
+    // Apply msrv_source logic
+    match msrv_source {
+      MsrvSource::Deps => {
+        // Original behavior: use deps only, ignore workspace
+        deps_result.map(|(version, contributors, deps_with_msrv)| ComputedMsrv {
+          version: version.clone(),
+          contributors,
+          deps_with_msrv,
+          deps_msrv: Some(version),
+          workspace_msrv,
+          source_used: MsrvSourceUsed::Deps,
+          warning: None,
+        })
+      }
+
+      MsrvSource::Workspace => {
+        // Preserve workspace rust-version, warn if deps need higher
+        match (&workspace_msrv, &deps_result) {
+          (Some(ws_ver), Some((deps_ver, contributors, deps_with_msrv))) => {
+            let warning = if deps_ver > ws_ver {
+              Some(format!(
+                "workspace rust-version ({}.{}) is lower than deps require ({}.{}); \
+                 deps {} need the higher version",
+                ws_ver.major,
+                ws_ver.minor,
+                deps_ver.major,
+                deps_ver.minor,
+                contributors.first().unwrap_or(&"unknown".to_string())
+              ))
+            } else {
+              None
+            };
+            Some(ComputedMsrv {
+              version: ws_ver.clone(),
+              contributors: contributors.clone(),
+              deps_with_msrv: *deps_with_msrv,
+              deps_msrv: Some(deps_ver.clone()),
+              workspace_msrv: Some(ws_ver.clone()),
+              source_used: MsrvSourceUsed::Workspace,
+              warning,
+            })
+          }
+          (Some(ws_ver), None) => {
+            // Workspace has rust-version but no deps do
+            Some(ComputedMsrv {
+              version: ws_ver.clone(),
+              contributors: Vec::new(),
+              deps_with_msrv: 0,
+              deps_msrv: None,
+              workspace_msrv: Some(ws_ver.clone()),
+              source_used: MsrvSourceUsed::Workspace,
+              warning: None,
+            })
+          }
+          (None, Some((deps_ver, contributors, deps_with_msrv))) => {
+            // No workspace rust-version, fall back to deps
+            Some(ComputedMsrv {
+              version: deps_ver.clone(),
+              contributors: contributors.clone(),
+              deps_with_msrv: *deps_with_msrv,
+              deps_msrv: Some(deps_ver.clone()),
+              workspace_msrv: None,
+              source_used: MsrvSourceUsed::Deps,
+              warning: Some("no workspace rust-version found, using deps MSRV".to_string()),
+            })
+          }
+          (None, None) => None,
+        }
+      }
+
+      MsrvSource::Max => {
+        // Take max(workspace, deps) - explicit workspace setting wins if higher
+        match (&workspace_msrv, &deps_result) {
+          (Some(ws_ver), Some((deps_ver, contributors, deps_with_msrv))) => {
+            let (version, source_used) = if ws_ver >= deps_ver {
+              (ws_ver.clone(), MsrvSourceUsed::MaxWorkspace)
+            } else {
+              (deps_ver.clone(), MsrvSourceUsed::MaxDeps)
+            };
+            Some(ComputedMsrv {
+              version,
+              contributors: contributors.clone(),
+              deps_with_msrv: *deps_with_msrv,
+              deps_msrv: Some(deps_ver.clone()),
+              workspace_msrv: Some(ws_ver.clone()),
+              source_used,
+              warning: None,
+            })
+          }
+          (Some(ws_ver), None) => {
+            // Workspace has rust-version but no deps do
+            Some(ComputedMsrv {
+              version: ws_ver.clone(),
+              contributors: Vec::new(),
+              deps_with_msrv: 0,
+              deps_msrv: None,
+              workspace_msrv: Some(ws_ver.clone()),
+              source_used: MsrvSourceUsed::MaxWorkspace,
+              warning: None,
+            })
+          }
+          (None, Some((deps_ver, contributors, deps_with_msrv))) => {
+            // No workspace rust-version, use deps
+            Some(ComputedMsrv {
+              version: deps_ver.clone(),
+              contributors: contributors.clone(),
+              deps_with_msrv: *deps_with_msrv,
+              deps_msrv: Some(deps_ver.clone()),
+              workspace_msrv: None,
+              source_used: MsrvSourceUsed::MaxDeps,
+              warning: None,
+            })
+          }
+          (None, None) => None,
+        }
+      }
+    }
+  }
+
+  /// Compute the workspace MSRV from all resolved dependencies (legacy method)
+  ///
+  /// The MSRV is the maximum `rust-version` across all dependencies in the
+  /// resolved graph. This ensures the workspace can build all its deps.
+  ///
+  /// Returns `None` if no dependencies specify rust-version.
+  ///
+  /// **Note:** Prefer `compute_msrv_with_config()` for config-aware behavior.
+  pub fn compute_msrv(&self) -> Option<ComputedMsrv> {
+    self
+      .compute_deps_msrv()
+      .map(|(version, contributors, deps_with_msrv)| ComputedMsrv {
+        version: version.clone(),
+        contributors,
+        deps_with_msrv,
+        deps_msrv: Some(version),
+        workspace_msrv: None,
+        source_used: MsrvSourceUsed::Deps,
+        warning: None,
+      })
+  }
+}
+
+/// Read the existing rust-version from workspace Cargo.toml
+///
+/// Parses [workspace.package].rust-version if it exists.
+fn read_workspace_rust_version(workspace_root: &Path) -> Option<Version> {
+  let cargo_toml_path = workspace_root.join("Cargo.toml");
+  let content = std::fs::read_to_string(&cargo_toml_path).ok()?;
+  let doc: toml_edit::DocumentMut = content.parse().ok()?;
+
+  // Try [workspace.package].rust-version
+  let rust_version_str = doc
+    .get("workspace")
+    .and_then(|ws| ws.get("package"))
+    .and_then(|pkg| pkg.get("rust-version"))
+    .and_then(|v| v.as_str())?;
+
+  // Parse as semver Version (rust-version is typically "1.XX" or "1.XX.0")
+  parse_rust_version(rust_version_str)
+}
+
+/// Parse a rust-version string into a semver Version
+///
+/// Handles formats like "1.70", "1.70.0", etc.
+fn parse_rust_version(s: &str) -> Option<Version> {
+  // Try parsing directly
+  if let Ok(v) = Version::parse(s) {
+    return Some(v);
+  }
+
+  // Handle "1.70" format (missing patch)
+  let parts: Vec<&str> = s.split('.').collect();
+  if parts.len() == 2
+    && let (Ok(major), Ok(minor)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+  {
+    return Some(Version::new(major, minor, 0));
+  }
+
+  None
 }
 
 /// A transitive dependency with fragmented features across targets
@@ -424,12 +623,33 @@ impl FragmentedTransitive {
 /// Result of MSRV computation from dependency graph
 #[derive(Debug, Clone)]
 pub struct ComputedMsrv {
-  /// The computed MSRV (maximum of all deps' rust-version)
+  /// The final MSRV to write (after applying msrv_source logic)
   pub version: Version,
-  /// Dependencies that contributed to the MSRV (those with the highest rust-version)
+  /// Dependencies that contributed to the deps-based MSRV
   pub contributors: Vec<String>,
   /// Total number of deps with rust-version specified
   pub deps_with_msrv: usize,
+  /// The MSRV computed from dependencies (before applying msrv_source logic)
+  pub deps_msrv: Option<Version>,
+  /// The existing workspace rust-version (if any)
+  pub workspace_msrv: Option<Version>,
+  /// Which source was used to determine the final version
+  pub source_used: MsrvSourceUsed,
+  /// Warning message if workspace MSRV is lower than deps require
+  pub warning: Option<String>,
+}
+
+/// Which source determined the final MSRV
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsrvSourceUsed {
+  /// Used the maximum from dependencies
+  Deps,
+  /// Preserved existing workspace rust-version
+  Workspace,
+  /// Used max of workspace and deps (workspace was higher)
+  MaxWorkspace,
+  /// Used max of workspace and deps (deps was higher)
+  MaxDeps,
 }
 
 impl MultiTargetMetadata {
@@ -468,5 +688,49 @@ impl MultiTargetMetadata {
     }
 
     map
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_parse_rust_version_full() {
+    let v = parse_rust_version("1.70.0").unwrap();
+    assert_eq!(v.major, 1);
+    assert_eq!(v.minor, 70);
+    assert_eq!(v.patch, 0);
+  }
+
+  #[test]
+  fn test_parse_rust_version_two_parts() {
+    let v = parse_rust_version("1.70").unwrap();
+    assert_eq!(v.major, 1);
+    assert_eq!(v.minor, 70);
+    assert_eq!(v.patch, 0);
+  }
+
+  #[test]
+  fn test_parse_rust_version_high_minor() {
+    let v = parse_rust_version("1.91").unwrap();
+    assert_eq!(v.major, 1);
+    assert_eq!(v.minor, 91);
+    assert_eq!(v.patch, 0);
+  }
+
+  #[test]
+  fn test_parse_rust_version_invalid() {
+    assert!(parse_rust_version("invalid").is_none());
+    assert!(parse_rust_version("").is_none());
+    assert!(parse_rust_version("1").is_none());
+    assert!(parse_rust_version("a.b.c").is_none());
+  }
+
+  #[test]
+  fn test_msrv_source_used_variants() {
+    // Just ensure the enum variants exist and are distinct
+    assert_ne!(MsrvSourceUsed::Deps, MsrvSourceUsed::Workspace);
+    assert_ne!(MsrvSourceUsed::MaxWorkspace, MsrvSourceUsed::MaxDeps);
   }
 }
