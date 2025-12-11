@@ -686,8 +686,14 @@ jobs:
 
   #[test]
   fn test_contains_target_match_quoted() {
-    assert!(contains_target_match(r#""thumbv7em-none-eabihf""#, "thumbv7em-none-eabihf"));
-    assert!(contains_target_match(r#"'thumbv7em-none-eabihf'"#, "thumbv7em-none-eabihf"));
+    assert!(contains_target_match(
+      r#""thumbv7em-none-eabihf""#,
+      "thumbv7em-none-eabihf"
+    ));
+    assert!(contains_target_match(
+      r#"'thumbv7em-none-eabihf'"#,
+      "thumbv7em-none-eabihf"
+    ));
   }
 
   #[test]
