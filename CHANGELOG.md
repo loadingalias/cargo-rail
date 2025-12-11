@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/loadingalias/cargo-rail/compare/v0.2.2...v0.3.0) - 2025-12-11
+
+### 🔧 Chores
+
+- update Cargo.lock ([e4b0f4a](https://github.com/loadingalias/cargo-rail/commit/e4b0f4a65d5ae19a664b87837ec5faf22b4e6a84))
+
+### 📦 Other Changes
+
+- crgo-rail: feat: added 'exclude' to the features pruning; updated cfg in rail.toml; upgraded the 'msrv' detection, resolution w/ cfg in rail.toml && added strict testing; fixed the 'quiche' issue where target-triples aren't defined in any TOML, but instead are in '.github/workflows' in yaml/yml files - validated against CF's quiche repo. add cargo-args output format ([5a7337a](https://github.com/loadingalias/cargo-rail/commit/5a7337a7e1529df4b299033ddbfd788b123c9333))
+
+
+
 ## [0.2.2](https://github.com/loadingalias/cargo-rail/compare/v0.2.0...v0.2.2) - 2025-12-10
 
 ### 🔧 Chores
