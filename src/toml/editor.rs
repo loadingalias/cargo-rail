@@ -99,6 +99,57 @@ impl TomlEditor {
     Some(current)
   }
 
+  /// Check if a key exists at the given path (e.g., "unify.msrv_source")
+  pub fn contains_path(&self, path: &str) -> bool {
+    self.get(path).is_some()
+  }
+
+  /// Ensure a section (table) exists, creating if needed.
+  /// Returns true if the section was created, false if it already existed.
+  pub fn ensure_section(&mut self, section: &str) -> bool {
+    if self.doc.contains_key(section) {
+      return false;
+    }
+
+    // Add a blank line before the new section for readability
+    let table = self.doc.as_table_mut();
+    table.insert(section, Item::Table(Table::new()));
+    true
+  }
+
+  /// Set a value at path from a raw TOML string, with an optional inline comment.
+  /// The value string should be a valid TOML value (e.g., "true", "\"max\"", "[]").
+  pub fn set_raw_with_comment(&mut self, path: &str, toml_value: &str, comment: Option<&str>) -> RailResult<()> {
+    // Parse the value as a standalone TOML assignment to extract the Value
+    let parse_str = format!("__key__ = {}", toml_value);
+    let parsed: DocumentMut = parse_str
+      .parse()
+      .map_err(|e| RailError::message(format!("Invalid TOML value '{}': {}", toml_value, e)))?;
+
+    let mut value = parsed
+      .get("__key__")
+      .and_then(|i| i.as_value())
+      .ok_or_else(|| RailError::message(format!("Failed to extract value from '{}'", toml_value)))?
+      .clone();
+
+    // Add inline comment if provided
+    if let Some(c) = comment {
+      value.decor_mut().set_suffix(format!("  # {}", c));
+    }
+
+    self.set(path, value)
+  }
+
+  /// Check if document has been modified from original content
+  pub fn has_changes(&self) -> bool {
+    self.doc.to_string() != self.original_content
+  }
+
+  /// Get the original content before modifications
+  pub fn original_content(&self) -> &str {
+    &self.original_content
+  }
+
   /// Insert into array
   pub fn array_push(&mut self, path: &str, value: impl Into<Value>) -> RailResult<()> {
     let item = self
@@ -252,5 +303,60 @@ mod tests {
     let content = editor.doc.to_string();
     assert!(content.contains("\"me\""));
     assert!(content.contains("\"you\""));
+  }
+
+  #[test]
+  fn test_editor_hyphenated_section() {
+    let mut file = NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(file, "[package]\nname = \"test\"\n").unwrap();
+
+    let mut editor = TomlEditor::open(file.path()).unwrap();
+
+    // Ensure hyphenated section exists
+    editor.ensure_section("change-detection");
+
+    // Set a value in the hyphenated section
+    editor
+      .set_raw_with_comment(
+        "change-detection.infrastructure",
+        r#"[".github/**"]"#,
+        Some("test comment"),
+      )
+      .unwrap();
+
+    let content = editor.doc.to_string();
+    assert!(
+      content.contains("[change-detection]"),
+      "Should have [change-detection] section, got:\n{}",
+      content
+    );
+    assert!(
+      content.contains("infrastructure"),
+      "Should have infrastructure field, got:\n{}",
+      content
+    );
+  }
+
+  #[test]
+  fn test_editor_contains_path_hyphenated() {
+    let mut file = NamedTempFile::new().unwrap();
+    use std::io::Write;
+    write!(
+      file,
+      r#"[package]
+name = "test"
+
+[change-detection]
+infrastructure = [".github/**"]
+"#
+    )
+    .unwrap();
+
+    let editor = TomlEditor::open(file.path()).unwrap();
+
+    assert!(editor.contains_path("package.name"));
+    assert!(editor.contains_path("change-detection.infrastructure"));
+    assert!(!editor.contains_path("change-detection.custom"));
   }
 }

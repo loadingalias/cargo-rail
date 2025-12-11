@@ -11,6 +11,7 @@
 
 mod change_detection;
 mod release;
+pub mod schema;
 mod split;
 mod unify;
 

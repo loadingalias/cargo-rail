@@ -21,6 +21,9 @@ targets = [
   "aarch64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
   "x86_64-unknown-linux-gnu",
+  # Tier 2 (Common)
+  "aarch64-unknown-linux-musl",
+  "x86_64-unknown-linux-musl",
   # Other
   "aarch64-pc-windows-msvc",
 ]
@@ -40,6 +43,8 @@ detect_unused = true  # Detect unused dependencies (default: true)
 remove_unused = true  # Auto-remove unused deps when applying (default: true)
 max_backups = 2  # Number of backup files to keep (default: 3)
 prune_dead_features = true  # Remove features never enabled in resolved graph (default: true)
+msrv_source = "max"  # How to compute MSRV: deps, workspace, max (default: max)
+preserve_features = []  # Features to preserve from pruning (glob patterns)
 
 
 [release]

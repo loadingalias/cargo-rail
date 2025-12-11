@@ -78,9 +78,7 @@ Examples:
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
-  cargo rail unify undo --list            # List available backups
-  cargo rail unify sync --check           # Preview target sync
-  cargo rail unify sync                   # Re-detect and merge targets into rail.toml";
+  cargo rail unify undo --list            # List available backups";
 
 const SPLIT_HELP: &str = "\
 Examples:
@@ -128,7 +126,9 @@ Examples:
 const CONFIG_HELP: &str = "\
 Examples:
   cargo rail config validate            # Validate rail.toml
-  cargo rail config validate -f json    # JSON output for CI";
+  cargo rail config validate -f json    # JSON output for CI
+  cargo rail config sync --check        # Preview config updates
+  cargo rail config sync                # Add missing fields, sync targets";
 
 /// Available subcommands
 #[derive(Subcommand)]
@@ -303,6 +303,21 @@ pub enum ConfigCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
   },
+  /// Sync configuration: add missing fields and update targets
+  ///
+  /// Scans the workspace for target triples and adds any missing config
+  /// fields with their default values. Preserves all existing settings,
+  /// comments, and formatting.
+  ///
+  /// Use this after upgrading cargo-rail to get new configuration options.
+  Sync {
+    /// Preview changes without modifying rail.toml
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
 }
 
 /// Subcommands for `cargo rail unify`
@@ -316,16 +331,6 @@ pub enum UnifyCommand {
     /// Specific backup ID to restore (defaults to most recent)
     #[arg(long = "backup-id")]
     backup_id: Option<String>,
-  },
-  /// Re-detect and sync targets to rail.toml
-  ///
-  /// Scans workspace for target triples (rust-toolchain.toml, .cargo/config.toml, etc.)
-  /// and merges any new targets into your rail.toml configuration.
-  /// Preserves existing targets and all other settings.
-  Sync {
-    /// Preview changes without modifying rail.toml
-    #[arg(long, short = 'c')]
-    check: bool,
   },
 }
 
@@ -436,7 +441,7 @@ impl Commands {
         ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
       },
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format } => format.is_json_like(),
+        ConfigCommand::Validate { format } | ConfigCommand::Sync { format, .. } => format.is_json_like(),
       },
       _ => false,
     }
@@ -458,7 +463,7 @@ impl Commands {
       } => *format = OutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format } => *format = OutputFormat::Json,
+        ConfigCommand::Validate { format } | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
       },
       _ => {}
     }

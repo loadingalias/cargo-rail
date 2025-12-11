@@ -3,7 +3,7 @@
 //! This is intentionally thin - all logic lives in the library.
 //! See rules.md: "Thin main.rs" principle.
 
-use cargo_rail::commands::cli::UnifyCommand;
+use cargo_rail::commands::cli::{ConfigCommand, UnifyCommand};
 use cargo_rail::commands::{self, CargoCli, Commands};
 use cargo_rail::error::{RailError, print_error};
 use cargo_rail::workspace;
@@ -56,13 +56,12 @@ fn main() {
     return;
   }
 
-  // Handle unify sync specially - it only needs workspace root, not full metadata
-  if let Commands::Unify {
-    command: Some(UnifyCommand::Sync { check }),
-    ..
+  // Handle config sync specially - it only needs workspace root, not full metadata
+  if let Commands::Config {
+    command: ConfigCommand::Sync { check, format },
   } = cli.command
   {
-    if let Err(e) = commands::run_unify_sync(&workspace_root, check) {
+    if let Err(e) = commands::run_config_sync(&workspace_root, check, format) {
       exit_with_error(e);
     }
     return;

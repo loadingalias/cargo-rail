@@ -151,18 +151,17 @@ Usage: cargo rail unify [OPTIONS] [COMMAND]
 
 Commands:
   undo  Restore manifests from a previous backup
-  sync  Re-detect and sync targets to rail.toml
   help  Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-      --json
-          Output in JSON format (shorthand for -f json)
-
   -c, --check
           Dry-run mode: preview changes without modifying files
+
+      --json
+          Output in JSON format (shorthand for -f json)
 
   -f, --format <FORMAT>
           Output format
@@ -203,8 +202,6 @@ Examples:
   cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups
-  cargo rail unify sync --check           # Preview target sync
-  cargo rail unify sync                   # Re-detect and merge targets into rail.toml
 ```
 
 ---
@@ -223,34 +220,6 @@ Options:
       --json                   Output in JSON format (shorthand for -f json)
   -h, --help                   Print help
   -V, --version                Print version
-```
-
----
-
-### cargo rail unify sync
-
-```
-Re-detect and sync targets to rail.toml
-
-Scans workspace for target triples (rust-toolchain.toml, .cargo/config.toml, etc.) and merges any new targets into your rail.toml configuration. Preserves existing targets and all other settings.
-
-Usage: cargo rail unify sync [OPTIONS]
-
-Options:
-  -c, --check
-          Preview changes without modifying rail.toml
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output in JSON format (shorthand for -f json)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -704,6 +673,7 @@ Usage: cargo rail config [OPTIONS] <COMMAND>
 
 Commands:
   validate  Validate the configuration file
+  sync      Sync configuration: add missing fields and update targets
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -722,6 +692,8 @@ Options:
 Examples:
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
+  cargo rail config sync --check        # Preview config updates
+  cargo rail config sync                # Add missing fields, sync targets
 ```
 
 ---
@@ -750,6 +722,50 @@ Options:
 
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail config sync
+
+```
+Sync configuration: add missing fields and update targets
+
+Scans the workspace for target triples and adds any missing config fields with their default values. Preserves all existing settings, comments, and formatting.
+
+Use this after upgrading cargo-rail to get new configuration options.
+
+Usage: cargo rail config sync [OPTIONS]
+
+Options:
+  -c, --check
+          Preview changes without modifying rail.toml
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
 
       --json
           Output in JSON format (shorthand for -f json)
