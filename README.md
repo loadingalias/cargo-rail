@@ -121,8 +121,8 @@ Keep your workspace lean. Per target triple:
 ```bash
 cargo rail unify --check    # Preview (CI-safe, exits 1 if changes needed)
 cargo rail unify            # Apply changes
-cargo rail unify sync       # Re-detect targets after adding new platforms
 cargo rail unify undo       # Restore from backup
+cargo rail config sync      # Add missing config fields + sync targets
 ```
 
 What it does:

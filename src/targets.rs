@@ -68,7 +68,7 @@ pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> Rai
 
     if let Ok(content) = std::fs::read_to_string(&file_path) {
       for target in &canonical_targets {
-        if content.contains(target) {
+        if contains_target_match(&content, target) {
           found.insert(target.clone());
         }
       }
@@ -149,6 +149,59 @@ pub fn get_rust_target_list() -> RailResult<Vec<String>> {
   targets
     .clone()
     .ok_or_else(|| RailError::message("Failed to get target list from rustc. Ensure rustc is installed and in PATH."))
+}
+
+/// Check if content contains a target triple as a complete word/token
+///
+/// This avoids false positives like matching "thumbv7em-none-eabi" when the
+/// file only contains "thumbv7em-none-eabihf". Target triples in config files
+/// are typically surrounded by:
+/// - Whitespace
+/// - Quotes (single or double)
+/// - Brackets
+/// - Commas
+/// - Newlines
+/// - Start/end of string
+fn contains_target_match(content: &str, target: &str) -> bool {
+  // Find all occurrences of the target string
+  let mut start = 0;
+  while let Some(pos) = content[start..].find(target) {
+    let absolute_pos = start + pos;
+    let end_pos = absolute_pos + target.len();
+
+    // Check character before (if any)
+    let char_before = if absolute_pos > 0 {
+      content[..absolute_pos].chars().last()
+    } else {
+      None
+    };
+
+    // Check character after (if any)
+    let char_after = content[end_pos..].chars().next();
+
+    // A target triple character is: alphanumeric, hyphen, or underscore
+    // Note: Some targets have dots (e.g., "thumbv8m.main-none-eabi") but treating
+    // dots as target chars breaks TOML table detection like [target.x86_64-linux-gnu].
+    // Since dotted targets are rare (only thumbv8m.* variants) and must be quoted
+    // in TOML anyway, we treat dots as boundaries. This works because:
+    // - In arrays: "thumbv8m.main-none-eabi" - the target is quoted, boundaries are quotes
+    // - In tables: [target."thumbv8m.main-none-eabi"] - must be quoted due to the dot
+    let is_target_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+
+    // Valid boundary: start of string, or non-target character
+    let valid_before = char_before.is_none() || !is_target_char(char_before.unwrap());
+    // Valid boundary: end of string, or non-target character
+    let valid_after = char_after.is_none() || !is_target_char(char_after.unwrap());
+
+    if valid_before && valid_after {
+      return true;
+    }
+
+    // Move past this match to find next occurrence
+    start = absolute_pos + 1;
+  }
+
+  false
 }
 
 /// Recursively find all .toml files in workspace
@@ -620,5 +673,144 @@ jobs:
     fs::write(workflows_dir.join("README.md"), "# Workflows").unwrap();
 
     assert!(!has_github_workflows(temp.path()));
+  }
+
+  // ============================================================================
+  // Word Boundary Matching Tests
+  // ============================================================================
+
+  #[test]
+  fn test_contains_target_match_exact() {
+    assert!(contains_target_match("thumbv7em-none-eabihf", "thumbv7em-none-eabihf"));
+  }
+
+  #[test]
+  fn test_contains_target_match_quoted() {
+    assert!(contains_target_match(r#""thumbv7em-none-eabihf""#, "thumbv7em-none-eabihf"));
+    assert!(contains_target_match(r#"'thumbv7em-none-eabihf'"#, "thumbv7em-none-eabihf"));
+  }
+
+  #[test]
+  fn test_contains_target_match_in_array() {
+    let content = r#"targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]"#;
+    assert!(contains_target_match(content, "x86_64-unknown-linux-gnu"));
+    assert!(contains_target_match(content, "aarch64-apple-darwin"));
+  }
+
+  #[test]
+  fn test_contains_target_match_in_table_key() {
+    let content = r#"[target.thumbv7em-none-eabihf]
+linker = "arm-none-eabi-gcc""#;
+    assert!(contains_target_match(content, "thumbv7em-none-eabihf"));
+  }
+
+  #[test]
+  fn test_contains_target_match_rejects_substring() {
+    // This is the critical test - should NOT match shorter target when only longer exists
+    let content = r#"targets = ["thumbv7em-none-eabihf"]"#;
+
+    // Should match the actual target
+    assert!(contains_target_match(content, "thumbv7em-none-eabihf"));
+
+    // Should NOT match the shorter substring target
+    assert!(
+      !contains_target_match(content, "thumbv7em-none-eabi"),
+      "Should not match 'thumbv7em-none-eabi' when file only contains 'thumbv7em-none-eabihf'"
+    );
+  }
+
+  #[test]
+  fn test_contains_target_match_rejects_all_substring_cases() {
+    // Test several known substring cases from rustc target list
+    let test_cases = [
+      ("aarch64-apple-ios-sim", "aarch64-apple-ios"),
+      ("arm-unknown-linux-gnueabihf", "arm-unknown-linux-gnueabi"),
+      ("x86_64-unknown-linux-gnux32", "x86_64-unknown-linux-gnu"),
+      ("wasm32-wasip1-threads", "wasm32-wasip1"),
+      ("x86_64-pc-windows-gnullvm", "x86_64-pc-windows-gnu"),
+    ];
+
+    for (full_target, substring_target) in test_cases {
+      let content = format!(r#"targets = ["{}"]"#, full_target);
+      assert!(
+        contains_target_match(&content, full_target),
+        "Should match full target: {}",
+        full_target
+      );
+      assert!(
+        !contains_target_match(&content, substring_target),
+        "Should NOT match substring '{}' when file only contains '{}'",
+        substring_target,
+        full_target
+      );
+    }
+  }
+
+  #[test]
+  fn test_contains_target_match_allows_both_when_both_present() {
+    // When both the short and long target are in the file, both should match
+    let content = r#"targets = ["thumbv7em-none-eabi", "thumbv7em-none-eabihf"]"#;
+
+    assert!(contains_target_match(content, "thumbv7em-none-eabi"));
+    assert!(contains_target_match(content, "thumbv7em-none-eabihf"));
+  }
+
+  #[test]
+  fn test_contains_target_match_yaml_format() {
+    let content = r#"
+matrix:
+  target:
+    - x86_64-unknown-linux-gnu
+    - aarch64-apple-darwin
+"#;
+    assert!(contains_target_match(content, "x86_64-unknown-linux-gnu"));
+    assert!(contains_target_match(content, "aarch64-apple-darwin"));
+    // Should not false positive on similar targets
+    assert!(!contains_target_match(content, "x86_64-unknown-linux-gnux32"));
+  }
+
+  #[test]
+  fn test_contains_target_match_with_dots() {
+    // Targets like thumbv8m.main-none-eabi have dots in them.
+    // In TOML, these MUST be quoted because dots are path separators.
+    // So we test the quoted form which is what users would actually write.
+    let content = r#"[target."thumbv8m.main-none-eabihf"]"#;
+    assert!(contains_target_match(content, "thumbv8m.main-none-eabihf"));
+    assert!(!contains_target_match(content, "thumbv8m.main-none-eabi"));
+
+    // Also test in array form
+    let content2 = r#"targets = ["thumbv8m.main-none-eabihf"]"#;
+    assert!(contains_target_match(content2, "thumbv8m.main-none-eabihf"));
+    assert!(!contains_target_match(content2, "thumbv8m.main-none-eabi"));
+  }
+
+  #[test]
+  fn test_detect_targets_no_false_positives() {
+    let temp = TempDir::new().unwrap();
+
+    // Create a file with ONLY the longer target
+    fs::write(
+      temp.path().join("rust-toolchain.toml"),
+      r#"
+[toolchain]
+channel = "stable"
+targets = ["thumbv7em-none-eabihf"]
+"#,
+    )
+    .unwrap();
+
+    let targets = detect_targets(temp.path()).unwrap();
+
+    // Should find the actual target
+    assert!(
+      targets.contains(&"thumbv7em-none-eabihf".to_string()),
+      "Should detect thumbv7em-none-eabihf"
+    );
+
+    // Should NOT find the substring target
+    assert!(
+      !targets.contains(&"thumbv7em-none-eabi".to_string()),
+      "Should NOT detect thumbv7em-none-eabi (false positive)"
+    );
   }
 }
