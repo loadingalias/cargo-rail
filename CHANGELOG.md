@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/loadingalias/cargo-rail/compare/v0.3.0...v0.4.0) - 2025-12-11
+
+### 📦 Other Changes
+
+- cargo-rail: feat(config): add `cargo rail config sync` for config upgrades; add a new command that safely updates rail.toml when upgrading cargo-rail versions. ([e5cef6b](https://github.com/loadingalias/cargo-rail/commit/e5cef6bcef3444ddfd75dc5c7bee2c077fd235f6))
+
+
+
 ## [0.3.0](https://github.com/loadingalias/cargo-rail/compare/v0.2.2...v0.3.0) - 2025-12-11
 
 ### 🔧 Chores
