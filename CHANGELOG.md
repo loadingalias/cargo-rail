@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2](https://github.com/loadingalias/cargo-rail/compare/v0.4.1...v0.4.2) - 2025-12-11
+
+### 📦 Other Changes
+
+- cargo-rail: chore: .gitignore ([327ffec](https://github.com/loadingalias/cargo-rail/commit/327ffec58e6032cb6f1c2fb664e9e6bc67c9700d))
+- cargo-rail: fixing the lockfile issue in releases ([a02172e](https://github.com/loadingalias/cargo-rail/commit/a02172e8272f707de00b01c3c4f9f000c4984ce0))
+
+
+
 ## [0.4.1](https://github.com/loadingalias/cargo-rail/compare/v0.4.0...v0.4.1) - 2025-12-11
 
 ### 📦 Other Changes
