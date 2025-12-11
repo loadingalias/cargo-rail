@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.1](https://github.com/loadingalias/cargo-rail/compare/v0.4.0...v0.4.1) - 2025-12-11
+
+### 📦 Other Changes
+
+- cargo-rail: push lockfile (this is annoying and needs to be addressed); fixing the 'target' fuzzy matching w/ word boundaries - this prevents the false positives seen in Quiche testing ([bfac137](https://github.com/loadingalias/cargo-rail/commit/bfac137e546003822e639f49b8d89ffe17979996))
+- cargo-rail: push lockfile (this is annoying and needs to be addressed); fixing the 'target' fuzzy matching w/ word boundaries - this prevents the false positives seen in Quiche testing ([18497fa](https://github.com/loadingalias/cargo-rail/commit/18497fab10ffa69967525a9e2bc01660f8d6e567))
+
+
+
 ## [0.4.0](https://github.com/loadingalias/cargo-rail/compare/v0.3.0...v0.4.0) - 2025-12-11
 
 ### 📦 Other Changes
