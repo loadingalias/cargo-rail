@@ -27,9 +27,6 @@ ci-check:
     cargo audit
     @echo "✅ CI checks passed!"
 
-waste:
-    cargo +nightly udeps --workspace --all-targets --all-features
-
 update:
     cargo update --workspace
     cargo upgrade --recursive
