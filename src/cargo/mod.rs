@@ -26,6 +26,6 @@ pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MsrvSourceUs
 pub use unify_analyzer::UnifyAnalyzer;
 pub use unify_report::UnifyReport;
 pub use unify_types::{
-  DuplicateCleanup, IssueSeverity, MemberEdit, OptionalFeature, PrunedFeature, TransitivePin, UnificationPlan,
-  UnifiedDep, UnifyIssue, UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
+  DuplicateCleanup, IssueSeverity, MemberEdit, OptionalFeature, PrunedFeature, TransitivePin, UndeclaredFeature,
+  UnificationPlan, UnifiedDep, UnifyIssue, UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
 };

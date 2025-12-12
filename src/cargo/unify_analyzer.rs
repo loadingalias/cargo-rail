@@ -9,8 +9,8 @@ use crate::cargo::{
   unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, UnificationPlan, UnifiedDep, UnifyIssue, ValidationResult,
-    VersionMismatch,
+    DuplicateCleanup, IssueSeverity, MemberEdit, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyIssue,
+    ValidationResult, VersionMismatch,
   },
 };
 use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
@@ -473,6 +473,56 @@ impl UnifyAnalyzer {
       member_edits.entry(crate_name).or_default().extend(edits);
     }
 
+    // === Detect undeclared features ===
+    // Find cases where a crate uses features that it didn't declare in Cargo.toml
+    // This happens when Cargo's feature unification "borrows" features from other members
+    let undeclared_features = if self.config.detect_undeclared_features {
+      progress!("Checking for undeclared feature dependencies...");
+      self.detect_undeclared_features()
+    } else {
+      Vec::new()
+    };
+
+    // Generate fixes or warnings for undeclared features
+    if self.config.fix_undeclared_features && !undeclared_features.is_empty() {
+      progress!(
+        "Generating fixes for {} undeclared feature issues...",
+        undeclared_features.len()
+      );
+      for uf in &undeclared_features {
+        let edit = MemberEdit::AddFeatures {
+          dep_name: uf.dep_name.clone(),
+          dep_kind: uf.dep_kind,
+          target: uf.target.clone(),
+          features_to_add: uf.undeclared_features.clone(),
+        };
+        member_edits.entry(uf.member.clone()).or_default().push(edit);
+      }
+    } else {
+      // Add issues for undeclared features (warn mode)
+      for uf in &undeclared_features {
+        issues.push(UnifyIssue {
+          dep_name: uf.dep_name.clone(),
+          severity: IssueSeverity::Warning,
+          message: format!(
+            "{} uses {} features [{}] but only declares [{}]. \
+             This crate relies on feature unification from other workspace members. \
+             After unification, standalone builds will fail. \
+             Fix: Add the missing features to {}'s Cargo.toml.",
+            uf.member,
+            uf.dep_name,
+            uf.undeclared_features.join(", "),
+            if uf.declared_features.is_empty() {
+              "none".to_string()
+            } else {
+              uf.declared_features.join(", ")
+            },
+            uf.member,
+          ),
+        });
+      }
+    }
+
     // Run validation
     let validation_results = self.validate_targets()?;
 
@@ -489,6 +539,7 @@ impl UnifyAnalyzer {
       optional_features,
       version_mismatches,
       unused_deps,
+      undeclared_features,
     })
   }
 
@@ -533,5 +584,96 @@ impl UnifyAnalyzer {
           .join(", ")
       )
     }
+  }
+
+  /// Detect dependencies where resolved features exceed declared features
+  ///
+  /// This catches cases where a crate relies on Cargo's feature unification to
+  /// "borrow" features from other workspace members. After workspace dependency
+  /// unification, standalone builds (cargo test -p <crate>) will fail because
+  /// the borrowed features are no longer available.
+  ///
+  /// Example:
+  /// - crate A declares: `backoff = "0.4"` (no features)
+  /// - crate B declares: `backoff = { version = "0.4", features = ["tokio"] }`
+  /// - crate A uses `backoff::future::retry()` which requires `features = ["futures"]`
+  /// - When building the whole workspace, A gets `futures` from B via unification
+  /// - After unification, A's standalone build fails
+  fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
+    let mut undeclared = Vec::new();
+
+    // Common features that are typically not actionable:
+    // - "default", "std" - usually implicit
+    // - Internal features like "*_backend", "*_impl" - implementation details
+    let should_skip_feature = |f: &str| -> bool {
+      f == "default" || f == "std" || f == "alloc" || f.ends_with("_backend") || f.ends_with("_impl")
+    };
+
+    // Build a map of what each member explicitly declares for each dependency
+    // We want to find cases where member A would need a feature that ONLY comes from member B
+    let mut member_declared_features: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+
+    for member in &self.manifests.members {
+      let mut dep_features: HashMap<String, HashSet<String>> = HashMap::new();
+      for (dep_key, usage) in &member.dependencies {
+        let mut feats: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
+        // If default_features = true (default), add "default"
+        if usage.default_features {
+          feats.insert("default".to_string());
+        }
+        dep_features.insert(dep_key.name.to_string(), feats);
+      }
+      member_declared_features.insert(member.package_name.clone(), dep_features);
+    }
+
+    // Compute the unified features (what will end up in workspace.dependencies)
+    // This is the UNION of all declared features across all members
+    let mut unified_features: HashMap<String, HashSet<String>> = HashMap::new();
+    for dep_features in member_declared_features.values() {
+      for (dep_name, features) in dep_features {
+        unified_features
+          .entry(dep_name.clone())
+          .or_default()
+          .extend(features.iter().cloned());
+      }
+    }
+
+    // Now check: for each member, are there features in unified that it doesn't declare?
+    // These are features "borrowed" from other workspace members
+    for member in &self.manifests.members {
+      for (dep_key, usage) in &member.dependencies {
+        let Some(unified) = unified_features.get(&*dep_key.name) else {
+          continue;
+        };
+
+        // Get declared features from this member's Cargo.toml
+        let mut declared: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
+        if usage.default_features {
+          declared.insert("default".to_string());
+        }
+
+        // Find features that are unified but not declared by this member
+        // These are features this member will lose access to after unification
+        let borrowed: Vec<String> = unified
+          .difference(&declared)
+          .filter(|f| !should_skip_feature(f))
+          .cloned()
+          .collect();
+
+        if !borrowed.is_empty() {
+          undeclared.push(UndeclaredFeature {
+            member: member.package_name.clone(),
+            dep_name: dep_key.name.to_string(),
+            undeclared_features: borrowed,
+            declared_features: declared.into_iter().collect(),
+            resolved_features: unified.iter().cloned().collect(),
+            dep_kind: usage.kind,
+            target: usage.target.clone(),
+          });
+        }
+      }
+    }
+
+    undeclared
   }
 }

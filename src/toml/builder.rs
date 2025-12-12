@@ -190,6 +190,18 @@ impl RailConfigBuilder {
       ));
     }
 
+    // Detect undeclared features
+    content.push_str(&format!(
+      "detect_undeclared_features = {}  # Detect features borrowed via Cargo unification (default: true)\n",
+      config.detect_undeclared_features
+    ));
+
+    // Auto-fix undeclared features
+    content.push_str(&format!(
+      "fix_undeclared_features = {}  # Auto-fix borrowed features by adding them to Cargo.toml (default: true)\n",
+      config.fix_undeclared_features
+    ));
+
     self.sections.push(format!("[unify]\n{}\n", content));
 
     self

@@ -65,6 +65,17 @@ pub enum MemberEdit {
     /// Name of the feature to remove
     feature_name: String,
   },
+  /// Add missing features to a dependency (fix undeclared feature borrowing)
+  AddFeatures {
+    /// Name of the dependency to update
+    dep_name: String,
+    /// Type of dependency (normal, dev, build)
+    dep_kind: DepKind,
+    /// Target platform constraint (if in target-specific section)
+    target: Option<String>,
+    /// Features to add to the dependency
+    features_to_add: Vec<String>,
+  },
 }
 
 /// Issue that prevents or warns about unification
@@ -180,6 +191,29 @@ pub struct TransitivePin {
   pub features: Vec<String>,
 }
 
+/// Record of a feature that is used at runtime but not declared in Cargo.toml
+///
+/// This happens when a crate relies on Cargo's feature unification to "borrow"
+/// features from another crate in the workspace. After unification, standalone
+/// builds of that crate will fail because the borrowed feature is no longer available.
+#[derive(Debug, Clone)]
+pub struct UndeclaredFeature {
+  /// Member crate that uses the undeclared feature
+  pub member: String,
+  /// Dependency name
+  pub dep_name: String,
+  /// Features that are resolved (enabled at runtime) but not declared
+  pub undeclared_features: Vec<String>,
+  /// Features that were declared in Cargo.toml
+  pub declared_features: Vec<String>,
+  /// Features from the resolved dependency graph
+  pub resolved_features: Vec<String>,
+  /// Kind of dependency (normal, dev, build)
+  pub dep_kind: DepKind,
+  /// Target platform constraint (if in target-specific section)
+  pub target: Option<String>,
+}
+
 // ============================================================================
 // UnificationPlan
 // ============================================================================
@@ -212,6 +246,9 @@ pub struct UnificationPlan {
   pub version_mismatches: Vec<VersionMismatch>,
   /// Unused dependencies detected in workspace members
   pub unused_deps: Vec<UnusedDep>,
+  /// Undeclared features detected (resolved > declared)
+  /// These indicate crates relying on feature unification from other workspace members
+  pub undeclared_features: Vec<UndeclaredFeature>,
 }
 
 impl UnificationPlan {
@@ -246,11 +283,13 @@ impl UnificationPlan {
 
     // Show member edits (deps being converted to workspace = true)
     if !self.member_edits.is_empty() {
-      // Collect unique dep names being converted, removed deps, and removed features
+      // Collect unique dep names being converted, removed deps, removed features, and added features
       let mut converted_deps: HashSet<String> = HashSet::new();
       let mut removed_deps: HashSet<String> = HashSet::new();
       let mut removed_features: HashSet<String> = HashSet::new();
-      for edits in self.member_edits.values() {
+      let mut features_added_count = 0usize;
+      let mut features_added_crates: HashSet<String> = HashSet::new();
+      for (member_name, edits) in &self.member_edits {
         for edit in edits {
           match edit {
             MemberEdit::UseWorkspace { dep_name, .. } => {
@@ -261,6 +300,10 @@ impl UnificationPlan {
             }
             MemberEdit::RemoveFeature { feature_name } => {
               removed_features.insert(feature_name.clone());
+            }
+            MemberEdit::AddFeatures { features_to_add, .. } => {
+              features_added_count += features_to_add.len();
+              features_added_crates.insert(member_name.clone());
             }
           }
         }
@@ -287,6 +330,16 @@ impl UnificationPlan {
         for dep_name in &removed_deps {
           s.push_str(&format!("  - {}\n", dep_name));
         }
+        s.push('\n');
+      }
+
+      // Show features being added (undeclared feature fixes)
+      if features_added_count > 0 {
+        s.push_str(&format!(
+          "Undeclared features to fix: {} features across {} crates\n",
+          features_added_count,
+          features_added_crates.len()
+        ));
         s.push('\n');
       }
     }
@@ -415,6 +468,383 @@ impl UnificationPlan {
       }
     }
 
+    // Show undeclared features - only as warnings if NOT being auto-fixed
+    // Check if we have AddFeatures edits (which means fix_undeclared_features is enabled)
+    let has_feature_fixes = self
+      .member_edits
+      .values()
+      .any(|edits| edits.iter().any(|e| matches!(e, MemberEdit::AddFeatures { .. })));
+
+    if !self.undeclared_features.is_empty() && !has_feature_fixes {
+      // Warn mode: show all undeclared features as warnings
+      s.push_str(&format!(
+        "\n⚠️  Undeclared features detected (will break standalone builds): {}\n",
+        self.undeclared_features.len()
+      ));
+      for uf in &self.undeclared_features {
+        s.push_str(&format!(
+          "  - {} in {}: needs features [{}] but only declares [{}]\n",
+          uf.dep_name,
+          uf.member,
+          uf.undeclared_features.join(", "),
+          uf.declared_features.join(", ")
+        ));
+      }
+      s.push_str("  These crates rely on feature unification from other workspace members.\n");
+      s.push_str("  After unification, standalone builds (cargo test -p <crate>) will fail.\n");
+      s.push_str("  Fix: Set fix_undeclared_features = true in rail.toml to auto-fix.\n");
+    }
+
     s
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_member_edit_add_features_struct() {
+    let edit = MemberEdit::AddFeatures {
+      dep_name: "serde".to_string(),
+      dep_kind: DepKind::Normal,
+      target: None,
+      features_to_add: vec!["derive".to_string(), "std".to_string()],
+    };
+
+    match edit {
+      MemberEdit::AddFeatures {
+        dep_name,
+        dep_kind,
+        target,
+        features_to_add,
+      } => {
+        assert_eq!(dep_name, "serde");
+        assert_eq!(dep_kind, DepKind::Normal);
+        assert!(target.is_none());
+        assert_eq!(features_to_add.len(), 2);
+        assert!(features_to_add.contains(&"derive".to_string()));
+      }
+      _ => panic!("Expected AddFeatures variant"),
+    }
+  }
+
+  #[test]
+  fn test_member_edit_add_features_with_target() {
+    let edit = MemberEdit::AddFeatures {
+      dep_name: "libc".to_string(),
+      dep_kind: DepKind::Normal,
+      target: Some("cfg(unix)".to_string()),
+      features_to_add: vec!["extra_traits".to_string()],
+    };
+
+    match edit {
+      MemberEdit::AddFeatures { target, .. } => {
+        assert_eq!(target, Some("cfg(unix)".to_string()));
+      }
+      _ => panic!("Expected AddFeatures variant"),
+    }
+  }
+
+  #[test]
+  fn test_member_edit_add_features_dev_dependency() {
+    let edit = MemberEdit::AddFeatures {
+      dep_name: "tokio".to_string(),
+      dep_kind: DepKind::Dev,
+      target: None,
+      features_to_add: vec!["rt-multi-thread".to_string(), "macros".to_string()],
+    };
+
+    match edit {
+      MemberEdit::AddFeatures { dep_kind, .. } => {
+        assert_eq!(dep_kind, DepKind::Dev);
+      }
+      _ => panic!("Expected AddFeatures variant"),
+    }
+  }
+
+  #[test]
+  fn test_member_edit_add_features_build_dependency() {
+    let edit = MemberEdit::AddFeatures {
+      dep_name: "cc".to_string(),
+      dep_kind: DepKind::Build,
+      target: None,
+      features_to_add: vec!["parallel".to_string()],
+    };
+
+    match edit {
+      MemberEdit::AddFeatures { dep_kind, .. } => {
+        assert_eq!(dep_kind, DepKind::Build);
+      }
+      _ => panic!("Expected AddFeatures variant"),
+    }
+  }
+
+  // ============================================================================
+  // UndeclaredFeature Tests
+  // ============================================================================
+
+  #[test]
+  fn test_undeclared_feature_struct() {
+    let uf = UndeclaredFeature {
+      member: "my-crate".to_string(),
+      dep_name: "backoff".to_string(),
+      undeclared_features: vec!["futures".to_string(), "tokio".to_string()],
+      declared_features: vec!["default".to_string()],
+      resolved_features: vec!["default".to_string(), "futures".to_string(), "tokio".to_string()],
+      dep_kind: DepKind::Normal,
+      target: None,
+    };
+
+    assert_eq!(uf.member, "my-crate");
+    assert_eq!(uf.dep_name, "backoff");
+    assert_eq!(uf.undeclared_features.len(), 2);
+    assert_eq!(uf.declared_features.len(), 1);
+    assert_eq!(uf.resolved_features.len(), 3);
+    assert_eq!(uf.dep_kind, DepKind::Normal);
+    assert!(uf.target.is_none());
+  }
+
+  #[test]
+  fn test_undeclared_feature_with_target() {
+    let uf = UndeclaredFeature {
+      member: "platform-crate".to_string(),
+      dep_name: "libc".to_string(),
+      undeclared_features: vec!["extra_traits".to_string()],
+      declared_features: vec![],
+      resolved_features: vec!["extra_traits".to_string()],
+      dep_kind: DepKind::Normal,
+      target: Some("cfg(unix)".to_string()),
+    };
+
+    assert_eq!(uf.target, Some("cfg(unix)".to_string()));
+  }
+
+  #[test]
+  fn test_undeclared_feature_dev_dependency() {
+    let uf = UndeclaredFeature {
+      member: "test-crate".to_string(),
+      dep_name: "tokio".to_string(),
+      undeclared_features: vec!["macros".to_string()],
+      declared_features: vec!["rt".to_string()],
+      resolved_features: vec!["rt".to_string(), "macros".to_string()],
+      dep_kind: DepKind::Dev,
+      target: None,
+    };
+
+    assert_eq!(uf.dep_kind, DepKind::Dev);
+  }
+
+  // ============================================================================
+  // UnificationPlan Summary Tests
+  // ============================================================================
+
+  #[test]
+  fn test_summary_with_add_features_edit() {
+    let mut plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![],
+    };
+
+    // Add a MemberEdit::AddFeatures
+    plan.member_edits.insert(
+      "test-crate".to_string(),
+      vec![MemberEdit::AddFeatures {
+        dep_name: "serde".to_string(),
+        dep_kind: DepKind::Normal,
+        target: None,
+        features_to_add: vec!["derive".to_string()],
+      }],
+    );
+
+    let summary = plan.summary();
+    assert!(summary.contains("Undeclared features to fix: 1 features across 1 crates"));
+  }
+
+  #[test]
+  fn test_summary_with_multiple_add_features_edits() {
+    let mut plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![],
+    };
+
+    // Add multiple AddFeatures edits
+    plan.member_edits.insert(
+      "crate-a".to_string(),
+      vec![
+        MemberEdit::AddFeatures {
+          dep_name: "serde".to_string(),
+          dep_kind: DepKind::Normal,
+          target: None,
+          features_to_add: vec!["derive".to_string(), "std".to_string()],
+        },
+        MemberEdit::AddFeatures {
+          dep_name: "tokio".to_string(),
+          dep_kind: DepKind::Normal,
+          target: None,
+          features_to_add: vec!["rt".to_string()],
+        },
+      ],
+    );
+    plan.member_edits.insert(
+      "crate-b".to_string(),
+      vec![MemberEdit::AddFeatures {
+        dep_name: "backoff".to_string(),
+        dep_kind: DepKind::Normal,
+        target: None,
+        features_to_add: vec!["futures".to_string()],
+      }],
+    );
+
+    let summary = plan.summary();
+    // 2 + 1 + 1 = 4 features across 2 crates
+    assert!(summary.contains("Undeclared features to fix: 4 features across 2 crates"));
+  }
+
+  #[test]
+  fn test_summary_undeclared_warning_when_no_fixes() {
+    let plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![UndeclaredFeature {
+        member: "my-crate".to_string(),
+        dep_name: "backoff".to_string(),
+        undeclared_features: vec!["futures".to_string()],
+        declared_features: vec![],
+        resolved_features: vec!["futures".to_string()],
+        dep_kind: DepKind::Normal,
+        target: None,
+      }],
+    };
+
+    // No AddFeatures edits = warn mode
+    let summary = plan.summary();
+    assert!(summary.contains("⚠️  Undeclared features detected"));
+    assert!(summary.contains("fix_undeclared_features = true"));
+  }
+
+  #[test]
+  fn test_summary_no_undeclared_warning_when_fixes_present() {
+    let mut plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![UndeclaredFeature {
+        member: "my-crate".to_string(),
+        dep_name: "backoff".to_string(),
+        undeclared_features: vec!["futures".to_string()],
+        declared_features: vec![],
+        resolved_features: vec!["futures".to_string()],
+        dep_kind: DepKind::Normal,
+        target: None,
+      }],
+    };
+
+    // Add a fix
+    plan.member_edits.insert(
+      "my-crate".to_string(),
+      vec![MemberEdit::AddFeatures {
+        dep_name: "backoff".to_string(),
+        dep_kind: DepKind::Normal,
+        target: None,
+        features_to_add: vec!["futures".to_string()],
+      }],
+    );
+
+    let summary = plan.summary();
+    // Should NOT show the warning since we have fixes
+    assert!(!summary.contains("⚠️  Undeclared features detected"));
+    // Should show the fix count
+    assert!(summary.contains("Undeclared features to fix: 1 features across 1 crates"));
+  }
+
+  #[test]
+  fn test_member_edit_clone() {
+    let edit = MemberEdit::AddFeatures {
+      dep_name: "test".to_string(),
+      dep_kind: DepKind::Normal,
+      target: Some("cfg(test)".to_string()),
+      features_to_add: vec!["a".to_string(), "b".to_string()],
+    };
+
+    let cloned = edit.clone();
+    match (edit, cloned) {
+      (
+        MemberEdit::AddFeatures {
+          dep_name: a,
+          features_to_add: fa,
+          ..
+        },
+        MemberEdit::AddFeatures {
+          dep_name: b,
+          features_to_add: fb,
+          ..
+        },
+      ) => {
+        assert_eq!(a, b);
+        assert_eq!(fa, fb);
+      }
+      _ => panic!("Expected AddFeatures"),
+    }
+  }
+
+  #[test]
+  fn test_undeclared_feature_clone() {
+    let uf = UndeclaredFeature {
+      member: "test".to_string(),
+      dep_name: "dep".to_string(),
+      undeclared_features: vec!["f1".to_string()],
+      declared_features: vec!["f2".to_string()],
+      resolved_features: vec!["f1".to_string(), "f2".to_string()],
+      dep_kind: DepKind::Dev,
+      target: Some("cfg(windows)".to_string()),
+    };
+
+    let cloned = uf.clone();
+    assert_eq!(uf.member, cloned.member);
+    assert_eq!(uf.dep_name, cloned.dep_name);
+    assert_eq!(uf.undeclared_features, cloned.undeclared_features);
+    assert_eq!(uf.target, cloned.target);
   }
 }

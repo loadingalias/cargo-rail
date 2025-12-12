@@ -263,4 +263,89 @@ impl ManifestWriter {
 
     Ok(())
   }
+
+  /// Add features to an existing dependency in a member's Cargo.toml
+  ///
+  /// This is used to fix undeclared feature dependencies - when a crate relies on
+  /// Cargo's feature unification to "borrow" features from other workspace members.
+  ///
+  /// # Arguments
+  /// * `member_toml_path` - Path to the member's Cargo.toml
+  /// * `dep_name` - Name of the dependency to update
+  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
+  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
+  /// * `features_to_add` - Features to add to the dependency
+  pub fn add_features(
+    &self,
+    member_toml_path: &Path,
+    dep_name: &str,
+    dep_kind: DepKind,
+    target: Option<&str>,
+    features_to_add: &[String],
+  ) -> RailResult<()> {
+    // Read member Cargo.toml
+    let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
+
+    // Get section name from kind
+    let kind_section = self.dep_kind_to_section(dep_kind);
+
+    // Handle target-specific vs regular sections
+    let dep_item = if let Some(target_cfg) = target {
+      // Target-specific: look in [target.'cfg(...)'.dependencies]
+      let path = format!("target.{}.{}", target_cfg, kind_section);
+      let table = manifest_ops::get_or_create_table(&mut doc, &path)?;
+      table.get_mut(dep_name)
+    } else {
+      // Regular section
+      doc
+        .get_mut(kind_section)
+        .and_then(|t| t.as_table_mut())
+        .and_then(|t| t.get_mut(dep_name))
+    };
+
+    let Some(dep_item) = dep_item else {
+      // Dependency not found in manifest - skip silently
+      // This can legitimately happen with:
+      // - Renamed dependencies (package = "other-name")
+      // - Target-specific deps where the target section doesn't exist
+      // - Dependencies that were already converted to workspace = true
+      return Ok(());
+    };
+
+    // Get existing features (if any)
+    let mut existing_features: Vec<String> = manifest_ops::extract_features(dep_item).unwrap_or_default();
+
+    // Add new features (dedup)
+    for feature in features_to_add {
+      if !existing_features.contains(feature) {
+        existing_features.push(feature.clone());
+      }
+    }
+
+    // Sort for consistency
+    existing_features.sort();
+
+    // Update the dependency entry
+    // If it's a simple string like `serde = "1.0"`, we need to convert it to a table
+    if dep_item.is_str() {
+      // Convert simple string (e.g., `dep = "1.0"`) to inline table with features
+      let version = dep_item
+        .as_str()
+        .expect("dep_item.is_str() was true but as_str() returned None")
+        .to_string();
+      let mut inline_table = toml_edit::InlineTable::new();
+      inline_table.insert("version", toml_edit::Value::from(version));
+      inline_table.insert("features", manifest_ops::build_feature_array(&existing_features));
+      *dep_item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline_table));
+    } else {
+      // Already a table, just update features
+      manifest_ops::set_features(dep_item, existing_features)?;
+    }
+
+    // Format and write
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(member_toml_path, &doc)?;
+
+    Ok(())
+  }
 }

@@ -170,6 +170,33 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, show_diff: bool, format: Output
           crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
             println!("  [features] {} -> REMOVE (dead/empty)", feature_name);
           }
+          crate::cargo::MemberEdit::AddFeatures {
+            dep_name,
+            dep_kind,
+            target,
+            features_to_add,
+          } => {
+            let section = match (dep_kind, target) {
+              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
+              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
+              (_, None) => "[dependencies]".to_string(),
+              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
+              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
+              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
+            };
+            let mut sorted_features = features_to_add.clone();
+            sorted_features.sort();
+            println!(
+              "  {} {} -> ADD features [{}]",
+              section,
+              dep_name,
+              sorted_features
+                .iter()
+                .map(|f| format!("\"{}\"", f))
+                .collect::<Vec<_>>()
+                .join(", ")
+            );
+          }
         }
       }
       println!();
@@ -322,6 +349,14 @@ pub fn run_unify_apply(
         crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
           writer.remove_feature(member_path, feature_name)?;
         }
+        crate::cargo::MemberEdit::AddFeatures {
+          dep_name,
+          dep_kind,
+          target,
+          features_to_add,
+        } => {
+          writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
+        }
       }
     }
   }
@@ -422,6 +457,33 @@ pub fn run_unify_apply(
     println!(
       "  {} optional features detected (user-facing, preserved)",
       plan.optional_features.len()
+    );
+  }
+  // Count undeclared feature fixes
+  let features_fixed: usize = plan
+    .member_edits
+    .values()
+    .flat_map(|edits| edits.iter())
+    .filter_map(|e| match e {
+      crate::cargo::MemberEdit::AddFeatures { features_to_add, .. } => Some(features_to_add.len()),
+      _ => None,
+    })
+    .sum();
+  if features_fixed > 0 {
+    let crates_fixed: std::collections::HashSet<_> = plan
+      .member_edits
+      .iter()
+      .filter(|(_, edits)| {
+        edits
+          .iter()
+          .any(|e| matches!(e, crate::cargo::MemberEdit::AddFeatures { .. }))
+      })
+      .map(|(name, _)| name)
+      .collect();
+    println!(
+      "  {} undeclared features fixed across {} crates",
+      features_fixed,
+      crates_fixed.len()
     );
   }
   if let Some(ref msrv) = plan.computed_msrv {

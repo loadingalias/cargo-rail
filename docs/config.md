@@ -107,6 +107,8 @@ Controls workspace dependency unification behavior. All options are optional wit
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
 | `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
 | `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
+| `detect_undeclared_features` | `bool` | `true` | Detect crates that rely on Cargo's feature unification to "borrow" features from other workspace members. These crates will fail when built standalone after unification. Reports as warnings (or auto-fixes if `fix_undeclared_features` is enabled). |
+| `fix_undeclared_features` | `bool` | `true` | Auto-fix undeclared feature dependencies by adding missing features to each crate's Cargo.toml. Produces a cleaner graph where standalone builds work correctly. Requires `detect_undeclared_features = true`. |
 | `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. Set to `0` to disable backup creation entirely. |
 
 **Example:**
@@ -119,6 +121,8 @@ detect_unused = true
 remove_unused = true
 prune_dead_features = true
 preserve_features = ["future-api", "unstable-*"]  # Keep these from pruning
+detect_undeclared_features = true  # Catch borrowed features
+fix_undeclared_features = true    # Auto-fix them (default)
 max_backups = 5
 ```
 

@@ -97,6 +97,21 @@ pub struct UnifyConfig {
   /// from member Cargo.toml files during unify.
   #[serde(default = "default_true")]
   pub remove_unused: bool,
+
+  /// Detect undeclared feature dependencies (default: true)
+  /// When enabled, compares resolved features against declared features in Cargo.toml
+  /// to find crates that rely on Cargo's feature unification to "borrow" features
+  /// from other workspace members. After unification, standalone builds of these
+  /// crates will fail. Reports as warnings to help fix before unification.
+  #[serde(default = "default_true")]
+  pub detect_undeclared_features: bool,
+
+  /// Auto-fix undeclared feature dependencies (default: true)
+  /// When enabled (and detect_undeclared_features is true), automatically adds
+  /// missing features to each crate's Cargo.toml instead of just warning.
+  /// This produces a cleaner graph where standalone builds work correctly.
+  #[serde(default = "default_true")]
+  pub fix_undeclared_features: bool,
 }
 
 impl Default for UnifyConfig {
@@ -118,6 +133,8 @@ impl Default for UnifyConfig {
       major_version_conflict: MajorVersionConflict::default(),
       detect_unused: true,
       remove_unused: true,
+      detect_undeclared_features: true,
+      fix_undeclared_features: true,
     }
   }
 }
@@ -707,5 +724,86 @@ mod tests {
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.msrv);
     assert_eq!(config.msrv_source, MsrvSource::Deps);
+  }
+
+  #[test]
+  fn test_detect_undeclared_features_default() {
+    let config = UnifyConfig::default();
+    assert!(config.detect_undeclared_features); // Default: true
+  }
+
+  #[test]
+  fn test_fix_undeclared_features_default() {
+    let config = UnifyConfig::default();
+    assert!(config.fix_undeclared_features); // Default: true
+  }
+
+  #[test]
+  fn test_detect_undeclared_features_parsing_true() {
+    let toml = r#"detect_undeclared_features = true"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.detect_undeclared_features);
+  }
+
+  #[test]
+  fn test_detect_undeclared_features_parsing_false() {
+    let toml = r#"detect_undeclared_features = false"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.detect_undeclared_features);
+  }
+
+  #[test]
+  fn test_fix_undeclared_features_parsing_true() {
+    let toml = r#"fix_undeclared_features = true"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.fix_undeclared_features);
+  }
+
+  #[test]
+  fn test_fix_undeclared_features_parsing_false() {
+    let toml = r#"fix_undeclared_features = false"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.fix_undeclared_features);
+  }
+
+  #[test]
+  fn test_undeclared_features_both_options() {
+    let toml = r#"
+      detect_undeclared_features = true
+      fix_undeclared_features = false
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.detect_undeclared_features);
+    assert!(!config.fix_undeclared_features);
+  }
+
+  #[test]
+  fn test_undeclared_features_with_other_options() {
+    let toml = r#"
+      detect_unused = true
+      remove_unused = true
+      detect_undeclared_features = true
+      fix_undeclared_features = true
+      prune_dead_features = false
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.detect_unused);
+    assert!(config.remove_unused);
+    assert!(config.detect_undeclared_features);
+    assert!(config.fix_undeclared_features);
+    assert!(!config.prune_dead_features);
+  }
+
+  #[test]
+  fn test_undeclared_features_detect_disabled_fix_enabled() {
+    // Edge case: fix enabled but detect disabled
+    // This is a valid config but fix won't do anything if detect is off
+    let toml = r#"
+      detect_undeclared_features = false
+      fix_undeclared_features = true
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.detect_undeclared_features);
+    assert!(config.fix_undeclared_features);
   }
 }
