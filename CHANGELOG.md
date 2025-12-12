@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/loadingalias/cargo-rail/compare/v0.5.0...v0.5.1) - 2025-12-12
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the schema issue; cleaning petgraph features manually ([aabd8a5](https://github.com/loadingalias/cargo-rail/commit/aabd8a5289e6e4ef8d30e0a59e6c7c95984e7027))
+
+
+
 ## [0.5.0](https://github.com/loadingalias/cargo-rail/compare/v0.4.2...v0.5.0) - 2025-12-12
 
 ### 📦 Other Changes
