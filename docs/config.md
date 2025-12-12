@@ -109,6 +109,7 @@ Controls workspace dependency unification behavior. All options are optional wit
 | `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
 | `detect_undeclared_features` | `bool` | `true` | Detect crates that rely on Cargo's feature unification to "borrow" features from other workspace members. These crates will fail when built standalone after unification. Reports as warnings (or auto-fixes if `fix_undeclared_features` is enabled). |
 | `fix_undeclared_features` | `bool` | `true` | Auto-fix undeclared feature dependencies by adding missing features to each crate's Cargo.toml. Produces a cleaner graph where standalone builds work correctly. Requires `detect_undeclared_features = true`. |
+| `skip_undeclared_patterns` | `string[]` | `["default", "std", "alloc", "*_backend", "*_impl"]` | Patterns for features to skip in undeclared feature detection. Supports glob patterns. Default patterns filter out features that are typically not actionable (standard library features, internal implementation details). |
 | `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. Set to `0` to disable backup creation entirely. |
 
 **Example:**
@@ -123,6 +124,7 @@ prune_dead_features = true
 preserve_features = ["future-api", "unstable-*"]  # Keep these from pruning
 detect_undeclared_features = true  # Catch borrowed features
 fix_undeclared_features = true    # Auto-fix them (default)
+skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]  # Features to skip
 max_backups = 5
 ```
 
@@ -470,6 +472,9 @@ detect_unused = true
 remove_unused = true
 prune_dead_features = true
 preserve_features = []  # Glob patterns: ["unstable-*", "future-api"]
+detect_undeclared_features = true  # Catch borrowed features
+fix_undeclared_features = true     # Auto-fix them
+skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]
 max_backups = 3
 
 # Version handling

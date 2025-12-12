@@ -202,6 +202,16 @@ impl RailConfigBuilder {
       config.fix_undeclared_features
     ));
 
+    // Skip patterns for undeclared features
+    if config.skip_undeclared_patterns.is_empty() {
+      content.push_str("skip_undeclared_patterns = []  # Features to skip in undeclared detection (glob patterns)\n");
+    } else {
+      content.push_str(&format!(
+        "skip_undeclared_patterns = {}  # Features to skip in undeclared detection\n",
+        self.formatter.array_string(&config.skip_undeclared_patterns, None)
+      ));
+    }
+
     self.sections.push(format!("[unify]\n{}\n", content));
 
     self

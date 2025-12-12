@@ -212,6 +212,9 @@ pub struct UndeclaredFeature {
   pub dep_kind: DepKind,
   /// Target platform constraint (if in target-specific section)
   pub target: Option<String>,
+  /// Which workspace members provide the borrowed features
+  /// Shows where the feature is coming from (for transparency)
+  pub borrowed_from: Vec<String>,
 }
 
 // ============================================================================
@@ -482,12 +485,17 @@ impl UnificationPlan {
         self.undeclared_features.len()
       ));
       for uf in &self.undeclared_features {
+        let borrowed_from_str = if uf.borrowed_from.is_empty() {
+          String::new()
+        } else {
+          format!(" (borrowed from {})", uf.borrowed_from.join(", "))
+        };
         s.push_str(&format!(
-          "  - {} in {}: needs features [{}] but only declares [{}]\n",
-          uf.dep_name,
+          "  - {}/{}: [{}]{}\n",
           uf.member,
+          uf.dep_name,
           uf.undeclared_features.join(", "),
-          uf.declared_features.join(", ")
+          borrowed_from_str
         ));
       }
       s.push_str("  These crates rely on feature unification from other workspace members.\n");
@@ -594,6 +602,7 @@ mod tests {
       resolved_features: vec!["default".to_string(), "futures".to_string(), "tokio".to_string()],
       dep_kind: DepKind::Normal,
       target: None,
+      borrowed_from: vec!["other-crate".to_string()],
     };
 
     assert_eq!(uf.member, "my-crate");
@@ -603,6 +612,7 @@ mod tests {
     assert_eq!(uf.resolved_features.len(), 3);
     assert_eq!(uf.dep_kind, DepKind::Normal);
     assert!(uf.target.is_none());
+    assert_eq!(uf.borrowed_from.len(), 1);
   }
 
   #[test]
@@ -615,6 +625,7 @@ mod tests {
       resolved_features: vec!["extra_traits".to_string()],
       dep_kind: DepKind::Normal,
       target: Some("cfg(unix)".to_string()),
+      borrowed_from: vec!["unix-crate".to_string()],
     };
 
     assert_eq!(uf.target, Some("cfg(unix)".to_string()));
@@ -630,6 +641,7 @@ mod tests {
       resolved_features: vec!["rt".to_string(), "macros".to_string()],
       dep_kind: DepKind::Dev,
       target: None,
+      borrowed_from: vec!["main-crate".to_string()],
     };
 
     assert_eq!(uf.dep_kind, DepKind::Dev);
@@ -746,6 +758,7 @@ mod tests {
         resolved_features: vec!["futures".to_string()],
         dep_kind: DepKind::Normal,
         target: None,
+        borrowed_from: vec!["other-crate".to_string()],
       }],
     };
 
@@ -778,6 +791,7 @@ mod tests {
         resolved_features: vec!["futures".to_string()],
         dep_kind: DepKind::Normal,
         target: None,
+        borrowed_from: vec!["other-crate".to_string()],
       }],
     };
 
@@ -839,6 +853,7 @@ mod tests {
       resolved_features: vec!["f1".to_string(), "f2".to_string()],
       dep_kind: DepKind::Dev,
       target: Some("cfg(windows)".to_string()),
+      borrowed_from: vec!["source-crate".to_string()],
     };
 
     let cloned = uf.clone();
@@ -846,5 +861,76 @@ mod tests {
     assert_eq!(uf.dep_name, cloned.dep_name);
     assert_eq!(uf.undeclared_features, cloned.undeclared_features);
     assert_eq!(uf.target, cloned.target);
+    assert_eq!(uf.borrowed_from, cloned.borrowed_from);
+  }
+
+  #[test]
+  fn test_summary_shows_borrowed_from_in_undeclared_warning() {
+    let plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![UndeclaredFeature {
+        member: "my-crate".to_string(),
+        dep_name: "tokio".to_string(),
+        undeclared_features: vec!["macros".to_string(), "rt".to_string()],
+        declared_features: vec![],
+        resolved_features: vec!["macros".to_string(), "rt".to_string()],
+        dep_kind: DepKind::Normal,
+        target: None,
+        borrowed_from: vec!["other-crate".to_string(), "third-crate".to_string()],
+      }],
+    };
+
+    // No AddFeatures edits = warn mode with borrowed_from
+    let summary = plan.summary();
+    assert!(summary.contains("⚠️  Undeclared features detected"));
+    assert!(summary.contains("my-crate/tokio"));
+    assert!(summary.contains("macros"));
+    assert!(summary.contains("rt"));
+    assert!(summary.contains("(borrowed from other-crate, third-crate)"));
+  }
+
+  #[test]
+  fn test_summary_borrowed_from_empty_not_shown() {
+    let plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits: std::collections::HashMap::new(),
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![UndeclaredFeature {
+        member: "my-crate".to_string(),
+        dep_name: "backoff".to_string(),
+        undeclared_features: vec!["futures".to_string()],
+        declared_features: vec![],
+        resolved_features: vec!["futures".to_string()],
+        dep_kind: DepKind::Normal,
+        target: None,
+        borrowed_from: vec![], // Empty - shouldn't show "borrowed from"
+      }],
+    };
+
+    let summary = plan.summary();
+    assert!(summary.contains("my-crate/backoff"));
+    assert!(summary.contains("futures"));
+    // Should NOT contain "borrowed from" when empty
+    assert!(!summary.contains("borrowed from"));
   }
 }

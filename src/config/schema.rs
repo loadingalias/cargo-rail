@@ -24,7 +24,7 @@ pub struct FieldSpec {
 /// the insertion order within each section.
 pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   // =========================================================================
-  // [unify] section - 18 fields
+  // [unify] section - 19 fields
   // =========================================================================
   FieldSpec {
     section: "unify",
@@ -127,6 +127,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "fix_undeclared_features",
     default_toml: "true",
     comment: "Auto-fix borrowed features (default: true)",
+  },
+  FieldSpec {
+    section: "unify",
+    key: "skip_undeclared_patterns",
+    default_toml: "[\"default\", \"std\", \"alloc\", \"*_backend\", \"*_impl\"]",
+    comment: "Features to skip in undeclared detection (glob patterns)",
   },
   FieldSpec {
     section: "unify",
@@ -264,7 +270,7 @@ mod tests {
   #[test]
   fn test_fields_for_section() {
     let unify_fields: Vec<_> = fields_for_section("unify").collect();
-    assert_eq!(unify_fields.len(), 18); // 16 + detect_undeclared_features + fix_undeclared_features
+    assert_eq!(unify_fields.len(), 19); // 16 + detect_undeclared_features + fix_undeclared_features + skip_undeclared_patterns
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
@@ -280,7 +286,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      29, // 18 unify + 10 release + 1 change-detection
+      30, // 19 unify + 10 release + 1 change-detection
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -288,7 +294,7 @@ mod tests {
   /// This test documents which config sections are syncable vs user-configured.
   ///
   /// SYNCABLE (auto-added by `config sync`):
-  /// - [unify] - 18 fields: workspace-wide dependency unification settings
+  /// - [unify] - 19 fields: workspace-wide dependency unification settings
   /// - [release] - 10 fields: workspace-wide release settings
   /// - [change-detection] - 1 field: infrastructure patterns (custom is user-defined)
   ///
@@ -324,6 +330,7 @@ mod tests {
     assert!(field_keys.contains(&("unify", "detect_unused")));
     assert!(field_keys.contains(&("unify", "detect_undeclared_features")));
     assert!(field_keys.contains(&("unify", "fix_undeclared_features")));
+    assert!(field_keys.contains(&("unify", "skip_undeclared_patterns")));
 
     // [release] critical fields
     assert!(field_keys.contains(&("release", "tag_format")));

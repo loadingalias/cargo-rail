@@ -593,6 +593,15 @@ impl UnifyAnalyzer {
   /// unification, standalone builds (cargo test -p <crate>) will fail because
   /// the borrowed features are no longer available.
   ///
+  /// Key distinctions:
+  /// - **Workspace policy**: Features in `[workspace.dependencies]` are intentional
+  ///   workspace-level declarations. Members using these don't need to re-declare.
+  /// - **Member borrowing**: Features that only come from another member are
+  ///   implicit coupling and should be flagged.
+  /// - **Conditional features**: Features declared via `[features]` table (e.g.,
+  ///   `my-feature = ["dep/feat"]`) count as declared - the author made an
+  ///   intentional choice.
+  ///
   /// Example:
   /// - crate A declares: `backoff = "0.4"` (no features)
   /// - crate B declares: `backoff = { version = "0.4", features = ["tokio"] }`
@@ -602,21 +611,32 @@ impl UnifyAnalyzer {
   fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
     let mut undeclared = Vec::new();
 
-    // Common features that are typically not actionable:
-    // - "default", "std" - usually implicit
-    // - Internal features like "*_backend", "*_impl" - implementation details
-    let should_skip_feature = |f: &str| -> bool {
-      f == "default" || f == "std" || f == "alloc" || f.ends_with("_backend") || f.ends_with("_impl")
-    };
+    // Step 1: Get workspace baseline (features declared in [workspace.dependencies])
+    // These are workspace policy - members don't need to re-declare them
+    let workspace_baseline: HashMap<String, HashSet<String>> = self
+      .existing_workspace_deps
+      .iter()
+      .map(|(name, dep)| {
+        let mut feats: HashSet<String> = dep.features.iter().cloned().collect();
+        if dep.default_features {
+          feats.insert("default".to_string());
+        }
+        (name.clone(), feats)
+      })
+      .collect();
 
-    // Build a map of what each member explicitly declares for each dependency
-    // We want to find cases where member A would need a feature that ONLY comes from member B
+    // Step 2: Build a map of what each member explicitly declares for each dependency
+    // Include both unconditional_features AND conditional_features (from [features] table)
+    // Also track which features each member contributes (for borrowed_from)
     let mut member_declared_features: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
 
     for member in &self.manifests.members {
       let mut dep_features: HashMap<String, HashSet<String>> = HashMap::new();
       for (dep_key, usage) in &member.dependencies {
         let mut feats: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
+        // Include conditional features (from [features] table like `my-feat = ["dep/feature"]`)
+        // The author made an intentional choice - this counts as declared
+        feats.extend(usage.conditional_features.iter().cloned());
         // If default_features = true (default), add "default"
         if usage.default_features {
           feats.insert("default".to_string());
@@ -626,49 +646,87 @@ impl UnifyAnalyzer {
       member_declared_features.insert(member.package_name.clone(), dep_features);
     }
 
-    // Compute the unified features (what will end up in workspace.dependencies)
-    // This is the UNION of all declared features across all members
-    let mut unified_features: HashMap<String, HashSet<String>> = HashMap::new();
-    for dep_features in member_declared_features.values() {
+    // Step 3: Track which members contribute which features (beyond workspace baseline)
+    // This powers the `borrowed_from` field for transparency
+    // Structure: dep_name -> feature -> set of member names
+    let mut feature_sources: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+
+    for (member_name, dep_features) in &member_declared_features {
       for (dep_name, features) in dep_features {
-        unified_features
-          .entry(dep_name.clone())
-          .or_default()
-          .extend(features.iter().cloned());
+        let baseline = workspace_baseline.get(dep_name);
+
+        for feat in features {
+          // Skip features that are in workspace baseline (workspace policy)
+          if baseline.is_some_and(|b| b.contains(feat)) {
+            continue;
+          }
+
+          feature_sources
+            .entry(dep_name.clone())
+            .or_default()
+            .entry(feat.clone())
+            .or_default()
+            .insert(member_name.clone());
+        }
       }
     }
 
-    // Now check: for each member, are there features in unified that it doesn't declare?
-    // These are features "borrowed" from other workspace members
+    // Step 4: Find borrowed features for each member
+    // A feature is borrowed if:
+    // - It's contributed by OTHER members (not this member)
+    // - It's NOT in workspace baseline (workspace policy doesn't count as borrowing)
+    // - It passes the skip filter (configurable via skip_undeclared_patterns)
     for member in &self.manifests.members {
       for (dep_key, usage) in &member.dependencies {
-        let Some(unified) = unified_features.get(&*dep_key.name) else {
+        let Some(feat_sources) = feature_sources.get(&*dep_key.name) else {
           continue;
         };
 
-        // Get declared features from this member's Cargo.toml
+        // Get this member's declared features (unconditional + conditional)
         let mut declared: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
+        declared.extend(usage.conditional_features.iter().cloned());
         if usage.default_features {
           declared.insert("default".to_string());
         }
 
-        // Find features that are unified but not declared by this member
-        // These are features this member will lose access to after unification
-        let borrowed: Vec<String> = unified
-          .difference(&declared)
-          .filter(|f| !should_skip_feature(f))
-          .cloned()
-          .collect();
+        // Find features this member borrows from others
+        let mut borrowed_features: Vec<String> = Vec::new();
+        let mut borrowed_from_members: HashSet<String> = HashSet::new();
 
-        if !borrowed.is_empty() {
+        for (feat, sources) in feat_sources {
+          // Skip if this member declares the feature itself
+          if declared.contains(feat) {
+            continue;
+          }
+
+          // Skip if configured to skip this feature pattern
+          if self.config.should_skip_undeclared_feature(feat) {
+            continue;
+          }
+
+          // This feature is borrowed from other members
+          borrowed_features.push(feat.clone());
+          for source in sources {
+            if source != &member.package_name {
+              borrowed_from_members.insert(source.clone());
+            }
+          }
+        }
+
+        if !borrowed_features.is_empty() {
+          borrowed_features.sort();
+          let mut borrowed_from: Vec<String> = borrowed_from_members.into_iter().collect();
+          borrowed_from.sort();
+
           undeclared.push(UndeclaredFeature {
             member: member.package_name.clone(),
             dep_name: dep_key.name.to_string(),
-            undeclared_features: borrowed,
+            undeclared_features: borrowed_features,
             declared_features: declared.into_iter().collect(),
-            resolved_features: unified.iter().cloned().collect(),
+            resolved_features: feat_sources.keys().cloned().collect(),
             dep_kind: usage.kind,
             target: usage.target.clone(),
+            borrowed_from,
           });
         }
       }

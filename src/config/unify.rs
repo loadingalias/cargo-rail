@@ -112,6 +112,12 @@ pub struct UnifyConfig {
   /// This produces a cleaner graph where standalone builds work correctly.
   #[serde(default = "default_true")]
   pub fix_undeclared_features: bool,
+
+  /// Patterns for features to skip in undeclared feature detection (glob supported)
+  /// Default: ["default", "std", "alloc", "*_backend", "*_impl"]
+  /// These are features that are typically not actionable or are implementation details.
+  #[serde(default = "default_skip_undeclared_patterns")]
+  pub skip_undeclared_patterns: Vec<String>,
 }
 
 impl Default for UnifyConfig {
@@ -135,6 +141,7 @@ impl Default for UnifyConfig {
       remove_unused: true,
       detect_undeclared_features: true,
       fix_undeclared_features: true,
+      skip_undeclared_patterns: default_skip_undeclared_patterns(),
     }
   }
 }
@@ -155,6 +162,23 @@ impl UnifyConfig {
   /// Supports glob patterns (e.g., "unstable-*", "bench*")
   pub fn should_preserve_feature(&self, feature_name: &str) -> bool {
     self.preserve_features.iter().any(|pattern| {
+      if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        // Use glob matching for patterns with wildcards
+        glob::Pattern::new(pattern)
+          .map(|p| p.matches(feature_name))
+          .unwrap_or(false)
+      } else {
+        // Exact match for literal patterns
+        pattern == feature_name
+      }
+    })
+  }
+
+  /// Check if a feature should be skipped in undeclared feature detection
+  ///
+  /// Supports glob patterns (e.g., "*_backend", "*_impl")
+  pub fn should_skip_undeclared_feature(&self, feature_name: &str) -> bool {
+    self.skip_undeclared_patterns.iter().any(|pattern| {
       if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
         // Use glob matching for patterns with wildcards
         glob::Pattern::new(pattern)
@@ -349,6 +373,16 @@ fn default_transitive_host() -> TransitiveFeatureHost {
 
 pub(crate) fn default_true() -> bool {
   true
+}
+
+fn default_skip_undeclared_patterns() -> Vec<String> {
+  vec![
+    "default".to_string(),
+    "std".to_string(),
+    "alloc".to_string(),
+    "*_backend".to_string(),
+    "*_impl".to_string(),
+  ]
 }
 
 // ============================================================================
@@ -805,5 +839,120 @@ mod tests {
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.detect_undeclared_features);
     assert!(config.fix_undeclared_features);
+  }
+
+  // ============================================================================
+  // skip_undeclared_patterns Tests
+  // ============================================================================
+
+  #[test]
+  fn test_skip_undeclared_patterns_default() {
+    let config = UnifyConfig::default();
+    assert!(!config.skip_undeclared_patterns.is_empty());
+    assert!(config.skip_undeclared_patterns.contains(&"default".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"std".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"alloc".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"*_backend".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"*_impl".to_string()));
+  }
+
+  #[test]
+  fn test_skip_undeclared_patterns_parsing() {
+    let toml = r#"
+      skip_undeclared_patterns = ["default", "std", "custom-*"]
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.skip_undeclared_patterns.len(), 3);
+    assert!(config.skip_undeclared_patterns.contains(&"default".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"std".to_string()));
+    assert!(config.skip_undeclared_patterns.contains(&"custom-*".to_string()));
+  }
+
+  #[test]
+  fn test_skip_undeclared_patterns_empty() {
+    let toml = r#"
+      skip_undeclared_patterns = []
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.skip_undeclared_patterns.is_empty());
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_exact_match() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec!["default".to_string(), "std".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_skip_undeclared_feature("default"));
+    assert!(config.should_skip_undeclared_feature("std"));
+    assert!(!config.should_skip_undeclared_feature("derive"));
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_glob_suffix() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec!["*_backend".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_skip_undeclared_feature("sqlite_backend"));
+    assert!(config.should_skip_undeclared_feature("postgres_backend"));
+    assert!(config.should_skip_undeclared_feature("_backend")); // Just suffix
+    assert!(!config.should_skip_undeclared_feature("backend"));
+    assert!(!config.should_skip_undeclared_feature("backend_"));
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_glob_prefix() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec!["unstable-*".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_skip_undeclared_feature("unstable-api"));
+    assert!(config.should_skip_undeclared_feature("unstable-internal"));
+    assert!(config.should_skip_undeclared_feature("unstable-")); // Just prefix
+    assert!(!config.should_skip_undeclared_feature("unstable"));
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_glob_question_mark() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec!["test-?".to_string()],
+      ..Default::default()
+    };
+    assert!(config.should_skip_undeclared_feature("test-1"));
+    assert!(config.should_skip_undeclared_feature("test-a"));
+    assert!(!config.should_skip_undeclared_feature("test-12"));
+    assert!(!config.should_skip_undeclared_feature("test-"));
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_multiple_patterns() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec![
+        "default".to_string(),
+        "std".to_string(),
+        "*_backend".to_string(),
+        "*_impl".to_string(),
+      ],
+      ..Default::default()
+    };
+    assert!(config.should_skip_undeclared_feature("default"));
+    assert!(config.should_skip_undeclared_feature("std"));
+    assert!(config.should_skip_undeclared_feature("sqlite_backend"));
+    assert!(config.should_skip_undeclared_feature("sync_impl"));
+    assert!(!config.should_skip_undeclared_feature("derive"));
+    assert!(!config.should_skip_undeclared_feature("serde"));
+  }
+
+  #[test]
+  fn test_should_skip_undeclared_feature_empty_patterns() {
+    let config = UnifyConfig {
+      skip_undeclared_patterns: vec![],
+      ..Default::default()
+    };
+    // Nothing should be skipped with empty patterns
+    assert!(!config.should_skip_undeclared_feature("default"));
+    assert!(!config.should_skip_undeclared_feature("std"));
+    assert!(!config.should_skip_undeclared_feature("anything"));
   }
 }
