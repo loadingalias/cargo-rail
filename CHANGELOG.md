@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.2](https://github.com/loadingalias/cargo-rail/compare/v0.5.1...v0.5.2) - 2025-12-12
+
+### 📦 Other Changes
+
+- cargo-rail: bumping Rust version to 1.92.0 stable ([ed566c1](https://github.com/loadingalias/cargo-rail/commit/ed566c11b16b97eb65aded9befde6117e684c54d))
+
+
+
 ## [0.5.1](https://github.com/loadingalias/cargo-rail/compare/v0.5.0...v0.5.1) - 2025-12-12
 
 ### 📦 Other Changes
