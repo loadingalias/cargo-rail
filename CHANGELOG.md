@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.3](https://github.com/loadingalias/cargo-rail/compare/v0.5.2...v0.5.3) - 2025-12-12
+
+### 🐛 Bug Fixes
+
+- lower MSRV from 1.92.0 to 1.91.0 ([8f6a475](https://github.com/loadingalias/cargo-rail/commit/8f6a475022e755ee66e9e8217eed21f2b9d71f3a))
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the schema/config for the 'undeclared features; resolution/fixing; added tests for it ([bc09254](https://github.com/loadingalias/cargo-rail/commit/bc0925406f907d9d1d0d5f6c2f8b9ba776ef8748))
+
+
+
 ## [0.5.2](https://github.com/loadingalias/cargo-rail/compare/v0.5.1...v0.5.2) - 2025-12-12
 
 ### 📦 Other Changes
