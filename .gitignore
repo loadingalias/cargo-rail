@@ -1,25 +1,24 @@
 # Rust
 /target
 
-# OS files
-.DS_Store
+# OS
 Thumbs.db
+.DS_Store
 
 # Claude
 .claude
 
-# Zed's Dead Baby
+# Zed
 .zed
 
 # Keys/Creds
 *.pem
 *.key
 
-# Docs/Notes/Examples
+# Personal - Notes, Docs, Examples, Testing, etc.
 rules.md
-**/demo.cast
-dx.md
-distribution
-issue.md
-backlog
 release.md
+todo.md
+**/demo.cast
+distribution/
+backlog/
