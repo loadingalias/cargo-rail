@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0](https://github.com/loadingalias/cargo-rail/compare/v0.4.2...v0.5.0) - 2025-12-12
+
+### 📦 Other Changes
+
+- cargo-rail: meilisearch PR revealed a bug in Meilisearch and in cargo-rail; fixing 'undeclard features detection' to avoid 'borrowed features' sneaking through. added 'auto-fix' undeclared features w/ warning for manual. This is a big win. ([cf1f5ee](https://github.com/loadingalias/cargo-rail/commit/cf1f5ee42b4d4b82db815ad8fda7796789988cd0))
+- cargo-rail: removing 'cargo-udeps' entirely. ([1a73394](https://github.com/loadingalias/cargo-rail/commit/1a73394b02b9ff85bad73570b137c9965b52eb14))
+
+
+
 ## [0.4.2](https://github.com/loadingalias/cargo-rail/compare/v0.4.1...v0.4.2) - 2025-12-11
 
 ### 📦 Other Changes
