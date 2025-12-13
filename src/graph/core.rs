@@ -57,9 +57,13 @@ pub struct WorkspaceGraph {
   /// Pre-sorted workspace member names - avoids repeated sort on each call
   sorted_members: Vec<String>,
 
-  /// Path cache: directory → owning crate name
+  /// Workspace root directory (for converting absolute paths to relative)
+  workspace_root: PathBuf,
+
+  /// Path cache: workspace-relative directory → owning crate name
   /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
+  /// Stores workspace-relative paths to support deleted files (no canonicalize needed)
   path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
 }
 
@@ -115,11 +119,15 @@ impl WorkspaceGraph {
     let mut sorted_members: Vec<String> = workspace_members.iter().cloned().collect();
     sorted_members.sort();
 
+    // Store workspace root for path normalization
+    let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
+
     let graph = Self {
       graph,
       name_to_node,
       workspace_members,
       sorted_members,
+      workspace_root,
       path_cache: RwLock::new(None),
     };
 
@@ -244,14 +252,20 @@ impl WorkspaceGraph {
   ///
   /// O(1) lookups using pre-built path cache.
   /// Filters out VCS directories (.git, .jj) and other non-source paths.
+  ///
+  /// Accepts both:
+  /// - Workspace-relative paths (e.g., "crates/foo/src/lib.rs")
+  /// - Absolute paths (will be converted to workspace-relative)
+  ///
+  /// Works for deleted files - does not require the file to exist on disk.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
     // Filter out VCS directories (git, jj, etc.)
     if Self::should_ignore_path(file_path) {
       return None;
     }
 
-    // Normalize path
-    let normalized = file_path.canonicalize().ok()?;
+    // Normalize to workspace-relative path
+    let relative_path = self.to_workspace_relative(file_path)?;
 
     let cache = self
       .path_cache
@@ -259,14 +273,18 @@ impl WorkspaceGraph {
       .expect("RwLock poisoned: another thread panicked while holding the lock");
     let cache_ref = cache.as_ref()?;
 
-    // Direct lookup
-    if let Some(crate_name) = cache_ref.get(&normalized) {
-      return Some(crate_name.clone());
+    // Walk up directory tree looking for a crate root
+    let mut current = relative_path.as_path();
+
+    // Check the file's directory first
+    if let Some(parent) = current.parent() {
+      if let Some(crate_name) = cache_ref.get(parent) {
+        return Some(crate_name.clone());
+      }
+      current = parent;
     }
 
-    // Walk up directory tree
-    let mut current = normalized.as_path();
-
+    // Walk up looking for parent directories
     while let Some(parent) = current.parent() {
       if let Some(crate_name) = cache_ref.get(parent) {
         return Some(crate_name.clone());
@@ -274,7 +292,24 @@ impl WorkspaceGraph {
       current = parent;
     }
 
-    None
+    // Check root directory (for root-level crate)
+    cache_ref.get(Path::new("")).cloned()
+  }
+
+  /// Convert a path to workspace-relative.
+  ///
+  /// Handles:
+  /// - Already relative paths: returned as-is
+  /// - Absolute paths: strips workspace root prefix
+  /// - Paths that don't exist: works without filesystem access
+  fn to_workspace_relative(&self, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+      // Try to strip workspace root prefix
+      path.strip_prefix(&self.workspace_root).ok().map(PathBuf::from)
+    } else {
+      // Already relative - assume it's workspace-relative
+      Some(path.to_path_buf())
+    }
   }
 
   /// Map multiple files to owning crates.
@@ -318,7 +353,8 @@ impl WorkspaceGraph {
 
   /// Build path-to-crate mapping cache.
   ///
-  /// Maps each workspace crate's root directory to its name.
+  /// Maps each workspace crate's root directory (workspace-relative) to its name.
+  /// Uses workspace-relative paths to support deleted files (no canonicalize needed).
   fn build_path_cache(&self) {
     let mut cache = HashMap::new();
 
@@ -326,11 +362,19 @@ impl WorkspaceGraph {
       if let Some(node_idx) = self.name_to_node.get(crate_name) {
         let node = &self.graph[*node_idx];
 
-        // Get crate root (parent of Cargo.toml)
-        if let Some(crate_root) = node.manifest_path.parent()
-          && let Ok(canonical) = crate_root.canonicalize()
-        {
-          cache.insert(canonical, crate_name.clone());
+        // Get crate root (parent of Cargo.toml) as workspace-relative path
+        if let Some(crate_root) = node.manifest_path.parent() {
+          // Convert to workspace-relative path
+          let relative_root = if crate_root.is_absolute() {
+            crate_root
+              .strip_prefix(&self.workspace_root)
+              .map(PathBuf::from)
+              .unwrap_or_else(|_| crate_root.to_path_buf())
+          } else {
+            crate_root.to_path_buf()
+          };
+
+          cache.insert(relative_root, crate_name.clone());
         }
       }
     }

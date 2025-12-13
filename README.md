@@ -12,7 +12,7 @@
   <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/v/cargo-rail.svg" alt="Crates.io"></a>
   <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/d/cargo-rail.svg" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.92.0%2B-orange.svg" alt="Rust 1.92.0+"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.91.0%2B-orange.svg" alt="Rust 1.91.0+"></a>
 </p>
 
 <p align="center">
@@ -130,6 +130,7 @@ What it does:
 - **Unifies versions** based on Cargo's resolver output
 - **Computes MSRV** from the dependency graph
 - **Prunes dead features** that are never enabled
+- **Fixes undeclared features** that don't exist on the dependency
 - **Detects unused deps** (opt-in)
 - **Pins transitives** — replaces `cargo-hakari` without a workspace-hack crate
 

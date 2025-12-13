@@ -703,6 +703,8 @@ Examples:
 ```
 Validate the configuration file
 
+Checks for parse errors, unknown keys, and semantic issues. By default, unknown keys warn locally but error in CI environments (detected via CI, GITHUB_ACTIONS, GITLAB_CI, or CIRCLECI env vars).
+
 Usage: cargo rail config validate [OPTIONS]
 
 Options:
@@ -725,6 +727,12 @@ Options:
 
       --json
           Output in JSON format (shorthand for -f json)
+
+      --strict
+          Treat warnings as errors (auto-enabled in CI)
+
+      --no-strict
+          Never treat warnings as errors (overrides CI auto-detection)
 
   -h, --help
           Print help (see a summary with '-h')

@@ -100,6 +100,7 @@ pub fn run_release_publish(
   bump: String,
   skip_publish: bool,
   skip_tag: bool,
+  yes: bool,
 ) -> RailResult<()> {
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
@@ -124,6 +125,11 @@ pub fn run_release_publish(
     .unwrap_or_else(|| ctx.graph.workspace_members().to_vec());
   validator.validate(&target_crates, release_config.require_clean)?;
 
+  // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
+  if let Some(warning) = validator.validate_branch(yes)? {
+    eprintln!("{}", warning);
+  }
+
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
@@ -132,7 +138,8 @@ pub fn run_release_publish(
 
   println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
-  if io::stdin().is_terminal() {
+  // Skip confirmation if --yes flag is set
+  if !yes && io::stdin().is_terminal() {
     println!("\nthis will:");
     println!("  - modify Cargo.toml (version bumps)");
     println!("  - update changelogs");

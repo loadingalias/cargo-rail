@@ -45,7 +45,7 @@ pub use affected::{AffectedOptions, run_affected};
 pub use clean::run_clean;
 pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand};
 pub use common::OutputFormat;
-pub use config::{run_config_sync, run_config_validate};
+pub use config::{StrictnessMode, run_config_sync, run_config_validate_standalone};
 pub use init::{run_init, run_init_standalone};
 pub use release::{run_release_check, run_release_init, run_release_plan, run_release_publish};
 pub use split::{run_split, run_split_init};
@@ -181,6 +181,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         check,
         skip_publish,
         skip_tag,
+        yes,
         format,
       } => {
         let names = if all || crate_names.is_empty() {
@@ -192,7 +193,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         if check {
           run_release_plan(ctx, names, bump, skip_publish, skip_tag, format)
         } else {
-          run_release_publish(ctx, names, all, bump, skip_publish, skip_tag)
+          run_release_publish(ctx, names, all, bump, skip_publish, skip_tag, yes)
         }
       }
       cli::ReleaseCommand::Check {
@@ -219,10 +220,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       format,
     } => run_clean(ctx, cache, backups, reports, check, format),
 
-    // Config
+    // Config commands are handled before WorkspaceContext is built
     Commands::Config { command } => match command {
-      cli::ConfigCommand::Validate { format } => run_config_validate(ctx, format),
-      // Sync is handled before WorkspaceContext is built (doesn't need full metadata)
+      cli::ConfigCommand::Validate { .. } => unreachable!("Config validate should be handled before dispatch"),
       cli::ConfigCommand::Sync { .. } => unreachable!("Config sync should be handled before dispatch"),
     },
   }

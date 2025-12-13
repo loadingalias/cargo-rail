@@ -298,10 +298,20 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum ConfigCommand {
   /// Validate the configuration file
+  ///
+  /// Checks for parse errors, unknown keys, and semantic issues.
+  /// By default, unknown keys warn locally but error in CI environments
+  /// (detected via CI, GITHUB_ACTIONS, GITLAB_CI, or CIRCLECI env vars).
   Validate {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
+    /// Treat warnings as errors (auto-enabled in CI)
+    #[arg(long, conflicts_with = "no_strict")]
+    strict: bool,
+    /// Never treat warnings as errors (overrides CI auto-detection)
+    #[arg(long, conflicts_with = "strict")]
+    no_strict: bool,
   },
   /// Sync configuration: add missing fields and update targets
   ///
@@ -396,6 +406,9 @@ pub enum ReleaseCommand {
     /// Skip git tag creation
     #[arg(long)]
     skip_tag: bool,
+    /// Skip confirmation prompts and allow non-default branch
+    #[arg(short = 'y', long)]
+    yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
@@ -441,7 +454,7 @@ impl Commands {
         ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
       },
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format } | ConfigCommand::Sync { format, .. } => format.is_json_like(),
+        ConfigCommand::Validate { format, .. } | ConfigCommand::Sync { format, .. } => format.is_json_like(),
       },
       _ => false,
     }
@@ -463,7 +476,7 @@ impl Commands {
       } => *format = OutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format } | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
+        ConfigCommand::Validate { format, .. } | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
       },
       _ => {}
     }

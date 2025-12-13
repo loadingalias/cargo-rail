@@ -675,23 +675,49 @@ paths = [{ crate = "crates/server" }]
 
 ## Validation
 
-cargo-rail validates configuration on load:
+cargo-rail provides comprehensive configuration validation via `cargo rail config validate`:
 
 ```bash
-# Check configuration validity
-cargo rail init --check
-
-# Commands will error on invalid config
-cargo rail unify  # Validates config before running
+cargo rail config validate              # Validate rail.toml
+cargo rail config validate --strict     # Treat warnings as errors
+cargo rail config validate --no-strict  # Force warnings-only mode
+cargo rail config validate -f json      # JSON output for CI integration
 ```
 
-Common validation errors:
+### What Gets Validated
 
-- **Invalid glob patterns** in `change-detection`
-- **Single mode with multiple paths** in split config
-- **Combined mode with one path** in split config
-- **Empty remote** in split config
-- **Unknown crate names** in `skip_changelog_for`
+1. **Syntax** - TOML parse errors with line/column information
+2. **Unknown keys** - Typos like `mrsv_source` instead of `msrv_source`
+3. **Semantic validation** - Split config requirements, target triple formats
+4. **Deprecation warnings** - Future-proofing for config migrations
+
+### CI Auto-Strict Mode
+
+By default, validation runs in **strict mode** when CI is detected (via `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` environment variables):
+
+- **In CI**: Unknown keys and other warnings become errors (exit code 2)
+- **Locally**: Unknown keys are warnings only
+
+Override with `--strict` or `--no-strict` flags.
+
+### Example CI Usage
+
+```yaml
+# .github/workflows/ci.yml
+- name: Validate config
+  run: cargo rail config validate
+  # Auto-strict in CI - fails on unknown keys
+```
+
+### Common Validation Errors
+
+| Error | Cause |
+|-------|-------|
+| TOML parse error at line X | Syntax error (missing quotes, invalid structure) |
+| Unknown top-level key 'foo' | Typo in section name |
+| Unknown key 'bar' in [unify] | Typo in field name or deprecated option |
+| Missing required field: remote | Split config without remote URL |
+| 'foo' doesn't look like a valid target | Target triple missing architecture separator |
 
 ## Migration
 

@@ -269,6 +269,25 @@ impl GitState {
   pub fn git(&self) -> &SystemGit {
     &self.git
   }
+
+  /// Get current branch name
+  ///
+  /// Returns "HEAD" if in detached HEAD state.
+  pub fn current_branch(&self) -> RailResult<String> {
+    self.git.current_branch()
+  }
+
+  /// Check if HEAD is detached (not on any branch)
+  pub fn is_detached_head(&self) -> RailResult<bool> {
+    self.git.is_detached_head()
+  }
+
+  /// Get the default branch name (main/master) via remote HEAD
+  ///
+  /// Returns `None` if no default branch can be determined.
+  pub fn default_branch(&self) -> RailResult<Option<String>> {
+    self.git.default_branch()
+  }
 }
 
 // ============================================================================

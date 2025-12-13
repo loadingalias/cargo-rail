@@ -616,3 +616,132 @@ fn test_release_check_extended_json() -> Result<()> {
 
   Ok(())
 }
+
+// ============================================================================
+// Release Safety Tests (Branch Detection)
+// ============================================================================
+
+/// Test that release fails from detached HEAD
+#[test]
+fn test_release_detached_head_fails() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-detached")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  let commit_sha = ws.commit("Add lib-a")?;
+
+  // Checkout detached HEAD
+  crate::helpers::git(&ws.path, &["checkout", &commit_sha])?;
+
+  // Run release (should fail with detached HEAD error)
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+  );
+
+  // Should fail (non-zero exit)
+  let output = output?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(!output.status.success(), "Release from detached HEAD should fail");
+  assert!(
+    stderr.contains("detached HEAD") || stderr.contains("Detached HEAD"),
+    "Error should mention detached HEAD.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that release from non-default branch fails without --yes
+#[test]
+fn test_release_non_default_branch_fails_without_yes() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-branch")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+
+  // Create and switch to a feature branch
+  crate::helpers::git(&ws.path, &["checkout", "-b", "feature-branch"])?;
+
+  // Run release without --yes (should fail)
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    !output.status.success(),
+    "Release from non-default branch should fail without --yes.\nstderr:\n{}",
+    stderr
+  );
+  assert!(
+    stderr.contains("feature-branch") || stderr.contains("not default branch") || stderr.contains("--yes"),
+    "Error should mention branch name or --yes flag.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that release from non-default branch succeeds with --yes
+#[test]
+fn test_release_non_default_branch_succeeds_with_yes() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-branch-yes")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial release")?;
+
+  // Create and switch to a feature branch
+  crate::helpers::git(&ws.path, &["checkout", "-b", "hotfix-1.0"])?;
+
+  // Make a change for the release
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn hotfix() {}")?;
+  ws.commit("feat: add hotfix function")?;
+
+  // Run release with --yes (should succeed)
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "Release with --yes should succeed.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Should show warning about non-default branch
+  assert!(
+    stderr.contains("warning") && stderr.contains("hotfix-1.0"),
+    "Should warn about non-default branch.\nstderr:\n{}",
+    stderr
+  );
+
+  // Should show the actual branch name in next steps
+  assert!(
+    stdout.contains("git push origin hotfix-1.0"),
+    "Next steps should show actual branch name.\nstdout:\n{}",
+    stdout
+  );
+
+  Ok(())
+}

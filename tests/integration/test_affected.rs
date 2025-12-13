@@ -1,6 +1,6 @@
 //! Integration tests for `cargo rail affected` command
 
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{NestedWorkspace, TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
 
 #[test]
@@ -345,6 +345,236 @@ fn test_affected_short_flags() -> Result<()> {
 
   let content = std::fs::read_to_string(&output_file)?;
   assert!(content.contains("short-a"), "File should contain short-a");
+
+  Ok(())
+}
+
+/// Test affected correctly detects deleted files
+#[test]
+fn test_affected_deleted_file() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-deleted")?;
+  ws.add_crate("del-crate", "0.1.0", &[])?;
+
+  // Add an extra source file to delete later
+  std::fs::write(ws.path.join("crates/del-crate/src/utils.rs"), "pub fn util() {}")?;
+  ws.commit("Add utils.rs")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Delete the source file
+  std::fs::remove_file(ws.path.join("crates/del-crate/src/utils.rs"))?;
+  ws.commit("Delete utils.rs from del-crate")?;
+
+  // Run affected - should detect del-crate as affected
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed with deleted files");
+  assert!(
+    stdout.contains("del-crate"),
+    "del-crate should be affected after file deletion, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected correctly handles renamed files
+#[test]
+fn test_affected_renamed_file() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-renamed")?;
+  ws.add_crate("ren-crate", "0.1.0", &[])?;
+
+  // Add a source file to rename later
+  std::fs::write(ws.path.join("crates/ren-crate/src/old_name.rs"), "pub fn old() {}")?;
+  ws.commit("Add old_name.rs")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Rename a source file using git mv (so git detects it as a rename)
+  git(
+    &ws.path,
+    &[
+      "mv",
+      "crates/ren-crate/src/old_name.rs",
+      "crates/ren-crate/src/new_name.rs",
+    ],
+  )?;
+  ws.commit("Rename old_name.rs to new_name.rs")?;
+
+  // Run affected - should detect ren-crate as affected
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed with renamed files");
+  assert!(
+    stdout.contains("ren-crate"),
+    "ren-crate should be affected after file rename, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected correctly handles deleted source file (regression test)
+#[test]
+fn test_affected_deleted_source_file() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-del-src")?;
+  ws.add_crate("src-del", "0.1.0", &[])?;
+
+  // Add an extra source file
+  std::fs::write(ws.path.join("crates/src-del/src/helper.rs"), "pub fn help() {}")?;
+  ws.commit("Add helper.rs")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Delete the source file
+  std::fs::remove_file(ws.path.join("crates/src-del/src/helper.rs"))?;
+  ws.commit("Delete helper.rs")?;
+
+  // Run affected - should detect src-del as affected
+  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed");
+  assert!(
+    stdout.contains("src-del"),
+    "src-del should be affected after source deletion, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected handles file moved between crates
+#[test]
+fn test_affected_file_moved_between_crates() -> Result<()> {
+  let ws = TestWorkspace::new_named("affected-move")?;
+  ws.add_crate("crate-a", "0.1.0", &[])?;
+  ws.add_crate("crate-b", "0.1.0", &[])?;
+
+  // Add a file to crate-a
+  std::fs::write(ws.path.join("crates/crate-a/src/shared.rs"), "pub fn shared() {}")?;
+  ws.commit("Add shared.rs to crate-a")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Move file from crate-a to crate-b
+  git(
+    &ws.path,
+    &["mv", "crates/crate-a/src/shared.rs", "crates/crate-b/src/shared.rs"],
+  )?;
+  ws.commit("Move shared.rs from crate-a to crate-b")?;
+
+  // Run affected - should detect BOTH crates as affected
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "affected", "--since", "origin/main", "--format", "names"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed");
+  assert!(
+    stdout.contains("crate-a"),
+    "crate-a should be affected (file removed), got: {}",
+    stdout
+  );
+  assert!(
+    stdout.contains("crate-b"),
+    "crate-b should be affected (file added), got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+// =============================================================================
+// Nested Workspace Tests (git root != cargo workspace root)
+// =============================================================================
+
+/// Test affected works with nested workspace (subdirectory layout)
+#[test]
+fn test_affected_nested_workspace_subdirectory() -> Result<()> {
+  // Create workspace in rust/ subdirectory
+  let ws = NestedWorkspace::new("rust")?;
+  ws.add_crate("nested-lib", "0.1.0")?;
+  ws.commit("Add nested-lib")?;
+
+  git(&ws.git_root, &["branch", "origin/main"])?;
+
+  // Modify file in nested crate
+  ws.modify_file("nested-lib", "src/lib.rs", "pub fn updated() {}")?;
+  ws.commit("Update nested-lib")?;
+
+  // Run affected from workspace root (not git root)
+  let output = run_cargo_rail(&ws.workspace_root, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed in nested workspace");
+  assert!(
+    stdout.contains("nested-lib"),
+    "nested-lib should be affected, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected ignores changes outside workspace in nested layout
+#[test]
+fn test_affected_nested_workspace_ignores_outside_changes() -> Result<()> {
+  let ws = NestedWorkspace::new("rust")?;
+  ws.add_crate("inside-lib", "0.1.0")?;
+  ws.commit("Add inside-lib")?;
+
+  git(&ws.git_root, &["branch", "origin/main"])?;
+
+  // Modify file OUTSIDE the workspace (at git root level)
+  std::fs::write(ws.git_root.join("docs/README.md"), "# Updated docs\n")?;
+  ws.commit("Update docs outside workspace")?;
+
+  // Run affected - should have no affected crates
+  let output = run_cargo_rail(&ws.workspace_root, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "affected should succeed");
+  // Should indicate no changes or docs-only
+  assert!(
+    !stdout.contains("inside-lib"),
+    "inside-lib should NOT be affected by outside changes, got: {}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test affected with deeply nested workspace (multiple levels)
+#[test]
+fn test_affected_deeply_nested_workspace() -> Result<()> {
+  // Create workspace in projects/backend/rust/ subdirectory
+  let ws = NestedWorkspace::new("projects/backend/rust")?;
+  ws.add_crate("deep-lib", "0.1.0")?;
+  ws.commit("Add deep-lib")?;
+
+  git(&ws.git_root, &["branch", "origin/main"])?;
+
+  // Modify the crate
+  ws.modify_file("deep-lib", "src/lib.rs", "pub fn deep() {}")?;
+  ws.commit("Update deep-lib")?;
+
+  // Run affected
+  let output = run_cargo_rail(&ws.workspace_root, &["rail", "affected", "--since", "origin/main"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "affected should succeed in deeply nested workspace"
+  );
+  assert!(
+    stdout.contains("deep-lib"),
+    "deep-lib should be affected, got: {}",
+    stdout
+  );
 
   Ok(())
 }

@@ -291,6 +291,123 @@ channel = "stable"
   }
 }
 
+/// Create a workspace nested inside a git repo (git root != workspace root)
+///
+/// Structure:
+/// ```text
+/// git_root/
+/// ├── .git/
+/// ├── docs/
+/// │   └── README.md
+/// └── rust/                  <- Cargo workspace root
+///     ├── Cargo.toml
+///     ├── .config/rail.toml
+///     └── crates/
+///         └── example/
+/// ```
+pub struct NestedWorkspace {
+  _root: TempDir,
+  /// Git repository root
+  pub git_root: PathBuf,
+  /// Cargo workspace root (subdirectory of git_root)
+  pub workspace_root: PathBuf,
+}
+
+impl NestedWorkspace {
+  /// Create a nested workspace where cargo workspace is in a subdirectory
+  pub fn new(subdir: &str) -> Result<Self> {
+    let root = TempDir::new_in(std::env::temp_dir()).context("Failed to create temp dir")?;
+    let git_root = root.path().to_path_buf();
+    let workspace_root = git_root.join(subdir);
+
+    // Initialize git repo at root level
+    git(&git_root, &["init", "--initial-branch=main"])?;
+    git(&git_root, &["config", "user.name", "Test User"])?;
+    git(&git_root, &["config", "user.email", "test@example.com"])?;
+
+    // Create some non-workspace files at git root
+    std::fs::create_dir_all(git_root.join("docs"))?;
+    std::fs::write(git_root.join("docs/README.md"), "# Project Docs\n")?;
+    std::fs::write(git_root.join("README.md"), "# Root README\n")?;
+
+    // Create workspace in subdirectory
+    std::fs::create_dir_all(&workspace_root)?;
+    std::fs::create_dir_all(workspace_root.join("crates"))?;
+
+    // Create workspace Cargo.toml
+    std::fs::write(
+      workspace_root.join("Cargo.toml"),
+      r#"[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+"#,
+    )?;
+
+    // Create .config/rail.toml
+    std::fs::create_dir_all(workspace_root.join(".config"))?;
+    std::fs::write(
+      workspace_root.join(".config/rail.toml"),
+      r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
+"#,
+    )?;
+
+    // Initial commit from git root
+    git(&git_root, &["add", "."])?;
+    git(&git_root, &["commit", "-m", "Initial nested workspace setup"])?;
+
+    Ok(Self {
+      _root: root,
+      git_root,
+      workspace_root,
+    })
+  }
+
+  /// Add a crate to the nested workspace
+  pub fn add_crate(&self, name: &str, version: &str) -> Result<PathBuf> {
+    let crate_path = self.workspace_root.join("crates").join(name);
+    std::fs::create_dir_all(&crate_path)?;
+    std::fs::create_dir_all(crate_path.join("src"))?;
+
+    std::fs::write(
+      crate_path.join("Cargo.toml"),
+      format!(
+        r#"[package]
+name = "{}"
+version = "{}"
+edition.workspace = true
+"#,
+        name, version
+      ),
+    )?;
+
+    std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}\n")?;
+
+    Ok(crate_path)
+  }
+
+  /// Commit from git root
+  pub fn commit(&self, message: &str) -> Result<String> {
+    git(&self.git_root, &["add", "."])?;
+    git(&self.git_root, &["commit", "-m", message])?;
+    let output = git(&self.git_root, &["rev-parse", "HEAD"])?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+  }
+
+  /// Modify a file in a crate
+  pub fn modify_file(&self, crate_name: &str, file: &str, content: &str) -> Result<()> {
+    let file_path = self.workspace_root.join("crates").join(crate_name).join(file);
+    std::fs::write(file_path, content)?;
+    Ok(())
+  }
+}
+
 /// Run git command in a directory
 pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
   let output = Command::new("git")

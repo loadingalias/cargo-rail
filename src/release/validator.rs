@@ -85,6 +85,47 @@ impl<'a> ReleaseValidator<'a> {
     Ok(())
   }
 
+  /// Validate git branch state for release
+  ///
+  /// Checks:
+  /// - Detached HEAD: hard error (cannot release without a branch)
+  /// - Non-default branch: error unless `allow_non_default` is true, then returns warning
+  ///
+  /// Returns `Some(warning)` if releasing from non-default branch with `allow_non_default=true`.
+  /// Returns `None` if on default branch or no default branch can be determined.
+  pub fn validate_branch(&self, allow_non_default: bool) -> RailResult<Option<String>> {
+    let git = &self.ctx.git;
+
+    // Hard error: detached HEAD
+    if git.is_detached_head()? {
+      return Err(RailError::with_help(
+        "Cannot release from detached HEAD",
+        "Checkout a branch first: git checkout <branch-name>",
+      ));
+    }
+
+    let current = git.current_branch()?;
+
+    // Check if on default branch
+    if let Some(default) = git.default_branch()? {
+      if current != default && !allow_non_default {
+        return Err(RailError::with_help(
+          format!("Releasing from '{}', not default branch '{}'", current, default),
+          format!("Pass --yes to confirm, or checkout {}", default),
+        ));
+      }
+      if current != default {
+        // Return warning for display
+        return Ok(Some(format!(
+          "warning: releasing from '{}', not default branch '{}'",
+          current, default
+        )));
+      }
+    }
+
+    Ok(None) // No warnings
+  }
+
   /// Check if working directory is clean (no uncommitted changes)
   fn check_clean_working_directory(&self) -> RailResult<()> {
     let output = Command::new("git")

@@ -89,6 +89,38 @@ impl SystemGit {
       .or(Ok("HEAD".to_string()))
   }
 
+  /// Check if HEAD is detached (not on any branch)
+  pub fn is_detached_head(&self) -> RailResult<bool> {
+    let branch = self.run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok(branch == "HEAD")
+  }
+
+  /// Get the default branch name (main/master) via remote HEAD
+  ///
+  /// Tries to detect the default branch by:
+  /// 1. Checking `refs/remotes/origin/HEAD` symbolic ref
+  /// 2. Falling back to checking for common branch names (main, master)
+  ///
+  /// Returns `None` if no default branch can be determined.
+  pub fn default_branch(&self) -> RailResult<Option<String>> {
+    // Try: git symbolic-ref refs/remotes/origin/HEAD
+    if let Ok(output) = self.run_git_stdout(&["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+      // Output: "refs/remotes/origin/main" -> extract "main"
+      if let Some(branch) = output.strip_prefix("refs/remotes/origin/") {
+        return Ok(Some(branch.to_string()));
+      }
+    }
+
+    // Fallback: check for common defaults
+    for name in &["main", "master"] {
+      if self.run_git_check(&["rev-parse", "--verify", &format!("refs/heads/{}", name)]) {
+        return Ok(Some((*name).to_string()));
+      }
+    }
+
+    Ok(None)
+  }
+
   /// Create a safe git command with isolated environment
   ///
   /// - Sets working directory to repo path

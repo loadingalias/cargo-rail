@@ -44,27 +44,26 @@ impl SystemGit {
 
   /// Get files changed in a specific commit
   ///
-  /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted).
+  /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted),
+  /// R(enamed), or C(opied).
+  ///
+  /// For renames and copies, both the old and new paths are returned:
+  /// - Old path with 'D' (deleted from old location)
+  /// - New path with 'A' (added at new location)
   pub fn get_changed_files(&self, commit_sha: &str) -> RailResult<Vec<(PathBuf, char)>> {
     let output = self.run_git(&["diff-tree", "--no-commit-id", "--name-status", "-r", commit_sha])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut files = Vec::new();
-
-    for line in stdout.lines() {
-      let parts: Vec<&str> = line.split_whitespace().collect();
-      if parts.len() >= 2 {
-        let change_type = parts[0].chars().next().unwrap_or('M');
-        let path = PathBuf::from(parts[1]);
-        files.push((path, change_type));
-      }
-    }
-
-    Ok(files)
+    parse_name_status_output(&stdout)
   }
 
   /// Get all files that changed between two refs.
   ///
-  /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted).
+  /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted),
+  /// R(enamed), or C(opied).
+  ///
+  /// For renames and copies, both the old and new paths are returned:
+  /// - Old path with 'D' (deleted from old location)
+  /// - New path with 'A' (added at new location)
   ///
   /// # Performance
   /// Uses `git diff --name-status` which is optimized for listing changes.
@@ -79,18 +78,7 @@ impl SystemGit {
 
     let output = self.run_git(&args)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut files = Vec::new();
-
-    for line in stdout.lines() {
-      let parts: Vec<&str> = line.split_whitespace().collect();
-      if parts.len() >= 2 {
-        let change_type = parts[0].chars().next().unwrap_or('M');
-        let path = PathBuf::from(parts[1]);
-        files.push((path, change_type));
-      }
-    }
-
-    Ok(files)
+    parse_name_status_output(&stdout)
   }
 
   /// Get commits touching a specific path in a range
@@ -545,6 +533,80 @@ impl SystemGit {
   }
 }
 
+/// Parse `git diff --name-status` output into (path, change_type) pairs.
+///
+/// Handles:
+/// - Simple changes: `M\tpath` (Modified), `A\tpath` (Added), `D\tpath` (Deleted)
+/// - Renames: `R100\told_path\tnew_path` - emits both (old_path, 'D') and (new_path, 'A')
+/// - Copies: `C100\tsrc_path\tdest_path` - emits both (src_path, 'M') and (dest_path, 'A')
+/// - Paths with spaces: handled correctly via tab-separation
+///
+/// The status codes from git are:
+/// - A: Added
+/// - C: Copied (followed by similarity percentage)
+/// - D: Deleted
+/// - M: Modified
+/// - R: Renamed (followed by similarity percentage)
+/// - T: Type changed
+/// - U: Unmerged
+/// - X: Unknown
+fn parse_name_status_output(output: &str) -> RailResult<Vec<(PathBuf, char)>> {
+  let mut files = Vec::new();
+
+  for line in output.lines() {
+    if line.is_empty() {
+      continue;
+    }
+
+    // Git uses tab-separated output for --name-status
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.is_empty() {
+      continue;
+    }
+
+    let status = parts[0];
+    let change_type = status.chars().next().unwrap_or('M');
+
+    match change_type {
+      'R' => {
+        // Rename: R100\told_path\tnew_path
+        // Treat as: delete from old location, add at new location
+        if parts.len() >= 3 {
+          files.push((PathBuf::from(parts[1]), 'D')); // Old path deleted
+          files.push((PathBuf::from(parts[2]), 'A')); // New path added
+        } else if parts.len() >= 2 {
+          // Fallback: if only one path, treat as modified
+          files.push((PathBuf::from(parts[1]), 'M'));
+        }
+      }
+      'C' => {
+        // Copy: C100\tsrc_path\tdest_path
+        // Source still exists (mark as touched), dest is new
+        if parts.len() >= 3 {
+          files.push((PathBuf::from(parts[1]), 'M')); // Source touched
+          files.push((PathBuf::from(parts[2]), 'A')); // Dest added
+        } else if parts.len() >= 2 {
+          files.push((PathBuf::from(parts[1]), 'A'));
+        }
+      }
+      'A' | 'D' | 'M' | 'T' | 'U' => {
+        // Simple status with single path
+        if parts.len() >= 2 {
+          files.push((PathBuf::from(parts[1]), change_type));
+        }
+      }
+      _ => {
+        // Unknown status - treat as modified if we have a path
+        if parts.len() >= 2 {
+          files.push((PathBuf::from(parts[1]), 'M'));
+        }
+      }
+    }
+  }
+
+  Ok(files)
+}
+
 /// Parse git log output into CommitInfo
 ///
 /// Format is %H%n%an%n%ae%n%at%n%cn%n%ce%n%ct%n%P%n%B
@@ -767,5 +829,96 @@ mod tests {
 
     // Should return empty list for non-existent directory
     assert!(files.is_empty(), "Non-existent directory should return empty list");
+  }
+
+  #[test]
+  fn test_parse_name_status_simple() {
+    // Simple modifications
+    let output = "M\tsrc/main.rs\nA\tsrc/new.rs\nD\tsrc/old.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0], (PathBuf::from("src/main.rs"), 'M'));
+    assert_eq!(result[1], (PathBuf::from("src/new.rs"), 'A'));
+    assert_eq!(result[2], (PathBuf::from("src/old.rs"), 'D'));
+  }
+
+  #[test]
+  fn test_parse_name_status_rename() {
+    // Rename: R100 (100% similarity) old_path -> new_path
+    let output = "R100\tsrc/old_name.rs\tsrc/new_name.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    // Should emit both: delete from old, add at new
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], (PathBuf::from("src/old_name.rs"), 'D'));
+    assert_eq!(result[1], (PathBuf::from("src/new_name.rs"), 'A'));
+  }
+
+  #[test]
+  fn test_parse_name_status_copy() {
+    // Copy: C100 (100% similarity) src_path -> dest_path
+    let output = "C095\tsrc/original.rs\tsrc/copied.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    // Should emit: source touched, dest added
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], (PathBuf::from("src/original.rs"), 'M'));
+    assert_eq!(result[1], (PathBuf::from("src/copied.rs"), 'A'));
+  }
+
+  #[test]
+  fn test_parse_name_status_paths_with_spaces() {
+    // Paths with spaces are handled by tab separation
+    let output = "M\tpath with spaces/file name.rs\nA\tanother path/new file.txt";
+    let result = parse_name_status_output(output).unwrap();
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], (PathBuf::from("path with spaces/file name.rs"), 'M'));
+    assert_eq!(result[1], (PathBuf::from("another path/new file.txt"), 'A'));
+  }
+
+  #[test]
+  fn test_parse_name_status_rename_with_spaces() {
+    // Rename with spaces in paths
+    let output = "R100\told path/old file.rs\tnew path/new file.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0], (PathBuf::from("old path/old file.rs"), 'D'));
+    assert_eq!(result[1], (PathBuf::from("new path/new file.rs"), 'A'));
+  }
+
+  #[test]
+  fn test_parse_name_status_mixed() {
+    // Mixed changes in one diff
+    let output = "M\tsrc/lib.rs\nR100\tsrc/old.rs\tsrc/renamed.rs\nA\tsrc/new.rs\nD\tsrc/deleted.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    assert_eq!(result.len(), 5);
+    assert_eq!(result[0], (PathBuf::from("src/lib.rs"), 'M'));
+    assert_eq!(result[1], (PathBuf::from("src/old.rs"), 'D')); // Rename source
+    assert_eq!(result[2], (PathBuf::from("src/renamed.rs"), 'A')); // Rename dest
+    assert_eq!(result[3], (PathBuf::from("src/new.rs"), 'A'));
+    assert_eq!(result[4], (PathBuf::from("src/deleted.rs"), 'D'));
+  }
+
+  #[test]
+  fn test_parse_name_status_empty() {
+    let result = parse_name_status_output("").unwrap();
+    assert!(result.is_empty());
+
+    let result = parse_name_status_output("\n\n").unwrap();
+    assert!(result.is_empty());
+  }
+
+  #[test]
+  fn test_parse_name_status_type_change() {
+    // Type change (e.g., file to symlink)
+    let output = "T\tsrc/link.rs";
+    let result = parse_name_status_output(output).unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0], (PathBuf::from("src/link.rs"), 'T'));
   }
 }

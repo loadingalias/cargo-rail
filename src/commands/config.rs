@@ -1,12 +1,11 @@
 //! `cargo rail config` - Configuration management commands
 
 use crate::commands::common::OutputFormat;
-use crate::config::{RailConfig, schema};
+use crate::config::{ConfigLoadResult, RailConfig, schema};
 use crate::error::{RailError, RailResult};
 use crate::toml::TomlEditor;
-use crate::workspace::WorkspaceContext;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 /// Validation result for JSON output
@@ -21,17 +20,132 @@ struct ValidationResult {
 }
 
 /// A single validation issue
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ValidationIssue {
   section: String,
   message: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  line: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  column: Option<usize>,
 }
 
-/// Validate the configuration file
-pub fn run_config_validate(ctx: &WorkspaceContext, format: OutputFormat) -> RailResult<()> {
-  let json = format.is_json();
+impl ValidationIssue {
+  fn new(section: impl Into<String>, message: impl Into<String>) -> Self {
+    Self {
+      section: section.into(),
+      message: message.into(),
+      line: None,
+      column: None,
+    }
+  }
 
-  // JSON mode enables structured error output and suppresses progress
+  fn with_location(mut self, line: usize, column: usize) -> Self {
+    self.line = Some(line);
+    self.column = Some(column);
+    self
+  }
+}
+
+/// Strictness mode for validation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictnessMode {
+  /// Explicit --strict flag
+  Strict,
+  /// Explicit --no-strict flag
+  NoStrict,
+  /// Auto-detect based on CI environment
+  Auto,
+}
+
+impl StrictnessMode {
+  /// Determine if we should be strict based on mode and environment
+  pub fn is_strict(&self) -> bool {
+    match self {
+      StrictnessMode::Strict => true,
+      StrictnessMode::NoStrict => false,
+      StrictnessMode::Auto => is_ci_environment(),
+    }
+  }
+}
+
+/// Check if running in a CI environment
+fn is_ci_environment() -> bool {
+  std::env::var("CI").is_ok()
+    || std::env::var("GITHUB_ACTIONS").is_ok()
+    || std::env::var("GITLAB_CI").is_ok()
+    || std::env::var("CIRCLECI").is_ok()
+}
+
+/// Known top-level keys in rail.toml
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+  "targets",
+  "unify",
+  "release",
+  "change-detection",
+  "crates",
+  "workspace",
+  "toolchain",
+];
+
+/// Known keys in [unify] section
+const KNOWN_UNIFY_KEYS: &[&str] = &[
+  "include_paths",
+  "include_renamed",
+  "pin_transitives",
+  "transitive_host",
+  "exclude",
+  "include",
+  "msrv",
+  "msrv_source",
+  "prune_dead_features",
+  "preserve_features",
+  "strict_version_compat",
+  "exact_pin_handling",
+  "major_version_conflict",
+  "detect_unused",
+  "remove_unused",
+  "detect_undeclared_features",
+  "fix_undeclared_features",
+  "skip_undeclared_patterns",
+  "max_backups",
+];
+
+/// Known keys in [release] section
+const KNOWN_RELEASE_KEYS: &[&str] = &[
+  "tag_prefix",
+  "tag_format",
+  "require_clean",
+  "publish_delay",
+  "create_github_release",
+  "sign_tags",
+  "changelog_path",
+  "changelog_relative_to",
+  "skip_changelog_for",
+  "require_changelog_entries",
+];
+
+/// Known keys in [change-detection] section
+const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &["infrastructure", "custom"];
+
+/// Deprecated keys (key -> suggested replacement or removal message)
+const DEPRECATED_KEYS: &[(&str, &str)] = &[
+  // No deprecated keys yet - this is infrastructure for future use
+  // Example: ("old_key", "use 'new_key' instead"),
+];
+
+/// Validate configuration file standalone (without WorkspaceContext)
+///
+/// This function can diagnose parse errors and unknown keys even when
+/// the config file is broken.
+pub fn run_config_validate_standalone(
+  workspace_root: &Path,
+  format: OutputFormat,
+  strictness: StrictnessMode,
+) -> RailResult<()> {
+  let json = format.is_json();
+  let strict = strictness.is_strict();
+
   if json {
     crate::output::set_json_mode(true);
   }
@@ -39,115 +153,124 @@ pub fn run_config_validate(ctx: &WorkspaceContext, format: OutputFormat) -> Rail
   let mut errors: Vec<ValidationIssue> = Vec::new();
   let mut warnings: Vec<ValidationIssue> = Vec::new();
 
-  // Check if config exists
-  let config_path = RailConfig::find_config_path(ctx.workspace_root());
+  // Find config file
+  let config_path = match RailConfig::find_config_path(workspace_root) {
+    Some(p) => p,
+    None => {
+      if json {
+        let result = ValidationResult {
+          command: "config",
+          action: "validate",
+          valid: false,
+          config_path: None,
+          errors: vec![ValidationIssue::new("config", "no configuration file found")],
+          warnings: vec![],
+        };
+        println!(
+          "{}",
+          serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
+        );
+        std::process::exit(2);
+      } else {
+        println!("no configuration file found");
+        println!("\nhelp: run 'cargo rail init' to create one");
+        return Err(RailError::message("no configuration file found"));
+      }
+    }
+  };
 
-  if config_path.is_none() {
-    if json {
-      let result = ValidationResult {
-        command: "config",
-        action: "validate",
-        valid: false,
-        config_path: None,
-        errors: vec![ValidationIssue {
-          section: "config".to_string(),
-          message: "no configuration file found".to_string(),
-        }],
-        warnings: vec![],
-      };
-      println!(
-        "{}",
-        serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-      );
-      // Exit with error code but no extra message (JSON has details)
-      std::process::exit(2);
+  // Read raw content for unknown key detection
+  let content = std::fs::read_to_string(&config_path)
+    .map_err(|e| RailError::message(format!("failed to read {}: {}", config_path.display(), e)))?;
+
+  // Phase 1: Check for parse errors with line/column info
+  let raw_doc: Result<toml_edit::DocumentMut, _> = content.parse();
+  if let Err(parse_err) = &raw_doc {
+    let err_str = parse_err.to_string();
+    // Try to extract line/column from toml_edit error
+    let issue = if let Some((line, col)) = extract_toml_error_location(&err_str) {
+      ValidationIssue::new("syntax", format!("TOML parse error: {}", err_str)).with_location(line, col)
     } else {
-      println!("no configuration file found");
-      println!("\nhelp: run 'cargo rail init' to create one");
-      return Err(RailError::message("no configuration file found"));
-    }
+      ValidationIssue::new("syntax", format!("TOML parse error: {}", err_str))
+    };
+    errors.push(issue);
   }
 
-  let config_path = config_path.unwrap();
-  let config = ctx.config.as_ref();
-
-  if config.is_none() {
-    errors.push(ValidationIssue {
-      section: "config".to_string(),
-      message: "configuration file exists but failed to load".to_string(),
-    });
+  // Phase 2: Check for unknown keys (only if parsing succeeded)
+  if let Ok(doc) = &raw_doc {
+    check_unknown_keys(doc, &mut warnings);
   }
 
-  if let Some(cfg) = config {
-    // Validate change detection config
-    if let Err(e) = cfg.change_detection.validate() {
-      errors.push(ValidationIssue {
-        section: "change_detection".to_string(),
-        message: e.to_string(),
-      });
-    }
+  // Phase 3: Check for deprecated keys
+  check_deprecated_keys(&content, &mut warnings);
 
-    // Validate release config
-    let workspace_members = ctx.graph.workspace_members();
-    match cfg.release.validate(workspace_members) {
-      Ok(release_warnings) => {
-        for w in release_warnings {
-          warnings.push(ValidationIssue {
-            section: "release".to_string(),
-            message: w,
-          });
+  // Phase 4: Try to load and validate semantically
+  match RailConfig::try_load(workspace_root) {
+    ConfigLoadResult::Loaded(config) => {
+      // Validate change detection config
+      if let Err(e) = config.change_detection.validate() {
+        errors.push(ValidationIssue::new("change_detection", e.to_string()));
+      }
+
+      // Validate per-crate split configs
+      for (crate_name, crate_config) in &config.crates {
+        if let Some(split_cfg) = &crate_config.split {
+          if split_cfg.remote.is_empty() {
+            errors.push(ValidationIssue::new(
+              format!("crates.{}.split", crate_name),
+              "missing required field: remote",
+            ));
+          }
+          if split_cfg.branch.is_empty() {
+            warnings.push(ValidationIssue::new(
+              format!("crates.{}.split", crate_name),
+              "branch is empty, will use default",
+            ));
+          }
         }
       }
-      Err(e) => {
-        errors.push(ValidationIssue {
-          section: "release".to_string(),
-          message: e.to_string(),
-        });
-      }
-    }
 
-    // Validate per-crate split configs
-    for (crate_name, crate_config) in &cfg.crates {
-      if let Some(split_cfg) = &crate_config.split {
-        // Check remote is set (required field)
-        if split_cfg.remote.is_empty() {
-          errors.push(ValidationIssue {
-            section: format!("crates.{}.split", crate_name),
-            message: "missing required field: remote".to_string(),
-          });
-        }
-
-        // Validate branch is set
-        if split_cfg.branch.is_empty() {
-          warnings.push(ValidationIssue {
-            section: format!("crates.{}.split", crate_name),
-            message: "branch is empty, will use default".to_string(),
-          });
+      // Check targets are valid
+      for target in &config.targets {
+        if !target.contains('-') {
+          warnings.push(ValidationIssue::new(
+            "targets",
+            format!("'{}' doesn't look like a valid target triple", target),
+          ));
         }
       }
     }
-
-    // Check targets are valid (basic check)
-    for target in &cfg.targets {
-      if !target.contains('-') {
-        warnings.push(ValidationIssue {
-          section: "targets".to_string(),
-          message: format!("'{}' doesn't look like a valid target triple", target),
-        });
+    ConfigLoadResult::ParseError { message, .. } => {
+      // Only add if we didn't already catch it in raw parsing
+      if errors.is_empty() {
+        errors.push(ValidationIssue::new("config", format!("failed to load: {}", message)));
       }
+    }
+    ConfigLoadResult::NotFound => {
+      // Already handled above
     }
   }
 
-  let valid = errors.is_empty();
+  // In strict mode, warnings become errors
+  let (final_errors, final_warnings) = if strict {
+    let mut all_errors = errors;
+    all_errors.extend(warnings.iter().cloned());
+    (all_errors, vec![])
+  } else {
+    (errors, warnings)
+  };
 
+  let valid = final_errors.is_empty();
+
+  // Output
   if json {
     let result = ValidationResult {
       command: "config",
       action: "validate",
       valid,
       config_path: Some(config_path.display().to_string()),
-      errors,
-      warnings,
+      errors: final_errors,
+      warnings: final_warnings,
     };
     println!(
       "{}",
@@ -155,19 +278,28 @@ pub fn run_config_validate(ctx: &WorkspaceContext, format: OutputFormat) -> Rail
     );
   } else {
     println!("config: {}", config_path.display());
+    if strict && is_ci_environment() {
+      println!("mode: strict (CI detected)");
+    } else if strict {
+      println!("mode: strict");
+    }
     println!();
 
-    if !errors.is_empty() {
+    if !final_errors.is_empty() {
       println!("errors:");
-      for e in &errors {
-        println!("  [{}] {}", e.section, e.message);
+      for e in &final_errors {
+        if let (Some(line), Some(col)) = (e.line, e.column) {
+          println!("  [{}:{}:{}] {}", e.section, line, col, e.message);
+        } else {
+          println!("  [{}] {}", e.section, e.message);
+        }
       }
       println!();
     }
 
-    if !warnings.is_empty() {
+    if !final_warnings.is_empty() {
       println!("warnings:");
-      for w in &warnings {
+      for w in &final_warnings {
         println!("  [{}] {}", w.section, w.message);
       }
       println!();
@@ -176,18 +308,82 @@ pub fn run_config_validate(ctx: &WorkspaceContext, format: OutputFormat) -> Rail
     if valid {
       println!("configuration is valid");
     } else {
-      println!("configuration has {} error(s)", errors.len());
+      println!("configuration has {} error(s)", final_errors.len());
     }
   }
 
   if valid {
     Ok(())
   } else if json {
-    // JSON mode: exit with error code but don't print extra message
-    // (the JSON output already contains the error details)
     std::process::exit(2);
   } else {
     Err(RailError::message("configuration validation failed"))
+  }
+}
+
+/// Extract line/column from toml_edit error message if present
+fn extract_toml_error_location(err: &str) -> Option<(usize, usize)> {
+  // toml_edit errors often contain "at line X column Y"
+  if let Some(at_pos) = err.find("at line ") {
+    let rest = &err[at_pos + 8..];
+    let parts: Vec<&str> = rest.split_whitespace().take(3).collect();
+    if parts.len() >= 3
+      && parts[1] == "column"
+      && let (Ok(line), Ok(col)) = (parts[0].parse::<usize>(), parts[2].parse::<usize>())
+    {
+      return Some((line, col));
+    }
+  }
+  None
+}
+
+/// Check for unknown keys in the TOML document
+fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<ValidationIssue>) {
+  let known_top: HashSet<&str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
+
+  for (key, item) in doc.iter() {
+    if !known_top.contains(key) {
+      warnings.push(ValidationIssue::new(
+        "config",
+        format!("unknown top-level key '{}'", key),
+      ));
+      continue;
+    }
+
+    // Check nested keys
+    if let Some(table) = item.as_table() {
+      let known_keys: Option<HashSet<&str>> = match key {
+        "unify" => Some(KNOWN_UNIFY_KEYS.iter().copied().collect()),
+        "release" => Some(KNOWN_RELEASE_KEYS.iter().copied().collect()),
+        "change-detection" => Some(KNOWN_CHANGE_DETECTION_KEYS.iter().copied().collect()),
+        _ => None, // crates, workspace, toolchain have dynamic keys
+      };
+
+      if let Some(known) = known_keys {
+        for (nested_key, _) in table.iter() {
+          if !known.contains(nested_key) {
+            warnings.push(ValidationIssue::new(
+              key,
+              format!("unknown key '{}' in [{}] section", nested_key, key),
+            ));
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Check for deprecated keys
+fn check_deprecated_keys(content: &str, warnings: &mut Vec<ValidationIssue>) {
+  for (deprecated_key, message) in DEPRECATED_KEYS {
+    // Simple check - look for the key in the content
+    // This is a heuristic; a proper check would parse the TOML
+    if content.contains(deprecated_key) {
+      warnings.push(ValidationIssue::new(
+        "deprecated",
+        format!("'{}' is deprecated: {}", deprecated_key, message),
+      ));
+    }
   }
 }
 

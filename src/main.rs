@@ -4,7 +4,7 @@
 //! See rules.md: "Thin main.rs" principle.
 
 use cargo_rail::commands::cli::{ConfigCommand, UnifyCommand};
-use cargo_rail::commands::{self, CargoCli, Commands};
+use cargo_rail::commands::{self, CargoCli, Commands, StrictnessMode};
 use cargo_rail::error::{RailError, print_error};
 use cargo_rail::workspace;
 
@@ -62,6 +62,28 @@ fn main() {
   } = cli.command
   {
     if let Err(e) = commands::run_config_sync(&workspace_root, check, format) {
+      exit_with_error(e);
+    }
+    return;
+  }
+
+  // Handle config validate specially - it can diagnose parse errors before WorkspaceContext
+  if let Commands::Config {
+    command: ConfigCommand::Validate {
+      format,
+      strict,
+      no_strict,
+    },
+  } = cli.command
+  {
+    let strictness = if strict {
+      StrictnessMode::Strict
+    } else if no_strict {
+      StrictnessMode::NoStrict
+    } else {
+      StrictnessMode::Auto
+    };
+    if let Err(e) = commands::run_config_validate_standalone(&workspace_root, format, strictness) {
       exit_with_error(e);
     }
     return;

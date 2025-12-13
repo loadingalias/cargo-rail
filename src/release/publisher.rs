@@ -133,8 +133,9 @@ impl<'a> ReleasePublisher<'a> {
     println!("\nrelease complete");
 
     if !skip_tag {
+      let branch = self.ctx.git.current_branch().unwrap_or_else(|_| "main".to_string());
       println!("\nnext:");
-      println!("  git push origin main");
+      println!("  git push origin {}", branch);
       println!("  git push origin --tags");
     }
 
@@ -161,6 +162,29 @@ impl<'a> ReleasePublisher<'a> {
         let manifest_path = pkg.manifest_path.clone().into_std_path_buf();
         VersionBumper::update_dependency_version(&manifest_path, &plan.name, &plan.new_version)?;
       }
+    }
+
+    Ok(())
+  }
+
+  /// Update Cargo.lock for a specific crate only
+  ///
+  /// Uses targeted `cargo update --package` to avoid upgrading external dependencies.
+  /// This is safer than `cargo update --workspace` which can inadvertently upgrade
+  /// pinned external dependencies during a release.
+  fn update_lockfile_for_crate(&self, crate_name: &str) -> RailResult<()> {
+    let output = Command::new("cargo")
+      .current_dir(self.ctx.workspace_root())
+      .args(["update", "--package", crate_name])
+      .output()
+      .map_err(|e| RailError::message(format!("Failed to run cargo update: {}", e)))?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::message(format!(
+        "cargo update --package {} failed: {}",
+        crate_name, stderr
+      )));
     }
 
     Ok(())
@@ -249,17 +273,8 @@ impl<'a> ReleasePublisher<'a> {
     let message = format!("chore(release): {} v{}", plan.name, plan.new_version);
 
     // Update Cargo.lock to reflect the new version
-    // This is necessary because editing Cargo.toml doesn't automatically update the lockfile
-    let output = Command::new("cargo")
-      .current_dir(self.ctx.workspace_root())
-      .args(["update", "--workspace"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run cargo update: {}", e)))?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::message(format!("cargo update failed: {}", stderr)));
-    }
+    // Use targeted update to only update this crate, not external dependencies
+    self.update_lockfile_for_crate(&plan.name)?;
 
     let output = Command::new("git")
       .current_dir(self.ctx.workspace_root())
