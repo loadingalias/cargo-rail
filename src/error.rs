@@ -352,6 +352,12 @@ pub enum GitError {
     /// Failure reason
     reason: String,
   },
+
+  /// Worktree has uncommitted changes
+  DirtyWorktree {
+    /// List of dirty files
+    files: Vec<String>,
+  },
 }
 
 impl GitError {
@@ -367,6 +373,7 @@ impl GitError {
         }
       }
       GitError::RepoNotFound { path } => Some(format!("run 'git init {}' or verify the path", path.display())),
+      GitError::DirtyWorktree { .. } => Some("commit or stash changes, or use --allow-dirty".to_string()),
       _ => None,
     }
   }
@@ -391,6 +398,20 @@ impl fmt::Display for GitError {
       }
       GitError::PushFailed { remote, branch, reason } => {
         write!(f, "push to {}/{} failed: {}", remote, branch, reason.trim())
+      }
+      GitError::DirtyWorktree { files } => {
+        let count = files.len();
+        if count <= 5 {
+          write!(f, "working tree has uncommitted changes:\n{}", files.join("\n"))
+        } else {
+          let shown: Vec<_> = files.iter().take(5).cloned().collect();
+          write!(
+            f,
+            "working tree has uncommitted changes:\n{}\n  ... and {} more",
+            shown.join("\n"),
+            count - 5
+          )
+        }
       }
     }
   }

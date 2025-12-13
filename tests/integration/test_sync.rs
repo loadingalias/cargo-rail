@@ -27,7 +27,10 @@ paths = [{{ crate = "crates/{0}" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform initial split
-  run_cargo_rail(&ws.path, &["rail", "split", "run", crate_name])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", crate_name, "--yes", "--allow-dirty"],
+  )?;
 
   Ok((ws, split_dir))
 }
@@ -41,7 +44,10 @@ fn test_sync_to_remote_basic() -> Result<()> {
   ws.commit("Update mylib in mono")?;
 
   // Sync to remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify change in split
   let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
@@ -68,7 +74,10 @@ fn test_sync_from_remote_basic() -> Result<()> {
   git(split_dir.path(), &["commit", "-m", "Update in split"])?;
 
   // Sync from remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--from-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify change in monorepo (on PR branch, not original branch)
   let mono_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
@@ -101,7 +110,10 @@ fn test_sync_from_remote_creates_pr_branch() -> Result<()> {
   git(split_dir.path(), &["commit", "-m", "Test change in split"])?;
 
   // Sync from remote - should create PR branch
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--from-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify we're on a PR branch (not the original branch)
   let current_branch_output = git(&ws.path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -150,14 +162,20 @@ fn test_sync_roundtrip_preserves_content() -> Result<()> {
   ws.commit("Set test function")?;
 
   // Sync to split
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify in split
   let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
   assert_eq!(split_content, original, "Split should have original content");
 
   // Sync back from split (should be no-op, but creates PR branch)
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--from-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--from-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify still matches (on PR branch)
   let final_content = std::fs::read_to_string(ws.path.join("crates/mylib/src/lib.rs"))?;
@@ -181,7 +199,10 @@ fn test_sync_multiple_commits() -> Result<()> {
   ws.commit("Update v3")?;
 
   // Sync all to remote
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Check that all commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -213,7 +234,10 @@ fn test_sync_preserves_commit_order() -> Result<()> {
   ws.commit("Update README v2")?;
 
   // Sync to split
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Get split commit history
   let log_output = git(split_dir.path(), &["log", "--reverse", "--format=%s"])?;
@@ -243,7 +267,10 @@ fn test_sync_skips_already_synced_commits() -> Result<()> {
   ws.modify_file("mylib", "src/lib.rs", "// First change")?;
   ws.commit("First change")?;
 
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Get commit count
   let log1 = git(split_dir.path(), &["log", "--oneline"])?;
@@ -253,7 +280,10 @@ fn test_sync_skips_already_synced_commits() -> Result<()> {
   ws.modify_file("mylib", "src/lib.rs", "// Second change")?;
   ws.commit("Second change")?;
 
-  run_cargo_rail(&ws.path, &["rail", "sync", "mylib", "--to-remote"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
 
   // Get new commit count
   let log2 = git(split_dir.path(), &["log", "--oneline"])?;
@@ -277,7 +307,16 @@ fn test_sync_strategy_ours() -> Result<()> {
   // Sync with --strategy ours
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "sync", "strategy-lib", "--to-remote", "--strategy", "ours"],
+    &[
+      "rail",
+      "sync",
+      "strategy-lib",
+      "--to-remote",
+      "--strategy",
+      "ours",
+      "--yes",
+      "--allow-dirty",
+    ],
   )?;
 
   assert!(
@@ -297,7 +336,16 @@ fn test_sync_strategy_theirs() -> Result<()> {
   // Sync with --strategy theirs
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "sync", "theirs-lib", "--to-remote", "--strategy", "theirs"],
+    &[
+      "rail",
+      "sync",
+      "theirs-lib",
+      "--to-remote",
+      "--strategy",
+      "theirs",
+      "--yes",
+      "--allow-dirty",
+    ],
   )?;
 
   assert!(
@@ -325,6 +373,81 @@ fn test_sync_json_output() -> Result<()> {
       assert!(parsed.is_ok(), "JSON output should be valid. stdout: {}", stdout);
     }
   }
+
+  Ok(())
+}
+
+// ============================================================================
+// Safety Rails Tests
+// ============================================================================
+
+/// Test that sync fails on dirty worktree without --allow-dirty
+#[test]
+fn test_sync_dirty_worktree_error() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("dirty-sync-lib")?;
+
+  // Make a change in mono that we want to sync
+  ws.modify_file("dirty-sync-lib", "src/lib.rs", "// Changed in mono")?;
+  ws.commit("Update in mono")?;
+
+  // Make worktree dirty by adding an uncommitted file
+  std::fs::write(ws.path.join("dirty.txt"), "uncommitted content")?;
+
+  // Run sync WITHOUT --allow-dirty - should fail
+  let output = run_cargo_rail(&ws.path, &["rail", "sync", "dirty-sync-lib", "--to-remote", "--yes"])?;
+
+  assert!(
+    !output.status.success(),
+    "Sync should fail on dirty worktree without --allow-dirty"
+  );
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("uncommitted changes") || stderr.contains("dirty"),
+    "Error should mention uncommitted changes. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that --allow-dirty bypasses the dirty worktree check for sync
+#[test]
+fn test_sync_allow_dirty_bypasses_check() -> Result<()> {
+  let (ws, split_dir) = setup_split_scenario("allow-dirty-sync-lib")?;
+
+  // Make a change in mono that we want to sync
+  ws.modify_file("allow-dirty-sync-lib", "src/lib.rs", "// Changed in mono")?;
+  ws.commit("Update in mono")?;
+
+  // Make worktree dirty
+  std::fs::write(ws.path.join("dirty.txt"), "uncommitted content")?;
+
+  // Run sync WITH --allow-dirty - should succeed
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "sync",
+      "allow-dirty-sync-lib",
+      "--to-remote",
+      "--yes",
+      "--allow-dirty",
+    ],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "Sync should succeed with --allow-dirty. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Verify sync happened
+  let split_content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
+  assert!(
+    split_content.contains("// Changed in mono"),
+    "Split should have the synced change"
+  );
 
   Ok(())
 }

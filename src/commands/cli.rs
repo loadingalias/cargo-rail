@@ -251,6 +251,12 @@ pub enum Commands {
     /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
+    /// Allow running on dirty worktree (uncommitted changes)
+    #[arg(long)]
+    allow_dirty: bool,
+    /// Skip confirmation prompts (for CI/automation)
+    #[arg(short = 'y', long)]
+    yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
@@ -369,6 +375,12 @@ pub enum SplitCommand {
     /// Dry-run mode: preview changes
     #[arg(long, short = 'c')]
     check: bool,
+    /// Allow running on dirty worktree (uncommitted changes)
+    #[arg(long)]
+    allow_dirty: bool,
+    /// Skip confirmation prompts (for CI/automation)
+    #[arg(short = 'y', long)]
+    yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,

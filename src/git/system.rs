@@ -121,6 +121,24 @@ impl SystemGit {
     Ok(None)
   }
 
+  /// Check if the worktree has uncommitted changes
+  ///
+  /// Returns `true` if there are staged or unstaged changes, including untracked files.
+  /// This is useful for safety checks before destructive operations.
+  pub fn is_dirty(&self) -> RailResult<bool> {
+    let output = self.run_git_stdout(&["status", "--porcelain"])?;
+    Ok(!output.is_empty())
+  }
+
+  /// Get list of dirty files in the worktree
+  ///
+  /// Returns the files with their status prefixes (e.g., " M file.txt", "?? new.txt").
+  /// Useful for displaying what's dirty when refusing to run on a dirty worktree.
+  pub fn dirty_files(&self) -> RailResult<Vec<String>> {
+    let output = self.run_git_stdout(&["status", "--porcelain"])?;
+    Ok(output.lines().map(|s| s.to_string()).collect())
+  }
+
   /// Create a safe git command with isolated environment
   ///
   /// - Sets working directory to repo path

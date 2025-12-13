@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
-use crate::error::RailResult;
+use crate::error::{GitError, RailError, RailResult};
 use crate::progress;
 use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine, SyncResult};
 use crate::utils;
@@ -17,40 +17,59 @@ struct CrateSyncResult {
   skipped: bool,
 }
 
+/// Arguments for the sync command
+pub struct SyncArgs {
+  /// Crate name to sync (mutually exclusive with `all`)
+  pub crate_name: Option<String>,
+  /// Sync all configured crates
+  pub all: bool,
+  /// Override remote repository URL
+  pub remote: Option<String>,
+  /// Sync from remote to monorepo only
+  pub from_remote: bool,
+  /// Sync from monorepo to remote only
+  pub to_remote: bool,
+  /// Conflict resolution strategy
+  pub strategy: ConflictStrategy,
+  /// Dry-run mode: preview changes without executing
+  pub check: bool,
+  /// Allow running on dirty worktree (uncommitted changes)
+  pub allow_dirty: bool,
+  /// Skip confirmation prompts (for CI/automation)
+  pub yes: bool,
+  /// Output format
+  pub format: OutputFormat,
+}
+
 /// Run the sync command
-#[allow(clippy::too_many_arguments)]
-pub fn run_sync(
-  ctx: &WorkspaceContext,
-  crate_name: Option<String>,
-  all: bool,
-  remote: Option<String>,
-  from_remote: bool,
-  to_remote: bool,
-  strategy: ConflictStrategy,
-  check: bool,
-  format: OutputFormat,
-) -> RailResult<()> {
-  let json = format.is_json();
+pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
+  let json = args.format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
     crate::output::set_json_mode(true);
   }
 
+  // Dirty worktree check (unless --allow-dirty or --check mode)
+  if !args.check && !args.allow_dirty && ctx.git.git().is_dirty()? {
+    let files = ctx.git.git().dirty_files()?;
+    return Err(RailError::Git(GitError::DirtyWorktree { files }));
+  }
+
   let builder = SplitSyncConfigBuilder::new(ctx)?
-    .with_crate_or_all(crate_name.clone(), all)?
-    .with_remote_override(remote);
+    .with_crate_or_all(args.crate_name.clone(), args.all)?
+    .with_remote_override(args.remote);
 
   let config_count = builder.count();
 
-  if config_count == 0 && all {
+  if config_count == 0 && args.all {
     return Err(crate::error::RailError::with_help(
       "no crates configured for sync",
       "run 'cargo rail split init' first",
     ));
   }
 
-  let direction = match (from_remote, to_remote) {
+  let direction = match (args.from_remote, args.to_remote) {
     (true, true) => {
       return Err(crate::error::RailError::with_help(
         "cannot use both --from-remote and --to-remote",
@@ -65,7 +84,7 @@ pub fn run_sync(
   let configs = builder.build_sync_configs()?;
 
   // Check mode
-  if check {
+  if args.check {
     if json {
       let dir_str = match direction {
         SyncDirection::MonoToRemote => "to_remote",
@@ -92,7 +111,7 @@ pub fn run_sync(
         "command": "sync",
         "check": true,
         "direction": dir_str,
-        "strategy": format!("{:?}", strategy).to_lowercase(),
+        "strategy": format!("{:?}", args.strategy).to_lowercase(),
         "crates": crates,
         "count": configs.len()
       });
@@ -113,7 +132,7 @@ pub fn run_sync(
       println!("    direction: {}", dir_display);
       println!("    target: {}", sync_config.target_repo_path.display());
       println!("    remote: {}", sync_config.remote_url);
-      println!("    strategy: {}", format!("{:?}", strategy).to_lowercase());
+      println!("    strategy: {}", format!("{:?}", args.strategy).to_lowercase());
       if !target_exists {
         println!("    warning: target repo missing (run split first)");
       }
@@ -123,8 +142,8 @@ pub fn run_sync(
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
-  // Interactive confirmation
-  if std::io::stdin().is_terminal() && !json {
+  // Interactive confirmation (unless --yes)
+  if !args.yes && std::io::stdin().is_terminal() && !json {
     let dir_sym = match direction {
       SyncDirection::MonoToRemote => "->",
       SyncDirection::RemoteToMono => "<-",
@@ -155,10 +174,11 @@ pub fn run_sync(
   }
 
   // Execute syncs and collect per-crate results
-  let crate_results: Vec<CrateSyncResult> = if config_count > 1 && all {
+  let crate_results: Vec<CrateSyncResult> = if config_count > 1 && args.all {
     progress!("syncing {} crates...", config_count);
 
     let ctx = ctx.clone();
+    let strategy = args.strategy;
     let results: Vec<RailResult<CrateSyncResult>> = configs
       .into_par_iter()
       .map(|(sync_config, target_exists)| {
@@ -208,7 +228,7 @@ pub fn run_sync(
       }
 
       progress!("syncing {}...", crate_name);
-      let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
+      let mut engine = SyncEngine::new(ctx, sync_config, args.strategy)?;
 
       let result = match direction {
         SyncDirection::MonoToRemote => engine.sync_to_remote()?,

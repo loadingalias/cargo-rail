@@ -4,40 +4,57 @@ use std::io::IsTerminal;
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::config::RailConfig;
-use crate::error::RailResult;
+use crate::error::{GitError, RailError, RailResult};
 use crate::progress;
 use crate::split::SplitEngine;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
+/// Arguments for the split run command
+pub struct SplitRunArgs {
+  /// Crate name to split (mutually exclusive with `all`)
+  pub crate_name: Option<String>,
+  /// Split all configured crates
+  pub all: bool,
+  /// Override remote repository URL
+  pub remote: Option<String>,
+  /// Dry-run mode: preview changes without executing
+  pub check: bool,
+  /// Allow running on dirty worktree (uncommitted changes)
+  pub allow_dirty: bool,
+  /// Skip confirmation prompts (for CI/automation)
+  pub yes: bool,
+  /// Output format
+  pub format: OutputFormat,
+}
+
 /// Run the split command
-pub fn run_split(
-  ctx: &WorkspaceContext,
-  crate_name: Option<String>,
-  all: bool,
-  remote: Option<String>,
-  check: bool,
-  format: OutputFormat,
-) -> RailResult<()> {
-  let json = format.is_json();
+pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
+  let json = args.format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
   if json {
     crate::output::set_json_mode(true);
   }
 
+  // Dirty worktree check (unless --allow-dirty or --check mode)
+  if !args.check && !args.allow_dirty && ctx.git.git().is_dirty()? {
+    let files = ctx.git.git().dirty_files()?;
+    return Err(RailError::Git(GitError::DirtyWorktree { files }));
+  }
+
   let builder = SplitSyncConfigBuilder::new(ctx)?
-    .with_crate_or_all(crate_name.clone(), all)?
-    .with_remote_override(remote)
+    .with_crate_or_all(args.crate_name.clone(), args.all)?
+    .with_remote_override(args.remote)
     .validate()?;
 
   let config_count = builder.count();
   let configs = builder.build_split_configs()?;
 
   // Check mode: show plan
-  if check {
-    match format {
+  if args.check {
+    match args.format {
       OutputFormat::Json => {
         let crates: Vec<_> = configs
           .iter()
@@ -98,8 +115,8 @@ pub fn run_split(
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
 
-  // Interactive confirmation
-  if std::io::stdin().is_terminal() && !json {
+  // Interactive confirmation (unless --yes)
+  if !args.yes && std::io::stdin().is_terminal() && !json {
     println!("splitting {} crate(s):\n", config_count);
     for config in &configs {
       println!("  {} -> {}", config.crate_name, config.target_repo_path.display());
@@ -112,7 +129,7 @@ pub fn run_split(
   }
 
   // Execute splits
-  if config_count > 1 && all {
+  if config_count > 1 && args.all {
     progress!("splitting {} crates...", config_count);
     let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs

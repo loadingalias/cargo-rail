@@ -31,7 +31,7 @@ paths = [{{ crate = "crates/mylib" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform split
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--yes", "--allow-dirty"])?;
 
   // Verify split structure
   assert!(split_path.join("Cargo.toml").exists(), "Cargo.toml should exist");
@@ -80,7 +80,7 @@ paths = [{{ crate = "crates/mylib" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--yes", "--allow-dirty"])?;
 
   // Check git history in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -123,7 +123,7 @@ paths = [{{ crate = "crates/lib-a" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-a"])?;
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-a", "--yes", "--allow-dirty"])?;
 
   // Check that only lib-a commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -162,7 +162,10 @@ paths = [{{ crate = "crates/lib-core" }}]
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-core"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "lib-core", "--yes", "--allow-dirty"],
+  )?;
 
   // Check that path dependency was transformed to version dependency
   let cargo_toml = std::fs::read_to_string(split_dir.path().join("Cargo.toml"))?;
@@ -209,7 +212,10 @@ paths = [
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "combined"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "combined", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify both crates exist with preserved structure
   let split_path = split_dir.path();
@@ -279,7 +285,10 @@ paths = [{{ crate = "crates/lib-release" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Perform split
-  run_cargo_rail(&ws.path, &["rail", "split", "run", "lib-release"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "lib-release", "--yes", "--allow-dirty"],
+  )?;
 
   // Prepare release config inside split repo
   let split_root = split_dir.path();
@@ -514,7 +523,10 @@ paths = [{{ crate = "crates/prefetch-lib" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Run split - should use parallel prefetch
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "prefetch-lib"])?;
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "prefetch-lib", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify split succeeded
   assert!(
@@ -598,7 +610,10 @@ paths = [{{ crate = "crates/dirty-lib" }}]
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
   // Run split - should succeed despite dirty history
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "dirty-lib"])?;
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "dirty-lib", "--yes", "--allow-dirty"],
+  )?;
 
   // Verify split succeeded
   assert!(
@@ -647,6 +662,99 @@ paths = [{{ crate = "crates/dirty-lib" }}]
   );
   assert!(log.contains("Restore dirty-lib"), "Should contain restore commit");
   assert!(log.contains("Update dirty-lib v3"), "Should contain v3 update");
+
+  Ok(())
+}
+
+// ============================================================================
+// Safety Rails Tests
+// ============================================================================
+
+/// Test that split fails on dirty worktree without --allow-dirty
+#[test]
+fn test_split_dirty_worktree_error() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("safety-lib", "0.1.0", &[])?;
+  ws.commit("Add safety-lib")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.safety-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/safety-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // Make worktree dirty by adding an uncommitted file
+  std::fs::write(ws.path.join("dirty.txt"), "uncommitted content")?;
+
+  // Run split WITHOUT --allow-dirty - should fail
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "safety-lib", "--yes"])?;
+
+  assert!(
+    !output.status.success(),
+    "Split should fail on dirty worktree without --allow-dirty"
+  );
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("uncommitted changes") || stderr.contains("dirty"),
+    "Error should mention uncommitted changes. stderr: {}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that --allow-dirty bypasses the dirty worktree check
+#[test]
+fn test_split_allow_dirty_bypasses_check() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("allow-dirty-lib", "0.1.0", &[])?;
+  ws.commit("Add allow-dirty-lib")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.allow-dirty-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/allow-dirty-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // Make worktree dirty
+  std::fs::write(ws.path.join("dirty.txt"), "uncommitted content")?;
+
+  // Run split WITH --allow-dirty - should succeed
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "allow-dirty-lib", "--yes", "--allow-dirty"],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "Split should succeed with --allow-dirty. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Verify split was created
+  assert!(
+    split_dir.path().join("Cargo.toml").exists(),
+    "Split repo should be created"
+  );
 
   Ok(())
 }
