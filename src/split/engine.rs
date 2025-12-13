@@ -408,7 +408,7 @@ impl<'a> SplitEngine<'a> {
     Ok(output.status.success() && !output.stdout.is_empty())
   }
 
-  /// Execute a split operation (ONE-TIME ONLY - use sync for updates)
+  /// Execute a split operation (idempotent - re-runs sync new commits only)
   pub fn split(&self, config: &SplitConfig) -> RailResult<()> {
     println!("🚂 Splitting crate: {}", config.crate_name);
     println!("   Mode: {:?}", config.mode);
@@ -424,10 +424,14 @@ impl<'a> SplitEngine<'a> {
       println!("   Exclude patterns: {} configured", config.exclude.len());
     }
 
-    // Check if remote already exists - if so, error with helpful message
+    // Check if target repo already exists (for idempotency)
+    let target_exists = config.target_repo_path.join(".git").exists();
+
+    // Check if remote already exists - warn but allow re-run for idempotency
     if let Some(ref remote_url) = config.remote_url {
       let remote_exists = self.check_remote_exists(remote_url)?;
-      if remote_exists {
+      if remote_exists && !target_exists {
+        // Remote exists but no local target - user probably wants to use sync instead
         return Err(RailError::with_help(
           format!("Split already exists at {}", remote_url),
           format!(
@@ -438,9 +442,10 @@ impl<'a> SplitEngine<'a> {
           ),
         ));
       }
+      // If both remote and target exist, we'll check mappings below for idempotency
     }
 
-    // Create fresh target repo
+    // Create or reuse target repo
     self.ensure_target_repo(&config.target_repo_path)?;
 
     // Discover workspace-level auxiliary files from workspace
@@ -461,12 +466,33 @@ impl<'a> SplitEngine<'a> {
       );
     }
 
-    // Create mapping store
+    // Create mapping store and load existing mappings (from both workspace and target)
     let mut mapping_store = MappingStore::new(config.crate_name.clone());
     mapping_store.load(self.ctx.workspace_root())?;
+    if target_exists {
+      mapping_store.load(&config.target_repo_path)?;
+    }
 
     // Walk filtered history to find commits touching the crate
     let filtered_commits = self.walk_filtered_history(&config.crate_paths)?;
+
+    // Count how many commits are already mapped (for idempotency)
+    let already_mapped_count = filtered_commits
+      .iter()
+      .filter(|c| mapping_store.has_mapping(&c.sha))
+      .count();
+
+    if already_mapped_count > 0 {
+      println!("   Found {} commits already split (will skip)", already_mapped_count);
+    }
+
+    // Check if all commits are already mapped - nothing to do
+    if already_mapped_count == filtered_commits.len() && !filtered_commits.is_empty() {
+      println!("\n✅ Split already up-to-date!");
+      println!("   All {} commits have been split previously.", filtered_commits.len());
+      println!("   Target repo: {}", config.target_repo_path.display());
+      return Ok(());
+    }
 
     if filtered_commits.is_empty() {
       println!("   No commits found that touch the crate paths");
@@ -505,10 +531,31 @@ impl<'a> SplitEngine<'a> {
       let mut last_recreated_sha: Option<String> = None;
 
       let mut skipped_commits = 0usize;
+      let mut skipped_already_mapped = 0usize;
+
+      // For incremental splits, find the last mapped commit's SHA in target repo
+      // to use as parent for new commits
+      if target_exists && already_mapped_count > 0 {
+        // Find the most recent mapped commit and use its target SHA as last_recreated_sha
+        for commit in filtered_commits.iter().rev() {
+          if let Ok(Some(target_sha)) = mapping_store.get_mapping(&commit.sha) {
+            last_recreated_sha = Some(target_sha);
+            break;
+          }
+        }
+      }
 
       for (idx, commit) in filtered_commits.iter().enumerate() {
-        if (idx + 1) % 10 == 0 || idx + 1 == filtered_commits.len() {
-          println!("   Progress: {}/{} commits", idx + 1, filtered_commits.len());
+        // Skip already-mapped commits (idempotency)
+        if mapping_store.has_mapping(&commit.sha) {
+          skipped_already_mapped += 1;
+          continue;
+        }
+
+        let new_count = idx + 1 - skipped_already_mapped;
+        let total_new = filtered_commits.len() - already_mapped_count;
+        if new_count.is_multiple_of(10) || new_count == total_new {
+          println!("   Progress: {}/{} new commits", new_count, total_new);
         }
 
         // Use prefetched files if available
@@ -539,11 +586,19 @@ impl<'a> SplitEngine<'a> {
         last_recreated_sha = Some(new_sha);
       }
 
-      if skipped_commits > 0 {
-        println!(
-          "   Skipped {} commits where path didn't exist (dirty history)",
-          skipped_commits
-        );
+      if skipped_commits > 0 || skipped_already_mapped > 0 {
+        if skipped_commits > 0 {
+          println!(
+            "   Skipped {} commits where path didn't exist (dirty history)",
+            skipped_commits
+          );
+        }
+        if skipped_already_mapped > 0 {
+          println!(
+            "   Skipped {} commits already split (idempotent)",
+            skipped_already_mapped
+          );
+        }
       }
 
       // Create workspace Cargo.toml if in workspace mode

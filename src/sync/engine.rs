@@ -261,77 +261,88 @@ impl<'a> SyncEngine<'a> {
       remote_git.get_commits_touching_path(Path::new("."), None, &branch_ref)?
     };
 
+    // Filter to only commits that need syncing (not already mapped)
+    let commits_to_sync: Vec<_> = new_commits
+      .iter()
+      .filter(|c| {
+        // Skip if this commit came from mono (check trailer)
+        if c.message.contains("Rail-Origin: mono@") {
+          return false;
+        }
+        // Skip if already synced (O(1) reverse mapping lookup)
+        if self.mapping_store.has_reverse_mapping(&c.sha) {
+          return false;
+        }
+        true
+      })
+      .collect();
+
+    // If nothing to sync, report up-to-date
+    if commits_to_sync.is_empty() {
+      println!("   No new commits to sync (already up-to-date)");
+      return Ok(SyncResult {
+        commits_synced: 0,
+        conflicts: Vec::new(),
+      });
+    }
+
     // Always create a PR branch for safety when syncing from remote
     // This prevents direct commits to protected branches (main, master, develop)
-    let pr_branch = if !new_commits.is_empty() {
-      // Create timestamped branch name
-      let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_secs();
+    // Use deterministic branch name (without timestamp) for idempotency
+    let branch_name = format!("cargo-rail-sync-{}", self.config.crate_name);
 
-      // Format: cargo-rail-sync-CRATE-TIMESTAMP
-      let branch_name = format!("cargo-rail-sync-{}-{}", self.config.crate_name, timestamp);
+    // Check if branch already exists
+    let branch_exists = self.ctx.git.git().branch_exists(&branch_name)?;
 
-      println!("   Creating PR branch: {}", branch_name);
-      self.ctx.git.git().create_and_checkout_branch(&branch_name)?;
-
+    let pr_branch = if branch_exists {
+      // Branch exists - switch to it and check if commits are already there
+      println!("   PR branch '{}' already exists, checking state...", branch_name);
+      self.ctx.git.git().checkout_branch(&branch_name)?;
       Some(branch_name)
     } else {
-      None
+      // Create new branch
+      println!("   Creating PR branch: {}", branch_name);
+      self.ctx.git.git().create_and_checkout_branch(&branch_name)?;
+      Some(branch_name)
     };
 
     let mut conflicts = Vec::new();
 
-    let synced_count = if new_commits.is_empty() {
-      println!("   No new commits to sync");
-      0
-    } else {
-      println!("   Syncing {} commits from remote...", new_commits.len());
+    // Process commits (we already filtered to only those needing sync above)
+    println!("   Syncing {} commits from remote...", commits_to_sync.len());
 
-      let mut count = 0;
-      let mut current_mono_head = self.ctx.git.git().head_commit()?; // Cache HEAD, update after each commit
+    let mut count = 0;
+    let mut current_mono_head = self.ctx.git.git().head_commit()?; // Cache HEAD, update after each commit
 
-      for commit in &new_commits {
-        // Skip if this commit came from mono (check trailer)
-        if commit.message.contains("Rail-Origin: mono@") {
-          continue;
-        }
+    for commit in &commits_to_sync {
+      // Resolve conflicts using 3-way merge (returns conflicts + changed_files for caching)
+      let resolution = self.resolve_conflicts_for_commit(commit, &remote_git)?;
 
-        // Skip if already synced (O(1) reverse mapping lookup)
-        if self.mapping_store.has_reverse_mapping(&commit.sha) {
-          continue;
-        }
+      // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
+      // Using HashSet<&Path> for O(1) membership testing - borrows from resolution.conflicts, no clones
+      let resolved_files: HashSet<&Path> = resolution.conflicts.iter().map(|c| c.file_path.as_path()).collect();
 
-        // Resolve conflicts using 3-way merge (returns conflicts + changed_files for caching)
-        let resolution = self.resolve_conflicts_for_commit(commit, &remote_git)?;
+      // Apply commit to mono (skipping already-resolved files, reusing cached changed_files)
+      let mono_sha = self.apply_remote_commit_to_mono(
+        commit,
+        &remote_git,
+        &resolved_files,
+        &current_mono_head,
+        &resolution.changed_files,
+      )?;
 
-        // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
-        // Using HashSet<&Path> for O(1) membership testing - borrows from resolution.conflicts, no clones
-        let resolved_files: HashSet<&Path> = resolution.conflicts.iter().map(|c| c.file_path.as_path()).collect();
-
-        // Apply commit to mono (skipping already-resolved files, reusing cached changed_files)
-        let mono_sha = self.apply_remote_commit_to_mono(
-          commit,
-          &remote_git,
-          &resolved_files,
-          &current_mono_head,
-          &resolution.changed_files,
-        )?;
-
-        // Extend conflicts AFTER apply (resolved_files borrows from resolution.conflicts)
-        if !resolution.conflicts.is_empty() {
-          conflicts.extend(resolution.conflicts);
-        }
-
-        // Record mapping (remote -> mono)
-        self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
-        count += 1;
-        current_mono_head = mono_sha; // Update cached HEAD (move, not clone)
+      // Extend conflicts AFTER apply (resolved_files borrows from resolution.conflicts)
+      if !resolution.conflicts.is_empty() {
+        conflicts.extend(resolution.conflicts);
       }
 
-      count
-    };
+      // Record mapping (remote -> mono)
+      self.mapping_store.record_mapping(&mono_sha, &commit.sha)?;
+      count += 1;
+      current_mono_head = mono_sha; // Update cached HEAD (move, not clone)
+    }
+
+    let synced_count = count;
 
     // Save mappings
     self.mapping_store.save(self.ctx.workspace_root())?;

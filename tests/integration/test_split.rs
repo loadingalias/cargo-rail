@@ -758,3 +758,389 @@ paths = [{{ crate = "crates/allow-dirty-lib" }}]
 
   Ok(())
 }
+
+/// Test that split is idempotent - running twice produces the same result (no-op on second run)
+#[test]
+fn test_split_idempotent_run_twice() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("idempotent-lib", "0.1.0", &[])?;
+  ws.commit("Initial commit")?;
+
+  // Make a few commits to have history
+  ws.modify_file("idempotent-lib", "src/lib.rs", "// Version 1")?;
+  ws.commit("Update v1")?;
+
+  ws.modify_file("idempotent-lib", "src/lib.rs", "// Version 2")?;
+  ws.commit("Update v2")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.idempotent-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/idempotent-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // First split
+  let output1 = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "idempotent-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output1.status.success(),
+    "First split should succeed. stderr: {}",
+    String::from_utf8_lossy(&output1.stderr)
+  );
+
+  // Get commit count after first split
+  let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count1: usize = String::from_utf8_lossy(&log1.stdout).trim().parse()?;
+
+  // Get HEAD SHA after first split
+  let head1 = git(split_dir.path(), &["rev-parse", "HEAD"])?;
+  let head_sha1 = String::from_utf8_lossy(&head1.stdout).trim().to_string();
+
+  // Second split (should be no-op)
+  let output2 = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "idempotent-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output2.status.success(),
+    "Second split should succeed. stderr: {}",
+    String::from_utf8_lossy(&output2.stderr)
+  );
+
+  // Verify "already up-to-date" message
+  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  assert!(
+    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
+    "Second run should indicate already up-to-date. stdout: {}",
+    stdout2
+  );
+
+  // Get commit count after second split
+  let log2 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count2: usize = String::from_utf8_lossy(&log2.stdout).trim().parse()?;
+
+  // Get HEAD SHA after second split
+  let head2 = git(split_dir.path(), &["rev-parse", "HEAD"])?;
+  let head_sha2 = String::from_utf8_lossy(&head2.stdout).trim().to_string();
+
+  // Verify no new commits were created
+  assert_eq!(
+    commit_count1, commit_count2,
+    "Commit count should not change on second split"
+  );
+  assert_eq!(head_sha1, head_sha2, "HEAD should not change on second split");
+
+  Ok(())
+}
+
+/// Test that split is incremental - new commits are added without duplicating existing ones
+#[test]
+fn test_split_incremental_new_commits() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("incremental-lib", "0.1.0", &[])?;
+  ws.commit("Initial commit")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.incremental-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/incremental-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // First split
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "incremental-lib", "--yes", "--allow-dirty"],
+  )?;
+
+  // Get commit count after first split
+  let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count1: usize = String::from_utf8_lossy(&log1.stdout).trim().parse()?;
+
+  // Add new commits to monorepo
+  ws.modify_file("incremental-lib", "src/lib.rs", "// New feature 1")?;
+  ws.commit("Add feature 1")?;
+
+  ws.modify_file("incremental-lib", "src/lib.rs", "// New feature 2")?;
+  ws.commit("Add feature 2")?;
+
+  // Second split (should add only new commits)
+  let output2 = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "incremental-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output2.status.success(),
+    "Incremental split should succeed. stderr: {}",
+    String::from_utf8_lossy(&output2.stderr)
+  );
+
+  // Get commit count after second split
+  let log2 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count2: usize = String::from_utf8_lossy(&log2.stdout).trim().parse()?;
+
+  // Should have exactly 2 more commits (for the 2 new features)
+  assert_eq!(
+    commit_count2,
+    commit_count1 + 2,
+    "Should have exactly 2 new commits. Before: {}, After: {}",
+    commit_count1,
+    commit_count2
+  );
+
+  // Verify the new commits are there
+  let log_output = git(split_dir.path(), &["log", "--oneline"])?;
+  let log = String::from_utf8_lossy(&log_output.stdout);
+  assert!(log.contains("Add feature 1"), "Should contain feature 1 commit");
+  assert!(log.contains("Add feature 2"), "Should contain feature 2 commit");
+
+  Ok(())
+}
+
+/// Test that split combined mode is idempotent
+#[test]
+fn test_split_combined_mode_idempotent() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("lib-core", "0.1.0", &[])?;
+  ws.add_crate("service-api", "0.1.0", &[("lib-core", r#"{ path = "../lib-core" }"#)])?;
+  ws.commit("Initial combined crates")?;
+
+  // Make commits to both crates
+  ws.modify_file("lib-core", "src/lib.rs", "// Core v1")?;
+  ws.commit("Update lib-core")?;
+
+  ws.modify_file("service-api", "src/lib.rs", "// API v1")?;
+  ws.commit("Update service-api")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.combined.split]
+remote = "{}"
+branch = "main"
+mode = "combined"
+paths = [
+  {{ crate = "crates/lib-core" }},
+  {{ crate = "crates/service-api" }}
+]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // First split
+  let output1 = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "combined", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output1.status.success(),
+    "First combined split should succeed. stderr: {}",
+    String::from_utf8_lossy(&output1.stderr)
+  );
+
+  // Get state after first split
+  let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count1: usize = String::from_utf8_lossy(&log1.stdout).trim().parse()?;
+  let head1 = git(split_dir.path(), &["rev-parse", "HEAD"])?;
+  let head_sha1 = String::from_utf8_lossy(&head1.stdout).trim().to_string();
+
+  // Second split (should be no-op)
+  let output2 = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "combined", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output2.status.success(),
+    "Second combined split should succeed. stderr: {}",
+    String::from_utf8_lossy(&output2.stderr)
+  );
+
+  // Verify "already up-to-date" message
+  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  assert!(
+    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
+    "Second run should indicate already up-to-date. stdout: {}",
+    stdout2
+  );
+
+  // Verify no changes
+  let log2 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count2: usize = String::from_utf8_lossy(&log2.stdout).trim().parse()?;
+  let head2 = git(split_dir.path(), &["rev-parse", "HEAD"])?;
+  let head_sha2 = String::from_utf8_lossy(&head2.stdout).trim().to_string();
+
+  assert_eq!(commit_count1, commit_count2, "Commit count should not change");
+  assert_eq!(head_sha1, head_sha2, "HEAD should not change");
+
+  Ok(())
+}
+
+/// Test that split recovers gracefully from partial/interrupted state
+#[test]
+fn test_split_partial_state_recovery() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("partial-lib", "0.1.0", &[])?;
+  ws.commit("Initial commit")?;
+
+  ws.modify_file("partial-lib", "src/lib.rs", "// V1")?;
+  ws.commit("Version 1")?;
+
+  ws.modify_file("partial-lib", "src/lib.rs", "// V2")?;
+  ws.commit("Version 2")?;
+
+  ws.modify_file("partial-lib", "src/lib.rs", "// V3")?;
+  ws.commit("Version 3")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.partial-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/partial-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // First split - creates full history
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "partial-lib", "--yes", "--allow-dirty"],
+  )?;
+
+  // Simulate partial state by manually removing mappings for later commits
+  // We'll delete the git-notes to simulate an interrupted split
+  let notes_ref = "refs/notes/rail/partial-lib".to_string();
+
+  // Get commit count before manipulation
+  let log_before = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let count_before: usize = String::from_utf8_lossy(&log_before.stdout).trim().parse()?;
+
+  // Delete notes in both repos to simulate interrupted state
+  let _ = git(&ws.path, &["update-ref", "-d", &notes_ref]);
+  let _ = git(split_dir.path(), &["update-ref", "-d", &notes_ref]);
+
+  // Now add a new commit
+  ws.modify_file("partial-lib", "src/lib.rs", "// V4 after interruption")?;
+  ws.commit("Version 4")?;
+
+  // Re-run split - should handle the missing mappings gracefully
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "partial-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output.status.success(),
+    "Split after partial state should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Verify split repo has commits (exact count depends on implementation)
+  let log_after = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let count_after: usize = String::from_utf8_lossy(&log_after.stdout).trim().parse()?;
+
+  // Should have at least as many commits as before (recovery may add more or same)
+  assert!(
+    count_after >= count_before,
+    "Should have at least {} commits after recovery, got {}",
+    count_before,
+    count_after
+  );
+
+  // Verify the new content is there
+  let content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
+  assert!(
+    content.contains("V4 after interruption"),
+    "Should have the latest content"
+  );
+
+  Ok(())
+}
+
+/// Test that split with auxiliary files is idempotent (final commit doesn't duplicate)
+#[test]
+fn test_split_auxiliary_files_idempotent() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("aux-lib", "0.1.0", &[])?;
+  ws.commit("Initial commit")?;
+
+  // Add some auxiliary files at workspace root
+  std::fs::write(ws.path.join("rustfmt.toml"), "max_width = 100")?;
+  std::fs::write(ws.path.join(".editorconfig"), "root = true")?;
+  git(&ws.path, &["add", "."])?;
+  git(&ws.path, &["commit", "-m", "Add config files"])?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.aux-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/aux-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  // First split
+  run_cargo_rail(&ws.path, &["rail", "split", "run", "aux-lib", "--yes", "--allow-dirty"])?;
+
+  // Count commits including auxiliary files commit
+  let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count1: usize = String::from_utf8_lossy(&log1.stdout).trim().parse()?;
+
+  // Second split - auxiliary files commit should not be duplicated
+  let output2 = run_cargo_rail(&ws.path, &["rail", "split", "run", "aux-lib", "--yes", "--allow-dirty"])?;
+  assert!(output2.status.success());
+
+  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  assert!(
+    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
+    "Should be up-to-date. stdout: {}",
+    stdout2
+  );
+
+  // Count should be the same
+  let log2 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
+  let commit_count2: usize = String::from_utf8_lossy(&log2.stdout).trim().parse()?;
+
+  assert_eq!(
+    commit_count1, commit_count2,
+    "Auxiliary files commit should not be duplicated"
+  );
+
+  // Verify auxiliary files exist
+  assert!(split_dir.path().join("rustfmt.toml").exists());
+  assert!(split_dir.path().join(".editorconfig").exists());
+
+  Ok(())
+}

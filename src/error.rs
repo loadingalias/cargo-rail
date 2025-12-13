@@ -16,17 +16,24 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
   /// Success - everything is good
-  Success = 0,
+  Success,
   /// Check failed - changes would be made (use in --check mode)
-  CheckFailed = 1,
+  CheckFailed,
   /// Error occurred (user or system error)
-  Error = 2,
+  Error,
+  /// Custom exit code (e.g., propagated from subprocess)
+  Custom(i32),
 }
 
 impl ExitCode {
   /// Convert to i32 for process exit
   pub fn as_i32(self) -> i32 {
-    self as i32
+    match self {
+      ExitCode::Success => 0,
+      ExitCode::CheckFailed => 1,
+      ExitCode::Error => 2,
+      ExitCode::Custom(code) => code,
+    }
   }
 }
 
@@ -57,6 +64,17 @@ pub enum RailError {
   /// Used by --check commands to signal that changes would be made.
   /// This is not a failure, but CI should treat it as "action needed".
   CheckHasPendingChanges,
+
+  /// Exit with specific code (no error message printed)
+  ///
+  /// Used for:
+  /// - Propagating subprocess exit codes (e.g., cargo test failures)
+  /// - Silent exits after JSON output has been written
+  /// - Any case where we need a specific exit code without error output
+  ExitWithCode {
+    /// The exit code to use
+    code: i32,
+  },
 }
 
 impl RailError {
@@ -95,6 +113,7 @@ impl RailError {
   pub fn exit_code(&self) -> ExitCode {
     match self {
       RailError::CheckHasPendingChanges => ExitCode::CheckFailed,
+      RailError::ExitWithCode { code } => ExitCode::Custom(*code),
       _ => ExitCode::Error,
     }
   }
@@ -123,7 +142,8 @@ impl fmt::Display for RailError {
         }
         Ok(())
       }
-      RailError::CheckHasPendingChanges => Ok(()), // Silent - no message
+      RailError::CheckHasPendingChanges => Ok(()), // Silent - CI signal
+      RailError::ExitWithCode { .. } => Ok(()),    // Silent - exit code only
     }
   }
 }
@@ -463,9 +483,13 @@ struct JsonError {
 ///
 /// In JSON mode, outputs a structured JSON error object instead of text.
 pub fn print_error(error: &RailError) {
-  // CheckHasPendingChanges is not an error - it's a signal for CI
-  // Don't print "error:" prefix for it
-  if matches!(error, RailError::CheckHasPendingChanges) {
+  // These are not errors to display - they're exit code signals
+  // CheckHasPendingChanges: CI signal for "changes would be made"
+  // ExitWithCode: subprocess errors or silent exits after JSON output
+  if matches!(
+    error,
+    RailError::CheckHasPendingChanges | RailError::ExitWithCode { .. }
+  ) {
     return;
   }
 

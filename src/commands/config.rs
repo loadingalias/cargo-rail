@@ -170,7 +170,7 @@ pub fn run_config_validate_standalone(
           "{}",
           serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
         );
-        std::process::exit(2);
+        return Err(RailError::ExitWithCode { code: 2 });
       } else {
         println!("no configuration file found");
         println!("\nhelp: run 'cargo rail init' to create one");
@@ -315,7 +315,7 @@ pub fn run_config_validate_standalone(
   if valid {
     Ok(())
   } else if json {
-    std::process::exit(2);
+    Err(RailError::ExitWithCode { code: 2 })
   } else {
     Err(RailError::message("configuration validation failed"))
   }
@@ -501,7 +501,7 @@ pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat)
 
     if has_changes {
       // Exit with code 1 to indicate changes are needed
-      std::process::exit(1);
+      return Err(RailError::CheckHasPendingChanges);
     }
   } else {
     // Apply mode

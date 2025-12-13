@@ -393,7 +393,10 @@ pub fn run_unify_apply(
       // Find a suitable member's path
       let first_member = &members[0];
       if let Some(pkg) = ctx.cargo.get_package(first_member) {
-        let member_path = pkg.manifest_path.parent().unwrap();
+        let member_path = pkg
+          .manifest_path
+          .parent()
+          .ok_or_else(|| RailError::message(format!("Invalid manifest path: {}", pkg.manifest_path)))?;
         let relative_path = member_path.strip_prefix(ctx.workspace_root()).unwrap_or(member_path);
         progress!(
           "  note: using '{}' as transitive host (virtual workspace detected)",

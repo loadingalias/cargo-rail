@@ -358,9 +358,13 @@ impl<'a> ReleasePublisher<'a> {
 
   /// Create GitHub release using gh CLI
   fn create_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    let check = Command::new("gh").args(["--version"]).output();
+    let gh_available = Command::new("gh")
+      .args(["--version"])
+      .output()
+      .map(|o| o.status.success())
+      .unwrap_or(false);
 
-    if check.is_err() || !check.unwrap().status.success() {
+    if !gh_available {
       eprintln!("  skipped github release (gh CLI not found)");
       return Ok(());
     }

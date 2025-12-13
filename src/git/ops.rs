@@ -323,6 +323,12 @@ impl SystemGit {
     Ok(())
   }
 
+  /// Check if a local branch exists
+  pub fn branch_exists(&self, branch_name: &str) -> RailResult<bool> {
+    let ref_name = format!("refs/heads/{}", branch_name);
+    Ok(self.run_git_check(&["show-ref", "--verify", "--quiet", &ref_name]))
+  }
+
   /// Create and checkout a branch
   pub fn create_and_checkout_branch(&self, branch_name: &str) -> RailResult<()> {
     self.create_branch(branch_name)?;

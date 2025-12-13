@@ -327,12 +327,8 @@ impl ManifestWriter {
 
     // Update the dependency entry
     // If it's a simple string like `serde = "1.0"`, we need to convert it to a table
-    if dep_item.is_str() {
+    if let Some(version) = dep_item.as_str() {
       // Convert simple string (e.g., `dep = "1.0"`) to inline table with features
-      let version = dep_item
-        .as_str()
-        .expect("dep_item.is_str() was true but as_str() returned None")
-        .to_string();
       let mut inline_table = toml_edit::InlineTable::new();
       inline_table.insert("version", toml_edit::Value::from(version));
       inline_table.insert("features", manifest_ops::build_feature_array(&existing_features));

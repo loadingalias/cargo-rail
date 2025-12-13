@@ -147,7 +147,9 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
     .map_err(|e| crate::error::RailError::message(format!("{} failed: {}", runner.name(), e)))?;
 
   if !status.success() {
-    std::process::exit(status.code().unwrap_or(1));
+    return Err(crate::error::RailError::ExitWithCode {
+      code: status.code().unwrap_or(1),
+    });
   }
 
   println!("\nall tests passed");
