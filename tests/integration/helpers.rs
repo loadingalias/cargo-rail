@@ -46,7 +46,7 @@ serde = { version = "1.0", features = ["derive"] }
 "#,
     )?;
 
-    // Create .config/rail.toml to disable sync_on_unify for tests
+    // Create .config/rail.toml for tests
     std::fs::create_dir_all(path.join(".config"))?;
     std::fs::write(
       path.join(".config/rail.toml"),
@@ -55,9 +55,6 @@ root = "."
 
 [toolchain]
 channel = "stable"
-
-[unify]
-use_all_features = true
 "#,
     )?;
 
