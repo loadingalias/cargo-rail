@@ -14,9 +14,18 @@ categories = [
     "development-tools::testing",
     "command-line-utilities",
 ]
-keywords = ["monorepo", "workspace", "affected", "hakari", "release"]
+keywords = ["monorepo", "workspace", "affected", "hakari", "release", "cicd", "copybara"]
 readme = "README.md"
-exclude = ["docs/", "tests/", ".github/", ".config/", "examples/"]
+exclude = [
+    "docs/",
+    "tests/",
+    ".github/",
+    ".config/",
+    "examples/",
+    "scripts/",
+    "distribution/",
+    "backlog/",
+]
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }

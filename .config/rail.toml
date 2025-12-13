@@ -47,6 +47,7 @@ msrv_source = "max"  # How to compute MSRV: deps, workspace, max (default: max)
 preserve_features = []  # Features to preserve from pruning (glob patterns)
 detect_undeclared_features = true  # Detect features borrowed via Cargo unification (default: true)
 fix_undeclared_features = true  # Auto-fix borrowed features (default: true)
+skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]  # Features to skip in undeclared detection (glob patterns)
 
 
 [release]

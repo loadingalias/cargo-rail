@@ -1,7 +1,6 @@
-//! Binary entry point for cargo-rail
+//! Entry point for cargo-rail
 //!
 //! This is intentionally thin - all logic lives in the library.
-//! See rules.md: "Thin main.rs" principle.
 
 use cargo_rail::commands::cli::{ConfigCommand, UnifyCommand};
 use cargo_rail::commands::{self, CargoCli, Commands, StrictnessMode};
