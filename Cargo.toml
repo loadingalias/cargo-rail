@@ -14,7 +14,7 @@ categories = [
     "development-tools::testing",
     "command-line-utilities",
 ]
-keywords = ["monorepo", "workspace", "affected", "hakari", "release", "cicd", "copybara"]
+keywords = ["monorepo", "workspace", "hakari", "release", "cicd"]
 readme = "README.md"
 exclude = [
     "docs/",
