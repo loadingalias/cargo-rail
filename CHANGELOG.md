@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/loadingalias/cargo-rail/compare/v0.6.0...v0.7.0) - 2025-12-14
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the keywords in the package metadata ([1a111b9](https://github.com/loadingalias/cargo-rail/commit/1a111b9caf518f84ebd2faddc5d8e0f251cf2182))
+
+
+
 ## [0.6.0](https://github.com/loadingalias/cargo-rail/compare/v0.5.3...v0.6.0) - 2025-12-14
 
 ### 📦 Other Changes
