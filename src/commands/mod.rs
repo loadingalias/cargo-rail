@@ -22,7 +22,8 @@
 pub mod affected;
 /// Clean up workspace artifacts
 pub mod clean;
-/// CLI argument definitions (clap structs)
+/// CLI argument definitions (clap structs) - internal, not part of stable API.
+#[doc(hidden)]
 pub mod cli;
 /// Common utilities for command implementations
 pub mod common;
@@ -43,9 +44,12 @@ pub mod unify;
 
 pub use affected::{AffectedOptions, run_affected};
 pub use clean::run_clean;
-pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand};
+#[doc(hidden)]
+pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
 pub use common::OutputFormat;
-pub use config::{StrictnessMode, run_config_sync, run_config_validate_standalone};
+pub use config::{
+  StrictnessMode, run_config_locate, run_config_print, run_config_sync, run_config_validate_standalone,
+};
 pub use init::{run_init, run_init_standalone};
 pub use release::{run_release_check, run_release_init, run_release_plan, run_release_publish};
 pub use split::{run_split, run_split_init};
@@ -67,6 +71,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       since,
       from,
       to,
+      merge_base,
       format,
       all,
       output,
@@ -77,6 +82,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         since,
         from,
         to,
+        merge_base,
         format,
         all,
         output,
@@ -86,6 +92,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
 
     Commands::Test {
       since,
+      merge_base,
       all,
       skip_nextest,
       explain,
@@ -93,6 +100,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     } => {
       let config = test::TestConfig {
         since,
+        merge_base,
         all,
         explain,
         prefer_nextest: !skip_nextest,
@@ -113,12 +121,13 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       skip_report,
       report_path,
       show_diff,
+      explain,
     } => {
       // Undo subcommand is handled before WorkspaceContext is built
       if command.is_some() {
         unreachable!("Undo subcommand should be handled before dispatch")
       } else if check {
-        run_unify_analyze(ctx, show_diff, format)
+        run_unify_analyze(ctx, show_diff, explain, format)
       } else {
         run_unify_apply(ctx, backup, skip_report, report_path)
       }
@@ -241,8 +250,13 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
 
     // Config commands are handled before WorkspaceContext is built
     Commands::Config { command } => match command {
+      cli::ConfigCommand::Locate { .. } => unreachable!("Config locate should be handled before dispatch"),
+      cli::ConfigCommand::Print { .. } => unreachable!("Config print should be handled before dispatch"),
       cli::ConfigCommand::Validate { .. } => unreachable!("Config validate should be handled before dispatch"),
       cli::ConfigCommand::Sync { .. } => unreachable!("Config sync should be handled before dispatch"),
     },
+
+    // Completions is handled before WorkspaceContext is built
+    Commands::Completions { .. } => unreachable!("Completions should be handled before dispatch"),
   }
 }

@@ -6,7 +6,7 @@
 use crate::config::{RailConfig, UnifyConfig};
 use crate::error::{RailError, RailResult};
 use crate::progress;
-use crate::toml::builder::RailConfigBuilder;
+use crate::toml::RailConfigBuilder;
 use crate::workspace::WorkspaceContext;
 use std::fs;
 use std::path::{Path, PathBuf};

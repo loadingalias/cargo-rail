@@ -12,6 +12,8 @@ use crate::workspace::{ChangeImpact, WorkspaceContext};
 pub struct TestConfig {
   /// Git ref to compare against (if None, auto-detect)
   pub since: Option<String>,
+  /// Use merge-base with default branch (better for feature branches)
+  pub merge_base: bool,
   /// Skip change detection and run all tests
   pub all: bool,
   /// Explain why tests are being run
@@ -37,7 +39,11 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
   } else {
     let analyzer = ChangeImpact::new(ctx);
 
-    let base_ref = if let Some(ref s) = config.since {
+    let base_ref = if config.merge_base {
+      // Use merge-base with auto-detected default branch
+      let default_branch = detect_default_base_ref(ctx.git.git())?;
+      ctx.git.git().get_merge_base(&default_branch, "HEAD")?
+    } else if let Some(ref s) = config.since {
       s.clone()
     } else {
       detect_default_base_ref(ctx.git.git())?

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Cargo State (merged from cargo_state.rs)
@@ -60,9 +60,16 @@ pub struct CargoState {
   proc_macro_crates: std::collections::HashSet<String>,
 }
 
+/// Cache version - increment when MetadataCache format changes
+/// This ensures old cache files are automatically invalidated
+const CACHE_VERSION: u32 = 1;
+
 /// Metadata cache structure
 #[derive(Serialize, Deserialize)]
 struct MetadataCache {
+  /// Cache format version - used to invalidate on schema changes
+  #[serde(default)]
+  version: u32,
   /// FNV-1a hash of Cargo.toml + Cargo.lock
   hash: u64,
   /// Cached metadata
@@ -83,11 +90,13 @@ impl CargoState {
 
     // Try to load from cache
     // Cache is valid only if:
-    // 1. Hash matches (Cargo.toml + Cargo.lock unchanged)
-    // 2. Workspace root path matches (repo hasn't been moved/copied)
+    // 1. Version matches (cache format unchanged)
+    // 2. Hash matches (Cargo.toml + Cargo.lock unchanged)
+    // 3. Workspace root path matches (repo hasn't been moved/copied)
     if let Some(cache) = fs::read_to_string(&cache_file)
       .ok()
       .and_then(|s| serde_json::from_str::<MetadataCache>(&s).ok())
+      && cache.version == CACHE_VERSION
       && cache.hash == current_hash
     {
       // Validate workspace root path matches current location
@@ -113,6 +122,7 @@ impl CargoState {
     // Save to cache
     if let Ok(()) = fs::create_dir_all(&cache_dir) {
       let cache = MetadataCache {
+        version: CACHE_VERSION,
         hash: current_hash,
         metadata: metadata.clone(),
       };
@@ -302,7 +312,6 @@ impl GitState {
 ///
 /// Uses Arc for efficient sharing across threads and parallel operations.
 /// Cloning is extremely cheap (just increments Arc refcounts).
-#[derive(Clone)]
 pub struct WorkspaceContext {
   /// Cargo workspace root (Cargo.toml location)
   /// Note: In most cases, git repo root == workspace root. Access git root via ctx.git.repo_root() if needed.
@@ -323,9 +332,13 @@ pub struct WorkspaceContext {
   /// Wrapped in Arc for efficient sharing
   pub config: Option<Arc<RailConfig>>,
 
-  /// Multi-target metadata (pre-loaded if targets configured)
-  /// This saves 150-600ms for unify operations by loading once
-  pub multi_target_metadata: Option<Arc<MultiTargetMetadata>>,
+  /// Configured targets for lazy multi-target metadata loading
+  targets: Vec<String>,
+
+  /// Lazy-loaded multi-target metadata (only loaded when unify needs it)
+  /// This saves 150-600ms for commands that don't need multi-target analysis.
+  /// Uses Mutex<Option<>> for lazy initialization with error handling.
+  multi_target_metadata: Mutex<Option<Arc<MultiTargetMetadata>>>,
 }
 
 impl WorkspaceContext {
@@ -394,19 +407,9 @@ impl WorkspaceContext {
       cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
     }
 
-    // Pre-load multi-target metadata if targets are configured
-    // This saves 150-600ms for unify operations
-    let multi_target_metadata = if let Some(ref cfg) = config
-      && !cfg.targets.is_empty()
-    {
-      progress!("Pre-loading metadata for {} target(s)...", cfg.targets.len());
-      Some(Arc::new(MultiTargetMetadata::load_parallel(
-        &workspace_root,
-        &cfg.targets,
-      )?))
-    } else {
-      None
-    };
+    // Store targets for lazy multi-target metadata loading
+    // The metadata is only loaded when unify actually needs it (saves 150-600ms for other commands)
+    let targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
 
     Ok(Self {
       workspace_root,
@@ -414,7 +417,8 @@ impl WorkspaceContext {
       cargo,
       graph,
       config,
-      multi_target_metadata,
+      targets,
+      multi_target_metadata: Mutex::new(None),
     })
   }
 
@@ -433,6 +437,32 @@ impl WorkspaceContext {
   /// Get rail config (convenience wrapper for require_config)
   pub fn rail_config(&self) -> RailResult<&RailConfig> {
     self.require_config().map(|arc| arc.as_ref())
+  }
+
+  /// Get multi-target metadata, loading lazily on first access.
+  ///
+  /// This is only used by `cargo rail unify`. Other commands don't need it,
+  /// so lazy loading saves 150-600ms for commands like `test`, `affected`, `split`, etc.
+  ///
+  /// The metadata is cached after first load - subsequent calls return the cached value.
+  pub fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
+    // Lock briefly to check if already loaded
+    let mut guard = self
+      .multi_target_metadata
+      .lock()
+      .map_err(|_| RailError::message("Lock poisoned".to_string()))?;
+
+    if let Some(ref cached) = *guard {
+      return Ok(Arc::clone(cached));
+    }
+
+    // Not loaded yet - load now
+    if !self.targets.is_empty() {
+      progress!("Loading metadata for {} target(s)...", self.targets.len());
+    }
+    let metadata = Arc::new(MultiTargetMetadata::load_parallel(&self.workspace_root, &self.targets)?);
+    *guard = Some(Arc::clone(&metadata));
+    Ok(metadata)
   }
 
   /// Get workspace root as Path reference (convenience)

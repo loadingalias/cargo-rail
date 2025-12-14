@@ -29,6 +29,7 @@ exclude = [
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }
+clap_complete = "4.5"
 cargo_metadata = "0.23.1"
 petgraph = { version = "0.8.3", default-features = false }
 toml_edit = { version = "0.23.9", features = ["serde"] }

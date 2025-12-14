@@ -3,6 +3,7 @@
 use super::SystemGit;
 use super::system::CommitInfo;
 use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::progress;
 use crate::utils;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,22 @@ impl SystemGit {
     let output = self.run_git(&args)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_name_status_output(&stdout)
+  }
+
+  /// Get the merge-base (common ancestor) between two refs
+  ///
+  /// This is useful for finding the point where a feature branch diverged
+  /// from the main branch, which gives more accurate change detection in CI.
+  pub fn get_merge_base(&self, ref1: &str, ref2: &str) -> RailResult<String> {
+    let output = self.run_git(&["merge-base", ref1, ref2])?;
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+      return Err(crate::error::RailError::message(format!(
+        "no common ancestor between {} and {}",
+        ref1, ref2
+      )));
+    }
+    Ok(sha)
   }
 
   /// Get commits touching a specific path in a range
@@ -281,7 +298,7 @@ impl SystemGit {
 
   /// Push to remote
   pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> RailResult<()> {
-    println!("   Pushing to remote '{}'...", remote_name);
+    progress!("   Pushing to remote '{}'...", remote_name);
 
     self.run_git_with_error(&["push", "-u", remote_name, branch], |stderr| {
       RailError::Git(GitError::PushFailed {
@@ -291,17 +308,17 @@ impl SystemGit {
       })
     })?;
 
-    println!("   ✅ Pushed to {}/{}", remote_name, branch);
+    progress!("   ✅ Pushed to {}/{}", remote_name, branch);
     Ok(())
   }
 
   /// Fetch from remote
   pub fn fetch_from_remote(&self, remote_name: &str) -> RailResult<()> {
-    println!("   Fetching from remote '{}'...", remote_name);
+    progress!("   Fetching from remote '{}'...", remote_name);
 
     self.run_git(&["fetch", remote_name])?;
 
-    println!("   ✅ Fetched from {}", remote_name);
+    progress!("   ✅ Fetched from {}", remote_name);
     Ok(())
   }
 

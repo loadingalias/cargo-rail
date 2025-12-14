@@ -177,7 +177,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   let crate_results: Vec<CrateSyncResult> = if config_count > 1 && args.all {
     progress!("syncing {} crates...", config_count);
 
-    let ctx = ctx.clone();
     let strategy = args.strategy;
     let results: Vec<RailResult<CrateSyncResult>> = configs
       .into_par_iter()
@@ -194,7 +193,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         }
 
         progress!("  {}", crate_name);
-        let mut engine = SyncEngine::new(&ctx, sync_config, strategy)?;
+        let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
 
         let result = match direction {
           SyncDirection::MonoToRemote => engine.sync_to_remote()?,

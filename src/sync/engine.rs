@@ -3,6 +3,7 @@ use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
+use crate::progress;
 use crate::sync::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
@@ -124,7 +125,7 @@ impl<'a> SyncEngine<'a> {
 
   /// Sync changes from monorepo to remote repository
   pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
-    println!("   Syncing monorepo → remote...");
+    progress!("   Syncing monorepo → remote...");
 
     // Load mappings (cached - only loads if not already loaded)
 
@@ -139,7 +140,7 @@ impl<'a> SyncEngine<'a> {
       remote_git.fetch_from_remote("origin")?;
       self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
-      println!("   Skipping fetch (local testing mode)");
+      progress!("   Skipping fetch (local testing mode)");
     }
     // Fetch updates mapping notes, so we need to reload from target repo
     // Clear the loaded flag and reload
@@ -158,9 +159,9 @@ impl<'a> SyncEngine<'a> {
         .get_commits_touching_paths(&self.config.crate_paths, last_synced_mono.as_deref(), "HEAD")?;
 
     if new_commits.is_empty() {
-      println!("   No new commits to sync");
+      progress!("   No new commits to sync");
     } else {
-      println!("   Syncing {} commits to remote...", new_commits.len());
+      progress!("   Syncing {} commits to remote...", new_commits.len());
 
       let mut synced_count = 0;
       let mut current_remote_head = remote_git.head_commit()?; // Cache HEAD, update after each commit
@@ -213,7 +214,7 @@ impl<'a> SyncEngine<'a> {
         remote_git.push_to_remote("origin", &self.config.branch)?;
         self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       } else {
-        println!("   Skipping push (local testing mode)");
+        progress!("   Skipping push (local testing mode)");
       }
     }
 
@@ -225,7 +226,7 @@ impl<'a> SyncEngine<'a> {
 
   /// Sync changes from remote repository to monorepo
   pub fn sync_from_remote(&mut self) -> RailResult<SyncResult> {
-    println!("   Syncing remote → monorepo...");
+    progress!("   Syncing remote → monorepo...");
 
     // Check current branch - NEVER commit directly to protected branches
     let _current_branch = self.ctx.git.git().current_branch()?;
@@ -243,7 +244,7 @@ impl<'a> SyncEngine<'a> {
       remote_git.fetch_from_remote("origin")?;
       self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
-      println!("   Skipping fetch (local testing mode)");
+      progress!("   Skipping fetch (local testing mode)");
     }
     // Fetch updates mapping notes, so we need to reload from target repo
     // Clear the loaded flag and reload
@@ -279,7 +280,7 @@ impl<'a> SyncEngine<'a> {
 
     // If nothing to sync, report up-to-date
     if commits_to_sync.is_empty() {
-      println!("   No new commits to sync (already up-to-date)");
+      progress!("   No new commits to sync (already up-to-date)");
       return Ok(SyncResult {
         commits_synced: 0,
         conflicts: Vec::new(),
@@ -296,12 +297,12 @@ impl<'a> SyncEngine<'a> {
 
     let pr_branch = if branch_exists {
       // Branch exists - switch to it and check if commits are already there
-      println!("   PR branch '{}' already exists, checking state...", branch_name);
+      progress!("   PR branch '{}' already exists, checking state...", branch_name);
       self.ctx.git.git().checkout_branch(&branch_name)?;
       Some(branch_name)
     } else {
       // Create new branch
-      println!("   Creating PR branch: {}", branch_name);
+      progress!("   Creating PR branch: {}", branch_name);
       self.ctx.git.git().create_and_checkout_branch(&branch_name)?;
       Some(branch_name)
     };
@@ -309,7 +310,7 @@ impl<'a> SyncEngine<'a> {
     let mut conflicts = Vec::new();
 
     // Process commits (we already filtered to only those needing sync above)
-    println!("   Syncing {} commits from remote...", commits_to_sync.len());
+    progress!("   Syncing {} commits from remote...", commits_to_sync.len());
 
     let mut count = 0;
     let mut current_mono_head = self.ctx.git.git().head_commit()?; // Cache HEAD, update after each commit
@@ -351,14 +352,14 @@ impl<'a> SyncEngine<'a> {
     if let Some(branch_name) = pr_branch
       && synced_count > 0
     {
-      println!(
+      progress!(
         "\n✅ Synced {} commit{} to branch: {}",
         synced_count,
         if synced_count == 1 { "" } else { "s" },
         branch_name
       );
-      println!("\n📋 To create a pull request:");
-      println!("   git push origin {}", branch_name);
+      progress!("\n📋 To create a pull request:");
+      progress!("   git push origin {}", branch_name);
 
       // Try to detect GitHub URL and suggest gh CLI command
       if let Ok(output) = std::process::Command::new("git")
@@ -369,13 +370,13 @@ impl<'a> SyncEngine<'a> {
       {
         let url = url.trim();
         if url.contains("github.com") {
-          println!(
+          progress!(
             "   gh pr create --title \"Sync {} from remote\"",
             self.config.crate_name
           );
         }
       }
-      println!();
+      progress!();
     }
 
     Ok(SyncResult {
@@ -386,7 +387,7 @@ impl<'a> SyncEngine<'a> {
 
   /// Sync changes bidirectionally between monorepo and remote
   pub fn sync_bidirectional(&mut self) -> RailResult<SyncResult> {
-    println!("   Detecting changes...");
+    progress!("   Detecting changes...");
 
     // Check both directions
     let mono_has_changes = self.check_mono_has_changes()?;
@@ -394,15 +395,15 @@ impl<'a> SyncEngine<'a> {
 
     match (mono_has_changes, remote_has_changes) {
       (true, false) => {
-        println!("   Only monorepo has changes");
+        progress!("   Only monorepo has changes");
         self.sync_to_remote()
       }
       (false, true) => {
-        println!("   Only remote has changes");
+        progress!("   Only remote has changes");
         self.sync_from_remote()
       }
       (true, true) => {
-        println!("   Both sides have changes, syncing both directions");
+        progress!("   Both sides have changes, syncing both directions");
         let to_remote = self.sync_to_remote()?;
         let from_remote = self.sync_from_remote()?;
 
@@ -412,7 +413,7 @@ impl<'a> SyncEngine<'a> {
         })
       }
       (false, false) => {
-        println!("   No changes on either side");
+        progress!("   No changes on either side");
         Ok(SyncResult {
           commits_synced: 0,
           conflicts: Vec::new(),
@@ -567,7 +568,7 @@ impl<'a> SyncEngine<'a> {
 
         // Skip files that were already resolved by conflict resolution (O(1) HashSet lookup)
         if resolved_files.contains(mono_path.as_path()) {
-          println!("      Skipping {} (already resolved)", mono_path.display());
+          progress!("      Skipping {} (already resolved)", mono_path.display());
           return None;
         }
 
@@ -765,7 +766,7 @@ impl<'a> SyncEngine<'a> {
       {
         Ok(crate::sync::conflict::MergeResult::Success) => {
           // Merged successfully - add to resolved files to prevent overwriting
-          println!("      ✅ Auto-merged {}", mono_path.display());
+          progress!("      ✅ Auto-merged {}", mono_path.display());
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
           });
@@ -820,7 +821,7 @@ impl<'a> SyncEngine<'a> {
 
       // Skip if only docs changed (no rebuild needed)
       if impact.categories.is_docs_only() {
-        eprintln!("Skipping sync: only documentation changed");
+        progress!("Skipping sync: only documentation changed");
         return Ok(false);
       }
 

@@ -9,7 +9,7 @@
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::multi_target_metadata::ComputedMsrv;
 use semver::VersionReq;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 // ============================================================================
@@ -415,12 +415,13 @@ impl UnificationPlan {
         "\nDead features (empty no-ops, safe to prune): {}\n",
         self.pruned_features.len()
       ));
-      // Group by crate
-      let mut by_crate: HashMap<&str, Vec<&str>> = HashMap::new();
+      // Group by crate (BTreeMap for deterministic output order)
+      let mut by_crate: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
       for pf in &self.pruned_features {
         by_crate.entry(&pf.crate_name).or_default().push(&pf.feature_name);
       }
-      for (crate_name, features) in by_crate {
+      for (crate_name, mut features) in by_crate {
+        features.sort_unstable();
         s.push_str(&format!("  - {}: {}\n", crate_name, features.join(", ")));
       }
     }
@@ -431,12 +432,13 @@ impl UnificationPlan {
         "\nOptional features (user-facing API, NOT removed): {}\n",
         self.optional_features.len()
       ));
-      // Group by crate
-      let mut by_crate: HashMap<&str, Vec<&str>> = HashMap::new();
+      // Group by crate (BTreeMap for deterministic output order)
+      let mut by_crate: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
       for of in &self.optional_features {
         by_crate.entry(&of.crate_name).or_default().push(&of.feature_name);
       }
-      for (crate_name, features) in by_crate {
+      for (crate_name, mut features) in by_crate {
+        features.sort_unstable();
         s.push_str(&format!("  - {}: {}\n", crate_name, features.join(", ")));
       }
     }
@@ -461,12 +463,13 @@ impl UnificationPlan {
         "\n  Unused dependencies detected: {}\n",
         self.unused_deps.len()
       ));
-      // Group by member
-      let mut by_member: HashMap<&str, Vec<&str>> = HashMap::new();
+      // Group by member (BTreeMap for deterministic output order)
+      let mut by_member: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
       for ud in &self.unused_deps {
         by_member.entry(&ud.member).or_default().push(&ud.dep_name);
       }
-      for (member, deps) in by_member {
+      for (member, mut deps) in by_member {
+        deps.sort_unstable();
         s.push_str(&format!("  - {}: {}\n", member, deps.join(", ")));
       }
     }

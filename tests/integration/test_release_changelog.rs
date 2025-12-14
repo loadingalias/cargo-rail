@@ -736,11 +736,11 @@ fn test_release_non_default_branch_succeeds_with_yes() -> Result<()> {
     stderr
   );
 
-  // Should show the actual branch name in next steps
+  // Should show the actual branch name in next steps (progress output goes to stderr)
   assert!(
-    stdout.contains("git push origin hotfix-1.0"),
-    "Next steps should show actual branch name.\nstdout:\n{}",
-    stdout
+    stderr.contains("git push origin hotfix-1.0"),
+    "Next steps should show actual branch name.\nstderr:\n{}",
+    stderr
   );
 
   Ok(())

@@ -3,6 +3,7 @@ use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use crate::git::mappings::MappingStore;
 use crate::git::{CommitInfo, SystemGit};
+use crate::progress;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
@@ -36,6 +37,11 @@ pub struct SplitConfig {
 
 /// Pre-fetched files for a commit: (file_path, content)
 type PrefetchedFiles = Vec<(PathBuf, Vec<u8>)>;
+
+/// Maximum number of commits to prefetch at once
+/// This bounds memory usage to O(window_size × avg_commit_size) instead of O(total_commits × avg_commit_size)
+/// For a typical crate with ~1-2MB of files, 50 commits uses ~50-100MB max
+const PREFETCH_WINDOW_SIZE: usize = 50;
 
 /// Parameters for recreating a commit in the target repository
 struct RecreateCommitParams<'a> {
@@ -137,12 +143,12 @@ impl<'a> SplitEngine<'a> {
   /// Walk commit history and filter commits that touch the given paths
   /// Returns commits in chronological order (oldest first)
   fn walk_filtered_history(&self, paths: &[PathBuf]) -> RailResult<Vec<CommitInfo>> {
-    println!("   Walking commit history to find commits touching crate...");
+    progress!("   Walking commit history to find commits touching crate...");
 
     // Use batched git command for all paths at once (much faster than N separate calls)
     let filtered_commits = self.ctx.git.git().get_commits_touching_paths(paths, None, "HEAD")?;
 
-    println!(
+    progress!(
       "   Found {} total commits that touch the crate paths",
       filtered_commits.len()
     );
@@ -410,18 +416,18 @@ impl<'a> SplitEngine<'a> {
 
   /// Execute a split operation (idempotent - re-runs sync new commits only)
   pub fn split(&self, config: &SplitConfig) -> RailResult<()> {
-    println!("🚂 Splitting crate: {}", config.crate_name);
-    println!("   Mode: {:?}", config.mode);
-    println!("   Target: {}", config.target_repo_path.display());
+    progress!("🚂 Splitting crate: {}", config.crate_name);
+    progress!("   Mode: {:?}", config.mode);
+    progress!("   Target: {}", config.target_repo_path.display());
 
     // Issue #25/#26: Compile exclude patterns (include uses glob directly)
     let exclude_patterns = Self::compile_patterns(&config.exclude);
 
     if !config.include.is_empty() {
-      println!("   Include patterns: {} configured", config.include.len());
+      progress!("   Include patterns: {} configured", config.include.len());
     }
     if !config.exclude.is_empty() {
-      println!("   Exclude patterns: {} configured", config.exclude.len());
+      progress!("   Exclude patterns: {} configured", config.exclude.len());
     }
 
     // Check if target repo already exists (for idempotency)
@@ -450,17 +456,17 @@ impl<'a> SplitEngine<'a> {
 
     // Discover workspace-level auxiliary files from workspace
     let aux_files = AuxiliaryFiles::discover(self.ctx.workspace_root())?;
-    println!("   Found {} workspace config files", aux_files.count());
+    progress!("   Found {} workspace config files", aux_files.count());
 
     // Discover project files (README, LICENSE) with crate-first fallback
     let crate_path = &config.crate_paths[0]; // Use first crate path for project files
     let project_files = ProjectFiles::discover(self.ctx.workspace_root(), crate_path)?;
-    println!("   Found {} project files (README, LICENSE)", project_files.count());
+    progress!("   Found {} project files (README, LICENSE)", project_files.count());
 
     // Issue #25: Find additional files to include based on include patterns
     let additional_files = Self::find_included_files(self.ctx.workspace_root(), &config.include)?;
     if !additional_files.is_empty() {
-      println!(
+      progress!(
         "   Found {} additional files from include patterns",
         additional_files.len()
       );
@@ -483,20 +489,20 @@ impl<'a> SplitEngine<'a> {
       .count();
 
     if already_mapped_count > 0 {
-      println!("   Found {} commits already split (will skip)", already_mapped_count);
+      progress!("   Found {} commits already split (will skip)", already_mapped_count);
     }
 
     // Check if all commits are already mapped - nothing to do
     if already_mapped_count == filtered_commits.len() && !filtered_commits.is_empty() {
-      println!("\n✅ Split already up-to-date!");
-      println!("   All {} commits have been split previously.", filtered_commits.len());
-      println!("   Target repo: {}", config.target_repo_path.display());
+      progress!("\n✅ Split already up-to-date!");
+      progress!("   All {} commits have been split previously.", filtered_commits.len());
+      progress!("   Target repo: {}", config.target_repo_path.display());
       return Ok(());
     }
 
     if filtered_commits.is_empty() {
-      println!("   No commits found that touch the crate paths");
-      println!("   Falling back to current state copy...");
+      progress!("   No commits found that touch the crate paths");
+      progress!("   Falling back to current state copy...");
 
       // Fallback to snapshot copy if no history found
       match config.mode {
@@ -516,22 +522,11 @@ impl<'a> SplitEngine<'a> {
       }
     } else {
       // Recreate history in target repo
-      println!("   Processing {} commits...", filtered_commits.len());
-
-      // Prefetch file contents in parallel for significant speedup on large repos
-      // This reads all files for all commits concurrently while we process sequentially
-      let use_parallel = filtered_commits.len() > 5; // Only parallelize if worthwhile
-      let prefetched_files = if use_parallel {
-        println!("   Prefetching file contents in parallel...");
-        self.prefetch_commit_files(&filtered_commits, &config.crate_paths)
-      } else {
-        HashMap::new()
-      };
+      progress!("   Processing {} commits...", filtered_commits.len());
 
       let mut last_recreated_sha: Option<String> = None;
-
       let mut skipped_commits = 0usize;
-      let mut skipped_already_mapped = 0usize;
+      let skipped_already_mapped = already_mapped_count;
 
       // For incremental splits, find the last mapped commit's SHA in target repo
       // to use as parent for new commits
@@ -545,56 +540,89 @@ impl<'a> SplitEngine<'a> {
         }
       }
 
-      for (idx, commit) in filtered_commits.iter().enumerate() {
-        // Skip already-mapped commits (idempotency)
-        if mapping_store.has_mapping(&commit.sha) {
-          skipped_already_mapped += 1;
-          continue;
-        }
+      // Filter out already-mapped commits upfront for accurate counting and windowing
+      let commits_to_process: Vec<&CommitInfo> = filtered_commits
+        .iter()
+        .filter(|c| !mapping_store.has_mapping(&c.sha))
+        .collect();
 
-        let new_count = idx + 1 - skipped_already_mapped;
-        let total_new = filtered_commits.len() - already_mapped_count;
-        if new_count.is_multiple_of(10) || new_count == total_new {
-          println!("   Progress: {}/{} new commits", new_count, total_new);
-        }
+      let total_new = commits_to_process.len();
 
-        // Use prefetched files if available
-        let prefetched = prefetched_files.get(&commit.sha);
+      // Process commits in windows to bound memory usage
+      // Each window prefetches files for up to PREFETCH_WINDOW_SIZE commits,
+      // processes them, then drops the prefetch cache before the next window.
+      // This limits memory to O(window_size × avg_commit_size) instead of O(total × avg_commit_size)
+      let use_parallel = total_new > 5;
 
-        let maybe_sha = self.recreate_commit_in_target(&RecreateCommitParams {
-          commit,
-          crate_paths: &config.crate_paths,
-          target_repo_path: &config.target_repo_path,
-          crate_name: &config.crate_name,
-          mode: &config.mode,
-          workspace_mode: &config.workspace_mode,
-          mapping_store: &mapping_store,
-          last_recreated_sha: last_recreated_sha.as_deref(),
-          prefetched_files: prefetched,
-        })?;
-
-        // Handle skipped commits (dirty history - path didn't exist at this commit)
-        let Some(new_sha) = maybe_sha else {
-          skipped_commits += 1;
-          continue;
+      for (window_idx, window) in commits_to_process.chunks(PREFETCH_WINDOW_SIZE).enumerate() {
+        // Prefetch this window's files in parallel
+        let prefetched_files: HashMap<String, PrefetchedFiles> = if use_parallel {
+          if window_idx == 0 {
+            if total_new > PREFETCH_WINDOW_SIZE {
+              progress!(
+                "   Prefetching in windows of {} commits to bound memory...",
+                PREFETCH_WINDOW_SIZE
+              );
+            } else {
+              progress!("   Prefetching file contents in parallel...");
+            }
+          }
+          // Convert &[&CommitInfo] to Vec<CommitInfo> for prefetch
+          let window_commits: Vec<CommitInfo> = window.iter().map(|c| (*c).clone()).collect();
+          self.prefetch_commit_files(&window_commits, &config.crate_paths)
+        } else {
+          HashMap::new()
         };
 
-        // Record mapping
-        mapping_store.record_mapping(&commit.sha, &new_sha)?;
+        // Process this window's commits
+        for (idx_in_window, commit) in window.iter().enumerate() {
+          let overall_idx = window_idx * PREFETCH_WINDOW_SIZE + idx_in_window + 1;
 
-        // Track last recreated commit
-        last_recreated_sha = Some(new_sha);
+          if overall_idx.is_multiple_of(10) || overall_idx == total_new {
+            progress!("   Progress: {}/{} new commits", overall_idx, total_new);
+          }
+
+          // Use prefetched files if available
+          let prefetched = prefetched_files.get(&commit.sha);
+
+          let maybe_sha = self.recreate_commit_in_target(&RecreateCommitParams {
+            commit,
+            crate_paths: &config.crate_paths,
+            target_repo_path: &config.target_repo_path,
+            crate_name: &config.crate_name,
+            mode: &config.mode,
+            workspace_mode: &config.workspace_mode,
+            mapping_store: &mapping_store,
+            last_recreated_sha: last_recreated_sha.as_deref(),
+            prefetched_files: prefetched,
+          })?;
+
+          // Handle skipped commits (dirty history - path didn't exist at this commit)
+          let Some(new_sha) = maybe_sha else {
+            skipped_commits += 1;
+            continue;
+          };
+
+          // Record mapping
+          mapping_store.record_mapping(&commit.sha, &new_sha)?;
+
+          // Track last recreated commit
+          last_recreated_sha = Some(new_sha);
+        }
+
+        // prefetched_files is dropped here at end of window iteration,
+        // freeing memory before the next window is prefetched
       }
 
       if skipped_commits > 0 || skipped_already_mapped > 0 {
         if skipped_commits > 0 {
-          println!(
+          progress!(
             "   Skipped {} commits where path didn't exist (dirty history)",
             skipped_commits
           );
         }
         if skipped_already_mapped > 0 {
-          println!(
+          progress!(
             "   Skipped {} commits already split (idempotent)",
             skipped_already_mapped
           );
@@ -603,20 +631,20 @@ impl<'a> SplitEngine<'a> {
 
       // Create workspace Cargo.toml if in workspace mode
       if config.mode == SplitMode::Combined && config.workspace_mode == WorkspaceMode::Workspace {
-        println!("   Creating workspace Cargo.toml...");
+        progress!("   Creating workspace Cargo.toml...");
         self.create_workspace_cargo_toml(&config.crate_paths, &config.target_repo_path)?;
       }
 
       // Copy workspace config files and project files to the final state
       let has_files = !aux_files.is_empty() || project_files.count() > 0 || !additional_files.is_empty();
       if has_files {
-        println!("   Copying workspace configs and project files...");
+        progress!("   Copying workspace configs and project files...");
         aux_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
         project_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
 
         // Issue #25: Copy additional files from include patterns
         if !additional_files.is_empty() {
-          println!(
+          progress!(
             "   Copying {} additional files from include patterns...",
             additional_files.len()
           );
@@ -655,7 +683,7 @@ impl<'a> SplitEngine<'a> {
 
         if !diff_cached.success() {
           // Exit code 1 means there are differences (i.e., staged changes)
-          println!("   Creating commit for auxiliary files");
+          progress!("   Creating commit for auxiliary files");
           std::process::Command::new("git")
             .current_dir(&config.target_repo_path)
             .args(["commit", "-m", "Add workspace configs and project files"])
@@ -671,17 +699,17 @@ impl<'a> SplitEngine<'a> {
     // Push to remote if URL is configured and is not a local file path
     if let Some(ref remote_url) = config.remote_url {
       if !remote_url.is_empty() && !utils::is_local_path(remote_url) {
-        println!("\n🚀 Pushing to remote...");
+        progress!("\n🚀 Pushing to remote...");
 
         // Open the target repo
         let target_git = SystemGit::open(&config.target_repo_path)?;
 
         // Add or update remote
         if !target_git.has_remote("origin")? {
-          println!("   Adding remote 'origin': {}", remote_url);
+          progress!("   Adding remote 'origin': {}", remote_url);
           target_git.add_remote("origin", remote_url)?;
         } else {
-          println!("   Remote 'origin' already exists");
+          progress!("   Remote 'origin' already exists");
         }
 
         // Push to remote
@@ -690,33 +718,33 @@ impl<'a> SplitEngine<'a> {
         // Push git-notes
         mapping_store.push_notes(&config.target_repo_path, "origin")?;
 
-        println!("   ✅ Pushed to {}", remote_url);
+        progress!("   ✅ Pushed to {}", remote_url);
       } else {
-        println!("\n💾 Split repository created locally");
+        progress!("\n💾 Split repository created locally");
         if utils::is_local_path(remote_url) {
-          println!("   Note: Remote is a local path, skipping push");
-          println!(
+          progress!("   Note: Remote is a local path, skipping push");
+          progress!(
             "   Local testing mode - split repo at: {}",
             config.target_repo_path.display()
           );
         } else {
-          println!("   No remote URL configured");
+          progress!("   No remote URL configured");
         }
-        println!("\n   To push to a real remote later:");
-        println!("   cd {}", config.target_repo_path.display());
-        println!("   git remote add origin <url>");
-        println!("   git push -u origin {}", config.branch);
+        progress!("\n   To push to a real remote later:");
+        progress!("   cd {}", config.target_repo_path.display());
+        progress!("   git remote add origin <url>");
+        progress!("   git push -u origin {}", config.branch);
       }
     } else {
-      println!("\n⚠️  No remote URL configured - repository created locally only");
-      println!("   To push manually:");
-      println!("   cd {}", config.target_repo_path.display());
-      println!("   git remote add origin <url>");
-      println!("   git push -u origin {}", config.branch);
+      progress!("\n⚠️  No remote URL configured - repository created locally only");
+      progress!("   To push manually:");
+      progress!("   cd {}", config.target_repo_path.display());
+      progress!("   git remote add origin <url>");
+      progress!("   git push -u origin {}", config.branch);
     }
 
-    println!("\n✅ Split complete!");
-    println!("   Target repo: {}", config.target_repo_path.display());
+    progress!("\n✅ Split complete!");
+    progress!("   Target repo: {}", config.target_repo_path.display());
 
     Ok(())
   }
@@ -731,7 +759,7 @@ impl<'a> SplitEngine<'a> {
     // Check if it's already a git repo
     let git_dir = target_path.join(".git");
     if !git_dir.exists() {
-      println!("   Initializing git repository at {}", target_path.display());
+      progress!("   Initializing git repository at {}", target_path.display());
 
       // Initialize using system git with main as default branch
       std::process::Command::new("git")
@@ -826,18 +854,18 @@ impl<'a> SplitEngine<'a> {
     let source_path = self.ctx.workspace_root().join(crate_path);
 
     // Copy source files
-    println!("   Copying source files from {}", crate_path.display());
+    progress!("   Copying source files from {}", crate_path.display());
     self.copy_directory_recursive(&source_path, target_repo_path)?;
 
     // Transform Cargo.toml manifest
     // Single mode is always standalone (no workspace)
-    println!("   Transforming Cargo.toml");
+    progress!("   Transforming Cargo.toml");
     let manifest_path = target_repo_path.join("Cargo.toml");
     self.apply_manifest_transform(&manifest_path, crate_name, false)?;
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
-      println!("   Copying auxiliary files");
+      progress!("   Copying auxiliary files");
       aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
     }
 
@@ -860,7 +888,7 @@ impl<'a> SplitEngine<'a> {
       let source_path = self.ctx.workspace_root().join(crate_path);
       let target_path = target_repo_path.join(crate_path);
 
-      println!("   Copying {} to {}", crate_path.display(), crate_path.display());
+      progress!("   Copying {} to {}", crate_path.display(), crate_path.display());
 
       // Create parent directories
       if let Some(parent) = target_path.parent() {
@@ -876,7 +904,7 @@ impl<'a> SplitEngine<'a> {
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
-      println!("   Copying auxiliary files");
+      progress!("   Copying auxiliary files");
       aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
     }
 
@@ -973,7 +1001,7 @@ impl<'a> SplitEngine<'a> {
     let target_toml = target_repo_path.join("Cargo.toml");
     std::fs::write(&target_toml, doc.to_string())?;
 
-    println!("   Created workspace Cargo.toml with {} members", members.len());
+    progress!("   Created workspace Cargo.toml with {} members", members.len());
 
     Ok(())
   }

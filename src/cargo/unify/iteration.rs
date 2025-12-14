@@ -11,14 +11,10 @@ use std::sync::Arc;
 
 /// A dependency candidate for unification
 pub struct UnifyCandidate<'a> {
-  /// The package name (always the underlying package, not the alias)
-  pub package_name: &'a str,
   /// The dep_key (for ByDepKey mode, or the first dep_key for ByPackage mode)
   pub dep_key: &'a DepKey,
   /// All usage sites for this candidate
   pub usages: Vec<&'a DepUsage>,
-  /// Number of unique members using this dependency
-  pub usage_count: usize,
 }
 
 /// Iterator that yields unification candidates based on configuration
@@ -94,12 +90,7 @@ impl<'a> Iterator for CandidateIterator<'a> {
         // Get all usage sites for this package (aggregated across variants)
         let usages = self.manifests.get_package_usage_sites(&dep_key.name);
 
-        return Some(UnifyCandidate {
-          package_name: &dep_key.name,
-          dep_key,
-          usages,
-          usage_count,
-        });
+        return Some(UnifyCandidate { dep_key, usages });
       } else {
         // ByDepKey mode (include_renamed = false)
         let usage_count = self.manifests.usage_count(dep_key);
@@ -110,12 +101,7 @@ impl<'a> Iterator for CandidateIterator<'a> {
 
         let usages = self.manifests.get_usage_sites(dep_key);
 
-        return Some(UnifyCandidate {
-          package_name: &dep_key.name,
-          dep_key,
-          usages,
-          usage_count,
-        });
+        return Some(UnifyCandidate { dep_key, usages });
       }
     }
 

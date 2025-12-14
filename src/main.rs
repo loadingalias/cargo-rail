@@ -26,14 +26,31 @@ fn main() {
     cargo_rail::output::set_json_mode(true);
   }
 
-  // Get workspace root
-  let workspace_root = match std::env::current_dir() {
-    Ok(dir) => dir,
-    Err(e) => {
-      eprintln!("Error: Failed to get current directory: {}", e);
-      std::process::exit(1);
+  // Get workspace root (from --workspace-root flag or current directory)
+  let workspace_root = if let Some(ref root) = cli.workspace_root {
+    if root.is_absolute() {
+      root.clone()
+    } else {
+      match std::env::current_dir() {
+        Ok(cwd) => cwd.join(root),
+        Err(e) => {
+          eprintln!("Error: Failed to get current directory: {}", e);
+          std::process::exit(1);
+        }
+      }
+    }
+  } else {
+    match std::env::current_dir() {
+      Ok(dir) => dir,
+      Err(e) => {
+        eprintln!("Error: Failed to get current directory: {}", e);
+        std::process::exit(1);
+      }
     }
   };
+
+  // Store config override path for commands that need it
+  let config_override = cli.config.as_deref();
 
   // Handle init command specially - it doesn't require a valid workspace
   if let Commands::Init { output, force, check } = cli.command {
@@ -85,6 +102,34 @@ fn main() {
     if let Err(e) = commands::run_config_validate_standalone(&workspace_root, format, strictness) {
       exit_with_error(e);
     }
+    return;
+  }
+
+  // Handle config locate - only needs workspace root and optional config override
+  if let Commands::Config {
+    command: ConfigCommand::Locate { format },
+  } = cli.command
+  {
+    if let Err(e) = commands::run_config_locate(&workspace_root, config_override, format) {
+      exit_with_error(e);
+    }
+    return;
+  }
+
+  // Handle config print - only needs workspace root and optional config override
+  if let Commands::Config {
+    command: ConfigCommand::Print { format },
+  } = cli.command
+  {
+    if let Err(e) = commands::run_config_print(&workspace_root, config_override, format) {
+      exit_with_error(e);
+    }
+    return;
+  }
+
+  // Handle completions - no workspace needed at all
+  if let Commands::Completions { shell } = cli.command {
+    commands::generate_completions(shell);
     return;
   }
 

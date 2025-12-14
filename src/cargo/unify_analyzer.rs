@@ -40,15 +40,9 @@ pub struct UnifyAnalyzer {
 impl UnifyAnalyzer {
   /// Create a new analyzer from workspace context
   pub fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
-    // Use pre-loaded multi-target metadata if available, otherwise load it
-    let metadata = if let Some(ref cached) = ctx.multi_target_metadata {
-      // Already loaded in WorkspaceContext - just clone Arc (cheap)
-      (**cached).clone()
-    } else {
-      // Not pre-loaded (no targets configured) - load default
-      let targets = ctx.config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
-      MultiTargetMetadata::load_parallel(ctx.workspace_root(), &targets)?
-    };
+    // Get multi-target metadata (lazily loaded on first access)
+    // This clones the inner data (required for ownership by this analyzer)
+    let metadata = (*ctx.multi_target_metadata()?).clone();
 
     // Parse all manifests once
     let workspace_packages = metadata.workspace_packages();

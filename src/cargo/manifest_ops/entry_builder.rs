@@ -165,8 +165,7 @@ mod tests {
   use crate::cargo::unify_types::UnifiedDep;
   use std::path::PathBuf;
 
-  use super::super::fields::{extract_features, extract_path, has_default_features, has_path};
-  use super::super::transform::{extract_version, is_inline_table_dep, is_optional, is_simple_string_dep};
+  use super::super::fields::extract_features;
   use super::super::workspace_ref::is_workspace_dep;
 
   fn create_test_dep(name: &str, version: &str) -> UnifiedDep {
@@ -185,9 +184,9 @@ mod tests {
   fn test_build_dep_entry_simple() {
     let dep = create_test_dep("serde", "1.0");
     let entry = build_dep_entry(&dep);
-    assert!(is_simple_string_dep(&entry));
-    // Version requirement parsing adds the caret operator
-    assert_eq!(extract_version(&entry).unwrap(), "^1.0");
+    // Simple case returns a string value
+    assert!(entry.as_str().is_some());
+    assert_eq!(entry.as_str().unwrap(), "^1.0");
   }
 
   #[test]
@@ -196,7 +195,7 @@ mod tests {
     dep.features = vec!["derive".to_string()];
 
     let entry = build_dep_entry(&dep);
-    assert!(is_inline_table_dep(&entry));
+    assert!(entry.as_inline_table().is_some());
     let features = extract_features(&entry).unwrap();
     assert_eq!(features, vec!["derive"]);
   }
@@ -207,9 +206,9 @@ mod tests {
     dep.path = Some(PathBuf::from("../local-crate"));
 
     let entry = build_dep_entry(&dep);
-    assert!(is_inline_table_dep(&entry));
-    assert!(has_path(&entry));
-    assert_eq!(extract_path(&entry).unwrap(), "../local-crate");
+    let table = entry.as_inline_table().unwrap();
+    assert!(table.contains_key("path"));
+    assert_eq!(table.get("path").unwrap().as_str().unwrap(), "../local-crate");
   }
 
   #[test]
@@ -218,15 +217,15 @@ mod tests {
     dep.default_features = false;
 
     let entry = build_dep_entry(&dep);
-    assert!(is_inline_table_dep(&entry));
-    assert!(!has_default_features(&entry));
+    let table = entry.as_inline_table().unwrap();
+    assert!(!table.get("default-features").unwrap().as_bool().unwrap());
   }
 
   #[test]
   fn test_build_workspace_dep_entry_simple() {
     let entry = build_workspace_dep_entry(None, false);
     assert!(is_workspace_dep(&entry));
-    assert!(is_inline_table_dep(&entry));
+    assert!(entry.as_inline_table().is_some());
   }
 
   #[test]
@@ -241,7 +240,8 @@ mod tests {
   fn test_build_workspace_dep_entry_optional() {
     let entry = build_workspace_dep_entry(None, true);
     assert!(is_workspace_dep(&entry));
-    assert!(is_optional(&entry));
+    let table = entry.as_inline_table().unwrap();
+    assert!(table.get("optional").unwrap().as_bool().unwrap());
   }
 
   #[test]

@@ -18,7 +18,6 @@ pub mod version_utils;
 
 // Re-export main types
 pub use feature_pruner::FeaturePruner;
-pub use iteration::{CandidateIterator, UnifyCandidate};
+pub use iteration::CandidateIterator;
 pub use transitive_planner::TransitivePlanner;
 pub use unused_finder::UnusedDepFinder;
-pub use version_utils::*;

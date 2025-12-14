@@ -632,12 +632,12 @@ fn test_sync_from_remote_idempotent() -> Result<()> {
     String::from_utf8_lossy(&output2.stderr)
   );
 
-  // Verify "already up-to-date" or similar message
-  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  // Verify "already up-to-date" or similar message (progress output goes to stderr)
+  let stderr2 = String::from_utf8_lossy(&output2.stderr);
   assert!(
-    stdout2.contains("already up-to-date") || stdout2.contains("No new commits") || stdout2.contains("0 commits"),
-    "Second sync should indicate nothing to sync. stdout: {}",
-    stdout2
+    stderr2.contains("already up-to-date") || stderr2.contains("No new commits") || stderr2.contains("0 commits"),
+    "Second sync should indicate nothing to sync. stderr: {}",
+    stderr2
   );
 
   // Count PR branches - should still be exactly one (not two)

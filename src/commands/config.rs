@@ -6,7 +6,7 @@ use crate::error::{RailError, RailResult};
 use crate::toml::TomlEditor;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Validation result for JSON output
 #[derive(Serialize)]
@@ -133,6 +133,207 @@ const DEPRECATED_KEYS: &[(&str, &str)] = &[
   // No deprecated keys yet - this is infrastructure for future use
   // Example: ("old_key", "use 'new_key' instead"),
 ];
+
+// ============================================================================
+// Config Locate
+// ============================================================================
+
+/// Result of config locate for JSON output
+#[derive(Serialize)]
+struct LocateResult {
+  command: &'static str,
+  action: &'static str,
+  found: bool,
+  path: Option<String>,
+  search_paths: Vec<String>,
+}
+
+/// Print the path to the active configuration file
+///
+/// This is the equivalent of `cargo locate-project` for rail.toml.
+/// Searches in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+pub fn run_config_locate(
+  workspace_root: &Path,
+  config_override: Option<&Path>,
+  format: OutputFormat,
+) -> RailResult<()> {
+  let json = format.is_json();
+
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
+  // If config path was explicitly provided, use it
+  if let Some(explicit_path) = config_override {
+    let path = if explicit_path.is_absolute() {
+      explicit_path.to_path_buf()
+    } else {
+      workspace_root.join(explicit_path)
+    };
+
+    if path.exists() {
+      if json {
+        let result = LocateResult {
+          command: "config",
+          action: "locate",
+          found: true,
+          path: Some(path.display().to_string()),
+          search_paths: vec![],
+        };
+        println!(
+          "{}",
+          serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
+        );
+      } else {
+        println!("{}", path.display());
+      }
+      return Ok(());
+    } else {
+      return Err(RailError::message(format!(
+        "specified config file not found: {}",
+        path.display()
+      )));
+    }
+  }
+
+  // Search standard locations
+  let search_paths = [
+    workspace_root.join("rail.toml"),
+    workspace_root.join(".rail.toml"),
+    workspace_root.join(".cargo").join("rail.toml"),
+    workspace_root.join(".config").join("rail.toml"),
+  ];
+
+  let config_path = RailConfig::find_config_path(workspace_root);
+
+  if json {
+    let result = LocateResult {
+      command: "config",
+      action: "locate",
+      found: config_path.is_some(),
+      path: config_path.as_ref().map(|p| p.display().to_string()),
+      search_paths: search_paths.iter().map(|p| p.display().to_string()).collect(),
+    };
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
+    );
+  } else if let Some(path) = &config_path {
+    println!("{}", path.display());
+  } else {
+    println!("no config file found");
+    println!();
+    println!("searched:");
+    for p in &search_paths {
+      println!("  {}", p.display());
+    }
+    println!();
+    println!("hint: run 'cargo rail init' to create one");
+    return Err(RailError::ExitWithCode { code: 1 });
+  }
+
+  Ok(())
+}
+
+// ============================================================================
+// Config Print
+// ============================================================================
+
+/// Print the effective configuration with defaults merged
+///
+/// Shows what cargo-rail will actually use: user settings plus defaults
+/// for any fields not explicitly set.
+pub fn run_config_print(workspace_root: &Path, config_override: Option<&Path>, format: OutputFormat) -> RailResult<()> {
+  let json = format.is_json();
+
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
+  // Load config from explicit path or search
+  let (config, config_path) = load_config_with_path(workspace_root, config_override)?;
+
+  if json {
+    // JSON output: serialize the config struct
+    #[derive(Serialize)]
+    struct PrintResult {
+      command: &'static str,
+      action: &'static str,
+      config_path: String,
+      config: RailConfig,
+    }
+
+    let result = PrintResult {
+      command: "config",
+      action: "print",
+      config_path: config_path.display().to_string(),
+      config,
+    };
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
+    );
+  } else {
+    // TOML output: serialize to TOML with a header comment
+    println!("# Effective configuration (loaded from {})", config_path.display());
+    println!("# This shows all settings including defaults for unset fields.");
+    println!();
+
+    let toml_str = toml_edit::ser::to_string_pretty(&config)
+      .map_err(|e| RailError::message(format!("failed to serialize config: {}", e)))?;
+    print!("{}", toml_str);
+  }
+
+  Ok(())
+}
+
+/// Load config from explicit path or search, returning both config and path
+fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<(RailConfig, PathBuf)> {
+  if let Some(explicit_path) = config_override {
+    let path = if explicit_path.is_absolute() {
+      explicit_path.to_path_buf()
+    } else {
+      workspace_root.join(explicit_path)
+    };
+
+    if !path.exists() {
+      return Err(RailError::message(format!(
+        "specified config file not found: {}",
+        path.display()
+      )));
+    }
+
+    let content = std::fs::read_to_string(&path)
+      .map_err(|e| RailError::message(format!("failed to read {}: {}", path.display(), e)))?;
+
+    let config: RailConfig = toml_edit::de::from_str(&content)
+      .map_err(|e| RailError::message(format!("failed to parse {}: {}", path.display(), e)))?;
+
+    return Ok((config, path));
+  }
+
+  // Search standard locations
+  let config_path = RailConfig::find_config_path(workspace_root).ok_or_else(|| {
+    RailError::with_help(
+      "no rail.toml found".to_string(),
+      "run 'cargo rail init' first to create a configuration file".to_string(),
+    )
+  })?;
+
+  match RailConfig::try_load(workspace_root) {
+    ConfigLoadResult::Loaded(config) => Ok((*config, config_path)),
+    ConfigLoadResult::ParseError { path, message } => Err(RailError::message(format!(
+      "failed to parse {}: {}",
+      path.display(),
+      message
+    ))),
+    ConfigLoadResult::NotFound => Err(RailError::message("config file not found".to_string())),
+  }
+}
+
+// ============================================================================
+// Config Validate
+// ============================================================================
 
 /// Validate configuration file standalone (without WorkspaceContext)
 ///

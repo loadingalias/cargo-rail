@@ -391,42 +391,6 @@ impl WorkspaceDepsBuilder {
   }
 }
 
-/// Member Cargo.toml builder (for converting to workspace inheritance)
-pub struct MemberManifestBuilder {
-  formatter: TomlFormatter,
-}
-
-impl Default for MemberManifestBuilder {
-  fn default() -> Self {
-    Self {
-      formatter: TomlFormatter::new(),
-    }
-  }
-}
-
-impl MemberManifestBuilder {
-  /// Create a new builder
-  pub fn new() -> Self {
-    Self::default()
-  }
-
-  /// Convert dependency to workspace = true
-  pub fn workspace_dep(&self, _name: &str, features: Option<Vec<String>>) -> String {
-    if let Some(feats) = features {
-      if feats.is_empty() {
-        "{ workspace = true }".to_string()
-      } else {
-        format!(
-          "{{ workspace = true, features = {} }}",
-          self.formatter.array_features(&feats)
-        )
-      }
-    } else {
-      "{ workspace = true }".to_string()
-    }
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;

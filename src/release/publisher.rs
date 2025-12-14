@@ -6,6 +6,7 @@ use crate::release::changelog::ChangelogGenerator;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
 use crate::release::version::VersionBumper;
 use crate::workspace::WorkspaceContext;
+use crate::{progress, warn};
 use chrono::Local;
 use std::fs;
 use std::process::Command;
@@ -83,60 +84,61 @@ impl<'a> ReleasePublisher<'a> {
     // Run pre-flight checks
     let warnings = self.preflight_check(skip_tag)?;
     for warning in &warnings {
-      eprintln!("warning: {}", warning);
+      warn!("warning: {}", warning);
     }
 
     for (i, crate_plan) in plan.crates.iter().enumerate() {
-      eprintln!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
+      progress!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
 
-      eprintln!(
+      progress!(
         "  version: {} -> {}",
-        crate_plan.current_version, crate_plan.new_version
+        crate_plan.current_version,
+        crate_plan.new_version
       );
       self.bump_crate_version(crate_plan)?;
 
       if !crate_plan.affected_dependents.is_empty() {
-        eprintln!("  updating {} dependents", crate_plan.affected_dependents.len());
+        progress!("  updating {} dependents", crate_plan.affected_dependents.len());
         self.update_dependents(crate_plan)?;
       }
 
-      eprintln!("  changelog");
+      progress!("  changelog");
       self.update_changelog(crate_plan)?;
 
-      eprintln!("  commit");
+      progress!("  commit");
       self.commit_version_bump(crate_plan)?;
 
       if !skip_tag {
-        eprintln!("  tag: {}", crate_plan.tag_name);
+        progress!("  tag: {}", crate_plan.tag_name);
         self.create_tag(crate_plan)?;
       }
 
       if !skip_publish && crate_plan.publish {
-        eprintln!("  publishing...");
+        progress!("  publishing...");
         self.publish_crate(crate_plan)?;
 
         if i + 1 < plan.crates.len() {
           let delay = self.release_config.publish_delay;
-          eprintln!("  waiting {}s...", delay);
+          progress!("  waiting {}s...", delay);
           thread::sleep(Duration::from_secs(delay));
         }
       } else if !crate_plan.publish {
-        eprintln!("  skipped publish (publish = false)");
+        progress!("  skipped publish (publish = false)");
       }
 
       if self.release_config.create_github_release && !skip_tag {
-        eprintln!("  github release");
+        progress!("  github release");
         self.create_github_release(crate_plan)?;
       }
     }
 
-    println!("\nrelease complete");
+    progress!("\nrelease complete");
 
     if !skip_tag {
       let branch = self.ctx.git.current_branch().unwrap_or_else(|_| "main".to_string());
-      println!("\nnext:");
-      println!("  git push origin {}", branch);
-      println!("  git push origin --tags");
+      progress!("\nnext:");
+      progress!("  git push origin {}", branch);
+      progress!("  git push origin --tags");
     }
 
     Ok(())
@@ -365,7 +367,7 @@ impl<'a> ReleasePublisher<'a> {
       .unwrap_or(false);
 
     if !gh_available {
-      eprintln!("  skipped github release (gh CLI not found)");
+      progress!("  skipped github release (gh CLI not found)");
       return Ok(());
     }
 
@@ -392,7 +394,7 @@ impl<'a> ReleasePublisher<'a> {
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      eprintln!("  github release failed: {}", stderr.trim());
+      progress!("  github release failed: {}", stderr.trim());
     }
 
     Ok(())

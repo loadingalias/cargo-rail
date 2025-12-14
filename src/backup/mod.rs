@@ -40,18 +40,20 @@ pub use metadata::{BackupMetadata, BackupRecord};
 /// Backup identifier (timestamp-based)
 pub type BackupId = String;
 
-/// Creates a backup ID from current timestamp
+/// Creates a backup ID from current timestamp.
+#[doc(hidden)]
 pub fn create_backup_id() -> BackupId {
   chrono::Local::now().format("%Y-%m-%d-%H%M%S-%3f").to_string()
 }
 
-/// Get the backup root directory for a workspace
-///
+/// Get the backup root directory for a workspace.
+#[doc(hidden)]
 pub fn get_backup_root(workspace_root: &Path) -> PathBuf {
   workspace_root.join("target").join("cargo-rail").join("backups")
 }
 
-/// Get the path to a specific backup directory
+/// Get the path to a specific backup directory.
+#[doc(hidden)]
 pub fn get_backup_dir(workspace_root: &Path, backup_id: &str) -> PathBuf {
   get_backup_root(workspace_root).join(backup_id)
 }

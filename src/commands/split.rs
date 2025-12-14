@@ -131,12 +131,11 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
   // Execute splits
   if config_count > 1 && args.all {
     progress!("splitting {} crates...", config_count);
-    let ctx = ctx.clone();
     let results: Vec<RailResult<()>> = configs
       .into_par_iter()
       .map(|config| {
         progress!("  {}", config.crate_name);
-        let engine = SplitEngine::new(&ctx)?;
+        let engine = SplitEngine::new(ctx)?;
         engine.split(&config)
       })
       .collect();

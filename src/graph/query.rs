@@ -37,11 +37,13 @@ pub struct AffectedAnalysis {
 ///
 /// Algorithm:
 /// 1. Map files → owning crates (O(n) with path cache)
-/// 2. For each changed crate, get transitive dependents (O(V+E) per crate)
-/// 3. Union all sets
+/// 2. Single reverse traversal from all direct crates to find dependents (O(V+E))
+/// 3. Union direct crates + dependents for test targets
 ///
 /// # Performance
-/// Typical: <50ms for <100 crates
+/// O(n + V + E) where n = files, V = vertices, E = edges.
+/// Typically <50ms for <100 crates. The single traversal approach is
+/// significantly faster than O(N × (V+E)) when many crates are directly affected.
 pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> RailResult<AffectedAnalysis> {
   if changed_files.is_empty() {
     return Ok(AffectedAnalysis {
@@ -69,13 +71,10 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
-  // Step 2: Get transitive dependents for each changed crate
-  let mut all_dependents = HashSet::new();
-
-  for crate_name in &direct_crates {
-    let dependents = graph.transitive_dependents(crate_name)?;
-    all_dependents.extend(dependents);
-  }
+  // Step 2: Get all transitive dependents in a single traversal
+  // This is O(V+E) regardless of how many direct crates there are,
+  // vs O(N × (V+E)) if we called transitive_dependents() for each crate
+  let all_dependents = graph.transitive_dependents_of_set(&direct_crates)?;
 
   // Step 3: Build test targets (direct + dependents)
   let mut test_targets = direct_crates.clone();

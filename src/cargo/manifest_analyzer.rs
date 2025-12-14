@@ -36,16 +36,6 @@ impl DepKey {
     }
   }
 
-  /// Get the canonical key (package name only, ignoring rename)
-  ///
-  /// Used when `include_renamed = true` to group renamed and non-renamed deps together
-  pub fn canonical(&self) -> Self {
-    Self {
-      name: Arc::clone(&self.name),
-      renamed_from: None,
-    }
-  }
-
   /// Check if this is a renamed dependency
   pub fn is_renamed(&self) -> bool {
     self.renamed_from.is_some()

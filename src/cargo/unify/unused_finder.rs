@@ -196,23 +196,6 @@ impl<'a> UnusedDepFinder<'a> {
   }
 }
 
-/// Parse a feature reference string to extract dep name and feature
-///
-/// Handles formats:
-/// - `dep/feature` -> Some(("dep", "feature"))
-/// - `dep?/feature` -> Some(("dep", "feature"))
-pub fn parse_feature_reference(s: &str) -> Option<(String, String)> {
-  if let Some(idx) = s.find('/') {
-    let dep_part = &s[..idx];
-    let feature = &s[idx + 1..];
-    let dep_name = dep_part.trim_end_matches('?');
-    if !feature.is_empty() {
-      return Some((dep_name.to_string(), feature.to_string()));
-    }
-  }
-  None
-}
-
 /// Check if a target constraint (cfg expression) matches any configured target
 ///
 /// This is a heuristic check - we look for common patterns in the cfg string
@@ -279,27 +262,6 @@ pub fn target_constraint_matches_any(cfg: &str, configured_targets: &[&str]) -> 
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn test_parse_feature_reference_standard() {
-    assert_eq!(
-      parse_feature_reference("tikv_alloc/mimalloc"),
-      Some(("tikv_alloc".to_string(), "mimalloc".to_string()))
-    );
-  }
-
-  #[test]
-  fn test_parse_feature_reference_optional() {
-    assert_eq!(
-      parse_feature_reference("serde?/derive"),
-      Some(("serde".to_string(), "derive".to_string()))
-    );
-  }
-
-  #[test]
-  fn test_parse_feature_reference_plain_feature() {
-    assert_eq!(parse_feature_reference("std"), None);
-  }
 
   #[test]
   fn test_target_constraint_matches_windows() {

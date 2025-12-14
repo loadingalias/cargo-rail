@@ -24,6 +24,8 @@ pub struct AffectedOptions {
   pub from: Option<String>,
   /// End of SHA range (used with `from` for SHA pair mode)
   pub to: Option<String>,
+  /// Use merge-base with default branch (better for feature branches)
+  pub merge_base: bool,
   /// Output format
   pub format: OutputFormat,
   /// Show all workspace crates regardless of changes
@@ -46,10 +48,16 @@ pub fn run_affected(ctx: &WorkspaceContext, opts: AffectedOptions) -> RailResult
     return display_all_crates(ctx, opts.format, opts.output.as_ref());
   }
 
-  // Auto-detect default branch if --since not specified
-  let since_ref = match opts.since {
-    Some(s) => s,
-    None => detect_default_base_ref(ctx.git.git())?,
+  // Determine the base ref for change detection
+  let since_ref = if opts.merge_base {
+    // Use merge-base with auto-detected default branch
+    let default_branch = detect_default_base_ref(ctx.git.git())?;
+    ctx.git.git().get_merge_base(&default_branch, "HEAD")?
+  } else {
+    match opts.since {
+      Some(s) => s,
+      None => detect_default_base_ref(ctx.git.git())?,
+    }
   };
 
   // Get changed files from git

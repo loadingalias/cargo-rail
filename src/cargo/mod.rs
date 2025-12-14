@@ -9,10 +9,10 @@
 pub mod cargo_transform;
 pub mod feature_scanner;
 pub mod manifest_analyzer;
-pub mod manifest_ops;
+mod manifest_ops; // Internal - used only by manifest_writer and cargo_transform
 pub mod manifest_writer;
 pub mod multi_target_metadata;
-pub mod unify;
+mod unify; // Internal - implementation details for UnifyAnalyzer
 pub mod unify_analyzer;
 pub mod unify_report;
 pub mod unify_types;

@@ -12,7 +12,12 @@ use crate::progress;
 use crate::workspace::WorkspaceContext;
 
 /// Analyze workspace dependencies (check mode)
-pub fn run_unify_analyze(ctx: &WorkspaceContext, show_diff: bool, format: OutputFormat) -> RailResult<()> {
+pub fn run_unify_analyze(
+  ctx: &WorkspaceContext,
+  show_diff: bool,
+  explain: bool,
+  format: OutputFormat,
+) -> RailResult<()> {
   let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
@@ -77,6 +82,11 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, show_diff: bool, format: Output
 
   // Display summary
   println!("{}", plan.summary());
+
+  // Show explain output if requested
+  if explain {
+    display_explain(&plan);
+  }
 
   // Show diff if requested
   if show_diff && (!plan.member_edits.is_empty() || !plan.workspace_deps.is_empty()) {
@@ -276,6 +286,7 @@ pub fn run_unify_apply(
   let backup_manager = BackupManager::new(ctx.workspace_root());
   let is_first_run = !backup_manager.has_backups();
   let should_backup = backup || is_first_run;
+  let mut created_backup_id: Option<String> = None;
 
   if should_backup {
     if is_first_run && !backup {
@@ -301,6 +312,7 @@ pub fn run_unify_apply(
     let max_backups = ctx.config.as_ref().map(|c| c.unify.max_backups).unwrap_or(3);
     let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
     progress!("backup: {}", backup_id);
+    created_backup_id = Some(backup_id);
   }
 
   let writer = ManifestWriter::new();
@@ -511,6 +523,11 @@ pub fn run_unify_apply(
 
   println!("\nnext: cargo check && cargo test");
 
+  // Show undo hint if backup was created
+  if let Some(backup_id) = created_backup_id {
+    println!("undo: cargo rail unify undo  (backup: {})", backup_id);
+  }
+
   Ok(())
 }
 
@@ -557,6 +574,123 @@ pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: O
   backup_manager.restore_backup(&target_backup_id)?;
 
   Ok(())
+}
+
+/// Display detailed explanation of unification decisions
+fn display_explain(plan: &crate::cargo::UnificationPlan) {
+  use std::collections::BTreeMap;
+
+  println!("\n=== Explanation ===\n");
+
+  // Explain dependencies being unified
+  if !plan.workspace_deps.is_empty() {
+    println!("Dependencies unified to [workspace.dependencies]:\n");
+    for dep in &plan.workspace_deps {
+      println!("  {} = \"{}\"", dep.name, dep.version_req);
+      println!("    reason: used by {} workspace member(s)", dep.used_by.len());
+      if dep.used_by.len() <= 5 {
+        for member in &dep.used_by {
+          println!("      - {}", member);
+        }
+      } else {
+        for member in dep.used_by.iter().take(3) {
+          println!("      - {}", member);
+        }
+        println!("      ... and {} more", dep.used_by.len() - 3);
+      }
+      if !dep.features.is_empty() {
+        println!("    features: union of features from all uses");
+        let mut sorted_features = dep.features.clone();
+        sorted_features.sort();
+        println!("      [{}]", sorted_features.join(", "));
+      }
+      println!();
+    }
+  }
+
+  // Explain transitive pins
+  if !plan.transitive_pins.is_empty() {
+    println!("Transitive dependencies pinned:\n");
+    for pin in &plan.transitive_pins {
+      println!("  {} = \"{}\"", pin.name, pin.version);
+      println!("    reason: transitive dep with target-specific features");
+      if !pin.features.is_empty() {
+        let mut sorted = pin.features.clone();
+        sorted.sort();
+        println!("    features: [{}]", sorted.join(", "));
+      }
+      println!();
+    }
+  }
+
+  // Explain unused deps being removed
+  if !plan.unused_deps.is_empty() {
+    println!("Unused dependencies flagged for removal:\n");
+    for unused in &plan.unused_deps {
+      println!("  {} in {}", unused.dep_name, unused.member);
+      println!("    reason: {:?}", unused.reason);
+      println!();
+    }
+  }
+
+  // Explain pruned features
+  if !plan.pruned_features.is_empty() {
+    println!("Dead features pruned:\n");
+    for pruned in &plan.pruned_features {
+      println!("  [features].{} in {}", pruned.feature_name, pruned.crate_name);
+      println!("    reason: empty feature (no dependencies, no sub-features)");
+      println!();
+    }
+  }
+
+  // Explain issues/blockers
+  if !plan.issues.is_empty() {
+    println!("Issues detected:\n");
+
+    // Group by severity
+    let mut by_severity: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for issue in &plan.issues {
+      let severity = format!("{:?}", issue.severity);
+      by_severity.entry(severity).or_default().push(issue);
+    }
+
+    for (severity, issues) in &by_severity {
+      println!("  {} ({}):", severity, issues.len());
+      for issue in issues {
+        println!("    {}: {}", issue.dep_name, issue.message);
+      }
+      println!();
+    }
+  }
+
+  // Explain undeclared features
+  if !plan.undeclared_features.is_empty() {
+    println!("Undeclared features detected:\n");
+    for uf in &plan.undeclared_features {
+      println!("  {} in {}", uf.dep_name, uf.member);
+      println!("    undeclared: [{}]", uf.undeclared_features.join(", "));
+      if !uf.borrowed_from.is_empty() {
+        println!("    borrowed from: {}", uf.borrowed_from.join(", "));
+      }
+      println!("    reason: features enabled via resolver but not declared in Cargo.toml");
+      println!();
+    }
+  }
+
+  // Explain why no changes if plan is empty
+  if plan.workspace_deps.is_empty()
+    && plan.member_edits.is_empty()
+    && plan.transitive_pins.is_empty()
+    && plan.unused_deps.is_empty()
+  {
+    println!("No unification opportunities found.\n");
+    println!("Possible reasons:");
+    println!("  - Dependencies are already unified");
+    println!("  - Dependencies have incompatible versions (see issues above)");
+    println!("  - Dependencies are excluded via [unify].exclude config");
+    println!("  - Dependencies are renamed (use include_renamed = true)");
+    println!("  - Single-use dependencies (not shared across crates)");
+  }
 }
 
 /// Check if a workspace is a "virtual" workspace (has [workspace] but no [package])

@@ -5,6 +5,8 @@
 
 use crate::error::RailResult;
 use crate::git::SystemGit;
+#[cfg(test)]
+use crate::progress;
 
 /// Detect the default base ref for change detection
 ///
@@ -77,7 +79,7 @@ mod tests {
       ref_str
     );
 
-    println!("Detected base ref: {}", ref_str);
+    progress!("Detected base ref: {}", ref_str);
   }
 
   #[test]

@@ -1,4 +1,5 @@
 use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::{progress, warn};
 use std::collections::HashMap;
 use std::path::Path;
 use std::thread;
@@ -151,13 +152,13 @@ impl MappingStore {
 
     // Skip if no mappings exist
     if self.mappings.is_empty() {
-      println!("   No git-notes to push (no mappings recorded)");
+      progress!("   No git-notes to push (no mappings recorded)");
       return Ok(());
     }
 
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
 
-    println!("   Pushing git-notes to remote '{}'...", remote);
+    progress!("   Pushing git-notes to remote '{}'...", remote);
 
     retry_operation(|| {
       let output = Command::new("git")
@@ -176,7 +177,7 @@ impl MappingStore {
       Ok(())
     })?;
 
-    println!("   ✅ Pushed git-notes");
+    progress!("   ✅ Pushed git-notes");
     Ok(())
   }
 
@@ -187,7 +188,7 @@ impl MappingStore {
     let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
     let refspec = format!("{}:{}", notes_ref, notes_ref);
 
-    println!("   Fetching git-notes from remote '{}'...", remote);
+    progress!("   Fetching git-notes from remote '{}'...", remote);
 
     // Retry the fetch operation
     let result = retry_operation(|| {
@@ -215,7 +216,7 @@ impl MappingStore {
 
     match result {
       Ok(_) => {
-        println!("   ✅ Fetched git-notes");
+        progress!("   ✅ Fetched git-notes");
         Ok(())
       }
       Err(e) => {
@@ -227,8 +228,8 @@ impl MappingStore {
         };
 
         if is_conflict {
-          println!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
-          println!("   🔄 Attempting automatic merge with union strategy...");
+          progress!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
+          progress!("   🔄 Attempting automatic merge with union strategy...");
 
           // Fetch to FETCH_HEAD without updating the ref
           let fetch_output = Command::new("git")
@@ -259,13 +260,13 @@ impl MappingStore {
             let merge_stderr = String::from_utf8_lossy(&merge_output.stderr);
 
             // If union merge fails, provide clear guidance
-            eprintln!("   ❌ Automatic git-notes merge failed");
-            eprintln!("   📋 Manual resolution required:");
-            eprintln!("      1. cd {}", repo_path.display());
-            eprintln!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
-            eprintln!("      3. Resolve conflicts manually");
-            eprintln!("      4. git notes --ref={} merge --commit", notes_ref);
-            eprintln!();
+            warn!("   ❌ Automatic git-notes merge failed");
+            warn!("   📋 Manual resolution required:");
+            warn!("      1. cd {}", repo_path.display());
+            warn!("      2. git notes --ref={} merge FETCH_HEAD", notes_ref);
+            warn!("      3. Resolve conflicts manually");
+            warn!("      4. git notes --ref={} merge --commit", notes_ref);
+            warn!("");
             return Err(RailError::with_help(
               format!("git notes merge failed: {}", merge_stderr),
               format!(
@@ -282,7 +283,7 @@ impl MappingStore {
             ));
           }
 
-          println!("   ✅ Git-notes merged successfully (union strategy)");
+          progress!("   ✅ Git-notes merged successfully (union strategy)");
           Ok(())
         } else {
           // Propagate other errors
@@ -329,9 +330,11 @@ where
           return Err(e);
         }
 
-        println!(
+        progress!(
           "   ⚠️  Operation failed. Retrying in {:?}... (Attempt {}/{})",
-          delay, attempt, max_retries
+          delay,
+          attempt,
+          max_retries
         );
         thread::sleep(delay);
         delay *= 2;

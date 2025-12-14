@@ -1,11 +1,14 @@
-//! CLI argument definitions for cargo-rail
+//! CLI argument definitions for cargo-rail.
 //!
-//! This module defines all CLI structures using clap. These are used by main.rs
-//! and the dispatch logic in commands/mod.rs.
+//! This module defines all CLI structures using clap. These are internal
+//! and used by main.rs and the dispatch logic in commands/mod.rs.
+//!
+//! **Note:** This is not part of the stable public API.
 
 use super::common::OutputFormat;
 use crate::sync::ConflictStrategy;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 const MAIN_HELP: &str = "\
@@ -50,6 +53,14 @@ pub struct RailCli {
   #[arg(long, global = true)]
   pub json: bool,
 
+  /// Path to rail.toml config file (bypass search order)
+  #[arg(long, global = true, value_name = "PATH")]
+  pub config: Option<PathBuf>,
+
+  /// Workspace root directory (default: current directory)
+  #[arg(long, global = true, value_name = "PATH")]
+  pub workspace_root: Option<PathBuf>,
+
   /// The subcommand to execute
   #[command(subcommand)]
   pub command: Commands,
@@ -58,15 +69,20 @@ pub struct RailCli {
 const AFFECTED_HELP: &str = "\
 Examples:
   cargo rail affected                     # Changes since origin/main
+  cargo rail affected --merge-base        # Changes since branch point (CI recommended)
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
   cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
-  cargo rail affected -f names-only       # Just crate names, one per line";
+  cargo rail affected -f names-only       # Just crate names, one per line
+
+CI tip: Use --merge-base for PRs to detect only your branch's changes,
+even if the target branch has moved forward.";
 
 const TEST_HELP: &str = "\
 Examples:
   cargo rail test                         # Test affected crates
+  cargo rail test --merge-base            # Test changes since branch point (CI)
   cargo rail test --all                   # Test all crates
   cargo rail test -- --nocapture          # Pass args to test runner
   cargo rail test --explain               # Show why each crate is tested";
@@ -74,6 +90,7 @@ Examples:
 const UNIFY_HELP: &str = "\
 Examples:
   cargo rail unify --check                # Preview changes (CI mode)
+  cargo rail unify --check --explain      # Show why each decision was made
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes
@@ -81,6 +98,10 @@ Examples:
   cargo rail unify undo --list            # List available backups";
 
 const SPLIT_HELP: &str = "\
+This is an advanced feature for extracting crates to standalone repositories
+while preserving git history. Most teams should start with 'affected', 'test',
+and 'unify' before using split/sync.
+
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
   cargo rail split init my-crate --check  # Preview generated config
@@ -89,6 +110,9 @@ Examples:
   cargo rail split run --all              # Split all configured crates";
 
 const SYNC_HELP: &str = "\
+This is an advanced feature for bidirectional sync between monorepo and split
+repositories. Requires 'split' to be configured first.
+
 Examples:
   cargo rail sync my-crate                # Bidirectional sync
   cargo rail sync my-crate --to-remote    # Push monorepo -> split repo
@@ -125,10 +149,32 @@ Examples:
 
 const CONFIG_HELP: &str = "\
 Examples:
+  cargo rail config locate              # Show which config file is active
+  cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
   cargo rail config sync --check        # Preview config updates
   cargo rail config sync                # Add missing fields, sync targets";
+
+const COMPLETIONS_HELP: &str = "\
+Examples:
+  cargo rail completions bash           # Output bash completions
+  cargo rail completions zsh            # Output zsh completions
+  cargo rail completions fish           # Output fish completions
+  cargo rail completions powershell     # Output PowerShell completions
+
+Installation:
+  # Bash (~/.bashrc)
+  eval \"$(cargo rail completions bash)\"
+
+  # Zsh (~/.zshrc)
+  eval \"$(cargo rail completions zsh)\"
+
+  # Fish (~/.config/fish/config.fish)
+  cargo rail completions fish | source
+
+  # PowerShell
+  cargo rail completions powershell | Out-String | Invoke-Expression";
 
 /// Available subcommands
 #[derive(Subcommand)]
@@ -145,6 +191,9 @@ pub enum Commands {
     /// End ref (for SHA pair mode)
     #[arg(long, requires = "from")]
     to: Option<String>,
+    /// Use merge-base with default branch (better for feature branches)
+    #[arg(long, conflicts_with_all = ["since", "from", "to"])]
+    merge_base: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
@@ -165,6 +214,9 @@ pub enum Commands {
     /// Git ref to compare against (auto-detects origin/main or origin/master)
     #[arg(long)]
     since: Option<String>,
+    /// Use merge-base with default branch (better for feature branches)
+    #[arg(long, conflicts_with = "since")]
+    merge_base: bool,
     /// Skip change detection and run all tests
     #[arg(long, short = 'a')]
     all: bool,
@@ -203,6 +255,9 @@ pub enum Commands {
     /// Show diff of changes to each manifest
     #[arg(long)]
     show_diff: bool,
+    /// Explain why each decision was made
+    #[arg(long)]
+    explain: bool,
   },
 
   /// Initialize configuration (rail.toml)
@@ -219,7 +274,7 @@ pub enum Commands {
     check: bool,
   },
 
-  /// Split a crate to a standalone repository with git history
+  /// (Advanced) Split a crate to a standalone repository with git history
   #[command(after_long_help = SPLIT_HELP)]
   Split {
     /// Split subcommand
@@ -227,7 +282,7 @@ pub enum Commands {
     command: SplitCommand,
   },
 
-  /// Sync changes between monorepo and split repos
+  /// (Advanced) Sync changes between monorepo and split repos
   #[command(after_long_help = SYNC_HELP)]
   Sync {
     /// Crate name to sync (mutually exclusive with --all)
@@ -298,11 +353,38 @@ pub enum Commands {
     #[command(subcommand)]
     command: ConfigCommand,
   },
+
+  /// Generate shell completions
+  #[command(after_long_help = COMPLETIONS_HELP)]
+  Completions {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    shell: Shell,
+  },
 }
 
 /// Subcommands for `cargo rail config`
 #[derive(Subcommand)]
 pub enum ConfigCommand {
+  /// Print the path to the active config file
+  ///
+  /// Shows which config file is being used. Searches in order:
+  /// rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+  Locate {
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
+  /// Print the effective configuration with defaults
+  ///
+  /// Shows the merged configuration: user settings plus defaults for
+  /// any unset fields. Useful for debugging and understanding what
+  /// cargo-rail will actually use.
+  Print {
+    /// Output format (default: toml, or json with -f json)
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
   /// Validate the configuration file
   ///
   /// Checks for parse errors, unknown keys, and semantic issues.
@@ -466,7 +548,10 @@ impl Commands {
         ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
       },
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format, .. } | ConfigCommand::Sync { format, .. } => format.is_json_like(),
+        ConfigCommand::Locate { format }
+        | ConfigCommand::Print { format }
+        | ConfigCommand::Validate { format, .. }
+        | ConfigCommand::Sync { format, .. } => format.is_json_like(),
       },
       _ => false,
     }
@@ -488,9 +573,18 @@ impl Commands {
       } => *format = OutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Config { command } => match command {
-        ConfigCommand::Validate { format, .. } | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
+        ConfigCommand::Locate { format }
+        | ConfigCommand::Print { format }
+        | ConfigCommand::Validate { format, .. }
+        | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
       },
       _ => {}
     }
   }
+}
+
+/// Generate shell completions and print to stdout
+pub fn generate_completions(shell: Shell) {
+  let mut cmd = CargoCli::command();
+  clap_complete::generate(shell, &mut cmd, "cargo-rail", &mut std::io::stdout());
 }

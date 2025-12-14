@@ -180,6 +180,60 @@ impl WorkspaceGraph {
     Ok(result)
   }
 
+  /// Get transitive reverse dependencies for multiple crates in a single traversal.
+  ///
+  /// This is more efficient than calling `transitive_dependents()` multiple times
+  /// when you have many direct crates, as it does a single O(V+E) traversal instead
+  /// of O(N × (V+E)) where N is the number of crates.
+  ///
+  /// # Performance
+  /// O(V + E) regardless of input set size. Significantly faster than N separate
+  /// traversals for large input sets.
+  pub fn transitive_dependents_of_set(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<String>> {
+    if crate_names.is_empty() {
+      return Ok(HashSet::new());
+    }
+
+    // Find all start nodes
+    let start_nodes: Vec<NodeIndex> = crate_names
+      .iter()
+      .filter_map(|name| self.name_to_node.get(name).copied())
+      .collect();
+
+    if start_nodes.is_empty() {
+      return Ok(HashSet::new());
+    }
+
+    // Single BFS/DFS from all start nodes
+    let mut visited = HashSet::new();
+    let mut stack = start_nodes;
+    let mut dependents = HashSet::new();
+
+    // Pre-compute start node indices for fast lookup
+    let start_node_set: HashSet<NodeIndex> = stack.iter().copied().collect();
+
+    while let Some(node_idx) = stack.pop() {
+      if visited.contains(&node_idx) {
+        continue;
+      }
+      visited.insert(node_idx);
+
+      // Add all incoming neighbors (things that depend on this)
+      for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
+        let neighbor = &self.graph[neighbor_idx];
+
+        // Only include workspace members that are not in the original set
+        if neighbor.is_workspace_member && !start_node_set.contains(&neighbor_idx) {
+          dependents.insert(neighbor.name.clone());
+        }
+
+        stack.push(neighbor_idx);
+      }
+    }
+
+    Ok(dependents)
+  }
+
   /// Get workspace members in dependency order (dependencies first, dependents last).
   ///
   /// Returns crates in the order they should be published: a crate's dependencies

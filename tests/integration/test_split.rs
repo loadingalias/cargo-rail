@@ -535,12 +535,12 @@ paths = [{{ crate = "crates/prefetch-lib" }}]
     String::from_utf8_lossy(&output.stderr)
   );
 
-  // Check stdout mentions parallel prefetch
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  // Check stderr mentions parallel prefetch (progress output goes to stderr)
+  let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stdout.contains("Prefetching file contents in parallel"),
-    "Should use parallel prefetch for 9 commits. stdout: {}",
-    stdout
+    stderr.contains("Prefetching file contents in parallel"),
+    "Should use parallel prefetch for 9 commits. stderr: {}",
+    stderr
   );
 
   // Verify the split repo has all commits
@@ -622,12 +622,12 @@ paths = [{{ crate = "crates/dirty-lib" }}]
     String::from_utf8_lossy(&output.stderr)
   );
 
-  // Check stdout mentions skipped commits
-  let stdout = String::from_utf8_lossy(&output.stdout);
+  // Check stderr mentions skipped commits (progress output goes to stderr)
+  let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stdout.contains("Skipped") && stdout.contains("dirty history"),
-    "Should mention skipped commits due to dirty history. stdout: {}",
-    stdout
+    stderr.contains("Skipped") && stderr.contains("dirty history"),
+    "Should mention skipped commits due to dirty history. stderr: {}",
+    stderr
   );
 
   // Verify the split repo exists and has files
@@ -818,12 +818,12 @@ paths = [{{ crate = "crates/idempotent-lib" }}]
     String::from_utf8_lossy(&output2.stderr)
   );
 
-  // Verify "already up-to-date" message
-  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  // Verify "already up-to-date" message (progress output goes to stderr)
+  let stderr2 = String::from_utf8_lossy(&output2.stderr);
   assert!(
-    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
-    "Second run should indicate already up-to-date. stdout: {}",
-    stdout2
+    stderr2.contains("already up-to-date") || stderr2.contains("already split"),
+    "Second run should indicate already up-to-date. stderr: {}",
+    stderr2
   );
 
   // Get commit count after second split
@@ -977,12 +977,12 @@ paths = [
     String::from_utf8_lossy(&output2.stderr)
   );
 
-  // Verify "already up-to-date" message
-  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  // Verify "already up-to-date" message (progress output goes to stderr)
+  let stderr2 = String::from_utf8_lossy(&output2.stderr);
   assert!(
-    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
-    "Second run should indicate already up-to-date. stdout: {}",
-    stdout2
+    stderr2.contains("already up-to-date") || stderr2.contains("already split"),
+    "Second run should indicate already up-to-date. stderr: {}",
+    stderr2
   );
 
   // Verify no changes
@@ -1122,11 +1122,12 @@ paths = [{{ crate = "crates/aux-lib" }}]
   let output2 = run_cargo_rail(&ws.path, &["rail", "split", "run", "aux-lib", "--yes", "--allow-dirty"])?;
   assert!(output2.status.success());
 
-  let stdout2 = String::from_utf8_lossy(&output2.stdout);
+  // Progress output goes to stderr
+  let stderr2 = String::from_utf8_lossy(&output2.stderr);
   assert!(
-    stdout2.contains("already up-to-date") || stdout2.contains("already split"),
-    "Should be up-to-date. stdout: {}",
-    stdout2
+    stderr2.contains("already up-to-date") || stderr2.contains("already split"),
+    "Should be up-to-date. stderr: {}",
+    stderr2
   );
 
   // Count should be the same
