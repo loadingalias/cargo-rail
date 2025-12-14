@@ -182,7 +182,7 @@ pub enum Commands {
   /// Show which crates are affected by changes
   #[command(after_long_help = AFFECTED_HELP)]
   Affected {
-    /// Git ref to compare against (auto-detects origin/main or origin/master)
+    /// Git ref to compare against (auto-detects default branch)
     #[arg(long)]
     since: Option<String>,
     /// Start ref (for SHA pair mode)
@@ -200,8 +200,8 @@ pub enum Commands {
     /// Show all workspace crates (ignore changes)
     #[arg(long, short = 'a')]
     all: bool,
-    /// Write output to file (e.g., $GITHUB_OUTPUT)
-    #[arg(long, short = 'o')]
+    /// Write output to file (appends to existing content)
+    #[arg(long, short = 'o', value_name = "PATH")]
     output: Option<PathBuf>,
     /// Explain why each crate is affected
     #[arg(long)]
@@ -211,7 +211,7 @@ pub enum Commands {
   /// Run tests for affected crates only
   #[command(after_long_help = TEST_HELP)]
   Test {
-    /// Git ref to compare against (auto-detects origin/main or origin/master)
+    /// Git ref to compare against (auto-detects default branch)
     #[arg(long)]
     since: Option<String>,
     /// Use merge-base with default branch (better for feature branches)
@@ -358,7 +358,7 @@ pub enum Commands {
   #[command(after_long_help = COMPLETIONS_HELP)]
   Completions {
     /// Shell to generate completions for
-    #[arg(value_enum)]
+    #[arg(value_enum, value_name = "SHELL")]
     shell: Shell,
   },
 }
@@ -381,7 +381,7 @@ pub enum ConfigCommand {
   /// any unset fields. Useful for debugging and understanding what
   /// cargo-rail will actually use.
   Print {
-    /// Output format (default: toml, or json with -f json)
+    /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
   },
@@ -438,6 +438,7 @@ pub enum SplitCommand {
   /// Configure split for crate(s)
   Init {
     /// Crate name(s) to configure
+    #[arg(value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Preview generated config without writing
     #[arg(long, short = 'c')]
@@ -446,7 +447,7 @@ pub enum SplitCommand {
   /// Execute split operation
   Run {
     /// Crate name to split (mutually exclusive with --all)
-    #[arg(conflicts_with = "all")]
+    #[arg(conflicts_with = "all", value_name = "CRATE")]
     crate_name: Option<String>,
     /// Split all configured crates
     #[arg(short, long)]
@@ -475,6 +476,7 @@ pub enum ReleaseCommand {
   /// Configure release settings
   Init {
     /// Crate name(s) to configure (optional)
+    #[arg(value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Preview generated config without writing
     #[arg(long, short = 'c')]
@@ -483,7 +485,7 @@ pub enum ReleaseCommand {
   /// Execute release (plan or publish)
   Run {
     /// Crate name(s) to release (mutually exclusive with --all)
-    #[arg(conflicts_with = "all")]
+    #[arg(conflicts_with = "all", value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Release all workspace crates
     #[arg(short, long)]
@@ -510,7 +512,7 @@ pub enum ReleaseCommand {
   /// Validate release readiness
   Check {
     /// Crate name(s) to check (mutually exclusive with --all)
-    #[arg(conflicts_with = "all")]
+    #[arg(conflicts_with = "all", value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Check all workspace crates (mutually exclusive with crate names)
     #[arg(short, long)]

@@ -106,6 +106,27 @@ impl TomlFormatter {
     self.array_string(targets, Some(generic_groups))
   }
 
+  /// Format array without grouping (simple multiline for readability)
+  pub fn array_simple(&self, items: &[String]) -> String {
+    if items.is_empty() {
+      return "[]".to_string();
+    }
+    if items.len() <= self.inline_array_threshold {
+      let content = items
+        .iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+      return format!("[{}]", content);
+    }
+    let mut output = String::from("[\n");
+    for item in items {
+      output.push_str(&format!("{}\"{}\",\n", self.indent, item));
+    }
+    output.push(']');
+    output
+  }
+
   /// Format section header with box comment
   pub fn section_header(&self, title: &str, description: &str) -> String {
     format!("# {}\n# {}\n[{}]\n", title.to_uppercase(), description, title)

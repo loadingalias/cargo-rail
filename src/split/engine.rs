@@ -286,9 +286,6 @@ impl<'a> SplitEngine<'a> {
       }
     }
 
-    // Auxiliary files are handled separately via AuxiliaryFiles::discover
-    // This section has been removed as it was redundant
-
     // Create commit using git command for determinism
     // Map parent SHAs from monorepo to split repo
     let mut mapped_parents: Vec<String> = params
