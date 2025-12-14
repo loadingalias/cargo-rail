@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/loadingalias/cargo-rail/compare/v0.5.3...v0.6.0) - 2025-12-14
+
+### 📦 Other Changes
+
+- cargo-rail: cleaning docs and fixing the broken generation script for the configs. cleaning and improving the readme; updating the docs for the last few commits. ([849273e](https://github.com/loadingalias/cargo-rail/commit/849273eb597372bf9af30ae5cd086c69fd3e3c71))
+- cargo-rail: cleaning up the CLI and config outputs/comments ([9783fca](https://github.com/loadingalias/cargo-rail/commit/9783fca7894f2a33e7ab50a89dbe066c3f9834a0))
+- cargo-rail: major dx, perf, and reliability updated. ([19b48c4](https://github.com/loadingalias/cargo-rail/commit/19b48c401165b1567893e093cf13ccd4fa94aebc))
+- cargo-rail: cleaning up the codebase; CICD. ([7ff3906](https://github.com/loadingalias/cargo-rail/commit/7ff3906fc7062786094049b03a04a9876198227a))
+- cargo-rail: added 'split/sync' safety rails; defrred 'git centralization'; removed the four unwrap()/expect() calls from the production code; fixed the 'process::exit()' in the lib code. ([6b8faa3](https://github.com/loadingalias/cargo-rail/commit/6b8faa3f5ef7b41b2d4a773721d4d6c71f5e5c49))
+- cargo-rail: feat(split/sync): add safety rails with --allow-dirty and --yes flags ([70d213a](https://github.com/loadingalias/cargo-rail/commit/70d213a6a37d41fdb26476640db6d6f3d514cbb2))
+- cargo-rail: feat: safety and correctness improvements ([4edda04](https://github.com/loadingalias/cargo-rail/commit/4edda04c5666788e3a489870b0b3685fc68f9eeb))
+
+
+
 ## [0.5.3](https://github.com/loadingalias/cargo-rail/compare/v0.5.2...v0.5.3) - 2025-12-12
 
 ### 🐛 Bug Fixes
