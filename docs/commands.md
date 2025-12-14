@@ -14,22 +14,25 @@ The rail subcommand
 Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
-  affected  Show which crates are affected by changes
-  test      Run tests for affected crates only
-  unify     Unify workspace dependencies (replaces workspace-hack crates)
-  init      Initialize configuration (rail.toml)
-  split     Split a crate to a standalone repository with git history
-  sync      Sync changes between monorepo and split repos
-  release   Publish releases (version bump, changelog, tag, publish)
-  clean     Clean generated artifacts (cache, backups, reports)
-  config    Configuration management
-  help      Print this message or the help of the given subcommand(s)
+  affected     Show which crates are affected by changes
+  test         Run tests for affected crates only
+  unify        Unify workspace dependencies (replaces workspace-hack crates)
+  init         Initialize configuration (rail.toml)
+  split        (Advanced) Split a crate to a standalone repository with git history
+  sync         (Advanced) Sync changes between monorepo and split repos
+  release      Publish releases (version bump, changelog, tag, publish)
+  clean        Clean generated artifacts (cache, backups, reports)
+  config       Configuration management
+  completions  Generate shell completions
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
-  -q, --quiet    Suppress progress messages (for CI/automation)
-      --json     Output in JSON format (shorthand for -f json)
-  -h, --help     Print help
-  -V, --version  Print version
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output in JSON format (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ---
@@ -46,7 +49,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --since <SINCE>
-          Git ref to compare against (auto-detects origin/main or origin/master)
+          Git ref to compare against (auto-detects default branch)
 
       --from <FROM>
           Start ref (for SHA pair mode)
@@ -54,8 +57,17 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --to <TO>
           End ref (for SHA pair mode)
+
+      --merge-base
+          Use merge-base with default branch (better for feature branches)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
@@ -74,8 +86,8 @@ Options:
   -a, --all
           Show all workspace crates (ignore changes)
 
-  -o, --output <OUTPUT>
-          Write output to file (e.g., $GITHUB_OUTPUT)
+  -o, --output <PATH>
+          Write output to file (appends to existing content)
 
       --explain
           Explain why each crate is affected
@@ -87,12 +99,16 @@ Options:
           Print version
 
 Examples:
-  cargo rail affected                     # Changes since origin/main
+  cargo rail affected                     # Changes since default branch
+  cargo rail affected --merge-base        # Changes since branch point (CI recommended)
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
   cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
   cargo rail affected -f names-only       # Just crate names, one per line
+
+CI tip: Use --merge-base for PRs to detect only your branch's changes,
+even if the target branch has moved forward.
 ```
 
 ---
@@ -113,16 +129,25 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --since <SINCE>
-          Git ref to compare against (auto-detects origin/main or origin/master)
-
-  -a, --all
-          Skip change detection and run all tests
+          Git ref to compare against (auto-detects default branch)
 
       --json
           Output in JSON format (shorthand for -f json)
 
+      --merge-base
+          Use merge-base with default branch (better for feature branches)
+
+  -a, --all
+          Skip change detection and run all tests
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --skip-nextest
           Disable automatic use of cargo-nextest
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
       --explain
           Explain why tests are being run
@@ -135,6 +160,7 @@ Options:
 
 Examples:
   cargo rail test                         # Test affected crates
+  cargo rail test --merge-base            # Test changes since branch point (CI)
   cargo rail test --all                   # Test all crates
   cargo rail test -- --nocapture          # Pass args to test runner
   cargo rail test --explain               # Show why each crate is tested
@@ -163,6 +189,9 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
   -f, --format <FORMAT>
           Output format
 
@@ -180,6 +209,9 @@ Options:
       --backup
           Create backups of all modified files
 
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
       --skip-report
           Skip generating the unify report
 
@@ -189,6 +221,9 @@ Options:
       --show-diff
           Show diff of changes to each manifest
 
+      --explain
+          Explain why each decision was made
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -197,6 +232,7 @@ Options:
 
 Examples:
   cargo rail unify --check                # Preview changes (CI mode)
+  cargo rail unify --check --explain      # Show why each decision was made
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes
@@ -218,6 +254,8 @@ Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
       --backup-id <BACKUP_ID>  Specific backup ID to restore (defaults to most recent)
       --json                   Output in JSON format (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -249,6 +287,12 @@ Options:
   -c, --check
           Dry-run mode: preview generated config without writing
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -267,7 +311,7 @@ Examples:
 ## cargo rail split
 
 ```
-Split a crate to a standalone repository with git history
+(Advanced) Split a crate to a standalone repository with git history
 
 Usage: cargo rail split [OPTIONS] <COMMAND>
 
@@ -283,11 +327,21 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+This is an advanced feature for extracting crates to standalone repositories
+while preserving git history. Most teams should start with 'affected', 'test',
+and 'unify' before using split/sync.
 
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
@@ -304,17 +358,19 @@ Examples:
 ```
 Configure split for crate(s)
 
-Usage: cargo rail split init [OPTIONS] [CRATE_NAMES]...
+Usage: cargo rail split init [OPTIONS] [CRATE]...
 
 Arguments:
-  [CRATE_NAMES]...  Crate name(s) to configure
+  [CRATE]...  Crate name(s) to configure
 
 Options:
-  -c, --check    Preview generated config without writing
-  -q, --quiet    Suppress progress messages (for CI/automation)
-      --json     Output in JSON format (shorthand for -f json)
-  -h, --help     Print help
-  -V, --version  Print version
+  -c, --check                  Preview generated config without writing
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output in JSON format (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ---
@@ -324,10 +380,10 @@ Options:
 ```
 Execute split operation
 
-Usage: cargo rail split run [OPTIONS] [CRATE_NAME]
+Usage: cargo rail split run [OPTIONS] [CRATE]
 
 Arguments:
-  [CRATE_NAME]
+  [CRATE]
           Crate name to split (mutually exclusive with --all)
 
 Options:
@@ -345,6 +401,18 @@ Options:
 
   -c, --check
           Dry-run mode: preview changes
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --allow-dirty
+          Allow running on dirty worktree (uncommitted changes)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -y, --yes
+          Skip confirmation prompts (for CI/automation)
 
   -f, --format <FORMAT>
           Output format
@@ -372,7 +440,7 @@ Options:
 ## cargo rail sync
 
 ```
-Sync changes between monorepo and split repos
+(Advanced) Sync changes between monorepo and split repos
 
 Usage: cargo rail sync [OPTIONS] [CRATE_NAME]
 
@@ -393,11 +461,17 @@ Options:
       --remote <REMOTE>
           Override remote repository
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --from-remote
           Sync from remote to monorepo only
 
       --to-remote
           Sync from monorepo to remote only
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
       --strategy <STRATEGY>
           Conflict resolution strategy
@@ -412,6 +486,12 @@ Options:
 
   -c, --check
           Dry-run mode: preview changes without executing
+
+      --allow-dirty
+          Allow running on dirty worktree (uncommitted changes)
+
+  -y, --yes
+          Skip confirmation prompts (for CI/automation)
 
   -f, --format <FORMAT>
           Output format
@@ -432,6 +512,9 @@ Options:
 
   -V, --version
           Print version
+
+This is an advanced feature for bidirectional sync between monorepo and split
+repositories. Requires 'split' to be configured first.
 
 Examples:
   cargo rail sync my-crate                # Bidirectional sync
@@ -462,6 +545,12 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -488,17 +577,19 @@ Examples:
 ```
 Configure release settings
 
-Usage: cargo rail release init [OPTIONS] [CRATE_NAMES]...
+Usage: cargo rail release init [OPTIONS] [CRATE]...
 
 Arguments:
-  [CRATE_NAMES]...  Crate name(s) to configure (optional)
+  [CRATE]...  Crate name(s) to configure (optional)
 
 Options:
-  -c, --check    Preview generated config without writing
-  -q, --quiet    Suppress progress messages (for CI/automation)
-      --json     Output in JSON format (shorthand for -f json)
-  -h, --help     Print help
-  -V, --version  Print version
+  -c, --check                  Preview generated config without writing
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output in JSON format (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ---
@@ -508,10 +599,10 @@ Options:
 ```
 Execute release (plan or publish)
 
-Usage: cargo rail release run [OPTIONS] [CRATE_NAMES]...
+Usage: cargo rail release run [OPTIONS] [CRATE]...
 
 Arguments:
-  [CRATE_NAMES]...
+  [CRATE]...
           Crate name(s) to release (mutually exclusive with --all)
 
 Options:
@@ -532,11 +623,20 @@ Options:
   -c, --check
           Dry-run mode: preview release plan
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --skip-publish
           Skip publishing to crates.io
 
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
       --skip-tag
           Skip git tag creation
+
+  -y, --yes
+          Skip confirmation prompts and allow non-default branch
 
   -f, --format <FORMAT>
           Output format
@@ -566,10 +666,10 @@ Options:
 ```
 Validate release readiness
 
-Usage: cargo rail release check [OPTIONS] [CRATE_NAMES]...
+Usage: cargo rail release check [OPTIONS] [CRATE]...
 
 Arguments:
-  [CRATE_NAMES]...
+  [CRATE]...
           Crate name(s) to check (mutually exclusive with --all)
 
 Options:
@@ -585,6 +685,9 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
   -f, --format <FORMAT>
           Output format
 
@@ -598,6 +701,9 @@ Options:
           - jsonl:         JSON Lines format (one object per line)
           
           [default: text]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -628,11 +734,17 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --reports
           Clean generated reports
 
   -c, --check
           Dry-run mode: preview what would be cleaned
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
@@ -672,6 +784,8 @@ Configuration management
 Usage: cargo rail config [OPTIONS] <COMMAND>
 
 Commands:
+  locate    Print the path to the active config file
+  print     Print the effective configuration with defaults
   validate  Validate the configuration file
   sync      Sync configuration: add missing fields and update targets
   help      Print this message or the help of the given subcommand(s)
@@ -683,6 +797,12 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -690,10 +810,102 @@ Options:
           Print version
 
 Examples:
+  cargo rail config locate              # Show which config file is active
+  cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
   cargo rail config sync --check        # Preview config updates
   cargo rail config sync                # Add missing fields, sync targets
+```
+
+---
+
+### cargo rail config locate
+
+```
+Print the path to the active config file
+
+Shows which config file is being used. Searches in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+
+Usage: cargo rail config locate [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail config print
+
+```
+Print the effective configuration with defaults
+
+Shows the merged configuration: user settings plus defaults for any unset fields. Useful for debugging and understanding what cargo-rail will actually use.
+
+Usage: cargo rail config print [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -731,8 +943,14 @@ Options:
       --strict
           Treat warnings as errors (auto-enabled in CI)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
       --no-strict
           Never treat warnings as errors (overrides CI auto-detection)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')
@@ -778,9 +996,69 @@ Options:
       --json
           Output in JSON format (shorthand for -f json)
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+```
+
+---
+
+## cargo rail completions
+
+```
+Generate shell completions
+
+Usage: cargo rail completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>
+          Shell to generate completions for
+          
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail completions bash           # Output bash completions
+  cargo rail completions zsh            # Output zsh completions
+  cargo rail completions fish           # Output fish completions
+  cargo rail completions powershell     # Output PowerShell completions
+
+Installation:
+  # Bash (~/.bashrc)
+  eval "$(cargo rail completions bash)"
+
+  # Zsh (~/.zshrc)
+  eval "$(cargo rail completions zsh)"
+
+  # Fish (~/.config/fish/config.fish)
+  cargo rail completions fish | source
+
+  # PowerShell
+  cargo rail completions powershell | Out-String | Invoke-Expression
 ```

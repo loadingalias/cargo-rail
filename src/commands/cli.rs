@@ -15,7 +15,7 @@ const MAIN_HELP: &str = "\
 Monorepo orchestration for Rust workspaces.
 
 Quick start:
-  cargo rail init              # Generate rail.toml
+  cargo rail init              # Generate .config/rail.toml (default)
   cargo rail affected          # See what changed
   cargo rail test              # Test affected crates only
   cargo rail unify --check     # Preview dependency unification
@@ -68,7 +68,7 @@ pub struct RailCli {
 
 const AFFECTED_HELP: &str = "\
 Examples:
-  cargo rail affected                     # Changes since origin/main
+  cargo rail affected                     # Changes since default branch
   cargo rail affected --merge-base        # Changes since branch point (CI recommended)
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs

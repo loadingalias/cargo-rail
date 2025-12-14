@@ -1,6 +1,6 @@
 # Configuration Reference
 
-> Complete reference for all rail.toml configuration options. Generated from source code.
+> Complete reference for all rail.toml configuration options. Kept in sync with source defaults and CLI behavior.
 
 ## Overview
 
@@ -37,10 +37,11 @@ cargo rail init --force            # Overwrite existing config
 
 ### Minimal Configuration
 
-cargo-rail works with sensible defaults. An empty file or minimal config is sufficient:
+cargo-rail works with sensible defaults. An empty file is valid; add options only when you need them:
 
 ```toml
-# Minimal config - uses defaults for everything
+# Minimal config (optional): set targets if you want multi-target validation.
+# (`cargo rail init` can auto-detect targets from *.toml and .github/workflows.)
 targets = ["x86_64-unknown-linux-gnu"]
 ```
 
@@ -60,7 +61,7 @@ detect_unused = true             # Find unused dependencies
 remove_unused = true             # Auto-remove them
 
 [release]
-tag_format = "{crate}-v{version}"
+tag_format = "{crate}-{prefix}{version}"
 create_github_release = false
 
 [change-detection]
@@ -237,7 +238,7 @@ Release automation settings for versioning, tagging, and publishing.
 ```toml
 [release]
 tag_prefix = "v"
-tag_format = "{crate}-v{version}"    # Produces: my-crate-v1.0.0
+tag_format = "{crate}-{prefix}{version}"    # Produces: my-crate-v1.0.0
 require_clean = true
 publish_delay = 10
 create_github_release = true
@@ -629,7 +630,8 @@ remove_unused = true
 prune_dead_features = true
 
 [release]
-tag_format = "{crate}-v{version}"
+tag_prefix = "v"
+tag_format = "{crate}-{prefix}{version}"
 require_clean = true
 require_changelog_entries = true
 create_github_release = true
@@ -733,7 +735,7 @@ Replace `cargo hakari generate` with cargo-rail:
 # After (cargo-rail)
 [unify]
 pin_transitives = true
-transitive_host = "root"  # or path to your hack crate
+transitive_host = "root"  # or a path to a workspace member crate (relative to workspace root)
 ```
 
 Then run:
@@ -749,14 +751,16 @@ cargo-rail provides similar functionality with tighter integration:
 ```toml
 # release-plz.toml → rail.toml
 [release]
-tag_format = "{crate}-v{version}"
+tag_format = "{crate}-{prefix}{version}"
 require_changelog_entries = true
 create_github_release = true
 ```
 
 ## Environment Variables
 
-None. All configuration is file-based for reproducibility.
+No cargo-rail-specific environment variables are required. For reproducibility, configuration is file-based.
+
+Note: `cargo rail config validate` defaults to strict mode in CI (detected via `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI`).
 
 ## See Also
 

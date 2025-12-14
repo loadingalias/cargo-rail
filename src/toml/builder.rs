@@ -40,9 +40,13 @@ impl RailConfigBuilder {
   pub fn targets(&mut self, targets: &[String]) -> &mut Self {
     let mut content = String::new();
     if targets.is_empty() {
-      content.push_str("# targets = []  # run 'cargo metadata' for each target triple\n");
+      content.push_str(
+        "# targets = []  # optional: set for multi-target validation; `cargo rail init` can auto-detect from *.toml and .github/workflows\n",
+      );
     } else {
-      content.push_str("# Targets for multi-platform validation (runs 'cargo metadata' per target)\n");
+      content.push_str(
+        "# Targets for multi-platform validation (runs `cargo metadata --filter-platform <target>` per target)\n",
+      );
       content.push_str(&format!("targets = {}\n", self.formatter.array_simple(targets)));
     }
     self.sections.push(content);
@@ -164,7 +168,7 @@ impl RailConfigBuilder {
 
     content.push_str(&format!("tag_prefix = \"{}\"\n", config.tag_prefix));
     content.push_str(&format!(
-      "tag_format = \"{}\"  # e.g. my-crate-v1.0.0\n",
+      "tag_format = \"{}\"  # e.g. my-crate-v1.0.0 (with tag_prefix = \"v\")\n",
       config.tag_format
     ));
     content.push_str(&format!("require_clean = {}\n", config.require_clean));

@@ -72,7 +72,7 @@
 ```rust
 pub struct WorkspaceContext {
     pub workspace_root: PathBuf,
-    pub git: Arc<GitState>,                         // Git pps
+    pub git: Arc<GitState>,                         // Git ops
     pub cargo: Arc<CargoState>,                     // Cargo metadata (O(1) package lookup)
     pub graph: Arc<WorkspaceGraph>,                 // Dep graph
     pub config: Option<Arc<RailConfig>>,
@@ -85,10 +85,10 @@ pub struct WorkspaceContext {
 
 ```rust
 // Get changed files
-let files = ctx.git.git().changed_files_between(from, to)?;
+let files = ctx.git.git().get_changed_files_between(from, to)?;
 
 // Look up a package (O(1))
-let pkg = ctx.cargo.get_package("my-crate")?;
+let pkg = ctx.cargo.get_package("my-crate").expect("workspace member exists");
 
 // Find transitive dependents
 let dependents = ctx.graph.transitive_dependents("my-crate")?;
@@ -108,7 +108,7 @@ Parse CLI (clap)
     ↓
 Init output mode (quiet/JSON)
     ↓
-Handle early commands (init, undo, sync)  ← These don't need full context
+Handle early commands (init, completions, config validate/sync/locate/print, unify undo)  ← These don't need full context
     ↓
 Build WorkspaceContext  (~100-300ms)
     ├─ GitState         (~5ms)

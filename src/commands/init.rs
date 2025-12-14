@@ -21,11 +21,11 @@ fn default_unify_config() -> UnifyConfig {
   UnifyConfig::default()
 }
 
-/// Detect target triples across all TOML files in workspace
+/// Detect target triples across config files in the workspace
 ///
 /// Uses fuzzy matching against rustc's canonical target list to find targets
 /// regardless of where they're defined (rust-toolchain.toml, .cargo/config.toml,
-/// Cross.toml, dist-workspace.toml, etc.).
+/// Cross.toml, dist-workspace.toml, .github/workflows/*.yml, etc.).
 ///
 /// Returns sorted list of detected targets.
 fn detect_targets(workspace_root: &Path) -> Vec<String> {

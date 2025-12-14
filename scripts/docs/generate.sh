@@ -40,10 +40,10 @@ done
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ensure_binary() {
-  if [ ! -f "$BINARY" ]; then
-    echo "Building cargo-rail (release)..."
-    cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
-  fi
+  # Always build (cargo is incremental and will no-op when up to date).
+  # This prevents regenerating docs from a stale binary.
+  echo "Building cargo-rail (release)..."
+  cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
