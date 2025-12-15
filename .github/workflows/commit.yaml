@@ -5,6 +5,10 @@ on:
     branches:
       - "**"
 
+  pull_request:
+    branches:
+      - main
+
   # Allow manual trigger
   workflow_dispatch:
 
@@ -47,7 +51,8 @@ jobs:
         id: affected
         uses: loadingalias/cargo-rail-action@88618d12427cee84efbe1ef556dd9f8445acad95  # v1.0.2
         with:
-          since: ${{ github.event.before }}
+          # For push: compare against previous commit; for PR: compare against base branch
+          since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
   # ==========================================================================
   # Job 2: CI (skipped if docs-only)
