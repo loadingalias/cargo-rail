@@ -157,6 +157,12 @@ impl RailConfigBuilder {
     }
     content.push_str(&format!("max_backups = {}\n", config.max_backups));
 
+    // === Formatting ===
+    content.push_str(&format!(
+      "sort_dependencies = {}  # false to preserve existing order\n",
+      config.sort_dependencies
+    ));
+
     self.sections.push(format!("[unify]\n{}", content));
 
     self
@@ -253,6 +259,8 @@ impl RailConfigBuilder {
 pub struct WorkspaceDepsBuilder {
   formatter: TomlFormatter,
   deps: Vec<(String, String, Option<String>)>, // Name, Value (formatted), Optional comment
+  /// Whether to sort dependencies alphabetically (default: true)
+  pub sort_dependencies: bool,
 }
 
 impl Default for WorkspaceDepsBuilder {
@@ -260,6 +268,7 @@ impl Default for WorkspaceDepsBuilder {
     Self {
       formatter: TomlFormatter::new(),
       deps: Vec::new(),
+      sort_dependencies: true,
     }
   }
 }
@@ -268,6 +277,13 @@ impl WorkspaceDepsBuilder {
   /// Create a new builder
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Set whether to sort dependencies alphabetically (default: true)
+  pub fn with_dependency_sort(mut self, sort: bool) -> Self {
+    self.sort_dependencies = sort;
+    self.formatter.sort_dependencies = sort;
+    self
   }
 
   /// Add dependency
@@ -302,11 +318,15 @@ impl WorkspaceDepsBuilder {
   pub fn build(&self) -> RailResult<String> {
     let mut content = String::from("\n[workspace.dependencies]\n");
 
-    // Sort dependencies
-    let mut sorted_deps = self.deps.clone();
-    sorted_deps.sort_by(|a, b| a.0.cmp(&b.0));
+    let deps_to_write = if self.sort_dependencies {
+      let mut sorted = self.deps.clone();
+      sorted.sort_by(|a, b| a.0.cmp(&b.0));
+      sorted
+    } else {
+      self.deps.clone()
+    };
 
-    for (name, value, comment) in sorted_deps {
+    for (name, value, comment) in deps_to_write {
       if let Some(c) = comment {
         content.push_str(&format!("{} = {}  # {}\n", name, value, c));
       } else {

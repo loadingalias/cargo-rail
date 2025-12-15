@@ -15,6 +15,8 @@ pub struct TomlFormatter {
   pub inline_feature_threshold: usize,
   /// Indentation string (usually 2 spaces)
   pub indent: &'static str,
+  /// Whether to sort dependencies alphabetically (true) or preserve order (false)
+  pub sort_dependencies: bool,
 }
 
 impl Default for TomlFormatter {
@@ -23,6 +25,7 @@ impl Default for TomlFormatter {
       inline_array_threshold: 4,
       inline_feature_threshold: 10,
       indent: "  ",
+      sort_dependencies: true,
     }
   }
 }
@@ -158,11 +161,11 @@ impl TomlFormatter {
   /// Format a Cargo.toml document in-place
   ///
   /// Applies standard formatting rules:
-  /// 1. Sorts dependencies
+  /// 1. Sorts dependencies (if dependency_sort is Alphabetical)
   /// 2. Standardizes table format (inline vs block)
   pub fn format_manifest(&self, doc: &mut DocumentMut) -> RailResult<()> {
-    // 1. Sort dependencies alphabetically
-    self.sort_dependencies(doc);
+    // 1. Sort dependencies (only if configured to sort alphabetically)
+    self.sort_deps(doc);
 
     // 2. Standardize table formatting (inline vs block)
     self.standardize_tables(doc);
@@ -171,7 +174,15 @@ impl TomlFormatter {
   }
 
   /// Sort dependencies in all dependency sections
-  fn sort_dependencies(&self, doc: &mut DocumentMut) {
+  ///
+  /// Only sorts if `sort_dependencies` is true.
+  /// When false, existing order is maintained.
+  fn sort_deps(&self, doc: &mut DocumentMut) {
+    // Skip sorting if configured to preserve existing order
+    if !self.sort_dependencies {
+      return;
+    }
+
     let sections = [
       "dependencies",
       "dev-dependencies",
