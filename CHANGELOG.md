@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.1](https://github.com/loadingalias/cargo-rail/compare/v0.7.0...v0.7.1) - 2025-12-15
+
+### 👷 CI
+
+- run workflow on pull requests ([e3fcf55](https://github.com/loadingalias/cargo-rail/commit/e3fcf558cdea1f5cf51640add66bddfa4ac588d2))
+
+### 📦 Other Changes
+
+- add configurable dependency sorting (#5) [#5](https://github.com/loadingalias/cargo-rail/pull/5) ([f055618](https://github.com/loadingalias/cargo-rail/commit/f05561864f4dd73f471524e20a8cdad3de619507))
+
+
+
 ## [0.7.0](https://github.com/loadingalias/cargo-rail/compare/v0.6.0...v0.7.0) - 2025-12-14
 
 ### 📦 Other Changes
