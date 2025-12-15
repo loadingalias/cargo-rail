@@ -140,6 +140,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     default_toml: "3",
     comment: "Number of backup files to keep (default: 3)",
   },
+  FieldSpec {
+    section: "unify",
+    key: "sort_dependencies",
+    default_toml: "true",
+    comment: "Sort deps alphabetically (default: true)",
+  },
   // =========================================================================
   // [release] section - 10 fields
   // =========================================================================
@@ -270,7 +276,7 @@ mod tests {
   #[test]
   fn test_fields_for_section() {
     let unify_fields: Vec<_> = fields_for_section("unify").collect();
-    assert_eq!(unify_fields.len(), 19); // 16 + detect_undeclared_features + fix_undeclared_features + skip_undeclared_patterns
+    assert_eq!(unify_fields.len(), 20); // 19 + sort_dependencies
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
@@ -286,7 +292,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      30, // 19 unify + 10 release + 1 change-detection
+      31, // 20 unify + 10 release + 1 change-detection
       "Total syncable fields count changed - update this test if intentional"
     );
   }

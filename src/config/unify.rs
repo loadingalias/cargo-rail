@@ -118,6 +118,11 @@ pub struct UnifyConfig {
   /// These are features that are typically not actionable or are implementation details.
   #[serde(default = "default_skip_undeclared_patterns")]
   pub skip_undeclared_patterns: Vec<String>,
+
+  /// Sort dependencies alphabetically when writing Cargo.toml files (default: true)
+  /// When false, preserves existing order and appends new deps at end.
+  #[serde(default = "default_true")]
+  pub sort_dependencies: bool,
 }
 
 impl Default for UnifyConfig {
@@ -142,6 +147,7 @@ impl Default for UnifyConfig {
       detect_undeclared_features: true,
       fix_undeclared_features: true,
       skip_undeclared_patterns: default_skip_undeclared_patterns(),
+      sort_dependencies: true,
     }
   }
 }
@@ -954,5 +960,42 @@ mod tests {
     assert!(!config.should_skip_undeclared_feature("default"));
     assert!(!config.should_skip_undeclared_feature("std"));
     assert!(!config.should_skip_undeclared_feature("anything"));
+  }
+
+  // ============================================================================
+  // sort_dependencies Tests
+  // ============================================================================
+
+  #[test]
+  fn test_sort_dependencies_default() {
+    let config = UnifyConfig::default();
+    assert!(config.sort_dependencies); // Default is true (alphabetical)
+  }
+
+  #[test]
+  fn test_sort_dependencies_parsing_true() {
+    let toml = r#"sort_dependencies = true"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.sort_dependencies);
+  }
+
+  #[test]
+  fn test_sort_dependencies_parsing_false() {
+    let toml = r#"sort_dependencies = false"#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.sort_dependencies);
+  }
+
+  #[test]
+  fn test_sort_dependencies_with_other_options() {
+    let toml = r#"
+      detect_unused = true
+      remove_unused = true
+      sort_dependencies = false
+    "#;
+    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.detect_unused);
+    assert!(config.remove_unused);
+    assert!(!config.sort_dependencies);
   }
 }

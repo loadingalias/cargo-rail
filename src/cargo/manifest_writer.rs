@@ -21,11 +21,17 @@ impl Default for ManifestWriter {
 }
 
 impl ManifestWriter {
-  /// Creates a new manifest writer
+  /// Creates a new manifest writer with default settings
   pub fn new() -> Self {
     Self {
       formatter: TomlFormatter::new(),
     }
+  }
+
+  /// Sets whether to sort dependencies when writing manifests
+  pub fn with_dependency_sort(mut self, sort: bool) -> Self {
+    self.formatter.sort_dependencies = sort;
+    self
   }
 
   /// Write unified dependencies to workspace Cargo.toml

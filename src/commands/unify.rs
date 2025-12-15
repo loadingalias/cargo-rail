@@ -315,7 +315,12 @@ pub fn run_unify_apply(
     created_backup_id = Some(backup_id);
   }
 
-  let writer = ManifestWriter::new();
+  let sort_mode = ctx
+    .config
+    .as_ref()
+    .map(|c| c.unify.sort_dependencies)
+    .unwrap_or(true);
+  let writer = ManifestWriter::new().with_dependency_sort(sort_mode);
 
   if !plan.workspace_deps.is_empty() {
     progress!("writing [workspace.dependencies]...");
