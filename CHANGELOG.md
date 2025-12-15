@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.2](https://github.com/loadingalias/cargo-rail/compare/v0.7.1...v0.7.2) - 2025-12-15
+
+### 🔧 Chores
+
+- add pre-push hook and fix formatting [#5](https://github.com/loadingalias/cargo-rail/pull/5) ([4919985](https://github.com/loadingalias/cargo-rail/commit/4919985c086cb7bd0c48d049c7c54b0da7c75e77))
+
+
+
 ## [0.7.1](https://github.com/loadingalias/cargo-rail/compare/v0.7.0...v0.7.1) - 2025-12-15
 
 ### 👷 CI
