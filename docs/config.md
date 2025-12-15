@@ -339,17 +339,73 @@ benchmarks = ["benches/**", "perf/**"]
 docs = ["docs/**", "*.md"]
 ```
 
-**Use Case:**
-Custom categories enable conditional CI:
+#### GitHub Actions Integration
+
+Use [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) for CI:
 
 ```yaml
-# .github/workflows/ci.yml
-- name: Check if benchmarks changed
+- uses: actions/checkout@v4
+  with: { fetch-depth: 0 }
+
+- uses: loadingalias/cargo-rail-action@v1
+  id: affected
+
+- name: Test affected
+  if: steps.affected.outputs.docs-only != 'true'
   run: |
-    if cargo rail affected --json | jq -e '.custom.benchmarks'; then
-      cargo bench
+    if [[ "${{ steps.affected.outputs.rebuild-all }}" == "true" ]]; then
+      cargo test --workspace
+    else
+      cargo test ${{ steps.affected.outputs.cargo-args }}
     fi
 ```
+
+**Action Outputs:**
+
+| Output | Description |
+|--------|-------------|
+| `docs-only` | `"true"` if only documentation changed |
+| `rebuild-all` | `"true"` if infrastructure files changed |
+| `crates` | Space-separated affected crates |
+| `cargo-args` | Ready-to-use `-p crate1 -p crate2` flags |
+| `matrix` | JSON array for `strategy.matrix` |
+| `count` | Number of affected crates |
+| `custom-categories` | JSON object of custom category matches |
+
+**Conditional Jobs with Custom Categories:**
+
+```yaml
+jobs:
+  detect:
+    outputs:
+      run-bench: ${{ contains(steps.affected.outputs.custom-categories, 'benchmarks') }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: loadingalias/cargo-rail-action@v1
+        id: affected
+
+  bench:
+    needs: detect
+    if: needs.detect.outputs.run-bench == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo bench
+```
+
+#### Output Formats
+
+The `affected` command supports multiple output formats via `--format`:
+
+| Format | Use Case | Example |
+|--------|----------|---------|
+| `text` | Human debugging | `direct: 2\n  lib-a` |
+| `json` | Scripting | `{"impact": {"direct": ["lib-a"]}}` |
+| `github` | `$GITHUB_OUTPUT` | `crates=lib-a lib-b` |
+| `github-matrix` | `strategy.matrix` | `{"include": [{"crate": "lib-a"}]}` |
+| `names-only` | Shell loops | `lib-a\nlib-b` |
+| `cargo-args` | Direct cargo use | `-p lib-a -p lib-b` |
 
 ---
 
@@ -370,6 +426,14 @@ Crate splitting and syncing configuration. Enables extracting crates to separate
 | `paths` | `CratePath[]` | yes | Crate paths to include. Format: `[{ crate = "path/to/crate" }]`<br>• `mode = "single"` requires exactly 1 path<br>• `mode = "combined"` requires 2+ paths |
 | `include` | `string[]` | no | Additional files/directories to include in the split (e.g., `["LICENSE", "README.md"]`) |
 | `exclude` | `string[]` | no | Files/directories to exclude from the split |
+
+**Choosing a Mode:**
+
+| Scenario | Mode | Result |
+|----------|------|--------|
+| Publish one crate independently | `single` | Files at repo root, standalone Cargo.toml |
+| Group related utility crates | `combined` + `standalone` | Preserves directory structure, independent crates |
+| Extract as sub-workspace | `combined` + `workspace` | Root Cargo.toml with `[workspace]` |
 
 **Single Crate Example:**
 
@@ -446,9 +510,21 @@ skip = false
 skip = true               # No changelog for internal crates
 ```
 
-#### [crates.NAME.sync]
+#### Syncing Split Repositories
 
-Reserved for future use. Currently has no effect.
+After initial split, use `cargo rail sync` for bidirectional synchronization:
+
+```bash
+cargo rail sync my-lib                # Auto-detect direction
+cargo rail sync my-lib --to-remote    # Monorepo → split repo
+cargo rail sync my-lib --from-remote  # Split repo → monorepo (PR branch)
+```
+
+**Key behaviors:**
+
+- **Idempotent**: Uses git-notes to track synced commits; re-running only processes new commits
+- **PR branch protection**: `--from-remote` creates `cargo-rail-sync-<crate>` branch, never commits to main
+- **Conflict resolution**: `--strategy` controls merge behavior (`manual`, `ours`, `theirs`, `union`)
 
 ---
 
