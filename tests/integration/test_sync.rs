@@ -378,9 +378,7 @@ fn test_sync_json_output() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Safety Rails Tests
-// ============================================================================
 
 /// Test that sync fails on dirty worktree without --allow-dirty
 #[test]

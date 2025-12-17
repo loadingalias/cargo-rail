@@ -134,9 +134,7 @@ const DEPRECATED_KEYS: &[(&str, &str)] = &[
   // Example: ("old_key", "use 'new_key' instead"),
 ];
 
-// ============================================================================
 // Config Locate
-// ============================================================================
 
 /// Result of config locate for JSON output
 #[derive(Serialize)]
@@ -235,9 +233,7 @@ pub fn run_config_locate(
   Ok(())
 }
 
-// ============================================================================
 // Config Print
-// ============================================================================
 
 /// Print the effective configuration with defaults merged
 ///
@@ -331,9 +327,7 @@ fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) 
   }
 }
 
-// ============================================================================
 // Config Validate
-// ============================================================================
 
 /// Validate configuration file standalone (without WorkspaceContext)
 ///
@@ -384,7 +378,7 @@ pub fn run_config_validate_standalone(
   let content = std::fs::read_to_string(&config_path)
     .map_err(|e| RailError::message(format!("failed to read {}: {}", config_path.display(), e)))?;
 
-  // Phase 1: Check for parse errors with line/column info
+  // Check for parse errors with line/column info
   let raw_doc: Result<toml_edit::DocumentMut, _> = content.parse();
   if let Err(parse_err) = &raw_doc {
     let err_str = parse_err.to_string();
@@ -397,15 +391,15 @@ pub fn run_config_validate_standalone(
     errors.push(issue);
   }
 
-  // Phase 2: Check for unknown keys (only if parsing succeeded)
+  // Check for unknown keys (only if parsing succeeded)
   if let Ok(doc) = &raw_doc {
     check_unknown_keys(doc, &mut warnings);
   }
 
-  // Phase 3: Check for deprecated keys
+  // Check for deprecated keys
   check_deprecated_keys(&content, &mut warnings);
 
-  // Phase 4: Try to load and validate semantically
+  // Try to load and validate semantically
   match RailConfig::try_load(workspace_root) {
     ConfigLoadResult::Loaded(config) => {
       // Validate change detection config
@@ -413,7 +407,7 @@ pub fn run_config_validate_standalone(
         errors.push(ValidationIssue::new("change_detection", e.to_string()));
       }
 
-      // Validate per-crate split configs
+      // Validate per-crate split config
       for (crate_name, crate_config) in &config.crates {
         if let Some(split_cfg) = &crate_config.split {
           if split_cfg.remote.is_empty() {
@@ -588,9 +582,7 @@ fn check_deprecated_keys(content: &str, warnings: &mut Vec<ValidationIssue>) {
   }
 }
 
-// ============================================================================
 // Config Sync
-// ============================================================================
 
 /// Result of target sync operation
 #[derive(Debug, Clone, Serialize)]
@@ -658,7 +650,7 @@ pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat)
   let mut editor = TomlEditor::open(&config_path)?;
   let mut fields_added: Vec<FieldChange> = Vec::new();
 
-  // Phase 1: Add missing fields from schema
+  // Add missing fields from schema
   for field in schema::SYNCABLE_FIELDS {
     let path = format!("{}.{}", field.section, field.key);
 
@@ -675,7 +667,7 @@ pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat)
     }
   }
 
-  // Phase 2: Sync targets from workspace
+  // Sync targets from workspace
   let targets_result = sync_targets(&mut editor, workspace_root)?;
 
   // Check for changes

@@ -90,7 +90,7 @@ impl<'a> SplitEngine<'a> {
     })
   }
 
-  /// Check if a file path should be excluded based on glob patterns (Issue #26)
+  /// Check if a file path should be excluded based on glob patterns
   fn should_exclude(path: &str, exclude_patterns: &[Pattern]) -> bool {
     for pattern in exclude_patterns {
       if pattern.matches(path) {
@@ -105,7 +105,7 @@ impl<'a> SplitEngine<'a> {
     patterns.iter().filter_map(|p| Pattern::new(p).ok()).collect()
   }
 
-  /// Find additional files to include based on include patterns (Issue #25)
+  /// Find additional files to include based on include patterns
   fn find_included_files(workspace_root: &Path, include_patterns: &[String]) -> RailResult<Vec<PathBuf>> {
     use std::collections::HashSet;
     let mut included = HashSet::new();
@@ -417,7 +417,7 @@ impl<'a> SplitEngine<'a> {
     progress!("   Mode: {:?}", config.mode);
     progress!("   Target: {}", config.target_repo_path.display());
 
-    // Issue #25/#26: Compile exclude patterns (include uses glob directly)
+    // Compile exclude patterns (include uses glob directly)
     let exclude_patterns = Self::compile_patterns(&config.exclude);
 
     if !config.include.is_empty() {
@@ -460,7 +460,7 @@ impl<'a> SplitEngine<'a> {
     let project_files = ProjectFiles::discover(self.ctx.workspace_root(), crate_path)?;
     progress!("   Found {} project files (README, LICENSE)", project_files.count());
 
-    // Issue #25: Find additional files to include based on include patterns
+    // Find additional files to include based on include patterns
     let additional_files = Self::find_included_files(self.ctx.workspace_root(), &config.include)?;
     if !additional_files.is_empty() {
       progress!(
@@ -639,7 +639,7 @@ impl<'a> SplitEngine<'a> {
         aux_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
         project_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
 
-        // Issue #25: Copy additional files from include patterns
+        // Copy additional files from include patterns
         if !additional_files.is_empty() {
           progress!(
             "   Copying {} additional files from include patterns...",
@@ -941,7 +941,7 @@ impl<'a> SplitEngine<'a> {
       // Remove exclude if present (not needed for split repo)
       table.remove("exclude");
 
-      // Filter default-members to only include split crates (Issue #2)
+      // Filter default-members to only include split crates
       let members_set: std::collections::HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
       if let Some(default_members) = table.get_mut("default-members")
         && let Some(arr) = default_members.as_array_mut()
@@ -958,11 +958,11 @@ impl<'a> SplitEngine<'a> {
         table.remove("default-members");
       }
 
-      // Remove workspace.dependencies - split crates have inlined deps (Issue #4)
+      // Remove workspace.dependencies - split crates have inlined deps
       table.remove("dependencies");
     }
 
-    // Filter profile package specs to only include split crates (Issue #3)
+    // Filter profile package specs to only include split crates
     let members_set: std::collections::HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
     if let Some(profile) = doc.get_mut("profile").and_then(|p| p.as_table_mut()) {
       for (_, profile_section) in profile.iter_mut() {

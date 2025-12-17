@@ -246,9 +246,7 @@ impl UnifyConfig {
   }
 }
 
-// ============================================================================
 // Helper Types
-// ============================================================================
 
 /// How to determine the final MSRV (Minimum Supported Rust Version)
 ///
@@ -361,9 +359,7 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
   }
 }
 
-// ============================================================================
 // Default Functions
-// ============================================================================
 
 fn default_max_backups() -> usize {
   3
@@ -391,9 +387,7 @@ fn default_skip_undeclared_patterns() -> Vec<String> {
   ]
 }
 
-// ============================================================================
 // Tests
-// ============================================================================
 
 #[test]
 fn test_transitive_feature_host_path() {
@@ -847,9 +841,7 @@ mod tests {
     assert!(config.fix_undeclared_features);
   }
 
-  // ============================================================================
   // skip_undeclared_patterns Tests
-  // ============================================================================
 
   #[test]
   fn test_skip_undeclared_patterns_default() {
@@ -962,9 +954,7 @@ mod tests {
     assert!(!config.should_skip_undeclared_feature("anything"));
   }
 
-  // ============================================================================
   // sort_dependencies Tests
-  // ============================================================================
 
   #[test]
   fn test_sort_dependencies_default() {

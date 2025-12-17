@@ -189,10 +189,8 @@ impl<'a> ReleaseValidator<'a> {
       .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
-    // Check if publish = false
-    if let Some(publish) = &package.publish
-      && publish.is_empty()
-    {
+    // Check if publish = false in Cargo.toml
+    if !crate::workspace::CargoState::is_package_publishable(package) {
       return Err(RailError::with_help(
         format!("Crate '{}' has publish = false in Cargo.toml", crate_name),
         "Remove 'publish = false' or exclude this crate from the release",
@@ -203,7 +201,16 @@ impl<'a> ReleaseValidator<'a> {
   }
 
   /// Check for path dependencies (which block publishing)
+  ///
+  /// This check is skipped for non-publishable crates since path-only
+  /// dependencies only matter for crates going to crates.io.
   fn check_path_dependencies(&self, crate_name: &str) -> RailResult<()> {
+    // Skip this check for non-publishable crates - path deps don't matter
+    // if the crate will never be published to crates.io
+    if !self.is_publishable(crate_name) {
+      return Ok(());
+    }
+
     let package = self
       .ctx
       .cargo
@@ -249,6 +256,86 @@ impl<'a> ReleaseValidator<'a> {
       ));
     }
     Ok(())
+  }
+
+  /// Check if a crate is publishable (combined Cargo.toml + rail.toml check)
+  ///
+  /// A crate is considered publishable if:
+  /// 1. Cargo.toml does not have `publish = false`, AND
+  /// 2. rail.toml does not have `[crates.NAME.release] publish = false`
+  ///
+  /// rail.toml takes precedence: if it explicitly sets `publish = true`,
+  /// that overrides Cargo.toml's `publish = false`.
+  pub fn is_publishable(&self, crate_name: &str) -> bool {
+    let package = match self.ctx.cargo.get_package(crate_name) {
+      Some(pkg) => pkg,
+      None => return false,
+    };
+
+    // Check Cargo.toml
+    let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
+
+    // Check rail.toml - takes precedence if set
+    let publish_from_config = self
+      .ctx
+      .config
+      .as_ref()
+      .and_then(|c| c.crates.get(crate_name))
+      .and_then(|c| c.release.as_ref())
+      .map(|r| r.publish);
+
+    // rail.toml takes precedence if explicitly set
+    publish_from_config.unwrap_or(publish_from_cargo)
+  }
+
+  /// Get the reason why a crate is not publishable
+  ///
+  /// Returns `None` if the crate is publishable.
+  pub fn unpublishable_reason(&self, crate_name: &str) -> Option<String> {
+    let package = match self.ctx.cargo.get_package(crate_name) {
+      Some(pkg) => pkg,
+      None => return Some(format!("crate '{}' not found", crate_name)),
+    };
+
+    // Check rail.toml first (takes precedence)
+    if let Some(config) = &self.ctx.config
+      && let Some(crate_config) = config.crates.get(crate_name)
+      && let Some(release_config) = &crate_config.release
+    {
+      // If rail.toml explicitly sets publish, use that
+      if !release_config.publish {
+        return Some("publish = false in rail.toml".to_string());
+      }
+      // If rail.toml explicitly sets publish = true, it's publishable
+      // (overrides Cargo.toml)
+      return None;
+    }
+
+    // Fall back to Cargo.toml check
+    if !crate::workspace::CargoState::is_package_publishable(package) {
+      return Some("publish = false in Cargo.toml".to_string());
+    }
+
+    None
+  }
+
+  /// Filter workspace members to only publishable crates
+  ///
+  /// Returns a tuple of (publishable_crates, skipped_crates_with_reasons)
+  pub fn publishable_members(&self) -> (Vec<String>, Vec<(String, String)>) {
+    let all_members = self.ctx.graph.workspace_members();
+    let mut publishable = Vec::new();
+    let mut skipped = Vec::new();
+
+    for name in all_members {
+      if let Some(reason) = self.unpublishable_reason(name) {
+        skipped.push((name.clone(), reason));
+      } else {
+        publishable.push(name.clone());
+      }
+    }
+
+    (publishable, skipped)
   }
 
   /// Run `cargo publish --dry-run` to validate package can be published

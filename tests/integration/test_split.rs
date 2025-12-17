@@ -572,24 +572,24 @@ paths = [{{ crate = "crates/prefetch-lib" }}]
 fn test_split_handles_dirty_history() -> Result<()> {
   let ws = TestWorkspace::new_named("split-dirty-history")?;
 
-  // Step 1: Create crate and commit
+  // Create crate and commit
   ws.add_crate("dirty-lib", "0.1.0", &[])?;
   ws.commit("Add dirty-lib")?;
 
-  // Step 2: Make a change
+  // Make a change
   ws.modify_file("dirty-lib", "src/lib.rs", "// Version 1")?;
   ws.commit("Update dirty-lib v1")?;
 
-  // Step 3: DELETE the crate entirely (simulating dirty history)
+  // DELETE the crate entirely (simulating dirty history)
   std::fs::remove_dir_all(ws.path.join("crates/dirty-lib"))?;
   ws.commit("Remove dirty-lib temporarily")?;
 
-  // Step 4: Recreate the crate (restoration)
+  // Recreate the crate (restoration)
   ws.add_crate("dirty-lib", "0.2.0", &[])?;
   ws.modify_file("dirty-lib", "src/lib.rs", "// Version 2 - restored")?;
   ws.commit("Restore dirty-lib")?;
 
-  // Step 5: Make another change after restoration
+  // Make another change after restoration
   ws.modify_file("dirty-lib", "src/lib.rs", "// Version 3 - final")?;
   ws.commit("Update dirty-lib v3")?;
 
@@ -666,9 +666,7 @@ paths = [{{ crate = "crates/dirty-lib" }}]
   Ok(())
 }
 
-// ============================================================================
 // Safety Rails Tests
-// ============================================================================
 
 /// Test that split fails on dirty worktree without --allow-dirty
 #[test]

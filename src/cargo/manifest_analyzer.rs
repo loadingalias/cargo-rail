@@ -1,7 +1,6 @@
 //! Unified manifest analysis for feature classification
 //!
-//! This module handles ALL manifest parsing and analysis, replacing the duplicate
-//! handling between manifest.rs and unify/manifest_parser.rs
+//! This module handles ALL manifest parsing and analysis
 
 use crate::error::{RailResult, ResultExt};
 use cargo_metadata::DependencyKind as MetadataDepKind;
@@ -11,11 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Value};
 
-// ============================================================================
 // Core Types
-// ============================================================================
 
-/// Unique identifier for a dependency
+/// Unique identifier for a dep
 ///
 /// Uses `Arc<str>` for the name fields to avoid expensive clones in hot loops.
 /// Cloning a DepKey is cheap (just Arc refcount bumps).
@@ -161,9 +158,7 @@ pub struct ParsedManifest {
   pub dependencies: HashMap<DepKey, DepUsage>,
 }
 
-// ============================================================================
 // Parse Context
-// ============================================================================
 
 /// Context for parsing dependency sections within a single manifest.
 /// Bundles common parameters to reduce function argument count.
@@ -176,9 +171,7 @@ struct ParseContext<'a> {
   dependencies: &'a mut HashMap<DepKey, DepUsage>,
 }
 
-// ============================================================================
 // Main Analyzer
-// ============================================================================
 
 /// Analyzes all workspace manifests for dependency usage patterns
 pub struct ManifestAnalyzer {
@@ -616,7 +609,7 @@ impl ManifestAnalyzer {
 
   /// Count how many crates use a package (aggregated across renamed and non-renamed deps)
   ///
-  /// Issue #6: When include_renamed = true, count all usages of the package
+  /// When include_renamed = true, count all usages of the package
   /// Uses package_index for O(1) key lookup instead of O(n) scan.
   pub fn package_usage_count(&self, package_name: &str) -> usize {
     let Some(dep_keys) = self.package_index.get(package_name) else {
@@ -637,7 +630,7 @@ impl ManifestAnalyzer {
 
   /// Get all dep keys that refer to a specific package (including renamed)
   ///
-  /// Issue #6: Used to find all renamed variants of a package
+  /// Used to find all renamed variants of a package
   /// Uses package_index for O(1) lookup instead of O(n) scan.
   pub fn dep_keys_for_package(&self, package_name: &str) -> Vec<&DepKey> {
     self
@@ -649,7 +642,7 @@ impl ManifestAnalyzer {
 
   /// Get aggregated usage sites for a package (all renamed and non-renamed usages)
   ///
-  /// Issue #6: Used when include_renamed = true to merge features across all usages
+  /// Used when include_renamed = true to merge features across all usages
   /// Uses package_index for O(1) key lookup instead of O(n) scan.
   pub fn get_package_usage_sites(&self, package_name: &str) -> Vec<&DepUsage> {
     let Some(dep_keys) = self.package_index.get(package_name) else {
@@ -668,7 +661,7 @@ impl ManifestAnalyzer {
 
   /// Compute union of features across all usages of a package (including renamed)
   ///
-  /// Issue #6: When include_renamed = true, aggregate features from all variants
+  /// When include_renamed = true, aggregate features from all variants
   pub fn compute_package_union(&self, package_name: &str) -> BTreeSet<String> {
     let mut union = BTreeSet::new();
 
@@ -683,7 +676,7 @@ impl ManifestAnalyzer {
 
   /// Check if a package has mixed default-features across all usages (including renamed)
   ///
-  /// Issue #6: When include_renamed = true, check across all variants
+  /// When include_renamed = true, check across all variants
   pub fn package_has_mixed_defaults(&self, package_name: &str) -> bool {
     let usages: Vec<_> = self
       .get_package_usage_sites(package_name)
@@ -701,7 +694,7 @@ impl ManifestAnalyzer {
 
   /// Get default-features policy across all usages of a package (including renamed)
   ///
-  /// Issue #6: When include_renamed = true, use conservative policy across all variants
+  /// When include_renamed = true, use conservative policy across all variants
   pub fn package_default_features_policy(&self, package_name: &str) -> Option<bool> {
     let usages: Vec<_> = self
       .get_package_usage_sites(package_name)
@@ -723,15 +716,13 @@ impl ManifestAnalyzer {
 
   /// Get unique package names from all dependencies
   ///
-  /// Issue #6: Used to iterate by package rather than by dep key
+  /// Used to iterate by package rather than by dep key
   pub fn unique_packages(&self) -> HashSet<Arc<str>> {
     self.usage_index.keys().map(|k| Arc::clone(&k.name)).collect()
   }
 }
 
-// ============================================================================
 // Workspace Dependencies Parser
-// ============================================================================
 
 /// Information about an existing workspace dependency
 #[derive(Debug, Clone)]
@@ -843,9 +834,7 @@ fn parse_workspace_dep_entry(name: &str, value: &Item) -> ExistingWorkspaceDep {
   dep
 }
 
-// ============================================================================
 // Unit Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

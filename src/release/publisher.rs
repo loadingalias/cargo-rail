@@ -1,4 +1,4 @@
-//! Release execution (publishing to crates.io and GitHub)
+//! Release execution and publishing to crates.io and GitHub (for now)
 
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
@@ -33,7 +33,7 @@ impl<'a> ReleasePublisher<'a> {
   pub fn preflight_check(&self, skip_tag: bool) -> RailResult<Vec<String>> {
     let mut warnings = Vec::new();
 
-    // Issue #17: Check gh CLI availability if GitHub releases are enabled
+    // Check gh CLI availability if GitHub releases are enabled
     if self.release_config.create_github_release && !skip_tag {
       let check = Command::new("gh").args(["--version"]).output();
       if check.is_err() || !check.as_ref().map(|o| o.status.success()).unwrap_or(false) {

@@ -28,8 +28,11 @@ pub fn run_release_plan(
   let bump_type = bump.parse::<BumpType>()?;
 
   let workspace_members = ctx.graph.workspace_members();
+  let validator = ReleaseValidator::new(ctx);
 
-  if let Some(ref names) = crate_names {
+  // Determine target crates, filtering to publishable when using --all (crate_names = None)
+  let (target_crates, skipped_crates) = if let Some(ref names) = crate_names {
+    // Explicit crate names - validate they exist
     for name in names {
       if !workspace_members.contains(name) {
         return Err(RailError::with_help(
@@ -38,23 +41,41 @@ pub fn run_release_plan(
         ));
       }
     }
+    (names.clone(), Vec::new())
+  } else {
+    // No specific crates = --all, filter to publishable only
+    let (publishable, skipped) = validator.publishable_members();
+
+    if publishable.is_empty() {
+      return Err(RailError::with_help(
+        "no publishable crates found",
+        "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
+      ));
+    }
+
+    (publishable, skipped)
+  };
+
+  // Report skipped crates (non-JSON mode only)
+  if !skipped_crates.is_empty() && !json {
+    crate::status!("skipped {} crate(s) (not publishable):", skipped_crates.len());
+    for (name, reason) in &skipped_crates {
+      crate::status!("  {}: {}", name, reason);
+    }
+    crate::status!("");
   }
 
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
-  // Validate release config (Issue #14: tag_format, Issue #20: skip_changelog_for)
+  // Validate release config (tag_format, skip_changelog_for)
   let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
 
   // Print warnings
   for warning in &warnings {
-    eprintln!("warning: {}", warning);
+    crate::warn!("{}", warning);
   }
-
-  // Issue #15: Run require_clean check in --check mode too (early feedback)
-  let validator = ReleaseValidator::new(ctx);
-  let target_crates = crate_names.clone().unwrap_or_else(|| workspace_members.to_vec());
 
   if release_config.require_clean {
     validator.validate(&target_crates, true)?;
@@ -64,14 +85,15 @@ pub fn run_release_plan(
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
   let planner = ReleasePlanner::new(ctx, release_config);
-  let plan = planner.plan(crate_names.clone(), &bump_type)?;
+  // Pass the filtered target_crates to the planner
+  let plan = planner.plan(Some(target_crates), &bump_type)?;
 
   if json {
     let json_output = serde_json::to_string_pretty(&plan)
       .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json_output);
   } else {
-    // Issue #16: Show publish_delay in the plan output
+    // Show publish_delay in the plan output
     println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
     // Show additional config info
@@ -106,8 +128,29 @@ pub fn run_release_publish(
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
+  let validator = ReleaseValidator::new(ctx);
+
   let targets = if all {
-    None
+    // Filter to only publishable crates when using --all
+    let (publishable, skipped) = validator.publishable_members();
+
+    if publishable.is_empty() {
+      return Err(RailError::with_help(
+        "no publishable crates found",
+        "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
+      ));
+    }
+
+    // Report skipped crates
+    if !skipped.is_empty() {
+      crate::status!("skipped {} crate(s) (not publishable):", skipped.len());
+      for (name, reason) in &skipped {
+        crate::status!("  {}: {}", name, reason);
+      }
+      crate::status!("");
+    }
+
+    Some(publishable)
   } else if let Some(names) = crate_names {
     Some(names)
   } else {
@@ -119,7 +162,6 @@ pub fn run_release_publish(
 
   let bump_type = bump.parse::<BumpType>()?;
 
-  let validator = ReleaseValidator::new(ctx);
   let target_crates = targets
     .clone()
     .unwrap_or_else(|| ctx.graph.workspace_members().to_vec());
@@ -127,7 +169,7 @@ pub fn run_release_publish(
 
   // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
   if let Some(warning) = validator.validate_branch(yes)? {
-    eprintln!("{}", warning);
+    crate::warn!("{}", warning);
   }
 
   // Validate changelog paths
@@ -182,8 +224,24 @@ pub fn run_release_check(
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
+  let validator = ReleaseValidator::new(ctx);
+
+  // Track skipped crates for reporting
+  let mut skipped_crates: Vec<(String, String)> = Vec::new();
+
   let target_crates = if all {
-    ctx.graph.workspace_members().to_vec()
+    // Filter to only publishable crates when using --all
+    let (publishable, skipped) = validator.publishable_members();
+    skipped_crates = skipped;
+
+    if publishable.is_empty() {
+      return Err(RailError::with_help(
+        "no publishable crates found",
+        "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
+      ));
+    }
+
+    publishable
   } else if let Some(names) = crate_names {
     names
   } else {
@@ -193,7 +251,15 @@ pub fn run_release_check(
     ));
   };
 
-  let validator = ReleaseValidator::new(ctx);
+  // Report skipped crates (non-JSON mode only, before validation output)
+  if !skipped_crates.is_empty() && !json {
+    crate::status!("skipped {} crate(s) (not publishable):", skipped_crates.len());
+    for (name, reason) in &skipped_crates {
+      crate::status!("  {}: {}", name, reason);
+    }
+    crate::status!("");
+  }
+
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Validate changelog paths
@@ -201,6 +267,18 @@ pub fn run_release_check(
 
   let mut results = Vec::new();
   for crate_name in &target_crates {
+    // For explicitly named crates, check publishability and report
+    // (for --all, we already filtered, so this is a no-op)
+    if !validator.is_publishable(crate_name) {
+      if !json {
+        let reason = validator
+          .unpublishable_reason(crate_name)
+          .unwrap_or_else(|| "unknown".to_string());
+        println!("{}: not publishable ({})", crate_name, reason);
+      }
+      continue;
+    }
+
     validator.validate_publishable(crate_name)?;
     results.push(crate_name.clone());
     if !json {
@@ -235,7 +313,7 @@ pub fn run_release_check(
         } else {
           has_extended_failures = true;
           if !json {
-            eprintln!(
+            crate::error!(
               "  {}: {} - FAILED: {}",
               crate_name,
               check.check_name,
@@ -266,6 +344,16 @@ pub fn run_release_check(
       "crates": results,
       "count": results.len()
     });
+
+    // Include skipped crates in JSON output
+    if !skipped_crates.is_empty() {
+      output["skipped"] = serde_json::json!(
+        skipped_crates
+          .iter()
+          .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
+          .collect::<Vec<_>>()
+      );
+    }
 
     if extended {
       output["extended"] = serde_json::json!(extended_results);
@@ -346,7 +434,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
     let crate_config = config.crates.entry(pkg.name.to_string()).or_default();
 
     crate_config.release = Some(CrateReleaseConfig {
-      publish: pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true),
+      publish: crate::workspace::CargoState::is_package_publishable(pkg),
     });
 
     if let Some(path) = changelog_path {

@@ -6,9 +6,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use super::workspace_ref::is_package_workspace_inherited;
 
-// ============================================================================
 // Batch Transformation Operations
-// ============================================================================
 
 /// Transform all dependencies in a section
 pub fn transform_dependencies_in_section<F>(doc: &mut DocumentMut, section: &str, mut transform_fn: F) -> RailResult<()>

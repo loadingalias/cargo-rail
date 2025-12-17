@@ -12,11 +12,9 @@ use semver::VersionReq;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-// ============================================================================
 // Core Types
-// ============================================================================
 
-/// A dependency that will be unified in [workspace.dependencies]
+/// A dep that will be unified in [workspace.dependencies]
 #[derive(Debug, Clone)]
 pub struct UnifiedDep {
   /// Dependency package name
@@ -35,10 +33,10 @@ pub struct UnifiedDep {
   pub path: Option<PathBuf>,
 }
 
-/// An edit to apply to a member's Cargo.toml
+/// An edit to apply to a member's `Cargo.toml`
 #[derive(Debug, Clone)]
 pub enum MemberEdit {
-  /// Replace dependency with workspace inheritance
+  /// Replace dep with workspace inheritance
   UseWorkspace {
     /// Name of the dependency to replace
     dep_name: String,
@@ -51,7 +49,7 @@ pub enum MemberEdit {
     /// Whether the dependency is optional
     is_optional: bool,
   },
-  /// Remove an unused dependency
+  /// Remove an unused dep
   RemoveDep {
     /// Name of the dependency to remove
     dep_name: String,
@@ -217,9 +215,7 @@ pub struct UndeclaredFeature {
   pub borrowed_from: Vec<String>,
 }
 
-// ============================================================================
 // UnificationPlan
-// ============================================================================
 
 /// Complete unification plan
 #[derive(Debug)]
@@ -591,9 +587,7 @@ mod tests {
     }
   }
 
-  // ============================================================================
   // UndeclaredFeature Tests
-  // ============================================================================
 
   #[test]
   fn test_undeclared_feature_struct() {
@@ -650,9 +644,7 @@ mod tests {
     assert_eq!(uf.dep_kind, DepKind::Dev);
   }
 
-  // ============================================================================
   // UnificationPlan Summary Tests
-  // ============================================================================
 
   #[test]
   fn test_summary_with_add_features_edit() {

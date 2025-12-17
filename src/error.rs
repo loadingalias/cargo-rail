@@ -496,10 +496,10 @@ pub fn print_error(error: &RailError) {
   if crate::output::is_json_mode() {
     print_error_json(error);
   } else {
-    eprintln!("error: {}", error);
+    crate::error!("{}", error);
 
     if let Some(help) = error.help_message() {
-      eprintln!("help: {}", help);
+      crate::help!("{}", help);
     }
   }
 }
@@ -525,6 +525,6 @@ fn print_error_json(error: &RailError) {
     println!("{}", json);
   } else {
     // Fallback to text if JSON serialization fails
-    eprintln!("error: {}", error);
+    crate::error!("{}", error);
   }
 }

@@ -2,6 +2,7 @@
 //!
 //! This is the core of the unify implementation that properly integrates
 //! with WorkspaceContext and uses multi-target metadata + manifest analysis.
+//! The undeclared features detection lives here.
 
 use crate::cargo::{
   manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
@@ -21,11 +22,7 @@ use semver::VersionReq;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-// ============================================================================
-// Main Analyzer
-// ============================================================================
-
-/// Analyzes workspace for dependency unification opportunities
+/// Analyzes workspace for dependency unifications
 pub struct UnifyAnalyzer {
   metadata: MultiTargetMetadata,
   manifests: ManifestAnalyzer,
@@ -129,7 +126,7 @@ impl UnifyAnalyzer {
       let dep_key = candidate.dep_key;
       let usage_sites = candidate.usages;
 
-      // === Check for major version conflicts ===
+      // Check for major version conflicts
       // Different major versions cannot be safely merged - behavior depends on config.
       let major_versions = find_major_version_conflicts(&usage_sites);
       if major_versions.len() > 1 {
@@ -165,7 +162,7 @@ impl UnifyAnalyzer {
         }
       }
 
-      // === Issue B: Check for exact version pins ===
+      // Check for exact version pins
       let has_exact_pin = usage_sites
         .iter()
         .any(|u| u.declared_version.as_ref().map(|v| is_exact_pin(v)).unwrap_or(false));
@@ -235,7 +232,7 @@ impl UnifyAnalyzer {
         VersionReq::parse(&format!("^{}", version)).unwrap_or_else(|_| VersionReq::parse(&version.to_string()).unwrap())
       };
 
-      // === Issue A: Check for version mismatches with existing workspace.dependencies ===
+      // Check for version mismatches with existing workspace.dependencies
       if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&*dep_key.name)
         && let Some(ref ws_version) = existing_ws_dep.version
       {
@@ -326,7 +323,7 @@ impl UnifyAnalyzer {
       // Get users - convert Arc<str> to String for output
       let users: HashSet<String> = usage_sites.iter().map(|u| u.used_by.to_string()).collect();
 
-      // === Issue C: Check include_paths config before processing path dependencies ===
+      // Check include_paths config before processing path dependencies
       let dep_path: Option<PathBuf> = if self.config.include_paths {
         // Check if any usage has a path (path dependencies)
         // If so, check if the dep is a workspace member to include path in workspace.dependencies
@@ -442,7 +439,7 @@ impl UnifyAnalyzer {
       (Vec::new(), Vec::new())
     };
 
-    // === Issue D: Detect unused dependencies ===
+    // Detect unused dependencies
     let unused_finder = UnusedDepFinder::new(&self.metadata, &self.manifests);
     let unused_deps = if self.config.detect_unused {
       progress!("Detecting unused dependencies...");
@@ -467,7 +464,7 @@ impl UnifyAnalyzer {
       member_edits.entry(crate_name).or_default().extend(edits);
     }
 
-    // === Detect undeclared features ===
+    // Detect undeclared features
     // Find cases where a crate uses features that it didn't declare in Cargo.toml
     // This happens when Cargo's feature unification "borrows" features from other members
     let undeclared_features = if self.config.detect_undeclared_features {
@@ -605,7 +602,7 @@ impl UnifyAnalyzer {
   fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
     let mut undeclared = Vec::new();
 
-    // Step 1: Get workspace baseline (features declared in [workspace.dependencies])
+    // Get workspace baseline (features declared in [workspace.dependencies])
     // These are workspace policy - members don't need to re-declare them
     let workspace_baseline: HashMap<String, HashSet<String>> = self
       .existing_workspace_deps
@@ -619,7 +616,7 @@ impl UnifyAnalyzer {
       })
       .collect();
 
-    // Step 2: Build a map of what each member explicitly declares for each dependency
+    // Build a map of what each member explicitly declares for each dependency
     // Include both unconditional_features AND conditional_features (from [features] table)
     // Also track which features each member contributes (for borrowed_from)
     let mut member_declared_features: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
@@ -640,7 +637,7 @@ impl UnifyAnalyzer {
       member_declared_features.insert(member.package_name.clone(), dep_features);
     }
 
-    // Step 3: Track which members contribute which features (beyond workspace baseline)
+    // Track which members contribute which features (beyond workspace baseline)
     // This powers the `borrowed_from` field for transparency
     // Structure: dep_name -> feature -> set of member names
     let mut feature_sources: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
@@ -665,7 +662,7 @@ impl UnifyAnalyzer {
       }
     }
 
-    // Step 4: Find borrowed features for each member
+    // Find borrowed features for each member
     // A feature is borrowed if:
     // - It's contributed by OTHER members (not this member)
     // - It's NOT in workspace baseline (workspace policy doesn't count as borrowing)

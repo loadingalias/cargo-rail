@@ -689,7 +689,7 @@ impl<'a> SyncEngine<'a> {
     // Find the base commit (common ancestor)
     let last_synced = self.find_last_synced_mono_commit()?;
 
-    // Phase 1: Build cache of all files modified in mono since last sync
+    // Build cache of all files modified in mono since last sync
     // Single git call instead of N calls (one per remote file)
     let mono_changed_paths: std::collections::HashSet<PathBuf> = if let Some(ref last) = last_synced {
       self
@@ -704,7 +704,7 @@ impl<'a> SyncEngine<'a> {
       std::collections::HashSet::new()
     };
 
-    // Phase 2: Identify conflicting files (files modified on both sides)
+    // Identify conflicting files (files modified on both sides)
     let mut conflicting_files = Vec::new();
     for (remote_path, _) in &changed_files {
       let mono_path = self.map_remote_path_to_mono(remote_path)?;
@@ -727,7 +727,7 @@ impl<'a> SyncEngine<'a> {
       conflicting_files.push((remote_path.clone(), mono_path, full_mono_path));
     }
 
-    // Phase 3: Bulk read base and incoming versions for all conflicting files
+    // Bulk read base and incoming versions for all conflicting files
     let base_items: Vec<(String, PathBuf)> = conflicting_files
       .iter()
       .filter_map(|(_, mono_path, _)| last_synced.as_ref().map(|sha| (sha.clone(), mono_path.clone())))
@@ -750,7 +750,7 @@ impl<'a> SyncEngine<'a> {
       vec![]
     };
 
-    // Phase 4: Resolve conflicts with bulk-loaded content
+    // Resolve conflicts with bulk-loaded content
     for (idx, (_, mono_path, full_mono_path)) in conflicting_files.iter().enumerate() {
       let base_content = if idx < base_contents.len() {
         &base_contents[idx]

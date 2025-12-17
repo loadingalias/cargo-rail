@@ -4,9 +4,7 @@ use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 use std::fs;
 
-// ============================================================================
 // Config Locate Tests
-// ============================================================================
 
 #[test]
 fn test_config_locate_finds_config() -> Result<()> {
@@ -102,9 +100,7 @@ fn test_config_locate_with_config_flag() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Config Print Tests
-// ============================================================================
 
 #[test]
 fn test_config_print_shows_defaults() -> Result<()> {
@@ -183,9 +179,7 @@ fn test_config_print_no_config() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Config Validate Tests
-// ============================================================================
 
 #[test]
 fn test_config_validate_valid_config() -> Result<()> {
@@ -327,9 +321,7 @@ fn test_config_validate_global_json_flag() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Config Sync Tests
-// ============================================================================
 
 #[test]
 fn test_config_sync_adds_missing_fields() -> Result<()> {

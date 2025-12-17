@@ -349,7 +349,7 @@ fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
     out.push('\n');
   }
 
-  // Issue #22: Show custom category matches
+  // Show custom category matches
   if !classification.custom_categories.is_empty() {
     out.push_str("custom categories:\n");
     let mut categories: Vec<_> = classification.custom_categories.keys().collect();
@@ -405,7 +405,7 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
 
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
-  // Issue #22: Include custom categories in JSON output
+  // Include custom categories in JSON output
   let output = json!({
       "command": "affected",
       "changed_files": analysis.changed_files,

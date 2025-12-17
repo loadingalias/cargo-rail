@@ -3,9 +3,7 @@
 use crate::error::{RailError, RailResult};
 use toml_edit::{DocumentMut, Item, Table};
 
-// ============================================================================
 // TOML Section Navigation
-// ============================================================================
 
 /// Ensure a section exists, creating if necessary
 pub fn ensure_section(doc: &mut DocumentMut, path: &str) -> RailResult<()> {
@@ -70,9 +68,7 @@ pub fn insert_dependency(section: &mut Table, name: &str, entry: Item) -> RailRe
   Ok(())
 }
 
-// ============================================================================
 // Target-Specific Dependencies
-// ============================================================================
 
 /// Add target-specific dependency
 pub fn insert_target_dependency(

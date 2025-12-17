@@ -288,7 +288,7 @@ fn detect_workspace_splits(
     let remote = format!("git@github.com:org/{}.git", pkg.name);
 
     // Check if crate has publish = false in Cargo.toml
-    let publish = pkg.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+    let publish = crate::workspace::CargoState::is_package_publishable(pkg);
 
     splits.push(SplitConfig {
       name: pkg.name.to_string(),

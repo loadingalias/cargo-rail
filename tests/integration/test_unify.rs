@@ -11,9 +11,7 @@
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
-// ============================================================================
 // Core Unification Tests
-// ============================================================================
 
 #[test]
 fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
@@ -306,9 +304,7 @@ root = "."
   Ok(())
 }
 
-// ============================================================================
 // Dependency Kinds and End-to-End Workflow Tests
-// ============================================================================
 
 #[test]
 fn test_unify_dep_kinds_display() -> Result<()> {
@@ -384,7 +380,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
 
   workspace.commit("Add crates before unification")?;
 
-  // Step 1: Analyze (should succeed)
+  // Analyze (should succeed)
   let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
@@ -393,7 +389,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
     "Analyze should show serde can be unified"
   );
 
-  // Step 2: Apply unification
+  // Apply unification
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
@@ -403,7 +399,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
     apply_stdout
   );
 
-  // Step 3: Verify workspace Cargo.toml was updated
+  // Verify workspace Cargo.toml was updated
   let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
 
   assert!(
@@ -416,7 +412,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
     "Workspace dependencies should include serde"
   );
 
-  // Step 4: Verify member Cargo.toml uses workspace inheritance
+  // Verify member Cargo.toml uses workspace inheritance
   let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
 
   assert!(
@@ -425,7 +421,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
     crate_a_toml
   );
 
-  // Step 5: Run analyze again - should show no unifiable deps
+  // Run analyze again - should show no unifiable deps
   let final_analyze = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let final_stdout = String::from_utf8_lossy(&final_analyze.stdout);
 
@@ -505,14 +501,10 @@ exclude = ["tokio"]
   Ok(())
 }
 
-// ============================================================================
 // Dependency Kinds: Dev and Build Dependencies
-// ============================================================================
 
 #[test]
 fn test_unify_dev_dependencies() -> Result<()> {
-  // Test that dev-dependencies are properly unified (Phase 1/3)
-
   let workspace = TestWorkspace::new()?;
 
   // Create crate-a with a dev-dependency
@@ -593,8 +585,6 @@ tempfile = "3.0"
 
 #[test]
 fn test_unify_build_dependencies() -> Result<()> {
-  // Test that build-dependencies are properly unified (Phase 1/3)
-
   let workspace = TestWorkspace::new()?;
 
   // Create crate-a with a build-dependency
@@ -669,7 +659,7 @@ cc = "1.0"
 
 #[test]
 fn test_unify_existing_workspace_deps_update() -> Result<()> {
-  // Test that existing workspace.dependencies are updated when features differ (Phase 4)
+  // Test that existing workspace.dependencies are updated when features differ
 
   let workspace = TestWorkspace::new()?;
 
@@ -862,9 +852,7 @@ root = "."
   Ok(())
 }
 
-// ============================================================================
 // Config Options: include, pin_transitives, include_renamed
-// ============================================================================
 
 /// Test include config forces specific dependencies to be included
 #[test]
@@ -1018,9 +1006,7 @@ include_renamed = true
   Ok(())
 }
 
-// ============================================================================
 // Renamed Dependencies and Usage Thresholds
-// ============================================================================
 
 /// Test that include_renamed = true allows renamed + non-renamed deps to count together
 /// for the >=2 usage threshold
@@ -1184,9 +1170,7 @@ detect_unused = false
   Ok(())
 }
 
-// ============================================================================
 // Config Options: include, exact_pin_handling
-// ============================================================================
 
 /// Test that the `include` config option forces a dependency with only 1 user
 /// to be included in workspace.dependencies
@@ -1491,9 +1475,7 @@ serde = "=1.0.200"
   Ok(())
 }
 
-// ============================================================================
 // Report Generation, TOML Comments, and Backup Tests
-// ============================================================================
 
 #[test]
 fn test_unify_report_generation() -> Result<()> {

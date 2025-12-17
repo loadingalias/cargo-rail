@@ -3,9 +3,7 @@
 use crate::error::{RailError, RailResult};
 use toml_edit::{Array, InlineTable, Item, Table, Value};
 
-// ============================================================================
 // Feature Array Operations
-// ============================================================================
 
 /// Build feature array from strings
 pub fn build_feature_array(features: &[String]) -> Value {
@@ -55,9 +53,7 @@ pub fn set_features(item: &mut Item, features: Vec<String>) -> RailResult<()> {
   }
 }
 
-// ============================================================================
 // Path Dependency Operations
-// ============================================================================
 
 /// Remove path field from dependency
 pub fn remove_path(item: &mut Item) -> bool {

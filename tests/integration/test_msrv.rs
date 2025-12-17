@@ -8,9 +8,7 @@
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
-// ============================================================================
 // MSRV Source Tests
-// ============================================================================
 
 /// Helper to create a workspace with rust-version set
 fn create_workspace_with_rust_version(rust_version: &str) -> Result<TestWorkspace> {

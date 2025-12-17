@@ -49,9 +49,7 @@ fn add_crate_with_manifest(workspace: &TestWorkspace, name: &str, manifest: &str
   Ok(())
 }
 
-// ============================================================================
 // TEST 1: Basic undeclared feature detection
-// ============================================================================
 
 #[test]
 fn test_undeclared_features_basic_detection() -> Result<()> {
@@ -108,9 +106,7 @@ tokio = { version = "1.0", features = ["rt"] }
   Ok(())
 }
 
-// ============================================================================
 // TEST 2: Workspace baseline respected
-// ============================================================================
 
 #[test]
 fn test_undeclared_features_workspace_baseline_respected() -> Result<()> {
@@ -187,9 +183,7 @@ serde = { workspace = true }
   Ok(())
 }
 
-// ============================================================================
 // TEST 3: Skip patterns work
-// ============================================================================
 
 #[test]
 fn test_undeclared_features_skip_patterns() -> Result<()> {
@@ -255,9 +249,7 @@ serde = { version = "1.0", default-features = false }
   Ok(())
 }
 
-// ============================================================================
 // TEST 4: Auto-fix adds features to member Cargo.toml
-// ============================================================================
 
 #[test]
 fn test_undeclared_features_auto_fix() -> Result<()> {
@@ -320,9 +312,7 @@ tokio = { version = "1.0", features = ["rt"] }
   Ok(())
 }
 
-// ============================================================================
 // TEST 5: Conditional features (from [features] table) are considered declared
-// ============================================================================
 
 #[test]
 fn test_undeclared_features_conditional_features_respected() -> Result<()> {

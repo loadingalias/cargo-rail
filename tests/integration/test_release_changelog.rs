@@ -284,10 +284,7 @@ fn test_release_explicit_version() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
-// changelog_relative_to Tests (Issue #19)
-// ============================================================================
-
+// changelog_relative_to Tests
 /// Test default changelog_relative_to behavior (crate-relative, backward compatible)
 #[test]
 fn test_changelog_relative_to_crate_default() -> Result<()> {
@@ -498,9 +495,7 @@ changelog_relative_to = "crate"
   Ok(())
 }
 
-// ============================================================================
 // Prerelease Bump Tests
-// ============================================================================
 
 /// Test --bump prerelease from stable version
 #[test]
@@ -563,9 +558,7 @@ fn test_bump_release_strips_prerelease() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Extended Check Tests
-// ============================================================================
 
 /// Test release check --extended runs dry-run publish validation
 #[test]
@@ -617,9 +610,7 @@ fn test_release_check_extended_json() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Release Safety Tests (Branch Detection)
-// ============================================================================
 
 /// Test that release fails from detached HEAD
 #[test]
@@ -740,6 +731,267 @@ fn test_release_non_default_branch_succeeds_with_yes() -> Result<()> {
   assert!(
     stderr.contains("git push origin hotfix-1.0"),
     "Next steps should show actual branch name.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Helper to create a crate with publish = false in Cargo.toml
+fn add_unpublishable_crate(ws: &TestWorkspace, name: &str, version: &str) -> Result<()> {
+  let crate_path = ws.path.join("crates").join(name);
+  std::fs::create_dir_all(&crate_path)?;
+  std::fs::create_dir_all(crate_path.join("src"))?;
+
+  // Cargo.toml with publish = false
+  let cargo_toml = format!(
+    r#"[package]
+name = "{}"
+version = "{}"
+edition = "2024"
+publish = false
+
+[dependencies]
+"#,
+    name, version
+  );
+  std::fs::write(crate_path.join("Cargo.toml"), cargo_toml)?;
+
+  // Add a basic `lib.rs`
+  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}\n")?;
+
+  Ok(())
+}
+
+/// Helper to add a crate with a path-only dep
+fn add_crate_with_path_dep(ws: &TestWorkspace, name: &str, version: &str, dep_name: &str, publish: bool) -> Result<()> {
+  let crate_path = ws.path.join("crates").join(name);
+  std::fs::create_dir_all(&crate_path)?;
+  std::fs::create_dir_all(crate_path.join("src"))?;
+
+  let publish_line = if publish { "" } else { "publish = false\n" };
+  let cargo_toml = format!(
+    r#"[package]
+name = "{}"
+version = "{}"
+edition = "2021"
+{}
+[dependencies]
+{} = {{ path = "../{}" }}
+"#,
+    name, version, publish_line, dep_name, dep_name
+  );
+  std::fs::write(crate_path.join("Cargo.toml"), cargo_toml)?;
+  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}\n")?;
+
+  Ok(())
+}
+
+/// Test that --all skips crates with publish = false in Cargo.toml
+#[test]
+fn test_release_check_all_skips_unpublishable_cargo_toml() -> Result<()> {
+  let ws = TestWorkspace::new_named("check-skip-unpub")?;
+  write_release_config(&ws, "")?;
+
+  // Add a publishable crate
+  ws.add_crate("lib-pub", "0.1.0", &[])?;
+
+  // Add an unpublishable crate (publish = false in Cargo.toml)
+  add_unpublishable_crate(&ws, "lib-internal", "0.1.0")?;
+
+  ws.commit("Add crates")?;
+
+  // Run release check --all
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  // Should succeed
+  assert!(
+    output.status.success(),
+    "release check --all should succeed.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Should show lib-pub as ready
+  assert!(
+    stdout.contains("lib-pub: ready"),
+    "Should report lib-pub as ready.\nstdout:\n{}",
+    stdout
+  );
+
+  // Should report lib-internal as skipped (in stderr)
+  assert!(
+    stderr.contains("skipped") && stderr.contains("lib-internal"),
+    "Should report lib-internal as skipped.\nstderr:\n{}",
+    stderr
+  );
+
+  // Should mention publish = false
+  assert!(
+    stderr.contains("publish = false"),
+    "Should explain why crate was skipped.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that path-only deps are allowed for crates with publish = false
+#[test]
+fn test_release_check_path_deps_allowed_for_unpublishable() -> Result<()> {
+  let ws = TestWorkspace::new_named("path-dep-unpub")?;
+  write_release_config(&ws, "")?;
+
+  // Add a publishable crate
+  ws.add_crate("lib-core", "0.1.0", &[])?;
+
+  // Add an unpublishable crate with a path-only dep
+  add_crate_with_path_dep(&ws, "wasm-bindings", "0.1.0", "lib-core", false)?;
+
+  ws.commit("Add crates")?;
+
+  // Run release check --all
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  // Should succeed - NOT error on path-only dep
+  assert!(
+    output.status.success(),
+    "Should NOT error on path-only dep in unpublishable crate.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Should NOT contain the path-only dependency error
+  assert!(
+    !stderr.contains("path-only dependency"),
+    "Should not complain about path-only deps for unpublishable crates.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+/// Test that explicitly naming an unpublishable crate reports its status
+#[test]
+fn test_release_check_explicit_unpublishable_crate() -> Result<()> {
+  let ws = TestWorkspace::new_named("explicit-unpub")?;
+  write_release_config(&ws, "")?;
+
+  // Add an unpublishable crate
+  add_unpublishable_crate(&ws, "internal-tool", "0.1.0")?;
+  ws.commit("Add crates")?;
+
+  // Run release check on the specific crate
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "internal-tool"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Should succeed and report the crate as not publishable
+  assert!(
+    output.status.success(),
+    "Should succeed when explicitly checking unpublishable crate.\nstdout:\n{}",
+    stdout
+  );
+
+  assert!(
+    stdout.contains("not publishable") || stdout.contains("publish = false"),
+    "Should report crate as not publishable.\nstdout:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+/// Test JSON output includes skipped crates
+#[test]
+fn test_release_check_json_includes_skipped() -> Result<()> {
+  let ws = TestWorkspace::new_named("json-skipped")?;
+  write_release_config(&ws, "")?;
+
+  // Add publishable and unpublishable crates
+  ws.add_crate("lib-pub", "0.1.0", &[])?;
+  add_unpublishable_crate(&ws, "lib-internal", "0.1.0")?;
+  ws.commit("Add crates")?;
+
+  // Run release check --all --json
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--json"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  // Parse JSON
+  let json: serde_json::Value =
+    serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("Should be valid JSON.\nstdout:\n{}", stdout));
+
+  // Should have skipped array
+  assert!(
+    json.get("skipped").is_some(),
+    "JSON should contain 'skipped' field.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json).unwrap_or_default()
+  );
+
+  // Skipped should contain lib-internal
+  let skipped = json["skipped"].as_array().expect("skipped should be array");
+  let has_internal = skipped.iter().any(|s| {
+    s.get("crate")
+      .and_then(|c| c.as_str())
+      .map(|c| c == "lib-internal")
+      .unwrap_or(false)
+  });
+
+  assert!(
+    has_internal,
+    "Skipped should include lib-internal.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json).unwrap_or_default()
+  );
+
+  Ok(())
+}
+
+/// Test that rail.toml publish = false is respected
+#[test]
+fn test_release_check_respects_rail_toml_publish_false() -> Result<()> {
+  let ws = TestWorkspace::new_named("rail-toml-unpub")?;
+
+  // Add crates (both publishable in Cargo.toml)
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate("lib-b", "0.1.0", &[])?;
+  ws.commit("Add crates")?;
+
+  // Configure lib-b as non-publishable in rail.toml
+  ws.write_release_config(
+    r#"require_clean = false
+
+[crates.lib-b.release]
+publish = false
+"#,
+  )?;
+
+  // Run release check --all
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  // Should succeed
+  assert!(
+    output.status.success(),
+    "Should succeed.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  // Should show lib-a as ready
+  assert!(
+    stdout.contains("lib-a: ready"),
+    "lib-a should be ready.\nstdout:\n{}",
+    stdout
+  );
+
+  // Should report lib-b as skipped due to rail.toml
+  assert!(
+    stderr.contains("lib-b") && stderr.contains("rail.toml"),
+    "lib-b should be skipped due to rail.toml.\nstderr:\n{}",
     stderr
   );
 

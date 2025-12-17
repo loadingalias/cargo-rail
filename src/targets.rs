@@ -519,9 +519,7 @@ linker = "clang"
     assert!(toml_files[0].ends_with("valid.toml"));
   }
 
-  // ============================================================================
   // GitHub Workflow YAML Tests
-  // ============================================================================
 
   #[test]
   fn test_find_github_workflow_files_empty() {
@@ -675,9 +673,7 @@ jobs:
     assert!(!has_github_workflows(temp.path()));
   }
 
-  // ============================================================================
   // Word Boundary Matching Tests
-  // ============================================================================
 
   #[test]
   fn test_contains_target_match_exact() {

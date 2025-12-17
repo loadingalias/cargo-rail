@@ -158,9 +158,12 @@ require_clean = true
   Ok(())
 }
 
-/// Test check fails for crate with publish = false
+/// Test check reports status for crate with publish = false
+///
+/// When explicitly checking an unpublishable crate, the command succeeds
+/// but reports the crate as "not publishable" rather than erroring.
 #[test]
-fn test_check_fails_for_unpublishable_crate() -> Result<()> {
+fn test_check_reports_unpublishable_crate_status() -> Result<()> {
   let ws = TestWorkspace::new_named("check-unpublish")?;
 
   // Add a crate with publish = false
@@ -194,15 +197,22 @@ require_clean = false
 
   ws.commit("Add private-crate with config")?;
 
-  // Check should fail for private crate
+  // Check should succeed and report the crate as not publishable
   let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "private-crate"])?;
-  assert!(!output.status.success(), "check should fail for publish = false crate");
+  let stdout = String::from_utf8_lossy(&output.stdout);
 
-  let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stderr.contains("publish") || stderr.contains("false"),
-    "Should mention publish restriction. stderr: {}",
-    stderr
+    output.status.success(),
+    "check should succeed for explicit unpublishable crate.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  // Should report crate as not publishable
+  assert!(
+    stdout.contains("not publishable") || stdout.contains("publish = false"),
+    "Should report crate as not publishable.\nstdout:\n{}",
+    stdout
   );
 
   Ok(())

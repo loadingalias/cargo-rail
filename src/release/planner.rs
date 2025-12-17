@@ -170,7 +170,7 @@ impl<'a> ReleasePlanner<'a> {
     };
 
     // Check if should publish - per-crate config takes priority, then Cargo.toml
-    let publish_from_cargo = package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true);
+    let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
     let publish = crate_config
       .and_then(|c| c.release.as_ref())
       .map(|r| r.publish)

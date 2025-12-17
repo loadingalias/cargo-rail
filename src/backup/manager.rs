@@ -85,15 +85,15 @@ impl BackupManager {
 
     let metadata = BackupMetadata::load(&backup_dir)?;
 
-    eprintln!("restoring backup: {}", metadata.timestamp);
-    eprintln!("  {} files", metadata.files_modified.len());
+    crate::status!("restoring backup: {}", metadata.timestamp);
+    crate::status!("  {} files", metadata.files_modified.len());
 
     for file in &metadata.files_modified {
       let src = backup_dir.join(file);
       let dest = self.workspace_root.join(file);
 
       if !src.exists() {
-        eprintln!("  skipped (missing): {}", file.display());
+        crate::status!("  skipped (missing): {}", file.display());
         continue;
       }
 
@@ -104,7 +104,7 @@ impl BackupManager {
 
       fs::copy(&src, &dest).map_err(|e| RailError::message(format!("failed to restore {}: {}", file.display(), e)))?;
 
-      eprintln!("  restored: {}", file.display());
+      crate::status!("  restored: {}", file.display());
     }
 
     println!("backup restored");
@@ -141,7 +141,7 @@ impl BackupManager {
           backups.push(BackupRecord::new(backup_id, metadata, path));
         }
         Err(e) => {
-          eprintln!("warning: skipping corrupted backup '{}': {}", backup_id, e);
+          crate::warn!("skipping corrupted backup '{}': {}", backup_id, e);
           continue;
         }
       }

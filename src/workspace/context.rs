@@ -35,9 +35,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-// ============================================================================
 // Cargo State (merged from cargo_state.rs)
-// ============================================================================
 
 /// Cargo state for the workspace
 ///
@@ -200,6 +198,21 @@ impl CargoState {
   pub fn proc_macro_crates(&self) -> &std::collections::HashSet<String> {
     &self.proc_macro_crates
   }
+
+  /// Check if a package is publishable based on Cargo.toml
+  ///
+  /// Returns `true` if the package can be published to a registry.
+  /// Returns `false` if `publish = false` in Cargo.toml.
+  ///
+  /// Note: This only checks Cargo.toml. For combined Cargo.toml + rail.toml
+  /// checking, use `ReleaseValidator::is_publishable()`.
+  pub fn is_package_publishable(package: &Package) -> bool {
+    // package.publish is Option<Vec<String>>:
+    // - None = publishable (no restriction)
+    // - Some([]) = publish = false (empty registry list)
+    // - Some(["crates-io"]) = can publish to listed registries
+    package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true)
+  }
 }
 
 /// Compute a content-based hash of workspace manifests
@@ -242,9 +255,7 @@ fn compute_workspace_hash(workspace_root: &Path) -> u64 {
   hash
 }
 
-// ============================================================================
 // Git State (merged from git_state.rs)
-// ============================================================================
 
 /// Git state for the workspace
 ///
@@ -300,9 +311,7 @@ impl GitState {
   }
 }
 
-// ============================================================================
 // Workspace Context
-// ============================================================================
 
 /// Unified workspace context containing all shared workspace-level data.
 ///
@@ -371,8 +380,8 @@ impl WorkspaceContext {
     let workspace_root_canonical = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
 
     if git_root_canonical != workspace_root_canonical {
-      eprintln!(
-        "⚠️  Warning: Git repo root ({}) differs from Cargo workspace root ({})",
+      crate::warn!(
+        "git repo root ({}) differs from Cargo workspace root ({})",
         git.repo_root().display(),
         workspace_root.display()
       );

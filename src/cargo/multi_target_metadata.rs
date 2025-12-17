@@ -749,9 +749,7 @@ mod tests {
     assert_ne!(MsrvSourceUsed::MaxWorkspace, MsrvSourceUsed::MaxDeps);
   }
 
-  // ============================================================================
   // Determinism Regression Tests
-  // ============================================================================
   // These tests verify that outputs are deterministic (sorted) to prevent
   // non-deterministic behavior from HashMap/HashSet iteration order.
 

@@ -34,7 +34,7 @@ fn main() {
       match std::env::current_dir() {
         Ok(cwd) => cwd.join(root),
         Err(e) => {
-          eprintln!("Error: Failed to get current directory: {}", e);
+          cargo_rail::error!("failed to get current directory: {}", e);
           std::process::exit(1);
         }
       }
@@ -43,7 +43,7 @@ fn main() {
     match std::env::current_dir() {
       Ok(dir) => dir,
       Err(e) => {
-        eprintln!("Error: Failed to get current directory: {}", e);
+        cargo_rail::error!("failed to get current directory: {}", e);
         std::process::exit(1);
       }
     }

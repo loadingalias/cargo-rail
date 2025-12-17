@@ -6,9 +6,7 @@ use super::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 use std::fs;
 
-// ============================================================================
 // Invalid Git Reference Tests
-// ============================================================================
 
 /// Test affected with non-existent git ref
 #[test]
@@ -51,9 +49,7 @@ fn test_affected_invalid_sha_pair() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Configuration Error Tests
-// ============================================================================
 
 /// Test commands fail gracefully with corrupted rail.toml
 #[test]
@@ -117,9 +113,7 @@ fn test_release_invalid_crate_name() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Split/Sync Error Tests
-// ============================================================================
 
 /// Test split with invalid crate name
 #[test]
@@ -173,9 +167,7 @@ root = "."
   Ok(())
 }
 
-// ============================================================================
 // Workspace Error Tests
-// ============================================================================
 
 /// Test running outside a cargo workspace
 #[test]
@@ -217,9 +209,7 @@ fn test_single_crate_workspace() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Test Command Error Tests
-// ============================================================================
 
 /// Test test command with invalid --since ref
 #[test]
@@ -237,9 +227,7 @@ fn test_test_invalid_since() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Init Error Tests
-// ============================================================================
 
 /// Test init refuses to overwrite existing config without --force
 #[test]
@@ -260,9 +248,7 @@ fn test_init_no_overwrite_without_force() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Unify Error Tests
-// ============================================================================
 
 /// Test unify undo when no backups exist
 #[test]
@@ -284,9 +270,7 @@ fn test_unify_undo_no_backups() -> Result<()> {
   Ok(())
 }
 
-// ============================================================================
 // Path Handling Tests
-// ============================================================================
 
 /// Test handling of paths with special characters
 #[test]

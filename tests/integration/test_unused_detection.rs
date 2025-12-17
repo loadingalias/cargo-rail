@@ -38,9 +38,7 @@ fn add_crate_with_manifest(workspace: &TestWorkspace, name: &str, manifest: &str
   Ok(())
 }
 
-// ============================================================================
 // TEST 1: Crate name normalization (hyphens vs underscores)
-// ============================================================================
 
 #[test]
 fn test_unused_detection_crate_name_normalization() -> Result<()> {
@@ -82,9 +80,7 @@ once_cell = "1.0"
   Ok(())
 }
 
-// ============================================================================
 // TEST 2: Optional deps referenced in features are NOT flagged
-// ============================================================================
 
 #[test]
 fn test_unused_detection_optional_dep_in_features_not_flagged() -> Result<()> {
@@ -201,9 +197,7 @@ serialization = ["serde/derive"]
   Ok(())
 }
 
-// ============================================================================
 // TEST 3: Optional deps are NEVER flagged (even if not in [features])
-// ============================================================================
 
 #[test]
 fn test_unused_detection_optional_deps_never_flagged() -> Result<()> {
@@ -248,9 +242,7 @@ default = []
   Ok(())
 }
 
-// ============================================================================
 // TEST 4: Target-specific deps for unconfigured targets NOT flagged
-// ============================================================================
 
 #[test]
 fn test_unused_detection_target_specific_unconfigured_not_flagged() -> Result<()> {
@@ -301,9 +293,7 @@ winapi = "0.3"
   Ok(())
 }
 
-// ============================================================================
 // TEST 5: Regular unused deps ARE flagged
-// ============================================================================
 
 #[test]
 fn test_unused_detection_truly_unused_dep_is_flagged() -> Result<()> {
@@ -346,9 +336,7 @@ log = "0.4"
   Ok(())
 }
 
-// ============================================================================
 // TEST 6: Workspace member deps are NOT flagged
-// ============================================================================
 
 #[test]
 fn test_unused_detection_workspace_member_not_flagged() -> Result<()> {
@@ -397,9 +385,7 @@ core-lib = { path = "../core-lib" }
   Ok(())
 }
 
-// ============================================================================
 // TEST 7: Multiple targets - deps present in ANY target are NOT flagged
-// ============================================================================
 
 #[test]
 fn test_unused_detection_multi_target_union() -> Result<()> {
@@ -446,9 +432,7 @@ log = "0.4"
   Ok(())
 }
 
-// ============================================================================
 // TEST 8: Renamed deps (package = "...") are NOT false positives
-// ============================================================================
 
 #[test]
 fn test_unused_detection_renamed_package_not_flagged() -> Result<()> {
@@ -495,9 +479,7 @@ pub fn hello() {}
   Ok(())
 }
 
-// ============================================================================
 // TEST 9: Verify zero false positives with common patterns
-// ============================================================================
 
 #[test]
 fn test_unused_detection_common_patterns_no_false_positives() -> Result<()> {

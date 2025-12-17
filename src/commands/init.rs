@@ -95,7 +95,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
 
   // Warn if not a Cargo workspace (skip warnings in quiet/JSON mode)
   if !is_cargo_workspace(workspace_root) && !check && !json && !crate::output::is_quiet() {
-    eprintln!("warning: no Cargo workspace detected in {}", workspace_root.display());
+    crate::warn!("no Cargo workspace detected in {}", workspace_root.display());
     eprintln!("         cargo-rail works best with Cargo workspaces\n");
   }
 
@@ -114,7 +114,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
     if !check && !json && !crate::output::is_quiet() {
-      eprintln!("note: existing config found at {}", existing.display());
+      crate::note!("existing config found at {}", existing.display());
       eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
     }
   }

@@ -56,7 +56,7 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
-  // Step 1: Map files → crates (uses interior mutability for cache)
+  // Map files → crates (uses interior mutability for cache)
   let direct_crates = graph.files_to_crates(changed_files);
 
   if direct_crates.is_empty() {
@@ -71,12 +71,12 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
-  // Step 2: Get all transitive dependents in a single traversal
+  // Get all transitive dependents in a single traversal
   // This is O(V+E) regardless of how many direct crates there are,
   // vs O(N × (V+E)) if we called transitive_dependents() for each crate
   let all_dependents = graph.transitive_dependents_of_set(&direct_crates)?;
 
-  // Step 3: Build test targets (direct + dependents)
+  // Build test targets (direct + dependents)
   let mut test_targets = direct_crates.clone();
   test_targets.extend(all_dependents.clone());
 

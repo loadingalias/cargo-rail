@@ -217,7 +217,8 @@ pub fn run_unify_analyze(
   let failed_validations: Vec<_> = plan.validation_results.iter().filter(|v| !v.success).collect();
 
   if !failed_validations.is_empty() {
-    eprintln!("\nvalidation errors:");
+    eprintln!();
+    crate::error!("validation errors:");
     for val in failed_validations {
       eprintln!(
         "  {}: {}",
@@ -229,7 +230,8 @@ pub fn run_unify_analyze(
 
   // Final message and exit code
   if plan.has_blocking_issues() {
-    eprintln!("\nerror: blocking issues prevent unification");
+    eprintln!();
+    crate::error!("blocking issues prevent unification");
     return Err(RailError::message("blocking issues prevent unification"));
   } else if !plan.workspace_deps.is_empty() || !plan.member_edits.is_empty() {
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
@@ -268,7 +270,7 @@ pub fn run_unify_apply(
 
   // Check for blockers
   if plan.has_blocking_issues() {
-    eprintln!("error: blocking issues prevent unification:");
+    crate::error!("blocking issues prevent unification:");
     for issue in &plan.issues {
       if issue.severity == crate::cargo::IssueSeverity::Error {
         eprintln!("  {}: {}", issue.dep_name, issue.message);
@@ -377,12 +379,12 @@ pub fn run_unify_apply(
   if !plan.transitive_pins.is_empty() {
     progress!("pinning {} transitives...", plan.transitive_pins.len());
 
-    // STEP 1: Add transitive deps to [workspace.dependencies] first
+    // Add transitive deps to [workspace.dependencies] first
     // This is required before we can reference them with `workspace = true`
     progress!("  adding to [workspace.dependencies]...");
     writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
 
-    // STEP 2: Add to host's [dev-dependencies] with workspace = true
+    // Add to host's [dev-dependencies] with workspace = true
     let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
     let is_root_host = matches!(
       transitive_host_setting,
@@ -432,7 +434,7 @@ pub fn run_unify_apply(
   if let Some(ref msrv) = plan.computed_msrv {
     // Show warning if workspace mode has compatibility issues
     if let Some(ref warning) = msrv.warning {
-      eprintln!("warning: {}", warning);
+      crate::warn!("{}", warning);
     }
     progress!(
       "writing rust-version = \"{}.{}\"...",
