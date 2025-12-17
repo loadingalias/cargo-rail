@@ -48,6 +48,7 @@ preserve_features = []  # Features to preserve from pruning (glob patterns)
 detect_undeclared_features = true  # Detect features borrowed via Cargo unification (default: true)
 fix_undeclared_features = true  # Auto-fix borrowed features (default: true)
 skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]  # Features to skip in undeclared detection (glob patterns)
+sort_dependencies = true  # Sort deps alphabetically (default: true)
 
 
 [release]
