@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.3](https://github.com/loadingalias/cargo-rail/compare/v0.7.2...v0.7.3) - 2025-12-16
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the release pipe; Issues #6 & 7 are addressed. added the improved macros for cleaner outputs w/o the log/tracing. [#6](https://github.com/loadingalias/cargo-rail/pull/6) ([5647d6b](https://github.com/loadingalias/cargo-rail/commit/5647d6b2dd51d12b7bbb0499ef5419551b284e84))
+
+
+
 ## [0.7.2](https://github.com/loadingalias/cargo-rail/compare/v0.7.1...v0.7.2) - 2025-12-15
 
 ### 🔧 Chores
