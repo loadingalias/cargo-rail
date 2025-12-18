@@ -16,9 +16,6 @@ Thumbs.db
 *.key
 
 # Personal - Notes, Docs, Examples, Testing, etc.
-rules.md
-release.md
-todo.md
+notes/
 **/demo.cast
 distribution/
-backlog/
