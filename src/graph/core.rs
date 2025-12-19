@@ -276,8 +276,8 @@ impl WorkspaceGraph {
         if neighbor_node.is_workspace_member
           && let Some(&to_subgraph_idx) = name_to_subgraph_idx.get(&neighbor_node.name)
           && let Some(edge) = self.graph.find_edge(from_graph_idx, neighbor_graph_idx)
+          && let Some(&kind) = self.graph.edge_weight(edge)
         {
-          let kind = *self.graph.edge_weight(edge).unwrap();
           // Skip dev-dependencies - they don't affect publish order and can have cycles
           // Also skip self-references (crate depending on itself for test features)
           if kind != DependencyKind::Development && from_name != &neighbor_node.name {
@@ -321,10 +321,8 @@ impl WorkspaceGraph {
     // Normalize to workspace-relative path
     let relative_path = self.to_workspace_relative(file_path)?;
 
-    let cache = self
-      .path_cache
-      .read()
-      .expect("RwLock poisoned: another thread panicked while holding the lock");
+    // If the lock is poisoned (another thread panicked), return None gracefully
+    let cache = self.path_cache.read().ok()?;
     let cache_ref = cache.as_ref()?;
 
     // Walk up directory tree looking for a crate root
@@ -433,7 +431,11 @@ impl WorkspaceGraph {
       }
     }
 
-    *self.path_cache.write().unwrap() = Some(cache);
+    // If the lock is poisoned (another thread panicked), skip cache update
+    // The cache will be rebuilt on next access attempt
+    if let Ok(mut guard) = self.path_cache.write() {
+      *guard = Some(cache);
+    }
   }
 }
 

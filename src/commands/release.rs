@@ -428,7 +428,10 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
 
     new_crates.push(pkg.name.clone());
 
-    let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
+    let Some(crate_dir) = pkg.manifest_path.parent() else {
+      // manifest_path always has a parent directory - skip if somehow malformed
+      continue;
+    };
     let changelog_path = crate::utils::detect_crate_changelog(crate_dir);
 
     let crate_config = config.crates.entry(pkg.name.to_string()).or_default();

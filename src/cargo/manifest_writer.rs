@@ -58,9 +58,11 @@ impl ManifestWriter {
     }
 
     // Second pass: write target-specific dependencies
-    for dep in deps.iter().filter(|d| d.target.is_some()) {
+    for dep in deps.iter() {
+      let Some(target) = dep.target.as_ref() else {
+        continue;
+      };
       let entry = manifest_ops::build_dep_entry(dep);
-      let target = dep.target.as_ref().unwrap();
       manifest_ops::insert_target_dependency(&mut doc, target, "dependencies", &dep.name, entry)
         .context("Failed to insert target dependency")?;
     }

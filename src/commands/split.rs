@@ -276,7 +276,10 @@ fn detect_workspace_splits(
     }
 
     // Get relative path from workspace root to crate directory
-    let crate_dir = pkg.manifest_path.parent().expect("manifest has parent");
+    let Some(crate_dir) = pkg.manifest_path.parent() else {
+      // manifest_path always has a parent directory - skip if somehow malformed
+      continue;
+    };
     // Detect per-crate CHANGELOG file
     let changelog_path = crate::utils::detect_crate_changelog(crate_dir);
     let rel_path = match crate_dir.strip_prefix(workspace_root) {

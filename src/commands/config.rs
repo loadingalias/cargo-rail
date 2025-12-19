@@ -796,8 +796,8 @@ fn sync_targets(editor: &mut TomlEditor, workspace_root: &Path) -> RailResult<Op
     .map_err(|e| RailError::message(format!("Failed to format targets: {}", e)))?;
 
   // Extract the value and insert it
-  if let Some(targets_item) = parsed.get("targets") {
-    editor.doc_mut()["targets"] = Item::Value(targets_item.as_value().unwrap().clone());
+  if let Some(value) = parsed.get("targets").and_then(|item| item.as_value()) {
+    editor.doc_mut()["targets"] = Item::Value(value.clone());
   }
 
   Ok(Some(TargetSyncResult {

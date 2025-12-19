@@ -189,9 +189,9 @@ fn contains_target_match(content: &str, target: &str) -> bool {
     let is_target_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
 
     // Valid boundary: start of string, or non-target character
-    let valid_before = char_before.is_none() || !is_target_char(char_before.unwrap());
+    let valid_before = char_before.is_none_or(|c| !is_target_char(c));
     // Valid boundary: end of string, or non-target character
-    let valid_after = char_after.is_none() || !is_target_char(char_after.unwrap());
+    let valid_after = char_after.is_none_or(|c| !is_target_char(c));
 
     if valid_before && valid_after {
       return true;

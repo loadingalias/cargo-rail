@@ -200,23 +200,21 @@ impl UnifyAnalyzer {
 
       // Always use highest version (cargo's resolver already picks highest compatible)
       // When targets resolve to different versions, we unify to highest
-      let version = if unique_versions.len() > 1 {
-        // Multiple versions found across targets - use highest
-        // This is the "silent win" - we unify duplicates automatically
-        let selected = unique_versions.iter().max().unwrap();
-
-        // Track the cleanup for reporting
-        let mut versions_found: Vec<_> = unique_versions.iter().map(|v| v.to_string()).collect();
-        versions_found.sort();
-        duplicates_cleaned.push(DuplicateCleanup {
-          dep_name: dep_key.name.to_string(),
-          versions_found,
-          selected_version: selected.to_string(),
-        });
-
-        selected
-      } else {
-        unique_versions.iter().next().unwrap()
+      let version = match unique_versions.iter().max() {
+        Some(max) if unique_versions.len() > 1 => {
+          // Multiple versions found across targets - use highest
+          // This is the "silent win" - we unify duplicates automatically
+          let mut versions_found: Vec<_> = unique_versions.iter().map(|v| v.to_string()).collect();
+          versions_found.sort();
+          duplicates_cleaned.push(DuplicateCleanup {
+            dep_name: dep_key.name.to_string(),
+            versions_found,
+            selected_version: max.to_string(),
+          });
+          max
+        }
+        Some(version) => version,
+        None => continue, // Empty set - shouldn't happen given versions check above
       };
 
       // Construct version requirement - preserve exact pins if configured
@@ -227,9 +225,15 @@ impl UnifyAnalyzer {
           .find_map(|u| u.declared_version.as_ref().filter(|v| is_exact_pin(v)))
           .cloned()
           .unwrap_or_else(|| format!("={}", version));
-        VersionReq::parse(&exact_version).unwrap_or_else(|_| VersionReq::parse(&format!("^{}", version)).unwrap())
+        // Try exact version first, fall back to caret format, then ultimate fallback
+        VersionReq::parse(&exact_version)
+          .or_else(|_| VersionReq::parse(&format!("^{}", version)))
+          .unwrap_or_else(|_| VersionReq::default())
       } else {
-        VersionReq::parse(&format!("^{}", version)).unwrap_or_else(|_| VersionReq::parse(&version.to_string()).unwrap())
+        // Try caret format first, fall back to plain version, then ultimate fallback
+        VersionReq::parse(&format!("^{}", version))
+          .or_else(|_| VersionReq::parse(&version.to_string()))
+          .unwrap_or_else(|_| VersionReq::default())
       };
 
       // Check for version mismatches with existing workspace.dependencies

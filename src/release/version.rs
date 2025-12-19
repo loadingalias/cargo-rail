@@ -88,8 +88,8 @@ impl BumpType {
         next.build = semver::BuildMetadata::EMPTY;
 
         if current.pre.is_empty() {
-          // No prerelease - add rc.1
-          next.pre = semver::Prerelease::new("rc.1").expect("BUG: 'rc.1' is a valid semver prerelease identifier");
+          // No prerelease - add rc.1 ("rc.1" is always valid per semver spec)
+          next.pre = semver::Prerelease::new("rc.1").unwrap_or(semver::Prerelease::EMPTY);
         } else {
           // Increment the numeric part of the prerelease
           // Supports: rc.1 -> rc.2, alpha.3 -> alpha.4, beta.0 -> beta.1

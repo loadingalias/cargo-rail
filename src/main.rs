@@ -1,6 +1,8 @@
 //! Entry point for cargo-rail
 //!
 //! This is intentionally thin - all logic lives in the library.
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 
 use cargo_rail::commands::cli::{ConfigCommand, UnifyCommand};
 use cargo_rail::commands::{self, CargoCli, Commands, StrictnessMode};
