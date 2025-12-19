@@ -260,6 +260,24 @@ impl UnificationPlan {
     self.issues.iter().any(|i| i.severity == IssueSeverity::Error)
   }
 
+  /// Total number of concrete member edits planned across the workspace.
+  ///
+  /// Note: `member_edits` may contain empty vectors in edge cases; this returns the
+  /// actual edit count and is the right basis for "would this mutate files?" checks.
+  pub fn member_edit_count(&self) -> usize {
+    self.member_edits.values().map(|v| v.len()).sum()
+  }
+
+  /// Returns true if the plan would mutate manifests or workspace MSRV.
+  ///
+  /// Intentionally ignores informational-only fields like `optional_features`.
+  pub fn has_planned_changes(&self, msrv_write_needed: bool) -> bool {
+    !self.workspace_deps.is_empty()
+      || self.member_edit_count() > 0
+      || !self.transitive_pins.is_empty()
+      || msrv_write_needed
+  }
+
   /// Generates a human-readable summary of the plan
   pub fn summary(&self) -> String {
     let mut s = String::new();
@@ -946,5 +964,34 @@ mod tests {
     assert!(summary.contains("futures"));
     // Should NOT contain "borrowed from" when empty
     assert!(!summary.contains("borrowed from"));
+  }
+
+  #[test]
+  fn test_member_edit_count_ignores_empty_entries() {
+    let mut member_edits = std::collections::HashMap::new();
+    member_edits.insert("crate-a".to_string(), vec![]);
+
+    let plan = UnificationPlan {
+      workspace_deps: vec![],
+      member_edits,
+      member_paths: std::collections::HashMap::new(),
+      transitive_pins: vec![],
+      validation_results: vec![],
+      issues: vec![],
+      computed_msrv: None,
+      duplicates_cleaned: vec![],
+      pruned_features: vec![],
+      optional_features: vec![OptionalFeature {
+        crate_name: "crate-a".to_string(),
+        feature_name: "serde".to_string(),
+        enables: vec!["serde/derive".to_string()],
+      }],
+      version_mismatches: vec![],
+      unused_deps: vec![],
+      undeclared_features: vec![],
+    };
+
+    assert_eq!(plan.member_edit_count(), 0);
+    assert!(!plan.has_planned_changes(false));
   }
 }

@@ -48,7 +48,7 @@ pub fn run_unify_analyze(
       })).collect::<Vec<_>>(),
       "summary": {
         "workspace_deps_count": plan.workspace_deps.len(),
-        "member_edits_count": plan.member_edits.values().map(|v| v.len()).sum::<usize>(),
+        "member_edits_count": plan.member_edit_count(),
         "members_affected": plan.member_edits.len(),
         "transitive_pins_count": plan.transitive_pins.len(),
         "duplicates_unified": plan.duplicates_cleaned.len(),
@@ -94,10 +94,7 @@ pub fn run_unify_analyze(
   }
 
   // Show diff if requested
-  let has_changes = !plan.member_edits.is_empty()
-    || !plan.workspace_deps.is_empty()
-    || !plan.transitive_pins.is_empty()
-    || msrv_write_needed;
+  let has_changes = plan.has_planned_changes(msrv_write_needed);
   if show_diff && has_changes {
     println!("\nplanned changes:\n");
 
@@ -275,7 +272,7 @@ pub fn run_unify_analyze(
     crate::error!("blocking issues prevent unification");
     return Err(RailError::message("blocking issues prevent unification"));
   } else if has_changes {
-    let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
+    let total_edits = plan.member_edit_count();
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
       println!(
         "\nready: {} dependencies, {} member edits",
@@ -325,11 +322,7 @@ pub fn run_unify_apply(
     return Err(crate::error::RailError::message("blocking issues prevent unification"));
   }
 
-  if plan.workspace_deps.is_empty()
-    && plan.member_edits.is_empty()
-    && plan.transitive_pins.is_empty()
-    && !msrv_write_needed
-  {
+  if !plan.has_planned_changes(msrv_write_needed) {
     println!("nothing to unify");
     return Ok(());
   }

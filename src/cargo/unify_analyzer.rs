@@ -556,6 +556,9 @@ impl UnifyAnalyzer {
     // Run validation
     let validation_results = self.validate_targets()?;
 
+    // Defensive cleanup: avoid representing "no-op members" as pending changes.
+    member_edits.retain(|_, edits| !edits.is_empty());
+
     Ok(UnificationPlan {
       workspace_deps,
       member_edits,
