@@ -70,15 +70,15 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   },
   FieldSpec {
     section: "unify",
-    key: "enforce_msrv_inheritance",
-    default_toml: "false",
-    comment: "Ensure members inherit workspace rust-version",
-  },
-  FieldSpec {
-    section: "unify",
     key: "msrv_source",
     default_toml: "\"max\"",
     comment: "How to compute MSRV: deps, workspace, max (default: max)",
+  },
+  FieldSpec {
+    section: "unify",
+    key: "enforce_msrv_inheritance",
+    default_toml: "false",
+    comment: "Ensure members inherit workspace rust-version",
   },
   FieldSpec {
     section: "unify",

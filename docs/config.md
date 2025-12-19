@@ -120,6 +120,7 @@ Controls workspace dependency unification behavior. All options are optional wit
 [unify]
 msrv = true
 msrv_source = "max"  # "deps" | "workspace" | "max"
+enforce_msrv_inheritance = false
 detect_unused = true
 remove_unused = true
 prune_dead_features = true
@@ -195,8 +196,8 @@ transitive_host = "root"
 [unify]
 # Core options (defaults shown)
 msrv = true
-enforce_msrv_inheritance = false
 msrv_source = "max"  # "deps" | "workspace" | "max"
+enforce_msrv_inheritance = false
 detect_unused = true
 remove_unused = true
 prune_dead_features = true
@@ -548,6 +549,7 @@ targets = [
 # Core
 msrv = true
 msrv_source = "max"  # "deps" | "workspace" | "max"
+enforce_msrv_inheritance = false
 detect_unused = true
 remove_unused = true
 prune_dead_features = true

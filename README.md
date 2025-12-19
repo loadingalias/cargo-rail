@@ -177,8 +177,8 @@ detect_unused = true
 prune_dead_features = true
 
 msrv = true
-enforce_msrv_inheritance = false
 msrv_source = "max"          # deps | workspace | max
+enforce_msrv_inheritance = false
 
 [release]
 tag_format = "{crate}-{prefix}{version}"

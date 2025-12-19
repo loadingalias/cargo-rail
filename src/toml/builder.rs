@@ -94,10 +94,6 @@ impl RailConfigBuilder {
 
     // === MSRV ===
     content.push_str(&format!("\nmsrv = {}\n", config.msrv));
-    content.push_str(&format!(
-      "enforce_msrv_inheritance = {}  # set rust-version = {{ workspace = true }} for members\n",
-      config.enforce_msrv_inheritance
-    ));
     let msrv_source_str = match config.msrv_source {
       crate::config::MsrvSource::Deps => "deps",
       crate::config::MsrvSource::Workspace => "workspace",
@@ -106,6 +102,10 @@ impl RailConfigBuilder {
     content.push_str(&format!(
       "msrv_source = \"{}\"  # deps | workspace | max\n",
       msrv_source_str
+    ));
+    content.push_str(&format!(
+      "enforce_msrv_inheritance = {}  # Ensure members inherit workspace rust-version\n",
+      config.enforce_msrv_inheritance
     ));
 
     // === Unused detection ===

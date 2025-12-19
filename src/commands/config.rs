@@ -98,6 +98,7 @@ const KNOWN_UNIFY_KEYS: &[&str] = &[
   "include",
   "msrv",
   "msrv_source",
+  "enforce_msrv_inheritance",
   "prune_dead_features",
   "preserve_features",
   "strict_version_compat",
