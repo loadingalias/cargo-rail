@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/loadingalias/cargo-rail/compare/v0.7.3...v0.8.0) - 2025-12-18
+
+### 📦 Other Changes
+
+- cargo-rail: unify(msrv): write x.y.z, enforce inheritance option, and add fast CI MSRV gate ([81d1a04](https://github.com/loadingalias/cargo-rail/commit/81d1a047ce51697ea9823361da3c9edc8874d5c0))
+- cargo-rail: adding the 'rail-substrate' lint package to improve the codebase's safety in production ([a9896a6](https://github.com/loadingalias/cargo-rail/commit/a9896a6b93cf5e0ce221462715b2ffaeccadc9d6))
+- cargo-rail: cleaning the .gitignore ([893f8e4](https://github.com/loadingalias/cargo-rail/commit/893f8e4c5baf2b520c848ba75af7b7c9af560589))
+- cargo-rail: bump rail.toml to v0.7.3 ([7e95136](https://github.com/loadingalias/cargo-rail/commit/7e9513632a3aceea64d867489f68ef925beec0d5))
+
+
+
 ## [0.7.3](https://github.com/loadingalias/cargo-rail/compare/v0.7.2...v0.7.3) - 2025-12-16
 
 ### 📦 Other Changes
