@@ -4,11 +4,37 @@
 //! We load metadata per target (in parallel) and cache it for reuse.
 
 use crate::error::RailResult;
-use cargo_metadata::{Metadata, MetadataCommand, Package};
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use rayon::prelude::*;
 use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+#[derive(Clone)]
+struct TargetMetadataEntry {
+  metadata: Metadata,
+  package_id_index: HashMap<PackageId, usize>,
+}
+
+impl TargetMetadataEntry {
+  fn new(metadata: Metadata) -> Self {
+    let package_id_index = metadata
+      .packages
+      .iter()
+      .enumerate()
+      .map(|(idx, pkg)| (pkg.id.clone(), idx))
+      .collect();
+
+    Self {
+      metadata,
+      package_id_index,
+    }
+  }
+
+  fn package_by_id(&self, id: &PackageId) -> Option<&Package> {
+    self.package_id_index.get(id).map(|&idx| &self.metadata.packages[idx])
+  }
+}
 
 /// Multi-target metadata cache for the HYBRID approach
 ///
@@ -18,7 +44,7 @@ use std::path::Path;
 #[derive(Clone)]
 pub struct MultiTargetMetadata {
   /// Metadata per target (or "default" if no targets specified)
-  cache: HashMap<String, Metadata>,
+  cache: HashMap<String, TargetMetadataEntry>,
 }
 
 impl MultiTargetMetadata {
@@ -30,7 +56,7 @@ impl MultiTargetMetadata {
     if targets.is_empty() {
       let metadata = Self::load_single_target(&workspace_root, None)?;
       let mut cache = HashMap::new();
-      cache.insert("default".to_string(), metadata);
+      cache.insert("default".to_string(), TargetMetadataEntry::new(metadata));
       return Ok(Self { cache });
     }
 
@@ -47,7 +73,7 @@ impl MultiTargetMetadata {
     let mut cache = HashMap::new();
     for result in results {
       let (target, metadata) = result?;
-      cache.insert(target, metadata);
+      cache.insert(target, TargetMetadataEntry::new(metadata));
     }
 
     Ok(Self { cache })
@@ -100,12 +126,12 @@ impl MultiTargetMetadata {
 
   /// Get metadata for a specific target
   pub fn get(&self, target: &str) -> Option<&Metadata> {
-    self.cache.get(target)
+    self.cache.get(target).map(|e| &e.metadata)
   }
 
   /// Get metadata for any target (useful when they should all be the same)
   pub fn any(&self) -> Option<&Metadata> {
-    self.cache.values().next()
+    self.cache.values().next().map(|e| &e.metadata)
   }
 
   /// Get all targets we have metadata for (sorted for deterministic output)
@@ -126,11 +152,12 @@ impl MultiTargetMetadata {
   pub fn all_versions(&self, dep_name: &str) -> HashMap<String, Version> {
     let mut versions = HashMap::new();
 
-    for (target, metadata) in &self.cache {
+    for (target, entry) in &self.cache {
+      let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         // Find the package in the resolved graph
         for node in &resolve.nodes {
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
+          if let Some(pkg) = entry.package_by_id(&node.id)
             && pkg.name == dep_name
           {
             versions.insert(target.clone(), pkg.version.clone());
@@ -153,7 +180,8 @@ impl MultiTargetMetadata {
   pub fn direct_dep_versions(&self, dep_name: &str) -> HashMap<String, Version> {
     let mut versions = HashMap::new();
 
-    for (target, metadata) in &self.cache {
+    for (target, entry) in &self.cache {
+      let metadata = &entry.metadata;
       // Get workspace member package IDs
       let workspace_member_ids: HashSet<_> = metadata.workspace_packages().iter().map(|p| &p.id).collect();
 
@@ -169,7 +197,7 @@ impl MultiTargetMetadata {
           for dep in &node.deps {
             if dep.name == dep_name {
               // Found a direct dependency - get its resolved version
-              if let Some(pkg) = metadata.packages.iter().find(|p| p.id == dep.pkg) {
+              if let Some(pkg) = entry.package_by_id(&dep.pkg) {
                 // Cargo resolves to exactly one version per target - just record it
                 versions.insert(target.clone(), pkg.version.clone());
                 break; // Found for this workspace member, move on
@@ -186,7 +214,8 @@ impl MultiTargetMetadata {
   /// Check if a dependency is transitive-only (never in direct deps)
   pub fn is_transitive_only(&self, dep_name: &str) -> bool {
     // Check all workspace packages to see if any directly depend on this
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       for pkg in metadata.workspace_packages() {
         for dep in &pkg.dependencies {
           if dep.name == dep_name {
@@ -197,10 +226,11 @@ impl MultiTargetMetadata {
     }
 
     // Check if it exists in the resolved graph at all
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         for node in &resolve.nodes {
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
+          if let Some(pkg) = entry.package_by_id(&node.id)
             && pkg.name == dep_name
           {
             return true; // In graph but not direct = transitive
@@ -218,7 +248,8 @@ impl MultiTargetMetadata {
   /// These cannot be pinned in workspace.dependencies without a registry source,
   /// so we skip them during transitive pinning.
   pub fn is_path_dependency(&self, dep_name: &str) -> bool {
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       for pkg in &metadata.packages {
         if pkg.name == dep_name {
           // source is None for path deps and workspace members
@@ -235,11 +266,12 @@ impl MultiTargetMetadata {
   pub fn all_features(&self, dep_name: &str) -> HashMap<String, HashSet<String>> {
     let mut features = HashMap::new();
 
-    for (target, metadata) in &self.cache {
+    for (target, entry) in &self.cache {
+      let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         for node in &resolve.nodes {
           // Find the package
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
+          if let Some(pkg) = entry.package_by_id(&node.id)
             && pkg.name == dep_name
           {
             // Get the features for this node
@@ -267,10 +299,11 @@ impl MultiTargetMetadata {
   pub fn targets_with_dep(&self, dep_name: &str) -> Vec<String> {
     let mut targets = Vec::new();
 
-    for (target, metadata) in &self.cache {
+    for (target, entry) in &self.cache {
+      let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         for node in &resolve.nodes {
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id)
+          if let Some(pkg) = entry.package_by_id(&node.id)
             && pkg.name == dep_name
           {
             targets.push(target.clone());
@@ -291,10 +324,11 @@ impl MultiTargetMetadata {
 
     // Find all transitive-only deps
     let mut all_deps = HashSet::new();
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         for node in &resolve.nodes {
-          if let Some(pkg) = metadata.packages.iter().find(|p| p.id == node.id) {
+          if let Some(pkg) = entry.package_by_id(&node.id) {
             all_deps.insert(pkg.name.clone());
           }
         }
@@ -375,7 +409,8 @@ impl MultiTargetMetadata {
     let mut seen_packages: HashSet<String> = HashSet::new();
 
     // Iterate through all packages in the resolved graph
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       for pkg in &metadata.packages {
         // Skip if we've already processed this package (may appear in multiple targets)
         let pkg_key = format!("{}@{}", pkg.name, pkg.version);
@@ -431,8 +466,8 @@ impl MultiTargetMetadata {
     // Get MSRV from dependencies
     let deps_result = self.compute_deps_msrv();
 
-    // Read existing workspace rust-version
-    let workspace_msrv = read_workspace_rust_version(workspace_root);
+    // Read existing rust-version baseline (prefer workspace.package, fallback to root package)
+    let (workspace_msrv, used_package_fallback) = read_workspace_rust_version(workspace_root);
 
     // Apply msrv_source logic
     match msrv_source {
@@ -455,14 +490,22 @@ impl MultiTargetMetadata {
           (Some(ws_ver), Some((deps_ver, contributors, deps_with_msrv))) => {
             let warning = if deps_ver > ws_ver {
               Some(format!(
-                "workspace rust-version ({}.{}) is lower than deps require ({}.{}); \
+                "workspace rust-version ({}.{}.{}) is lower than deps require ({}.{}.{}); \
                  deps {} need the higher version",
                 ws_ver.major,
                 ws_ver.minor,
+                ws_ver.patch,
                 deps_ver.major,
                 deps_ver.minor,
+                deps_ver.patch,
                 contributors.first().unwrap_or(&"unknown".to_string())
               ))
+            } else if used_package_fallback {
+              Some(
+                "no [workspace.package].rust-version found; using [package].rust-version as baseline and writing it to [workspace.package].rust-version. \
+consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoid drift."
+                  .to_string(),
+              )
             } else {
               None
             };
@@ -485,7 +528,15 @@ impl MultiTargetMetadata {
               deps_msrv: None,
               workspace_msrv: Some(ws_ver.clone()),
               source_used: MsrvSourceUsed::Workspace,
-              warning: None,
+              warning: if used_package_fallback {
+                Some(
+                  "no [workspace.package].rust-version found; using [package].rust-version as baseline and writing it to [workspace.package].rust-version. \
+consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoid drift."
+                    .to_string(),
+                )
+              } else {
+                None
+              },
             })
           }
           (None, Some((deps_ver, contributors, deps_with_msrv))) => {
@@ -520,7 +571,15 @@ impl MultiTargetMetadata {
               deps_msrv: Some(deps_ver.clone()),
               workspace_msrv: Some(ws_ver.clone()),
               source_used,
-              warning: None,
+              warning: if used_package_fallback {
+                Some(
+                  "no [workspace.package].rust-version found; using [package].rust-version as baseline. \
+consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoid drift."
+                    .to_string(),
+                )
+              } else {
+                None
+              },
             })
           }
           (Some(ws_ver), None) => {
@@ -532,7 +591,15 @@ impl MultiTargetMetadata {
               deps_msrv: None,
               workspace_msrv: Some(ws_ver.clone()),
               source_used: MsrvSourceUsed::MaxWorkspace,
-              warning: None,
+              warning: if used_package_fallback {
+                Some(
+                  "no [workspace.package].rust-version found; using [package].rust-version as baseline. \
+consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoid drift."
+                    .to_string(),
+                )
+              } else {
+                None
+              },
             })
           }
           (None, Some((deps_ver, contributors, deps_with_msrv))) => {
@@ -576,23 +643,43 @@ impl MultiTargetMetadata {
   }
 }
 
-/// Read the existing rust-version from workspace Cargo.toml
+/// Read the existing rust-version baseline from workspace root Cargo.toml.
 ///
-/// Parses [workspace.package].rust-version if it exists.
-fn read_workspace_rust_version(workspace_root: &Path) -> Option<Version> {
+/// Prefers `[workspace.package].rust-version`. If absent, falls back to
+/// `[package].rust-version` (if it is a string value).
+///
+/// Returns `(version, used_package_fallback)`.
+fn read_workspace_rust_version(workspace_root: &Path) -> (Option<Version>, bool) {
   let cargo_toml_path = workspace_root.join("Cargo.toml");
-  let content = std::fs::read_to_string(&cargo_toml_path).ok()?;
-  let doc: toml_edit::DocumentMut = content.parse().ok()?;
+  let Ok(content) = std::fs::read_to_string(&cargo_toml_path) else {
+    return (None, false);
+  };
+  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+    return (None, false);
+  };
 
   // Try [workspace.package].rust-version
-  let rust_version_str = doc
+  let workspace_rust_version_str = doc
     .get("workspace")
     .and_then(|ws| ws.get("package"))
     .and_then(|pkg| pkg.get("rust-version"))
-    .and_then(|v| v.as_str())?;
+    .and_then(|v| v.as_str());
 
-  // Parse as semver Version (rust-version is typically "1.XX" or "1.XX.0")
-  parse_rust_version(rust_version_str)
+  if let Some(s) = workspace_rust_version_str {
+    return (parse_rust_version(s), false);
+  }
+
+  // Fallback: root [package].rust-version (string only, not workspace inheritance)
+  let package_rust_version_str = doc
+    .get("package")
+    .and_then(|pkg| pkg.get("rust-version"))
+    .and_then(|v| v.as_str());
+
+  if let Some(s) = package_rust_version_str {
+    return (parse_rust_version(s), true);
+  }
+
+  (None, false)
 }
 
 /// Parse a rust-version string into a semver Version
@@ -686,7 +773,8 @@ impl MultiTargetMetadata {
 
     let mut map = HashMap::new();
 
-    for metadata in self.cache.values() {
+    for entry in self.cache.values() {
+      let metadata = &entry.metadata;
       for pkg in &metadata.packages {
         // Find the lib target to get the actual library name
         let lib_name = pkg

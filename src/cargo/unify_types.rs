@@ -74,6 +74,10 @@ pub enum MemberEdit {
     /// Features to add to the dependency
     features_to_add: Vec<String>,
   },
+  /// Ensure this crate inherits MSRV from the workspace
+  ///
+  /// Sets `[package].rust-version = { workspace = true }`.
+  EnforceMsrvInheritance,
 }
 
 /// Issue that prevents or warns about unification
@@ -288,6 +292,7 @@ impl UnificationPlan {
       let mut removed_features: HashSet<String> = HashSet::new();
       let mut features_added_count = 0usize;
       let mut features_added_crates: HashSet<String> = HashSet::new();
+      let mut msrv_inheritance_crates: HashSet<String> = HashSet::new();
       for (member_name, edits) in &self.member_edits {
         for edit in edits {
           match edit {
@@ -303,6 +308,9 @@ impl UnificationPlan {
             MemberEdit::AddFeatures { features_to_add, .. } => {
               features_added_count += features_to_add.len();
               features_added_crates.insert(member_name.clone());
+            }
+            MemberEdit::EnforceMsrvInheritance => {
+              msrv_inheritance_crates.insert(member_name.clone());
             }
           }
         }
@@ -341,6 +349,14 @@ impl UnificationPlan {
         ));
         s.push('\n');
       }
+
+      if !msrv_inheritance_crates.is_empty() {
+        s.push_str(&format!(
+          "MSRV inheritance to enforce: {} crates\n",
+          msrv_inheritance_crates.len()
+        ));
+        s.push('\n');
+      }
     }
 
     s.push_str(&format!("Member edits: {}\n", self.member_edits.len()));
@@ -375,6 +391,9 @@ impl UnificationPlan {
         "\nComputed MSRV: {} (from {} deps with rust-version)\n",
         msrv.version, msrv.deps_with_msrv
       ));
+      if let Some(ref warning) = msrv.warning {
+        s.push_str(&format!("  Warning: {}\n", warning));
+      }
       if !msrv.contributors.is_empty() {
         let contributors_str = if msrv.contributors.len() > 3 {
           format!(

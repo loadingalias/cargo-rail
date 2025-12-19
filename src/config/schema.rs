@@ -24,7 +24,7 @@ pub struct FieldSpec {
 /// the insertion order within each section.
 pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   // =========================================================================
-  // [unify] section - 19 fields
+  // [unify] section - 21 fields
   // =========================================================================
   FieldSpec {
     section: "unify",
@@ -67,6 +67,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "msrv",
     default_toml: "true",
     comment: "Compute and write rust-version (default: true)",
+  },
+  FieldSpec {
+    section: "unify",
+    key: "enforce_msrv_inheritance",
+    default_toml: "false",
+    comment: "Ensure members inherit workspace rust-version",
   },
   FieldSpec {
     section: "unify",
@@ -276,7 +282,7 @@ mod tests {
   #[test]
   fn test_fields_for_section() {
     let unify_fields: Vec<_> = fields_for_section("unify").collect();
-    assert_eq!(unify_fields.len(), 20); // 19 + sort_dependencies
+    assert_eq!(unify_fields.len(), 21); // 20 + sort_dependencies
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
@@ -292,7 +298,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      31, // 20 unify + 10 release + 1 change-detection
+      32, // 21 unify + 10 release + 1 change-detection
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -300,7 +306,7 @@ mod tests {
   /// This test documents which config sections are syncable vs user-configured.
   ///
   /// SYNCABLE (auto-added by `config sync`):
-  /// - [unify] - 19 fields: workspace-wide dependency unification settings
+  /// - [unify] - 21 fields: workspace-wide dependency unification settings
   /// - [release] - 10 fields: workspace-wide release settings
   /// - [change-detection] - 1 field: infrastructure patterns (custom is user-defined)
   ///

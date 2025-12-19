@@ -6,7 +6,7 @@
   <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/v/cargo-rail.svg" alt="Crates.io"></a>
   <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/d/cargo-rail.svg" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="Rust 1.85+"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/crates/msrv/cargo-rail" alt="MSRV"></a>
 </p>
 
 <p align="center">
@@ -43,6 +43,15 @@ cargo install cargo-rail
 ```
 
 Optionally, install via the [pre-built binaries](https://github.com/loadingalias/cargo-rail/releases) or `cargo binstall cargo-rail`
+
+---
+
+## MSRV policy
+
+- **MSRV source of truth**: `Cargo.toml` (`rust-version`, written as `major.minor.patch`)
+- **Cargo requirement**: Cargo shipped with that Rust release (newer Cargo is fine)
+- **CI**: builds on MSRV to prevent accidental bumps
+- **Workspaces**: `cargo rail unify` writes `[workspace.package].rust-version`; enable `[unify].enforce_msrv_inheritance = true` to set `[package].rust-version = { workspace = true }` in member crates
 
 ---
 
@@ -168,6 +177,7 @@ detect_unused = true
 prune_dead_features = true
 
 msrv = true
+enforce_msrv_inheritance = false
 msrv_source = "max"          # deps | workspace | max
 
 [release]

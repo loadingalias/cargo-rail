@@ -2,7 +2,7 @@
 name = "cargo-rail"
 version = "0.7.3"
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = { workspace = true }
 license = "MIT"
 authors = ["loadingalias"]
 description = "Graph-aware testing, dependency unification, and crate extraction for Rust monorepos"
@@ -26,6 +26,13 @@ exclude = [
     "distribution/",
     "backlog/",
 ]
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[workspace.package]
+rust-version = "1.91.0"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "cargo"] }

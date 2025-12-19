@@ -55,7 +55,7 @@ msrv_source = "{}"
 #[test]
 fn test_msrv_source_max_preserves_higher_workspace_version() -> Result<()> {
   // Test that msrv_source = "max" preserves workspace version if it's higher
-  let workspace = create_workspace_with_rust_version("1.85")?;
+  let workspace = create_workspace_with_rust_version("1.85.0")?;
   write_rail_config(&workspace, "max")?;
 
   // Add a simple crate
@@ -80,7 +80,7 @@ fn test_msrv_source_max_preserves_higher_workspace_version() -> Result<()> {
 #[test]
 fn test_msrv_source_workspace_preserves_existing() -> Result<()> {
   // Test that msrv_source = "workspace" keeps existing rust-version
-  let workspace = create_workspace_with_rust_version("1.70")?;
+  let workspace = create_workspace_with_rust_version("1.70.0")?;
   write_rail_config(&workspace, "workspace")?;
 
   // Add a crate
@@ -104,7 +104,7 @@ fn test_msrv_source_workspace_preserves_existing() -> Result<()> {
 #[test]
 fn test_msrv_source_deps_uses_dependency_version() -> Result<()> {
   // Test that msrv_source = "deps" uses deps version (ignoring workspace)
-  let workspace = create_workspace_with_rust_version("1.80")?;
+  let workspace = create_workspace_with_rust_version("1.80.0")?;
   write_rail_config(&workspace, "deps")?;
 
   // Add a crate
@@ -129,7 +129,7 @@ fn test_msrv_source_deps_uses_dependency_version() -> Result<()> {
 #[test]
 fn test_msrv_disabled_skips_computation() -> Result<()> {
   // Test that msrv = false skips MSRV computation entirely
-  let workspace = create_workspace_with_rust_version("1.70")?;
+  let workspace = create_workspace_with_rust_version("1.70.0")?;
 
   let config = r#"[unify]
 msrv = false
@@ -158,7 +158,7 @@ msrv = false
 #[test]
 fn test_msrv_default_is_max_mode() -> Result<()> {
   // Test that the default msrv_source is "max"
-  let workspace = create_workspace_with_rust_version("1.75")?;
+  let workspace = create_workspace_with_rust_version("1.75.0")?;
 
   // Create config without msrv_source (use default)
   let config = r#"[unify]
@@ -181,6 +181,109 @@ msrv = true
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_msrv_package_only_baseline_is_used_and_written_to_workspace() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  let cargo_toml = r#"[package]
+name = "root"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Test Author"]
+rust-version = "1.72.0"
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Test Author"]
+"#;
+  std::fs::write(workspace.path.join("Cargo.toml"), cargo_toml)?;
+
+  // Root [package] requires at least one target for `cargo metadata` to succeed.
+  std::fs::create_dir_all(workspace.path.join("src"))?;
+  std::fs::write(workspace.path.join("src/lib.rs"), "pub fn root() {}\n")?;
+
+  workspace.commit("Use package-only rust-version baseline")?;
+
+  let config = r#"[unify]
+msrv = true
+msrv_source = "workspace"
+"#;
+  std::fs::create_dir_all(workspace.path.join(".config"))?;
+  std::fs::write(workspace.path.join(".config/rail.toml"), config)?;
+
+  workspace.add_crate("a", "0.1.0", &[])?;
+  workspace.commit("Add member crate")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nStdout:\n{}\nStderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let updated = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    updated.contains("[workspace.package]") && updated.contains("rust-version = \"1.72.0\""),
+    "Expected unify to write [workspace.package].rust-version.\nCargo.toml:\n{}",
+    updated
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_msrv_enforce_inheritance_sets_members_to_workspace() -> Result<()> {
+  let workspace = create_workspace_with_rust_version("1.72.0")?;
+
+  let config = r#"[unify]
+msrv = true
+msrv_source = "workspace"
+enforce_msrv_inheritance = true
+"#;
+  std::fs::create_dir_all(workspace.path.join(".config"))?;
+  std::fs::write(workspace.path.join(".config/rail.toml"), config)?;
+
+  workspace.add_crate("a", "0.1.0", &[])?;
+  workspace.add_crate("b", "0.1.0", &[])?;
+  workspace.commit("Add member crates")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nStdout:\n{}\nStderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  for member in ["a", "b"] {
+    let manifest_path = workspace.path.join("crates").join(member).join("Cargo.toml");
+    let content = std::fs::read_to_string(&manifest_path)?;
+    let doc: toml_edit::DocumentMut = content.parse()?;
+    let pkg = doc
+      .get("package")
+      .and_then(|p| p.as_table())
+      .expect("member has [package]");
+    let rv = pkg.get("rust-version").expect("member has rust-version");
+    let rv_tbl = rv.as_table_like().expect("rust-version is workspace inheritance");
+    assert_eq!(
+      rv_tbl.get("workspace").and_then(|v| v.as_bool()),
+      Some(true),
+      "Expected {} to inherit rust-version from workspace.\nCargo.toml:\n{}",
+      member,
+      content
+    );
+  }
 
   Ok(())
 }

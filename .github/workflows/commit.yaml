@@ -55,11 +55,64 @@ jobs:
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
   # ==========================================================================
-  # Job 2: CI (skipped if docs-only)
+  # Job 2: MSRV enforcement (fast fail)
+  # ==========================================================================
+  msrv:
+    name: MSRV Check
+    needs: detect
+    if: needs.detect.outputs.docs-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Detect MSRV
+        id: msrv
+        shell: bash
+        run: |
+          msrv="$(python3 - <<'PY'
+          import pathlib, tomllib
+
+          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          msrv = (
+              data.get("workspace", {}).get("package", {}).get("rust-version")
+              or data.get("package", {}).get("rust-version")
+          )
+          if isinstance(msrv, dict):
+              msrv = None
+          if not msrv:
+              raise SystemExit("No rust-version found in Cargo.toml")
+          print(msrv)
+          PY
+          )"
+
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          echo "Using MSRV: $msrv"
+
+      - name: Install Rust MSRV Toolchain
+        uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e  # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1  # v2.8.1
+        with:
+          shared-key: "cargo-rail-msrv-v1"
+          key: msrv-${{ steps.msrv.outputs.msrv }}
+          cache-on-failure: true
+
+      - name: Compile (MSRV)
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  # ==========================================================================
+  # Job 3: CI (skipped if docs-only)
   # ==========================================================================
   ci:
     name: CI (${{ matrix.target.name }})
-    needs: detect
+    needs: [msrv, detect]
     if: needs.detect.outputs.docs-only != 'true'
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30

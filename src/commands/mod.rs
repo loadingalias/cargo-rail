@@ -59,6 +59,88 @@ pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
+use std::path::Path;
+
+/// Result of attempting to dispatch a command without building WorkspaceContext.
+#[doc(hidden)]
+pub enum PreContextDispatch {
+  /// The command ran and the process should exit.
+  Handled,
+  /// The command requires a WorkspaceContext to run.
+  NeedsContext(Commands),
+}
+
+/// Handle commands that don't need WorkspaceContext.
+///
+/// Centralizes "pre-context" routing so `main.rs` stays thin.
+#[doc(hidden)]
+pub fn try_dispatch_pre_context(
+  cmd: Commands,
+  workspace_root: &Path,
+  config_override: Option<&Path>,
+  json: bool,
+) -> RailResult<PreContextDispatch> {
+  match cmd {
+    Commands::Init { output, force, check } => {
+      init::run_init_standalone(workspace_root, &output, force, check, json)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Unify {
+      command: Some(cli::UnifyCommand::Undo { list, backup_id }),
+      ..
+    } => {
+      unify::run_unify_undo(workspace_root, list, backup_id)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Config {
+      command: cli::ConfigCommand::Sync { check, format },
+    } => {
+      config::run_config_sync(workspace_root, check, format)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Config {
+      command: cli::ConfigCommand::Validate {
+        format,
+        strict,
+        no_strict,
+      },
+    } => {
+      let strictness = if strict {
+        StrictnessMode::Strict
+      } else if no_strict {
+        StrictnessMode::NoStrict
+      } else {
+        StrictnessMode::Auto
+      };
+      config::run_config_validate_standalone(workspace_root, format, strictness)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Config {
+      command: cli::ConfigCommand::Locate { format },
+    } => {
+      config::run_config_locate(workspace_root, config_override, format)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Config {
+      command: cli::ConfigCommand::Print { format },
+    } => {
+      config::run_config_print(workspace_root, config_override, format)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Completions { shell } => {
+      cli::generate_completions(shell);
+      Ok(PreContextDispatch::Handled)
+    }
+
+    other => Ok(PreContextDispatch::NeedsContext(other)),
+  }
+}
 
 /// Dispatch a command to its handler
 ///

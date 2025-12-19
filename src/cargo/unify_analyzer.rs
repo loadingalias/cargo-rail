@@ -15,7 +15,7 @@ use crate::cargo::{
   },
 };
 use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
-use crate::error::RailResult;
+use crate::error::{RailResult, ResultExt};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use semver::VersionReq;
@@ -434,6 +434,41 @@ impl UnifyAnalyzer {
       None
     };
 
+    // Optionally ensure every workspace member inherits MSRV from the workspace.
+    //
+    // This is only safe when we have (or will write) `[workspace.package].rust-version`.
+    // When msrv is disabled or cannot be computed, `rust-version = { workspace = true }`
+    // would cause Cargo to error if the workspace value is absent.
+    if self.config.enforce_msrv_inheritance {
+      if !self.config.msrv {
+        issues.push(UnifyIssue {
+          dep_name: "rust-version".to_string(),
+          severity: IssueSeverity::Warning,
+          message: "enforce_msrv_inheritance is enabled but unify.msrv is false; skipping MSRV inheritance enforcement"
+            .to_string(),
+        });
+      } else if computed_msrv.is_none() {
+        issues.push(UnifyIssue {
+          dep_name: "rust-version".to_string(),
+          severity: IssueSeverity::Warning,
+          message:
+            "enforce_msrv_inheritance is enabled but no workspace MSRV could be determined; skipping MSRV inheritance enforcement"
+              .to_string(),
+        });
+      } else {
+        progress!("Enforcing MSRV inheritance on workspace members...");
+        for (member_name, manifest_path) in &member_paths {
+          if member_manifest_inherits_msrv(manifest_path)? {
+            continue;
+          }
+          member_edits
+            .entry(member_name.clone())
+            .or_default()
+            .push(MemberEdit::EnforceMsrvInheritance);
+        }
+      }
+    }
+
     // Scan for dead and optional features if enabled
     let feature_pruner = FeaturePruner::new(&self.metadata, &self.config);
     let (pruned_features, optional_features) = if self.config.prune_dead_features {
@@ -729,4 +764,27 @@ impl UnifyAnalyzer {
 
     undeclared
   }
+}
+
+fn member_manifest_inherits_msrv(manifest_path: &Path) -> RailResult<bool> {
+  let content =
+    std::fs::read_to_string(manifest_path).context(format!("Failed to read {}", manifest_path.display()))?;
+  let doc: toml_edit::DocumentMut = content
+    .parse()
+    .context(format!("Failed to parse {}", manifest_path.display()))?;
+
+  let Some(pkg) = doc.get("package").and_then(|p| p.as_table()) else {
+    // No [package] section (likely a virtual workspace member). Nothing to enforce.
+    return Ok(true);
+  };
+
+  let Some(rv) = pkg.get("rust-version") else {
+    return Ok(false);
+  };
+
+  let Some(rv_tbl) = rv.as_table_like() else {
+    return Ok(false);
+  };
+
+  Ok(rv_tbl.get("workspace").and_then(|v| v.as_bool()) == Some(true))
 }

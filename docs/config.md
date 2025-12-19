@@ -102,7 +102,8 @@ Controls workspace dependency unification behavior. All options are optional wit
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version`. The MSRV is determined by `msrv_source`. |
+| `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version` (written as `major.minor.patch`). The MSRV is determined by `msrv_source`. |
+| `enforce_msrv_inheritance` | `bool` | `false` | Ensure every workspace member inherits MSRV by setting `[package].rust-version = { workspace = true }` in each member's `Cargo.toml`. This makes `[workspace.package].rust-version` actually apply across the workspace. |
 | `msrv_source` | `enum` | `"max"` | How to compute the final MSRV:<br>• `"deps"` - Use maximum from dependencies only (original behavior)<br>• `"workspace"` - Preserve existing rust-version, warn if deps need higher<br>• `"max"` - Take max(workspace, deps) - your explicit setting wins if higher |
 | `detect_unused` | `bool` | `true` | Detect dependencies declared in manifests but absent from the resolved cargo graph. |
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
@@ -150,6 +151,7 @@ major_version_conflict = "bump"
 
 - In my experience, `major_version_conflict = "bump"` works in most cases; some may require code fixes
 - Use `"warn"` for safety, `"bump"` for the leanest build graph
+- If `[workspace.package].rust-version` is missing but root `[package].rust-version` is present, `unify` uses it as the baseline and writes it to `[workspace.package].rust-version` (consider enabling `enforce_msrv_inheritance` to avoid drift)
 
 #### Dependency Selection
 
@@ -193,6 +195,7 @@ transitive_host = "root"
 [unify]
 # Core options (defaults shown)
 msrv = true
+enforce_msrv_inheritance = false
 msrv_source = "max"  # "deps" | "workspace" | "max"
 detect_unused = true
 remove_unused = true

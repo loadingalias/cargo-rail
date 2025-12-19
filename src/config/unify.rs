@@ -46,6 +46,16 @@ pub struct UnifyConfig {
   #[serde(default = "default_true")]
   pub msrv: bool,
 
+  /// Enforce MSRV inheritance on workspace members (default: false)
+  ///
+  /// When enabled, `cargo rail unify` ensures every workspace member's Cargo.toml
+  /// has `package.rust-version = { workspace = true }`, so that
+  /// `[workspace.package].rust-version` is actually enforced across the workspace.
+  ///
+  /// Note: this requires `msrv = true` and a workspace MSRV that exists or can be computed.
+  #[serde(default)]
+  pub enforce_msrv_inheritance: bool,
+
   /// How to determine the final MSRV value (default: "max")
   /// - "deps": Use maximum from dependencies only (original behavior)
   /// - "workspace": Preserve existing rust-version, warn if deps need higher
@@ -136,6 +146,7 @@ impl Default for UnifyConfig {
       include: Vec::new(),
       max_backups: default_max_backups(),
       msrv: true,
+      enforce_msrv_inheritance: false,
       msrv_source: MsrvSource::default(),
       prune_dead_features: true,
       preserve_features: Vec::new(),

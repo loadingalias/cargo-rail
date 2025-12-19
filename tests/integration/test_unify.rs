@@ -946,6 +946,7 @@ serde = "1.0"
     workspace.path.join("rail.toml"),
     r#"[unify]
 pin_transitives = true
+msrv = false
 "#,
   )?;
 
@@ -991,6 +992,7 @@ serde = "1.0"
     workspace.path.join("rail.toml"),
     r#"[unify]
 include_renamed = true
+msrv = false
 "#,
   )?;
 
@@ -1123,6 +1125,7 @@ root = "."
 [unify]
 include_renamed = false
 detect_unused = false
+msrv = false
 "#,
   )?;
 

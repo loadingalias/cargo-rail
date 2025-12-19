@@ -186,7 +186,7 @@ impl ManifestWriter {
   /// Write MSRV (rust-version) to workspace manifest
   ///
   /// Writes to [workspace.package].rust-version so that members can inherit it
-  /// via `rust-version.workspace = true`
+  /// via `rust-version = { workspace = true }`
   pub fn write_workspace_msrv(&self, workspace_toml_path: &Path, msrv: &semver::Version) -> RailResult<()> {
     // Read workspace Cargo.toml
     let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
@@ -198,8 +198,8 @@ impl ManifestWriter {
     let ws_package = manifest_ops::get_or_create_table(&mut doc, "workspace.package")
       .context("Failed to create [workspace.package]")?;
 
-    // Format MSRV as "major.minor" (standard rust-version format)
-    let msrv_str = format!("{}.{}", msrv.major, msrv.minor);
+    // Format MSRV as "major.minor.patch" (explicit and unambiguous)
+    let msrv_str = format!("{}.{}.{}", msrv.major, msrv.minor, msrv.patch);
 
     // Insert or update rust-version
     ws_package.insert("rust-version", toml_edit::value(&msrv_str));
@@ -208,6 +208,25 @@ impl ManifestWriter {
     self.formatter.format_manifest(&mut doc)?;
     manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
+    Ok(())
+  }
+
+  /// Ensure a member manifest inherits `rust-version` from `[workspace.package]`.
+  ///
+  /// Sets `[package].rust-version = { workspace = true }`.
+  pub fn enforce_member_msrv_inheritance(&self, member_toml_path: &Path) -> RailResult<()> {
+    let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
+
+    let Some(pkg) = doc.get_mut("package").and_then(|p| p.as_table_like_mut()) else {
+      return Ok(());
+    };
+
+    let mut tbl = toml_edit::InlineTable::new();
+    tbl.insert("workspace", true.into());
+    pkg.insert("rust-version", toml_edit::value(toml_edit::Value::InlineTable(tbl)));
+
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(member_toml_path, &doc)?;
     Ok(())
   }
 

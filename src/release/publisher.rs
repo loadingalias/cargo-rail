@@ -84,7 +84,7 @@ impl<'a> ReleasePublisher<'a> {
     // Run pre-flight checks
     let warnings = self.preflight_check(skip_tag)?;
     for warning in &warnings {
-      warn!("warning: {}", warning);
+      warn!("{}", warning);
     }
 
     for (i, crate_plan) in plan.crates.iter().enumerate() {

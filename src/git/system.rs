@@ -143,7 +143,7 @@ impl SystemGit {
   ///
   /// - Sets working directory to repo path
   /// - Clears environment variables
-  /// - Whitelists only PATH and HOME
+  /// - Whitelists only essential variables (PATH, HOME, auth-related vars)
   /// - Adds safe configuration overrides
   pub(crate) fn git_cmd(&self) -> Command {
     let mut cmd = Command::new("git");
@@ -153,11 +153,29 @@ impl SystemGit {
 
     // Isolated environment (don't trust global config)
     cmd.env_clear();
-    if let Ok(path) = std::env::var("PATH") {
+    // Always preserve PATH for process execution.
+    if let Some(path) = std::env::var_os("PATH") {
       cmd.env("PATH", path);
     }
-    if let Ok(home) = std::env::var("HOME") {
-      cmd.env("HOME", home);
+    // Preserve common home directory variables for git config/credentials.
+    for key in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
+      if let Some(val) = std::env::var_os(key) {
+        cmd.env(key, val);
+      }
+    }
+    // Preserve common auth-related variables so fetch/push work with SSH agents and askpass.
+    for key in [
+      "SSH_AUTH_SOCK",
+      "SSH_ASKPASS",
+      "DISPLAY",
+      "GIT_ASKPASS",
+      "GIT_SSH",
+      "GIT_SSH_COMMAND",
+      "GIT_TERMINAL_PROMPT",
+    ] {
+      if let Some(val) = std::env::var_os(key) {
+        cmd.env(key, val);
+      }
     }
 
     // Force safe behavior (override user config)
@@ -256,4 +274,66 @@ impl SystemGit {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+  use super::*;
+  use std::ffi::OsStr;
+  use std::sync::{Mutex, OnceLock};
+
+  static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+  fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+  }
+
+  fn command_has_env_value(cmd: &Command, key: &str, value: &str) -> bool {
+    cmd
+      .get_envs()
+      .any(|(k, v)| k == OsStr::new(key) && v == Some(OsStr::new(value)))
+  }
+
+  #[test]
+  fn test_git_cmd_preserves_ssh_auth_sock_when_set() {
+    let _guard = lock_env();
+    let key = "SSH_AUTH_SOCK";
+    let prev = std::env::var_os(key);
+
+    unsafe {
+      std::env::set_var(key, "cargo-rail-test-sock");
+    }
+    let git = SystemGit::open(Path::new(".")).unwrap();
+    let cmd = git.git_cmd();
+    assert!(command_has_env_value(&cmd, key, "cargo-rail-test-sock"));
+
+    match prev {
+      Some(v) => unsafe {
+        std::env::set_var(key, v);
+      },
+      None => unsafe {
+        std::env::remove_var(key);
+      },
+    }
+  }
+
+  #[test]
+  fn test_git_cmd_preserves_git_ssh_command_when_set() {
+    let _guard = lock_env();
+    let key = "GIT_SSH_COMMAND";
+    let prev = std::env::var_os(key);
+
+    unsafe {
+      std::env::set_var(key, "ssh -o BatchMode=yes");
+    }
+    let git = SystemGit::open(Path::new(".")).unwrap();
+    let cmd = git.git_cmd();
+    assert!(command_has_env_value(&cmd, key, "ssh -o BatchMode=yes"));
+
+    match prev {
+      Some(v) => unsafe {
+        std::env::set_var(key, v);
+      },
+      None => unsafe {
+        std::env::remove_var(key);
+      },
+    }
+  }
+}

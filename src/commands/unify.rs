@@ -30,6 +30,11 @@ pub fn run_unify_analyze(
 
   // Run analysis
   let plan = analyzer.analyze()?;
+  let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
+    workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
+  } else {
+    false
+  };
 
   // JSON output mode
   if json {
@@ -89,16 +94,49 @@ pub fn run_unify_analyze(
   }
 
   // Show diff if requested
-  if show_diff && (!plan.member_edits.is_empty() || !plan.workspace_deps.is_empty()) {
+  let has_changes = !plan.member_edits.is_empty()
+    || !plan.workspace_deps.is_empty()
+    || !plan.transitive_pins.is_empty()
+    || msrv_write_needed;
+  if show_diff && has_changes {
     println!("\nplanned changes:\n");
 
+    // Show MSRV update first (workspace manifest)
+    if let Some(msrv) = plan.computed_msrv.as_ref()
+      && msrv_write_needed
+    {
+      println!("[workspace.package]:");
+      println!(
+        "  rust-version = \"{}.{}.{}\"",
+        msrv.version.major, msrv.version.minor, msrv.version.patch
+      );
+      println!();
+    }
+
     // Show workspace deps that will be added
-    if !plan.workspace_deps.is_empty() {
+    if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() {
       println!("[workspace.dependencies]:");
       for dep in &plan.workspace_deps {
         println!("  + {} = \"{}\"", dep.name, dep.version_req);
         if !dep.features.is_empty() {
           let mut features = dep.features.clone();
+          features.sort();
+          println!(
+            "      features = [{}]",
+            features
+              .iter()
+              .map(|f| format!("\"{}\"", f))
+              .collect::<Vec<_>>()
+              .join(", ")
+          );
+        }
+      }
+
+      // Show transitive pins (also written to workspace.dependencies)
+      for pin in &plan.transitive_pins {
+        println!("  + {} = \"{}\"  # transitive pin", pin.name, pin.version);
+        if !pin.features.is_empty() {
+          let mut features = pin.features.clone();
           features.sort();
           println!(
             "      features = [{}]",
@@ -207,6 +245,9 @@ pub fn run_unify_analyze(
                 .join(", ")
             );
           }
+          crate::cargo::MemberEdit::EnforceMsrvInheritance => {
+            println!("  [package] rust-version = {{ workspace = true }}");
+          }
         }
       }
       println!();
@@ -233,9 +274,9 @@ pub fn run_unify_analyze(
     eprintln!();
     crate::error!("blocking issues prevent unification");
     return Err(RailError::message("blocking issues prevent unification"));
-  } else if !plan.workspace_deps.is_empty() || !plan.member_edits.is_empty() {
+  } else if has_changes {
     let total_edits: usize = plan.member_edits.values().map(|v| v.len()).sum();
-    if !plan.workspace_deps.is_empty() {
+    if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
       println!(
         "\nready: {} dependencies, {} member edits",
         plan.workspace_deps.len(),
@@ -267,6 +308,11 @@ pub fn run_unify_apply(
   let analyzer = UnifyAnalyzer::new(ctx)?;
 
   let plan = analyzer.analyze()?;
+  let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
+    workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
+  } else {
+    false
+  };
 
   // Check for blockers
   if plan.has_blocking_issues() {
@@ -279,7 +325,11 @@ pub fn run_unify_apply(
     return Err(crate::error::RailError::message("blocking issues prevent unification"));
   }
 
-  if plan.workspace_deps.is_empty() && plan.member_edits.is_empty() {
+  if plan.workspace_deps.is_empty()
+    && plan.member_edits.is_empty()
+    && plan.transitive_pins.is_empty()
+    && !msrv_write_needed
+  {
     println!("nothing to unify");
     return Ok(());
   }
@@ -298,8 +348,19 @@ pub fn run_unify_apply(
     }
 
     let mut files_to_backup = Vec::new();
-    if !plan.workspace_deps.is_empty() {
+    if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
       files_to_backup.push(PathBuf::from("Cargo.toml"));
+    }
+
+    // Transitive pins may also modify the configured host's Cargo.toml.
+    if !plan.transitive_pins.is_empty() {
+      let host_path = transitive_pins_host_manifest_path(ctx)?;
+      if let Ok(rel_path) = host_path.strip_prefix(ctx.workspace_root()) {
+        // Avoid duplicating root Cargo.toml when host is root.
+        if rel_path != std::path::Path::new("Cargo.toml") {
+          files_to_backup.push(rel_path.to_path_buf());
+        }
+      }
     }
 
     for member_name in plan.member_edits.keys() {
@@ -372,6 +433,9 @@ pub fn run_unify_apply(
         } => {
           writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
         }
+        crate::cargo::MemberEdit::EnforceMsrvInheritance => {
+          writer.enforce_member_msrv_inheritance(member_path)?;
+        }
       }
     }
   }
@@ -385,50 +449,13 @@ pub fn run_unify_apply(
     writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
 
     // Add to host's [dev-dependencies] with workspace = true
-    let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
-    let is_root_host = matches!(
-      transitive_host_setting,
-      None | Some(crate::config::TransitiveFeatureHost::Root)
-    );
-
-    // For virtual workspaces (no [package] section), we can't use the root as the transitive host
-    // because virtual manifests can't have [dev-dependencies]
-    if is_root_host && is_virtual_workspace(ctx.workspace_root()) {
-      // Auto-select first workspace member as the host
-      let members = ctx.graph.workspace_members();
-      if members.is_empty() {
-        return Err(RailError::with_help(
-          "transitive_host = \"root\" is incompatible with virtual workspaces".to_string(),
-          "Virtual workspaces cannot have [dev-dependencies]. Set transitive_host to a workspace member path in your rail.toml:\n  \
-           [unify]\n  \
-           transitive_host = \"crates/some-crate\"".to_string(),
-        ));
-      }
-
-      // Find a suitable member's path
-      let first_member = &members[0];
-      if let Some(pkg) = ctx.cargo.get_package(first_member) {
-        let member_path = pkg
-          .manifest_path
-          .parent()
-          .ok_or_else(|| RailError::message(format!("Invalid manifest path: {}", pkg.manifest_path)))?;
-        let relative_path = member_path.strip_prefix(ctx.workspace_root()).unwrap_or(member_path);
-        progress!(
-          "  note: using '{}' as transitive host (virtual workspace detected)",
-          relative_path
-        );
-        let host_path = member_path.join("Cargo.toml");
-        writer.add_transitive_pins(&host_path.into_std_path_buf(), &plan.transitive_pins)?;
-      } else {
-        return Err(RailError::message("Failed to find a suitable transitive host member"));
-      }
-    } else {
-      let host_path = match transitive_host_setting {
-        Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
-        _ => ctx.workspace_root().join("Cargo.toml"),
-      };
-      writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
+    let host_path = transitive_pins_host_manifest_path(ctx)?;
+    let host_dir = host_path.parent().unwrap_or(&host_path);
+    let relative_path = host_dir.strip_prefix(ctx.workspace_root()).unwrap_or(host_dir);
+    if relative_path != std::path::Path::new("") && host_path != ctx.workspace_root().join("Cargo.toml") {
+      progress!("  host: {}", relative_path.display());
     }
+    writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
   }
 
   if let Some(ref msrv) = plan.computed_msrv {
@@ -436,12 +463,15 @@ pub fn run_unify_apply(
     if let Some(ref warning) = msrv.warning {
       crate::warn!("{}", warning);
     }
-    progress!(
-      "writing rust-version = \"{}.{}\"...",
-      msrv.version.major,
-      msrv.version.minor
-    );
-    writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
+    if msrv_write_needed {
+      progress!(
+        "writing rust-version = \"{}.{}.{}\"...",
+        msrv.version.major,
+        msrv.version.minor,
+        msrv.version.patch
+      );
+      writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
+    }
   }
 
   if !no_report {
@@ -519,8 +549,8 @@ pub fn run_unify_apply(
       ),
     };
     println!(
-      "  rust-version = {}.{} ({})",
-      msrv.version.major, msrv.version.minor, source_desc
+      "  rust-version = {}.{}.{} ({})",
+      msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
     );
   }
 
@@ -714,4 +744,65 @@ fn is_virtual_workspace(workspace_root: &std::path::Path) -> bool {
 
   // A virtual workspace has [workspace] but no [package]
   doc.contains_key("workspace") && !doc.contains_key("package")
+}
+
+fn workspace_msrv_write_needed(workspace_root: &std::path::Path, msrv: &semver::Version) -> RailResult<bool> {
+  use std::fs;
+
+  let root_manifest = workspace_root.join("Cargo.toml");
+  let Ok(content) = fs::read_to_string(&root_manifest) else {
+    return Ok(true);
+  };
+  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+    return Ok(true);
+  };
+
+  let desired = format!("{}.{}.{}", msrv.major, msrv.minor, msrv.patch);
+  let current = doc
+    .get("workspace")
+    .and_then(|ws| ws.get("package"))
+    .and_then(|pkg| pkg.get("rust-version"))
+    .and_then(|v| v.as_str());
+
+  Ok(current != Some(desired.as_str()))
+}
+
+fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std::path::PathBuf> {
+  let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
+  let is_root_host = matches!(
+    transitive_host_setting,
+    None | Some(crate::config::TransitiveFeatureHost::Root)
+  );
+
+  // For virtual workspaces (no [package] section), we can't use the root as the transitive host
+  // because virtual manifests can't have [dev-dependencies].
+  if is_root_host && is_virtual_workspace(ctx.workspace_root()) {
+    // Auto-select first workspace member as the host
+    let members = ctx.graph.workspace_members();
+    if members.is_empty() {
+      return Err(RailError::with_help(
+        "transitive_host = \"root\" is incompatible with virtual workspaces".to_string(),
+        "Virtual workspaces cannot have [dev-dependencies]. Set transitive_host to a workspace member path in your rail.toml:\n  \
+           [unify]\n  \
+           transitive_host = \"crates/some-crate\""
+          .to_string(),
+      ));
+    }
+
+    let first_member = &members[0];
+    if let Some(pkg) = ctx.cargo.get_package(first_member) {
+      let member_path = pkg
+        .manifest_path
+        .parent()
+        .ok_or_else(|| RailError::message(format!("Invalid manifest path: {}", pkg.manifest_path)))?;
+      return Ok(member_path.join("Cargo.toml").into_std_path_buf());
+    }
+
+    return Err(RailError::message("Failed to find a suitable transitive host member"));
+  }
+
+  Ok(match transitive_host_setting {
+    Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
+    _ => ctx.workspace_root().join("Cargo.toml"),
+  })
 }
