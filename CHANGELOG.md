@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.1](https://github.com/loadingalias/cargo-rail/compare/v0.8.0...v0.8.1) - 2025-12-18
+
+### 📦 Other Changes
+
+- cargo-rail: reordering the schema/builder to keep 'msrv' cfg together. pinning actions; adjusting readme/docs ([32bd4f2](https://github.com/loadingalias/cargo-rail/commit/32bd4f27e89e3385a6c7f736c4b4159ac3eb5e6e))
+- cargo-rail: fix(unify): don’t fail --check when only optional features are reported (exit code fuckery) ([477c867](https://github.com/loadingalias/cargo-rail/commit/477c867a826e7d3e722a19b6c24d7f443d96962b))
+
+
+
 ## [0.8.0](https://github.com/loadingalias/cargo-rail/compare/v0.7.3...v0.8.0) - 2025-12-18
 
 ### 📦 Other Changes
