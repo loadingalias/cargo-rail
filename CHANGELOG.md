@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0](https://github.com/loadingalias/cargo-rail/compare/v0.8.1...v0.9.0) - 2026-02-03
+
+### 📦 Other Changes
+
+- cargo-rail - feat(cli): add --ignore-bin-crates to affected/test (#10) - fix(workspace): invalidate metadata cache on member manifest changes   (#9) - feat(unify): support -o/--output in --check mode (#1 for the   cargo-rail-action) - ci(release): publish SHA256SUMS and SHA256SUMS.json; drop macOS x86_64 [#9](https://github.com/loadingalias/cargo-rail/pull/9) [#10](https://github.com/loadingalias/cargo-rail/pull/10) ([e61c4b8](https://github.com/loadingalias/cargo-rail/commit/e61c4b830d5293b92a396be75e4d71d44452b414))
+- cargo-rail: bumping the serde-json crate (patch) ([5a0fc67](https://github.com/loadingalias/cargo-rail/commit/5a0fc6714204ae3481c3f295386441363652a538))
+
+
+
 ## [0.8.1](https://github.com/loadingalias/cargo-rail/compare/v0.8.0...v0.8.1) - 2025-12-18
 
 ### 📦 Other Changes
