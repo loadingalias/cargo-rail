@@ -30,6 +30,8 @@ pub struct AffectedOptions {
   pub format: OutputFormat,
   /// Show all workspace crates regardless of changes
   pub all: bool,
+  /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+  pub ignore_bin_crates: bool,
   /// Write output to file instead of stdout
   pub output: Option<PathBuf>,
   /// Show detailed explanation of why crates are affected
@@ -45,7 +47,7 @@ pub fn run_affected(ctx: &WorkspaceContext, opts: AffectedOptions) -> RailResult
 
   // If --all flag is set, show all workspace crates regardless of changes
   if opts.all {
-    return display_all_crates(ctx, opts.format, opts.output.as_ref());
+    return display_all_crates(ctx, opts.format, opts.ignore_bin_crates, opts.output.as_ref());
   }
 
   // Determine the base ref for change detection
@@ -78,18 +80,38 @@ pub fn run_affected(ctx: &WorkspaceContext, opts: AffectedOptions) -> RailResult
 
   // Explain mode: detailed breakdown of why crates are affected
   if opts.explain {
-    return display_explain(ctx, &changed_files, &analysis, &classification);
+    return display_explain(ctx, &changed_files, &analysis, &classification, opts.ignore_bin_crates);
   }
 
   // Output results
-  display_results(&analysis, &classification, opts.format, opts.output.as_ref())?;
+  let analysis = if opts.ignore_bin_crates {
+    filter_binary_only_crates(ctx, &analysis)
+  } else {
+    analysis
+  };
+
+  display_results(
+    &analysis,
+    &classification,
+    opts.format,
+    opts.ignore_bin_crates,
+    opts.output.as_ref(),
+  )?;
 
   Ok(())
 }
 
 /// Display all workspace crates (--all mode)
-fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file: Option<&PathBuf>) -> RailResult<()> {
-  let all_crates = ctx.graph.workspace_members();
+fn display_all_crates(
+  ctx: &WorkspaceContext,
+  format: OutputFormat,
+  ignore_bin_crates: bool,
+  output_file: Option<&PathBuf>,
+) -> RailResult<()> {
+  let mut all_crates: Vec<String> = ctx.graph.workspace_members().to_vec();
+  if ignore_bin_crates {
+    all_crates.retain(|c| !ctx.cargo.is_binary_only(c.as_str()));
+  }
 
   let output = match format {
     OutputFormat::Text => {
@@ -105,6 +127,7 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
       let output = json!({
           "command": "affected",
           "all": true,
+          "ignore_bin_crates": ignore_bin_crates,
           "crates": all_crates,
           "count": all_crates.len()
       });
@@ -112,12 +135,13 @@ fn display_all_crates(ctx: &WorkspaceContext, format: OutputFormat, output_file:
         .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?
     }
     OutputFormat::NamesOnly => all_crates.join("\n"),
-    OutputFormat::CargoArgs => format_cargo_args_list(all_crates),
+    OutputFormat::CargoArgs => format_cargo_args_list(&all_crates),
     OutputFormat::GitHub => {
       let test_matrix = serde_json::to_string(&all_crates)
         .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
       format!(
-        "docs_only=false\nrebuild_all=false\ntest_matrix={}\naffected_count={}\ncrates={}",
+        "docs_only=false\nrebuild_all=false\nignore_bin_crates={}\ntest_matrix={}\naffected_count={}\ncrates={}",
+        ignore_bin_crates,
         test_matrix,
         all_crates.len(),
         all_crates.join(" ")
@@ -150,6 +174,7 @@ fn display_explain(
   changed_files: &[PathBuf],
   analysis: &AffectedAnalysis,
   classification: &ChangeClassification,
+  ignore_bin_crates: bool,
 ) -> RailResult<()> {
   use std::collections::HashMap;
 
@@ -190,7 +215,42 @@ fn display_explain(
   println!();
 
   // Show direct crates with their changed files
-  let (direct, dependents, _) = get_sorted_analysis(analysis);
+  let (direct_all, dependents_all, _) = get_sorted_analysis(analysis);
+  let direct: Vec<String> = if ignore_bin_crates {
+    direct_all
+      .iter()
+      .filter(|c| !ctx.cargo.is_binary_only(c))
+      .cloned()
+      .collect()
+  } else {
+    direct_all.clone()
+  };
+  let dependents: Vec<String> = if ignore_bin_crates {
+    dependents_all
+      .iter()
+      .filter(|c| !ctx.cargo.is_binary_only(c))
+      .cloned()
+      .collect()
+  } else {
+    dependents_all.clone()
+  };
+
+  if ignore_bin_crates {
+    let ignored: Vec<String> = direct_all
+      .iter()
+      .chain(dependents_all.iter())
+      .filter(|c| ctx.cargo.is_binary_only(c))
+      .cloned()
+      .collect();
+
+    if !ignored.is_empty() {
+      println!("ignored binary-only crates ({}):", ignored.len());
+      for name in ignored {
+        println!("  {}", name);
+      }
+      println!();
+    }
+  }
 
   if !direct.is_empty() {
     println!("direct ({}):", direct.len());
@@ -241,6 +301,39 @@ fn display_explain(
   println!("test targets: {}", test_count);
 
   Ok(())
+}
+
+fn filter_binary_only_crates(ctx: &WorkspaceContext, analysis: &AffectedAnalysis) -> AffectedAnalysis {
+  let direct = analysis
+    .impact
+    .direct
+    .iter()
+    .filter(|c| !ctx.cargo.is_binary_only(c))
+    .cloned()
+    .collect();
+  let dependents = analysis
+    .impact
+    .dependents
+    .iter()
+    .filter(|c| !ctx.cargo.is_binary_only(c))
+    .cloned()
+    .collect();
+  let test_targets = analysis
+    .impact
+    .test_targets
+    .iter()
+    .filter(|c| !ctx.cargo.is_binary_only(c))
+    .cloned()
+    .collect();
+
+  AffectedAnalysis {
+    changed_files: analysis.changed_files.clone(),
+    impact: crate::graph::query::AffectedSet {
+      direct,
+      dependents,
+      test_targets,
+    },
+  }
 }
 
 /// Write output to stdout or file
@@ -295,16 +388,17 @@ fn display_results(
   analysis: &AffectedAnalysis,
   classification: &ChangeClassification,
   format: OutputFormat,
+  ignore_bin_crates: bool,
   output_file: Option<&PathBuf>,
 ) -> RailResult<()> {
   let output = match format {
     OutputFormat::Text => format_text(analysis, classification),
-    OutputFormat::Json => format_json(analysis, classification)?,
+    OutputFormat::Json => format_json(analysis, classification, ignore_bin_crates)?,
     OutputFormat::NamesOnly => format_names_only(analysis),
     OutputFormat::CargoArgs => format_cargo_args(analysis),
-    OutputFormat::GitHub => format_github(analysis, classification)?,
+    OutputFormat::GitHub => format_github(analysis, classification, ignore_bin_crates)?,
     OutputFormat::GitHubMatrix => format_github_matrix(analysis)?,
-    OutputFormat::JsonLines => format_jsonl(analysis, classification)?,
+    OutputFormat::JsonLines => format_jsonl(analysis, classification, ignore_bin_crates)?,
   };
 
   write_output(&output, output_file)
@@ -400,7 +494,11 @@ fn format_text(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
 }
 
 /// Format results in JSON format
-fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
+fn format_json(
+  analysis: &AffectedAnalysis,
+  classification: &ChangeClassification,
+  ignore_bin_crates: bool,
+) -> RailResult<String> {
   use serde_json::json;
 
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
@@ -408,6 +506,7 @@ fn format_json(analysis: &AffectedAnalysis, classification: &ChangeClassificatio
   // Include custom categories in JSON output
   let output = json!({
       "command": "affected",
+      "ignore_bin_crates": ignore_bin_crates,
       "changed_files": analysis.changed_files,
       "impact": {
           "direct": direct,
@@ -465,7 +564,11 @@ fn format_cargo_args_list(crates: &[String]) -> String {
 /// - Details: direct, transitive, changed_files_count
 /// - Infrastructure: infrastructure_files (JSON array)
 /// - Custom: custom_categories (JSON object)
-fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
+fn format_github(
+  analysis: &AffectedAnalysis,
+  classification: &ChangeClassification,
+  ignore_bin_crates: bool,
+) -> RailResult<String> {
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
 
   let test_matrix = serde_json::to_string(&test_targets)
@@ -480,6 +583,7 @@ fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassificat
   Ok(format!(
     "docs_only={}\n\
      rebuild_all={}\n\
+     ignore_bin_crates={}\n\
      test_matrix={}\n\
      affected_count={}\n\
      crates={}\n\
@@ -490,6 +594,7 @@ fn format_github(analysis: &AffectedAnalysis, classification: &ChangeClassificat
      custom_categories={}",
     classification.docs_only,
     classification.rebuild_all,
+    ignore_bin_crates,
     test_matrix,
     test_targets.len(),
     test_targets.join(" "),
@@ -515,7 +620,11 @@ fn format_github_matrix(analysis: &AffectedAnalysis) -> RailResult<String> {
 }
 
 /// Format JSON Lines output (one JSON object per line)
-fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassification) -> RailResult<String> {
+fn format_jsonl(
+  analysis: &AffectedAnalysis,
+  classification: &ChangeClassification,
+  ignore_bin_crates: bool,
+) -> RailResult<String> {
   use serde_json::json;
 
   let (direct, dependents, test_targets) = get_sorted_analysis(analysis);
@@ -524,6 +633,7 @@ fn format_jsonl(analysis: &AffectedAnalysis, classification: &ChangeClassificati
       "type": "metadata",
       "docs_only": classification.docs_only,
       "rebuild_all": classification.rebuild_all,
+      "ignore_bin_crates": ignore_bin_crates,
       "changed_files_count": analysis.changed_files.len(),
       "affected_count": test_targets.len()
   });

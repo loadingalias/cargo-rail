@@ -16,6 +16,8 @@ pub struct TestConfig {
   pub merge_base: bool,
   /// Skip change detection and run all tests
   pub all: bool,
+  /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+  pub ignore_bin_crates: bool,
   /// Explain why tests are being run
   pub explain: bool,
   /// Prefer cargo-nextest if available
@@ -84,12 +86,38 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
     (targets, Some(impact), rebuild_all)
   };
 
+  let mut test_targets = test_targets;
+  let mut ignored_binary_only: Vec<String> = Vec::new();
+
+  if config.ignore_bin_crates {
+    test_targets.retain(|c| {
+      let binary_only = ctx.cargo.is_binary_only(c);
+      if binary_only {
+        ignored_binary_only.push(c.clone());
+      }
+      !binary_only
+    });
+    ignored_binary_only.sort();
+  }
+
   if test_targets.is_empty() {
-    println!("no affected crates");
+    if config.ignore_bin_crates {
+      println!("no affected crates (after filtering binary-only crates)");
+    } else {
+      println!("no affected crates");
+    }
     return Ok(());
   }
 
   if config.explain {
+    if config.ignore_bin_crates && !ignored_binary_only.is_empty() {
+      println!("ignored binary-only crates: {}", ignored_binary_only.len());
+      for name in &ignored_binary_only {
+        println!("  {}", name);
+      }
+      println!();
+    }
+
     if let Some(ref impact) = impact {
       println!("changed files: {}", impact.changed_files.len());
       println!("rebuild: {}", if impact.requires_rebuild { "yes" } else { "no" });
@@ -119,15 +147,26 @@ pub fn run_test(ctx: &WorkspaceContext, config: TestConfig) -> RailResult<()> {
       }
       println!();
 
-      if !impact.direct_crates.is_empty() {
-        println!("direct: {}", impact.direct_crates.len());
-        for crate_name in &impact.direct_crates {
+      let direct: Vec<&String> = impact
+        .direct_crates
+        .iter()
+        .filter(|c| !config.ignore_bin_crates || !ctx.cargo.is_binary_only(c.as_str()))
+        .collect();
+      if !direct.is_empty() {
+        println!("direct: {}", direct.len());
+        for crate_name in direct {
           println!("  {}", crate_name);
         }
       }
-      if !impact.transitive_crates.is_empty() {
-        println!("transitive: {}", impact.transitive_crates.len());
-        for crate_name in &impact.transitive_crates {
+
+      let transitive: Vec<&String> = impact
+        .transitive_crates
+        .iter()
+        .filter(|c| !config.ignore_bin_crates || !ctx.cargo.is_binary_only(c.as_str()))
+        .collect();
+      if !transitive.is_empty() {
+        println!("transitive: {}", transitive.len());
+        for crate_name in transitive {
           println!("  {}", crate_name);
         }
       }

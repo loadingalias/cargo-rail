@@ -86,6 +86,9 @@ Options:
   -a, --all
           Show all workspace crates (ignore changes)
 
+      --ignore-bin-crates
+          Ignore binary-only crates (packages with [[bin]] but no lib target)
+
   -o, --output <PATH>
           Write output to file (appends to existing content)
 
@@ -103,6 +106,7 @@ Examples:
   cargo rail affected --merge-base        # Changes since branch point (CI recommended)
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
+  cargo rail affected --ignore-bin-crates # Skip binary-only crates (no lib target)
   cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
   cargo rail affected -f names-only       # Just crate names, one per line
@@ -140,6 +144,9 @@ Options:
   -a, --all
           Skip change detection and run all tests
 
+      --ignore-bin-crates
+          Ignore binary-only crates (packages with [[bin]] but no lib target)
+
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
@@ -162,6 +169,7 @@ Examples:
   cargo rail test                         # Test affected crates
   cargo rail test --merge-base            # Test changes since branch point (CI)
   cargo rail test --all                   # Test all crates
+  cargo rail test --ignore-bin-crates     # Skip binary-only crates (no lib target)
   cargo rail test -- --nocapture          # Pass args to test runner
   cargo rail test --explain               # Show why each crate is tested
 ```
@@ -198,11 +206,6 @@ Options:
           Possible values:
           - text:          Human-readable text output (default)
           - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
           
           [default: text]
 
@@ -217,6 +220,9 @@ Options:
 
       --report-path <REPORT_PATH>
           Custom path for the unify report (default: target/cargo-rail/unify-report.md)
+
+  -o, --output <PATH>
+          Write output to file (appends to existing content)
 
       --show-diff
           Show diff of changes to each manifest
@@ -233,6 +239,7 @@ Options:
 Examples:
   cargo rail unify --check                # Preview changes (CI mode)
   cargo rail unify --check --explain      # Show why each decision was made
+  cargo rail unify --check -f json -o out.json  # Write JSON output to file
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes

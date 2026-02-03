@@ -64,7 +64,7 @@ runs:
         # Shared prefix: stable across commits (invalidates on bump)
         shared-key: "cargo-rail-v1"
 
-        # Workflow and platform-specific suffix: commit-ubuntu-latest, commit-macos-latest, etc.
+        # Workflow and platform-specific suffix: commit-ubuntu-latest, commit-macos-14, etc.
         # Ensures each workflow and platform maintains separate cache
         key: ${{ inputs.cache-key }}
 

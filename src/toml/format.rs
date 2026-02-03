@@ -275,11 +275,10 @@ pub enum TargetTier {
 /// Classify a target triple into a tier
 pub fn classify_target_tier(target: &str) -> TargetTier {
   match target {
-    "x86_64-unknown-linux-gnu"
-    | "aarch64-unknown-linux-gnu"
-    | "x86_64-pc-windows-msvc"
-    | "x86_64-apple-darwin"
-    | "aarch64-apple-darwin" => TargetTier::Tier1,
+    "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" | "x86_64-pc-windows-msvc" | "aarch64-apple-darwin" => {
+      TargetTier::Tier1
+    }
+    "aarch64-pc-windows-msvc" => TargetTier::Tier2,
     t if t.contains("musl") || t.contains("wasm") => TargetTier::Tier2,
     _ => TargetTier::Other,
   }

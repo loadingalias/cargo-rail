@@ -272,7 +272,7 @@ mod tests {
 
   #[test]
   fn test_target_constraint_matches_unix() {
-    let targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"];
+    let targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"];
     assert!(target_constraint_matches_any("cfg(unix)", &targets));
     assert!(!target_constraint_matches_any("cfg(windows)", &targets));
   }

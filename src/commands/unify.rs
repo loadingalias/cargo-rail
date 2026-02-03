@@ -6,17 +6,86 @@
 //! 3. Intersection-based feature unification
 
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
-use crate::commands::common::OutputFormat;
+use crate::commands::common::UnifyOutputFormat;
 use crate::error::{RailError, RailResult};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
+use std::path::PathBuf;
+
+struct UnifyTextSink {
+  buffer: Option<String>,
+}
+
+impl UnifyTextSink {
+  fn new(capture: bool) -> Self {
+    Self {
+      buffer: capture.then_some(String::new()),
+    }
+  }
+
+  fn push_line(&mut self, args: std::fmt::Arguments<'_>) {
+    if let Some(ref mut buf) = self.buffer {
+      use std::fmt::Write as _;
+      let _ = buf.write_fmt(args);
+      buf.push('\n');
+    } else {
+      println!("{}", args);
+    }
+  }
+
+  fn finish(self) -> Option<String> {
+    self.buffer
+  }
+}
+
+macro_rules! outln {
+  ($sink:expr $(,)?) => {{
+    $sink.push_line(format_args!(""));
+  }};
+  ($sink:expr, $($arg:tt)*) => {{
+    $sink.push_line(format_args!($($arg)*));
+  }};
+}
+
+fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> {
+  use std::io::Write as _;
+
+  let needs_trailing_newline = !content.ends_with('\n');
+  match output_file {
+    Some(path) => {
+      let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
+      file
+        .write_all(content.as_bytes())
+        .map_err(|e| RailError::message(format!("failed to write '{}': {}", path.display(), e)))?;
+      if needs_trailing_newline {
+        file
+          .write_all(b"\n")
+          .map_err(|e| RailError::message(format!("failed to write '{}': {}", path.display(), e)))?;
+      }
+      progress!("output: {}", path.display());
+      Ok(())
+    }
+    None => {
+      print!("{}", content);
+      if needs_trailing_newline {
+        println!();
+      }
+      Ok(())
+    }
+  }
+}
 
 /// Analyze workspace dependencies (check mode)
 pub fn run_unify_analyze(
   ctx: &WorkspaceContext,
   show_diff: bool,
   explain: bool,
-  format: OutputFormat,
+  format: UnifyOutputFormat,
+  output: Option<&PathBuf>,
 ) -> RailResult<()> {
   let json = format.is_json();
 
@@ -36,11 +105,15 @@ pub fn run_unify_analyze(
     false
   };
 
-  // JSON output mode
+  let has_changes = plan.has_planned_changes(msrv_write_needed);
+
+  // JSON output mode (but still honor exit codes)
   if json {
-    let output = serde_json::json!({
+    let output_json = serde_json::json!({
       "command": "unify",
       "check": true,
+      "msrv_write_needed": msrv_write_needed,
+      "has_changes": has_changes,
       "workspace_deps": plan.workspace_deps.iter().map(|d| serde_json::json!({
         "name": d.name,
         "version": d.version_req,
@@ -63,62 +136,62 @@ pub fn run_unify_analyze(
         "severity": format!("{:?}", i.severity),
         "message": i.message,
       })).collect::<Vec<_>>(),
-      "duplicates_cleaned": plan.duplicates_cleaned.iter().map(|d| serde_json::json!({
-        "dep_name": d.dep_name,
-        "selected_version": d.selected_version,
-        "previous_versions": d.versions_found,
-      })).collect::<Vec<_>>(),
-      "pruned_features": plan.pruned_features.iter().map(|f| serde_json::json!({
-        "crate_name": f.crate_name,
-        "feature_name": f.feature_name,
-      })).collect::<Vec<_>>(),
-      "optional_features": plan.optional_features.iter().map(|f| serde_json::json!({
-        "crate_name": f.crate_name,
-        "feature_name": f.feature_name,
-        "enables": f.enables,
-      })).collect::<Vec<_>>(),
     });
-    println!(
-      "{}",
-      serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
-    );
+
+    let rendered =
+      serde_json::to_string_pretty(&output_json).map_err(|e| RailError::message(format!("JSON error: {}", e)))?;
+    write_output(&rendered, output)?;
+
+    if plan.has_blocking_issues() {
+      return Err(RailError::message("blocking issues prevent unification"));
+    }
+    if has_changes {
+      return Err(RailError::CheckHasPendingChanges);
+    }
     return Ok(());
   }
 
+  let mut sink = UnifyTextSink::new(output.is_some());
+
   // Display summary
-  println!("{}", plan.summary());
+  outln!(sink, "{}", plan.summary());
 
   // Show explain output if requested
   if explain {
-    display_explain(&plan);
+    display_explain(&mut sink, &plan);
   }
 
   // Show diff if requested
-  let has_changes = plan.has_planned_changes(msrv_write_needed);
   if show_diff && has_changes {
-    println!("\nplanned changes:\n");
+    outln!(sink);
+    outln!(sink, "planned changes:");
+    outln!(sink);
 
     // Show MSRV update first (workspace manifest)
     if let Some(msrv) = plan.computed_msrv.as_ref()
       && msrv_write_needed
     {
-      println!("[workspace.package]:");
-      println!(
+      outln!(sink, "[workspace.package]:");
+      outln!(
+        sink,
         "  rust-version = \"{}.{}.{}\"",
-        msrv.version.major, msrv.version.minor, msrv.version.patch
+        msrv.version.major,
+        msrv.version.minor,
+        msrv.version.patch
       );
-      println!();
+      outln!(sink);
     }
 
     // Show workspace deps that will be added
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() {
-      println!("[workspace.dependencies]:");
+      outln!(sink, "[workspace.dependencies]:");
       for dep in &plan.workspace_deps {
-        println!("  + {} = \"{}\"", dep.name, dep.version_req);
+        outln!(sink, "  + {} = \"{}\"", dep.name, dep.version_req);
         if !dep.features.is_empty() {
           let mut features = dep.features.clone();
           features.sort();
-          println!(
+          outln!(
+            sink,
             "      features = [{}]",
             features
               .iter()
@@ -131,11 +204,12 @@ pub fn run_unify_analyze(
 
       // Show transitive pins (also written to workspace.dependencies)
       for pin in &plan.transitive_pins {
-        println!("  + {} = \"{}\"  # transitive pin", pin.name, pin.version);
+        outln!(sink, "  + {} = \"{}\"  # transitive pin", pin.name, pin.version);
         if !pin.features.is_empty() {
           let mut features = pin.features.clone();
           features.sort();
-          println!(
+          outln!(
+            sink,
             "      features = [{}]",
             features
               .iter()
@@ -145,7 +219,7 @@ pub fn run_unify_analyze(
           );
         }
       }
-      println!();
+      outln!(sink);
     }
 
     // Show member edits
@@ -161,7 +235,7 @@ pub fn run_unify_analyze(
         .get(member)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| member.clone());
-      println!("{}:", path);
+      outln!(sink, "{}:", path);
       for edit in edits {
         match edit {
           crate::cargo::MemberEdit::UseWorkspace {
@@ -195,7 +269,7 @@ pub fn run_unify_analyze(
             if *is_optional {
               line.push_str(", optional = true");
             }
-            println!("{}", line);
+            outln!(sink, "{}", line);
           }
           crate::cargo::MemberEdit::RemoveDep {
             dep_name,
@@ -210,10 +284,10 @@ pub fn run_unify_analyze(
               (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
               (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
             };
-            println!("  {} {} -> REMOVE (unused)", section, dep_name);
+            outln!(sink, "  {} {} -> REMOVE (unused)", section, dep_name);
           }
           crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
-            println!("  [features] {} -> REMOVE (dead/empty)", feature_name);
+            outln!(sink, "  [features] {} -> REMOVE (dead/empty)", feature_name);
           }
           crate::cargo::MemberEdit::AddFeatures {
             dep_name,
@@ -231,7 +305,8 @@ pub fn run_unify_analyze(
             };
             let mut sorted_features = features_to_add.clone();
             sorted_features.sort();
-            println!(
+            outln!(
+              sink,
               "  {} {} -> ADD features [{}]",
               section,
               dep_name,
@@ -243,11 +318,11 @@ pub fn run_unify_analyze(
             );
           }
           crate::cargo::MemberEdit::EnforceMsrvInheritance => {
-            println!("  [package] rust-version = {{ workspace = true }}");
+            outln!(sink, "  [package] rust-version = {{ workspace = true }}");
           }
         }
       }
-      println!();
+      outln!(sink);
     }
   }
 
@@ -270,22 +345,38 @@ pub fn run_unify_analyze(
   if plan.has_blocking_issues() {
     eprintln!();
     crate::error!("blocking issues prevent unification");
+    if let Some(content) = sink.finish() {
+      write_output(&content, output)?;
+    }
     return Err(RailError::message("blocking issues prevent unification"));
   } else if has_changes {
     let total_edits = plan.member_edit_count();
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
-      println!(
+      outln!(
+        sink,
         "\nready: {} dependencies, {} member edits",
         plan.workspace_deps.len(),
         total_edits
       );
     } else {
-      println!("\nready: {} members, {} edits", plan.member_edits.len(), total_edits);
+      outln!(
+        sink,
+        "\nready: {} members, {} edits",
+        plan.member_edits.len(),
+        total_edits
+      );
     }
-    println!("Changes detected. Run without --check to apply.");
+    outln!(sink, "Changes detected. Run without --check to apply.");
+    if let Some(content) = sink.finish() {
+      write_output(&content, output)?;
+    }
     return Err(RailError::CheckHasPendingChanges);
   } else {
-    println!("\nno unification opportunities found");
+    outln!(sink, "\nno unification opportunities found");
+  }
+
+  if let Some(content) = sink.finish() {
+    write_output(&content, output)?;
   }
 
   Ok(())
@@ -603,75 +694,82 @@ pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: O
 }
 
 /// Display detailed explanation of unification decisions
-fn display_explain(plan: &crate::cargo::UnificationPlan) {
+fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPlan) {
   use std::collections::BTreeMap;
 
-  println!("\n=== Explanation ===\n");
+  outln!(sink);
+  outln!(sink, "=== Explanation ===");
+  outln!(sink);
 
   // Explain dependencies being unified
   if !plan.workspace_deps.is_empty() {
-    println!("Dependencies unified to [workspace.dependencies]:\n");
+    outln!(sink, "Dependencies unified to [workspace.dependencies]:");
+    outln!(sink);
     for dep in &plan.workspace_deps {
-      println!("  {} = \"{}\"", dep.name, dep.version_req);
-      println!("    reason: used by {} workspace member(s)", dep.used_by.len());
+      outln!(sink, "  {} = \"{}\"", dep.name, dep.version_req);
+      outln!(sink, "    reason: used by {} workspace member(s)", dep.used_by.len());
       if dep.used_by.len() <= 5 {
         for member in &dep.used_by {
-          println!("      - {}", member);
+          outln!(sink, "      - {}", member);
         }
       } else {
         for member in dep.used_by.iter().take(3) {
-          println!("      - {}", member);
+          outln!(sink, "      - {}", member);
         }
-        println!("      ... and {} more", dep.used_by.len() - 3);
+        outln!(sink, "      ... and {} more", dep.used_by.len() - 3);
       }
       if !dep.features.is_empty() {
-        println!("    features: union of features from all uses");
+        outln!(sink, "    features: union of features from all uses");
         let mut sorted_features = dep.features.clone();
         sorted_features.sort();
-        println!("      [{}]", sorted_features.join(", "));
+        outln!(sink, "      [{}]", sorted_features.join(", "));
       }
-      println!();
+      outln!(sink);
     }
   }
 
   // Explain transitive pins
   if !plan.transitive_pins.is_empty() {
-    println!("Transitive dependencies pinned:\n");
+    outln!(sink, "Transitive dependencies pinned:");
+    outln!(sink);
     for pin in &plan.transitive_pins {
-      println!("  {} = \"{}\"", pin.name, pin.version);
-      println!("    reason: transitive dep with target-specific features");
+      outln!(sink, "  {} = \"{}\"", pin.name, pin.version);
+      outln!(sink, "    reason: transitive dep with target-specific features");
       if !pin.features.is_empty() {
         let mut sorted = pin.features.clone();
         sorted.sort();
-        println!("    features: [{}]", sorted.join(", "));
+        outln!(sink, "    features: [{}]", sorted.join(", "));
       }
-      println!();
+      outln!(sink);
     }
   }
 
   // Explain unused deps being removed
   if !plan.unused_deps.is_empty() {
-    println!("Unused dependencies flagged for removal:\n");
+    outln!(sink, "Unused dependencies flagged for removal:");
+    outln!(sink);
     for unused in &plan.unused_deps {
-      println!("  {} in {}", unused.dep_name, unused.member);
-      println!("    reason: {:?}", unused.reason);
-      println!();
+      outln!(sink, "  {} in {}", unused.dep_name, unused.member);
+      outln!(sink, "    reason: {:?}", unused.reason);
+      outln!(sink);
     }
   }
 
   // Explain pruned features
   if !plan.pruned_features.is_empty() {
-    println!("Dead features pruned:\n");
+    outln!(sink, "Dead features pruned:");
+    outln!(sink);
     for pruned in &plan.pruned_features {
-      println!("  [features].{} in {}", pruned.feature_name, pruned.crate_name);
-      println!("    reason: empty feature (no dependencies, no sub-features)");
-      println!();
+      outln!(sink, "  [features].{} in {}", pruned.feature_name, pruned.crate_name);
+      outln!(sink, "    reason: empty feature (no dependencies, no sub-features)");
+      outln!(sink);
     }
   }
 
   // Explain issues/blockers
   if !plan.issues.is_empty() {
-    println!("Issues detected:\n");
+    outln!(sink, "Issues detected:");
+    outln!(sink);
 
     // Group by severity
     let mut by_severity: BTreeMap<String, Vec<_>> = BTreeMap::new();
@@ -681,25 +779,29 @@ fn display_explain(plan: &crate::cargo::UnificationPlan) {
     }
 
     for (severity, issues) in &by_severity {
-      println!("  {} ({}):", severity, issues.len());
+      outln!(sink, "  {} ({}):", severity, issues.len());
       for issue in issues {
-        println!("    {}: {}", issue.dep_name, issue.message);
+        outln!(sink, "    {}: {}", issue.dep_name, issue.message);
       }
-      println!();
+      outln!(sink);
     }
   }
 
   // Explain undeclared features
   if !plan.undeclared_features.is_empty() {
-    println!("Undeclared features detected:\n");
+    outln!(sink, "Undeclared features detected:");
+    outln!(sink);
     for uf in &plan.undeclared_features {
-      println!("  {} in {}", uf.dep_name, uf.member);
-      println!("    undeclared: [{}]", uf.undeclared_features.join(", "));
+      outln!(sink, "  {} in {}", uf.dep_name, uf.member);
+      outln!(sink, "    undeclared: [{}]", uf.undeclared_features.join(", "));
       if !uf.borrowed_from.is_empty() {
-        println!("    borrowed from: {}", uf.borrowed_from.join(", "));
+        outln!(sink, "    borrowed from: {}", uf.borrowed_from.join(", "));
       }
-      println!("    reason: features enabled via resolver but not declared in Cargo.toml");
-      println!();
+      outln!(
+        sink,
+        "    reason: features enabled via resolver but not declared in Cargo.toml"
+      );
+      outln!(sink);
     }
   }
 
@@ -709,13 +811,14 @@ fn display_explain(plan: &crate::cargo::UnificationPlan) {
     && plan.transitive_pins.is_empty()
     && plan.unused_deps.is_empty()
   {
-    println!("No unification opportunities found.\n");
-    println!("Possible reasons:");
-    println!("  - Dependencies are already unified");
-    println!("  - Dependencies have incompatible versions (see issues above)");
-    println!("  - Dependencies are excluded via [unify].exclude config");
-    println!("  - Dependencies are renamed (use include_renamed = true)");
-    println!("  - Single-use dependencies (not shared across crates)");
+    outln!(sink, "No unification opportunities found.");
+    outln!(sink);
+    outln!(sink, "Possible reasons:");
+    outln!(sink, "  - Dependencies are already unified");
+    outln!(sink, "  - Dependencies have incompatible versions (see issues above)");
+    outln!(sink, "  - Dependencies are excluded via [unify].exclude config");
+    outln!(sink, "  - Dependencies are renamed (use include_renamed = true)");
+    outln!(sink, "  - Single-use dependencies (not shared across crates)");
   }
 }
 

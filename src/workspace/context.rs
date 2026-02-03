@@ -60,7 +60,7 @@ pub struct CargoState {
 
 /// Cache version - increment when MetadataCache format changes
 /// This ensures old cache files are automatically invalidated
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// Metadata cache structure
 #[derive(Serialize, Deserialize)]
@@ -68,7 +68,7 @@ struct MetadataCache {
   /// Cache format version - used to invalidate on schema changes
   #[serde(default)]
   version: u32,
-  /// FNV-1a hash of Cargo.toml + Cargo.lock
+  /// FNV-1a hash of Cargo.toml + Cargo.lock + all workspace member Cargo.toml manifests
   hash: u64,
   /// Cached metadata
   metadata: Metadata,
@@ -77,25 +77,21 @@ struct MetadataCache {
 impl CargoState {
   /// Load cargo metadata from workspace root
   ///
-  /// Uses a content-based cache (FNV-1a hash of Cargo.toml + Cargo.lock)
-  /// stored in `target/rail/metadata.json` to speed up subsequent loads.
+  /// Uses a content-based cache (FNV-1a hash of workspace Cargo.toml/Cargo.lock + all workspace member Cargo.toml)
+  /// stored in `target/cargo-rail/metadata.json` to speed up subsequent loads.
   fn load(workspace_root: &Path) -> RailResult<Self> {
     let cache_dir = workspace_root.join("target").join("cargo-rail");
     let cache_file = cache_dir.join("metadata.json");
 
-    // Compute current hash
-    let current_hash = compute_workspace_hash(workspace_root);
-
     // Try to load from cache
     // Cache is valid only if:
     // 1. Version matches (cache format unchanged)
-    // 2. Hash matches (Cargo.toml + Cargo.lock unchanged)
+    // 2. Hash matches (workspace + member manifests unchanged)
     // 3. Workspace root path matches (repo hasn't been moved/copied)
     if let Some(cache) = fs::read_to_string(&cache_file)
       .ok()
       .and_then(|s| serde_json::from_str::<MetadataCache>(&s).ok())
       && cache.version == CACHE_VERSION
-      && cache.hash == current_hash
     {
       // Validate workspace root path matches current location
       // This handles the case where a repo is copied/moved to a different path
@@ -106,10 +102,13 @@ impl CargoState {
       let cached_root_canonical = cached_root.canonicalize().unwrap_or_else(|_| cached_root.to_path_buf());
 
       if current_root_canonical == cached_root_canonical {
-        // Cache hit - use cached metadata
-        return Ok(Self::from_metadata(cache.metadata));
+        let current_hash = compute_workspace_hash_with_members(workspace_root, &cache.metadata);
+        if cache.hash == current_hash {
+          // Cache hit - use cached metadata
+          return Ok(Self::from_metadata(cache.metadata));
+        }
       }
-      // Path mismatch - cache is stale, will reload below
+      // Hash mismatch or path mismatch - cache is stale, will reload below
     }
 
     // Cache miss or mismatch - load fresh metadata
@@ -119,12 +118,26 @@ impl CargoState {
 
     // Save to cache
     if let Ok(()) = fs::create_dir_all(&cache_dir) {
+      let current_hash = compute_workspace_hash_with_members(workspace_root, &metadata);
       let cache = MetadataCache {
         version: CACHE_VERSION,
         hash: current_hash,
         metadata: metadata.clone(),
       };
-      let _ = fs::write(&cache_file, serde_json::to_string(&cache).unwrap_or_default());
+      match serde_json::to_string(&cache) {
+        Ok(json) => {
+          if let Err(e) = fs::write(&cache_file, json) {
+            crate::warn!("failed to write metadata cache {}: {}", cache_file.display(), e);
+          }
+        }
+        Err(e) => {
+          crate::warn!(
+            "failed to serialize metadata cache {}: {} (proceeding without cache)",
+            cache_file.display(),
+            e
+          );
+        }
+      }
     }
 
     Ok(Self::from_metadata(metadata))
@@ -213,43 +226,80 @@ impl CargoState {
     // - Some(["crates-io"]) = can publish to listed registries
     package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true)
   }
+
+  /// Check if a workspace member is binary-only (has `[[bin]]` targets but no library target).
+  ///
+  /// This is used by commands like `affected` and `test` to optionally skip crates
+  /// that can't be selected by `cargo test -p <crate>` (no library target).
+  pub fn is_binary_only(&self, crate_name: &str) -> bool {
+    let Some(pkg) = self.get_package(crate_name) else {
+      return false;
+    };
+
+    let mut has_bin = false;
+    let mut has_lib_like = false;
+
+    for target in &pkg.targets {
+      for kind in &target.kind {
+        match kind {
+          cargo_metadata::TargetKind::Bin => has_bin = true,
+          cargo_metadata::TargetKind::Lib | cargo_metadata::TargetKind::ProcMacro => has_lib_like = true,
+          _ => {}
+        }
+      }
+    }
+
+    has_bin && !has_lib_like
+  }
 }
 
 /// Compute a content-based hash of workspace manifests
 ///
-/// Uses FNV-1a hash of Cargo.toml + Cargo.lock to detect changes
-fn compute_workspace_hash(workspace_root: &Path) -> u64 {
+/// Uses FNV-1a hash of workspace Cargo.toml/Cargo.lock plus all workspace member Cargo.toml
+/// manifests to detect changes that invalidate cached cargo metadata.
+fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadata) -> u64 {
   const FNV_PRIME: u64 = 0x100000001b3;
   const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 
   let mut hash = FNV_OFFSET_BASIS;
 
-  // Hash Cargo.toml
-  if let Ok(mut file) = fs::File::open(workspace_root.join("Cargo.toml")) {
+  fn hash_file(hash: &mut u64, path: &Path, fnv_prime: u64) {
+    let Ok(mut file) = fs::File::open(path) else {
+      // If the file doesn't exist or can't be opened, still mix in a marker so the hash
+      // is very unlikely to match a previous state where it was readable.
+      // This avoids "accidental cache hit" if a file becomes unreadable.
+      *hash ^= 0xff;
+      *hash = hash.wrapping_mul(fnv_prime);
+      return;
+    };
+
     let mut buffer = [0; 8192];
     while let Ok(n) = file.read(&mut buffer) {
       if n == 0 {
         break;
       }
       for byte in &buffer[..n] {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+        *hash ^= *byte as u64;
+        *hash = hash.wrapping_mul(fnv_prime);
       }
     }
   }
 
-  // Hash Cargo.lock if it exists
-  if let Ok(mut file) = fs::File::open(workspace_root.join("Cargo.lock")) {
-    let mut buffer = [0; 8192];
-    while let Ok(n) = file.read(&mut buffer) {
-      if n == 0 {
-        break;
-      }
-      for byte in &buffer[..n] {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-      }
-    }
+  // Hash workspace root Cargo.toml and Cargo.lock (if present)
+  hash_file(&mut hash, &workspace_root.join("Cargo.toml"), FNV_PRIME);
+  hash_file(&mut hash, &workspace_root.join("Cargo.lock"), FNV_PRIME);
+
+  // Hash all workspace member manifests (sorted for determinism)
+  let mut member_manifests: Vec<PathBuf> = metadata
+    .workspace_packages()
+    .iter()
+    .map(|p| p.manifest_path.as_std_path().to_path_buf())
+    .collect();
+
+  member_manifests.sort_unstable_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+
+  for manifest_path in member_manifests {
+    hash_file(&mut hash, &manifest_path, FNV_PRIME);
   }
 
   hash

@@ -5,7 +5,7 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::OutputFormat;
+use super::common::{OutputFormat, UnifyOutputFormat};
 use crate::sync::ConflictStrategy;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -72,6 +72,7 @@ Examples:
   cargo rail affected --merge-base        # Changes since branch point (CI recommended)
   cargo rail affected --since HEAD~5      # Changes in last 5 commits
   cargo rail affected --from abc --to def # Changes between two SHAs
+  cargo rail affected --ignore-bin-crates # Skip binary-only crates (no lib target)
   cargo rail affected --explain           # Show why each crate is affected
   cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
   cargo rail affected -f names-only       # Just crate names, one per line
@@ -84,6 +85,7 @@ Examples:
   cargo rail test                         # Test affected crates
   cargo rail test --merge-base            # Test changes since branch point (CI)
   cargo rail test --all                   # Test all crates
+  cargo rail test --ignore-bin-crates     # Skip binary-only crates (no lib target)
   cargo rail test -- --nocapture          # Pass args to test runner
   cargo rail test --explain               # Show why each crate is tested";
 
@@ -91,6 +93,7 @@ const UNIFY_HELP: &str = "\
 Examples:
   cargo rail unify --check                # Preview changes (CI mode)
   cargo rail unify --check --explain      # Show why each decision was made
+  cargo rail unify --check -f json -o out.json  # Write JSON output to file
   cargo rail unify                        # Apply changes
   cargo rail unify --backup               # Apply with backup
   cargo rail unify --show-diff            # Show manifest changes
@@ -200,6 +203,9 @@ pub enum Commands {
     /// Show all workspace crates (ignore changes)
     #[arg(long, short = 'a')]
     all: bool,
+    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+    #[arg(long)]
+    ignore_bin_crates: bool,
     /// Write output to file (appends to existing content)
     #[arg(long, short = 'o', value_name = "PATH")]
     output: Option<PathBuf>,
@@ -220,6 +226,9 @@ pub enum Commands {
     /// Skip change detection and run all tests
     #[arg(long, short = 'a')]
     all: bool,
+    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+    #[arg(long)]
+    ignore_bin_crates: bool,
     /// Disable automatic use of cargo-nextest
     #[arg(long)]
     skip_nextest: bool,
@@ -242,7 +251,7 @@ pub enum Commands {
     check: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: UnifyOutputFormat,
     /// Create backups of all modified files
     #[arg(long)]
     backup: bool,
@@ -252,6 +261,9 @@ pub enum Commands {
     /// Custom path for the unify report (default: target/cargo-rail/unify-report.md)
     #[arg(long)]
     report_path: Option<PathBuf>,
+    /// Write output to file (appends to existing content)
+    #[arg(long, short = 'o', value_name = "PATH", requires = "check")]
+    output: Option<PathBuf>,
     /// Show diff of changes to each manifest
     #[arg(long)]
     show_diff: bool,
@@ -537,10 +549,10 @@ impl Commands {
   /// Used for early JSON mode detection to suppress progress messages.
   pub fn is_json_format(&self) -> bool {
     match self {
-      Commands::Affected { format, .. }
-      | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. }
-      | Commands::Clean { format, .. } => format.is_json_like(),
+      Commands::Affected { format, .. } | Commands::Sync { format, .. } | Commands::Clean { format, .. } => {
+        format.is_json_like()
+      }
+      Commands::Unify { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
         SplitCommand::Run { format, .. } => format.is_json_like(),
@@ -562,10 +574,10 @@ impl Commands {
   /// Apply global --json flag by overriding format to Json
   pub fn apply_json_override(&mut self) {
     match self {
-      Commands::Affected { format, .. }
-      | Commands::Unify { format, .. }
-      | Commands::Sync { format, .. }
-      | Commands::Clean { format, .. } => *format = OutputFormat::Json,
+      Commands::Affected { format, .. } | Commands::Sync { format, .. } | Commands::Clean { format, .. } => {
+        *format = OutputFormat::Json
+      }
+      Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },
       } => *format = OutputFormat::Json,

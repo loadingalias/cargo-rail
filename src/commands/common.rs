@@ -50,6 +50,31 @@ impl OutputFormat {
   }
 }
 
+/// Output format for `cargo rail unify`.
+///
+/// `unify` currently supports only text and JSON output. Unlike commands such as `affected`,
+/// it does not produce list-like formats (cargo-args, github, jsonl, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum UnifyOutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+}
+
+impl UnifyOutputFormat {
+  /// Check if this format is JSON
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+
+  /// Check if this format is a JSON-like structured format
+  pub fn is_json_like(&self) -> bool {
+    self.is_json()
+  }
+}
+
 /// Builder for split/sync configurations
 ///
 /// Centralizes the logic for selecting crates (by name, --all, etc.)

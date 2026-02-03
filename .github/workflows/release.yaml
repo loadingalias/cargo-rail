@@ -3,6 +3,8 @@
 # Triggered by pushing a version tag (v0.1.0, v1.0.0, etc.)
 #
 # This workflow builds pre-built binaries and uploads them to GitHub Releases.
+# It also publishes `SHA256SUMS` and `SHA256SUMS.json` so downstream packagers can
+# verify assets without downloading everything just to compute hashes.
 # The version bump, changelog, tagging, and crates.io publish are done locally
 # via `cargo rail release run cargo-rail --bump <version>`.
 #
@@ -130,3 +132,72 @@ jobs:
           tar: all
           zip: windows
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # Job 3: Publish SHA256SUMS for release assets
+  # ==========================================================================
+  publish-checksums:
+    name: Publish SHA256SUMS
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Only include platform archives produced by the release workflow.
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "cargo-rail-*.tar.*"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "cargo-rail-*.zip" || true
+
+          shopt -s nullglob
+          files=(cargo-rail-*.tar.* cargo-rail-*.zip)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No matching release assets found to checksum." >&2
+            exit 1
+          fi
+
+      - name: Generate SHA256SUMS and SHA256SUMS.json
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=(cargo-rail-*.tar.* cargo-rail-*.zip)
+          sha256sum "${files[@]}" | sort -k2 > SHA256SUMS
+
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import time
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          lines = pathlib.Path("SHA256SUMS").read_text().splitlines()
+          entries = []
+          for line in lines:
+            line = line.strip()
+            if not line:
+              continue
+            # sha256sum format: "<hash>  <filename>"
+            digest, filename = line.split(maxsplit=1)
+            filename = filename.lstrip("*").strip()
+            entries.append({"file": filename, "sha256": digest})
+
+          payload = {
+            "tool": "cargo-rail",
+            "tag": tag,
+            "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "entries": entries,
+          }
+          pathlib.Path("SHA256SUMS.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Upload checksum assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" SHA256SUMS SHA256SUMS.json --clobber

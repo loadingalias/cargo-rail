@@ -156,6 +156,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       merge_base,
       format,
       all,
+      ignore_bin_crates,
       output,
       explain,
     } => run_affected(
@@ -167,6 +168,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         merge_base,
         format,
         all,
+        ignore_bin_crates,
         output,
         explain,
       },
@@ -176,6 +178,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       since,
       merge_base,
       all,
+      ignore_bin_crates,
       skip_nextest,
       explain,
       test_args,
@@ -184,6 +187,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         since,
         merge_base,
         all,
+        ignore_bin_crates,
         explain,
         prefer_nextest: !skip_nextest,
         test_args,
@@ -202,6 +206,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       backup,
       skip_report,
       report_path,
+      output,
       show_diff,
       explain,
     } => {
@@ -209,7 +214,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       if command.is_some() {
         unreachable!("Undo subcommand should be handled before dispatch")
       } else if check {
-        run_unify_analyze(ctx, show_diff, explain, format)
+        run_unify_analyze(ctx, show_diff, explain, format, output.as_ref())
       } else {
         run_unify_apply(ctx, backup, skip_report, report_path)
       }
