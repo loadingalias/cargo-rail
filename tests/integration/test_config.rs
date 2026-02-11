@@ -207,6 +207,37 @@ fn test_config_validate_valid_config() -> Result<()> {
 }
 
 #[test]
+fn test_config_validate_strict_accepts_sort_dependencies() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-strict-sort-deps")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"targets = ["x86_64-unknown-linux-gnu"]
+
+[unify]
+sort_dependencies = true
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+  assert!(
+    output.status.success(),
+    "strict config validation should accept unify.sort_dependencies"
+  );
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], true);
+  assert_eq!(json["errors"], serde_json::Value::Array(vec![]));
+  assert_eq!(json["warnings"], serde_json::Value::Array(vec![]));
+
+  Ok(())
+}
+
+#[test]
 fn test_config_validate_no_config() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-no-config")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;

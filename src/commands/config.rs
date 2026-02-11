@@ -110,6 +110,7 @@ const KNOWN_UNIFY_KEYS: &[&str] = &[
   "fix_undeclared_features",
   "skip_undeclared_patterns",
   "max_backups",
+  "sort_dependencies",
 ];
 
 /// Known keys in [release] section
@@ -876,5 +877,21 @@ fn print_sync_applied(config_path: &Path, fields_added: &[FieldChange], targets:
     } else {
       println!("targets: in sync ({} targets)", t.total);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_known_unify_keys_match_schema_fields() {
+    let known: BTreeSet<&str> = KNOWN_UNIFY_KEYS.iter().copied().collect();
+    let from_schema: BTreeSet<&str> = schema::fields_for_section("unify").map(|field| field.key).collect();
+
+    assert_eq!(
+      known, from_schema,
+      "KNOWN_UNIFY_KEYS must stay in sync with schema::SYNCABLE_FIELDS for [unify]"
+    );
   }
 }

@@ -8,6 +8,10 @@ Thumbs.db
 # Claude
 .claude
 
+# Codex
+.agents
+AGENTS.md
+
 # Zed
 .zed
 
@@ -20,4 +24,3 @@ notes/
 **/demo.cast
 distribution/
 todo.md
-AGENTS.md
