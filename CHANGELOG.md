@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/loadingalias/cargo-rail/compare/v0.9.0...v0.9.1) - 2026-02-10
+
+### 📦 Other Changes
+
+- rscrypto: fixing the formatting gaps and patching the 'config validate --strict' gap around sorted deps. ([6afc371](https://github.com/loadingalias/cargo-rail/commit/6afc371477690f8e559a95ea8af33697f94a7c1e))
+
+
+
 ## [0.9.0](https://github.com/loadingalias/cargo-rail/compare/v0.8.1...v0.9.0) - 2026-02-03
 
 ### 📦 Other Changes
