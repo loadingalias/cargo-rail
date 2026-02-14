@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.0](https://github.com/loadingalias/cargo-rail/compare/v0.9.1...v0.10.0) - 2026-02-14
+
+### ⚠️ BREAKING CHANGES
+
+- [**breaking**] replace affected/test with plan/run system ([3ca7fe8](https://github.com/loadingalias/cargo-rail/commit/3ca7fe8529c3dbb26c85cb19d6f95e518e7db10e))
+
+
+
 ## [0.9.1](https://github.com/loadingalias/cargo-rail/compare/v0.9.0...v0.9.1) - 2026-02-10
 
 ### 📦 Other Changes
