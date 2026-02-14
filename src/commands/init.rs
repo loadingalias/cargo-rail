@@ -39,6 +39,7 @@ fn build_rail_config(targets: Vec<String>) -> RailConfig {
     unify: default_unify_config(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
+    run: crate::config::RunConfig::default(),
     crates: Default::default(),
   }
 }
@@ -128,6 +129,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
     .unify(&config.unify)
     .release(&config.release)
     .change_detection(&config.change_detection)
+    .run(&config.run)
     .splits_template()
     .build()?;
 
@@ -188,6 +190,7 @@ mod tests {
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
       change_detection: crate::config::ChangeDetectionConfig::default(),
+      run: crate::config::RunConfig::default(),
       crates: Default::default(),
     };
 
@@ -196,12 +199,15 @@ mod tests {
       .targets(&config.targets)
       .unify(&config.unify)
       .release(&config.release)
+      .change_detection(&config.change_detection)
+      .run(&config.run)
       .splits_template()
       .build()
       .unwrap();
 
     // Should contain section headers
     assert!(toml.contains("[unify]"));
+    assert!(toml.contains("[change-detection]"));
 
     // Should contain helpful comments
     assert!(toml.contains("cargo-rail configuration"));

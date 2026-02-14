@@ -140,8 +140,7 @@ impl MappingStore {
     self.reverse_mappings.clear();
   }
 
-  /// Get the number of mappings (only used in tests)
-  #[cfg(test)]
+  /// Get the number of mappings currently loaded.
   pub fn count(&self) -> usize {
     self.mappings.len()
   }
@@ -385,6 +384,16 @@ mod tests {
       .args(["config", "user.email", "test@example.com"])
       .output()
       .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "commit.gpgsign", "false"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "tag.gpgsign", "false"])
+      .output()
+      .unwrap();
 
     // Create an initial commit (git-notes need at least one commit)
     std::fs::write(repo_path.join("test.txt"), "test").unwrap();
@@ -476,6 +485,16 @@ mod tests {
     Command::new("git")
       .current_dir(repo_path)
       .args(["config", "user.email", "test@example.com"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "commit.gpgsign", "false"])
+      .output()
+      .unwrap();
+    Command::new("git")
+      .current_dir(repo_path)
+      .args(["config", "tag.gpgsign", "false"])
       .output()
       .unwrap();
 

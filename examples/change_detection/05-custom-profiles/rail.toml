@@ -1,0 +1,30 @@
+# cargo-rail configuration
+# Custom profile/workflow mapping with complete [run] section keys.
+
+[run]
+default_profile = "local"
+
+[run.workflow]
+commit = "ci"
+nightly = "nightly"
+weekly = "extended"
+
+[run.profile.local]
+surfaces = ["test"]
+run_args = []
+merge_base = true
+
+[run.profile.ci]
+surfaces = ["build", "test"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true
+
+[run.profile.nightly]
+surfaces = ["build", "test", "docs"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true
+
+[run.profile.extended]
+surfaces = ["build", "test", "docs", "bench"]
+run_args = ["--workspace", "--locked", "{cargo_args}"]
+merge_base = true

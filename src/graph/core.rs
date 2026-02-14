@@ -94,7 +94,7 @@ impl WorkspaceGraph {
         is_workspace_member: workspace_pkg_ids.contains(&package.id),
       };
 
-      let node_idx = graph.add_node(node.clone());
+      let node_idx = graph.add_node(node);
       name_to_node.insert(package.name.as_ref().to_string(), node_idx);
       id_to_node.insert(package.id.clone(), node_idx);
 
@@ -157,10 +157,9 @@ impl WorkspaceGraph {
     let mut dependents = HashSet::new();
 
     while let Some(node_idx) = stack.pop() {
-      if visited.contains(&node_idx) {
+      if !visited.insert(node_idx) {
         continue;
       }
-      visited.insert(node_idx);
 
       // Add all incoming neighbors (things that depend on this)
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
@@ -213,10 +212,9 @@ impl WorkspaceGraph {
     let start_node_set: HashSet<NodeIndex> = stack.iter().copied().collect();
 
     while let Some(node_idx) = stack.pop() {
-      if visited.contains(&node_idx) {
+      if !visited.insert(node_idx) {
         continue;
       }
-      visited.insert(node_idx);
 
       // Add all incoming neighbors (things that depend on this)
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {

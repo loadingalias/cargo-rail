@@ -18,8 +18,9 @@
            ┌──────────────────────────┼──────────────────────────┐
            ▼                          ▼                          ▼
     ┌─────────────┐            ┌─────────────┐            ┌─────────────┐
-    │  affected   │            │   unify     │            │  release    │
-    │  test       │            │   split     │            │  sync       │
+    │    plan     │            │   unify     │            │  release    │
+    │ run(exec)   │            │   split     │            │  sync       │
+    │             │            │             │            │             │
     └─────────────┘            └─────────────┘            └─────────────┘
            │                          │                          │
            └──────────────────────────┼──────────────────────────┘
@@ -142,22 +143,19 @@ pub fn run_whatever(ctx: &WorkspaceContext, args: Args) -> RailResult<()> {
 }
 ```
 
----
+## Planner Pipeline
 
-## Change Detection (3 Layers)
+`cargo rail plan` is the primary planning surface. The pipeline is deterministic and file-first:
 
 ```
-Layer 1: classify_file(path) → ChangeKind
-         Pure function. No I/O. Just path inspection.
-              ↓
-Layer 2: ChangeImpact::analyze(from, to) → ImpactReport
-         Uses git + graph + cargo metadata.
-              ↓
-Layer 3: ChangeClassifier::classify(files) → ChangeClassification
-         Applies user config (docs-only, rebuild_all, custom categories).
+1. Collect changed files from git refs
+2. Classify file kinds (rust/toml/ci/script/docs/custom)
+3. Resolve file ownership to crates (or workspace/unowned)
+4. Expand transitive impact via workspace graph
+5. Emit surfaces + trace (proof-carrying reasons)
 ```
 
-Why layered? Layer 1 is fast and testable. Layer 2 adds graph awareness. Layer 3 adds user preferences.
+This output contract is consumed by humans (`--explain`), CI (`-f github`), and executors (`cargo rail run`).
 
 ---
 
@@ -217,10 +215,10 @@ Key insight: operates on **resolved** dependencies (what Cargo chose), not manif
 → `src/cargo/unify_analyzer.rs` (plan generation)
 → `src/cargo/manifest_writer.rs` (TOML output)
 
-### Changing change detection
+### Changing planning behavior
 
-→ `src/change_detection/classify.rs` (file classification)
-→ `src/workspace/change_analyzer.rs` (impact analysis)
+→ `src/commands/plan.rs` (planner pipeline + surfaces + trace)
+→ `src/change_detection/classify.rs` (file kind classification)
 
 ### Modifying split/sync/release
 
@@ -235,10 +233,9 @@ Key insight: operates on **resolved** dependencies (what Cargo chose), not manif
 ```
 "Where do I find..."
 
-affected crates logic     → src/commands/affected.rs
-                          → src/workspace/change_analyzer.rs
+planner contract          → src/commands/plan.rs
 
-test runner               → src/commands/test.rs
+run executor              → src/commands/run.rs
                           → src/test/
 
 dependency unification    → src/cargo/unify_*.rs
@@ -275,3 +272,4 @@ output control            → src/output.rs
 | 2 | Error |
 
 Exit code 1 lets CI detect "changes needed" vs "something broke". This is honestly not needed and will likely be adjusted in the next major release.
+Exit code 1 lets CI detect "changes needed" vs "something broke".

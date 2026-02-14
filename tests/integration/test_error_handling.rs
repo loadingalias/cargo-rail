@@ -8,25 +8,25 @@ use std::fs;
 
 // Invalid Git Reference Tests
 
-/// Test affected with non-existent git ref
+/// Test plan with non-existent git ref
 #[test]
-fn test_affected_invalid_since_ref() -> Result<()> {
+fn test_plan_invalid_since_ref() -> Result<()> {
   let ws = TestWorkspace::new_named("error-invalid-ref")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add crate")?;
 
   // Use a non-existent ref
-  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "nonexistent-branch-xyz"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "nonexistent-branch-xyz"])?;
 
   // Should fail (non-zero exit code)
-  assert!(!output.status.success(), "affected with invalid ref should fail");
+  assert!(!output.status.success(), "plan with invalid ref should fail");
 
   Ok(())
 }
 
-/// Test affected with invalid SHA pair
+/// Test plan with invalid SHA pair
 #[test]
-fn test_affected_invalid_sha_pair() -> Result<()> {
+fn test_plan_invalid_sha_pair() -> Result<()> {
   let ws = TestWorkspace::new_named("error-invalid-sha")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add crate")?;
@@ -36,7 +36,7 @@ fn test_affected_invalid_sha_pair() -> Result<()> {
     &ws.path,
     &[
       "rail",
-      "affected",
+      "plan",
       "--from",
       "0000000000000000000000000000000000000000",
       "--to",
@@ -44,7 +44,7 @@ fn test_affected_invalid_sha_pair() -> Result<()> {
     ],
   )?;
 
-  assert!(!output.status.success(), "affected with invalid SHA should fail");
+  assert!(!output.status.success(), "plan with invalid SHA should fail");
 
   Ok(())
 }
@@ -196,13 +196,13 @@ fn test_single_crate_workspace() -> Result<()> {
   super::helpers::git(&ws.path, &["add", "."])?;
   super::helpers::git(&ws.path, &["commit", "-m", "Add modification"])?;
 
-  // Affected should work (single crate is technically a workspace)
-  let output = run_cargo_rail(&ws.path, &["rail", "affected", "--since", "HEAD~1"])?;
+  // Planner should work (single crate is technically a workspace)
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD~1"])?;
 
   // This should succeed for a single crate
   assert!(
     output.status.success(),
-    "affected in single crate should work. stderr: {}",
+    "plan in single crate should work. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
@@ -211,18 +211,18 @@ fn test_single_crate_workspace() -> Result<()> {
 
 // Test Command Error Tests
 
-/// Test test command with invalid --since ref
+/// Test run command with invalid --since ref
 #[test]
-fn test_test_invalid_since() -> Result<()> {
+fn test_run_invalid_since() -> Result<()> {
   let ws = TestWorkspace::new_named("error-test-since")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add crate")?;
 
   // Use invalid since ref
-  let output = run_cargo_rail(&ws.path, &["rail", "test", "--since", "invalid-ref-xyz"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "run", "--since", "invalid-ref-xyz"])?;
 
   // Should fail with error
-  assert!(!output.status.success(), "test with invalid ref should fail");
+  assert!(!output.status.success(), "run with invalid ref should fail");
 
   Ok(())
 }
@@ -322,7 +322,7 @@ root = "."
   super::helpers::git(&path_with_space, &["commit", "-m", "Initial"])?;
 
   // Should handle paths with spaces
-  let output = run_cargo_rail(&path_with_space, &["rail", "affected", "--since", "HEAD"])?;
+  let output = run_cargo_rail(&path_with_space, &["rail", "plan", "--since", "HEAD"])?;
 
   // Should succeed
   assert!(

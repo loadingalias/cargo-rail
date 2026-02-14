@@ -619,28 +619,6 @@ consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoi
       }
     }
   }
-
-  /// Compute the workspace MSRV from all resolved dependencies (legacy method)
-  ///
-  /// The MSRV is the maximum `rust-version` across all dependencies in the
-  /// resolved graph. This ensures the workspace can build all its deps.
-  ///
-  /// Returns `None` if no dependencies specify rust-version.
-  ///
-  /// **Note:** Prefer `compute_msrv_with_config()` for config-aware behavior.
-  pub fn compute_msrv(&self) -> Option<ComputedMsrv> {
-    self
-      .compute_deps_msrv()
-      .map(|(version, contributors, deps_with_msrv)| ComputedMsrv {
-        version: version.clone(),
-        contributors,
-        deps_with_msrv,
-        deps_msrv: Some(version),
-        workspace_msrv: None,
-        source_used: MsrvSourceUsed::Deps,
-        warning: None,
-      })
-  }
 }
 
 /// Read the existing rust-version baseline from workspace root Cargo.toml.

@@ -409,6 +409,12 @@ edition.workspace = true
 pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
   let output = Command::new("git")
     .current_dir(cwd)
+    .env("GIT_CONFIG_COUNT", "2")
+    .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+    .env("GIT_CONFIG_VALUE_0", "false")
+    .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+    .env("GIT_CONFIG_VALUE_1", "false")
+    .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
     .args(args)
     .output()
     .context("Failed to run git command")?;
@@ -427,6 +433,11 @@ pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
 
   let output = Command::new(cargo_rail_bin)
     .current_dir(cwd)
+    .env("GIT_CONFIG_COUNT", "2")
+    .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+    .env("GIT_CONFIG_VALUE_0", "false")
+    .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+    .env("GIT_CONFIG_VALUE_1", "false")
     .args(args)
     .output()
     .context("Failed to run cargo-rail")?;

@@ -216,7 +216,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     comment: "Error if no changelog entries for release",
   },
   // =========================================================================
-  // [change-detection] section - 2 fields
+  // [change-detection] section - 4 fields
   // =========================================================================
   // Note: infrastructure has a complex default array. We provide a minimal
   // default here that users can expand. The full default from `cargo rail init`
@@ -224,8 +224,35 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   FieldSpec {
     section: "change-detection",
     key: "infrastructure",
-    default_toml: "[\".github/**\", \"Cargo.lock\"]",
+    default_toml: "[\".github/**\", \"scripts/**\", \"justfile\", \"Justfile\", \"Makefile\", \"makefile\", \"GNUmakefile\", \"*.sh\", \"Taskfile.yml\", \"Taskfile.yaml\", \".pre-commit-config.yaml\", \"deny.toml\", \"cliff.toml\", \"release.toml\", \"release-plz.toml\"]",
     comment: "Files that trigger full workspace rebuild",
+  },
+  FieldSpec {
+    section: "change-detection",
+    key: "conservative_unclassified_owner_fallback",
+    default_toml: "true",
+    comment: "Enable build+test fallback for unclassified crate-owned files",
+  },
+  FieldSpec {
+    section: "change-detection",
+    key: "confidence_profile",
+    default_toml: "\"balanced\"",
+    comment: "Planner confidence profile: strict, balanced, fast",
+  },
+  FieldSpec {
+    section: "change-detection",
+    key: "bot_pr_confidence_profile",
+    default_toml: "\"strict\"",
+    comment: "Optional planner profile override for bot-authored PRs",
+  },
+  // =========================================================================
+  // [run] section - 1 field
+  // =========================================================================
+  FieldSpec {
+    section: "run",
+    key: "default_profile",
+    default_toml: "\"local\"",
+    comment: "Default run profile (built-ins: local, ci, nightly)",
   },
   // Note: custom is a table {} not a simple value, so we don't auto-add it.
   // Users who want custom categories should add them manually.
@@ -273,6 +300,7 @@ mod tests {
     assert_eq!(secs[0], "unify");
     assert_eq!(secs[1], "release");
     assert_eq!(secs[2], "change-detection");
+    assert_eq!(secs[3], "run");
     // No duplicates
     let mut unique = secs.clone();
     unique.dedup();
@@ -289,7 +317,10 @@ mod tests {
     assert_eq!(release_fields.len(), 10);
 
     let change_detection_fields: Vec<_> = fields_for_section("change-detection").collect();
-    assert_eq!(change_detection_fields.len(), 1);
+    assert_eq!(change_detection_fields.len(), 4);
+
+    let run_fields: Vec<_> = fields_for_section("run").collect();
+    assert_eq!(run_fields.len(), 1);
   }
 
   #[test]
@@ -298,7 +329,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      32, // 21 unify + 10 release + 1 change-detection
+      36, // 21 unify + 10 release + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -308,7 +339,8 @@ mod tests {
   /// SYNCABLE (auto-added by `config sync`):
   /// - [unify] - 21 fields: workspace-wide dependency unification settings
   /// - [release] - 10 fields: workspace-wide release settings
-  /// - [change-detection] - 1 field: infrastructure patterns (custom is user-defined)
+  /// - [change-detection] - 4 fields: infra patterns, conservative fallback, and confidence profiles
+  /// - [run] - 1 field: default profile selector for `cargo rail run`
   ///
   /// NOT SYNCABLE (user must configure manually):
   /// - [crates.X.split] - Per-crate split configuration (remote, branch, mode, paths)
@@ -330,6 +362,7 @@ mod tests {
       sections.contains(&"change-detection"),
       "change-detection section must be covered"
     );
+    assert!(sections.contains(&"run"), "run section must be covered");
 
     // Verify key fields from each section exist
     let field_keys: Vec<_> = SYNCABLE_FIELDS.iter().map(|f| (f.section, f.key)).collect();
@@ -350,5 +383,11 @@ mod tests {
 
     // [change-detection] field
     assert!(field_keys.contains(&("change-detection", "infrastructure")));
+    assert!(field_keys.contains(&("change-detection", "conservative_unclassified_owner_fallback")));
+    assert!(field_keys.contains(&("change-detection", "confidence_profile")));
+    assert!(field_keys.contains(&("change-detection", "bot_pr_confidence_profile")));
+
+    // [run] field
+    assert!(field_keys.contains(&("run", "default_profile")));
   }
 }

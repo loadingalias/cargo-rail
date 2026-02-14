@@ -8,10 +8,15 @@ use semver::Version;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleasePlan {
+  /// Contract version for release plan schema.
+  pub plan_contract_version: u32,
+  /// Canonical crate order (dependency order).
+  pub canonical_crate_order: Vec<String>,
   /// Crates to release in dependency order
   pub crates: Vec<CrateReleasePlan>,
   /// Summary statistics
@@ -33,10 +38,20 @@ pub struct CrateReleasePlan {
   pub changelog_path: PathBuf,
   /// Git tag name for this release
   pub tag_name: String,
+  /// Previous matching release tag (if any)
+  pub previous_tag: Option<String>,
+  /// Changelog range start ref (if any)
+  pub changelog_range_start: Option<String>,
+  /// Changelog range end ref
+  pub changelog_range_end: String,
   /// Whether to publish to crates.io
   pub publish: bool,
+  /// Human-readable publish intent
+  pub publish_intent: String,
   /// Whether to generate changelog
   pub generate_changelog: bool,
+  /// Canonical bump expression `old -> new`.
+  pub bump: String,
   /// Dependents that will need version updates
   pub affected_dependents: Vec<String>,
 }
@@ -103,8 +118,11 @@ impl<'a> ReleasePlanner<'a> {
       crates_to_publish,
       crates_to_tag: crate_plans.len(),
     };
+    let canonical_crate_order = crate_plans.iter().map(|plan| plan.name.clone()).collect();
 
     Ok(ReleasePlan {
+      plan_contract_version: 1,
+      canonical_crate_order,
       crates: crate_plans,
       summary,
     })
@@ -134,6 +152,7 @@ impl<'a> ReleasePlanner<'a> {
 
     // Determine tag name
     let tag_name = self.format_tag(crate_name, &new_version);
+    let previous_tag = self.find_previous_tag(crate_name)?;
 
     // Get per-crate config (if any)
     let crate_config = self.ctx.config.as_ref().and_then(|c| c.crates.get(crate_name));
@@ -178,6 +197,12 @@ impl<'a> ReleasePlanner<'a> {
 
     // Find affected dependents
     let affected_dependents = self.ctx.graph.transitive_dependents(crate_name)?;
+    let bump = format!("{} -> {}", current_version, new_version);
+    let publish_intent = if publish {
+      "publish_to_crates_io".to_string()
+    } else {
+      "skip_publish".to_string()
+    };
 
     Ok(CrateReleasePlan {
       name: crate_name.to_string(),
@@ -186,8 +211,13 @@ impl<'a> ReleasePlanner<'a> {
       manifest_path,
       changelog_path,
       tag_name,
+      previous_tag: previous_tag.clone(),
+      changelog_range_start: previous_tag,
+      changelog_range_end: "HEAD".to_string(),
       publish,
+      publish_intent,
       generate_changelog,
+      bump,
       affected_dependents,
     })
   }
@@ -215,6 +245,33 @@ impl<'a> ReleasePlanner<'a> {
         .replace("{crate}", crate_name)
         .replace("{version}", &version.to_string())
     }
+  }
+
+  fn find_previous_tag(&self, crate_name: &str) -> RailResult<Option<String>> {
+    let workspace_members = self.ctx.graph.workspace_members();
+    let is_single_crate = workspace_members.len() == 1;
+    let pattern = if is_single_crate {
+      format!("{}*", self.release_config.tag_prefix)
+    } else {
+      self
+        .release_config
+        .tag_format
+        .replace("{crate}", crate_name)
+        .replace("{version}", "*")
+    };
+
+    let output = Command::new("git")
+      .current_dir(self.ctx.workspace_root())
+      .args(["tag", "--list", &pattern, "--sort=-version:refname"])
+      .output()
+      .map_err(|e| RailError::message(format!("Failed to run git tag: {}", e)))?;
+
+    if !output.status.success() {
+      return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().next().map(|s| s.to_string()))
   }
 }
 

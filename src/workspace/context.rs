@@ -145,7 +145,10 @@ impl CargoState {
 
   /// Build CargoState from metadata, constructing the package index and proc-macro cache
   fn from_metadata(metadata: Metadata) -> Self {
-    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
+    // Normalize path separators on Windows (cargo metadata uses forward slashes).
+    // Using .components().collect() converts to platform-native separators without
+    // adding the \\?\ prefix that canonicalize() would add.
+    let workspace_root: PathBuf = metadata.workspace_root.as_std_path().components().collect();
 
     // Build O(1) lookup index: package name → index in metadata.packages
     let workspace_member_ids: std::collections::HashSet<_> = metadata.workspace_members.iter().collect();
@@ -229,7 +232,7 @@ impl CargoState {
 
   /// Check if a workspace member is binary-only (has `[[bin]]` targets but no library target).
   ///
-  /// This is used by commands like `affected` and `test` to optionally skip crates
+  /// This is used by planner/executor flows to optionally skip crates
   /// that can't be selected by `cargo test -p <crate>` (no library target).
   pub fn is_binary_only(&self, crate_name: &str) -> bool {
     let Some(pkg) = self.get_package(crate_name) else {
@@ -464,6 +467,9 @@ impl WorkspaceContext {
 
       // Validate unify config (e.g., transitive_host path)
       cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
+
+      // Validate run profile schema.
+      cfg.run.validate().map_err(RailError::Config)?;
     }
 
     // Store targets for lazy multi-target metadata loading
@@ -493,15 +499,10 @@ impl WorkspaceContext {
     })
   }
 
-  /// Get rail config (convenience wrapper for require_config)
-  pub fn rail_config(&self) -> RailResult<&RailConfig> {
-    self.require_config().map(|arc| arc.as_ref())
-  }
-
   /// Get multi-target metadata, loading lazily on first access.
   ///
   /// This is only used by `cargo rail unify`. Other commands don't need it,
-  /// so lazy loading saves 150-600ms for commands like `test`, `affected`, `split`, etc.
+  /// so lazy loading saves 150-600ms for commands like `plan`, `run`, `split`, etc.
   ///
   /// The metadata is cached after first load - subsequent calls return the cached value.
   pub fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
@@ -539,8 +540,22 @@ impl WorkspaceContext {
   pub fn workspace_prefix(&self) -> Option<PathBuf> {
     let git_root = self.git.repo_root();
 
+    // On Windows, paths from different sources may have incompatible representations:
+    // - Forward vs backslash separators (C:/foo vs C:\foo)
+    // - 8.3 short names vs long names (RUNNER~1 vs runneradmin)
+    // - Case differences (on case-insensitive filesystems)
+    //
+    // We must canonicalize both paths to get a consistent representation.
+    // Note: canonicalize() adds \\?\ prefix on Windows, but strip_prefix handles this
+    // correctly when both paths have the same prefix.
+    let git_root_canonical = git_root.canonicalize().unwrap_or_else(|_| git_root.to_path_buf());
+    let workspace_canonical = self
+      .workspace_root
+      .canonicalize()
+      .unwrap_or_else(|_| self.workspace_root.clone());
+
     // If workspace is nested inside git repo, compute the relative prefix
-    if let Ok(prefix) = self.workspace_root.strip_prefix(git_root) {
+    if let Ok(prefix) = workspace_canonical.strip_prefix(&git_root_canonical) {
       if prefix.as_os_str().is_empty() {
         None // Same directory
       } else {
@@ -559,7 +574,11 @@ impl WorkspaceContext {
   /// Returns `None` if the path doesn't belong to this workspace.
   pub fn to_workspace_path(&self, git_path: &Path) -> Option<PathBuf> {
     if let Some(prefix) = self.workspace_prefix() {
-      git_path.strip_prefix(&prefix).ok().map(|p| p.to_path_buf())
+      // Git always uses forward slashes, but PathBuf::from converts to platform separators.
+      // On Windows, this causes strip_prefix to fail when git_path has / but prefix has \.
+      // Normalize git_path by rebuilding through components to use platform separators.
+      let normalized = git_path.components().collect::<PathBuf>();
+      normalized.strip_prefix(&prefix).ok().map(|p| p.to_path_buf())
     } else {
       Some(git_path.to_path_buf())
     }

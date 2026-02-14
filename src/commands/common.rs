@@ -52,7 +52,7 @@ impl OutputFormat {
 
 /// Output format for `cargo rail unify`.
 ///
-/// `unify` currently supports only text and JSON output. Unlike commands such as `affected`,
+/// `unify` currently supports only text and JSON output. Unlike planner/executor surfaces,
 /// it does not produce list-like formats (cargo-args, github, jsonl, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum UnifyOutputFormat {
@@ -72,6 +72,34 @@ impl UnifyOutputFormat {
   /// Check if this format is a JSON-like structured format
   pub fn is_json_like(&self) -> bool {
     self.is_json()
+  }
+}
+
+/// Output format for `cargo rail plan`.
+///
+/// `plan` is the primary planning surface and intentionally supports a minimal
+/// format set: human text, full JSON contract, and GitHub Actions key/value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum PlanOutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+  /// GitHub Actions output format for $GITHUB_OUTPUT
+  #[value(name = "github")]
+  GitHub,
+}
+
+impl PlanOutputFormat {
+  /// Check if this format is JSON.
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+
+  /// Check if this format is a JSON-like structured format.
+  pub fn is_json_like(&self) -> bool {
+    matches!(self, Self::Json | Self::GitHub)
   }
 }
 

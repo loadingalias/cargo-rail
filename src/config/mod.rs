@@ -6,18 +6,21 @@
 //! - `ReleaseConfig` - Release management settings
 //! - `SplitConfig` - Crate splitting/syncing settings
 //! - `ChangeDetectionConfig` - Change detection settings
+//! - `RunConfig` - `cargo rail run` profile settings
 //!
 //! Configuration is searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 
 mod change_detection;
 mod release;
+mod run;
 pub mod schema;
 mod split;
 mod unify;
 
 // Re-export all public types
-pub use change_detection::ChangeDetectionConfig;
+pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile};
 pub use release::{ChangelogConfig, ChangelogRelativeTo, CrateReleaseConfig, ReleaseConfig};
+pub use run::{RunConfig, RunProfile, is_builtin_profile};
 pub use split::{CratePath, CrateSplitConfig, CrateSyncConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use unify::{ExactPinHandling, MajorVersionConflict, MsrvSource, TransitiveFeatureHost, UnifyConfig};
 
@@ -41,9 +44,12 @@ pub struct RailConfig {
   /// Release management settings
   #[serde(default)]
   pub release: ReleaseConfig,
-  /// Change detection settings (for `affected` command)
+  /// Change detection settings (for planner classification)
   #[serde(default, rename = "change-detection")]
   pub change_detection: ChangeDetectionConfig,
+  /// Run profile settings for `cargo rail run`.
+  #[serde(default)]
+  pub run: RunConfig,
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
   pub crates: HashMap<String, CrateConfig>,

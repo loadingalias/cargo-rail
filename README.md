@@ -1,319 +1,249 @@
-<p align="center">
-  <img src="https://socialify.git.ci/loadingalias/cargo-rail/image?font=Jost&language=1&name=1&owner=1&pattern=Solid&theme=Auto" alt="cargo-rail" width="640" height="320" />
-</p>
+# cargo-rail
 
-<p align="center">
-  <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/v/cargo-rail.svg" alt="Crates.io"></a>
-  <a href="https://crates.io/crates/cargo-rail"><img src="https://img.shields.io/crates/d/cargo-rail.svg" alt="Downloads"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/crates/msrv/cargo-rail" alt="MSRV"></a>
-</p>
+> Cargo-native control plane for Rust monorepos: plan changes, run only needed work locally and in CI, unify the graph (deps/features), split/sync crates into new repos/monorepos, and automate releases with 14 core dependencies.
 
-<p align="center">
-  <a href="#install">Install</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#commands">Commands</a> •
-  <a href="#real-world-results">Results</a> •
-  <a href="https://github.com/loadingalias/cargo-rail-action">GitHub Action</a>
-</p>
+[![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail) [![docs.rs](https://img.shields.io/docsrs/cargo-rail)](https://docs.rs/cargo-rail) [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml) [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
----
+## Why cargo-rail
 
-## What It Replaces
+**Impact on real repos (validated across tokio, helix, meilisearch):**
 
-| Problem | Before | After |
-|---------|--------|-------|
-| **Build graph drift** | `cargo-hakari`, workspace-hack crates | `cargo rail unify` |
-| **Unused deps** | `cargo-udeps`, `cargo-machete`, `cargo-shear` | `cargo rail unify` |
-| **Dead features** | `cargo-features-manager`, manual audit | `cargo rail unify` |
-| **MSRV computation** | `cargo-msrv`, compile-and-fail loops | `cargo rail unify` |
-| **CI waste** | `paths-filter` + shell scripts | `cargo rail affected` |
-| **CI costs** | Test everything, bill for everything | Test what changed |
-| **Crate extraction** | `git subtree`, `git-filter-repo`, Google's Copybara | `cargo rail split` |
-| **Release orchestration** | `release-plz`, `cargo-release`, `git-cliff` | `cargo rail release` |
+| Metric | Impact |
+|---|---|
+| **CI surface execution** | 55% fewer surfaces run per merge |
+| **Weighted test/build units** | 64% reduction in compute units |
+| **Dependencies unified** | 78 across 47 crates (avg 1.7 per crate) |
+| **Undeclared features fixed** | 141 silent bugs prevented |
+| **Tooling consolidation** | 6 cargo plugins → 1 command |
+| **MSRV computation** | Automatic from dependency graph |
 
-**11 dependencies. One config file.**
+**Two compound effects = massive time/cost savings:**
+1. **Change detection** (`plan`/`run`) reduces what runs — 55% fewer CI surfaces, 64% fewer compute units
+2. **Dependency unification** (`unify`) reduces build graph complexity — cleaner deps, smaller build units, fewer rebuilds
 
----
-
-## Install
-
-```bash
-cargo install cargo-rail
-```
-
-Optionally, install via the [pre-built binaries](https://github.com/loadingalias/cargo-rail/releases) or `cargo binstall cargo-rail`
-
----
-
-## MSRV policy
-
-- **MSRV source of truth**: `Cargo.toml` (`rust-version`, written as `major.minor.patch`)
-- **Cargo requirement**: Cargo shipped with that Rust release (newer Cargo is fine)
-- **CI**: builds on MSRV to prevent accidental bumps
-- **Workspaces**: `cargo rail unify` writes `[workspace.package].rust-version`; enable `[unify].enforce_msrv_inheritance = true` to set `[package].rust-version = { workspace = true }` in member crates
-
----
+**Before cargo-rail:** Run 6 tools separately (hakari, udeps, machete, shear, features-manager, msrv), each with different data/timing
+**After cargo-rail:** `cargo rail unify --check` in one metadata call
 
 ## Quick Start
 
 ```bash
-cargo rail init              # generate .config/rail.toml
-cargo rail unify --check     # preview what would change (read-only)
-cargo rail unify             # apply changes
+# install
+cargo install cargo-rail
+
+# generate config
+cargo rail init
+
+# deterministic planning + execution
+cargo rail plan --merge-base
+cargo rail run --merge-base --profile ci
+
+# dependency hygiene
+cargo rail unify --check
 ```
 
-[Demo](https://github.com/user-attachments/assets/93f34633-aa0e-4cde-8723-c81f3f474bac) using `ripgrep` codebase.
+Pre-built binaries: [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases)
 
-<sub>*`cargo rail unify` on ripgrep — 9 deps unified, 6 dead features pruned*</sub>
+## Core Workflows
 
----
+### Change Planning + Execution (`plan` / `run`)
 
-## Commands
+**Problem:** CI wastes resources testing unchanged code. Teams either (1) test everything on every commit, or (2) build custom scripts that drift from local behavior.
 
-### `affected` / `test`
-
-Graph-aware change detection. Only test what's affected:
+**Solution:** One planner contract, used everywhere:
 
 ```bash
-cargo rail affected                    # list affected crates
-cargo rail affected --merge-base       # compare against merge-base (CI)
-cargo rail affected -f cargo-args      # output: -p crate1 -p crate2
-cargo rail affected -f github-matrix   # output: JSON matrix for Actions
-cargo rail test                        # run tests for affected crates
-cargo rail test --explain              # show why each crate is affected
+# Local: what would CI run if I pushed this branch?
+cargo rail plan --merge-base
+
+# CI: deterministic plan → selective execution
+cargo rail plan --merge-base -f github  # outputs: build=true, test=false, docs=true, ...
+cargo rail run --merge-base --profile ci  # runs ONLY what plan selected
 ```
 
-**CI Integration:**
+**How repos use this:**
+1. Configure change detection rules in `.config/rail.toml` (infrastructure files, doc-only changes, etc.)
+2. Run `plan` to see impact classification (which surfaces: build, test, bench, docs, infra)
+3. Run `run` to execute only selected surfaces — locally or in CI
+4. Use `--explain` to understand any decision: "why did this run?" / "why was this skipped?"
 
-```yaml
-- uses: loadingalias/cargo-rail-action@v1
-  id: rail
+Result: **55% fewer CI surface executions, 64% reduction in weighted compute units** (validated on tokio/helix/meilisearch).
 
-- run: cargo nextest run ${{ steps.rail.outputs.cargo-args }}
-  if: steps.rail.outputs.should-test == 'true'
-```
+### Dependency Unification (`unify`)
 
-### `unify`
+**Problem:** Teams juggle 6+ cargo plugins for dependency hygiene (hakari, udeps, machete, shear, features-manager, msrv). Each runs separately, on different data, with different CLI patterns. Undeclared features (borrowed from Cargo's resolver) break isolated builds.
 
-Dependency unification based on Cargo's resolved output:
+**Solution:** `cargo rail unify` — one command, one metadata call, comprehensive analysis:
 
 ```bash
-cargo rail unify --check    # preview changes (exits 1 if drift detected)
-cargo rail unify            # apply to workspace
-cargo rail unify --explain  # show reasoning for each change
-cargo rail unify undo       # restore from backup
+cargo rail unify --check    # preview all changes
+cargo rail unify            # apply workspace-wide
+cargo rail unify --explain  # understand each decision
 ```
 
-What it does:
-
-- **Unifies versions** — writes to `[workspace.dependencies]`, converts members to `workspace = true`
-- **Prunes dead features** — removes features never enabled in the resolved graph
-- **Fixes undeclared features** — adds missing feature declarations to member manifests
-- **Detects unused deps** — flags dependencies not used anywhere (auto-removes on apply)
+**What it does:**
+- **Unifies versions** — writes to `[workspace.dependencies]`, converts members to `{ workspace = true }`
+- **Fixes undeclared features** — detects features borrowed via Cargo's unified resolution
+- **Prunes dead features** — removes features never enabled in resolved graph
+- **Detects unused deps** — flags dependencies not used anywhere
 - **Computes MSRV** — derives minimum Rust version from dependency graph
-- **Pins transitives** — replaces `cargo-hakari` without a workspace-hack crate
+- **Replaces workspace-hack** — enable `pin_transitives` for cargo-hakari equivalent
 
-Multi-target aware: runs `cargo metadata` per target triple in parallel, computes feature *intersections* not unions.
+**Validated impact on real repos:**
 
-### `split` / `sync`
+| Repository | Crates | Locked Deps | Deps Unified | Undeclared Features | MSRV Computed |
+|---|---:|---:|---:|---:|---|
+| tokio-rs/tokio | 10 | 224 | 9 | 19 | 1.85.0 |
+| helix-editor/helix | 14 | 351 | 15 | 25 | 1.87.0 |
+| meilisearch/meilisearch | 23 | 835 | 54 | 97 | 1.88.0 |
+| **Aggregate** | **47** | **1,410** | **78** | **141** | — |
 
-Extract crates with full git history. Bidirectional sync with 3-way conflict resolution:
+Config files and validation artifacts: [examples/unify/](examples/unify/)
+
+**Tools replaced:** cargo-hakari, cargo-udeps, cargo-machete, cargo-shear, cargo-features-manager, cargo-msrv (6 tools → 1 command)
+
+### Split + Sync (Google Copybara Replacement)
+
+**Problem:** Teams need to publish crates from monorepos but want clean standalone repos with full git history. Existing tools (git subtree, git-filter-repo) are one-way and manual. Google's Copybara requires Bazel and complex config.
+
+**Solution:** `cargo rail split` + `cargo rail sync` — bidirectional sync with 3-way conflict resolution:
 
 ```bash
-cargo rail split init crate/s         # configure extraction
-cargo rail split run crate/s          # extract with history
-cargo rail split run crate/s --check  # preview (dry-run)
+# Extract crate to standalone repo with full git history
+cargo rail split init my-crate  # configure once
+cargo rail split run my-crate   # extract with history preserved
 
-cargo rail sync crate/s               # bidirectional sync
-cargo rail sync crate/s --to-remote   # push changes to split repo
-cargo rail sync crate/s --from-remote # pull changes (creates PR branch)
+# Bidirectional sync
+cargo rail sync my-crate --to-remote    # push monorepo changes to split repo
+cargo rail sync my-crate --from-remote  # pull split repo changes (creates PR branch)
 ```
 
 **Three modes:**
+- `single`: one crate → one repo (most common)
+- `combined`: multiple crates → one repo (shared utilities)
+- `workspace`: multiple crates → workspace structure (mirrors monorepo)
 
-- `single` — one crate → one repo (most common)
-- `combined` — multiple crates → one repo (shared utilities)
-- `workspace` — multiple crates → workspace structure (mirrors monorepo)
+Built on system git (not libgit2) for deterministic SHAs and full git fidelity.
 
-Safety: refuses dirty worktree by default. `--allow-dirty` to override, `--yes` for CI.
+### Release Automation (`release`)
 
-### `release`
+Release checks, versioning, changelogs, tags, dependency-order publish.
 
-Dependency-order publishing with changelog generation:
+## Why This Model
 
-```bash
-cargo rail release check crate/s              # validate release readiness
-cargo rail release run crate/s --bump minor   # bump, tag, publish
-cargo rail release run crate/s --check        # preview release plan
-```
+- One planner contract for local and CI.
+- One executor (`run`) for planner-selected surfaces.
+- One config (`rail.toml`) for policy.
+- Check-mode exit code `1` means "changes detected" (not a crash).
 
-Safety: detects default branch, refuses detached HEAD, warns on non-default branch.
+## GitHub Actions Integration
 
-### `config`
+For CI integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating.
 
-Manage configuration:
-
-```bash
-cargo rail init              # generate .config/rail.toml
-cargo rail config locate     # print active config path
-cargo rail config print      # print effective config with defaults
-cargo rail config validate   # check for errors and unknown keys
-cargo rail config sync       # update config with detected targets (incredibly useful on update)
-```
-
----
+The action keeps CI behavior aligned with local `plan` + `run` workflows.
 
 ## Configuration
 
-Generated by `cargo rail init` at `.config/rail.toml`:
+`cargo rail init` generates `.config/rail.toml`.
+
+**Example config:**
 
 ```toml
-targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# Platform targets for multi-target validation
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+]
 
 [unify]
-pin_transitives = false      # enable for hakari replacement
-detect_unused = true
-prune_dead_features = true
-
-msrv = true
-msrv_source = "max"          # deps | workspace | max
-enforce_msrv_inheritance = false
+pin_transitives = false      # Enable for cargo-hakari replacement
+detect_unused = true         # Detect unused dependencies
+prune_dead_features = true   # Remove features never enabled
+msrv = true                  # Compute workspace rust-version
+detect_undeclared_features = true  # Find borrowed features
 
 [release]
-tag_format = "{crate}-{prefix}{version}"
-publish_delay = 5            # seconds between publishes
+tag_format = "{prefix}{version}"
+publish_delay = 5
+sign_tags = true
 
 [change-detection]
-infrastructure = [".github/**", "scripts/**", "*.sh"]
+# Files triggering full workspace rebuild
+infrastructure = [
+  ".github/**",
+  "scripts/**",
+  "justfile",
+  "rust-toolchain.toml",
+]
 ```
 
-Full reference: [docs/config.md](docs/config.md)
+**Full documentation:**
+- [Configuration reference](docs/config.md)
+- [Command reference](docs/commands.md)
+- [Architecture](docs/architecture.md)
+- [Change detection recipe](docs/change-detection-recipe.md)
+- [Change detection operations guide](docs/change-detection-operations.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
----
+## Migration Guides
 
-## Real-World Results
+- Replace `affected` / `test` flows for pre-v0.10.0 releases of `cargo-rail`: [docs/adr/0001-migrate-affected-test-to-plan-run.md](docs/adr/0001-migrate-affected-test-to-plan-run.md)
+- Replace `cargo-hakari`: [docs/migrate-hakari.md](docs/migrate-hakari.md)
 
-Tested on production workspaces:
+## Proven On Large Repos
 
-| Repo | Crates | Deps Unified | Dead Features |
-|------|--------|--------------|---------------|
-| **[tikv](https://github.com/tikv/tikv)** | 72 | 61 | 3 |
-| **[meilisearch](https://github.com/meilisearch/meilisearch)** | 19 | 46 | 1 |
-| **[helix](https://github.com/helix-editor/helix)** | 12 | 16 | 1 |
-| **[tokio](https://github.com/tokio-rs/tokio)** | 10 | 10 | 0 |
-| **[ripgrep](https://github.com/BurntSushi/ripgrep)** | 10 | 9 | 6 |
-| **[polars](https://github.com/pola-rs/polars)** | 33 | 2 | 9 |
-| **[ruff](https://github.com/astral-sh/ruff)** | 43 | 0 | 0 |
+All core workflows (`plan`/`run`, `unify`, `split`, `sync`, `release`) validated on production repos:
 
-Demo recordings: [`examples/`](examples/)
+| Repository | Crates | Locked Deps | Validation Coverage |
+|---|---:|---:|---|
+| [tokio-rs/tokio](https://github.com/tokio-rs/tokio) | 10 | 224 | Plan/run (5 merges), unify, split, sync, release |
+| [helix-editor/helix](https://github.com/helix-editor/helix) | 14 | 351 | Plan/run (5 merges), unify, split, sync, release |
+| [meilisearch/meilisearch](https://github.com/meilisearch/meilisearch) | 23 | 835 | Plan/run (5 merges), unify, split, sync, release |
 
----
+**Why this matters:**
 
-## Migrating from cargo-hakari
+Validation isn't a single test — it's a protocol:
 
-Create a branch. Run `--check` first. Review the diff. This touches your entire workspace.
+1. **Reproducibility**: Every command in [docs/large-repo-validation.md](docs/large-repo-validation.md) runs on forked repos with real merge history
+2. **Metrics collection**: Automated scripts measure execution reduction, surface accuracy, plan duration, unify impact
+3. **Quality audit**: Heuristics flag potential false positives/negatives for human review
+4. **Real-world scenarios**: Tests run on actual merge commits and real dependency graphs, not synthetic fixtures
 
-```bash
-git checkout -b migrate-to-rail
-rm -rf crates/workspace-hack
-cargo rail init
-# set pin_transitives = true in rail.toml
-cargo rail unify --check        # review first
-cargo rail unify                # apply
-cargo check --workspace && cargo test --workspace
-```
+**Change detection results (15 merge scenarios):**
+- 55% execution reduction rate (surfaces)
+- 64% weighted reduction rate (compute units)
+- Average plan duration: 632ms
+- Quality audit: 2 potential false-negatives, 1 potential false-positive (flagged for review)
 
-Full guide: [docs/migrate-hakari.md](docs/migrate-hakari.md)
+**Unify results (3 repos, 47 crates):**
+- 78 dependencies unified
+- 141 undeclared features fixed (silent bugs prevented)
+- 2 dead features pruned
+- MSRV computed for all repos (1.85.0 - 1.88.0)
 
----
+Full protocol and raw artifacts: [examples/README.md](examples/README.md)
 
-## Design Decisions
+## Examples
 
-**Resolution-based** — Uses Cargo's actual resolver output, not syntax parsing. If Cargo resolves it, cargo-rail sees it.
+Each workflow includes working config files and reproducible command sequences:
 
-**Multi-target** — Runs `cargo metadata --filter-platform` per target in parallel. Computes feature *intersections*, not unions, w/ guardrails where it counts.
+- Change detection: [examples/change_detection/](examples/change_detection/)
+- Unify: [examples/unify/](examples/unify/)
+- Split/sync: [examples/split-sync/](examples/split-sync/)
+- Release: [examples/release/](examples/release/)
 
-**System git** — Uses your `git` binary directly. No libgit2, no gitoxide. Deterministic SHAs.
+All examples run on real repos (tokio, helix, meilisearch) and include:
+- Rail config (`.config/rail.toml`)
+- Command sequence (step-by-step)
+- Expected outputs
+- Validation artifacts
 
-**Lossless TOML** — Preserves comments and formatting via `toml_edit`.
+## Getting Help
 
-**Minimal deps** — 11 direct dependencies. Built the release workflow specifically to avoid 200+ dep toolchains.
+- Issues: [GitHub Issues](https://github.com/loadingalias/cargo-rail/issues)
+- Crate: [crates.io/cargo-rail](https://crates.io/crates/cargo-rail)
 
----
+## License
 
-## FAQ
-
-<details>
-<summary><strong>How is this different from cargo-hakari?</strong></summary>
-
-cargo-hakari creates a workspace-hack crate. cargo-rail writes unified versions directly to `[workspace.dependencies]` — no extra crate. Enable `pin_transitives = true` for equivalent behavior w/o the added CI check and lockfile steps.
-</details>
-
-<details>
-<summary><strong>Does it work with workspace inheritance?</strong></summary>
-
-Yes. Writes to `[workspace.dependencies]` and converts member manifests to `{ workspace = true }`.
-</details>
-
-<details>
-<summary><strong>Virtual workspaces?</strong></summary>
-
-Supported. For `pin_transitives`, `cargo-rail` auto-selects a workspace member as the transitive host (or configure `transitive_host` explicitly).
-</details>
-
-<details>
-<summary><strong>Private registries?</strong></summary>
-
-Works via `cargo metadata`, which respects `.cargo/config.toml`.
-</details>
-
-<details>
-<summary><strong>Does this replace Bazel/Buck2 for Rust teams?</strong></summary>
-
-For pure Rust workspaces, yes... it can. `cargo-rail` provides graph-aware testing, dependency unification, and crate extraction without learning a new build system. If you're using Bazel/Buck2 *only* for Rust (not polyglot builds), cargo-rail gives you the key benefits — affected analysis, hermetic builds via lockfiles, crate distribution — while staying in Cargo's ecosystem. I'm exploring the best way to build a proper cache feature (local will come first; remote will follow), as well.
-</details>
-
-<details>
-<summary><strong>Why not just use cargo's built-in workspace features?</strong></summary>
-
-Cargo workspaces are the foundation. cargo-rail adds what's missing: automatic version unification across the resolver's actual output, dead feature detection/pruning, MSRV computation from the dependency graph w/ options for how you use it, unused dep detection/removal, and graph-aware change detection. These require analysis Cargo doesn't do.
-</details>
-
-<details>
-<summary><strong>How much CI time does this actually save?</strong></summary>
-
-Depends on your workspace. In a 30-crate workspace where a PR touches 3 crates, you test 3 crates + their dependents instead of 50. I've seen 60-80% reductions in CI minutes for my own workspaces; teams with large workspaces and frequent, focused PRs will likely experience similar numbers.
-</details>
-
-<details>
-<summary><strong>What are "undeclared features" and why should I care?</strong></summary>
-
-Cargo unifies deps across your workspace. If `crate-a` depends on `serde` and `crate-b` depends on `serde` with `features = ["derive"]`, Cargo builds `serde` once with `derive` enabled for both. Now `crate-a` can use `#[derive(Serialize)]` even though it never declared that feature — it's "borrowing" from `crate-b`.
-
-This works fine until: (1) you test `crate-a` in isolation, (2) you publish `crate-a`, or (3) `crate-b` drops the feature. Then `crate-a` breaks with cryptic compile errors.
-
-`cargo rail unify` detects these borrowed features and auto-fixes them by adding the missing declarations to each crate's `Cargo.toml`. Cleaner graphs, safer publishes, tests that actually test what you ship.
-</details>
-
----
-
-## Documentation
-
-- [Command Reference](docs/commands.md)
-- [Config Reference](docs/config.md)
-- [Migration Guide](docs/migrate-hakari.md)
-
----
-
-## Contributing
-
-Issues, PRs, and feedback welcome.
-
----
-
-<p align="center">
-  <a href="https://github.com/loadingalias/cargo-rail">GitHub</a> •
-  <a href="https://crates.io/crates/cargo-rail">crates.io</a> •
-  <a href="https://github.com/loadingalias/cargo-rail-action">GitHub Action</a>
-</p>
+Licensed under [MIT](LICENSE).

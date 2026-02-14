@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Configuration for sync operation
+#[derive(Clone)]
 pub struct SyncConfig {
   /// Name of the crate being synced
   pub crate_name: String,

@@ -352,6 +352,204 @@ fn test_config_validate_global_json_flag() -> Result<()> {
   Ok(())
 }
 
+#[test]
+fn test_config_validate_with_config_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-with-flag")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  ws.remove_config()?;
+
+  let custom_config = ws.path.join("custom-rail.toml");
+  fs::write(&custom_config, "targets = []\n")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "--config", "custom-rail.toml", "config", "validate"],
+  )?;
+  assert!(output.status.success(), "config validate with --config should succeed");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("custom-rail.toml"),
+    "should validate override config path"
+  );
+  assert!(
+    stdout.contains("configuration is valid"),
+    "output should confirm valid config"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_with_missing_config_flag_fails() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-with-missing-flag")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  ws.remove_config()?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "--config", "missing.toml", "config", "validate", "-f", "json"],
+  )?;
+  assert!(!output.status.success(), "validate with missing --config should fail");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("specified config file not found")),
+    "expected missing override error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_rejects_invalid_run_profile_surface() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-run-invalid-surface")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"[run.profile.bad]
+surfaces = ["not-a-surface"]
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(!output.status.success(), "invalid run surface should fail validation");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("unknown surface 'not-a-surface'")),
+    "expected unknown surface error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_strict_reports_unknown_run_profile_key() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-run-unknown-key")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"[run.profile.ci]
+surfaces = ["build", "test"]
+unexpected = true
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+  assert!(
+    !output.status.success(),
+    "strict mode should fail on unknown run profile key"
+  );
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("unknown key 'unexpected' in [run.profile.ci] section")),
+    "expected strict unknown-key error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_rejects_invalid_run_workflow_mapping() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-run-invalid-workflow")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"[run.workflow]
+commit = "missing_profile"
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(
+    !output.status.success(),
+    "invalid run workflow mapping should fail validation"
+  );
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("unknown profile 'missing_profile'")),
+    "expected unknown workflow profile error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_rejects_invalid_run_profile_token() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-run-invalid-token")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"[run.profile.docs_custom]
+surfaces = ["docs"]
+run_args = ["--manifest-path", "{bad_token}/Cargo.toml"]
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(!output.status.success(), "invalid token should fail validation");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("unknown token '{bad_token}'")),
+    "expected unknown token validation error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
 // Config Sync Tests
 
 #[test]
@@ -618,6 +816,56 @@ msrv = true
   assert!(json["config_path"].as_str().is_some());
   assert!(json["fields_added"].as_array().is_some());
   assert!(json["has_changes"].as_bool().is_some());
+
+  Ok(())
+}
+
+#[test]
+fn test_config_sync_with_config_flag() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-sync-with-flag")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  ws.remove_config()?;
+
+  let custom_config = ws.path.join("custom-rail.toml");
+  fs::write(
+    &custom_config,
+    r#"targets = ["x86_64-unknown-linux-gnu"]
+
+[unify]
+msrv = true
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "--config", "custom-rail.toml", "config", "sync"])?;
+  assert!(output.status.success(), "config sync with --config should succeed");
+
+  let synced = fs::read_to_string(&custom_config)?;
+  assert!(synced.contains("[release]"), "sync should update override config file");
+  assert!(
+    !ws.path.join(".config").join("rail.toml").exists(),
+    "sync should not require default config path"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_sync_with_missing_config_flag_fails() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-sync-with-missing-flag")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  ws.remove_config()?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "--config", "missing.toml", "config", "sync"])?;
+  assert!(!output.status.success(), "sync with missing --config should fail");
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("specified config file not found"),
+    "expected missing override error. stderr:\n{}",
+    stderr
+  );
 
   Ok(())
 }

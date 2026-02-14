@@ -1677,3 +1677,108 @@ root = "."
 
   Ok(())
 }
+
+#[test]
+fn test_unify_apply_writes_mutation_receipts() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-mutation-receipts")?;
+
+  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+  workspace.commit("Add crates for unify receipt test")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify apply should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let receipts_dir = workspace.path.join("target/cargo-rail/receipts");
+  let entries = std::fs::read_dir(&receipts_dir)?;
+  let receipt_paths: Vec<_> = entries
+    .filter_map(|entry| entry.ok().map(|e| e.path()))
+    .filter(|path| {
+      path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.contains("unify-") && name.ends_with(".json"))
+        .unwrap_or(false)
+    })
+    .collect();
+
+  assert!(
+    !receipt_paths.is_empty(),
+    "expected unify mutation receipts under {}",
+    receipts_dir.display()
+  );
+
+  for receipt_path in receipt_paths {
+    let content = std::fs::read_to_string(&receipt_path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+
+    assert_eq!(json["contract_version"], 1);
+    assert!(json.get("operation_id").is_some());
+    assert!(json["plan"]["inputs_fingerprint"].is_string());
+    assert!(json["plan"]["resolved_refs"].is_object());
+    assert!(json["plan"]["actions"].is_array());
+    assert!(json["plan"]["risks"].is_array());
+    assert!(json["plan"]["trace"].is_array());
+  }
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_apply_from_plan_file() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-apply-plan-file")?;
+
+  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+  workspace.commit("Add crates for plan apply test")?;
+
+  let plan_path = workspace.path.join("unify-plan.json");
+  let check_output = run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "unify",
+      "--check",
+      "-f",
+      "json",
+      "-o",
+      plan_path.to_string_lossy().as_ref(),
+    ],
+  )?;
+  assert_eq!(
+    check_output.status.code(),
+    Some(1),
+    "check should report pending changes"
+  );
+
+  let apply_output = run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "unify",
+      "--plan",
+      plan_path.to_string_lossy().as_ref(),
+      "--skip-report",
+    ],
+  )?;
+  assert!(
+    apply_output.status.success(),
+    "unify apply --plan should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout),
+    String::from_utf8_lossy(&apply_output.stderr)
+  );
+
+  let post_check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(
+    post_check.status.code(),
+    Some(0),
+    "workspace should be unified after plan apply"
+  );
+
+  Ok(())
+}

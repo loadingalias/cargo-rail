@@ -14,8 +14,8 @@ The rail subcommand
 Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
-  affected     Show which crates are affected by changes
-  test         Run tests for affected crates only
+  run          Execute planner-selected surfaces
+  plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
   split        (Advanced) Split a crate to a standalone repository with git history
@@ -23,6 +23,9 @@ Commands:
   release      Publish releases (version bump, changelog, tag, publish)
   clean        Clean generated artifacts (cache, backups, reports)
   config       Configuration management
+  hash         Hash and compare planner contracts
+  diff-hash    Explain why two planner hashes differ
+  graph        Planner reasoning graph for explainability
   completions  Generate shell completions
   help         Print this message or the help of the given subcommand(s)
 
@@ -37,12 +40,89 @@ Options:
 
 ---
 
-## cargo rail affected
+## cargo rail run
 
 ```
-Show which crates are affected by changes
+Execute planner-selected surfaces
 
-Usage: cargo rail affected [OPTIONS]
+Usage: cargo rail run [OPTIONS] [-- <RUN_ARGS>...]
+
+Arguments:
+  [RUN_ARGS]...
+          Pass additional arguments to the selected runner
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --since <SINCE>
+          Git ref to compare against (auto-detects default branch)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --merge-base
+          Use merge-base with default branch (better for feature branches)
+
+  -a, --all
+          Skip change detection and run all workspace crates
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --surface <SURFACE>
+          Surface(s) to execute (repeatable)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --profile <PROFILE>
+          Named profile to map to one or more surfaces
+
+      --workflow <WORKFLOW>
+          Named workflow mapped to a profile via `[run.workflow]`
+
+      --dry-run
+          Preview selected execution without spawning subprocesses
+
+      --print-cmd
+          Print command(s) prior to execution
+
+      --explain
+          Explain why surfaces and targets were selected
+
+      --ignore-bin-crates
+          Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+
+      --skip-nextest
+          Disable automatic use of cargo-nextest
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail run                              # Execute planner-selected test surface
+  cargo rail run --merge-base                 # Compare from branch point (CI)
+  cargo rail run --surface build --surface test
+  cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
+  cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
+  cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
+  cargo rail run --all --surface test         # Force full test run
+  cargo rail run --dry-run --print-cmd        # Preview exact execution
+  cargo rail run -- --nocapture               # Pass args to underlying runner
+```
+
+---
+
+## cargo rail plan
+
+```
+Build a deterministic file-first change plan
+
+Usage: cargo rail plan [OPTIONS]
 
 Options:
   -q, --quiet
@@ -73,27 +153,22 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text:   Human-readable text output (default)
+          - json:   Machine-readable JSON output
+          - github: GitHub Actions output format for $GITHUB_OUTPUT
           
           [default: text]
-
-  -a, --all
-          Show all workspace crates (ignore changes)
-
-      --ignore-bin-crates
-          Ignore binary-only crates (packages with [[bin]] but no lib target)
 
   -o, --output <PATH>
           Write output to file (appends to existing content)
 
       --explain
-          Explain why each crate is affected
+          Show concise human reasoning chain
+
+      --confidence-profile <PROFILE>
+          Planner confidence profile override (strict|balanced|fast)
+          
+          [possible values: strict, balanced, fast]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -102,76 +177,14 @@ Options:
           Print version
 
 Examples:
-  cargo rail affected                     # Changes since default branch
-  cargo rail affected --merge-base        # Changes since branch point (CI recommended)
-  cargo rail affected --since HEAD~5      # Changes in last 5 commits
-  cargo rail affected --from abc --to def # Changes between two SHAs
-  cargo rail affected --ignore-bin-crates # Skip binary-only crates (no lib target)
-  cargo rail affected --explain           # Show why each crate is affected
-  cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
-  cargo rail affected -f names-only       # Just crate names, one per line
-
-CI tip: Use --merge-base for PRs to detect only your branch's changes,
-even if the target branch has moved forward.
-```
-
----
-
-## cargo rail test
-
-```
-Run tests for affected crates only
-
-Usage: cargo rail test [OPTIONS] [-- <TEST_ARGS>...]
-
-Arguments:
-  [TEST_ARGS]...
-          Pass additional arguments to the test runner
-
-Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --since <SINCE>
-          Git ref to compare against (auto-detects default branch)
-
-      --json
-          Output in JSON format (shorthand for -f json)
-
-      --merge-base
-          Use merge-base with default branch (better for feature branches)
-
-  -a, --all
-          Skip change detection and run all tests
-
-      --ignore-bin-crates
-          Ignore binary-only crates (packages with [[bin]] but no lib target)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --skip-nextest
-          Disable automatic use of cargo-nextest
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-      --explain
-          Explain why tests are being run
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Examples:
-  cargo rail test                         # Test affected crates
-  cargo rail test --merge-base            # Test changes since branch point (CI)
-  cargo rail test --all                   # Test all crates
-  cargo rail test --ignore-bin-crates     # Skip binary-only crates (no lib target)
-  cargo rail test -- --nocapture          # Pass args to test runner
-  cargo rail test --explain               # Show why each crate is tested
+  cargo rail plan                           # Changes since default branch
+  cargo rail plan --merge-base              # Changes since branch point (CI recommended)
+  cargo rail plan --confidence-profile strict  # Conservative planner profile
+  cargo rail plan --since HEAD~5            # Changes in last 5 commits
+  cargo rail plan --from abc --to def       # Changes between two SHAs
+  cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan -f json                   # Full machine-readable contract
+  cargo rail plan -f github                 # GitHub Actions key=value output
 ```
 
 ---
@@ -200,20 +213,23 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
+      --plan <PATH>
+          Apply from a previously generated mutation plan file
+
   -f, --format <FORMAT>
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
           
           [default: text]
 
-      --backup
-          Create backups of all modified files
-
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --backup
+          Create backups of all modified files
 
       --skip-report
           Skip generating the unify report
@@ -347,7 +363,7 @@ Options:
           Print version
 
 This is an advanced feature for extracting crates to standalone repositories
-while preserving git history. Most teams should start with 'affected', 'test',
+while preserving git history. Most teams should start with 'plan', 'run',
 and 'unify' before using split/sync.
 
 Examples:
@@ -412,11 +428,14 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
-      --allow-dirty
-          Allow running on dirty worktree (uncommitted changes)
+      --plan <PATH>
+          Apply from a previously generated mutation plan file
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --allow-dirty
+          Allow running on dirty worktree (uncommitted changes)
 
   -y, --yes
           Skip confirmation prompts (for CI/automation)
@@ -493,6 +512,9 @@ Options:
 
   -c, --check
           Dry-run mode: preview changes without executing
+
+      --plan <PATH>
+          Apply from a previously generated mutation plan file
 
       --allow-dirty
           Allow running on dirty worktree (uncommitted changes)
@@ -633,11 +655,14 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
-      --skip-publish
-          Skip publishing to crates.io
+      --plan <PATH>
+          Apply from a previously generated mutation plan file
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --skip-publish
+          Skip publishing to crates.io
 
       --skip-tag
           Skip git tag creation
@@ -1014,6 +1039,188 @@ Options:
 
   -V, --version
           Print version
+```
+
+---
+
+## cargo rail hash
+
+```
+Hash and compare planner contracts
+
+Usage: cargo rail hash [OPTIONS]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --since <SINCE>
+          Git ref to compare against (auto-detects default branch)
+
+      --from <FROM>
+          Start ref (for SHA pair mode)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --to <TO>
+          End ref (for SHA pair mode)
+
+      --merge-base
+          Use merge-base with default branch (better for feature branches)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --confidence-profile <PROFILE>
+          Planner confidence profile override (strict|balanced|fast)
+          
+          [possible values: strict, balanced, fast]
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail hash                          # Hash current planner contract
+  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
+  cargo rail hash -f json                  # Structured hash output
+  cargo rail diff-hash plan-a.json plan-b.json
+  cargo rail diff-hash plan-a.json plan-b.json -f json
+```
+
+---
+
+## cargo rail diff-hash
+
+```
+Explain why two planner hashes differ
+
+Usage: cargo rail diff-hash [OPTIONS] <A> <B>
+
+Arguments:
+  <A>
+          First planner JSON path
+
+  <B>
+          Second planner JSON path
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+          
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail hash                          # Hash current planner contract
+  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
+  cargo rail hash -f json                  # Structured hash output
+  cargo rail diff-hash plan-a.json plan-b.json
+  cargo rail diff-hash plan-a.json plan-b.json -f json
+```
+
+---
+
+## cargo rail graph
+
+```
+Planner reasoning graph for explainability
+
+Usage: cargo rail graph [OPTIONS]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --since <SINCE>
+          Git ref to compare against (auto-detects default branch)
+
+      --from <FROM>
+          Start ref (for SHA pair mode)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --to <TO>
+          End ref (for SHA pair mode)
+
+      --merge-base
+          Use merge-base with default branch (better for feature branches)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --confidence-profile <PROFILE>
+          Planner confidence profile override (strict|balanced|fast)
+          
+          [possible values: strict, balanced, fast]
+
+      --dot
+          Output GraphViz DOT instead of JSON
+
+  -o, --output <PATH>
+          Write output to file (appends to existing content)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail graph                             # Planner reasoning graph (json)
+  cargo rail graph --merge-base                # Graph against merge-base comparison
+  cargo rail graph --dot                       # GraphViz DOT output
+  cargo rail graph --since HEAD~3 -o graph.dot # Write graph output to file
 ```
 
 ---

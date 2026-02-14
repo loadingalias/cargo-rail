@@ -8,7 +8,7 @@ cargo-rail uses `rail.toml` for workspace-level configuration. This file control
 
 - **Dependency unification** (`cargo rail unify`)
 - **Release automation** (`cargo rail release`)
-- **Change detection** (`cargo rail affected`)
+- **Change planning + execution** (`cargo rail plan`, `cargo rail run`)
 - **Crate splitting** (`cargo rail split`)
 
 ### Configuration File Location
@@ -80,6 +80,7 @@ Configuration options at the workspace root level.
 | `unify` | `table` | `{}` | Dependency unification settings (see below) |
 | `release` | `table` | `{}` | Release management settings (see below) |
 | `change-detection` | `table` | `{}` | Change detection settings (see below) |
+| `run` | `table` | `{}` | Run profile settings for `cargo rail run` (see below) |
 | `crates` | `table` | `{}` | Per-crate configuration (see below) |
 
 **Example:**
@@ -297,12 +298,15 @@ require_changelog_entries = false
 
 ### [change-detection] Configuration
 
-Settings for the `affected` and `test` commands. Controls how changes are classified and which crates are affected.
+Settings for planner path classification.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `infrastructure` | `string[]` | see below | Glob patterns for infrastructure files that trigger `rebuild_all` when modified. Changes to these files require testing all crates. |
-| `custom` | `table<string, string[]>` | `{}` | Custom path patterns and their categories. Keys are category names, values are glob pattern arrays. Used for conditional CI logic. |
+| `infrastructure` | `string[]` | see below | Path patterns treated as infra changes. |
+| `conservative_unclassified_owner_fallback` | `bool` | `true` | If `true`, unclassified files owned by crates conservatively enable `build` + `test`. |
+| `confidence_profile` | `enum` | `"balanced"` | Planner confidence profile:<br>• `"strict"` - expands crate-owned changes to conservative `build` + `test` with transitive seeding<br>• `"balanced"` - default behavior<br>• `"fast"` - disables conservative transitive surface seeding for speed |
+| `bot_pr_confidence_profile` | `enum?` | `unset` | Optional profile override applied only for bot-authored GitHub pull requests (for example set to `"strict"`). |
+| `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces in `cargo rail plan` output. Category names must use ASCII letters/digits with `_` or `-` (for example `verify_models`, `bench-extended`). |
 
 **Default Infrastructure Patterns:**
 
@@ -333,83 +337,164 @@ infrastructure = [
 infrastructure = [
     ".github/**",
     "justfile",
-    "Cargo.lock",        # Add lock file
+    "Cargo.lock",
     "rust-toolchain.toml"
 ]
+confidence_profile = "balanced"
+bot_pr_confidence_profile = "strict"  # optional; only active for bot PRs
 
 [change-detection.custom]
-verify = ["verify/**/*.rs"]           # Stateright models
+verify = ["verify/**/*.rs"]
 benchmarks = ["benches/**", "perf/**"]
 docs = ["docs/**", "*.md"]
 ```
 
-#### GitHub Actions Integration
+#### Planner-First GitHub Actions Integration
 
-Use [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) for CI:
+Use `cargo rail plan -f github` as the CI source of truth:
 
 ```yaml
 - uses: actions/checkout@v4
-  with: { fetch-depth: 0 }
+  with:
+    fetch-depth: 0
 
-- uses: loadingalias/cargo-rail-action@v1
-  id: affected
+- name: Build plan outputs
+  id: plan
+  run: cargo rail plan --merge-base -f github >> "$GITHUB_OUTPUT"
 
-- name: Test affected
-  if: steps.affected.outputs.docs-only != 'true'
-  run: |
-    if [[ "${{ steps.affected.outputs.rebuild-all }}" == "true" ]]; then
-      cargo test --workspace
-    else
-      cargo test ${{ steps.affected.outputs.cargo-args }}
-    fi
+- name: Test selected crates
+  if: steps.plan.outputs.test == 'true'
+  run: cargo rail run --merge-base --profile ci
+
+- name: Docs pipeline
+  if: steps.plan.outputs.docs == 'true'
+  run: cargo rail run --merge-base --surface docs
 ```
 
-**Action Outputs:**
+For a full end-to-end operating recipe (local + CI + trust checklist), see:
+`docs/change-detection-recipe.md`.
+
+**`plan -f github` outputs:**
 
 | Output | Description |
 |--------|-------------|
-| `docs-only` | `"true"` if only documentation changed |
-| `rebuild-all` | `"true"` if infrastructure files changed |
-| `crates` | Space-separated affected crates |
-| `cargo-args` | Ready-to-use `-p crate1 -p crate2` flags |
-| `matrix` | JSON array for `strategy.matrix` |
-| `count` | Number of affected crates |
-| `custom-categories` | JSON object of custom category matches |
+| `build` | `"true"` when build surface is enabled |
+| `test` | `"true"` when test surface is enabled |
+| `bench` | `"true"` when bench surface is enabled |
+| `docs` | `"true"` when docs surface is enabled |
+| `infra` | `"true"` when infra surface is enabled |
+| `plan_contract_version` | Planner contract version (for deterministic replay compatibility checks) |
+| `base_ref` | Resolved baseline ref used for change detection |
+| `head_ref` | Resolved head ref (usually `WORKTREE` for local runs) |
+| `confidence_profile` | Effective planner confidence profile (`strict`, `balanced`, `fast`) |
+| `confidence_profile_source` | Source of selected profile (`config`, `cli`, `bot_pr_policy`, etc.) |
+| `direct_crates` | Space-separated direct impacted crates |
+| `transitive_crates` | Space-separated transitive impacted crates |
+| `custom_surfaces` | JSON map of `custom:<name> -> bool` |
+| `plan_json` | Full planner contract as compact JSON |
 
-**Conditional Jobs with Custom Categories:**
+#### Decision Receipt Artifact (Recommended)
+
+`cargo rail run` writes a deterministic decision receipt under `target/cargo-rail/receipts/`.
+Upload it in CI so incident/debug review can answer "why this ran" without log spelunking:
 
 ```yaml
-jobs:
-  detect:
-    outputs:
-      run-bench: ${{ contains(steps.affected.outputs.custom-categories, 'benchmarks') }}
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: loadingalias/cargo-rail-action@v1
-        id: affected
+- name: Run targeted surfaces
+  run: cargo rail run --merge-base --profile ci
 
-  bench:
-    needs: detect
-    if: needs.detect.outputs.run-bench == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo bench
+- name: Upload rail receipts
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: cargo-rail-receipts
+    path: target/cargo-rail/receipts/*.json
+    if-no-files-found: ignore
 ```
+
+#### Migration from Coarse Outputs to Surfaces
+
+| Legacy pattern | Planner-first replacement |
+|----------------|---------------------------|
+| `docs-only == true` | `docs == true` and `test == false` |
+| `rebuild-all == true` | `infra == true` |
+| surface dispatch | `cargo rail run --surface test` |
+| `custom-categories` checks | Parse `custom_surfaces` JSON |
 
 #### Output Formats
 
-The `affected` command supports multiple output formats via `--format`:
+Planner outputs support three formats:
 
 | Format | Use Case | Example |
 |--------|----------|---------|
-| `text` | Human debugging | `direct: 2\n  lib-a` |
-| `json` | Scripting | `{"impact": {"direct": ["lib-a"]}}` |
-| `github` | `$GITHUB_OUTPUT` | `crates=lib-a lib-b` |
-| `github-matrix` | `strategy.matrix` | `{"include": [{"crate": "lib-a"}]}` |
-| `names-only` | Shell loops | `lib-a\nlib-b` |
-| `cargo-args` | Direct cargo use | `-p lib-a -p lib-b` |
+| `text` | Human-readable summary | `plan\nchanged files: 1` |
+| `json` | Full machine contract | `{"files":[...],"surfaces":{...}}` |
+| `github` | GitHub key/value outputs | `test=true` |
+
+---
+
+### [run] Configuration
+
+Execution profile configuration for `cargo rail run`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `default_profile` | `string?` | `unset` | Default profile when no `--surface`/`--profile` is passed. |
+| `profile` | `table` | `{}` | User-defined profile map: `[run.profile.<name>]`. |
+| `workflow` | `table<string,string>` | `{}` | Optional workflow-name to profile-name mapping for CI wrappers. |
+
+Built-in profiles:
+
+- `local` -> `["test"]`
+- `ci` -> `["build", "test"]`
+- `nightly` -> `["build", "test", "docs"]`
+
+Precedence:
+
+1. `--surface` overrides all profile selection.
+2. `--profile` overrides `run.default_profile`.
+3. `run.default_profile` overrides built-in fallback (`local`).
+
+User-defined profile schema:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `surfaces` | `string[]` | yes | Surfaces to execute (`build`, `test`, `bench`, `docs`, `infra`). |
+| `run_args` | `string[]` | no | Args prepended before CLI `RUN_ARGS`. |
+| `since` | `string?` | no | Default `--since` baseline when CLI does not pass `--since`/`--merge-base`. |
+| `merge_base` | `bool?` | no | Default merge-base mode when CLI does not pass `--since`/`--merge-base`. |
+
+Token substitutions (stable expansion order):
+
+1. `{workspace_root}`
+2. `{base_ref}`
+3. `{cargo_args}` (only valid in `run_args`)
+
+Allowed tokens by field:
+
+- `run.profile.<name>.run_args`: `{workspace_root}`, `{base_ref}`, `{cargo_args}`
+- `run.profile.<name>.since`: `{workspace_root}`, `{base_ref}`
+
+Example:
+
+```toml
+[run]
+default_profile = "ci"
+
+[run.workflow]
+commit = "ci"
+nightly = "nightly"
+bench-weekly = "bench_weekly"
+
+[run.profile.bench]
+surfaces = ["bench"]
+run_args = ["--", "--bench", "core"]
+since = "origin/main"
+
+[run.profile.bench_weekly]
+surfaces = ["bench"]
+run_args = ["--", "--bench", "critical", "{cargo_args}"]
+since = "{base_ref}"
+```
 
 ---
 
@@ -720,6 +805,8 @@ sign_tags = true
 
 [change-detection]
 infrastructure = [".github/**", "justfile", "Cargo.lock"]
+confidence_profile = "strict"
+bot_pr_confidence_profile = "strict"
 
 [change-detection.custom]
 benchmarks = ["benches/**"]
@@ -847,4 +934,6 @@ Note: `cargo rail config validate` defaults to strict mode in CI (detected via `
 
 - [Commands Reference](./commands.md) - All cargo-rail commands
 - [Migration Guide](./migrate-hakari.md) - Migrating from cargo-hakari
+- [Migration Guide](./migrate-plan-run.md) - Migrating legacy command flows to `plan` / `run`
+- [Troubleshooting](./troubleshooting.md) - Diagnose planner and executor decisions
 - [README](../README.md) - Project overview and quick start

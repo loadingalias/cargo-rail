@@ -1,9 +1,13 @@
 //! `cargo rail sync` - Bidirectional sync between monorepo and split repositories.
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::error::{GitError, RailError, RailResult};
+use crate::git::SystemGit;
+use crate::git::mappings::MappingStore;
+use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine, SyncResult};
 use crate::utils;
@@ -33,6 +37,8 @@ pub struct SyncArgs {
   pub strategy: ConflictStrategy,
   /// Dry-run mode: preview changes without executing
   pub check: bool,
+  /// Apply from a previously generated mutation plan file
+  pub plan_path: Option<PathBuf>,
   /// Allow running on dirty worktree (uncommitted changes)
   pub allow_dirty: bool,
   /// Skip confirmation prompts (for CI/automation)
@@ -82,6 +88,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   };
 
   let configs = builder.build_sync_configs()?;
+  let snapshots = collect_sync_snapshots(ctx, &configs, &direction, args.strategy);
+  let expected_mutation_plan = build_sync_mutation_plan(ctx, &configs, &direction, args.strategy, args.allow_dirty)?;
+  let pre_heads = collect_sync_heads(ctx.workspace_root(), &configs);
 
   // Check mode
   if args.check {
@@ -113,7 +122,13 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         "direction": dir_str,
         "strategy": format!("{:?}", args.strategy).to_lowercase(),
         "crates": crates,
-        "count": configs.len()
+        "count": configs.len(),
+        "planning": {
+          "source_head": ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
+          "targets": snapshots,
+          "conflict_candidates": compute_conflict_candidates(&configs),
+        },
+        "mutation_plan": expected_mutation_plan,
       });
       println!("{}", serde_json::to_string_pretty(&output)?);
       return Ok(());
@@ -173,12 +188,47 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     }
   }
 
+  let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
+    let from_file = mutation::read_plan_file(path)?;
+    if !from_file.operation_id.starts_with("sync-") {
+      return Err(RailError::with_help(
+        format!("plan '{}' is not a sync plan", path.display()),
+        "generate a sync plan using 'cargo rail sync --check -f json'".to_string(),
+      ));
+    }
+    mutation::validate_pre_apply(ctx, &from_file)?;
+    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
+      return Err(RailError::with_help(
+        "provided sync plan does not match current requested operation",
+        "regenerate the sync plan and rerun with --plan",
+      ));
+    }
+    from_file
+  } else {
+    mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
+    expected_mutation_plan
+  };
+
+  let plan_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "sync",
+    "plan",
+    "planned",
+    mutation_plan.clone(),
+    vec![MutationTrace::new(
+      "SYNC_PLAN_CREATED",
+      format!("planned sync for {} crate(s)", config_count),
+    )],
+  )?;
+  progress!("receipt: {}", plan_receipt.display());
+
   // Execute syncs and collect per-crate results
+  let configs_for_exec = configs.clone();
   let crate_results: Vec<CrateSyncResult> = if config_count > 1 && args.all {
     progress!("syncing {} crates...", config_count);
 
     let strategy = args.strategy;
-    let results: Vec<RailResult<CrateSyncResult>> = configs
+    let results: Vec<RailResult<CrateSyncResult>> = configs_for_exec
       .into_par_iter()
       .map(|(sync_config, target_exists)| {
         let crate_name = sync_config.crate_name.clone();
@@ -213,7 +263,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     results.into_iter().collect::<RailResult<Vec<_>>>()?
   } else {
     let mut results = Vec::new();
-    for (sync_config, target_exists) in configs {
+    for (sync_config, target_exists) in configs_for_exec {
       let crate_name = sync_config.crate_name.clone();
 
       if !target_exists {
@@ -247,6 +297,21 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
   // Print summary
   print_sync_summary(&crate_results, json)?;
+  let post_heads = collect_sync_heads(ctx.workspace_root(), &configs);
+  let audit_path = write_sync_audit_artifact(ctx.workspace_root(), &configs, &crate_results, &pre_heads, &post_heads)?;
+  progress!("sync audit: {}", audit_path.display());
+  let apply_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "sync",
+    "apply",
+    "applied",
+    mutation_plan,
+    vec![
+      MutationTrace::new("SYNC_APPLY_STARTED", "started sync apply"),
+      MutationTrace::new("SYNC_APPLY_COMPLETED", "completed sync apply"),
+    ],
+  )?;
+  progress!("receipt: {}", apply_receipt.display());
 
   Ok(())
 }
@@ -341,4 +406,199 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
   }
 
   Ok(())
+}
+
+fn build_sync_mutation_plan(
+  ctx: &WorkspaceContext,
+  configs: &[(crate::sync::SyncConfig, bool)],
+  direction: &SyncDirection,
+  strategy: ConflictStrategy,
+  allow_dirty: bool,
+) -> RailResult<mutation::MutationPlan> {
+  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let direction_name = match direction {
+    SyncDirection::MonoToRemote => "mono_to_remote",
+    SyncDirection::RemoteToMono => "remote_to_mono",
+    SyncDirection::Both => "bidirectional",
+    SyncDirection::None => "none",
+  };
+
+  let mut sorted = configs.iter().collect::<Vec<_>>();
+  sorted.sort_by(|a, b| a.0.crate_name.cmp(&b.0.crate_name));
+
+  let actions = sorted
+    .into_iter()
+    .map(|(config, target_exists)| {
+      let target_head = SystemGit::open(&config.target_repo_path)
+        .and_then(|git| git.head_commit())
+        .unwrap_or_else(|_| "none".to_string());
+      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
+      MutationAction::new(
+        "SYNC_CRATE",
+        config.crate_name.clone(),
+        Some(format!(
+          "direction={}, strategy={}, target_exists={}, source_head={}, target_head={}, mapping_count={}",
+          direction_name,
+          format!("{:?}", strategy).to_lowercase(),
+          target_exists,
+          source_head,
+          target_head,
+          mapping_count
+        )),
+      )
+    })
+    .collect();
+
+  let mut risks = Vec::new();
+  if allow_dirty {
+    risks.push(MutationRisk::new(
+      "ALLOW_DIRTY_WORKTREE",
+      "medium",
+      "sync is allowed on a dirty worktree",
+    ));
+  }
+  if matches!(direction, SyncDirection::Both) {
+    risks.push(MutationRisk::new(
+      "BIDIRECTIONAL_SYNC",
+      "medium",
+      "bidirectional sync can create larger conflict surfaces",
+    ));
+  }
+
+  let trace = vec![MutationTrace::new(
+    "SYNC_CONFIGS_RESOLVED",
+    format!("resolved {} sync config(s)", configs.len()),
+  )];
+
+  mutation::build_plan(ctx, "sync", actions, risks, trace)
+}
+
+fn collect_sync_snapshots(
+  ctx: &WorkspaceContext,
+  configs: &[(crate::sync::SyncConfig, bool)],
+  direction: &SyncDirection,
+  strategy: ConflictStrategy,
+) -> Vec<serde_json::Value> {
+  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let direction_name = match direction {
+    SyncDirection::MonoToRemote => "mono_to_remote",
+    SyncDirection::RemoteToMono => "remote_to_mono",
+    SyncDirection::Both => "bidirectional",
+    SyncDirection::None => "none",
+  };
+
+  configs
+    .iter()
+    .map(|(config, target_exists)| {
+      let target_head = SystemGit::open(&config.target_repo_path)
+        .and_then(|git| git.head_commit())
+        .ok();
+      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
+      serde_json::json!({
+        "crate_name": config.crate_name,
+        "direction": direction_name,
+        "strategy": format!("{:?}", strategy).to_lowercase(),
+        "source_head": source_head,
+        "target_head": target_head,
+        "target_exists": target_exists,
+        "mapping_snapshot": {
+          "mapping_count": mapping_count,
+        },
+      })
+    })
+    .collect()
+}
+
+fn compute_conflict_candidates(configs: &[(crate::sync::SyncConfig, bool)]) -> Vec<serde_json::Value> {
+  configs
+    .iter()
+    .map(|(config, _)| {
+      let paths: Vec<String> = config.crate_paths.iter().map(|p| p.display().to_string()).collect();
+      serde_json::json!({
+        "crate_name": config.crate_name,
+        "candidate_paths": paths,
+      })
+    })
+    .collect()
+}
+
+fn mapping_count_for(workspace_root: &Path, crate_name: &str, target_repo_path: &Path) -> usize {
+  let mut store = MappingStore::new(crate_name.to_string());
+  let _ = store.load(workspace_root);
+  let _ = store.load(target_repo_path);
+  store.count()
+}
+
+fn collect_sync_heads(
+  workspace_root: &Path,
+  configs: &[(crate::sync::SyncConfig, bool)],
+) -> std::collections::BTreeMap<String, (Option<String>, Option<String>)> {
+  let mono_head = SystemGit::open(workspace_root).and_then(|git| git.head_commit()).ok();
+  let mut out = std::collections::BTreeMap::new();
+  for (config, _) in configs {
+    let target_head = SystemGit::open(&config.target_repo_path)
+      .and_then(|git| git.head_commit())
+      .ok();
+    out.insert(config.crate_name.clone(), (mono_head.clone(), target_head));
+  }
+  out
+}
+
+fn write_sync_audit_artifact(
+  workspace_root: &Path,
+  configs: &[(crate::sync::SyncConfig, bool)],
+  results: &[CrateSyncResult],
+  pre_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
+  post_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
+) -> RailResult<PathBuf> {
+  let dir = workspace_root.join("target").join("cargo-rail").join("receipts");
+  std::fs::create_dir_all(&dir)?;
+  let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+  let path = dir.join(format!("sync-audit-{}.json", nonce));
+
+  let by_crate: Vec<_> = configs
+    .iter()
+    .map(|(config, _)| {
+      let result = results.iter().find(|r| r.crate_name == config.crate_name);
+      let pre = pre_heads.get(&config.crate_name).cloned().unwrap_or((None, None));
+      let post = post_heads.get(&config.crate_name).cloned().unwrap_or((None, None));
+      let conflicts: Vec<String> = result
+        .map(|r| {
+          r.result
+            .conflicts
+            .iter()
+            .map(|c| c.file_path.display().to_string())
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+      serde_json::json!({
+        "crate_name": config.crate_name,
+        "source_refs": {
+          "mono_pre": pre.0,
+          "mono_post": post.0,
+          "target_pre": pre.1,
+          "target_post": post.1,
+        },
+        "selected_commits": {
+          "count": result.map(|r| r.result.commits_synced).unwrap_or(0),
+        },
+        "produced_commits": {
+          "count": result.map(|r| r.result.commits_synced).unwrap_or(0),
+        },
+        "conflict_outcomes": conflicts,
+      })
+    })
+    .collect();
+
+  let json = serde_json::json!({
+    "artifact": "sync_audit",
+    "version": 1,
+    "generated_at_utc": chrono::Utc::now().to_rfc3339(),
+    "crates": by_crate,
+  });
+  let rendered = serde_json::to_vec_pretty(&json)
+    .map_err(|e| RailError::message(format!("failed to serialize sync audit: {}", e)))?;
+  std::fs::write(&path, rendered)
+    .map_err(|e| RailError::message(format!("failed to write sync audit '{}': {}", path.display(), e)))?;
+  Ok(path)
 }

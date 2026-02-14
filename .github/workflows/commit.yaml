@@ -42,7 +42,7 @@ jobs:
       count: ${{ steps.affected.outputs.count }}
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Required for change detection
           persist-credentials: false
@@ -51,6 +51,8 @@ jobs:
         id: affected
         uses: loadingalias/cargo-rail-action@88618d12427cee84efbe1ef556dd9f8445acad95  # v1.0.2
         with:
+          # Pin to v0.9.1 while feature/change-planning-v3 is in development
+          version: 0.9.1
           # For push: compare against previous commit; for PR: compare against base branch
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
@@ -65,7 +67,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -93,12 +95,12 @@ jobs:
           echo "Using MSRV: $msrv"
 
       - name: Install Rust MSRV Toolchain
-        uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561  # master
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # master
         with:
           toolchain: ${{ steps.msrv.outputs.msrv }}
 
       - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1  # v2.8.1
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
           shared-key: "cargo-rail-msrv-v1"
           key: msrv-${{ steps.msrv.outputs.msrv }}
@@ -144,7 +146,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
 
@@ -164,7 +166,7 @@ jobs:
 
       - name: Upload JUnit Test Report
         if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: junit-report-${{ matrix.target.name }}
           path: target/nextest/commit/junit.xml
@@ -173,7 +175,7 @@ jobs:
 
       - name: Publish Test Report
         if: always()
-        uses: mikepenz/action-junit-report@e08919a3b1fb83a78393dfb775a9c37f17d8eea6  # v6.0.1
+        uses: mikepenz/action-junit-report@74626db7353a25a20a72816467ebf035f674c5f8  # v6.2.0
         with:
           report_paths: 'target/nextest/commit/junit.xml'
           check_name: 'Test Results (${{ matrix.target.name }})'
@@ -183,12 +185,3 @@ jobs:
           require_tests: true
           annotate_only: false
           summary: true
-
-      - name: Upload Nextest Results (on failure)
-        if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
-        with:
-          name: nextest-results-${{ matrix.target.name }}
-          path: target/nextest/
-          retention-days: 7
-          if-no-files-found: ignore

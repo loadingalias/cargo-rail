@@ -5,6 +5,9 @@ use std::io::IsTerminal;
 use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
 use crate::config::RailConfig;
 use crate::error::{GitError, RailError, RailResult};
+use crate::git::SystemGit;
+use crate::git::mappings::MappingStore;
+use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::split::SplitEngine;
 use crate::utils;
@@ -21,6 +24,8 @@ pub struct SplitRunArgs {
   pub remote: Option<String>,
   /// Dry-run mode: preview changes without executing
   pub check: bool,
+  /// Apply from a previously generated mutation plan file
+  pub plan_path: Option<std::path::PathBuf>,
   /// Allow running on dirty worktree (uncommitted changes)
   pub allow_dirty: bool,
   /// Skip confirmation prompts (for CI/automation)
@@ -51,6 +56,8 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 
   let config_count = builder.count();
   let configs = builder.build_split_configs()?;
+  let snapshots = collect_split_snapshots(ctx, &configs);
+  let expected_mutation_plan = build_split_mutation_plan(ctx, &configs, args.allow_dirty)?;
 
   // Check mode: show plan
   if args.check {
@@ -72,7 +79,12 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           "command": "split",
           "check": true,
           "crates": crates,
-          "count": configs.len()
+          "count": configs.len(),
+          "planning": {
+            "source_head": ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
+            "targets": snapshots,
+          },
+          "mutation_plan": expected_mutation_plan,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
       }
@@ -128,6 +140,40 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     }
   }
 
+  let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
+    let from_file = mutation::read_plan_file(path)?;
+    if !from_file.operation_id.starts_with("split-") {
+      return Err(RailError::with_help(
+        format!("plan '{}' is not a split plan", path.display()),
+        "generate a split plan using 'cargo rail split run --check -f json'".to_string(),
+      ));
+    }
+    mutation::validate_pre_apply(ctx, &from_file)?;
+    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
+      return Err(RailError::with_help(
+        "provided split plan does not match current requested operation",
+        "regenerate the split plan and rerun with --plan",
+      ));
+    }
+    from_file
+  } else {
+    mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
+    expected_mutation_plan
+  };
+
+  let plan_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "split",
+    "plan",
+    "planned",
+    mutation_plan.clone(),
+    vec![MutationTrace::new(
+      "SPLIT_PLAN_CREATED",
+      format!("planned split for {} crate(s)", config_count),
+    )],
+  )?;
+  progress!("receipt: {}", plan_receipt.display());
+
   // Execute splits
   if config_count > 1 && args.all {
     progress!("splitting {} crates...", config_count);
@@ -152,6 +198,18 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
   }
 
   println!("split complete");
+  let apply_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "split",
+    "apply",
+    "applied",
+    mutation_plan,
+    vec![
+      MutationTrace::new("SPLIT_APPLY_STARTED", "started split apply"),
+      MutationTrace::new("SPLIT_APPLY_COMPLETED", "completed split apply"),
+    ],
+  )?;
+  progress!("receipt: {}", apply_receipt.display());
   Ok(())
 }
 
@@ -183,6 +241,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
+    run: crate::config::RunConfig::default(),
     crates: Default::default(),
   });
 
@@ -314,4 +373,79 @@ fn detect_workspace_splits(
 fn serialize_splits_config(config: &RailConfig) -> RailResult<String> {
   toml_edit::ser::to_string_pretty(config)
     .map_err(|e| crate::error::RailError::message(format!("config serialization failed: {}", e)))
+}
+
+fn build_split_mutation_plan(
+  ctx: &WorkspaceContext,
+  configs: &[crate::split::SplitConfig],
+  allow_dirty: bool,
+) -> RailResult<mutation::MutationPlan> {
+  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let mut sorted_configs = configs.iter().collect::<Vec<_>>();
+  sorted_configs.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+
+  let actions = sorted_configs
+    .into_iter()
+    .map(|config| {
+      let target_head = SystemGit::open(&config.target_repo_path)
+        .and_then(|git| git.head_commit())
+        .unwrap_or_else(|_| "none".to_string());
+      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
+      MutationAction::new(
+        "SPLIT_CRATE",
+        config.crate_name.clone(),
+        Some(format!(
+          "source_head={}, target={}, target_head={}, mapping_count={}",
+          source_head,
+          config.target_repo_path.display(),
+          target_head,
+          mapping_count
+        )),
+      )
+    })
+    .collect();
+
+  let mut risks = Vec::new();
+  if allow_dirty {
+    risks.push(MutationRisk::new(
+      "ALLOW_DIRTY_WORKTREE",
+      "medium",
+      "split is allowed on a dirty worktree",
+    ));
+  }
+
+  let trace = vec![MutationTrace::new(
+    "SPLIT_CONFIGS_RESOLVED",
+    format!("resolved {} split config(s)", configs.len()),
+  )];
+
+  mutation::build_plan(ctx, "split", actions, risks, trace)
+}
+
+fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::SplitConfig]) -> Vec<serde_json::Value> {
+  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let mut out = Vec::new();
+
+  for config in configs {
+    let target_head = SystemGit::open(&config.target_repo_path)
+      .and_then(|git| git.head_commit())
+      .ok();
+    let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
+    out.push(serde_json::json!({
+      "crate_name": config.crate_name,
+      "source_head": source_head,
+      "target_head": target_head,
+      "mapping_snapshot": {
+        "mapping_count": mapping_count,
+      },
+    }));
+  }
+  out
+}
+
+fn mapping_count_for(workspace_root: &std::path::Path, crate_name: &str, target_repo_path: &std::path::Path) -> usize {
+  let mut store = MappingStore::new(crate_name.to_string());
+  let _ = store.load(workspace_root);
+  let _ = store.load(target_repo_path);
+  store.count()
 }

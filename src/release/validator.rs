@@ -2,6 +2,7 @@
 
 use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
+use crate::release::planner::ReleasePlan;
 use crate::workspace::WorkspaceContext;
 use std::path::PathBuf;
 use std::process::Command;
@@ -195,6 +196,56 @@ impl<'a> ReleaseValidator<'a> {
         format!("Crate '{}' has publish = false in Cargo.toml", crate_name),
         "Remove 'publish = false' or exclude this crate from the release",
       ));
+    }
+
+    Ok(())
+  }
+
+  /// Validate preconditions for applying a release plan.
+  pub fn validate_apply_preconditions(
+    &self,
+    plan: &ReleasePlan,
+    skip_publish: bool,
+    skip_tag: bool,
+    require_clean: bool,
+  ) -> RailResult<()> {
+    if require_clean {
+      self.check_clean_working_directory()?;
+    }
+
+    if !skip_tag {
+      for crate_plan in &plan.crates {
+        let output = Command::new("git")
+          .current_dir(self.ctx.workspace_root())
+          .args([
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/tags/{}", crate_plan.tag_name),
+          ])
+          .output()
+          .map_err(|e| RailError::message(format!("Failed to validate tag '{}': {}", crate_plan.tag_name, e)))?;
+        if output.status.success() {
+          return Err(RailError::with_help(
+            format!("tag '{}' already exists", crate_plan.tag_name),
+            "regenerate plan with a new version or delete the conflicting tag".to_string(),
+          ));
+        }
+      }
+    }
+
+    if !skip_publish {
+      let output = Command::new("cargo")
+        .current_dir(self.ctx.workspace_root())
+        .args(["search", "serde", "--limit", "1"])
+        .output()
+        .map_err(|e| RailError::message(format!("Failed to verify crates.io access: {}", e)))?;
+      if !output.status.success() {
+        return Err(RailError::with_help(
+          "crates.io precondition check failed",
+          "verify network access and cargo credentials before publishing".to_string(),
+        ));
+      }
     }
 
     Ok(())

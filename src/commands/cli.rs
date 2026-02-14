@@ -5,7 +5,7 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{OutputFormat, UnifyOutputFormat};
+use super::common::{OutputFormat, PlanOutputFormat, UnifyOutputFormat};
 use crate::sync::ConflictStrategy;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -16,8 +16,8 @@ Monorepo orchestration for Rust workspaces.
 
 Quick start:
   cargo rail init              # Generate .config/rail.toml (default)
-  cargo rail affected          # See what changed
-  cargo rail test              # Test affected crates only
+  cargo rail plan              # Build deterministic change plan
+  cargo rail run               # Execute planner-selected surfaces
   cargo rail unify --check     # Preview dependency unification
 
 Docs: https://github.com/loadingalias/cargo-rail";
@@ -66,28 +66,28 @@ pub struct RailCli {
   pub command: Commands,
 }
 
-const AFFECTED_HELP: &str = "\
+const RUN_HELP: &str = "\
 Examples:
-  cargo rail affected                     # Changes since default branch
-  cargo rail affected --merge-base        # Changes since branch point (CI recommended)
-  cargo rail affected --since HEAD~5      # Changes in last 5 commits
-  cargo rail affected --from abc --to def # Changes between two SHAs
-  cargo rail affected --ignore-bin-crates # Skip binary-only crates (no lib target)
-  cargo rail affected --explain           # Show why each crate is affected
-  cargo rail affected -f github-matrix    # Output for GitHub Actions matrix
-  cargo rail affected -f names-only       # Just crate names, one per line
+  cargo rail run                              # Execute planner-selected test surface
+  cargo rail run --merge-base                 # Compare from branch point (CI)
+  cargo rail run --surface build --surface test
+  cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
+  cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
+  cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
+  cargo rail run --all --surface test         # Force full test run
+  cargo rail run --dry-run --print-cmd        # Preview exact execution
+  cargo rail run -- --nocapture               # Pass args to underlying runner";
 
-CI tip: Use --merge-base for PRs to detect only your branch's changes,
-even if the target branch has moved forward.";
-
-const TEST_HELP: &str = "\
+const PLAN_HELP: &str = "\
 Examples:
-  cargo rail test                         # Test affected crates
-  cargo rail test --merge-base            # Test changes since branch point (CI)
-  cargo rail test --all                   # Test all crates
-  cargo rail test --ignore-bin-crates     # Skip binary-only crates (no lib target)
-  cargo rail test -- --nocapture          # Pass args to test runner
-  cargo rail test --explain               # Show why each crate is tested";
+  cargo rail plan                           # Changes since default branch
+  cargo rail plan --merge-base              # Changes since branch point (CI recommended)
+  cargo rail plan --confidence-profile strict  # Conservative planner profile
+  cargo rail plan --since HEAD~5            # Changes in last 5 commits
+  cargo rail plan --from abc --to def       # Changes between two SHAs
+  cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan -f json                   # Full machine-readable contract
+  cargo rail plan -f github                 # GitHub Actions key=value output";
 
 const UNIFY_HELP: &str = "\
 Examples:
@@ -102,7 +102,7 @@ Examples:
 
 const SPLIT_HELP: &str = "\
 This is an advanced feature for extracting crates to standalone repositories
-while preserving git history. Most teams should start with 'affected', 'test',
+while preserving git history. Most teams should start with 'plan', 'run',
 and 'unify' before using split/sync.
 
 Examples:
@@ -159,6 +159,21 @@ Examples:
   cargo rail config sync --check        # Preview config updates
   cargo rail config sync                # Add missing fields, sync targets";
 
+const HASH_HELP: &str = "\
+Examples:
+  cargo rail hash                          # Hash current planner contract
+  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
+  cargo rail hash -f json                  # Structured hash output
+  cargo rail diff-hash plan-a.json plan-b.json
+  cargo rail diff-hash plan-a.json plan-b.json -f json";
+
+const GRAPH_HELP: &str = "\
+Examples:
+  cargo rail graph                             # Planner reasoning graph (json)
+  cargo rail graph --merge-base                # Graph against merge-base comparison
+  cargo rail graph --dot                       # GraphViz DOT output
+  cargo rail graph --since HEAD~3 -o graph.dot # Write graph output to file";
+
 const COMPLETIONS_HELP: &str = "\
 Examples:
   cargo rail completions bash           # Output bash completions
@@ -182,9 +197,50 @@ Installation:
 /// Available subcommands
 #[derive(Subcommand)]
 pub enum Commands {
-  /// Show which crates are affected by changes
-  #[command(after_long_help = AFFECTED_HELP)]
-  Affected {
+  /// Execute planner-selected surfaces
+  #[command(after_long_help = RUN_HELP)]
+  Run {
+    /// Git ref to compare against (auto-detects default branch)
+    #[arg(long)]
+    since: Option<String>,
+    /// Use merge-base with default branch (better for feature branches)
+    #[arg(long, conflicts_with = "since")]
+    merge_base: bool,
+    /// Skip change detection and run all workspace crates
+    #[arg(long, short = 'a')]
+    all: bool,
+    /// Surface(s) to execute (repeatable)
+    #[arg(long = "surface", value_name = "SURFACE")]
+    surfaces: Vec<String>,
+    /// Named profile to map to one or more surfaces
+    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["surfaces", "workflow"])]
+    profile: Option<String>,
+    /// Named workflow mapped to a profile via `[run.workflow]`
+    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["surfaces", "profile"])]
+    workflow: Option<String>,
+    /// Preview selected execution without spawning subprocesses
+    #[arg(long)]
+    dry_run: bool,
+    /// Print command(s) prior to execution
+    #[arg(long)]
+    print_cmd: bool,
+    /// Explain why surfaces and targets were selected
+    #[arg(long)]
+    explain: bool,
+    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
+    #[arg(long)]
+    ignore_bin_crates: bool,
+    /// Disable automatic use of cargo-nextest
+    #[arg(long)]
+    skip_nextest: bool,
+    /// Pass additional arguments to the selected runner
+    #[arg(last = true)]
+    run_args: Vec<String>,
+  },
+
+  /// Build a deterministic file-first change plan
+  #[command(after_long_help = PLAN_HELP)]
+  Plan {
     /// Git ref to compare against (auto-detects default branch)
     #[arg(long)]
     since: Option<String>,
@@ -199,45 +255,16 @@ pub enum Commands {
     merge_base: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
-    /// Show all workspace crates (ignore changes)
-    #[arg(long, short = 'a')]
-    all: bool,
-    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
-    #[arg(long)]
-    ignore_bin_crates: bool,
+    format: PlanOutputFormat,
     /// Write output to file (appends to existing content)
     #[arg(long, short = 'o', value_name = "PATH")]
     output: Option<PathBuf>,
-    /// Explain why each crate is affected
+    /// Show concise human reasoning chain
     #[arg(long)]
     explain: bool,
-  },
-
-  /// Run tests for affected crates only
-  #[command(after_long_help = TEST_HELP)]
-  Test {
-    /// Git ref to compare against (auto-detects default branch)
-    #[arg(long)]
-    since: Option<String>,
-    /// Use merge-base with default branch (better for feature branches)
-    #[arg(long, conflicts_with = "since")]
-    merge_base: bool,
-    /// Skip change detection and run all tests
-    #[arg(long, short = 'a')]
-    all: bool,
-    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
-    #[arg(long)]
-    ignore_bin_crates: bool,
-    /// Disable automatic use of cargo-nextest
-    #[arg(long)]
-    skip_nextest: bool,
-    /// Explain why tests are being run
-    #[arg(long)]
-    explain: bool,
-    /// Pass additional arguments to the test runner
-    #[arg(last = true)]
-    test_args: Vec<String>,
+    /// Planner confidence profile override (strict|balanced|fast)
+    #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
+    confidence_profile: Option<String>,
   },
 
   /// Unify workspace dependencies (replaces workspace-hack crates)
@@ -249,6 +276,9 @@ pub enum Commands {
     /// Dry-run mode: preview changes without modifying files
     #[arg(long, short = 'c')]
     check: bool,
+    /// Apply from a previously generated mutation plan file
+    #[arg(long, value_name = "PATH", conflicts_with = "check")]
+    plan: Option<PathBuf>,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: UnifyOutputFormat,
@@ -318,6 +348,9 @@ pub enum Commands {
     /// Dry-run mode: preview changes without executing
     #[arg(long, short = 'c')]
     check: bool,
+    /// Apply from a previously generated mutation plan file
+    #[arg(long, value_name = "PATH", conflicts_with = "check")]
+    plan: Option<PathBuf>,
     /// Allow running on dirty worktree (uncommitted changes)
     #[arg(long)]
     allow_dirty: bool,
@@ -364,6 +397,67 @@ pub enum Commands {
     /// Subcommand
     #[command(subcommand)]
     command: ConfigCommand,
+  },
+
+  /// Hash and compare planner contracts
+  #[command(after_long_help = HASH_HELP)]
+  Hash {
+    /// Git ref to compare against (auto-detects default branch)
+    #[arg(long)]
+    since: Option<String>,
+    /// Start ref (for SHA pair mode)
+    #[arg(long, conflicts_with = "since", requires = "to")]
+    from: Option<String>,
+    /// End ref (for SHA pair mode)
+    #[arg(long, requires = "from")]
+    to: Option<String>,
+    /// Use merge-base with default branch (better for feature branches)
+    #[arg(long, conflicts_with_all = ["since", "from", "to"])]
+    merge_base: bool,
+    /// Planner confidence profile override (strict|balanced|fast)
+    #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
+    confidence_profile: Option<String>,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
+
+  /// Explain why two planner hashes differ
+  #[command(after_long_help = HASH_HELP)]
+  DiffHash {
+    /// First planner JSON path
+    a: PathBuf,
+    /// Second planner JSON path
+    b: PathBuf,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
+
+  /// Planner reasoning graph for explainability
+  #[command(after_long_help = GRAPH_HELP)]
+  Graph {
+    /// Git ref to compare against (auto-detects default branch)
+    #[arg(long)]
+    since: Option<String>,
+    /// Start ref (for SHA pair mode)
+    #[arg(long, conflicts_with = "since", requires = "to")]
+    from: Option<String>,
+    /// End ref (for SHA pair mode)
+    #[arg(long, requires = "from")]
+    to: Option<String>,
+    /// Use merge-base with default branch (better for feature branches)
+    #[arg(long, conflicts_with_all = ["since", "from", "to"])]
+    merge_base: bool,
+    /// Planner confidence profile override (strict|balanced|fast)
+    #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
+    confidence_profile: Option<String>,
+    /// Output GraphViz DOT instead of JSON
+    #[arg(long)]
+    dot: bool,
+    /// Write output to file (appends to existing content)
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
   },
 
   /// Generate shell completions
@@ -470,6 +564,9 @@ pub enum SplitCommand {
     /// Dry-run mode: preview changes
     #[arg(long, short = 'c')]
     check: bool,
+    /// Apply from a previously generated mutation plan file
+    #[arg(long, value_name = "PATH", conflicts_with = "check")]
+    plan: Option<PathBuf>,
     /// Allow running on dirty worktree (uncommitted changes)
     #[arg(long)]
     allow_dirty: bool,
@@ -508,6 +605,9 @@ pub enum ReleaseCommand {
     /// Dry-run mode: preview release plan
     #[arg(long, short = 'c')]
     check: bool,
+    /// Apply from a previously generated mutation plan file
+    #[arg(long, value_name = "PATH", conflicts_with = "check")]
+    plan: Option<PathBuf>,
     /// Skip publishing to crates.io
     #[arg(long)]
     skip_publish: bool,
@@ -549,9 +649,8 @@ impl Commands {
   /// Used for early JSON mode detection to suppress progress messages.
   pub fn is_json_format(&self) -> bool {
     match self {
-      Commands::Affected { format, .. } | Commands::Sync { format, .. } | Commands::Clean { format, .. } => {
-        format.is_json_like()
-      }
+      Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
+      Commands::Plan { format, .. } => format.is_json_like(),
       Commands::Unify { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
@@ -567,6 +666,8 @@ impl Commands {
         | ConfigCommand::Validate { format, .. }
         | ConfigCommand::Sync { format, .. } => format.is_json_like(),
       },
+      Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => format.is_json_like(),
+      Commands::Graph { dot, .. } => !dot,
       _ => false,
     }
   }
@@ -574,9 +675,8 @@ impl Commands {
   /// Apply global --json flag by overriding format to Json
   pub fn apply_json_override(&mut self) {
     match self {
-      Commands::Affected { format, .. } | Commands::Sync { format, .. } | Commands::Clean { format, .. } => {
-        *format = OutputFormat::Json
-      }
+      Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = OutputFormat::Json,
+      Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
       Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },
@@ -592,6 +692,8 @@ impl Commands {
         | ConfigCommand::Validate { format, .. }
         | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
       },
+      Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => *format = OutputFormat::Json,
+      Commands::Graph { .. } => {}
       _ => {}
     }
   }

@@ -10,6 +10,31 @@ use crate::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Normalize a path from git output to a platform-native path.
+///
+/// On Windows, git (via MSYS2) outputs paths like `/c/Users/...` which need to be
+/// converted to native Windows paths like `C:\Users\...` for proper path operations.
+///
+/// This avoids using `canonicalize()` which adds the `\\?\` extended-length prefix
+/// that can cause compatibility issues with other tools.
+fn normalize_git_path(path: &str) -> PathBuf {
+  #[cfg(windows)]
+  {
+    // MSYS-style path: /c/Users/... -> C:\Users\...
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b'/' && bytes[1].is_ascii_alphabetic() {
+      let drive = (bytes[1] as char).to_ascii_uppercase();
+      let rest = &path[2..]; // includes leading /
+      let windows_path = format!("{}:{}", drive, rest.replace('/', "\\"));
+      return PathBuf::from(windows_path);
+    }
+  }
+
+  // For non-MSYS paths or non-Windows, use the path directly.
+  // PathBuf handles forward slashes correctly on all platforms.
+  PathBuf::from(path)
+}
+
 /// Information about a git commit
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -65,11 +90,11 @@ impl SystemGit {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let worktree_root = stdout.trim();
+    let worktree_root = normalize_git_path(stdout.trim());
 
     Ok(Self {
       repo_path: path.to_path_buf(),
-      worktree_root: PathBuf::from(worktree_root),
+      worktree_root,
     })
   }
 

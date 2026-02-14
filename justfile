@@ -2,12 +2,28 @@ build:
     cargo build --workspace --all-targets --all-features
     @echo "✅ Success!"
 
+plan:
+    cargo rail plan --merge-base -f json
+
+run:
+    cargo rail run --merge-base --profile local
+
+ci:
+    @if [ -z "${RAIL_SINCE:-}" ]; then \
+        echo "RAIL_SINCE is required (example: export RAIL_SINCE=origin/main)"; \
+        exit 2; \
+    fi
+    cargo rail run --since "$RAIL_SINCE" --profile ci
+
+explain:
+    cargo rail plan --merge-base --explain
+
 build-release:
     cargo build --workspace --all-targets --all-features --release
     @echo "✅ Success!"
 
 test crate="":
-    @scripts/test/test.sh "{{crate}}"
+    @scripts/test/test.sh "{{ crate }}"
 
 check:
     cargo fmt --all

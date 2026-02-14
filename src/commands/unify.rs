@@ -8,6 +8,7 @@
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
 use crate::commands::common::UnifyOutputFormat;
 use crate::error::{RailError, RailResult};
+use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use std::path::PathBuf;
@@ -106,9 +107,26 @@ pub fn run_unify_analyze(
   };
 
   let has_changes = plan.has_planned_changes(msrv_write_needed);
+  let mutation_plan = build_unify_mutation_plan(ctx, &plan, msrv_write_needed, false, true, output)?;
 
   // JSON output mode (but still honor exit codes)
   if json {
+    let mut canonical_actions = mutation_plan.actions.clone();
+    canonical_actions.sort_by(|a, b| {
+      a.code
+        .cmp(&b.code)
+        .then_with(|| a.target.cmp(&b.target))
+        .then_with(|| a.detail.cmp(&b.detail))
+    });
+    let mut reason_codes: Vec<String> = mutation_plan
+      .trace
+      .iter()
+      .map(|t| t.code.clone())
+      .chain(mutation_plan.risks.iter().map(|r| r.code.clone()))
+      .collect();
+    reason_codes.sort();
+    reason_codes.dedup();
+
     let output_json = serde_json::json!({
       "command": "unify",
       "check": true,
@@ -136,6 +154,9 @@ pub fn run_unify_analyze(
         "severity": format!("{:?}", i.severity),
         "message": i.message,
       })).collect::<Vec<_>>(),
+      "action_plan": canonical_actions,
+      "reason_codes": reason_codes,
+      "mutation_plan": mutation_plan,
     });
 
     let rendered =
@@ -388,6 +409,7 @@ pub fn run_unify_apply(
   backup: bool,
   no_report: bool,
   report_path: Option<std::path::PathBuf>,
+  plan_path: Option<std::path::PathBuf>,
 ) -> RailResult<()> {
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
@@ -417,6 +439,51 @@ pub fn run_unify_apply(
     println!("nothing to unify");
     return Ok(());
   }
+
+  let expected_mutation_plan =
+    build_unify_mutation_plan(ctx, &plan, msrv_write_needed, backup, no_report, report_path.as_ref())?;
+  let mutation_plan = if let Some(path) = plan_path.as_ref() {
+    let from_file = mutation::read_plan_file(path)?;
+    if from_file.contract_version != mutation::MUTATION_CONTRACT_VERSION {
+      return Err(RailError::with_help(
+        format!(
+          "unsupported mutation plan contract version: {} (expected {})",
+          from_file.contract_version,
+          mutation::MUTATION_CONTRACT_VERSION
+        ),
+        "regenerate the plan using the current cargo-rail version".to_string(),
+      ));
+    }
+    if !from_file.operation_id.starts_with("unify-") {
+      return Err(RailError::with_help(
+        format!("plan '{}' is not a unify plan", path.display()),
+        "use a plan generated from 'cargo rail unify --check -f json'".to_string(),
+      ));
+    }
+    mutation::validate_pre_apply(ctx, &from_file)?;
+    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
+      return Err(RailError::with_help(
+        "provided plan does not match current requested unify operation".to_string(),
+        "regenerate the plan and re-run apply with --plan".to_string(),
+      ));
+    }
+    from_file
+  } else {
+    mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
+    expected_mutation_plan
+  };
+  let plan_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "unify",
+    "plan",
+    "planned",
+    mutation_plan.clone(),
+    vec![MutationTrace::new(
+      "UNIFY_PLAN_CREATED",
+      "created deterministic unify mutation plan",
+    )],
+  )?;
+  progress!("receipt: {}", plan_receipt.display());
 
   // Create backup if requested or first run
   let backup_manager = BackupManager::new(ctx.workspace_root());
@@ -644,6 +711,19 @@ pub fn run_unify_apply(
   if let Some(backup_id) = created_backup_id {
     println!("undo: cargo rail unify undo  (backup: {})", backup_id);
   }
+
+  let apply_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "unify",
+    "apply",
+    "applied",
+    mutation_plan,
+    vec![
+      MutationTrace::new("UNIFY_APPLY_STARTED", "started applying unify plan"),
+      MutationTrace::new("UNIFY_APPLY_COMPLETED", "completed unify apply"),
+    ],
+  )?;
+  progress!("receipt: {}", apply_receipt.display());
 
   Ok(())
 }
@@ -901,4 +981,135 @@ fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std:
     Some(crate::config::TransitiveFeatureHost::Path(p)) => ctx.workspace_root().join(p).join("Cargo.toml"),
     _ => ctx.workspace_root().join("Cargo.toml"),
   })
+}
+
+fn build_unify_mutation_plan(
+  ctx: &WorkspaceContext,
+  plan: &crate::cargo::UnificationPlan,
+  msrv_write_needed: bool,
+  backup_enabled: bool,
+  no_report: bool,
+  report_path: Option<&std::path::PathBuf>,
+) -> RailResult<mutation::MutationPlan> {
+  let mut actions = Vec::new();
+  let mut risks = Vec::new();
+  let mut trace = Vec::new();
+
+  if !plan.workspace_deps.is_empty() {
+    actions.push(MutationAction::new(
+      "WRITE_WORKSPACE_DEPS",
+      "Cargo.toml:[workspace.dependencies]",
+      Some(format!("{} dependencies", plan.workspace_deps.len())),
+    ));
+  }
+
+  if !plan.member_edits.is_empty() {
+    actions.push(MutationAction::new(
+      "APPLY_MEMBER_EDITS",
+      "workspace member manifests",
+      Some(format!("{} member(s)", plan.member_edits.len())),
+    ));
+  }
+
+  if !plan.transitive_pins.is_empty() {
+    actions.push(MutationAction::new(
+      "APPLY_TRANSITIVE_PINS",
+      "transitive host manifest",
+      Some(format!("{} pinned dependencies", plan.transitive_pins.len())),
+    ));
+  }
+
+  if msrv_write_needed {
+    actions.push(MutationAction::new(
+      "WRITE_WORKSPACE_MSRV",
+      "Cargo.toml:[workspace.package.rust-version]",
+      None,
+    ));
+  }
+
+  if backup_enabled {
+    actions.push(MutationAction::new("CREATE_BACKUP", "target/cargo-rail/backups", None));
+  }
+
+  if !no_report {
+    let target = report_path
+      .map(|p| p.display().to_string())
+      .unwrap_or_else(|| "target/cargo-rail/unify-report.md".to_string());
+    actions.push(MutationAction::new("WRITE_REPORT", target, None));
+  }
+
+  let error_count = plan
+    .issues
+    .iter()
+    .filter(|issue| issue.severity == crate::cargo::IssueSeverity::Error)
+    .count();
+  if error_count > 0 {
+    risks.push(MutationRisk::new(
+      "BLOCKING_ISSUES",
+      "high",
+      format!("{} blocking issue(s) detected", error_count),
+    ));
+  }
+
+  if !plan.transitive_pins.is_empty() {
+    risks.push(MutationRisk::new(
+      "TRANSITIVE_PIN_SIDE_EFFECTS",
+      "medium",
+      "transitive pinning mutates host dev-dependencies",
+    ));
+  }
+
+  trace.push(MutationTrace::new(
+    "UNIFY_ANALYSIS_COMPLETE",
+    format!(
+      "planned {} workspace dep(s), {} member edit(s), {} transitive pin(s)",
+      plan.workspace_deps.len(),
+      plan.member_edit_count(),
+      plan.transitive_pins.len()
+    ),
+  ));
+  if !plan.workspace_deps.is_empty() {
+    trace.push(MutationTrace::new(
+      "UNIFY_VERSION_DECISIONS",
+      format!(
+        "resolved versions for {} workspace dependency entries",
+        plan.workspace_deps.len()
+      ),
+    ));
+  }
+  let feature_edit_count: usize = plan
+    .member_edits
+    .values()
+    .flat_map(|edits| edits.iter())
+    .filter(|edit| {
+      matches!(
+        edit,
+        crate::cargo::MemberEdit::AddFeatures { .. } | crate::cargo::MemberEdit::RemoveFeature { .. }
+      )
+    })
+    .count();
+  if feature_edit_count > 0 {
+    trace.push(MutationTrace::new(
+      "UNIFY_FEATURE_DECISIONS",
+      format!("planned {} feature-level member edit(s)", feature_edit_count),
+    ));
+  }
+  if msrv_write_needed || plan.computed_msrv.is_some() {
+    trace.push(MutationTrace::new(
+      "UNIFY_MSRV_DECISIONS",
+      format!(
+        "msrv evaluated: computed={}, write_needed={}",
+        plan.computed_msrv.is_some(),
+        msrv_write_needed
+      ),
+    ));
+  }
+  if !plan.transitive_pins.is_empty() {
+    trace.push(MutationTrace::new(
+      "UNIFY_TRANSITIVE_DECISIONS",
+      format!("planned {} transitive pin decision(s)", plan.transitive_pins.len()),
+    ));
+  }
+
+  mutation::build_plan(ctx, "unify", actions, risks, trace)
 }

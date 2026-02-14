@@ -9,6 +9,7 @@
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 
 use crate::change_detection::classify::{ChangeKind, classify_file};
@@ -98,7 +99,8 @@ impl ImpactReport {
 
   /// Check if a specific crate is affected
   pub fn affects_crate(&self, crate_name: &str) -> bool {
-    self.direct_crates.contains(&crate_name.to_string()) || self.transitive_crates.contains(&crate_name.to_string())
+    self.direct_crates.iter().any(|name| name == crate_name)
+      || self.transitive_crates.iter().any(|name| name == crate_name)
   }
 
   /// Get minimal test set (only affected crates)
@@ -141,7 +143,7 @@ impl<'a> ChangeImpact<'a> {
     let categories = self.categorize_changes(&changed_files);
 
     // 4. Use graph to find affected crates
-    let file_paths: Vec<PathBuf> = changed_files.iter().map(|(p, _)| p.clone()).collect();
+    let file_paths: Vec<&Path> = changed_files.iter().map(|(p, _)| p.as_path()).collect();
     let analysis = crate::graph::analyze(&self.ctx.graph, &file_paths)?;
 
     // 4. Determine rebuild/retest requirements

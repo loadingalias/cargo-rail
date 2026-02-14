@@ -24,3 +24,6 @@ notes/
 **/demo.cast
 distribution/
 todo.md
+MERGE_CHECKLIST.md
+VALIDATION_REPORT.md
+examples/unify/VALIDATION_RESULTS.md

@@ -1,7 +1,7 @@
 //! High-level TOML document builders
 
 use super::format::{TomlFormatter, TomlValue};
-use crate::config::{ChangeDetectionConfig, ReleaseConfig, UnifyConfig};
+use crate::config::{ChangeDetectionConfig, ConfidenceProfile, ReleaseConfig, RunConfig, UnifyConfig};
 use crate::error::RailResult;
 
 /// Rail config builder
@@ -223,10 +223,32 @@ impl RailConfigBuilder {
       "infrastructure = {}\n",
       self.formatter.array_string(&config.infrastructure, None)
     ));
+    content.push_str(&format!(
+      "conservative_unclassified_owner_fallback = {}\n",
+      config.conservative_unclassified_owner_fallback
+    ));
+    let confidence_profile = match config.confidence_profile {
+      ConfidenceProfile::Strict => "strict",
+      ConfidenceProfile::Balanced => "balanced",
+      ConfidenceProfile::Fast => "fast",
+    };
+    content.push_str(&format!("confidence_profile = \"{}\"\n", confidence_profile));
+    let bot_profile = match config.bot_pr_confidence_profile.unwrap_or(ConfidenceProfile::Strict) {
+      ConfidenceProfile::Strict => "strict",
+      ConfidenceProfile::Balanced => "balanced",
+      ConfidenceProfile::Fast => "fast",
+    };
+    content.push_str(&format!(
+      "bot_pr_confidence_profile = \"{}\"  # optional bot PR override\n",
+      bot_profile
+    ));
 
     if !config.custom.is_empty() {
       content.push_str("\n[change-detection.custom]\n");
-      for (category, patterns) in &config.custom {
+      let mut categories: Vec<_> = config.custom.iter().collect();
+      categories.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+      for (category, patterns) in categories {
         content.push_str(&format!(
           "{} = {}\n",
           category,
@@ -236,6 +258,65 @@ impl RailConfigBuilder {
     }
 
     self.sections.push(format!("\n[change-detection]\n{}", content));
+    self
+  }
+
+  /// Add run profile section.
+  pub fn run(&mut self, config: &RunConfig) -> &mut Self {
+    let mut content = String::new();
+
+    content.push_str(&format!(
+      "default_profile = \"{}\"\n",
+      config.default_profile.as_deref().unwrap_or("local")
+    ));
+
+    if !config.workflow.is_empty() {
+      content.push_str("\n[run.workflow]\n");
+      let mut workflows: Vec<_> = config.workflow.iter().collect();
+      workflows.sort_by(|(a, _), (b, _)| a.cmp(b));
+      for (workflow, profile) in workflows {
+        content.push_str(&format!("{} = \"{}\"\n", workflow, profile));
+      }
+    }
+
+    if !config.profiles.is_empty() {
+      let mut profiles: Vec<_> = config.profiles.iter().collect();
+      profiles.sort_by(|(a, _), (b, _)| a.cmp(b));
+      for (profile_name, profile) in profiles {
+        content.push_str(&format!("\n[run.profile.{}]\n", profile_name));
+        content.push_str(&format!(
+          "surfaces = {}\n",
+          self.formatter.array_string(&profile.surfaces, None)
+        ));
+        if !profile.run_args.is_empty() {
+          content.push_str(&format!(
+            "run_args = {}\n",
+            self.formatter.array_string(&profile.run_args, None)
+          ));
+        }
+        if let Some(since) = &profile.since {
+          content.push_str(&format!("since = \"{}\"\n", since));
+        }
+        if let Some(merge_base) = profile.merge_base {
+          content.push_str(&format!("merge_base = {}\n", merge_base));
+        }
+      }
+    } else {
+      content.push_str("\n# Optional workflow -> profile mapping:\n");
+      content.push_str("# [run.workflow]\n");
+      content.push_str("# commit = \"ci\"\n");
+      content.push_str("# nightly = \"nightly\"\n");
+      content.push_str("\n# Optional user-defined run profiles:\n");
+      content.push_str("# [run.profile.ci]\n");
+      content.push_str("# surfaces = [\"build\", \"test\"]\n");
+      content.push_str("# merge_base = true\n");
+      content.push_str("\n# [run.profile.docs_custom]\n");
+      content.push_str("# surfaces = [\"docs\"]\n");
+      content.push_str("# run_args = [\"--workspace\", \"{cargo_args}\"]\n");
+      content.push_str("# since = \"{base_ref}\"\n");
+    }
+
+    self.sections.push(format!("\n[run]\n{}", content));
     self
   }
 
@@ -355,6 +436,7 @@ mod tests {
       unify: UnifyConfig::default(),
       release: ReleaseConfig::default(),
       change_detection: crate::config::ChangeDetectionConfig::default(),
+      run: crate::config::RunConfig::default(),
       crates: Default::default(),
     };
 
@@ -364,6 +446,7 @@ mod tests {
       .unify(&config.unify)
       .release(&config.release)
       .change_detection(&config.change_detection)
+      .run(&config.run)
       .splits_template()
       .build()
       .unwrap();
@@ -372,7 +455,30 @@ mod tests {
     assert!(output.contains("[unify]"));
     assert!(output.contains("[release]"));
     assert!(output.contains("[change-detection]"));
+    assert!(output.contains("[run]"));
     assert!(output.contains("[crates.my-crate.split]"));
+  }
+
+  #[test]
+  fn test_change_detection_custom_categories_are_sorted() {
+    use std::collections::HashMap;
+
+    let mut builder = RailConfigBuilder::new();
+    let mut custom = HashMap::new();
+    custom.insert("zeta".to_string(), vec!["z/**".to_string()]);
+    custom.insert("alpha".to_string(), vec!["a/**".to_string()]);
+    let config = ChangeDetectionConfig {
+      infrastructure: vec![".github/**".to_string()],
+      custom,
+      conservative_unclassified_owner_fallback: true,
+      confidence_profile: ConfidenceProfile::Balanced,
+      bot_pr_confidence_profile: None,
+    };
+
+    let output = builder.header().change_detection(&config).build().unwrap();
+    let alpha_idx = output.find("alpha = [\"a/**\"]").unwrap();
+    let zeta_idx = output.find("zeta = [\"z/**\"]").unwrap();
+    assert!(alpha_idx < zeta_idx);
   }
 
   #[test]

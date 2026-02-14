@@ -83,6 +83,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
   "unify",
   "release",
   "change-detection",
+  "run",
   "crates",
   "workspace",
   "toolchain",
@@ -128,13 +129,18 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
 ];
 
 /// Known keys in [change-detection] section
-const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &["infrastructure", "custom"];
-
-/// Deprecated keys (key -> suggested replacement or removal message)
-const DEPRECATED_KEYS: &[(&str, &str)] = &[
-  // No deprecated keys yet - this is infrastructure for future use
-  // Example: ("old_key", "use 'new_key' instead"),
+const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &[
+  "infrastructure",
+  "custom",
+  "conservative_unclassified_owner_fallback",
+  "confidence_profile",
+  "bot_pr_confidence_profile",
 ];
+
+/// Known keys in [run] section
+const KNOWN_RUN_KEYS: &[&str] = &["default_profile", "profile", "workflow"];
+/// Known keys in [run.profile.<name>] section
+const KNOWN_RUN_PROFILE_KEYS: &[&str] = &["surfaces", "run_args", "since", "merge_base"];
 
 // Config Locate
 
@@ -337,6 +343,7 @@ fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) 
 /// the config file is broken.
 pub fn run_config_validate_standalone(
   workspace_root: &Path,
+  config_override: Option<&Path>,
   format: OutputFormat,
   strictness: StrictnessMode,
 ) -> RailResult<()> {
@@ -351,16 +358,24 @@ pub fn run_config_validate_standalone(
   let mut warnings: Vec<ValidationIssue> = Vec::new();
 
   // Find config file
-  let config_path = match RailConfig::find_config_path(workspace_root) {
-    Some(p) => p,
-    None => {
+  let config_path = match resolve_config_path(workspace_root, config_override) {
+    Ok(path) => path,
+    Err(err) => {
+      let is_default_lookup_miss = config_override.is_none();
       if json {
         let result = ValidationResult {
           command: "config",
           action: "validate",
           valid: false,
           config_path: None,
-          errors: vec![ValidationIssue::new("config", "no configuration file found")],
+          errors: vec![ValidationIssue::new(
+            "config",
+            if is_default_lookup_miss {
+              "no configuration file found".to_string()
+            } else {
+              err.to_string()
+            },
+          )],
           warnings: vec![],
         };
         println!(
@@ -368,11 +383,13 @@ pub fn run_config_validate_standalone(
           serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
         );
         return Err(RailError::ExitWithCode { code: 2 });
-      } else {
+      }
+      if is_default_lookup_miss {
         println!("no configuration file found");
         println!("\nhelp: run 'cargo rail init' to create one");
         return Err(RailError::message("no configuration file found"));
       }
+      return Err(err);
     }
   };
 
@@ -398,15 +415,15 @@ pub fn run_config_validate_standalone(
     check_unknown_keys(doc, &mut warnings);
   }
 
-  // Check for deprecated keys
-  check_deprecated_keys(&content, &mut warnings);
-
   // Try to load and validate semantically
-  match RailConfig::try_load(workspace_root) {
-    ConfigLoadResult::Loaded(config) => {
+  match parse_config_from_path(&config_path) {
+    Ok(config) => {
       // Validate change detection config
       if let Err(e) = config.change_detection.validate() {
         errors.push(ValidationIssue::new("change_detection", e.to_string()));
+      }
+      if let Err(e) = config.run.validate() {
+        errors.push(ValidationIssue::new("run", e.to_string()));
       }
 
       // Validate per-crate split config
@@ -437,14 +454,11 @@ pub fn run_config_validate_standalone(
         }
       }
     }
-    ConfigLoadResult::ParseError { message, .. } => {
+    Err(err) => {
       // Only add if we didn't already catch it in raw parsing
       if errors.is_empty() {
-        errors.push(ValidationIssue::new("config", format!("failed to load: {}", message)));
+        errors.push(ValidationIssue::new("config", format!("failed to load: {}", err)));
       }
-    }
-    ConfigLoadResult::NotFound => {
-      // Already handled above
     }
   }
 
@@ -553,6 +567,7 @@ fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<Validatio
         "unify" => Some(KNOWN_UNIFY_KEYS.iter().copied().collect()),
         "release" => Some(KNOWN_RELEASE_KEYS.iter().copied().collect()),
         "change-detection" => Some(KNOWN_CHANGE_DETECTION_KEYS.iter().copied().collect()),
+        "run" => Some(KNOWN_RUN_KEYS.iter().copied().collect()),
         _ => None, // crates, workspace, toolchain have dynamic keys
       };
 
@@ -565,21 +580,40 @@ fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<Validatio
             ));
           }
         }
+
+        if key == "run" {
+          check_run_nested_keys(table, warnings);
+        }
       }
     }
   }
 }
 
-/// Check for deprecated keys
-fn check_deprecated_keys(content: &str, warnings: &mut Vec<ValidationIssue>) {
-  for (deprecated_key, message) in DEPRECATED_KEYS {
-    // Simple check - look for the key in the content
-    // This is a heuristic; a proper check would parse the TOML
-    if content.contains(deprecated_key) {
-      warnings.push(ValidationIssue::new(
-        "deprecated",
-        format!("'{}' is deprecated: {}", deprecated_key, message),
-      ));
+fn check_run_nested_keys(table: &toml_edit::Table, warnings: &mut Vec<ValidationIssue>) {
+  if let Some(profile_item) = table.get("profile")
+    && let Some(profile_table) = profile_item.as_table()
+  {
+    let known: HashSet<&str> = KNOWN_RUN_PROFILE_KEYS.iter().copied().collect();
+    for (profile_name, profile_value) in profile_table.iter() {
+      let Some(profile_cfg) = profile_value.as_table() else {
+        warnings.push(ValidationIssue::new(
+          "run",
+          format!("run.profile.{} must be a table", profile_name),
+        ));
+        continue;
+      };
+
+      for (profile_key, _) in profile_cfg.iter() {
+        if !known.contains(profile_key) {
+          warnings.push(ValidationIssue::new(
+            "run",
+            format!(
+              "unknown key '{}' in [run.profile.{}] section",
+              profile_key, profile_name
+            ),
+          ));
+        }
+      }
     }
   }
 }
@@ -634,7 +668,12 @@ struct ConfigSyncResult {
 /// - 0: Config is up to date (no changes needed or changes applied)
 /// - 1: Changes detected (--check mode only)
 /// - 2: Error
-pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat) -> RailResult<()> {
+pub fn run_config_sync(
+  workspace_root: &Path,
+  config_override: Option<&Path>,
+  check: bool,
+  format: OutputFormat,
+) -> RailResult<()> {
   let json = format.is_json();
 
   if json {
@@ -642,12 +681,7 @@ pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat)
   }
 
   // Find existing config
-  let config_path = RailConfig::find_config_path(workspace_root).ok_or_else(|| {
-    RailError::with_help(
-      "no rail.toml found".to_string(),
-      "run 'cargo rail init' first to create a configuration file".to_string(),
-    )
-  })?;
+  let config_path = resolve_config_path(workspace_root, config_override)?;
 
   let mut editor = TomlEditor::open(&config_path)?;
   let mut fields_added: Vec<FieldChange> = Vec::new();
@@ -741,6 +775,37 @@ pub fn run_config_sync(workspace_root: &Path, check: bool, format: OutputFormat)
   }
 
   Ok(())
+}
+
+fn resolve_config_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<PathBuf> {
+  if let Some(explicit_path) = config_override {
+    let path = if explicit_path.is_absolute() {
+      explicit_path.to_path_buf()
+    } else {
+      workspace_root.join(explicit_path)
+    };
+    if path.exists() {
+      return Ok(path);
+    }
+    return Err(RailError::message(format!(
+      "specified config file not found: {}",
+      path.display()
+    )));
+  }
+
+  RailConfig::find_config_path(workspace_root).ok_or_else(|| {
+    RailError::with_help(
+      "no rail.toml found".to_string(),
+      "run 'cargo rail init' first to create a configuration file".to_string(),
+    )
+  })
+}
+
+fn parse_config_from_path(config_path: &Path) -> RailResult<RailConfig> {
+  let content = std::fs::read_to_string(config_path)
+    .map_err(|e| RailError::message(format!("failed to read {}: {}", config_path.display(), e)))?;
+  toml_edit::de::from_str::<RailConfig>(&content)
+    .map_err(|e| RailError::message(format!("failed to parse {}: {}", config_path.display(), e)))
 }
 
 /// Sync targets from workspace into config
@@ -893,5 +958,19 @@ mod tests {
       known, from_schema,
       "KNOWN_UNIFY_KEYS must stay in sync with schema::SYNCABLE_FIELDS for [unify]"
     );
+  }
+
+  #[test]
+  fn test_known_run_keys_cover_schema_fields() {
+    let known: BTreeSet<&str> = KNOWN_RUN_KEYS.iter().copied().collect();
+    let from_schema: BTreeSet<&str> = schema::fields_for_section("run").map(|field| field.key).collect();
+
+    for field in from_schema {
+      assert!(
+        known.contains(field),
+        "KNOWN_RUN_KEYS must include schema field [run].{}",
+        field
+      );
+    }
   }
 }

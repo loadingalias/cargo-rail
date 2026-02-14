@@ -2,6 +2,7 @@
 
 use crate::commands::common::OutputFormat;
 use crate::error::{RailError, RailResult};
+use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::release::planner::ReleasePlanner;
 use crate::release::publisher::ReleasePublisher;
 use crate::release::validator::ReleaseValidator;
@@ -87,9 +88,14 @@ pub fn run_release_plan(
   let planner = ReleasePlanner::new(ctx, release_config);
   // Pass the filtered target_crates to the planner
   let plan = planner.plan(Some(target_crates), &bump_type)?;
+  let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, release_config.require_clean)?;
 
   if json {
-    let json_output = serde_json::to_string_pretty(&plan)
+    let enriched = serde_json::json!({
+      "release_plan": plan,
+      "mutation_plan": mutation_plan,
+    });
+    let json_output = serde_json::to_string_pretty(&enriched)
       .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json_output);
   } else {
@@ -114,23 +120,33 @@ pub fn run_release_plan(
   Err(RailError::CheckHasPendingChanges)
 }
 
+/// Arguments for release execution.
+pub struct ReleasePublishArgs {
+  /// Explicit crate names to release; ignored when `all` is true.
+  pub crate_names: Option<Vec<String>>,
+  /// Release all publishable workspace crates.
+  pub all: bool,
+  /// Version bump strategy.
+  pub bump: String,
+  /// Skip publishing crates to the registry.
+  pub skip_publish: bool,
+  /// Skip creating git tags.
+  pub skip_tag: bool,
+  /// Skip interactive confirmation prompts.
+  pub yes: bool,
+  /// Apply using a previously generated mutation plan.
+  pub plan_path: Option<std::path::PathBuf>,
+}
+
 /// Execute a release
-pub fn run_release_publish(
-  ctx: &WorkspaceContext,
-  crate_names: Option<Vec<String>>,
-  all: bool,
-  bump: String,
-  skip_publish: bool,
-  skip_tag: bool,
-  yes: bool,
-) -> RailResult<()> {
+pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> RailResult<()> {
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
   let validator = ReleaseValidator::new(ctx);
 
-  let targets = if all {
+  let targets = if args.all {
     // Filter to only publishable crates when using --all
     let (publishable, skipped) = validator.publishable_members();
 
@@ -151,7 +167,7 @@ pub fn run_release_publish(
     }
 
     Some(publishable)
-  } else if let Some(names) = crate_names {
+  } else if let Some(names) = args.crate_names {
     Some(names)
   } else {
     return Err(RailError::with_help(
@@ -160,7 +176,7 @@ pub fn run_release_publish(
     ));
   };
 
-  let bump_type = bump.parse::<BumpType>()?;
+  let bump_type = args.bump.parse::<BumpType>()?;
 
   let target_crates = targets
     .clone()
@@ -168,7 +184,7 @@ pub fn run_release_publish(
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
-  if let Some(warning) = validator.validate_branch(yes)? {
+  if let Some(warning) = validator.validate_branch(args.yes)? {
     crate::warn!("{}", warning);
   }
 
@@ -177,19 +193,46 @@ pub fn run_release_publish(
 
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(targets, &bump_type)?;
+  let expected_mutation_plan = build_release_mutation_plan(
+    ctx,
+    &plan,
+    args.skip_publish,
+    args.skip_tag,
+    release_config.require_clean,
+  )?;
+  let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
+    let from_file = mutation::read_plan_file(path)?;
+    if !from_file.operation_id.starts_with("release-") {
+      return Err(RailError::with_help(
+        format!("plan '{}' is not a release plan", path.display()),
+        "generate a release plan using 'cargo rail release run --check --json'".to_string(),
+      ));
+    }
+    mutation::validate_pre_apply(ctx, &from_file)?;
+    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
+      return Err(RailError::with_help(
+        "provided release plan does not match current requested operation",
+        "regenerate plan and re-run with --plan",
+      ));
+    }
+    from_file
+  } else {
+    mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
+    expected_mutation_plan
+  };
 
-  println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
+  println!("{}", plan.format_summary_with_flags(args.skip_publish, args.skip_tag));
 
   // Skip confirmation if --yes flag is set
-  if !yes && io::stdin().is_terminal() {
+  if !args.yes && io::stdin().is_terminal() {
     println!("\nthis will:");
     println!("  - modify Cargo.toml (version bumps)");
     println!("  - update changelogs");
     println!("  - create git commits");
-    if !skip_tag {
+    if !args.skip_tag {
       println!("  - create {} tag(s)", plan.crates.len());
     }
-    if !skip_publish {
+    if !args.skip_publish {
       println!("  - publish to crates.io (irreversible)");
     }
 
@@ -199,8 +242,35 @@ pub fn run_release_publish(
     }
   }
 
+  validator.validate_apply_preconditions(&plan, args.skip_publish, args.skip_tag, release_config.require_clean)?;
+  let plan_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "release",
+    "plan",
+    "planned",
+    mutation_plan.clone(),
+    vec![MutationTrace::new(
+      "RELEASE_PLAN_CREATED",
+      format!("planned release for {} crate(s)", plan.summary.total_crates),
+    )],
+  )?;
+  crate::progress!("receipt: {}", plan_receipt.display());
+
   let publisher = ReleasePublisher::new(ctx, release_config);
-  publisher.execute(&plan, skip_publish, skip_tag)?;
+  publisher.execute(&plan, args.skip_publish, args.skip_tag)?;
+
+  let apply_receipt = mutation::write_receipt(
+    ctx.workspace_root(),
+    "release",
+    "apply",
+    "applied",
+    mutation_plan,
+    vec![
+      MutationTrace::new("RELEASE_APPLY_STARTED", "started release apply"),
+      MutationTrace::new("RELEASE_APPLY_COMPLETED", "completed release apply"),
+    ],
+  )?;
+  crate::progress!("receipt: {}", apply_receipt.display());
 
   Ok(())
 }
@@ -376,6 +446,76 @@ pub fn run_release_check(
   Ok(())
 }
 
+fn build_release_mutation_plan(
+  ctx: &WorkspaceContext,
+  plan: &crate::release::planner::ReleasePlan,
+  skip_publish: bool,
+  skip_tag: bool,
+  require_clean: bool,
+) -> RailResult<mutation::MutationPlan> {
+  let mut actions = Vec::new();
+  let mut sorted = plan.crates.clone();
+  sorted.sort_by(|a, b| a.name.cmp(&b.name));
+
+  for crate_plan in &sorted {
+    actions.push(MutationAction::new(
+      "BUMP_VERSION",
+      crate_plan.name.clone(),
+      Some(format!("{} -> {}", crate_plan.current_version, crate_plan.new_version)),
+    ));
+    actions.push(MutationAction::new(
+      "UPDATE_CHANGELOG",
+      crate_plan.changelog_path.display().to_string(),
+      Some(format!("crate={}", crate_plan.name)),
+    ));
+    actions.push(MutationAction::new(
+      "COMMIT_RELEASE",
+      crate_plan.name.clone(),
+      Some(format!("tag={}", crate_plan.tag_name)),
+    ));
+    if !skip_tag {
+      actions.push(MutationAction::new(
+        "CREATE_TAG",
+        crate_plan.tag_name.clone(),
+        Some(format!("crate={}", crate_plan.name)),
+      ));
+    }
+    if !skip_publish && crate_plan.publish {
+      actions.push(MutationAction::new(
+        "PUBLISH_CRATE",
+        crate_plan.name.clone(),
+        Some("registry=crates-io".to_string()),
+      ));
+    }
+  }
+
+  let mut risks = Vec::new();
+  if !skip_publish {
+    risks.push(MutationRisk::new(
+      "CRATES_IO_PUBLISH",
+      "high",
+      "publishing to crates.io is irreversible",
+    ));
+  }
+  if require_clean {
+    risks.push(MutationRisk::new(
+      "REQUIRE_CLEAN_WORKTREE",
+      "low",
+      "release requires a clean worktree",
+    ));
+  }
+
+  let trace = vec![MutationTrace::new(
+    "RELEASE_PLAN_RESOLVED",
+    format!(
+      "resolved {} crate(s), {} publish candidate(s), skip_tag={}, skip_publish={}",
+      plan.summary.total_crates, plan.summary.crates_to_publish, skip_tag, skip_publish
+    ),
+  )];
+
+  mutation::build_plan(ctx, "release", actions, risks, trace)
+}
+
 /// Initialize release configuration
 pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
   use crate::config::{ChangelogConfig, CrateReleaseConfig, RailConfig};
@@ -414,6 +554,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
+    run: crate::config::RunConfig::default(),
     crates: Default::default(),
   });
 

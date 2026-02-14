@@ -23,6 +23,10 @@ fn test_init_creates_config() -> Result<()> {
   assert!(config_content.contains("[unify]"));
   assert!(config_content.contains("[release]"));
   assert!(config_content.contains("[change-detection]"));
+  assert!(config_content.contains("[run]"));
+  assert!(config_content.contains("[run.workflow]"));
+  assert!(config_content.contains("[run.profile.ci]"));
+  assert!(config_content.contains("{cargo_args}"));
 
   Ok(())
 }
@@ -131,6 +135,46 @@ fn test_init_generated_config_is_valid() -> Result<()> {
 
   // Verify basic fields exist (targets should be present, possibly empty)
   let _ = &config.targets; // Just verify it's accessible
+
+  Ok(())
+}
+
+#[test]
+fn test_init_generated_config_passes_strict_validate() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-strict-validate")?;
+  ws.remove_config()?;
+
+  let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+  assert!(
+    init_output.status.success(),
+    "init should succeed before strict validation"
+  );
+
+  let validate_output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+  assert!(
+    validate_output.status.success(),
+    "generated config must pass strict validation. stderr:\n{}",
+    String::from_utf8_lossy(&validate_output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_init_generated_config_sync_check_is_idempotent() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-sync-idempotent")?;
+  ws.remove_config()?;
+
+  let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+  assert!(init_output.status.success(), "init should succeed");
+
+  let sync_check_output = run_cargo_rail(&ws.path, &["rail", "config", "sync", "--check", "-f", "json"])?;
+  assert!(
+    sync_check_output.status.success(),
+    "fresh init config should be sync-idempotent. stdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&sync_check_output.stdout),
+    String::from_utf8_lossy(&sync_check_output.stderr)
+  );
 
   Ok(())
 }

@@ -1,0 +1,52 @@
+# cargo-rail configuration
+# Balanced baseline with complete [change-detection] and [run] sections.
+
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+]
+
+[change-detection]
+# Paths that trigger full workspace rebuild
+infrastructure = [
+  ".github/**",
+  "scripts/**",
+  "justfile",
+  "Justfile",
+  "Makefile",
+  "makefile",
+  "GNUmakefile",
+  "*.sh",
+  "Taskfile.yml",
+  "Taskfile.yaml",
+  ".pre-commit-config.yaml",
+  "deny.toml",
+  "cliff.toml",
+  "release.toml",
+  "release-plz.toml",
+]
+conservative_unclassified_owner_fallback = true
+confidence_profile = "balanced"
+# bot_pr_confidence_profile = "strict"  # optional bot PR override
+
+[run]
+default_profile = "local"
+
+[run.workflow]
+commit = "ci"
+nightly = "nightly"
+
+[run.profile.local]
+surfaces = ["test"]
+run_args = []
+merge_base = true
+
+[run.profile.ci]
+surfaces = ["build", "test", "infra"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true
+
+[run.profile.nightly]
+surfaces = ["build", "test", "docs", "bench"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true

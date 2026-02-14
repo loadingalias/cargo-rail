@@ -320,8 +320,7 @@ impl ChangelogGenerator {
         .join(" ");
       Some(links)
     } else {
-      let refs = prs.iter().map(|n| format!("#{}", n)).collect::<Vec<_>>().join(" ");
-      Some(refs)
+      Some(prs.iter().map(|pr| format!("#{}", pr)).collect::<Vec<_>>().join(" "))
     }
   }
 
@@ -633,5 +632,26 @@ mod tests {
 
     let line = generator.format_entry(&commit);
     assert!(line.contains("[**breaking**] change API"));
+  }
+
+  #[test]
+  fn format_entry_without_github_keeps_plain_pr_refs() {
+    let commit = ConventionalCommit {
+      commit_type: CommitType::Feature,
+      scope: None,
+      breaking: false,
+      description: "add feature (#12)",
+      body: Some("follow-up #34"),
+      sha: "abcdef1234567890",
+    };
+
+    let generator = ChangelogGenerator {
+      workspace_root: std::path::PathBuf::new(),
+      github_repo: None,
+    };
+
+    let line = generator.format_entry(&commit);
+    assert!(line.contains("#12 #34"));
+    assert!(line.contains("(abcdef1)"));
   }
 }

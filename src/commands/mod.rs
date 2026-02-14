@@ -14,12 +14,11 @@
 //! - **sync**: Bidirectional sync between monorepo and split repos
 //!
 //! ## Inspection
-//! - **affected**: Find crates affected by changes (used by split/sync)
+//! - **plan**: Deterministic file-first planner (primary planning surface)
+//! - **run**: Surface-driven executor using planner contract
 //!
 //! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
 
-/// Find crates affected by changes
-pub mod affected;
 /// Clean up workspace artifacts
 pub mod clean;
 /// CLI argument definitions (clap structs) - internal, not part of stable API.
@@ -29,20 +28,25 @@ pub mod cli;
 pub mod common;
 /// Configuration management commands
 pub mod config;
+/// Planner reasoning graph command
+pub mod graph;
+/// Planner hash and diff introspection commands
+pub mod hash;
 /// Initialize cargo-rail configuration
 pub mod init;
+/// Deterministic file-first change planner
+pub mod plan;
 /// Release planning and publishing
 pub mod release;
+/// Surface-driven execution built on planner contract
+pub mod run;
 /// Split crates into standalone repositories
 pub mod split;
 /// Bidirectional sync between monorepo and split repos
 pub mod sync;
-/// Smart test runner for affected crates
-pub mod test;
 /// Workspace dependency unification commands
 pub mod unify;
 
-pub use affected::{AffectedOptions, run_affected};
 pub use clean::run_clean;
 #[doc(hidden)]
 pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
@@ -50,11 +54,14 @@ pub use common::OutputFormat;
 pub use config::{
   StrictnessMode, run_config_locate, run_config_print, run_config_sync, run_config_validate_standalone,
 };
+pub use graph::run_graph;
+pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
+pub use plan::{PlanOptions, run_plan};
 pub use release::{run_release_check, run_release_init, run_release_plan, run_release_publish};
+pub use run::run_run;
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
-pub use test::run_test;
 pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
 
 use crate::error::RailResult;
@@ -97,7 +104,7 @@ pub fn try_dispatch_pre_context(
     Commands::Config {
       command: cli::ConfigCommand::Sync { check, format },
     } => {
-      config::run_config_sync(workspace_root, check, format)?;
+      config::run_config_sync(workspace_root, config_override, check, format)?;
       Ok(PreContextDispatch::Handled)
     }
 
@@ -115,7 +122,7 @@ pub fn try_dispatch_pre_context(
       } else {
         StrictnessMode::Auto
       };
-      config::run_config_validate_standalone(workspace_root, format, strictness)?;
+      config::run_config_validate_standalone(workspace_root, config_override, format, strictness)?;
       Ok(PreContextDispatch::Handled)
     }
 
@@ -148,52 +155,59 @@ pub fn try_dispatch_pre_context(
 /// and the workspace context, then calls the appropriate handler.
 pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
   match cmd {
-    // Graph Commands
-    Commands::Affected {
+    Commands::Run {
+      since,
+      merge_base,
+      all,
+      surfaces,
+      profile,
+      workflow,
+      dry_run,
+      print_cmd,
+      explain,
+      ignore_bin_crates,
+      skip_nextest,
+      run_args,
+    } => run_run(
+      ctx,
+      run::RunOptions {
+        since,
+        merge_base,
+        all,
+        surfaces,
+        profile,
+        workflow,
+        dry_run,
+        print_cmd,
+        explain,
+        ignore_bin_crates,
+        skip_nextest,
+        run_args,
+      },
+    ),
+
+    Commands::Plan {
       since,
       from,
       to,
       merge_base,
       format,
-      all,
-      ignore_bin_crates,
       output,
       explain,
-    } => run_affected(
+      confidence_profile,
+    } => run_plan(
       ctx,
-      AffectedOptions {
+      PlanOptions {
         since,
         from,
         to,
         merge_base,
         format,
-        all,
-        ignore_bin_crates,
         output,
         explain,
+        confidence_profile,
       },
     ),
-
-    Commands::Test {
-      since,
-      merge_base,
-      all,
-      ignore_bin_crates,
-      skip_nextest,
-      explain,
-      test_args,
-    } => {
-      let config = test::TestConfig {
-        since,
-        merge_base,
-        all,
-        ignore_bin_crates,
-        explain,
-        prefer_nextest: !skip_nextest,
-        test_args,
-      };
-      run_test(ctx, config)
-    }
 
     // Init is handled before WorkspaceContext is built
     Commands::Init { .. } => unreachable!("Init command should be handled before dispatch"),
@@ -202,6 +216,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     Commands::Unify {
       command,
       check,
+      plan,
       format,
       backup,
       skip_report,
@@ -216,7 +231,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       } else if check {
         run_unify_analyze(ctx, show_diff, explain, format, output.as_ref())
       } else {
-        run_unify_apply(ctx, backup, skip_report, report_path)
+        run_unify_apply(ctx, backup, skip_report, report_path, plan)
       }
     }
 
@@ -235,6 +250,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         all,
         remote,
         check,
+        plan,
         allow_dirty,
         yes,
         format,
@@ -245,6 +261,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
           all,
           remote,
           check,
+          plan_path: plan,
           allow_dirty,
           yes,
           format,
@@ -260,6 +277,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       to_remote,
       strategy,
       check,
+      plan,
       allow_dirty,
       yes,
       format,
@@ -273,6 +291,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         to_remote,
         strategy,
         check,
+        plan_path: plan,
         allow_dirty,
         yes,
         format,
@@ -294,6 +313,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         all,
         bump,
         check,
+        plan,
         skip_publish,
         skip_tag,
         yes,
@@ -308,7 +328,18 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         if check {
           run_release_plan(ctx, names, bump, skip_publish, skip_tag, format)
         } else {
-          run_release_publish(ctx, names, all, bump, skip_publish, skip_tag, yes)
+          run_release_publish(
+            ctx,
+            release::ReleasePublishArgs {
+              crate_names: names,
+              all,
+              bump,
+              skip_publish,
+              skip_tag,
+              yes,
+              plan_path: plan,
+            },
+          )
         }
       }
       cli::ReleaseCommand::Check {
@@ -342,6 +373,48 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       cli::ConfigCommand::Validate { .. } => unreachable!("Config validate should be handled before dispatch"),
       cli::ConfigCommand::Sync { .. } => unreachable!("Config sync should be handled before dispatch"),
     },
+
+    Commands::Hash {
+      since,
+      from,
+      to,
+      merge_base,
+      confidence_profile,
+      format,
+    } => run_hash(
+      ctx,
+      hash::HashOptions {
+        since,
+        from,
+        to,
+        merge_base,
+        confidence_profile,
+        format,
+      },
+    ),
+
+    Commands::DiffHash { a, b, format } => run_diff_hash(a, b, format),
+
+    Commands::Graph {
+      since,
+      from,
+      to,
+      merge_base,
+      confidence_profile,
+      dot,
+      output,
+    } => run_graph(
+      ctx,
+      graph::GraphOptions {
+        since,
+        from,
+        to,
+        merge_base,
+        confidence_profile,
+        dot,
+        output,
+      },
+    ),
 
     // Completions is handled before WorkspaceContext is built
     Commands::Completions { .. } => unreachable!("Completions should be handled before dispatch"),
