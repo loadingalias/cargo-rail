@@ -9,10 +9,8 @@ on:
     branches:
       - main
 
-  # Allow manual trigger
   workflow_dispatch:
 
-# Cancel in-progress runs for the same branch
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -23,46 +21,45 @@ env:
   CARGO_RAIL_TEST_MODE: commit
   CARGO_INCREMENTAL: 0
 
-# Lock down permissions to read-only by default
 permissions:
   contents: read
-  checks: write  # Required for publishing test reports
-  pull-requests: write  # Required for PR comments on test results
+  checks: write
+  pull-requests: write
 
 jobs:
   # ==========================================================================
-  # Job 1: Detect what changed (dogfooding cargo-rail-action)
+  # Job 1: Planner (dogfooding cargo-rail-action v3)
   # ==========================================================================
-  detect:
-    name: Detect Changes
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
     outputs:
-      docs-only: ${{ steps.affected.outputs.docs-only }}
-      rebuild-all: ${{ steps.affected.outputs.rebuild-all }}
-      count: ${{ steps.affected.outputs.count }}
+      build: ${{ steps.plan.outputs.build }}
+      test: ${{ steps.plan.outputs.test }}
+      docs: ${{ steps.plan.outputs.docs }}
+      infra: ${{ steps.plan.outputs.infra }}
+      base-ref: ${{ steps.plan.outputs.base-ref }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          fetch-depth: 0  # Required for change detection
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Detect affected crates
-        id: affected
-        uses: loadingalias/cargo-rail-action@88618d12427cee84efbe1ef556dd9f8445acad95  # v1.0.2
+      - name: Build Plan
+        id: plan
+        uses: loadingalias/cargo-rail-action@cac3400e5d64c4698dee0318e2467086ec03cb09  # v3.0.0
         with:
-          # Pin to v0.9.1 while feature/change-planning-v3 is in development
-          version: 0.9.1
-          # For push: compare against previous commit; for PR: compare against base branch
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          args: '--explain'
 
   # ==========================================================================
   # Job 2: MSRV enforcement (fast fail)
   # ==========================================================================
   msrv:
     name: MSRV Check
-    needs: detect
-    if: needs.detect.outputs.docs-only != 'true'
+    needs: plan
+    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -110,44 +107,42 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
 
   # ==========================================================================
-  # Job 3: CI (skipped if docs-only)
+  # Job 3: CI Matrix
   # ==========================================================================
   ci:
     name: CI (${{ matrix.target.name }})
-    needs: [msrv, detect]
-    if: needs.detect.outputs.docs-only != 'true'
+    needs: [msrv, plan]
+    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: true
       matrix:
         target:
-          # Linux x86-64 (GitHub Free)
           - name: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             cache-key: commit-linux-x64
 
-          # Linux ARM64 (GitHub Teams/Enterprise)
           - name: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             cache-key: commit-linux-arm64
 
-          # Windows x86-64 (GitHub Free)
           - name: x86_64-pc-windows-msvc
             runner: windows-latest
             cache-key: commit-windows-x64
 
-          # Windows ARM64 (GitHub Free in public repos)
           - name: aarch64-pc-windows-msvc
             runner: windows-11-arm
             cache-key: commit-windows-arm64
 
-          # macOS tested locally (not in CI)
+    env:
+      RAIL_SINCE: ${{ needs.plan.outputs.base-ref }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup
@@ -155,14 +150,25 @@ jobs:
         with:
           cache-key: ${{ matrix.target.cache-key }}
 
+      # Infra changes trigger full workspace; otherwise use change detection
       - name: Quality Checks
         run: just ci-check
 
       - name: Build
-        run: just build
+        if: needs.plan.outputs.infra == 'true'
+        run: just build-all
+
+      - name: Build (smart)
+        if: needs.plan.outputs.infra != 'true' && needs.plan.outputs.build == 'true'
+        run: just ci-build
 
       - name: Tests
-        run: just test
+        if: needs.plan.outputs.infra == 'true'
+        run: just test-all
+
+      - name: Tests (smart)
+        if: needs.plan.outputs.infra != 'true' && needs.plan.outputs.test == 'true'
+        run: just ci-test
 
       - name: Upload JUnit Test Report
         if: always()

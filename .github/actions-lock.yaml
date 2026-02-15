@@ -34,6 +34,14 @@ actions/upload-artifact:
   updated: "2026-02-14T22:34:32Z"
   notes: "Upload build artifacts and test results"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# cargo-rail Ecosystem
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+loadingalias/cargo-rail-action:
+  ref: v3.0.0
+  sha: "cac3400e5d64c4698dee0318e2467086ec03cb09"
+  updated: "2026-02-15T06:00:00Z"
+  notes: "Planner-first CI transport for cargo rail plan surfaces"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Testing & Reporting
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 mikepenz/action-junit-report:

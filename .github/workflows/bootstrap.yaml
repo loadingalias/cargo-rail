@@ -129,10 +129,10 @@ jobs:
         run: just ci-check
 
       - name: Build
-        run: just build
+        run: just build-all
 
       - name: Tests
-        run: just test
+        run: just test-all
 
       - name: Upload JUnit Test Report
         if: always()

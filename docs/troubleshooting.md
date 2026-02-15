@@ -64,6 +64,44 @@ cargo rail plan --since <expected-base> --explain
 
 - `--ignore-bin-crates` may remove binary-only crates from package-scoped surfaces.
 
+## Common Configuration Errors
+
+### "Unknown surface 'custom:X'" in profile
+
+Custom surfaces cannot be used in `[run.profile.X].surfaces`:
+
+```toml
+# ❌ WRONG - custom surfaces are not valid here
+[run.profile.bench]
+surfaces = ["build", "custom:benchmarks"]  # Error!
+
+# ✅ CORRECT - use built-in surfaces only
+[run.profile.bench]
+surfaces = ["bench"]
+```
+
+Custom surfaces are **plan outputs** for CI gating, not profile inputs. Extract them in CI:
+
+```yaml
+- id: custom
+  run: |
+    BENCHMARKS=$(echo '${{ steps.rail.outputs.custom-surfaces }}' | jq -r '.["custom:benchmarks"] // "false"')
+    echo "benchmarks=$BENCHMARKS" >> "$GITHUB_OUTPUT"
+```
+
+### Missing profile for workflow
+
+If you define `[run.workflow]` mappings, ensure the target profiles exist:
+
+```toml
+[run.workflow]
+commit = "ci"       # Requires [run.profile.ci] to exist
+nightly = "full"    # Requires [run.profile.full] to exist
+
+[run.profile.ci]
+surfaces = ["build", "test"]
+```
+
 ## CI vs Local Mismatch
 
 Use the same base-ref strategy and profile in both places:

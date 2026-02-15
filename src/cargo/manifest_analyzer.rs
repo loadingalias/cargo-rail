@@ -154,8 +154,8 @@ pub struct ParsedManifest {
   pub path: PathBuf,
   /// Package name
   pub package_name: String,
-  /// All dependencies with their usage
-  pub dependencies: HashMap<DepKey, DepUsage>,
+  /// All dependencies with their usages (Vec because same dep can appear in multiple sections)
+  pub dependencies: HashMap<DepKey, Vec<DepUsage>>,
 }
 
 // Parse Context
@@ -167,8 +167,8 @@ struct ParseContext<'a> {
   package_name: &'a str,
   /// Path to the Cargo.toml being parsed
   manifest_path: &'a Path,
-  /// Output map to collect parsed dependencies
-  dependencies: &'a mut HashMap<DepKey, DepUsage>,
+  /// Output map to collect parsed dependencies (Vec allows same dep in multiple sections)
+  dependencies: &'a mut HashMap<DepKey, Vec<DepUsage>>,
 }
 
 // Main Analyzer
@@ -211,8 +211,8 @@ impl ManifestAnalyzer {
     let mut usage_index: HashMap<DepKey, Vec<DepUsage>> = HashMap::new();
 
     for member in &parsed_members {
-      for (dep_key, usage) in &member.dependencies {
-        usage_index.entry(dep_key.clone()).or_default().push(usage.clone());
+      for (dep_key, usages) in &member.dependencies {
+        usage_index.entry(dep_key.clone()).or_default().extend(usages.iter().cloned());
       }
     }
 
@@ -301,8 +301,10 @@ impl ManifestAnalyzer {
               // Pattern 1: "dep:name" - explicit dep reference (Rust 2021+)
               if let Some(dep_name) = s.strip_prefix("dep:") {
                 let dep_key = DepKey::new(dep_name);
-                if let Some(usage) = dependencies.get_mut(&dep_key) {
-                  usage.referenced_in_features = true;
+                if let Some(usages) = dependencies.get_mut(&dep_key) {
+                  for usage in usages {
+                    usage.referenced_in_features = true;
+                  }
                 }
               }
               // Pattern 2: "name/feat" - dep with feature
@@ -310,19 +312,23 @@ impl ManifestAnalyzer {
                 // Strip optional "dep:" prefix from the dep part
                 let dep_name = dep.strip_prefix("dep:").unwrap_or(dep);
                 let dep_key = DepKey::new(dep_name);
-                if let Some(usage) = dependencies.get_mut(&dep_key) {
-                  usage.conditional_features.insert(feat.to_string());
-                  usage.referenced_in_features = true;
+                if let Some(usages) = dependencies.get_mut(&dep_key) {
+                  for usage in usages {
+                    usage.conditional_features.insert(feat.to_string());
+                    usage.referenced_in_features = true;
+                  }
                 }
               }
               // Pattern 3: bare "name" - check if it matches an optional dep
               else {
                 let dep_key = DepKey::new(s);
-                if let Some(usage) = dependencies.get_mut(&dep_key) {
-                  // Only count as referenced if the dep is optional
-                  // (non-optional deps with same name as features are already resolved)
-                  if usage.optional {
-                    usage.referenced_in_features = true;
+                if let Some(usages) = dependencies.get_mut(&dep_key) {
+                  for usage in usages {
+                    // Only count as referenced if the dep is optional
+                    // (non-optional deps with same name as features are already resolved)
+                    if usage.optional {
+                      usage.referenced_in_features = true;
+                    }
                   }
                 }
               }
@@ -394,7 +400,7 @@ impl ManifestAnalyzer {
           referenced_in_features: false, // Filled in later by features parsing
         };
 
-        ctx.dependencies.insert(dep_key, usage);
+        ctx.dependencies.entry(dep_key).or_default().push(usage);
       }
     }
 

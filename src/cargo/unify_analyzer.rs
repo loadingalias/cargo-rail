@@ -314,15 +314,12 @@ impl UnifyAnalyzer {
         }
       };
 
-      // Check if target-specific
-      let targets_with_dep = self.metadata.targets_with_dep(&dep_key.name);
-      let all_targets = self.metadata.targets();
-      let target = if targets_with_dep.len() < all_targets.len() {
-        // This is target-specific, try to infer cfg
-        Some(self.infer_target_cfg(&targets_with_dep))
-      } else {
-        None
-      };
+      // Note: Target constraints stay in member manifests, not workspace.dependencies.
+      // Members use `[target.'cfg(...)'.dependencies] dep = { workspace = true }`.
+      // We don't set target on UnifiedDep because [workspace.dependencies] cannot
+      // have [target] sections in virtual workspaces, and even in non-virtual ones
+      // it's cleaner to keep target constraints where they're used.
+      let target = None;
 
       // Get users - convert Arc<str> to String for output
       let users: HashSet<String> = usage_sites.iter().map(|u| u.used_by.to_string()).collect();
@@ -599,26 +596,6 @@ impl UnifyAnalyzer {
     Ok(results)
   }
 
-  /// Infer a cfg expression from a list of targets
-  fn infer_target_cfg(&self, targets: &[String]) -> String {
-    // Simple heuristic: if all Unix-like, use cfg(unix)
-    if targets.iter().all(|t| t.contains("linux") || t.contains("darwin")) {
-      "cfg(unix)".to_string()
-    } else if targets.iter().all(|t| t.contains("windows")) {
-      "cfg(windows)".to_string()
-    } else {
-      // Fall back to listing all targets
-      format!(
-        "cfg(any({}))",
-        targets
-          .iter()
-          .map(|t| format!("target = \"{}\"", t))
-          .collect::<Vec<_>>()
-          .join(", ")
-      )
-    }
-  }
-
   /// Detect dependencies where resolved features exceed declared features
   ///
   /// This catches cases where a crate relies on Cargo's feature unification to
@@ -644,6 +621,16 @@ impl UnifyAnalyzer {
   fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
     let mut undeclared = Vec::new();
 
+    // Get workspace member names - we skip undeclared feature detection for these
+    // Workspace member deps often have optional features that change APIs (like `unicode-lines`)
+    // Adding them automatically would break code that wasn't written for those features
+    let workspace_member_names: HashSet<String> = self
+      .metadata
+      .workspace_packages()
+      .iter()
+      .map(|p| p.name.to_string())
+      .collect();
+
     // Get workspace baseline (features declared in [workspace.dependencies])
     // These are workspace policy - members don't need to re-declare them
     let workspace_baseline: HashMap<String, HashSet<String>> = self
@@ -665,14 +652,17 @@ impl UnifyAnalyzer {
 
     for member in &self.manifests.members {
       let mut dep_features: HashMap<String, HashSet<String>> = HashMap::new();
-      for (dep_key, usage) in &member.dependencies {
-        let mut feats: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
-        // Include conditional features (from [features] table like `my-feat = ["dep/feature"]`)
-        // The author made an intentional choice - this counts as declared
-        feats.extend(usage.conditional_features.iter().cloned());
-        // If default_features = true (default), add "default"
-        if usage.default_features {
-          feats.insert("default".to_string());
+      for (dep_key, usages) in &member.dependencies {
+        let mut feats: HashSet<String> = HashSet::new();
+        for usage in usages {
+          feats.extend(usage.unconditional_features.iter().cloned());
+          // Include conditional features (from [features] table like `my-feat = ["dep/feature"]`)
+          // The author made an intentional choice - this counts as declared
+          feats.extend(usage.conditional_features.iter().cloned());
+          // If default_features = true (default), add "default"
+          if usage.default_features {
+            feats.insert("default".to_string());
+          }
         }
         dep_features.insert(dep_key.name.to_string(), feats);
       }
@@ -680,89 +670,157 @@ impl UnifyAnalyzer {
     }
 
     // Track which members contribute which features (beyond workspace baseline)
-    // This powers the `borrowed_from` field for transparency
-    // Structure: dep_name -> feature -> set of member names
+    // Also track if the feature declaration is target-specific (has a target constraint)
+    // Structure: dep_name -> feature -> (members, is_target_specific)
+    // A feature is target-specific if ALL its declarations have target constraints
     let mut feature_sources: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+    let mut feature_is_target_specific: HashMap<String, HashMap<String, bool>> = HashMap::new();
 
-    for (member_name, dep_features) in &member_declared_features {
-      for (dep_name, features) in dep_features {
-        let baseline = workspace_baseline.get(dep_name);
+    for member in &self.manifests.members {
+      for (dep_key, usages) in &member.dependencies {
+        let baseline = workspace_baseline.get(&*dep_key.name);
 
-        for feat in features {
-          // Skip features that are in workspace baseline (workspace policy)
-          if baseline.is_some_and(|b| b.contains(feat)) {
-            continue;
+        for usage in usages {
+          // Combine unconditional and conditional features
+          let mut feats: HashSet<&String> = usage.unconditional_features.iter().collect();
+          feats.extend(usage.conditional_features.iter());
+
+          let is_target_specific = usage.target.is_some();
+
+          for feat in feats {
+            // Skip features that are in workspace baseline (workspace policy)
+            if baseline.is_some_and(|b| b.contains(feat)) {
+              continue;
+            }
+
+            feature_sources
+              .entry(dep_key.name.to_string())
+              .or_default()
+              .entry(feat.clone())
+              .or_default()
+              .insert(member.package_name.clone());
+
+            // Track target-specificity: only consider target-specific if ALL declarations are
+            let entry = feature_is_target_specific
+              .entry(dep_key.name.to_string())
+              .or_default()
+              .entry(feat.clone())
+              .or_insert(true); // Start assuming target-specific
+            if !is_target_specific {
+              // Found a non-target-specific declaration, so it's not platform-specific
+              *entry = false;
+            }
           }
-
-          feature_sources
-            .entry(dep_name.clone())
-            .or_default()
-            .entry(feat.clone())
-            .or_default()
-            .insert(member_name.clone());
         }
       }
     }
+
+    // Track platform-specific features we skip (for warning output)
+    let mut skipped_platform_features: Vec<(String, String, String)> = Vec::new(); // (member, dep, feature)
+
+    // Track workspace member deps we skip (for warning output)
+    let mut skipped_workspace_member_deps: HashSet<String> = HashSet::new();
 
     // Find borrowed features for each member
     // A feature is borrowed if:
     // - It's contributed by OTHER members (not this member)
     // - It's NOT in workspace baseline (workspace policy doesn't count as borrowing)
     // - It passes the skip filter (configurable via skip_undeclared_patterns)
+    // - It's NOT target-specific (all declarations have target constraints)
+    // - The dep is NOT a workspace member (their features are intentional opt-ins)
     for member in &self.manifests.members {
-      for (dep_key, usage) in &member.dependencies {
+      for (dep_key, usages) in &member.dependencies {
+        // Skip workspace member deps entirely - their optional features are intentional
+        // opt-ins that may change APIs. Adding them would break code not written for them.
+        if workspace_member_names.contains(&*dep_key.name) {
+          skipped_workspace_member_deps.insert(dep_key.name.to_string());
+          continue;
+        }
+
         let Some(feat_sources) = feature_sources.get(&*dep_key.name) else {
           continue;
         };
 
-        // Get this member's declared features (unconditional + conditional)
-        let mut declared: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
-        declared.extend(usage.conditional_features.iter().cloned());
-        if usage.default_features {
-          declared.insert("default".to_string());
-        }
+        let target_specific_map = feature_is_target_specific.get(&*dep_key.name);
 
-        // Find features this member borrows from others
-        let mut borrowed_features: Vec<String> = Vec::new();
-        let mut borrowed_from_members: HashSet<String> = HashSet::new();
-
-        for (feat, sources) in feat_sources {
-          // Skip if this member declares the feature itself
-          if declared.contains(feat) {
-            continue;
+        // Check each usage of this dep (can appear in multiple sections)
+        for usage in usages {
+          // Get this usage's declared features (unconditional + conditional)
+          let mut declared: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
+          declared.extend(usage.conditional_features.iter().cloned());
+          if usage.default_features {
+            declared.insert("default".to_string());
           }
 
-          // Skip if configured to skip this feature pattern
-          if self.config.should_skip_undeclared_feature(feat) {
-            continue;
-          }
+          // Find features this member borrows from others
+          let mut borrowed_features: Vec<String> = Vec::new();
+          let mut borrowed_from_members: HashSet<String> = HashSet::new();
 
-          // This feature is borrowed from other members
-          borrowed_features.push(feat.clone());
-          for source in sources {
-            if source != &member.package_name {
-              borrowed_from_members.insert(source.clone());
+          for (feat, sources) in feat_sources {
+            // Skip if this member declares the feature itself
+            if declared.contains(feat) {
+              continue;
+            }
+
+            // Skip if configured to skip this feature pattern
+            if self.config.should_skip_undeclared_feature(feat) {
+              continue;
+            }
+
+            // Skip if feature is target-specific (all declarations have target constraints)
+            // These can't be added unconditionally without breaking cross-platform builds
+            if let Some(ts_map) = target_specific_map {
+              if ts_map.get(feat).copied().unwrap_or(false) {
+                skipped_platform_features.push((
+                  member.package_name.clone(),
+                  dep_key.name.to_string(),
+                  feat.clone(),
+                ));
+                continue;
+              }
+            }
+
+            // This feature is borrowed from other members and is safe to add
+            borrowed_features.push(feat.clone());
+            for source in sources {
+              if source != &member.package_name {
+                borrowed_from_members.insert(source.clone());
+              }
             }
           }
-        }
 
-        if !borrowed_features.is_empty() {
-          borrowed_features.sort();
-          let mut borrowed_from: Vec<String> = borrowed_from_members.into_iter().collect();
-          borrowed_from.sort();
+          if !borrowed_features.is_empty() {
+            borrowed_features.sort();
+            let mut borrowed_from: Vec<String> = borrowed_from_members.into_iter().collect();
+            borrowed_from.sort();
 
-          undeclared.push(UndeclaredFeature {
-            member: member.package_name.clone(),
-            dep_name: dep_key.name.to_string(),
-            undeclared_features: borrowed_features,
-            declared_features: declared.into_iter().collect(),
-            resolved_features: feat_sources.keys().cloned().collect(),
-            dep_kind: usage.kind,
-            target: usage.target.clone(),
-            borrowed_from,
-          });
+            undeclared.push(UndeclaredFeature {
+              member: member.package_name.clone(),
+              dep_name: dep_key.name.to_string(),
+              undeclared_features: borrowed_features,
+              declared_features: declared.into_iter().collect(),
+              resolved_features: feat_sources.keys().cloned().collect(),
+              dep_kind: usage.kind,
+              target: usage.target.clone(),
+              borrowed_from,
+            });
+          }
         }
       }
+    }
+
+    // Log skipped items
+    if !skipped_workspace_member_deps.is_empty() {
+      progress!(
+        "  Skipped undeclared feature detection for {} workspace member deps (features are opt-in)",
+        skipped_workspace_member_deps.len()
+      );
+    }
+    if !skipped_platform_features.is_empty() {
+      progress!(
+        "  Skipped {} platform-specific undeclared features (target-constrained declarations)",
+        skipped_platform_features.len()
+      );
     }
 
     undeclared

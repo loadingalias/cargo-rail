@@ -54,7 +54,7 @@ impl<'a> UnusedDepFinder<'a> {
       let resolved_deps = self.get_resolved_deps_for_member(&member.package_name);
 
       // Check each declared dependency
-      for (dep_key, usage) in &member.dependencies {
+      for (dep_key, usages) in &member.dependencies {
         // Skip workspace member deps - they're always structurally "used"
         // Use &*dep_key.name to get &str for comparison
         if workspace_member_names.contains(&*dep_key.name) {
@@ -79,47 +79,50 @@ impl<'a> UnusedDepFinder<'a> {
           continue; // Dep is resolved, definitely used
         }
 
-        // === Smart filtering to avoid false positives ===
+        // Check each usage of this dep (can appear in multiple sections)
+        for usage in usages {
+          // === Smart filtering to avoid false positives ===
 
-        // Filter 1: Optional deps are ALWAYS feature-gated
-        // Cargo automatically creates an implicit feature for each optional dependency,
-        // so code can use `#[cfg(feature = "dep_name")]` even without explicit [features] entries.
-        // We cannot safely determine if an optional dep is "unused" without analyzing source code
-        // for cfg attributes, so we conservatively skip all optional deps.
-        if usage.optional {
-          continue;
-        }
-
-        // Filter 2: Target-specific deps for unconfigured targets
-        // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
-        // that target configured, we can't verify if it's used or not.
-        if let Some(ref target_cfg) = usage.target {
-          if !target_constraint_matches_any(target_cfg, &configured_targets) {
-            // Target not configured - can't verify, assume it's valid
+          // Filter 1: Optional deps are ALWAYS feature-gated
+          // Cargo automatically creates an implicit feature for each optional dependency,
+          // so code can use `#[cfg(feature = "dep_name")]` even without explicit [features] entries.
+          // We cannot safely determine if an optional dep is "unused" without analyzing source code
+          // for cfg attributes, so we conservatively skip all optional deps.
+          if usage.optional {
             continue;
           }
 
-          // Target IS configured but dep still not in resolved graph
-          // This is genuinely suspicious - flag it with context
+          // Filter 2: Target-specific deps for unconfigured targets
+          // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
+          // that target configured, we can't verify if it's used or not.
+          if let Some(target_cfg) = &usage.target {
+            if !target_constraint_matches_any(target_cfg, &configured_targets) {
+              // Target not configured - can't verify, assume it's valid
+              continue;
+            }
+
+            // Target IS configured but dep still not in resolved graph
+            // This is genuinely suspicious - flag it with context
+            unused.push(UnusedDep {
+              member: member.package_name.clone(),
+              dep_name: dep_key.name.to_string(),
+              kind: usage.kind,
+              reason: UnusedReason::TargetConfiguredButNotResolved {
+                target_cfg: target_cfg.clone(),
+              },
+            });
+            continue;
+          }
+
+          // This is a non-conditional, non-optional dep that's not in the resolved graph
+          // This is genuinely unused
           unused.push(UnusedDep {
             member: member.package_name.clone(),
             dep_name: dep_key.name.to_string(),
             kind: usage.kind,
-            reason: UnusedReason::TargetConfiguredButNotResolved {
-              target_cfg: target_cfg.clone(),
-            },
+            reason: UnusedReason::NotInResolvedGraph,
           });
-          continue;
         }
-
-        // This is a non-conditional, non-optional dep that's not in the resolved graph
-        // This is genuinely unused
-        unused.push(UnusedDep {
-          member: member.package_name.clone(),
-          dep_name: dep_key.name.to_string(),
-          kind: usage.kind,
-          reason: UnusedReason::NotInResolvedGraph,
-        });
       }
     }
 
@@ -142,12 +145,14 @@ impl<'a> UnusedDepFinder<'a> {
         .iter()
         .find(|m| m.package_name == dep.member)
         .and_then(|m| {
-          m.dependencies.iter().find_map(|(key, usage)| {
-            if *key.name == dep.dep_name && usage.kind == dep.kind {
-              usage.target.clone()
-            } else {
-              None
-            }
+          m.dependencies.iter().find_map(|(key, usages)| {
+            usages.iter().find_map(|usage| {
+              if *key.name == dep.dep_name && usage.kind == dep.kind {
+                usage.target.clone()
+              } else {
+                None
+              }
+            })
           })
         });
 

@@ -295,6 +295,28 @@ impl MultiTargetMetadata {
     features
   }
 
+  /// Get features enabled for a package on ALL targets (intersection)
+  ///
+  /// Features only enabled on some targets are platform-specific and should
+  /// not be added unconditionally to manifests.
+  #[allow(dead_code)] // May be useful for future platform-aware features
+  pub fn universal_features(&self, dep_name: &str) -> HashSet<String> {
+    let per_target = self.all_features(dep_name);
+    if per_target.is_empty() {
+      return HashSet::new();
+    }
+
+    // Start with features from first target, intersect with rest
+    let mut iter = per_target.values();
+    let mut result = iter.next().cloned().unwrap_or_default();
+
+    for feats in iter {
+      result.retain(|f| feats.contains(f));
+    }
+
+    result
+  }
+
   /// Check which targets include a specific dependency (sorted for deterministic output)
   pub fn targets_with_dep(&self, dep_name: &str) -> Vec<String> {
     let mut targets = Vec::new();

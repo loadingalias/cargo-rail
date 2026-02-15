@@ -306,7 +306,7 @@ Settings for planner path classification.
 | `conservative_unclassified_owner_fallback` | `bool` | `true` | If `true`, unclassified files owned by crates conservatively enable `build` + `test`. |
 | `confidence_profile` | `enum` | `"balanced"` | Planner confidence profile:<br>• `"strict"` - expands crate-owned changes to conservative `build` + `test` with transitive seeding<br>• `"balanced"` - default behavior<br>• `"fast"` - disables conservative transitive surface seeding for speed |
 | `bot_pr_confidence_profile` | `enum?` | `unset` | Optional profile override applied only for bot-authored GitHub pull requests (for example set to `"strict"`). |
-| `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces in `cargo rail plan` output. Category names must use ASCII letters/digits with `_` or `-` (for example `verify_models`, `bench-extended`). |
+| `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces in `cargo rail plan` output. **Important:** Custom surfaces are plan OUTPUTS for CI gating—they cannot be used in `[run.profile.X].surfaces`. Category names must use ASCII letters/digits with `_` or `-` (for example `verify_models`, `bench-extended`). |
 
 **Default Infrastructure Patterns:**
 
@@ -347,6 +347,36 @@ bot_pr_confidence_profile = "strict"  # optional; only active for bot PRs
 verify = ["verify/**/*.rs"]
 benchmarks = ["benches/**", "perf/**"]
 docs = ["docs/**", "*.md"]
+```
+
+#### Custom Surfaces vs Built-in Surfaces
+
+Custom surfaces serve a different purpose than built-in surfaces:
+
+| Aspect | Built-in Surfaces | Custom Surfaces |
+|--------|-------------------|-----------------|
+| Values | `build`, `test`, `bench`, `docs`, `infra` | `custom:<name>` (user-defined) |
+| Use in `[run.profile.X].surfaces` | ✅ Yes | ❌ No |
+| Appears in plan output | ✅ Yes | ✅ Yes |
+| Use in CI job gating | ✅ Yes | ✅ Yes (extract from `custom_surfaces` JSON) |
+
+**Why this distinction?** Built-in surfaces map to cargo commands (`cargo build`, `cargo test`, etc.). Custom surfaces are arbitrary categories for CI decision-making—they don't map to cargo commands, so they can't be "executed" by `cargo rail run`.
+
+**CI gating pattern for custom surfaces:**
+
+```yaml
+- uses: loadingalias/cargo-rail-action@v1
+  id: rail
+
+- name: Extract custom surfaces
+  id: custom
+  run: |
+    BENCHMARKS=$(echo '${{ steps.rail.outputs.custom-surfaces }}' | jq -r '.["custom:benchmarks"] // "false"')
+    echo "benchmarks=$BENCHMARKS" >> "$GITHUB_OUTPUT"
+
+- name: Run benchmark suite
+  if: steps.custom.outputs.benchmarks == 'true' || steps.rail.outputs.infra == 'true'
+  run: cargo bench
 ```
 
 #### Planner-First GitHub Actions Integration
@@ -458,7 +488,7 @@ User-defined profile schema:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `surfaces` | `string[]` | yes | Surfaces to execute (`build`, `test`, `bench`, `docs`, `infra`). |
+| `surfaces` | `string[]` | yes | Built-in surfaces to execute: `build`, `test`, `bench`, `docs`, `infra`. **Note:** Custom surfaces (defined in `[change-detection.custom]`) cannot be used here—they are plan outputs for CI job gating, not profile inputs. |
 | `run_args` | `string[]` | no | Args prepended before CLI `RUN_ARGS`. |
 | `since` | `string?` | no | Default `--since` baseline when CLI does not pass `--since`/`--merge-base`. |
 | `merge_base` | `bool?` | no | Default merge-base mode when CLI does not pass `--since`/`--merge-base`. |

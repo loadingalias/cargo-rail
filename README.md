@@ -1,27 +1,28 @@
 # cargo-rail
 
-> Cargo-native control plane for Rust monorepos: plan changes, run only needed work locally and in CI, unify the graph (deps/features), split/sync crates into new repos/monorepos, and automate releases with 14 core dependencies.
+> A deterministic, cargo-native control plane for Rust monorepos: build/check/test/bench only what changes locally and in CI, unify the graph (deps/features), split/sync crates into new repos/monorepos, and automate releases with 14 core dependencies.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail) [![docs.rs](https://img.shields.io/docsrs/cargo-rail)](https://docs.rs/cargo-rail) [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml) [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
-## Why cargo-rail
+## Why
 
-**Impact on real repos (validated across tokio, helix, meilisearch):**
+**Documented impact on real repos (tokio, helix, meilisearch):**
 
 | Metric | Impact |
 |---|---|
-| **CI surface execution** | 55% fewer surfaces run per merge |
-| **Weighted test/build units** | 64% reduction in compute units |
-| **Dependencies unified** | 78 across 47 crates (avg 1.7 per crate) |
-| **Undeclared features fixed** | 141 silent bugs prevented |
-| **Tooling consolidation** | 6 cargo plugins → 1 command |
-| **MSRV computation** | Automatic from dependency graph |
+| **CI Surface Execution** | 55% fewer surfaces run per merge |
+| **Weighted `test`/`build` Units** | 64% reduction in compute units |
+| **Dependencies Unified** | 78 across 47 crates (avg 1.7 per crate) |
+| **Undeclared `features` Fixed** | 141 silent bugs prevented |
+| **Tooling Consolidation** | 6-8 cargo plugins → 1 command |
+| **MSRV Computation** | Automatic from dependency graph |
 
-**Two compound effects = massive time/cost savings:**
-1. **Change detection** (`plan`/`run`) reduces what runs — 55% fewer CI surfaces, 64% fewer compute units
-2. **Dependency unification** (`unify`) reduces build graph complexity — cleaner deps, smaller build units, fewer rebuilds
+**Compounding effects = massive time/cost savings:**
+1. **Change Detection** (`plan`/`run`) reduces what runs — 55% fewer CI surfaces, 64% fewer compute units w/ shown determinism
+2. **Dependency Unification** (`unify`) reduces build graph complexity — cleaner deps, smaller build units, fewer rebuilds
+3. **Smaller Build Graphs** cargo-rail uses 14 core-deps for automatically removing unused dependencies, pruning truly dead features, unifying undeclared features, computing MSRV, splitting and synching crate/s to new, clean repos, and the entire release workflow w/ changelog generation. This results in fewer tools and less cargo-metadata fetches.
 
-**Before cargo-rail:** Run 6 tools separately (hakari, udeps, machete, shear, features-manager, msrv), each with different data/timing
+**Before cargo-rail:** Run 6 tools separately (hakari and/or workspace-hack, udeps, machete, shear, features-manager, msrv, sort, and more), each with different data/timing
 **After cargo-rail:** `cargo rail unify --check` in one metadata call
 
 ## Quick Start
@@ -33,21 +34,23 @@ cargo install cargo-rail
 # generate config
 cargo rail init
 
+# dependency hygiene
+cargo rail unify --check
+
 # deterministic planning + execution
 cargo rail plan --merge-base
 cargo rail run --merge-base --profile ci
+cargo rail plan --merge-base --explain
 
-# dependency hygiene
-cargo rail unify --check
 ```
 
 Pre-built binaries: [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases)
 
-## Core Workflows
+## Workflows
 
-### Change Planning + Execution (`plan` / `run`)
+### Change Planning (detection) + Execution (`plan` / `run`)
 
-**Problem:** CI wastes resources testing unchanged code. Teams either (1) test everything on every commit, or (2) build custom scripts that drift from local behavior.
+**Problem:** CICD wastes resources testing unchanged code. We either (1) test everything on every commit, or (2) build custom scripts that drift from local behavior.
 
 **Solution:** One planner contract, used everywhere:
 
@@ -60,17 +63,17 @@ cargo rail plan --merge-base -f github  # outputs: build=true, test=false, docs=
 cargo rail run --merge-base --profile ci  # runs ONLY what plan selected
 ```
 
-**How repos use this:**
-1. Configure change detection rules in `.config/rail.toml` (infrastructure files, doc-only changes, etc.)
-2. Run `plan` to see impact classification (which surfaces: build, test, bench, docs, infra)
-3. Run `run` to execute only selected surfaces — locally or in CI
-4. Use `--explain` to understand any decision: "why did this run?" / "why was this skipped?"
+**How to use this effectively:**
+1. Configure change detection rules in `.config/rail.toml` (infrastructure files, doc-only changes, custom, etc.)
+2. Run `plan` to see impact classification (which surfaces: build, test, bench, docs, infra, custom)
+3. Run `run` to execute only selected surfaces — locally or in CI - or wire to `justfile`, `makefile`, `xtask`, or shell scripts.
+4. Use `--explain` to understand any decision: "why did this run?" / "why was this skipped?" 
 
-Result: **55% fewer CI surface executions, 64% reduction in weighted compute units** (validated on tokio/helix/meilisearch).
+Result: **55% fewer CI surface executions, 64% reduction in weighted compute units** (validated on tokio/helix/meilisearch) See: [Examples](examples/change_detection).
 
 ### Dependency Unification (`unify`)
 
-**Problem:** Teams juggle 6+ cargo plugins for dependency hygiene (hakari, udeps, machete, shear, features-manager, msrv). Each runs separately, on different data, with different CLI patterns. Undeclared features (borrowed from Cargo's resolver) break isolated builds.
+**Problem:** We all juggle 6+ cargo plugins for dependency hygiene (hakari, udeps, machete, shear, features-manager, msrv, sort, etc.). Each runs separately, on different data, with different CLI patterns... pulling the same cargo-metadata over and over. Undeclared features (borrowed from Cargo's resolver) break isolated builds silently.
 
 **Solution:** `cargo rail unify` — one command, one metadata call, comprehensive analysis:
 
@@ -87,6 +90,7 @@ cargo rail unify --explain  # understand each decision
 - **Detects unused deps** — flags dependencies not used anywhere
 - **Computes MSRV** — derives minimum Rust version from dependency graph
 - **Replaces workspace-hack** — enable `pin_transitives` for cargo-hakari equivalent
+- **Configurable** - we all have different ideas about what clean means, such as whether to remove unused dependencies or prune features or sort manifests - that's what your `rail.toml` file is for.
 
 **Validated impact on real repos:**
 
@@ -97,24 +101,22 @@ cargo rail unify --explain  # understand each decision
 | meilisearch/meilisearch | 23 | 835 | 54 | 97 | 1.88.0 |
 | **Aggregate** | **47** | **1,410** | **78** | **141** | — |
 
-Config files and validation artifacts: [examples/unify/](examples/unify/)
-
-**Tools replaced:** cargo-hakari, cargo-udeps, cargo-machete, cargo-shear, cargo-features-manager, cargo-msrv (6 tools → 1 command)
+Config files and validation artifacts: [Examples](examples/unify/)
 
 ### Split + Sync (Google Copybara Replacement)
 
-**Problem:** Teams need to publish crates from monorepos but want clean standalone repos with full git history. Existing tools (git subtree, git-filter-repo) are one-way and manual. Google's Copybara requires Bazel and complex config.
+**Problem:** We need/want to publish crates from monorepos but want clean standalone repos with full git history. I wanted to build in a canonical dev monorepo, but release crates independently. Google'sCopybara requires so much and it's built w/ Java. Existing tools (git subtree, git-filter-repo) are one-way and manual. This offers us a bidirectional sync engine w/ 3-way merge conflict resolution in the event we need it; it never merges to `main` w/o a review PR for the canonical repo.
 
 **Solution:** `cargo rail split` + `cargo rail sync` — bidirectional sync with 3-way conflict resolution:
 
 ```bash
 # Extract crate to standalone repo with full git history
-cargo rail split init my-crate  # configure once
-cargo rail split run my-crate   # extract with history preserved
+cargo rail split init crate/s  # configure once, automatically
+cargo rail split run crate/s   # extract with history preserved
 
 # Bidirectional sync
-cargo rail sync my-crate --to-remote    # push monorepo changes to split repo
-cargo rail sync my-crate --from-remote  # pull split repo changes (creates PR branch)
+cargo rail sync crate/s --to-remote    # push monorepo changes to split repo
+cargo rail sync crate/s --from-remote  # pull split repo changes (creates PR branch)
 ```
 
 **Three modes:**
@@ -122,76 +124,49 @@ cargo rail sync my-crate --from-remote  # pull split repo changes (creates PR br
 - `combined`: multiple crates → one repo (shared utilities)
 - `workspace`: multiple crates → workspace structure (mirrors monorepo)
 
-Built on system git (not libgit2) for deterministic SHAs and full git fidelity.
+Built on system git (not libgit2) for deterministic SHAs and full git fidelity with less attack surface/weight in the graph.
 
 ### Release Automation (`release`)
 
-Release checks, versioning, changelogs, tags, dependency-order publish.
+Release checks, versioning, changelogs, tags, dependency-order publish. Release_plz is great, but it's pulling in something like 500 deps to release our work. That's too much weight to carry around in the graph and too much attack surface in my world. I release `cargo-rail` with 1`cargo-rail`.
 
-## Why This Model
+```bash
+# Cut a new release
+cargo rail release run cargo-rail --bump patch --yes  # swap 'patch', 'minor', or 'major' as needed
+git push origin main --follow-tags   # follow up
+```
 
-- One planner contract for local and CI.
-- One executor (`run`) for planner-selected surfaces.
-- One config (`rail.toml`) for policy.
-- Check-mode exit code `1` means "changes detected" (not a crash).
+This gives me a clean changelog, tags, crates.io / Github release.
 
 ## GitHub Actions Integration
 
-For CI integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating.
+For CICD integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating. It will make output cleaner and more readable.
 
 The action keeps CI behavior aligned with local `plan` + `run` workflows.
 
-## Configuration
+## Config
 
-`cargo rail init` generates `.config/rail.toml`.
+- `cargo rail init` generates `.config/rail.toml`.
+- `cargo rail config sync` updates `.config/rail.toml` with latest defaults from new releases installed.
+- `cargo rail config validate` validates `.config/rail.toml` for when you're unsure.
 
-**Example config:**
-
-```toml
-# Platform targets for multi-target validation
-targets = [
-  "aarch64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-pc-windows-msvc",
-  "x86_64-unknown-linux-gnu",
-]
-
-[unify]
-pin_transitives = false      # Enable for cargo-hakari replacement
-detect_unused = true         # Detect unused dependencies
-prune_dead_features = true   # Remove features never enabled
-msrv = true                  # Compute workspace rust-version
-detect_undeclared_features = true  # Find borrowed features
-
-[release]
-tag_format = "{prefix}{version}"
-publish_delay = 5
-sign_tags = true
-
-[change-detection]
-# Files triggering full workspace rebuild
-infrastructure = [
-  ".github/**",
-  "scripts/**",
-  "justfile",
-  "rust-toolchain.toml",
-]
-```
+By default, on `cargo rail init`, the `rail.toml` file is written to the `.config/` directory. It's created if it doesn't exist. However, you can move/change it to the workspace root if you prefer it there. You can also 'unhide' the file if you'd like. [Reference](docs/config.md)
 
 **Full documentation:**
-- [Configuration reference](docs/config.md)
-- [Command reference](docs/commands.md)
+- [Configuration Reference](docs/config.md)
+- [Command Reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
-- [Change detection recipe](docs/change-detection-recipe.md)
-- [Change detection operations guide](docs/change-detection-operations.md)
+- [Change Detection Recipe](docs/change-detection-recipe.md)
+- [Change Detection Operations Guide](docs/change-detection-operations.md)
+- [How to Use Change Detection Effectively](docs/how-to-use-cargo-rail-change-detection.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## Migration Guides
 
-- Replace `affected` / `test` flows for pre-v0.10.0 releases of `cargo-rail`: [docs/adr/0001-migrate-affected-test-to-plan-run.md](docs/adr/0001-migrate-affected-test-to-plan-run.md)
-- Replace `cargo-hakari`: [docs/migrate-hakari.md](docs/migrate-hakari.md)
+- [Migrate from `cargo-hakari`](docs/migrate-hakari.md)
+- [Upgrade from `cargo-rail` v0.9.1 to v0.10.0](docs/upgrade-to-v0.10.0.md)
 
-## Proven On Large Repos
+## Tested & Proven On Large Repos - THIS NEEDS WORK! It's thin.
 
 All core workflows (`plan`/`run`, `unify`, `split`, `sync`, `release`) validated on production repos:
 
@@ -201,9 +176,9 @@ All core workflows (`plan`/`run`, `unify`, `split`, `sync`, `release`) validated
 | [helix-editor/helix](https://github.com/helix-editor/helix) | 14 | 351 | Plan/run (5 merges), unify, split, sync, release |
 | [meilisearch/meilisearch](https://github.com/meilisearch/meilisearch) | 23 | 835 | Plan/run (5 merges), unify, split, sync, release |
 
-**Why this matters:**
+**How to Validate:**
 
-Validation isn't a single test — it's a protocol:
+Validation isn't a single test — it's a protocol by design:
 
 1. **Reproducibility**: Every command in [docs/large-repo-validation.md](docs/large-repo-validation.md) runs on forked repos with real merge history
 2. **Metrics collection**: Automated scripts measure execution reduction, surface accuracy, plan duration, unify impact
@@ -224,7 +199,7 @@ Validation isn't a single test — it's a protocol:
 
 Full protocol and raw artifacts: [examples/README.md](examples/README.md)
 
-## Examples
+## Examples - THIS NEEDS WORK! It's thin.
 
 Each workflow includes working config files and reproducible command sequences:
 

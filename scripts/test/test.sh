@@ -1,34 +1,62 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CRATE="${1:-}"
+# Smart Test Runner
+#
+# Uses cargo-rail for intelligent change detection.
+# Always shows the plan before executing.
+#
+# Usage:
+#   ./test.sh              # Smart: test affected crates only
+#   ./test.sh <crate>      # Direct: test specific crate
+#   ./test.sh --all        # Full: test entire workspace
+#
+# Environment:
+#   CARGO_RAIL_TEST_MODE   # "local" (default) or "commit" (CI)
+#   RAIL_SINCE             # Git ref for CI comparison
 
-echo "Running Unit, Integration, and Property Tests via Nextest..."
-export CARGO_RAIL_TEST_MODE=${CARGO_RAIL_TEST_MODE:-local}
-echo "Test mode: $CARGO_RAIL_TEST_MODE"
+ARG="${1:-}"
+MODE="${CARGO_RAIL_TEST_MODE:-local}"
 
-# Select nextest profile based on test mode
-case "$CARGO_RAIL_TEST_MODE" in
-  commit)
-    PROFILE="commit"
-    ;;
-  local | *)
-    PROFILE="default"
-    ;;
-esac
-
-echo "Using nextest profile: $PROFILE"
-
-if [ -n "$CRATE" ]; then
-  # User specified a crate explicitly
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "🎯 Running tests for specific crate: $CRATE"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  cargo nextest run -p "$CRATE" -P "$PROFILE" --all-features --config-file .config/nextest.toml
+# Select nextest profile based on mode
+if [ "$MODE" = "commit" ]; then
+  NEXTEST_PROFILE="commit"
 else
-  # Full workspace test
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "🔄 Running tests for entire workspace"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  cargo nextest run --workspace -P "$PROFILE" --all-features --config-file .config/nextest.toml
+  NEXTEST_PROFILE="default"
 fi
+
+# Determine comparison ref
+if [ -n "${RAIL_SINCE:-}" ]; then
+  PLAN_ARGS="--since $RAIL_SINCE"
+else
+  PLAN_ARGS="--merge-base"
+fi
+
+echo "Running Tests"
+echo "Mode: $MODE | Nextest profile: $NEXTEST_PROFILE"
+echo ""
+
+# Full workspace test (no change detection)
+if [ "$ARG" = "--all" ]; then
+  echo "Full workspace test (--all)"
+  echo ""
+  cargo nextest run --workspace -P "$NEXTEST_PROFILE" --all-features --config-file .config/nextest.toml
+  exit 0
+fi
+
+# Specific crate: Direct test
+if [ -n "$ARG" ]; then
+  echo "Testing specific crate: $ARG"
+  echo ""
+  cargo nextest run -p "$ARG" -P "$NEXTEST_PROFILE" --all-features --config-file .config/nextest.toml
+  exit 0
+fi
+
+# Smart mode: Use cargo-rail for change detection
+echo "Change Detection Plan:"
+echo ""
+cargo rail plan $PLAN_ARGS --explain
+echo ""
+
+echo "Testing affected crates..."
+cargo rail run $PLAN_ARGS --surface test

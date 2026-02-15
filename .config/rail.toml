@@ -78,8 +78,18 @@ infrastructure = [
   "Cargo.toml",
   "Cargo.lock",
 ]
+conservative_unclassified_owner_fallback = true  # Enable build+test fallback for unclassified crate-owned files
+confidence_profile = "balanced"  # Planner confidence profile: strict, balanced, fast
+bot_pr_confidence_profile = "strict"  # Optional planner profile override for bot-authored PRs
+
+[run]
+default_profile = "local"  # Default run profile (built-ins: local, ci, nightly)
 # Custom categories are optional - docs_only is detected automatically
 # custom = {}  # Example: verify = ["verify/**/*.rs"]
+
+# Custom profile for commit.yaml workflow
+[run.profile.commit]
+surfaces = ["build", "test"]
 
 
 # Split/Sync: Use 'cargo rail split init <crate>' to configure individual crates

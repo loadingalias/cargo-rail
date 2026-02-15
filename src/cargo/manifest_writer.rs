@@ -45,26 +45,15 @@ impl ManifestWriter {
     // Ensure [workspace] section exists
     manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
 
-    // First pass: write regular dependencies (no target)
-    // This scope ensures deps_table reference is released before we handle target deps
-    {
-      let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
-        .context("Failed to create [workspace.dependencies]")?;
+    // Write all dependencies to [workspace.dependencies]
+    // Note: Target constraints stay in member manifests (e.g., [target.'cfg(unix)'.dependencies])
+    // with `workspace = true`. We never write [target] sections to workspace Cargo.toml.
+    let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
+      .context("Failed to create [workspace.dependencies]")?;
 
-      for dep in deps.iter().filter(|d| d.target.is_none()) {
-        let entry = manifest_ops::build_dep_entry(dep);
-        manifest_ops::insert_dependency(deps_table, &dep.name, entry).context("Failed to insert regular dependency")?;
-      }
-    }
-
-    // Second pass: write target-specific dependencies
-    for dep in deps.iter() {
-      let Some(target) = dep.target.as_ref() else {
-        continue;
-      };
+    for dep in deps {
       let entry = manifest_ops::build_dep_entry(dep);
-      manifest_ops::insert_target_dependency(&mut doc, target, "dependencies", &dep.name, entry)
-        .context("Failed to insert target dependency")?;
+      manifest_ops::insert_dependency(deps_table, &dep.name, entry).context("Failed to insert dependency")?;
     }
 
     // Format and write

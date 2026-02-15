@@ -1,47 +1,62 @@
-build:
-    cargo build --workspace --all-targets --all-features
-    @echo "✅ Success!"
-
-plan:
-    cargo rail plan --merge-base -f json
-
-run:
-    cargo rail run --merge-base --profile local
-
-ci:
-    @if [ -z "${RAIL_SINCE:-}" ]; then \
-        echo "RAIL_SINCE is required (example: export RAIL_SINCE=origin/main)"; \
-        exit 2; \
-    fi
-    cargo rail run --since "$RAIL_SINCE" --profile ci
-
-explain:
-    cargo rail plan --merge-base --explain
-
-build-release:
-    cargo build --workspace --all-targets --all-features --release
-    @echo "✅ Success!"
+check:
+    @scripts/check/check.sh
 
 test crate="":
     @scripts/test/test.sh "{{ crate }}"
 
-check:
-    cargo fmt --all
-    cargo check --workspace --all-targets --all-features
-    cargo clippy --workspace --all-targets --all-features --fix --allow-dirty -- -D warnings
-    cargo deny check all
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-    cargo audit
-    @echo "✅ All checks passed!"
+build:
+    @echo "Change Detection Plan:"
+    @echo ""
+    @cargo rail plan --merge-base --explain
+    @echo ""
+    @echo "Building affected crates..."
+    @cargo rail run --merge-base --profile local --surface build
+
+build-release:
+    @echo "Change Detection Plan:"
+    @echo ""
+    @cargo rail plan --merge-base --explain
+    @echo ""
+    @echo "Building affected crates (release)..."
+    @cargo rail run --merge-base --profile local --surface build -- --release
+
+# Full Workspace Commands (no change detection)
+
+check-all:
+    @scripts/check/check.sh --all
+
+test-all:
+    @scripts/test/test.sh --all
+
+build-all:
+    cargo build --workspace --all-targets --all-features
+
+build-release-all:
+    cargo build --workspace --all-targets --all-features --release
+
+# CI Commands (for GitHub Actions)
 
 ci-check:
-    cargo fmt --all -- --check
-    cargo check --workspace --all-targets --all-features
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo deny check all
-    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
-    cargo audit
-    @echo "✅ CI checks passed!"
+    @scripts/check/check.sh --ci
+
+ci-test:
+    @scripts/test/test.sh
+
+ci-build:
+    @cargo rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
+
+# Explainability
+
+plan:
+    cargo rail plan --merge-base -f json
+
+why:
+    cargo rail plan --merge-base --explain
+
+dry-run surface="test":
+    cargo rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
+
+# Maintenance
 
 update:
     cargo update --workspace
@@ -50,10 +65,8 @@ update:
 gen-docs:
     @scripts/docs/generate.sh
 
-# Pin GitHub Actions to commit SHAs for security
 pin-actions:
     @scripts/ci/pin-actions.sh --update-lock
 
-# Verify all GitHub Actions are properly pinned
 verify-actions:
     @scripts/ci/pin-actions.sh --verify-only
