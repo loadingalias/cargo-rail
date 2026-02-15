@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.1](https://github.com/loadingalias/cargo-rail/compare/v0.10.0...v0.10.1) - 2026-02-15
+
+### 📦 Other Changes
+
+- cargo-rail: fixing the chicken-and-egg issue in CICD; fixing the lint issues. pinned the GHA SHAs. ([023aed4](https://github.com/loadingalias/cargo-rail/commit/023aed475bb6c4bda89760060a6891390fe05b37))
+- cargo-rail: formatting fixes ([b8a550b](https://github.com/loadingalias/cargo-rail/commit/b8a550bba296ac2ab6f8d7abbff400d01cf470e9))
+- cargo-rail: fixing the 'target' bug in virtual workspaces w/ target-specific deps. Adding Vec to manifest_analyzer becasue a dep can live in multiple sections (dev-dep and dep) as an example. updated docs. configured cargo-rail change-detection and GHA usage IN cargo-rail. 🍲 ([8f90b23](https://github.com/loadingalias/cargo-rail/commit/8f90b23fc24c90e5016e5a0f79ed9c35eea35e44))
+
+
+
 ## [0.10.0](https://github.com/loadingalias/cargo-rail/compare/v0.9.1...v0.10.0) - 2026-02-14
 
 ### ⚠️ BREAKING CHANGES
