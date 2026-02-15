@@ -212,7 +212,10 @@ impl ManifestAnalyzer {
 
     for member in &parsed_members {
       for (dep_key, usages) in &member.dependencies {
-        usage_index.entry(dep_key.clone()).or_default().extend(usages.iter().cloned());
+        usage_index
+          .entry(dep_key.clone())
+          .or_default()
+          .extend(usages.iter().cloned());
       }
     }
 

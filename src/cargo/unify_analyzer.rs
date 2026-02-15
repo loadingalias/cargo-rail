@@ -771,11 +771,7 @@ impl UnifyAnalyzer {
             // These can't be added unconditionally without breaking cross-platform builds
             if let Some(ts_map) = target_specific_map {
               if ts_map.get(feat).copied().unwrap_or(false) {
-                skipped_platform_features.push((
-                  member.package_name.clone(),
-                  dep_key.name.to_string(),
-                  feat.clone(),
-                ));
+                skipped_platform_features.push((member.package_name.clone(), dep_key.name.to_string(), feat.clone()));
                 continue;
               }
             }
