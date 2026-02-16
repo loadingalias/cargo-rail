@@ -106,27 +106,40 @@ Create two PRs per repo:
 
 ## Post-Unify Metrics
 
-_To be recorded after applying unify changes._
+**Date:** 2026-02-15
 
-| Repository | cargo check | cargo build | cargo test | Delta |
-|------------|-------------|-------------|------------|-------|
-| **tokio** | TBD | TBD | TBD | TBD |
-| **helix** | TBD | TBD | TBD | TBD |
-| **meilisearch** | TBD | TBD | TBD | TBD |
-| **helix-db** | TBD | TBD | TBD | TBD |
+All repositories pass `cargo check --workspace` after unification:
+
+| Repository | Status | Notes |
+|------------|--------|-------|
+| **tokio** | ✅ Pass | No warnings |
+| **helix** | ✅ Pass | No warnings |
+| **meilisearch** | ✅ Pass | No warnings |
+| **helix-db** | ✅ Pass | 1 warning (duplicate bench target, upstream issue) |
+
+**Build graph impact:** Unification reduces duplicate dependency resolutions. Exact timing improvements vary by workspace structure and caching state.
 
 ---
 
 ## Change Detection Results
 
-_To be recorded after configuring change-detection and validating on historical PRs._
+**Date:** 2026-02-15
 
-| Repository | PRs Analyzed | Avg Surfaces Skipped | Est. CI Reduction |
-|------------|--------------|----------------------|-------------------|
-| **tokio** | TBD | TBD | TBD |
-| **helix** | TBD | TBD | TBD |
-| **meilisearch** | TBD | TBD | TBD |
-| **helix-db** | TBD | TBD | TBD |
+Analysis of 10 recent commits per repository:
+
+| Repository | Commits | Skip Build | Skip Tests | Targeted | Key Insight |
+|------------|---------|------------|------------|----------|-------------|
+| **tokio** | 10 | 10% | 0% | 80% | Most commits need tests; value in crate targeting |
+| **helix** | 10 | 20% | 20% | 20% | Config/doc changes detectable |
+| **meilisearch** | 10 | **50%** | **50%** | 70% | High CI reduction potential |
+| **helix-db** | 10 | 0% | 0% | 70% | Value in crate targeting, not skipping |
+
+**Analysis:**
+- **meilisearch** has strongest change-detection value (50% CI reduction)
+- **tokio** and **helix-db** benefit from crate targeting (70-80% of runs affect subset)
+- **helix** moderate benefit from config/doc detection
+
+**Metrics source:** [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing) — each fork includes `docs/CHANGE_DETECTION_METRICS.md`
 
 ---
 

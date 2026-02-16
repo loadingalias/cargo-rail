@@ -165,7 +165,7 @@ By default, on `cargo rail init`, the `rail.toml` file is written to the `.confi
 ## Migration Guides
 
 - [Migrate from `cargo-hakari`](docs/migrate-hakari.md)
-- [Upgrade from `cargo-rail` v0.9.1 to v0.10.1](docs/upgrade-to-v0.10.1.md)
+- [Upgrade from `cargo-rail` v0.9.x to v0.10.x](docs/upgrade-to-v0.10.0.md)
 
 ## Tested & Proven On Large Repos
 
