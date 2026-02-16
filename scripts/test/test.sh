@@ -59,4 +59,9 @@ cargo rail plan $PLAN_ARGS --explain
 echo ""
 
 echo "Testing affected crates..."
-cargo rail run $PLAN_ARGS --surface test
+if [ "$MODE" = "commit" ]; then
+  # CI mode: force commit profile and nextest JUnit output path.
+  cargo rail run $PLAN_ARGS --surface test -- -P "$NEXTEST_PROFILE" --config-file .config/nextest.toml
+else
+  cargo rail run $PLAN_ARGS --surface test
+fi

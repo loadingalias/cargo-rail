@@ -143,8 +143,19 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Publish Test Report
+      - name: Detect JUnit Test Report
         if: always()
+        id: junit
+        shell: bash
+        run: |
+          if [ -f target/nextest/commit/junit.xml ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish Test Report
+        if: always() && steps.junit.outputs.found == 'true'
         uses: mikepenz/action-junit-report@74626db7353a25a20a72816467ebf035f674c5f8  # v6.2.0
         with:
           report_paths: 'target/nextest/commit/junit.xml'
