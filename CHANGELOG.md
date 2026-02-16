@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.2](https://github.com/loadingalias/cargo-rail/compare/v0.10.1...v0.10.2) - 2026-02-15
+
+### ⚡ Performance
+
+- cleanup iteration patterns and documentation ([1ae1a3a](https://github.com/loadingalias/cargo-rail/commit/1ae1a3a993db86c919a6fb75c09f27c2a21728ce))
+
+
+
 ## [0.10.1](https://github.com/loadingalias/cargo-rail/compare/v0.10.0...v0.10.1) - 2026-02-15
 
 ### 📦 Other Changes
