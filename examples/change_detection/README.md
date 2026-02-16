@@ -1,28 +1,109 @@
 # Change Detection Examples
 
-Canonical, copy-paste-ready examples for planner-first change detection.
+Two approaches based on your project's tooling:
 
-## Structure
+## Choose Your Pattern
 
-- `01-minimal/rail.toml`: smallest usable setup.
-- `02-balanced-monorepo/rail.toml`: practical baseline for most teams.
-- `03-strict-bot-pr/rail.toml`: stricter policy for bot-authored PRs.
-- `04-github-actions/workflow.yaml`: minimal planner-first GHA workflow.
-- `05-custom-profiles/rail.toml`: custom profiles/workflow mapping without command sprawl.
+| Pattern | For Projects With | Strategy |
+|---------|-------------------|----------|
+| [**with-task-runner/**](with-task-runner/) | just, make, xtask, scripts | `cargo rail plan` + your task runner |
+| [**standalone/**](standalone/) | No task runner | `cargo rail run` handles everything |
 
-## Fast validation
+## With Task Runner (Recommended for Large Projects)
+
+If you already have **just**, **make**, **xtask**, or shell scripts:
 
 ```bash
-cargo rail config validate --strict -f json
-cargo rail plan --merge-base --explain
-cargo rail run --merge-base --profile ci --dry-run --print-cmd
+# cargo-rail provides change detection
+PLAN=$(cargo rail plan --merge-base -f json)
+
+# Your task runner handles execution
+if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
+  cargo xtask test        # or: just test, make test, ./scripts/test.sh
+fi
 ```
 
-## Trust checklist
+**Why?**
+- cargo-rail stays focused on change detection
+- Your existing build logic doesn't change
+- Full control over execution
+- No lock-in
 
-- `plan` is the source of truth for CI gating.
-- `run` uses the same baseline semantics (`--merge-base` or `--since <ref>`).
-- Receipts are uploaded from `target/cargo-rail/receipts/*.json`.
-- CI YAML does not re-implement changed-file logic.
+**Real examples:** [helix](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix), [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch)
 
-See `docs/change-detection-recipe.md` for the full operating recipe.
+## Standalone (Simpler, Less Flexible)
+
+If you don't have a task runner:
+
+```bash
+# cargo-rail handles both detection and execution
+cargo rail run --merge-base --surface test
+cargo rail run --workflow ci
+```
+
+**Why?**
+- Single command for plan + execute
+- No scripting required
+- Built-in surfaces: build, test, bench, docs
+
+**Real examples:** [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio), [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db)
+
+## Configuration Reference
+
+### Infrastructure Files
+
+Files that trigger full workspace rebuild:
+
+```toml
+[change-detection]
+infrastructure = [
+  ".github/**",       # CI changes
+  "scripts/**",       # Build scripts
+  "justfile",         # Task runner
+  "deny.toml",        # License/security
+  "rust-toolchain.toml",
+  "Cargo.toml",
+  "Cargo.lock",
+]
+```
+
+### Confidence Profiles
+
+| Profile | Behavior |
+|---------|----------|
+| `strict` | Conservative — runs more, misses less |
+| `balanced` | Default — good tradeoff |
+| `fast` | Aggressive — skips transitive checks |
+
+```toml
+[change-detection]
+confidence_profile = "balanced"
+bot_pr_confidence_profile = "strict"  # Override for dependabot, etc.
+```
+
+### Custom Surfaces
+
+Detect non-Rust asset changes:
+
+```toml
+[change-detection.custom]
+themes = ["runtime/themes/**"]
+queries = ["runtime/queries/**"]
+workloads = ["workloads/**"]
+```
+
+Plan output includes `custom:themes`, `custom:queries`, etc.
+
+## Validation
+
+```bash
+cargo rail config validate --strict
+cargo rail plan --merge-base --explain
+cargo rail run --merge-base --dry-run --print-cmd
+```
+
+## See Also
+
+- [Configuration Reference](../../docs/config.md)
+- [Troubleshooting](../../docs/troubleshooting.md)
+- [Validation Forks](https://github.com/loadingalias/cargo-rail-testing)

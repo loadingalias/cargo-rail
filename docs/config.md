@@ -401,8 +401,8 @@ Use `cargo rail plan -f github` as the CI source of truth:
   run: cargo rail run --merge-base --surface docs
 ```
 
-For a full end-to-end operating recipe (local + CI + trust checklist), see:
-`docs/change-detection-recipe.md`.
+For a full end-to-end operating guide (local + CI + trust checklist), see:
+[docs/change-detection.md](change-detection.md).
 
 **`plan -f github` outputs:**
 

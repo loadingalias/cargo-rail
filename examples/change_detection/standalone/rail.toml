@@ -1,0 +1,46 @@
+# cargo-rail configuration
+# For projects WITHOUT a task runner
+#
+# Strategy: cargo rail run handles both detection and execution.
+
+[change-detection]
+infrastructure = [
+  ".github/**",
+  "scripts/**",
+  "deny.toml",
+  "rust-toolchain.toml",
+  "Cargo.toml",
+  "Cargo.lock",
+]
+confidence_profile = "balanced"
+bot_pr_confidence_profile = "strict"
+conservative_unclassified_owner_fallback = true
+
+# Custom surfaces (optional)
+# [change-detection.custom]
+# stress_test = ["stress-test/**"]
+
+[run]
+default_profile = "local"
+
+# Workflow-to-profile mapping for CI
+[run.workflow]
+commit = "ci"
+nightly = "nightly"
+
+# Local development: just tests
+[run.profile.local]
+surfaces = ["test"]
+merge_base = true
+
+# CI: build + test
+[run.profile.ci]
+surfaces = ["build", "test"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true
+
+# Nightly: full validation
+[run.profile.nightly]
+surfaces = ["build", "test", "docs", "bench"]
+run_args = ["--workspace", "{cargo_args}"]
+merge_base = true

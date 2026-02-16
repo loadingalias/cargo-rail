@@ -157,9 +157,7 @@ By default, on `cargo rail init`, the `rail.toml` file is written to the `.confi
 - [Configuration Reference](docs/config.md)
 - [Command Reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
-- [Change Detection Recipe](docs/change-detection-recipe.md)
-- [Change Detection Operations Guide](docs/change-detection-operations.md)
-- [How to Use Change Detection Effectively](docs/how-to-use-cargo-rail-change-detection.md)
+- [Change Detection Guide](docs/change-detection.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
 ## Migration Guides
@@ -182,7 +180,7 @@ All core workflows (`plan`/`run`, `unify`) validated on production repos with fu
 
 **How to Validate:**
 
-1. **Reproducibility**: Every command in [docs/large-repo-validation.md](docs/large-repo-validation.md) runs on forked repos with real merge history
+1. **Reproducibility**: Every command in [examples/validation-protocol.md](examples/validation-protocol.md) runs on forked repos with real merge history
 2. **Metrics collection**: Automated scripts measure execution reduction, surface accuracy, plan duration, unify impact
 3. **Quality audit**: Heuristics flag potential false positives/negatives for human review
 4. **Real-world scenarios**: Tests run on actual merge commits and real dependency graphs, not synthetic fixtures
@@ -202,7 +200,7 @@ Each workflow includes working config files and reproducible command sequences:
 | Workflow | Examples | Real-World Configs |
 |---|---|---|
 | Change detection | [examples/change_detection/](examples/change_detection/) | [tokio](https://github.com/loadingalias/cargo-rail-testing/blob/main/tokio/.config/rail.toml), [helix](https://github.com/loadingalias/cargo-rail-testing/blob/main/helix/.config/rail.toml), [meilisearch](https://github.com/loadingalias/cargo-rail-testing/blob/main/meilisearch/.config/rail.toml) |
-| Unify | [examples/unify/](examples/unify/) | [Validation results](examples/unify/VALIDATION_RESULTS.md) |
+| Unify | [examples/unify/](examples/unify/) | [Validation results](examples/unify/unify-results.md) |
 | Split/sync | [examples/split-sync/](examples/split-sync/) | — |
 | Release | [examples/release/](examples/release/) | — |
 

@@ -1,0 +1,40 @@
+# cargo-rail configuration
+# For projects WITH a task runner (just, make, xtask, scripts)
+#
+# Strategy: cargo rail plan provides change detection data,
+# your task runner handles execution.
+
+[change-detection]
+infrastructure = [
+  ".github/**",
+  "scripts/**",
+  "justfile",
+  "Justfile",
+  "Makefile",
+  "deny.toml",
+  "rust-toolchain.toml",
+  "Cargo.toml",
+  "Cargo.lock",
+]
+confidence_profile = "balanced"
+bot_pr_confidence_profile = "strict"
+conservative_unclassified_owner_fallback = true
+
+# Custom surfaces for non-Rust assets
+[change-detection.custom]
+themes = ["runtime/themes/**"]
+queries = ["runtime/queries/**"]
+docs = ["docs/**", "book/**"]
+
+# Run profiles are optional when using external task runner
+# Include them for fallback or local convenience
+[run]
+default_profile = "local"
+
+[run.profile.local]
+surfaces = ["test"]
+merge_base = true
+
+[run.profile.ci]
+surfaces = ["build", "test"]
+merge_base = true

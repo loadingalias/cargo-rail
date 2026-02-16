@@ -1,18 +1,32 @@
-# Unify Examples
+# Unify
 
 Dependency unification validated on production Rust workspaces.
 
+## What This Replaces
+
+| Tool | Purpose |
+|------|---------|
+| **cargo-hakari** | Dependency unification + workspace-hack |
+| **cargo-udeps** | Unused dependency detection |
+| **cargo-machete** | Unused dependency detection |
+| **cargo-shear** | Unused dependency detection |
+| **cargo-features-manager** | Feature management |
+| **cargo-msrv** | MSRV computation |
+| **cargo-sort** | Dependency sorting |
+
+**Single command:** `cargo rail unify --check`
+
 ## Validated Repositories
 
-These repos run `cargo rail unify --check` successfully with measurable impact:
+| Repository | Crates | Deps Unified | Undeclared Features | MSRV |
+|------------|-------:|-------------:|--------------------:|------|
+| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) | 10 | 9 | 7 | 1.85.0 |
+| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) | 14 | 15 | 19 | 1.87.0 |
+| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) | 23 | 54 | 215 | 1.88.0 |
+| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) | 6 | 18 | 17 | 1.88.0 |
+| **Total** | **53** | **96** | **258** | — |
 
-| Repository | Crates | Locked Deps | Config | Results |
-|---|---:|---:|---|---|
-| tokio-rs/tokio | 10 | 224 | [rail.toml (local)](../../cargo-rail-testing/tokio/.config/rail.toml) | 9 deps unified, 19 undeclared features fixed, MSRV 1.85.0 |
-| helix-editor/helix | 14 | 351 | [rail.toml (local)](../../cargo-rail-testing/helix/.config/rail.toml) | 15 deps unified, 25 undeclared features fixed, MSRV 1.87.0 |
-| meilisearch/meilisearch | 23 | 835 | [rail.toml (local)](../../cargo-rail-testing/meilisearch/.config/rail.toml) | 54 deps unified, 97 undeclared features fixed, MSRV 1.88.0 |
-
-**Aggregate:** 78 dependencies unified, 141 undeclared features fixed across 47 crates.
+**Full results:** [unify-results.md](unify-results.md)
 
 ## What Unify Does
 
@@ -24,17 +38,6 @@ Single metadata call, comprehensive analysis:
 - **Detects unused deps** — flags dependencies not used anywhere
 - **Computes MSRV** — derives minimum Rust version from dependency graph
 - **Replaces workspace-hack** — enable `pin_transitives` for cargo-hakari equivalent
-
-## Tools Replaced
-
-cargo-rail unify consolidates 6 cargo plugins into one command:
-
-- ❌ cargo-hakari → ✅ `cargo rail unify` (with `pin_transitives = true`)
-- ❌ cargo-udeps → ✅ `cargo rail unify` (with `detect_unused = true`)
-- ❌ cargo-machete → ✅ `cargo rail unify` (with `detect_unused = true`)
-- ❌ cargo-shear → ✅ `cargo rail unify` (with `detect_unused = true`)
-- ❌ cargo-features-manager → ✅ `cargo rail unify` (with `prune_dead_features = true`)
-- ❌ cargo-msrv → ✅ `cargo rail unify` (with `msrv = true`)
 
 ## Quick Start
 
@@ -50,11 +53,12 @@ cargo rail unify
 
 # Understand decisions
 cargo rail unify --check --explain
+
+# Undo if needed
+cargo rail unify undo
 ```
 
-## Baseline Config
-
-Use `rail.toml` from this directory as a starting point. Key settings:
+## Configuration
 
 ```toml
 [unify]
@@ -64,17 +68,8 @@ prune_dead_features = true         # Remove unused feature flags
 detect_unused = true               # Detect unused dependencies
 msrv = true                        # Compute workspace rust-version
 pin_transitives = false            # Enable for cargo-hakari replacement
+exclude = ["thiserror"]            # Skip specific dependencies
 ```
-
-## Validation Artifacts
-
-Latest validation run artifacts are in:
-- `../../cargo-rail-testing/artifacts/unify-validation-*/`
-
-These include:
-- Per-repo baseline metrics (locked deps, features, etc.)
-- Unify check outputs (JSON + text)
-- Aggregate summary with totals
 
 ## Trust Checklist
 
@@ -88,8 +83,6 @@ Before running `unify` (without `--check`):
 6. ✅ Use `cargo rail unify undo` if needed
 
 ## Example Output
-
-From tokio-rs/tokio:
 
 ```
 Loading metadata for 17 target(s)...
@@ -113,3 +106,8 @@ Computed MSRV: 1.85.0 (from 132 deps with rust-version)
 ready: 9 dependencies, 52 member edits
 Changes detected. Run without --check to apply.
 ```
+
+## See Also
+
+- [Configuration Reference](../../docs/config.md) — Full `[unify]` options
+- [Migration from cargo-hakari](../../docs/migrate-hakari.md)
