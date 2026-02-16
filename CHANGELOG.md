@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.10.3](https://github.com/loadingalias/cargo-rail/compare/v0.10.2...v0.10.3) - 2026-02-16
+
+### 🐛 Bug Fixes
+
+- **unify**: keep workspace member deps path-pinned ([30a86aa](https://github.com/loadingalias/cargo-rail/commit/30a86aa862eef5f9ddcd263414aa0c14fabe60c0))
+
+### 🔧 Chores
+
+- gitignore update for the 'tokio_lesson.md' ([da54241](https://github.com/loadingalias/cargo-rail/commit/da54241dcf66a7d8bfe303bce4e0f5eeb7a50200))
+
+### 📝 Documentation
+
+- reorganize examples and consolidate change detection docs ([63dd986](https://github.com/loadingalias/cargo-rail/commit/63dd986688a1025e2f6378d23f5459df4618e593))
+
+
+
 ## [0.10.2](https://github.com/loadingalias/cargo-rail/compare/v0.10.1...v0.10.2) - 2026-02-15
 
 ### ⚡ Performance
