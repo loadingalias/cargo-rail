@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.4](https://github.com/loadingalias/cargo-rail/compare/v0.10.3...v0.10.4) - 2026-02-16
+
+### 👷 CI
+
+- make junit reporting robust in smart test mode ([94f74fe](https://github.com/loadingalias/cargo-rail/commit/94f74fe94fe544f6f6c5cbaafe0285d057941af1))
+
+
+
 ## [0.10.3](https://github.com/loadingalias/cargo-rail/compare/v0.10.2...v0.10.3) - 2026-02-16
 
 ### 🐛 Bug Fixes
