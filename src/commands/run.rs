@@ -80,14 +80,15 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
 
   let requested_test_surface = effective.surfaces.iter().any(|surface| surface == "test");
   let mut executed_any = false;
-  let mut executed_surfaces = Vec::new();
-  let mut skipped_surfaces = Vec::new();
-  for surface in effective.surfaces.clone() {
-    if !surface_enabled(&opts, plan.as_ref(), &surface) {
+  let surface_count = effective.surfaces.len();
+  let mut executed_surfaces = Vec::with_capacity(surface_count);
+  let mut skipped_surfaces = Vec::with_capacity(surface_count);
+  for surface in &effective.surfaces {
+    if !surface_enabled(&opts, plan.as_ref(), surface) {
       if opts.explain || opts.dry_run {
         println!("skip surface `{}` (not enabled by plan)", surface);
       }
-      skipped_surfaces.push(surface);
+      skipped_surfaces.push(surface.clone());
       continue;
     }
 

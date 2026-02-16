@@ -11,7 +11,7 @@
 use crate::change_detection::classify::{ChangeKind, classify_file};
 use crate::config::ChangeDetectionConfig;
 use glob::Pattern;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 /// Presentation-level classification of changed files
@@ -27,7 +27,7 @@ pub struct ChangeClassification {
   /// Infrastructure files that triggered rebuild_all
   pub infrastructure_files: Vec<String>,
   /// Custom category matches: category name -> matched files
-  pub custom_categories: HashMap<String, Vec<String>>,
+  pub custom_categories: FxHashMap<String, Vec<String>>,
 }
 
 impl ChangeClassification {

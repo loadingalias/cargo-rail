@@ -4,11 +4,10 @@ use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
 use crate::release::version::BumpType;
 use crate::workspace::WorkspaceContext;
+use rustc_hash::FxHashMap;
 use semver::Version;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize)]
@@ -102,8 +101,8 @@ impl<'a> ReleasePlanner<'a> {
       .collect();
 
     // Build plan for each crate
-    let mut crate_plans = Vec::new();
-    let mut version_map: HashMap<String, Version> = HashMap::new();
+    let mut crate_plans = Vec::with_capacity(ordered_targets.len());
+    let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
 
     for crate_name in &ordered_targets {
       let plan = self.plan_crate(crate_name, bump_type, &version_map)?;
@@ -133,7 +132,7 @@ impl<'a> ReleasePlanner<'a> {
     &self,
     crate_name: &str,
     bump_type: &BumpType,
-    _version_map: &HashMap<String, Version>,
+    _version_map: &FxHashMap<String, Version>,
   ) -> RailResult<CrateReleasePlan> {
     // Get crate metadata
     let package = self
@@ -260,18 +259,7 @@ impl<'a> ReleasePlanner<'a> {
         .replace("{version}", "*")
     };
 
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["tag", "--list", &pattern, "--sort=-version:refname"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git tag: {}", e)))?;
-
-    if !output.status.success() {
-      return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().next().map(|s| s.to_string()))
+    self.ctx.git.git().find_latest_tag(&pattern)
   }
 }
 

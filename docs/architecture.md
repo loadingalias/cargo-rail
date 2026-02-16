@@ -271,5 +271,4 @@ output control            → src/output.rs
 | 1 | Check mode found changes (actionable, not error) |
 | 2 | Error |
 
-Exit code 1 lets CI detect "changes needed" vs "something broke". This is honestly not needed and will likely be adjusted in the next major release.
 Exit code 1 lets CI detect "changes needed" vs "something broke".

@@ -377,7 +377,7 @@ fn serialize_splits_config(config: &RailConfig) -> RailResult<String> {
 
 fn build_split_mutation_plan(
   ctx: &WorkspaceContext,
-  configs: &[crate::split::SplitConfig],
+  configs: &[crate::split::SplitParams],
   allow_dirty: bool,
 ) -> RailResult<mutation::MutationPlan> {
   let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
@@ -422,7 +422,7 @@ fn build_split_mutation_plan(
   mutation::build_plan(ctx, "split", actions, risks, trace)
 }
 
-fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::SplitConfig]) -> Vec<serde_json::Value> {
+fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::SplitParams]) -> Vec<serde_json::Value> {
   let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
   let mut out = Vec::new();
 

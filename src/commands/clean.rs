@@ -262,14 +262,14 @@ fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
 
 fn clean_backups_handler(ctx: &WorkspaceContext, delete_all: bool) -> RailResult<Vec<String>> {
   let backup_manager = BackupManager::new(&ctx.workspace_root);
-  let mut cleaned = Vec::new();
 
   if !backup_manager.has_backups() {
-    return Ok(cleaned);
+    return Ok(Vec::new());
   }
 
   // Get list of backups that will be cleaned before cleaning
   let backup_list = backup_manager.list_backups()?;
+  let mut cleaned = Vec::with_capacity(backup_list.len());
 
   if delete_all {
     progress!("removing all backups...");

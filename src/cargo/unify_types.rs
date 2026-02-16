@@ -8,71 +8,78 @@
 
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::multi_target_metadata::ComputedMsrv;
+use rustc_hash::FxHashMap;
 use semver::VersionReq;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // Core Types
 
 /// A dep that will be unified in [workspace.dependencies]
+///
+/// Uses `Arc<str>` for identifier fields to avoid redundant allocations.
+/// The same package/feature names are shared across multiple structures.
 #[derive(Debug, Clone)]
 pub struct UnifiedDep {
   /// Dependency package name
-  pub name: String,
+  pub name: Arc<str>,
   /// Version requirement (e.g., "^1.0.0")
   pub version_req: VersionReq,
   /// Features to enable (minimal intersection across all uses)
-  pub features: Vec<String>,
+  pub features: Vec<Arc<str>>,
   /// Whether to enable default features
   pub default_features: bool,
   /// List of workspace members that use this dependency
-  pub used_by: Vec<String>,
+  pub used_by: Vec<Arc<str>>,
   /// Target platform constraint (e.g., "cfg(unix)")
-  pub target: Option<String>,
+  pub target: Option<Arc<str>>,
   /// Local path for path dependencies
   pub path: Option<PathBuf>,
 }
 
 /// An edit to apply to a member's `Cargo.toml`
+///
+/// Uses `Arc<str>` for identifier fields to share allocations with source data.
 #[derive(Debug, Clone)]
 pub enum MemberEdit {
   /// Replace dep with workspace inheritance
   UseWorkspace {
     /// Name of the dependency to replace
-    dep_name: String,
+    dep_name: Arc<str>,
     /// Type of dependency (normal, dev, build)
     dep_kind: DepKind,
     /// Target platform constraint (e.g., "cfg(unix)") - preserves which section to edit
-    target: Option<String>,
+    target: Option<Arc<str>>,
     /// Additional features to enable locally (beyond workspace features)
-    local_features: Vec<String>,
+    local_features: Vec<Arc<str>>,
     /// Whether the dependency is optional
     is_optional: bool,
   },
   /// Remove an unused dep
   RemoveDep {
     /// Name of the dependency to remove
-    dep_name: String,
+    dep_name: Arc<str>,
     /// Type of dependency (normal, dev, build)
     dep_kind: DepKind,
     /// Target platform constraint (if in target-specific section)
-    target: Option<String>,
+    target: Option<Arc<str>>,
   },
   /// Remove a dead feature (empty no-op)
   RemoveFeature {
     /// Name of the feature to remove
-    feature_name: String,
+    feature_name: Arc<str>,
   },
   /// Add missing features to a dependency (fix undeclared feature borrowing)
   AddFeatures {
     /// Name of the dependency to update
-    dep_name: String,
+    dep_name: Arc<str>,
     /// Type of dependency (normal, dev, build)
     dep_kind: DepKind,
     /// Target platform constraint (if in target-specific section)
-    target: Option<String>,
+    target: Option<Arc<str>>,
     /// Features to add to the dependency
-    features_to_add: Vec<String>,
+    features_to_add: Vec<Arc<str>>,
   },
   /// Ensure this crate inherits MSRV from the workspace
   ///
@@ -84,11 +91,11 @@ pub enum MemberEdit {
 #[derive(Debug, Clone)]
 pub struct UnifyIssue {
   /// Name of the dependency with the issue
-  pub dep_name: String,
+  pub dep_name: Arc<str>,
   /// Whether this blocks unification or is just a warning
   pub severity: IssueSeverity,
   /// Description of the issue
-  pub message: String,
+  pub message: Arc<str>,
 }
 
 /// Severity level of a unification issue
@@ -104,31 +111,31 @@ pub enum IssueSeverity {
 #[derive(Debug)]
 pub struct ValidationResult {
   /// Target platform being validated
-  pub target: String,
+  pub target: Arc<str>,
   /// Whether validation passed
   pub success: bool,
   /// Error message if validation failed
-  pub error: Option<String>,
+  pub error: Option<Arc<str>>,
 }
 
 /// Record of a duplicate version that was cleaned up
 #[derive(Debug, Clone)]
 pub struct DuplicateCleanup {
   /// Dependency name
-  pub dep_name: String,
+  pub dep_name: Arc<str>,
   /// Versions that were found across different targets
-  pub versions_found: Vec<String>,
+  pub versions_found: Vec<Arc<str>>,
   /// Version that was selected (always highest)
-  pub selected_version: String,
+  pub selected_version: Arc<str>,
 }
 
 /// Record of a truly dead feature (empty no-op) that can be safely pruned
 #[derive(Debug, Clone)]
 pub struct PrunedFeature {
   /// Crate that declared the feature
-  pub crate_name: String,
+  pub crate_name: Arc<str>,
   /// Feature name that was pruned
-  pub feature_name: String,
+  pub feature_name: Arc<str>,
 }
 
 /// Record of an optional feature that's not currently enabled but enables something
@@ -136,33 +143,33 @@ pub struct PrunedFeature {
 #[derive(Debug, Clone)]
 pub struct OptionalFeature {
   /// Crate that declared the feature
-  pub crate_name: String,
+  pub crate_name: Arc<str>,
   /// Feature name
-  pub feature_name: String,
+  pub feature_name: Arc<str>,
   /// What this feature enables (for reporting)
-  pub enables: Vec<String>,
+  pub enables: Vec<Arc<str>>,
 }
 
 /// Record of a version mismatch between member manifest and workspace.dependencies
 #[derive(Debug, Clone)]
 pub struct VersionMismatch {
   /// Member that has the mismatched version
-  pub member: String,
+  pub member: Arc<str>,
   /// Dependency name
-  pub dep_name: String,
+  pub dep_name: Arc<str>,
   /// Version declared in the member's Cargo.toml
-  pub member_version: String,
+  pub member_version: Arc<str>,
   /// Version in workspace.dependencies
-  pub workspace_version: String,
+  pub workspace_version: Arc<str>,
 }
 
 /// Record of an unused dependency (declared but not in resolved graph)
 #[derive(Debug, Clone)]
 pub struct UnusedDep {
   /// Member that has the unused dependency
-  pub member: String,
+  pub member: Arc<str>,
   /// Dependency name
-  pub dep_name: String,
+  pub dep_name: Arc<str>,
   /// Kind of dependency (normal, dev, build)
   pub kind: DepKind,
   /// Why this dependency was flagged as unused
@@ -178,7 +185,7 @@ pub enum UnusedReason {
   /// (e.g., `[target.'cfg(windows)'.dependencies]` when windows target is configured)
   TargetConfiguredButNotResolved {
     /// The target cfg expression from the manifest
-    target_cfg: String,
+    target_cfg: Arc<str>,
   },
 }
 
@@ -186,11 +193,11 @@ pub enum UnusedReason {
 #[derive(Debug, Clone)]
 pub struct TransitivePin {
   /// Dependency name
-  pub name: String,
+  pub name: Arc<str>,
   /// Resolved version
   pub version: semver::Version,
   /// Features to enable
-  pub features: Vec<String>,
+  pub features: Vec<Arc<str>>,
 }
 
 /// Record of a feature that is used at runtime but not declared in Cargo.toml
@@ -201,22 +208,22 @@ pub struct TransitivePin {
 #[derive(Debug, Clone)]
 pub struct UndeclaredFeature {
   /// Member crate that uses the undeclared feature
-  pub member: String,
+  pub member: Arc<str>,
   /// Dependency name
-  pub dep_name: String,
+  pub dep_name: Arc<str>,
   /// Features that are resolved (enabled at runtime) but not declared
-  pub undeclared_features: Vec<String>,
+  pub undeclared_features: Vec<Arc<str>>,
   /// Features that were declared in Cargo.toml
-  pub declared_features: Vec<String>,
+  pub declared_features: Vec<Arc<str>>,
   /// Features from the resolved dependency graph
-  pub resolved_features: Vec<String>,
+  pub resolved_features: Vec<Arc<str>>,
   /// Kind of dependency (normal, dev, build)
   pub dep_kind: DepKind,
   /// Target platform constraint (if in target-specific section)
-  pub target: Option<String>,
+  pub target: Option<Arc<str>>,
   /// Which workspace members provide the borrowed features
   /// Shows where the feature is coming from (for transparency)
-  pub borrowed_from: Vec<String>,
+  pub borrowed_from: Vec<Arc<str>>,
 }
 
 // UnificationPlan
@@ -227,9 +234,9 @@ pub struct UnificationPlan {
   /// Dependencies to add to [workspace.dependencies]
   pub workspace_deps: Vec<UnifiedDep>,
   /// Edits to apply to each member's Cargo.toml
-  pub member_edits: HashMap<String, Vec<MemberEdit>>,
+  pub member_edits: FxHashMap<Arc<str>, Vec<MemberEdit>>,
   /// Mapping from package name to manifest path (relative to workspace root)
-  pub member_paths: HashMap<String, PathBuf>,
+  pub member_paths: FxHashMap<Arc<str>, PathBuf>,
   /// Transitive dependencies to pin (with version info)
   pub transitive_pins: Vec<TransitivePin>,
   /// Results from validating across target platforms
@@ -290,7 +297,8 @@ impl UnificationPlan {
         s.push_str(&format!("  - {} = \"{}\"", dep.name, dep.version_req));
 
         if !dep.features.is_empty() {
-          s.push_str(&format!(", features = [{}]", dep.features.join(", ")));
+          let feats: Vec<&str> = dep.features.iter().map(|f| &**f).collect();
+          s.push_str(&format!(", features = [{}]", feats.join(", ")));
         }
 
         if !dep.default_features {
@@ -305,37 +313,37 @@ impl UnificationPlan {
     // Show member edits (deps being converted to workspace = true)
     if !self.member_edits.is_empty() {
       // Collect unique dep names being converted, removed deps, removed features, and added features
-      let mut converted_deps: HashSet<String> = HashSet::new();
-      let mut removed_deps: HashSet<String> = HashSet::new();
-      let mut removed_features: HashSet<String> = HashSet::new();
+      let mut converted_deps: HashSet<Arc<str>> = HashSet::new();
+      let mut removed_deps: HashSet<Arc<str>> = HashSet::new();
+      let mut removed_features: HashSet<Arc<str>> = HashSet::new();
       let mut features_added_count = 0usize;
-      let mut features_added_crates: HashSet<String> = HashSet::new();
-      let mut msrv_inheritance_crates: HashSet<String> = HashSet::new();
+      let mut features_added_crates: HashSet<Arc<str>> = HashSet::new();
+      let mut msrv_inheritance_crates: HashSet<Arc<str>> = HashSet::new();
       for (member_name, edits) in &self.member_edits {
         for edit in edits {
           match edit {
             MemberEdit::UseWorkspace { dep_name, .. } => {
-              converted_deps.insert(dep_name.clone());
+              converted_deps.insert(Arc::clone(dep_name));
             }
             MemberEdit::RemoveDep { dep_name, .. } => {
-              removed_deps.insert(dep_name.clone());
+              removed_deps.insert(Arc::clone(dep_name));
             }
             MemberEdit::RemoveFeature { feature_name } => {
-              removed_features.insert(feature_name.clone());
+              removed_features.insert(Arc::clone(feature_name));
             }
             MemberEdit::AddFeatures { features_to_add, .. } => {
               features_added_count += features_to_add.len();
-              features_added_crates.insert(member_name.clone());
+              features_added_crates.insert(Arc::clone(member_name));
             }
             MemberEdit::EnforceMsrvInheritance => {
-              msrv_inheritance_crates.insert(member_name.clone());
+              msrv_inheritance_crates.insert(Arc::clone(member_name));
             }
           }
         }
       }
 
       // Only show if there are deps being converted that aren't already in workspace_deps
-      let workspace_dep_names: HashSet<_> = self.workspace_deps.iter().map(|d| d.name.clone()).collect();
+      let workspace_dep_names: HashSet<Arc<str>> = self.workspace_deps.iter().map(|d| Arc::clone(&d.name)).collect();
       let conversion_only: Vec<_> = converted_deps.difference(&workspace_dep_names).collect();
 
       if !conversion_only.is_empty() {
@@ -547,13 +555,18 @@ impl UnificationPlan {
 mod tests {
   use super::*;
 
+  /// Helper to create Arc<str> from string literal
+  fn arc(s: &str) -> Arc<str> {
+    Arc::from(s)
+  }
+
   #[test]
   fn test_member_edit_add_features_struct() {
     let edit = MemberEdit::AddFeatures {
-      dep_name: "serde".to_string(),
+      dep_name: arc("serde"),
       dep_kind: DepKind::Normal,
       target: None,
-      features_to_add: vec!["derive".to_string(), "std".to_string()],
+      features_to_add: vec![arc("derive"), arc("std")],
     };
 
     match edit {
@@ -563,11 +576,11 @@ mod tests {
         target,
         features_to_add,
       } => {
-        assert_eq!(dep_name, "serde");
+        assert_eq!(&*dep_name, "serde");
         assert_eq!(dep_kind, DepKind::Normal);
         assert!(target.is_none());
         assert_eq!(features_to_add.len(), 2);
-        assert!(features_to_add.contains(&"derive".to_string()));
+        assert!(features_to_add.iter().any(|f| &**f == "derive"));
       }
       _ => panic!("Expected AddFeatures variant"),
     }
@@ -576,15 +589,15 @@ mod tests {
   #[test]
   fn test_member_edit_add_features_with_target() {
     let edit = MemberEdit::AddFeatures {
-      dep_name: "libc".to_string(),
+      dep_name: arc("libc"),
       dep_kind: DepKind::Normal,
-      target: Some("cfg(unix)".to_string()),
-      features_to_add: vec!["extra_traits".to_string()],
+      target: Some(arc("cfg(unix)")),
+      features_to_add: vec![arc("extra_traits")],
     };
 
     match edit {
       MemberEdit::AddFeatures { target, .. } => {
-        assert_eq!(target, Some("cfg(unix)".to_string()));
+        assert_eq!(target.as_deref(), Some("cfg(unix)"));
       }
       _ => panic!("Expected AddFeatures variant"),
     }
@@ -593,10 +606,10 @@ mod tests {
   #[test]
   fn test_member_edit_add_features_dev_dependency() {
     let edit = MemberEdit::AddFeatures {
-      dep_name: "tokio".to_string(),
+      dep_name: arc("tokio"),
       dep_kind: DepKind::Dev,
       target: None,
-      features_to_add: vec!["rt-multi-thread".to_string(), "macros".to_string()],
+      features_to_add: vec![arc("rt-multi-thread"), arc("macros")],
     };
 
     match edit {
@@ -610,10 +623,10 @@ mod tests {
   #[test]
   fn test_member_edit_add_features_build_dependency() {
     let edit = MemberEdit::AddFeatures {
-      dep_name: "cc".to_string(),
+      dep_name: arc("cc"),
       dep_kind: DepKind::Build,
       target: None,
-      features_to_add: vec!["parallel".to_string()],
+      features_to_add: vec![arc("parallel")],
     };
 
     match edit {
@@ -629,18 +642,18 @@ mod tests {
   #[test]
   fn test_undeclared_feature_struct() {
     let uf = UndeclaredFeature {
-      member: "my-crate".to_string(),
-      dep_name: "backoff".to_string(),
-      undeclared_features: vec!["futures".to_string(), "tokio".to_string()],
-      declared_features: vec!["default".to_string()],
-      resolved_features: vec!["default".to_string(), "futures".to_string(), "tokio".to_string()],
+      member: arc("my-crate"),
+      dep_name: arc("backoff"),
+      undeclared_features: vec![arc("futures"), arc("tokio")],
+      declared_features: vec![arc("default")],
+      resolved_features: vec![arc("default"), arc("futures"), arc("tokio")],
       dep_kind: DepKind::Normal,
       target: None,
-      borrowed_from: vec!["other-crate".to_string()],
+      borrowed_from: vec![arc("other-crate")],
     };
 
-    assert_eq!(uf.member, "my-crate");
-    assert_eq!(uf.dep_name, "backoff");
+    assert_eq!(&*uf.member, "my-crate");
+    assert_eq!(&*uf.dep_name, "backoff");
     assert_eq!(uf.undeclared_features.len(), 2);
     assert_eq!(uf.declared_features.len(), 1);
     assert_eq!(uf.resolved_features.len(), 3);
@@ -652,30 +665,30 @@ mod tests {
   #[test]
   fn test_undeclared_feature_with_target() {
     let uf = UndeclaredFeature {
-      member: "platform-crate".to_string(),
-      dep_name: "libc".to_string(),
-      undeclared_features: vec!["extra_traits".to_string()],
+      member: arc("platform-crate"),
+      dep_name: arc("libc"),
+      undeclared_features: vec![arc("extra_traits")],
       declared_features: vec![],
-      resolved_features: vec!["extra_traits".to_string()],
+      resolved_features: vec![arc("extra_traits")],
       dep_kind: DepKind::Normal,
-      target: Some("cfg(unix)".to_string()),
-      borrowed_from: vec!["unix-crate".to_string()],
+      target: Some(arc("cfg(unix)")),
+      borrowed_from: vec![arc("unix-crate")],
     };
 
-    assert_eq!(uf.target, Some("cfg(unix)".to_string()));
+    assert_eq!(uf.target.as_deref(), Some("cfg(unix)"));
   }
 
   #[test]
   fn test_undeclared_feature_dev_dependency() {
     let uf = UndeclaredFeature {
-      member: "test-crate".to_string(),
-      dep_name: "tokio".to_string(),
-      undeclared_features: vec!["macros".to_string()],
-      declared_features: vec!["rt".to_string()],
-      resolved_features: vec!["rt".to_string(), "macros".to_string()],
+      member: arc("test-crate"),
+      dep_name: arc("tokio"),
+      undeclared_features: vec![arc("macros")],
+      declared_features: vec![arc("rt")],
+      resolved_features: vec![arc("rt"), arc("macros")],
       dep_kind: DepKind::Dev,
       target: None,
-      borrowed_from: vec!["main-crate".to_string()],
+      borrowed_from: vec![arc("main-crate")],
     };
 
     assert_eq!(uf.dep_kind, DepKind::Dev);
@@ -687,8 +700,8 @@ mod tests {
   fn test_summary_with_add_features_edit() {
     let mut plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -703,12 +716,12 @@ mod tests {
 
     // Add a MemberEdit::AddFeatures
     plan.member_edits.insert(
-      "test-crate".to_string(),
+      arc("test-crate"),
       vec![MemberEdit::AddFeatures {
-        dep_name: "serde".to_string(),
+        dep_name: arc("serde"),
         dep_kind: DepKind::Normal,
         target: None,
-        features_to_add: vec!["derive".to_string()],
+        features_to_add: vec![arc("derive")],
       }],
     );
 
@@ -720,8 +733,8 @@ mod tests {
   fn test_summary_with_multiple_add_features_edits() {
     let mut plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -736,29 +749,29 @@ mod tests {
 
     // Add multiple AddFeatures edits
     plan.member_edits.insert(
-      "crate-a".to_string(),
+      arc("crate-a"),
       vec![
         MemberEdit::AddFeatures {
-          dep_name: "serde".to_string(),
+          dep_name: arc("serde"),
           dep_kind: DepKind::Normal,
           target: None,
-          features_to_add: vec!["derive".to_string(), "std".to_string()],
+          features_to_add: vec![arc("derive"), arc("std")],
         },
         MemberEdit::AddFeatures {
-          dep_name: "tokio".to_string(),
+          dep_name: arc("tokio"),
           dep_kind: DepKind::Normal,
           target: None,
-          features_to_add: vec!["rt".to_string()],
+          features_to_add: vec![arc("rt")],
         },
       ],
     );
     plan.member_edits.insert(
-      "crate-b".to_string(),
+      arc("crate-b"),
       vec![MemberEdit::AddFeatures {
-        dep_name: "backoff".to_string(),
+        dep_name: arc("backoff"),
         dep_kind: DepKind::Normal,
         target: None,
-        features_to_add: vec!["futures".to_string()],
+        features_to_add: vec![arc("futures")],
       }],
     );
 
@@ -771,8 +784,8 @@ mod tests {
   fn test_summary_undeclared_warning_when_no_fixes() {
     let plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -783,14 +796,14 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![UndeclaredFeature {
-        member: "my-crate".to_string(),
-        dep_name: "backoff".to_string(),
-        undeclared_features: vec!["futures".to_string()],
+        member: arc("my-crate"),
+        dep_name: arc("backoff"),
+        undeclared_features: vec![arc("futures")],
         declared_features: vec![],
-        resolved_features: vec!["futures".to_string()],
+        resolved_features: vec![arc("futures")],
         dep_kind: DepKind::Normal,
         target: None,
-        borrowed_from: vec!["other-crate".to_string()],
+        borrowed_from: vec![arc("other-crate")],
       }],
     };
 
@@ -804,8 +817,8 @@ mod tests {
   fn test_summary_no_undeclared_warning_when_fixes_present() {
     let mut plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -816,25 +829,25 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![UndeclaredFeature {
-        member: "my-crate".to_string(),
-        dep_name: "backoff".to_string(),
-        undeclared_features: vec!["futures".to_string()],
+        member: arc("my-crate"),
+        dep_name: arc("backoff"),
+        undeclared_features: vec![arc("futures")],
         declared_features: vec![],
-        resolved_features: vec!["futures".to_string()],
+        resolved_features: vec![arc("futures")],
         dep_kind: DepKind::Normal,
         target: None,
-        borrowed_from: vec!["other-crate".to_string()],
+        borrowed_from: vec![arc("other-crate")],
       }],
     };
 
     // Add a fix
     plan.member_edits.insert(
-      "my-crate".to_string(),
+      arc("my-crate"),
       vec![MemberEdit::AddFeatures {
-        dep_name: "backoff".to_string(),
+        dep_name: arc("backoff"),
         dep_kind: DepKind::Normal,
         target: None,
-        features_to_add: vec!["futures".to_string()],
+        features_to_add: vec![arc("futures")],
       }],
     );
 
@@ -848,10 +861,10 @@ mod tests {
   #[test]
   fn test_member_edit_clone() {
     let edit = MemberEdit::AddFeatures {
-      dep_name: "test".to_string(),
+      dep_name: arc("test"),
       dep_kind: DepKind::Normal,
-      target: Some("cfg(test)".to_string()),
-      features_to_add: vec!["a".to_string(), "b".to_string()],
+      target: Some(arc("cfg(test)")),
+      features_to_add: vec![arc("a"), arc("b")],
     };
 
     let cloned = edit.clone();
@@ -878,14 +891,14 @@ mod tests {
   #[test]
   fn test_undeclared_feature_clone() {
     let uf = UndeclaredFeature {
-      member: "test".to_string(),
-      dep_name: "dep".to_string(),
-      undeclared_features: vec!["f1".to_string()],
-      declared_features: vec!["f2".to_string()],
-      resolved_features: vec!["f1".to_string(), "f2".to_string()],
+      member: arc("test"),
+      dep_name: arc("dep"),
+      undeclared_features: vec![arc("f1")],
+      declared_features: vec![arc("f2")],
+      resolved_features: vec![arc("f1"), arc("f2")],
       dep_kind: DepKind::Dev,
-      target: Some("cfg(windows)".to_string()),
-      borrowed_from: vec!["source-crate".to_string()],
+      target: Some(arc("cfg(windows)")),
+      borrowed_from: vec![arc("source-crate")],
     };
 
     let cloned = uf.clone();
@@ -900,8 +913,8 @@ mod tests {
   fn test_summary_shows_borrowed_from_in_undeclared_warning() {
     let plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -912,14 +925,14 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![UndeclaredFeature {
-        member: "my-crate".to_string(),
-        dep_name: "tokio".to_string(),
-        undeclared_features: vec!["macros".to_string(), "rt".to_string()],
+        member: arc("my-crate"),
+        dep_name: arc("tokio"),
+        undeclared_features: vec![arc("macros"), arc("rt")],
         declared_features: vec![],
-        resolved_features: vec!["macros".to_string(), "rt".to_string()],
+        resolved_features: vec![arc("macros"), arc("rt")],
         dep_kind: DepKind::Normal,
         target: None,
-        borrowed_from: vec!["other-crate".to_string(), "third-crate".to_string()],
+        borrowed_from: vec![arc("other-crate"), arc("third-crate")],
       }],
     };
 
@@ -936,8 +949,8 @@ mod tests {
   fn test_summary_borrowed_from_empty_not_shown() {
     let plan = UnificationPlan {
       workspace_deps: vec![],
-      member_edits: std::collections::HashMap::new(),
-      member_paths: std::collections::HashMap::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -948,11 +961,11 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![UndeclaredFeature {
-        member: "my-crate".to_string(),
-        dep_name: "backoff".to_string(),
-        undeclared_features: vec!["futures".to_string()],
+        member: arc("my-crate"),
+        dep_name: arc("backoff"),
+        undeclared_features: vec![arc("futures")],
         declared_features: vec![],
-        resolved_features: vec!["futures".to_string()],
+        resolved_features: vec![arc("futures")],
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![], // Empty - shouldn't show "borrowed from"
@@ -968,13 +981,13 @@ mod tests {
 
   #[test]
   fn test_member_edit_count_ignores_empty_entries() {
-    let mut member_edits = std::collections::HashMap::new();
-    member_edits.insert("crate-a".to_string(), vec![]);
+    let mut member_edits: FxHashMap<Arc<str>, Vec<MemberEdit>> = FxHashMap::default();
+    member_edits.insert(arc("crate-a"), vec![]);
 
     let plan = UnificationPlan {
       workspace_deps: vec![],
       member_edits,
-      member_paths: std::collections::HashMap::new(),
+      member_paths: FxHashMap::default(),
       transitive_pins: vec![],
       validation_results: vec![],
       issues: vec![],
@@ -982,9 +995,9 @@ mod tests {
       duplicates_cleaned: vec![],
       pruned_features: vec![],
       optional_features: vec![OptionalFeature {
-        crate_name: "crate-a".to_string(),
-        feature_name: "serde".to_string(),
-        enables: vec!["serde/derive".to_string()],
+        crate_name: arc("crate-a"),
+        feature_name: arc("serde"),
+        enables: vec![arc("serde/derive")],
       }],
       version_mismatches: vec![],
       unused_deps: vec![],

@@ -13,9 +13,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use cargo_rail::backup::{BackupManager, BackupMetadata};
-//!
+//! ```text
 //! let manager = BackupManager::new(workspace_root);
 //!
 //! // Create backup before modifications

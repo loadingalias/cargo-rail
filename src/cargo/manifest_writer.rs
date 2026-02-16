@@ -73,13 +73,13 @@ impl ManifestWriter {
   /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
   /// * `local_features` - Additional features to enable locally
   /// * `is_optional` - Whether the dependency is optional
-  pub fn update_member(
+  pub fn update_member<S: AsRef<str>>(
     &self,
     member_toml_path: &Path,
     dep_name: &str,
     dep_kind: DepKind,
     target: Option<&str>,
-    local_features: Option<Vec<String>>,
+    local_features: Option<&[S]>,
     is_optional: bool,
   ) -> RailResult<()> {
     // Read member Cargo.toml
@@ -291,13 +291,13 @@ impl ManifestWriter {
   /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
   /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
   /// * `features_to_add` - Features to add to the dependency
-  pub fn add_features(
+  pub fn add_features<S: AsRef<str>>(
     &self,
     member_toml_path: &Path,
     dep_name: &str,
     dep_kind: DepKind,
     target: Option<&str>,
-    features_to_add: &[String],
+    features_to_add: &[S],
   ) -> RailResult<()> {
     // Read member Cargo.toml
     let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
@@ -333,8 +333,9 @@ impl ManifestWriter {
 
     // Add new features (dedup)
     for feature in features_to_add {
-      if !existing_features.contains(feature) {
-        existing_features.push(feature.clone());
+      let feat_str = feature.as_ref();
+      if !existing_features.iter().any(|f| f == feat_str) {
+        existing_features.push(feat_str.to_string());
       }
     }
 
@@ -351,7 +352,7 @@ impl ManifestWriter {
       *dep_item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline_table));
     } else {
       // Already a table, just update features
-      manifest_ops::set_features(dep_item, existing_features)?;
+      manifest_ops::set_features(dep_item, &existing_features)?;
     }
 
     // Format and write

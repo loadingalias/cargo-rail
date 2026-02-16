@@ -389,13 +389,8 @@ pub(crate) fn default_true() -> bool {
 }
 
 fn default_skip_undeclared_patterns() -> Vec<String> {
-  vec![
-    "default".to_string(),
-    "std".to_string(),
-    "alloc".to_string(),
-    "*_backend".to_string(),
-    "*_impl".to_string(),
-  ]
+  const PATTERNS: &[&str] = &["default", "std", "alloc", "*_backend", "*_impl"];
+  PATTERNS.iter().map(|&s| String::from(s)).collect()
 }
 
 // Tests

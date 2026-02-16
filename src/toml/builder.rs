@@ -403,15 +403,14 @@ impl WorkspaceDepsBuilder {
   pub fn build(&self) -> RailResult<String> {
     let mut content = String::from("\n[workspace.dependencies]\n");
 
-    let deps_to_write = if self.sort_dependencies {
-      let mut sorted = self.deps.clone();
-      sorted.sort_by(|a, b| a.0.cmp(&b.0));
-      sorted
-    } else {
-      self.deps.clone()
-    };
+    // Use indices + sorting to avoid cloning the entire Vec
+    let mut indices: Vec<usize> = (0..self.deps.len()).collect();
+    if self.sort_dependencies {
+      indices.sort_by(|&a, &b| self.deps[a].0.cmp(&self.deps[b].0));
+    }
 
-    for (name, value, comment) in deps_to_write {
+    for idx in indices {
+      let (name, value, comment) = &self.deps[idx];
       if let Some(c) = comment {
         content.push_str(&format!("{} = {}  # {}\n", name, value, c));
       } else {
@@ -461,10 +460,10 @@ mod tests {
 
   #[test]
   fn test_change_detection_custom_categories_are_sorted() {
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap;
 
     let mut builder = RailConfigBuilder::new();
-    let mut custom = HashMap::new();
+    let mut custom = FxHashMap::default();
     custom.insert("zeta".to_string(), vec!["z/**".to_string()]);
     custom.insert("alpha".to_string(), vec!["a/**".to_string()]);
     let config = ChangeDetectionConfig {

@@ -297,7 +297,7 @@ pub fn run_release_check(
   let validator = ReleaseValidator::new(ctx);
 
   // Track skipped crates for reporting
-  let mut skipped_crates: Vec<(String, String)> = Vec::new();
+  let mut skipped_crates: Vec<(String, String)> = Vec::with_capacity(8);
 
   let target_crates = if all {
     // Filter to only publishable crates when using --all
@@ -335,7 +335,7 @@ pub fn run_release_check(
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let mut results = Vec::new();
+  let mut results = Vec::with_capacity(target_crates.len());
   for crate_name in &target_crates {
     // For explicitly named crates, check publishability and report
     // (for --all, we already filtered, so this is a no-op)
@@ -357,7 +357,7 @@ pub fn run_release_check(
   }
 
   // Extended validation: cargo publish --dry-run and MSRV check
-  let mut extended_results = Vec::new();
+  let mut extended_results = Vec::with_capacity(target_crates.len());
   let mut has_extended_failures = false;
 
   if extended {
@@ -368,7 +368,7 @@ pub fn run_release_check(
     let ext_results = validator.validate_extended(&target_crates);
 
     for (crate_name, checks) in ext_results {
-      let mut crate_checks = Vec::new();
+      let mut crate_checks = Vec::with_capacity(checks.len());
 
       for check in checks {
         if check.passed {
@@ -453,7 +453,8 @@ fn build_release_mutation_plan(
   skip_tag: bool,
   require_clean: bool,
 ) -> RailResult<mutation::MutationPlan> {
-  let mut actions = Vec::new();
+  // Pre-allocate for expected actions: ~5 per crate (bump, changelog, commit, tag, publish)
+  let mut actions = Vec::with_capacity(plan.crates.len() * 5);
   let mut sorted = plan.crates.clone();
   sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -558,8 +559,8 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
     crates: Default::default(),
   });
 
-  let mut new_crates = Vec::new();
-  let mut existing_crates = Vec::new();
+  let mut new_crates = Vec::with_capacity(target_crates.len());
+  let mut existing_crates = Vec::with_capacity(target_crates.len());
 
   for pkg in target_crates {
     if config.crates.contains_key(pkg.name.as_str()) && config.crates[pkg.name.as_str()].release.is_some() {

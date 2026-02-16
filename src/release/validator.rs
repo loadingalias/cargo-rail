@@ -129,18 +129,7 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Check if working directory is clean (no uncommitted changes)
   fn check_clean_working_directory(&self) -> RailResult<()> {
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["status", "--porcelain"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git status: {}", e)))?;
-
-    if !output.status.success() {
-      return Err(RailError::message("git status failed"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
+    if self.ctx.git.git().is_dirty()? {
       return Err(RailError::with_help(
         "Working directory has uncommitted changes",
         "Commit or stash your changes before releasing, or set require_clean = false in [release] section of rail.toml",
@@ -215,17 +204,7 @@ impl<'a> ReleaseValidator<'a> {
 
     if !skip_tag {
       for crate_plan in &plan.crates {
-        let output = Command::new("git")
-          .current_dir(self.ctx.workspace_root())
-          .args([
-            "rev-parse",
-            "-q",
-            "--verify",
-            &format!("refs/tags/{}", crate_plan.tag_name),
-          ])
-          .output()
-          .map_err(|e| RailError::message(format!("Failed to validate tag '{}': {}", crate_plan.tag_name, e)))?;
-        if output.status.success() {
+        if self.ctx.git.git().tag_exists(&crate_plan.tag_name)? {
           return Err(RailError::with_help(
             format!("tag '{}' already exists", crate_plan.tag_name),
             "regenerate plan with a new version or delete the conflicting tag".to_string(),
@@ -375,8 +354,9 @@ impl<'a> ReleaseValidator<'a> {
   /// Returns a tuple of (publishable_crates, skipped_crates_with_reasons)
   pub fn publishable_members(&self) -> (Vec<String>, Vec<(String, String)>) {
     let all_members = self.ctx.graph.workspace_members();
-    let mut publishable = Vec::new();
-    let mut skipped = Vec::new();
+    let member_count = all_members.len();
+    let mut publishable = Vec::with_capacity(member_count);
+    let mut skipped = Vec::with_capacity(member_count / 4); // Most crates are publishable
 
     for name in all_members {
       if let Some(reason) = self.unpublishable_reason(name) {

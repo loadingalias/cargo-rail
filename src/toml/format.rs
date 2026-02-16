@@ -286,23 +286,34 @@ pub fn classify_target_tier(target: &str) -> TargetTier {
 
 /// Group targets by tier
 pub fn group_targets(targets: &[String]) -> Vec<(String, Vec<String>)> {
-  let mut tier1 = Vec::new();
-  let mut tier2 = Vec::new();
+  // Pre-allocate based on expected distribution (most targets are Tier 1/2)
+  let mut tier1 = Vec::with_capacity(targets.len() / 2);
+  let mut tier2 = Vec::with_capacity(targets.len() / 2);
   let mut other = Vec::new();
 
-  for target in targets {
+  // Build indices per tier to avoid cloning during classification
+  let mut tier1_idx = Vec::with_capacity(targets.len() / 2);
+  let mut tier2_idx = Vec::with_capacity(targets.len() / 2);
+  let mut other_idx = Vec::new();
+
+  for (idx, target) in targets.iter().enumerate() {
     match classify_target_tier(target) {
-      TargetTier::Tier1 => tier1.push(target.clone()),
-      TargetTier::Tier2 => tier2.push(target.clone()),
-      _ => other.push(target.clone()),
+      TargetTier::Tier1 => tier1_idx.push(idx),
+      TargetTier::Tier2 => tier2_idx.push(idx),
+      _ => other_idx.push(idx),
     }
   }
 
-  tier1.sort();
-  tier2.sort();
-  other.sort();
+  // Sort indices by target name, then clone only the sorted targets
+  tier1_idx.sort_by(|&a, &b| targets[a].cmp(&targets[b]));
+  tier2_idx.sort_by(|&a, &b| targets[a].cmp(&targets[b]));
+  other_idx.sort_by(|&a, &b| targets[a].cmp(&targets[b]));
 
-  let mut groups = Vec::new();
+  tier1.extend(tier1_idx.iter().map(|&i| targets[i].clone()));
+  tier2.extend(tier2_idx.iter().map(|&i| targets[i].clone()));
+  other.extend(other_idx.iter().map(|&i| targets[i].clone()));
+
+  let mut groups = Vec::with_capacity(3);
   if !tier1.is_empty() {
     groups.push(("Tier 1 (Guaranteed)".to_string(), tier1));
   }

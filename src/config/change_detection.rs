@@ -3,8 +3,8 @@
 //! This config is consumed by planner file classification and custom surfaces.
 
 use crate::error::ConfigError;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Confidence profile for planner safety behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -30,7 +30,7 @@ pub struct ChangeDetectionConfig {
   /// Custom path patterns and their categories
   /// Example: verify = ["verify/**/*.rs"] for Stateright verification models
   #[serde(default)]
-  pub custom: HashMap<String, Vec<String>>,
+  pub custom: FxHashMap<String, Vec<String>>,
 
   /// When true, unclassified crate-owned files conservatively enable build+test surfaces.
   ///
@@ -53,7 +53,7 @@ impl Default for ChangeDetectionConfig {
   fn default() -> Self {
     Self {
       infrastructure: default_infrastructure_patterns(),
-      custom: HashMap::new(),
+      custom: FxHashMap::default(),
       conservative_unclassified_owner_fallback: default_conservative_unclassified_owner_fallback(),
       confidence_profile: ConfidenceProfile::default(),
       bot_pr_confidence_profile: None,
@@ -99,23 +99,24 @@ impl ChangeDetectionConfig {
 }
 
 fn default_infrastructure_patterns() -> Vec<String> {
-  vec![
-    ".github/**".to_string(),
-    "scripts/**".to_string(),
-    "justfile".to_string(),
-    "Justfile".to_string(),
-    "Makefile".to_string(),
-    "makefile".to_string(),
-    "GNUmakefile".to_string(),
-    "*.sh".to_string(),
-    "Taskfile.yml".to_string(),
-    "Taskfile.yaml".to_string(),
-    ".pre-commit-config.yaml".to_string(),
-    "deny.toml".to_string(),
-    "cliff.toml".to_string(),
-    "release.toml".to_string(),
-    "release-plz.toml".to_string(),
-  ]
+  const PATTERNS: &[&str] = &[
+    ".github/**",
+    "scripts/**",
+    "justfile",
+    "Justfile",
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "*.sh",
+    "Taskfile.yml",
+    "Taskfile.yaml",
+    ".pre-commit-config.yaml",
+    "deny.toml",
+    "cliff.toml",
+    "release.toml",
+    "release-plz.toml",
+  ];
+  PATTERNS.iter().map(|&s| String::from(s)).collect()
 }
 
 fn default_conservative_unclassified_owner_fallback() -> bool {
@@ -134,12 +135,11 @@ fn is_valid_custom_category(category: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{ChangeDetectionConfig, ConfidenceProfile};
-  use std::collections::HashMap;
+  use super::{ChangeDetectionConfig, ConfidenceProfile, FxHashMap};
 
   #[test]
   fn test_validate_accepts_valid_custom_category_names() {
-    let mut custom = HashMap::new();
+    let mut custom = FxHashMap::default();
     custom.insert("verify_models".to_string(), vec!["verify/**".to_string()]);
     custom.insert("bench-extended".to_string(), vec!["perf/**".to_string()]);
     let cfg = ChangeDetectionConfig {
@@ -154,7 +154,7 @@ mod tests {
 
   #[test]
   fn test_validate_rejects_invalid_custom_category_names() {
-    let mut custom = HashMap::new();
+    let mut custom = FxHashMap::default();
     custom.insert("custom:verify".to_string(), vec!["verify/**".to_string()]);
     let cfg = ChangeDetectionConfig {
       infrastructure: vec![".github/**".to_string()],

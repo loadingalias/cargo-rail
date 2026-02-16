@@ -51,11 +51,7 @@ impl<'a> ReleasePublisher<'a> {
       }
 
       // Check for git remote
-      let remote_check = Command::new("git")
-        .current_dir(self.ctx.workspace_root())
-        .args(["remote", "get-url", "origin"])
-        .output();
-      if remote_check.is_err() || !remote_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+      if !self.ctx.git.git().has_remote("origin")? {
         warnings.push("No git remote 'origin' found. GitHub releases require a remote.".to_string());
       }
     }
@@ -63,11 +59,7 @@ impl<'a> ReleasePublisher<'a> {
     // Check sign_tags prerequisites if enabled
     if self.release_config.sign_tags && !skip_tag {
       // Check if user has GPG/SSH key configured
-      let signing_check = Command::new("git")
-        .current_dir(self.ctx.workspace_root())
-        .args(["config", "--get", "user.signingkey"])
-        .output();
-      if signing_check.is_err() || !signing_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+      if !self.ctx.git.git().has_signing_configured() {
         warnings.push(
           "Tag signing enabled but no signing key configured. \
                     Run 'git config user.signingkey <KEY_ID>'"
@@ -278,60 +270,21 @@ impl<'a> ReleasePublisher<'a> {
     // Use targeted update to only update this crate, not external dependencies
     self.update_lockfile_for_crate(&plan.name)?;
 
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["add", "."])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git add: {}", e)))?;
-
-    if !output.status.success() {
-      return Err(RailError::message("git add failed"));
-    }
-
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["commit", "-m", &message])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git commit: {}", e)))?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::message(format!("git commit failed: {}", stderr)));
-    }
+    // Stage all changes and commit
+    self.ctx.git.git().stage_all()?;
+    self.ctx.git.git().commit(&message)?;
 
     Ok(())
   }
 
   /// Create git tag
   fn create_tag(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(self.ctx.workspace_root());
-
-    // When sign_tags=false, explicitly disable signing to override user's git config
-    // This ensures the user's tag.gpgsign=true doesn't interfere
-    if self.release_config.sign_tags {
-      cmd.args(["tag", "-s"]);
-    } else {
-      // Use -c to override any user git config that enables signing
-      cmd.args(["-c", "tag.gpgsign=false", "tag", "-a"]);
-    }
-
-    cmd.args([
-      &plan.tag_name,
-      "-m",
-      &format!("Release {} v{}", plan.name, plan.new_version),
-    ]);
-
-    let output = cmd
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git tag: {}", e)))?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::message(format!("git tag failed: {}", stderr)));
-    }
-
-    Ok(())
+    let message = format!("Release {} v{}", plan.name, plan.new_version);
+    self
+      .ctx
+      .git
+      .git()
+      .create_tag(&plan.tag_name, Some(&message), self.release_config.sign_tags)
   }
 
   /// Publish crate to crates.io
@@ -443,19 +396,6 @@ impl<'a> ReleasePublisher<'a> {
         .replace("{version}", "*")
     };
 
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["tag", "--list", &pattern, "--sort=-version:refname"])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git tag: {}", e)))?;
-
-    if !output.status.success() {
-      return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let tags: Vec<&str> = stdout.lines().collect();
-
-    Ok(tags.first().map(|s| s.to_string()))
+    self.ctx.git.git().find_latest_tag(&pattern)
   }
 }

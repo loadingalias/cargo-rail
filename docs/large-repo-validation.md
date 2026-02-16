@@ -4,12 +4,14 @@ This document records reproducible validation runs against four large Rust repos
 
 ## Repositories Under Test
 
-| Repository | Crates | Description | Fork Location |
-|------------|--------|-------------|---------------|
-| **tokio** | 10 | Async runtime for Rust | `loadingalias/tokio` |
-| **helix** | 14 | Modal text editor | `loadingalias/helix` |
-| **meilisearch** | 23 | Full-text search engine | `loadingalias/meilisearch` |
-| **helix-db** | 6 | Graph database | `loadingalias/helix-db` |
+| Repository | Crates | Description | Fork |
+|------------|--------|-------------|------|
+| **tokio** | 10 | Async runtime for Rust | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) |
+| **helix** | 14 | Modal text editor | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) |
+| **meilisearch** | 23 | Full-text search engine | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) |
+| **helix-db** | 6 | Graph database | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) |
+
+**Validation forks**: [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing)
 
 ---
 
@@ -84,17 +86,21 @@ Create two PRs per repo:
 
 **Date:** 2026-02-15
 
-| Repository | Deps to Unify | Undeclared Features | Dead Features | MSRV Computed |
-|------------|---------------|---------------------|---------------|---------------|
-| **tokio** | 9 | 113 across 10 crates | 0 | 1.85.0 |
-| **helix** | 15 | 37 across 9 crates | 1 | 1.87.0 |
-| **meilisearch** | 54 | 283 across 22 crates | 1 | 1.88.0 |
-| **helix-db** | 18 | 22 across 4 crates | 0 | 1.88.0 |
+| Repository | Deps Unified | Undeclared Features | Dead Features | MSRV | Exclusions |
+|------------|--------------|---------------------|---------------|------|------------|
+| **tokio** | 9 | 7 across 5 crates | 0 | 1.85.0 | — |
+| **helix** | 15 | 19 across 6 crates | 1 | 1.87.0 | — |
+| **meilisearch** | 54 | 215 across 22 crates | 1 | 1.88.0 | `thiserror` |
+| **helix-db** | 18 | 17 across 4 crates | 0 | 1.88.0 | `dirs` |
 
 **Totals:**
 - **96 dependencies** unified
-- **455 undeclared features** fixed (silent bugs prevented)
+- **258 undeclared features** fixed (silent bugs prevented)
 - **2 dead features** pruned
+
+**Exclusions Explained:**
+- `thiserror` (meilisearch): v1 → v2 breaks `{type}` syntax in error macros
+- `dirs` (helix-db): Intentional multi-major-version in transitive deps
 
 ---
 

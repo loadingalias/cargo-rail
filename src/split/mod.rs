@@ -9,4 +9,4 @@
 /// Split engine implementation
 pub mod engine;
 
-pub use engine::{SplitConfig, SplitEngine};
+pub use engine::{SplitEngine, SplitParams};

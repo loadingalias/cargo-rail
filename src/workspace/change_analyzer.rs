@@ -146,7 +146,7 @@ impl<'a> ChangeImpact<'a> {
     let file_paths: Vec<&Path> = changed_files.iter().map(|(p, _)| p.as_path()).collect();
     let analysis = crate::graph::analyze(&self.ctx.graph, &file_paths)?;
 
-    // 4. Determine rebuild/retest requirements
+    // 5. Determine rebuild/retest requirements
     let requires_rebuild = categories.has_source_changes() || categories.has_config_changes();
     let requires_retest = requires_rebuild || categories.has_test_changes() || categories.has_example_changes();
 

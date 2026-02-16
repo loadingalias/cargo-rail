@@ -76,13 +76,16 @@ pub fn run_graph(ctx: &WorkspaceContext, opts: GraphOptions) -> RailResult<()> {
 }
 
 fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
-  let mut nodes = Vec::new();
-  let mut edges = Vec::new();
+  // Estimate: each file typically has 1-2 owners, so nodes ~ 2*files, edges ~ 2*files
+  let file_count = plan.files.len();
+  let mut nodes = Vec::with_capacity(file_count * 2);
+  let mut edges = Vec::with_capacity(file_count * 2);
   let mut seen = BTreeSet::new();
 
   for file in &plan.files {
     let file_id = format!("file:{}", file.path);
-    if seen.insert(file_id.clone()) {
+    let is_new_file = seen.insert(file_id.clone());
+    if is_new_file {
       nodes.push(GraphNode {
         id: file_id.clone(),
         kind: "file".to_string(),
@@ -92,7 +95,8 @@ fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
 
     for owner in &file.owners {
       let crate_id = format!("crate:{}", owner);
-      if seen.insert(crate_id.clone()) {
+      let is_new_crate = seen.insert(crate_id.clone());
+      if is_new_crate {
         nodes.push(GraphNode {
           id: crate_id.clone(),
           kind: "crate".to_string(),
@@ -101,7 +105,7 @@ fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
       }
       edges.push(GraphEdge {
         from: file_id.clone(),
-        to: crate_id,
+        to: crate_id, // Move instead of clone - last use
         relation: "owned_by".to_string(),
       });
     }
@@ -109,7 +113,8 @@ fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
 
   for (surface, decision) in &plan.surfaces {
     let surface_id = format!("surface:{}", surface);
-    if seen.insert(surface_id.clone()) {
+    let is_new_surface = seen.insert(surface_id.clone());
+    if is_new_surface {
       nodes.push(GraphNode {
         id: surface_id.clone(),
         kind: "surface".to_string(),
@@ -122,13 +127,15 @@ fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
     }
 
     for reason_id in &decision.reasons {
-      let reason = plan.trace.iter().find(|r| r.id == *reason_id);
-      let reason_label = match reason {
-        Some(r) => r.code.to_string(),
-        None => format!("reason_{}", reason_id),
-      };
       let reason_node_id = format!("reason:{}", reason_id);
-      if seen.insert(reason_node_id.clone()) {
+      let is_new_reason = seen.insert(reason_node_id.clone());
+      if is_new_reason {
+        let reason_label = plan
+          .trace
+          .iter()
+          .find(|r| r.id == *reason_id)
+          .map(|r| r.code.to_string())
+          .unwrap_or_else(|| format!("reason_{}", reason_id));
         nodes.push(GraphNode {
           id: reason_node_id.clone(),
           kind: "reason".to_string(),
@@ -136,7 +143,7 @@ fn build_graph(plan: &crate::commands::plan::PlanOutput) -> PlannerGraph {
         });
       }
       edges.push(GraphEdge {
-        from: reason_node_id,
+        from: reason_node_id, // Move - last use
         to: surface_id.clone(),
         relation: "enables".to_string(),
       });

@@ -132,7 +132,7 @@ impl SystemGit {
       .collect();
 
     // Fetch commit info sequentially to preserve order
-    let mut commits = Vec::new();
+    let mut commits = Vec::with_capacity(shas.len());
     for sha in shas {
       commits.push(self.get_commit(&sha)?);
     }
@@ -182,7 +182,7 @@ impl SystemGit {
       .collect();
 
     // Fetch commit info sequentially to preserve order (already deduplicated by git)
-    let mut commits = Vec::new();
+    let mut commits = Vec::with_capacity(shas.len());
     for sha in shas {
       commits.push(self.get_commit(&sha)?);
     }
@@ -241,18 +241,15 @@ impl SystemGit {
       return Ok(vec![]);
     }
 
-    // Prepare items for bulk read
-    let items: Vec<(String, PathBuf)> = files
-      .iter()
-      .map(|file| (commit_sha.to_string(), path.join(file)))
-      .collect();
+    // Build paths first (owned), then create references for bulk API
+    let paths: Vec<PathBuf> = files.iter().map(|file| path.join(file)).collect();
+    let items: Vec<(&str, &Path)> = paths.iter().map(|p| (commit_sha, p.as_path())).collect();
 
     // Read all files in one batch (100x+ faster than loop)
     let contents = self.read_files_bulk(&items)?;
 
     // Combine full paths (with crate prefix) with contents
-    // Use paths from items (which include the crate prefix) not files (which are relative)
-    let results: Vec<(PathBuf, Vec<u8>)> = items.into_iter().map(|(_, path)| path).zip(contents).collect();
+    let results: Vec<(PathBuf, Vec<u8>)> = paths.into_iter().zip(contents).collect();
 
     Ok(results)
   }
@@ -425,7 +422,7 @@ impl SystemGit {
   ///
   /// # Returns
   /// Vec of file contents in the same order as input. Empty Vec if file doesn't exist.
-  pub fn read_files_bulk(&self, items: &[(String, PathBuf)]) -> RailResult<Vec<Vec<u8>>> {
+  pub fn read_files_bulk(&self, items: &[(&str, &Path)]) -> RailResult<Vec<Vec<u8>>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -598,12 +595,12 @@ fn parse_name_status_output_z(output: &[u8]) -> RailResult<Vec<(PathBuf, char)>>
         };
         let Some(new_path) = next_path() else {
           // Fallback: if only one path, treat as modified
-          files.push((PathBuf::from(String::from_utf8_lossy(old_path).to_string()), 'M'));
+          files.push((PathBuf::from(String::from_utf8_lossy(old_path).into_owned()), 'M'));
           continue;
         };
 
-        files.push((PathBuf::from(String::from_utf8_lossy(old_path).to_string()), 'D'));
-        files.push((PathBuf::from(String::from_utf8_lossy(new_path).to_string()), 'A'));
+        files.push((PathBuf::from(String::from_utf8_lossy(old_path).into_owned()), 'D'));
+        files.push((PathBuf::from(String::from_utf8_lossy(new_path).into_owned()), 'A'));
       }
       'C' => {
         // Copy: C100\0src_path\0dest_path\0
@@ -612,25 +609,25 @@ fn parse_name_status_output_z(output: &[u8]) -> RailResult<Vec<(PathBuf, char)>>
           continue;
         };
         let Some(dest_path) = next_path() else {
-          files.push((PathBuf::from(String::from_utf8_lossy(src_path).to_string()), 'A'));
+          files.push((PathBuf::from(String::from_utf8_lossy(src_path).into_owned()), 'A'));
           continue;
         };
 
-        files.push((PathBuf::from(String::from_utf8_lossy(src_path).to_string()), 'M'));
-        files.push((PathBuf::from(String::from_utf8_lossy(dest_path).to_string()), 'A'));
+        files.push((PathBuf::from(String::from_utf8_lossy(src_path).into_owned()), 'M'));
+        files.push((PathBuf::from(String::from_utf8_lossy(dest_path).into_owned()), 'A'));
       }
       'A' | 'D' | 'M' | 'T' | 'U' => {
         let Some(path) = next_path() else {
           continue;
         };
-        files.push((PathBuf::from(String::from_utf8_lossy(path).to_string()), change_type));
+        files.push((PathBuf::from(String::from_utf8_lossy(path).into_owned()), change_type));
       }
       _ => {
         // Unknown status - treat as modified if we have a path
         let Some(path) = next_path() else {
           continue;
         };
-        files.push((PathBuf::from(String::from_utf8_lossy(path).to_string()), 'M'));
+        files.push((PathBuf::from(String::from_utf8_lossy(path).into_owned()), 'M'));
       }
     }
   }
@@ -765,11 +762,12 @@ mod tests {
     let head = git.head_commit().unwrap();
 
     // Prepare items to read
-    let items = vec![
-      (head.clone(), PathBuf::from("Cargo.toml")),
-      (head.clone(), PathBuf::from("README.md")),
-      (head.clone(), PathBuf::from("this-does-not-exist.txt")),
+    let paths = [
+      PathBuf::from("Cargo.toml"),
+      PathBuf::from("README.md"),
+      PathBuf::from("this-does-not-exist.txt"),
     ];
+    let items: Vec<(&str, &Path)> = paths.iter().map(|p| (head.as_str(), p.as_path())).collect();
 
     let results = git.read_files_bulk(&items).unwrap();
 

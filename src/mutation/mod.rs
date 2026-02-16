@@ -5,8 +5,8 @@
 //! - Pre-apply drift checks
 //! - Immutable execution receipts
 
-use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
+use crate::utils::{config_fingerprint, file_fingerprint, fnv1a64, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -325,50 +325,9 @@ fn capture_pre_apply_checks(ctx: &WorkspaceContext) -> RailResult<MutationPreApp
     git_head: ctx.git.git().head_commit()?,
     config_fingerprint: config_fingerprint(workspace_root),
     toolchain_fingerprint: toolchain_fingerprint(workspace_root),
-    lock_fingerprint: file_fingerprint_or_none(&workspace_root.join("Cargo.lock")),
-    metadata_fingerprint: file_fingerprint_or_none(&workspace_root.join("target/cargo-rail/metadata.json")),
+    lock_fingerprint: file_fingerprint(&workspace_root.join("Cargo.lock")),
+    metadata_fingerprint: file_fingerprint(&workspace_root.join("target/cargo-rail/metadata.json")),
   })
-}
-
-fn config_fingerprint(workspace_root: &Path) -> String {
-  if let Some(config_path) = RailConfig::find_config_path(workspace_root) {
-    return file_fingerprint_or_none(&config_path);
-  }
-  "none".to_string()
-}
-
-fn toolchain_fingerprint(workspace_root: &Path) -> String {
-  let candidates = [
-    workspace_root.join("rust-toolchain.toml"),
-    workspace_root.join("rust-toolchain"),
-  ];
-
-  for candidate in candidates {
-    if candidate.exists() {
-      return file_fingerprint_or_none(&candidate);
-    }
-  }
-
-  "none".to_string()
-}
-
-fn file_fingerprint_or_none(path: &Path) -> String {
-  match fs::read(path) {
-    Ok(bytes) => format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
-    Err(_) => "none".to_string(),
-  }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-  const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-  const FNV_PRIME: u64 = 0x100000001b3;
-
-  let mut hash = FNV_OFFSET_BASIS;
-  for byte in bytes {
-    hash ^= *byte as u64;
-    hash = hash.wrapping_mul(FNV_PRIME);
-  }
-  hash
 }
 
 #[cfg(test)]

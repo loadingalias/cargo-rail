@@ -362,10 +362,12 @@ impl ChangelogGenerator {
       .map(|(sha, subject, body)| parse_conventional_commit(sha, subject, body.as_deref()))
       .collect();
 
-    // 3. Group by type
-    let mut breaking = Vec::new();
-    let mut features = Vec::new();
-    let mut fixes = Vec::new();
+    // 3. Group by type - pre-allocate based on expected distribution
+    // Most commits are features/fixes, breaking changes are rare
+    let commit_count = parsed.len();
+    let mut breaking = Vec::with_capacity(commit_count / 10); // ~10% breaking
+    let mut features = Vec::with_capacity(commit_count / 3); // ~33% features
+    let mut fixes = Vec::with_capacity(commit_count / 3); // ~33% fixes
     let mut other_groups: std::collections::HashMap<CommitType, Vec<&ConventionalCommit>> =
       std::collections::HashMap::new();
 

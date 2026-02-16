@@ -9,12 +9,15 @@ use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
 use glob::Pattern;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Configuration for a split operation
-pub struct SplitConfig {
+/// Runtime parameters for a split operation
+///
+/// Distinct from `config::SplitConfig` which is the deserialized config schema.
+/// This struct holds computed/resolved values needed to execute the split.
+pub struct SplitParams {
   /// Name of the crate being split
   pub crate_name: String,
   /// Paths to crate directories in monorepo
@@ -162,8 +165,13 @@ impl<'a> SplitEngine<'a> {
   /// reading file contents for many commits concurrently while the sequential
   /// commit recreation happens.
   ///
-  /// Returns a HashMap from commit SHA to its prefetched files.
-  fn prefetch_commit_files(&self, commits: &[CommitInfo], crate_paths: &[PathBuf]) -> HashMap<String, PrefetchedFiles> {
+  /// Returns a FxHashMap from commit SHA to its prefetched files (faster String hashing).
+  /// Accepts references to avoid cloning CommitInfo structs.
+  fn prefetch_commit_files(
+    &self,
+    commits: &[&CommitInfo],
+    crate_paths: &[PathBuf],
+  ) -> FxHashMap<String, PrefetchedFiles> {
     // Use rayon to prefetch files in parallel
     // Each commit's file collection is independent, so this is safe
     let git = self.ctx.git.git();
@@ -173,7 +181,8 @@ impl<'a> SplitEngine<'a> {
       .par_iter()
       .filter_map(|commit| {
         let paths = Arc::clone(&paths_arc);
-        let mut all_files = Vec::new();
+        // Pre-allocate for expected files per commit (typically 10-50 files per crate)
+        let mut all_files = Vec::with_capacity(32);
 
         for crate_path in paths.iter() {
           match git.collect_tree_files(&commit.sha, crate_path) {
@@ -226,15 +235,16 @@ impl<'a> SplitEngine<'a> {
   /// (e.g., when files were deleted at this commit - "dirty history")
   fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<Option<String>> {
     // Use pre-fetched files if available, otherwise collect them now
-    let all_files: Vec<(PathBuf, Vec<u8>)> = if let Some(prefetched) = params.prefetched_files {
-      prefetched.clone()
+    // Use Cow to avoid cloning the prefetched Vec when it's already available
+    let all_files: std::borrow::Cow<'_, PrefetchedFiles> = if let Some(prefetched) = params.prefetched_files {
+      std::borrow::Cow::Borrowed(prefetched)
     } else {
-      let mut files = Vec::new();
+      let mut files = Vec::with_capacity(params.crate_paths.len() * 32);
       for crate_path in params.crate_paths {
         let collected = self.ctx.git.git().collect_tree_files(&params.commit.sha, crate_path)?;
         files.extend(collected);
       }
-      files
+      std::borrow::Cow::Owned(files)
     };
 
     // Handle "dirty history" - commits where the path was deleted or didn't exist yet
@@ -247,17 +257,16 @@ impl<'a> SplitEngine<'a> {
     }
 
     // Write files to target repo, applying transforms
-    for (file_path, content_bytes) in &all_files {
+    for (file_path, content_bytes) in all_files.iter() {
       let target_path = match params.mode {
         SplitMode::Single => {
           // For single mode, move files to root (strip crate path prefix)
-          let mut relative = file_path.clone();
-          for crate_path in params.crate_paths {
-            if let Ok(stripped) = file_path.strip_prefix(crate_path) {
-              relative = stripped.to_path_buf();
-              break;
-            }
-          }
+          // Find matching prefix first to avoid unnecessary PathBuf clone
+          let relative = params
+            .crate_paths
+            .iter()
+            .find_map(|crate_path| file_path.strip_prefix(crate_path).ok().map(Path::to_path_buf))
+            .unwrap_or_else(|| file_path.clone());
           params.target_repo_path.join(relative)
         }
         SplitMode::Combined => {
@@ -400,19 +409,11 @@ impl<'a> SplitEngine<'a> {
 
   /// Check if remote repository exists and has content
   fn check_remote_exists(&self, remote_url: &str) -> RailResult<bool> {
-    use std::process::Command;
-
-    let output = Command::new("git")
-      .args(["ls-remote", "--heads", remote_url])
-      .output()
-      .context("Failed to check remote")?;
-
-    // If command succeeds and has output, remote exists with content
-    Ok(output.status.success() && !output.stdout.is_empty())
+    self.ctx.git.git().ls_remote_has_content(remote_url)
   }
 
   /// Execute a split operation (idempotent - re-runs sync new commits only)
-  pub fn split(&self, config: &SplitConfig) -> RailResult<()> {
+  pub fn split(&self, config: &SplitParams) -> RailResult<()> {
     progress!("🚂 Splitting crate: {}", config.crate_name);
     progress!("   Mode: {:?}", config.mode);
     progress!("   Target: {}", config.target_repo_path.display());
@@ -553,7 +554,7 @@ impl<'a> SplitEngine<'a> {
 
       for (window_idx, window) in commits_to_process.chunks(PREFETCH_WINDOW_SIZE).enumerate() {
         // Prefetch this window's files in parallel
-        let prefetched_files: HashMap<String, PrefetchedFiles> = if use_parallel {
+        let prefetched_files: FxHashMap<String, PrefetchedFiles> = if use_parallel {
           if window_idx == 0 {
             if total_new > PREFETCH_WINDOW_SIZE {
               progress!(
@@ -564,11 +565,10 @@ impl<'a> SplitEngine<'a> {
               progress!("   Prefetching file contents in parallel...");
             }
           }
-          // Convert &[&CommitInfo] to Vec<CommitInfo> for prefetch
-          let window_commits: Vec<CommitInfo> = window.iter().map(|c| (*c).clone()).collect();
-          self.prefetch_commit_files(&window_commits, &config.crate_paths)
+          // Pass references directly - no cloning needed
+          self.prefetch_commit_files(window, &config.crate_paths)
         } else {
-          HashMap::new()
+          FxHashMap::default()
         };
 
         // Process this window's commits
@@ -666,25 +666,13 @@ impl<'a> SplitEngine<'a> {
         }
 
         // Create a final commit if any files were added
-        // git add -A is safe to run unconditionally (no-op if no changes)
-        std::process::Command::new("git")
-          .current_dir(&config.target_repo_path)
-          .args(["add", "-A"])
-          .status()?;
+        let target_git = SystemGit::open(&config.target_repo_path)?;
+        target_git.stage_all()?;
 
         // Check if there are staged changes before committing
-        let diff_cached = std::process::Command::new("git")
-          .current_dir(&config.target_repo_path)
-          .args(["diff", "--cached", "--quiet"])
-          .status()?;
-
-        if !diff_cached.success() {
-          // Exit code 1 means there are differences (i.e., staged changes)
+        if target_git.has_staged_changes()? {
           progress!("   Creating commit for auxiliary files");
-          std::process::Command::new("git")
-            .current_dir(&config.target_repo_path)
-            .args(["commit", "-m", "Add workspace configs and project files"])
-            .status()?;
+          target_git.commit("Add workspace configs and project files")?;
         }
       }
     }
@@ -759,12 +747,7 @@ impl<'a> SplitEngine<'a> {
       progress!("   Initializing git repository at {}", target_path.display());
 
       // Initialize using system git with main as default branch
-      std::process::Command::new("git")
-        .arg("init")
-        .arg("--initial-branch=main")
-        .arg(target_path)
-        .output()
-        .with_context(|| format!("Failed to initialize git repository at {}", target_path.display()))?;
+      crate::git::init_repo(target_path, "main")?;
 
       // Configure git identity from source repository
       self.configure_git_identity(target_path)?;
@@ -775,67 +758,23 @@ impl<'a> SplitEngine<'a> {
 
   /// Configure git identity in the target repository by copying from source
   fn configure_git_identity(&self, target_path: &Path) -> RailResult<()> {
-    use std::process::Command;
-
     // Get identity from source repository
-    let user_name = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["config", "user.name"])
-      .output()
-      .ok()
-      .and_then(|o| {
-        if o.status.success() {
-          Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-        } else {
-          None
-        }
-      });
-
-    let user_email = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["config", "user.email"])
-      .output()
-      .ok()
-      .and_then(|o| {
-        if o.status.success() {
-          Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-        } else {
-          None
-        }
-      });
+    let user_name = self.ctx.git.git().get_config("user.name")?.unwrap_or_default();
+    let user_email = self.ctx.git.git().get_config("user.email")?.unwrap_or_default();
 
     // Set identity in target repository
     // Use a fallback if source doesn't have identity configured
-    let name = user_name.as_deref().unwrap_or("Cargo Rail");
-    let email = user_email.as_deref().unwrap_or("cargo-rail@localhost");
+    let name = if user_name.is_empty() { "Cargo Rail" } else { &user_name };
+    let email = if user_email.is_empty() {
+      "cargo-rail@localhost"
+    } else {
+      &user_email
+    };
 
-    let output = Command::new("git")
-      .current_dir(target_path)
-      .args(["config", "user.name", name])
-      .output()
-      .context("Failed to configure git user.name")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git config user.name".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
-
-    let output = Command::new("git")
-      .current_dir(target_path)
-      .args(["config", "user.email", email])
-      .output()
-      .context("Failed to configure git user.email")?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git config user.email".to_string(),
-        stderr: stderr.to_string(),
-      }));
-    }
+    // Open target repo and set config
+    let target_git = SystemGit::open(target_path)?;
+    target_git.set_config("user.name", name)?;
+    target_git.set_config("user.email", email)?;
 
     Ok(())
   }

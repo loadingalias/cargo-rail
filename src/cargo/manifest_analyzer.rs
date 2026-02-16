@@ -5,6 +5,7 @@
 use crate::error::{RailResult, ResultExt};
 use cargo_metadata::DependencyKind as MetadataDepKind;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -199,7 +200,7 @@ impl ManifestAnalyzer {
       .collect();
 
     // Collect results, propagating any errors
-    let mut parsed_members = Vec::new();
+    let mut parsed_members = Vec::with_capacity(results.len());
     for result in results {
       parsed_members.push(result?);
     }
@@ -753,18 +754,18 @@ pub struct ExistingWorkspaceDep {
 /// Returns a map of dependency name to its current configuration.
 /// This is used to detect deps that already exist in workspace.dependencies
 /// so we don't add duplicates.
-pub fn parse_existing_workspace_deps(workspace_root: &Path) -> RailResult<HashMap<String, ExistingWorkspaceDep>> {
+pub fn parse_existing_workspace_deps(workspace_root: &Path) -> RailResult<FxHashMap<String, ExistingWorkspaceDep>> {
   let workspace_toml = workspace_root.join("Cargo.toml");
   let content = match std::fs::read_to_string(&workspace_toml) {
     Ok(c) => c,
-    Err(_) => return Ok(HashMap::new()), // No workspace Cargo.toml
+    Err(_) => return Ok(FxHashMap::default()), // No workspace Cargo.toml
   };
 
   let doc: DocumentMut = content
     .parse()
     .with_context(|| format!("Failed to parse {}", workspace_toml.display()))?;
 
-  let mut existing = HashMap::new();
+  let mut existing = FxHashMap::default();
 
   // Check for [workspace.dependencies] section
   let Some(workspace) = doc.get("workspace").and_then(|w| w.as_table()) else {

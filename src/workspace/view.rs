@@ -6,7 +6,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```text
 //! let view = WorkspaceView::new(&ctx);
 //! if let Some(info) = view.crate_info("my-crate") {
 //!     println!("Path: {}", info.crate_root.display());

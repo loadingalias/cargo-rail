@@ -9,7 +9,8 @@ use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::{MemberEdit, OptionalFeature, PrunedFeature};
 use crate::config::UnifyConfig;
 use crate::progress;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 /// Scans for dead and optional features in workspace crates
 pub struct FeaturePruner<'a> {
@@ -46,26 +47,26 @@ impl<'a> FeaturePruner<'a> {
           continue;
         }
         pruned.push(PrunedFeature {
-          crate_name: result.crate_name.clone(),
-          feature_name: feature_name.clone(),
+          crate_name: Arc::from(result.crate_name.as_str()),
+          feature_name: Arc::from(feature_name.as_str()),
         });
       }
 
       // Optional features (enable something, user-facing API)
       for feature_name in &result.optional_features {
         // Get what this feature enables for reporting
-        let enables = self
+        let enables: Vec<Arc<str>> = self
           .metadata
           .workspace_packages()
           .iter()
           .find(|p| p.name == result.crate_name)
           .and_then(|p| p.features.get(feature_name))
-          .cloned()
+          .map(|v| v.iter().map(|s| Arc::from(s.as_str())).collect())
           .unwrap_or_default();
 
         optional.push(OptionalFeature {
-          crate_name: result.crate_name.clone(),
-          feature_name: feature_name.clone(),
+          crate_name: Arc::from(result.crate_name.as_str()),
+          feature_name: Arc::from(feature_name.as_str()),
           enables,
         });
       }
@@ -92,16 +93,17 @@ impl<'a> FeaturePruner<'a> {
   }
 
   /// Generate removal edits for pruned features
-  pub fn generate_prune_edits(&self, pruned: &[PrunedFeature]) -> HashMap<String, Vec<MemberEdit>> {
-    let mut edits: HashMap<String, Vec<MemberEdit>> = HashMap::new();
+  pub fn generate_prune_edits(&self, pruned: &[PrunedFeature]) -> FxHashMap<Arc<str>, Vec<MemberEdit>> {
+    // Pre-allocate with estimated number of unique crates
+    let mut edits: FxHashMap<Arc<str>, Vec<MemberEdit>> = FxHashMap::default();
+    edits.reserve(pruned.len().min(32));
 
     for pf in pruned {
-      edits
-        .entry(pf.crate_name.clone())
-        .or_default()
-        .push(MemberEdit::RemoveFeature {
-          feature_name: pf.feature_name.clone(),
-        });
+      // Use entry API with clone only when inserting new key
+      let entry = edits.entry(Arc::clone(&pf.crate_name));
+      entry.or_default().push(MemberEdit::RemoveFeature {
+        feature_name: Arc::clone(&pf.feature_name),
+      });
     }
 
     edits

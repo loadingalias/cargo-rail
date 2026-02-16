@@ -1,8 +1,8 @@
 //! Run/execution profile configuration.
 
 use crate::error::ConfigError;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 const BUILTIN_PROFILE_NAMES: &[&str] = &["local", "ci", "nightly"];
 const SUPPORTED_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
@@ -17,10 +17,10 @@ pub struct RunConfig {
   pub default_profile: Option<String>,
   /// User-defined profiles keyed by profile name.
   #[serde(default, rename = "profile")]
-  pub profiles: HashMap<String, RunProfile>,
+  pub profiles: FxHashMap<String, RunProfile>,
   /// Optional workflow-to-profile mapping (for CI wrappers and conventions).
   #[serde(default)]
-  pub workflow: HashMap<String, String>,
+  pub workflow: FxHashMap<String, String>,
 }
 
 /// A named run profile.
@@ -92,6 +92,22 @@ impl RunProfile {
     }
 
     for surface in &self.surfaces {
+      // custom:* surfaces are plan OUTPUTS, not profile inputs
+      if surface.starts_with("custom:") {
+        return Err(ConfigError::InvalidField {
+          field: format!("run.profile.{}.surfaces", profile_name),
+          reason: format!(
+            "invalid surface '{}'\n\n\
+             Custom surfaces are plan OUTPUTS for CI gating, not profile inputs.\n\
+             Valid profile surfaces: {}\n\n\
+             To gate CI jobs on custom surfaces, extract from plan JSON output:\n  \
+             WORKLOADS=$(echo \"$PLAN_JSON\" | jq -r '.surfaces[\"custom:workloads\"]')",
+            surface,
+            SUPPORTED_SURFACES.join(", ")
+          ),
+        });
+      }
+
       if !SUPPORTED_SURFACES.contains(&surface.as_str()) {
         return Err(ConfigError::InvalidField {
           field: format!("run.profile.{}.surfaces", profile_name),
@@ -239,5 +255,29 @@ mod tests {
     );
     let err = cfg.validate().expect_err("unknown since token should fail validation");
     assert!(err.to_string().contains("unknown token '{cargo_args}'"));
+  }
+
+  #[test]
+  fn validate_rejects_custom_surface_in_profile() {
+    let mut cfg = RunConfig::default();
+    cfg.profiles.insert(
+      "ci".to_string(),
+      RunProfile {
+        surfaces: vec!["custom:workloads".to_string()],
+        ..RunProfile::default()
+      },
+    );
+    let err = cfg.validate().expect_err("custom surface in profile should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("invalid surface 'custom:workloads'"));
+    assert!(msg.contains("plan OUTPUTS"));
+  }
+
+  #[test]
+  fn validate_rejects_workflow_mapping_to_missing_profile() {
+    let mut cfg = RunConfig::default();
+    cfg.workflow.insert("commit".to_string(), "missing".to_string());
+    let err = cfg.validate().expect_err("missing profile mapping should fail");
+    assert!(err.to_string().contains("unknown profile 'missing'"));
   }
 }

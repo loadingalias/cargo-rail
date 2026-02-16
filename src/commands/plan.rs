@@ -2,9 +2,9 @@
 
 use crate::commands::common::PlanOutputFormat;
 use crate::config::ConfidenceProfile;
-use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
+use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use glob::Pattern;
 use serde::Serialize;
@@ -51,6 +51,7 @@ pub(crate) struct PlanOutput {
   pub(crate) impact: PlanImpact,
   pub(crate) surfaces: BTreeMap<String, SurfaceDecision>,
   pub(crate) trace: Vec<TraceReason>,
+  pub(crate) reproducibility: Reproducibility,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +110,15 @@ pub(crate) struct TraceReason {
   pub(crate) surface: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct Reproducibility {
+  pub(crate) cargo_rail_version: &'static str,
+  pub(crate) config_hash: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) git_merge_base: Option<String>,
+  pub(crate) git_shallow_clone: bool,
+}
+
 #[derive(Debug)]
 struct FileKind {
   kind: String,
@@ -125,6 +135,7 @@ const RC_FILE_KIND_TOML_TOOLING: &str = "FILE_KIND_TOML_TOOLING";
 const RC_FILE_KIND_CI: &str = "FILE_KIND_CI";
 const RC_FILE_KIND_SCRIPT: &str = "FILE_KIND_SCRIPT";
 const RC_FILE_KIND_DOCS: &str = "FILE_KIND_DOCS";
+const RC_FILE_KIND_REPO_CONFIG: &str = "FILE_KIND_REPO_CONFIG";
 const RC_FILE_KIND_CUSTOM: &str = "FILE_KIND_CUSTOM";
 const RC_FILE_KIND_UNCLASSIFIED: &str = "FILE_KIND_UNCLASSIFIED";
 const RC_FILE_OWNS_CRATE_DIRECT: &str = "FILE_OWNS_CRATE_DIRECT";
@@ -182,10 +193,11 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   let custom_patterns = compile_custom_patterns(ctx);
 
-  let mut trace = Vec::new();
+  let changed_file_count = changed_files.len();
+  let mut trace = Vec::with_capacity(changed_file_count * 4); // Multiple trace entries per file
   let mut surface_refs: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
 
-  let mut planned_files = Vec::new();
+  let mut planned_files = Vec::with_capacity(changed_file_count);
   let mut direct_crates: BTreeSet<String> = BTreeSet::new();
   let mut build_test_seed_crates: BTreeSet<String> = BTreeSet::new();
 
@@ -322,6 +334,13 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   let surfaces = build_surfaces(&surface_refs, &custom_patterns);
 
+  // Compute reproducibility metadata
+  let git_merge_base = if refs.merge_base {
+    Some(refs.resolved_base.clone())
+  } else {
+    None
+  };
+
   let output = PlanOutput {
     plan_contract_version: PLAN_CONTRACT_VERSION,
     inputs: PlanInputs {
@@ -346,6 +365,12 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     },
     surfaces,
     trace,
+    reproducibility: Reproducibility {
+      cargo_rail_version: env!("CARGO_PKG_VERSION"),
+      config_hash: config_fingerprint(ctx.workspace_root()),
+      git_merge_base,
+      git_shallow_clone: is_shallow_clone(ctx.workspace_root()),
+    },
   };
 
   validate_surface_reason_invariants(&output)?;
@@ -460,7 +485,7 @@ fn validate_surface_reason_invariants(output: &PlanOutput) -> RailResult<()> {
 
 fn ensure_surface(surfaces: &mut Vec<String>, surface: &str) {
   if !surfaces.iter().any(|existing| existing == surface) {
-    surfaces.push(surface.to_string());
+    surfaces.push(String::from(surface));
   }
 }
 
@@ -637,6 +662,14 @@ fn classify_file_kind(path: &str, custom_patterns: &[(String, Pattern)]) -> File
     };
   }
 
+  if is_repo_config(path) {
+    return FileKind {
+      kind: "config".to_string(),
+      sub_kind: Some("repo".to_string()),
+      reason_code: RC_FILE_KIND_REPO_CONFIG,
+    };
+  }
+
   FileKind {
     kind: "script".to_string(),
     sub_kind: None,
@@ -668,6 +701,37 @@ fn is_docs(path: &str) -> bool {
     || path.ends_with("README")
 }
 
+/// Repository configuration files that don't affect Rust build.
+///
+/// These are root-level dotfiles and config files that configure
+/// tooling, editors, or repository behavior but don't require
+/// rebuilding or retesting Rust code.
+fn is_repo_config(path: &str) -> bool {
+  // Only match root-level files (no directory separator)
+  if path.contains('/') {
+    return false;
+  }
+
+  // Common dotfiles
+  matches!(
+    path,
+    ".gitignore"
+      | ".gitattributes"
+      | ".editorconfig"
+      | ".dockerignore"
+      | ".prettierrc"
+      | ".prettierignore"
+      | ".eslintrc"
+      | ".eslintignore"
+      | ".npmrc"
+      | ".nvmrc"
+      | ".node-version"
+      | ".python-version"
+      | ".ruby-version"
+      | ".tool-versions"
+  )
+}
+
 fn owner_scope(path: &str, owners: &[String]) -> String {
   if !owners.is_empty() {
     return "crate".to_string();
@@ -687,18 +751,26 @@ fn owner_scope(path: &str, owners: &[String]) -> String {
 }
 
 fn derive_surfaces_for_kind(kind: &FileKind) -> Vec<String> {
+  // Static slices for common surface combinations
+  static BUILD_TEST: &[&str] = &["build", "test"];
+  static TEST_ONLY: &[&str] = &["test"];
+  static BENCH_ONLY: &[&str] = &["bench"];
+  static INFRA_BUILD_TEST: &[&str] = &["infra", "build", "test"];
+  static INFRA_ONLY: &[&str] = &["infra"];
+  static DOCS_ONLY: &[&str] = &["docs"];
+
   match (kind.kind.as_str(), kind.sub_kind.as_deref()) {
-    ("rust", Some("src")) => vec!["build".to_string(), "test".to_string()],
-    ("rust", Some("test")) => vec!["test".to_string()],
-    ("rust", Some("bench")) => vec!["bench".to_string()],
-    ("toml", Some("manifest")) => vec!["build".to_string(), "test".to_string()],
+    ("rust", Some("src")) => BUILD_TEST.iter().map(|&s| String::from(s)).collect(),
+    ("rust", Some("test")) => TEST_ONLY.iter().map(|&s| String::from(s)).collect(),
+    ("rust", Some("bench")) => BENCH_ONLY.iter().map(|&s| String::from(s)).collect(),
+    ("toml", Some("manifest")) => BUILD_TEST.iter().map(|&s| String::from(s)).collect(),
     ("toml", Some("workspace")) | ("toml", Some("tooling")) => {
-      vec!["infra".to_string(), "build".to_string(), "test".to_string()]
+      INFRA_BUILD_TEST.iter().map(|&s| String::from(s)).collect()
     }
-    ("ci", _) | ("script", _) => vec!["infra".to_string()],
-    ("docs", _) => vec!["docs".to_string()],
-    (custom, _) if custom.starts_with("custom:") => vec![custom.to_string()],
-    _ => vec!["docs".to_string()],
+    ("ci", _) | ("script", _) => INFRA_ONLY.iter().map(|&s| String::from(s)).collect(),
+    ("docs", _) | ("config", Some("repo")) => DOCS_ONLY.iter().map(|&s| String::from(s)).collect(),
+    (custom, _) if custom.starts_with("custom:") => vec![String::from(custom)],
+    _ => DOCS_ONLY.iter().map(|&s| String::from(s)).collect(),
   }
 }
 
@@ -720,7 +792,9 @@ fn emit_transitive_build_test_trace(
   trace: &mut Vec<TraceReason>,
   surface_refs: &mut BTreeMap<String, BTreeSet<u32>>,
 ) -> RailResult<()> {
-  let surfaces = [String::from("build"), String::from("test")];
+  // Use owned Strings once, reuse via slice reference
+  static BUILD_TEST_SURFACES: &[&str] = &["build", "test"];
+  let surfaces: Vec<String> = BUILD_TEST_SURFACES.iter().map(|&s| String::from(s)).collect();
   for direct in build_test_seed_crates {
     let deps = ctx.graph.transitive_dependents(direct)?;
     for dependent in deps {
@@ -750,13 +824,9 @@ fn build_surfaces(
   surface_refs: &BTreeMap<String, BTreeSet<u32>>,
   custom_patterns: &[(String, Pattern)],
 ) -> BTreeMap<String, SurfaceDecision> {
-  let mut surface_names = vec![
-    "build".to_string(),
-    "test".to_string(),
-    "bench".to_string(),
-    "docs".to_string(),
-    "infra".to_string(),
-  ];
+  // Use static slice and map to owned strings
+  static BUILTIN_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
+  let mut surface_names: Vec<String> = BUILTIN_SURFACES.iter().map(|&s| String::from(s)).collect();
 
   let mut custom_names: BTreeSet<String> = BTreeSet::new();
   for (name, _) in custom_patterns {
@@ -863,57 +933,38 @@ fn format_text(output: &PlanOutput, explain: bool) -> String {
     out.push('\n');
     out.push_str("trace:\n");
     for reason in &output.trace {
-      match (&reason.file, &reason.crate_name, &reason.depends_on, &reason.surface) {
-        (Some(file), Some(crate_name), Some(depends_on), Some(surface)) => {
-          out.push_str(&format!(
-            "  r{} {} file={} crate={} depends_on={} surface={}\n",
-            reason.id, reason.code, file, crate_name, depends_on, surface
-          ));
-        }
-        (Some(file), Some(crate_name), Some(depends_on), None) => {
-          out.push_str(&format!(
-            "  r{} {} file={} crate={} depends_on={}\n",
-            reason.id, reason.code, file, crate_name, depends_on
-          ));
-        }
-        (Some(file), Some(crate_name), None, Some(surface)) => {
-          out.push_str(&format!(
-            "  r{} {} file={} crate={} surface={}\n",
-            reason.id, reason.code, file, crate_name, surface
-          ));
-        }
-        (Some(file), None, None, Some(surface)) => {
-          out.push_str(&format!(
-            "  r{} {} file={} surface={}\n",
-            reason.id, reason.code, file, surface
-          ));
-        }
-        (Some(file), None, None, None) => {
-          out.push_str(&format!("  r{} {} file={}\n", reason.id, reason.code, file));
-        }
-        (None, Some(crate_name), Some(depends_on), Some(surface)) => {
-          out.push_str(&format!(
-            "  r{} {} crate={} depends_on={} surface={}\n",
-            reason.id, reason.code, crate_name, depends_on, surface
-          ));
-        }
-        (None, Some(crate_name), Some(depends_on), None) => {
-          out.push_str(&format!(
-            "  r{} {} crate={} depends_on={}\n",
-            reason.id, reason.code, crate_name, depends_on
-          ));
-        }
-        (None, None, None, Some(surface)) => {
-          out.push_str(&format!("  r{} {} surface={}\n", reason.id, reason.code, surface));
-        }
-        _ => {
-          out.push_str(&format!("  r{} {}\n", reason.id, reason.code));
-        }
-      }
+      out.push_str(&format_trace_line(reason));
     }
   }
 
   out
+}
+
+/// Format a single trace line using a builder approach
+///
+/// Dynamically builds the output string based on which optional fields are present,
+/// eliminating combinatorial match arms.
+fn format_trace_line(reason: &TraceReason) -> String {
+  use std::fmt::Write;
+
+  let mut line = format!("  r{} {}", reason.id, reason.code);
+
+  // Append fields in canonical order: file, crate, depends_on, surface
+  if let Some(file) = &reason.file {
+    let _ = write!(line, " file={}", file);
+  }
+  if let Some(crate_name) = &reason.crate_name {
+    let _ = write!(line, " crate={}", crate_name);
+  }
+  if let Some(depends_on) = &reason.depends_on {
+    let _ = write!(line, " depends_on={}", depends_on);
+  }
+  if let Some(surface) = &reason.surface {
+    let _ = write!(line, " surface={}", surface);
+  }
+
+  line.push('\n');
+  line
 }
 
 fn format_github(output: &PlanOutput) -> RailResult<String> {
@@ -1010,41 +1061,10 @@ fn surface_enabled(output: &PlanOutput, key: &str) -> bool {
   output.surfaces.get(key).map(|s| s.enabled).unwrap_or(false)
 }
 
-fn config_fingerprint(workspace_root: &Path) -> String {
-  if let Some(config_path) = RailConfig::find_config_path(workspace_root)
-    && let Ok(bytes) = std::fs::read(config_path)
-  {
-    return format!("fnv1a64:{:016x}", fnv1a64(&bytes));
-  }
-
-  "none".to_string()
-}
-
-fn toolchain_fingerprint(workspace_root: &Path) -> String {
-  let candidates = [
-    workspace_root.join("rust-toolchain.toml"),
-    workspace_root.join("rust-toolchain"),
-  ];
-
-  for candidate in candidates {
-    if let Ok(bytes) = std::fs::read(candidate) {
-      return format!("fnv1a64:{:016x}", fnv1a64(&bytes));
-    }
-  }
-
-  "none".to_string()
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-  const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-  const FNV_PRIME: u64 = 0x100000001b3;
-
-  let mut hash = FNV_OFFSET_BASIS;
-  for byte in bytes {
-    hash ^= *byte as u64;
-    hash = hash.wrapping_mul(FNV_PRIME);
-  }
-  hash
+fn is_shallow_clone(workspace_root: &Path) -> bool {
+  // Check for .git/shallow file which indicates a shallow clone
+  let shallow_file = workspace_root.join(".git/shallow");
+  shallow_file.exists()
 }
 
 fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> {

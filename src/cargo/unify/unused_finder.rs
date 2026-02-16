@@ -8,6 +8,7 @@ use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::{MemberEdit, UnusedDep, UnusedReason};
 use crate::progress;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Detects unused dependencies in workspace members
 pub struct UnusedDepFinder<'a> {
@@ -104,11 +105,11 @@ impl<'a> UnusedDepFinder<'a> {
             // Target IS configured but dep still not in resolved graph
             // This is genuinely suspicious - flag it with context
             unused.push(UnusedDep {
-              member: member.package_name.clone(),
-              dep_name: dep_key.name.to_string(),
+              member: Arc::from(member.package_name.as_str()),
+              dep_name: Arc::clone(&dep_key.name),
               kind: usage.kind,
               reason: UnusedReason::TargetConfiguredButNotResolved {
-                target_cfg: target_cfg.clone(),
+                target_cfg: Arc::from(target_cfg.as_str()),
               },
             });
             continue;
@@ -117,8 +118,8 @@ impl<'a> UnusedDepFinder<'a> {
           // This is a non-conditional, non-optional dep that's not in the resolved graph
           // This is genuinely unused
           unused.push(UnusedDep {
-            member: member.package_name.clone(),
-            dep_name: dep_key.name.to_string(),
+            member: Arc::from(member.package_name.as_str()),
+            dep_name: Arc::clone(&dep_key.name),
             kind: usage.kind,
             reason: UnusedReason::NotInResolvedGraph,
           });
@@ -139,16 +140,16 @@ impl<'a> UnusedDepFinder<'a> {
 
     for dep in unused {
       // Find the target constraint for this dep (needed for correct section)
-      let target = self
+      let target: Option<Arc<str>> = self
         .manifests
         .members
         .iter()
-        .find(|m| m.package_name == dep.member)
+        .find(|m| m.package_name == &*dep.member)
         .and_then(|m| {
           m.dependencies.iter().find_map(|(key, usages)| {
             usages.iter().find_map(|usage| {
-              if *key.name == dep.dep_name && usage.kind == dep.kind {
-                usage.target.clone()
+              if *key.name == *dep.dep_name && usage.kind == dep.kind {
+                usage.target.as_ref().map(|t| Arc::from(t.as_str()))
               } else {
                 None
               }
@@ -157,10 +158,10 @@ impl<'a> UnusedDepFinder<'a> {
         });
 
       edits
-        .entry(dep.member.clone())
+        .entry(dep.member.to_string())
         .or_default()
         .push(MemberEdit::RemoveDep {
-          dep_name: dep.dep_name.clone(),
+          dep_name: Arc::clone(&dep.dep_name),
           dep_kind: dep.kind,
           target,
         });

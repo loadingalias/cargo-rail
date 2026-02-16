@@ -148,7 +148,15 @@ impl RailConfig {
     None
   }
 
-  /// Load config from rail.toml (searches multiple locations)
+  /// Load config from rail.toml (searches multiple locations).
+  ///
+  /// Searches: `rail.toml`, `.rail.toml`, `.cargo/rail.toml`, `.config/rail.toml`
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ConfigError::NotFound`] if no config file exists.
+  ///
+  /// Returns [`ConfigError::ParseError`] if the config file cannot be read or parsed.
   pub fn load(path: &Path) -> RailResult<Self> {
     match Self::try_load(path) {
       ConfigLoadResult::Loaded(config) => Ok(*config),

@@ -1,9 +1,70 @@
-//! Utility functions for cross-platform path handling
+//! Utility functions for cross-platform path handling and hashing
 
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::config::RailConfig;
 use crate::error::RailResult;
+
+// ============================================================================
+// Hashing and Fingerprinting
+// ============================================================================
+
+/// FNV-1a 64-bit hash function
+///
+/// A fast, non-cryptographic hash suitable for fingerprinting file contents.
+/// Used for change detection and cache invalidation.
+#[inline]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+  const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+  const FNV_PRIME: u64 = 0x100000001b3;
+
+  let mut hash = FNV_OFFSET_BASIS;
+  for byte in bytes {
+    hash ^= *byte as u64;
+    hash = hash.wrapping_mul(FNV_PRIME);
+  }
+  hash
+}
+
+/// Compute a fingerprint for a file's contents
+///
+/// Returns a formatted fingerprint string like `fnv1a64:0123456789abcdef`,
+/// or `"none"` if the file cannot be read.
+pub fn file_fingerprint(path: &Path) -> String {
+  match fs::read(path) {
+    Ok(bytes) => format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
+    Err(_) => "none".to_string(),
+  }
+}
+
+/// Compute a fingerprint for the rail.toml configuration file
+///
+/// Searches for config in standard locations and returns its fingerprint,
+/// or `"none"` if no config file is found.
+pub fn config_fingerprint(workspace_root: &Path) -> String {
+  RailConfig::find_config_path(workspace_root)
+    .map(|p| file_fingerprint(&p))
+    .unwrap_or_else(|| "none".to_string())
+}
+
+/// Compute a fingerprint for the Rust toolchain file
+///
+/// Checks for `rust-toolchain.toml` then `rust-toolchain` and returns
+/// the fingerprint of the first found, or `"none"` if neither exists.
+pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
+  ["rust-toolchain.toml", "rust-toolchain"]
+    .iter()
+    .map(|name| workspace_root.join(name))
+    .find(|p| p.exists())
+    .map(|p| file_fingerprint(&p))
+    .unwrap_or_else(|| "none".to_string())
+}
+
+// ============================================================================
+// Path Utilities
+// ============================================================================
 
 /// Check if a path is a local filesystem path (not a remote URL)
 ///
@@ -131,6 +192,30 @@ pub fn path_to_git_format(path: &Path) -> String {
 mod tests {
   use super::*;
   use std::path::PathBuf;
+
+  #[test]
+  fn test_fnv1a64_empty() {
+    assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+  }
+
+  #[test]
+  fn test_fnv1a64_known_values() {
+    // FNV-1a test vectors
+    assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+    assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+  }
+
+  #[test]
+  fn test_fnv1a64_deterministic() {
+    let data = b"hello world";
+    assert_eq!(fnv1a64(data), fnv1a64(data));
+  }
+
+  #[test]
+  fn test_file_fingerprint_missing_file() {
+    let result = file_fingerprint(Path::new("/nonexistent/path/to/file"));
+    assert_eq!(result, "none");
+  }
 
   #[test]
   fn test_is_local_path_classification() {

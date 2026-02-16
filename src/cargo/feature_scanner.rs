@@ -193,7 +193,8 @@ impl FeatureScanner {
     // This catches conditional features like `dep/feature` in [features] tables
     let referenced_features = Self::build_referenced_features_map(metadata);
 
-    let mut results = Vec::new();
+    let workspace_pkg_count = metadata.workspace_packages().len();
+    let mut results = Vec::with_capacity(workspace_pkg_count);
 
     for pkg in metadata.workspace_packages() {
       // Skip crates with no declared features

@@ -12,8 +12,8 @@
 |---|---|
 | **CI Surface Execution** | 55% fewer surfaces run per merge |
 | **Weighted `test`/`build` Units** | 64% reduction in compute units |
-| **Dependencies Unified** | 78 across 47 crates (avg 1.7 per crate) |
-| **Undeclared `features` Fixed** | 141 silent bugs prevented |
+| **Dependencies Unified** | 96 across 53 crates (avg 1.8 per crate) |
+| **Undeclared `features` Fixed** | 258 silent bugs prevented |
 | **Tooling Consolidation** | 6-8 cargo plugins → 1 command |
 | **MSRV Computation** | Automatic from dependency graph |
 
@@ -94,14 +94,15 @@ cargo rail unify --explain  # understand each decision
 
 **Validated impact on real repos:**
 
-| Repository | Crates | Locked Deps | Deps Unified | Undeclared Features | MSRV Computed |
-|---|---:|---:|---:|---:|---|
-| tokio-rs/tokio | 10 | 224 | 9 | 19 | 1.85.0 |
-| helix-editor/helix | 14 | 351 | 15 | 25 | 1.87.0 |
-| meilisearch/meilisearch | 23 | 835 | 54 | 97 | 1.88.0 |
-| **Aggregate** | **47** | **1,410** | **78** | **141** | — |
+| Repository | Crates | Deps Unified | Undeclared Features | MSRV Computed |
+|---|---:|---:|---:|---|
+| [tokio-rs/tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) | 10 | 9 | 7 | 1.85.0 |
+| [helix-editor/helix](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) | 14 | 15 | 19 | 1.87.0 |
+| [meilisearch/meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) | 23 | 54 | 215 | 1.88.0 |
+| [helixdb/helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) | 6 | 18 | 17 | 1.88.0 |
+| **Aggregate** | **53** | **96** | **258** | — |
 
-Config files and validation artifacts: [Examples](examples/unify/)
+Config files and validation artifacts: [Examples](examples/unify/) | [Validation Forks](https://github.com/loadingalias/cargo-rail-testing)
 
 ### Split + Sync (Google Copybara Replacement)
 
@@ -164,55 +165,51 @@ By default, on `cargo rail init`, the `rail.toml` file is written to the `.confi
 ## Migration Guides
 
 - [Migrate from `cargo-hakari`](docs/migrate-hakari.md)
-- [Upgrade from `cargo-rail` v0.9.1 to v0.10.0](docs/upgrade-to-v0.10.0.md)
+- [Upgrade from `cargo-rail` v0.9.1 to v0.10.1](docs/upgrade-to-v0.10.1.md)
 
-## Tested & Proven On Large Repos - THIS NEEDS WORK! It's thin.
+## Tested & Proven On Large Repos
 
-All core workflows (`plan`/`run`, `unify`, `split`, `sync`, `release`) validated on production repos:
+All core workflows (`plan`/`run`, `unify`) validated on production repos with full git history:
 
-| Repository | Crates | Locked Deps | Validation Coverage |
-|---|---:|---:|---|
-| [tokio-rs/tokio](https://github.com/tokio-rs/tokio) | 10 | 224 | Plan/run (5 merges), unify, split, sync, release |
-| [helix-editor/helix](https://github.com/helix-editor/helix) | 14 | 351 | Plan/run (5 merges), unify, split, sync, release |
-| [meilisearch/meilisearch](https://github.com/meilisearch/meilisearch) | 23 | 835 | Plan/run (5 merges), unify, split, sync, release |
+| Repository | Crates | Validation | Fork |
+|---|---:|---|---|
+| tokio-rs/tokio | 10 | Unify (9 deps, 7 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) |
+| helix-editor/helix | 14 | Unify (15 deps, 19 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) |
+| meilisearch/meilisearch | 23 | Unify (54 deps, 215 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) |
+| helixdb/helix-db | 6 | Unify (18 deps, 17 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) |
+
+**Validation forks**: [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing) — full configs, integration guides, and reproducible artifacts.
 
 **How to Validate:**
-
-Validation isn't a single test — it's a protocol by design:
 
 1. **Reproducibility**: Every command in [docs/large-repo-validation.md](docs/large-repo-validation.md) runs on forked repos with real merge history
 2. **Metrics collection**: Automated scripts measure execution reduction, surface accuracy, plan duration, unify impact
 3. **Quality audit**: Heuristics flag potential false positives/negatives for human review
 4. **Real-world scenarios**: Tests run on actual merge commits and real dependency graphs, not synthetic fixtures
 
-**Change detection results (15 merge scenarios):**
-- 55% execution reduction rate (surfaces)
-- 64% weighted reduction rate (compute units)
-- Average plan duration: 632ms
-- Quality audit: 2 potential false-negatives, 1 potential false-positive (flagged for review)
-
-**Unify results (3 repos, 47 crates):**
-- 78 dependencies unified
-- 141 undeclared features fixed (silent bugs prevented)
+**Unify results (4 repos, 53 crates):**
+- 96 dependencies unified to `[workspace.dependencies]`
+- 258 undeclared features fixed (silent bugs prevented)
 - 2 dead features pruned
 - MSRV computed for all repos (1.85.0 - 1.88.0)
 
 Full protocol and raw artifacts: [examples/README.md](examples/README.md)
 
-## Examples - THIS NEEDS WORK! It's thin.
+## Examples
 
 Each workflow includes working config files and reproducible command sequences:
 
-- Change detection: [examples/change_detection/](examples/change_detection/)
-- Unify: [examples/unify/](examples/unify/)
-- Split/sync: [examples/split-sync/](examples/split-sync/)
-- Release: [examples/release/](examples/release/)
+| Workflow | Examples | Real-World Configs |
+|---|---|---|
+| Change detection | [examples/change_detection/](examples/change_detection/) | [tokio](https://github.com/loadingalias/cargo-rail-testing/blob/main/tokio/.config/rail.toml), [helix](https://github.com/loadingalias/cargo-rail-testing/blob/main/helix/.config/rail.toml), [meilisearch](https://github.com/loadingalias/cargo-rail-testing/blob/main/meilisearch/.config/rail.toml) |
+| Unify | [examples/unify/](examples/unify/) | [Validation results](examples/unify/VALIDATION_RESULTS.md) |
+| Split/sync | [examples/split-sync/](examples/split-sync/) | — |
+| Release | [examples/release/](examples/release/) | — |
 
-All examples run on real repos (tokio, helix, meilisearch) and include:
-- Rail config (`.config/rail.toml`)
-- Command sequence (step-by-step)
-- Expected outputs
-- Validation artifacts
+**Full validation configs**: Each fork in [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing) includes:
+- `.config/rail.toml` — production-ready config
+- `docs/cargo-rail-integration-guide.md` — step-by-step integration
+- `docs/CHANGE_DETECTION_METRICS.md` — measured impact analysis
 
 ## Getting Help
 

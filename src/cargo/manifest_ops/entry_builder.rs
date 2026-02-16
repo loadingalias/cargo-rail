@@ -11,21 +11,8 @@ use super::fields::build_feature_array;
 /// - `Item::Value(Value::String)` for simple case (version only)
 /// - `Item::Value(Value::InlineTable)` for complex case (features, path, etc.)
 ///
-/// # Examples
-///
-/// ```ignore
-/// let dep = UnifiedDep {
-///     name: "serde".to_string(),
-///     version_req: "1.0".parse().unwrap(),
-///     features: vec![],
-///     default_features: true,
-///     used_by: vec!["crate1".to_string()],
-///     target: None,
-///     path: None,
-/// };
-/// let entry = build_dep_entry(&dep);
-/// // Result: Item::Value(Value::String("1.0"))
-/// ```
+/// Simple version-only deps return `Item::Value(Value::String("^1.0"))`.
+/// Deps with features/path/default-features=false return inline tables.
 pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
   // Simple case: just version, no features, defaults enabled, no path
   if dep.features.is_empty() && dep.default_features && dep.path.is_none() {
@@ -78,7 +65,7 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
 /// # Returns
 ///
 /// `{ workspace = true }` with optional fields and `#unified` comment marker
-pub fn build_workspace_dep_entry(local_features: Option<Vec<String>>, is_optional: bool) -> Item {
+pub fn build_workspace_dep_entry<S: AsRef<str>>(local_features: Option<&[S]>, is_optional: bool) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
 
@@ -86,7 +73,7 @@ pub fn build_workspace_dep_entry(local_features: Option<Vec<String>>, is_optiona
   if let Some(features) = local_features
     && !features.is_empty()
   {
-    table.insert("features", build_feature_array(&features));
+    table.insert("features", build_feature_array(features));
   }
 
   // Add optional if needed
@@ -108,7 +95,7 @@ pub fn build_workspace_dep_entry(local_features: Option<Vec<String>>, is_optiona
 /// # Arguments
 ///
 /// * `features` - Features to enable for the transitive dependency
-pub fn build_transitive_entry(features: &[String]) -> Item {
+pub fn build_transitive_entry<S: AsRef<str>>(features: &[S]) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
 
@@ -136,7 +123,7 @@ pub fn build_transitive_entry(features: &[String]) -> Item {
 ///
 /// * `version` - The semver version to use
 /// * `features` - Features to enable (intersection across all targets)
-pub fn build_versioned_dep_entry(version: &semver::Version, features: &[String]) -> Item {
+pub fn build_versioned_dep_entry<S: AsRef<str>>(version: &semver::Version, features: &[S]) -> Item {
   // Simple case: just version, no features - let cargo use defaults
   // This is safe because we're not changing the feature set
   if features.is_empty() {
@@ -164,17 +151,18 @@ mod tests {
   use super::*;
   use crate::cargo::unify_types::UnifiedDep;
   use std::path::PathBuf;
+  use std::sync::Arc;
 
   use super::super::fields::extract_features;
   use super::super::workspace_ref::is_workspace_dep;
 
   fn create_test_dep(name: &str, version: &str) -> UnifiedDep {
     UnifiedDep {
-      name: name.to_string(),
+      name: Arc::from(name),
       version_req: version.parse().unwrap(),
       features: vec![],
       default_features: true,
-      used_by: vec!["test-crate".to_string()],
+      used_by: vec![Arc::from("test-crate")],
       target: None,
       path: None,
     }
@@ -192,7 +180,7 @@ mod tests {
   #[test]
   fn test_build_dep_entry_with_features() {
     let mut dep = create_test_dep("serde", "1.0");
-    dep.features = vec!["derive".to_string()];
+    dep.features = vec![Arc::from("derive")];
 
     let entry = build_dep_entry(&dep);
     assert!(entry.as_inline_table().is_some());
@@ -223,14 +211,15 @@ mod tests {
 
   #[test]
   fn test_build_workspace_dep_entry_simple() {
-    let entry = build_workspace_dep_entry(None, false);
+    let entry = build_workspace_dep_entry::<String>(None, false);
     assert!(is_workspace_dep(&entry));
     assert!(entry.as_inline_table().is_some());
   }
 
   #[test]
   fn test_build_workspace_dep_entry_with_features() {
-    let entry = build_workspace_dep_entry(Some(vec!["extra".to_string()]), false);
+    let features = ["extra".to_string()];
+    let entry = build_workspace_dep_entry(Some(&features[..]), false);
     assert!(is_workspace_dep(&entry));
     let features = extract_features(&entry).unwrap();
     assert_eq!(features, vec!["extra"]);
@@ -238,7 +227,7 @@ mod tests {
 
   #[test]
   fn test_build_workspace_dep_entry_optional() {
-    let entry = build_workspace_dep_entry(None, true);
+    let entry = build_workspace_dep_entry::<String>(None, true);
     assert!(is_workspace_dep(&entry));
     let table = entry.as_inline_table().unwrap();
     assert!(table.get("optional").unwrap().as_bool().unwrap());
@@ -246,10 +235,10 @@ mod tests {
 
   #[test]
   fn test_build_transitive_entry() {
-    let features = vec!["feature1".to_string(), "feature2".to_string()];
+    let features = ["feature1".to_string(), "feature2".to_string()];
     let entry = build_transitive_entry(&features);
     assert!(is_workspace_dep(&entry));
     let extracted = extract_features(&entry).unwrap();
-    assert_eq!(extracted, features);
+    assert_eq!(extracted, vec!["feature1", "feature2"]);
   }
 }

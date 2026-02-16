@@ -67,9 +67,13 @@ pub struct SystemGit {
 }
 
 impl SystemGit {
-  /// Open a git repository
+  /// Open a git repository.
   ///
-  /// This performs ONE subprocess call to get the repository metadata.
+  /// Performs ONE subprocess call to get the repository metadata.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`GitError::RepoNotFound`] if `path` is not inside a git repository.
   pub fn open(path: &Path) -> RailResult<Self> {
     // Get repo metadata in one subprocess call
     let output = Command::new("git")
@@ -218,10 +222,7 @@ impl SystemGit {
   /// - Success checking
   /// - Error formatting
   ///
-  /// # Example
-  /// ```ignore
-  /// let output = git.run_git(&["status", "--short"])?;
-  /// ```
+  /// Example: `git.run_git(&["status", "--short"])?`
   pub(crate) fn run_git(&self, args: &[&str]) -> RailResult<std::process::Output> {
     let mut cmd = self.git_cmd();
     cmd.args(args);
@@ -268,14 +269,10 @@ impl SystemGit {
   /// This allows using specific GitError variants while still getting
   /// the boilerplate reduction benefits.
   ///
-  /// # Example
-  /// ```ignore
+  /// Example:
+  /// ```text
   /// git.run_git_with_error(&["push", "-u", "origin", "main"], |stderr| {
-  ///   RailError::Git(GitError::PushFailed {
-  ///     remote: "origin".to_string(),
-  ///     branch: "main".to_string(),
-  ///     reason: stderr.to_string(),
-  ///   })
+  ///   RailError::Git(GitError::PushFailed { ... })
   /// })?;
   /// ```
   pub(crate) fn run_git_with_error<F>(&self, args: &[&str], error_fn: F) -> RailResult<std::process::Output>
@@ -296,6 +293,168 @@ impl SystemGit {
 
     Ok(output)
   }
+
+  /// Check if a tag exists
+  pub fn tag_exists(&self, tag_name: &str) -> RailResult<bool> {
+    let ref_name = format!("refs/tags/{}", tag_name);
+    Ok(self.run_git_check(&["rev-parse", "-q", "--verify", &ref_name]))
+  }
+
+  /// Get a git config value
+  ///
+  /// Returns `Ok(Some(value))` if the config key exists,
+  /// `Ok(None)` if it doesn't exist, or `Err` for other failures.
+  pub fn get_config(&self, key: &str) -> RailResult<Option<String>> {
+    let mut cmd = self.git_cmd();
+    cmd.args(["config", "--get", key]);
+
+    match cmd.output() {
+      Ok(output) if output.status.success() => Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string())),
+      Ok(output) if output.status.code() == Some(1) => {
+        // Exit code 1 means key not found (not an error)
+        Ok(None)
+      }
+      Ok(output) => {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(RailError::Git(GitError::CommandFailed {
+          command: format!("git config --get {}", key),
+          stderr: stderr.to_string(),
+        }))
+      }
+      Err(e) => Err(RailError::message(format!("Failed to get git config {}: {}", key, e))),
+    }
+  }
+
+  /// Set a git config value
+  pub fn set_config(&self, key: &str, value: &str) -> RailResult<()> {
+    self.run_git(&["config", key, value])?;
+    Ok(())
+  }
+
+  /// Stage all changes (git add -A)
+  pub fn stage_all(&self) -> RailResult<()> {
+    self.run_git(&["add", "-A"])?;
+    Ok(())
+  }
+
+  /// Check if there are staged changes
+  pub fn has_staged_changes(&self) -> RailResult<bool> {
+    // git diff --cached --quiet returns 1 if there are changes
+    Ok(!self.run_git_check(&["diff", "--cached", "--quiet"]))
+  }
+
+  /// Create a commit with the given message
+  pub fn commit(&self, message: &str) -> RailResult<String> {
+    self.run_git(&["commit", "-m", message])?;
+    // Return the new commit SHA
+    self.run_git_stdout(&["rev-parse", "HEAD"])
+  }
+
+  /// Create a tag
+  ///
+  /// If `message` is Some, creates an annotated tag. Otherwise creates a lightweight tag.
+  /// If `sign` is true, creates a signed tag (requires GPG/SSH key).
+  /// If `sign` is false, explicitly disables signing to override user's git config.
+  pub fn create_tag(&self, name: &str, message: Option<&str>, sign: bool) -> RailResult<()> {
+    let mut cmd = self.git_cmd();
+
+    if sign {
+      cmd.args(["tag", "-s"]);
+    } else {
+      // Override user's tag.gpgsign=true config to ensure unsigned tag
+      cmd.args(["-c", "tag.gpgsign=false", "tag", "-a"]);
+    }
+
+    if let Some(msg) = message {
+      cmd.args(["-m", msg]);
+    }
+
+    cmd.arg(name);
+
+    let output = cmd.output().context("Failed to run git tag")?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: format!("git tag {}", name),
+        stderr: stderr.to_string(),
+      }));
+    }
+
+    Ok(())
+  }
+
+  /// Find the latest tag matching a pattern (sorted by version)
+  ///
+  /// Returns the tag name if found, None if no matching tags exist.
+  /// Uses version sorting to find the highest version tag.
+  pub fn find_latest_tag(&self, pattern: &str) -> RailResult<Option<String>> {
+    let mut cmd = self.git_cmd();
+    cmd.args(["tag", "--list", pattern, "--sort=-version:refname"]);
+
+    match cmd.output() {
+      Ok(output) if output.status.success() => {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().next().map(|s| s.to_string()))
+      }
+      Ok(_) => Ok(None), // No matching tags found
+      Err(e) => Err(RailError::message(format!("Failed to find tag: {}", e))),
+    }
+  }
+
+  /// Check if a remote URL has content (branches)
+  pub fn ls_remote_has_content(&self, url: &str) -> RailResult<bool> {
+    let mut cmd = self.git_cmd();
+    cmd.args(["ls-remote", "--heads", url]);
+
+    match cmd.output() {
+      Ok(output) => Ok(output.status.success() && !output.stdout.is_empty()),
+      Err(e) => Err(RailError::message(format!("Failed to check remote: {}", e))),
+    }
+  }
+
+  /// Get formatted git log output
+  ///
+  /// Returns commit data in the specified format between the given refs.
+  pub fn log_formatted(&self, format: &str, from: Option<&str>, to: &str) -> RailResult<String> {
+    let format_arg = format!("--format={}", format);
+    let range = if let Some(from_ref) = from {
+      format!("{}..{}", from_ref, to)
+    } else {
+      to.to_string()
+    };
+
+    self.run_git_stdout(&["log", &format_arg, &range])
+  }
+
+  /// Check if signing is configured (GPG or SSH)
+  pub fn has_signing_configured(&self) -> bool {
+    self.get_config("user.signingkey").ok().flatten().is_some()
+      || self.get_config("gpg.format").ok().flatten().is_some()
+  }
+}
+
+/// Initialize a new git repository at the given path
+///
+/// This is a standalone function since it creates a new repo (no existing SystemGit).
+pub fn init_repo(path: &std::path::Path, initial_branch: &str) -> RailResult<()> {
+  let output = Command::new("git")
+    .arg("init")
+    .arg("--initial-branch")
+    .arg(initial_branch)
+    .arg(path)
+    .output()
+    .context("Failed to run git init")?;
+
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    return Err(RailError::Git(GitError::CommandFailed {
+      command: "git init".to_string(),
+      stderr: stderr.to_string(),
+    }));
+  }
+
+  Ok(())
 }
 
 #[cfg(test)]

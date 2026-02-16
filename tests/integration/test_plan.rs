@@ -744,6 +744,128 @@ conservative_unclassified_owner_fallback = false
 }
 
 #[test]
+fn test_plan_repo_config_files_no_build_test() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-repo-config")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("add crate")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Add .gitignore at workspace root - this is a repo config file
+  std::fs::write(ws.path.join(".gitignore"), "target/\n*.log\n")?;
+  ws.commit("add gitignore")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(output.status.success(), "plan should succeed");
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+
+  // .gitignore should be classified as config:repo
+  assert_eq!(
+    json["files"][0]["kind"],
+    Value::String("config".to_string()),
+    ".gitignore should be classified as config kind"
+  );
+  assert_eq!(
+    json["files"][0]["sub_kind"],
+    Value::String("repo".to_string()),
+    ".gitignore should have repo sub_kind"
+  );
+
+  // Repo config files should only trigger docs surface (like docs files)
+  // They should NOT trigger build/test surfaces
+  assert_eq!(
+    json["surfaces"]["docs"]["enabled"],
+    Value::Bool(true),
+    "repo config should enable docs surface"
+  );
+  assert_eq!(
+    json["surfaces"]["build"]["enabled"],
+    Value::Bool(false),
+    "repo config should NOT enable build surface"
+  );
+  assert_eq!(
+    json["surfaces"]["test"]["enabled"],
+    Value::Bool(false),
+    "repo config should NOT enable test surface"
+  );
+
+  // Verify the trace has the correct reason code
+  let trace = json["trace"].as_array().expect("trace should be array");
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_REPO_CONFIG".to_string())),
+    "trace should include FILE_KIND_REPO_CONFIG reason"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_editorconfig_is_repo_config() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-editorconfig")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("add crate")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  std::fs::write(ws.path.join(".editorconfig"), "[*]\nindent_style = space\n")?;
+  ws.commit("add editorconfig")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(output.status.success(), "plan should succeed");
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+
+  assert_eq!(json["files"][0]["kind"], Value::String("config".to_string()));
+  assert_eq!(json["files"][0]["sub_kind"], Value::String("repo".to_string()));
+  assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(false));
+  assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(false));
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_nested_gitignore_is_unclassified() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-nested-gitignore")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("add crate")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  // Nested .gitignore inside a crate - should NOT be repo config
+  // (repo config is only root-level files)
+  let crate_gitignore = ws.path.join("crates/lib-a/.gitignore");
+  std::fs::write(&crate_gitignore, "*.tmp\n")?;
+  ws.commit("add nested gitignore")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(output.status.success(), "plan should succeed");
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+
+  // Nested .gitignore should NOT be classified as config:repo
+  // It's a crate-owned file and falls to unclassified
+  assert_ne!(
+    json["files"][0]["kind"],
+    Value::String("config".to_string()),
+    "nested .gitignore should NOT be config kind"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_plan_confidence_profile_strict_expands_docs_owned_file() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-profile-strict")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
@@ -1006,6 +1128,8 @@ fn normalize_plan_json_value(value: &mut Value) -> Result<()> {
   value["inputs"]["workspace_root"] = Value::String("<WORKSPACE_ROOT>".to_string());
   value["inputs"]["config_fingerprint"] = Value::String("<CONFIG_FP>".to_string());
   value["inputs"]["toolchain_fingerprint"] = Value::String("<TOOLCHAIN_FP>".to_string());
+  value["reproducibility"]["cargo_rail_version"] = Value::String("<VERSION>".to_string());
+  value["reproducibility"]["config_hash"] = Value::String("<CONFIG_HASH>".to_string());
   Ok(())
 }
 

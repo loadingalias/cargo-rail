@@ -15,7 +15,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! // Layer 1: Quick file classification
 //! let kind = classify_file(path);
 //!

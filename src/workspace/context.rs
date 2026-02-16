@@ -409,6 +409,14 @@ impl WorkspaceContext {
   /// Loads git state, cargo metadata, builds graph, and attempts to load rail.toml config.
   /// Config is optional - commands that require it should check and error.
   ///
+  /// # Errors
+  ///
+  /// Returns [`RailError::Git`] if `workspace_root` is not a git repository.
+  ///
+  /// Returns [`RailError::Message`] if `cargo metadata` fails (e.g., invalid `Cargo.toml`).
+  ///
+  /// Returns [`RailError::Config`] if `rail.toml` exists but fails to parse.
+  ///
   /// # Performance
   ///
   /// - Git state: <5ms (single git rev-parse)

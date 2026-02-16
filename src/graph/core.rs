@@ -24,7 +24,8 @@ use cargo_metadata::DependencyKind;
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -48,8 +49,8 @@ pub struct WorkspaceGraph {
   /// Edges: DependencyKind (Normal, Dev, Build)
   graph: DiGraph<PackageNode, DependencyKind>,
 
-  /// Index: package name → node index
-  name_to_node: HashMap<String, NodeIndex>,
+  /// Index: package name → node index (FxHashMap for faster String hashing)
+  name_to_node: FxHashMap<String, NodeIndex>,
 
   /// Workspace members only (subset of graph nodes) - for O(1) membership checks
   workspace_members: HashSet<String>,
@@ -64,7 +65,7 @@ pub struct WorkspaceGraph {
   /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
   /// Stores workspace-relative paths to support deleted files (no canonicalize needed)
-  path_cache: RwLock<Option<HashMap<PathBuf, String>>>,
+  path_cache: RwLock<Option<FxHashMap<PathBuf, String>>>,
 }
 
 impl WorkspaceGraph {
@@ -77,8 +78,8 @@ impl WorkspaceGraph {
   pub fn from_metadata(metadata: &cargo_metadata::Metadata) -> RailResult<Self> {
     // Build petgraph
     let mut graph = DiGraph::new();
-    let mut name_to_node = HashMap::new();
-    let mut id_to_node = HashMap::new();
+    let mut name_to_node = FxHashMap::default();
+    let mut id_to_node = FxHashMap::default();
     let mut workspace_members = HashSet::new();
 
     // Get workspace member IDs
@@ -146,7 +147,12 @@ impl WorkspaceGraph {
   ///
   /// Uses petgraph DFS for efficient traversal.
   ///
+  /// # Errors
+  ///
+  /// Returns [`RailError`] if `crate_name` is not found in the graph.
+  ///
   /// # Performance
+  ///
   /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
   pub fn transitive_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let start_node = self.find_node(crate_name)?;
@@ -165,8 +171,8 @@ impl WorkspaceGraph {
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
         let neighbor = &self.graph[neighbor_idx];
 
-        // Only include workspace members
-        if neighbor.is_workspace_member && neighbor_idx != start_node {
+        // Only include workspace members; skip clone if already in set
+        if neighbor.is_workspace_member && neighbor_idx != start_node && !dependents.contains(&neighbor.name) {
           dependents.insert(neighbor.name.clone());
         }
 
@@ -220,8 +226,11 @@ impl WorkspaceGraph {
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
         let neighbor = &self.graph[neighbor_idx];
 
-        // Only include workspace members that are not in the original set
-        if neighbor.is_workspace_member && !start_node_set.contains(&neighbor_idx) {
+        // Only include workspace members not in original set; skip clone if already in set
+        if neighbor.is_workspace_member
+          && !start_node_set.contains(&neighbor_idx)
+          && !dependents.contains(&neighbor.name)
+        {
           dependents.insert(neighbor.name.clone());
         }
 
@@ -249,7 +258,7 @@ impl WorkspaceGraph {
     // This is critical: external dependencies can have cycles (e.g., serde/serde_derive in dev deps),
     // but workspace members should never have cycles (Cargo enforces this)
     let mut subgraph = DiGraph::<&PackageNode, DependencyKind>::new();
-    let mut name_to_subgraph_idx = HashMap::new();
+    let mut name_to_subgraph_idx = FxHashMap::default();
 
     // Add only workspace member nodes
     for (name, &idx) in &self.name_to_node {
@@ -406,7 +415,7 @@ impl WorkspaceGraph {
   /// Maps each workspace crate's root directory (workspace-relative) to its name.
   /// Uses workspace-relative paths to support deleted files (no canonicalize needed).
   fn build_path_cache(&self) {
-    let mut cache = HashMap::new();
+    let mut cache = FxHashMap::default();
 
     for crate_name in &self.workspace_members {
       if let Some(node_idx) = self.name_to_node.get(crate_name) {

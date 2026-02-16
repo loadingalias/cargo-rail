@@ -2,7 +2,7 @@
 
 use crate::config::{RailConfig, SplitConfig as ConfigSplitConfig};
 use crate::error::{ConfigError, RailError, RailResult};
-use crate::split::SplitConfig;
+use crate::split::SplitParams;
 use crate::sync::SyncConfig;
 use crate::workspace::WorkspaceContext;
 use clap::ValueEnum;
@@ -191,8 +191,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
     self.split_configs.len()
   }
 
-  /// Build SplitConfig instances for the split engine
-  pub fn build_split_configs(self) -> RailResult<Vec<SplitConfig>> {
+  /// Build SplitParams instances for the split engine
+  pub fn build_split_configs(self) -> RailResult<Vec<SplitParams>> {
     let mut configs = Vec::new();
 
     for split_config in &self.split_configs {
@@ -210,7 +210,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         split_config.target_repo_path(self.ctx.workspace_root())
       };
 
-      configs.push(SplitConfig {
+      configs.push(SplitParams {
         crate_name: split_config.name.clone(),
         crate_paths,
         mode: split_config.mode.clone(),

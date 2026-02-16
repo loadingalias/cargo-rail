@@ -308,7 +308,8 @@ impl<'a> SyncEngine<'a> {
       Some(branch_name)
     };
 
-    let mut conflicts = Vec::new();
+    // Pre-allocate for expected conflicts (typically a small fraction of commits)
+    let mut conflicts = Vec::with_capacity(commits_to_sync.len().min(16));
 
     // Process commits (we already filtered to only those needing sync above)
     progress!("   Syncing {} commits from remote...", commits_to_sync.len());
@@ -363,19 +364,13 @@ impl<'a> SyncEngine<'a> {
       progress!("   git push origin {}", branch_name);
 
       // Try to detect GitHub URL and suggest gh CLI command
-      if let Ok(output) = std::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(self.ctx.workspace_root())
-        .output()
-        && let Ok(url) = String::from_utf8(output.stdout)
+      if let Ok(Some(url)) = self.ctx.git.git().get_config("remote.origin.url")
+        && url.contains("github.com")
       {
-        let url = url.trim();
-        if url.contains("github.com") {
-          progress!(
-            "   gh pr create --title \"Sync {} from remote\"",
-            self.config.crate_name
-          );
-        }
+        progress!(
+          "   gh pr create --title \"Sync {} from remote\"",
+          self.config.crate_name
+        );
       }
       progress!();
     }
@@ -487,9 +482,10 @@ impl<'a> SyncEngine<'a> {
     }
 
     // Bulk read all files that need to be added/modified (single git call instead of N calls)
-    let bulk_items: Vec<(String, PathBuf)> = modifications
+    // Uses references to avoid cloning SHA and paths for each file
+    let bulk_items: Vec<(&str, &Path)> = modifications
       .iter()
-      .map(|(path, _)| (commit.sha.clone(), path.clone()))
+      .map(|(path, _)| (commit.sha.as_str(), path.as_path()))
       .collect();
 
     let file_contents = if !bulk_items.is_empty() {
@@ -591,9 +587,10 @@ impl<'a> SyncEngine<'a> {
     }
 
     // Bulk read all files that need to be added/modified (single git call instead of N calls)
-    let bulk_items: Vec<(String, PathBuf)> = modifications
+    // Uses references to avoid cloning SHA and paths for each file
+    let bulk_items: Vec<(&str, &Path)> = modifications
       .iter()
-      .map(|(remote_path, _, _)| (commit.sha.clone(), (*remote_path).clone()))
+      .map(|(remote_path, _, _)| (commit.sha.as_str(), (*remote_path).as_path()))
       .collect();
 
     let file_contents = if !bulk_items.is_empty() {
@@ -682,8 +679,6 @@ impl<'a> SyncEngine<'a> {
     remote_commit: &crate::git::CommitInfo,
     remote_git: &SystemGit,
   ) -> RailResult<ConflictResolutionResult> {
-    let mut conflicts = Vec::new();
-
     // Get files changed in this remote commit
     let changed_files = remote_git.get_changed_files(&remote_commit.sha)?;
 
@@ -706,7 +701,8 @@ impl<'a> SyncEngine<'a> {
     };
 
     // Identify conflicting files (files modified on both sides)
-    let mut conflicting_files = Vec::new();
+    // Pre-allocate for worst case (all files conflict) - typically much smaller
+    let mut conflicting_files = Vec::with_capacity(changed_files.len());
     for (remote_path, _) in &changed_files {
       let mono_path = self.map_remote_path_to_mono(remote_path)?;
       let full_mono_path = self.ctx.workspace_root().join(&mono_path);
@@ -728,15 +724,23 @@ impl<'a> SyncEngine<'a> {
       conflicting_files.push((remote_path.clone(), mono_path, full_mono_path));
     }
 
-    // Bulk read base and incoming versions for all conflicting files
-    let base_items: Vec<(String, PathBuf)> = conflicting_files
-      .iter()
-      .filter_map(|(_, mono_path, _)| last_synced.as_ref().map(|sha| (sha.clone(), mono_path.clone())))
-      .collect();
+    // Pre-allocate conflicts vec now that we know the size
+    let mut conflicts = Vec::with_capacity(conflicting_files.len());
 
-    let incoming_items: Vec<(String, PathBuf)> = conflicting_files
+    // Bulk read base and incoming versions for all conflicting files
+    // Uses references to avoid cloning SHA and paths for each file
+    let base_items: Vec<(&str, &Path)> = if let Some(ref sha) = last_synced {
+      conflicting_files
+        .iter()
+        .map(|(_, mono_path, _)| (sha.as_str(), mono_path.as_path()))
+        .collect()
+    } else {
+      vec![]
+    };
+
+    let incoming_items: Vec<(&str, &Path)> = conflicting_files
       .iter()
-      .map(|(remote_path, _, _)| (remote_commit.sha.clone(), remote_path.clone()))
+      .map(|(remote_path, _, _)| (remote_commit.sha.as_str(), remote_path.as_path()))
       .collect();
 
     let base_contents = if !base_items.is_empty() {

@@ -6,6 +6,7 @@
 use crate::error::RailResult;
 use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use semver::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -44,7 +45,8 @@ impl TargetMetadataEntry {
 #[derive(Clone)]
 pub struct MultiTargetMetadata {
   /// Metadata per target (or "default" if no targets specified)
-  cache: HashMap<String, TargetMetadataEntry>,
+  /// Uses FxHashMap for faster String key lookups
+  cache: FxHashMap<String, TargetMetadataEntry>,
 }
 
 impl MultiTargetMetadata {
@@ -55,8 +57,8 @@ impl MultiTargetMetadata {
     // If no targets specified, load default metadata
     if targets.is_empty() {
       let metadata = Self::load_single_target(&workspace_root, None)?;
-      let mut cache = HashMap::new();
-      cache.insert("default".to_string(), TargetMetadataEntry::new(metadata));
+      let mut cache = FxHashMap::default();
+      cache.insert(String::from("default"), TargetMetadataEntry::new(metadata));
       return Ok(Self { cache });
     }
 
@@ -70,7 +72,7 @@ impl MultiTargetMetadata {
       .collect();
 
     // Collect results, propagating any errors
-    let mut cache = HashMap::new();
+    let mut cache = FxHashMap::default();
     for result in results {
       let (target, metadata) = result?;
       cache.insert(target, TargetMetadataEntry::new(metadata));
@@ -88,7 +90,7 @@ impl MultiTargetMetadata {
 
     // Add target filtering if specified
     if let Some(target_triple) = target {
-      cmd.other_options(vec!["--filter-platform".to_string(), target_triple.to_string()]);
+      cmd.other_options(vec![String::from("--filter-platform"), String::from(target_triple)]);
     }
 
     // IMPORTANT: NO --all-features! We want cargo's default resolution
@@ -150,19 +152,22 @@ impl MultiTargetMetadata {
   /// Returns map of target -> version
   /// NOTE: This includes transitive dependencies - use direct_dep_versions() for direct deps only
   pub fn all_versions(&self, dep_name: &str) -> HashMap<String, Version> {
-    let mut versions = HashMap::new();
+    let mut versions = HashMap::with_capacity(self.cache.len());
 
     for (target, entry) in &self.cache {
       let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
         // Find the package in the resolved graph
-        for node in &resolve.nodes {
-          if let Some(pkg) = entry.package_by_id(&node.id)
-            && pkg.name == dep_name
-          {
-            versions.insert(target.clone(), pkg.version.clone());
-            break; // Found it for this target
-          }
+        // Clone target/version only when we find a match (outside inner loop)
+        let found_version = resolve.nodes.iter().find_map(|node| {
+          entry
+            .package_by_id(&node.id)
+            .filter(|pkg| pkg.name == dep_name)
+            .map(|pkg| pkg.version.clone())
+        });
+
+        if let Some(version) = found_version {
+          versions.insert(target.clone(), version);
         }
       }
     }
@@ -178,7 +183,7 @@ impl MultiTargetMetadata {
   /// Note: Within each target, cargo's resolver produces exactly ONE version per crate.
   /// We return that resolved version for each target where the dep is a direct dependency.
   pub fn direct_dep_versions(&self, dep_name: &str) -> HashMap<String, Version> {
-    let mut versions = HashMap::new();
+    let mut versions = HashMap::with_capacity(self.cache.len());
 
     for (target, entry) in &self.cache {
       let metadata = &entry.metadata;
@@ -186,24 +191,23 @@ impl MultiTargetMetadata {
       let workspace_member_ids: HashSet<_> = metadata.workspace_packages().iter().map(|p| &p.id).collect();
 
       if let Some(resolve) = &metadata.resolve {
-        // Look at direct dependencies of workspace members only
-        for node in &resolve.nodes {
-          // Skip if not a workspace member
-          if !workspace_member_ids.contains(&node.id) {
-            continue;
-          }
+        // Find first workspace member that has dep_name as a direct dependency
+        // Clone target/version only once when found (outside inner loops)
+        let found_version = resolve
+          .nodes
+          .iter()
+          .filter(|node| workspace_member_ids.contains(&node.id))
+          .find_map(|node| {
+            node
+              .deps
+              .iter()
+              .find(|dep| dep.name == dep_name)
+              .and_then(|dep| entry.package_by_id(&dep.pkg))
+              .map(|pkg| pkg.version.clone())
+          });
 
-          // Check if this workspace member has dep_name as a direct dependency
-          for dep in &node.deps {
-            if dep.name == dep_name {
-              // Found a direct dependency - get its resolved version
-              if let Some(pkg) = entry.package_by_id(&dep.pkg) {
-                // Cargo resolves to exactly one version per target - just record it
-                versions.insert(target.clone(), pkg.version.clone());
-                break; // Found for this workspace member, move on
-              }
-            }
-          }
+        if let Some(version) = found_version {
+          versions.insert(target.clone(), version);
         }
       }
     }
@@ -214,32 +218,27 @@ impl MultiTargetMetadata {
   /// Check if a dependency is transitive-only (never in direct deps)
   pub fn is_transitive_only(&self, dep_name: &str) -> bool {
     // Check all workspace packages to see if any directly depend on this
-    for entry in self.cache.values() {
-      let metadata = &entry.metadata;
-      for pkg in metadata.workspace_packages() {
-        for dep in &pkg.dependencies {
-          if dep.name == dep_name {
-            return false; // Found in direct deps
-          }
-        }
-      }
+    let is_direct_dep = self.cache.values().any(|entry| {
+      entry
+        .metadata
+        .workspace_packages()
+        .iter()
+        .any(|pkg| pkg.dependencies.iter().any(|dep| dep.name == dep_name))
+    });
+
+    if is_direct_dep {
+      return false;
     }
 
     // Check if it exists in the resolved graph at all
-    for entry in self.cache.values() {
-      let metadata = &entry.metadata;
-      if let Some(resolve) = &metadata.resolve {
-        for node in &resolve.nodes {
-          if let Some(pkg) = entry.package_by_id(&node.id)
-            && pkg.name == dep_name
-          {
-            return true; // In graph but not direct = transitive
-          }
-        }
-      }
-    }
-
-    false // Not in graph at all
+    self.cache.values().any(|entry| {
+      entry.metadata.resolve.as_ref().is_some_and(|resolve| {
+        resolve
+          .nodes
+          .iter()
+          .any(|node| entry.package_by_id(&node.id).is_some_and(|pkg| pkg.name == dep_name))
+      })
+    })
   }
 
   /// Check if a dependency is a path/workspace dependency (not from a registry)
@@ -248,46 +247,41 @@ impl MultiTargetMetadata {
   /// These cannot be pinned in workspace.dependencies without a registry source,
   /// so we skip them during transitive pinning.
   pub fn is_path_dependency(&self, dep_name: &str) -> bool {
-    for entry in self.cache.values() {
-      let metadata = &entry.metadata;
-      for pkg in &metadata.packages {
-        if pkg.name == dep_name {
-          // source is None for path deps and workspace members
-          // source is Some("registry+...") for published deps
-          return pkg.source.is_none();
-        }
-      }
-    }
-    false
+    // source is None for path deps and workspace members
+    // source is Some("registry+...") for published deps
+    self
+      .cache
+      .values()
+      .flat_map(|entry| &entry.metadata.packages)
+      .find(|pkg| pkg.name == dep_name)
+      .is_some_and(|pkg| pkg.source.is_none())
   }
 
   /// Get features enabled for a package across all targets
   /// Returns map of target -> set of features
   pub fn all_features(&self, dep_name: &str) -> HashMap<String, HashSet<String>> {
-    let mut features = HashMap::new();
+    let mut features = HashMap::with_capacity(self.cache.len());
 
     for (target, entry) in &self.cache {
       let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
-        for node in &resolve.nodes {
-          // Find the package
-          if let Some(pkg) = entry.package_by_id(&node.id)
-            && pkg.name == dep_name
-          {
-            // Get the features for this node
-            let feat_set: HashSet<String> = node
-              .features
-              .iter()
-              .filter(|f| {
-                // Filter out non-existent features (cargo metadata quirk)
-                pkg.features.contains_key(f.as_str())
-              })
-              .map(|f| f.to_string())
-              .collect();
+        // Find the package and collect features - clone target only once when found
+        let found_features = resolve.nodes.iter().find_map(|node| {
+          entry
+            .package_by_id(&node.id)
+            .filter(|pkg| pkg.name == dep_name)
+            .map(|pkg| {
+              node
+                .features
+                .iter()
+                .filter(|f| pkg.features.contains_key(f.as_str()))
+                .map(|f| f.to_string())
+                .collect::<HashSet<String>>()
+            })
+        });
 
-            features.insert(target.clone(), feat_set);
-            break;
-          }
+        if let Some(feat_set) = found_features {
+          features.insert(target.clone(), feat_set);
         }
       }
     }
@@ -319,18 +313,19 @@ impl MultiTargetMetadata {
 
   /// Check which targets include a specific dependency (sorted for deterministic output)
   pub fn targets_with_dep(&self, dep_name: &str) -> Vec<String> {
-    let mut targets = Vec::new();
+    let mut targets = Vec::with_capacity(self.cache.len());
 
     for (target, entry) in &self.cache {
       let metadata = &entry.metadata;
       if let Some(resolve) = &metadata.resolve {
-        for node in &resolve.nodes {
-          if let Some(pkg) = entry.package_by_id(&node.id)
-            && pkg.name == dep_name
-          {
-            targets.push(target.clone());
-            break;
-          }
+        // Check if any node matches - clone target only once when found
+        let has_dep = resolve
+          .nodes
+          .iter()
+          .any(|node| entry.package_by_id(&node.id).is_some_and(|pkg| pkg.name == dep_name));
+
+        if has_dep {
+          targets.push(target.clone());
         }
       }
     }
@@ -344,30 +339,27 @@ impl MultiTargetMetadata {
   pub fn find_fragmented_transitives(&self) -> Vec<FragmentedTransitive> {
     let mut transitives = Vec::new();
 
-    // Find all transitive-only deps
-    let mut all_deps = HashSet::new();
-    for entry in self.cache.values() {
-      let metadata = &entry.metadata;
-      if let Some(resolve) = &metadata.resolve {
-        for node in &resolve.nodes {
-          if let Some(pkg) = entry.package_by_id(&node.id) {
-            all_deps.insert(pkg.name.clone());
-          }
-        }
-      }
-    }
+    // Find all transitive-only deps - use flat_map to avoid nested loops with clones
+    let all_deps: HashSet<&str> = self
+      .cache
+      .values()
+      .filter_map(|entry| entry.metadata.resolve.as_ref())
+      .flat_map(|resolve| &resolve.nodes)
+      .filter_map(|node| self.cache.values().find_map(|entry| entry.package_by_id(&node.id)))
+      .map(|pkg| pkg.name.as_str())
+      .collect();
 
     for dep_name in all_deps {
-      if !self.is_transitive_only(&dep_name) {
+      if !self.is_transitive_only(dep_name) {
         continue; // Skip direct deps
       }
 
       // Skip path dependencies - they can't be pinned from a registry
-      if self.is_path_dependency(&dep_name) {
+      if self.is_path_dependency(dep_name) {
         continue;
       }
 
-      let features = self.all_features(&dep_name);
+      let features = self.all_features(dep_name);
       // Convert to sorted Vecs for stable comparison (HashSet iteration is non-deterministic)
       let unique_sets: HashSet<_> = features
         .values()
@@ -395,7 +387,7 @@ impl MultiTargetMetadata {
           .unwrap_or_default();
 
         // Get the resolved version (use highest across all targets)
-        let versions = self.all_versions(&dep_name);
+        let versions = self.all_versions(dep_name);
         let version = match versions.values().max() {
           Some(v) => v.clone(),
           None => continue, // Skip if we can't determine version

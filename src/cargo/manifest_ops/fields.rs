@@ -6,10 +6,10 @@ use toml_edit::{Array, InlineTable, Item, Table, Value};
 // Feature Array Operations
 
 /// Build feature array from strings
-pub fn build_feature_array(features: &[String]) -> Value {
+pub fn build_feature_array<S: AsRef<str>>(features: &[S]) -> Value {
   let mut array = Array::new();
   for feature in features {
-    array.push(feature.as_str());
+    array.push(feature.as_ref());
   }
   Value::from(array)
 }
@@ -41,12 +41,12 @@ fn extract_features_from_table(table: &Table) -> Option<Vec<String>> {
 }
 
 /// Update or add features in dependency entry
-pub fn set_features(item: &mut Item, features: Vec<String>) -> RailResult<()> {
+pub fn set_features<S: AsRef<str>>(item: &mut Item, features: &[S]) -> RailResult<()> {
   if let Some(table) = item.as_inline_table_mut() {
-    table.insert("features", build_feature_array(&features));
+    table.insert("features", build_feature_array(features));
     Ok(())
   } else if let Some(table) = item.as_table_mut() {
-    table.insert("features", Item::Value(build_feature_array(&features)));
+    table.insert("features", Item::Value(build_feature_array(features)));
     Ok(())
   } else {
     Err(RailError::message("cannot set features: item is not a table"))
@@ -98,7 +98,7 @@ mod tests {
     table.insert("version", Value::from("1.0"));
     let mut item = Item::Value(Value::InlineTable(table));
 
-    set_features(&mut item, vec!["new".to_string()]).unwrap();
+    set_features(&mut item, &["new".to_string()]).unwrap();
 
     let features = extract_features(&item).unwrap();
     assert_eq!(features, vec!["new"]);

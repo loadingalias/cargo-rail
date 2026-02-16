@@ -6,6 +6,7 @@
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::TransitivePin;
 use crate::progress;
+use std::sync::Arc;
 
 /// Plans transitive dependency pinning
 pub struct TransitivePlanner<'a> {
@@ -29,9 +30,9 @@ impl<'a> TransitivePlanner<'a> {
     fragmented
       .into_iter()
       .map(|f| TransitivePin {
-        name: f.name,
+        name: Arc::from(f.name),
         version: f.version,
-        features: f.unified_features,
+        features: f.unified_features.into_iter().map(Arc::from).collect(),
       })
       .collect()
   }

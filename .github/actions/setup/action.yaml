@@ -47,7 +47,7 @@ runs:
     - name: Install cargo-rail
       uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
       with:
-        tool: cargo-rail@0.10.0
+        tool: cargo-rail@0.10.1
 
     - name: Install Rust Nightly Toolchain
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # master

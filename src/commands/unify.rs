@@ -132,11 +132,14 @@ pub fn run_unify_analyze(
       "check": true,
       "msrv_write_needed": msrv_write_needed,
       "has_changes": has_changes,
-      "workspace_deps": plan.workspace_deps.iter().map(|d| serde_json::json!({
-        "name": d.name,
-        "version": d.version_req,
-        "features": d.features,
-      })).collect::<Vec<_>>(),
+      "workspace_deps": plan.workspace_deps.iter().map(|d| {
+        let features: Vec<&str> = d.features.iter().map(|f| &**f).collect();
+        serde_json::json!({
+          "name": &*d.name,
+          "version": d.version_req,
+          "features": features,
+        })
+      }).collect::<Vec<_>>(),
       "summary": {
         "workspace_deps_count": plan.workspace_deps.len(),
         "member_edits_count": plan.member_edit_count(),
@@ -150,9 +153,9 @@ pub fn run_unify_analyze(
       },
       "has_blocking_issues": plan.has_blocking_issues(),
       "issues": plan.issues.iter().map(|i| serde_json::json!({
-        "dep_name": i.dep_name,
+        "dep_name": &*i.dep_name,
         "severity": format!("{:?}", i.severity),
-        "message": i.message,
+        "message": &*i.message,
       })).collect::<Vec<_>>(),
       "action_plan": canonical_actions,
       "reason_codes": reason_codes,
@@ -255,7 +258,7 @@ pub fn run_unify_analyze(
         .member_paths
         .get(member)
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| member.clone());
+        .unwrap_or_else(|| member.to_string());
       outln!(sink, "{}:", path);
       for edit in edits {
         match edit {
@@ -354,11 +357,7 @@ pub fn run_unify_analyze(
     eprintln!();
     crate::error!("validation errors:");
     for val in failed_validations {
-      eprintln!(
-        "  {}: {}",
-        val.target,
-        val.error.as_ref().unwrap_or(&"unknown".to_string())
-      );
+      eprintln!("  {}: {}", val.target, val.error.as_deref().unwrap_or("unknown"));
     }
   }
 
@@ -498,7 +497,8 @@ pub fn run_unify_apply(
       progress!("creating backup...");
     }
 
-    let mut files_to_backup = Vec::new();
+    // Estimate: root Cargo.toml + one per member with edits
+    let mut files_to_backup = Vec::with_capacity(1 + plan.member_edits.len());
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
       files_to_backup.push(PathBuf::from("Cargo.toml"));
     }
@@ -561,7 +561,7 @@ pub fn run_unify_apply(
             if local_features.is_empty() {
               None
             } else {
-              Some(local_features.clone())
+              Some(local_features.as_slice())
             },
             *is_optional,
           )?;
@@ -991,9 +991,9 @@ fn build_unify_mutation_plan(
   no_report: bool,
   report_path: Option<&std::path::PathBuf>,
 ) -> RailResult<mutation::MutationPlan> {
-  let mut actions = Vec::new();
-  let mut risks = Vec::new();
-  let mut trace = Vec::new();
+  let mut actions = Vec::with_capacity(8); // Typically few distinct action types
+  let mut risks = Vec::with_capacity(4);
+  let mut trace = Vec::with_capacity(8);
 
   if !plan.workspace_deps.is_empty() {
     actions.push(MutationAction::new(

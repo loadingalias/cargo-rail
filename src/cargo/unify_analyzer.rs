@@ -18,18 +18,20 @@ use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::{RailResult, ResultExt};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
+use rustc_hash::{FxHashMap, FxHashSet};
 use semver::VersionReq;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Analyzes workspace for dependency unifications
 pub struct UnifyAnalyzer {
-  metadata: MultiTargetMetadata,
+  /// Multi-target metadata (Arc for cheap sharing - avoids expensive clone)
+  metadata: Arc<MultiTargetMetadata>,
   manifests: ManifestAnalyzer,
   /// Configuration for unification behavior (can be overridden at runtime)
   pub config: UnifyConfig,
   /// Existing workspace dependencies (already in [workspace.dependencies])
-  existing_workspace_deps: HashMap<String, ExistingWorkspaceDep>,
+  existing_workspace_deps: FxHashMap<String, ExistingWorkspaceDep>,
   /// Workspace root path (for path normalization)
   workspace_root: PathBuf,
 }
@@ -38,8 +40,8 @@ impl UnifyAnalyzer {
   /// Create a new analyzer from workspace context
   pub fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
     // Get multi-target metadata (lazily loaded on first access)
-    // This clones the inner data (required for ownership by this analyzer)
-    let metadata = (*ctx.multi_target_metadata()?).clone();
+    // Uses Arc::clone for cheap reference counting instead of cloning the entire cache
+    let metadata = ctx.multi_target_metadata()?;
 
     // Parse all manifests once
     let workspace_packages = metadata.workspace_packages();
@@ -97,25 +99,26 @@ impl UnifyAnalyzer {
 
   /// Analyze workspace and generate unification plan
   pub fn analyze(&self) -> RailResult<UnificationPlan> {
-    let mut workspace_deps = Vec::new();
-    let mut member_edits: HashMap<String, Vec<MemberEdit>> = HashMap::new();
-    let mut member_paths: HashMap<String, PathBuf> = HashMap::new();
-    let mut issues = Vec::new();
-    let mut duplicates_cleaned = Vec::new();
-    let mut version_mismatches = Vec::new();
+    let dep_count = self.manifests.all_dependencies().len();
+    let mut workspace_deps = Vec::with_capacity(dep_count);
+    let mut member_edits: FxHashMap<Arc<str>, Vec<MemberEdit>> = FxHashMap::default();
+    let mut member_paths: FxHashMap<Arc<str>, PathBuf> = FxHashMap::default();
+    let mut issues = Vec::with_capacity(16); // Issues are rare, small pre-alloc
+    let mut duplicates_cleaned = Vec::with_capacity(8);
+    let mut version_mismatches = Vec::with_capacity(8);
 
     // Pre-compute workspace member names for reuse
-    let workspace_member_names: HashSet<String> = self
+    let workspace_member_names: FxHashSet<Arc<str>> = self
       .metadata
       .workspace_packages()
       .iter()
-      .map(|pkg| pkg.name.to_string())
+      .map(|pkg| Arc::from(pkg.name.as_str()))
       .collect();
 
     // Build member_paths mapping from metadata
     for pkg in self.metadata.workspace_packages() {
       let manifest_path = pkg.manifest_path.clone().into_std_path_buf();
-      member_paths.insert(pkg.name.to_string(), manifest_path);
+      member_paths.insert(Arc::from(pkg.name.as_str()), manifest_path);
     }
 
     progress!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
@@ -135,27 +138,27 @@ impl UnifyAnalyzer {
           MajorVersionConflict::Warn => {
             // Skip unification, emit warning - both versions stay in the graph
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.to_string(),
+              dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
-              message: format!(
+              message: Arc::from(format!(
                 "Multiple major versions detected (majors: {}) - skipping unification. \
                  Consider consolidating to a single major version to reduce duplicate compilation, \
                  or set major_version_conflict = \"bump\" to force unification to highest version.",
                 versions_str.join(", ")
-              ),
+              )),
             });
             continue; // Skip this dependency, continue with others
           }
           MajorVersionConflict::Bump => {
             // Emit warning but continue with unification to highest version
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.to_string(),
+              dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
-              message: format!(
+              message: Arc::from(format!(
                 "Multiple major versions detected (majors: {}) - bumping to highest resolved version. \
                  This may break crates depending on older major versions.",
                 versions_str.join(", ")
-              ),
+              )),
             });
             // Don't continue - fall through to use highest resolved version
           }
@@ -175,11 +178,12 @@ impl UnifyAnalyzer {
           }
           ExactPinHandling::Warn => {
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.to_string(),
+              dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
-              message: "Has exact version pin (=x.y.z) - converting to caret (^). \
-                        Consider adding to unify.exclude or setting exact_pin_handling = \"skip\""
-                .to_string(),
+              message: Arc::from(
+                "Has exact version pin (=x.y.z) - converting to caret (^). \
+                        Consider adding to unify.exclude or setting exact_pin_handling = \"skip\"",
+              ),
             });
           }
           ExactPinHandling::Preserve => {
@@ -196,7 +200,7 @@ impl UnifyAnalyzer {
       }
 
       // Get unique versions across all targets
-      let unique_versions: HashSet<_> = versions.values().collect();
+      let unique_versions: FxHashSet<_> = versions.values().collect();
 
       // Always use highest version (cargo's resolver already picks highest compatible)
       // When targets resolve to different versions, we unify to highest
@@ -204,12 +208,12 @@ impl UnifyAnalyzer {
         Some(max) if unique_versions.len() > 1 => {
           // Multiple versions found across targets - use highest
           // This is the "silent win" - we unify duplicates automatically
-          let mut versions_found: Vec<_> = unique_versions.iter().map(|v| v.to_string()).collect();
+          let mut versions_found: Vec<Arc<str>> = unique_versions.iter().map(|v| Arc::from(v.to_string())).collect();
           versions_found.sort();
           duplicates_cleaned.push(DuplicateCleanup {
-            dep_name: dep_key.name.to_string(),
+            dep_name: Arc::clone(&dep_key.name),
             versions_found,
-            selected_version: max.to_string(),
+            selected_version: Arc::from(max.to_string()),
           });
           max
         }
@@ -245,10 +249,10 @@ impl UnifyAnalyzer {
             && !versions_compatible(declared, ws_version)
           {
             version_mismatches.push(VersionMismatch {
-              member: usage.used_by.to_string(),
-              dep_name: dep_key.name.to_string(),
-              member_version: declared.clone(),
-              workspace_version: ws_version.clone(),
+              member: Arc::clone(&usage.used_by),
+              dep_name: Arc::clone(&dep_key.name),
+              member_version: Arc::from(declared.as_str()),
+              workspace_version: Arc::from(ws_version.as_str()),
             });
 
             // Add as issue based on strictness config
@@ -258,13 +262,13 @@ impl UnifyAnalyzer {
               IssueSeverity::Warning
             };
             issues.push(UnifyIssue {
-              dep_name: dep_key.name.to_string(),
+              dep_name: Arc::clone(&dep_key.name),
               severity,
-              message: format!(
+              message: Arc::from(format!(
                 "{} declares \"{}\" but workspace.dependencies has \"{}\". \
                  Converting to workspace = true may break this crate.",
                 usage.used_by, declared, ws_version
-              ),
+              )),
             });
           }
         }
@@ -321,8 +325,8 @@ impl UnifyAnalyzer {
       // it's cleaner to keep target constraints where they're used.
       let target = None;
 
-      // Get users - convert Arc<str> to String for output
-      let users: HashSet<String> = usage_sites.iter().map(|u| u.used_by.to_string()).collect();
+      // Get users - use Arc<str> to share allocations
+      let users: FxHashSet<Arc<str>> = usage_sites.iter().map(|u| Arc::clone(&u.used_by)).collect();
 
       // Check include_paths config before processing path dependencies
       let dep_path: Option<PathBuf> = if self.config.include_paths {
@@ -330,7 +334,7 @@ impl UnifyAnalyzer {
         // If so, check if the dep is a workspace member to include path in workspace.dependencies
         usage_sites.iter().find_map(|u| {
           u.path.as_ref().and_then(|p| {
-            if !workspace_member_names.contains(&*dep_key.name) {
+            if !workspace_member_names.iter().any(|m| &**m == &*dep_key.name) {
               return None;
             }
             // Normalize path relative to workspace root using helper
@@ -345,7 +349,7 @@ impl UnifyAnalyzer {
       };
 
       // Compute the unified features (this is what workspace.dependencies should have)
-      let computed_features: Vec<String> = features.into_iter().collect();
+      let computed_features: Vec<Arc<str>> = features.into_iter().map(Arc::from).collect();
 
       // Check if this dep already exists in workspace.dependencies
       let existing_dep = self.existing_workspace_deps.get(&*dep_key.name);
@@ -355,9 +359,9 @@ impl UnifyAnalyzer {
       let needs_workspace_update = match existing_dep {
         None => true, // Doesn't exist, need to add
         Some(existing) => {
-          // Check if features are different
-          let mut existing_features: Vec<String> = existing.features.clone();
-          let mut computed: Vec<String> = computed_features.clone();
+          // Check if features are different (compare as &str)
+          let mut existing_features: Vec<&str> = existing.features.iter().map(String::as_str).collect();
+          let mut computed: Vec<&str> = computed_features.iter().map(|s| &**s).collect();
           existing_features.sort();
           computed.sort();
 
@@ -375,7 +379,7 @@ impl UnifyAnalyzer {
       // Create unified dep if workspace needs update
       if needs_workspace_update {
         let unified = UnifiedDep {
-          name: dep_key.name.to_string(),
+          name: Arc::clone(&dep_key.name),
           version_req,
           features: workspace_features.clone(),
           default_features,
@@ -391,11 +395,12 @@ impl UnifyAnalyzer {
       // This happens whether or not the dep already exists in workspace.dependencies
       for usage in usage_sites {
         // Compute local features (member features - workspace features)
-        let local_features: Vec<_> = usage
+        // Convert to Arc<str> and filter out features already in workspace
+        let local_features: Vec<Arc<str>> = usage
           .unconditional_features
           .iter()
-          .filter(|f| !workspace_features.contains(f))
-          .cloned()
+          .filter(|f| !workspace_features.iter().any(|wf| &**wf == *f))
+          .map(|f| Arc::from(f.as_str()))
           .collect();
 
         // Use the cargo_toml_key from the usage - this is the actual key in Cargo.toml
@@ -403,14 +408,14 @@ impl UnifyAnalyzer {
         // This is critical for include_renamed mode where usage_sites are aggregated
         // across multiple dep_keys for the same package
         let edit = MemberEdit::UseWorkspace {
-          dep_name: usage.cargo_toml_key.to_string(),
+          dep_name: Arc::clone(&usage.cargo_toml_key),
           dep_kind: usage.kind,
-          target: usage.target.clone(), // Preserve target for correct section
+          target: usage.target.as_ref().map(|t| Arc::from(t.as_str())), // Preserve target for correct section
           local_features,
           is_optional: usage.optional,
         };
 
-        member_edits.entry(usage.used_by.to_string()).or_default().push(edit);
+        member_edits.entry(Arc::clone(&usage.used_by)).or_default().push(edit);
       }
     }
 
@@ -439,18 +444,19 @@ impl UnifyAnalyzer {
     if self.config.enforce_msrv_inheritance {
       if !self.config.msrv {
         issues.push(UnifyIssue {
-          dep_name: "rust-version".to_string(),
+          dep_name: Arc::from("rust-version"),
           severity: IssueSeverity::Warning,
-          message: "enforce_msrv_inheritance is enabled but unify.msrv is false; skipping MSRV inheritance enforcement"
-            .to_string(),
+          message: Arc::from(
+            "enforce_msrv_inheritance is enabled but unify.msrv is false; skipping MSRV inheritance enforcement",
+          ),
         });
       } else if computed_msrv.is_none() {
         issues.push(UnifyIssue {
-          dep_name: "rust-version".to_string(),
+          dep_name: Arc::from("rust-version"),
           severity: IssueSeverity::Warning,
-          message:
-            "enforce_msrv_inheritance is enabled but no workspace MSRV could be determined; skipping MSRV inheritance enforcement"
-              .to_string(),
+          message: Arc::from(
+            "enforce_msrv_inheritance is enabled but no workspace MSRV could be determined; skipping MSRV inheritance enforcement",
+          ),
         });
       } else {
         progress!("Enforcing MSRV inheritance on workspace members...");
@@ -459,7 +465,7 @@ impl UnifyAnalyzer {
             continue;
           }
           member_edits
-            .entry(member_name.clone())
+            .entry(Arc::clone(member_name))
             .or_default()
             .push(MemberEdit::EnforceMsrvInheritance);
         }
@@ -491,7 +497,7 @@ impl UnifyAnalyzer {
         unused_deps.len()
       );
       for (member, edits) in unused_finder.generate_removal_edits(&unused_deps) {
-        member_edits.entry(member).or_default().extend(edits);
+        member_edits.entry(Arc::from(member)).or_default().extend(edits);
       }
     }
 
@@ -518,34 +524,37 @@ impl UnifyAnalyzer {
       );
       for uf in &undeclared_features {
         let edit = MemberEdit::AddFeatures {
-          dep_name: uf.dep_name.clone(),
+          dep_name: Arc::clone(&uf.dep_name),
           dep_kind: uf.dep_kind,
           target: uf.target.clone(),
           features_to_add: uf.undeclared_features.clone(),
         };
-        member_edits.entry(uf.member.clone()).or_default().push(edit);
+        member_edits.entry(Arc::clone(&uf.member)).or_default().push(edit);
       }
     } else {
       // Add issues for undeclared features (warn mode)
       for uf in &undeclared_features {
+        let undeclared_str: Vec<&str> = uf.undeclared_features.iter().map(|s| &**s).collect();
+        let declared_str = if uf.declared_features.is_empty() {
+          "none".to_string()
+        } else {
+          let strs: Vec<&str> = uf.declared_features.iter().map(|s| &**s).collect();
+          strs.join(", ")
+        };
         issues.push(UnifyIssue {
-          dep_name: uf.dep_name.clone(),
+          dep_name: Arc::clone(&uf.dep_name),
           severity: IssueSeverity::Warning,
-          message: format!(
+          message: Arc::from(format!(
             "{} uses {} features [{}] but only declares [{}]. \
              This crate relies on feature unification from other workspace members. \
              After unification, standalone builds will fail. \
              Fix: Add the missing features to {}'s Cargo.toml.",
             uf.member,
             uf.dep_name,
-            uf.undeclared_features.join(", "),
-            if uf.declared_features.is_empty() {
-              "none".to_string()
-            } else {
-              uf.declared_features.join(", ")
-            },
+            undeclared_str.join(", "),
+            declared_str,
             uf.member,
-          ),
+          )),
         });
       }
     }
@@ -575,18 +584,19 @@ impl UnifyAnalyzer {
 
   /// Validate that the unification works for all targets
   fn validate_targets(&self) -> RailResult<Vec<ValidationResult>> {
-    let mut results = Vec::new();
+    let targets = self.metadata.targets();
+    let mut results = Vec::with_capacity(targets.len());
 
-    for target in self.metadata.targets() {
+    for target in targets {
       // Simple check: does metadata load successfully for this target?
       // In production, you might want to run `cargo check --target=X`
       let success = self.metadata.get(target).is_some();
 
       results.push(ValidationResult {
-        target: target.to_string(),
+        target: Arc::from(target),
         success,
         error: if !success {
-          Some("Failed to load metadata".to_string())
+          Some(Arc::from("Failed to load metadata"))
         } else {
           None
         },
@@ -594,6 +604,95 @@ impl UnifyAnalyzer {
     }
 
     Ok(results)
+  }
+
+  // ============================================================================
+  // Helper methods for detect_undeclared_features
+  // ============================================================================
+
+  /// Get workspace member package names
+  fn workspace_member_names(&self) -> FxHashSet<String> {
+    self
+      .metadata
+      .workspace_packages()
+      .iter()
+      .map(|p| p.name.to_string())
+      .collect()
+  }
+
+  /// Build workspace baseline features from [workspace.dependencies]
+  ///
+  /// These are workspace policy - members don't need to re-declare them.
+  fn workspace_baseline_features(&self) -> FxHashMap<String, FxHashSet<String>> {
+    self
+      .existing_workspace_deps
+      .iter()
+      .map(|(name, dep)| {
+        let mut feats: FxHashSet<String> = dep.features.iter().cloned().collect();
+        if dep.default_features {
+          feats.insert("default".to_string());
+        }
+        (name.clone(), feats)
+      })
+      .collect()
+  }
+
+  /// Track which members contribute which features (beyond workspace baseline)
+  ///
+  /// Returns (feature_sources, feature_is_target_specific):
+  /// - feature_sources: dep_name -> feature -> set of members that declare it
+  /// - feature_is_target_specific: dep_name -> feature -> true if ALL declarations are target-specific
+  fn track_feature_sources(
+    &self,
+    workspace_baseline: &FxHashMap<String, FxHashSet<String>>,
+  ) -> (
+    FxHashMap<String, FxHashMap<String, FxHashSet<String>>>,
+    FxHashMap<String, FxHashMap<String, bool>>,
+  ) {
+    let mut feature_sources: FxHashMap<String, FxHashMap<String, FxHashSet<String>>> = FxHashMap::default();
+    let mut feature_is_target_specific: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
+
+    for member in &self.manifests.members {
+      for (dep_key, usages) in &member.dependencies {
+        let baseline = workspace_baseline.get(&*dep_key.name);
+        // Compute dep name string once per (member, dep) pair instead of per-feature
+        let dep_name_str = dep_key.name.to_string();
+
+        for usage in usages {
+          let mut feats: FxHashSet<&String> = usage.unconditional_features.iter().collect();
+          feats.extend(usage.conditional_features.iter());
+
+          let is_target_specific = usage.target.is_some();
+
+          for feat in feats {
+            // Skip features in workspace baseline (workspace policy)
+            if baseline.is_some_and(|b| b.contains(feat)) {
+              continue;
+            }
+
+            // Clone dep_name_str once per feature instead of allocating twice
+            feature_sources
+              .entry(dep_name_str.clone())
+              .or_default()
+              .entry(feat.clone())
+              .or_default()
+              .insert(member.package_name.clone());
+
+            // Track target-specificity: only consider target-specific if ALL declarations are
+            let entry = feature_is_target_specific
+              .entry(dep_name_str.clone())
+              .or_default()
+              .entry(feat.clone())
+              .or_insert(true);
+            if !is_target_specific {
+              *entry = false;
+            }
+          }
+        }
+      }
+    }
+
+    (feature_sources, feature_is_target_specific)
   }
 
   /// Detect dependencies where resolved features exceed declared features
@@ -611,127 +710,19 @@ impl UnifyAnalyzer {
   /// - **Conditional features**: Features declared via `[features]` table (e.g.,
   ///   `my-feature = ["dep/feat"]`) count as declared - the author made an
   ///   intentional choice.
-  ///
-  /// Example:
-  /// - crate A declares: `backoff = "0.4"` (no features)
-  /// - crate B declares: `backoff = { version = "0.4", features = ["tokio"] }`
-  /// - crate A uses `backoff::future::retry()` which requires `features = ["futures"]`
-  /// - When building the whole workspace, A gets `futures` from B via unification
-  /// - After unification, A's standalone build fails
   fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
-    let mut undeclared = Vec::new();
+    let workspace_member_names = self.workspace_member_names();
+    let workspace_baseline = self.workspace_baseline_features();
+    let (feature_sources, feature_is_target_specific) = self.track_feature_sources(&workspace_baseline);
 
-    // Get workspace member names - we skip undeclared feature detection for these
-    // Workspace member deps often have optional features that change APIs (like `unicode-lines`)
-    // Adding them automatically would break code that wasn't written for those features
-    let workspace_member_names: HashSet<String> = self
-      .metadata
-      .workspace_packages()
-      .iter()
-      .map(|p| p.name.to_string())
-      .collect();
-
-    // Get workspace baseline (features declared in [workspace.dependencies])
-    // These are workspace policy - members don't need to re-declare them
-    let workspace_baseline: HashMap<String, HashSet<String>> = self
-      .existing_workspace_deps
-      .iter()
-      .map(|(name, dep)| {
-        let mut feats: HashSet<String> = dep.features.iter().cloned().collect();
-        if dep.default_features {
-          feats.insert("default".to_string());
-        }
-        (name.clone(), feats)
-      })
-      .collect();
-
-    // Build a map of what each member explicitly declares for each dependency
-    // Include both unconditional_features AND conditional_features (from [features] table)
-    // Also track which features each member contributes (for borrowed_from)
-    let mut member_declared_features: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
-
-    for member in &self.manifests.members {
-      let mut dep_features: HashMap<String, HashSet<String>> = HashMap::new();
-      for (dep_key, usages) in &member.dependencies {
-        let mut feats: HashSet<String> = HashSet::new();
-        for usage in usages {
-          feats.extend(usage.unconditional_features.iter().cloned());
-          // Include conditional features (from [features] table like `my-feat = ["dep/feature"]`)
-          // The author made an intentional choice - this counts as declared
-          feats.extend(usage.conditional_features.iter().cloned());
-          // If default_features = true (default), add "default"
-          if usage.default_features {
-            feats.insert("default".to_string());
-          }
-        }
-        dep_features.insert(dep_key.name.to_string(), feats);
-      }
-      member_declared_features.insert(member.package_name.clone(), dep_features);
-    }
-
-    // Track which members contribute which features (beyond workspace baseline)
-    // Also track if the feature declaration is target-specific (has a target constraint)
-    // Structure: dep_name -> feature -> (members, is_target_specific)
-    // A feature is target-specific if ALL its declarations have target constraints
-    let mut feature_sources: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
-    let mut feature_is_target_specific: HashMap<String, HashMap<String, bool>> = HashMap::new();
-
-    for member in &self.manifests.members {
-      for (dep_key, usages) in &member.dependencies {
-        let baseline = workspace_baseline.get(&*dep_key.name);
-
-        for usage in usages {
-          // Combine unconditional and conditional features
-          let mut feats: HashSet<&String> = usage.unconditional_features.iter().collect();
-          feats.extend(usage.conditional_features.iter());
-
-          let is_target_specific = usage.target.is_some();
-
-          for feat in feats {
-            // Skip features that are in workspace baseline (workspace policy)
-            if baseline.is_some_and(|b| b.contains(feat)) {
-              continue;
-            }
-
-            feature_sources
-              .entry(dep_key.name.to_string())
-              .or_default()
-              .entry(feat.clone())
-              .or_default()
-              .insert(member.package_name.clone());
-
-            // Track target-specificity: only consider target-specific if ALL declarations are
-            let entry = feature_is_target_specific
-              .entry(dep_key.name.to_string())
-              .or_default()
-              .entry(feat.clone())
-              .or_insert(true); // Start assuming target-specific
-            if !is_target_specific {
-              // Found a non-target-specific declaration, so it's not platform-specific
-              *entry = false;
-            }
-          }
-        }
-      }
-    }
-
-    // Track platform-specific features we skip (for warning output)
-    let mut skipped_platform_features: Vec<(String, String, String)> = Vec::new(); // (member, dep, feature)
-
-    // Track workspace member deps we skip (for warning output)
-    let mut skipped_workspace_member_deps: HashSet<String> = HashSet::new();
+    let mut undeclared = Vec::with_capacity(16);
+    let mut skipped_platform_features: Vec<(String, String, String)> = Vec::with_capacity(8);
+    let mut skipped_workspace_member_deps: FxHashSet<String> = FxHashSet::default();
 
     // Find borrowed features for each member
-    // A feature is borrowed if:
-    // - It's contributed by OTHER members (not this member)
-    // - It's NOT in workspace baseline (workspace policy doesn't count as borrowing)
-    // - It passes the skip filter (configurable via skip_undeclared_patterns)
-    // - It's NOT target-specific (all declarations have target constraints)
-    // - The dep is NOT a workspace member (their features are intentional opt-ins)
     for member in &self.manifests.members {
       for (dep_key, usages) in &member.dependencies {
-        // Skip workspace member deps entirely - their optional features are intentional
-        // opt-ins that may change APIs. Adding them would break code not written for them.
+        // Skip workspace member deps - their optional features are intentional opt-ins
         if workspace_member_names.contains(&*dep_key.name) {
           skipped_workspace_member_deps.insert(dep_key.name.to_string());
           continue;
@@ -743,63 +734,16 @@ impl UnifyAnalyzer {
 
         let target_specific_map = feature_is_target_specific.get(&*dep_key.name);
 
-        // Check each usage of this dep (can appear in multiple sections)
         for usage in usages {
-          // Get this usage's declared features (unconditional + conditional)
-          let mut declared: HashSet<String> = usage.unconditional_features.iter().cloned().collect();
-          declared.extend(usage.conditional_features.iter().cloned());
-          if usage.default_features {
-            declared.insert("default".to_string());
-          }
-
-          // Find features this member borrows from others
-          let mut borrowed_features: Vec<String> = Vec::new();
-          let mut borrowed_from_members: HashSet<String> = HashSet::new();
-
-          for (feat, sources) in feat_sources {
-            // Skip if this member declares the feature itself
-            if declared.contains(feat) {
-              continue;
-            }
-
-            // Skip if configured to skip this feature pattern
-            if self.config.should_skip_undeclared_feature(feat) {
-              continue;
-            }
-
-            // Skip if feature is target-specific (all declarations have target constraints)
-            // These can't be added unconditionally without breaking cross-platform builds
-            if let Some(ts_map) = target_specific_map
-              && ts_map.get(feat).copied().unwrap_or(false)
-            {
-              skipped_platform_features.push((member.package_name.clone(), dep_key.name.to_string(), feat.clone()));
-              continue;
-            }
-
-            // This feature is borrowed from other members and is safe to add
-            borrowed_features.push(feat.clone());
-            for source in sources {
-              if source != &member.package_name {
-                borrowed_from_members.insert(source.clone());
-              }
-            }
-          }
-
-          if !borrowed_features.is_empty() {
-            borrowed_features.sort();
-            let mut borrowed_from: Vec<String> = borrowed_from_members.into_iter().collect();
-            borrowed_from.sort();
-
-            undeclared.push(UndeclaredFeature {
-              member: member.package_name.clone(),
-              dep_name: dep_key.name.to_string(),
-              undeclared_features: borrowed_features,
-              declared_features: declared.into_iter().collect(),
-              resolved_features: feat_sources.keys().cloned().collect(),
-              dep_kind: usage.kind,
-              target: usage.target.clone(),
-              borrowed_from,
-            });
+          if let Some(borrowed) = self.find_borrowed_features_for_usage(
+            member,
+            dep_key,
+            usage,
+            feat_sources,
+            target_specific_map,
+            &mut skipped_platform_features,
+          ) {
+            undeclared.push(borrowed);
           }
         }
       }
@@ -820,6 +764,75 @@ impl UnifyAnalyzer {
     }
 
     undeclared
+  }
+
+  /// Find borrowed features for a single dependency usage
+  #[allow(clippy::too_many_arguments)]
+  fn find_borrowed_features_for_usage(
+    &self,
+    member: &crate::cargo::manifest_analyzer::ParsedManifest,
+    dep_key: &crate::cargo::manifest_analyzer::DepKey,
+    usage: &crate::cargo::manifest_analyzer::DepUsage,
+    feat_sources: &FxHashMap<String, FxHashSet<String>>,
+    target_specific_map: Option<&FxHashMap<String, bool>>,
+    skipped_platform_features: &mut Vec<(String, String, String)>,
+  ) -> Option<UndeclaredFeature> {
+    // Get this usage's declared features
+    let mut declared: FxHashSet<String> = usage.unconditional_features.iter().cloned().collect();
+    declared.extend(usage.conditional_features.iter().cloned());
+    if usage.default_features {
+      declared.insert("default".to_string());
+    }
+
+    let mut borrowed_features: Vec<Arc<str>> = Vec::with_capacity(feat_sources.len());
+    let mut borrowed_from_members: FxHashSet<Arc<str>> = FxHashSet::default();
+
+    for (feat, sources) in feat_sources {
+      // Skip if this member declares the feature itself
+      if declared.contains(feat) {
+        continue;
+      }
+
+      // Skip if configured to skip this feature pattern
+      if self.config.should_skip_undeclared_feature(feat) {
+        continue;
+      }
+
+      // Skip if feature is target-specific (all declarations have target constraints)
+      if let Some(ts_map) = target_specific_map
+        && ts_map.get(feat).copied().unwrap_or(false)
+      {
+        skipped_platform_features.push((member.package_name.clone(), dep_key.name.to_string(), feat.clone()));
+        continue;
+      }
+
+      // This feature is borrowed from other members
+      borrowed_features.push(Arc::from(feat.as_str()));
+      for source in sources {
+        if source != &member.package_name {
+          borrowed_from_members.insert(Arc::from(source.as_str()));
+        }
+      }
+    }
+
+    if borrowed_features.is_empty() {
+      return None;
+    }
+
+    borrowed_features.sort();
+    let mut borrowed_from: Vec<Arc<str>> = borrowed_from_members.into_iter().collect();
+    borrowed_from.sort();
+
+    Some(UndeclaredFeature {
+      member: Arc::from(member.package_name.as_str()),
+      dep_name: Arc::clone(&dep_key.name),
+      undeclared_features: borrowed_features,
+      declared_features: declared.into_iter().map(|s| Arc::from(s.as_str())).collect(),
+      resolved_features: feat_sources.keys().map(|s| Arc::from(s.as_str())).collect(),
+      dep_kind: usage.kind,
+      target: usage.target.as_ref().map(|t| Arc::from(t.as_str())),
+      borrowed_from,
+    })
   }
 }
 

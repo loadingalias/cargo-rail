@@ -51,9 +51,11 @@ pub fn set_json_mode(json: bool) {
 ///
 /// Always shown, even in quiet mode. Adds `error: ` prefix.
 ///
-/// ```ignore
-/// error!("failed to read file");
+/// ```no_run
+/// # fn main() {
+/// cargo_rail::error!("failed to read file");
 /// // Output: error: failed to read file
+/// # }
 /// ```
 #[macro_export]
 macro_rules! error {
@@ -66,9 +68,11 @@ macro_rules! error {
 ///
 /// Always shown, even in quiet mode. Adds `warning: ` prefix.
 ///
-/// ```ignore
-/// warn!("deprecated option will be removed in v2.0");
+/// ```no_run
+/// # fn main() {
+/// cargo_rail::warn!("deprecated option will be removed in v2.0");
 /// // Output: warning: deprecated option will be removed in v2.0
+/// # }
 /// ```
 #[macro_export]
 macro_rules! warn {
@@ -82,12 +86,14 @@ macro_rules! warn {
 /// Always shown, even in quiet mode. Adds `help: ` prefix.
 /// Typically used after an error to suggest a fix.
 ///
-/// ```ignore
-/// error!("missing required argument");
-/// help!("run with --help for usage");
+/// ```no_run
+/// # fn main() {
+/// cargo_rail::error!("missing required argument");
+/// cargo_rail::help!("run with --help for usage");
 /// // Output:
 /// // error: missing required argument
 /// // help: run with --help for usage
+/// # }
 /// ```
 #[macro_export]
 macro_rules! help {
@@ -101,9 +107,12 @@ macro_rules! help {
 /// Suppressed in quiet mode. No prefix added.
 /// Use for transient progress info like "analyzing...", "writing files...".
 ///
-/// ```ignore
-/// status!("analyzing {} crates...", crates.len());
-/// // Output: analyzing 42 crates...
+/// ```no_run
+/// # fn main() {
+/// # let crates = vec![1, 2, 3];
+/// cargo_rail::status!("analyzing {} crates...", crates.len());
+/// // Output: analyzing 3 crates...
+/// # }
 /// ```
 #[macro_export]
 macro_rules! status {
@@ -119,9 +128,12 @@ macro_rules! status {
 /// Suppressed in quiet mode. Adds `note: ` prefix.
 /// Use for non-critical informational messages.
 ///
-/// ```ignore
-/// note!("existing config found at {}", path.display());
+/// ```no_run
+/// # fn main() {
+/// # let path = std::path::Path::new("/project/.config/rail.toml");
+/// cargo_rail::note!("existing config found at {}", path.display());
 /// // Output: note: existing config found at /project/.config/rail.toml
+/// # }
 /// ```
 #[macro_export]
 macro_rules! note {

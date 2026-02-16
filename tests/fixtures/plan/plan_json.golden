@@ -34,6 +34,11 @@
     "workspace_root": "<WORKSPACE_ROOT>"
   },
   "plan_contract_version": 1,
+  "reproducibility": {
+    "cargo_rail_version": "<VERSION>",
+    "config_hash": "<CONFIG_HASH>",
+    "git_shallow_clone": false
+  },
   "surfaces": {
     "bench": {
       "enabled": false,
