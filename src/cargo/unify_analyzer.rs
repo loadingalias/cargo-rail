@@ -97,6 +97,27 @@ impl UnifyAnalyzer {
     PathBuf::from(dep_path)
   }
 
+  /// Normalize a workspace member directory path relative to the workspace root.
+  fn normalize_workspace_member_path(&self, member_manifest_path: &Path) -> PathBuf {
+    let member_dir = member_manifest_path.parent().unwrap_or(member_manifest_path);
+
+    let canonical_workspace = self
+      .workspace_root
+      .canonicalize()
+      .unwrap_or_else(|_| self.workspace_root.clone());
+    let canonical_member = member_dir.canonicalize().unwrap_or_else(|_| member_dir.to_path_buf());
+
+    if let Ok(relative) = canonical_member.strip_prefix(&canonical_workspace) {
+      return relative.to_path_buf();
+    }
+
+    if let Ok(relative) = member_dir.strip_prefix(&self.workspace_root) {
+      return relative.to_path_buf();
+    }
+
+    member_dir.to_path_buf()
+  }
+
   /// Analyze workspace and generate unification plan
   pub fn analyze(&self) -> RailResult<UnificationPlan> {
     let dep_count = self.manifests.all_dependencies().len();
@@ -107,18 +128,20 @@ impl UnifyAnalyzer {
     let mut duplicates_cleaned = Vec::with_capacity(8);
     let mut version_mismatches = Vec::with_capacity(8);
 
-    // Pre-compute workspace member names for reuse
-    let workspace_member_names: FxHashSet<Arc<str>> = self
-      .metadata
-      .workspace_packages()
-      .iter()
-      .map(|pkg| Arc::from(pkg.name.as_str()))
-      .collect();
+    // Pre-compute workspace member metadata for reuse.
+    let mut workspace_member_names: FxHashSet<Arc<str>> = FxHashSet::default();
+    let mut workspace_member_paths: FxHashMap<Arc<str>, PathBuf> = FxHashMap::default();
 
-    // Build member_paths mapping from metadata
+    // Build member_paths mapping from metadata (manifest file paths)
     for pkg in self.metadata.workspace_packages() {
+      let member_name = Arc::from(pkg.name.as_str());
       let manifest_path = pkg.manifest_path.clone().into_std_path_buf();
-      member_paths.insert(Arc::from(pkg.name.as_str()), manifest_path);
+      workspace_member_names.insert(Arc::clone(&member_name));
+      workspace_member_paths.insert(
+        Arc::clone(&member_name),
+        self.normalize_workspace_member_path(&manifest_path),
+      );
+      member_paths.insert(member_name, manifest_path);
     }
 
     progress!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
@@ -328,20 +351,17 @@ impl UnifyAnalyzer {
       // Get users - use Arc<str> to share allocations
       let users: FxHashSet<Arc<str>> = usage_sites.iter().map(|u| Arc::clone(&u.used_by)).collect();
 
-      // Check include_paths config before processing path dependencies
-      let dep_path: Option<PathBuf> = if self.config.include_paths {
-        // Check if any usage has a path (path dependencies)
-        // If so, check if the dep is a workspace member to include path in workspace.dependencies
+      // Workspace members must always carry `path` so member-to-member deps stay local.
+      // This prevents dual-resolution in fresh lockfiles (local member + crates.io package).
+      let dep_path: Option<PathBuf> = if workspace_member_names.contains(&dep_key.name) {
+        workspace_member_paths.get(&dep_key.name).cloned()
+      } else if self.config.include_paths {
+        // Include explicit path deps for non-member packages only when requested.
         usage_sites.iter().find_map(|u| {
           u.path.as_ref().and_then(|p| {
-            if !workspace_member_names.iter().any(|m| &**m == &*dep_key.name) {
-              return None;
-            }
-            // Normalize path relative to workspace root using helper
-            match &u.manifest_path {
-              Some(manifest_path) => Some(self.normalize_dep_path(manifest_path, p)),
-              None => Some(PathBuf::from(p)), // No manifest_path - use as-is (shouldn't happen)
-            }
+            u.manifest_path
+              .as_ref()
+              .map(|manifest_path| self.normalize_dep_path(manifest_path, p))
           })
         })
       } else {
@@ -365,8 +385,12 @@ impl UnifyAnalyzer {
           existing_features.sort();
           computed.sort();
 
-          // Also check if existing has path but we found one now
-          let path_differs = dep_path.is_some() && existing.path.is_none();
+          // Also check if existing path is missing or differs from resolved path.
+          let path_differs = match (&dep_path, &existing.path) {
+            (Some(new_path), Some(existing_path)) => Path::new(existing_path) != new_path,
+            (Some(_), None) => true,
+            _ => false,
+          };
 
           existing_features != computed || existing.default_features != default_features || path_differs
         }

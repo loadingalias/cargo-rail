@@ -852,6 +852,70 @@ root = "."
   Ok(())
 }
 
+#[test]
+fn test_unify_workspace_member_version_deps_always_get_path() -> Result<()> {
+  let workspace = TestWorkspace::new_named("tokio-member-path")?;
+
+  // Workspace member that other members depend on via VERSION (Tokio-style).
+  workspace.add_crate("tokio", "1.0.0", &[])?;
+  workspace.add_crate("tokio-stream", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
+  workspace.add_crate(
+    "tokio-util",
+    "0.1.0",
+    &[("tokio", r#"{ version = "1.0.0", features = ["rt"] }"#)],
+  )?;
+
+  // Simulate Tokio's patch strategy where member deps are declared by version and patched locally.
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let mut root = std::fs::read_to_string(&root_manifest)?;
+  root.push_str("\n[patch.crates-io]\ntokio = { path = \"crates/tokio\" }\n");
+  std::fs::write(&root_manifest, root)?;
+
+  // Critical: even with include_paths disabled, workspace member deps must still carry a path.
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+include_paths = false
+"#,
+  )?;
+
+  workspace.commit("Add tokio-style member dependencies with crates-io patch")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("tokio = {") && workspace_toml.contains("path = \"crates/tokio\""),
+    "Workspace member dependency must include path for local resolution.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+
+  let stream_toml = std::fs::read_to_string(workspace.path.join("crates/tokio-stream/Cargo.toml"))?;
+  assert!(
+    stream_toml.contains("tokio = { workspace = true"),
+    "tokio-stream should inherit tokio from workspace.\nCargo.toml:\n{}",
+    stream_toml
+  );
+
+  let util_toml = std::fs::read_to_string(workspace.path.join("crates/tokio-util/Cargo.toml"))?;
+  assert!(
+    util_toml.contains("tokio = { workspace = true"),
+    "tokio-util should inherit tokio from workspace.\nCargo.toml:\n{}",
+    util_toml
+  );
+
+  Ok(())
+}
+
 // Config Options: include, pin_transitives, include_renamed
 
 /// Test include config forces specific dependencies to be included
