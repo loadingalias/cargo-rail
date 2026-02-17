@@ -1095,6 +1095,103 @@ fn test_unify_workspace_member_cohort_with_non_default_members_still_unifies() -
   Ok(())
 }
 
+#[test]
+fn test_unify_workspace_member_features_stay_local_not_hoisted() -> Result<()> {
+  let workspace = TestWorkspace::new_named("member-features-local")?;
+
+  // Member with optional feature surface
+  let core_path = workspace.path.join("crates/core-member");
+  std::fs::create_dir_all(core_path.join("src"))?;
+  std::fs::write(
+    core_path.join("Cargo.toml"),
+    r#"[package]
+name = "core-member"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+net = []
+"#,
+  )?;
+  std::fs::write(core_path.join("src/lib.rs"), "pub fn core() {}")?;
+
+  // Consumer that needs core-member/net
+  let consumer_a_path = workspace.path.join("crates/consumer-a");
+  std::fs::create_dir_all(consumer_a_path.join("src"))?;
+  std::fs::write(
+    consumer_a_path.join("Cargo.toml"),
+    r#"[package]
+name = "consumer-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+core-member = { version = "0.1.0", features = ["net"] }
+"#,
+  )?;
+  std::fs::write(consumer_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+
+  // Consumer that does not need net
+  let consumer_b_path = workspace.path.join("crates/consumer-b");
+  std::fs::create_dir_all(consumer_b_path.join("src"))?;
+  std::fs::write(
+    consumer_b_path.join("Cargo.toml"),
+    r#"[package]
+name = "consumer-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+core-member = "0.1.0"
+"#,
+  )?;
+  std::fs::write(consumer_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let mut root = std::fs::read_to_string(&root_manifest)?;
+  root.push_str("\n[patch.crates-io]\ncore-member = { path = \"crates/core-member\" }\n");
+  std::fs::write(&root_manifest, root)?;
+
+  workspace.commit("Add workspace member feature split scenario")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("core-member = {"),
+    "workspace.dependencies should include core-member.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+  assert!(
+    !workspace_toml.contains("core-member = { path = \"crates/core-member\", version = \"^0.1.0\", features")
+      && !workspace_toml.contains("core-member = { path = 'crates\\core-member', version = \"^0.1.0\", features"),
+    "workspace member features must not be hoisted to workspace.dependencies.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+
+  let consumer_a_toml = std::fs::read_to_string(consumer_a_path.join("Cargo.toml"))?;
+  assert!(
+    consumer_a_toml.contains("core-member = { workspace = true, features = [\"net\"]"),
+    "consumer-a should retain local member feature declaration.\nCargo.toml:\n{}",
+    consumer_a_toml
+  );
+
+  let consumer_b_toml = std::fs::read_to_string(consumer_b_path.join("Cargo.toml"))?;
+  assert!(
+    consumer_b_toml.contains("core-member = { workspace = true"),
+    "consumer-b should use workspace inheritance without net feature.\nCargo.toml:\n{}",
+    consumer_b_toml
+  );
+
+  Ok(())
+}
+
 // Config Options: include, pin_transitives, include_renamed
 
 /// Test include config forces specific dependencies to be included

@@ -477,47 +477,58 @@ impl UnifyAnalyzer {
         }
       }
 
-      // Check for mixed defaults - use union strategy if present
-      // When include_renamed = true, check across all package variants
-      let has_mixed_defaults = if self.config.include_renamed {
-        self.manifests.package_has_mixed_defaults(&dep_key.name)
-      } else {
-        self.manifests.has_mixed_defaults(dep_key)
-      };
+      let is_workspace_member_dep = workspace_member_names.contains(&dep_key.name);
 
-      // Compute features - when include_renamed = true, aggregate across all variants
-      // Note: intersection doesn't make sense across renamed deps (they're separate usages)
-      // so we use union to ensure all needed features are included
-      let (features, default_features) = if self.config.include_renamed {
-        // For package-level aggregation, always use union strategy
-        // (renamed deps typically have distinct feature needs)
-        let features = self.manifests.compute_package_union(&dep_key.name);
-        // When mixed defaults detected, use default-features = true to preserve
-        // features for crates that rely on them (same logic as non-include_renamed path)
-        let df = if has_mixed_defaults {
-          true
+      // For workspace-member dependencies, we only unify source/version/path atomically.
+      // Feature policy remains local per member to avoid enabling member features globally
+      // (for example Tokio's "full" leaking into WASM jobs via workspace.dependencies).
+      //
+      // Non-member deps keep existing feature/default-features unification behavior.
+      let (features, default_features) = if is_workspace_member_dep {
+        (std::collections::BTreeSet::new(), true)
+      } else {
+        // Check for mixed defaults - use union strategy if present
+        // When include_renamed = true, check across all package variants
+        let has_mixed_defaults = if self.config.include_renamed {
+          self.manifests.package_has_mixed_defaults(&dep_key.name)
         } else {
-          self
-            .manifests
-            .package_default_features_policy(&dep_key.name)
-            .unwrap_or(true)
+          self.manifests.has_mixed_defaults(dep_key)
         };
-        (features, df)
-      } else {
-        // Standard per-dep_key logic
-        let intersection = self.manifests.compute_intersection(dep_key);
 
-        if has_mixed_defaults || intersection.is_empty() {
-          // Use union strategy for:
-          // 1. Mixed default-features settings
-          // 2. No common features (empty intersection)
-          // Set default-features = true (max/union strategy)
-          (self.manifests.compute_union(dep_key), true)
+        // Compute features - when include_renamed = true, aggregate across all variants
+        // Note: intersection doesn't make sense across renamed deps (they're separate usages)
+        // so we use union to ensure all needed features are included
+        if self.config.include_renamed {
+          // For package-level aggregation, always use union strategy
+          // (renamed deps typically have distinct feature needs)
+          let features = self.manifests.compute_package_union(&dep_key.name);
+          // When mixed defaults detected, use default-features = true to preserve
+          // features for crates that rely on them (same logic as non-include_renamed path)
+          let df = if has_mixed_defaults {
+            true
+          } else {
+            self
+              .manifests
+              .package_default_features_policy(&dep_key.name)
+              .unwrap_or(true)
+          };
+          (features, df)
         } else {
-          // Use intersection (minimal) strategy
-          // Use conservative default-features policy
-          let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
-          (intersection, df)
+          // Standard per-dep_key logic
+          let intersection = self.manifests.compute_intersection(dep_key);
+
+          if has_mixed_defaults || intersection.is_empty() {
+            // Use union strategy for:
+            // 1. Mixed default-features settings
+            // 2. No common features (empty intersection)
+            // Set default-features = true (max/union strategy)
+            (self.manifests.compute_union(dep_key), true)
+          } else {
+            // Use intersection (minimal) strategy
+            // Use conservative default-features policy
+            let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
+            (intersection, df)
+          }
         }
       };
 
@@ -533,7 +544,7 @@ impl UnifyAnalyzer {
 
       // Workspace members must always carry `path` so member-to-member deps stay local.
       // This prevents dual-resolution in fresh lockfiles (local member + crates.io package).
-      let dep_path: Option<PathBuf> = if workspace_member_names.contains(&dep_key.name) {
+      let dep_path: Option<PathBuf> = if is_workspace_member_dep {
         workspace_member_paths.get(&dep_key.name).cloned()
       } else if self.config.include_paths {
         // Include explicit path deps for non-member packages only when requested.
