@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.8](https://github.com/loadingalias/cargo-rail/compare/v0.10.7...v0.10.8) - 2026-02-17
+
+### 🐛 Bug Fixes
+
+- **unify**: keep cfg-gated features used in tests ([9e086cd](https://github.com/loadingalias/cargo-rail/commit/9e086cdb2eb9cb59fd1f49d31eafcd57cb207bb1))
+
+### 📝 Documentation
+
+- update README with expanded change-detection metrics ([15ae8d2](https://github.com/loadingalias/cargo-rail/commit/15ae8d201feca584ce3237ddea78daa7b8d6324f))
+
+
+
 ## [0.10.7](https://github.com/loadingalias/cargo-rail/compare/v0.10.6...v0.10.7) - 2026-02-16
 
 ### 🐛 Bug Fixes
