@@ -9,6 +9,22 @@ Two approaches based on your project's tooling:
 | [**with-task-runner/**](with-task-runner/) | just, make, xtask, scripts | `cargo rail plan` + your task runner |
 | [**standalone/**](standalone/) | No task runner | `cargo rail run` handles everything |
 
+## Measured Impact (Last 20 Commits per Repo)
+
+Generated with `/Users/mr.wolf/loadingalias/cargo-rail-testing/scripts/measure-impact.sh`.
+
+| Repository | Could Skip Build | Could Skip Tests | Targeted (Not Full Run) |
+|---|---:|---:|---:|
+| tokio | 10% | 0% | 95% |
+| meilisearch | 35% | 35% | 60% |
+| helix | 30% | 30% | 40% |
+| helix-db | 10% | 10% | 75% |
+| **Aggregate (80 commits)** | **21%** | **19%** | **68%** |
+
+Interpretation:
+- Task-runner repos (`meilisearch`, `helix`) show the largest immediate test/build skip savings.
+- Standalone repos still gain deterministic targeting and explainable plan traces.
+
 ## With Task Runner (Recommended for Large Projects)
 
 If you already have **just**, **make**, **xtask**, or shell scripts:

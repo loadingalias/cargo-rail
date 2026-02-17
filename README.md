@@ -6,19 +6,20 @@
 
 ## Why
 
-**Documented impact on real repos (tokio, helix, meilisearch):**
+**Documented change-detection impact on real repos (tokio, helix, meilisearch, helix-db):**
 
 | Metric | Impact |
 |---|---|
-| **CI Surface Execution** | 55% fewer surfaces run per merge |
-| **Weighted `test`/`build` Units** | 64% reduction in compute units |
-| **Dependencies Unified** | 96 across 53 crates (avg 1.8 per crate) |
+| **Commits Measured** | 80 (20 per repo) |
+| **Could Skip Build** | 21% |
+| **Could Skip Tests** | 19% |
+| **Targeted (Not Full Run)** | 68% |
+| **Dependencies Unified** | 132 across 53 crates |
 | **Undeclared `features` Fixed** | 258 silent bugs prevented |
-| **Tooling Consolidation** | 6-8 cargo plugins → 1 command |
 | **MSRV Computation** | Automatic from dependency graph |
 
 **Compounding effects = massive time/cost savings:**
-1. **Change Detection** (`plan`/`run`) reduces what runs — 55% fewer CI surfaces, 64% fewer compute units w/ shown determinism
+1. **Change Detection** (`plan`/`run`) reduces what runs — 68% of measured commits avoided full-run behavior, with explicit plan traces.
 2. **Dependency Unification** (`unify`) reduces build graph complexity — cleaner deps, smaller build units, fewer rebuilds
 3. **Smaller Build Graphs** cargo-rail uses 14 core-deps for automatically removing unused dependencies, pruning truly dead features, unifying undeclared features, computing MSRV, splitting and synching crate/s to new, clean repos, and the entire release workflow w/ changelog generation. This results in fewer tools and less cargo-metadata fetches.
 
@@ -69,7 +70,7 @@ cargo rail run --merge-base --profile ci  # runs ONLY what plan selected
 3. Run `run` to execute only selected surfaces — locally or in CI - or wire to `justfile`, `makefile`, `xtask`, or shell scripts.
 4. Use `--explain` to understand any decision: "why did this run?" / "why was this skipped?" 
 
-Result: **55% fewer CI surface executions, 64% reduction in weighted compute units** (validated on tokio/helix/meilisearch) See: [Examples](examples/change_detection).
+Result: **21% build skip, 19% test skip, 68% targeted/non-full runs** across 80 measured commits (tokio/helix/meilisearch/helix-db). See: [Examples](examples/change_detection).
 
 ### Dependency Unification (`unify`)
 
@@ -96,11 +97,11 @@ cargo rail unify --explain  # understand each decision
 
 | Repository | Crates | Deps Unified | Undeclared Features | MSRV Computed |
 |---|---:|---:|---:|---|
-| [tokio-rs/tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 9 | 7 | 1.85.0 |
-| [helix-editor/helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 15 | 19 | 1.87.0 |
-| [meilisearch/meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 54 | 215 | 1.88.0 |
-| [helixdb/helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 18 | 17 | 1.88.0 |
-| **Aggregate** | **53** | **96** | **258** | — |
+| [tokio-rs/tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 13 | 7 | 1.85.0 |
+| [helix-editor/helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 28 | 19 | 1.87.0 |
+| [meilisearch/meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 70 | 215 | 1.88.0 |
+| [helixdb/helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 21 | 17 | 1.88.0 |
+| **Aggregate** | **53** | **132** | **258** | — |
 
 Config files and validation artifacts: [Examples](examples/unify/) | [Validation Forks](https://github.com/loadingalias/cargo-rail-testing)
 
@@ -171,10 +172,10 @@ All core workflows (`plan`/`run`, `unify`) validated on production repos with fu
 
 | Repository | Crates | Validation | Fork |
 |---|---:|---|---|
-| tokio-rs/tokio | 10 | Unify (9 deps, 7 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) |
-| helix-editor/helix | 14 | Unify (15 deps, 19 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) |
-| meilisearch/meilisearch | 23 | Unify (54 deps, 215 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) |
-| helixdb/helix-db | 6 | Unify (18 deps, 17 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) |
+| tokio-rs/tokio | 10 | Unify (13 deps, 7 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) |
+| helix-editor/helix | 14 | Unify (28 deps, 19 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) |
+| meilisearch/meilisearch | 23 | Unify (70 deps, 215 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) |
+| helixdb/helix-db | 6 | Unify (21 deps, 17 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) |
 
 **Validation forks**: [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing) — full configs, integration guides, and reproducible artifacts.
 
@@ -186,7 +187,7 @@ All core workflows (`plan`/`run`, `unify`) validated on production repos with fu
 4. **Real-world scenarios**: Tests run on actual merge commits and real dependency graphs, not synthetic fixtures
 
 **Unify results (4 repos, 53 crates):**
-- 96 dependencies unified to `[workspace.dependencies]`
+- 132 dependencies unified to `[workspace.dependencies]`
 - 258 undeclared features fixed (silent bugs prevented)
 - 2 dead features pruned
 - MSRV computed for all repos (1.85.0 - 1.88.0)
