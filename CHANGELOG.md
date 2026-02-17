@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.6](https://github.com/loadingalias/cargo-rail/compare/v0.10.5...v0.10.6) - 2026-02-16
+
+### 🐛 Bug Fixes
+
+- **unify**: enforce atomic workspace-member cohorts for non-default members to prevent Tokio split-source graphs ([5e588ec](https://github.com/loadingalias/cargo-rail/commit/5e588ec11c294dae878b5a1879a0cbc1af145fd8))
+
+### ✅ Testing
+
+- **unify**: make non-default-member cohort path assertions cross-platform (Windows-safe) ([147872b](https://github.com/loadingalias/cargo-rail/commit/147872bbc7a7f103a94c6a2ac5c6e0caa55f7bc3))
+
+
+
 ## [0.10.5](https://github.com/loadingalias/cargo-rail/compare/v0.10.4...v0.10.5) - 2026-02-16
 
 ### 🐛 Bug Fixes
