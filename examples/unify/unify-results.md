@@ -11,7 +11,7 @@ Validation Forks:
 | Metric | Count |
 |---|---:|
 | Total crates | 53 |
-| Dependencies unified | 96 |
+| Dependencies unified | 132 |
 | Dead features pruned | 2 |
 | Unused deps detected | 0 |
 | Undeclared features fixed | 258 |
@@ -20,10 +20,10 @@ Validation Forks:
 
 | Repository | Crates | Deps Unified | Dead Features | Undeclared Features | MSRV | Exclusions |
 |---|---:|---:|---:|---:|---|---|
-| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 9 | 0 | 7 | 1.85.0 | — |
-| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 15 | 1 | 19 | 1.87.0 | — |
-| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 54 | 1 | 215 | 1.88.0 | `thiserror` |
-| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 18 | 0 | 17 | 1.88.0 | `dirs` |
+| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 13 | 0 | 7 | 1.85.0 | — |
+| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 28 | 1 | 19 | 1.87.0 | — |
+| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 70 | 1 | 215 | 1.88.0 | — |
+| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 21 | 0 | 17 | 1.88.0 | — |
 
 ## Validation Status
 
@@ -31,10 +31,7 @@ All repositories pass `cargo check --workspace` and `cargo test --workspace` aft
 
 ## Exclusions Explained
 
-| Repository | Excluded | Reason |
-|---|---|---|
-| meilisearch | `thiserror` | v1 → v2 breaks `{type}` syntax in error macros |
-| helix-db | `dirs` | Intentional multi-major-version in transitive deps |
+No explicit `exclude` entries were used in this run.
 
 ## Dead Features Pruned
 
@@ -56,8 +53,7 @@ sort_dependencies = false       # Preserve upstream ordering
 prune_dead_features = true      # Remove empty no-op features
 fix_undeclared_features = true  # Auto-fix borrowed features
 # Per-repo overrides:
-# - meilisearch: exclude = ["thiserror"]
-# - helix-db: exclude = ["dirs"]
+# - none
 ```
 
 ## Tools Replaced

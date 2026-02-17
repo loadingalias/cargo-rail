@@ -20,11 +20,11 @@ Dependency unification validated on production Rust workspaces.
 
 | Repository | Crates | Deps Unified | Undeclared Features | MSRV |
 |------------|-------:|-------------:|--------------------:|------|
-| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 9 | 7 | 1.85.0 |
-| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 15 | 19 | 1.87.0 |
-| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 54 | 215 | 1.88.0 |
-| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 18 | 17 | 1.88.0 |
-| **Total** | **53** | **96** | **258** | — |
+| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 13 | 7 | 1.85.0 |
+| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 28 | 19 | 1.87.0 |
+| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 70 | 215 | 1.88.0 |
+| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 21 | 17 | 1.88.0 |
+| **Total** | **53** | **132** | **258** | — |
 
 **Full results:** [unify-results.md](unify-results.md)
 
@@ -96,7 +96,7 @@ Generating fixes for 5 undeclared feature issues...
 
 === Unification Plan ===
 
-Dependencies to unify: 9
+Dependencies to unify: 13
   - bytes = "^1.11.1" (used by 4 crates)
   - parking_lot = "^0.12.5" (used by 3 crates)
   - tracing = "^0.1.44", features = [std] (used by 3 crates)
@@ -105,7 +105,7 @@ Dependencies to unify: 9
 Undeclared features to fix: 7 features across 5 crates
 Computed MSRV: 1.85.0 (from 132 deps with rust-version)
 
-ready: 9 dependencies, 44 member edits
+ready: 13 dependencies, 58 member edits
 Changes detected. Run without --check to apply.
 ```
 
