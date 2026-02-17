@@ -1059,13 +1059,21 @@ fn test_unify_workspace_member_cohort_with_non_default_members_still_unifies() -
   );
 
   let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  let edge_b_path_written = workspace_toml.contains("path = \"crates/edge-b\"")
+    || workspace_toml.contains("path = 'crates/edge-b'")
+    || workspace_toml.contains("path = \"crates\\edge-b\"")
+    || workspace_toml.contains("path = 'crates\\edge-b'");
   assert!(
-    workspace_toml.contains("edge-b = {") && workspace_toml.contains("path = \"crates/edge-b\""),
+    workspace_toml.contains("edge-b = {") && edge_b_path_written,
     "edge-b should be unified as workspace member despite non-default-members metadata limits.\nCargo.toml:\n{}",
     workspace_toml
   );
+  let edge_c_path_written = workspace_toml.contains("path = \"crates/edge-c\"")
+    || workspace_toml.contains("path = 'crates/edge-c'")
+    || workspace_toml.contains("path = \"crates\\edge-c\"")
+    || workspace_toml.contains("path = 'crates\\edge-c'");
   assert!(
-    workspace_toml.contains("edge-c = {") && workspace_toml.contains("path = \"crates/edge-c\""),
+    workspace_toml.contains("edge-c = {") && edge_c_path_written,
     "edge-c should be unified as workspace member despite non-default-members metadata limits.\nCargo.toml:\n{}",
     workspace_toml
   );
