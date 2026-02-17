@@ -1017,6 +1017,76 @@ exclude = ["tokio"]
   Ok(())
 }
 
+#[test]
+fn test_unify_workspace_member_cohort_with_non_default_members_still_unifies() -> Result<()> {
+  let workspace = TestWorkspace::new_named("non-default-member-cohort")?;
+
+  // default member: excluded from the member-dependency cohort
+  workspace.add_crate("root-default", "0.1.0", &[])?;
+
+  // non-default member cohort:
+  // edge-a -> edge-b -> edge-c
+  workspace.add_crate(
+    "edge-a",
+    "0.1.0",
+    &[("edge-b", r#"{ path = "../edge-b", version = "0.1.0" }"#)],
+  )?;
+  workspace.add_crate(
+    "edge-b",
+    "0.1.0",
+    &[("edge-c", r#"{ path = "../edge-c", version = "0.1.0" }"#)],
+  )?;
+  workspace.add_crate("edge-c", "0.1.0", &[])?;
+
+  // Restrict default-members so edge-* crates are often absent from resolved metadata's
+  // direct-dependency traversal. Cohort logic must still unify edge-b/edge-c atomically.
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let mut root = std::fs::read_to_string(&root_manifest)?;
+  root = root.replace(
+    "resolver = \"2\"\n",
+    "resolver = \"2\"\ndefault-members = [\"crates/root-default\"]\n",
+  );
+  std::fs::write(&root_manifest, root)?;
+
+  workspace.commit("Add non-default workspace member cohort")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("edge-b = {") && workspace_toml.contains("path = \"crates/edge-b\""),
+    "edge-b should be unified as workspace member despite non-default-members metadata limits.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+  assert!(
+    workspace_toml.contains("edge-c = {") && workspace_toml.contains("path = \"crates/edge-c\""),
+    "edge-c should be unified as workspace member despite non-default-members metadata limits.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+
+  let edge_a_toml = std::fs::read_to_string(workspace.path.join("crates/edge-a/Cargo.toml"))?;
+  assert!(
+    edge_a_toml.contains("edge-b = { workspace = true"),
+    "edge-a should inherit edge-b from workspace.\nCargo.toml:\n{}",
+    edge_a_toml
+  );
+
+  let edge_b_toml = std::fs::read_to_string(workspace.path.join("crates/edge-b/Cargo.toml"))?;
+  assert!(
+    edge_b_toml.contains("edge-c = { workspace = true"),
+    "edge-b should inherit edge-c from workspace.\nCargo.toml:\n{}",
+    edge_b_toml
+  );
+
+  Ok(())
+}
+
 // Config Options: include, pin_transitives, include_renamed
 
 /// Test include config forces specific dependencies to be included

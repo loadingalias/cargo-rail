@@ -19,6 +19,7 @@ use crate::error::{RailResult, ResultExt};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use rustc_hash::{FxHashMap, FxHashSet};
+use semver::Version;
 use semver::VersionReq;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -294,6 +295,7 @@ impl UnifyAnalyzer {
     // Pre-compute workspace member metadata for reuse.
     let mut workspace_member_names: FxHashSet<Arc<str>> = FxHashSet::default();
     let mut workspace_member_paths: FxHashMap<Arc<str>, PathBuf> = FxHashMap::default();
+    let mut workspace_member_versions: FxHashMap<Arc<str>, Version> = FxHashMap::default();
 
     // Build member_paths mapping from metadata (manifest file paths)
     for pkg in self.metadata.workspace_packages() {
@@ -304,6 +306,7 @@ impl UnifyAnalyzer {
         Arc::clone(&member_name),
         self.normalize_workspace_member_path(&manifest_path),
       );
+      workspace_member_versions.insert(Arc::clone(&member_name), pkg.version.clone());
       member_paths.insert(member_name, manifest_path);
     }
 
@@ -384,30 +387,40 @@ impl UnifyAnalyzer {
       // Get version from metadata - but ONLY from direct dependencies of workspace members
       // This uses direct_dep_versions() which filters out transitive dependencies
       let versions = self.metadata.direct_dep_versions(&dep_key.name);
-      if versions.is_empty() {
-        continue; // Not a direct dependency of any workspace member
-      }
 
-      // Get unique versions across all targets
-      let unique_versions: FxHashSet<_> = versions.values().collect();
-
-      // Always use highest version (cargo's resolver already picks highest compatible)
-      // When targets resolve to different versions, we unify to highest
-      let version = match unique_versions.iter().max() {
-        Some(max) if unique_versions.len() > 1 => {
-          // Multiple versions found across targets - use highest
-          // This is the "silent win" - we unify duplicates automatically
-          let mut versions_found: Vec<Arc<str>> = unique_versions.iter().map(|v| Arc::from(v.to_string())).collect();
-          versions_found.sort();
-          duplicates_cleaned.push(DuplicateCleanup {
-            dep_name: Arc::clone(&dep_key.name),
-            versions_found,
-            selected_version: Arc::from(max.to_string()),
-          });
-          max
+      // Workspace-member deps must be unifyable even when Cargo metadata excludes
+      // non-default members from resolved direct-dependency traversal.
+      let version = if versions.is_empty() {
+        if workspace_member_names.contains(&dep_key.name) {
+          match workspace_member_versions.get(&dep_key.name) {
+            Some(v) => v,
+            None => continue,
+          }
+        } else {
+          continue; // Not a direct dependency of any workspace member
         }
-        Some(version) => version,
-        None => continue, // Empty set - shouldn't happen given versions check above
+      } else {
+        // Get unique versions across all targets
+        let unique_versions: FxHashSet<_> = versions.values().collect();
+
+        // Always use highest version (cargo's resolver already picks highest compatible)
+        // When targets resolve to different versions, we unify to highest
+        match unique_versions.iter().max() {
+          Some(max) if unique_versions.len() > 1 => {
+            // Multiple versions found across targets - use highest
+            // This is the "silent win" - we unify duplicates automatically
+            let mut versions_found: Vec<Arc<str>> = unique_versions.iter().map(|v| Arc::from(v.to_string())).collect();
+            versions_found.sort();
+            duplicates_cleaned.push(DuplicateCleanup {
+              dep_name: Arc::clone(&dep_key.name),
+              versions_found,
+              selected_version: Arc::from(max.to_string()),
+            });
+            *max
+          }
+          Some(version) => *version,
+          None => continue, // Empty set - shouldn't happen given versions check above
+        }
       };
 
       // Construct version requirement - preserve exact pins if configured
