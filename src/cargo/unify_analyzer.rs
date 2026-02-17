@@ -11,7 +11,7 @@ use crate::cargo::{
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
     DuplicateCleanup, IssueSeverity, MemberEdit, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyIssue,
-    ValidationResult, VersionMismatch,
+    UnifyIssueKind, ValidationResult, VersionMismatch,
   },
 };
 use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
@@ -32,6 +32,8 @@ pub struct UnifyAnalyzer {
   pub config: UnifyConfig,
   /// Existing workspace dependencies (already in [workspace.dependencies])
   existing_workspace_deps: FxHashMap<String, ExistingWorkspaceDep>,
+  /// Precomputed cohort diagnostics from config + workspace-member graph policy
+  cohort_issues: Vec<UnifyIssue>,
   /// Workspace root path (for path normalization)
   workspace_root: PathBuf,
 }
@@ -50,16 +52,176 @@ impl UnifyAnalyzer {
     // Parse existing workspace.dependencies to avoid duplicates
     let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;
 
-    // Build config from context
-    let config = ctx.config.as_ref().map(|c| c.unify.clone()).unwrap_or_default();
+    // Build config from context, then enforce workspace-member cohort semantics.
+    let base_config = ctx.config.as_ref().map(|c| c.unify.clone()).unwrap_or_default();
+    let workspace_member_names: FxHashSet<Arc<str>> = workspace_packages
+      .iter()
+      .map(|pkg| Arc::from(pkg.name.as_str()))
+      .collect();
+    let (config, cohort_issues) =
+      Self::apply_workspace_member_cohort_policy(base_config, &manifests, &workspace_member_names);
 
     Ok(Self {
       metadata,
       manifests,
       config,
       existing_workspace_deps,
+      cohort_issues,
       workspace_root: ctx.workspace_root().to_path_buf(),
     })
+  }
+
+  /// Build connected cohorts of workspace members that depend on each other.
+  fn build_workspace_member_cohorts(
+    manifests: &ManifestAnalyzer,
+    workspace_member_names: &FxHashSet<Arc<str>>,
+  ) -> Vec<Vec<Arc<str>>> {
+    let mut adjacency: FxHashMap<Arc<str>, FxHashSet<Arc<str>>> = FxHashMap::default();
+    for member in workspace_member_names {
+      adjacency.entry(Arc::clone(member)).or_default();
+    }
+
+    for member in &manifests.members {
+      let member_name: Arc<str> = Arc::from(member.package_name.as_str());
+      if !workspace_member_names.contains(&member_name) {
+        continue;
+      }
+
+      for dep_key in member.dependencies.keys() {
+        if !workspace_member_names.contains(&dep_key.name) {
+          continue;
+        }
+
+        adjacency
+          .entry(Arc::clone(&member_name))
+          .or_default()
+          .insert(Arc::clone(&dep_key.name));
+        adjacency
+          .entry(Arc::clone(&dep_key.name))
+          .or_default()
+          .insert(Arc::clone(&member_name));
+      }
+    }
+
+    let mut visited: FxHashSet<Arc<str>> = FxHashSet::default();
+    let mut cohorts = Vec::new();
+    let mut nodes: Vec<_> = adjacency.keys().cloned().collect();
+    nodes.sort();
+
+    for node in nodes {
+      if visited.contains(&node) {
+        continue;
+      }
+
+      let mut stack = vec![Arc::clone(&node)];
+      let mut component = Vec::new();
+
+      while let Some(current) = stack.pop() {
+        if !visited.insert(Arc::clone(&current)) {
+          continue;
+        }
+        component.push(Arc::clone(&current));
+        if let Some(neighbors) = adjacency.get(&current) {
+          for neighbor in neighbors {
+            if !visited.contains(neighbor) {
+              stack.push(Arc::clone(neighbor));
+            }
+          }
+        }
+      }
+
+      component.sort();
+      cohorts.push(component);
+    }
+
+    cohorts
+  }
+
+  /// Enforce atomic unification policy for workspace-member cohorts.
+  ///
+  /// This prevents local-vs-registry splits when only part of an interconnected
+  /// workspace-member dependency set would otherwise be unified.
+  fn apply_workspace_member_cohort_policy(
+    mut config: UnifyConfig,
+    manifests: &ManifestAnalyzer,
+    workspace_member_names: &FxHashSet<Arc<str>>,
+  ) -> (UnifyConfig, Vec<UnifyIssue>) {
+    let mut issues = Vec::new();
+    let cohorts = Self::build_workspace_member_cohorts(manifests, workspace_member_names);
+
+    for cohort in cohorts.into_iter().filter(|c| c.len() > 1) {
+      let excluded_members: Vec<&Arc<str>> = cohort.iter().filter(|name| config.should_exclude(name)).collect();
+
+      if !excluded_members.is_empty() {
+        if excluded_members.len() != cohort.len() {
+          let mut cohort_names: Vec<&str> = cohort.iter().map(|s| &**s).collect();
+          let mut excluded_names: Vec<&str> = excluded_members.iter().map(|s| &***s).collect();
+          cohort_names.sort_unstable();
+          excluded_names.sort_unstable();
+          issues.push(UnifyIssue {
+            kind: UnifyIssueKind::WorkspaceMemberCohortSplitRisk,
+            dep_name: Arc::clone(excluded_members[0]),
+            severity: IssueSeverity::Warning,
+            message: Arc::from(format!(
+              "Workspace-member cohort [{}] was partially excluded [{}]. \
+               Applying exclude atomically to the full cohort to prevent local-vs-registry source splits.",
+              cohort_names.join(", "),
+              excluded_names.join(", ")
+            )),
+          });
+        }
+
+        for member in &cohort {
+          if !config.should_exclude(member) {
+            config.exclude.push(member.to_string());
+          }
+        }
+        continue;
+      }
+
+      let mut low_usage_members = Vec::new();
+      let mut regular_members = Vec::new();
+      for member in &cohort {
+        if config.should_include(member) {
+          regular_members.push(member.to_string());
+          continue;
+        }
+
+        if manifests.package_usage_count(member) < 2 {
+          low_usage_members.push(member.to_string());
+        } else {
+          regular_members.push(member.to_string());
+        }
+      }
+
+      if !low_usage_members.is_empty() && !regular_members.is_empty() {
+        low_usage_members.sort();
+        regular_members.sort();
+        let mut cohort_names: Vec<&str> = cohort.iter().map(|s| &**s).collect();
+        cohort_names.sort_unstable();
+
+        issues.push(UnifyIssue {
+          kind: UnifyIssueKind::WorkspaceMemberCohortSplitRisk,
+          dep_name: Arc::from(regular_members[0].as_str()),
+          severity: IssueSeverity::Warning,
+          message: Arc::from(format!(
+            "Workspace-member cohort [{}] would split under single-user filtering \
+             (single-user members: [{}]). cargo-rail will unify the entire cohort atomically.",
+            cohort_names.join(", "),
+            low_usage_members.join(", ")
+          )),
+        });
+      }
+
+      // Cohort members bypass single-user heuristics: all-or-nothing behavior by default.
+      for member in &cohort {
+        if !config.should_include(member) {
+          config.include.push(member.to_string());
+        }
+      }
+    }
+
+    (config, issues)
   }
 
   /// Normalize a dependency path relative to the workspace root.
@@ -124,7 +286,8 @@ impl UnifyAnalyzer {
     let mut workspace_deps = Vec::with_capacity(dep_count);
     let mut member_edits: FxHashMap<Arc<str>, Vec<MemberEdit>> = FxHashMap::default();
     let mut member_paths: FxHashMap<Arc<str>, PathBuf> = FxHashMap::default();
-    let mut issues = Vec::with_capacity(16); // Issues are rare, small pre-alloc
+    let mut issues = self.cohort_issues.clone();
+    issues.reserve(16); // Issues are rare, small pre-alloc
     let mut duplicates_cleaned = Vec::with_capacity(8);
     let mut version_mismatches = Vec::with_capacity(8);
 
@@ -161,6 +324,7 @@ impl UnifyAnalyzer {
           MajorVersionConflict::Warn => {
             // Skip unification, emit warning - both versions stay in the graph
             issues.push(UnifyIssue {
+              kind: UnifyIssueKind::General,
               dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
               message: Arc::from(format!(
@@ -175,6 +339,7 @@ impl UnifyAnalyzer {
           MajorVersionConflict::Bump => {
             // Emit warning but continue with unification to highest version
             issues.push(UnifyIssue {
+              kind: UnifyIssueKind::General,
               dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
               message: Arc::from(format!(
@@ -201,6 +366,7 @@ impl UnifyAnalyzer {
           }
           ExactPinHandling::Warn => {
             issues.push(UnifyIssue {
+              kind: UnifyIssueKind::General,
               dep_name: Arc::clone(&dep_key.name),
               severity: IssueSeverity::Warning,
               message: Arc::from(
@@ -285,6 +451,7 @@ impl UnifyAnalyzer {
               IssueSeverity::Warning
             };
             issues.push(UnifyIssue {
+              kind: UnifyIssueKind::General,
               dep_name: Arc::clone(&dep_key.name),
               severity,
               message: Arc::from(format!(
@@ -468,6 +635,7 @@ impl UnifyAnalyzer {
     if self.config.enforce_msrv_inheritance {
       if !self.config.msrv {
         issues.push(UnifyIssue {
+          kind: UnifyIssueKind::General,
           dep_name: Arc::from("rust-version"),
           severity: IssueSeverity::Warning,
           message: Arc::from(
@@ -476,6 +644,7 @@ impl UnifyAnalyzer {
         });
       } else if computed_msrv.is_none() {
         issues.push(UnifyIssue {
+          kind: UnifyIssueKind::General,
           dep_name: Arc::from("rust-version"),
           severity: IssueSeverity::Warning,
           message: Arc::from(
@@ -566,6 +735,7 @@ impl UnifyAnalyzer {
           strs.join(", ")
         };
         issues.push(UnifyIssue {
+          kind: UnifyIssueKind::General,
           dep_name: Arc::clone(&uf.dep_name),
           severity: IssueSeverity::Warning,
           message: Arc::from(format!(

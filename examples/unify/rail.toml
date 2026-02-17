@@ -15,7 +15,7 @@ exact_pin_handling = "warn"
 major_version_conflict = "warn"  # warn = skip, bump = force highest
 
 msrv = true
-msrv_source = "max"  # deps | workspace | max
+msrv_source = "workspace"  # deps | workspace | max
 enforce_msrv_inheritance = false  # Ensure members inherit workspace rust-version
 
 detect_unused = true
@@ -33,7 +33,7 @@ skip_undeclared_patterns = [
   "*_impl",
 ]
 
-exclude = []
-include = []
+exclude = []  # excluding one workspace member excludes its whole member cohort
+include = []  # workspace-member cohorts are auto-included
 max_backups = 3
-sort_dependencies = true  # false to preserve existing order
+sort_dependencies = false  # false to preserve existing order

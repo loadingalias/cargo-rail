@@ -28,10 +28,17 @@ pub struct UnifyConfig {
   pub transitive_host: TransitiveFeatureHost,
 
   /// Dependencies to exclude from unification (safety hatch)
+  ///
+  /// Workspace-member dependencies are handled as connected cohorts.
+  /// Excluding one member excludes the full cohort atomically to avoid
+  /// local-vs-registry split graphs.
   #[serde(default)]
   pub exclude: Vec<String>,
 
   /// Dependencies to force-include in unification (safety hatch)
+  ///
+  /// Workspace-member cohorts are auto-included by cargo-rail to prevent
+  /// single-user threshold splits; this option is mainly for non-member deps.
   #[serde(default)]
   pub include: Vec<String>,
 

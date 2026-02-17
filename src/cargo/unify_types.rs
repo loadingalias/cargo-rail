@@ -90,12 +90,23 @@ pub enum MemberEdit {
 /// Issue that prevents or warns about unification
 #[derive(Debug, Clone)]
 pub struct UnifyIssue {
+  /// Classification of the issue for machine-readable diagnostics
+  pub kind: UnifyIssueKind,
   /// Name of the dependency with the issue
   pub dep_name: Arc<str>,
   /// Whether this blocks unification or is just a warning
   pub severity: IssueSeverity,
   /// Description of the issue
   pub message: Arc<str>,
+}
+
+/// Category of unification issue
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifyIssueKind {
+  /// Generic issue with no special category
+  General,
+  /// A workspace-member cohort would be split across local and registry sources
+  WorkspaceMemberCohortSplitRisk,
 }
 
 /// Severity level of a unification issue
@@ -391,13 +402,19 @@ impl UnificationPlan {
     if !self.issues.is_empty() {
       s.push_str(&format!("\nIssues requiring attention: {}\n", self.issues.len()));
       for issue in &self.issues {
+        let kind_suffix = if issue.kind == UnifyIssueKind::General {
+          ""
+        } else {
+          " [WorkspaceMemberCohortSplitRisk]"
+        };
         s.push_str(&format!(
-          "  - [{}] {}: {}\n",
+          "  - [{}]{} {}: {}\n",
           if issue.severity == IssueSeverity::Error {
             "ERROR"
           } else {
             "WARN"
           },
+          kind_suffix,
           issue.dep_name,
           issue.message
         ));

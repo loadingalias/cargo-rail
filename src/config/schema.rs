@@ -54,13 +54,13 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     section: "unify",
     key: "exclude",
     default_toml: "[]",
-    comment: "Dependencies to skip unification",
+    comment: "Dependencies to skip unification (workspace-member cohorts exclude atomically)",
   },
   FieldSpec {
     section: "unify",
     key: "include",
     default_toml: "[]",
-    comment: "Dependencies to force unification",
+    comment: "Dependencies to force unification (workspace-member cohorts auto-include)",
   },
   FieldSpec {
     section: "unify",

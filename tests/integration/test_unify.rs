@@ -916,6 +916,107 @@ include_paths = false
   Ok(())
 }
 
+#[test]
+fn test_unify_workspace_member_cohort_unifies_atomically() -> Result<()> {
+  let workspace = TestWorkspace::new_named("tokio-cohort-atomic")?;
+
+  workspace.add_crate("tokio", "1.0.0", &[])?;
+  workspace.add_crate("tokio-stream", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
+  workspace.add_crate("tokio-util", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
+  workspace.add_crate(
+    "tokio-test",
+    "0.1.0",
+    &[
+      ("tokio", r#""1.0.0""#),
+      ("tokio-stream", r#""0.1.0""#),
+      ("tokio-util", r#""0.1.0""#),
+    ],
+  )?;
+
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let mut root = std::fs::read_to_string(&root_manifest)?;
+  root.push_str(
+    "\n[patch.crates-io]\ntokio = { path = \"crates/tokio\" }\ntokio-stream = { path = \"crates/tokio-stream\" }\ntokio-util = { path = \"crates/tokio-util\" }\n",
+  );
+  std::fs::write(&root_manifest, root)?;
+
+  workspace.commit("Add connected tokio member cohort")?;
+
+  // The low-usage members (tokio-stream/tokio-util) should still unify because
+  // workspace-member cohorts are handled atomically.
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    workspace_toml.contains("tokio = {") && workspace_toml.contains("path = \"crates/tokio\""),
+    "tokio should be unified as workspace member.\nCargo.toml:\n{}",
+    workspace_toml
+  );
+  assert!(
+    workspace_toml.contains("tokio-stream = {") && workspace_toml.contains("path = \"crates/tokio-stream\""),
+    "tokio-stream should be unified with member path (cohort atomicity).\nCargo.toml:\n{}",
+    workspace_toml
+  );
+  assert!(
+    workspace_toml.contains("tokio-util = {") && workspace_toml.contains("path = \"crates/tokio-util\""),
+    "tokio-util should be unified with member path (cohort atomicity).\nCargo.toml:\n{}",
+    workspace_toml
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_workspace_member_partial_exclude_applies_to_full_cohort() -> Result<()> {
+  let workspace = TestWorkspace::new_named("tokio-cohort-partial-exclude")?;
+
+  workspace.add_crate("tokio", "1.0.0", &[])?;
+  workspace.add_crate("tokio-stream", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
+  workspace.add_crate("tokio-util", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
+  workspace.add_crate(
+    "tokio-test",
+    "0.1.0",
+    &[
+      ("tokio", r#""1.0.0""#),
+      ("tokio-stream", r#""0.1.0""#),
+      ("tokio-util", r#""0.1.0""#),
+    ],
+  )?;
+
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let mut root = std::fs::read_to_string(&root_manifest)?;
+  root.push_str(
+    "\n[patch.crates-io]\ntokio = { path = \"crates/tokio\" }\ntokio-stream = { path = \"crates/tokio-stream\" }\ntokio-util = { path = \"crates/tokio-util\" }\n",
+  );
+  std::fs::write(&root_manifest, root)?;
+
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"[unify]
+exclude = ["tokio"]
+"#,
+  )?;
+
+  workspace.commit("Partially exclude tokio member cohort")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    stdout.contains("Applying exclude atomically to the full cohort"),
+    "Should warn about partial workspace-member cohort exclusion.\nOutput:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
 // Config Options: include, pin_transitives, include_renamed
 
 /// Test include config forces specific dependencies to be included

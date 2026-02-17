@@ -20,10 +20,10 @@ Dependency unification validated on production Rust workspaces.
 
 | Repository | Crates | Deps Unified | Undeclared Features | MSRV |
 |------------|-------:|-------------:|--------------------:|------|
-| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) | 10 | 9 | 7 | 1.85.0 |
-| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) | 14 | 15 | 19 | 1.87.0 |
-| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) | 23 | 54 | 215 | 1.88.0 |
-| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) | 6 | 18 | 17 | 1.88.0 |
+| [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 9 | 7 | 1.85.0 |
+| [helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 15 | 19 | 1.87.0 |
+| [meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 54 | 215 | 1.88.0 |
+| [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 18 | 17 | 1.88.0 |
 | **Total** | **53** | **96** | **258** | — |
 
 **Full results:** [unify-results.md](unify-results.md)
@@ -71,6 +71,8 @@ pin_transitives = false            # Enable for cargo-hakari replacement
 exclude = ["thiserror"]            # Skip specific dependencies
 ```
 
+Workspace-member dependencies are unified as atomic cohorts. Excluding one member excludes its connected member cohort to prevent local-vs-registry split graphs.
+
 ## Trust Checklist
 
 Before running `unify` (without `--check`):
@@ -90,7 +92,7 @@ Analyzing 50 dependencies...
 Computing MSRV from dependency graph...
 Detecting unused dependencies...
 Checking for undeclared feature dependencies...
-Generating fixes for 19 undeclared feature issues...
+Generating fixes for 5 undeclared feature issues...
 
 === Unification Plan ===
 
@@ -100,10 +102,10 @@ Dependencies to unify: 9
   - tracing = "^0.1.44", features = [std] (used by 3 crates)
   ...
 
-Undeclared features to fix: 113 features across 10 crates
+Undeclared features to fix: 7 features across 5 crates
 Computed MSRV: 1.85.0 (from 132 deps with rust-version)
 
-ready: 9 dependencies, 52 member edits
+ready: 9 dependencies, 44 member edits
 Changes detected. Run without --check to apply.
 ```
 

@@ -144,7 +144,7 @@ impl RailConfigBuilder {
 
     // === Safety hatches ===
     if config.exclude.is_empty() {
-      content.push_str("\nexclude = []\n");
+      content.push_str("\nexclude = []  # excluding one workspace member excludes its whole member cohort\n");
     } else {
       content.push_str(&format!(
         "\nexclude = {}\n",
@@ -152,7 +152,7 @@ impl RailConfigBuilder {
       ));
     }
     if config.include.is_empty() {
-      content.push_str("include = []\n");
+      content.push_str("include = []  # workspace-member cohorts are auto-included\n");
     } else {
       content.push_str(&format!(
         "include = {}\n",

@@ -96,10 +96,10 @@ cargo rail unify --explain  # understand each decision
 
 | Repository | Crates | Deps Unified | Undeclared Features | MSRV Computed |
 |---|---:|---:|---:|---|
-| [tokio-rs/tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) | 10 | 9 | 7 | 1.85.0 |
-| [helix-editor/helix](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) | 14 | 15 | 19 | 1.87.0 |
-| [meilisearch/meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) | 23 | 54 | 215 | 1.88.0 |
-| [helixdb/helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) | 6 | 18 | 17 | 1.88.0 |
+| [tokio-rs/tokio](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) | 10 | 9 | 7 | 1.85.0 |
+| [helix-editor/helix](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) | 14 | 15 | 19 | 1.87.0 |
+| [meilisearch/meilisearch](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) | 23 | 54 | 215 | 1.88.0 |
+| [helixdb/helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) | 6 | 18 | 17 | 1.88.0 |
 | **Aggregate** | **53** | **96** | **258** | — |
 
 Config files and validation artifacts: [Examples](examples/unify/) | [Validation Forks](https://github.com/loadingalias/cargo-rail-testing)
@@ -171,10 +171,10 @@ All core workflows (`plan`/`run`, `unify`) validated on production repos with fu
 
 | Repository | Crates | Validation | Fork |
 |---|---:|---|---|
-| tokio-rs/tokio | 10 | Unify (9 deps, 7 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) |
-| helix-editor/helix | 14 | Unify (15 deps, 19 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix) |
-| meilisearch/meilisearch | 23 | Unify (54 deps, 215 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/meilisearch) |
-| helixdb/helix-db | 6 | Unify (18 deps, 17 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) |
+| tokio-rs/tokio | 10 | Unify (9 deps, 7 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/tokio) |
+| helix-editor/helix | 14 | Unify (15 deps, 19 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix) |
+| meilisearch/meilisearch | 23 | Unify (54 deps, 215 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/meilisearch) |
+| helixdb/helix-db | 6 | Unify (18 deps, 17 features), Plan/run | [Fork](https://github.com/loadingalias/cargo-rail-testing/tree/unify/helix-db) |
 
 **Validation forks**: [cargo-rail-testing](https://github.com/loadingalias/cargo-rail-testing) — full configs, integration guides, and reproducible artifacts.
 
@@ -199,7 +199,7 @@ Each workflow includes working config files and reproducible command sequences:
 
 | Workflow | Examples | Real-World Configs |
 |---|---|---|
-| Change detection | [examples/change_detection/](examples/change_detection/) | [tokio](https://github.com/loadingalias/cargo-rail-testing/blob/main/tokio/.config/rail.toml), [helix](https://github.com/loadingalias/cargo-rail-testing/blob/main/helix/.config/rail.toml), [meilisearch](https://github.com/loadingalias/cargo-rail-testing/blob/main/meilisearch/.config/rail.toml) |
+| Change detection | [examples/change_detection/](examples/change_detection/) | [tokio](https://github.com/loadingalias/cargo-rail-testing/blob/unify/tokio/.config/rail.toml), [helix](https://github.com/loadingalias/cargo-rail-testing/blob/unify/helix/.config/rail.toml), [meilisearch](https://github.com/loadingalias/cargo-rail-testing/blob/unify/meilisearch/.config/rail.toml) |
 | Unify | [examples/unify/](examples/unify/) | [Validation results](examples/unify/unify-results.md) |
 | Split/sync | [examples/split-sync/](examples/split-sync/) | — |
 | Release | [examples/release/](examples/release/) | — |

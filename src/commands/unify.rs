@@ -153,6 +153,7 @@ pub fn run_unify_analyze(
       },
       "has_blocking_issues": plan.has_blocking_issues(),
       "issues": plan.issues.iter().map(|i| serde_json::json!({
+        "kind": format!("{:?}", i.kind),
         "dep_name": &*i.dep_name,
         "severity": format!("{:?}", i.severity),
         "message": &*i.message,

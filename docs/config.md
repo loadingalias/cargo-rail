@@ -161,8 +161,8 @@ major_version_conflict = "bump"
 |--------|------|---------|-------------|
 | `include_paths` | `bool` | `true` | Include path dependencies in unification. If `false`, path dependencies are excluded. |
 | `include_renamed` | `bool` | `false` | Include renamed dependencies (`package = "..."`). When enabled, features are aggregated across all variants using union. Opt-in due to complexity. |
-| `exclude` | `string[]` | `[]` | Dependencies to skip from unification (safety hatch). Useful for platform-specific or problematic dependencies. |
-| `include` | `string[]` | `[]` | Force-include specific dependencies in unification, even if they're single-use. |
+| `exclude` | `string[]` | `[]` | Dependencies to skip from unification (safety hatch). Useful for platform-specific or problematic dependencies. For workspace-member dependency cohorts, excluding one member excludes the full cohort atomically to prevent local-vs-registry splits. |
+| `include` | `string[]` | `[]` | Force-include specific dependencies in unification, even if they're single-use. Workspace-member cohorts are auto-included by cargo-rail to avoid threshold-based cohort splits. |
 
 **Example:**
 
@@ -173,6 +173,8 @@ include_renamed = false
 exclude = ["openssl", "windows-sys"]  # Platform-specific
 include = ["my-special-dep"]          # Force include
 ```
+
+**Workspace-member cohort rule:** cargo-rail unifies connected workspace-member dependency sets atomically. A partial outcome (some members local, siblings from crates.io) is blocked automatically.
 
 #### Transitive Pinning
 
