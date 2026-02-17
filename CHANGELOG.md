@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.7](https://github.com/loadingalias/cargo-rail/compare/v0.10.6...v0.10.7) - 2026-02-16
+
+### 🐛 Bug Fixes
+
+- **unify**: keep workspace-member features local to avoid global feature leakage ([cd6d4c0](https://github.com/loadingalias/cargo-rail/commit/cd6d4c0718a4aa1ff6ccc5da991799f5e6966284))
+
+
+
 ## [0.10.6](https://github.com/loadingalias/cargo-rail/compare/v0.10.5...v0.10.6) - 2026-02-16
 
 ### 🐛 Bug Fixes
