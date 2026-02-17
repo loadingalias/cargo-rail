@@ -26,18 +26,28 @@ use super::multi_target_metadata::MultiTargetMetadata;
 /// This prevents pruning features that are used for conditional compilation.
 fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
   let mut features = HashSet::new();
-  let src_dir = crate_dir.join("src");
+  // Feature gates can be used in multiple crate targets, not only src/.
+  // Scan the common Rust target roots to avoid pruning test-only features.
+  for dir_name in ["src", "tests", "benches", "examples"] {
+    let dir = crate_dir.join(dir_name);
+    if !dir.exists() {
+      continue;
+    }
 
-  if !src_dir.exists() {
-    return features;
+    if let Ok(entries) = glob::glob(&format!("{}/**/*.rs", dir.display())) {
+      for entry in entries.flatten() {
+        if let Ok(content) = fs::read_to_string(&entry) {
+          extract_cfg_features(&content, &mut features);
+        }
+      }
+    }
   }
 
-  // Walk the src directory for .rs files
-  if let Ok(entries) = glob::glob(&format!("{}/**/*.rs", src_dir.display())) {
-    for entry in entries.flatten() {
-      if let Ok(content) = fs::read_to_string(&entry) {
-        extract_cfg_features(&content, &mut features);
-      }
+  // build.rs may also use feature cfgs.
+  let build_script = crate_dir.join("build.rs");
+  if build_script.exists() {
+    if let Ok(content) = fs::read_to_string(build_script) {
+      extract_cfg_features(&content, &mut features);
     }
   }
 
@@ -531,5 +541,26 @@ mod tests {
     assert!(!is_valid_feature_name("foo bar"));
     assert!(!is_valid_feature_name("foo/bar"));
     assert!(!is_valid_feature_name("foo:bar"));
+  }
+
+  #[test]
+  fn test_scan_source_for_cfg_features_includes_tests_dir() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let crate_dir = temp.path();
+
+    fs::create_dir_all(crate_dir.join("src")).expect("mkdir src");
+    fs::create_dir_all(crate_dir.join("tests")).expect("mkdir tests");
+    fs::write(crate_dir.join("src/lib.rs"), "pub fn ping() {}").expect("write lib.rs");
+    fs::write(
+      crate_dir.join("tests/integration.rs"),
+      r#"#[cfg(feature = "test-ollama")] fn run() {}"#,
+    )
+    .expect("write integration test");
+
+    let features = scan_source_for_cfg_features(crate_dir);
+    assert!(
+      features.contains("test-ollama"),
+      "should detect feature cfg used from tests/"
+    );
   }
 }
