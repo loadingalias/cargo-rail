@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.5](https://github.com/loadingalias/cargo-rail/compare/v0.10.4...v0.10.5) - 2026-02-16
+
+### 🐛 Bug Fixes
+
+- **unify**: enforce atomic workspace-member cohorts to prevent split local/registry graphs (Tokio) ([9ae8c05](https://github.com/loadingalias/cargo-rail/commit/9ae8c051399a0e2f86fa1eca94f17709bd45f57e))
+
+
+
 ## [0.10.4](https://github.com/loadingalias/cargo-rail/compare/v0.10.3...v0.10.4) - 2026-02-16
 
 ### 👷 CI
