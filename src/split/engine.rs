@@ -1,6 +1,12 @@
+//! Split engine for deterministic crate extraction.
+//!
+//! Rebuilds crate history into a target repository while preserving stable commit
+//! metadata and applying manifest transformations for split modes.
+
 use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::git::git_cmd_for_path;
 use crate::git::mappings::MappingStore;
 use crate::git::{CommitInfo, SystemGit};
 use crate::progress;
@@ -200,15 +206,10 @@ impl<'a> SplitEngine<'a> {
       .collect()
   }
 
-  /// Apply Cargo.toml transformation to a manifest file
-  /// Returns Ok(()) if transform succeeded or file doesn't exist
+  /// Apply Cargo.toml transformation for split output.
   ///
-  /// # Arguments
-  /// * `manifest_path` - Path to the Cargo.toml to transform
-  /// * `crate_name` - Name of the crate being transformed
-  /// * `target_has_workspace` - Whether target repo will have a workspace structure
-  ///   - true: keep `[lints] workspace = true` (Combined + Workspace mode)
-  ///   - false: resolve `[lints]` to actual values (Single or Combined + Standalone mode)
+  /// If the manifest does not exist, this is a no-op. Workspace inheritance is
+  /// preserved only when the split target will remain a workspace.
   fn apply_manifest_transform(
     &self,
     manifest_path: &Path,
@@ -230,9 +231,10 @@ impl<'a> SplitEngine<'a> {
     Ok(())
   }
 
-  /// Recreate a commit in the target repository with transforms applied
-  /// Returns the new commit SHA, or None if the commit should be skipped
-  /// (e.g., when files were deleted at this commit - "dirty history")
+  /// Recreate one commit in the target repository with split transforms applied.
+  ///
+  /// Returns `Some(new_sha)` when a commit is materialized, or `None` when the
+  /// source commit should be skipped (for example, path was deleted at that point).
   fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<Option<String>> {
     // Use pre-fetched files if available, otherwise collect them now
     // Use Cow to avoid cloning the prefetched Vec when it's already available
@@ -328,33 +330,21 @@ impl<'a> SplitEngine<'a> {
   /// Create a git commit using git commands for determinism
   /// Uses git commit-tree for full control over parents
   fn create_git_commit(&self, params: &CommitParams) -> RailResult<String> {
-    use std::process::Command;
-
     // Stage all files
-    let status = Command::new("git")
-      .current_dir(params.repo_path)
-      .args(["add", "-A"])
-      .status()
-      .context("Failed to run git add")?;
-
-    if !status.success() {
+    let add_output = Self::run_git_in_repo(params.repo_path, &["add", "-A"])?;
+    if !add_output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git add".to_string(),
-        stderr: "git add failed".to_string(),
+        stderr: String::from_utf8_lossy(&add_output.stderr).trim().to_string(),
       }));
     }
 
     // Write the tree
-    let output = Command::new("git")
-      .current_dir(params.repo_path)
-      .args(["write-tree"])
-      .output()
-      .context("Failed to write tree")?;
-
+    let output = Self::run_git_in_repo(params.repo_path, &["write-tree"])?;
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git write-tree".to_string(),
-        stderr: "git write-tree failed".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
       }));
     }
 
@@ -365,9 +355,8 @@ impl<'a> SplitEngine<'a> {
     let commit_date = format!("{} +0000", params.timestamp);
 
     // Build commit-tree command
-    let mut cmd = Command::new("git");
+    let mut cmd = git_cmd_for_path(params.repo_path);
     cmd
-      .current_dir(params.repo_path)
       .env("GIT_AUTHOR_NAME", params.author_name)
       .env("GIT_AUTHOR_EMAIL", params.author_email)
       .env("GIT_AUTHOR_DATE", &author_date)
@@ -398,13 +387,23 @@ impl<'a> SplitEngine<'a> {
     let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
 
     // Update the branch reference
-    Command::new("git")
-      .current_dir(params.repo_path)
-      .args(["update-ref", "HEAD", &commit_sha])
-      .status()
-      .context("Failed to update HEAD")?;
+    let update_output = Self::run_git_in_repo(params.repo_path, &["update-ref", "HEAD", &commit_sha])?;
+    if !update_output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git update-ref HEAD".to_string(),
+        stderr: String::from_utf8_lossy(&update_output.stderr).trim().to_string(),
+      }));
+    }
 
     Ok(commit_sha)
+  }
+
+  fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> RailResult<std::process::Output> {
+    let mut cmd = git_cmd_for_path(repo_path);
+    cmd.args(args);
+    cmd
+      .output()
+      .with_context(|| format!("Failed to execute git {}", args.join(" ")))
   }
 
   /// Check if remote repository exists and has content

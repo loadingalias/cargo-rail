@@ -4,12 +4,12 @@ use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::release::changelog::ChangelogGenerator;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
+use crate::release::process;
 use crate::release::version::VersionBumper;
 use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
 use chrono::Local;
 use std::fs;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -35,8 +35,7 @@ impl<'a> ReleasePublisher<'a> {
 
     // Check gh CLI availability if GitHub releases are enabled
     if self.release_config.create_github_release && !skip_tag {
-      let check = Command::new("gh").args(["--version"]).output();
-      if check.is_err() || !check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+      if !process::succeeds("gh", &["--version"], None) {
         warnings.push(
           "GitHub releases enabled but 'gh' CLI not found. \
                     Install from https://cli.github.com/ or set create_github_release = false"
@@ -44,8 +43,7 @@ impl<'a> ReleasePublisher<'a> {
         );
       } else {
         // Check gh auth status
-        let auth_check = Command::new("gh").args(["auth", "status"]).output();
-        if auth_check.is_err() || !auth_check.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+        if !process::succeeds("gh", &["auth", "status"], None) {
           warnings.push("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
         }
       }
@@ -167,11 +165,11 @@ impl<'a> ReleasePublisher<'a> {
   /// This is safer than `cargo update --workspace` which can inadvertently upgrade
   /// pinned external dependencies during a release.
   fn update_lockfile_for_crate(&self, crate_name: &str) -> RailResult<()> {
-    let output = Command::new("cargo")
-      .current_dir(self.ctx.workspace_root())
-      .args(["update", "--package", crate_name])
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run cargo update: {}", e)))?;
+    let output = process::run(
+      "cargo",
+      &["update", "--package", crate_name],
+      Some(self.ctx.workspace_root()),
+    )?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,11 +292,7 @@ impl<'a> ReleasePublisher<'a> {
       .parent()
       .ok_or_else(|| RailError::message("Invalid manifest path"))?;
 
-    let output = Command::new("cargo")
-      .current_dir(crate_dir)
-      .args(["publish", "--allow-dirty"]) // dirty because we just committed
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run cargo publish: {}", e)))?;
+    let output = process::run("cargo", &["publish", "--allow-dirty"], Some(crate_dir))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
@@ -313,13 +307,7 @@ impl<'a> ReleasePublisher<'a> {
 
   /// Create GitHub release using gh CLI
   fn create_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    let gh_available = Command::new("gh")
-      .args(["--version"])
-      .output()
-      .map(|o| o.status.success())
-      .unwrap_or(false);
-
-    if !gh_available {
+    if !process::succeeds("gh", &["--version"], None) {
       progress!("  skipped github release (gh CLI not found)");
       return Ok(());
     }
@@ -331,9 +319,9 @@ impl<'a> ReleasePublisher<'a> {
       format!("Release {} v{}", plan.name, plan.new_version)
     };
 
-    let output = Command::new("gh")
-      .current_dir(self.ctx.workspace_root())
-      .args([
+    let output = process::run(
+      "gh",
+      &[
         "release",
         "create",
         &plan.tag_name,
@@ -341,9 +329,9 @@ impl<'a> ReleasePublisher<'a> {
         &format!("{} v{}", plan.name, plan.new_version),
         "--notes",
         &notes,
-      ])
-      .output()
-      .map_err(|e| RailError::message(format!("gh release failed: {}", e)))?;
+      ],
+      Some(self.ctx.workspace_root()),
+    )?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);

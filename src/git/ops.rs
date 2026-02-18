@@ -351,7 +351,7 @@ impl SystemGit {
 
   /// Create a commit with specific metadata
   ///
-  /// Returns the new commit SHA.
+  /// Creates a commit and returns its SHA.
   pub fn create_commit_with_metadata(
     &self,
     message: &str,
@@ -417,11 +417,7 @@ impl SystemGit {
   /// - Can read 1000+ files in <500ms
   /// - Processes files in parallel chunks using rayon
   ///
-  /// # Arguments
-  /// - `items`: Vec of (commit_sha, path) tuples to read
-  ///
-  /// # Returns
-  /// Vec of file contents in the same order as input. Empty Vec if file doesn't exist.
+  /// Output order matches input order. Missing files produce empty byte vectors.
   pub fn read_files_bulk(&self, items: &[(&str, &Path)]) -> RailResult<Vec<Vec<u8>>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -533,11 +529,7 @@ impl SystemGit {
   /// - Processes commits in parallel using rayon
   /// - Can fetch 1000+ commits in <2s
   ///
-  /// # Arguments
-  /// - `shas`: Vec of commit SHAs to fetch
-  ///
-  /// # Returns
-  /// Vec of CommitInfo in the same order as input
+  /// Output order matches input SHA order.
   pub fn get_commits_bulk(&self, shas: &[String]) -> RailResult<Vec<CommitInfo>> {
     use rayon::prelude::*;
 

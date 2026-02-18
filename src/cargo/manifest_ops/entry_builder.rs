@@ -57,14 +57,8 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
 ///
 /// Used in member manifests to reference [workspace.dependencies].
 ///
-/// # Arguments
-///
-/// * `local_features` - Additional features to enable locally (beyond workspace features)
-/// * `is_optional` - Whether the dependency is optional
-///
-/// # Returns
-///
-/// `{ workspace = true }` with optional fields and `#unified` comment marker
+/// Produces `{ workspace = true }` plus optional feature/optional fields and
+/// the `#unified` comment marker.
 pub fn build_workspace_dep_entry<S: AsRef<str>>(local_features: Option<&[S]>, is_optional: bool) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
@@ -91,10 +85,6 @@ pub fn build_workspace_dep_entry<S: AsRef<str>>(local_features: Option<&[S]>, is
 /// Build a transitive dependency entry for pinning
 ///
 /// Used for workspace-hack replacement (dev-dependencies with workspace = true and features).
-///
-/// # Arguments
-///
-/// * `features` - Features to enable for the transitive dependency
 pub fn build_transitive_entry<S: AsRef<str>>(features: &[S]) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
@@ -118,11 +108,6 @@ pub fn build_transitive_entry<S: AsRef<str>>(features: &[S]) -> Item {
 /// IMPORTANT: When pinning transitives with explicit features, we MUST set
 /// `default-features = false` to prevent cargo from enabling default features
 /// that might pull in new dependencies not present in the current Cargo.lock.
-///
-/// # Arguments
-///
-/// * `version` - The semver version to use
-/// * `features` - Features to enable (intersection across all targets)
 pub fn build_versioned_dep_entry<S: AsRef<str>>(version: &semver::Version, features: &[S]) -> Item {
   // Simple case: just version, no features - let cargo use defaults
   // This is safe because we're not changing the feature set

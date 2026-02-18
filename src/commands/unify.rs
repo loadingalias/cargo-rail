@@ -11,6 +11,7 @@ use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 struct UnifyTextSink {
@@ -77,6 +78,34 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
       }
       Ok(())
     }
+  }
+}
+
+fn format_quoted_list(values: &[impl AsRef<str>]) -> String {
+  let mut out = String::with_capacity(values.iter().map(|v| v.as_ref().len()).sum::<usize>() + values.len() * 4 + 2);
+  out.push('[');
+  for (idx, value) in values.iter().enumerate() {
+    if idx > 0 {
+      out.push_str(", ");
+    }
+    out.push('"');
+    out.push_str(value.as_ref());
+    out.push('"');
+  }
+  out.push(']');
+  out
+}
+
+fn dependency_section<'a>(dep_kind: &crate::cargo::DepKind, target: Option<&'a str>) -> std::borrow::Cow<'a, str> {
+  use std::borrow::Cow;
+
+  match (dep_kind, target) {
+    (crate::cargo::DepKind::Dev, None) => Cow::Borrowed("[dev-dependencies]"),
+    (crate::cargo::DepKind::Build, None) => Cow::Borrowed("[build-dependencies]"),
+    (_, None) => Cow::Borrowed("[dependencies]"),
+    (crate::cargo::DepKind::Dev, Some(t)) => Cow::Owned(format!("[target.'{}'.dev-dependencies]", t)),
+    (crate::cargo::DepKind::Build, Some(t)) => Cow::Owned(format!("[target.'{}'.build-dependencies]", t)),
+    (_, Some(t)) => Cow::Owned(format!("[target.'{}'.dependencies]", t)),
   }
 }
 
@@ -215,15 +244,7 @@ pub fn run_unify_analyze(
         if !dep.features.is_empty() {
           let mut features = dep.features.clone();
           features.sort();
-          outln!(
-            sink,
-            "      features = [{}]",
-            features
-              .iter()
-              .map(|f| format!("\"{}\"", f))
-              .collect::<Vec<_>>()
-              .join(", ")
-          );
+          outln!(sink, "      features = {}", format_quoted_list(&features));
         }
       }
 
@@ -233,15 +254,7 @@ pub fn run_unify_analyze(
         if !pin.features.is_empty() {
           let mut features = pin.features.clone();
           features.sort();
-          outln!(
-            sink,
-            "      features = [{}]",
-            features
-              .iter()
-              .map(|f| format!("\"{}\"", f))
-              .collect::<Vec<_>>()
-              .join(", ")
-          );
+          outln!(sink, "      features = {}", format_quoted_list(&features));
         }
       }
       outln!(sink);
@@ -270,26 +283,13 @@ pub fn run_unify_analyze(
             local_features,
             is_optional,
           } => {
-            let section = match (dep_kind, target) {
-              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
-              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
-              (_, None) => "[dependencies]".to_string(),
-              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
-              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
-              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
-            };
-            let mut line = format!("  {} {} -> workspace = true", section, dep_name);
+            let section = dependency_section(dep_kind, target.as_deref());
+            let mut line = String::with_capacity(64 + section.len() + dep_name.len());
+            let _ = write!(line, "  {} {} -> workspace = true", section, dep_name);
             if !local_features.is_empty() {
               let mut features = local_features.clone();
               features.sort();
-              line.push_str(&format!(
-                ", features = [{}]",
-                features
-                  .iter()
-                  .map(|f| format!("\"{}\"", f))
-                  .collect::<Vec<_>>()
-                  .join(", ")
-              ));
+              let _ = write!(line, ", features = {}", format_quoted_list(&features));
             }
             if *is_optional {
               line.push_str(", optional = true");
@@ -301,14 +301,7 @@ pub fn run_unify_analyze(
             dep_kind,
             target,
           } => {
-            let section = match (dep_kind, target) {
-              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
-              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
-              (_, None) => "[dependencies]".to_string(),
-              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
-              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
-              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
-            };
+            let section = dependency_section(dep_kind, target.as_deref());
             outln!(sink, "  {} {} -> REMOVE (unused)", section, dep_name);
           }
           crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
@@ -320,26 +313,15 @@ pub fn run_unify_analyze(
             target,
             features_to_add,
           } => {
-            let section = match (dep_kind, target) {
-              (crate::cargo::DepKind::Dev, None) => "[dev-dependencies]".to_string(),
-              (crate::cargo::DepKind::Build, None) => "[build-dependencies]".to_string(),
-              (_, None) => "[dependencies]".to_string(),
-              (crate::cargo::DepKind::Dev, Some(t)) => format!("[target.'{}'.dev-dependencies]", t),
-              (crate::cargo::DepKind::Build, Some(t)) => format!("[target.'{}'.build-dependencies]", t),
-              (_, Some(t)) => format!("[target.'{}'.dependencies]", t),
-            };
+            let section = dependency_section(dep_kind, target.as_deref());
             let mut sorted_features = features_to_add.clone();
             sorted_features.sort();
             outln!(
               sink,
-              "  {} {} -> ADD features [{}]",
+              "  {} {} -> ADD features {}",
               section,
               dep_name,
-              sorted_features
-                .iter()
-                .map(|f| format!("\"{}\"", f))
-                .collect::<Vec<_>>()
-                .join(", ")
+              format_quoted_list(&sorted_features)
             );
           }
           crate::cargo::MemberEdit::EnforceMsrvInheritance => {

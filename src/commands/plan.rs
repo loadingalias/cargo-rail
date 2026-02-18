@@ -882,51 +882,50 @@ fn push_trace(
 }
 
 fn format_text(output: &PlanOutput, explain: bool) -> String {
-  let mut out = String::new();
+  use std::fmt::Write as _;
+
+  let estimated_capacity = 128
+    + (output.files.len() * 72)
+    + (output.impact.direct_crates.len() * 20)
+    + (output.impact.transitive_crates.len() * 20)
+    + (output.trace.len() * 64);
+  let mut out = String::with_capacity(estimated_capacity);
 
   out.push_str("plan\n\n");
-  out.push_str(&format!("changed files: {}\n", output.files.len()));
+  let _ = writeln!(out, "changed files: {}", output.files.len());
   for file in &output.files {
     let owners = if file.owners.is_empty() {
-      file.owner_scope.clone()
+      std::borrow::Cow::Borrowed(file.owner_scope.as_str())
     } else {
-      file.owners.join(",")
+      std::borrow::Cow::Owned(file.owners.join(","))
     };
 
     if let Some(sub) = &file.sub_kind {
-      out.push_str(&format!("  {} [{}:{}] -> {}\n", file.path, file.kind, sub, owners));
+      let _ = writeln!(out, "  {} [{}:{}] -> {}", file.path, file.kind, sub, owners);
     } else {
-      out.push_str(&format!("  {} [{}] -> {}\n", file.path, file.kind, owners));
+      let _ = writeln!(out, "  {} [{}] -> {}", file.path, file.kind, owners);
     }
   }
 
   out.push('\n');
-  out.push_str(&format!("direct crates: {}\n", output.impact.direct_crates.len()));
+  let _ = writeln!(out, "direct crates: {}", output.impact.direct_crates.len());
   for crate_name in &output.impact.direct_crates {
-    out.push_str(&format!("  {}\n", crate_name));
+    let _ = writeln!(out, "  {}", crate_name);
   }
 
-  out.push_str(&format!(
-    "transitive crates: {}\n",
-    output.impact.transitive_crates.len()
-  ));
+  let _ = writeln!(out, "transitive crates: {}", output.impact.transitive_crates.len());
   for crate_name in &output.impact.transitive_crates {
-    out.push_str(&format!("  {}\n", crate_name));
+    let _ = writeln!(out, "  {}", crate_name);
   }
 
   out.push('\n');
   out.push_str("surfaces:\n");
   for (name, decision) in &output.surfaces {
-    out.push_str(&format!(
-      "  {}: {}{}\n",
-      name,
-      if decision.enabled { "on" } else { "off" },
-      if decision.reasons.is_empty() {
-        String::new()
-      } else {
-        format!(" ({} reason(s))", decision.reasons.len())
-      }
-    ));
+    let _ = write!(out, "  {}: {}", name, if decision.enabled { "on" } else { "off" });
+    if !decision.reasons.is_empty() {
+      let _ = write!(out, " ({} reason(s))", decision.reasons.len());
+    }
+    out.push('\n');
   }
 
   if explain {
@@ -968,6 +967,8 @@ fn format_trace_line(reason: &TraceReason) -> String {
 }
 
 fn format_github(output: &PlanOutput) -> RailResult<String> {
+  use std::fmt::Write as _;
+
   let plan_json = to_json(output)?;
 
   let custom_states: BTreeMap<String, bool> = output
@@ -995,7 +996,14 @@ fn format_github(output: &PlanOutput) -> RailResult<String> {
     .collect();
 
   let crates_sorted: Vec<&str> = crate_union.iter().copied().collect();
-  let cargo_args: Vec<String> = crates_sorted.iter().map(|c| format!("-p {}", c)).collect();
+  let mut cargo_args = String::with_capacity(crates_sorted.len() * 8);
+  for (idx, crate_name) in crates_sorted.iter().enumerate() {
+    if idx > 0 {
+      cargo_args.push(' ');
+    }
+    cargo_args.push_str("-p ");
+    cargo_args.push_str(crate_name);
+  }
 
   let matrix_json = to_json(&crates_sorted)?;
 
@@ -1007,54 +1015,36 @@ fn format_github(output: &PlanOutput) -> RailResult<String> {
     .collect();
   let active_surfaces_json = to_json(&active_surfaces)?;
 
-  Ok(format!(
-    "build={}\n\
-     test={}\n\
-     bench={}\n\
-     docs={}\n\
-     infra={}\n\
-     plan_contract_version={}\n\
-     base_ref={}\n\
-     head_ref={}\n\
-     confidence_profile={}\n\
-     confidence_profile_source={}\n\
-     direct_crates={}\n\
-     transitive_crates={}\n\
-     custom_surfaces={}\n\
-     plan_json={}\n\
-     files={}\n\
-     changed_files_count={}\n\
-     surfaces={}\n\
-     trace={}\n\
-     crates={}\n\
-     count={}\n\
-     cargo_args={}\n\
-     matrix={}\n\
-     active_surfaces={}",
-    surface_enabled(output, "build"),
-    surface_enabled(output, "test"),
-    surface_enabled(output, "bench"),
-    surface_enabled(output, "docs"),
-    surface_enabled(output, "infra"),
-    output.plan_contract_version,
-    output.inputs.refs.resolved_base,
-    output.inputs.refs.resolved_head,
-    output.inputs.confidence_profile,
-    output.inputs.confidence_profile_source,
-    output.impact.direct_crates.join(" "),
-    output.impact.transitive_crates.join(" "),
-    custom_json,
-    plan_json,
-    files_json,
-    output.files.len(),
-    surfaces_json,
-    trace_json,
-    crates_sorted.join(" "),
-    crates_sorted.len(),
-    cargo_args.join(" "),
-    matrix_json,
-    active_surfaces_json,
-  ))
+  let mut out = String::with_capacity(512 + plan_json.len() + surfaces_json.len() + trace_json.len());
+  let _ = writeln!(out, "build={}", surface_enabled(output, "build"));
+  let _ = writeln!(out, "test={}", surface_enabled(output, "test"));
+  let _ = writeln!(out, "bench={}", surface_enabled(output, "bench"));
+  let _ = writeln!(out, "docs={}", surface_enabled(output, "docs"));
+  let _ = writeln!(out, "infra={}", surface_enabled(output, "infra"));
+  let _ = writeln!(out, "plan_contract_version={}", output.plan_contract_version);
+  let _ = writeln!(out, "base_ref={}", output.inputs.refs.resolved_base);
+  let _ = writeln!(out, "head_ref={}", output.inputs.refs.resolved_head);
+  let _ = writeln!(out, "confidence_profile={}", output.inputs.confidence_profile);
+  let _ = writeln!(
+    out,
+    "confidence_profile_source={}",
+    output.inputs.confidence_profile_source
+  );
+  let _ = writeln!(out, "direct_crates={}", output.impact.direct_crates.join(" "));
+  let _ = writeln!(out, "transitive_crates={}", output.impact.transitive_crates.join(" "));
+  let _ = writeln!(out, "custom_surfaces={}", custom_json);
+  let _ = writeln!(out, "plan_json={}", plan_json);
+  let _ = writeln!(out, "files={}", files_json);
+  let _ = writeln!(out, "changed_files_count={}", output.files.len());
+  let _ = writeln!(out, "surfaces={}", surfaces_json);
+  let _ = writeln!(out, "trace={}", trace_json);
+  let _ = writeln!(out, "crates={}", crates_sorted.join(" "));
+  let _ = writeln!(out, "count={}", crates_sorted.len());
+  let _ = writeln!(out, "cargo_args={}", cargo_args);
+  let _ = writeln!(out, "matrix={}", matrix_json);
+  let _ = write!(out, "active_surfaces={}", active_surfaces_json);
+
+  Ok(out)
 }
 
 fn surface_enabled(output: &PlanOutput, key: &str) -> bool {

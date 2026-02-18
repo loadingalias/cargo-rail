@@ -65,14 +65,8 @@ impl ManifestWriter {
 
   /// Update a member's Cargo.toml to use workspace inheritance
   ///
-  /// # Arguments
-  ///
-  /// * `member_toml_path` - Path to the member's Cargo.toml
-  /// * `dep_name` - Name of the dependency to update
-  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
-  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
-  /// * `local_features` - Additional features to enable locally
-  /// * `is_optional` - Whether the dependency is optional
+  /// Rewrites the dependency entry to `workspace = true`, preserving optional
+  /// and local feature overlays when provided.
   pub fn update_member<S: AsRef<str>>(
     &self,
     member_toml_path: &Path,
@@ -221,12 +215,8 @@ impl ManifestWriter {
 
   /// Remove an unused dependency from a member's Cargo.toml
   ///
-  /// # Arguments
-  ///
-  /// * `member_toml_path` - Path to the member's Cargo.toml
-  /// * `dep_name` - Name of the dependency to remove
-  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
-  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
+  /// Removes the dependency from the resolved dependency section (optionally
+  /// target-scoped) and writes the manifest back.
   pub fn remove_dep(
     &self,
     member_toml_path: &Path,
@@ -261,9 +251,7 @@ impl ManifestWriter {
 
   /// Remove a dead feature from a member's Cargo.toml
   ///
-  /// # Arguments
-  /// * `member_toml_path` - Path to the member's Cargo.toml
-  /// * `feature_name` - Name of the feature to remove
+  /// No-ops if the manifest has no `[features]` table or the feature is absent.
   pub fn remove_feature(&self, member_toml_path: &Path, feature_name: &str) -> RailResult<()> {
     // Read member Cargo.toml
     let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
@@ -285,12 +273,8 @@ impl ManifestWriter {
   /// This is used to fix undeclared feature dependencies - when a crate relies on
   /// Cargo's feature unification to "borrow" features from other workspace members.
   ///
-  /// # Arguments
-  /// * `member_toml_path` - Path to the member's Cargo.toml
-  /// * `dep_name` - Name of the dependency to update
-  /// * `dep_kind` - Type of dependency (Normal, Dev, Build)
-  /// * `target` - Optional target platform constraint (e.g., "cfg(unix)")
-  /// * `features_to_add` - Features to add to the dependency
+  /// Adds missing features idempotently and preserves existing dependency form
+  /// (string or table) where possible.
   pub fn add_features<S: AsRef<str>>(
     &self,
     member_toml_path: &Path,

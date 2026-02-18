@@ -22,7 +22,7 @@ use super::multi_target_metadata::MultiTargetMetadata;
 
 /// Scan source files for `cfg(feature = "...")` patterns
 ///
-/// Returns a set of feature names referenced in the source code.
+/// Produces the set of feature names referenced in source.
 /// This prevents pruning features that are used for conditional compilation.
 fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
   let mut features = HashSet::new();
@@ -45,10 +45,10 @@ fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
 
   // build.rs may also use feature cfgs.
   let build_script = crate_dir.join("build.rs");
-  if build_script.exists() {
-    if let Ok(content) = fs::read_to_string(build_script) {
-      extract_cfg_features(&content, &mut features);
-    }
+  if build_script.exists()
+    && let Ok(content) = fs::read_to_string(build_script)
+  {
+    extract_cfg_features(&content, &mut features);
   }
 
   features

@@ -1,7 +1,8 @@
-/// Conflict resolution for cargo-rail
-///
-/// Handles file-level conflicts when syncing changes between monorepo and split repos.
-/// Uses Git's battle-tested 3-way merge algorithm via `git merge-file`.
+//! Conflict resolution for sync operations.
+//!
+//! Handles file-level conflicts between monorepo and split repositories using
+//! Git's 3-way merge (`git merge-file`) with configurable strategy.
+
 use crate::error::{RailResult, ResultExt};
 use clap::ValueEnum;
 use std::path::{Path, PathBuf};
@@ -57,17 +58,15 @@ impl ConflictResolver {
     self.strategy
   }
 
-  /// Resolve conflicts for a single file using 3-way merge
+  /// Resolve a single file with 3-way merge.
   ///
-  /// # Arguments
-  /// * `current_path` - Path to current file (in monorepo)
-  /// * `base_content` - Content of the common ancestor
-  /// * `incoming_content` - Content from remote/split repo
+  /// Applies the configured conflict strategy and writes merged content back to
+  /// `current_path`. When conflicts remain, conflict markers are preserved in
+  /// the file and reported via [`MergeResult::Conflicts`].
   ///
-  /// # Returns
-  /// * `Ok(MergeResult::Success)` - Merged successfully
-  /// * `Ok(MergeResult::Conflicts)` - Conflicts detected (markers inserted)
-  /// * `Err(_)` - Merge failed
+  /// # Errors
+  ///
+  /// Returns an error when temporary file I/O or `git merge-file` execution fails.
   pub fn resolve_file(
     &self,
     current_path: &Path,

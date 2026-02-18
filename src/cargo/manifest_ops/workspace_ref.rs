@@ -5,10 +5,6 @@ use toml_edit::Item;
 /// Check if dependency entry uses workspace = true
 ///
 /// Works for both inline tables and regular tables.
-///
-/// # Returns
-///
-/// `true` if the dependency has `workspace = true`, `false` otherwise
 pub fn is_workspace_dep(item: &Item) -> bool {
   if let Some(table) = item.as_inline_table() {
     table.get("workspace").and_then(|v| v.as_bool()).unwrap_or(false)
@@ -27,10 +23,6 @@ pub fn is_package_workspace_inherited(item: &Item) -> bool {
 }
 
 /// Extract and remove workspace = true marker from dependency
-///
-/// # Returns
-///
-/// `true` if workspace marker was present and removed, `false` otherwise
 pub fn extract_workspace_marker(item: &mut Item) -> bool {
   if let Some(table) = item.as_inline_table_mut() {
     table.remove("workspace").is_some()

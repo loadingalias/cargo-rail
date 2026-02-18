@@ -39,6 +39,9 @@ pub struct UnifyAnalyzer {
   workspace_root: PathBuf,
 }
 
+type FeatureSources = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
+type FeatureTargetSpecific = FxHashMap<String, FxHashMap<String, bool>>;
+
 impl UnifyAnalyzer {
   /// Create a new analyzer from workspace context
   pub fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
@@ -229,10 +232,6 @@ impl UnifyAnalyzer {
   ///
   /// Takes a path that's relative to a member's Cargo.toml and converts it
   /// to be relative to the workspace root.
-  ///
-  /// # Arguments
-  /// * `member_manifest_path` - Path to the member's Cargo.toml
-  /// * `dep_path` - The dependency path (relative to member's Cargo.toml)
   fn normalize_dep_path(&self, member_manifest_path: &Path, dep_path: &str) -> PathBuf {
     // Get the member's directory (parent of Cargo.toml)
     let member_dir = member_manifest_path.parent().unwrap_or(member_manifest_path);
@@ -863,12 +862,9 @@ impl UnifyAnalyzer {
   fn track_feature_sources(
     &self,
     workspace_baseline: &FxHashMap<String, FxHashSet<String>>,
-  ) -> (
-    FxHashMap<String, FxHashMap<String, FxHashSet<String>>>,
-    FxHashMap<String, FxHashMap<String, bool>>,
-  ) {
-    let mut feature_sources: FxHashMap<String, FxHashMap<String, FxHashSet<String>>> = FxHashMap::default();
-    let mut feature_is_target_specific: FxHashMap<String, FxHashMap<String, bool>> = FxHashMap::default();
+  ) -> (FeatureSources, FeatureTargetSpecific) {
+    let mut feature_sources: FeatureSources = FxHashMap::default();
+    let mut feature_is_target_specific: FeatureTargetSpecific = FxHashMap::default();
 
     for member in &self.manifests.members {
       for (dep_key, usages) in &member.dependencies {

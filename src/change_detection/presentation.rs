@@ -90,8 +90,8 @@ impl ChangeClassifier {
 
   /// Classify a list of changed file paths
   ///
-  /// Returns a `ChangeClassification` with docs_only, rebuild_all,
-  /// infrastructure_files, and custom_categories populated.
+  /// Produces a [`ChangeClassification`] with docs-only/full-rebuild signals,
+  /// triggering infrastructure files, and matched custom categories.
   pub fn classify<P: AsRef<Path>>(&self, files: &[P]) -> ChangeClassification {
     let mut result = ChangeClassification::default();
     let mut has_non_doc_changes = false;

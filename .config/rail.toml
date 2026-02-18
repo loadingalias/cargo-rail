@@ -4,8 +4,8 @@
 #
 # Commands:
 #   cargo rail init           - Generate this config
-#   cargo rail affected       - Show crates affected by changes
-#   cargo rail test           - Run tests for affected crates
+#   cargo rail plan           - Build a deterministic change plan
+#   cargo rail run            - Execute planner-selected surfaces
 #   cargo rail unify          - Unify workspace dependencies
 #   cargo rail split          - Split crate to standalone repo
 #   cargo rail sync           - Sync monorepo <-> split repos

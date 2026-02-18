@@ -188,6 +188,14 @@ pub struct ManifestAnalyzer {
 }
 
 impl ManifestAnalyzer {
+  fn unconditional_usages(&self, dep: &DepKey) -> Vec<&DepUsage> {
+    self
+      .usage_index
+      .get(dep)
+      .map(|usages| usages.iter().filter(|u| u.target.is_none()).collect())
+      .unwrap_or_default()
+  }
+
   /// Parse all workspace member manifests (in parallel)
   pub fn parse_workspace(_workspace_root: &Path, members: &[&cargo_metadata::Package]) -> RailResult<Self> {
     // Parse manifests in parallel for 50-70% speedup
@@ -495,7 +503,7 @@ impl ManifestAnalyzer {
   ///
   /// These features should stay local (in member Cargo.toml) because they may
   /// have platform-specific requirements (like cfg flags or OS restrictions).
-  /// Returns the set of features that appear only in target-constrained usages.
+  /// Produces features that appear only in target-constrained usages.
   pub fn compute_target_local_features(&self, dep: &DepKey) -> BTreeSet<String> {
     let Some(usages) = self.usage_index.get(dep) else {
       return BTreeSet::new();
@@ -525,12 +533,7 @@ impl ManifestAnalyzer {
   /// Target-specific usages are excluded because their features may have
   /// platform-specific requirements.
   pub fn compute_intersection(&self, dep: &DepKey) -> BTreeSet<String> {
-    let Some(usages) = self.usage_index.get(dep) else {
-      return BTreeSet::new();
-    };
-
-    // Filter to unconditional usages only
-    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+    let unconditional_usages = self.unconditional_usages(dep);
 
     // Include ALL dep kinds - workspace deps serve all usage contexts
     if unconditional_usages.len() < 2 {
@@ -571,12 +574,7 @@ impl ManifestAnalyzer {
   ///
   /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
   pub fn has_mixed_defaults(&self, dep: &DepKey) -> bool {
-    let Some(usages) = self.usage_index.get(dep) else {
-      return false;
-    };
-
-    // Filter to unconditional usages only
-    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+    let unconditional_usages = self.unconditional_usages(dep);
 
     // Include ALL dep kinds - workspace deps serve all usage contexts
     if unconditional_usages.len() < 2 {
@@ -594,10 +592,7 @@ impl ManifestAnalyzer {
   ///
   /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
   pub fn default_features_policy(&self, dep: &DepKey) -> Option<bool> {
-    let usages = self.usage_index.get(dep)?;
-
-    // Filter to unconditional usages only
-    let unconditional_usages: Vec<_> = usages.iter().filter(|u| u.target.is_none()).collect();
+    let unconditional_usages = self.unconditional_usages(dep);
 
     // Include ALL dep kinds - workspace deps serve all usage contexts
     if unconditional_usages.is_empty() {
@@ -751,7 +746,7 @@ pub struct ExistingWorkspaceDep {
 
 /// Parse existing [workspace.dependencies] from the workspace root Cargo.toml
 ///
-/// Returns a map of dependency name to its current configuration.
+/// Produces a map of dependency name to current workspace configuration.
 /// This is used to detect deps that already exist in workspace.dependencies
 /// so we don't add duplicates.
 pub fn parse_existing_workspace_deps(workspace_root: &Path) -> RailResult<FxHashMap<String, ExistingWorkspaceDep>> {

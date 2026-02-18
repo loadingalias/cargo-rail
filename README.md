@@ -1,6 +1,6 @@
 # cargo-rail
 
-> A deterministic, cargo-native control plane for Rust monorepos: build/check/test/bench only what changes locally and in CI, unify the graph (deps/features), split/sync crates into new repos/monorepos, and automate releases with 14 core dependencies.
+> Deterministic Rust monorepo orchestration: run only impacted CI surfaces, unify dependency graphs, split/sync crates across repos, and automate releases.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail) [![docs.rs](https://img.shields.io/docsrs/cargo-rail)](https://docs.rs/cargo-rail) [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml) [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
@@ -18,13 +18,13 @@
 | **Undeclared `features` Fixed** | 258 silent bugs prevented |
 | **MSRV Computation** | Automatic from dependency graph |
 
-**Compounding effects = massive time/cost savings:**
+**Why this matters:**
 1. **Change Detection** (`plan`/`run`) reduces what runs — 68% of measured commits avoided full-run behavior, with explicit plan traces.
-2. **Dependency Unification** (`unify`) reduces build graph complexity — cleaner deps, smaller build units, fewer rebuilds
-3. **Smaller Build Graphs** cargo-rail uses 14 core-deps for automatically removing unused dependencies, pruning truly dead features, unifying undeclared features, computing MSRV, splitting and synching crate/s to new, clean repos, and the entire release workflow w/ changelog generation. This results in fewer tools and less cargo-metadata fetches.
+2. **Dependency Unification** (`unify`) reduces graph complexity — cleaner deps, smaller build units, fewer rebuilds.
+3. **Toolchain Consolidation** keeps workflows in one tool with 14 core dependencies, reducing repeated metadata fetches and plugin sprawl.
 
-**Before cargo-rail:** Run 6 tools separately (hakari and/or workspace-hack, udeps, machete, shear, features-manager, msrv, sort, and more), each with different data/timing
-**After cargo-rail:** `cargo rail unify --check` in one metadata call
+**Before cargo-rail:** run multiple plugins independently (hakari/workspace-hack, udeps, machete, shear, features-manager, msrv, sort, and others), often over separate metadata views.  
+**After cargo-rail:** run `cargo rail unify --check` with one metadata call.
 
 ## Quick Start
 
@@ -51,9 +51,9 @@ Pre-built binaries: [GitHub Releases](https://github.com/loadingalias/cargo-rail
 
 ### Change Planning (detection) + Execution (`plan` / `run`)
 
-**Problem:** CICD wastes resources testing unchanged code. We either (1) test everything on every commit, or (2) build custom scripts that drift from local behavior.
+**Problem:** CI/CD often runs full pipelines for small changes, or relies on custom scripts that drift from local behavior.
 
-**Solution:** One planner contract, used everywhere:
+**Solution:** one planner contract used locally and in CI:
 
 ```bash
 # Local: what would CI run if I pushed this branch?
@@ -67,16 +67,16 @@ cargo rail run --merge-base --profile ci  # runs ONLY what plan selected
 **How to use this effectively:**
 1. Configure change detection rules in `.config/rail.toml` (infrastructure files, doc-only changes, custom, etc.)
 2. Run `plan` to see impact classification (which surfaces: build, test, bench, docs, infra, custom)
-3. Run `run` to execute only selected surfaces — locally or in CI - or wire to `justfile`, `makefile`, `xtask`, or shell scripts.
+3. Run `run` to execute only selected surfaces, locally or in CI, and integrate with `justfile`, `makefile`, `xtask`, or shell scripts.
 4. Use `--explain` to understand any decision: "why did this run?" / "why was this skipped?" 
 
 Result: **21% build skip, 19% test skip, 68% targeted/non-full runs** across 80 measured commits (tokio/helix/meilisearch/helix-db). See: [Examples](examples/change_detection).
 
 ### Dependency Unification (`unify`)
 
-**Problem:** We all juggle 6+ cargo plugins for dependency hygiene (hakari, udeps, machete, shear, features-manager, msrv, sort, etc.). Each runs separately, on different data, with different CLI patterns... pulling the same cargo-metadata over and over. Undeclared features (borrowed from Cargo's resolver) break isolated builds silently.
+**Problem:** dependency hygiene usually requires multiple plugins (hakari, udeps, machete, shear, features-manager, msrv, sort, and others), each with separate commands and metadata passes. Undeclared features borrowed from Cargo's resolver can break isolated builds silently.
 
-**Solution:** `cargo rail unify` — one command, one metadata call, comprehensive analysis:
+**Solution:** `cargo rail unify` provides one command and one metadata pass for integrated analysis:
 
 ```bash
 cargo rail unify --check    # preview all changes
@@ -91,7 +91,7 @@ cargo rail unify --explain  # understand each decision
 - **Detects unused deps** — flags dependencies not used anywhere
 - **Computes MSRV** — derives minimum Rust version from dependency graph
 - **Replaces workspace-hack** — enable `pin_transitives` for cargo-hakari equivalent
-- **Configurable** - we all have different ideas about what clean means, such as whether to remove unused dependencies or prune features or sort manifests - that's what your `rail.toml` file is for.
+- **Configurable** — tune behavior in `rail.toml` (unused removal, feature pruning, sorting, and more).
 
 **Validated impact on real repos:**
 
@@ -105,20 +105,20 @@ cargo rail unify --explain  # understand each decision
 
 Config files and validation artifacts: [Examples](examples/unify/) | [Validation Forks](https://github.com/loadingalias/cargo-rail-testing)
 
-### Split + Sync (Google Copybara Replacement)
+### Split + Sync (Copybara Alternative)
 
-**Problem:** We need/want to publish crates from monorepos but want clean standalone repos with full git history. I wanted to build in a canonical dev monorepo, but release crates independently. Google'sCopybara requires so much and it's built w/ Java. Existing tools (git subtree, git-filter-repo) are one-way and manual. This offers us a bidirectional sync engine w/ 3-way merge conflict resolution in the event we need it; it never merges to `main` w/o a review PR for the canonical repo.
+**Problem:** teams often need to develop in a monorepo but publish crates from standalone repos with full history. Existing tools (`git subtree`, `git-filter-repo`) are mostly one-way and manual.
 
 **Solution:** `cargo rail split` + `cargo rail sync` — bidirectional sync with 3-way conflict resolution:
 
 ```bash
-# Extract crate to standalone repo with full git history
-cargo rail split init crate/s  # configure once, automatically
-cargo rail split run crate/s   # extract with history preserved
+# Extract a crate to a standalone repo with full git history
+cargo rail split init crates/my-crate  # configure once
+cargo rail split run crates/my-crate   # extract with history preserved
 
 # Bidirectional sync
-cargo rail sync crate/s --to-remote    # push monorepo changes to split repo
-cargo rail sync crate/s --from-remote  # pull split repo changes (creates PR branch)
+cargo rail sync crates/my-crate --to-remote    # push monorepo changes to split repo
+cargo rail sync crates/my-crate --from-remote  # pull split repo changes (creates PR branch)
 ```
 
 **Three modes:**
@@ -130,7 +130,7 @@ Built on system git (not libgit2) for deterministic SHAs and full git fidelity w
 
 ### Release Automation (`release`)
 
-Release checks, versioning, changelogs, tags, dependency-order publish. Release_plz is great, but it's pulling in something like 500 deps to release our work. That's too much weight to carry around in the graph and too much attack surface in my world. I release `cargo-rail` with 1`cargo-rail`.
+Release checks, versioning, changelogs, tags, and dependency-order publish in one flow, with a lean dependency footprint.
 
 ```bash
 # Cut a new release
@@ -138,11 +138,11 @@ cargo rail release run cargo-rail --bump patch --yes  # swap 'patch', 'minor', o
 git push origin main --follow-tags   # follow up
 ```
 
-This gives me a clean changelog, tags, crates.io / Github release.
+This produces changelog entries, tags, crates.io publish, and GitHub release metadata.
 
 ## GitHub Actions Integration
 
-For CICD integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating. It will make output cleaner and more readable.
+For CI/CD integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) (`uses: loadingalias/cargo-rail-action@v3`) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating.
 
 The action keeps CI behavior aligned with local `plan` + `run` workflows.
 
@@ -192,7 +192,7 @@ All core workflows (`plan`/`run`, `unify`) validated on production repos with fu
 - 2 dead features pruned
 - MSRV computed for all repos (1.85.0 - 1.88.0)
 
-Full protocol and raw artifacts: [examples/README.md](examples/README.md)
+Full protocol and raw artifacts: [Validation protocol](examples/validation-protocol.md) | [Unify results](examples/unify/unify-results.md)
 
 ## Examples
 
@@ -214,6 +214,18 @@ Each workflow includes working config files and reproducible command sequences:
 
 - Issues: [GitHub Issues](https://github.com/loadingalias/cargo-rail/issues)
 - Crate: [crates.io/cargo-rail](https://crates.io/crates/cargo-rail)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md).
+
+## Code of Conduct
+
+See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 

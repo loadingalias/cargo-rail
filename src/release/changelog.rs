@@ -348,10 +348,8 @@ impl ChangelogGenerator {
 
   /// Generate changelog from git history
   ///
-  /// # Arguments
-  /// * `from_tag` - Starting tag (exclusive), or None for all history
-  /// * `to_ref` - Ending reference (inclusive), usually "HEAD"
-  /// * `paths` - Optional paths to filter commits (for monorepo per-crate changelogs)
+  /// Uses conventional-commit grouping and optional path filtering for
+  /// per-crate changelog generation in monorepos.
   pub fn generate(&self, from_tag: Option<&str>, to_ref: &str, paths: Option<&[&Path]>) -> RailResult<String> {
     // 1. Get commits from git
     let commits = self.get_commits(from_tag, to_ref, paths)?;

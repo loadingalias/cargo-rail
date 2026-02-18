@@ -25,13 +25,8 @@ impl BackupManager {
 
   /// Create a backup of specified files
   ///
-  /// # Arguments
-  /// * `files` - Files to backup (relative to workspace root)
-  /// * `metadata` - Metadata about the backup
-  /// * `max_backups` - Maximum backups to keep. 0 means skip backup entirely.
-  ///
-  /// # Returns
-  /// Backup ID if backup was created, or a placeholder if max_backups is 0
+  /// Backs up files relative to the workspace root. When `max_backups` is `0`,
+  /// backup creation is skipped and a placeholder id is returned.
   pub fn create_backup(
     &self,
     files: &[PathBuf],

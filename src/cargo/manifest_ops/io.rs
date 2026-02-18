@@ -8,14 +8,6 @@ use toml_edit::DocumentMut;
 ///
 /// Provides consistent error handling for reading and parsing Cargo.toml files.
 ///
-/// # Arguments
-///
-/// * `path` - Path to the TOML file
-///
-/// # Returns
-///
-/// The parsed TOML document
-///
 /// # Errors
 ///
 /// Returns error if file cannot be read or TOML is invalid
@@ -30,11 +22,6 @@ pub fn read_toml_file(path: &Path) -> RailResult<DocumentMut> {
 /// Write a TOML document to a file
 ///
 /// Provides consistent error handling for writing Cargo.toml files.
-///
-/// # Arguments
-///
-/// * `path` - Path to write to
-/// * `doc` - The TOML document to write
 ///
 /// # Errors
 ///

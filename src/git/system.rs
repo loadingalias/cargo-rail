@@ -161,7 +161,7 @@ impl SystemGit {
 
   /// Get list of dirty files in the worktree
   ///
-  /// Returns the files with their status prefixes (e.g., " M file.txt", "?? new.txt").
+  /// Lists files with status prefixes (e.g., " M file.txt", "?? new.txt").
   /// Useful for displaying what's dirty when refusing to run on a dirty worktree.
   pub fn dirty_files(&self) -> RailResult<Vec<String>> {
     let output = self.run_git_stdout(&["status", "--porcelain"])?;
@@ -386,7 +386,7 @@ impl SystemGit {
 
   /// Find the latest tag matching a pattern (sorted by version)
   ///
-  /// Returns the tag name if found, None if no matching tags exist.
+  /// Produces the tag name when found, or `None` when no tags match.
   /// Uses version sorting to find the highest version tag.
   pub fn find_latest_tag(&self, pattern: &str) -> RailResult<Option<String>> {
     let mut cmd = self.git_cmd();

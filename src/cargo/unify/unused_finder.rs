@@ -144,7 +144,7 @@ impl<'a> UnusedDepFinder<'a> {
         .manifests
         .members
         .iter()
-        .find(|m| m.package_name == &*dep.member)
+        .find(|m| m.package_name == *dep.member)
         .and_then(|m| {
           m.dependencies.iter().find_map(|(key, usages)| {
             usages.iter().find_map(|usage| {

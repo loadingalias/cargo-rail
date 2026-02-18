@@ -3,9 +3,10 @@
 use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
 use crate::release::planner::ReleasePlan;
+use crate::release::process;
+use crate::utils;
 use crate::workspace::WorkspaceContext;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Result of a single validation check
 #[derive(Debug, Clone)]
@@ -151,14 +152,18 @@ impl<'a> ReleaseValidator<'a> {
       .manifest_path
       .parent()
       .ok_or_else(|| RailError::message("Invalid manifest path"))?;
+    let relative_path = crate_dir
+      .as_std_path()
+      .strip_prefix(self.ctx.workspace_root())
+      .unwrap_or_else(|_| crate_dir.as_std_path());
+    let git_path = utils::path_to_git_format(relative_path);
 
     // Check for changes in this directory
-    let output = Command::new("git")
-      .current_dir(self.ctx.workspace_root())
-      .args(["status", "--porcelain", "--"])
-      .arg(crate_dir)
-      .output()
-      .map_err(|e| RailError::message(format!("Failed to run git status: {}", e)))?;
+    let output = self
+      .ctx
+      .git
+      .git()
+      .run_git(&["status", "--porcelain", "--", &git_path])?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
@@ -214,11 +219,11 @@ impl<'a> ReleaseValidator<'a> {
     }
 
     if !skip_publish {
-      let output = Command::new("cargo")
-        .current_dir(self.ctx.workspace_root())
-        .args(["search", "serde", "--limit", "1"])
-        .output()
-        .map_err(|e| RailError::message(format!("Failed to verify crates.io access: {}", e)))?;
+      let output = process::run(
+        "cargo",
+        &["search", "serde", "--limit", "1"],
+        Some(self.ctx.workspace_root()),
+      )?;
       if !output.status.success() {
         return Err(RailError::with_help(
           "crates.io precondition check failed",
@@ -351,7 +356,7 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Filter workspace members to only publishable crates
   ///
-  /// Returns a tuple of (publishable_crates, skipped_crates_with_reasons)
+  /// Produces `(publishable_crates, skipped_with_reason)` for workspace members.
   pub fn publishable_members(&self) -> (Vec<String>, Vec<(String, String)>) {
     let all_members = self.ctx.graph.workspace_members();
     let member_count = all_members.len();
@@ -388,10 +393,11 @@ impl<'a> ReleaseValidator<'a> {
     };
 
     // Run cargo publish --dry-run
-    let output = Command::new("cargo")
-      .current_dir(crate_dir)
-      .args(["publish", "--dry-run", "--allow-dirty"])
-      .output();
+    let output = process::run(
+      "cargo",
+      &["publish", "--dry-run", "--allow-dirty"],
+      Some(crate_dir.as_std_path()),
+    );
 
     match output {
       Ok(result) => {
@@ -440,9 +446,7 @@ impl<'a> ReleaseValidator<'a> {
 
     // Check if the MSRV toolchain is available
     let toolchain = format!("+{}", msrv_str);
-    let check_toolchain = Command::new("rustup")
-      .args(["run", &msrv_str, "rustc", "--version"])
-      .output();
+    let check_toolchain = process::run("rustup", &["run", &msrv_str, "rustc", "--version"], None);
 
     match check_toolchain {
       Ok(result) if !result.status.success() => {
@@ -462,10 +466,11 @@ impl<'a> ReleaseValidator<'a> {
     }
 
     // Run cargo check with the MSRV toolchain
-    let output = Command::new("cargo")
-      .current_dir(crate_dir)
-      .args([&toolchain, "check", "--lib", "--quiet"])
-      .output();
+    let output = process::run(
+      "cargo",
+      &[&toolchain, "check", "--lib", "--quiet"],
+      Some(crate_dir.as_std_path()),
+    );
 
     match output {
       Ok(result) => {
@@ -488,7 +493,7 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Run extended validation checks (dry-run publish, MSRV)
   ///
-  /// Returns a list of validation results. Does not fail fast - runs all checks.
+  /// Runs all checks without fail-fast and returns grouped validation results.
   pub fn validate_extended(&self, crate_names: &[String]) -> Vec<(String, Vec<ValidationResult>)> {
     crate_names
       .iter()

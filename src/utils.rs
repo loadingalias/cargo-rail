@@ -30,8 +30,8 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 
 /// Compute a fingerprint for a file's contents
 ///
-/// Returns a formatted fingerprint string like `fnv1a64:0123456789abcdef`,
-/// or `"none"` if the file cannot be read.
+/// Produces a formatted fingerprint like `fnv1a64:0123456789abcdef`,
+/// or `"none"` when the file cannot be read.
 pub fn file_fingerprint(path: &Path) -> String {
   match fs::read(path) {
     Ok(bytes) => format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
@@ -41,8 +41,8 @@ pub fn file_fingerprint(path: &Path) -> String {
 
 /// Compute a fingerprint for the rail.toml configuration file
 ///
-/// Searches for config in standard locations and returns its fingerprint,
-/// or `"none"` if no config file is found.
+/// Searches standard config locations and emits the fingerprint,
+/// or `"none"` when no config file is found.
 pub fn config_fingerprint(workspace_root: &Path) -> String {
   RailConfig::find_config_path(workspace_root)
     .map(|p| file_fingerprint(&p))
@@ -51,8 +51,8 @@ pub fn config_fingerprint(workspace_root: &Path) -> String {
 
 /// Compute a fingerprint for the Rust toolchain file
 ///
-/// Checks for `rust-toolchain.toml` then `rust-toolchain` and returns
-/// the fingerprint of the first found, or `"none"` if neither exists.
+/// Checks `rust-toolchain.toml` then `rust-toolchain` and emits the
+/// fingerprint of the first match, or `"none"` if neither exists.
 pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
   ["rust-toolchain.toml", "rust-toolchain"]
     .iter()

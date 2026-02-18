@@ -18,6 +18,7 @@
 
 pub mod changelog;
 pub mod planner;
+mod process;
 pub mod publisher;
 pub mod validator;
 pub mod version;

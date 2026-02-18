@@ -1,3 +1,8 @@
+//! Bidirectional sync engine between monorepo and split repositories.
+//!
+//! Coordinates commit mapping, conflict detection/resolution, and Cargo.toml
+//! transforms while preserving deterministic sync behavior.
+
 use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;

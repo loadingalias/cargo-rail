@@ -21,8 +21,7 @@ impl<'a> TransitivePlanner<'a> {
 
   /// Find fragmented transitive dependencies and generate pins
   ///
-  /// Returns a list of transitive dependencies that should be pinned
-  /// to unify versions across targets.
+  /// Produces transitive pins needed to unify versions across targets.
   pub fn find_pins(&self) -> Vec<TransitivePin> {
     progress!("Analyzing transitive dependencies...");
     let fragmented = self.metadata.find_fragmented_transitives();

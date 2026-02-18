@@ -414,24 +414,22 @@ impl MultiTargetMetadata {
 
   /// Compute the MSRV from dependencies only (internal helper)
   ///
-  /// Returns the maximum rust-version across all resolved dependencies,
-  /// along with the list of deps that contributed to that maximum.
+  /// Computes the maximum rust-version across resolved dependencies,
+  /// plus the deps that contributed to that maximum.
   fn compute_deps_msrv(&self) -> Option<(Version, Vec<String>, usize)> {
     let mut max_version: Option<Version> = None;
-    let mut contributors: Vec<String> = Vec::new();
+    let mut contributors: Vec<&str> = Vec::new();
     let mut deps_with_msrv = 0;
-    let mut seen_packages: HashSet<String> = HashSet::new();
+    let mut seen_packages: HashSet<&PackageId> = HashSet::new();
 
     // Iterate through all packages in the resolved graph
     for entry in self.cache.values() {
       let metadata = &entry.metadata;
       for pkg in &metadata.packages {
         // Skip if we've already processed this package (may appear in multiple targets)
-        let pkg_key = format!("{}@{}", pkg.name, pkg.version);
-        if seen_packages.contains(&pkg_key) {
+        if !seen_packages.insert(&pkg.id) {
           continue;
         }
-        seen_packages.insert(pkg_key);
 
         // Check if this package has rust-version specified
         if let Some(ref rust_version) = pkg.rust_version {
@@ -440,14 +438,14 @@ impl MultiTargetMetadata {
           match &max_version {
             None => {
               max_version = Some(rust_version.clone());
-              contributors = vec![pkg.name.to_string()];
+              contributors = vec![pkg.name.as_str()];
             }
             Some(current_max) => {
               if rust_version > current_max {
                 max_version = Some(rust_version.clone());
-                contributors = vec![pkg.name.to_string()];
+                contributors = vec![pkg.name.as_str()];
               } else if rust_version == current_max {
-                contributors.push(pkg.name.to_string());
+                contributors.push(pkg.name.as_str());
               }
             }
           }
@@ -455,7 +453,13 @@ impl MultiTargetMetadata {
       }
     }
 
-    max_version.map(|v| (v, contributors, deps_with_msrv))
+    max_version.map(|v| {
+      (
+        v,
+        contributors.into_iter().map(std::borrow::ToOwned::to_owned).collect(),
+        deps_with_msrv,
+      )
+    })
   }
 
   /// Compute the workspace MSRV with config-driven source selection
@@ -463,13 +467,8 @@ impl MultiTargetMetadata {
   /// Takes into account the existing workspace rust-version and the msrv_source
   /// configuration to determine the final MSRV value.
   ///
-  /// # Arguments
-  /// * `workspace_root` - Path to workspace root (for reading existing rust-version)
-  /// * `msrv_source` - How to determine the final MSRV (deps, workspace, or max)
-  ///
-  /// # Returns
-  /// * `None` if no MSRV can be determined (no deps have rust-version AND no workspace rust-version)
-  /// * `Some(ComputedMsrv)` with the final MSRV and metadata about the computation
+  /// Returns `None` when neither dependencies nor workspace metadata provide an
+  /// MSRV; otherwise returns the computed version and provenance details.
   pub fn compute_msrv_with_config(
     &self,
     workspace_root: &Path,
@@ -512,7 +511,7 @@ impl MultiTargetMetadata {
                 deps_ver.major,
                 deps_ver.minor,
                 deps_ver.patch,
-                contributors.first().unwrap_or(&"unknown".to_string())
+                contributors.first().map_or("unknown", String::as_str)
               ))
             } else if used_package_fallback {
               Some(
@@ -757,7 +756,7 @@ impl MultiTargetMetadata {
   /// The resolved dependency graph uses library names, but Cargo.toml uses
   /// package names. This mapping allows correct lookup when detecting unused deps.
   ///
-  /// Returns a map where:
+  /// Produces a map where:
   /// - Key: package name (e.g., "mopa-maintained")
   /// - Value: library name normalized with underscores (e.g., "mopa")
   pub fn package_to_lib_name_map(&self) -> HashMap<String, String> {

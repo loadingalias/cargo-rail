@@ -12,7 +12,7 @@ pub fn is_exact_pin(version: &str) -> bool {
 
 /// Extract major version from a declared version string
 ///
-/// Returns the major version number, handling various version formats:
+/// Extracts the major version across common requirement formats:
 /// - "1.0" -> Some(1)
 /// - "^2.3.0" -> Some(2)
 /// - ">=0.5" -> Some(0)
@@ -24,8 +24,8 @@ pub fn extract_major_version(version: &str) -> Option<u32> {
 
 /// Check for major version conflicts in declared versions
 ///
-/// Returns the set of unique major versions found. If the set has more than
-/// one element, there's a conflict that cannot be safely unified.
+/// Produces the set of unique major versions. If more than one value is
+/// present, the dependency cannot be unified safely.
 pub fn find_major_version_conflicts(usages: &[&DepUsage]) -> HashSet<u32> {
   usages
     .iter()

@@ -162,7 +162,7 @@ impl VersionBumper {
   /// Uses lossless TOML editing to preserve comments and formatting.
   ///
   /// # Errors
-  /// Returns an error if the crate uses workspace version inheritance.
+  /// Fails when the crate uses workspace version inheritance.
   pub fn bump_version(manifest_path: &Path, bump_type: BumpType) -> RailResult<Version> {
     use crate::toml::editor::TomlEditor;
 

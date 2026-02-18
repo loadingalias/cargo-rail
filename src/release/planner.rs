@@ -82,9 +82,8 @@ impl<'a> ReleasePlanner<'a> {
 
   /// Build a release plan
   ///
-  /// # Arguments
-  /// * `crate_names` - Specific crates to release, or None for all workspace members
-  /// * `bump_type` - How to bump versions
+  /// Uses dependency order for deterministic crate sequencing and computes
+  /// per-crate publish/tag/changelog intent.
   pub fn plan(&self, crate_names: Option<Vec<String>>, bump_type: &BumpType) -> RailResult<ReleasePlan> {
     // Determine which crates to release
     let target_crates = if let Some(names) = crate_names {
@@ -266,9 +265,7 @@ impl<'a> ReleasePlanner<'a> {
 impl ReleasePlan {
   /// Format summary for display
   ///
-  /// # Arguments
-  /// * `skip_publish` - If true, show publishing as skipped for all crates
-  /// * `skip_tag` - If true, show tagging as skipped for all crates
+  /// Applies skip flags to presentation only; it does not mutate the plan.
   pub fn format_summary_with_flags(&self, skip_publish: bool, skip_tag: bool) -> String {
     let mut output = String::new();
 

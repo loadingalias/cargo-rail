@@ -16,38 +16,22 @@ use std::sync::OnceLock;
 
 /// Detect all Rust target triples mentioned in any .toml file in the workspace
 ///
-/// This function:
-/// 1. Gets the canonical list of targets from `rustc --print target-list`
-/// 2. Recursively searches all .toml files in the workspace (skipping build artifacts)
-/// 3. Fuzzy matches file contents against canonical targets
-/// 4. Returns deduplicated, sorted list of found targets
+/// Scans workspace TOML and GitHub workflow files, matches against rustc's
+/// canonical target list, and returns a deduplicated sorted result.
 ///
 /// # Performance
 /// - Caches rustc output (one-time ~5ms cost)
 /// - Typical workspace: <5ms total
 /// - Large workspace (60+ crates): <10ms total
 ///
-/// # Arguments
-/// * `workspace_root` - Path to workspace root directory
-///
-/// # Returns
-/// Sorted list of detected target triples
 pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
   detect_targets_excluding(workspace_root, &[])
 }
 
 /// Detect targets excluding specific files
 ///
-/// Same as `detect_targets` but allows excluding specific files from scanning.
-/// This is useful for `unify sync` which needs to exclude rail.toml itself
-/// to avoid circular detection.
-///
-/// # Arguments
-/// * `workspace_root` - Path to workspace root directory
-/// * `exclude` - Paths to exclude from scanning
-///
-/// # Returns
-/// Sorted list of detected target triples
+/// Same as [`detect_targets`] but skips paths in `exclude`.
+/// Useful when a caller needs to avoid circular self-detection.
 pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> RailResult<Vec<String>> {
   // Get canonical target list from rustc (cached)
   let canonical_targets = get_rust_target_list()?;
@@ -85,12 +69,6 @@ pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> Rai
 /// Validate that the given targets are valid Rust target triples
 ///
 /// Returns an error if any of the targets are not in rustc's canonical target list.
-///
-/// # Arguments
-/// * `targets` - List of target triples to validate
-///
-/// # Returns
-/// Ok(()) if all targets are valid, or an error listing invalid targets
 pub fn validate_targets(targets: &[String]) -> RailResult<()> {
   if targets.is_empty() {
     return Ok(());
@@ -217,11 +195,8 @@ fn find_toml_files(workspace_root: &Path) -> Vec<PathBuf> {
 
 /// Recursive helper for find_toml_files
 ///
-/// # Arguments
-/// * `dir` - Current directory to search
-/// * `current_depth` - Current recursion depth
-/// * `max_depth` - Maximum depth to recurse
-/// * `toml_files` - Accumulator for found files
+/// Walks the directory tree depth-first and appends discovered `.toml` files
+/// to the provided accumulator.
 fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize, toml_files: &mut Vec<PathBuf>) {
   // Stop at max depth
   if current_depth > max_depth {
@@ -260,12 +235,6 @@ fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize,
 /// Many monorepos define their cross-compilation targets in GitHub Actions
 /// workflow files rather than TOML configuration files. This function
 /// finds all workflow files for target detection.
-///
-/// # Arguments
-/// * `workspace_root` - Path to workspace root directory
-///
-/// # Returns
-/// List of paths to workflow files
 fn find_github_workflow_files(workspace_root: &Path) -> Vec<PathBuf> {
   let workflows_dir = workspace_root.join(".github").join("workflows");
 
