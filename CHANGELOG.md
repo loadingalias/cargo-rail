@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.10](https://github.com/loadingalias/cargo-rail/compare/v0.10.9...v0.10.10) - 2026-02-18
+
+### 🐛 Bug Fixes
+
+- handle empty git paths by replacing with "." in release validator; introduced today (a2ec9b1). ([ddc2f50](https://github.com/loadingalias/cargo-rail/commit/ddc2f505b48f0037c889db4755a917575a8aa3d6))
+- **unify**: eliminate multi-target false positives in unused dependency detection ([3220bde](https://github.com/loadingalias/cargo-rail/commit/3220bde2156d0add9a2a4a508384757203f49240))
+
+
+
 ## [0.10.9](https://github.com/loadingalias/cargo-rail/compare/v0.10.8...v0.10.9) - 2026-02-18
 
 ### 🐛 Bug Fixes
