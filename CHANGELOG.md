@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.9](https://github.com/loadingalias/cargo-rail/compare/v0.10.8...v0.10.9) - 2026-02-18
+
+### 🐛 Bug Fixes
+
+- **unify**: remove source-unused deps and streamline hot-path plumbing [#11](https://github.com/loadingalias/cargo-rail/pull/11) ([1ebd343](https://github.com/loadingalias/cargo-rail/commit/1ebd343ece80f89942b244c79159f407e302858c))
+
+
+
 ## [0.10.8](https://github.com/loadingalias/cargo-rail/compare/v0.10.7...v0.10.8) - 2026-02-17
 
 ### 🐛 Bug Fixes
