@@ -304,31 +304,71 @@ fn run_unused_crate_dependency_check(
     .output()
     .with_context(|| format!("running cargo check in {}", workspace_root.display()))?;
 
-  let mut by_member: HashMap<String, HashSet<String>> = HashMap::new();
+  let mut member_targets: HashMap<String, HashSet<String>> = HashMap::new();
+  let mut member_dep_unused_targets: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+
   for line in String::from_utf8_lossy(&output.stdout).lines() {
-    let Ok(message) = serde_json::from_str::<CargoCompilerMessage>(line) else {
+    let Ok(message) = serde_json::from_str::<CargoEvent>(line) else {
       continue;
     };
-    if message.reason != "compiler-message" {
+    if message.reason != "compiler-message" && message.reason != "compiler-artifact" {
       continue;
     }
-    if message.message.code.as_ref().and_then(|c| c.code.as_deref()) != Some("unused_crate_dependencies") {
-      continue;
-    }
+
     let Some(manifest_path) = message.manifest_path.as_deref() else {
       continue;
     };
     let Some(member_name) = resolve_member_name(manifest_path, manifest_to_member) else {
       continue;
     };
-    let Some(crate_name) = parse_unused_crate_name(&message.message.message) else {
+
+    let Some(target) = message.target.as_ref() else {
+      continue;
+    };
+    if !is_relevant_target(target) {
+      continue;
+    }
+    let target_id = target.identifier();
+    member_targets
+      .entry(member_name.to_string())
+      .or_default()
+      .insert(target_id.clone());
+
+    if message.reason != "compiler-message" {
+      continue;
+    }
+    let Some(diagnostic) = message.message.as_ref() else {
+      continue;
+    };
+    if diagnostic.code.as_ref().and_then(|c| c.code.as_deref()) != Some("unused_crate_dependencies") {
+      continue;
+    }
+    let Some(crate_name) = parse_unused_crate_name(&diagnostic.message) else {
       continue;
     };
 
-    by_member
+    member_dep_unused_targets
       .entry(member_name.to_string())
       .or_default()
-      .insert(crate_name.replace('-', "_"));
+      .entry(crate_name.replace('-', "_"))
+      .or_default()
+      .insert(target_id);
+  }
+
+  let mut by_member: HashMap<String, HashSet<String>> = HashMap::new();
+  for (member, dep_targets) in member_dep_unused_targets {
+    let Some(all_targets) = member_targets.get(&member) else {
+      continue;
+    };
+    if all_targets.is_empty() {
+      continue;
+    }
+
+    for (dep_name, warned_targets) in dep_targets {
+      if all_targets.iter().all(|target| warned_targets.contains(target)) {
+        by_member.entry(member.clone()).or_default().insert(dep_name);
+      }
+    }
   }
 
   Ok(by_member)
@@ -347,10 +387,27 @@ fn parse_unused_crate_name(message: &str) -> Option<&str> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoCompilerMessage {
+struct CargoEvent {
   reason: String,
   manifest_path: Option<String>,
-  message: CargoDiagnostic,
+  target: Option<CargoTarget>,
+  message: Option<CargoDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoTarget {
+  kind: Vec<String>,
+  name: String,
+  src_path: Option<String>,
+}
+
+impl CargoTarget {
+  fn identifier(&self) -> String {
+    match &self.src_path {
+      Some(src_path) => src_path.clone(),
+      None => format!("{}:{}", self.kind.join(","), self.name),
+    }
+  }
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,6 +419,10 @@ struct CargoDiagnostic {
 #[derive(Debug, Deserialize)]
 struct CargoDiagnosticCode {
   code: Option<String>,
+}
+
+fn is_relevant_target(target: &CargoTarget) -> bool {
+  !target.kind.iter().any(|kind| kind == "custom-build")
 }
 
 /// Check if a target constraint (cfg expression) matches any configured target

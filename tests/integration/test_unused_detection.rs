@@ -134,6 +134,61 @@ serialization = ["serde"]
 }
 
 #[test]
+fn test_unused_detection_multi_target_does_not_union_false_positive() -> Result<()> {
+  // Regression: rustc's unused-crate-dependencies lint is target-local.
+  // A dep used in lib but not in bin must NOT be treated as package-unused.
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1.0"
+"#,
+  )?;
+
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! test crate
+use once_cell::sync::Lazy;
+
+static CELL: Lazy<u8> = Lazy::new(|| 7);
+
+pub fn hello() -> u8 {
+  *CELL
+}
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/main.rs"),
+    r#"fn main() {
+  println!("bin target");
+}
+"#,
+  )?;
+
+  workspace.commit("Add lib+bin crate using dependency only in lib")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    !stdout.contains("once_cell") || !stdout.contains("Unused"),
+    "once_cell should NOT be flagged as unused when used by lib target\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_unused_detection_optional_dep_with_dep_syntax_not_flagged() -> Result<()> {
   // Test the `dep:name` syntax (Rust 2021+) for optional deps
 
