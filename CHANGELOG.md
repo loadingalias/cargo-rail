@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.12](https://github.com/loadingalias/cargo-rail/compare/v0.10.11...v0.10.12) - 2026-02-19
+
+### 🐛 Bug Fixes
+
+- **unify,release**: use compiler diagnostics for unused-dep removals and harden release preflight ([55f2aad](https://github.com/loadingalias/cargo-rail/commit/55f2aad8404d9086b1e70c9e659d37e1d31ffdac))
+
+### ✅ Testing
+
+- **unused-detection**: fix rail.toml targets placement for cross-platform target-specific test ([d9ce80b](https://github.com/loadingalias/cargo-rail/commit/d9ce80bb57e7a507d4f6ae3ad282418df96ea42b))
+
+
+
 ## [0.10.10](https://github.com/loadingalias/cargo-rail/compare/v0.10.9...v0.10.10) - 2026-02-18
 
 ### 🐛 Bug Fixes
