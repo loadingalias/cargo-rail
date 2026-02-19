@@ -603,6 +603,10 @@ msrv = true
     "prune_dead_features should be added"
   );
   assert!(config.contains("tag_format"), "tag_format should be added to [release]");
+  assert!(
+    config.contains("require_release_notes"),
+    "require_release_notes should be added to [release]"
+  );
 
   // Verify existing value preserved
   assert!(

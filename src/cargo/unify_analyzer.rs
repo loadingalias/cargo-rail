@@ -695,7 +695,12 @@ impl UnifyAnalyzer {
     };
 
     // Detect unused dependencies
-    let unused_finder = UnusedDepFinder::new(&self.workspace_root, &self.metadata, &self.manifests);
+    let unused_finder = UnusedDepFinder::new(
+      &self.workspace_root,
+      &self.metadata,
+      &self.manifests,
+      self.config.compiler_diag_cache,
+    );
     let unused_deps = if self.config.detect_unused {
       progress!("Detecting unused dependencies...");
       unused_finder.find()

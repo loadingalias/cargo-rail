@@ -111,6 +111,10 @@ impl RailConfigBuilder {
     // === Unused detection ===
     content.push_str(&format!("\ndetect_unused = {}\n", config.detect_unused));
     content.push_str(&format!(
+      "compiler_diag_cache = {}  # reuse rustc diagnostics across runs\n",
+      config.compiler_diag_cache
+    ));
+    content.push_str(&format!(
       "remove_unused = {}  # requires detect_unused = true\n",
       config.remove_unused
     ));
@@ -208,6 +212,10 @@ impl RailConfigBuilder {
     content.push_str(&format!(
       "require_changelog_entries = {}\n",
       config.require_changelog_entries
+    ));
+    content.push_str(&format!(
+      "require_release_notes = {}  # fail if target version lacks release notes\n",
+      config.require_release_notes
     ));
 
     self.sections.push(format!("\n[release]\n{}", content));

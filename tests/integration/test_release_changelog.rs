@@ -175,6 +175,82 @@ fn release_respects_skip_and_require_flags() -> Result<()> {
   Ok(())
 }
 
+#[test]
+fn test_release_preflight_requires_release_notes_by_default() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-require-notes-default")?;
+  ws.write_release_config(
+    r#"tag_prefix = "v"
+tag_format = "v{version}"
+skip_changelog_for = []
+require_changelog_entries = false
+require_release_notes = true
+require_clean = false
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("v0.1.0", "Initial lib-a")?;
+
+  // No commits since last tag -> generated changelog entries are empty.
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    !output.status.success(),
+    "release should fail preflight when release notes are missing\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    stderr.contains("no release notes for lib-a v0.1.1") || stdout.contains("no release notes for lib-a v0.1.1"),
+    "expected missing release notes error\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_preflight_can_disable_release_notes_requirement() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-require-notes-disabled")?;
+  ws.write_release_config(
+    r#"tag_prefix = "v"
+tag_format = "v{version}"
+skip_changelog_for = []
+require_changelog_entries = false
+require_release_notes = false
+require_clean = false
+"#,
+  )?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("v0.1.0", "Initial lib-a")?;
+
+  // No commits since last tag, but opt-out should allow release apply.
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "release should succeed when require_release_notes=false\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
 /// Test release --json output format
 #[test]
 fn test_release_json_output() -> Result<()> {

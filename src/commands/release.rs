@@ -242,7 +242,13 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     }
   }
 
-  validator.validate_apply_preconditions(&plan, args.skip_publish, args.skip_tag, release_config.require_clean)?;
+  validator.validate_apply_preconditions(
+    &plan,
+    args.skip_publish,
+    args.skip_tag,
+    release_config.require_clean,
+    release_config.require_release_notes,
+  )?;
   let plan_receipt = mutation::write_receipt(
     ctx.workspace_root(),
     "release",

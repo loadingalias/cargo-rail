@@ -113,8 +113,8 @@ pub fn run_clean(
   // Execute cleaning
   let mut cleaned = CleanArtifacts::new();
 
-  if clean_cache && let Some(path) = clean_metadata_cache(ctx)? {
-    cleaned.cache_files.push(path);
+  if clean_cache {
+    cleaned.cache_files = clean_cache_files(ctx)?;
   }
 
   if clean_reports {
@@ -152,9 +152,14 @@ fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifact
     .join("target")
     .join("cargo-rail")
     .join("metadata.json");
+  let compiler_cache_dir = ctx.workspace_root.join("target").join("cargo-rail").join("cache");
 
   if cache_path.exists() {
     artifacts.cache_files.push(cache_path.display().to_string());
+  }
+
+  if compiler_cache_dir.exists() {
+    artifacts.cache_files.push(compiler_cache_dir.display().to_string());
   }
 }
 
@@ -205,12 +210,14 @@ fn collect_backup_artifacts(
   Ok(())
 }
 
-fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<Option<String>> {
+fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
   let cache_path = ctx
     .workspace_root
     .join("target")
     .join("cargo-rail")
     .join("metadata.json");
+  let compiler_cache_dir = ctx.workspace_root.join("target").join("cargo-rail").join("cache");
+  let mut cleaned_paths = Vec::new();
 
   if cache_path.exists() {
     progress!("removing cache...");
@@ -220,10 +227,21 @@ fn clean_metadata_cache(ctx: &WorkspaceContext) -> RailResult<Option<String>> {
         "check file permissions or if the file is in use",
       )
     })?;
-    Ok(Some(cache_path.display().to_string()))
-  } else {
-    Ok(None)
+    cleaned_paths.push(cache_path.display().to_string());
   }
+
+  if compiler_cache_dir.exists() {
+    progress!("removing cache...");
+    fs::remove_dir_all(&compiler_cache_dir).map_err(|e| {
+      RailError::with_help(
+        format!("failed to remove {}: {}", compiler_cache_dir.display(), e),
+        "check directory permissions or if files are in use",
+      )
+    })?;
+    cleaned_paths.push(compiler_cache_dir.display().to_string());
+  }
+
+  Ok(cleaned_paths)
 }
 
 fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {

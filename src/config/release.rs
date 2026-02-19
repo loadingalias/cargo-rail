@@ -50,6 +50,13 @@ pub struct ReleaseConfig {
   /// If true, error when there are no changelog entries for a crate
   #[serde(default)]
   pub require_changelog_entries: bool,
+
+  /// If true, require release notes for the target version before publishing/tagging.
+  ///
+  /// This preflight check fails release apply when generated changelog entries are empty
+  /// and no existing `## [<version>]` section exists in the crate's changelog.
+  #[serde(default = "default_true")]
+  pub require_release_notes: bool,
 }
 
 impl Default for ReleaseConfig {
@@ -65,6 +72,7 @@ impl Default for ReleaseConfig {
       changelog_relative_to: ChangelogRelativeTo::default(),
       skip_changelog_for: Vec::new(),
       require_changelog_entries: false,
+      require_release_notes: true,
     }
   }
 }
@@ -212,5 +220,18 @@ mod tests {
     "#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
     assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
+  }
+
+  #[test]
+  fn test_require_release_notes_default_true() {
+    let config = ReleaseConfig::default();
+    assert!(config.require_release_notes);
+  }
+
+  #[test]
+  fn test_require_release_notes_parsing_false() {
+    let toml = r#"require_release_notes = false"#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(!config.require_release_notes);
   }
 }

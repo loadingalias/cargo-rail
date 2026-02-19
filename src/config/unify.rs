@@ -114,6 +114,12 @@ pub struct UnifyConfig {
   #[serde(default = "default_true")]
   pub detect_unused: bool,
 
+  /// Cache compiler diagnostics for target-aware unused-dependency detection (default: true)
+  /// When enabled, rustc unused-crate diagnostics are persisted in
+  /// `target/cargo-rail/cache/compiler-diags-v1.json` and reused across runs.
+  #[serde(default = "default_true")]
+  pub compiler_diag_cache: bool,
+
   /// Automatically remove unused dependencies when applying (default: true)
   /// Requires detect_unused = true. When enabled, unused deps are removed
   /// from member Cargo.toml files during unify.
@@ -166,6 +172,7 @@ impl Default for UnifyConfig {
       exact_pin_handling: ExactPinHandling::default(),
       major_version_conflict: MajorVersionConflict::default(),
       detect_unused: true,
+      compiler_diag_cache: true,
       remove_unused: true,
       detect_undeclared_features: true,
       fix_undeclared_features: true,
@@ -441,6 +448,7 @@ mod tests {
     assert!(config.include.is_empty());
     assert!(config.msrv); // Default: true
     assert!(config.detect_unused); // Default: true
+    assert!(config.compiler_diag_cache); // Default: true
     assert!(config.remove_unused); // Default: true
   }
 
@@ -537,6 +545,7 @@ mod tests {
   fn test_detect_unused_default() {
     let config = UnifyConfig::default();
     assert!(config.detect_unused); // Default: true
+    assert!(config.compiler_diag_cache); // Default: true
     assert!(config.remove_unused); // Default: true
   }
 
@@ -546,12 +555,14 @@ mod tests {
       strict_version_compat = false
       exact_pin_handling = "preserve"
       detect_unused = true
+      compiler_diag_cache = false
       remove_unused = true
     "#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.strict_version_compat);
     assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
     assert!(config.detect_unused);
+    assert!(!config.compiler_diag_cache);
     assert!(config.remove_unused);
   }
 

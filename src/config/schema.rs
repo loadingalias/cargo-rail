@@ -24,7 +24,7 @@ pub struct FieldSpec {
 /// the insertion order within each section.
 pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   // =========================================================================
-  // [unify] section - 21 fields
+  // [unify] section - 22 fields
   // =========================================================================
   FieldSpec {
     section: "unify",
@@ -118,6 +118,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   },
   FieldSpec {
     section: "unify",
+    key: "compiler_diag_cache",
+    default_toml: "true",
+    comment: "Cache rustc source diagnostics for faster repeated unify runs (default: true)",
+  },
+  FieldSpec {
+    section: "unify",
     key: "remove_unused",
     default_toml: "true",
     comment: "Auto-remove unused deps (default: true)",
@@ -153,7 +159,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     comment: "Sort deps alphabetically (default: true)",
   },
   // =========================================================================
-  // [release] section - 10 fields
+  // [release] section - 11 fields
   // =========================================================================
   FieldSpec {
     section: "release",
@@ -214,6 +220,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "require_changelog_entries",
     default_toml: "false",
     comment: "Error if no changelog entries for release",
+  },
+  FieldSpec {
+    section: "release",
+    key: "require_release_notes",
+    default_toml: "true",
+    comment: "Require release notes for target version before apply",
   },
   // =========================================================================
   // [change-detection] section - 4 fields
@@ -310,11 +322,11 @@ mod tests {
   #[test]
   fn test_fields_for_section() {
     let unify_fields: Vec<_> = fields_for_section("unify").collect();
-    assert_eq!(unify_fields.len(), 21); // 20 + sort_dependencies
+    assert_eq!(unify_fields.len(), 22); // 21 + compiler_diag_cache
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
-    assert_eq!(release_fields.len(), 10);
+    assert_eq!(release_fields.len(), 11);
 
     let change_detection_fields: Vec<_> = fields_for_section("change-detection").collect();
     assert_eq!(change_detection_fields.len(), 4);
@@ -329,7 +341,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      36, // 21 unify + 10 release + 4 change-detection + 1 run
+      38, // 22 unify + 11 release + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -337,8 +349,8 @@ mod tests {
   /// This test documents which config sections are syncable vs user-configured.
   ///
   /// SYNCABLE (auto-added by `config sync`):
-  /// - [unify] - 21 fields: workspace-wide dependency unification settings
-  /// - [release] - 10 fields: workspace-wide release settings
+  /// - [unify] - 22 fields: workspace-wide dependency unification settings
+  /// - [release] - 11 fields: workspace-wide release settings
   /// - [change-detection] - 4 fields: infra patterns, conservative fallback, and confidence profiles
   /// - [run] - 1 field: default profile selector for `cargo rail run`
   ///
@@ -373,6 +385,7 @@ mod tests {
     assert!(field_keys.contains(&("unify", "prune_dead_features")));
     assert!(field_keys.contains(&("unify", "preserve_features")));
     assert!(field_keys.contains(&("unify", "detect_unused")));
+    assert!(field_keys.contains(&("unify", "compiler_diag_cache")));
     assert!(field_keys.contains(&("unify", "detect_undeclared_features")));
     assert!(field_keys.contains(&("unify", "fix_undeclared_features")));
     assert!(field_keys.contains(&("unify", "skip_undeclared_patterns")));
@@ -380,6 +393,7 @@ mod tests {
     // [release] critical fields
     assert!(field_keys.contains(&("release", "tag_format")));
     assert!(field_keys.contains(&("release", "changelog_path")));
+    assert!(field_keys.contains(&("release", "require_release_notes")));
 
     // [change-detection] field
     assert!(field_keys.contains(&("change-detection", "infrastructure")));

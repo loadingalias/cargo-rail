@@ -695,3 +695,92 @@ mod tests {
 
   Ok(())
 }
+
+#[test]
+fn test_unused_detection_compiler_diag_cache_writes_cache_file() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+
+  workspace.commit("Add crate for compiler diag cache test")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "unify --check should exit with 1 when changes are detected\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
+  assert!(
+    cache_file.exists(),
+    "compiler diagnostics cache should exist at {}\nstdout:\n{}\nstderr:\n{}",
+    cache_file.display(),
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_compiler_diag_cache_disabled_does_not_write_cache_file() -> Result<()> {
+  let workspace = TestWorkspace::new()?;
+
+  let config = r#"[workspace]
+root = "."
+
+[unify]
+detect_unused = true
+compiler_diag_cache = false
+"#;
+  fs::write(workspace.path.join(".config/rail.toml"), config)?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+
+  workspace.commit("Add crate for compiler diag cache disabled test")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "unify --check should exit with 1 when changes are detected\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
+  assert!(
+    !cache_file.exists(),
+    "compiler diagnostics cache should not exist when disabled at {}\nstdout:\n{}\nstderr:\n{}",
+    cache_file.display(),
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}

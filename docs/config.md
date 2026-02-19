@@ -58,6 +58,7 @@ targets = [
 msrv = true                      # Compute MSRV from dependencies
 prune_dead_features = true       # Remove unused features
 detect_unused = true             # Find unused dependencies
+compiler_diag_cache = true       # Reuse rustc diagnostics across runs
 remove_unused = true             # Auto-remove them
 
 [release]
@@ -107,6 +108,7 @@ Controls workspace dependency unification behavior. All options are optional wit
 | `enforce_msrv_inheritance` | `bool` | `false` | Ensure every workspace member inherits MSRV by setting `[package].rust-version = { workspace = true }` in each member's `Cargo.toml`. This makes `[workspace.package].rust-version` actually apply across the workspace. |
 | `msrv_source` | `enum` | `"max"` | How to compute the final MSRV:<br>• `"deps"` - Use maximum from dependencies only (original behavior)<br>• `"workspace"` - Preserve existing rust-version, warn if deps need higher<br>• `"max"` - Take max(workspace, deps) - your explicit setting wins if higher |
 | `detect_unused` | `bool` | `true` | Detect unused dependencies using two signals: (1) declared deps absent from the resolved cargo graph, and (2) rustc `unused_crate_dependencies` diagnostics for deps that resolve but are never referenced in source. Optional deps and deps behind unconfigured target constraints are conservatively skipped. |
+| `compiler_diag_cache` | `bool` | `true` | Cache target-aware rustc `unused_crate_dependencies` diagnostics in `target/cargo-rail/cache/compiler-diags-v1.json` and reuse them across runs. Disable to force fresh compiler checks each run. |
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
 | `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
 | `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
@@ -123,6 +125,7 @@ msrv = true
 msrv_source = "max"  # "deps" | "workspace" | "max"
 enforce_msrv_inheritance = false
 detect_unused = true
+compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
 preserve_features = ["future-api", "unstable-*"]  # Keep these from pruning
@@ -202,6 +205,7 @@ msrv = true
 msrv_source = "max"  # "deps" | "workspace" | "max"
 enforce_msrv_inheritance = false
 detect_unused = true
+compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
 preserve_features = []  # Glob patterns to preserve from pruning
@@ -260,6 +264,7 @@ sign_tags = true
 | `changelog_relative_to` | `enum` | `"crate"` | What changelog paths are relative to:<br>• `"crate"` - Relative to each crate's directory<br>• `"workspace"` - Relative to workspace root |
 | `skip_changelog_for` | `string[]` | `[]` | Crate names that should not generate changelog entries. |
 | `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
+| `require_release_notes` | `bool` | `true` | If `true`, preflight fails release apply when the target version has no release notes (`## [<version>]`) and changelog generation produces no entries. Set to `false` to allow note-less releases. |
 
 **Example:**
 
@@ -288,6 +293,7 @@ changelog_path = "CHANGELOG.md"
 changelog_relative_to = "crate"
 skip_changelog_for = []
 require_changelog_entries = false
+require_release_notes = true
 ```
 
 **Notes:**
@@ -668,6 +674,7 @@ msrv = true
 msrv_source = "max"  # "deps" | "workspace" | "max"
 enforce_msrv_inheritance = false
 detect_unused = true
+compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
 preserve_features = []  # Glob patterns: ["unstable-*", "future-api"]
@@ -705,6 +712,7 @@ changelog_path = "CHANGELOG.md"
 changelog_relative_to = "crate"
 skip_changelog_for = []
 require_changelog_entries = true
+require_release_notes = true
 
 # Change detection
 [change-detection]
@@ -824,6 +832,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 pin_transitives = true
 msrv = true
 detect_unused = true
+compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
 
@@ -832,6 +841,7 @@ tag_prefix = "v"
 tag_format = "{crate}-{prefix}{version}"
 require_clean = true
 require_changelog_entries = true
+require_release_notes = true
 create_github_release = true
 sign_tags = true
 
@@ -953,6 +963,7 @@ cargo-rail provides similar functionality with tighter integration:
 [release]
 tag_format = "{crate}-{prefix}{version}"
 require_changelog_entries = true
+require_release_notes = true
 create_github_release = true
 ```
 

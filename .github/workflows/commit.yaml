@@ -32,6 +32,7 @@ jobs:
   # ==========================================================================
   plan:
     name: Plan
+    if: github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     outputs:
       build: ${{ steps.plan.outputs.build }}

@@ -106,6 +106,7 @@ const KNOWN_UNIFY_KEYS: &[&str] = &[
   "exact_pin_handling",
   "major_version_conflict",
   "detect_unused",
+  "compiler_diag_cache",
   "remove_unused",
   "detect_undeclared_features",
   "fix_undeclared_features",
@@ -126,6 +127,7 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
   "changelog_relative_to",
   "skip_changelog_for",
   "require_changelog_entries",
+  "require_release_notes",
 ];
 
 /// Known keys in [change-detection] section
@@ -972,5 +974,16 @@ mod tests {
         field
       );
     }
+  }
+
+  #[test]
+  fn test_known_release_keys_match_schema_fields() {
+    let known: BTreeSet<&str> = KNOWN_RELEASE_KEYS.iter().copied().collect();
+    let from_schema: BTreeSet<&str> = schema::fields_for_section("release").map(|field| field.key).collect();
+
+    assert_eq!(
+      known, from_schema,
+      "KNOWN_RELEASE_KEYS must stay in sync with schema::SYNCABLE_FIELDS for [release]"
+    );
   }
 }

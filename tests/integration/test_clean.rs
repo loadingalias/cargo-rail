@@ -38,6 +38,12 @@ fn create_test_workspace() -> TempDir {
   fs::create_dir_all(workspace.join("target/cargo-rail")).unwrap();
   fs::write(workspace.join("target/cargo-rail/metadata.json"), "{}").unwrap();
   fs::write(workspace.join("target/cargo-rail/report.md"), "# Report").unwrap();
+  fs::create_dir_all(workspace.join("target/cargo-rail/cache")).unwrap();
+  fs::write(
+    workspace.join("target/cargo-rail/cache/compiler-diags-v1.json"),
+    "{\"version\":1,\"entries\":{}}",
+  )
+  .unwrap();
 
   // Initialize git repo
   std::process::Command::new("git")
@@ -84,6 +90,12 @@ fn test_clean_all() {
 
   // Verify artifacts exist
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(
+    temp
+      .path()
+      .join("target/cargo-rail/cache/compiler-diags-v1.json")
+      .exists()
+  );
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -93,6 +105,7 @@ fn test_clean_all() {
 
   // Verify artifacts removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(!temp.path().join("target/cargo-rail/cache").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   assert_eq!(manager.list_backups().unwrap().len(), 0);
 }
@@ -107,6 +120,7 @@ fn test_clean_cache_only() {
 
   // Verify cache removed, others remain
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(!temp.path().join("target/cargo-rail/cache").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -122,6 +136,7 @@ fn test_clean_reports_only() {
 
   // Verify reports removed, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(temp.path().join("target/cargo-rail/cache").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -137,6 +152,7 @@ fn test_clean_backups_prune() {
 
   // Verify backups pruned, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(temp.path().join("target/cargo-rail/cache").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 3);
@@ -152,6 +168,7 @@ fn test_clean_default() {
 
   // Verify everything removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
+  assert!(!temp.path().join("target/cargo-rail/cache").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 0);

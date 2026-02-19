@@ -2,10 +2,12 @@
 
 use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
+use crate::release::changelog::ChangelogGenerator;
 use crate::release::planner::ReleasePlan;
 use crate::release::process;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
+use std::fs;
 use std::path::PathBuf;
 
 /// Result of a single validation check
@@ -205,6 +207,7 @@ impl<'a> ReleaseValidator<'a> {
     skip_publish: bool,
     skip_tag: bool,
     require_clean: bool,
+    require_release_notes: bool,
   ) -> RailResult<()> {
     if require_clean {
       self.check_clean_working_directory()?;
@@ -231,6 +234,54 @@ impl<'a> ReleaseValidator<'a> {
         return Err(RailError::with_help(
           "crates.io precondition check failed",
           "verify network access and cargo credentials before publishing".to_string(),
+        ));
+      }
+    }
+
+    if require_release_notes {
+      self.validate_release_notes(plan)?;
+    }
+
+    Ok(())
+  }
+
+  /// Ensure each crate being released has release notes for its target version.
+  ///
+  /// A crate passes if either:
+  /// - changelog generation is disabled for that crate, or
+  /// - changelog already contains `## [<version>]`, or
+  /// - generated changelog entries for this release are non-empty.
+  fn validate_release_notes(&self, plan: &ReleasePlan) -> RailResult<()> {
+    let generator = ChangelogGenerator::new(self.ctx.workspace_root());
+
+    for crate_plan in &plan.crates {
+      if !crate_plan.generate_changelog {
+        continue;
+      }
+
+      if changelog_contains_version_entry(&crate_plan.changelog_path, &crate_plan.new_version.to_string()) {
+        continue;
+      }
+
+      let crate_dir = crate_plan
+        .manifest_path
+        .parent()
+        .ok_or_else(|| RailError::message("Invalid manifest path"))?;
+      let generated = generator.generate(
+        crate_plan.changelog_range_start.as_deref(),
+        &crate_plan.changelog_range_end,
+        Some(&[crate_dir]),
+      )?;
+
+      if generated.trim().is_empty() {
+        return Err(RailError::with_help(
+          format!(
+            "no release notes for {} v{} in {}",
+            crate_plan.name,
+            crate_plan.new_version,
+            crate_plan.changelog_path.display()
+          ),
+          "add user-facing commits, pre-populate the version section, or set [release].require_release_notes = false",
         ));
       }
     }
@@ -630,4 +681,12 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
   }
 
   components.iter().collect()
+}
+
+fn changelog_contains_version_entry(path: &std::path::Path, version: &str) -> bool {
+  let Ok(contents) = fs::read_to_string(path) else {
+    return false;
+  };
+  let needle = format!("## [{}]", version);
+  contents.lines().any(|line| line.trim_start().starts_with(&needle))
 }

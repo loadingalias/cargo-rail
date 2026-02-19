@@ -13,6 +13,8 @@ pub mod cargo;
 pub mod change_detection;
 /// CLI command implementations.
 pub mod commands;
+/// Compiler diagnostics collection and caching.
+pub mod compiler;
 /// Configuration file parsing.
 pub mod config;
 /// Error types and result aliases.
