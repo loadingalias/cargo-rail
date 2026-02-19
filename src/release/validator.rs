@@ -156,7 +156,10 @@ impl<'a> ReleaseValidator<'a> {
       .as_std_path()
       .strip_prefix(self.ctx.workspace_root())
       .unwrap_or_else(|_| crate_dir.as_std_path());
-    let git_path = utils::path_to_git_format(relative_path);
+    let git_path = {
+      let path = utils::path_to_git_format(relative_path);
+      if path.is_empty() { ".".to_string() } else { path }
+    };
 
     // Check for changes in this directory
     let output = self
