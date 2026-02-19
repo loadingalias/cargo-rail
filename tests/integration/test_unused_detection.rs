@@ -327,9 +327,7 @@ fn test_unused_detection_target_specific_unconfigured_not_flagged() -> Result<()
   let workspace = create_workspace_with_unused_detection()?;
 
   // Config with only linux target (no windows)
-  let config = r#"[workspace]
-root = "."
-targets = ["x86_64-unknown-linux-gnu"]
+  let config = r#"targets = ["x86_64-unknown-linux-gnu"]
 
 [unify]
 detect_unused = true
