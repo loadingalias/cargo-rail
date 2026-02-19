@@ -1041,8 +1041,14 @@ paths = [{{ crate = "crates/partial-lib" }}]
   let count_before: usize = String::from_utf8_lossy(&log_before.stdout).trim().parse()?;
 
   // Delete notes in both repos to simulate interrupted state
-  let _ = git(&ws.path, &["update-ref", "-d", &notes_ref]);
-  let _ = git(split_dir.path(), &["update-ref", "-d", &notes_ref]);
+  let ws_notes_ref = git(&ws.path, &["for-each-ref", "--format=%(refname)", &notes_ref])?;
+  if !String::from_utf8_lossy(&ws_notes_ref.stdout).trim().is_empty() {
+    git(&ws.path, &["update-ref", "-d", &notes_ref])?;
+  }
+  let split_notes_ref = git(split_dir.path(), &["for-each-ref", "--format=%(refname)", &notes_ref])?;
+  if !String::from_utf8_lossy(&split_notes_ref.stdout).trim().is_empty() {
+    git(split_dir.path(), &["update-ref", "-d", &notes_ref])?;
+  }
 
   // Now add a new commit
   ws.modify_file("partial-lib", "src/lib.rs", "// V4 after interruption")?;

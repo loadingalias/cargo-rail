@@ -114,7 +114,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     section: "unify",
     key: "detect_unused",
     default_toml: "true",
-    comment: "Detect unused dependencies (default: true)",
+    comment: "Detect unused deps via resolved graph + rustc source diagnostics (default: true)",
   },
   FieldSpec {
     section: "unify",

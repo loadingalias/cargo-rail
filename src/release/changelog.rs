@@ -137,10 +137,15 @@ fn parse_github_remote(url: &str) -> Option<(String, String)> {
   Some((org.to_string(), repo.to_string()))
 }
 
+fn git_command(workspace_root: &Path) -> Command {
+  let mut cmd = Command::new("git");
+  cmd.current_dir(workspace_root);
+  cmd
+}
+
 /// Detect GitHub repository from the git remote
 pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
-  let output = Command::new("git")
-    .current_dir(workspace_root)
+  let output = git_command(workspace_root)
     .args(["config", "--get", "remote.origin.url"])
     .output()
     .ok()?;
@@ -313,14 +318,11 @@ impl ChangelogGenerator {
     }
 
     if let Some((org, repo)) = &self.github_repo {
-      let links = prs
-        .iter()
-        .map(|n| format!("[#{}](https://github.com/{}/{}/pull/{})", n, org, repo, n))
-        .collect::<Vec<_>>()
-        .join(" ");
-      Some(links)
+      Some(format_pr_links(&prs, |pr| {
+        format!("[#{}](https://github.com/{}/{}/pull/{})", pr, org, repo, pr)
+      }))
     } else {
-      Some(prs.iter().map(|pr| format!("#{}", pr)).collect::<Vec<_>>().join(" "))
+      Some(format_pr_links(&prs, |pr| format!("#{}", pr)))
     }
   }
 
@@ -457,8 +459,8 @@ impl ChangelogGenerator {
       to_ref.to_string()
     };
 
-    let mut cmd = Command::new("git");
-    cmd.current_dir(&self.workspace_root).args([
+    let mut cmd = git_command(&self.workspace_root);
+    cmd.args([
       "log",
       &range,
       "--format=%H%x00%s%x00%b%x00",
@@ -493,15 +495,19 @@ impl ChangelogGenerator {
         continue;
       }
 
-      let parts: Vec<&str> = commit_block.split('\0').collect();
-      if parts.len() < 2 {
+      let mut parts = commit_block.splitn(3, '\0');
+      let Some(sha) = parts.next() else {
         continue;
-      }
+      };
+      let Some(subject) = parts.next() else {
+        continue;
+      };
+      let body_raw = parts.next().unwrap_or_default();
 
-      let sha = parts[0].trim().to_string();
-      let subject = parts[1].trim().to_string();
-      let body = if parts.len() > 2 && !parts[2].trim().is_empty() {
-        Some(parts[2].trim().to_string())
+      let sha = sha.trim().to_string();
+      let subject = subject.trim().to_string();
+      let body = if !body_raw.trim().is_empty() {
+        Some(body_raw.trim().to_string())
       } else {
         None
       };
@@ -511,6 +517,20 @@ impl ChangelogGenerator {
 
     Ok(commits)
   }
+}
+
+fn format_pr_links<F>(prs: &[u32], mut render: F) -> String
+where
+  F: FnMut(u32) -> String,
+{
+  let mut out = String::new();
+  for (idx, pr) in prs.iter().copied().enumerate() {
+    if idx > 0 {
+      out.push(' ');
+    }
+    out.push_str(&render(pr));
+  }
+  out
 }
 
 #[cfg(test)]

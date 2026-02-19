@@ -378,13 +378,14 @@ impl MultiTargetMetadata {
         // that aren't in the current Cargo.lock, breaking resolution.
         // The intersection approach is safe - it only pins features that
         // are already enabled everywhere, avoiding new dep introduction.
-        let common_features: HashSet<String> = features
-          .values()
-          .fold(None, |acc: Option<HashSet<String>>, set| match acc {
-            None => Some(set.clone()),
-            Some(existing) => Some(existing.intersection(set).cloned().collect()),
-          })
-          .unwrap_or_default();
+        let mut feature_sets = features.values();
+        let Some(first_set) = feature_sets.next() else {
+          continue;
+        };
+        let mut common_features = first_set.clone();
+        for set in feature_sets {
+          common_features.retain(|feature| set.contains(feature));
+        }
 
         // Get the resolved version (use highest across all targets)
         let versions = self.all_versions(dep_name);

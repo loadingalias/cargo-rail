@@ -5,6 +5,10 @@
 
 use std::process::Command;
 
+fn cargo_command() -> Command {
+  Command::new("cargo")
+}
+
 /// Test runner variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestRunner {
@@ -27,7 +31,7 @@ impl TestRunner {
   pub fn is_available(&self) -> bool {
     match self {
       Self::CargoTest => true, // cargo is always available
-      Self::Nextest => Command::new("cargo")
+      Self::Nextest => cargo_command()
         .arg("nextest")
         .arg("--version")
         .output()
@@ -38,7 +42,7 @@ impl TestRunner {
 
   /// Build a command to run tests for the given packages
   pub fn build_command(&self, packages: &[String], args: &[String]) -> Command {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = cargo_command();
 
     match self {
       Self::CargoTest => {

@@ -1,25 +1,34 @@
 //! Unused dependency detection
 //!
-//! Compares declared dependencies (from Cargo.toml) against the resolved
-//! cargo graph to find deps that are declared but never actually used.
+//! Combines graph-level checks with rustc's source-level diagnostics.
 
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
+use crate::cargo::manifest_analyzer::{DepKind, DepUsage};
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::{MemberEdit, UnusedDep, UnusedReason};
+use crate::error::ResultExt;
 use crate::progress;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 /// Detects unused dependencies in workspace members
 pub struct UnusedDepFinder<'a> {
+  workspace_root: &'a Path,
   metadata: &'a MultiTargetMetadata,
   manifests: &'a ManifestAnalyzer,
 }
 
 impl<'a> UnusedDepFinder<'a> {
   /// Create a new unused dependency finder
-  pub fn new(metadata: &'a MultiTargetMetadata, manifests: &'a ManifestAnalyzer) -> Self {
-    Self { metadata, manifests }
+  pub fn new(workspace_root: &'a Path, metadata: &'a MultiTargetMetadata, manifests: &'a ManifestAnalyzer) -> Self {
+    Self {
+      workspace_root,
+      metadata,
+      manifests,
+    }
   }
 
   /// Detect unused dependencies in workspace members
@@ -31,6 +40,7 @@ impl<'a> UnusedDepFinder<'a> {
   /// - Only truly unreferenced deps are flagged
   pub fn find(&self) -> Vec<UnusedDep> {
     let mut unused = Vec::new();
+    let source_unused = self.detect_source_unused_deps();
 
     // Pre-compute workspace member names (these are never "unused")
     let workspace_member_names: HashSet<String> = self
@@ -77,33 +87,38 @@ impl<'a> UnusedDepFinder<'a> {
             .unwrap_or_else(|| dep_key.name.replace('-', "_"))
         };
         if resolved_deps.contains(&resolved_name) {
-          continue; // Dep is resolved, definitely used
+          // Source-level detection catches "declared + resolved but never referenced".
+          // This solves the common single-crate case where graph-only checks miss dead deps.
+          for usage in usages {
+            if self.should_skip_usage(usage, &configured_targets) {
+              continue;
+            }
+            if usage.kind != DepKind::Normal {
+              continue;
+            }
+            let Some(member_unused) = source_unused.get(&member.package_name) else {
+              continue;
+            };
+            if !member_unused.contains(&resolved_name) {
+              continue;
+            }
+            unused.push(UnusedDep {
+              member: Arc::from(member.package_name.as_str()),
+              dep_name: Arc::clone(&dep_key.name),
+              kind: usage.kind,
+              reason: UnusedReason::NotUsedInSource,
+            });
+          }
+          continue;
         }
 
         // Check each usage of this dep (can appear in multiple sections)
         for usage in usages {
-          // === Smart filtering to avoid false positives ===
-
-          // Filter 1: Optional deps are ALWAYS feature-gated
-          // Cargo automatically creates an implicit feature for each optional dependency,
-          // so code can use `#[cfg(feature = "dep_name")]` even without explicit [features] entries.
-          // We cannot safely determine if an optional dep is "unused" without analyzing source code
-          // for cfg attributes, so we conservatively skip all optional deps.
-          if usage.optional {
+          if self.should_skip_usage(usage, &configured_targets) {
             continue;
           }
 
-          // Filter 2: Target-specific deps for unconfigured targets
-          // If a dep has a target constraint (e.g., cfg(windows)) and we don't have
-          // that target configured, we can't verify if it's used or not.
           if let Some(target_cfg) = &usage.target {
-            if !target_constraint_matches_any(target_cfg, &configured_targets) {
-              // Target not configured - can't verify, assume it's valid
-              continue;
-            }
-
-            // Target IS configured but dep still not in resolved graph
-            // This is genuinely suspicious - flag it with context
             unused.push(UnusedDep {
               member: Arc::from(member.package_name.as_str()),
               dep_name: Arc::clone(&dep_key.name),
@@ -132,6 +147,47 @@ impl<'a> UnusedDepFinder<'a> {
     }
 
     unused
+  }
+
+  /// Conservative skip rules to avoid false positives.
+  fn should_skip_usage(&self, usage: &DepUsage, configured_targets: &[&str]) -> bool {
+    // Optional deps may be used under cfg(feature = "...") without explicit references.
+    if usage.optional {
+      return true;
+    }
+
+    // If target isn't configured, we cannot verify usage accurately.
+    if let Some(target_cfg) = &usage.target {
+      return !target_constraint_matches_any(target_cfg, configured_targets);
+    }
+
+    false
+  }
+
+  /// Detect source-unused crates via rustc's `unused_crate_dependencies` lint.
+  ///
+  /// This is the only reliable source-level signal for dependencies that are
+  /// declared/resolved but never referenced in Rust code.
+  fn detect_source_unused_deps(&self) -> HashMap<String, HashSet<String>> {
+    if !has_source_check_candidates(&self.manifests) {
+      return HashMap::new();
+    }
+
+    let manifest_to_member = build_manifest_member_index(&self.manifests.members);
+    if manifest_to_member.is_empty() {
+      return HashMap::new();
+    }
+
+    match run_unused_crate_dependency_check(self.workspace_root, &manifest_to_member) {
+      Ok(map) => map,
+      Err(error) => {
+        crate::warn!(
+          "source-level unused dependency detection failed; falling back to graph-only detection: {}",
+          error
+        );
+        HashMap::new()
+      }
+    }
   }
 
   /// Generate removal edits for unused dependencies
@@ -200,6 +256,112 @@ impl<'a> UnusedDepFinder<'a> {
 
     deps
   }
+}
+
+fn build_manifest_member_index(members: &[crate::cargo::manifest_analyzer::ParsedManifest]) -> HashMap<String, String> {
+  let mut index = HashMap::with_capacity(members.len() * 2);
+  for member in members {
+    index.insert(member.path.to_string_lossy().into_owned(), member.package_name.clone());
+    if let Ok(canonical) = member.path.canonicalize() {
+      index.insert(canonical.to_string_lossy().into_owned(), member.package_name.clone());
+    }
+  }
+  index
+}
+
+fn has_source_check_candidates(manifests: &ManifestAnalyzer) -> bool {
+  manifests.members.iter().any(|member| {
+    member
+      .dependencies
+      .values()
+      .flatten()
+      .any(|usage| usage.kind == DepKind::Normal && !usage.optional && usage.target.is_none())
+  })
+}
+
+fn run_unused_crate_dependency_check(
+  workspace_root: &Path,
+  manifest_to_member: &HashMap<String, String>,
+) -> crate::error::RailResult<HashMap<String, HashSet<String>>> {
+  let rustflags = std::env::var("RUSTFLAGS").ok();
+  let lint_flag = "-Wunused-crate-dependencies";
+  let merged_rustflags = match rustflags {
+    Some(flags) if flags.split_whitespace().any(|flag| flag == lint_flag) => flags,
+    Some(flags) => format!("{} {}", flags, lint_flag),
+    None => lint_flag.to_string(),
+  };
+
+  let output = Command::new("cargo")
+    .current_dir(workspace_root)
+    .env("RUSTFLAGS", merged_rustflags)
+    .args([
+      "check",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--message-format=json",
+    ])
+    .output()
+    .with_context(|| format!("running cargo check in {}", workspace_root.display()))?;
+
+  let mut by_member: HashMap<String, HashSet<String>> = HashMap::new();
+  for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let Ok(message) = serde_json::from_str::<CargoCompilerMessage>(line) else {
+      continue;
+    };
+    if message.reason != "compiler-message" {
+      continue;
+    }
+    if message.message.code.as_ref().and_then(|c| c.code.as_deref()) != Some("unused_crate_dependencies") {
+      continue;
+    }
+    let Some(manifest_path) = message.manifest_path.as_deref() else {
+      continue;
+    };
+    let Some(member_name) = resolve_member_name(manifest_path, manifest_to_member) else {
+      continue;
+    };
+    let Some(crate_name) = parse_unused_crate_name(&message.message.message) else {
+      continue;
+    };
+
+    by_member
+      .entry(member_name.to_string())
+      .or_default()
+      .insert(crate_name.replace('-', "_"));
+  }
+
+  Ok(by_member)
+}
+
+fn resolve_member_name<'a>(manifest_path: &str, manifest_to_member: &'a HashMap<String, String>) -> Option<&'a str> {
+  manifest_to_member.get(manifest_path).map(String::as_str)
+}
+
+fn parse_unused_crate_name(message: &str) -> Option<&str> {
+  let prefix = "extern crate `";
+  let start = message.find(prefix)? + prefix.len();
+  let rest = &message[start..];
+  let end = rest.find('`')?;
+  Some(&rest[..end])
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoCompilerMessage {
+  reason: String,
+  manifest_path: Option<String>,
+  message: CargoDiagnostic,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDiagnostic {
+  message: String,
+  code: Option<CargoDiagnosticCode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDiagnosticCode {
+  code: Option<String>,
 }
 
 /// Check if a target constraint (cfg expression) matches any configured target

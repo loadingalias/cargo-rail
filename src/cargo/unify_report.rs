@@ -140,6 +140,7 @@ impl UnifyReport {
           DepKind::Build => "build",
         };
         let reason_str = match &ud.reason {
+          UnusedReason::NotUsedInSource => "unused in source".to_string(),
           UnusedReason::NotInResolvedGraph => "not in resolved graph".to_string(),
           UnusedReason::TargetConfiguredButNotResolved { target_cfg } => {
             format!("target `{}` configured but not resolved", target_cfg)

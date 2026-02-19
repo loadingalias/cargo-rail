@@ -37,6 +37,8 @@ pub struct UnifyAnalyzer {
   cohort_issues: Vec<UnifyIssue>,
   /// Workspace root path (for path normalization)
   workspace_root: PathBuf,
+  /// Canonical workspace root path (computed once)
+  canonical_workspace_root: PathBuf,
 }
 
 type FeatureSources = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
@@ -64,6 +66,8 @@ impl UnifyAnalyzer {
       .collect();
     let (config, cohort_issues) =
       Self::apply_workspace_member_cohort_policy(base_config, &manifests, &workspace_member_names);
+    let workspace_root = ctx.workspace_root().to_path_buf();
+    let canonical_workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
 
     Ok(Self {
       metadata,
@@ -71,7 +75,8 @@ impl UnifyAnalyzer {
       config,
       existing_workspace_deps,
       cohort_issues,
-      workspace_root: ctx.workspace_root().to_path_buf(),
+      workspace_root,
+      canonical_workspace_root,
     })
   }
 
@@ -239,14 +244,10 @@ impl UnifyAnalyzer {
     let absolute_dep_path = member_dir.join(dep_path);
 
     // Canonicalize to resolve .. and symlinks (if path exists)
-    let canonical_workspace = self
-      .workspace_root
-      .canonicalize()
-      .unwrap_or_else(|_| self.workspace_root.clone());
     let canonical_dep = absolute_dep_path.canonicalize().unwrap_or(absolute_dep_path.clone());
 
     // Make relative to workspace root
-    if let Ok(relative) = canonical_dep.strip_prefix(&canonical_workspace) {
+    if let Ok(relative) = canonical_dep.strip_prefix(&self.canonical_workspace_root) {
       return relative.to_path_buf();
     }
 
@@ -263,13 +264,9 @@ impl UnifyAnalyzer {
   fn normalize_workspace_member_path(&self, member_manifest_path: &Path) -> PathBuf {
     let member_dir = member_manifest_path.parent().unwrap_or(member_manifest_path);
 
-    let canonical_workspace = self
-      .workspace_root
-      .canonicalize()
-      .unwrap_or_else(|_| self.workspace_root.clone());
     let canonical_member = member_dir.canonicalize().unwrap_or_else(|_| member_dir.to_path_buf());
 
-    if let Ok(relative) = canonical_member.strip_prefix(&canonical_workspace) {
+    if let Ok(relative) = canonical_member.strip_prefix(&self.canonical_workspace_root) {
       return relative.to_path_buf();
     }
 
@@ -698,7 +695,7 @@ impl UnifyAnalyzer {
     };
 
     // Detect unused dependencies
-    let unused_finder = UnusedDepFinder::new(&self.metadata, &self.manifests);
+    let unused_finder = UnusedDepFinder::new(&self.workspace_root, &self.metadata, &self.manifests);
     let unused_deps = if self.config.detect_unused {
       progress!("Detecting unused dependencies...");
       unused_finder.find()

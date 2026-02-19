@@ -68,8 +68,15 @@ fn test_config_locate_json_output() -> Result<()> {
   assert_eq!(json["command"], "config");
   assert_eq!(json["action"], "locate");
   assert_eq!(json["found"], true);
-  assert!(json["path"].as_str().is_some());
-  assert!(json["search_paths"].as_array().is_some());
+  let path = json["path"].as_str().expect("path should be a string");
+  assert!(path.ends_with("rail.toml"), "path should point to rail.toml");
+  let search_paths = json["search_paths"]
+    .as_array()
+    .expect("search_paths should be an array");
+  assert!(
+    !search_paths.is_empty(),
+    "search_paths should include checked config locations"
+  );
 
   Ok(())
 }
@@ -149,7 +156,11 @@ fn test_config_print_json_output() -> Result<()> {
 
   assert_eq!(json["command"], "config");
   assert_eq!(json["action"], "print");
-  assert!(json["config_path"].as_str().is_some());
+  let config_path = json["config_path"].as_str().expect("config_path should be a string");
+  assert!(
+    config_path.ends_with("rail.toml"),
+    "config_path should point to rail.toml"
+  );
   assert!(json["config"].is_object());
   assert!(json["config"]["unify"].is_object());
 
@@ -286,9 +297,15 @@ fn test_config_validate_json_output() -> Result<()> {
   assert_eq!(json["command"], "config");
   assert_eq!(json["action"], "validate");
   assert_eq!(json["valid"], true);
-  assert!(json["config_path"].as_str().is_some());
-  assert!(json["errors"].as_array().is_some());
-  assert!(json["warnings"].as_array().is_some());
+  let config_path = json["config_path"].as_str().expect("config_path should be a string");
+  assert!(
+    config_path.ends_with("rail.toml"),
+    "config_path should point to rail.toml"
+  );
+  let errors = json["errors"].as_array().expect("errors should be an array");
+  let warnings = json["warnings"].as_array().expect("warnings should be an array");
+  assert!(errors.is_empty(), "valid config should have no errors");
+  assert!(warnings.is_empty(), "valid config should have no warnings");
 
   Ok(())
 }
@@ -813,9 +830,23 @@ msrv = true
 
   assert_eq!(json["command"], "config");
   assert_eq!(json["action"], "sync");
-  assert!(json["config_path"].as_str().is_some());
-  assert!(json["fields_added"].as_array().is_some());
-  assert!(json["has_changes"].as_bool().is_some());
+  let config_path = json["config_path"].as_str().expect("config_path should be a string");
+  assert!(
+    config_path.ends_with("rail.toml"),
+    "config_path should point to rail.toml"
+  );
+  let fields_added = json["fields_added"]
+    .as_array()
+    .expect("fields_added should be an array");
+  assert!(
+    !fields_added.is_empty(),
+    "sync should add missing config fields for the minimal test config"
+  );
+  assert_eq!(
+    json["has_changes"].as_bool(),
+    Some(true),
+    "sync should report changes for the minimal test config"
+  );
 
   Ok(())
 }

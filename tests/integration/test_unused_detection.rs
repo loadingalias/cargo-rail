@@ -61,6 +61,18 @@ edition = "2021"
 once_cell = "1.0"
 "#,
   )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! test crate
+use once_cell::sync::Lazy;
+
+static CELL: Lazy<u8> = Lazy::new(|| 7);
+
+pub fn hello() -> u8 {
+  *CELL
+}
+"#,
+  )?;
 
   workspace.commit("Add crate with hyphenated dependency")?;
 
@@ -225,6 +237,14 @@ default = []
 # Note: serde is NOT referenced in any feature, but may be used via #[cfg(feature = "serde")]
 "#,
   )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! test crate
+use log as _;
+
+pub fn hello() {}
+"#,
+  )?;
 
   workspace.commit("Add crate with optional dep not in features")?;
 
@@ -232,9 +252,9 @@ default = []
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // serde is optional - should NOT be flagged as unused because we can't
-  // verify if it's used via #[cfg(feature = "serde")] in source code
+  // verify if it's used via #[cfg(feature = "serde")] in source code.
   assert!(
-    !stdout.contains("Unused"),
+    !stdout.contains("serde") || !stdout.contains("Unused"),
     "Optional dep 'serde' should NOT be flagged as unused\nOutput:\n{}",
     stdout
   );
@@ -276,6 +296,14 @@ log = "0.4"
 winapi = "0.3"
 "#,
   )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! test crate
+use log as _;
+
+pub fn hello() {}
+"#,
+  )?;
 
   workspace.commit("Add crate with windows-specific dep")?;
 
@@ -297,8 +325,8 @@ winapi = "0.3"
 
 #[test]
 fn test_unused_detection_truly_unused_dep_is_flagged() -> Result<()> {
-  // A non-optional dep that doesn't appear in the resolved graph should be flagged
-  // This tests a TRUE positive scenario
+  // A non-optional dep that's resolved but never referenced in source should be flagged.
+  // This validates source-level detection (`unused_crate_dependencies`).
 
   let workspace = create_workspace_with_unused_detection()?;
 
@@ -325,12 +353,54 @@ log = "0.4"
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // log should be in resolved graph (it's a real dep)
-  // So it should NOT be flagged
+  // log is declared but never referenced in source - it should be flagged.
   assert!(
-    !stdout.contains("log") || !stdout.contains("Unused"),
-    "log should NOT be flagged (it's in the resolved graph)\nOutput:\n{}",
+    stdout.contains("log"),
+    "log should be flagged as unused\nOutput:\n{}",
     stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_single_crate_issue_11_repro() -> Result<()> {
+  // Repro from GH issue #11:
+  // a single-crate repo with an unused dependency should be auto-removed by `unify`.
+  let workspace = TestWorkspace::new_single_crate("my-lib", "0.1.0")?;
+
+  let cargo_toml = r#"[package]
+name = "my-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eyre = "0.6"
+"#;
+  fs::write(workspace.path.join("Cargo.toml"), cargo_toml)?;
+  workspace.commit("Add unused eyre dependency")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let check_stdout = String::from_utf8_lossy(&check.stdout);
+  assert!(
+    check_stdout.contains("\"unused_deps\": 1"),
+    "expected one unused dependency in check output\nstdout:\n{}",
+    check_stdout
+  );
+
+  let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply.status.success(),
+    "unify apply should succeed\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply.stdout),
+    String::from_utf8_lossy(&apply.stderr)
+  );
+
+  let final_toml = fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    !final_toml.contains("eyre"),
+    "eyre should be removed from Cargo.toml\n{}",
+    final_toml
   );
 
   Ok(())
@@ -414,6 +484,14 @@ edition = "2021"
 
 [dependencies]
 log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! test crate
+use log as _;
+
+pub fn hello() {}
 "#,
   )?;
 
@@ -512,6 +590,33 @@ async-runtime = ["tokio"]
 [dev-dependencies]
 # Dev dep for tests
 tempfile = "3.0"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"//! Test crate
+use log as _;
+
+#[derive(serde::Serialize)]
+pub struct Entry {
+  pub id: u64,
+}
+
+pub fn build() -> u64 {
+  let entry = Entry { id: 1 };
+  entry.id
+}
+
+#[cfg(test)]
+mod tests {
+  use tempfile::NamedTempFile;
+
+  #[test]
+  fn creates_temp_file() {
+    let file = NamedTempFile::new().expect("temp file");
+    assert!(file.path().exists());
+  }
+}
 "#,
   )?;
 

@@ -174,7 +174,7 @@ pub struct VersionMismatch {
   pub workspace_version: Arc<str>,
 }
 
-/// Record of an unused dependency (declared but not in resolved graph)
+/// Record of an unused dependency.
 #[derive(Debug, Clone)]
 pub struct UnusedDep {
   /// Member that has the unused dependency
@@ -190,6 +190,9 @@ pub struct UnusedDep {
 /// Reason a dependency was flagged as unused
 #[derive(Debug, Clone)]
 pub enum UnusedReason {
+  /// Present in the resolved graph but reported as unused by rustc
+  /// (`unused_crate_dependencies`).
+  NotUsedInSource,
   /// Not found in resolved dependency graph for any configured target
   NotInResolvedGraph,
   /// Target-specific dep where the target IS configured but dep still not resolved

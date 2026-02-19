@@ -58,14 +58,20 @@ fn create_test_workspace() -> TempDir {
     .output()
     .unwrap();
 
-  // Create backups
-  // Note: max_backups=0 means NO backups (Issue #9 fix), so we use a large number
-  let manager = BackupManager::new(workspace);
-  let files = vec![]; // Empty files list is fine for testing backup creation logic
+  // Create deterministic backup fixtures (avoid time-based sleeps).
+  let backup_root = workspace.join("target/cargo-rail/backups");
+  fs::create_dir_all(&backup_root).unwrap();
   for i in 1..=5 {
-    let metadata = BackupMetadata::new(format!("test {}", i));
-    manager.create_backup(&files, metadata, 100).unwrap(); // 100 = allow up to 100 backups
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    let backup_dir = backup_root.join(format!("2024-01-01-00000{}-000", i));
+    fs::create_dir_all(&backup_dir).unwrap();
+    let metadata = BackupMetadata {
+      timestamp: format!("2024-01-01T00:00:0{}+00:00", i),
+      command: format!("test {}", i),
+      files_modified: vec![],
+      config_snapshot: None,
+      description: None,
+    };
+    metadata.save(&backup_dir).unwrap();
   }
 
   temp

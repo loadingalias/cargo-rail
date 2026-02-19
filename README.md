@@ -93,6 +93,8 @@ cargo rail unify --explain  # understand each decision
 - **Replaces workspace-hack** — enable `pin_transitives` for cargo-hakari equivalent
 - **Configurable** — tune behavior in `rail.toml` (unused removal, feature pruning, sorting, and more).
 
+Unused detection combines resolved-graph analysis with rustc diagnostics (`unused_crate_dependencies`) so deps that are resolved but never referenced are also removed. Optional deps and unconfigured target-gated deps are conservatively skipped.
+
 **Validated impact on real repos:**
 
 | Repository | Crates | Deps Unified | Undeclared Features | MSRV Computed |

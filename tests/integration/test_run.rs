@@ -219,8 +219,11 @@ fn test_runner_auto_detect_base_ref() -> Result<()> {
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add lib-a")?;
 
-  // Create a base branch (if main doesn't exist, create it; otherwise use it)
-  let _ = git(&ws.path, &["branch", "base-branch"]);
+  // Create a base branch if it does not exist.
+  let existing_base_branch = git(&ws.path, &["branch", "--list", "base-branch"])?;
+  if String::from_utf8_lossy(&existing_base_branch.stdout).trim().is_empty() {
+    git(&ws.path, &["branch", "base-branch"])?;
+  }
   git(&ws.path, &["checkout", "-b", "feature-branch"])?;
 
   ws.modify_file(

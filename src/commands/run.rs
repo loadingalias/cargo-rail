@@ -7,7 +7,7 @@ use crate::git::detect_default_base_ref;
 use crate::progress;
 use crate::test::runner::select_runner;
 use crate::workspace::WorkspaceContext;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::process::Command;
 
@@ -300,7 +300,7 @@ fn builtin_profile_surfaces(profile: &str) -> Option<Vec<String>> {
 }
 
 fn dedup_surfaces(mut surfaces: Vec<String>) -> Vec<String> {
-  let mut seen = BTreeSet::new();
+  let mut seen: HashSet<String> = HashSet::with_capacity(surfaces.len());
   surfaces.retain(|surface| seen.insert(surface.clone()));
   surfaces
 }
@@ -320,15 +320,15 @@ fn resolve_targets(
       .map(|p| p.name.to_string())
       .collect()
   } else if let Some(output) = plan {
-    let mut selected = output
+    let selected = output
       .impact
       .direct_crates
       .iter()
       .chain(output.impact.transitive_crates.iter())
       .cloned()
+      .collect::<BTreeSet<_>>()
+      .into_iter()
       .collect::<Vec<_>>();
-    selected.sort();
-    selected.dedup();
 
     // Conservative fallback for ownerless/global changes on package-scoped surfaces.
     if selected.is_empty()

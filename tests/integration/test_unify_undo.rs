@@ -115,7 +115,6 @@ fn test_unify_undo_specific_backup_id() -> Result<()> {
 
   // Create two backups by running unify twice
   run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
-  std::thread::sleep(std::time::Duration::from_secs(1)); // Ensure different timestamp
   run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
 
   // Get list of backups

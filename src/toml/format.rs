@@ -59,11 +59,7 @@ impl TomlFormatter {
 
     // Check if we should inline
     if items.len() <= self.inline_array_threshold {
-      let content = items
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<_>>()
-        .join(", ");
+      let content = join_quoted(items.iter().map(String::as_str));
       return format!("[{}]", content);
     }
 
@@ -90,11 +86,7 @@ impl TomlFormatter {
       output.push(']');
       output
     } else {
-      let content = features
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<_>>()
-        .join(", ");
+      let content = join_quoted(features.iter().map(String::as_str));
       format!("[{}]", content)
     }
   }
@@ -115,11 +107,7 @@ impl TomlFormatter {
       return "[]".to_string();
     }
     if items.len() <= self.inline_array_threshold {
-      let content = items
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<_>>()
-        .join(", ");
+      let content = join_quoted(items.iter().map(String::as_str));
       return format!("[{}]", content);
     }
     let mut output = String::from("[\n");
@@ -347,11 +335,27 @@ impl std::fmt::Display for TomlValue {
       TomlValue::Bool(b) => write!(f, "{}", b),
       TomlValue::Integer(i) => write!(f, "{}", i),
       TomlValue::Array(arr) => {
-        let content = arr.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ");
+        let content = join_quoted(arr.iter().map(String::as_str));
         write!(f, "[{}]", content)
       }
     }
   }
+}
+
+fn join_quoted<'a, I>(items: I) -> String
+where
+  I: IntoIterator<Item = &'a str>,
+{
+  let mut out = String::new();
+  for (idx, item) in items.into_iter().enumerate() {
+    if idx > 0 {
+      out.push_str(", ");
+    }
+    out.push('"');
+    out.push_str(item);
+    out.push('"');
+  }
+  out
 }
 
 /// A named group of items for array formatting

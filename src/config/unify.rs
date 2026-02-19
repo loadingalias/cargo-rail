@@ -104,8 +104,13 @@ pub struct UnifyConfig {
   pub major_version_conflict: MajorVersionConflict,
 
   /// Detect unused dependencies in workspace members (default: true)
-  /// When enabled, compares declared deps against the resolved cargo graph
-  /// to find deps that are declared but never actually used.
+  /// When enabled, uses two signals:
+  /// - Graph-level: declared deps absent from the resolved cargo graph.
+  /// - Source-level: rustc `unused_crate_dependencies` diagnostics for deps
+  ///   that are resolved but never referenced in source.
+  ///
+  /// Optional deps and deps behind unconfigured target constraints are
+  /// conservatively skipped to avoid false positives.
   #[serde(default = "default_true")]
   pub detect_unused: bool,
 

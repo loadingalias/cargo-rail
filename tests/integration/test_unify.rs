@@ -1278,7 +1278,13 @@ edition.workspace = true
 serde = "1.0"
 "#,
   )?;
-  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
+  std::fs::write(
+    crate_path.join("src/lib.rs"),
+    r#"use serde as _;
+
+pub fn hello() {}
+"#,
+  )?;
   workspace.commit("Add crate")?;
 
   // Configure rail.toml with pin_transitives
@@ -1324,7 +1330,13 @@ edition.workspace = true
 serde = "1.0"
 "#,
   )?;
-  std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
+  std::fs::write(
+    crate_path.join("src/lib.rs"),
+    r#"use serde as _;
+
+pub fn hello() {}
+"#,
+  )?;
   workspace.commit("Add crate")?;
 
   // Configure rail.toml with include_renamed
