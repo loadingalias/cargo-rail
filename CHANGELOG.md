@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0](https://github.com/loadingalias/cargo-rail/compare/v0.10.12...v0.11.0) - 2026-04-09
+
+### ✨ Features
+
+- **plan**: add stable execution scope for CI and package-scoped runs ([5258fb4](https://github.com/loadingalias/cargo-rail/commit/5258fb4a061a0fe28455d018ba5c68372fc5619d))
+
+### 🐛 Bug Fixes
+
+- **ci**: isolate cargo-rail bootstrap target dir on Windows ([6e50bfd](https://github.com/loadingalias/cargo-rail/commit/6e50bfdc93ae719dd10a6f58cfa338551a0dd61c))
+- **test**: normalize workspace-root path assertion for Windows ([fa39716](https://github.com/loadingalias/cargo-rail/commit/fa397165a1542324763ff118f31fb7cfb38d46a5))
+- ci ([247f025](https://github.com/loadingalias/cargo-rail/commit/247f02527528a9faf3cc72b90c0ee7b427b90393))
+
+### 📦 Other Changes
+
+- Make pre-push script executable ([4f0484b](https://github.com/loadingalias/cargo-rail/commit/4f0484bf67c05400406dcc138afdf051ecfc105a))
+- fix ci ([ca1c73e](https://github.com/loadingalias/cargo-rail/commit/ca1c73e437589b79154ea954c50372b9f15d5c06))
+
+
+
 ## [0.10.12](https://github.com/loadingalias/cargo-rail/compare/v0.10.11...v0.10.12) - 2026-02-19
 
 ### 🐛 Bug Fixes
