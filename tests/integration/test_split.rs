@@ -436,7 +436,7 @@ branch = "main"
 mode = "single"
 paths = [{{ crate = "crates/json-lib" }}]
 "#,
-      target_dir.path().display()
+      target_dir.path().display().to_string().replace('\\', "\\\\")
     ),
   )?;
 
