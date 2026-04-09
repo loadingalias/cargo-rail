@@ -720,6 +720,8 @@ run_args = ["--manifest-path", "{workspace_root}/Cargo.toml", "{cargo_args}", "-
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let manifest_path = ws.path.join("Cargo.toml");
+  let stdout_normalized = stdout.replace('\\', "/");
+  let manifest_path_normalized = manifest_path.display().to_string().replace('\\', "/");
 
   assert!(output.status.success(), "run should succeed");
   assert!(
@@ -728,7 +730,7 @@ run_args = ["--manifest-path", "{workspace_root}/Cargo.toml", "{cargo_args}", "-
     stdout
   );
   assert!(
-    stdout.contains(&manifest_path.display().to_string()),
+    stdout_normalized.contains(&manifest_path_normalized),
     "workspace_root token should expand to absolute path. Output:\n{}",
     stdout
   );
