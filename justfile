@@ -7,18 +7,18 @@ test crate="":
 build:
     @echo "Change Detection Plan:"
     @echo ""
-    @cargo run --quiet -- rail plan --merge-base --explain
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates..."
-    @cargo run --quiet -- rail run --merge-base --profile local --surface build
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --profile local --surface build
 
 build-release:
     @echo "Change Detection Plan:"
     @echo ""
-    @cargo run --quiet -- rail plan --merge-base --explain
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates (release)..."
-    @cargo run --quiet -- rail run --merge-base --profile local --surface build -- --release
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --profile local --surface build -- --release
 
 # Full Workspace Commands (no change detection)
 
@@ -43,18 +43,18 @@ ci-test:
     @scripts/test/test.sh
 
 ci-build:
-    @cargo run --quiet -- rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
 
 # Explainability
 
 plan:
-    cargo run --quiet -- rail plan --merge-base -f json
+    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
 
 why:
-    cargo run --quiet -- rail plan --merge-base --explain
+    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
 
 dry-run surface="test":
-    cargo run --quiet -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
+    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
 
 # Maintenance
 

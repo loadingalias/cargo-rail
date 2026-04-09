@@ -16,7 +16,11 @@ set -euo pipefail
 #   CARGO_RAIL_TEST_MODE    # "commit" forces CI mode
 #   RAIL_SINCE              # Git ref for comparison
 
-RAIL_CMD=(cargo run --quiet -- rail)
+# Run the control-plane cargo-rail binary from an isolated target dir.
+# This avoids Windows file-lock conflicts when cargo-rail later asks Cargo
+# to build or test the workspace's own `target` tree.
+RAIL_BOOTSTRAP_TARGET_DIR="${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}"
+RAIL_CMD=(cargo run --quiet --target-dir "$RAIL_BOOTSTRAP_TARGET_DIR" -- rail)
 
 # Parse arguments
 CI_MODE=false

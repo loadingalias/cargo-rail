@@ -15,7 +15,11 @@ set -euo pipefail
 #   CARGO_RAIL_TEST_MODE   # "local" (default) or "commit" (CI)
 #   RAIL_SINCE             # Git ref for CI comparison
 
-RAIL_CMD=(cargo run --quiet -- rail)
+# Run the control-plane cargo-rail binary from an isolated target dir.
+# On Windows, `cargo nextest` cannot rebuild `target/debug/cargo-rail.exe`
+# while that exact binary is still running via `cargo run`.
+RAIL_BOOTSTRAP_TARGET_DIR="${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}"
+RAIL_CMD=(cargo run --quiet --target-dir "$RAIL_BOOTSTRAP_TARGET_DIR" -- rail)
 
 ARG="${1:-}"
 MODE="${CARGO_RAIL_TEST_MODE:-local}"
