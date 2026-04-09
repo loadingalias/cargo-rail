@@ -204,7 +204,7 @@ fn test_runner_with_explain() -> Result<()> {
 
   // Should show detailed explanation
   assert!(
-    stdout.contains("changed files:") || stdout.contains("direct:") || stdout.contains("source:"),
+    stdout.contains("surfaces:") || stdout.contains("why:") || stdout.contains("explain:"),
     "Should show detailed explanation with --explain. Output:\n{}",
     stdout
   );
@@ -393,6 +393,151 @@ fn test_runner_all_skip_nextest() -> Result<()> {
     output.status.success(),
     "test --all --skip-nextest should succeed. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_build_surface_uses_planner_selected_packages() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-build-selected-packages")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate("lib-b", "0.1.0", &[])?;
+  ws.commit("Add crates")?;
+
+  git(&ws.path, &["branch", "baseline"])?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed_for_build() {}")?;
+  ws.commit("Modify lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "baseline",
+      "--surface",
+      "build",
+      "--dry-run",
+      "--print-cmd",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "run should succeed. Output:\n{}", stdout);
+  assert!(
+    stdout.contains("build: cargo check -p lib-a"),
+    "build should target selected crate(s). Output:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains(" -p lib-b"),
+    "build should not include unaffected crates. Output:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains("build: cargo check --workspace"),
+    "partial selection should not use --workspace. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_build_surface_ignore_bin_crates_filters_spawned_command() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-build-ignore-bin")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  std::fs::create_dir_all(ws.path.join("crates/bin-only/src"))?;
+  std::fs::write(
+    ws.path.join("crates/bin-only/Cargo.toml"),
+    r#"[package]
+name = "bin-only"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "bin-only"
+path = "src/main.rs"
+
+[dependencies]
+"#,
+  )?;
+  std::fs::write(ws.path.join("crates/bin-only/src/main.rs"), "fn main() {}\n")?;
+  ws.commit("Add lib and bin-only crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "build",
+      "--ignore-bin-crates",
+      "--dry-run",
+      "--print-cmd",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "run should succeed. Output:\n{}", stdout);
+  assert!(
+    stdout.contains("build: cargo check -p lib-a"),
+    "ignore-bin-crates should keep non-bin crates in build command. Output:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains("bin-only"),
+    "ignore-bin-crates should remove bin-only crates from build command. Output:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains("build: cargo check --workspace"),
+    "ignore-bin-crates should force package-scoped build. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_build_surface_global_change_uses_workspace_scope() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-build-workspace-scope")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate("lib-b", "0.1.0", &[])?;
+  ws.commit("Add crates")?;
+
+  git(&ws.path, &["branch", "baseline"])?;
+  std::fs::write(
+    ws.path.join("rust-toolchain.toml"),
+    "[toolchain]\nchannel = \"stable\"\n",
+  )?;
+  ws.commit("Add toolchain file")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "baseline",
+      "--surface",
+      "build",
+      "--dry-run",
+      "--print-cmd",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "run should succeed. Output:\n{}", stdout);
+  assert!(
+    stdout.contains("build: cargo check --workspace"),
+    "global build scope should use workspace execution. Output:\n{}",
+    stdout
   );
 
   Ok(())
@@ -589,6 +734,43 @@ run_args = ["--manifest-path", "{workspace_root}/Cargo.toml", "{cargo_args}", "-
   assert!(
     stdout.contains("--color never --quiet"),
     "cargo_args token should splice CLI args before trailing profile args. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_workspace_root_applies_to_spawned_subprocesses() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-workspace-root-cwd")?;
+  ws.add_crate("cwd-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  let outside_cwd = ws.path.parent().expect("temp workspace should have parent directory");
+  let workspace_root = ws.path.display().to_string();
+  let args = [
+    "rail",
+    "--workspace-root",
+    workspace_root.as_str(),
+    "run",
+    "--all",
+    "--surface",
+    "build",
+    "--print-cmd",
+  ];
+  let output = run_cargo_rail(outside_cwd, &args)?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "run should succeed from outside workspace when --workspace-root is set. stdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    stdout.contains("build: cargo check --workspace"),
+    "build command should execute via run surface. Output:\n{}",
     stdout
   );
 

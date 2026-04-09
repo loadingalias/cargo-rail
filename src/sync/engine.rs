@@ -129,6 +129,25 @@ impl<'a> SyncEngine<'a> {
     }
   }
 
+  /// Check whether a monorepo path belongs to this sync scope.
+  ///
+  /// - `single`: only files under the single configured crate path
+  /// - `combined`: files under any configured crate path
+  fn mono_path_in_scope(&self, path: &Path) -> bool {
+    match self.config.mode {
+      SplitMode::Single => self
+        .config
+        .crate_paths
+        .first()
+        .is_some_and(|crate_path| path.starts_with(crate_path)),
+      SplitMode::Combined => self
+        .config
+        .crate_paths
+        .iter()
+        .any(|crate_path| path.starts_with(crate_path)),
+    }
+  }
+
   /// Sync changes from monorepo to remote repository
   pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
     progress!("   Syncing monorepo → remote...");
@@ -461,15 +480,14 @@ impl<'a> SyncEngine<'a> {
     // Get changed files in mono
     let changed_files = self.ctx.git.git().get_changed_files(&commit.sha)?;
 
-    // Filter to only files in crate path
-    let crate_path = &self.config.crate_paths[0];
+    // Filter to only files in configured crate path scope.
     let relevant_files: Vec<_> = changed_files
       .into_iter()
       .filter(|(path, _)| {
         // Skip files that shouldn't be synced (target dir, etc.)
         let path_str = path.to_string_lossy();
         let should_exclude = path_str.contains("/target/") || path_str.contains("\\target\\");
-        path.starts_with(crate_path) && !should_exclude
+        self.mono_path_in_scope(path) && !should_exclude
       })
       .collect();
 
@@ -648,10 +666,13 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn map_mono_path_to_remote(&self, mono_path: &Path) -> RailResult<PathBuf> {
-    let crate_path = &self.config.crate_paths[0];
-
     match self.config.mode {
       SplitMode::Single => {
+        let crate_path = self
+          .config
+          .crate_paths
+          .first()
+          .ok_or_else(|| crate::error::RailError::message("single-mode sync requires exactly one crate path"))?;
         // Strip crate path prefix
         Ok(mono_path.strip_prefix(crate_path)?.to_path_buf())
       }
@@ -663,10 +684,13 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn map_remote_path_to_mono(&self, remote_path: &Path) -> RailResult<PathBuf> {
-    let crate_path = &self.config.crate_paths[0];
-
     match self.config.mode {
       SplitMode::Single => {
+        let crate_path = self
+          .config
+          .crate_paths
+          .first()
+          .ok_or_else(|| crate::error::RailError::message("single-mode sync requires exactly one crate path"))?;
         // Prepend crate path
         Ok(crate_path.join(remote_path))
       }
@@ -806,39 +830,19 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn check_mono_has_changes(&self) -> RailResult<bool> {
-    use crate::workspace::ChangeImpact;
-
     let last_synced = self.find_last_synced_mono_commit()?;
-    let from = last_synced.as_deref().unwrap_or("HEAD~1");
-
-    // Use ChangeImpact for smarter detection
-    let analyzer = ChangeImpact::new(self.ctx);
-
-    // Check if this specific crate has changes
-    if let Some(impact) = analyzer.analyze_crate_changes(&self.config.crate_name, from, Some("HEAD"))? {
-      // Filter out commits from remote
-      let crate_path = &self.config.crate_paths[0];
-      let new_commits = self
+    let new_commits =
+      self
         .ctx
         .git
         .git()
-        .get_commits_touching_path(crate_path, last_synced.as_deref(), "HEAD")?;
+        .get_commits_touching_paths(&self.config.crate_paths, last_synced.as_deref(), "HEAD")?;
 
-      let relevant_commits: Vec<_> = new_commits
+    Ok(
+      new_commits
         .into_iter()
-        .filter(|c| !c.message.contains("Rail-Origin: remote@"))
-        .collect();
-
-      // Skip if only docs changed (no rebuild needed)
-      if impact.categories.is_docs_only() {
-        progress!("Skipping sync: only documentation changed");
-        return Ok(false);
-      }
-
-      Ok(!relevant_commits.is_empty())
-    } else {
-      Ok(false)
-    }
+        .any(|commit| !commit.message.contains("Rail-Origin: remote@")),
+    )
   }
 
   fn check_remote_has_changes(&self) -> RailResult<bool> {

@@ -49,6 +49,7 @@ pub(crate) struct PlanOutput {
   pub(crate) inputs: PlanInputs,
   pub(crate) files: Vec<PlannedFile>,
   pub(crate) impact: PlanImpact,
+  pub(crate) scope: ExecutionScope,
   pub(crate) surfaces: BTreeMap<String, SurfaceDecision>,
   pub(crate) trace: Vec<TraceReason>,
   pub(crate) reproducibility: Reproducibility,
@@ -88,6 +89,27 @@ pub(crate) struct PlannedFile {
 pub(crate) struct PlanImpact {
   pub(crate) direct_crates: Vec<String>,
   pub(crate) transitive_crates: Vec<String>,
+}
+
+/// Execution-focused projection of the planner contract.
+///
+/// This is the stable handoff for runners and CI transport layers.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExecutionScope {
+  pub(crate) scope_contract_version: u32,
+  pub(crate) resolved_base: String,
+  pub(crate) resolved_head: String,
+  pub(crate) mode: ExecutionScopeMode,
+  pub(crate) crates: Vec<String>,
+  pub(crate) surfaces: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionScopeMode {
+  Empty,
+  Crates,
+  Workspace,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,7 +169,9 @@ const RC_CONFIDENCE_PROFILE_FAST: &str = "CONFIDENCE_PROFILE_FAST";
 const RC_CONFIDENCE_STRICT_OWNER_EXPANSION: &str = "CONFIDENCE_STRICT_OWNER_EXPANSION";
 const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIVE";
 const RC_BOT_PR_CONFIDENCE_OVERRIDE: &str = "BOT_PR_CONFIDENCE_OVERRIDE";
-const PLAN_CONTRACT_VERSION: u32 = 1;
+const PLAN_CONTRACT_VERSION: u32 = 2;
+const SCOPE_CONTRACT_VERSION: u32 = 1;
+const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
 struct EffectiveConfidenceProfile {
@@ -178,8 +202,13 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
 
   let rendered = match opts.format {
     PlanOutputFormat::Text => format_text(&output, opts.explain),
-    PlanOutputFormat::Json => to_json_pretty(&output)?,
-    PlanOutputFormat::GitHub => format_github(&output)?,
+    PlanOutputFormat::Json => {
+      let payload = serde_json::to_value(&output).map_err(json_err)?;
+      let envelope = crate::output::machine_json_envelope("plan", "inspect", "success", 0, payload);
+      to_json_pretty(&envelope)?
+    }
+    PlanOutputFormat::GitHub => format_github(&output, false)?,
+    PlanOutputFormat::GitHubDebug => format_github(&output, true)?,
   };
 
   write_output(&rendered, opts.output.as_ref())
@@ -341,6 +370,18 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     None
   };
 
+  let impact = PlanImpact {
+    direct_crates: direct_crates.into_iter().collect(),
+    transitive_crates,
+  };
+  let scope = build_execution_scope(
+    &impact,
+    &surfaces,
+    ctx.cargo.metadata().workspace_packages().len(),
+    &refs.resolved_base,
+    &refs.resolved_head,
+  );
+
   let output = PlanOutput {
     plan_contract_version: PLAN_CONTRACT_VERSION,
     inputs: PlanInputs {
@@ -359,10 +400,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       confidence_profile_source: confidence.source.to_string(),
     },
     files: planned_files,
-    impact: PlanImpact {
-      direct_crates: direct_crates.into_iter().collect(),
-      transitive_crates,
-    },
+    impact,
+    scope,
     surfaces,
     trace,
     reproducibility: Reproducibility {
@@ -489,9 +528,150 @@ fn ensure_surface(surfaces: &mut Vec<String>, surface: &str) {
   }
 }
 
+fn build_execution_scope(
+  impact: &PlanImpact,
+  surfaces: &BTreeMap<String, SurfaceDecision>,
+  workspace_package_count: usize,
+  resolved_base: &str,
+  resolved_head: &str,
+) -> ExecutionScope {
+  let crates = impacted_crates_for_scope(impact);
+  let package_scoped_surface_enabled = surfaces
+    .iter()
+    .any(|(name, decision)| decision.enabled && PACKAGE_SCOPED_SURFACES.contains(&name.as_str()));
+
+  let (mode, crates) = if !package_scoped_surface_enabled {
+    (ExecutionScopeMode::Empty, Vec::new())
+  } else if crates.is_empty() || crates.len() == workspace_package_count {
+    (ExecutionScopeMode::Workspace, Vec::new())
+  } else {
+    (ExecutionScopeMode::Crates, crates)
+  };
+
+  ExecutionScope {
+    scope_contract_version: SCOPE_CONTRACT_VERSION,
+    resolved_base: resolved_base.to_string(),
+    resolved_head: resolved_head.to_string(),
+    mode,
+    crates,
+    surfaces: scope_surfaces(surfaces),
+  }
+}
+
+fn impacted_crates_for_scope(impact: &PlanImpact) -> Vec<String> {
+  impact
+    .direct_crates
+    .iter()
+    .chain(&impact.transitive_crates)
+    .cloned()
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect()
+}
+
+fn scope_surfaces(surfaces: &BTreeMap<String, SurfaceDecision>) -> BTreeMap<String, bool> {
+  surfaces
+    .iter()
+    .map(|(name, decision)| (name.clone(), decision.enabled))
+    .collect()
+}
+
 /// Render concise planner explain text used by command surfaces that consume planning.
 pub(crate) fn render_plan_explain(output: &PlanOutput) -> String {
   format_text(output, true)
+}
+
+fn reason_description(code: &str) -> &'static str {
+  match code {
+    RC_FILE_KIND_RUST_SRC => "Rust source file changed",
+    RC_FILE_KIND_RUST_TEST => "Rust test file changed",
+    RC_FILE_KIND_RUST_BENCH => "Rust benchmark file changed",
+    RC_FILE_KIND_TOML_MANIFEST => "Cargo.toml changed",
+    RC_FILE_KIND_TOML_WORKSPACE => "Workspace Cargo.toml changed",
+    RC_FILE_KIND_TOML_TOOLING => "Tooling config changed",
+    RC_FILE_KIND_CI => "CI or workflow file changed",
+    RC_FILE_KIND_SCRIPT => "Script file changed",
+    RC_FILE_KIND_DOCS => "Documentation changed",
+    RC_FILE_KIND_CUSTOM => "Custom pattern matched",
+    RC_FILE_KIND_UNCLASSIFIED => "Unclassified file changed",
+    RC_FILE_OWNS_CRATE_DIRECT => "File directly owns a crate",
+    RC_TRANSITIVE_DEPENDS_ON_DIRECT => "Transitive dependency of changed crate",
+    RC_OWNER_UNCERTAIN_FALLBACK => "Conservative fallback for uncertain ownership",
+    RC_CONFIDENCE_PROFILE_STRICT => "Strict confidence profile active",
+    RC_CONFIDENCE_PROFILE_BALANCED => "Balanced confidence profile active",
+    RC_CONFIDENCE_PROFILE_FAST => "Fast confidence profile active",
+    RC_CONFIDENCE_STRICT_OWNER_EXPANSION => "Strict mode expands owned crates",
+    RC_CONFIDENCE_FAST_SKIP_TRANSITIVE => "Fast mode skips transitive expansion",
+    RC_BOT_PR_CONFIDENCE_OVERRIDE => "Bot PR confidence override applied",
+    _ => "Planner reason",
+  }
+}
+
+fn reason_lookup(output: &PlanOutput) -> BTreeMap<u32, &TraceReason> {
+  output.trace.iter().map(|reason| (reason.id, reason)).collect()
+}
+
+fn summarize_reason_ids(reason_ids: &[u32], lookup: &BTreeMap<u32, &TraceReason>) -> String {
+  let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+  for reason_id in reason_ids {
+    if let Some(reason) = lookup.get(reason_id) {
+      *counts.entry(reason.code.as_ref()).or_default() += 1;
+    }
+  }
+
+  let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
+  ranked.sort_by(|(left_code, left_count), (right_code, right_count)| {
+    right_count.cmp(left_count).then_with(|| left_code.cmp(right_code))
+  });
+
+  let parts: Vec<String> = ranked
+    .into_iter()
+    .take(3)
+    .map(|(code, count)| {
+      let description = reason_description(code);
+      if count > 1 {
+        format!("{} ({count}x)", description)
+      } else {
+        description.to_string()
+      }
+    })
+    .collect();
+
+  if parts.is_empty() {
+    "No planner reasons".to_string()
+  } else {
+    parts.join("; ")
+  }
+}
+
+fn collect_active_reason_ids(output: &PlanOutput) -> Vec<u32> {
+  let mut ids = BTreeSet::new();
+  for decision in output.surfaces.values() {
+    if decision.enabled {
+      ids.extend(decision.reasons.iter().copied());
+    }
+  }
+  ids.into_iter().collect()
+}
+
+fn active_surface_names(output: &PlanOutput) -> Vec<&str> {
+  output
+    .scope
+    .surfaces
+    .iter()
+    .filter(|(_, enabled)| **enabled)
+    .map(|(name, _)| name.as_str())
+    .collect()
+}
+
+fn summarize_surface_reason(output: &PlanOutput, surface: &str) -> Option<String> {
+  let decision = output.surfaces.get(surface)?;
+  if !decision.enabled {
+    return None;
+  }
+
+  let lookup = reason_lookup(output);
+  Some(summarize_reason_ids(&decision.reasons, &lookup))
 }
 
 fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<ResolvedRefs> {
@@ -884,165 +1064,72 @@ fn push_trace(
 fn format_text(output: &PlanOutput, explain: bool) -> String {
   use std::fmt::Write as _;
 
-  let estimated_capacity = 128
-    + (output.files.len() * 72)
-    + (output.impact.direct_crates.len() * 20)
-    + (output.impact.transitive_crates.len() * 20)
-    + (output.trace.len() * 64);
+  let estimated_capacity = 256 + (output.impact.direct_crates.len() * 24) + (output.scope.crates.len() * 24);
   let mut out = String::with_capacity(estimated_capacity);
+  let active_surfaces = active_surface_names(output);
+  let lookup = reason_lookup(output);
+  let top_reasons = summarize_reason_ids(&collect_active_reason_ids(output), &lookup);
 
   out.push_str("plan\n\n");
+  let _ = writeln!(out, "base: {}", output.scope.resolved_base);
   let _ = writeln!(out, "changed files: {}", output.files.len());
-  for file in &output.files {
-    let owners = if file.owners.is_empty() {
-      std::borrow::Cow::Borrowed(file.owner_scope.as_str())
+  let _ = writeln!(
+    out,
+    "surfaces: {}",
+    if active_surfaces.is_empty() {
+      "none".to_string()
     } else {
-      std::borrow::Cow::Owned(file.owners.join(","))
-    };
-
-    if let Some(sub) = &file.sub_kind {
-      let _ = writeln!(out, "  {} [{}:{}] -> {}", file.path, file.kind, sub, owners);
-    } else {
-      let _ = writeln!(out, "  {} [{}] -> {}", file.path, file.kind, owners);
+      active_surfaces.join(", ")
+    }
+  );
+  match output.scope.mode {
+    ExecutionScopeMode::Workspace => {
+      let _ = writeln!(out, "scope: workspace");
+    }
+    ExecutionScopeMode::Crates => {
+      let _ = writeln!(out, "scope: crates ({})", output.scope.crates.len());
+    }
+    ExecutionScopeMode::Empty => {
+      let _ = writeln!(out, "scope: empty");
     }
   }
-
-  out.push('\n');
-  let _ = writeln!(out, "direct crates: {}", output.impact.direct_crates.len());
-  for crate_name in &output.impact.direct_crates {
-    let _ = writeln!(out, "  {}", crate_name);
+  if !output.impact.direct_crates.is_empty() {
+    let _ = writeln!(out, "direct crates: {}", output.impact.direct_crates.join(", "));
   }
-
-  let _ = writeln!(out, "transitive crates: {}", output.impact.transitive_crates.len());
-  for crate_name in &output.impact.transitive_crates {
-    let _ = writeln!(out, "  {}", crate_name);
+  if matches!(output.scope.mode, ExecutionScopeMode::Crates) && !output.scope.crates.is_empty() {
+    let _ = writeln!(out, "execution crates: {}", output.scope.crates.join(", "));
   }
-
-  out.push('\n');
-  out.push_str("surfaces:\n");
-  for (name, decision) in &output.surfaces {
-    let _ = write!(out, "  {}: {}", name, if decision.enabled { "on" } else { "off" });
-    if !decision.reasons.is_empty() {
-      let _ = write!(out, " ({} reason(s))", decision.reasons.len());
-    }
-    out.push('\n');
-  }
+  let _ = writeln!(out, "why: {}", top_reasons);
 
   if explain {
     out.push('\n');
-    out.push_str("trace:\n");
-    for reason in &output.trace {
-      out.push_str(&format_trace_line(reason));
+    out.push_str("explain:\n");
+    for surface in active_surfaces {
+      if let Some(summary) = summarize_surface_reason(output, surface) {
+        let _ = writeln!(out, "  {}: {}", surface, summary);
+      }
     }
   }
 
   out
 }
 
-/// Format a single trace line using a builder approach
-///
-/// Dynamically builds the output string based on which optional fields are present,
-/// eliminating combinatorial match arms.
-fn format_trace_line(reason: &TraceReason) -> String {
-  use std::fmt::Write;
-
-  let mut line = format!("  r{} {}", reason.id, reason.code);
-
-  // Append fields in canonical order: file, crate, depends_on, surface
-  if let Some(file) = &reason.file {
-    let _ = write!(line, " file={}", file);
-  }
-  if let Some(crate_name) = &reason.crate_name {
-    let _ = write!(line, " crate={}", crate_name);
-  }
-  if let Some(depends_on) = &reason.depends_on {
-    let _ = write!(line, " depends_on={}", depends_on);
-  }
-  if let Some(surface) = &reason.surface {
-    let _ = write!(line, " surface={}", surface);
-  }
-
-  line.push('\n');
-  line
-}
-
-fn format_github(output: &PlanOutput) -> RailResult<String> {
+fn format_github(output: &PlanOutput, debug: bool) -> RailResult<String> {
   use std::fmt::Write as _;
 
-  let plan_json = to_json(output)?;
-
-  let custom_states: BTreeMap<String, bool> = output
-    .surfaces
-    .iter()
-    .filter(|(name, _)| name.starts_with("custom:"))
-    .map(|(name, state)| (name.clone(), state.enabled))
-    .collect();
-
-  let custom_json = to_json(&custom_states)?;
-
-  // Projection keys: derived views of PlanOutput data for direct consumption
-  let file_paths: Vec<&str> = output.files.iter().map(|f| f.path.as_str()).collect();
-  let files_json = to_json(&file_paths)?;
-
-  let surfaces_json = to_json(&output.surfaces)?;
-  let trace_json = to_json(&output.trace)?;
-
-  let crate_union: BTreeSet<&str> = output
-    .impact
-    .direct_crates
-    .iter()
-    .chain(&output.impact.transitive_crates)
-    .map(String::as_str)
-    .collect();
-
-  let crates_sorted: Vec<&str> = crate_union.iter().copied().collect();
-  let mut cargo_args = String::with_capacity(crates_sorted.len() * 8);
-  for (idx, crate_name) in crates_sorted.iter().enumerate() {
-    if idx > 0 {
-      cargo_args.push(' ');
-    }
-    cargo_args.push_str("-p ");
-    cargo_args.push_str(crate_name);
-  }
-
-  let matrix_json = to_json(&crates_sorted)?;
-
-  let active_surfaces: Vec<&str> = output
-    .surfaces
-    .iter()
-    .filter(|(_, s)| s.enabled)
-    .map(|(name, _)| name.as_str())
-    .collect();
-  let active_surfaces_json = to_json(&active_surfaces)?;
-
-  let mut out = String::with_capacity(512 + plan_json.len() + surfaces_json.len() + trace_json.len());
+  let scope_json = to_json(&output.scope)?;
+  let plan_json = if debug { Some(to_json(output)?) } else { None };
+  let mut out = String::with_capacity(160 + scope_json.len() + plan_json.as_ref().map_or(0, String::len));
   let _ = writeln!(out, "build={}", surface_enabled(output, "build"));
   let _ = writeln!(out, "test={}", surface_enabled(output, "test"));
   let _ = writeln!(out, "bench={}", surface_enabled(output, "bench"));
   let _ = writeln!(out, "docs={}", surface_enabled(output, "docs"));
   let _ = writeln!(out, "infra={}", surface_enabled(output, "infra"));
-  let _ = writeln!(out, "plan_contract_version={}", output.plan_contract_version);
   let _ = writeln!(out, "base_ref={}", output.inputs.refs.resolved_base);
-  let _ = writeln!(out, "head_ref={}", output.inputs.refs.resolved_head);
-  let _ = writeln!(out, "confidence_profile={}", output.inputs.confidence_profile);
-  let _ = writeln!(
-    out,
-    "confidence_profile_source={}",
-    output.inputs.confidence_profile_source
-  );
-  let _ = writeln!(out, "direct_crates={}", output.impact.direct_crates.join(" "));
-  let _ = writeln!(out, "transitive_crates={}", output.impact.transitive_crates.join(" "));
-  let _ = writeln!(out, "custom_surfaces={}", custom_json);
-  let _ = writeln!(out, "plan_json={}", plan_json);
-  let _ = writeln!(out, "files={}", files_json);
-  let _ = writeln!(out, "changed_files_count={}", output.files.len());
-  let _ = writeln!(out, "surfaces={}", surfaces_json);
-  let _ = writeln!(out, "trace={}", trace_json);
-  let _ = writeln!(out, "crates={}", crates_sorted.join(" "));
-  let _ = writeln!(out, "count={}", crates_sorted.len());
-  let _ = writeln!(out, "cargo_args={}", cargo_args);
-  let _ = writeln!(out, "matrix={}", matrix_json);
-  let _ = write!(out, "active_surfaces={}", active_surfaces_json);
+  let _ = writeln!(out, "scope_json={}", scope_json);
+  if let Some(plan_json) = plan_json {
+    let _ = writeln!(out, "plan_json={}", plan_json);
+  }
 
   Ok(out)
 }
@@ -1062,7 +1149,8 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
     Some(path) => {
       let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(true)
+        .write(true)
         .open(path)
         .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
       writeln!(file, "{}", content)

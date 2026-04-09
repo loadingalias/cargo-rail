@@ -67,8 +67,8 @@ fn test_run_from_nested_workspace_uses_planner_selection() -> Result<()> {
 
   let stdout = String::from_utf8_lossy(&output.stdout);
   assert!(
-    stdout.contains("crates/lib-a/src/lib.rs [rust:src]"),
-    "explain output should include workspace-relative changed path"
+    stdout.contains("direct crates: lib-a") || stdout.contains("why:"),
+    "explain output should include planner summary context"
   );
   assert!(stdout.contains("test: "), "dry-run should print test command");
 

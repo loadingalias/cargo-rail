@@ -15,42 +15,42 @@ runs:
     # Install cargo tools FIRST, before Rust toolchain installation
     # This prevents Windows issues where massive toolchain updates interfere with cargo bin directory
     - name: Install just
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: just
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: cargo-nextest
 
     - name: Install cargo-deny
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: cargo-deny
 
     - name: Install cargo-audit
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: cargo-audit
 
     - name: Install cargo-semver-checks
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: cargo-semver-checks
 
     - name: Install git-cliff
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: git-cliff
 
     - name: Install cargo-rail
-      uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131  # v2
+      uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9  # v2
       with:
         tool: cargo-rail@0.10.1
 
     - name: Install Rust Nightly Toolchain
-      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9  # master
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
       with:
         toolchain: nightly
         components: clippy, rustfmt

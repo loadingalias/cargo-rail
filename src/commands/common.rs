@@ -89,6 +89,9 @@ pub enum PlanOutputFormat {
   /// GitHub Actions output format for $GITHUB_OUTPUT
   #[value(name = "github")]
   GitHub,
+  /// GitHub Actions output with embedded planner contract for debugging
+  #[value(name = "github-debug")]
+  GitHubDebug,
 }
 
 impl PlanOutputFormat {
@@ -99,7 +102,7 @@ impl PlanOutputFormat {
 
   /// Check if this format is a JSON-like structured format.
   pub fn is_json_like(&self) -> bool {
-    matches!(self, Self::Json | Self::GitHub)
+    matches!(self, Self::Json | Self::GitHub | Self::GitHubDebug)
   }
 }
 
@@ -113,6 +116,28 @@ pub struct SplitSyncConfigBuilder<'a> {
   config: &'a RailConfig,
   split_configs: Vec<ConfigSplitConfig>,
   remote_override: Option<String>,
+}
+
+/// Enforce explicit confirmation for destructive operations in non-interactive contexts.
+///
+/// Allowed confirmation paths:
+/// - interactive prompt is available (`prompt_possible`)
+/// - explicit `--yes`
+/// - `--plan <path>` (fingerprint-validated mutation plan)
+pub fn enforce_safety_gate(
+  operation: &str,
+  yes: bool,
+  plan_path: Option<&std::path::Path>,
+  prompt_possible: bool,
+) -> RailResult<()> {
+  if yes || plan_path.is_some() || prompt_possible {
+    return Ok(());
+  }
+
+  Err(RailError::with_help(
+    format!("{} requires explicit confirmation in non-interactive mode", operation),
+    "use --yes to confirm explicitly, or pass --plan <PATH> from a prior --check JSON plan",
+  ))
 }
 
 impl<'a> SplitSyncConfigBuilder<'a> {

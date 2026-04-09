@@ -7,18 +7,18 @@ test crate="":
 build:
     @echo "Change Detection Plan:"
     @echo ""
-    @cargo rail plan --merge-base --explain
+    @cargo run --quiet -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates..."
-    @cargo rail run --merge-base --profile local --surface build
+    @cargo run --quiet -- rail run --merge-base --profile local --surface build
 
 build-release:
     @echo "Change Detection Plan:"
     @echo ""
-    @cargo rail plan --merge-base --explain
+    @cargo run --quiet -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates (release)..."
-    @cargo rail run --merge-base --profile local --surface build -- --release
+    @cargo run --quiet -- rail run --merge-base --profile local --surface build -- --release
 
 # Full Workspace Commands (no change detection)
 
@@ -43,18 +43,18 @@ ci-test:
     @scripts/test/test.sh
 
 ci-build:
-    @cargo rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
+    @cargo run --quiet -- rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
 
 # Explainability
 
 plan:
-    cargo rail plan --merge-base -f json
+    cargo run --quiet -- rail plan --merge-base -f json
 
 why:
-    cargo rail plan --merge-base --explain
+    cargo run --quiet -- rail plan --merge-base --explain
 
 dry-run surface="test":
-    cargo rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
+    cargo run --quiet -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
 
 # Maintenance
 

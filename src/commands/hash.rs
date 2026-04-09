@@ -49,7 +49,7 @@ pub fn run_hash(ctx: &WorkspaceContext, opts: HashOptions) -> RailResult<()> {
   let hash = format!("fnv1a64:{:016x}", fnv1a64(canonical.as_bytes()));
 
   if opts.format.is_json() {
-    let out = serde_json::json!({
+    let payload = serde_json::json!({
       "command": "hash",
       "algorithm": "fnv1a64",
       "hash": hash,
@@ -57,6 +57,7 @@ pub fn run_hash(ctx: &WorkspaceContext, opts: HashOptions) -> RailResult<()> {
       "plan_contract_version": plan.plan_contract_version,
       "refs": plan.inputs.refs,
     });
+    let out = crate::output::machine_json_envelope("hash", "inspect", "success", 0, payload);
     println!(
       "{}",
       serde_json::to_string_pretty(&out).map_err(|e| RailError::message(format!("failed to render JSON: {}", e)))?
@@ -85,7 +86,7 @@ pub fn run_diff_hash(a: PathBuf, b: PathBuf, format: OutputFormat) -> RailResult
   let equal = a_hash == b_hash;
 
   if format.is_json() {
-    let out = serde_json::json!({
+    let payload = serde_json::json!({
       "command": "diff-hash",
       "a": a.display().to_string(),
       "b": b.display().to_string(),
@@ -94,6 +95,7 @@ pub fn run_diff_hash(a: PathBuf, b: PathBuf, format: OutputFormat) -> RailResult
       "equal": equal,
       "changes": changes,
     });
+    let out = crate::output::machine_json_envelope("diff-hash", "inspect", "success", 0, payload);
     println!(
       "{}",
       serde_json::to_string_pretty(&out).map_err(|e| RailError::message(format!("failed to render JSON: {}", e)))?

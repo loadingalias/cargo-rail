@@ -153,6 +153,7 @@ pub fn run_whatever(ctx: &WorkspaceContext, args: Args) -> RailResult<()> {
 3. Resolve file ownership to crates (or workspace/unowned)
 4. Expand transitive impact via workspace graph
 5. Emit surfaces + trace (proof-carrying reasons)
+6. Project an execution scope for runners and CI handoff
 ```
 
 This output contract is consumed by humans (`--explain`), CI (`-f github`), and executors (`cargo rail run`).

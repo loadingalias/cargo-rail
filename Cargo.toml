@@ -35,23 +35,23 @@ resolver = "3"
 rust-version = "1.91.0"
 
 [dependencies]
-clap = { version = "4.5.58", features = ["derive", "cargo"] }
-clap_complete = "4.5.66"
+clap = { version = "4.6.0", features = ["derive", "cargo"] }
+clap_complete = "4.6.0"
 cargo_metadata = "0.23.1"
 petgraph = { version = "0.8.3", default-features = false }
-toml_edit = { version = "0.25.1", features = ["serde"] }
+toml_edit = { version = "0.25.11", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-semver = "1.0.27"
+semver = "1.0.28"
 rayon = "1.11.0"
-winnow = "0.7.14"
-chrono = "0.4.43"
+winnow = "1.0.1"
+chrono = "0.4.44"
 glob = "0.3.3"
-rustc-hash = "2.1.1"
+rustc-hash = "2.1.2"
 
 [dev-dependencies]
-anyhow = "1.0.101"
-tempfile = "3.25.0"
+anyhow = "1.0.102"
+tempfile = "3.27.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -64,6 +64,8 @@ cargo rail plan --merge-base -f github  # outputs: build=true, test=false, docs=
 cargo rail run --merge-base --profile ci  # runs ONLY what plan selected
 ```
 
+The planner also emits a compact execution scope (`scope_json`) so CI wrappers and local scripts can hand off the selected run scope without reconstructing it from raw planner data. Treat `impact` as diagnostic output; use `scope_json` or `.scope` for package selection.
+
 **How to use this effectively:**
 1. Configure change detection rules in `.config/rail.toml` (infrastructure files, doc-only changes, custom, etc.)
 2. Run `plan` to see impact classification (which surfaces: build, test, bench, docs, infra, custom)

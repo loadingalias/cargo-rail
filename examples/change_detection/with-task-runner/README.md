@@ -16,13 +16,21 @@ This keeps cargo-rail focused on what it does best (change detection) while lett
 ```bash
 # Get plan as JSON
 PLAN=$(cargo rail plan --merge-base -f json)
+SCOPE=$(echo "$PLAN" | jq -c '.scope')
 
 # Check which surfaces are enabled
 echo "$PLAN" | jq '.surfaces | to_entries | map(select(.value.enabled)) | .[].key'
 
-# Run xtask commands based on plan
+# Run xtask commands based on plan + scope
 if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
-  cargo xtask test
+  if echo "$SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
+    cargo xtask test --workspace
+  elif echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
+    mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
+    cargo xtask test "${CRATES[@]}"
+  else
+    echo "planner enabled test surface, but no package-scoped work was selected"
+  fi
 fi
 
 if echo "$PLAN" | jq -e '.surfaces["custom:themes"].enabled' > /dev/null; then
@@ -39,8 +47,20 @@ plan:
 run-if-test:
   #!/usr/bin/env bash
   PLAN=$(cargo rail plan --merge-base -f json)
+  SCOPE=$(echo "$PLAN" | jq -c '.scope')
   if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
-    cargo nextest run
+    if echo "$SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
+      cargo nextest run --workspace
+    elif echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
+      mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
+      ARGS=()
+      for crate in "${CRATES[@]}"; do
+        ARGS+=(-p "$crate")
+      done
+      cargo nextest run "${ARGS[@]}"
+    else
+      echo "planner enabled test surface, but no package-scoped work was selected"
+    fi
   else
     echo "test surface disabled, skipping"
   fi
@@ -55,7 +75,8 @@ jobs:
     outputs:
       build: ${{ steps.rail.outputs.build }}
       test: ${{ steps.rail.outputs.test }}
-      themes: ${{ steps.custom.outputs.themes }}
+      scope_json: ${{ steps.rail.outputs.scope-json }}
+      themes: ${{ steps.rail.outputs.custom_themes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,14 +85,8 @@ jobs:
       - uses: loadingalias/cargo-rail-action@v3
         id: rail
         with:
-          mode: full
+          mode: minimal
           args: '--explain'
-
-      - name: Extract custom surfaces
-        id: custom
-        run: |
-          THEMES=$(echo '${{ steps.rail.outputs.custom-surfaces }}' | jq -r '.["custom:themes"] // "false"')
-          echo "themes=$THEMES" >> "$GITHUB_OUTPUT"
 
   test:
     needs: plan
@@ -79,7 +94,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo xtask test
+      - name: Run targeted tests
+        env:
+          SCOPE_JSON: ${{ needs.plan.outputs.scope_json }}
+        run: |
+          SCOPE_MODE=$(echo "$SCOPE_JSON" | jq -r '.mode')
+          if [ "$SCOPE_MODE" = "workspace" ]; then
+            cargo xtask test --workspace
+          elif [ "$SCOPE_MODE" = "crates" ]; then
+            mapfile -t CRATES < <(echo "$SCOPE_JSON" | jq -r '.crates[]')
+            cargo xtask test "${CRATES[@]}"
+          else
+            echo "planner enabled test surface, but no package-scoped work was selected"
+          fi
 
   themes:
     needs: plan
@@ -94,7 +121,7 @@ jobs:
 
 1. **Separation of concerns**: cargo-rail knows what changed, your task runner knows how to build/test
 2. **No lock-in**: If you stop using cargo-rail, your task runner still works
-3. **Full control**: Complex build steps stay in your existing tooling
+3. **Stable handoff**: use the planner-owned scope contract for package selection instead of rebuilding it from `impact`
 4. **Composable**: CI consumes plan output, runs your commands
 
 ## Real Examples

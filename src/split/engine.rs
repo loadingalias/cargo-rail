@@ -456,8 +456,7 @@ impl<'a> SplitEngine<'a> {
     progress!("   Found {} workspace config files", aux_files.count());
 
     // Discover project files (README, LICENSE) with crate-first fallback
-    let crate_path = &config.crate_paths[0]; // Use first crate path for project files
-    let project_files = ProjectFiles::discover(self.ctx.workspace_root(), crate_path)?;
+    let project_files = ProjectFiles::discover(self.ctx.workspace_root(), &config.crate_paths)?;
     progress!("   Found {} project files (README, LICENSE)", project_files.count());
 
     // Find additional files to include based on include patterns

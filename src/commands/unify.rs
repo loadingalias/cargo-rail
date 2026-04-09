@@ -57,7 +57,8 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
     Some(path) => {
       let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(true)
+        .write(true)
         .open(path)
         .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
       file
@@ -156,7 +157,7 @@ pub fn run_unify_analyze(
     reason_codes.sort();
     reason_codes.dedup();
 
-    let output_json = serde_json::json!({
+    let payload = serde_json::json!({
       "command": "unify",
       "check": true,
       "msrv_write_needed": msrv_write_needed,
@@ -192,6 +193,21 @@ pub fn run_unify_analyze(
       "mutation_plan": mutation_plan,
     });
 
+    let exit_code = if plan.has_blocking_issues() {
+      2
+    } else if has_changes {
+      1
+    } else {
+      0
+    };
+    let result = if plan.has_blocking_issues() {
+      "failed"
+    } else if has_changes {
+      "pending_changes"
+    } else {
+      "success"
+    };
+    let output_json = crate::output::machine_json_envelope("unify", "check", result, exit_code, payload);
     let rendered =
       serde_json::to_string_pretty(&output_json).map_err(|e| RailError::message(format!("JSON error: {}", e)))?;
     write_output(&rendered, output)?;

@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
+use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
@@ -64,7 +64,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
   let builder = SplitSyncConfigBuilder::new(ctx)?
     .with_crate_or_all(args.crate_name.clone(), args.all)?
-    .with_remote_override(args.remote);
+    .with_remote_override(args.remote)
+    .validate()?;
 
   let config_count = builder.count();
 
@@ -116,7 +117,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         })
         .collect();
 
-      let output = serde_json::json!({
+      let payload = serde_json::json!({
         "command": "sync",
         "check": true,
         "direction": dir_str,
@@ -130,8 +131,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         },
         "mutation_plan": expected_mutation_plan,
       });
+      let output = crate::output::machine_json_envelope("sync", "check", "pending_changes", 1, payload);
       println!("{}", serde_json::to_string_pretty(&output)?);
-      return Ok(());
+      return Err(crate::error::RailError::CheckHasPendingChanges);
     }
 
     let dir_display = match direction {
@@ -156,6 +158,13 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     println!("\nChanges detected. Run without --check to apply.");
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
+
+  enforce_safety_gate(
+    "sync apply",
+    args.yes,
+    args.plan_path.as_deref(),
+    std::io::stdin().is_terminal() && !json,
+  )?;
 
   // Interactive confirmation (unless --yes)
   if !args.yes && std::io::stdin().is_terminal() && !json {
@@ -341,7 +350,7 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
     let total_commits: usize = results.iter().map(|r| r.result.commits_synced).sum();
     let total_conflicts: usize = results.iter().map(|r| r.result.conflicts.len()).sum();
 
-    let output = serde_json::json!({
+    let payload = serde_json::json!({
       "command": "sync",
       "crates": crates,
       "summary": {
@@ -351,6 +360,7 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
         "crates_skipped": results.iter().filter(|r| r.skipped).count()
       }
     });
+    let output = crate::output::machine_json_envelope("sync", "apply", "success", 0, payload);
     println!("{}", serde_json::to_string_pretty(&output)?);
     return Ok(());
   }

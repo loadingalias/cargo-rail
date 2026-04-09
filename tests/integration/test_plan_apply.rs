@@ -15,6 +15,11 @@ fn test_graph_outputs_json_and_dot() -> Result<()> {
   let json_out = run_cargo_rail(&ws.path, &["rail", "graph", "--since", "HEAD~1"])?;
   assert!(json_out.status.success(), "graph json should succeed");
   let json: serde_json::Value = serde_json::from_slice(&json_out.stdout)?;
+  assert_eq!(json["schema_version"], serde_json::json!(1));
+  assert_eq!(json["command"], serde_json::json!("graph"));
+  assert_eq!(json["mode"], serde_json::json!("inspect"));
+  assert_eq!(json["result"], serde_json::json!("success"));
+  assert_eq!(json["exit_code"], serde_json::json!(0));
   assert!(json["nodes"].is_array());
   assert!(json["edges"].is_array());
 
@@ -124,7 +129,11 @@ paths = [{{ crate = "crates/mylib" }}]
       "json",
     ],
   )?;
-  assert!(check.status.success(), "sync --check -f json should succeed");
+  assert_eq!(
+    check.status.code(),
+    Some(1),
+    "sync --check -f json should exit 1 when pending changes are detected"
+  );
   let plan_path = ws.path.join("sync-plan.json");
   std::fs::write(&plan_path, &check.stdout)?;
 

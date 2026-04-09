@@ -26,12 +26,12 @@
 actions/checkout:
   ref: v6.0.2
   sha: "de0fac2e4500dabe0009e67214ff5f5447ce83dd"
-  updated: "2026-02-15T19:23:23Z"
+  updated: "2026-04-09T02:36:45Z"
   notes: "Repository checkout - used in every workflow"
 actions/upload-artifact:
   ref: v6.0.0
   sha: "b7c566a772e6b6bfb58ed0dc250532a479d7789f"
-  updated: "2026-02-15T19:23:23Z"
+  updated: "2026-04-09T02:36:46Z"
   notes: "Upload build artifacts and test results"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # cargo-rail Ecosystem
@@ -39,7 +39,7 @@ actions/upload-artifact:
 loadingalias/cargo-rail-action:
   ref: v3.0.0
   sha: "cac3400e5d64c4698dee0318e2467086ec03cb09"
-  updated: "2026-02-15T19:23:24Z"
+  updated: "2026-04-09T02:36:47Z"
   notes: "Planner-first CI transport for cargo rail plan surfaces"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Testing & Reporting
@@ -47,25 +47,25 @@ loadingalias/cargo-rail-action:
 mikepenz/action-junit-report:
   ref: v6.2.0
   sha: "74626db7353a25a20a72816467ebf035f674c5f8"
-  updated: "2026-02-15T19:23:25Z"
+  updated: "2026-04-09T02:36:47Z"
   notes: "Publish JUnit test reports as GitHub Checks"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Rust Toolchain & Ecosystem
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 dtolnay/rust-toolchain:
   ref: master
-  sha: "efa25f7f19611383d5b0ccf2d1c8914531636bf9"
-  updated: "2026-02-15T19:23:25Z"
+  sha: "3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9"
+  updated: "2026-04-09T02:36:48Z"
   notes: "Rust toolchain installation - always tracks latest nightly"
 taiki-e/install-action:
   ref: v2
-  sha: "288875dd3d64326724fa6d9593062d9f8ba0b131"
-  updated: "2026-02-15T19:23:26Z"
+  sha: "80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9"
+  updated: "2026-04-09T02:36:48Z"
   notes: "Install cargo tools (nextest, just, deny, audit)"
 Swatinem/rust-cache:
   ref: v2.8.2
   sha: "779680da715d629ac1d338a641029a2f4372abb5"
-  updated: "2026-02-15T19:23:27Z"
+  updated: "2026-04-09T02:36:49Z"
   notes: "GitHub runner Rust cache"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Release Workflow Actions
@@ -73,15 +73,15 @@ Swatinem/rust-cache:
 taiki-e/create-gh-release-action:
   ref: v1.9.2
   sha: "56a8b3f8449593aa02b91f7b84da564f476e94f0"
-  updated: "2026-02-15T19:23:27Z"
+  updated: "2026-04-09T02:36:50Z"
   notes: "Create GitHub releases from CHANGELOG.md"
 taiki-e/setup-cross-toolchain-action:
   ref: v1.38.0
   sha: "b8d1a322a6009a2b7220f53996695778eef89b41"
-  updated: "2026-02-15T19:23:28Z"
+  updated: "2026-04-09T02:36:51Z"
   notes: "Cross-compilation toolchain setup for multi-target builds"
 taiki-e/upload-rust-binary-action:
   ref: v1.28.0
   sha: "f391289bcff6a7f36b6301c0a74199657bbb4561"
-  updated: "2026-02-15T19:23:29Z"
+  updated: "2026-04-09T02:36:51Z"
   notes: "Build and upload pre-built binaries to GitHub Releases"

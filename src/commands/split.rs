@@ -2,7 +2,7 @@
 
 use std::io::IsTerminal;
 
-use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder};
+use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
 use crate::config::RailConfig;
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
@@ -75,7 +75,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             })
           })
           .collect();
-        let output = serde_json::json!({
+        let payload = serde_json::json!({
           "command": "split",
           "check": true,
           "crates": crates,
@@ -86,6 +86,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           },
           "mutation_plan": expected_mutation_plan,
         });
+        let output = crate::output::machine_json_envelope("split", "check", "pending_changes", 1, payload);
         println!("{}", serde_json::to_string_pretty(&output)?);
       }
       OutputFormat::NamesOnly => {
@@ -126,6 +127,13 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     }
     return Err(crate::error::RailError::CheckHasPendingChanges);
   }
+
+  enforce_safety_gate(
+    "split apply",
+    args.yes,
+    args.plan_path.as_deref(),
+    std::io::stdin().is_terminal() && !json,
+  )?;
 
   // Interactive confirmation (unless --yes)
   if !args.yes && std::io::stdin().is_terminal() && !json {

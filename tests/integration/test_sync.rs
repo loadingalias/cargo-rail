@@ -35,6 +35,68 @@ paths = [{{ crate = "crates/{0}" }}]
   Ok((ws, split_dir))
 }
 
+/// Helper to set up a combined split scenario with two crates.
+fn setup_combined_split_scenario(group_name: &str, crate_a: &str, crate_b: &str) -> Result<(TestWorkspace, TempDir)> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate(crate_a, "0.1.0", &[])?;
+  ws.add_crate(crate_b, "0.1.0", &[])?;
+  ws.commit(&format!("Initial {} group", group_name))?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.{0}.split]
+remote = "{1}"
+branch = "main"
+mode = "combined"
+paths = [
+  {{ crate = "crates/{2}" }},
+  {{ crate = "crates/{3}" }}
+]
+"#,
+    group_name,
+    split_dir.path().display().to_string().replace('\\', "\\\\"),
+    crate_a,
+    crate_b
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", group_name, "--yes", "--allow-dirty"],
+  )?;
+
+  Ok((ws, split_dir))
+}
+
+#[test]
+fn test_sync_requires_explicit_confirmation_non_interactive() -> Result<()> {
+  let (ws, _split_dir) = setup_split_scenario("confirm-sync")?;
+
+  ws.modify_file("confirm-sync", "src/lib.rs", "// change requiring sync")?;
+  ws.commit("Update confirm-sync in mono")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "confirm-sync", "--to-remote", "--allow-dirty"],
+  )?;
+  assert!(
+    !output.status.success(),
+    "sync should fail without --yes/--plan in non-interactive mode"
+  );
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("explicit confirmation") && stderr.contains("--yes") && stderr.contains("--plan"),
+    "safety gate message missing expected guidance.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
 #[test]
 fn test_sync_to_remote_basic() -> Result<()> {
   let (ws, split_dir) = setup_split_scenario("mylib")?;
@@ -365,15 +427,52 @@ fn test_sync_json_output() -> Result<()> {
 
   // Run sync with --check and --json
   let output = run_cargo_rail(&ws.path, &["rail", "sync", "json-lib", "--check", "--json"])?;
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "sync --check --json should exit 1 when pending changes are detected"
+  );
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+  assert!(parsed.is_ok(), "JSON output should be valid. stdout: {}", stdout);
+  let json = parsed?;
+  assert_eq!(json["schema_version"], serde_json::json!(1));
+  assert_eq!(json["command"], serde_json::json!("sync"));
+  assert_eq!(json["mode"], serde_json::json!("check"));
+  assert_eq!(json["result"], serde_json::json!("pending_changes"));
+  assert_eq!(json["exit_code"], serde_json::json!(1));
 
-  if output.status.success() {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // If successful, should be valid JSON (or empty if no changes)
-    if !stdout.trim().is_empty() {
-      let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-      assert!(parsed.is_ok(), "JSON output should be valid. stdout: {}", stdout);
-    }
-  }
+  Ok(())
+}
+
+#[test]
+fn test_sync_combined_mode_syncs_all_configured_paths() -> Result<()> {
+  let (ws, split_dir) = setup_combined_split_scenario("combined-sync", "combo-a", "combo-b")?;
+
+  ws.modify_file("combo-a", "src/lib.rs", "// Changed combo-a")?;
+  ws.modify_file("combo-b", "src/lib.rs", "// Changed combo-b")?;
+  ws.commit("Update both combined crates")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "combined-sync", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output.status.success(),
+    "combined sync should succeed. stderr: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let a_content = std::fs::read_to_string(split_dir.path().join("crates/combo-a/src/lib.rs"))?;
+  let b_content = std::fs::read_to_string(split_dir.path().join("crates/combo-b/src/lib.rs"))?;
+  assert!(
+    a_content.contains("// Changed combo-a"),
+    "combined sync should include changes from first configured path"
+  );
+  assert!(
+    b_content.contains("// Changed combo-b"),
+    "combined sync should include changes from second configured path"
+  );
 
   Ok(())
 }

@@ -33,11 +33,25 @@
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 1,
+  "plan_contract_version": 2,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",
     "git_shallow_clone": false
+  },
+  "scope": {
+    "crates": [],
+    "mode": "workspace",
+    "resolved_base": "origin/main",
+    "resolved_head": "WORKTREE",
+    "scope_contract_version": 1,
+    "surfaces": {
+      "bench": false,
+      "build": true,
+      "docs": false,
+      "infra": false,
+      "test": true
+    }
   },
   "surfaces": {
     "bench": {

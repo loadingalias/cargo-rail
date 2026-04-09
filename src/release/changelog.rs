@@ -8,8 +8,8 @@ use std::path::Path;
 use std::process::Command;
 use winnow::Parser;
 use winnow::ascii::{space0, till_line_ending};
-use winnow::combinator::{alt, opt, preceded, terminated};
-use winnow::token::take_until;
+use winnow::combinator::{opt, preceded, terminated};
+use winnow::token::{take_till, take_until};
 
 // Winnow 0.7.x uses Result, not PResult
 type PResult<T> = winnow::error::Result<T>;
@@ -160,19 +160,21 @@ pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
 
 /// Parse commit type from string
 fn parse_commit_type(input: &mut &str) -> PResult<CommitType> {
-  alt((
-    "feat".value(CommitType::Feature),
-    "fix".value(CommitType::Fix),
-    "chore".value(CommitType::Chore),
-    "docs".value(CommitType::Docs),
-    "style".value(CommitType::Style),
-    "refactor".value(CommitType::Refactor),
-    "perf".value(CommitType::Perf),
-    "test".value(CommitType::Test),
-    "build".value(CommitType::Build),
-    "ci".value(CommitType::Ci),
-  ))
-  .parse_next(input)
+  take_till(1.., ['(', '!', ':'])
+    .verify_map(|value: &str| match value {
+      "feat" => Some(CommitType::Feature),
+      "fix" => Some(CommitType::Fix),
+      "chore" => Some(CommitType::Chore),
+      "docs" => Some(CommitType::Docs),
+      "style" => Some(CommitType::Style),
+      "refactor" => Some(CommitType::Refactor),
+      "perf" => Some(CommitType::Perf),
+      "test" => Some(CommitType::Test),
+      "build" => Some(CommitType::Build),
+      "ci" => Some(CommitType::Ci),
+      _ => None,
+    })
+    .parse_next(input)
 }
 
 /// Parse optional scope in parentheses: (scope)
@@ -579,6 +581,15 @@ mod tests {
     let commit = parse_conventional_commit("abc123", "Update README", None);
     assert_eq!(commit.commit_type, CommitType::Other);
     assert_eq!(commit.description, "Update README");
+  }
+
+  #[test]
+  fn test_parse_conventional_commit_ci() {
+    let commit = parse_conventional_commit("abc123", "ci: update release workflow", None);
+    assert_eq!(commit.commit_type, CommitType::Ci);
+    assert_eq!(commit.scope, None);
+    assert!(!commit.breaking);
+    assert_eq!(commit.description, "update release workflow");
   }
 
   #[test]

@@ -1,14 +1,17 @@
 //! `cargo rail run` - planner-contract executor.
 
-use super::plan::{PlanOptions, PlanOutput, build_plan_output, render_plan_explain};
+use super::plan::{
+  ExecutionScope, ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain,
+};
 use crate::commands::common::PlanOutputFormat;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::progress;
 use crate::test::runner::select_runner;
 use crate::workspace::WorkspaceContext;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 /// Options for the `run` command.
@@ -74,17 +77,20 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     }
   }
 
-  let test_targets = resolve_targets(ctx, &opts, plan.as_ref(), "test")?;
-  let build_targets = resolve_targets(ctx, &opts, plan.as_ref(), "build")?;
-  let bench_targets = resolve_targets(ctx, &opts, plan.as_ref(), "bench")?;
+  let scope = plan.as_ref().map(|output| &output.scope);
+  let test_targets = resolve_targets(ctx, &opts, scope, "test")?;
+  let build_targets = resolve_targets(ctx, &opts, scope, "build")?;
+  let bench_targets = resolve_targets(ctx, &opts, scope, "bench")?;
+  let workspace_package_count = ctx.cargo.metadata().workspace_packages().len();
 
   let requested_test_surface = effective.surfaces.iter().any(|surface| surface == "test");
   let mut executed_any = false;
   let surface_count = effective.surfaces.len();
+  let workspace_root = ctx.workspace_root();
   let mut executed_surfaces = Vec::with_capacity(surface_count);
   let mut skipped_surfaces = Vec::with_capacity(surface_count);
   for surface in &effective.surfaces {
-    if !surface_enabled(&opts, plan.as_ref(), surface) {
+    if !surface_enabled(&opts, scope, surface) {
       if opts.explain || opts.dry_run {
         println!("skip surface `{}` (not enabled by plan)", surface);
       }
@@ -95,27 +101,30 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     executed_any = true;
     executed_surfaces.push(surface.clone());
     match surface.as_str() {
-      "test" => run_test_surface(&opts, &test_targets, &effective.run_args)?,
+      "test" => run_test_surface(&opts, workspace_root, &test_targets, &effective.run_args)?,
       "build" => run_workspace_surface(
         &opts,
+        workspace_root,
+        workspace_package_count,
         "build",
-        "cargo",
-        &["check", "--workspace"],
+        &["check"],
         &build_targets,
         &effective.run_args,
       )?,
       "bench" => run_workspace_surface(
         &opts,
+        workspace_root,
+        workspace_package_count,
         "bench",
-        "cargo",
-        &["bench", "--workspace"],
+        &["bench"],
         &bench_targets,
         &effective.run_args,
       )?,
       "docs" => run_workspace_surface(
         &opts,
+        workspace_root,
+        workspace_package_count,
         "docs",
-        "cargo",
         &["doc", "--workspace", "--no-deps"],
         &[],
         &effective.run_args,
@@ -308,9 +317,10 @@ fn dedup_surfaces(mut surfaces: Vec<String>) -> Vec<String> {
 fn resolve_targets(
   ctx: &WorkspaceContext,
   opts: &RunOptions,
-  plan: Option<&PlanOutput>,
+  scope: Option<&ExecutionScope>,
   surface: &str,
 ) -> RailResult<Vec<String>> {
+  let package_scoped_surface = matches!(surface, "build" | "test" | "bench");
   let mut targets: Vec<String> = if opts.all {
     ctx
       .cargo
@@ -319,56 +329,47 @@ fn resolve_targets(
       .iter()
       .map(|p| p.name.to_string())
       .collect()
-  } else if let Some(output) = plan {
-    let selected = output
-      .impact
-      .direct_crates
-      .iter()
-      .chain(output.impact.transitive_crates.iter())
-      .cloned()
-      .collect::<BTreeSet<_>>()
-      .into_iter()
-      .collect::<Vec<_>>();
-
-    // Conservative fallback for ownerless/global changes on package-scoped surfaces.
-    if selected.is_empty()
-      && output
-        .surfaces
-        .get(surface)
-        .map(|decision| decision.enabled)
-        .unwrap_or(false)
-      && matches!(surface, "build" | "test" | "bench")
-    {
-      ctx
-        .cargo
-        .metadata()
-        .workspace_packages()
-        .iter()
-        .map(|p| p.name.to_string())
-        .collect()
+  } else if let Some(scope) = scope {
+    if !package_scoped_surface {
+      Vec::new()
     } else {
-      selected
+      match scope.mode {
+        ExecutionScopeMode::Empty => Vec::new(),
+        ExecutionScopeMode::Crates => scope.crates.clone(),
+        ExecutionScopeMode::Workspace => ctx
+          .cargo
+          .metadata()
+          .workspace_packages()
+          .iter()
+          .map(|p| p.name.to_string())
+          .collect(),
+      }
     }
   } else {
     Vec::new()
   };
 
-  if opts.ignore_bin_crates && matches!(surface, "build" | "test" | "bench") {
+  if opts.ignore_bin_crates && package_scoped_surface {
     targets.retain(|crate_name| !ctx.cargo.is_binary_only(crate_name));
   }
 
   Ok(targets)
 }
 
-fn surface_enabled(opts: &RunOptions, plan: Option<&PlanOutput>, surface: &str) -> bool {
+fn surface_enabled(opts: &RunOptions, scope: Option<&ExecutionScope>, surface: &str) -> bool {
   opts.all
-    || plan
-      .and_then(|output| output.surfaces.get(surface))
-      .map(|decision| decision.enabled)
+    || scope
+      .and_then(|scope| scope.surfaces.get(surface))
+      .copied()
       .unwrap_or(false)
 }
 
-fn run_test_surface(opts: &RunOptions, targets: &[String], run_args: &[String]) -> RailResult<()> {
+fn run_test_surface(
+  opts: &RunOptions,
+  workspace_root: &Path,
+  targets: &[String],
+  run_args: &[String],
+) -> RailResult<()> {
   if targets.is_empty() {
     println!("no test targets");
     return Ok(());
@@ -381,19 +382,38 @@ fn run_test_surface(opts: &RunOptions, targets: &[String], run_args: &[String]) 
   }
 
   let mut cmd = runner.build_command(targets, run_args);
-  run_or_print_command(opts, "test", &mut cmd)
+  run_or_print_command(opts, workspace_root, "test", &mut cmd)
 }
 
 fn run_workspace_surface(
   opts: &RunOptions,
+  workspace_root: &Path,
+  workspace_package_count: usize,
   surface: &str,
-  bin: &str,
   args: &[&str],
   targets: &[String],
   run_args: &[String],
 ) -> RailResult<()> {
-  let mut cmd = Command::new(bin);
+  let package_scoped = matches!(surface, "build" | "bench");
+  if package_scoped && targets.is_empty() {
+    println!("no {} targets", surface);
+    return Ok(());
+  }
+
+  let mut cmd = Command::new("cargo");
   cmd.args(args);
+
+  if package_scoped {
+    // Keep `--workspace` for full-workspace runs to avoid very long command lines.
+    if !opts.ignore_bin_crates && targets.len() == workspace_package_count {
+      cmd.arg("--workspace");
+    } else {
+      for target in targets {
+        cmd.arg("-p").arg(target);
+      }
+    }
+  }
+
   cmd.args(run_args);
 
   if opts.explain {
@@ -403,10 +423,12 @@ fn run_workspace_surface(
     }
   }
 
-  run_or_print_command(opts, surface, &mut cmd)
+  run_or_print_command(opts, workspace_root, surface, &mut cmd)
 }
 
-fn run_or_print_command(opts: &RunOptions, surface: &str, cmd: &mut Command) -> RailResult<()> {
+fn run_or_print_command(opts: &RunOptions, workspace_root: &Path, surface: &str, cmd: &mut Command) -> RailResult<()> {
+  cmd.current_dir(workspace_root);
+
   if opts.print_cmd || opts.dry_run {
     println!("{}: {}", surface, render_command(cmd));
   }
@@ -483,6 +505,7 @@ fn write_run_decision_receipt(
         "bench": targets.bench,
       }
     },
+    "scope": plan.map(|output| &output.scope),
     "plan": plan,
   });
   let bytes = serde_json::to_vec_pretty(&receipt)

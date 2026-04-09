@@ -96,18 +96,21 @@ impl AuxiliaryFiles {
 
 impl ProjectFiles {
   /// Discover project files with crate-first, workspace-fallback logic
-  pub fn discover(workspace_root: &Path, crate_path: &Path) -> RailResult<Self> {
+  pub fn discover(workspace_root: &Path, crate_paths: &[PathBuf]) -> RailResult<Self> {
     let mut files = Vec::new();
 
     // Project files to look for (check crate dir first, then workspace root)
     let candidates = vec!["README.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE"];
 
     for filename in candidates {
-      // Check crate directory first
-      let crate_file = crate_path.join(filename);
+      // Check each crate directory first (in config order), then workspace root.
+      let crate_file = crate_paths
+        .iter()
+        .map(|crate_path| workspace_root.join(crate_path).join(filename))
+        .find(|path| path.exists() && path.is_file());
       let workspace_file = workspace_root.join(filename);
 
-      let source_path = if crate_file.exists() && crate_file.is_file() {
+      let source_path = if let Some(crate_file) = crate_file {
         crate_file
       } else if workspace_file.exists() && workspace_file.is_file() {
         workspace_file

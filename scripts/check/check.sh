@@ -16,6 +16,8 @@ set -euo pipefail
 #   CARGO_RAIL_TEST_MODE    # "commit" forces CI mode
 #   RAIL_SINCE              # Git ref for comparison
 
+RAIL_CMD=(cargo run --quiet -- rail)
+
 # Parse arguments
 CI_MODE=false
 FULL_WORKSPACE=false
@@ -57,7 +59,7 @@ echo ""
 if [ "$FULL_WORKSPACE" = false ]; then
   echo "Change Detection Plan:"
   echo ""
-  cargo rail plan $PLAN_ARGS --explain
+  "${RAIL_CMD[@]}" plan $PLAN_ARGS --explain
   echo ""
 fi
 
@@ -76,7 +78,7 @@ if [ "$FULL_WORKSPACE" = true ]; then
   cargo clippy --workspace --all-targets --all-features $CLIPPY_FIX -- -D warnings
 else
   echo "Smart checks (affected crates)..."
-  cargo rail run $PLAN_ARGS --surface build
+  "${RAIL_CMD[@]}" run $PLAN_ARGS --surface build
 fi
 
 # Docs always full workspace (cross-crate links require it)

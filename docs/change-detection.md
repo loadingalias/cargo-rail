@@ -43,8 +43,25 @@ cargo rail run --all --surface test
 
 - name: Test
   if: steps.plan.outputs.test == 'true'
-  run: cargo nextest run --workspace
+  env:
+    SCOPE_JSON: ${{ steps.plan.outputs.scope-json }}
+  run: |
+    SCOPE_MODE=$(echo "$SCOPE_JSON" | jq -r '.mode')
+    if [ "$SCOPE_MODE" = "workspace" ]; then
+      cargo nextest run --workspace
+    elif [ "$SCOPE_MODE" = "crates" ]; then
+      mapfile -t CRATES < <(echo "$SCOPE_JSON" | jq -r '.crates[]')
+      ARGS=()
+      for crate in "${CRATES[@]}"; do
+        ARGS+=(-p "$crate")
+      done
+      cargo nextest run "${ARGS[@]}"
+    else
+      echo "planner enabled test surface, but no package-scoped work was selected"
+    fi
 ```
+
+Use `scope-json` when a downstream job or script needs the exact execution handoff. Use `impact` only for explanation and debugging. Use action `mode: debug` only when you need `plan-json` for deeper debugging.
 
 ---
 
@@ -75,7 +92,7 @@ benchmarks = ["benches/**", "perf/**"]
 e2e = ["tests/e2e/**"]
 ```
 
-**Note:** Custom surfaces like `custom:benchmarks` are plan **outputs** for CI gating—they cannot be used in `[run.profile.X].surfaces`. Extract them from the `custom_surfaces` JSON output in CI. See the config reference for details.
+**Note:** Custom surfaces like `custom:benchmarks` are plan **outputs** for CI gating. They cannot be used in `[run.profile.X].surfaces`. In CI, read them from `scope-json.surfaces["custom:<name>"]` or use the action's `custom_<name>` outputs.
 
 ### Custom Profiles
 
@@ -214,7 +231,6 @@ jobs:
       test: ${{ steps.plan.outputs.test }}
       docs: ${{ steps.plan.outputs.docs }}
       infra: ${{ steps.plan.outputs.infra }}
-      summary: ${{ steps.plan.outputs.plan_json }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -327,30 +343,46 @@ jobs:
 
 ## Using the Planner as an Oracle
 
-The most flexible pattern: use the planner for decisions, run your own commands.
+The most flexible pattern: use planner gates for surface decisions and the scope contract for package selection. Do not reconstruct execution scope from `impact`.
 
 ```yaml
 - id: plan
-  run: cargo rail plan --merge-base -f json > plan.json
+  uses: loadingalias/cargo-rail-action@v3
 
 - name: Custom Test Suite
-  if: ${{ fromJson(needs.plan.outputs.plan_json).surfaces.test.enabled }}
+  if: steps.plan.outputs.test == 'true'
   run: |
-    # Your custom test commands
-    cargo test --workspace --doc
-    cargo nextest run -P ci
-    ./scripts/integration-tests.sh
+    SCOPE='${{ steps.plan.outputs.scope-json }}'
+    MODE="$(echo "$SCOPE" | jq -r '.mode')"
+
+    if [ "$MODE" = "workspace" ]; then
+      cargo nextest run --workspace -P ci
+    elif [ "$MODE" = "crates" ]; then
+      mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
+      ARGS=()
+      for crate in "${CRATES[@]}"; do
+        ARGS+=(-p "$crate")
+      done
+      cargo nextest run -P ci "${ARGS[@]}"
+    else
+      echo "no package-scoped work selected"
+    fi
 ```
 
 Access planner data in scripts:
 
 ```bash
-# Get affected crates
-CRATES=$(cargo rail plan --merge-base -f json | jq -r '.impact.direct_crates | join(" ")')
+# Get the compact execution handoff
+SCOPE=$(cargo rail plan --merge-base -f json | jq -c '.scope')
 
-# Check if surface is enabled
-if cargo rail plan --merge-base -f json | jq -e '.surfaces.test.enabled' > /dev/null; then
-  cargo test -p $CRATES
+# Check if the planner selected targeted crates
+if echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
+  mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
+  ARGS=()
+  for crate in "${CRATES[@]}"; do
+    ARGS+=(-p "$crate")
+  done
+  cargo nextest run "${ARGS[@]}"
 fi
 ```
 

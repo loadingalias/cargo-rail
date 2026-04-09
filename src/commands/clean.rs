@@ -73,7 +73,8 @@ pub fn run_clean(
   // Check mode: preview what would be cleaned
   if check {
     if json {
-      let output = serde_json::json!({
+      let has_changes = !artifacts.is_empty();
+      let payload = serde_json::json!({
         "command": "clean",
         "check": true,
         "would_clean": {
@@ -82,8 +83,15 @@ pub fn run_clean(
           "backups": artifacts.backups,
         },
         "total": artifacts.total_count(),
-        "has_changes": !artifacts.is_empty()
+        "has_changes": has_changes
       });
+      let output = crate::output::machine_json_envelope(
+        "clean",
+        "check",
+        if has_changes { "pending_changes" } else { "success" },
+        if has_changes { 1 } else { 0 },
+        payload,
+      );
       println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
       println!("would clean:\n");
@@ -127,7 +135,7 @@ pub fn run_clean(
 
   // Output results
   if json {
-    let output = serde_json::json!({
+    let payload = serde_json::json!({
       "command": "clean",
       "cleaned": {
         "cache": cleaned.cache_files,
@@ -136,6 +144,7 @@ pub fn run_clean(
       },
       "total": cleaned.total_count()
     });
+    let output = crate::output::machine_json_envelope("clean", "apply", "success", 0, payload);
     println!("{}", serde_json::to_string_pretty(&output)?);
   } else if cleaned.is_empty() {
     println!("nothing to clean");

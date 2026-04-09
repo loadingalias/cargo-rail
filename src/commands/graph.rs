@@ -69,7 +69,9 @@ pub fn run_graph(ctx: &WorkspaceContext, opts: GraphOptions) -> RailResult<()> {
   let rendered = if opts.dot {
     to_dot(&graph)
   } else {
-    serde_json::to_string_pretty(&graph).map_err(|e| RailError::message(format!("graph JSON failed: {}", e)))?
+    let payload = serde_json::to_value(&graph).map_err(|e| RailError::message(format!("graph JSON failed: {}", e)))?;
+    let output = crate::output::machine_json_envelope("graph", "inspect", "success", 0, payload);
+    serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("graph JSON failed: {}", e)))?
   };
 
   write_output(&rendered, opts.output.as_ref())
@@ -192,7 +194,8 @@ fn write_output(content: &str, output_file: Option<&PathBuf>) -> RailResult<()> 
     Some(path) => {
       let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(true)
+        .write(true)
         .open(path)
         .map_err(|e| RailError::message(format!("failed to open '{}': {}", path.display(), e)))?;
       writeln!(file, "{}", content)

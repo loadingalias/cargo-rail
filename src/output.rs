@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static QUIET: AtomicBool = AtomicBool::new(false);
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Stable schema version for machine-readable command output envelopes.
+pub const MACHINE_OUTPUT_SCHEMA_VERSION: u32 = 1;
+
 /// Initialize output settings. Call once at startup.
 #[doc(hidden)]
 pub fn init(quiet: bool) {
@@ -43,6 +46,54 @@ pub fn set_json_mode(json: bool) {
   if json {
     QUIET.store(true, Ordering::Relaxed);
   }
+}
+
+/// Build a stable machine-readable JSON envelope.
+///
+/// The returned object always contains:
+/// - `schema_version`
+/// - `command`
+/// - `mode`
+/// - `result`
+/// - `exit_code`
+///
+/// If `payload` is an object, its keys are merged into the top-level envelope
+/// without overriding existing standard keys. Non-object payloads are stored in
+/// `payload`.
+pub fn machine_json_envelope(
+  command: &str,
+  mode: &str,
+  result: &str,
+  exit_code: i32,
+  payload: serde_json::Value,
+) -> serde_json::Value {
+  let mut out = serde_json::Map::new();
+  out.insert(
+    "schema_version".to_string(),
+    serde_json::Value::Number(serde_json::Number::from(MACHINE_OUTPUT_SCHEMA_VERSION)),
+  );
+  out.insert("command".to_string(), serde_json::Value::String(command.to_string()));
+  out.insert("mode".to_string(), serde_json::Value::String(mode.to_string()));
+  out.insert("result".to_string(), serde_json::Value::String(result.to_string()));
+  out.insert(
+    "exit_code".to_string(),
+    serde_json::Value::Number(serde_json::Number::from(exit_code)),
+  );
+
+  match payload {
+    serde_json::Value::Object(map) => {
+      for (key, value) in map {
+        if !out.contains_key(&key) {
+          out.insert(key, value);
+        }
+      }
+    }
+    other => {
+      out.insert("payload".to_string(), other);
+    }
+  }
+
+  serde_json::Value::Object(out)
 }
 
 // Critical Output (always shown)

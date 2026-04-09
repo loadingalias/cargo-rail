@@ -23,8 +23,12 @@ Look at:
 
 - `surfaces.*.enabled`
 - `surfaces.*.reasons`
+- `scope.mode`
+- `scope.crates`
 - `impact.direct_crates`
 - `impact.transitive_crates`
+
+Use `scope` for execution decisions. Treat `impact` as diagnostic context that explains direct vs transitive ownership.
 
 3. Preview executor behavior without running commands:
 
@@ -85,7 +89,7 @@ Custom surfaces are **plan outputs** for CI gating, not profile inputs. Extract 
 ```yaml
 - id: custom
   run: |
-    BENCHMARKS=$(echo '${{ steps.rail.outputs.custom-surfaces }}' | jq -r '.["custom:benchmarks"] // "false"')
+    BENCHMARKS="${{ steps.rail.outputs.custom_benchmarks }}"
     echo "benchmarks=$BENCHMARKS" >> "$GITHUB_OUTPUT"
 ```
 

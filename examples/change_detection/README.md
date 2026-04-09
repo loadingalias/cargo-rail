@@ -32,12 +32,22 @@ If you already have **just**, **make**, **xtask**, or shell scripts:
 ```bash
 # cargo-rail provides change detection
 PLAN=$(cargo rail plan --merge-base -f json)
+SCOPE=$(echo "$PLAN" | jq -c '.scope')
 
 # Your task runner handles execution
 if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
-  cargo xtask test        # or: just test, make test, ./scripts/test.sh
+  if echo "$SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
+    cargo xtask test --workspace
+  elif echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
+    mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
+    cargo xtask test "${CRATES[@]}"
+  else
+    echo "planner enabled test surface, but no package-scoped work was selected"
+  fi
 fi
 ```
+
+Use `.scope` for package selection. Keep the full plan for gates, trace, and debugging. Do not rebuild execution scope from `impact`.
 
 **Why?**
 - cargo-rail stays focused on change detection

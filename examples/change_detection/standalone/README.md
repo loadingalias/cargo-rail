@@ -44,7 +44,7 @@ jobs:
       - uses: loadingalias/cargo-rail-action@v3
         id: rail
         with:
-          mode: full
+          mode: minimal
           args: '--explain'
 
   test:

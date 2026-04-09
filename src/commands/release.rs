@@ -1,6 +1,6 @@
 //! `cargo rail release` - Release automation
 
-use crate::commands::common::OutputFormat;
+use crate::commands::common::{OutputFormat, enforce_safety_gate};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::release::planner::ReleasePlanner;
@@ -91,11 +91,13 @@ pub fn run_release_plan(
   let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, release_config.require_clean)?;
 
   if json {
-    let enriched = serde_json::json!({
+    let payload = serde_json::json!({
       "release_plan": plan,
       "mutation_plan": mutation_plan,
+      "check": true,
     });
-    let json_output = serde_json::to_string_pretty(&enriched)
+    let output = crate::output::machine_json_envelope("release", "check", "pending_changes", 1, payload);
+    let json_output = serde_json::to_string_pretty(&output)
       .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json_output);
   } else {
@@ -222,6 +224,13 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   };
 
   println!("{}", plan.format_summary_with_flags(args.skip_publish, args.skip_tag));
+
+  enforce_safety_gate(
+    "release apply",
+    args.yes,
+    args.plan_path.as_deref(),
+    io::stdin().is_terminal(),
+  )?;
 
   // Skip confirmation if --yes flag is set
   if !args.yes && io::stdin().is_terminal() {
@@ -414,8 +423,8 @@ pub fn run_release_check(
   }
 
   if json {
-    let mut output = serde_json::json!({
-      "command": "check",
+    let mut payload = serde_json::json!({
+      "action": "check",
       "status": if has_extended_failures { "failed" } else { "passed" },
       "crates": results,
       "count": results.len()
@@ -423,7 +432,7 @@ pub fn run_release_check(
 
     // Include skipped crates in JSON output
     if !skipped_crates.is_empty() {
-      output["skipped"] = serde_json::json!(
+      payload["skipped"] = serde_json::json!(
         skipped_crates
           .iter()
           .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
@@ -432,8 +441,12 @@ pub fn run_release_check(
     }
 
     if extended {
-      output["extended"] = serde_json::json!(extended_results);
+      payload["extended"] = serde_json::json!(extended_results);
     }
+
+    let exit_code = if has_extended_failures { 2 } else { 0 };
+    let result = if has_extended_failures { "failed" } else { "success" };
+    let output = crate::output::machine_json_envelope("release", "validate", result, exit_code, payload);
 
     println!(
       "{}",
@@ -446,7 +459,7 @@ pub fn run_release_check(
   }
 
   if has_extended_failures && json {
-    return Err(RailError::CheckHasPendingChanges);
+    return Err(RailError::ExitWithCode { code: 2 });
   }
 
   Ok(())

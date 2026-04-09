@@ -1,0 +1,8 @@
+build=true
+test=true
+bench=false
+docs=false
+infra=false
+base_ref=origin/main
+scope_json={"crates":[],"mode":"workspace","resolved_base":"origin/main","resolved_head":"WORKTREE","scope_contract_version":1,"surfaces":{"bench":false,"build":true,"docs":false,"infra":false,"test":true}}
+plan_json={"files":[{"kind":"rust","owner_scope":"crate","owners":["lib-a"],"path":"crates/lib-a/src/lib.rs","sub_kind":"src"}],"impact":{"direct_crates":["lib-a"],"transitive_crates":["lib-b"]},"inputs":{"confidence_profile":"balanced","confidence_profile_source":"config","config_fingerprint":"<CONFIG_FP>","refs":{"from":null,"merge_base":false,"resolved_base":"origin/main","resolved_head":"WORKTREE","since":"origin/main","to":null},"toolchain_fingerprint":"<TOOLCHAIN_FP>","workspace_root":"<WORKSPACE_ROOT>"},"plan_contract_version":2,"reproducibility":{"cargo_rail_version":"<VERSION>","config_hash":"<CONFIG_HASH>","git_shallow_clone":false},"scope":{"crates":[],"mode":"workspace","resolved_base":"origin/main","resolved_head":"WORKTREE","scope_contract_version":1,"surfaces":{"bench":false,"build":true,"docs":false,"infra":false,"test":true}},"surfaces":{"bench":{"enabled":false,"reasons":[]},"build":{"enabled":true,"reasons":[3,4]},"docs":{"enabled":false,"reasons":[]},"infra":{"enabled":false,"reasons":[]},"test":{"enabled":true,"reasons":[3,4]}},"trace":[{"code":"CONFIDENCE_PROFILE_BALANCED","id":1},{"code":"FILE_OWNS_CRATE_DIRECT","crate":"lib-a","file":"crates/lib-a/src/lib.rs","id":2},{"code":"FILE_KIND_RUST_SRC","file":"crates/lib-a/src/lib.rs","id":3,"surface":"build"},{"code":"TRANSITIVE_DEPENDS_ON_DIRECT","crate":"lib-b","depends_on":"lib-a","id":4,"surface":"build"}]}

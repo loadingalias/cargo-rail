@@ -8,6 +8,7 @@ use std::process::Command;
 
 const GOLDEN_PLAN_JSON: &str = include_str!("../fixtures/plan/plan_json.golden");
 const GOLDEN_PLAN_GITHUB: &str = include_str!("../fixtures/plan/plan_github.golden");
+const GOLDEN_PLAN_GITHUB_DEBUG: &str = include_str!("../fixtures/plan/plan_github_debug.golden");
 
 #[test]
 fn test_plan_json_contract_and_impact() -> Result<()> {
@@ -30,10 +31,16 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   let stdout = String::from_utf8_lossy(&output.stdout);
   let json: Value = serde_json::from_str(&stdout)?;
 
-  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(1.into()));
+  assert_eq!(json["schema_version"], serde_json::Value::Number(1.into()));
+  assert_eq!(json["command"], serde_json::Value::String("plan".to_string()));
+  assert_eq!(json["mode"], serde_json::Value::String("inspect".to_string()));
+  assert_eq!(json["result"], serde_json::Value::String("success".to_string()));
+  assert_eq!(json["exit_code"], serde_json::Value::Number(0.into()));
+  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(2.into()));
   assert!(json.get("inputs").is_some(), "missing inputs");
   assert!(json.get("files").is_some(), "missing files");
   assert!(json.get("impact").is_some(), "missing impact");
+  assert!(json.get("scope").is_some(), "missing scope");
   assert!(json.get("surfaces").is_some(), "missing surfaces");
   assert!(json.get("trace").is_some(), "missing trace");
 
@@ -53,6 +60,15 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
 
   assert!(direct.contains(&"lib-a"), "lib-a should be direct");
   assert!(transitive.contains(&"lib-b"), "lib-b should be transitive");
+  assert_eq!(
+    json["scope"]["scope_contract_version"],
+    serde_json::Value::Number(1.into())
+  );
+  assert_eq!(
+    json["scope"]["mode"],
+    serde_json::Value::String("workspace".to_string())
+  );
+  assert_eq!(json["scope"]["crates"], serde_json::json!([]));
 
   assert_eq!(json["surfaces"]["build"]["enabled"], serde_json::Value::Bool(true));
   assert_eq!(json["surfaces"]["test"]["enabled"], serde_json::Value::Bool(true));
@@ -101,6 +117,39 @@ fn test_plan_github_golden_output() -> Result<()> {
 }
 
 #[test]
+fn test_plan_github_debug_golden_output() -> Result<()> {
+  let ws = setup_golden_workspace("plan-github-debug-golden")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "github-debug"],
+  )?;
+  assert!(output.status.success(), "plan github-debug should succeed");
+
+  let actual = normalize_plan_github_debug_output(&String::from_utf8_lossy(&output.stdout))?;
+  assert_eq!(actual, GOLDEN_PLAN_GITHUB_DEBUG.trim_end());
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_text_output_is_concise() -> Result<()> {
+  let ws = setup_golden_workspace("plan-text-summary")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "origin/main"])?;
+  assert!(output.status.success(), "plan text should succeed");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(stdout.contains("surfaces: build, test"));
+  assert!(stdout.contains("scope: workspace"));
+  assert!(stdout.contains("why:"));
+  assert!(!stdout.contains("transitive crates:"));
+  assert!(!stdout.contains("trace:"));
+
+  Ok(())
+}
+
+#[test]
 fn test_plan_docs_only_surfaces() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-docs")?;
   ws.add_crate("docs-a", "0.1.0", &[])?;
@@ -120,6 +169,7 @@ fn test_plan_docs_only_surfaces() -> Result<()> {
   let stdout = String::from_utf8_lossy(&output.stdout);
   let json: Value = serde_json::from_str(&stdout)?;
 
+  assert_eq!(json["scope"]["mode"], Value::String("empty".to_string()));
   assert_eq!(json["surfaces"]["docs"]["enabled"], serde_json::Value::Bool(true));
   assert_eq!(json["surfaces"]["build"]["enabled"], serde_json::Value::Bool(false));
   assert_eq!(json["surfaces"]["test"]["enabled"], serde_json::Value::Bool(false));
@@ -146,6 +196,8 @@ fn test_plan_rust_src_fixture() -> Result<()> {
   let json: Value = serde_json::from_slice(&output.stdout)?;
   assert_eq!(json["files"][0]["kind"], Value::String("rust".to_string()));
   assert_eq!(json["files"][0]["sub_kind"], Value::String("src".to_string()));
+  assert_eq!(json["scope"]["mode"], Value::String("workspace".to_string()));
+  assert_eq!(json["scope"]["crates"], serde_json::json!([]));
   assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(true));
   assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(true));
 
@@ -242,9 +294,35 @@ fn test_plan_toml_infra_fixture() -> Result<()> {
   let json: Value = serde_json::from_slice(&output.stdout)?;
   assert_eq!(json["files"][0]["kind"], Value::String("toml".to_string()));
   assert_eq!(json["files"][0]["sub_kind"], Value::String("tooling".to_string()));
+  assert_eq!(json["scope"]["mode"], Value::String("workspace".to_string()));
+  assert_eq!(json["scope"]["crates"], serde_json::json!([]));
   assert_eq!(json["surfaces"]["infra"]["enabled"], Value::Bool(true));
   assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(true));
   assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(true));
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_partial_workspace_scope_uses_crates_mode() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-partial-scope")?;
+  ws.add_crate("scope-a", "0.1.0", &[])?;
+  ws.add_crate("scope-b", "0.1.0", &[])?;
+  ws.commit("add crates")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  ws.modify_file("scope-a", "src/lib.rs", "pub fn changed() -> bool { true }")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(output.status.success(), "plan should succeed");
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["scope"]["mode"], Value::String("crates".to_string()));
+  assert_eq!(json["scope"]["crates"], serde_json::json!(["scope-a"]));
 
   Ok(())
 }
@@ -309,6 +387,61 @@ fn test_plan_github_deterministic_output() -> Result<()> {
     String::from_utf8_lossy(&first.stdout),
     String::from_utf8_lossy(&second.stdout),
     "plan GitHub output should be byte-identical across identical runs"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_output_file_overwrites_existing_content() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-output-overwrite")?;
+  ws.add_crate("write-a", "0.1.0", &[])?;
+  ws.commit("add crate")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+  ws.modify_file("write-a", "src/lib.rs", "pub fn updated() -> bool { true }")?;
+  ws.commit("change src")?;
+
+  let output_path = ws.path.join("plan-output.json");
+  let output_path_str = output_path.to_string_lossy().to_string();
+
+  let first = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "plan",
+      "--since",
+      "origin/main",
+      "--format",
+      "json",
+      "--output",
+      &output_path_str,
+    ],
+  )?;
+  assert!(first.status.success(), "first output write should succeed");
+
+  let second = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "plan",
+      "--since",
+      "origin/main",
+      "--format",
+      "json",
+      "--output",
+      &output_path_str,
+    ],
+  )?;
+  assert!(second.status.success(), "second output write should succeed");
+
+  let content = std::fs::read_to_string(&output_path)?;
+  let parsed: Value = serde_json::from_str(&content)?;
+  assert_eq!(parsed["plan_contract_version"], Value::Number(2.into()));
+  assert_eq!(
+    content.matches("\"plan_contract_version\"").count(),
+    1,
+    "output file should contain a single JSON document, not appended documents"
   );
 
   Ok(())
@@ -440,12 +573,12 @@ verify = ["verify/**"]
   assert!(gh_stdout.contains("build="), "github output must include build key");
   assert!(gh_stdout.contains("test="), "github output must include test key");
   assert!(
-    gh_stdout.contains("custom_surfaces="),
-    "github output must include custom_surfaces key"
+    gh_stdout.contains("scope_json="),
+    "github output must include scope_json key"
   );
   assert!(
-    gh_stdout.contains("plan_json="),
-    "github output must include plan_json key"
+    !gh_stdout.contains("plan_json="),
+    "compact github output must omit plan_json"
   );
 
   Ok(())
@@ -1052,57 +1185,23 @@ fn test_plan_github_projections() -> Result<()> {
     .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
     .collect();
 
-  // All 23 keys must be present
-  let expected_keys = [
-    "build",
-    "test",
-    "bench",
-    "docs",
-    "infra",
-    "plan_contract_version",
-    "base_ref",
-    "head_ref",
-    "confidence_profile",
-    "confidence_profile_source",
-    "direct_crates",
-    "transitive_crates",
-    "custom_surfaces",
-    "plan_json",
-    "files",
-    "changed_files_count",
-    "surfaces",
-    "trace",
-    "crates",
-    "count",
-    "cargo_args",
-    "matrix",
-    "active_surfaces",
-  ];
+  // All projection keys must be present
+  let expected_keys = ["build", "test", "bench", "docs", "infra", "base_ref", "scope_json"];
   for key in expected_keys {
     assert!(kv.contains_key(key), "missing key: {}", key);
   }
 
-  // Validate projection values
-  assert_eq!(kv["changed_files_count"], "1");
-  assert_eq!(kv["crates"], "lib-a lib-b");
-  assert_eq!(kv["count"], "2");
-  assert_eq!(kv["cargo_args"], "-p lib-a -p lib-b");
-  assert_eq!(kv["plan_contract_version"], "1");
   assert_eq!(kv["base_ref"], "origin/main");
-  assert_eq!(kv["head_ref"], "WORKTREE");
-  assert_eq!(kv["confidence_profile"], "balanced");
-  assert_eq!(kv["confidence_profile_source"], "config");
 
-  let matrix: Vec<String> = serde_json::from_str(&kv["matrix"])?;
-  assert_eq!(matrix, vec!["lib-a", "lib-b"]);
-
-  let active_surfaces: Vec<String> = serde_json::from_str(&kv["active_surfaces"])?;
-  assert!(active_surfaces.contains(&"build".to_string()));
-  assert!(active_surfaces.contains(&"test".to_string()));
-  assert!(!active_surfaces.contains(&"bench".to_string()));
-
-  let files: Vec<String> = serde_json::from_str(&kv["files"])?;
-  assert_eq!(files, vec!["crates/lib-a/src/lib.rs"]);
+  let scope_json: Value = serde_json::from_str(&kv["scope_json"])?;
+  assert_eq!(scope_json["mode"], serde_json::json!("workspace"));
+  assert_eq!(scope_json["crates"], serde_json::json!([]));
+  assert_eq!(scope_json["scope_contract_version"], serde_json::json!(1));
+  assert_eq!(scope_json["resolved_head"], serde_json::json!("WORKTREE"));
+  assert!(
+    !kv.contains_key("plan_json"),
+    "compact github output should omit plan_json"
+  );
 
   Ok(())
 }
@@ -1125,9 +1224,18 @@ fn normalize_plan_json_output(stdout: &str) -> Result<String> {
 }
 
 fn normalize_plan_json_value(value: &mut Value) -> Result<()> {
+  if let Some(object) = value.as_object_mut() {
+    object.remove("schema_version");
+    object.remove("command");
+    object.remove("mode");
+    object.remove("result");
+    object.remove("exit_code");
+  }
   value["inputs"]["workspace_root"] = Value::String("<WORKSPACE_ROOT>".to_string());
   value["inputs"]["config_fingerprint"] = Value::String("<CONFIG_FP>".to_string());
   value["inputs"]["toolchain_fingerprint"] = Value::String("<TOOLCHAIN_FP>".to_string());
+  value["scope"]["resolved_base"] = Value::String("origin/main".to_string());
+  value["scope"]["resolved_head"] = Value::String("WORKTREE".to_string());
   value["reproducibility"]["cargo_rail_version"] = Value::String("<VERSION>".to_string());
   value["reproducibility"]["config_hash"] = Value::String("<CONFIG_HASH>".to_string());
   Ok(())
@@ -1145,26 +1253,51 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
     kv.insert(key.to_string(), value.to_string());
   }
 
-  let plan_json_raw = kv
-    .get("plan_json")
-    .ok_or_else(|| anyhow!("missing plan_json key in github output"))?;
-  let mut plan_json: Value = serde_json::from_str(plan_json_raw)?;
-  normalize_plan_json_value(&mut plan_json)?;
+  let scope_json_raw = kv
+    .get("scope_json")
+    .ok_or_else(|| anyhow!("missing scope_json key in github output"))?;
+  let scope_json: Value = serde_json::from_str(scope_json_raw)?;
 
-  let custom_surfaces_raw = kv
-    .get("custom_surfaces")
-    .ok_or_else(|| anyhow!("missing custom_surfaces key in github output"))?;
-  let custom_surfaces: Value = serde_json::from_str(custom_surfaces_raw)?;
+  let ordered_keys = ["build", "test", "bench", "docs", "infra", "base_ref", "scope_json"];
 
-  // Parse JSON-valued projection keys through serde_json roundtrip for consistent formatting
-  let json_keys = ["files", "surfaces", "trace", "matrix", "active_surfaces"];
-  let mut normalized_json: BTreeMap<String, String> = BTreeMap::new();
-  for json_key in json_keys {
-    if let Some(raw) = kv.get(json_key) {
-      let parsed: Value = serde_json::from_str(raw)?;
-      normalized_json.insert(json_key.to_string(), serde_json::to_string(&parsed)?);
+  let mut lines = Vec::new();
+  for key in ordered_keys {
+    match key {
+      "scope_json" => lines.push(format!("{}={}", key, serde_json::to_string(&scope_json)?)),
+      _ => {
+        let value = kv
+          .get(key)
+          .ok_or_else(|| anyhow!("missing {} key in github output", key))?;
+        lines.push(format!("{}={}", key, value));
+      }
     }
   }
+
+  Ok(lines.join("\n"))
+}
+
+fn normalize_plan_github_debug_output(stdout: &str) -> Result<String> {
+  let mut kv = BTreeMap::new();
+  for line in stdout.lines() {
+    if line.trim().is_empty() {
+      continue;
+    }
+    let (key, value) = line
+      .split_once('=')
+      .ok_or_else(|| anyhow!("invalid github-debug output line: {}", line))?;
+    kv.insert(key.to_string(), value.to_string());
+  }
+
+  let scope_json_raw = kv
+    .get("scope_json")
+    .ok_or_else(|| anyhow!("missing scope_json key in github-debug output"))?;
+  let scope_json: Value = serde_json::from_str(scope_json_raw)?;
+
+  let plan_json_raw = kv
+    .get("plan_json")
+    .ok_or_else(|| anyhow!("missing plan_json key in github-debug output"))?;
+  let mut plan_json: Value = serde_json::from_str(plan_json_raw)?;
+  normalize_plan_json_value(&mut plan_json)?;
 
   let ordered_keys = [
     "build",
@@ -1172,38 +1305,20 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
     "bench",
     "docs",
     "infra",
-    "plan_contract_version",
     "base_ref",
-    "head_ref",
-    "confidence_profile",
-    "confidence_profile_source",
-    "direct_crates",
-    "transitive_crates",
-    "custom_surfaces",
+    "scope_json",
     "plan_json",
-    "files",
-    "changed_files_count",
-    "surfaces",
-    "trace",
-    "crates",
-    "count",
-    "cargo_args",
-    "matrix",
-    "active_surfaces",
   ];
 
   let mut lines = Vec::new();
   for key in ordered_keys {
     match key {
-      "custom_surfaces" => lines.push(format!("{}={}", key, serde_json::to_string(&custom_surfaces)?)),
+      "scope_json" => lines.push(format!("{}={}", key, serde_json::to_string(&scope_json)?)),
       "plan_json" => lines.push(format!("{}={}", key, serde_json::to_string(&plan_json)?)),
-      k if normalized_json.contains_key(k) => {
-        lines.push(format!("{}={}", k, normalized_json[k]));
-      }
       _ => {
         let value = kv
           .get(key)
-          .ok_or_else(|| anyhow!("missing {} key in github output", key))?;
+          .ok_or_else(|| anyhow!("missing {} key in github-debug output", key))?;
         lines.push(format!("{}={}", key, value));
       }
     }

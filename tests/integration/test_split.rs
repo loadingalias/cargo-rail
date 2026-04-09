@@ -321,7 +321,16 @@ require_clean = false
   // Run release publish in split repo (skip crates.io)
   let output = run_cargo_rail(
     split_root,
-    &["rail", "release", "run", "--all", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   assert!(output.status.success(), "Split release should succeed");
 
@@ -436,19 +445,19 @@ paths = [{{ crate = "crates/json-lib" }}]
     &ws.path,
     &["rail", "split", "run", "json-lib", "--check", "--format", "json"],
   )?;
-
-  if output.status.success() {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // If there's output, it should be valid JSON
-    if !stdout.trim().is_empty() {
-      let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-      assert!(
-        parsed.is_ok(),
-        "split --json should output valid JSON. stdout: {}",
-        stdout
-      );
-    }
-  }
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "split run --check --format json should exit 1 when changes are pending"
+  );
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)
+    .unwrap_or_else(|_| panic!("split --json should output valid JSON. stdout: {}", stdout));
+  assert_eq!(json["schema_version"], serde_json::json!(1));
+  assert_eq!(json["command"], serde_json::json!("split"));
+  assert_eq!(json["mode"], serde_json::json!("check"));
+  assert_eq!(json["result"], serde_json::json!("pending_changes"));
+  assert_eq!(json["exit_code"], serde_json::json!(1));
 
   Ok(())
 }
@@ -667,6 +676,44 @@ paths = [{{ crate = "crates/dirty-lib" }}]
 }
 
 // Safety Rails Tests
+
+/// Test that split apply requires explicit confirmation in non-interactive mode
+#[test]
+fn test_split_requires_explicit_confirmation_non_interactive() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("confirm-lib", "0.1.0", &[])?;
+  ws.commit("Add confirm-lib")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.confirm-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/confirm-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "confirm-lib", "--allow-dirty"])?;
+  assert!(
+    !output.status.success(),
+    "split should fail without --yes/--plan in non-interactive mode"
+  );
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("explicit confirmation") && stderr.contains("--yes") && stderr.contains("--plan"),
+    "safety gate message missing expected guidance.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
 
 /// Test that split fails on dirty worktree without --allow-dirty
 #[test]

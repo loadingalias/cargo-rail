@@ -135,13 +135,14 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
 
   if check {
     if json {
-      let output = serde_json::json!({
+      let payload = serde_json::json!({
         "command": "init",
         "check": true,
         "config_path": config_path.display().to_string(),
         "targets_detected": detected_targets,
         "content": toml_content
       });
+      let output = crate::output::machine_json_envelope("init", "check", "success", 0, payload);
       println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
       println!("{}", toml_content);
@@ -151,12 +152,13 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
     write_config_file(&config_path, &toml_content)?;
 
     if json {
-      let output = serde_json::json!({
+      let payload = serde_json::json!({
         "command": "init",
         "status": "created",
         "config_path": config_path.display().to_string(),
         "targets_detected": detected_targets
       });
+      let output = crate::output::machine_json_envelope("init", "apply", "created", 0, payload);
       println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
       progress!("created: {}", config_path.display());

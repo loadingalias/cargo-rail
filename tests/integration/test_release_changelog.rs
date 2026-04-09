@@ -79,7 +79,16 @@ fn release_changelog_generates_links_and_prs() -> Result<()> {
   // Run release (skip crates.io but create tag/changelog)
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -154,7 +163,16 @@ fn release_respects_skip_and_require_flags() -> Result<()> {
 
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "--all", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -195,7 +213,16 @@ require_clean = false
   // No commits since last tag -> generated changelog entries are empty.
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -236,7 +263,16 @@ require_clean = false
   // No commits since last tag, but opt-out should allow release apply.
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -261,17 +297,21 @@ fn test_release_json_output() -> Result<()> {
 
   // Run release plan with --json
   let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--json"])?;
-
-  if output.status.success() {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should be valid JSON
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-    assert!(
-      parsed.is_ok(),
-      "release --json should output valid JSON. stdout: {}",
-      stdout
-    );
-  }
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "release run --check --json should exit 1 when changes are pending"
+  );
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)
+    .unwrap_or_else(|_| panic!("release --json should output valid JSON. stdout: {}", stdout));
+  assert_eq!(json["schema_version"], serde_json::json!(1));
+  assert_eq!(json["command"], serde_json::json!("release"));
+  assert_eq!(json["mode"], serde_json::json!("check"));
+  assert_eq!(json["result"], serde_json::json!("pending_changes"));
+  assert_eq!(json["exit_code"], serde_json::json!(1));
+  assert!(json.get("release_plan").is_some());
+  assert!(json.get("mutation_plan").is_some());
 
   Ok(())
 }
@@ -384,7 +424,16 @@ changelog_path = "CHANGELOG.md"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -436,7 +485,16 @@ changelog_relative_to = "workspace"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -499,7 +557,16 @@ changelog_relative_to = "workspace"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -549,7 +616,16 @@ changelog_relative_to = "crate"
   // Run release
   let output = run_cargo_rail(
     &ws.path,
-    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -677,6 +753,14 @@ fn test_release_check_extended_json() -> Result<()> {
   );
 
   let json = parsed.unwrap();
+  assert_eq!(json["schema_version"], serde_json::json!(1));
+  assert_eq!(json["command"], serde_json::json!("release"));
+  assert_eq!(json["mode"], serde_json::json!("validate"));
+  assert!(json["result"] == serde_json::json!("success") || json["result"] == serde_json::json!("failed"));
+  assert!(
+    json["exit_code"] == serde_json::json!(0) || json["exit_code"] == serde_json::json!(2),
+    "release check extended should report exit_code 0 or 2"
+  );
   assert!(
     json.get("extended").is_some(),
     "JSON should contain 'extended' field.\nJSON:\n{}",
@@ -687,6 +771,37 @@ fn test_release_check_extended_json() -> Result<()> {
 }
 
 // Release Safety Tests (Branch Detection)
+
+/// Test that release apply requires explicit confirmation in non-interactive mode
+#[test]
+fn test_release_requires_explicit_confirmation_non_interactive() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-confirmation-gate")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial release")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn gate() {}")?;
+  ws.commit("feat: add release-gated change")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+  )?;
+  assert!(
+    !output.status.success(),
+    "release should fail without --yes/--plan in non-interactive mode"
+  );
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("explicit confirmation") && stderr.contains("--yes") && stderr.contains("--plan"),
+    "safety gate message missing expected guidance.\nstderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
 
 /// Test that release fails from detached HEAD
 #[test]

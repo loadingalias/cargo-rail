@@ -366,24 +366,18 @@ Custom surfaces serve a different purpose than built-in surfaces:
 | Values | `build`, `test`, `bench`, `docs`, `infra` | `custom:<name>` (user-defined) |
 | Use in `[run.profile.X].surfaces` | ✅ Yes | ❌ No |
 | Appears in plan output | ✅ Yes | ✅ Yes |
-| Use in CI job gating | ✅ Yes | ✅ Yes (extract from `custom_surfaces` JSON) |
+| Use in CI job gating | ✅ Yes | ✅ Yes (via `scope_json.surfaces` or action `custom_<name>` outputs) |
 
 **Why this distinction?** Built-in surfaces map to cargo commands (`cargo build`, `cargo test`, etc.). Custom surfaces are arbitrary categories for CI decision-making—they don't map to cargo commands, so they can't be "executed" by `cargo rail run`.
 
 **CI gating pattern for custom surfaces:**
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v1
+- uses: loadingalias/cargo-rail-action@v3
   id: rail
 
-- name: Extract custom surfaces
-  id: custom
-  run: |
-    BENCHMARKS=$(echo '${{ steps.rail.outputs.custom-surfaces }}' | jq -r '.["custom:benchmarks"] // "false"')
-    echo "benchmarks=$BENCHMARKS" >> "$GITHUB_OUTPUT"
-
 - name: Run benchmark suite
-  if: steps.custom.outputs.benchmarks == 'true' || steps.rail.outputs.infra == 'true'
+  if: steps.rail.outputs.custom_benchmarks == 'true' || steps.rail.outputs.infra == 'true'
   run: cargo bench
 ```
 
@@ -421,15 +415,10 @@ For a full end-to-end operating guide (local + CI + trust checklist), see:
 | `bench` | `"true"` when bench surface is enabled |
 | `docs` | `"true"` when docs surface is enabled |
 | `infra` | `"true"` when infra surface is enabled |
-| `plan_contract_version` | Planner contract version (for deterministic replay compatibility checks) |
 | `base_ref` | Resolved baseline ref used for change detection |
-| `head_ref` | Resolved head ref (usually `WORKTREE` for local runs) |
-| `confidence_profile` | Effective planner confidence profile (`strict`, `balanced`, `fast`) |
-| `confidence_profile_source` | Source of selected profile (`config`, `cli`, `bot_pr_policy`, etc.) |
-| `direct_crates` | Space-separated direct impacted crates |
-| `transitive_crates` | Space-separated transitive impacted crates |
-| `custom_surfaces` | JSON map of `custom:<name> -> bool` |
-| `plan_json` | Full planner contract as compact JSON |
+| `scope_json` | Compact execution handoff emitted by the planner |
+
+Use `cargo rail plan -f github-debug` when you also need `plan_json` for debugging or incident review.
 
 #### Decision Receipt Artifact (Recommended)
 
@@ -456,17 +445,18 @@ Upload it in CI so incident/debug review can answer "why this ran" without log s
 | `docs-only == true` | `docs == true` and `test == false` |
 | `rebuild-all == true` | `infra == true` |
 | surface dispatch | `cargo rail run --surface test` |
-| `custom-categories` checks | Parse `custom_surfaces` JSON |
+| `custom-categories` checks | Parse `scope_json.surfaces["custom:<name>"]` or use action `custom_<name>` outputs |
 
 #### Output Formats
 
-Planner outputs support three formats:
+Planner outputs support four formats:
 
 | Format | Use Case | Example |
 |--------|----------|---------|
-| `text` | Human-readable summary | `plan\nchanged files: 1` |
+| `text` | Human-readable summary | `plan\nsurfaces: build, test` |
 | `json` | Full machine contract | `{"files":[...],"surfaces":{...}}` |
 | `github` | GitHub key/value outputs | `test=true` |
+| `github-debug` | GitHub outputs plus `plan_json` | `plan_json={...}` |
 
 ---
 

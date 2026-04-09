@@ -15,6 +15,8 @@ set -euo pipefail
 #   CARGO_RAIL_TEST_MODE   # "local" (default) or "commit" (CI)
 #   RAIL_SINCE             # Git ref for CI comparison
 
+RAIL_CMD=(cargo run --quiet -- rail)
+
 ARG="${1:-}"
 MODE="${CARGO_RAIL_TEST_MODE:-local}"
 
@@ -55,13 +57,13 @@ fi
 # Smart mode: Use cargo-rail for change detection
 echo "Change Detection Plan:"
 echo ""
-cargo rail plan $PLAN_ARGS --explain
+"${RAIL_CMD[@]}" plan $PLAN_ARGS --explain
 echo ""
 
 echo "Testing affected crates..."
 if [ "$MODE" = "commit" ]; then
   # CI mode: force commit profile and nextest JUnit output path.
-  cargo rail run $PLAN_ARGS --surface test -- -P "$NEXTEST_PROFILE" --config-file .config/nextest.toml
+  "${RAIL_CMD[@]}" run $PLAN_ARGS --surface test -- -P "$NEXTEST_PROFILE" --config-file .config/nextest.toml
 else
-  cargo rail run $PLAN_ARGS --surface test
+  "${RAIL_CMD[@]}" run $PLAN_ARGS --surface test
 fi

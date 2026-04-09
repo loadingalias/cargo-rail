@@ -8,6 +8,16 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
+fn print_config_json<T: Serialize>(mode: &str, result: &str, exit_code: i32, payload: &T) -> RailResult<()> {
+  let payload_value = serde_json::to_value(payload).map_err(|e| RailError::message(e.to_string()))?;
+  let output = crate::output::machine_json_envelope("config", mode, result, exit_code, payload_value);
+  println!(
+    "{}",
+    serde_json::to_string_pretty(&output).map_err(|e| RailError::message(e.to_string()))?
+  );
+  Ok(())
+}
+
 /// Validation result for JSON output
 #[derive(Serialize)]
 struct ValidationResult {
@@ -188,10 +198,7 @@ pub fn run_config_locate(
           path: Some(path.display().to_string()),
           search_paths: vec![],
         };
-        println!(
-          "{}",
-          serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-        );
+        print_config_json("locate", "success", 0, &result)?;
       } else {
         println!("{}", path.display());
       }
@@ -222,10 +229,12 @@ pub fn run_config_locate(
       path: config_path.as_ref().map(|p| p.display().to_string()),
       search_paths: search_paths.iter().map(|p| p.display().to_string()).collect(),
     };
-    println!(
-      "{}",
-      serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-    );
+    print_config_json(
+      "locate",
+      if config_path.is_some() { "success" } else { "not_found" },
+      0,
+      &result,
+    )?;
   } else if let Some(path) = &config_path {
     println!("{}", path.display());
   } else {
@@ -275,10 +284,7 @@ pub fn run_config_print(workspace_root: &Path, config_override: Option<&Path>, f
       config_path: config_path.display().to_string(),
       config,
     };
-    println!(
-      "{}",
-      serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-    );
+    print_config_json("print", "success", 0, &result)?;
   } else {
     // TOML output: serialize to TOML with a header comment
     println!("# Effective configuration (loaded from {})", config_path.display());
@@ -380,10 +386,7 @@ pub fn run_config_validate_standalone(
           )],
           warnings: vec![],
         };
-        println!(
-          "{}",
-          serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-        );
+        print_config_json("validate", "failed", 2, &result)?;
         return Err(RailError::ExitWithCode { code: 2 });
       }
       if is_default_lookup_miss {
@@ -485,10 +488,12 @@ pub fn run_config_validate_standalone(
       errors: final_errors,
       warnings: final_warnings,
     };
-    println!(
-      "{}",
-      serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-    );
+    print_config_json(
+      "validate",
+      if valid { "success" } else { "failed" },
+      if valid { 0 } else { 2 },
+      &result,
+    )?;
   } else {
     println!("config: {}", config_path.display());
     if strict && is_ci_environment() {
@@ -722,10 +727,12 @@ pub fn run_config_sync(
         targets: targets_result,
         has_changes,
       };
-      println!(
-        "{}",
-        serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-      );
+      print_config_json(
+        "sync",
+        if has_changes { "pending_changes" } else { "success" },
+        if has_changes { 1 } else { 0 },
+        &result,
+      )?;
     } else {
       print_sync_preview(&config_path, &fields_added, &targets_result, has_changes);
     }
@@ -746,10 +753,7 @@ pub fn run_config_sync(
           targets: targets_result,
           has_changes: false,
         };
-        println!(
-          "{}",
-          serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-        );
+        print_config_json("sync", "success", 0, &result)?;
       } else {
         println!("config: {} (up to date)", config_path.display());
       }
@@ -767,10 +771,7 @@ pub fn run_config_sync(
         targets: targets_result,
         has_changes: true,
       };
-      println!(
-        "{}",
-        serde_json::to_string_pretty(&result).map_err(|e| RailError::message(e.to_string()))?
-      );
+      print_config_json("sync", "applied", 0, &result)?;
     } else {
       print_sync_applied(&config_path, &fields_added, &targets_result);
     }

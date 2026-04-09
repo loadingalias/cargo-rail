@@ -153,14 +153,15 @@ Options:
           Output format
 
           Possible values:
-          - text:   Human-readable text output (default)
-          - json:   Machine-readable JSON output
-          - github: GitHub Actions output format for $GITHUB_OUTPUT
+          - text:         Human-readable text output (default)
+          - json:         Machine-readable JSON output
+          - github:       GitHub Actions output format for $GITHUB_OUTPUT
+          - github-debug: GitHub Actions output with embedded planner contract for debugging
           
           [default: text]
 
   -o, --output <PATH>
-          Write output to file (appends to existing content)
+          Write output to file (overwrites existing content)
 
       --explain
           Show concise human reasoning chain
@@ -184,7 +185,8 @@ Examples:
   cargo rail plan --from abc --to def       # Changes between two SHAs
   cargo rail plan --explain                 # Show concise proof chain
   cargo rail plan -f json                   # Full machine-readable contract
-  cargo rail plan -f github                 # GitHub Actions key=value output
+  cargo rail plan -f github                 # Compact GitHub Actions key=value output
+  cargo rail plan -f github-debug           # GitHub Actions output plus plan_json
 ```
 
 ---
@@ -238,7 +240,7 @@ Options:
           Custom path for the unify report (default: target/cargo-rail/unify-report.md)
 
   -o, --output <PATH>
-          Write output to file (appends to existing content)
+          Write output to file (overwrites existing content)
 
       --show-diff
           Show diff of changes to each manifest
@@ -371,6 +373,7 @@ Examples:
   cargo rail split init my-crate --check  # Preview generated config
   cargo rail split run my-crate --check   # Preview the split
   cargo rail split run my-crate           # Execute the split
+  cargo rail split run my-crate --yes     # Non-interactive apply confirmation
   cargo rail split run --all              # Split all configured crates
 ```
 
@@ -549,6 +552,7 @@ Examples:
   cargo rail sync my-crate                # Bidirectional sync
   cargo rail sync my-crate --to-remote    # Push monorepo -> split repo
   cargo rail sync my-crate --from-remote  # Pull split repo -> monorepo (PR branch)
+  cargo rail sync my-crate --to-remote --yes  # Non-interactive apply confirmation
   cargo rail sync --all                   # Sync all configured crates
 ```
 
@@ -592,6 +596,7 @@ Examples:
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
@@ -1208,7 +1213,7 @@ Options:
           Output GraphViz DOT instead of JSON
 
   -o, --output <PATH>
-          Write output to file (appends to existing content)
+          Write output to file (overwrites existing content)
 
   -h, --help
           Print help (see a summary with '-h')
