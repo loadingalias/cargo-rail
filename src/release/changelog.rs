@@ -124,10 +124,8 @@ fn parse_github_remote(url: &str) -> Option<(String, String)> {
     ssh
   } else if let Some(ssh) = trimmed.strip_prefix("ssh://git@github.com/") {
     ssh
-  } else if let Some(https) = trimmed.strip_prefix("https://github.com/") {
-    https
   } else {
-    return None;
+    trimmed.strip_prefix("https://github.com/")?
   };
 
   let mut parts = repo_part.split('/');

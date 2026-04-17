@@ -149,7 +149,7 @@ pub fn run_whatever(ctx: &WorkspaceContext, args: Args) -> RailResult<()> {
 
 ```
 1. Collect changed files from git refs
-2. Classify file kinds (rust/toml/ci/script/docs/custom)
+2. Classify builtin file kinds (rust/toml/ci/script/docs) and overlay custom surfaces
 3. Resolve file ownership to crates (or workspace/unowned)
 4. Expand transitive impact via workspace graph
 5. Emit surfaces + trace (proof-carrying reasons)

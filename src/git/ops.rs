@@ -565,10 +565,7 @@ fn parse_name_status_output_z(output: &[u8]) -> RailResult<Vec<(PathBuf, char)>>
   let mut files = Vec::new();
 
   let mut parts = output.split(|&b| b == 0);
-  loop {
-    let Some(status_bytes) = parts.next() else {
-      break;
-    };
+  while let Some(status_bytes) = parts.next() {
     if status_bytes.is_empty() {
       continue;
     }

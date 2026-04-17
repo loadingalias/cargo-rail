@@ -36,7 +36,7 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert_eq!(json["mode"], serde_json::Value::String("inspect".to_string()));
   assert_eq!(json["result"], serde_json::Value::String("success".to_string()));
   assert_eq!(json["exit_code"], serde_json::Value::Number(0.into()));
-  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(2.into()));
+  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(3.into()));
   assert!(json.get("inputs").is_some(), "missing inputs");
   assert!(json.get("files").is_some(), "missing files");
   assert!(json.get("impact").is_some(), "missing impact");
@@ -437,7 +437,7 @@ fn test_plan_output_file_overwrites_existing_content() -> Result<()> {
 
   let content = std::fs::read_to_string(&output_path)?;
   let parsed: Value = serde_json::from_str(&content)?;
-  assert_eq!(parsed["plan_contract_version"], Value::Number(2.into()));
+  assert_eq!(parsed["plan_contract_version"], Value::Number(3.into()));
   assert_eq!(
     content.matches("\"plan_contract_version\"").count(),
     1,
@@ -585,7 +585,7 @@ verify = ["verify/**"]
 }
 
 #[test]
-fn test_plan_custom_surface_precedence_over_docs_classification() -> Result<()> {
+fn test_plan_custom_surface_is_additive_with_docs_classification() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-custom-precedence")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
 
@@ -610,9 +610,124 @@ verify = ["crates/**/README.md"]
   );
 
   let json: Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(json["files"][0]["kind"], Value::String("custom:verify".to_string()));
+  assert_eq!(json["files"][0]["kind"], Value::String("docs".to_string()));
+  assert_eq!(
+    json["files"][0]["custom_surfaces"],
+    serde_json::json!(["custom:verify"])
+  );
   assert_eq!(json["surfaces"]["custom:verify"]["enabled"], Value::Bool(true));
-  assert_eq!(json["surfaces"]["docs"]["enabled"], Value::Bool(false));
+  assert_eq!(json["surfaces"]["docs"]["enabled"], Value::Bool(true));
+
+  let trace = json["trace"].as_array().expect("trace should be array");
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_DOCS".to_string())),
+    "trace should include FILE_KIND_DOCS for builtin classification"
+  );
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_CUSTOM".to_string())),
+    "trace should include FILE_KIND_CUSTOM for the overlay surface"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_custom_surface_is_additive_with_infra_classification() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-custom-infra-overlap")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+
+  let config = r#"[change-detection.custom]
+merge_validation = [".github/workflows/**"]
+"#;
+  std::fs::write(ws.path.join(".config/rail.toml"), config)?;
+  ws.commit("configure custom change detection")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  let workflow_dir = ws.path.join(".github/workflows");
+  std::fs::create_dir_all(&workflow_dir)?;
+  std::fs::write(workflow_dir.join("ci.yaml"), "name: CI\non: [push]\n")?;
+  ws.commit("add workflow file")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(
+    output.status.success(),
+    "plan should succeed with overlapping infra/custom patterns"
+  );
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["files"][0]["kind"], Value::String("ci".to_string()));
+  assert_eq!(
+    json["files"][0]["custom_surfaces"],
+    serde_json::json!(["custom:merge_validation"])
+  );
+  assert_eq!(json["surfaces"]["infra"]["enabled"], Value::Bool(true));
+  assert_eq!(
+    json["surfaces"]["custom:merge_validation"]["enabled"],
+    Value::Bool(true)
+  );
+
+  let trace = json["trace"].as_array().expect("trace should be array");
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_CI".to_string())),
+    "trace should include FILE_KIND_CI for builtin infra classification"
+  );
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_CUSTOM".to_string())),
+    "trace should include FILE_KIND_CUSTOM for the overlay surface"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_file_can_enable_multiple_custom_surfaces() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-multiple-custom-overlap")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+
+  let config = r#"[change-detection.custom]
+docs_pipeline = ["docs/**"]
+manual_gate = ["docs/**"]
+"#;
+  std::fs::write(ws.path.join(".config/rail.toml"), config)?;
+  ws.commit("configure custom change detection")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  let docs_dir = ws.path.join("docs");
+  std::fs::create_dir_all(&docs_dir)?;
+  std::fs::write(docs_dir.join("guide.md"), "# Guide\n")?;
+  ws.commit("add docs guide")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(
+    output.status.success(),
+    "plan should allow multiple custom surfaces per file"
+  );
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["files"][0]["kind"], Value::String("docs".to_string()));
+  assert_eq!(
+    json["files"][0]["custom_surfaces"],
+    serde_json::json!(["custom:docs_pipeline", "custom:manual_gate"])
+  );
+  assert_eq!(json["surfaces"]["docs"]["enabled"], Value::Bool(true));
+  assert_eq!(json["surfaces"]["custom:docs_pipeline"]["enabled"], Value::Bool(true));
+  assert_eq!(json["surfaces"]["custom:manual_gate"]["enabled"], Value::Bool(true));
 
   Ok(())
 }

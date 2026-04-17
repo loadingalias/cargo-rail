@@ -4,6 +4,7 @@ use super::plan::{
   ExecutionScope, ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain,
 };
 use crate::commands::common::PlanOutputFormat;
+use crate::commands::common::format_preview_list;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::progress;
@@ -376,9 +377,13 @@ fn run_test_surface(
   }
 
   let runner = select_runner(!opts.skip_nextest);
-  progress!("testing {} crates ({}):", targets.len(), runner.name());
-  for target in targets {
-    progress!("  {}", target);
+  progress!("testing {} crates ({})", targets.len(), runner.name());
+  if targets.len() <= 12 {
+    for target in targets {
+      progress!("  {}", target);
+    }
+  } else {
+    progress!("targets: {}", format_preview_list(targets, 12));
   }
 
   let mut cmd = runner.build_command(targets, run_args);
@@ -417,9 +422,15 @@ fn run_workspace_surface(
   cmd.args(run_args);
 
   if opts.explain {
-    println!("surface `{}` targets: {}", surface, targets.len());
-    for target in targets {
-      println!("  {}", target);
+    if package_scoped {
+      println!(
+        "surface `{}` targets ({}): {}",
+        surface,
+        targets.len(),
+        format_preview_list(targets, 12)
+      );
+    } else {
+      println!("surface `{}` targets: workspace", surface);
     }
   }
 

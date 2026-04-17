@@ -254,7 +254,7 @@ impl RailConfigBuilder {
     if !config.custom.is_empty() {
       content.push_str("\n[change-detection.custom]\n");
       let mut categories: Vec<_> = config.custom.iter().collect();
-      categories.sort_by(|(a, _), (b, _)| a.cmp(b));
+      categories.sort_by_key(|(a, _)| *a);
 
       for (category, patterns) in categories {
         content.push_str(&format!(
@@ -281,7 +281,7 @@ impl RailConfigBuilder {
     if !config.workflow.is_empty() {
       content.push_str("\n[run.workflow]\n");
       let mut workflows: Vec<_> = config.workflow.iter().collect();
-      workflows.sort_by(|(a, _), (b, _)| a.cmp(b));
+      workflows.sort_by_key(|(a, _)| *a);
       for (workflow, profile) in workflows {
         content.push_str(&format!("{} = \"{}\"\n", workflow, profile));
       }
@@ -289,7 +289,7 @@ impl RailConfigBuilder {
 
     if !config.profiles.is_empty() {
       let mut profiles: Vec<_> = config.profiles.iter().collect();
-      profiles.sort_by(|(a, _), (b, _)| a.cmp(b));
+      profiles.sort_by_key(|(a, _)| *a);
       for (profile_name, profile) in profiles {
         content.push_str(&format!("\n[run.profile.{}]\n", profile_name));
         content.push_str(&format!(

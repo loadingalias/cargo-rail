@@ -33,7 +33,7 @@
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 2,
+  "plan_contract_version": 3,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",

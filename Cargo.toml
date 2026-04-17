@@ -35,15 +35,15 @@ resolver = "3"
 rust-version = "1.91.0"
 
 [dependencies]
-clap = { version = "4.6.0", features = ["derive", "cargo"] }
-clap_complete = "4.6.0"
+clap = { version = "4.6.1", features = ["derive", "cargo"] }
+clap_complete = "4.6.2"
 cargo_metadata = "0.23.1"
 petgraph = { version = "0.8.3", default-features = false }
 toml_edit = { version = "0.25.11", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 semver = "1.0.28"
-rayon = "1.11.0"
+rayon = "1.12.0"
 winnow = "1.0.1"
 chrono = "0.4.44"
 glob = "0.3.3"

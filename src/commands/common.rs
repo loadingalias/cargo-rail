@@ -8,6 +8,29 @@ use crate::workspace::WorkspaceContext;
 use clap::ValueEnum;
 use std::path::PathBuf;
 
+/// Render a deterministic preview for a potentially large list.
+///
+/// Keeps small lists intact and truncates large lists with a `+N more` suffix.
+pub(crate) fn format_preview_list(items: &[String], preview_limit: usize) -> String {
+  if items.is_empty() {
+    return "none".to_string();
+  }
+
+  let preview_limit = preview_limit.max(1);
+  let preview = items
+    .iter()
+    .take(preview_limit)
+    .map(String::as_str)
+    .collect::<Vec<_>>()
+    .join(", ");
+
+  if items.len() <= preview_limit {
+    preview
+  } else {
+    format!("{preview}, ... +{} more", items.len() - preview_limit)
+  }
+}
+
 /// Standard output format for all commands
 ///
 /// Supports both simple (text/json) and specialized formats (GitHub Actions, JSONL, etc.)
@@ -287,5 +310,27 @@ impl<'a> SplitSyncConfigBuilder<'a> {
     }
 
     Ok(configs)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::format_preview_list;
+
+  #[test]
+  fn preview_list_keeps_short_lists() {
+    let items = vec!["rail-a".to_string(), "rail-b".to_string(), "rail-c".to_string()];
+    assert_eq!(format_preview_list(&items, 5), "rail-a, rail-b, rail-c");
+  }
+
+  #[test]
+  fn preview_list_truncates_large_lists() {
+    let items = vec![
+      "rail-a".to_string(),
+      "rail-b".to_string(),
+      "rail-c".to_string(),
+      "rail-d".to_string(),
+    ];
+    assert_eq!(format_preview_list(&items, 2), "rail-a, rail-b, ... +2 more");
   }
 }

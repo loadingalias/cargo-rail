@@ -370,6 +370,11 @@ Custom surfaces serve a different purpose than built-in surfaces:
 
 **Why this distinction?** Built-in surfaces map to cargo commands (`cargo build`, `cargo test`, etc.). Custom surfaces are arbitrary categories for CI decision-making—they don't map to cargo commands, so they can't be "executed" by `cargo rail run`.
 
+Custom surfaces are additive. If a path also matches a built-in classification such as
+`infra`, `docs`, or `bench`, `cargo rail plan` enables both the built-in surface and the
+matching `custom:<name>` surface(s). Custom routing is an overlay, not a replacement for
+core planner semantics.
+
 **CI gating pattern for custom surfaces:**
 
 ```yaml

@@ -1,6 +1,6 @@
 //! `cargo rail plan` - deterministic file-first change planner.
 
-use crate::commands::common::PlanOutputFormat;
+use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::ConfidenceProfile;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
@@ -81,6 +81,8 @@ pub(crate) struct PlannedFile {
   pub(crate) kind: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) sub_kind: Option<String>,
+  #[serde(skip_serializing_if = "Vec::is_empty")]
+  pub(crate) custom_surfaces: Vec<String>,
   pub(crate) owners: Vec<String>,
   pub(crate) owner_scope: String,
 }
@@ -169,7 +171,7 @@ const RC_CONFIDENCE_PROFILE_FAST: &str = "CONFIDENCE_PROFILE_FAST";
 const RC_CONFIDENCE_STRICT_OWNER_EXPANSION: &str = "CONFIDENCE_STRICT_OWNER_EXPANSION";
 const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIVE";
 const RC_BOT_PR_CONFIDENCE_OVERRIDE: &str = "BOT_PR_CONFIDENCE_OVERRIDE";
-const PLAN_CONTRACT_VERSION: u32 = 2;
+const PLAN_CONTRACT_VERSION: u32 = 3;
 const SCOPE_CONTRACT_VERSION: u32 = 1;
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
@@ -253,7 +255,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   }
 
   for path in &changed_files {
-    let file_kind = classify_file_kind(path, &custom_patterns);
+    let file_kind = classify_file_kind(path);
+    let custom_surfaces = custom_surfaces_for_path(path, &custom_patterns);
     let mut owners: Vec<String> = ctx.graph.files_to_crates(&[Path::new(path)]).into_iter().collect();
     owners.sort();
 
@@ -349,10 +352,23 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       &kind_surfaces,
     );
 
+    if !custom_surfaces.is_empty() {
+      push_trace(
+        &mut trace,
+        &mut surface_refs,
+        RC_FILE_KIND_CUSTOM,
+        Some(path),
+        None,
+        None,
+        &custom_surfaces,
+      );
+    }
+
     planned_files.push(PlannedFile {
       path: path.clone(),
       kind: file_kind.kind,
       sub_kind: file_kind.sub_kind,
+      custom_surfaces,
       owners,
       owner_scope,
     });
@@ -747,17 +763,7 @@ fn compile_custom_patterns(ctx: &WorkspaceContext) -> Vec<(String, Pattern)> {
   patterns
 }
 
-fn classify_file_kind(path: &str, custom_patterns: &[(String, Pattern)]) -> FileKind {
-  for (name, pattern) in custom_patterns {
-    if pattern.matches(path) {
-      return FileKind {
-        kind: format!("custom:{}", name),
-        sub_kind: None,
-        reason_code: RC_FILE_KIND_CUSTOM,
-      };
-    }
-  }
-
+fn classify_file_kind(path: &str) -> FileKind {
   if path.ends_with(".rs") {
     if path.starts_with("benches/") || path.contains("/benches/") {
       return FileKind {
@@ -855,6 +861,18 @@ fn classify_file_kind(path: &str, custom_patterns: &[(String, Pattern)]) -> File
     sub_kind: None,
     reason_code: RC_FILE_KIND_UNCLASSIFIED,
   }
+}
+
+fn custom_surfaces_for_path(path: &str, custom_patterns: &[(String, Pattern)]) -> Vec<String> {
+  let mut surfaces = Vec::new();
+
+  for (name, pattern) in custom_patterns {
+    if pattern.matches(path) {
+      ensure_surface(&mut surfaces, &format!("custom:{}", name));
+    }
+  }
+
+  surfaces
 }
 
 fn is_script(path: &str) -> bool {
@@ -1094,10 +1112,20 @@ fn format_text(output: &PlanOutput, explain: bool) -> String {
     }
   }
   if !output.impact.direct_crates.is_empty() {
-    let _ = writeln!(out, "direct crates: {}", output.impact.direct_crates.join(", "));
+    let _ = writeln!(
+      out,
+      "direct crates ({}): {}",
+      output.impact.direct_crates.len(),
+      format_preview_list(&output.impact.direct_crates, 12)
+    );
   }
   if matches!(output.scope.mode, ExecutionScopeMode::Crates) && !output.scope.crates.is_empty() {
-    let _ = writeln!(out, "execution crates: {}", output.scope.crates.join(", "));
+    let _ = writeln!(
+      out,
+      "execution crates ({}): {}",
+      output.scope.crates.len(),
+      format_preview_list(&output.scope.crates, 12)
+    );
   }
   let _ = writeln!(out, "why: {}", top_reasons);
 

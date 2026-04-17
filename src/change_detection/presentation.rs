@@ -100,12 +100,12 @@ impl ChangeClassifier {
       let path = file.as_ref();
       let path_str = path.to_string_lossy();
 
-      // Check for infrastructure files that trigger rebuild_all
+      // Infrastructure and custom categories are additive. A path can both
+      // force rebuild_all and participate in custom CI routing.
       if self.is_infrastructure_file(&path_str) {
         result.rebuild_all = true;
         result.infrastructure_files.push(path_str.to_string());
         has_non_doc_changes = true;
-        continue;
       }
 
       // Check custom categories
@@ -202,6 +202,32 @@ mod tests {
 
     assert!(result.custom_categories.contains_key("verify"));
     assert_eq!(result.custom_categories["verify"].len(), 1);
+  }
+
+  #[test]
+  fn test_infrastructure_file_can_also_match_custom_category() {
+    let mut config = ChangeDetectionConfig {
+      infrastructure: vec![".github/**".to_string()],
+      ..Default::default()
+    };
+    config
+      .custom
+      .insert("merge_validation".to_string(), vec![".github/workflows/**".to_string()]);
+
+    let classifier = ChangeClassifier::new(&config);
+
+    let files = vec![PathBuf::from(".github/workflows/ci.yml")];
+    let result = classifier.classify(&files);
+
+    assert!(result.rebuild_all, "workflow changes should still require rebuild_all");
+    assert_eq!(
+      result.infrastructure_files,
+      vec![".github/workflows/ci.yml".to_string()]
+    );
+    assert!(
+      result.custom_categories.contains_key("merge_validation"),
+      "workflow changes should also match custom merge-validation routing"
+    );
   }
 
   #[test]
