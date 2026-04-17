@@ -146,7 +146,7 @@ This produces changelog entries, tags, crates.io publish, and GitHub release met
 
 ## GitHub Actions Integration
 
-For CI/CD integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) (`uses: loadingalias/cargo-rail-action@v3`) — a thin transport over `cargo rail plan -f github` that handles installation, checksum verification, and output publishing for job gating.
+For CI/CD integration, use [cargo-rail-action](https://github.com/loadingalias/cargo-rail-action) (`uses: loadingalias/cargo-rail-action@v4`) — a planner-first GitHub transport that handles installation, checksum verification, and output publishing for job gating.
 
 The action keeps CI behavior aligned with local `plan` + `run` workflows.
 

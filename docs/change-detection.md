@@ -36,7 +36,7 @@ cargo rail run --all --surface test
 ### CI Integration
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v3
+- uses: loadingalias/cargo-rail-action@v4
   id: plan
   with:
     since: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -236,7 +236,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: loadingalias/cargo-rail-action@v3
+      - uses: loadingalias/cargo-rail-action@v4
         id: plan
         with:
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
@@ -347,7 +347,7 @@ The most flexible pattern: use planner gates for surface decisions and the scope
 
 ```yaml
 - id: plan
-  uses: loadingalias/cargo-rail-action@v3
+  uses: loadingalias/cargo-rail-action@v4
 
 - name: Custom Test Suite
   if: steps.plan.outputs.test == 'true'

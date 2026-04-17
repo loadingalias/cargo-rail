@@ -82,7 +82,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: loadingalias/cargo-rail-action@v3
+      - uses: loadingalias/cargo-rail-action@v4
         id: rail
         with:
           mode: minimal

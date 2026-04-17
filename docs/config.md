@@ -378,7 +378,7 @@ core planner semantics.
 **CI gating pattern for custom surfaces:**
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v3
+- uses: loadingalias/cargo-rail-action@v4
   id: rail
 
 - name: Run benchmark suite

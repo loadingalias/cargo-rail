@@ -65,7 +65,7 @@ After (canonical pattern):
 
 ## Action migration (`cargo-rail-action`)
 
-`cargo-rail-action` is a thin transport over `cargo rail plan -f github`.
+`cargo-rail-action` is a planner-first GitHub transport over `cargo rail plan`.
 
 - Keep `mode: minimal` unless you explicitly need legacy projection outputs.
 - Gate jobs from action outputs, then execute with `cargo rail run`.
