@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/loadingalias/cargo-rail/compare/v0.11.0...v0.12.0) - 2026-04-17
+
+### 🐛 Bug Fixes
+
+- **ci**: pin cargo-rail-action v4.1.1 and update docs to v4 ([bb0a4f0](https://github.com/loadingalias/cargo-rail/commit/bb0a4f008f041d07acc8601fc189ff7108961f30))
+
+### 📦 Other Changes
+
+- cargo-rail: make custom planner surfaces additive and summarize large plan targets ([2c9f29c](https://github.com/loadingalias/cargo-rail/commit/2c9f29c3fa65193ef6e251465c291ef3d2bf5ec3))
+
+
+
 ## [0.11.0](https://github.com/loadingalias/cargo-rail/compare/v0.10.12...v0.11.0) - 2026-04-09
 
 ### ✨ Features
