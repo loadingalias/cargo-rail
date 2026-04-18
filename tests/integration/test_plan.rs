@@ -692,6 +692,50 @@ merge_validation = [".github/workflows/**"]
 }
 
 #[test]
+fn test_plan_configured_infra_pattern_adds_infra_surface() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-configured-infra-pattern")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+
+  let config = r#"[change-detection]
+infrastructure = ["notes/**"]
+"#;
+  std::fs::write(ws.path.join(".config/rail.toml"), config)?;
+  ws.commit("configure infra pattern")?;
+
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  let notes_dir = ws.path.join("notes");
+  std::fs::create_dir_all(&notes_dir)?;
+  std::fs::write(notes_dir.join("archive.bin"), "payload\n")?;
+  ws.commit("add notes payload")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(
+    output.status.success(),
+    "plan should succeed with configured infra pattern"
+  );
+
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["files"][0]["kind"], Value::String("unknown".to_string()));
+  assert_eq!(json["surfaces"]["infra"]["enabled"], Value::Bool(true));
+  assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(false));
+  assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(false));
+
+  let trace = json["trace"].as_array().expect("trace should be array");
+  assert!(
+    trace
+      .iter()
+      .any(|entry| entry["code"] == Value::String("FILE_KIND_INFRA_PATTERN".to_string())),
+    "trace should include FILE_KIND_INFRA_PATTERN for configured infra matching"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_plan_file_can_enable_multiple_custom_surfaces() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-multiple-custom-overlap")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
@@ -984,7 +1028,9 @@ conservative_unclassified_owner_fallback = false
   assert!(output.status.success(), "plan should succeed");
 
   let json: Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(json["surfaces"]["infra"]["enabled"], Value::Bool(true));
+  assert_eq!(json["files"][0]["kind"], Value::String("unknown".to_string()));
+  assert_eq!(json["surfaces"]["docs"]["enabled"], Value::Bool(true));
+  assert_eq!(json["surfaces"]["infra"]["enabled"], Value::Bool(false));
   assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(false));
   assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(false));
 
@@ -1104,10 +1150,10 @@ fn test_plan_nested_gitignore_is_unclassified() -> Result<()> {
 
   // Nested .gitignore should NOT be classified as config:repo
   // It's a crate-owned file and falls to unclassified
-  assert_ne!(
+  assert_eq!(
     json["files"][0]["kind"],
-    Value::String("config".to_string()),
-    "nested .gitignore should NOT be config kind"
+    Value::String("unknown".to_string()),
+    "nested .gitignore should classify as unknown"
   );
 
   Ok(())

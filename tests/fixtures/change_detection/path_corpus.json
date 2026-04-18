@@ -1,0 +1,73 @@
+[
+  {
+    "path": "README.md",
+    "kind": "docs",
+    "surfaces": ["docs"]
+  },
+  {
+    "path": "docs/guide.md",
+    "kind": "docs",
+    "surfaces": ["docs"]
+  },
+  {
+    "path": ".github/workflows/ci.yml",
+    "kind": "ci",
+    "surfaces": ["infra"]
+  },
+  {
+    "path": "config/pipeline.yaml",
+    "kind": "unknown",
+    "surfaces": ["docs"]
+  },
+  {
+    "path": "scripts/check.sh",
+    "kind": "script",
+    "surfaces": ["infra"]
+  },
+  {
+    "path": "Cargo.toml",
+    "kind": "toml",
+    "sub_kind": "workspace",
+    "surfaces": ["infra", "build", "test"]
+  },
+  {
+    "path": "Cargo.lock",
+    "kind": "toml",
+    "sub_kind": "lock",
+    "surfaces": ["infra", "build", "test"]
+  },
+  {
+    "path": "vendor/foreign/Cargo.lock",
+    "kind": "unknown",
+    "surfaces": ["docs"]
+  },
+  {
+    "path": "crates/lib-a/Cargo.toml",
+    "kind": "toml",
+    "sub_kind": "manifest",
+    "surfaces": ["build", "test"]
+  },
+  {
+    "path": "rust-toolchain.toml",
+    "kind": "toml",
+    "sub_kind": "tooling",
+    "surfaces": ["infra", "build", "test"]
+  },
+  {
+    "path": "crates/lib-a/benches/smoke.rs",
+    "kind": "rust",
+    "sub_kind": "bench",
+    "surfaces": ["bench"]
+  },
+  {
+    "path": ".gitignore",
+    "kind": "config",
+    "sub_kind": "repo",
+    "surfaces": ["docs"]
+  },
+  {
+    "path": "notes/archive.bin",
+    "kind": "unknown",
+    "surfaces": ["docs"]
+  }
+]

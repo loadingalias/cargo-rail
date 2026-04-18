@@ -1,28 +1,25 @@
-//! Advanced change detection and classification
+//! Canonical change detection.
 //!
-//! This module provides intelligent file change classification with a layered architecture:
+//! The planner taxonomy in `classify` is the source of truth for every
+//! higher-level layer:
 //!
-//! - **Layer 1: `classify`** - Pure file classification by path (fast, no I/O)
-//!   - `ChangeKind`: Source, Test, Example, BuildScript, Config, Documentation, Other
-//!
-//! - **Layer 2: `workspace::change_analyzer`** - Graph + cargo aware impact analysis
-//!   - `ImpactReport`: Direct crates, transitive dependents, rebuild requirements
-//!   - Proc-macro detection via cached workspace state
-//!
-//! - **Layer 3: `presentation`** - User-configurable presentation choices
-//!   - `ChangeClassification`: docs-only, rebuild-all, custom categories
-//!   - Driven by `ChangeDetectionConfig` from rail.toml
+//! - `classify` provides the canonical path profile plus planner
+//!   `kind` / `sub_kind` projection and configured pattern helpers.
+//! - [`workspace::change_analyzer`](crate::workspace::change_analyzer)
+//!   buckets those canonical profiles into graph-aware impact reports.
+//! - `presentation` applies configured infrastructure and custom-pattern
+//!   overlays without re-implementing path heuristics.
 //!
 //! # Usage
 //!
 //! ```text
-//! // Layer 1: Quick file classification
-//! let kind = classify_file(path);
+//! // Canonical path profile / planner taxonomy
+//! let profile = classify_path(path);
 //!
 //! // Layer 2: Full impact analysis (requires workspace context)
 //! let impact = ChangeImpact::new(&ctx).analyze_changes("main", None)?;
 //!
-//! // Layer 3: Presentation classification
+//! // Layer 3: Presentation helpers
 //! let classifier = ChangeClassifier::new(&config.change_detection);
 //! let classification = classifier.classify(&changed_files);
 //! ```
@@ -30,8 +27,8 @@
 pub mod classify;
 pub mod presentation;
 
-// Layer 1: File classification types
-pub use classify::{ChangeKind, ConfigKind, TestKind};
+// Canonical path classification types
+pub use classify::{ChangeKind, ConfigKind, FileProfile, TestKind, classify_file, classify_path};
 
 // Layer 3: Presentation classification
 pub use presentation::{ChangeClassification, ChangeClassifier};

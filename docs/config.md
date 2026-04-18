@@ -491,7 +491,7 @@ User-defined profile schema:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `surfaces` | `string[]` | yes | Built-in surfaces to execute: `build`, `test`, `bench`, `docs`, `infra`. **Note:** Custom surfaces (defined in `[change-detection.custom]`) cannot be used here—they are plan outputs for CI job gating, not profile inputs. |
+| `surfaces` | `string[]` | yes | Built-in run surfaces to execute: `build`, `test`, `bench`, `docs`. **Note:** `infra` and custom surfaces (defined in `[change-detection.custom]`) are planner outputs for CI job gating, not profile inputs. |
 | `run_args` | `string[]` | no | Args prepended before CLI `RUN_ARGS`. |
 | `since` | `string?` | no | Default `--since` baseline when CLI does not pass `--since`/`--merge-base`. |
 | `merge_base` | `bool?` | no | Default merge-base mode when CLI does not pass `--since`/`--merge-base`. |

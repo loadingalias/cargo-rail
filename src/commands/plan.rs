@@ -1,12 +1,18 @@
 //! `cargo rail plan` - deterministic file-first change planner.
 
+use crate::change_detection::classify::{
+  FileProfile, RC_FILE_KIND_CI, RC_FILE_KIND_CUSTOM, RC_FILE_KIND_DOCS, RC_FILE_KIND_INFRA_PATTERN,
+  RC_FILE_KIND_REPO_CONFIG, RC_FILE_KIND_RUST_BENCH, RC_FILE_KIND_RUST_SRC, RC_FILE_KIND_RUST_TEST,
+  RC_FILE_KIND_SCRIPT, RC_FILE_KIND_TOML_LOCKFILE, RC_FILE_KIND_TOML_MANIFEST, RC_FILE_KIND_TOML_TOOLING,
+  RC_FILE_KIND_TOML_WORKSPACE, RC_FILE_KIND_UNCLASSIFIED, classify_path, compile_custom_patterns,
+  compile_infrastructure_patterns, custom_surface_names, custom_surfaces_for_path, matches_infrastructure_patterns,
+};
 use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::ConfidenceProfile;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
-use glob::Pattern;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
@@ -143,25 +149,6 @@ pub(crate) struct Reproducibility {
   pub(crate) git_shallow_clone: bool,
 }
 
-#[derive(Debug)]
-struct FileKind {
-  kind: String,
-  sub_kind: Option<String>,
-  reason_code: &'static str,
-}
-
-const RC_FILE_KIND_RUST_SRC: &str = "FILE_KIND_RUST_SRC";
-const RC_FILE_KIND_RUST_TEST: &str = "FILE_KIND_RUST_TEST";
-const RC_FILE_KIND_RUST_BENCH: &str = "FILE_KIND_RUST_BENCH";
-const RC_FILE_KIND_TOML_MANIFEST: &str = "FILE_KIND_TOML_MANIFEST";
-const RC_FILE_KIND_TOML_WORKSPACE: &str = "FILE_KIND_TOML_WORKSPACE";
-const RC_FILE_KIND_TOML_TOOLING: &str = "FILE_KIND_TOML_TOOLING";
-const RC_FILE_KIND_CI: &str = "FILE_KIND_CI";
-const RC_FILE_KIND_SCRIPT: &str = "FILE_KIND_SCRIPT";
-const RC_FILE_KIND_DOCS: &str = "FILE_KIND_DOCS";
-const RC_FILE_KIND_REPO_CONFIG: &str = "FILE_KIND_REPO_CONFIG";
-const RC_FILE_KIND_CUSTOM: &str = "FILE_KIND_CUSTOM";
-const RC_FILE_KIND_UNCLASSIFIED: &str = "FILE_KIND_UNCLASSIFIED";
 const RC_FILE_OWNS_CRATE_DIRECT: &str = "FILE_OWNS_CRATE_DIRECT";
 const RC_TRANSITIVE_DEPENDS_ON_DIRECT: &str = "TRANSITIVE_DEPENDS_ON_DIRECT";
 const RC_OWNER_UNCERTAIN_FALLBACK: &str = "OWNER_UNCERTAIN_FALLBACK";
@@ -222,7 +209,10 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   let changed_files = collect_changed_files(ctx, &refs)?;
   let confidence = resolve_confidence_profile(ctx, opts)?;
 
-  let custom_patterns = compile_custom_patterns(ctx);
+  let change_detection_config = ctx.config.as_ref().map(|config| &config.change_detection);
+  let infrastructure_patterns = compile_infrastructure_patterns(change_detection_config);
+  let custom_patterns = compile_custom_patterns(change_detection_config);
+  let configured_custom_surfaces = custom_surface_names(&custom_patterns);
 
   let changed_file_count = changed_files.len();
   let mut trace = Vec::with_capacity(changed_file_count * 4); // Multiple trace entries per file
@@ -255,7 +245,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   }
 
   for path in &changed_files {
-    let file_kind = classify_file_kind(path);
+    let file_kind = classify_path(Path::new(path));
     let custom_surfaces = custom_surfaces_for_path(path, &custom_patterns);
     let mut owners: Vec<String> = ctx.graph.files_to_crates(&[Path::new(path)]).into_iter().collect();
     owners.sort();
@@ -275,9 +265,16 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
     let owner_scope = owner_scope(path, &owners);
 
-    let mut kind_surfaces = derive_surfaces_for_kind(&file_kind);
+    let mut kind_surfaces: Vec<String> = file_kind
+      .default_surfaces()
+      .iter()
+      .map(|surface| (*surface).to_string())
+      .collect();
+    let has_builtin_infra_surface = kind_surfaces.iter().any(|surface| surface == "infra");
+    let extra_infra_surface =
+      !has_builtin_infra_surface && matches_infrastructure_patterns(path, &infrastructure_patterns);
 
-    let apply_owner_uncertain_fallback = file_kind.reason_code == RC_FILE_KIND_UNCLASSIFIED
+    let apply_owner_uncertain_fallback = file_kind == FileProfile::Unknown
       && !owners.is_empty()
       && confidence.profile != ConfidenceProfile::Fast
       && conservative_owner_fallback_enabled(ctx);
@@ -319,7 +316,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       }
     }
 
-    let baseline_transitive_seed = file_kind_seeds_build_test_transitive(&file_kind) || apply_owner_uncertain_fallback;
+    let baseline_transitive_seed = file_kind.seeds_build_test_transitive() || apply_owner_uncertain_fallback;
     let should_seed_build_test_transitive = match confidence.profile {
       ConfidenceProfile::Strict => !owners.is_empty() || baseline_transitive_seed,
       ConfidenceProfile::Balanced => baseline_transitive_seed,
@@ -345,12 +342,25 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     push_trace(
       &mut trace,
       &mut surface_refs,
-      file_kind.reason_code,
+      file_kind.reason_code(),
       Some(path),
       None,
       None,
       &kind_surfaces,
     );
+
+    if extra_infra_surface {
+      let infra_surfaces = vec!["infra".to_string()];
+      push_trace(
+        &mut trace,
+        &mut surface_refs,
+        RC_FILE_KIND_INFRA_PATTERN,
+        Some(path),
+        None,
+        None,
+        &infra_surfaces,
+      );
+    }
 
     if !custom_surfaces.is_empty() {
       push_trace(
@@ -366,8 +376,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
     planned_files.push(PlannedFile {
       path: path.clone(),
-      kind: file_kind.kind,
-      sub_kind: file_kind.sub_kind,
+      kind: file_kind.planned_kind().to_string(),
+      sub_kind: file_kind.planned_sub_kind().map(str::to_string),
       custom_surfaces,
       owners,
       owner_scope,
@@ -377,7 +387,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   let transitive_crates = compute_transitive_impact(ctx, &direct_crates)?;
   emit_transitive_build_test_trace(ctx, &build_test_seed_crates, &mut trace, &mut surface_refs)?;
 
-  let surfaces = build_surfaces(&surface_refs, &custom_patterns);
+  let surfaces = build_surfaces(&surface_refs, &configured_custom_surfaces);
 
   // Compute reproducibility metadata
   let git_merge_base = if refs.merge_base {
@@ -605,9 +615,12 @@ fn reason_description(code: &str) -> &'static str {
     RC_FILE_KIND_TOML_MANIFEST => "Cargo.toml changed",
     RC_FILE_KIND_TOML_WORKSPACE => "Workspace Cargo.toml changed",
     RC_FILE_KIND_TOML_TOOLING => "Tooling config changed",
+    RC_FILE_KIND_TOML_LOCKFILE => "Cargo.lock changed",
     RC_FILE_KIND_CI => "CI or workflow file changed",
     RC_FILE_KIND_SCRIPT => "Script file changed",
     RC_FILE_KIND_DOCS => "Documentation changed",
+    RC_FILE_KIND_REPO_CONFIG => "Repository config changed",
+    RC_FILE_KIND_INFRA_PATTERN => "Configured infrastructure pattern matched",
     RC_FILE_KIND_CUSTOM => "Custom pattern matched",
     RC_FILE_KIND_UNCLASSIFIED => "Unclassified file changed",
     RC_FILE_OWNS_CRATE_DIRECT => "File directly owns a crate",
@@ -739,197 +752,6 @@ fn collect_changed_files(ctx: &WorkspaceContext, refs: &ResolvedRefs) -> RailRes
   Ok(files)
 }
 
-fn compile_custom_patterns(ctx: &WorkspaceContext) -> Vec<(String, Pattern)> {
-  let mut patterns = Vec::new();
-
-  let Some(config) = &ctx.config else {
-    return patterns;
-  };
-
-  let mut names: Vec<String> = config.change_detection.custom.keys().cloned().collect();
-  names.sort();
-
-  for name in names {
-    let Some(globs) = config.change_detection.custom.get(&name) else {
-      continue;
-    };
-    for glob in globs {
-      if let Ok(pattern) = Pattern::new(glob) {
-        patterns.push((name.clone(), pattern));
-      }
-    }
-  }
-
-  patterns
-}
-
-fn classify_file_kind(path: &str) -> FileKind {
-  if path.ends_with(".rs") {
-    if path.starts_with("benches/") || path.contains("/benches/") {
-      return FileKind {
-        kind: "rust".to_string(),
-        sub_kind: Some("bench".to_string()),
-        reason_code: RC_FILE_KIND_RUST_BENCH,
-      };
-    }
-
-    if path.starts_with("tests/") || path.contains("/tests/") {
-      return FileKind {
-        kind: "rust".to_string(),
-        sub_kind: Some("test".to_string()),
-        reason_code: RC_FILE_KIND_RUST_TEST,
-      };
-    }
-
-    return FileKind {
-      kind: "rust".to_string(),
-      sub_kind: Some("src".to_string()),
-      reason_code: RC_FILE_KIND_RUST_SRC,
-    };
-  }
-
-  if path == "rust-toolchain.toml"
-    || path == "rust-toolchain"
-    || path.ends_with(".cargo/config")
-    || path.ends_with(".cargo/config.toml")
-  {
-    return FileKind {
-      kind: "toml".to_string(),
-      sub_kind: Some("tooling".to_string()),
-      reason_code: RC_FILE_KIND_TOML_TOOLING,
-    };
-  }
-
-  if path.ends_with(".toml") {
-    if path == "Cargo.toml" {
-      return FileKind {
-        kind: "toml".to_string(),
-        sub_kind: Some("workspace".to_string()),
-        reason_code: RC_FILE_KIND_TOML_WORKSPACE,
-      };
-    }
-
-    if path.ends_with("Cargo.toml") {
-      return FileKind {
-        kind: "toml".to_string(),
-        sub_kind: Some("manifest".to_string()),
-        reason_code: RC_FILE_KIND_TOML_MANIFEST,
-      };
-    }
-
-    return FileKind {
-      kind: "toml".to_string(),
-      sub_kind: Some("tooling".to_string()),
-      reason_code: RC_FILE_KIND_TOML_TOOLING,
-    };
-  }
-
-  if path.starts_with(".github/") || path.ends_with(".yml") || path.ends_with(".yaml") {
-    return FileKind {
-      kind: "ci".to_string(),
-      sub_kind: None,
-      reason_code: RC_FILE_KIND_CI,
-    };
-  }
-
-  if is_script(path) {
-    return FileKind {
-      kind: "script".to_string(),
-      sub_kind: None,
-      reason_code: RC_FILE_KIND_SCRIPT,
-    };
-  }
-
-  if is_docs(path) {
-    return FileKind {
-      kind: "docs".to_string(),
-      sub_kind: None,
-      reason_code: RC_FILE_KIND_DOCS,
-    };
-  }
-
-  if is_repo_config(path) {
-    return FileKind {
-      kind: "config".to_string(),
-      sub_kind: Some("repo".to_string()),
-      reason_code: RC_FILE_KIND_REPO_CONFIG,
-    };
-  }
-
-  FileKind {
-    kind: "script".to_string(),
-    sub_kind: None,
-    reason_code: RC_FILE_KIND_UNCLASSIFIED,
-  }
-}
-
-fn custom_surfaces_for_path(path: &str, custom_patterns: &[(String, Pattern)]) -> Vec<String> {
-  let mut surfaces = Vec::new();
-
-  for (name, pattern) in custom_patterns {
-    if pattern.matches(path) {
-      ensure_surface(&mut surfaces, &format!("custom:{}", name));
-    }
-  }
-
-  surfaces
-}
-
-fn is_script(path: &str) -> bool {
-  path.ends_with(".sh")
-    || path.ends_with(".bash")
-    || path.ends_with(".zsh")
-    || path.ends_with(".ps1")
-    || path.ends_with(".py")
-    || path.ends_with(".rb")
-    || path.ends_with(".pl")
-    || path == "justfile"
-    || path == "Justfile"
-    || path == "Makefile"
-    || path == "makefile"
-    || path == "GNUmakefile"
-}
-
-fn is_docs(path: &str) -> bool {
-  path.ends_with(".md")
-    || path.ends_with(".txt")
-    || path.ends_with(".adoc")
-    || path.ends_with(".rst")
-    || path.ends_with("LICENSE")
-    || path.ends_with("README")
-}
-
-/// Repository configuration files that don't affect Rust build.
-///
-/// These are root-level dotfiles and config files that configure
-/// tooling, editors, or repository behavior but don't require
-/// rebuilding or retesting Rust code.
-fn is_repo_config(path: &str) -> bool {
-  // Only match root-level files (no directory separator)
-  if path.contains('/') {
-    return false;
-  }
-
-  // Common dotfiles
-  matches!(
-    path,
-    ".gitignore"
-      | ".gitattributes"
-      | ".editorconfig"
-      | ".dockerignore"
-      | ".prettierrc"
-      | ".prettierignore"
-      | ".eslintrc"
-      | ".eslintignore"
-      | ".npmrc"
-      | ".nvmrc"
-      | ".node-version"
-      | ".python-version"
-      | ".ruby-version"
-      | ".tool-versions"
-  )
-}
-
 fn owner_scope(path: &str, owners: &[String]) -> String {
   if !owners.is_empty() {
     return "crate".to_string();
@@ -945,30 +767,6 @@ fn owner_scope(path: &str, owners: &[String]) -> String {
     "workspace".to_string()
   } else {
     "unowned".to_string()
-  }
-}
-
-fn derive_surfaces_for_kind(kind: &FileKind) -> Vec<String> {
-  // Static slices for common surface combinations
-  static BUILD_TEST: &[&str] = &["build", "test"];
-  static TEST_ONLY: &[&str] = &["test"];
-  static BENCH_ONLY: &[&str] = &["bench"];
-  static INFRA_BUILD_TEST: &[&str] = &["infra", "build", "test"];
-  static INFRA_ONLY: &[&str] = &["infra"];
-  static DOCS_ONLY: &[&str] = &["docs"];
-
-  match (kind.kind.as_str(), kind.sub_kind.as_deref()) {
-    ("rust", Some("src")) => BUILD_TEST.iter().map(|&s| String::from(s)).collect(),
-    ("rust", Some("test")) => TEST_ONLY.iter().map(|&s| String::from(s)).collect(),
-    ("rust", Some("bench")) => BENCH_ONLY.iter().map(|&s| String::from(s)).collect(),
-    ("toml", Some("manifest")) => BUILD_TEST.iter().map(|&s| String::from(s)).collect(),
-    ("toml", Some("workspace")) | ("toml", Some("tooling")) => {
-      INFRA_BUILD_TEST.iter().map(|&s| String::from(s)).collect()
-    }
-    ("ci", _) | ("script", _) => INFRA_ONLY.iter().map(|&s| String::from(s)).collect(),
-    ("docs", _) | ("config", Some("repo")) => DOCS_ONLY.iter().map(|&s| String::from(s)).collect(),
-    (custom, _) if custom.starts_with("custom:") => vec![String::from(custom)],
-    _ => DOCS_ONLY.iter().map(|&s| String::from(s)).collect(),
   }
 }
 
@@ -1011,27 +809,14 @@ fn emit_transitive_build_test_trace(
   Ok(())
 }
 
-fn file_kind_seeds_build_test_transitive(kind: &FileKind) -> bool {
-  matches!(
-    (kind.kind.as_str(), kind.sub_kind.as_deref()),
-    ("rust", Some("src")) | ("toml", Some("manifest")) | ("toml", Some("workspace")) | ("toml", Some("tooling"))
-  )
-}
-
 fn build_surfaces(
   surface_refs: &BTreeMap<String, BTreeSet<u32>>,
-  custom_patterns: &[(String, Pattern)],
+  custom_surfaces: &[String],
 ) -> BTreeMap<String, SurfaceDecision> {
   // Use static slice and map to owned strings
   static BUILTIN_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
   let mut surface_names: Vec<String> = BUILTIN_SURFACES.iter().map(|&s| String::from(s)).collect();
-
-  let mut custom_names: BTreeSet<String> = BTreeSet::new();
-  for (name, _) in custom_patterns {
-    custom_names.insert(format!("custom:{}", name));
-  }
-
-  surface_names.extend(custom_names);
+  surface_names.extend(custom_surfaces.iter().cloned());
 
   let mut result = BTreeMap::new();
   for surface in surface_names {

@@ -461,6 +461,39 @@ surfaces = ["not-a-surface"]
 }
 
 #[test]
+fn test_config_validate_rejects_infra_run_profile_surface() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-run-infra-surface")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  let config_path = ws.path.join(".config").join("rail.toml");
+  fs::write(
+    &config_path,
+    r#"[run.profile.bad]
+surfaces = ["infra"]
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(!output.status.success(), "infra run surface should fail validation");
+
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["valid"], false);
+  let errors = json["errors"].as_array().unwrap();
+  assert!(
+    errors
+      .iter()
+      .filter_map(|e| e["message"].as_str())
+      .any(|msg| msg.contains("`infra` is a planner OUTPUT")),
+    "expected infra planner-output error. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_config_validate_strict_reports_unknown_run_profile_key() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-run-unknown-key")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;

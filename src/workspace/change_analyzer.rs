@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::change_detection::classify::{ChangeKind, classify_file};
+use crate::change_detection::classify::{FileProfile, classify_path};
 
 /// Categorization of changed files by type
 #[derive(Debug, Default)]
@@ -188,29 +188,22 @@ impl<'a> ChangeImpact<'a> {
   fn categorize_changes(&self, files: &[(PathBuf, char)]) -> ChangeCategories {
     let mut categories = ChangeCategories::default();
 
-    // Use pre-computed proc-macro crates from CargoState (O(1) lookup per file)
-    let proc_macro_crates = self.ctx.cargo.proc_macro_crates();
-
     for (path, _change_type) in files {
-      let mut kind = classify_file(path);
-
-      // Enhance classification with proc-macro detection (O(1) lookup)
-      if let ChangeKind::Source { is_proc_macro } = kind
-        && !is_proc_macro
-        && let Some(crate_name) = self.ctx.graph.file_to_crate(path)
-        && proc_macro_crates.contains(&crate_name)
-      {
-        kind = ChangeKind::Source { is_proc_macro: true };
-      }
-
-      match kind {
-        ChangeKind::Source { .. } => categories.source_files.push(path.clone()),
-        ChangeKind::Test { .. } => categories.test_files.push(path.clone()),
-        ChangeKind::Example => categories.example_files.push(path.clone()),
-        ChangeKind::BuildScript => categories.build_scripts.push(path.clone()),
-        ChangeKind::Config { .. } => categories.config_files.push(path.clone()),
-        ChangeKind::Documentation => categories.doc_files.push(path.clone()),
-        ChangeKind::Other => categories.other_files.push(path.clone()),
+      match classify_path(path) {
+        FileProfile::RustSrc => categories.source_files.push(path.clone()),
+        FileProfile::RustTest | FileProfile::RustBench => categories.test_files.push(path.clone()),
+        FileProfile::RustExample => categories.example_files.push(path.clone()),
+        FileProfile::RustBuildScript => categories.build_scripts.push(path.clone()),
+        FileProfile::TomlManifest
+        | FileProfile::TomlWorkspace
+        | FileProfile::TomlCargoConfig
+        | FileProfile::TomlRustToolchain
+        | FileProfile::TomlTooling
+        | FileProfile::CargoLock => {
+          categories.config_files.push(path.clone());
+        }
+        FileProfile::Docs | FileProfile::RepoConfig => categories.doc_files.push(path.clone()),
+        FileProfile::Ci | FileProfile::Script | FileProfile::Unknown => categories.other_files.push(path.clone()),
       }
     }
 
@@ -272,6 +265,7 @@ mod tests {
 
     assert!(!cat.is_docs_only());
     assert!(cat.has_example_changes());
+    assert!(!cat.has_source_changes());
   }
 
   #[test]

@@ -47,6 +47,7 @@ pub struct RunOptions {
 /// Execute `run` with planner-driven surface selection.
 pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   let effective = resolve_effective_inputs(ctx, &opts)?;
+  validate_executable_surfaces(&effective.surfaces)?;
   let mut plan = None;
 
   if !opts.all {
@@ -130,15 +131,10 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
         &[],
         &effective.run_args,
       )?,
-      "infra" => {
-        if opts.dry_run || opts.explain {
-          println!("surface `infra` selected; no built-in executor yet");
-        }
-      }
       unknown => {
         return Err(RailError::with_help(
           format!("unsupported surface '{}'", unknown),
-          "use --surface build|test|bench|docs|infra",
+          "use --surface build|test|bench|docs",
         ));
       }
     }
@@ -307,6 +303,38 @@ fn builtin_profile_surfaces(profile: &str) -> Option<Vec<String>> {
     "nightly" => Some(vec!["build".to_string(), "test".to_string(), "docs".to_string()]),
     _ => None,
   }
+}
+
+fn validate_executable_surfaces(surfaces: &[String]) -> RailResult<()> {
+  const EXECUTABLE_SURFACES: &[&str] = &["build", "test", "bench", "docs"];
+
+  for surface in surfaces {
+    if surface == "infra" {
+      return Err(RailError::with_help(
+        "surface 'infra' is a planner output, not an executable run surface",
+        "gate CI on `cargo rail plan` output, or execute build|test|bench|docs",
+      ));
+    }
+
+    if surface.starts_with("custom:") {
+      return Err(RailError::with_help(
+        format!(
+          "surface '{}' is a planner output, not an executable run surface",
+          surface
+        ),
+        "extract custom surfaces from `cargo rail plan -f json` for CI gating",
+      ));
+    }
+
+    if !EXECUTABLE_SURFACES.contains(&surface.as_str()) {
+      return Err(RailError::with_help(
+        format!("unsupported surface '{}'", surface),
+        "use --surface build|test|bench|docs",
+      ));
+    }
+  }
+
+  Ok(())
 }
 
 fn dedup_surfaces(mut surfaces: Vec<String>) -> Vec<String> {

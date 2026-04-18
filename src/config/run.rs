@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 const BUILTIN_PROFILE_NAMES: &[&str] = &["local", "ci", "nightly"];
-const SUPPORTED_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
+const SUPPORTED_SURFACES: &[&str] = &["build", "test", "bench", "docs"];
 const ALLOWED_RUN_ARG_TOKENS: &[&str] = &["workspace_root", "base_ref", "cargo_args"];
 const ALLOWED_SINCE_TOKENS: &[&str] = &["workspace_root", "base_ref"];
 
@@ -92,6 +92,21 @@ impl RunProfile {
     }
 
     for surface in &self.surfaces {
+      if surface == "infra" {
+        return Err(ConfigError::InvalidField {
+          field: format!("run.profile.{}.surfaces", profile_name),
+          reason: format!(
+            "invalid surface '{}'\n\n\
+             `infra` is a planner OUTPUT for CI gating, not a run surface.\n\
+             Valid profile surfaces: {}\n\n\
+             To gate CI jobs on infra, extract it from plan JSON output:\n  \
+             INFRA=$(echo \"$PLAN_JSON\" | jq -r '.surfaces.infra.enabled')",
+            surface,
+            SUPPORTED_SURFACES.join(", ")
+          ),
+        });
+      }
+
       // custom:* surfaces are plan OUTPUTS, not profile inputs
       if surface.starts_with("custom:") {
         return Err(ConfigError::InvalidField {
@@ -101,7 +116,7 @@ impl RunProfile {
              Custom surfaces are plan OUTPUTS for CI gating, not profile inputs.\n\
              Valid profile surfaces: {}\n\n\
              To gate CI jobs on custom surfaces, extract from plan JSON output:\n  \
-             WORKLOADS=$(echo \"$PLAN_JSON\" | jq -r '.surfaces[\"custom:workloads\"]')",
+             WORKLOADS=$(echo \"$PLAN_JSON\" | jq -r '.surfaces[\"custom:workloads\"].enabled')",
             surface,
             SUPPORTED_SURFACES.join(", ")
           ),
@@ -271,6 +286,22 @@ mod tests {
     let msg = err.to_string();
     assert!(msg.contains("invalid surface 'custom:workloads'"));
     assert!(msg.contains("plan OUTPUTS"));
+  }
+
+  #[test]
+  fn validate_rejects_infra_surface_in_profile() {
+    let mut cfg = RunConfig::default();
+    cfg.profiles.insert(
+      "ci".to_string(),
+      RunProfile {
+        surfaces: vec!["infra".to_string()],
+        ..RunProfile::default()
+      },
+    );
+    let err = cfg.validate().expect_err("infra surface in profile should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("invalid surface 'infra'"));
+    assert!(msg.contains("planner OUTPUT"));
   }
 
   #[test]

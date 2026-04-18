@@ -8,9 +8,11 @@
 //! This layer applies user-configurable rules (from ChangeDetectionConfig) to classify
 //! changed files for presentation to the user or CI systems.
 
-use crate::change_detection::classify::{ChangeKind, classify_file};
+use crate::change_detection::classify::{
+  classify_path, compile_custom_patterns, compile_infrastructure_patterns, custom_surfaces_for_path,
+  matches_infrastructure_patterns,
+};
 use crate::config::ChangeDetectionConfig;
-use glob::Pattern;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
@@ -52,34 +54,17 @@ impl ChangeClassification {
 /// Applies configuration rules to classify changes for display/CI integration.
 pub struct ChangeClassifier {
   /// Compiled infrastructure patterns
-  infra_patterns: Vec<Pattern>,
+  infra_patterns: Vec<glob::Pattern>,
   /// Compiled custom category patterns: (category_name, patterns)
-  custom_patterns: Vec<(String, Vec<Pattern>)>,
+  custom_patterns: Vec<(String, glob::Pattern)>,
 }
 
 impl ChangeClassifier {
   /// Create a new classifier from configuration
   pub fn new(config: &ChangeDetectionConfig) -> Self {
-    // Compile infrastructure patterns
-    let infra_patterns: Vec<Pattern> = config
-      .infrastructure
-      .iter()
-      .filter_map(|p| Pattern::new(p).ok())
-      .collect();
-
-    // Compile custom category patterns
-    let custom_patterns: Vec<(String, Vec<Pattern>)> = config
-      .custom
-      .iter()
-      .map(|(category, patterns)| {
-        let compiled: Vec<Pattern> = patterns.iter().filter_map(|p| Pattern::new(p).ok()).collect();
-        (category.clone(), compiled)
-      })
-      .collect();
-
     Self {
-      infra_patterns,
-      custom_patterns,
+      infra_patterns: compile_infrastructure_patterns(Some(config)),
+      custom_patterns: compile_custom_patterns(Some(config)),
     }
   }
 
@@ -99,38 +84,35 @@ impl ChangeClassifier {
     for file in files {
       let path = file.as_ref();
       let path_str = path.to_string_lossy();
+      let profile = classify_path(path);
+      let builtin_infra = profile.default_surfaces().contains(&"infra");
+      let configured_infra = matches_infrastructure_patterns(&path_str, &self.infra_patterns);
+      let effective_infra = builtin_infra || configured_infra;
 
-      // Infrastructure and custom categories are additive. A path can both
-      // force rebuild_all and participate in custom CI routing.
-      if self.is_infrastructure_file(&path_str) {
+      if effective_infra {
         result.rebuild_all = true;
-        result.infrastructure_files.push(path_str.to_string());
+        if !result
+          .infrastructure_files
+          .iter()
+          .any(|existing| existing == path_str.as_ref())
+        {
+          result.infrastructure_files.push(path_str.to_string());
+        }
         has_non_doc_changes = true;
       }
 
-      // Check custom categories
-      for (category, patterns) in &self.custom_patterns {
-        for pattern in patterns {
-          if pattern.matches(&path_str) {
-            result
-              .custom_categories
-              .entry(category.clone())
-              .or_default()
-              .push(path_str.to_string());
-            break; // Only match once per category per file
-          }
+      for surface in custom_surfaces_for_path(&path_str, &self.custom_patterns) {
+        let Some(category) = surface.strip_prefix("custom:") else {
+          continue;
+        };
+        let matches = result.custom_categories.entry(category.to_string()).or_default();
+        if !matches.iter().any(|existing| existing == path_str.as_ref()) {
+          matches.push(path_str.to_string());
         }
       }
 
-      // Check file classification for docs-only detection
-      let kind = classify_file(path);
-      match kind {
-        ChangeKind::Documentation => {
-          // Still potentially docs_only
-        }
-        _ => {
-          has_non_doc_changes = true;
-        }
+      if !profile.is_docs_only() {
+        has_non_doc_changes = true;
       }
     }
 
@@ -138,11 +120,6 @@ impl ChangeClassifier {
     result.docs_only = !files.is_empty() && !has_non_doc_changes;
 
     result
-  }
-
-  /// Check if a file path matches infrastructure patterns
-  fn is_infrastructure_file(&self, path_str: &str) -> bool {
-    self.infra_patterns.iter().any(|p| p.matches(path_str))
   }
 }
 

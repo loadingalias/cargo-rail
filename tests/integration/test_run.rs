@@ -115,6 +115,27 @@ fn test_runner_ci_only_change_skips_tests() -> Result<()> {
 }
 
 #[test]
+fn test_runner_rejects_infra_surface() -> Result<()> {
+  let ws = TestWorkspace::new_named("run-reject-infra-surface")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "run", "--surface", "infra"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let combined = format!("{stdout}\n{stderr}");
+
+  assert!(!output.status.success(), "infra surface should be rejected");
+  assert!(
+    combined.contains("planner output") && combined.contains("build|test|bench|docs"),
+    "expected planner-output rejection. Output:\n{}",
+    combined
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_runner_transitive_dependencies() -> Result<()> {
   // Setup: lib-a <- lib-b <- lib-c (chain)
   let ws = TestWorkspace::new()?;
