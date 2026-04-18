@@ -6,7 +6,7 @@
 //! - Commit/PR links and breaking markers
 //! - skip_changelog_for and require_changelog_entries flags
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
 
 fn write_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
@@ -954,6 +954,26 @@ publish = false
   Ok(())
 }
 
+fn add_workspace_dependency(ws: &TestWorkspace, name: &str, version: &str) -> Result<()> {
+  let root_manifest = ws.path.join("Cargo.toml");
+  let manifest = std::fs::read_to_string(&root_manifest)?;
+  let needle = "[workspace.dependencies]\n";
+  let replacement = format!(
+    "{}{} = {{ version = \"{}\", path = \"crates/{}\" }}\n",
+    needle, name, version, name
+  );
+  let updated = manifest.replacen(needle, &replacement, 1);
+  std::fs::write(root_manifest, updated)?;
+  Ok(())
+}
+
+fn tag_release(ws: &TestWorkspace, crate_name: &str, version: &str) -> Result<()> {
+  ws.tag(
+    &format!("{}-v{}", crate_name, version),
+    &format!("Release {} {}", crate_name, version),
+  )
+}
+
 /// Helper to add a crate with a path-only dep
 fn add_crate_with_path_dep(ws: &TestWorkspace, name: &str, version: &str, dep_name: &str, publish: bool) -> Result<()> {
   let crate_path = ws.path.join("crates").join(name);
@@ -1184,6 +1204,284 @@ publish = false
     stderr.contains("lib-b") && stderr.contains("rail.toml"),
     "lib-b should be skipped due to rail.toml.\nstderr:\n{}",
     stderr
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_run_rejects_partial_dependent_closure() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-partial-closure")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate(
+    "lib-b",
+    "0.1.0",
+    &[("lib-a", "{ version = \"^0.1.0\", path = \"../lib-a\" }")],
+  )?;
+  ws.add_crate(
+    "lib-c",
+    "0.1.0",
+    &[("lib-b", "{ version = \"^0.1.0\", path = \"../lib-b\" }")],
+  )?;
+  ws.commit("Add release closure crates")?;
+  tag_release(&ws, "lib-a", "0.1.0")?;
+  tag_release(&ws, "lib-b", "0.1.0")?;
+  tag_release(&ws, "lib-c", "0.1.0")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "lib-a", "--check"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let combined = format!("{}\n{}", stdout, stderr);
+
+  assert!(
+    !output.status.success(),
+    "partial subset release should be rejected.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    combined.contains("partial release would leave dependent crate(s) out of sync"),
+    "expected partial closure error.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    combined.contains("lib-b") && combined.contains("lib-c"),
+    "expected missing dependent closure in error output.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    combined.contains("--include-dependents"),
+    "expected opt-in guidance for dependent closure.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_run_include_dependents_expands_full_closure() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-include-dependents")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate(
+    "lib-b",
+    "0.1.0",
+    &[("lib-a", "{ version = \"^0.1.0\", path = \"../lib-a\" }")],
+  )?;
+  ws.add_crate(
+    "lib-c",
+    "0.1.0",
+    &[("lib-b", "{ version = \"^0.1.0\", path = \"../lib-b\" }")],
+  )?;
+  ws.commit("Add release closure crates")?;
+  tag_release(&ws, "lib-a", "0.1.0")?;
+  tag_release(&ws, "lib-b", "0.1.0")?;
+  tag_release(&ws, "lib-c", "0.1.0")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--check", "--include-dependents"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "check mode should exit with pending changes.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    stdout.contains("lib-a") && stdout.contains("lib-b") && stdout.contains("lib-c"),
+    "expected full dependent closure in plan output.\nstdout:\n{}",
+    stdout
+  );
+  let lib_a_idx = stdout.find("1. lib-a").expect("expected lib-a first in release plan");
+  let lib_b_idx = stdout.find("2. lib-b").expect("expected lib-b second in release plan");
+  let lib_c_idx = stdout.find("3. lib-c").expect("expected lib-c third in release plan");
+  assert!(
+    lib_a_idx < lib_b_idx && lib_b_idx < lib_c_idx,
+    "dependent closure should be released in dependency order.\nstdout:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-subset-apply")?;
+  write_release_config(&ws, "require_release_notes = false")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate(
+    "lib-b",
+    "0.1.0",
+    &[("lib-a", "{ version = \"^0.1.0\", path = \"../lib-a\" }")],
+  )?;
+  ws.add_crate("lib-c", "0.1.0", &[])?;
+  ws.commit("Add release subset crates")?;
+  tag_release(&ws, "lib-a", "0.1.0")?;
+  tag_release(&ws, "lib-b", "0.1.0")?;
+  tag_release(&ws, "lib-c", "0.1.0")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--include-dependents",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "subset release should succeed.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  let lib_a_manifest = std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?;
+  let lib_b_manifest = std::fs::read_to_string(ws.path.join("crates/lib-b/Cargo.toml"))?;
+  let lib_c_manifest = std::fs::read_to_string(ws.path.join("crates/lib-c/Cargo.toml"))?;
+  assert!(lib_a_manifest.contains("version = \"0.1.1\""));
+  assert!(lib_b_manifest.contains("version = \"0.1.1\""));
+  assert!(lib_b_manifest.contains("^0.1.1"));
+  assert!(lib_c_manifest.contains("version = \"0.1.0\""));
+
+  let tags = String::from_utf8_lossy(&git(&ws.path, &["tag", "--list"])?.stdout).to_string();
+  assert!(tags.contains("lib-a-v0.1.1"), "missing lib-a tag.\ntags:\n{}", tags);
+  assert!(tags.contains("lib-b-v0.1.1"), "missing lib-b tag.\ntags:\n{}", tags);
+  assert!(
+    !tags.contains("lib-c-v0.1.1"),
+    "unrelated crate should not be tagged.\ntags:\n{}",
+    tags
+  );
+
+  assert!(ws.path.join("crates/lib-a/CHANGELOG.md").exists());
+  assert!(ws.path.join("crates/lib-b/CHANGELOG.md").exists());
+  assert!(
+    !ws.path.join("crates/lib-c/CHANGELOG.md").exists(),
+    "unrelated crate should not get a changelog"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_run_apply_supports_publish_false_from_rail_toml() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-run-publish-false")?;
+  ws.add_crate("internal-tool", "0.1.0", &[])?;
+  ws.commit("Add internal-tool")?;
+  ws.write_release_config(
+    r#"tag_prefix = "v"
+tag_format = "{crate}-v{version}"
+require_clean = false
+require_release_notes = false
+
+[crates.internal-tool.release]
+publish = false
+"#,
+  )?;
+  tag_release(&ws, "internal-tool", "0.1.0")?;
+  ws.modify_file("internal-tool", "src/lib.rs", "pub fn changed() {}\n")?;
+  ws.commit("feat: update internal-tool")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "internal-tool", "--yes"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let combined = format!("{}\n{}", stdout, stderr);
+
+  assert!(
+    output.status.success(),
+    "publish = false release should succeed without crates.io publish.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    combined.contains("skipped publish (publish = false)"),
+    "expected publish = false skip message.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(ws.path.join("crates/internal-tool/CHANGELOG.md").exists());
+  let tags = String::from_utf8_lossy(&git(&ws.path, &["tag", "--list"])?.stdout).to_string();
+  assert!(tags.contains("v0.1.1"));
+
+  Ok(())
+}
+
+#[test]
+fn test_subset_release_updates_shared_workspace_dependency_versions() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-workspace-deps")?;
+  write_release_config(&ws, "require_release_notes = false")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  add_workspace_dependency(&ws, "lib-a", "0.1.0")?;
+  ws.add_crate("lib-b", "0.1.0", &[("lib-a", "{ workspace = true }")])?;
+  ws.commit("Add workspace dependency crates")?;
+  tag_release(&ws, "lib-a", "0.1.0")?;
+  tag_release(&ws, "lib-b", "0.1.0")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--include-dependents",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "subset release with workspace dependencies should succeed.\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  let root_manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?;
+  let lib_b_manifest = std::fs::read_to_string(ws.path.join("crates/lib-b/Cargo.toml"))?;
+  assert!(
+    root_manifest.contains("lib-a = { version = \"0.1.1\", path = \"crates/lib-a\" }"),
+    "workspace dependency should be bumped.\nCargo.toml:\n{}",
+    root_manifest
+  );
+  assert!(
+    lib_b_manifest.contains("version = \"0.1.1\""),
+    "dependent crate should be version bumped as part of the approved closure.\nCargo.toml:\n{}",
+    lib_b_manifest
+  );
+  assert!(
+    lib_b_manifest.contains("lib-a = { workspace = true }"),
+    "workspace dependency declaration should remain workspace-based.\nCargo.toml:\n{}",
+    lib_b_manifest
   );
 
   Ok(())

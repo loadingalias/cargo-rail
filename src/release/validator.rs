@@ -80,10 +80,9 @@ impl<'a> ReleaseValidator<'a> {
       }
     }
 
-    // 4. Check for path dependencies and config restrictions
+    // 4. Check for path dependencies
     for crate_name in crate_names {
       self.check_path_dependencies(crate_name)?;
-      self.check_config_restrictions(crate_name)?;
     }
 
     Ok(())
@@ -329,21 +328,6 @@ impl<'a> ReleaseValidator<'a> {
       }
     }
 
-    Ok(())
-  }
-
-  /// Check rail.toml config restrictions
-  fn check_config_restrictions(&self, crate_name: &str) -> RailResult<()> {
-    if let Some(config) = &self.ctx.config
-      && let Some(crate_config) = config.crates.get(crate_name)
-      && let Some(release_config) = &crate_config.release
-      && !release_config.publish
-    {
-      return Err(RailError::with_help(
-        format!("Crate '{}' is configured as non-publishable in rail.toml", crate_name),
-        "Update rail.toml [crates.NAME.release] section to allow publishing",
-      ));
-    }
     Ok(())
   }
 

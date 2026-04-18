@@ -596,6 +596,7 @@ Examples:
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
@@ -672,6 +673,9 @@ Options:
       --skip-tag
           Skip git tag creation
 
+      --include-dependents
+          Expand explicit crate selection to include the full dependent closure
+
   -y, --yes
           Skip confirmation prompts and allow non-default branch
 
@@ -724,6 +728,9 @@ Options:
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
+
+      --include-dependents
+          Expand explicit crate selection to include the full dependent closure
 
   -f, --format <FORMAT>
           Output format

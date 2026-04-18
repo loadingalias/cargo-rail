@@ -316,6 +316,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         plan,
         skip_publish,
         skip_tag,
+        include_dependents,
         yes,
         format,
       } => {
@@ -326,7 +327,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         };
 
         if check {
-          run_release_plan(ctx, names, bump, skip_publish, skip_tag, format)
+          run_release_plan(ctx, names, bump, skip_publish, skip_tag, include_dependents, format)
         } else {
           run_release_publish(
             ctx,
@@ -336,6 +337,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
               bump,
               skip_publish,
               skip_tag,
+              include_dependents,
               yes,
               plan_path: plan,
             },
@@ -346,6 +348,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         crate_names,
         all,
         extended,
+        include_dependents,
         format,
       } => {
         let names = if all || crate_names.is_empty() {
@@ -353,7 +356,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         } else {
           Some(crate_names)
         };
-        run_release_check(ctx, names, all, extended, format)
+        run_release_check(ctx, names, all, extended, include_dependents, format)
       }
     },
 

@@ -185,6 +185,24 @@ impl WorkspaceGraph {
     Ok(result)
   }
 
+  /// Get direct workspace dependents for a crate.
+  ///
+  /// Returns only workspace members with an immediate dependency edge to `crate_name`.
+  pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
+    let node = self.find_node(crate_name)?;
+    let mut dependents = Vec::new();
+
+    for neighbor_idx in self.graph.neighbors_directed(node, Direction::Incoming) {
+      let neighbor = &self.graph[neighbor_idx];
+      if neighbor.is_workspace_member {
+        dependents.push(neighbor.name.clone());
+      }
+    }
+
+    dependents.sort();
+    Ok(dependents)
+  }
+
   /// Get transitive reverse dependencies for multiple crates in a single traversal.
   ///
   /// This is more efficient than calling `transitive_dependents()` multiple times
@@ -304,7 +322,7 @@ impl WorkspaceGraph {
     })?;
 
     // Collect names in dependency order
-    let result: Vec<String> = sorted.into_iter().map(|idx| subgraph[idx].name.clone()).collect();
+    let result: Vec<String> = sorted.into_iter().rev().map(|idx| subgraph[idx].name.clone()).collect();
 
     Ok(result)
   }

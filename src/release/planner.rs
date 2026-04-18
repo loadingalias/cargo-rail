@@ -7,6 +7,7 @@ use crate::workspace::WorkspaceContext;
 use rustc_hash::FxHashMap;
 use semver::Version;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// A plan for releasing one or more crates
@@ -66,6 +67,15 @@ pub struct ReleaseSummary {
   pub crates_to_tag: usize,
 }
 
+/// How explicit crate selections should handle dependent closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependentPolicy {
+  /// Reject partial selections that would leave dependents out of sync.
+  RejectPartialClosure,
+  /// Expand explicit selection to the full dependent closure.
+  IncludeDependents,
+}
+
 /// Release planner
 pub struct ReleasePlanner<'a> {
   /// Workspace context
@@ -84,27 +94,21 @@ impl<'a> ReleasePlanner<'a> {
   ///
   /// Uses dependency order for deterministic crate sequencing and computes
   /// per-crate publish/tag/changelog intent.
-  pub fn plan(&self, crate_names: Option<Vec<String>>, bump_type: &BumpType) -> RailResult<ReleasePlan> {
-    // Determine which crates to release
-    let target_crates = if let Some(names) = crate_names {
-      names
-    } else {
-      self.ctx.graph.workspace_members().to_vec()
-    };
-
-    // Get crates in dependency order
-    let all_ordered = self.ctx.graph.publish_order()?;
-    let ordered_targets: Vec<String> = all_ordered
-      .into_iter()
-      .filter(|name| target_crates.contains(name))
-      .collect();
+  pub fn plan(
+    &self,
+    crate_names: Option<Vec<String>>,
+    bump_type: &BumpType,
+    dependent_policy: DependentPolicy,
+  ) -> RailResult<ReleasePlan> {
+    let ordered_targets = self.resolve_targets(crate_names, dependent_policy)?;
+    let planned_crates: HashSet<String> = ordered_targets.iter().cloned().collect();
 
     // Build plan for each crate
     let mut crate_plans = Vec::with_capacity(ordered_targets.len());
     let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
 
     for crate_name in &ordered_targets {
-      let plan = self.plan_crate(crate_name, bump_type, &version_map)?;
+      let plan = self.plan_crate(crate_name, bump_type, &version_map, &planned_crates)?;
       version_map.insert(crate_name.clone(), plan.new_version.clone());
       crate_plans.push(plan);
     }
@@ -132,6 +136,7 @@ impl<'a> ReleasePlanner<'a> {
     crate_name: &str,
     bump_type: &BumpType,
     _version_map: &FxHashMap<String, Version>,
+    planned_crates: &HashSet<String>,
   ) -> RailResult<CrateReleasePlan> {
     // Get crate metadata
     let package = self
@@ -193,8 +198,14 @@ impl<'a> ReleasePlanner<'a> {
       .map(|r| r.publish)
       .unwrap_or(publish_from_cargo);
 
-    // Find affected dependents
-    let affected_dependents = self.ctx.graph.transitive_dependents(crate_name)?;
+    // Only mutate dependents that are explicitly part of this release plan.
+    let affected_dependents = self
+      .ctx
+      .graph
+      .direct_dependents(crate_name)?
+      .into_iter()
+      .filter(|dependent| planned_crates.contains(dependent))
+      .collect();
     let bump = format!("{} -> {}", current_version, new_version);
     let publish_intent = if publish {
       "publish_to_crates_io".to_string()
@@ -259,6 +270,48 @@ impl<'a> ReleasePlanner<'a> {
     };
 
     self.ctx.git.git().find_latest_tag(&pattern)
+  }
+
+  pub(crate) fn resolve_targets(
+    &self,
+    crate_names: Option<Vec<String>>,
+    dependent_policy: DependentPolicy,
+  ) -> RailResult<Vec<String>> {
+    let all_ordered = self.ctx.graph.publish_order()?;
+    let Some(targets) = crate_names else {
+      return Ok(all_ordered);
+    };
+    let workspace_members = self.ctx.graph.workspace_members();
+    for crate_name in &targets {
+      if !workspace_members.contains(crate_name) {
+        return Err(RailError::with_help(
+          format!("crate '{}' not found", crate_name),
+          format!("available: {}", workspace_members.join(", ")),
+        ));
+      }
+    }
+
+    let requested: HashSet<String> = targets.into_iter().collect();
+    let dependents = self.ctx.graph.transitive_dependents_of_set(&requested)?;
+
+    if !dependents.is_empty() && dependent_policy == DependentPolicy::RejectPartialClosure {
+      let mut missing: Vec<String> = dependents.into_iter().collect();
+      missing.sort();
+      return Err(RailError::with_help(
+        format!(
+          "partial release would leave dependent crate(s) out of sync: {}",
+          missing.join(", ")
+        ),
+        "re-run with --include-dependents or release the full dependent closure",
+      ));
+    }
+
+    let mut selected = requested;
+    if dependent_policy == DependentPolicy::IncludeDependents {
+      selected.extend(dependents);
+    }
+
+    Ok(all_ordered.into_iter().filter(|name| selected.contains(name)).collect())
   }
 }
 

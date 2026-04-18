@@ -10,7 +10,7 @@ build:
     @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates..."
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --profile local --surface build
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build
 
 build-release:
     @echo "Change Detection Plan:"
@@ -18,7 +18,7 @@ build-release:
     @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
     @echo ""
     @echo "Building affected crates (release)..."
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --profile local --surface build -- --release
+    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build -- --release
 
 # Full Workspace Commands (no change detection)
 

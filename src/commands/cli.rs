@@ -132,6 +132,7 @@ Examples:
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Preview release plan
   cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
@@ -618,6 +619,9 @@ pub enum ReleaseCommand {
     /// Skip git tag creation
     #[arg(long)]
     skip_tag: bool,
+    /// Expand explicit crate selection to include the full dependent closure
+    #[arg(long)]
+    include_dependents: bool,
     /// Skip confirmation prompts and allow non-default branch
     #[arg(short = 'y', long)]
     yes: bool,
@@ -636,6 +640,9 @@ pub enum ReleaseCommand {
     /// Run extended validation (cargo publish --dry-run, MSRV check)
     #[arg(long, short = 'e')]
     extended: bool,
+    /// Expand explicit crate selection to include the full dependent closure
+    #[arg(long)]
+    include_dependents: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,

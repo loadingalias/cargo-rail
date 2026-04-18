@@ -4,6 +4,7 @@ mod test_classification;
 mod test_clean;
 mod test_config;
 mod test_error_handling;
+mod test_frontdoor_smoke;
 mod test_git_notes;
 mod test_hash;
 mod test_init;

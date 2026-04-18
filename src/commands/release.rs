@@ -3,7 +3,7 @@
 use crate::commands::common::{OutputFormat, enforce_safety_gate};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
-use crate::release::planner::ReleasePlanner;
+use crate::release::planner::{DependentPolicy, ReleasePlanner};
 use crate::release::publisher::ReleasePublisher;
 use crate::release::validator::ReleaseValidator;
 use crate::release::version::BumpType;
@@ -17,6 +17,7 @@ pub fn run_release_plan(
   bump: String,
   skip_publish: bool,
   skip_tag: bool,
+  include_dependents: bool,
   format: OutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
@@ -31,40 +32,7 @@ pub fn run_release_plan(
   let workspace_members = ctx.graph.workspace_members();
   let validator = ReleaseValidator::new(ctx);
 
-  // Determine target crates, filtering to publishable when using --all (crate_names = None)
-  let (target_crates, skipped_crates) = if let Some(ref names) = crate_names {
-    // Explicit crate names - validate they exist
-    for name in names {
-      if !workspace_members.contains(name) {
-        return Err(RailError::with_help(
-          format!("crate '{}' not found", name),
-          format!("available: {}", workspace_members.join(", ")),
-        ));
-      }
-    }
-    (names.clone(), Vec::new())
-  } else {
-    // No specific crates = --all, filter to publishable only
-    let (publishable, skipped) = validator.publishable_members();
-
-    if publishable.is_empty() {
-      return Err(RailError::with_help(
-        "no publishable crates found",
-        "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
-      ));
-    }
-
-    (publishable, skipped)
-  };
-
-  // Report skipped crates (non-JSON mode only)
-  if !skipped_crates.is_empty() && !json {
-    crate::status!("skipped {} crate(s) (not publishable):", skipped_crates.len());
-    for (name, reason) in &skipped_crates {
-      crate::status!("  {}: {}", name, reason);
-    }
-    crate::status!("");
-  }
+  let target_crates = crate_names;
 
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
@@ -78,6 +46,11 @@ pub fn run_release_plan(
     crate::warn!("{}", warning);
   }
 
+  let policy = dependent_policy(include_dependents);
+  let planner = ReleasePlanner::new(ctx, release_config);
+  let plan = planner.plan(target_crates, &bump_type, policy)?;
+  let target_crates = plan.canonical_crate_order.clone();
+
   if release_config.require_clean {
     validator.validate(&target_crates, true)?;
   }
@@ -85,9 +58,6 @@ pub fn run_release_plan(
   // Validate changelog paths (catches path traversal issues early)
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let planner = ReleasePlanner::new(ctx, release_config);
-  // Pass the filtered target_crates to the planner
-  let plan = planner.plan(Some(target_crates), &bump_type)?;
   let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, release_config.require_clean)?;
 
   if json {
@@ -134,6 +104,8 @@ pub struct ReleasePublishArgs {
   pub skip_publish: bool,
   /// Skip creating git tags.
   pub skip_tag: bool,
+  /// Expand explicit crate selection to include the full dependent closure.
+  pub include_dependents: bool,
   /// Skip interactive confirmation prompts.
   pub yes: bool,
   /// Apply using a previously generated mutation plan.
@@ -149,26 +121,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   let validator = ReleaseValidator::new(ctx);
 
   let targets = if args.all {
-    // Filter to only publishable crates when using --all
-    let (publishable, skipped) = validator.publishable_members();
-
-    if publishable.is_empty() {
-      return Err(RailError::with_help(
-        "no publishable crates found",
-        "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
-      ));
-    }
-
-    // Report skipped crates
-    if !skipped.is_empty() {
-      crate::status!("skipped {} crate(s) (not publishable):", skipped.len());
-      for (name, reason) in &skipped {
-        crate::status!("  {}: {}", name, reason);
-      }
-      crate::status!("");
-    }
-
-    Some(publishable)
+    None
   } else if let Some(names) = args.crate_names {
     Some(names)
   } else {
@@ -180,9 +133,10 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
 
   let bump_type = args.bump.parse::<BumpType>()?;
 
-  let target_crates = targets
-    .clone()
-    .unwrap_or_else(|| ctx.graph.workspace_members().to_vec());
+  let policy = dependent_policy(args.include_dependents);
+  let planner = ReleasePlanner::new(ctx, release_config);
+  let plan = planner.plan(targets, &bump_type, policy)?;
+  let target_crates = plan.canonical_crate_order.clone();
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
@@ -193,8 +147,6 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let planner = ReleasePlanner::new(ctx, release_config);
-  let plan = planner.plan(targets, &bump_type)?;
   let expected_mutation_plan = build_release_mutation_plan(
     ctx,
     &plan,
@@ -296,6 +248,7 @@ pub fn run_release_check(
   crate_names: Option<Vec<String>>,
   all: bool,
   extended: bool,
+  include_dependents: bool,
   format: OutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
@@ -314,7 +267,7 @@ pub fn run_release_check(
   // Track skipped crates for reporting
   let mut skipped_crates: Vec<(String, String)> = Vec::with_capacity(8);
 
-  let target_crates = if all {
+  let mut target_crates = if all {
     // Filter to only publishable crates when using --all
     let (publishable, skipped) = validator.publishable_members();
     skipped_crates = skipped;
@@ -345,6 +298,11 @@ pub fn run_release_check(
     crate::status!("");
   }
 
+  if !all {
+    let policy = dependent_policy(include_dependents);
+    let planner = ReleasePlanner::new(ctx, release_config);
+    target_crates = planner.resolve_targets(Some(target_crates), policy)?;
+  }
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Validate changelog paths
@@ -463,6 +421,14 @@ pub fn run_release_check(
   }
 
   Ok(())
+}
+
+fn dependent_policy(include_dependents: bool) -> DependentPolicy {
+  if include_dependents {
+    DependentPolicy::IncludeDependents
+  } else {
+    DependentPolicy::RejectPartialClosure
+  }
 }
 
 fn build_release_mutation_plan(
