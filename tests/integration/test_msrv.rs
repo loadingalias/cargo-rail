@@ -66,11 +66,9 @@ fn test_msrv_source_max_preserves_higher_workspace_version() -> Result<()> {
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // Should show rust-version 1.85 (from workspace, not deps)
-  // The message should indicate it's from workspace
   assert!(
-    stdout.contains("1.85") || stdout.contains("rust-version"),
-    "Should show rust-version info.\nOutput:\n{}",
+    stdout.contains("status: no changes"),
+    "Should recognize that the existing workspace rust-version already satisfies MSRV.\nOutput:\n{}",
     stdout
   );
 
@@ -91,10 +89,9 @@ fn test_msrv_source_workspace_preserves_existing() -> Result<()> {
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // Should preserve the workspace version
   assert!(
-    stdout.contains("1.70") || stdout.contains("preserved"),
-    "Should preserve workspace rust-version.\nOutput:\n{}",
+    stdout.contains("status: no changes"),
+    "Should preserve the existing workspace rust-version without planning changes.\nOutput:\n{}",
     stdout
   );
 

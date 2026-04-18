@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// Render a deterministic preview for a potentially large list.
 ///
 /// Keeps small lists intact and truncates large lists with a `+N more` suffix.
-pub(crate) fn format_preview_list(items: &[String], preview_limit: usize) -> String {
+pub(crate) fn format_preview_list<T: AsRef<str>>(items: &[T], preview_limit: usize) -> String {
   if items.is_empty() {
     return "none".to_string();
   }
@@ -20,7 +20,7 @@ pub(crate) fn format_preview_list(items: &[String], preview_limit: usize) -> Str
   let preview = items
     .iter()
     .take(preview_limit)
-    .map(String::as_str)
+    .map(AsRef::as_ref)
     .collect::<Vec<_>>()
     .join(", ");
 

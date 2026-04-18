@@ -64,7 +64,7 @@ fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
 
   // Should show success
   assert!(
-    stdout.contains("ready:") || stdout.contains("Unification Plan"),
+    stdout.contains("changed:") && stdout.contains("next:"),
     "Should complete analysis successfully.\nOutput:\n{}",
     stdout
   );
@@ -144,8 +144,8 @@ root = "."
 "#,
   )?;
 
-  // Run analyze - should show WARNING about major version conflict
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  // Run analyze with explanation output - should surface the conflict warning
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -222,7 +222,7 @@ fn test_unify_feature_union() -> Result<()> {
   // The workspace dependency will have NO features, and each member will keep its local features.
   // This is correct behavior - we just verify unification is possible.
   assert!(
-    stdout.contains("Ready to unify") || stdout.contains("Dependencies to unify"),
+    stdout.contains("changed:") && stdout.contains("next:"),
     "Should show dependencies can be unified.\nOutput:\n{}",
     stdout
   );
@@ -343,7 +343,7 @@ tempfile = "3.0"
 
   workspace.commit("Add crates with different dep kinds")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--show-diff"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should show tempfile can be unified
@@ -353,9 +353,9 @@ tempfile = "3.0"
     stdout
   );
 
-  // Should show "Used as: dependencies, dev-dependencies"
+  // Diff output should preserve the original dependency sections.
   assert!(
-    stdout.contains("Used as:") || stdout.contains("dependencies"),
+    stdout.contains("[dependencies]") || stdout.contains("[dev-dependencies]"),
     "Should show dep_kinds in output.\nOutput:\n{}",
     stdout
   );
@@ -377,11 +377,19 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   )?;
 
   workspace.add_crate("crate-b", "0.1.0", &[("serde", r#"{ version = "1.0" }"#)])?;
+  std::fs::write(
+    workspace.path.join("crates/crate-a/src/lib.rs"),
+    "use serde as _;\npub fn a() {}",
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/crate-b/src/lib.rs"),
+    "use serde as _;\npub fn b() {}",
+  )?;
 
   workspace.commit("Add crates before unification")?;
 
   // Analyze (should succeed)
-  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let analyze_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--show-diff"])?;
   let analyze_stdout = String::from_utf8_lossy(&analyze_output.stdout);
 
   assert!(
@@ -426,9 +434,7 @@ fn test_unify_end_to_end_analyze_then_apply() -> Result<()> {
   let final_stdout = String::from_utf8_lossy(&final_analyze.stdout);
 
   assert!(
-    final_stdout.contains("No unification opportunities")
-      || final_stdout.contains("0 dependencies unified")
-      || !final_stdout.contains("Dependencies to unify:"),
+    final_stdout.contains("status: no changes"),
     "After unification, there should be no more unifiable deps.\nOutput:\n{}",
     final_stdout
   );
@@ -604,7 +610,10 @@ cc = "1.0"
 "#,
   )?;
 
-  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+  std::fs::write(
+    crate_a_path.join("src/lib.rs"),
+    "use serde as _;\nuse anyhow as _;\npub fn a() {}",
+  )?;
 
   // Create crate-b with same build-dependency
   let crate_b_path = workspace.path.join("crates/crate-b");
@@ -623,7 +632,7 @@ cc = "1.0"
 "#,
   )?;
 
-  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "use serde as _;\npub fn b() {}")?;
 
   workspace.commit("Add crates with build-dependencies")?;
 
@@ -1005,12 +1014,12 @@ exclude = ["tokio"]
 
   workspace.commit("Partially exclude tokio member cohort")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(
     stdout.contains("Applying exclude atomically to the full cohort"),
-    "Should warn about partial workspace-member cohort exclusion.\nOutput:\n{}",
+    "Should explain partial workspace-member cohort exclusion.\nOutput:\n{}",
     stdout
   );
 
@@ -1245,7 +1254,7 @@ include = ["serde"]
   )?;
 
   // Run unify with include config
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--show-diff"])?;
 
   // Exit code 1 = check found pending changes (correct behavior)
   assert!(
@@ -1384,7 +1393,10 @@ edition.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 "#,
   )?;
-  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+  std::fs::write(
+    crate_a_path.join("src/lib.rs"),
+    "use serde as _;\nuse anyhow as _;\npub fn a() {}",
+  )?;
 
   // crate-b uses serde renamed as "my_serde"
   let crate_b_path = workspace.path.join("crates/crate-b");
@@ -1402,7 +1414,10 @@ edition.workspace = true
 my_serde = { package = "serde", version = "1.0", features = ["rc"] }
 "#,
   )?;
-  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+  std::fs::write(
+    crate_b_path.join("src/lib.rs"),
+    "use serde as _;\nuse anyhow as _;\npub fn b() {}",
+  )?;
 
   workspace.commit("Add crates with renamed dep")?;
 
@@ -1410,7 +1425,7 @@ my_serde = { package = "serde", version = "1.0", features = ["rc"] }
   let output_without = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout_without = String::from_utf8_lossy(&output_without.stdout);
   assert!(
-    !stdout_without.contains("Dependencies to unify:") || stdout_without.contains("Dependencies to unify: 0"),
+    !stdout_without.contains("serde"),
     "Without include_renamed config, serde shouldn't qualify (each variant has 1 user).\nOutput:\n{}",
     stdout_without
   );
@@ -1427,7 +1442,7 @@ include_renamed = true
   let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
   let stdout_with = String::from_utf8_lossy(&output_with.stdout);
   assert!(
-    stdout_with.contains("serde") && stdout_with.contains("Dependencies to unify"),
+    stdout_with.contains("serde"),
     "With include_renamed config, serde should qualify (2 users total).\nOutput:\n{}",
     stdout_with
   );
@@ -1489,7 +1504,7 @@ msrv = false
 
   // Should show no unification opportunities since each has only 1 user
   assert!(
-    analyze_stdout.contains("no unification opportunities") || analyze_stdout.contains("nothing to unify"),
+    analyze_stdout.contains("status: no changes"),
     "Should show no unification opportunities when deps are properly separated.\nOutput:\n{}",
     analyze_stdout
   );
@@ -1500,7 +1515,7 @@ msrv = false
 
   // Should indicate no changes
   assert!(
-    apply_stdout.contains("nothing to unify") || apply_stdout.contains("no unification opportunities"),
+    apply_stdout.contains("nothing to unify"),
     "Apply should indicate no changes needed.\nstdout:\n{}",
     apply_stdout
   );
@@ -1560,7 +1575,10 @@ serde = "1.0"
 anyhow = "1.0"
 "#,
   )?;
-  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+  std::fs::write(
+    crate_a_path.join("src/lib.rs"),
+    "use serde as _;\nuse anyhow as _;\npub fn a() {}",
+  )?;
 
   // crate-b uses only serde (not anyhow)
   let crate_b_path = workspace.path.join("crates/crate-b");
@@ -1578,12 +1596,12 @@ edition.workspace = true
 serde = "1.0"
 "#,
   )?;
-  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "use serde as _;\npub fn b() {}")?;
 
   workspace.commit("Add crates")?;
 
   // Run unify analyze
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--show-diff"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // serde should be unified (2 users)
@@ -1740,8 +1758,8 @@ anyhow = "1.0"
 
   workspace.commit("Add crates with exact pins")?;
 
-  // Run unify check
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  // Run unify check with explanation output
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // anyhow should be unified (no exact pin)
@@ -1751,12 +1769,8 @@ anyhow = "1.0"
     stdout
   );
 
-  // serde should NOT appear in unification plan (has exact pin, skip mode)
-  // Check that serde is not in the "Dependencies to unify" section
-  // (it may appear in other messages like "Analyzing X dependencies")
-  let unify_section = stdout.split("Dependencies to unify").nth(1).unwrap_or("");
   assert!(
-    !unify_section.contains("serde =") && !unify_section.contains("serde:"),
+    stdout.contains("serde [skipped_dependency]"),
     "serde should be skipped due to exact pin.\nOutput:\n{}",
     stdout
   );
@@ -1787,7 +1801,7 @@ edition.workspace = true
 serde = "=1.0.200"
 "#,
   )?;
-  std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}")?;
+  std::fs::write(crate_a_path.join("src/lib.rs"), "use serde as _;\npub fn a() {}")?;
 
   // crate-b also uses serde with exact pin
   let crate_b_path = workspace.path.join("crates/crate-b");
@@ -1805,12 +1819,12 @@ edition.workspace = true
 serde = "=1.0.200"
 "#,
   )?;
-  std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}")?;
+  std::fs::write(crate_b_path.join("src/lib.rs"), "use serde as _;\npub fn b() {}")?;
 
   workspace.commit("Add crates with exact pins")?;
 
   // Run unify check
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // serde should be in the plan (warn mode converts but still unifies)
@@ -1820,10 +1834,10 @@ serde = "=1.0.200"
     stdout
   );
 
-  // Should show a warning about exact pin
+  // Should explain the exact pin conversion explicitly
   assert!(
-    stdout.contains("[WARN]") && stdout.contains("exact"),
-    "Should warn about exact version pin.\nOutput:\n{}",
+    stdout.contains("exact_pin_warn_caret"),
+    "Should explain exact version pin handling.\nOutput:\n{}",
     stdout
   );
 

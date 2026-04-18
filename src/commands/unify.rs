@@ -6,7 +6,7 @@
 //! 3. Intersection-based feature unification
 
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
-use crate::commands::common::UnifyOutputFormat;
+use crate::commands::common::{UnifyOutputFormat, format_preview_list};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
@@ -110,6 +110,199 @@ fn dependency_section<'a>(dep_kind: &crate::cargo::DepKind, target: Option<&'a s
   }
 }
 
+fn mutation_targets(plan: &crate::cargo::UnificationPlan, msrv_write_needed: bool) -> Vec<String> {
+  let mut targets = Vec::new();
+  if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
+    targets.push("Cargo.toml".to_string());
+  }
+
+  let mut members: Vec<String> = plan
+    .member_edits
+    .keys()
+    .filter_map(|member| {
+      plan.member_paths.get(member).map(|path| {
+        path
+          .strip_prefix(std::path::Path::new("."))
+          .unwrap_or(path)
+          .display()
+          .to_string()
+      })
+    })
+    .collect();
+  members.sort();
+  targets.extend(members);
+  targets
+}
+
+fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
+  plan
+    .issues
+    .iter()
+    .filter(|issue| issue.severity == crate::cargo::IssueSeverity::Error)
+    .map(|issue| format!("{}: {}", issue.dep_name, issue.message))
+    .collect()
+}
+
+fn write_compact_summary(
+  sink: &mut UnifyTextSink,
+  plan: &crate::cargo::UnificationPlan,
+  msrv_write_needed: bool,
+  has_changes: bool,
+) {
+  outln!(sink, "unify");
+  outln!(sink);
+  outln!(sink, "changed:");
+
+  let workspace_dep_names: Vec<String> = plan.workspace_deps.iter().map(|dep| dep.name.to_string()).collect();
+  if workspace_dep_names.is_empty()
+    && plan.member_edit_count() == 0
+    && plan.transitive_pins.is_empty()
+    && !msrv_write_needed
+    && plan.pruned_features.is_empty()
+    && plan.unused_deps.is_empty()
+  {
+    outln!(sink, "  none");
+  } else {
+    if !workspace_dep_names.is_empty() {
+      outln!(
+        sink,
+        "  workspace deps ({}): {}",
+        workspace_dep_names.len(),
+        format_preview_list(&workspace_dep_names, 8)
+      );
+    }
+
+    let members_affected = plan.member_edits.len();
+    if plan.member_edit_count() > 0 {
+      outln!(
+        sink,
+        "  member edits: {} across {} crate(s)",
+        plan.member_edit_count(),
+        members_affected
+      );
+    }
+
+    if !plan.transitive_pins.is_empty() {
+      let pin_names: Vec<String> = plan.transitive_pins.iter().map(|pin| pin.name.to_string()).collect();
+      outln!(
+        sink,
+        "  transitive pins ({}): {}",
+        pin_names.len(),
+        format_preview_list(&pin_names, 8)
+      );
+    }
+
+    let undeclared_fix_count: usize = plan
+      .member_edits
+      .values()
+      .flat_map(|edits| edits.iter())
+      .filter_map(|edit| match edit {
+        crate::cargo::MemberEdit::AddFeatures { features_to_add, .. } => Some(features_to_add.len()),
+        _ => None,
+      })
+      .sum();
+    if undeclared_fix_count > 0 {
+      let crates_fixed = plan
+        .member_edits
+        .values()
+        .filter(|edits| {
+          edits
+            .iter()
+            .any(|edit| matches!(edit, crate::cargo::MemberEdit::AddFeatures { .. }))
+        })
+        .count();
+      outln!(
+        sink,
+        "  undeclared-feature fixes: {} feature(s) across {} crate(s)",
+        undeclared_fix_count,
+        crates_fixed
+      );
+    }
+
+    if !plan.unused_deps.is_empty() {
+      outln!(sink, "  unused deps removed: {}", plan.unused_deps.len());
+    }
+    if !plan.pruned_features.is_empty() {
+      outln!(sink, "  dead features pruned: {}", plan.pruned_features.len());
+    }
+    if msrv_write_needed && let Some(msrv) = plan.computed_msrv.as_ref() {
+      outln!(
+        sink,
+        "  rust-version: {}.{}.{}",
+        msrv.version.major,
+        msrv.version.minor,
+        msrv.version.patch
+      );
+    }
+  }
+
+  outln!(sink);
+  outln!(sink, "will mutate:");
+  let targets = mutation_targets(plan, msrv_write_needed);
+  if targets.is_empty() {
+    outln!(sink, "  none");
+  } else {
+    outln!(sink, "  {}", format_preview_list(&targets, 8));
+  }
+
+  outln!(sink);
+  outln!(sink, "blocked:");
+  let blocked = blocked_issue_lines(plan);
+  if blocked.is_empty() {
+    outln!(sink, "  none");
+  } else {
+    for line in blocked.iter().take(5) {
+      outln!(sink, "  {}", line);
+    }
+    if blocked.len() > 5 {
+      outln!(sink, "  ... +{} more", blocked.len() - 5);
+    }
+  }
+
+  outln!(sink);
+  outln!(sink, "next:");
+  if !blocked.is_empty() {
+    outln!(sink, "  cargo rail unify --check --explain");
+  } else if has_changes {
+    outln!(sink, "  cargo rail unify");
+    outln!(sink, "  cargo rail unify --check --show-diff");
+    outln!(sink, "  cargo rail unify --check --explain");
+  } else {
+    outln!(sink, "  cargo rail unify --check --explain");
+  }
+}
+
+fn decision_reasons_to_json(reasons: &[crate::cargo::UnifyDecisionReason]) -> Vec<serde_json::Value> {
+  reasons
+    .iter()
+    .map(|reason| {
+      serde_json::json!({
+        "code": reason.code.as_str(),
+        "summary": &*reason.summary,
+        "features": reason.features.iter().map(|value| &**value).collect::<Vec<_>>(),
+        "members": reason.members.iter().map(|value| &**value).collect::<Vec<_>>(),
+        "borrowed_from": reason.borrowed_from.iter().map(|value| &**value).collect::<Vec<_>>(),
+      })
+    })
+    .collect()
+}
+
+fn dependency_decisions_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<serde_json::Value> {
+  plan
+    .dependency_decisions
+    .iter()
+    .map(|decision| {
+      serde_json::json!({
+        "dep_name": &*decision.dep_name,
+        "subject": decision.subject.as_str(),
+        "member": decision.member.as_deref(),
+        "target": decision.target.as_deref(),
+        "reasons": decision_reasons_to_json(&decision.reasons),
+      })
+    })
+    .collect()
+}
+
 /// Analyze workspace dependencies (check mode)
 pub fn run_unify_analyze(
   ctx: &WorkspaceContext,
@@ -188,6 +381,7 @@ pub fn run_unify_analyze(
         "severity": format!("{:?}", i.severity),
         "message": &*i.message,
       })).collect::<Vec<_>>(),
+      "dependency_decisions": dependency_decisions_to_json(&plan),
       "action_plan": canonical_actions,
       "reason_codes": reason_codes,
       "mutation_plan": mutation_plan,
@@ -223,8 +417,8 @@ pub fn run_unify_analyze(
 
   let mut sink = UnifyTextSink::new(output.is_some());
 
-  // Display summary
-  outln!(sink, "{}", plan.summary());
+  // Default output stays terse; detailed reasoning belongs behind --explain or JSON.
+  write_compact_summary(&mut sink, &plan, msrv_write_needed, has_changes);
 
   // Show explain output if requested
   if explain {
@@ -369,29 +563,13 @@ pub fn run_unify_analyze(
     }
     return Err(RailError::message("blocking issues prevent unification"));
   } else if has_changes {
-    let total_edits = plan.member_edit_count();
-    if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
-      outln!(
-        sink,
-        "\nready: {} dependencies, {} member edits",
-        plan.workspace_deps.len(),
-        total_edits
-      );
-    } else {
-      outln!(
-        sink,
-        "\nready: {} members, {} edits",
-        plan.member_edits.len(),
-        total_edits
-      );
-    }
-    outln!(sink, "Changes detected. Run without --check to apply.");
     if let Some(content) = sink.finish() {
       write_output(&content, output)?;
     }
     return Err(RailError::CheckHasPendingChanges);
   } else {
-    outln!(sink, "\nno unification opportunities found");
+    outln!(sink);
+    outln!(sink, "status: no changes");
   }
 
   if let Some(content) = sink.finish() {
@@ -780,44 +958,43 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
   outln!(sink, "=== Explanation ===");
   outln!(sink);
 
-  // Explain dependencies being unified
-  if !plan.workspace_deps.is_empty() {
-    outln!(sink, "Dependencies unified to [workspace.dependencies]:");
+  if !plan.dependency_decisions.is_empty() {
+    outln!(sink, "Dependency decisions:");
     outln!(sink);
-    for dep in &plan.workspace_deps {
-      outln!(sink, "  {} = \"{}\"", dep.name, dep.version_req);
-      outln!(sink, "    reason: used by {} workspace member(s)", dep.used_by.len());
-      if dep.used_by.len() <= 5 {
-        for member in &dep.used_by {
-          outln!(sink, "      - {}", member);
-        }
-      } else {
-        for member in dep.used_by.iter().take(3) {
-          outln!(sink, "      - {}", member);
-        }
-        outln!(sink, "      ... and {} more", dep.used_by.len() - 3);
+    for decision in &plan.dependency_decisions {
+      match (&decision.member, &decision.target) {
+        (Some(member), Some(target)) => outln!(
+          sink,
+          "  {} [{}:{} @ {}]",
+          decision.dep_name,
+          decision.subject.as_str(),
+          member,
+          target
+        ),
+        (Some(member), None) => outln!(
+          sink,
+          "  {} [{}:{}]",
+          decision.dep_name,
+          decision.subject.as_str(),
+          member
+        ),
+        (None, _) => outln!(sink, "  {} [{}]", decision.dep_name, decision.subject.as_str()),
       }
-      if !dep.features.is_empty() {
-        outln!(sink, "    features: union of features from all uses");
-        let mut sorted_features = dep.features.clone();
-        sorted_features.sort();
-        outln!(sink, "      [{}]", sorted_features.join(", "));
-      }
-      outln!(sink);
-    }
-  }
-
-  // Explain transitive pins
-  if !plan.transitive_pins.is_empty() {
-    outln!(sink, "Transitive dependencies pinned:");
-    outln!(sink);
-    for pin in &plan.transitive_pins {
-      outln!(sink, "  {} = \"{}\"", pin.name, pin.version);
-      outln!(sink, "    reason: transitive dep with target-specific features");
-      if !pin.features.is_empty() {
-        let mut sorted = pin.features.clone();
-        sorted.sort();
-        outln!(sink, "    features: [{}]", sorted.join(", "));
+      for reason in &decision.reasons {
+        outln!(sink, "    - {}: {}", reason.code.as_str(), reason.summary);
+        if !reason.features.is_empty() {
+          outln!(sink, "      features: {}", format_preview_list(&reason.features, 10));
+        }
+        if !reason.members.is_empty() {
+          outln!(sink, "      members: {}", format_preview_list(&reason.members, 10));
+        }
+        if !reason.borrowed_from.is_empty() {
+          outln!(
+            sink,
+            "      borrowed from: {}",
+            format_preview_list(&reason.borrowed_from, 10)
+          );
+        }
       }
       outln!(sink);
     }
@@ -866,8 +1043,12 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
     }
   }
 
-  // Explain undeclared features
-  if !plan.undeclared_features.is_empty() {
+  // Explain undeclared features that remain warnings instead of fixes.
+  let has_feature_fixes = plan
+    .dependency_decisions
+    .iter()
+    .any(|decision| decision.subject == crate::cargo::UnifyDecisionSubject::UndeclaredFeatureFix);
+  if !plan.undeclared_features.is_empty() && !has_feature_fixes {
     outln!(sink, "Undeclared features detected:");
     outln!(sink);
     for uf in &plan.undeclared_features {
@@ -1111,4 +1292,154 @@ fn build_unify_mutation_plan(
   }
 
   mutation::build_plan(ctx, "unify", actions, risks, trace)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::cargo::{
+    DepKind, UnificationPlan, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject,
+  };
+  use rustc_hash::FxHashMap;
+  use std::sync::Arc;
+
+  fn arc(value: &str) -> Arc<str> {
+    Arc::from(value)
+  }
+
+  fn empty_plan() -> UnificationPlan {
+    UnificationPlan {
+      workspace_deps: Vec::new(),
+      member_edits: FxHashMap::default(),
+      member_paths: FxHashMap::default(),
+      transitive_pins: Vec::new(),
+      validation_results: Vec::new(),
+      issues: Vec::new(),
+      computed_msrv: None,
+      duplicates_cleaned: Vec::new(),
+      pruned_features: Vec::new(),
+      optional_features: Vec::new(),
+      version_mismatches: Vec::new(),
+      unused_deps: Vec::new(),
+      undeclared_features: Vec::new(),
+      dependency_decisions: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn test_dependency_decisions_to_json_includes_reason_codes() {
+    let mut plan = empty_plan();
+    plan.dependency_decisions.push(UnifyDecision {
+      dep_name: arc("tokio"),
+      subject: UnifyDecisionSubject::UndeclaredFeatureFix,
+      member: Some(arc("crate-b")),
+      target: Some(arc("cfg(unix)")),
+      reasons: vec![UnifyDecisionReason {
+        code: UnifyDecisionCode::UndeclaredFeatureFix,
+        summary: arc("Added missing features locally."),
+        features: vec![arc("macros")],
+        members: vec![arc("crate-b")],
+        borrowed_from: vec![arc("crate-a")],
+      }],
+    });
+
+    let json = dependency_decisions_to_json(&plan);
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0]["dep_name"], "tokio");
+    assert_eq!(json[0]["subject"], "undeclared_feature_fix");
+    assert_eq!(json[0]["member"], "crate-b");
+    assert_eq!(json[0]["target"], "cfg(unix)");
+    assert_eq!(json[0]["reasons"][0]["code"], "undeclared_feature_fix");
+    assert_eq!(json[0]["reasons"][0]["features"][0], "macros");
+    assert_eq!(json[0]["reasons"][0]["borrowed_from"][0], "crate-a");
+  }
+
+  #[test]
+  fn test_display_explain_renders_dependency_decisions() {
+    let mut plan = empty_plan();
+    plan.dependency_decisions.extend([
+      UnifyDecision {
+        dep_name: arc("serde"),
+        subject: UnifyDecisionSubject::WorkspaceDependency,
+        member: None,
+        target: None,
+        reasons: vec![
+          UnifyDecisionReason {
+            code: UnifyDecisionCode::FeatureIntersection,
+            summary: arc("Used intersection to keep only shared features."),
+            features: vec![arc("derive")],
+            members: vec![arc("crate-a"), arc("crate-b")],
+            borrowed_from: Vec::new(),
+          },
+          UnifyDecisionReason {
+            code: UnifyDecisionCode::ExactPinWarnCaret,
+            summary: arc("Converted exact pin to ^1.0.200."),
+            features: Vec::new(),
+            members: vec![arc("crate-a"), arc("crate-b")],
+            borrowed_from: Vec::new(),
+          },
+        ],
+      },
+      UnifyDecision {
+        dep_name: arc("tokio"),
+        subject: UnifyDecisionSubject::WorkspaceDependency,
+        member: None,
+        target: None,
+        reasons: vec![UnifyDecisionReason {
+          code: UnifyDecisionCode::CohortEnforced,
+          summary: arc("Enforced atomic workspace-member cohort."),
+          features: Vec::new(),
+          members: vec![arc("tokio"), arc("tokio-stream"), arc("tokio-util")],
+          borrowed_from: Vec::new(),
+        }],
+      },
+      UnifyDecision {
+        dep_name: arc("windows-sys"),
+        subject: UnifyDecisionSubject::TransitivePin,
+        member: None,
+        target: None,
+        reasons: vec![UnifyDecisionReason {
+          code: UnifyDecisionCode::TransitivePin,
+          summary: arc("Pinned transitively to stabilize target-specific feature resolution."),
+          features: vec![arc("Win32_Foundation")],
+          members: Vec::new(),
+          borrowed_from: Vec::new(),
+        }],
+      },
+      UnifyDecision {
+        dep_name: arc("tokio"),
+        subject: UnifyDecisionSubject::UndeclaredFeatureFix,
+        member: Some(arc("crate-c")),
+        target: None,
+        reasons: vec![UnifyDecisionReason {
+          code: UnifyDecisionCode::UndeclaredFeatureFix,
+          summary: arc("Added missing features to stop borrowed resolver state."),
+          features: vec![arc("macros")],
+          members: vec![arc("crate-c")],
+          borrowed_from: vec![arc("crate-a")],
+        }],
+      },
+    ]);
+    plan.member_edits.insert(
+      arc("crate-c"),
+      vec![crate::cargo::MemberEdit::AddFeatures {
+        dep_name: arc("tokio"),
+        dep_kind: DepKind::Normal,
+        target: None,
+        features_to_add: vec![arc("macros")],
+      }],
+    );
+
+    let mut sink = UnifyTextSink::new(true);
+    display_explain(&mut sink, &plan);
+    let output = sink.finish().expect("captured output");
+
+    assert!(output.contains("Dependency decisions:"));
+    assert!(output.contains("intersection: Used intersection to keep only shared features."));
+    assert!(output.contains("exact_pin_warn_caret: Converted exact pin to ^1.0.200."));
+    assert!(output.contains("cohort_enforced: Enforced atomic workspace-member cohort."));
+    assert!(output.contains("transitive_pin: Pinned transitively to stabilize target-specific feature resolution."));
+    assert!(output.contains("undeclared_feature_fix: Added missing features to stop borrowed resolver state."));
+    assert!(output.contains("borrowed from: crate-a"));
+  }
 }

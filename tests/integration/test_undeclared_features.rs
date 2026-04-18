@@ -8,6 +8,7 @@
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
+use serde_json::Value;
 use std::fs;
 
 /// Helper to create a workspace with undeclared feature detection enabled
@@ -307,6 +308,76 @@ tokio = { version = "1.0", features = ["rt"] }
     crate_b_toml.contains("workspace = true") || crate_b_toml.contains("workspace=true"),
     "crate-b should use workspace inheritance after unification.\nContent:\n{}",
     crate_b_toml
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_undeclared_features_json_exposes_decision_reasons() -> Result<()> {
+  let workspace = create_fresh_workspace_with_undeclared_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "crate-a",
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["macros", "rt"] }
+"#,
+    "pub fn a() {}",
+  )?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "crate-b",
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["rt"] }
+"#,
+    "pub fn b() {}",
+  )?;
+
+  workspace.commit("Add crates for JSON decision test")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  let decisions = json["dependency_decisions"]
+    .as_array()
+    .expect("dependency_decisions should be an array");
+
+  assert!(
+    decisions.iter().any(|decision| {
+      decision["dep_name"] == "tokio"
+        && decision["subject"] == "workspace_dependency"
+        && decision["reasons"].as_array().is_some_and(|reasons| {
+          reasons
+            .iter()
+            .any(|reason| reason["code"] == "intersection" || reason["code"] == "union")
+        })
+    }),
+    "workspace dependency decisions should include feature strategy reasons.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+
+  assert!(
+    decisions.iter().any(|decision| {
+      decision["dep_name"] == "tokio"
+        && decision["subject"] == "undeclared_feature_fix"
+        && decision["member"] == "crate-b"
+        && decision["reasons"]
+          .as_array()
+          .is_some_and(|reasons| reasons.iter().any(|reason| reason["code"] == "undeclared_feature_fix"))
+    }),
+    "undeclared feature fixes should be exposed as dependency decisions.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json)?
   );
 
   Ok(())

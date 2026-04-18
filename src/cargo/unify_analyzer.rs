@@ -10,8 +10,9 @@ use crate::cargo::{
   unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyIssue,
-    UnifyIssueKind, ValidationResult, VersionMismatch,
+    DuplicateCleanup, IssueSeverity, MemberEdit, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyDecision,
+    UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnifyIssueKind, ValidationResult,
+    VersionMismatch,
   },
 };
 use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
@@ -35,6 +36,8 @@ pub struct UnifyAnalyzer {
   existing_workspace_deps: FxHashMap<String, ExistingWorkspaceDep>,
   /// Precomputed cohort diagnostics from config + workspace-member graph policy
   cohort_issues: Vec<UnifyIssue>,
+  /// Explainability records for cohort policy decisions keyed by member package name.
+  cohort_decisions: FxHashMap<Arc<str>, Vec<CohortDecision>>,
   /// Workspace root path (for path normalization)
   workspace_root: PathBuf,
   /// Canonical workspace root path (computed once)
@@ -43,6 +46,12 @@ pub struct UnifyAnalyzer {
 
 type FeatureSources = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
 type FeatureTargetSpecific = FxHashMap<String, FxHashMap<String, bool>>;
+
+#[derive(Debug, Clone)]
+struct CohortDecision {
+  summary: Arc<str>,
+  members: Vec<Arc<str>>,
+}
 
 impl UnifyAnalyzer {
   /// Create a new analyzer from workspace context
@@ -64,7 +73,7 @@ impl UnifyAnalyzer {
       .iter()
       .map(|pkg| Arc::from(pkg.name.as_str()))
       .collect();
-    let (config, cohort_issues) =
+    let (config, cohort_issues, cohort_decisions) =
       Self::apply_workspace_member_cohort_policy(base_config, &manifests, &workspace_member_names);
     let workspace_root = ctx.workspace_root().to_path_buf();
     let canonical_workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
@@ -75,6 +84,7 @@ impl UnifyAnalyzer {
       config,
       existing_workspace_deps,
       cohort_issues,
+      cohort_decisions,
       workspace_root,
       canonical_workspace_root,
     })
@@ -154,8 +164,9 @@ impl UnifyAnalyzer {
     mut config: UnifyConfig,
     manifests: &ManifestAnalyzer,
     workspace_member_names: &FxHashSet<Arc<str>>,
-  ) -> (UnifyConfig, Vec<UnifyIssue>) {
+  ) -> (UnifyConfig, Vec<UnifyIssue>, FxHashMap<Arc<str>, Vec<CohortDecision>>) {
     let mut issues = Vec::new();
+    let mut cohort_decisions: FxHashMap<Arc<str>, Vec<CohortDecision>> = FxHashMap::default();
     let cohorts = Self::build_workspace_member_cohorts(manifests, workspace_member_names);
 
     for cohort in cohorts.into_iter().filter(|c| c.len() > 1) {
@@ -167,6 +178,11 @@ impl UnifyAnalyzer {
           let mut excluded_names: Vec<&str> = excluded_members.iter().map(|s| &***s).collect();
           cohort_names.sort_unstable();
           excluded_names.sort_unstable();
+          let summary = Arc::from(format!(
+            "Enforced atomic workspace-member cohort [{}] after partial exclusion [{}] to avoid local-vs-registry splits.",
+            cohort_names.join(", "),
+            excluded_names.join(", ")
+          ));
           issues.push(UnifyIssue {
             kind: UnifyIssueKind::WorkspaceMemberCohortSplitRisk,
             dep_name: Arc::clone(excluded_members[0]),
@@ -178,6 +194,15 @@ impl UnifyAnalyzer {
               excluded_names.join(", ")
             )),
           });
+          for member in &cohort {
+            cohort_decisions
+              .entry(Arc::clone(member))
+              .or_default()
+              .push(CohortDecision {
+                summary: Arc::clone(&summary),
+                members: cohort.to_vec(),
+              });
+          }
         }
 
         for member in &cohort {
@@ -208,6 +233,11 @@ impl UnifyAnalyzer {
         regular_members.sort();
         let mut cohort_names: Vec<&str> = cohort.iter().map(|s| &**s).collect();
         cohort_names.sort_unstable();
+        let summary = Arc::from(format!(
+          "Enforced atomic workspace-member cohort [{}] because single-user filtering would split [{}].",
+          cohort_names.join(", "),
+          low_usage_members.join(", ")
+        ));
 
         issues.push(UnifyIssue {
           kind: UnifyIssueKind::WorkspaceMemberCohortSplitRisk,
@@ -220,6 +250,16 @@ impl UnifyAnalyzer {
             low_usage_members.join(", ")
           )),
         });
+
+        for member in &cohort {
+          cohort_decisions
+            .entry(Arc::clone(member))
+            .or_default()
+            .push(CohortDecision {
+              summary: Arc::clone(&summary),
+              members: cohort.to_vec(),
+            });
+        }
       }
 
       // Cohort members bypass single-user heuristics: all-or-nothing behavior by default.
@@ -230,7 +270,49 @@ impl UnifyAnalyzer {
       }
     }
 
-    (config, issues)
+    (config, issues, cohort_decisions)
+  }
+
+  fn record_decision_reason(
+    decisions: &mut Vec<UnifyDecision>,
+    dep_name: Arc<str>,
+    subject: UnifyDecisionSubject,
+    member: Option<Arc<str>>,
+    target: Option<Arc<str>>,
+    reason: UnifyDecisionReason,
+  ) {
+    Self::record_decision_reasons(decisions, dep_name, subject, member, target, vec![reason]);
+  }
+
+  fn record_decision_reasons(
+    decisions: &mut Vec<UnifyDecision>,
+    dep_name: Arc<str>,
+    subject: UnifyDecisionSubject,
+    member: Option<Arc<str>>,
+    target: Option<Arc<str>>,
+    mut reasons: Vec<UnifyDecisionReason>,
+  ) {
+    if reasons.is_empty() {
+      return;
+    }
+
+    if let Some(existing) = decisions.iter_mut().find(|decision| {
+      decision.dep_name == dep_name
+        && decision.subject == subject
+        && decision.member == member
+        && decision.target == target
+    }) {
+      existing.reasons.append(&mut reasons);
+      return;
+    }
+
+    decisions.push(UnifyDecision {
+      dep_name,
+      subject,
+      member,
+      target,
+      reasons,
+    });
   }
 
   /// Normalize a dependency path relative to the workspace root.
@@ -287,6 +369,7 @@ impl UnifyAnalyzer {
     issues.reserve(16); // Issues are rare, small pre-alloc
     let mut duplicates_cleaned = Vec::with_capacity(8);
     let mut version_mismatches = Vec::with_capacity(8);
+    let mut dependency_decisions = Vec::with_capacity(dep_count);
 
     // Pre-compute workspace member metadata for reuse.
     let mut workspace_member_names: FxHashSet<Arc<str>> = FxHashSet::default();
@@ -361,6 +444,22 @@ impl UnifyAnalyzer {
         match self.config.exact_pin_handling {
           ExactPinHandling::Skip => {
             // Skip this dep entirely - don't unify exact pins
+            Self::record_decision_reason(
+              &mut dependency_decisions,
+              Arc::clone(&dep_key.name),
+              UnifyDecisionSubject::SkippedDependency,
+              None,
+              None,
+              UnifyDecisionReason {
+                code: UnifyDecisionCode::ExactPinSkipped,
+                summary: Arc::from(
+                  "Skipped because exact_pin_handling = \"skip\" and at least one usage is pinned exactly.",
+                ),
+                features: Vec::new(),
+                members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+                borrowed_from: Vec::new(),
+              },
+            );
             continue;
           }
           ExactPinHandling::Warn => {
@@ -437,6 +536,36 @@ impl UnifyAnalyzer {
           .or_else(|_| VersionReq::parse(&version.to_string()))
           .unwrap_or_else(|_| VersionReq::default())
       };
+      let mut decision_reasons = Vec::new();
+      if has_exact_pin {
+        match self.config.exact_pin_handling {
+          ExactPinHandling::Preserve => {
+            decision_reasons.push(UnifyDecisionReason {
+              code: UnifyDecisionCode::ExactPinPreserved,
+              summary: Arc::from(format!(
+                "Preserved exact pin in workspace.dependencies because exact_pin_handling = \"preserve\" ({}).",
+                version_req
+              )),
+              features: Vec::new(),
+              members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+              borrowed_from: Vec::new(),
+            });
+          }
+          ExactPinHandling::Warn => {
+            decision_reasons.push(UnifyDecisionReason {
+              code: UnifyDecisionCode::ExactPinWarnCaret,
+              summary: Arc::from(format!(
+                "Converted exact pin to {} because exact_pin_handling = \"warn\".",
+                version_req
+              )),
+              features: Vec::new(),
+              members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+              borrowed_from: Vec::new(),
+            });
+          }
+          ExactPinHandling::Skip => {}
+        }
+      }
 
       // Check for version mismatches with existing workspace.dependencies
       if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&*dep_key.name)
@@ -480,8 +609,8 @@ impl UnifyAnalyzer {
       // (for example Tokio's "full" leaking into WASM jobs via workspace.dependencies).
       //
       // Non-member deps keep existing feature/default-features unification behavior.
-      let (features, default_features) = if is_workspace_member_dep {
-        (std::collections::BTreeSet::new(), true)
+      let (features, default_features, feature_reason) = if is_workspace_member_dep {
+        (std::collections::BTreeSet::new(), true, None)
       } else {
         // Check for mixed defaults - use union strategy if present
         // When include_renamed = true, check across all package variants
@@ -508,7 +637,21 @@ impl UnifyAnalyzer {
               .package_default_features_policy(&dep_key.name)
               .unwrap_or(true)
           };
-          (features, df)
+          let mut feature_list: Vec<Arc<str>> = features.iter().map(|feature| Arc::from(feature.as_str())).collect();
+          feature_list.sort();
+          (
+            features,
+            df,
+            Some(UnifyDecisionReason {
+              code: UnifyDecisionCode::FeatureUnion,
+              summary: Arc::from(
+                "Used union because include_renamed aggregates distinct Cargo.toml keys at the package level.",
+              ),
+              features: feature_list,
+              members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+              borrowed_from: Vec::new(),
+            }),
+          )
         } else {
           // Standard per-dep_key logic
           let intersection = self.manifests.compute_intersection(dep_key);
@@ -518,15 +661,49 @@ impl UnifyAnalyzer {
             // 1. Mixed default-features settings
             // 2. No common features (empty intersection)
             // Set default-features = true (max/union strategy)
-            (self.manifests.compute_union(dep_key), true)
+            let union = self.manifests.compute_union(dep_key);
+            let mut feature_list: Vec<Arc<str>> = union.iter().map(|feature| Arc::from(feature.as_str())).collect();
+            feature_list.sort();
+            let summary = if has_mixed_defaults {
+              "Used union because dependency usages disagree on default-features."
+            } else {
+              "Used union because the shared feature intersection was empty."
+            };
+            (
+              union,
+              true,
+              Some(UnifyDecisionReason {
+                code: UnifyDecisionCode::FeatureUnion,
+                summary: Arc::from(summary),
+                features: feature_list,
+                members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+                borrowed_from: Vec::new(),
+              }),
+            )
           } else {
             // Use intersection (minimal) strategy
             // Use conservative default-features policy
             let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
-            (intersection, df)
+            let mut feature_list: Vec<Arc<str>> =
+              intersection.iter().map(|feature| Arc::from(feature.as_str())).collect();
+            feature_list.sort();
+            (
+              intersection,
+              df,
+              Some(UnifyDecisionReason {
+                code: UnifyDecisionCode::FeatureIntersection,
+                summary: Arc::from("Used intersection to keep only features shared by every usage."),
+                features: feature_list,
+                members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+                borrowed_from: Vec::new(),
+              }),
+            )
           }
         }
       };
+      if let Some(reason) = feature_reason {
+        decision_reasons.push(reason);
+      }
 
       // Note: Target constraints stay in member manifests, not workspace.dependencies.
       // Members use `[target.'cfg(...)'.dependencies] dep = { workspace = true }`.
@@ -557,6 +734,17 @@ impl UnifyAnalyzer {
 
       // Compute the unified features (this is what workspace.dependencies should have)
       let computed_features: Vec<Arc<str>> = features.into_iter().map(Arc::from).collect();
+      if let Some(cohort_entries) = self.cohort_decisions.get(&dep_key.name) {
+        for entry in cohort_entries {
+          decision_reasons.push(UnifyDecisionReason {
+            code: UnifyDecisionCode::CohortEnforced,
+            summary: Arc::clone(&entry.summary),
+            features: Vec::new(),
+            members: entry.members.clone(),
+            borrowed_from: Vec::new(),
+          });
+        }
+      }
 
       // Check if this dep already exists in workspace.dependencies
       let existing_dep = self.existing_workspace_deps.get(&*dep_key.name);
@@ -600,6 +788,14 @@ impl UnifyAnalyzer {
         };
         workspace_deps.push(unified);
       }
+      Self::record_decision_reasons(
+        &mut dependency_decisions,
+        Arc::clone(&dep_key.name),
+        UnifyDecisionSubject::WorkspaceDependency,
+        None,
+        None,
+        decision_reasons,
+      );
 
       // Compute member edits for ALL dep kinds (normal, dev, build)
       // Per design doc: all dep kinds should be unified, not just Normal
@@ -636,6 +832,24 @@ impl UnifyAnalyzer {
     } else {
       Vec::new()
     };
+    for pin in &transitive_pins {
+      Self::record_decision_reason(
+        &mut dependency_decisions,
+        Arc::clone(&pin.name),
+        UnifyDecisionSubject::TransitivePin,
+        None,
+        None,
+        UnifyDecisionReason {
+          code: UnifyDecisionCode::TransitivePin,
+          summary: Arc::from(
+            "Pinned transitively because target-specific feature resolution would otherwise fragment the graph.",
+          ),
+          features: pin.features.clone(),
+          members: Vec::new(),
+          borrowed_from: Vec::new(),
+        },
+      );
+    }
 
     // Compute MSRV if enabled
     let computed_msrv = if self.config.msrv {
@@ -748,6 +962,23 @@ impl UnifyAnalyzer {
           features_to_add: uf.undeclared_features.clone(),
         };
         member_edits.entry(Arc::clone(&uf.member)).or_default().push(edit);
+        Self::record_decision_reason(
+          &mut dependency_decisions,
+          Arc::clone(&uf.dep_name),
+          UnifyDecisionSubject::UndeclaredFeatureFix,
+          Some(Arc::clone(&uf.member)),
+          uf.target.clone(),
+          UnifyDecisionReason {
+            code: UnifyDecisionCode::UndeclaredFeatureFix,
+            summary: Arc::from(format!(
+              "Added missing features to {} so it stops borrowing resolver state from other workspace members.",
+              uf.member
+            )),
+            features: uf.undeclared_features.clone(),
+            members: vec![Arc::clone(&uf.member)],
+            borrowed_from: uf.borrowed_from.clone(),
+          },
+        );
       }
     } else {
       // Add issues for undeclared features (warn mode)
@@ -783,6 +1014,23 @@ impl UnifyAnalyzer {
 
     // Defensive cleanup: avoid representing "no-op members" as pending changes.
     member_edits.retain(|_, edits| !edits.is_empty());
+    for decision in &mut dependency_decisions {
+      decision.reasons.sort_by(|left, right| {
+        left
+          .code
+          .as_str()
+          .cmp(right.code.as_str())
+          .then_with(|| left.summary.cmp(&right.summary))
+      });
+    }
+    dependency_decisions.sort_by(|left, right| {
+      left
+        .dep_name
+        .cmp(&right.dep_name)
+        .then_with(|| left.subject.as_str().cmp(right.subject.as_str()))
+        .then_with(|| left.member.cmp(&right.member))
+        .then_with(|| left.target.cmp(&right.target))
+    });
 
     Ok(UnificationPlan {
       workspace_deps,
@@ -798,6 +1046,7 @@ impl UnifyAnalyzer {
       version_mismatches,
       unused_deps,
       undeclared_features,
+      dependency_decisions,
     })
   }
 

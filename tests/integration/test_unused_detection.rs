@@ -76,7 +76,7 @@ pub fn hello() -> u8 {
 
   workspace.commit("Add crate with hyphenated dependency")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -120,7 +120,7 @@ serialization = ["serde"]
 
   workspace.commit("Add crate with optional dep referenced in features")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // serde is optional but referenced in features - should NOT be flagged
@@ -174,7 +174,7 @@ pub fn hello() -> u8 {
 
   workspace.commit("Add lib+bin crate using dependency only in lib")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -403,7 +403,7 @@ log = "0.4"
 
   workspace.commit("Add test crate")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // log is declared but never referenced in source - it should be flagged.

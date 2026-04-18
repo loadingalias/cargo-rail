@@ -240,6 +240,98 @@ pub struct UndeclaredFeature {
   pub borrowed_from: Vec<Arc<str>>,
 }
 
+/// Subject area for a per-dependency decision entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifyDecisionSubject {
+  /// A dependency being written or updated in `[workspace.dependencies]`.
+  WorkspaceDependency,
+  /// A dependency skipped from workspace unification.
+  SkippedDependency,
+  /// A transitive dependency pinned into the workspace/host manifest.
+  TransitivePin,
+  /// A member-local dependency fix for undeclared features.
+  UndeclaredFeatureFix,
+}
+
+impl UnifyDecisionSubject {
+  /// Stable machine-readable string for JSON/text output.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::WorkspaceDependency => "workspace_dependency",
+      Self::SkippedDependency => "skipped_dependency",
+      Self::TransitivePin => "transitive_pin",
+      Self::UndeclaredFeatureFix => "undeclared_feature_fix",
+    }
+  }
+}
+
+/// Machine-readable code for a unify decision reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifyDecisionCode {
+  /// Shared features were selected using the intersection strategy.
+  FeatureIntersection,
+  /// Features were widened using a union strategy.
+  FeatureUnion,
+  /// Exact version pins were preserved in the workspace dependency.
+  ExactPinPreserved,
+  /// Exact version pins were converted to a caret requirement with a warning.
+  ExactPinWarnCaret,
+  /// Exact version pins caused the dependency to be skipped.
+  ExactPinSkipped,
+  /// A workspace-member cohort was enforced atomically.
+  CohortEnforced,
+  /// A dependency was pinned transitively to stabilize resolution.
+  TransitivePin,
+  /// Missing features were added locally to avoid borrowed-feature breakage.
+  UndeclaredFeatureFix,
+}
+
+impl UnifyDecisionCode {
+  /// Stable machine-readable string for JSON/text output.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::FeatureIntersection => "intersection",
+      Self::FeatureUnion => "union",
+      Self::ExactPinPreserved => "exact_pin_preserved",
+      Self::ExactPinWarnCaret => "exact_pin_warn_caret",
+      Self::ExactPinSkipped => "exact_pin_skipped",
+      Self::CohortEnforced => "cohort_enforced",
+      Self::TransitivePin => "transitive_pin",
+      Self::UndeclaredFeatureFix => "undeclared_feature_fix",
+    }
+  }
+}
+
+/// One reason attached to a dependency decision.
+#[derive(Debug, Clone)]
+pub struct UnifyDecisionReason {
+  /// Machine-readable reason code.
+  pub code: UnifyDecisionCode,
+  /// Human-readable summary.
+  pub summary: Arc<str>,
+  /// Feature names involved in the decision when relevant.
+  pub features: Vec<Arc<str>>,
+  /// Workspace members involved in the decision when relevant.
+  pub members: Vec<Arc<str>>,
+  /// Feature providers for borrowed-feature repairs.
+  pub borrowed_from: Vec<Arc<str>>,
+}
+
+/// Per-dependency explainability record shared by text and JSON output.
+#[derive(Debug, Clone)]
+pub struct UnifyDecision {
+  /// Dependency name this decision applies to.
+  pub dep_name: Arc<str>,
+  /// Decision subject.
+  pub subject: UnifyDecisionSubject,
+  /// Member crate for member-local fixes/skips when applicable.
+  pub member: Option<Arc<str>>,
+  /// Target-specific manifest section for member-local fixes when applicable.
+  pub target: Option<Arc<str>>,
+  /// Concrete reasons behind the decision.
+  pub reasons: Vec<UnifyDecisionReason>,
+}
+
 // UnificationPlan
 
 /// Complete unification plan
@@ -273,6 +365,8 @@ pub struct UnificationPlan {
   /// Undeclared features detected (resolved > declared)
   /// These indicate crates relying on feature unification from other workspace members
   pub undeclared_features: Vec<UndeclaredFeature>,
+  /// Per-dependency explainability records for text/JSON output.
+  pub dependency_decisions: Vec<UnifyDecision>,
 }
 
 impl UnificationPlan {
@@ -732,6 +826,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      dependency_decisions: vec![],
     };
 
     // Add a MemberEdit::AddFeatures
@@ -765,6 +860,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      dependency_decisions: vec![],
     };
 
     // Add multiple AddFeatures edits
@@ -825,6 +921,7 @@ mod tests {
         target: None,
         borrowed_from: vec![arc("other-crate")],
       }],
+      dependency_decisions: vec![],
     };
 
     // No AddFeatures edits = warn mode
@@ -858,6 +955,7 @@ mod tests {
         target: None,
         borrowed_from: vec![arc("other-crate")],
       }],
+      dependency_decisions: vec![],
     };
 
     // Add a fix
@@ -954,6 +1052,7 @@ mod tests {
         target: None,
         borrowed_from: vec![arc("other-crate"), arc("third-crate")],
       }],
+      dependency_decisions: vec![],
     };
 
     // No AddFeatures edits = warn mode with borrowed_from
@@ -990,6 +1089,7 @@ mod tests {
         target: None,
         borrowed_from: vec![], // Empty - shouldn't show "borrowed from"
       }],
+      dependency_decisions: vec![],
     };
 
     let summary = plan.summary();
@@ -1022,6 +1122,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      dependency_decisions: vec![],
     };
 
     assert_eq!(plan.member_edit_count(), 0);
