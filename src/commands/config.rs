@@ -144,7 +144,7 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
 const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &[
   "infrastructure",
   "custom",
-  "conservative_unclassified_owner_fallback",
+  "unknown_file_policy",
   "confidence_profile",
   "bot_pr_confidence_profile",
 ];

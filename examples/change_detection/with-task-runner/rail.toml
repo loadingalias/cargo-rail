@@ -18,7 +18,7 @@ infrastructure = [
 ]
 confidence_profile = "balanced"
 bot_pr_confidence_profile = "strict"
-conservative_unclassified_owner_fallback = true
+unknown_file_policy = "strict"
 
 # Custom surfaces for non-Rust assets
 [change-detection.custom]

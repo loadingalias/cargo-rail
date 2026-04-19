@@ -73,7 +73,11 @@ fn test_plan_classification_corpus() -> Result<()> {
     let json: Value = serde_json::from_slice(&output.stdout)?;
     let planned_file = json["files"]
       .as_array()
-      .and_then(|files| files.iter().find(|file| file["path"].as_str() == Some(case.path.as_str())))
+      .and_then(|files| {
+        files
+          .iter()
+          .find(|file| file["path"].as_str() == Some(case.path.as_str()))
+      })
       .ok_or_else(|| anyhow!("planned file '{}' missing from output", case.path))?;
 
     assert_eq!(

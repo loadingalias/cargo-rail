@@ -14,6 +14,9 @@
     "direct_crates": [
       "lib-a"
     ],
+    "execution_transitive_crates": [
+      "lib-b"
+    ],
     "transitive_crates": [
       "lib-b"
     ]
@@ -84,16 +87,19 @@
   "trace": [
     {
       "code": "CONFIDENCE_PROFILE_BALANCED",
+      "description": "Balanced confidence profile active",
       "id": 1
     },
     {
       "code": "FILE_OWNS_CRATE_DIRECT",
       "crate": "lib-a",
+      "description": "File directly owns a crate",
       "file": "crates/lib-a/src/lib.rs",
       "id": 2
     },
     {
       "code": "FILE_KIND_RUST_SRC",
+      "description": "Rust source file changed",
       "file": "crates/lib-a/src/lib.rs",
       "id": 3,
       "surface": "build"
@@ -102,6 +108,7 @@
       "code": "TRANSITIVE_DEPENDS_ON_DIRECT",
       "crate": "lib-b",
       "depends_on": "lib-a",
+      "description": "Transitive dependency of changed crate",
       "id": 4,
       "surface": "build"
     }

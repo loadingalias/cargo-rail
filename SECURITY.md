@@ -4,10 +4,10 @@
 
 Security fixes are applied to the latest release series.
 
-| Version | Supported |
+| Release line | Status |
 |---|---|
-| Latest | :white_check_mark: |
-| Older | :x: |
+| Latest | supported |
+| Older | unsupported |
 
 ## Reporting a Vulnerability
 

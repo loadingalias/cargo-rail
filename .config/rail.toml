@@ -78,7 +78,7 @@ infrastructure = [
   "Cargo.toml",
   "Cargo.lock",
 ]
-conservative_unclassified_owner_fallback = true  # Enable build+test fallback for unclassified crate-owned files
+unknown_file_policy = "strict"  # Unknown files: crate-owned => build+test, everything else => infra
 confidence_profile = "balanced"  # Planner confidence profile: strict, balanced, fast
 bot_pr_confidence_profile = "strict"  # Optional planner profile override for bot-authored PRs
 

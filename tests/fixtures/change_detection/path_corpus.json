@@ -17,7 +17,8 @@
   {
     "path": "config/pipeline.yaml",
     "kind": "unknown",
-    "surfaces": ["docs"]
+    "default_surfaces": [],
+    "surfaces": ["infra"]
   },
   {
     "path": "scripts/check.sh",
@@ -39,7 +40,8 @@
   {
     "path": "vendor/foreign/Cargo.lock",
     "kind": "unknown",
-    "surfaces": ["docs"]
+    "default_surfaces": [],
+    "surfaces": ["infra"]
   },
   {
     "path": "crates/lib-a/Cargo.toml",
@@ -68,6 +70,7 @@
   {
     "path": "notes/archive.bin",
     "kind": "unknown",
-    "surfaces": ["docs"]
+    "default_surfaces": [],
+    "surfaces": ["infra"]
   }
 ]

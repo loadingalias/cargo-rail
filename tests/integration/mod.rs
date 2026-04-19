@@ -12,6 +12,7 @@ mod test_msrv;
 mod test_nested_workspace;
 mod test_plan;
 mod test_plan_apply;
+mod test_plan_classification_corpus;
 mod test_release_changelog;
 mod test_run;
 mod test_split;

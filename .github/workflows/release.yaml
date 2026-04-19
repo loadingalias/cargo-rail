@@ -102,6 +102,16 @@ jobs:
         with:
           toolchain: stable
 
+      # Normalize workspace source paths in release artifacts without rewriting diagnostics.
+      - name: Configure path remapping
+        shell: bash
+        run: |
+          flags="--remap-path-prefix=${GITHUB_WORKSPACE}=/workspace --remap-path-scope=object"
+          if [ -n "${RUSTFLAGS:-}" ]; then
+            flags="${RUSTFLAGS} ${flags}"
+          fi
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+
       - name: Setup cross-compilation
         uses: taiki-e/setup-cross-toolchain-action@b8d1a322a6009a2b7220f53996695778eef89b41  # v1.38.0
         with:

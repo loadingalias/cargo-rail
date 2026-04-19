@@ -259,6 +259,54 @@ impl WorkspaceGraph {
     Ok(dependents)
   }
 
+  /// Get `(depends_on, dependent)` pairs for transitive reverse dependencies of multiple crates.
+  ///
+  /// Returns one pair for each workspace dependent reachable from each input crate.
+  /// If a dependent is reachable from multiple input crates, one pair is returned per
+  /// originating crate. Output is sorted lexicographically by `(depends_on, dependent)`.
+  pub fn transitive_dependent_pairs_of_set(&self, crate_names: &HashSet<String>) -> RailResult<Vec<(String, String)>> {
+    if crate_names.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let start_nodes: Vec<NodeIndex> = crate_names
+      .iter()
+      .filter_map(|name| self.name_to_node.get(name).copied())
+      .collect();
+
+    if start_nodes.is_empty() {
+      return Ok(Vec::new());
+    }
+
+    let mut visited: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
+    let mut stack = Vec::with_capacity(start_nodes.len());
+    for start_node in start_nodes {
+      visited.insert((start_node, start_node));
+      stack.push((start_node, start_node));
+    }
+
+    let mut pairs = Vec::new();
+
+    while let Some((node_idx, start_node)) = stack.pop() {
+      for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
+        let state = (neighbor_idx, start_node);
+        if !visited.insert(state) {
+          continue;
+        }
+
+        let neighbor = &self.graph[neighbor_idx];
+        if neighbor.is_workspace_member && neighbor_idx != start_node {
+          pairs.push((self.graph[start_node].name.clone(), neighbor.name.clone()));
+        }
+
+        stack.push(state);
+      }
+    }
+
+    pairs.sort();
+    Ok(pairs)
+  }
+
   /// Get workspace members in dependency order (dependencies first, dependents last).
   ///
   /// Returns crates in the order they should be published: a crate's dependencies
@@ -467,6 +515,37 @@ impl WorkspaceGraph {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::path::PathBuf;
+  use std::sync::RwLock;
+
+  fn test_graph(edges: &[(&str, &str)]) -> WorkspaceGraph {
+    let mut graph = DiGraph::new();
+    let mut name_to_node = FxHashMap::default();
+    let mut workspace_members = HashSet::new();
+
+    for name in ["a", "b", "c", "d"] {
+      let node = graph.add_node(PackageNode {
+        name: name.to_string(),
+        manifest_path: PathBuf::from(format!("crates/{name}/Cargo.toml")),
+        is_workspace_member: true,
+      });
+      name_to_node.insert(name.to_string(), node);
+      workspace_members.insert(name.to_string());
+    }
+
+    for (from, to) in edges {
+      graph.add_edge(name_to_node[*from], name_to_node[*to], DependencyKind::Normal);
+    }
+
+    WorkspaceGraph {
+      graph,
+      name_to_node,
+      workspace_members,
+      sorted_members: vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
+      workspace_root: PathBuf::from("/tmp/workspace"),
+      path_cache: RwLock::new(None),
+    }
+  }
 
   #[test]
   fn test_should_ignore_path() {
@@ -554,6 +633,26 @@ mod tests {
     assert!(
       !WorkspaceGraph::should_ignore_path(Path::new("README.md")),
       "README.md should not be ignored"
+    );
+  }
+
+  #[test]
+  fn test_transitive_dependent_pairs_of_set_is_sorted_and_preserves_seed_provenance() {
+    let graph = test_graph(&[("b", "a"), ("c", "a"), ("d", "b"), ("d", "c")]);
+    let seeds = HashSet::from(["a".to_string(), "c".to_string()]);
+
+    let pairs = graph
+      .transitive_dependent_pairs_of_set(&seeds)
+      .expect("pair traversal should succeed");
+
+    assert_eq!(
+      pairs,
+      vec![
+        ("a".to_string(), "b".to_string()),
+        ("a".to_string(), "c".to_string()),
+        ("a".to_string(), "d".to_string()),
+        ("c".to_string(), "d".to_string()),
+      ]
     );
   }
 }

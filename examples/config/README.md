@@ -1,34 +1,20 @@
 # Config Example
 
-A complete, documented `rail.toml` configuration file.
+This directory contains a complete `rail.toml`.
 
-## Usage
+## Use It
 
 ```bash
-# Generate config for your workspace
 cargo rail init
-
-# Or copy this example
-cp examples/config/rail.toml .config/rail.toml
+cargo rail config validate --strict
 ```
 
-## Sections
-
-| Section | Purpose |
-|---------|---------|
-| `targets` | Platform targets for multi-target validation |
-| `[unify]` | Dependency unification settings |
-| `[change-detection]` | Change detection rules and confidence profiles |
-| `[run]` | Execution profiles for `cargo rail run` |
-| `[release]` | Release automation settings |
-| `[crates.<name>.*]` | Per-crate overrides |
-
-## Validate
+Or copy the example into your workspace:
 
 ```bash
-cargo rail config validate --strict
+cp examples/config/rail.toml .config/rail.toml
 ```
 
 ## Reference
 
-Full documentation: [docs/config.md](../../docs/config.md)
+- [Configuration Reference](../../docs/config.md)

@@ -1,108 +1,34 @@
 # Change Detection: Standalone
 
-For projects **without** a dedicated task runner (no just, make, or xtask).
+Use this pattern when `cargo-rail` should handle both planning and execution.
 
-## Strategy
-
-`cargo rail run` handles both change detection and execution using built-in surfaces.
-
-## Usage
-
-### Local Development
+## Local Example
 
 ```bash
-# See what changed and why
 cargo rail plan --merge-base --explain
-
-# Run tests for affected crates
 cargo rail run --merge-base --surface test
-
-# Preview commands without running
 cargo rail run --merge-base --dry-run --print-cmd
-
-# Use a named profile
-cargo rail run --workflow ci
-
-# Force full workspace test
-cargo rail run --all --surface test
 ```
 
-### GitHub Actions
+## CI Example
 
 ```yaml
-jobs:
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      build: ${{ steps.rail.outputs.build }}
-      test: ${{ steps.rail.outputs.test }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+- uses: loadingalias/cargo-rail-action@v4
+  id: rail
 
-      - uses: loadingalias/cargo-rail-action@v4
-        id: rail
-        with:
-          mode: minimal
-          args: '--explain'
+- name: Run selected tests
+  if: steps.rail.outputs.test == 'true'
+  run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --surface test
 
-  test:
-    needs: plan
-    if: needs.plan.outputs.test == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo rail run --merge-base --surface test
-
-  build:
-    needs: plan
-    if: needs.plan.outputs.build == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo rail run --merge-base --surface build
+- name: Run selected build
+  if: steps.rail.outputs.build == 'true'
+  run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --surface build
 ```
 
 ## Built-in Surfaces
 
-| Surface | Command |
-|---------|---------|
-| `build` | `cargo check --workspace` |
-| `test` | `cargo test` or `cargo nextest run` |
-| `bench` | `cargo bench --workspace` |
-| `docs` | `cargo doc --workspace --no-deps` |
-| `infra` | No executor (CI gating only) |
-
-## Profiles
-
-Profiles bundle surfaces together:
-
-```toml
-[run.profile.ci]
-surfaces = ["build", "test"]
-
-[run.profile.nightly]
-surfaces = ["build", "test", "docs", "bench"]
-```
-
-Run with: `cargo rail run --profile ci`
-
-## Workflow Mapping
-
-Map CI workflow names to profiles:
-
-```toml
-[run.workflow]
-commit = "ci"
-nightly = "nightly"
-```
-
-Run with: `cargo rail run --workflow commit`
-
-## Real Examples
-
-- [tokio](https://github.com/loadingalias/cargo-rail-testing/tree/main/tokio) — no task runner
-- [helix-db](https://github.com/loadingalias/cargo-rail-testing/tree/main/helix-db) — no task runner
+- `build`
+- `test`
+- `bench`
+- `docs`
+- `infra` for gating only

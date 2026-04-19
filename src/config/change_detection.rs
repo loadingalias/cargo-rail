@@ -4,7 +4,7 @@
 
 use crate::error::ConfigError;
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Confidence profile for planner safety behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -17,6 +17,21 @@ pub enum ConfidenceProfile {
   Balanced,
   /// Fastest behavior; minimizes conservative expansion.
   Fast,
+}
+
+/// Policy for unknown file kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownFilePolicy {
+  /// Treat unknown files as docs-only.
+  Docs,
+  /// Crate-owned unknown files enable build+test; everything else stays docs-only.
+  OwnedBuildTest,
+  /// Workspace-scoped unknown files enable infra; everything else stays docs-only.
+  WorkspaceInfra,
+  /// Crate-owned unknown files enable build+test and non-crate unknown files enable infra.
+  #[default]
+  Strict,
 }
 
 /// Configuration for planner change detection.
@@ -32,11 +47,17 @@ pub struct ChangeDetectionConfig {
   #[serde(default)]
   pub custom: FxHashMap<String, Vec<String>>,
 
-  /// When true, unclassified crate-owned files conservatively enable build+test surfaces.
+  /// Policy for unknown file kinds.
   ///
-  /// Set to false to keep aggressive behavior for unknown file kinds.
-  #[serde(default = "default_conservative_unclassified_owner_fallback")]
-  pub conservative_unclassified_owner_fallback: bool,
+  /// Accepts legacy boolean values for backward compatibility:
+  /// - `true`  => `owned_build_test`
+  /// - `false` => `docs`
+  #[serde(
+    default = "default_unknown_file_policy",
+    alias = "conservative_unclassified_owner_fallback",
+    deserialize_with = "deserialize_unknown_file_policy"
+  )]
+  pub unknown_file_policy: UnknownFilePolicy,
 
   /// Confidence profile used by planner unless explicitly overridden by CLI.
   #[serde(default)]
@@ -54,7 +75,7 @@ impl Default for ChangeDetectionConfig {
     Self {
       infrastructure: default_infrastructure_patterns(),
       custom: FxHashMap::default(),
-      conservative_unclassified_owner_fallback: default_conservative_unclassified_owner_fallback(),
+      unknown_file_policy: default_unknown_file_policy(),
       confidence_profile: ConfidenceProfile::default(),
       bot_pr_confidence_profile: None,
     }
@@ -119,8 +140,26 @@ fn default_infrastructure_patterns() -> Vec<String> {
   PATTERNS.iter().map(|&s| String::from(s)).collect()
 }
 
-fn default_conservative_unclassified_owner_fallback() -> bool {
-  true
+fn default_unknown_file_policy() -> UnknownFilePolicy {
+  UnknownFilePolicy::Strict
+}
+
+fn deserialize_unknown_file_policy<'de, D>(deserializer: D) -> Result<UnknownFilePolicy, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum UnknownFilePolicyInput {
+    Bool(bool),
+    Policy(UnknownFilePolicy),
+  }
+
+  match UnknownFilePolicyInput::deserialize(deserializer)? {
+    UnknownFilePolicyInput::Bool(true) => Ok(UnknownFilePolicy::OwnedBuildTest),
+    UnknownFilePolicyInput::Bool(false) => Ok(UnknownFilePolicy::Docs),
+    UnknownFilePolicyInput::Policy(policy) => Ok(policy),
+  }
 }
 
 fn is_valid_custom_category(category: &str) -> bool {
@@ -135,7 +174,7 @@ fn is_valid_custom_category(category: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use super::{ChangeDetectionConfig, ConfidenceProfile, FxHashMap};
+  use super::{ChangeDetectionConfig, ConfidenceProfile, FxHashMap, UnknownFilePolicy};
 
   #[test]
   fn test_validate_accepts_valid_custom_category_names() {
@@ -145,7 +184,7 @@ mod tests {
     let cfg = ChangeDetectionConfig {
       infrastructure: vec![".github/**".to_string()],
       custom,
-      conservative_unclassified_owner_fallback: true,
+      unknown_file_policy: UnknownFilePolicy::Strict,
       confidence_profile: ConfidenceProfile::Balanced,
       bot_pr_confidence_profile: None,
     };
@@ -159,10 +198,34 @@ mod tests {
     let cfg = ChangeDetectionConfig {
       infrastructure: vec![".github/**".to_string()],
       custom,
-      conservative_unclassified_owner_fallback: true,
+      unknown_file_policy: UnknownFilePolicy::Strict,
       confidence_profile: ConfidenceProfile::Balanced,
       bot_pr_confidence_profile: None,
     };
     assert!(cfg.validate().is_err());
+  }
+
+  #[test]
+  fn test_legacy_bool_unknown_file_policy_true_maps_to_owned_build_test() {
+    let cfg: ChangeDetectionConfig = toml_edit::de::from_str(
+      r#"
+      conservative_unclassified_owner_fallback = true
+      "#,
+    )
+    .expect("legacy bool config should parse");
+
+    assert_eq!(cfg.unknown_file_policy, UnknownFilePolicy::OwnedBuildTest);
+  }
+
+  #[test]
+  fn test_legacy_bool_unknown_file_policy_false_maps_to_docs() {
+    let cfg: ChangeDetectionConfig = toml_edit::de::from_str(
+      r#"
+      conservative_unclassified_owner_fallback = false
+      "#,
+    )
+    .expect("legacy bool config should parse");
+
+    assert_eq!(cfg.unknown_file_policy, UnknownFilePolicy::Docs);
   }
 }

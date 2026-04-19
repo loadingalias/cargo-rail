@@ -311,7 +311,7 @@ Settings for planner path classification.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `infrastructure` | `string[]` | see below | Path patterns treated as infra changes. |
-| `conservative_unclassified_owner_fallback` | `bool` | `true` | If `true`, unclassified files owned by crates conservatively enable `build` + `test`. |
+| `unknown_file_policy` | `enum` | `"strict"` | Unknown-file policy:<br>• `"docs"` - keep unknown files docs-only<br>• `"owned_build_test"` - crate-owned unknown files enable `build` + `test`<br>• `"workspace_infra"` - non-crate unknown files enable `infra`<br>• `"strict"` - crate-owned unknown files enable `build` + `test`; everything else enables `infra` |
 | `confidence_profile` | `enum` | `"balanced"` | Planner confidence profile:<br>• `"strict"` - expands crate-owned changes to conservative `build` + `test` with transitive seeding<br>• `"balanced"` - default behavior<br>• `"fast"` - disables conservative transitive surface seeding for speed |
 | `bot_pr_confidence_profile` | `enum?` | `unset` | Optional profile override applied only for bot-authored GitHub pull requests (for example set to `"strict"`). |
 | `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces in `cargo rail plan` output. **Important:** Custom surfaces are plan OUTPUTS for CI gating—they cannot be used in `[run.profile.X].surfaces`. Category names must use ASCII letters/digits with `_` or `-` (for example `verify_models`, `bench-extended`). |
@@ -972,6 +972,5 @@ Note: `cargo rail config validate` defaults to strict mode in CI (detected via `
 
 - [Commands Reference](./commands.md) - All cargo-rail commands
 - [Migration Guide](./migrate-hakari.md) - Migrating from cargo-hakari
-- [Migration Guide](./migrate-plan-run.md) - Migrating legacy command flows to `plan` / `run`
 - [Troubleshooting](./troubleshooting.md) - Diagnose planner and executor decisions
 - [README](../README.md) - Project overview and quick start

@@ -44,6 +44,7 @@ const BENCH_ONLY_SURFACES: &[&str] = &["bench"];
 const INFRA_BUILD_TEST_SURFACES: &[&str] = &["infra", "build", "test"];
 const INFRA_ONLY_SURFACES: &[&str] = &["infra"];
 const DOCS_ONLY_SURFACES: &[&str] = &["docs"];
+const NO_SURFACES: &[&str] = &[];
 
 /// Coarse legacy classification retained for compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +199,8 @@ impl FileProfile {
         INFRA_BUILD_TEST_SURFACES
       }
       Self::Ci | Self::Script => INFRA_ONLY_SURFACES,
-      Self::Docs | Self::RepoConfig | Self::Unknown => DOCS_ONLY_SURFACES,
+      Self::Docs | Self::RepoConfig => DOCS_ONLY_SURFACES,
+      Self::Unknown => NO_SURFACES,
     }
   }
 
@@ -469,6 +471,8 @@ mod tests {
     kind: String,
     #[serde(default)]
     sub_kind: Option<String>,
+    #[serde(default)]
+    default_surfaces: Option<Vec<String>>,
     surfaces: Vec<String>,
   }
 
@@ -493,7 +497,7 @@ mod tests {
           .iter()
           .map(|surface| (*surface).to_string())
           .collect::<Vec<_>>(),
-        case.surfaces,
+        case.default_surfaces.clone().unwrap_or_else(|| case.surfaces.clone()),
         "surface mismatch for {}",
         case.path
       );

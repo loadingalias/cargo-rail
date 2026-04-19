@@ -241,9 +241,9 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   },
   FieldSpec {
     section: "change-detection",
-    key: "conservative_unclassified_owner_fallback",
-    default_toml: "true",
-    comment: "Enable build+test fallback for unclassified crate-owned files",
+    key: "unknown_file_policy",
+    default_toml: "\"strict\"",
+    comment: "Unknown-file policy: docs, owned_build_test, workspace_infra, strict",
   },
   FieldSpec {
     section: "change-detection",
@@ -397,7 +397,7 @@ mod tests {
 
     // [change-detection] field
     assert!(field_keys.contains(&("change-detection", "infrastructure")));
-    assert!(field_keys.contains(&("change-detection", "conservative_unclassified_owner_fallback")));
+    assert!(field_keys.contains(&("change-detection", "unknown_file_policy")));
     assert!(field_keys.contains(&("change-detection", "confidence_profile")));
     assert!(field_keys.contains(&("change-detection", "bot_pr_confidence_profile")));
 

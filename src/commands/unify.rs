@@ -110,7 +110,11 @@ fn dependency_section<'a>(dep_kind: &crate::cargo::DepKind, target: Option<&'a s
   }
 }
 
-fn mutation_targets(plan: &crate::cargo::UnificationPlan, msrv_write_needed: bool) -> Vec<String> {
+fn mutation_targets(
+  plan: &crate::cargo::UnificationPlan,
+  workspace_root: &std::path::Path,
+  msrv_write_needed: bool,
+) -> Vec<String> {
   let mut targets = Vec::new();
   if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
     targets.push("Cargo.toml".to_string());
@@ -121,11 +125,12 @@ fn mutation_targets(plan: &crate::cargo::UnificationPlan, msrv_write_needed: boo
     .keys()
     .filter_map(|member| {
       plan.member_paths.get(member).map(|path| {
-        path
-          .strip_prefix(std::path::Path::new("."))
-          .unwrap_or(path)
-          .display()
-          .to_string()
+        let relative = if path.is_absolute() {
+          path.strip_prefix(workspace_root).unwrap_or(path)
+        } else {
+          path.strip_prefix(std::path::Path::new(".")).unwrap_or(path)
+        };
+        crate::utils::path_to_git_format(relative)
       })
     })
     .collect();
@@ -146,6 +151,7 @@ fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
 fn write_compact_summary(
   sink: &mut UnifyTextSink,
   plan: &crate::cargo::UnificationPlan,
+  workspace_root: &std::path::Path,
   msrv_write_needed: bool,
   has_changes: bool,
 ) {
@@ -238,7 +244,7 @@ fn write_compact_summary(
 
   outln!(sink);
   outln!(sink, "will mutate:");
-  let targets = mutation_targets(plan, msrv_write_needed);
+  let targets = mutation_targets(plan, workspace_root, msrv_write_needed);
   if targets.is_empty() {
     outln!(sink, "  none");
   } else {
@@ -418,7 +424,7 @@ pub fn run_unify_analyze(
   let mut sink = UnifyTextSink::new(output.is_some());
 
   // Default output stays terse; detailed reasoning belongs behind --explain or JSON.
-  write_compact_summary(&mut sink, &plan, msrv_write_needed, has_changes);
+  write_compact_summary(&mut sink, &plan, ctx.workspace_root(), msrv_write_needed, has_changes);
 
   // Show explain output if requested
   if explain {

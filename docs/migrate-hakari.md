@@ -1,102 +1,40 @@
-# Migrating from cargo-hakari
+# Migrate from cargo-hakari
 
-If you're using `cargo-hakari` or a workspace hack crate, migration takes about 5 minutes.
+`cargo-rail unify` replaces the workspace-hack flow with one config file and one command.
 
-## Why migrate?
+## Minimal Migration
 
-- **No more meta-crate** cluttering your workspace
-- **Single config file** instead of hakari.toml + workspace-hack crate
-- **Resolution-based** - uses Cargo's actual resolver output
-- **Multi-target aware** - computes intersections across all your target triples
+1. remove the workspace-hack crate
+2. remove `hakari.toml`
+3. enable transitive pinning in `rail.toml`
+4. run `cargo rail unify --check`
+5. apply with `cargo rail unify`
 
-## Steps
-
-### 1. Create a branch
-
-```bash
-git checkout -b migrate-to-rail
-```
-
-### 2. Remove cargo-hakari setup
-
-```bash
-# Remove the workspace-hack crate
-rm -rf crates/workspace-hack  # or wherever yours lives
-
-# Remove from workspace members in root Cargo.toml
-# Remove workspace-hack dependency from all member Cargo.tomls
-# Delete .config/hakari.toml if present
-```
-
-### 3. Initialize cargo-rail
-
-```bash
-cargo install cargo-rail
-cargo rail init
-```
-
-### 4. Enable transitive pinning
-
-Edit `.config/rail.toml`:
+## Config
 
 ```toml
 [unify]
-pin_transitives = true    # This replaces cargo-hakari
-msrv = true               # Optional: compute MSRV from deps
-prune_dead_features = true
+pin_transitives = true
 ```
 
-### 5. Run unify
+## Commands
 
 ```bash
-# Preview first
+cargo rail init
 cargo rail unify --check
-
-# Apply changes
 cargo rail unify
 ```
 
-### 6. Verify
-
-```bash
-cargo check --workspace
-cargo test --workspace
-```
-
-### 7. Commit
-
-```bash
-git add -A
-git commit -m "chore: migrate from cargo-hakari to cargo-rail"
-```
-
-## What `pin_transitives` does
-
-Instead of a workspace-hack crate that forces dependency unification, cargo-rail:
-
-1. Analyzes the resolved dependency graph per target triple
-2. Identifies transitive dependencies used by multiple workspace members
-3. Pins them in `[workspace.dependencies]` at the root
-4. Updates member `Cargo.toml` files to use `workspace = true`
-
-The result is the same build graph optimization without the meta-crate.
-
-## Differences from cargo-hakari
+## Mapping
 
 | cargo-hakari | cargo-rail |
-|--------------|------------|
-| Workspace-hack crate | No extra crate |
-| hakari.toml config | rail.toml config |
+|---|---|
+| workspace-hack crate | no extra crate |
+| `hakari.toml` | `rail.toml` |
 | `cargo hakari generate` | `cargo rail unify` |
-| Single target | Multi-target (parallel) |
-| Syntax-based | Resolution-based |
 
 ## Rollback
-
-If something goes wrong:
 
 ```bash
 cargo rail unify undo
 ```
-
-This restores from the automatic backup created during unify.

@@ -232,8 +232,13 @@ impl RailConfigBuilder {
       self.formatter.array_string(&config.infrastructure, None)
     ));
     content.push_str(&format!(
-      "conservative_unclassified_owner_fallback = {}\n",
-      config.conservative_unclassified_owner_fallback
+      "unknown_file_policy = \"{}\"\n",
+      match config.unknown_file_policy {
+        crate::config::UnknownFilePolicy::Docs => "docs",
+        crate::config::UnknownFilePolicy::OwnedBuildTest => "owned_build_test",
+        crate::config::UnknownFilePolicy::WorkspaceInfra => "workspace_infra",
+        crate::config::UnknownFilePolicy::Strict => "strict",
+      }
     ));
     let confidence_profile = match config.confidence_profile {
       ConfidenceProfile::Strict => "strict",
@@ -477,7 +482,7 @@ mod tests {
     let config = ChangeDetectionConfig {
       infrastructure: vec![".github/**".to_string()],
       custom,
-      conservative_unclassified_owner_fallback: true,
+      unknown_file_policy: crate::config::UnknownFilePolicy::Strict,
       confidence_profile: ConfidenceProfile::Balanced,
       bot_pr_confidence_profile: None,
     };

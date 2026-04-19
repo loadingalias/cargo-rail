@@ -12,6 +12,8 @@ struct CorpusCase {
   kind: String,
   #[serde(default)]
   sub_kind: Option<String>,
+  #[serde(default)]
+  default_surfaces: Option<Vec<String>>,
   surfaces: Vec<String>,
 }
 
@@ -36,8 +38,8 @@ fn test_classification_corpus_matches_planner_taxonomy() {
         .iter()
         .map(|surface| (*surface).to_string())
         .collect::<Vec<_>>(),
-      case.surfaces,
-      "surface mismatch for {}",
+      case.default_surfaces.clone().unwrap_or_else(|| case.surfaces.clone()),
+      "default surface mismatch for {}",
       case.path
     );
   }

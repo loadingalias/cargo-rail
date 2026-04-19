@@ -8,7 +8,7 @@ use crate::change_detection::classify::{
   compile_infrastructure_patterns, custom_surface_names, custom_surfaces_for_path, matches_infrastructure_patterns,
 };
 use crate::commands::common::{PlanOutputFormat, format_preview_list};
-use crate::config::ConfidenceProfile;
+use crate::config::{ConfidenceProfile, UnknownFilePolicy};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
@@ -97,6 +97,7 @@ pub(crate) struct PlannedFile {
 pub(crate) struct PlanImpact {
   pub(crate) direct_crates: Vec<String>,
   pub(crate) transitive_crates: Vec<String>,
+  pub(crate) execution_transitive_crates: Vec<String>,
 }
 
 /// Execution-focused projection of the planner contract.
@@ -130,6 +131,7 @@ pub(crate) struct SurfaceDecision {
 pub(crate) struct TraceReason {
   pub(crate) id: u32,
   pub(crate) code: &'static str,
+  pub(crate) description: &'static str,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) file: Option<String>,
   #[serde(rename = "crate", skip_serializing_if = "Option::is_none")]
@@ -221,6 +223,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   let mut planned_files = Vec::with_capacity(changed_file_count);
   let mut direct_crates: BTreeSet<String> = BTreeSet::new();
   let mut build_test_seed_crates: BTreeSet<String> = BTreeSet::new();
+  let unknown_policy = unknown_file_policy(ctx);
 
   push_trace(
     &mut trace,
@@ -274,17 +277,23 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     let extra_infra_surface =
       !has_builtin_infra_surface && matches_infrastructure_patterns(path, &infrastructure_patterns);
 
-    let apply_owner_uncertain_fallback = file_kind == FileProfile::Unknown
+    let unknown_owner_build_test = file_kind == FileProfile::Unknown
       && !owners.is_empty()
       && confidence.profile != ConfidenceProfile::Fast
-      && conservative_owner_fallback_enabled(ctx);
+      && matches!(
+        unknown_policy,
+        UnknownFilePolicy::OwnedBuildTest | UnknownFilePolicy::Strict
+      );
+
+    if file_kind == FileProfile::Unknown {
+      for surface in unknown_surfaces_for_path(unknown_policy, &owners) {
+        ensure_surface(&mut kind_surfaces, surface);
+      }
+    }
 
     let apply_strict_owner_expansion = confidence.profile == ConfidenceProfile::Strict && !owners.is_empty();
 
-    if apply_owner_uncertain_fallback {
-      ensure_surface(&mut kind_surfaces, "build");
-      ensure_surface(&mut kind_surfaces, "test");
-
+    if unknown_owner_build_test {
       let fallback_surfaces = vec!["build".to_string(), "test".to_string()];
       for owner in &owners {
         push_trace(
@@ -316,7 +325,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       }
     }
 
-    let baseline_transitive_seed = file_kind.seeds_build_test_transitive() || apply_owner_uncertain_fallback;
+    let baseline_transitive_seed = file_kind.seeds_build_test_transitive() || unknown_owner_build_test;
     let should_seed_build_test_transitive = match confidence.profile {
       ConfidenceProfile::Strict => !owners.is_empty() || baseline_transitive_seed,
       ConfidenceProfile::Balanced => baseline_transitive_seed,
@@ -385,7 +394,18 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   }
 
   let transitive_crates = compute_transitive_impact(ctx, &direct_crates)?;
-  emit_transitive_build_test_trace(ctx, &build_test_seed_crates, &mut trace, &mut surface_refs)?;
+  let execution_transitive_pairs = compute_transitive_impact_pairs(ctx, &build_test_seed_crates)?;
+  let execution_transitive_crates = if build_test_seed_crates == direct_crates {
+    transitive_crates.clone()
+  } else {
+    execution_transitive_pairs
+      .iter()
+      .map(|(_, dependent)| dependent.clone())
+      .collect::<BTreeSet<_>>()
+      .into_iter()
+      .collect()
+  };
+  emit_transitive_build_test_trace(&execution_transitive_pairs, &mut trace, &mut surface_refs);
 
   let surfaces = build_surfaces(&surface_refs, &configured_custom_surfaces);
 
@@ -399,9 +419,11 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   let impact = PlanImpact {
     direct_crates: direct_crates.into_iter().collect(),
     transitive_crates,
+    execution_transitive_crates: execution_transitive_crates.clone(),
   };
   let scope = build_execution_scope(
-    &impact,
+    &impact.direct_crates,
+    &execution_transitive_crates,
     &surfaces,
     ctx.cargo.metadata().workspace_packages().len(),
     &refs.resolved_base,
@@ -443,12 +465,43 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   Ok(output)
 }
 
-fn conservative_owner_fallback_enabled(ctx: &WorkspaceContext) -> bool {
+fn unknown_file_policy(ctx: &WorkspaceContext) -> UnknownFilePolicy {
   ctx
     .config
     .as_ref()
-    .map(|config| config.change_detection.conservative_unclassified_owner_fallback)
-    .unwrap_or(true)
+    .map(|config| config.change_detection.unknown_file_policy)
+    .unwrap_or_default()
+}
+
+fn unknown_surfaces_for_path(policy: UnknownFilePolicy, owners: &[String]) -> &'static [&'static str] {
+  const BUILD_TEST: &[&str] = &["build", "test"];
+  const INFRA: &[&str] = &["infra"];
+  const DOCS: &[&str] = &["docs"];
+
+  match policy {
+    UnknownFilePolicy::Docs => DOCS,
+    UnknownFilePolicy::OwnedBuildTest => {
+      if owners.is_empty() {
+        DOCS
+      } else {
+        BUILD_TEST
+      }
+    }
+    UnknownFilePolicy::WorkspaceInfra => {
+      if owners.is_empty() {
+        INFRA
+      } else {
+        DOCS
+      }
+    }
+    UnknownFilePolicy::Strict => {
+      if owners.is_empty() {
+        INFRA
+      } else {
+        BUILD_TEST
+      }
+    }
+  }
 }
 
 fn resolve_confidence_profile(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<EffectiveConfidenceProfile> {
@@ -555,13 +608,14 @@ fn ensure_surface(surfaces: &mut Vec<String>, surface: &str) {
 }
 
 fn build_execution_scope(
-  impact: &PlanImpact,
+  direct_crates: &[String],
+  execution_transitive_crates: &[String],
   surfaces: &BTreeMap<String, SurfaceDecision>,
   workspace_package_count: usize,
   resolved_base: &str,
   resolved_head: &str,
 ) -> ExecutionScope {
-  let crates = impacted_crates_for_scope(impact);
+  let crates = impacted_crates_for_scope(direct_crates, execution_transitive_crates);
   let package_scoped_surface_enabled = surfaces
     .iter()
     .any(|(name, decision)| decision.enabled && PACKAGE_SCOPED_SURFACES.contains(&name.as_str()));
@@ -584,11 +638,10 @@ fn build_execution_scope(
   }
 }
 
-fn impacted_crates_for_scope(impact: &PlanImpact) -> Vec<String> {
-  impact
-    .direct_crates
+fn impacted_crates_for_scope(direct_crates: &[String], execution_transitive_crates: &[String]) -> Vec<String> {
+  direct_crates
     .iter()
-    .chain(&impact.transitive_crates)
+    .chain(execution_transitive_crates)
     .cloned()
     .collect::<BTreeSet<_>>()
     .into_iter()
@@ -782,31 +835,33 @@ fn compute_transitive_impact(ctx: &WorkspaceContext, direct_crates: &BTreeSet<St
   Ok(transitive)
 }
 
-fn emit_transitive_build_test_trace(
+fn compute_transitive_impact_pairs(
   ctx: &WorkspaceContext,
-  build_test_seed_crates: &BTreeSet<String>,
+  direct_crates: &BTreeSet<String>,
+) -> RailResult<Vec<(String, String)>> {
+  let direct_set: HashSet<String> = direct_crates.iter().cloned().collect();
+  ctx.graph.transitive_dependent_pairs_of_set(&direct_set)
+}
+
+fn emit_transitive_build_test_trace(
+  execution_transitive_pairs: &[(String, String)],
   trace: &mut Vec<TraceReason>,
   surface_refs: &mut BTreeMap<String, BTreeSet<u32>>,
-) -> RailResult<()> {
+) {
   // Use owned Strings once, reuse via slice reference
   static BUILD_TEST_SURFACES: &[&str] = &["build", "test"];
   let surfaces: Vec<String> = BUILD_TEST_SURFACES.iter().map(|&s| String::from(s)).collect();
-  for direct in build_test_seed_crates {
-    let deps = ctx.graph.transitive_dependents(direct)?;
-    for dependent in deps {
-      push_trace(
-        trace,
-        surface_refs,
-        RC_TRANSITIVE_DEPENDS_ON_DIRECT,
-        None,
-        Some(&dependent),
-        Some(direct),
-        &surfaces,
-      );
-    }
+  for (depends_on, dependent) in execution_transitive_pairs {
+    push_trace(
+      trace,
+      surface_refs,
+      RC_TRANSITIVE_DEPENDS_ON_DIRECT,
+      None,
+      Some(dependent),
+      Some(depends_on),
+      &surfaces,
+    );
   }
-
-  Ok(())
 }
 
 fn build_surfaces(
@@ -855,6 +910,7 @@ fn push_trace(
   trace.push(TraceReason {
     id,
     code,
+    description: reason_description(code),
     file: file.map(ToString::to_string),
     crate_name: crate_name.map(ToString::to_string),
     depends_on: depends_on.map(ToString::to_string),

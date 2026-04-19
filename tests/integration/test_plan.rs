@@ -61,6 +61,10 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert!(direct.contains(&"lib-a"), "lib-a should be direct");
   assert!(transitive.contains(&"lib-b"), "lib-b should be transitive");
   assert_eq!(
+    json["impact"]["execution_transitive_crates"],
+    serde_json::json!(["lib-b"])
+  );
+  assert_eq!(
     json["scope"]["scope_contract_version"],
     serde_json::Value::Number(1.into())
   );
@@ -1204,6 +1208,14 @@ fn test_plan_confidence_profile_strict_expands_docs_owned_file() -> Result<()> {
     transitive.iter().any(|name| name.as_str() == Some("lib-b")),
     "strict mode should seed transitive impact from crate-owned docs changes"
   );
+  assert!(
+    json["impact"]["execution_transitive_crates"]
+      .as_array()
+      .ok_or_else(|| anyhow!("execution_transitive_crates should be array"))?
+      .iter()
+      .any(|name| name.as_str() == Some("lib-b")),
+    "strict mode should widen execution scope for dependent crates"
+  );
 
   Ok(())
 }
@@ -1241,6 +1253,11 @@ fn test_plan_confidence_profile_fast_disables_transitive_build_test() -> Result<
     Some(1),
     "transitive impact list remains graph-level"
   );
+  assert_eq!(
+    json["impact"]["execution_transitive_crates"].as_array().map(Vec::len),
+    Some(0),
+    "fast profile should not widen execution transitive crates"
+  );
 
   let trace = json["trace"]
     .as_array()
@@ -1262,6 +1279,8 @@ fn test_plan_confidence_profile_fast_disables_transitive_build_test() -> Result<
     1,
     "fast profile should avoid adding transitive build reasons"
   );
+  assert_eq!(json["scope"]["mode"], Value::String("crates".to_string()));
+  assert_eq!(json["scope"]["crates"], serde_json::json!(["lib-a"]));
 
   Ok(())
 }

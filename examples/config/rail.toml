@@ -94,8 +94,8 @@ confidence_profile = "balanced"
 # Optional override for bot-authored PRs (e.g., dependabot)
 bot_pr_confidence_profile = "strict"
 
-# Enable build+test fallback for unclassified crate-owned files
-conservative_unclassified_owner_fallback = true
+# Unknown files: crate-owned => build+test, everything else => infra
+unknown_file_policy = "strict"
 
 # Custom surfaces (triggers custom:<name> in plan output)
 # [change-detection.custom]

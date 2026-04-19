@@ -101,7 +101,7 @@ pub fn validate_targets(targets: &[String]) -> RailResult<()> {
 /// Get canonical list of Rust target triples from rustc
 ///
 /// Caches the result using OnceLock for efficiency (rustc call is ~5ms).
-/// Returns ~285 target triples as of Rust 1.91.
+/// Returns ~320 target triples as of Rust 1.95.
 pub fn get_rust_target_list() -> RailResult<Vec<String>> {
   static TARGETS: OnceLock<Option<Vec<String>>> = OnceLock::new();
 

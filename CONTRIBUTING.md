@@ -1,43 +1,47 @@
 # Contributing to cargo-rail
 
-Thanks for contributing.
+## Local Setup
 
-## Development Setup
+Required tools:
 
-Prerequisites:
-
-- Rust toolchain (stable; MSRV is enforced in CI)
+- Rust stable
 - `just`
 - `cargo-nextest`
 - `cargo-deny`
-- `cargo-audit`
+
+Typical local workflow:
 
 ```bash
-just build
 just check
 just test
 ```
 
-For full-workspace verification:
+Full-workspace verification:
 
 ```bash
 just check-all
 just test-all
 ```
 
-## Change Requirements
+Regenerate command docs when CLI help changes:
 
-- Keep changes focused and atomic.
+```bash
+just gen-docs
+```
+
+## Expectations
+
+- Keep changes focused.
 - Update docs when behavior changes.
-- Add or update tests for behavior changes.
-- Run `just check-all && just test` before opening a PR.
+- Add or update tests when behavior changes.
+- Run `just check && just test` before opening a PR.
 
 ## Pull Requests
 
 - Use a clear title and summary.
-- Include rationale and expected behavior changes.
+- Call out user-visible behavior changes.
 - Link related issues when applicable.
 
 ## Security
 
-Please do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md).
+Do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md).
