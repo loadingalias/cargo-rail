@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0](https://github.com/loadingalias/cargo-rail/compare/v0.12.0...v0.13.0) - 2026-04-18
+
+### ✨ Features
+
+- **planner**: finalize v0.13.0 semantics, docs cleanup, and MSRV 1.95 ([075d023](https://github.com/loadingalias/cargo-rail/commit/075d0235deeab81f60c381d7ddc8ff2e212f60d5))
+
+### 📦 Other Changes
+
+- tighten unify explainability and harden action contract validation ([29989f2](https://github.com/loadingalias/cargo-rail/commit/29989f29c64b9f6b2ff3946cb4994b4593d34b97))
+- unify change detection under canonical planner taxonomy ([07317a2](https://github.com/loadingalias/cargo-rail/commit/07317a21c91a2c5f4afbcb115ee984ff5870c825))
+
+
+
 ## [0.12.0](https://github.com/loadingalias/cargo-rail/compare/v0.11.0...v0.12.0) - 2026-04-17
 
 ### 🐛 Bug Fixes
