@@ -24,7 +24,7 @@
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::config::{ConfigLoadResult, RailConfig};
-use crate::error::{ConfigError, RailError, RailResult};
+use crate::error::{ConfigError, GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use crate::progress;
@@ -376,11 +376,14 @@ impl GitState {
 /// Cloning is extremely cheap (just increments Arc refcounts).
 pub struct WorkspaceContext {
   /// Cargo workspace root (Cargo.toml location)
-  /// Note: In most cases, git repo root == workspace root. Access git root via ctx.git.repo_root() if needed.
+  /// Note: In most cases, git repo root == workspace root. Access git root via `ctx.git()?.repo_root()` if needed.
   pub workspace_root: PathBuf,
 
-  /// Git state and operations (Arc for cheap cloning across threads)
-  pub git: Arc<GitState>,
+  /// Git state and operations, when the workspace is inside a Git repository.
+  ///
+  /// Commands that require Git must call [`WorkspaceContext::git`] so Cargo-only
+  /// commands can still run in sandboxed workspaces.
+  git: Option<Arc<GitState>>,
 
   /// Cargo metadata and workspace info (Arc for cheap cloning across threads)
   pub cargo: Arc<CargoState>,
@@ -406,12 +409,10 @@ pub struct WorkspaceContext {
 impl WorkspaceContext {
   /// Build workspace context from a root directory.
   ///
-  /// Loads git state, cargo metadata, builds graph, and attempts to load rail.toml config.
+  /// Loads optional git state, cargo metadata, builds graph, and attempts to load rail.toml config.
   /// Config is optional - commands that require it should check and error.
   ///
   /// # Errors
-  ///
-  /// Returns [`RailError::Git`] if `workspace_root` is not a git repository.
   ///
   /// Returns [`RailError::Message`] if `cargo metadata` fails (e.g., invalid `Cargo.toml`).
   ///
@@ -425,8 +426,13 @@ impl WorkspaceContext {
   /// - Config load: <5ms (or None if not found)
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    // Load git state
-    let git = Arc::new(GitState::open(workspace_root)?);
+    // Load git state when available. Cargo-only commands such as `unify --check`
+    // must work in source sandboxes that intentionally omit `.git`.
+    let git = match GitState::open(workspace_root) {
+      Ok(git) => Some(Arc::new(git)),
+      Err(RailError::Git(GitError::RepoNotFound { .. })) => None,
+      Err(err) => return Err(err),
+    };
 
     // Load cargo state
     let cargo = Arc::new(CargoState::load(workspace_root)?);
@@ -434,18 +440,20 @@ impl WorkspaceContext {
 
     // Validate git repo root and workspace_root match (or warn if they differ)
     // Canonicalize both paths to handle Windows short (8.3) vs long path formats
-    let git_root_canonical = git
-      .repo_root()
-      .canonicalize()
-      .unwrap_or_else(|_| git.repo_root().to_path_buf());
-    let workspace_root_canonical = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
+    if let Some(git) = git.as_ref() {
+      let git_root_canonical = git
+        .repo_root()
+        .canonicalize()
+        .unwrap_or_else(|_| git.repo_root().to_path_buf());
+      let workspace_root_canonical = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
 
-    if git_root_canonical != workspace_root_canonical {
-      crate::warn!(
-        "git repo root ({}) differs from Cargo workspace root ({})",
-        git.repo_root().display(),
-        workspace_root.display()
-      );
+      if git_root_canonical != workspace_root_canonical {
+        crate::warn!(
+          "git repo root ({}) differs from Cargo workspace root ({})",
+          git.repo_root().display(),
+          workspace_root.display()
+        );
+      }
     }
 
     // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
@@ -507,6 +515,20 @@ impl WorkspaceContext {
     })
   }
 
+  /// Return Git state for commands that require repository history.
+  pub fn git(&self) -> RailResult<&GitState> {
+    self.git.as_deref().ok_or_else(|| {
+      RailError::Git(GitError::RepoNotFound {
+        path: self.workspace_root.clone(),
+      })
+    })
+  }
+
+  /// Return true when this workspace is inside a Git repository.
+  pub fn has_git(&self) -> bool {
+    self.git.is_some()
+  }
+
   /// Get multi-target metadata, loading lazily on first access.
   ///
   /// This is only used by `cargo rail unify`. Other commands don't need it,
@@ -546,7 +568,7 @@ impl WorkspaceContext {
   /// This is used to strip the prefix from git-relative paths so they can be
   /// matched against workspace-relative paths (e.g., for crate membership).
   pub fn workspace_prefix(&self) -> Option<PathBuf> {
-    let git_root = self.git.repo_root();
+    let git_root = self.git.as_ref()?.repo_root();
 
     // On Windows, paths from different sources may have incompatible representations:
     // - Forward vs backslash separators (C:/foo vs C:\foo)
@@ -609,12 +631,12 @@ mod tests {
     let ctx = ctx.unwrap();
 
     // Verify all components are initialized
-    assert!(ctx.git.repo_root().exists(), "Repo root should exist");
+    assert!(ctx.git().unwrap().repo_root().exists(), "Repo root should exist");
     assert!(ctx.workspace_root.exists(), "Workspace root should exist");
 
     // Git state should be initialized (git root typically == workspace root)
     // We allow them to differ but in most cases they're the same
-    let _ = ctx.git.repo_root();
+    let _ = ctx.git().unwrap().repo_root();
 
     // Cargo state should be initialized
     assert_eq!(
@@ -650,14 +672,14 @@ mod tests {
     let ctx = WorkspaceContext::build(&current_dir).unwrap();
 
     // Should be able to access git operations via git() accessor
-    let head = ctx.git.git().head_commit();
+    let head = ctx.git().unwrap().git().head_commit();
     assert!(head.is_ok(), "Should get HEAD commit");
 
     let head_sha = head.unwrap();
     assert_eq!(head_sha.len(), 40, "HEAD SHA should be 40 characters");
 
     // Should be able to get current branch
-    let branch = ctx.git.git().current_branch();
+    let branch = ctx.git().unwrap().git().current_branch();
     assert!(branch.is_ok(), "Should get current branch");
   }
 

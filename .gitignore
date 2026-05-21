@@ -22,3 +22,7 @@ AGENTS.md
 # Personal - Notes, Docs, Examples, Testing, etc.
 notes/
 distribution/
+docs/tasks/planner-control-plane.md
+docs/tasks/typescript.md
+docs/tasks/forbidden-feature-policy.md
+docs/tasks/release_lane_updates.md

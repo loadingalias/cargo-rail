@@ -1,16 +1,16 @@
 //! Workspace context and state management
 //!
-//! This module unifies Git, Cargo, and Graph into a single WorkspaceContext.
+//! This module unifies optional Git, Cargo, and Graph into a single WorkspaceContext.
 //!
 //! # Architecture
 //!
-//! WorkspaceContext = GitState + CargoState + DependencyGraph + Config
+//! WorkspaceContext = optional GitState + CargoState + DependencyGraph + Config
 //!
 //! Built once at startup, passed by reference to all commands.
 
 /// Change impact analysis
 pub mod change_analyzer;
-/// Unified workspace context (includes GitState and CargoState)
+/// Unified workspace context (includes optional GitState and CargoState)
 pub mod context;
 /// File path utilities
 pub mod files;

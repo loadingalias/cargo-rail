@@ -269,7 +269,7 @@ impl<'a> ReleasePlanner<'a> {
         .replace("{version}", "*")
     };
 
-    self.ctx.git.git().find_latest_tag(&pattern)
+    self.ctx.git()?.git().find_latest_tag(&pattern)
   }
 
   pub(crate) fn resolve_targets(

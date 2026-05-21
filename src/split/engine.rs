@@ -155,7 +155,7 @@ impl<'a> SplitEngine<'a> {
     progress!("   Walking commit history to find commits touching crate...");
 
     // Use batched git command for all paths at once (much faster than N separate calls)
-    let filtered_commits = self.ctx.git.git().get_commits_touching_paths(paths, None, "HEAD")?;
+    let filtered_commits = self.ctx.git()?.git().get_commits_touching_paths(paths, None, "HEAD")?;
 
     progress!(
       "   Found {} total commits that touch the crate paths",
@@ -180,7 +180,10 @@ impl<'a> SplitEngine<'a> {
   ) -> FxHashMap<String, PrefetchedFiles> {
     // Use rayon to prefetch files in parallel
     // Each commit's file collection is independent, so this is safe
-    let git = self.ctx.git.git();
+    let Ok(git_state) = self.ctx.git() else {
+      return FxHashMap::default();
+    };
+    let git = git_state.git();
     let paths_arc = Arc::new(crate_paths.to_vec());
 
     commits
@@ -243,7 +246,11 @@ impl<'a> SplitEngine<'a> {
     } else {
       let mut files = Vec::with_capacity(params.crate_paths.len() * 32);
       for crate_path in params.crate_paths {
-        let collected = self.ctx.git.git().collect_tree_files(&params.commit.sha, crate_path)?;
+        let collected = self
+          .ctx
+          .git()?
+          .git()
+          .collect_tree_files(&params.commit.sha, crate_path)?;
         files.extend(collected);
       }
       std::borrow::Cow::Owned(files)
@@ -408,7 +415,7 @@ impl<'a> SplitEngine<'a> {
 
   /// Check if remote repository exists and has content
   fn check_remote_exists(&self, remote_url: &str) -> RailResult<bool> {
-    self.ctx.git.git().ls_remote_has_content(remote_url)
+    self.ctx.git()?.git().ls_remote_has_content(remote_url)
   }
 
   /// Execute a split operation (idempotent - re-runs sync new commits only)
@@ -757,8 +764,8 @@ impl<'a> SplitEngine<'a> {
   /// Configure git identity in the target repository by copying from source
   fn configure_git_identity(&self, target_path: &Path) -> RailResult<()> {
     // Get identity from source repository
-    let user_name = self.ctx.git.git().get_config("user.name")?.unwrap_or_default();
-    let user_email = self.ctx.git.git().get_config("user.email")?.unwrap_or_default();
+    let user_name = self.ctx.git()?.git().get_config("user.name")?.unwrap_or_default();
+    let user_email = self.ctx.git()?.git().get_config("user.email")?.unwrap_or_default();
 
     // Set identity in target repository
     // Use a fallback if source doesn't have identity configured

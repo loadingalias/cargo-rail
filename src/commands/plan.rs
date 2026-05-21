@@ -769,12 +769,12 @@ fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<Resolv
   }
 
   let resolved_base = if opts.merge_base {
-    let default_branch = detect_default_base_ref(ctx.git.git())?;
-    ctx.git.git().get_merge_base(&default_branch, "HEAD")?
+    let default_branch = detect_default_base_ref(ctx.git()?.git())?;
+    ctx.git()?.git().get_merge_base(&default_branch, "HEAD")?
   } else if let Some(since) = &opts.since {
     since.clone()
   } else {
-    detect_default_base_ref(ctx.git.git())?
+    detect_default_base_ref(ctx.git()?.git())?
   };
 
   Ok(ResolvedRefs {
@@ -789,9 +789,9 @@ fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<Resolv
 
 fn collect_changed_files(ctx: &WorkspaceContext, refs: &ResolvedRefs) -> RailResult<Vec<String>> {
   let raw = if let (Some(from), Some(to)) = (refs.from.as_deref(), refs.to.as_deref()) {
-    ctx.git.git().get_changed_files_between(from, Some(to))?
+    ctx.git()?.git().get_changed_files_between(from, Some(to))?
   } else {
-    ctx.git.git().get_changed_files_between(&refs.resolved_base, None)?
+    ctx.git()?.git().get_changed_files_between(&refs.resolved_base, None)?
   };
 
   let mut files: Vec<String> = raw

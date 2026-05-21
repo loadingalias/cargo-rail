@@ -44,8 +44,8 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
   }
 
   // Dirty worktree check (unless --allow-dirty or --check mode)
-  if !args.check && !args.allow_dirty && ctx.git.git().is_dirty()? {
-    let files = ctx.git.git().dirty_files()?;
+  if !args.check && !args.allow_dirty && ctx.git()?.git().is_dirty()? {
+    let files = ctx.git()?.git().dirty_files()?;
     return Err(RailError::Git(GitError::DirtyWorktree { files }));
   }
 
@@ -81,7 +81,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           "crates": crates,
           "count": configs.len(),
           "planning": {
-            "source_head": ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
+            "source_head": ctx.git()?.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
             "targets": snapshots,
           },
           "mutation_plan": expected_mutation_plan,
@@ -388,7 +388,7 @@ fn build_split_mutation_plan(
   configs: &[crate::split::SplitParams],
   allow_dirty: bool,
 ) -> RailResult<mutation::MutationPlan> {
-  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let source_head = ctx.git()?.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
   let mut sorted_configs = configs.iter().collect::<Vec<_>>();
   sorted_configs.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
 
@@ -431,7 +431,10 @@ fn build_split_mutation_plan(
 }
 
 fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::SplitParams]) -> Vec<serde_json::Value> {
-  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let source_head = ctx
+    .git()
+    .and_then(|git| git.git().head_commit())
+    .unwrap_or_else(|_| "unknown".to_string());
   let mut out = Vec::new();
 
   for config in configs {

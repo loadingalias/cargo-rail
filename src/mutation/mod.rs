@@ -156,8 +156,8 @@ pub fn build_plan(
   trace: Vec<MutationTrace>,
 ) -> RailResult<MutationPlan> {
   let resolved_refs = MutationResolvedRefs {
-    git_head: ctx.git.git().head_commit()?,
-    git_branch: ctx.git.current_branch()?,
+    git_head: ctx.git()?.git().head_commit()?,
+    git_branch: ctx.git()?.current_branch()?,
   };
   let pre_apply = capture_pre_apply_checks(ctx)?;
 
@@ -322,7 +322,7 @@ fn sanitize_for_filename(input: &str) -> String {
 fn capture_pre_apply_checks(ctx: &WorkspaceContext) -> RailResult<MutationPreApplyChecks> {
   let workspace_root = ctx.workspace_root();
   Ok(MutationPreApplyChecks {
-    git_head: ctx.git.git().head_commit()?,
+    git_head: ctx.git()?.git().head_commit()?,
     config_fingerprint: config_fingerprint(workspace_root),
     toolchain_fingerprint: toolchain_fingerprint(workspace_root),
     lock_fingerprint: file_fingerprint(&workspace_root.join("Cargo.lock")),

@@ -336,11 +336,23 @@ pub fn run_unify_analyze(
   };
 
   let has_changes = plan.has_planned_changes(msrv_write_needed);
-  let mutation_plan = build_unify_mutation_plan(ctx, &plan, msrv_write_needed, false, true, output)?;
 
   // JSON output mode (but still honor exit codes)
   if json {
-    let mut canonical_actions = mutation_plan.actions.clone();
+    let (actions, risks, trace) = build_unify_mutation_parts(&plan, msrv_write_needed, false, true, output);
+    let mutation_plan = if ctx.has_git() {
+      Some(mutation::build_plan(
+        ctx,
+        "unify",
+        actions.clone(),
+        risks.clone(),
+        trace.clone(),
+      )?)
+    } else {
+      None
+    };
+
+    let mut canonical_actions = actions;
     canonical_actions.sort_by(|a, b| {
       a.code
         .cmp(&b.code)
@@ -348,11 +360,22 @@ pub fn run_unify_analyze(
         .then_with(|| a.detail.cmp(&b.detail))
     });
     let mut reason_codes: Vec<String> = mutation_plan
-      .trace
-      .iter()
-      .map(|t| t.code.clone())
-      .chain(mutation_plan.risks.iter().map(|r| r.code.clone()))
-      .collect();
+      .as_ref()
+      .map(|plan| {
+        plan
+          .trace
+          .iter()
+          .map(|t| t.code.clone())
+          .chain(plan.risks.iter().map(|r| r.code.clone()))
+          .collect()
+      })
+      .unwrap_or_else(|| {
+        trace
+          .iter()
+          .map(|t| t.code.clone())
+          .chain(risks.iter().map(|r| r.code.clone()))
+          .collect()
+      });
     reason_codes.sort();
     reason_codes.dedup();
 
@@ -390,6 +413,7 @@ pub fn run_unify_analyze(
       "dependency_decisions": dependency_decisions_to_json(&plan),
       "action_plan": canonical_actions,
       "reason_codes": reason_codes,
+      "mutation_plan_available": mutation_plan.is_some(),
       "mutation_plan": mutation_plan,
     });
 
@@ -1177,6 +1201,18 @@ fn build_unify_mutation_plan(
   no_report: bool,
   report_path: Option<&std::path::PathBuf>,
 ) -> RailResult<mutation::MutationPlan> {
+  let (actions, risks, trace) =
+    build_unify_mutation_parts(plan, msrv_write_needed, backup_enabled, no_report, report_path);
+  mutation::build_plan(ctx, "unify", actions, risks, trace)
+}
+
+fn build_unify_mutation_parts(
+  plan: &crate::cargo::UnificationPlan,
+  msrv_write_needed: bool,
+  backup_enabled: bool,
+  no_report: bool,
+  report_path: Option<&std::path::PathBuf>,
+) -> (Vec<MutationAction>, Vec<MutationRisk>, Vec<MutationTrace>) {
   let mut actions = Vec::with_capacity(8); // Typically few distinct action types
   let mut risks = Vec::with_capacity(4);
   let mut trace = Vec::with_capacity(8);
@@ -1297,7 +1333,7 @@ fn build_unify_mutation_plan(
     ));
   }
 
-  mutation::build_plan(ctx, "unify", actions, risks, trace)
+  (actions, risks, trace)
 }
 
 #[cfg(test)]

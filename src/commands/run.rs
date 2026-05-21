@@ -261,7 +261,7 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
     run_args.extend(opts.run_args.clone());
   }
 
-  let base_ref = detect_default_base_ref(ctx.git.git())?;
+  let base_ref = detect_default_base_ref(ctx.git()?.git())?;
   let workspace_root = ctx.workspace_root().display().to_string();
   run_args = run_args
     .into_iter()

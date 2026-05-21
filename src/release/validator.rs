@@ -97,7 +97,7 @@ impl<'a> ReleaseValidator<'a> {
   /// Returns `Some(warning)` if releasing from non-default branch with `allow_non_default=true`.
   /// Returns `None` if on default branch or no default branch can be determined.
   pub fn validate_branch(&self, allow_non_default: bool) -> RailResult<Option<String>> {
-    let git = &self.ctx.git;
+    let git = self.ctx.git()?;
 
     // Hard error: detached HEAD
     if git.is_detached_head()? {
@@ -131,7 +131,7 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Check if working directory is clean (no uncommitted changes)
   fn check_clean_working_directory(&self) -> RailResult<()> {
-    if self.ctx.git.git().is_dirty()? {
+    if self.ctx.git()?.git().is_dirty()? {
       return Err(RailError::with_help(
         "Working directory has uncommitted changes",
         "Commit or stash your changes before releasing, or set require_clean = false in [release] section of rail.toml",
@@ -165,7 +165,7 @@ impl<'a> ReleaseValidator<'a> {
     // Check for changes in this directory
     let output = self
       .ctx
-      .git
+      .git()?
       .git()
       .run_git(&["status", "--porcelain", "--", &git_path])?;
 
@@ -214,7 +214,7 @@ impl<'a> ReleaseValidator<'a> {
 
     if !skip_tag {
       for crate_plan in &plan.crates {
-        if self.ctx.git.git().tag_exists(&crate_plan.tag_name)? {
+        if self.ctx.git()?.git().tag_exists(&crate_plan.tag_name)? {
           return Err(RailError::with_help(
             format!("tag '{}' already exists", crate_plan.tag_name),
             "regenerate plan with a new version or delete the conflicting tag".to_string(),

@@ -176,12 +176,11 @@ impl<'a> SyncEngine<'a> {
     let last_synced_mono = self.find_last_synced_mono_commit()?;
 
     // Get new commits in mono that touch any of the crate paths (handles both single and combined modes)
-    let new_commits =
-      self
-        .ctx
-        .git
-        .git()
-        .get_commits_touching_paths(&self.config.crate_paths, last_synced_mono.as_deref(), "HEAD")?;
+    let new_commits = self.ctx.git()?.git().get_commits_touching_paths(
+      &self.config.crate_paths,
+      last_synced_mono.as_deref(),
+      "HEAD",
+    )?;
 
     if new_commits.is_empty() {
       progress!("   No new commits to sync");
@@ -254,7 +253,7 @@ impl<'a> SyncEngine<'a> {
     progress!("   Syncing remote → monorepo...");
 
     // Check current branch - NEVER commit directly to protected branches
-    let _current_branch = self.ctx.git.git().current_branch()?;
+    let _current_branch = self.ctx.git()?.git().current_branch()?;
 
     // Load mappings (cached - only loads if not already loaded)
 
@@ -318,17 +317,17 @@ impl<'a> SyncEngine<'a> {
     let branch_name = format!("cargo-rail-sync-{}", self.config.crate_name);
 
     // Check if branch already exists
-    let branch_exists = self.ctx.git.git().branch_exists(&branch_name)?;
+    let branch_exists = self.ctx.git()?.git().branch_exists(&branch_name)?;
 
     let pr_branch = if branch_exists {
       // Branch exists - switch to it and check if commits are already there
       progress!("   PR branch '{}' already exists, checking state...", branch_name);
-      self.ctx.git.git().checkout_branch(&branch_name)?;
+      self.ctx.git()?.git().checkout_branch(&branch_name)?;
       Some(branch_name)
     } else {
       // Create new branch
       progress!("   Creating PR branch: {}", branch_name);
-      self.ctx.git.git().create_and_checkout_branch(&branch_name)?;
+      self.ctx.git()?.git().create_and_checkout_branch(&branch_name)?;
       Some(branch_name)
     };
 
@@ -339,7 +338,7 @@ impl<'a> SyncEngine<'a> {
     progress!("   Syncing {} commits from remote...", commits_to_sync.len());
 
     let mut count = 0;
-    let mut current_mono_head = self.ctx.git.git().head_commit()?; // Cache HEAD, update after each commit
+    let mut current_mono_head = self.ctx.git()?.git().head_commit()?; // Cache HEAD, update after each commit
 
     for commit in &commits_to_sync {
       // Resolve conflicts using 3-way merge (returns conflicts + changed_files for caching)
@@ -388,7 +387,7 @@ impl<'a> SyncEngine<'a> {
       progress!("   git push origin {}", branch_name);
 
       // Try to detect GitHub URL and suggest gh CLI command
-      if let Ok(Some(url)) = self.ctx.git.git().get_config("remote.origin.url")
+      if let Ok(Some(url)) = self.ctx.git()?.git().get_config("remote.origin.url")
         && url.contains("github.com")
       {
         progress!(
@@ -446,7 +445,7 @@ impl<'a> SyncEngine<'a> {
 
   fn find_last_synced_mono_commit(&self) -> RailResult<Option<String>> {
     // Find the most recent mono commit that has a mapping
-    let commits = self.ctx.git.git().commit_history(Some(100))?;
+    let commits = self.ctx.git()?.git().commit_history(Some(100))?;
 
     for commit in commits {
       if self.mapping_store.has_mapping(&commit.sha) {
@@ -478,7 +477,7 @@ impl<'a> SyncEngine<'a> {
     current_remote_head: &str,
   ) -> RailResult<String> {
     // Get changed files in mono
-    let changed_files = self.ctx.git.git().get_changed_files(&commit.sha)?;
+    let changed_files = self.ctx.git()?.git().get_changed_files(&commit.sha)?;
 
     // Filter to only files in configured crate path scope.
     let relevant_files: Vec<_> = changed_files
@@ -512,7 +511,7 @@ impl<'a> SyncEngine<'a> {
       .collect();
 
     let file_contents = if !bulk_items.is_empty() {
-      self.ctx.git.git().read_files_bulk(&bulk_items)?
+      self.ctx.git()?.git().read_files_bulk(&bulk_items)?
     } else {
       vec![]
     };
@@ -654,7 +653,7 @@ impl<'a> SyncEngine<'a> {
 
     let parent_shas = vec![current_mono_head.to_string()];
 
-    let new_commit_sha = self.ctx.git.git().create_commit_with_metadata(
+    let new_commit_sha = self.ctx.git()?.git().create_commit_with_metadata(
       &message,
       &commit.author,
       &commit.author_email,
@@ -719,7 +718,7 @@ impl<'a> SyncEngine<'a> {
     let mono_changed_paths: std::collections::HashSet<PathBuf> = if let Some(ref last) = last_synced {
       self
         .ctx
-        .git
+        .git()?
         .git()
         .get_changed_files_between(last, Some("HEAD"))?
         .into_iter()
@@ -773,7 +772,7 @@ impl<'a> SyncEngine<'a> {
       .collect();
 
     let base_contents = if !base_items.is_empty() {
-      self.ctx.git.git().read_files_bulk(&base_items)?
+      self.ctx.git()?.git().read_files_bulk(&base_items)?
     } else {
       vec![Vec::new(); conflicting_files.len()]
     };
@@ -834,7 +833,7 @@ impl<'a> SyncEngine<'a> {
     let new_commits =
       self
         .ctx
-        .git
+        .git()?
         .git()
         .get_commits_touching_paths(&self.config.crate_paths, last_synced.as_deref(), "HEAD")?;
 

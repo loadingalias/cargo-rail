@@ -10,6 +10,7 @@
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
+use tempfile::TempDir;
 
 // Core Unification Tests
 
@@ -2145,6 +2146,64 @@ fn test_unify_apply_from_plan_file() -> Result<()> {
     Some(0),
     "workspace should be unified after plan apply"
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_check_json_runs_without_git_repository() -> Result<()> {
+  let root = TempDir::new()?;
+  let workspace_root = root.path();
+
+  std::fs::write(
+    workspace_root.join("Cargo.toml"),
+    r#"[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+"#,
+  )?;
+  std::fs::create_dir_all(workspace_root.join(".config"))?;
+  std::fs::write(
+    workspace_root.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
+"#,
+  )?;
+
+  let crate_root = workspace_root.join("crates").join("standalone");
+  std::fs::create_dir_all(crate_root.join("src"))?;
+  std::fs::write(
+    crate_root.join("Cargo.toml"),
+    r#"[package]
+name = "standalone"
+version = "0.1.0"
+edition.workspace = true
+"#,
+  )?;
+  std::fs::write(crate_root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+
+  assert!(
+    !workspace_root.join(".git").exists(),
+    "test workspace must not have a git repo"
+  );
+
+  let output = run_cargo_rail(workspace_root, &["rail", "unify", "--check", "-f", "json"])?;
+  assert!(
+    output.status.success(),
+    "unify --check should not require git.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["mutation_plan_available"], false);
+  assert!(json["mutation_plan"].is_null());
 
   Ok(())
 }

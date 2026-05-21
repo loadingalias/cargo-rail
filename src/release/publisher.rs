@@ -49,7 +49,7 @@ impl<'a> ReleasePublisher<'a> {
       }
 
       // Check for git remote
-      if !self.ctx.git.git().has_remote("origin")? {
+      if !self.ctx.git()?.git().has_remote("origin")? {
         warnings.push("No git remote 'origin' found. GitHub releases require a remote.".to_string());
       }
     }
@@ -57,7 +57,7 @@ impl<'a> ReleasePublisher<'a> {
     // Check sign_tags prerequisites if enabled
     if self.release_config.sign_tags && !skip_tag {
       // Check if user has GPG/SSH key configured
-      if !self.ctx.git.git().has_signing_configured() {
+      if !self.ctx.git()?.git().has_signing_configured() {
         warnings.push(
           "Tag signing enabled but no signing key configured. \
                     Run 'git config user.signingkey <KEY_ID>'"
@@ -125,7 +125,7 @@ impl<'a> ReleasePublisher<'a> {
     progress!("\nrelease complete");
 
     if !skip_tag {
-      let branch = self.ctx.git.current_branch().unwrap_or_else(|_| "main".to_string());
+      let branch = self.ctx.git()?.current_branch().unwrap_or_else(|_| "main".to_string());
       progress!("\nnext:");
       progress!("  git push origin {}", branch);
       progress!("  git push origin --tags");
@@ -269,8 +269,8 @@ impl<'a> ReleasePublisher<'a> {
     self.update_lockfile_for_crate(&plan.name)?;
 
     // Stage all changes and commit
-    self.ctx.git.git().stage_all()?;
-    self.ctx.git.git().commit(&message)?;
+    self.ctx.git()?.git().stage_all()?;
+    self.ctx.git()?.git().commit(&message)?;
 
     Ok(())
   }
@@ -280,7 +280,7 @@ impl<'a> ReleasePublisher<'a> {
     let message = format!("Release {} v{}", plan.name, plan.new_version);
     self
       .ctx
-      .git
+      .git()?
       .git()
       .create_tag(&plan.tag_name, Some(&message), self.release_config.sign_tags)
   }
@@ -384,6 +384,6 @@ impl<'a> ReleasePublisher<'a> {
         .replace("{version}", "*")
     };
 
-    self.ctx.git.git().find_latest_tag(&pattern)
+    self.ctx.git()?.git().find_latest_tag(&pattern)
   }
 }

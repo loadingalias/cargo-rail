@@ -57,8 +57,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   }
 
   // Dirty worktree check (unless --allow-dirty or --check mode)
-  if !args.check && !args.allow_dirty && ctx.git.git().is_dirty()? {
-    let files = ctx.git.git().dirty_files()?;
+  if !args.check && !args.allow_dirty && ctx.git()?.git().is_dirty()? {
+    let files = ctx.git()?.git().dirty_files()?;
     return Err(RailError::Git(GitError::DirtyWorktree { files }));
   }
 
@@ -125,7 +125,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         "crates": crates,
         "count": configs.len(),
         "planning": {
-          "source_head": ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
+          "source_head": ctx.git()?.git().head_commit().unwrap_or_else(|_| "unknown".to_string()),
           "targets": snapshots,
           "conflict_candidates": compute_conflict_candidates(&configs),
         },
@@ -425,7 +425,7 @@ fn build_sync_mutation_plan(
   strategy: ConflictStrategy,
   allow_dirty: bool,
 ) -> RailResult<mutation::MutationPlan> {
-  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let source_head = ctx.git()?.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
   let direction_name = match direction {
     SyncDirection::MonoToRemote => "mono_to_remote",
     SyncDirection::RemoteToMono => "remote_to_mono",
@@ -489,7 +489,10 @@ fn collect_sync_snapshots(
   direction: &SyncDirection,
   strategy: ConflictStrategy,
 ) -> Vec<serde_json::Value> {
-  let source_head = ctx.git.git().head_commit().unwrap_or_else(|_| "unknown".to_string());
+  let source_head = ctx
+    .git()
+    .and_then(|git| git.git().head_commit())
+    .unwrap_or_else(|_| "unknown".to_string());
   let direction_name = match direction {
     SyncDirection::MonoToRemote => "mono_to_remote",
     SyncDirection::RemoteToMono => "remote_to_mono",
