@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.13.1](https://github.com/loadingalias/cargo-rail/compare/v0.13.0...v0.13.1) - 2026-05-21
+
+### 🐛 Bug Fixes
+
+- **unify**: allow check mode outside git repos ([1d64a6c](https://github.com/loadingalias/cargo-rail/commit/1d64a6ca11f18933bf3c854327bca896e965e1a0))
+
+### 🔧 Chores
+
+- **ci**: bump cargo-rail-action to v4.1.3 ([04e3096](https://github.com/loadingalias/cargo-rail/commit/04e3096ba247ba9bd65ac36e4b75dc5bdf827612))
+
+### 📦 Other Changes
+
+- hore(ci): bump cargo-rail-action to v4.1.2 ([fb9f944](https://github.com/loadingalias/cargo-rail/commit/fb9f94415d4904b9dca9f7b0ecf42d2b665870b5))
+
+
+
 ## [0.13.0](https://github.com/loadingalias/cargo-rail/compare/v0.12.0...v0.13.0) - 2026-04-18
 
 ### ✨ Features
