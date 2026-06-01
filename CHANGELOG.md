@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.3](https://github.com/loadingalias/cargo-rail/compare/v0.13.2...v0.13.3) - 2026-06-01
+
+### 🐛 Bug Fixes
+
+- **ci**: wait for cargo-rail release creation ([3fd90c5](https://github.com/loadingalias/cargo-rail/commit/3fd90c5d76b2dc27f0cbccb800a957dc52aabdcc))
+
+
+
 ## [0.13.2](https://github.com/loadingalias/cargo-rail/compare/v0.13.1...v0.13.2) - 2026-06-01
 
 ### ✨ Features
