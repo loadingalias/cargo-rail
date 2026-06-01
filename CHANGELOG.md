@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.2](https://github.com/loadingalias/cargo-rail/compare/v0.13.1...v0.13.2) - 2026-06-01
+
+### ✨ Features
+
+- **release**: own end-to-end publishing lane ([aa2b2d3](https://github.com/loadingalias/cargo-rail/commit/aa2b2d360f4fd04578ec1dc8a64cc93241adcfbc))
+
+
+
 ## [0.13.1](https://github.com/loadingalias/cargo-rail/compare/v0.13.0...v0.13.1) - 2026-05-21
 
 ### 🐛 Bug Fixes
