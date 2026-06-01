@@ -29,6 +29,10 @@ pub struct ReleaseConfig {
   #[serde(default)]
   pub create_github_release: bool,
 
+  /// Push release commit and tags to the git remote before public publishing.
+  #[serde(default)]
+  pub push: bool,
+
   /// Sign git tags with GPG/SSH (default: false)
   #[serde(default)]
   pub sign_tags: bool,
@@ -57,6 +61,13 @@ pub struct ReleaseConfig {
   /// and no existing `## [<version>]` section exists in the crate's changelog.
   #[serde(default = "default_true")]
   pub require_release_notes: bool,
+
+  /// Directory containing manual release note overrides.
+  ///
+  /// If `release-notes/v1.2.3.md` or `release-notes/<tag>.md` exists, cargo-rail
+  /// uses it as the GitHub release body instead of generated changelog text.
+  #[serde(default = "default_release_notes_dir")]
+  pub release_notes_dir: String,
 }
 
 impl Default for ReleaseConfig {
@@ -67,12 +78,14 @@ impl Default for ReleaseConfig {
       require_clean: true,
       publish_delay: default_publish_delay(),
       create_github_release: false,
+      push: false,
       sign_tags: false,
       changelog_path: default_changelog_path(),
       changelog_relative_to: ChangelogRelativeTo::default(),
       skip_changelog_for: Vec::new(),
       require_changelog_entries: false,
       require_release_notes: true,
+      release_notes_dir: default_release_notes_dir(),
     }
   }
 }
@@ -106,6 +119,13 @@ impl ReleaseConfig {
                 Tags may not be identifiable."
           .to_string(),
       );
+    }
+
+    if self.create_github_release && !self.push {
+      return Err(ConfigError::InvalidField {
+        field: "release.create_github_release".to_string(),
+        reason: "create_github_release = true requires push = true so cargo-rail owns the pushed tag".to_string(),
+      });
     }
 
     // Validate skip_changelog_for - check that all crate names exist
@@ -176,6 +196,10 @@ fn default_changelog_path() -> String {
   "CHANGELOG.md".to_string()
 }
 
+fn default_release_notes_dir() -> String {
+  "release-notes".to_string()
+}
+
 // Tests
 
 #[cfg(test)]
@@ -233,5 +257,17 @@ mod tests {
     let toml = r#"require_release_notes = false"#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.require_release_notes);
+  }
+
+  #[test]
+  fn test_github_release_requires_owned_push() {
+    let config = ReleaseConfig {
+      create_github_release: true,
+      push: false,
+      ..ReleaseConfig::default()
+    };
+
+    let err = config.validate(&["crate-a".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("requires push = true"));
   }
 }

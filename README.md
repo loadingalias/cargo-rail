@@ -50,12 +50,15 @@ cargo rail unify
 
 ### Release Workflow
 
-Use `release` for checks, changelog generation, tags, and publish ordering.
+Use `release` for checks, changelog generation, tags, remote push, GitHub Releases, and publish ordering.
 
 ```bash
 cargo rail release check
 cargo rail release run cargo-rail --bump patch --yes
 ```
+
+For an owned GitHub release, set both `push = true` and `create_github_release = true`.
+cargo-rail pushes the release commit and tag before publishing crates or making the GitHub Release public.
 
 ### Split / Sync
 

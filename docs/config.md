@@ -241,7 +241,8 @@ Release automation settings for versioning, tagging, and publishing.
 | `tag_format` | `string` | `"{crate}-{prefix}{version}"` | Tag template. Available variables:<br>• `{crate}` - Crate name<br>• `{version}` - Version number<br>• `{prefix}` - Value of `tag_prefix` |
 | `require_clean` | `bool` | `true` | Require clean working directory before release operations. |
 | `publish_delay` | `u64` | `5` | Delay between crate publishes in seconds. Allows crates.io to propagate dependencies. |
-| `create_github_release` | `bool` | `false` | Automatically create GitHub releases via `gh` CLI after tagging. Requires `gh` to be installed and authenticated. |
+| `create_github_release` | `bool` | `false` | Create GitHub Releases via `gh`. Requires `push = true`; cargo-rail pushes the tag first, creates a draft release, publishes registries, then publishes the GitHub Release. |
+| `push` | `bool` | `false` | Push release commits and tags to `origin` before public publishing. Uses an atomic push for the branch and release tags. |
 | `sign_tags` | `bool` | `false` | Sign git tags with GPG or SSH. Requires git signing to be configured. |
 
 **Example:**
@@ -252,6 +253,7 @@ tag_prefix = "v"
 tag_format = "{crate}-{prefix}{version}"    # Produces: my-crate-v1.0.0
 require_clean = true
 publish_delay = 10
+push = true
 create_github_release = true
 sign_tags = true
 ```
@@ -265,6 +267,7 @@ sign_tags = true
 | `skip_changelog_for` | `string[]` | `[]` | Crate names that should not generate changelog entries. |
 | `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
 | `require_release_notes` | `bool` | `true` | If `true`, preflight fails release apply when the target version has no release notes (`## [<version>]`) and changelog generation produces no entries. Set to `false` to allow note-less releases. |
+| `release_notes_dir` | `string` | `"release-notes"` | Directory for manual release body overrides. `v<version>.md` or `<tag>.md` takes precedence over generated notes. |
 
 **Example:**
 
@@ -274,6 +277,7 @@ changelog_path = "CHANGELOG.md"
 changelog_relative_to = "crate"
 skip_changelog_for = ["internal-utils"]
 require_changelog_entries = true
+release_notes_dir = "release-notes"
 ```
 
 **Complete Example:**
@@ -285,6 +289,7 @@ tag_prefix = "v"
 tag_format = "{crate}-{prefix}{version}"
 require_clean = true
 publish_delay = 5
+push = false
 create_github_release = false
 sign_tags = false
 
@@ -294,6 +299,7 @@ changelog_relative_to = "crate"
 skip_changelog_for = []
 require_changelog_entries = false
 require_release_notes = true
+release_notes_dir = "release-notes"
 ```
 
 **Notes:**
@@ -301,6 +307,8 @@ require_release_notes = true
 - In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
 - For single-crate workspaces, use `tag_format = "v{version}"`
 - `changelog_relative_to = "workspace"` is useful for unified changelogs
+- `create_github_release = true` with `push = false` is rejected because GitHub may create a tag from the wrong commit.
+- Put curated release notes in `release-notes/v1.2.3.md` when generated notes are too large or too noisy.
 
 ---
 
@@ -699,6 +707,7 @@ tag_prefix = "v"
 tag_format = "{crate}-{prefix}{version}"
 require_clean = true
 publish_delay = 5
+push = true
 create_github_release = true
 sign_tags = true
 
@@ -708,6 +717,7 @@ changelog_relative_to = "crate"
 skip_changelog_for = []
 require_changelog_entries = true
 require_release_notes = true
+release_notes_dir = "release-notes"
 
 # Change detection
 [change-detection]

@@ -235,6 +235,18 @@ impl<'a> ReleaseValidator<'a> {
           "verify network access and cargo credentials before publishing".to_string(),
         ));
       }
+
+      for crate_plan in plan.crates.iter().filter(|crate_plan| crate_plan.publish) {
+        if self.crates_io_version_exists(&crate_plan.name, &crate_plan.new_version.to_string())? {
+          return Err(RailError::with_help(
+            format!(
+              "{} v{} already exists on crates.io",
+              crate_plan.name, crate_plan.new_version
+            ),
+            "choose a new version before running release apply",
+          ));
+        }
+      }
     }
 
     if require_release_notes {
@@ -242,6 +254,31 @@ impl<'a> ReleaseValidator<'a> {
     }
 
     Ok(())
+  }
+
+  fn crates_io_version_exists(&self, crate_name: &str, version: &str) -> RailResult<bool> {
+    let output = process::run(
+      "cargo",
+      &["search", crate_name, "--limit", "5"],
+      Some(self.ctx.workspace_root()),
+    )?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::with_help(
+        format!("failed to query crates.io for {}", crate_name),
+        stderr.trim().to_string(),
+      ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let quoted_version = format!("\"{}\"", version);
+    Ok(stdout.lines().any(|line| {
+      let Some((name, rest)) = line.split_once(" = ") else {
+        return false;
+      };
+      name.trim() == crate_name && rest.trim_start().starts_with(&quoted_version)
+    }))
   }
 
   /// Ensure each crate being released has release notes for its target version.
@@ -255,6 +292,10 @@ impl<'a> ReleaseValidator<'a> {
 
     for crate_plan in &plan.crates {
       if !crate_plan.generate_changelog {
+        continue;
+      }
+
+      if self.release_notes_override_exists(crate_plan) {
         continue;
       }
 
@@ -286,6 +327,15 @@ impl<'a> ReleaseValidator<'a> {
     }
 
     Ok(())
+  }
+
+  fn release_notes_override_exists(&self, crate_plan: &crate::release::planner::CrateReleasePlan) -> bool {
+    let Some(config) = self.ctx.config.as_ref() else {
+      return false;
+    };
+    let dir = self.ctx.workspace_root().join(&config.release.release_notes_dir);
+    dir.join(format!("v{}.md", crate_plan.new_version)).exists()
+      || dir.join(format!("{}.md", crate_plan.tag_name)).exists()
   }
 
   /// Check for path dependencies (which block publishing)

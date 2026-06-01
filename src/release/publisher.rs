@@ -10,8 +10,12 @@ use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
 use chrono::Local;
 use std::fs;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
+
+const GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES: usize = 120_000;
+const RELEASE_REMOTE: &str = "origin";
 
 /// Release publisher
 pub struct ReleasePublisher<'a> {
@@ -30,34 +34,70 @@ impl<'a> ReleasePublisher<'a> {
   /// Pre-flight validation: check all prerequisites before starting release
   ///
   /// This catches issues early rather than failing mid-release.
-  pub fn preflight_check(&self, skip_tag: bool) -> RailResult<Vec<String>> {
+  pub fn preflight_check(&self, plan: &ReleasePlan, skip_tag: bool) -> RailResult<Vec<String>> {
     let mut warnings = Vec::new();
+    let git = self.ctx.git()?.git();
 
-    // Check gh CLI availability if GitHub releases are enabled
+    if self.release_config.create_github_release && !self.release_config.push {
+      return Err(RailError::with_help(
+        "invalid release config: create_github_release requires push",
+        "set [release].push = true so cargo-rail owns the pushed tag before creating a GitHub Release",
+      ));
+    }
+
     if self.release_config.create_github_release && !skip_tag {
       if !process::succeeds("gh", &["--version"], None) {
-        warnings.push(
-          "GitHub releases enabled but 'gh' CLI not found. \
-                    Install from https://cli.github.com/ or set create_github_release = false"
-            .to_string(),
-        );
-      } else {
-        // Check gh auth status
-        if !process::succeeds("gh", &["auth", "status"], None) {
-          warnings.push("GitHub CLI not authenticated. Run 'gh auth login' first.".to_string());
-        }
+        return Err(RailError::with_help(
+          "GitHub releases enabled but gh CLI was not found",
+          "install gh from https://cli.github.com/ or set create_github_release = false",
+        ));
       }
 
-      // Check for git remote
-      if !self.ctx.git()?.git().has_remote("origin")? {
-        warnings.push("No git remote 'origin' found. GitHub releases require a remote.".to_string());
+      if !process::succeeds("gh", &["auth", "status"], Some(self.ctx.workspace_root())) {
+        return Err(RailError::with_help(
+          "GitHub CLI is not authenticated",
+          "run 'gh auth login' or provide GITHUB_TOKEN in CI",
+        ));
+      }
+
+      for crate_plan in &plan.crates {
+        if self.github_release_exists(&crate_plan.tag_name) {
+          warnings.push(format!(
+            "GitHub release '{}' already exists; cargo-rail will reuse it",
+            crate_plan.tag_name
+          ));
+        }
+      }
+    }
+
+    if self.release_config.push {
+      if !git.has_remote(RELEASE_REMOTE)? {
+        return Err(RailError::with_help(
+          "release push enabled but remote 'origin' does not exist",
+          "add an origin remote or set [release].push = false",
+        ));
+      }
+
+      let branch = git.current_branch()?;
+      let refspec = format!("HEAD:{}", branch);
+      git.run_git(&["push", "--dry-run", RELEASE_REMOTE, &refspec])?;
+
+      if !skip_tag {
+        for crate_plan in &plan.crates {
+          if self.remote_tag_exists(&crate_plan.tag_name)? {
+            return Err(RailError::with_help(
+              format!("remote tag '{}' already exists", crate_plan.tag_name),
+              "choose a new version or inspect the existing release state before rerunning",
+            ));
+          }
+        }
       }
     }
 
     // Check sign_tags prerequisites if enabled
     if self.release_config.sign_tags && !skip_tag {
       // Check if user has GPG/SSH key configured
-      if !self.ctx.git()?.git().has_signing_configured() {
+      if !git.has_signing_configured() {
         warnings.push(
           "Tag signing enabled but no signing key configured. \
                     Run 'git config user.signingkey <KEY_ID>'"
@@ -72,7 +112,7 @@ impl<'a> ReleasePublisher<'a> {
   /// Execute a release plan
   pub fn execute(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<()> {
     // Run pre-flight checks
-    let warnings = self.preflight_check(skip_tag)?;
+    let warnings = self.preflight_check(plan, skip_tag)?;
     for warning in &warnings {
       warn!("{}", warning);
     }
@@ -94,6 +134,7 @@ impl<'a> ReleasePublisher<'a> {
 
       progress!("  changelog");
       self.update_changelog(crate_plan)?;
+      self.validate_release_notes_size(crate_plan)?;
 
       progress!("  commit");
       self.commit_version_bump(crate_plan)?;
@@ -102,9 +143,23 @@ impl<'a> ReleasePublisher<'a> {
         progress!("  tag: {}", crate_plan.tag_name);
         self.create_tag(crate_plan)?;
       }
+    }
 
+    if self.release_config.push {
+      progress!("  pushing release refs");
+      self.push_release_refs(plan, skip_tag)?;
+    }
+
+    if self.release_config.create_github_release && !skip_tag {
+      for crate_plan in &plan.crates {
+        progress!("  github draft: {}", crate_plan.tag_name);
+        self.create_github_release_draft(crate_plan)?;
+      }
+    }
+
+    for (i, crate_plan) in plan.crates.iter().enumerate() {
       if !skip_publish && crate_plan.publish {
-        progress!("  publishing...");
+        progress!("  publishing {}...", crate_plan.name);
         self.publish_crate(crate_plan)?;
 
         if i + 1 < plan.crates.len() {
@@ -113,18 +168,20 @@ impl<'a> ReleasePublisher<'a> {
           thread::sleep(Duration::from_secs(delay));
         }
       } else if !crate_plan.publish {
-        progress!("  skipped publish (publish = false)");
+        progress!("  skipped publish (publish = false) for {}", crate_plan.name);
       }
+    }
 
-      if self.release_config.create_github_release && !skip_tag {
-        progress!("  github release");
-        self.create_github_release(crate_plan)?;
+    if self.release_config.create_github_release && !skip_tag {
+      for crate_plan in &plan.crates {
+        progress!("  github publish: {}", crate_plan.tag_name);
+        self.publish_github_release(crate_plan)?;
       }
     }
 
     progress!("\nrelease complete");
 
-    if !skip_tag {
+    if !skip_tag && !self.release_config.push {
       let branch = self.ctx.git()?.current_branch().unwrap_or_else(|_| "main".to_string());
       progress!("\nnext:");
       progress!("  git push origin {}", branch);
@@ -285,6 +342,28 @@ impl<'a> ReleasePublisher<'a> {
       .create_tag(&plan.tag_name, Some(&message), self.release_config.sign_tags)
   }
 
+  fn push_release_refs(&self, plan: &ReleasePlan, skip_tag: bool) -> RailResult<()> {
+    let git = self.ctx.git()?.git();
+    let branch = git.current_branch()?;
+    let head_refspec = format!("HEAD:{}", branch);
+    let mut args = vec![
+      "push".to_string(),
+      "--atomic".to_string(),
+      RELEASE_REMOTE.to_string(),
+      head_refspec,
+    ];
+
+    if !skip_tag {
+      for crate_plan in &plan.crates {
+        args.push(format!("refs/tags/{}", crate_plan.tag_name));
+      }
+    }
+
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    git.run_git(&borrowed)?;
+    Ok(())
+  }
+
   /// Publish crate to crates.io
   fn publish_crate(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     let crate_dir = plan
@@ -305,40 +384,145 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
-  /// Create GitHub release using gh CLI
-  fn create_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    if !process::succeeds("gh", &["--version"], None) {
-      progress!("  skipped github release (gh CLI not found)");
+  /// Create a draft GitHub release targeting the exact pushed commit.
+  fn create_github_release_draft(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    if self.github_release_exists(&plan.tag_name) {
+      progress!("  github release already exists: {}", plan.tag_name);
       return Ok(());
     }
 
-    let notes = if plan.changelog_path.exists() {
-      fs::read_to_string(&plan.changelog_path)
-        .unwrap_or_else(|_| format!("Release {} v{}", plan.name, plan.new_version))
-    } else {
-      format!("Release {} v{}", plan.name, plan.new_version)
-    };
-
+    let target = self.tag_target_commit(&plan.tag_name)?;
+    let notes_file = self.write_release_notes_temp(plan)?;
     let output = process::run(
       "gh",
       &[
         "release",
         "create",
         &plan.tag_name,
+        "--target",
+        &target,
         "--title",
         &format!("{} v{}", plan.name, plan.new_version),
-        "--notes",
-        &notes,
+        "--notes-file",
+        notes_file
+          .to_str()
+          .ok_or_else(|| RailError::message("release notes path is not valid UTF-8"))?,
+        "--draft",
       ],
       Some(self.ctx.workspace_root()),
     )?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
-      progress!("  github release failed: {}", stderr.trim());
+      return Err(RailError::message(format!(
+        "gh release create failed for {}: {}",
+        plan.tag_name,
+        stderr.trim()
+      )));
     }
 
     Ok(())
+  }
+
+  fn publish_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    let output = process::run(
+      "gh",
+      &["release", "edit", &plan.tag_name, "--draft=false", "--latest"],
+      Some(self.ctx.workspace_root()),
+    )?;
+
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::message(format!(
+        "gh release edit failed for {}: {}",
+        plan.tag_name,
+        stderr.trim()
+      )));
+    }
+
+    Ok(())
+  }
+
+  fn github_release_exists(&self, tag_name: &str) -> bool {
+    process::succeeds("gh", &["release", "view", tag_name], Some(self.ctx.workspace_root()))
+  }
+
+  fn remote_tag_exists(&self, tag_name: &str) -> RailResult<bool> {
+    let output = self
+      .ctx
+      .git()?
+      .git()
+      .run_git(&["ls-remote", "--tags", RELEASE_REMOTE, tag_name])?;
+    Ok(!output.stdout.is_empty())
+  }
+
+  fn tag_target_commit(&self, tag_name: &str) -> RailResult<String> {
+    self.ctx.git()?.git().run_git_stdout(&["rev-list", "-n", "1", tag_name])
+  }
+
+  fn validate_release_notes_size(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    if !self.release_config.create_github_release {
+      return Ok(());
+    }
+
+    let notes = self.release_notes(plan)?;
+    if notes.len() > GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES {
+      return Err(RailError::with_help(
+        format!(
+          "release notes for {} v{} are {} bytes, above the {} byte GitHub safety limit",
+          plan.name,
+          plan.new_version,
+          notes.len(),
+          GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES
+        ),
+        format!(
+          "provide a shorter manual override at {}/v{}.md",
+          self.release_config.release_notes_dir, plan.new_version
+        ),
+      ));
+    }
+    Ok(())
+  }
+
+  fn write_release_notes_temp(&self, plan: &CrateReleasePlan) -> RailResult<PathBuf> {
+    let dir = self.ctx.workspace_root().join("target/cargo-rail/release-notes");
+    fs::create_dir_all(&dir).map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
+    let path = dir.join(format!("{}.md", sanitize_filename(&plan.tag_name)));
+    fs::write(&path, self.release_notes(plan)?)
+      .map_err(|e| RailError::message(format!("failed to write {}: {}", path.display(), e)))?;
+    Ok(path)
+  }
+
+  fn release_notes(&self, plan: &CrateReleasePlan) -> RailResult<String> {
+    if let Some(path) = self.release_notes_override_path(plan) {
+      return fs::read_to_string(&path)
+        .map_err(|e| RailError::message(format!("failed to read {}: {}", path.display(), e)));
+    }
+
+    if plan.changelog_path.exists() {
+      let changelog = fs::read_to_string(&plan.changelog_path)
+        .map_err(|e| RailError::message(format!("failed to read {}: {}", plan.changelog_path.display(), e)))?;
+      if let Some(section) = extract_changelog_section(&changelog, &plan.new_version.to_string()) {
+        return Ok(section);
+      }
+    }
+
+    Ok(format!("Release {} v{}\n", plan.name, plan.new_version))
+  }
+
+  fn release_notes_override_path(&self, plan: &CrateReleasePlan) -> Option<PathBuf> {
+    let dir = self.ctx.workspace_root().join(&self.release_config.release_notes_dir);
+    let version_path = dir.join(format!("v{}.md", plan.new_version));
+    if version_path.exists() {
+      return Some(version_path);
+    }
+
+    let tag_path = dir.join(format!("{}.md", plan.tag_name));
+    if tag_path.exists() {
+      return Some(tag_path);
+    }
+
+    None
   }
 
   /// Get current date in YYYY-MM-DD format
@@ -385,5 +569,65 @@ impl<'a> ReleasePublisher<'a> {
     };
 
     self.ctx.git()?.git().find_latest_tag(&pattern)
+  }
+}
+
+fn extract_changelog_section(changelog: &str, version: &str) -> Option<String> {
+  let needle = format!("## [{}]", version);
+  let mut section = String::new();
+  let mut in_section = false;
+
+  for line in changelog.lines() {
+    if line.trim_start().starts_with("## ") {
+      if in_section {
+        break;
+      }
+      in_section = line.trim_start().starts_with(&needle);
+    }
+
+    if in_section {
+      section.push_str(line);
+      section.push('\n');
+    }
+  }
+
+  if section.trim().is_empty() { None } else { Some(section) }
+}
+
+fn sanitize_filename(value: &str) -> String {
+  value
+    .chars()
+    .map(|c| {
+      if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+        c
+      } else {
+        '-'
+      }
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_extract_changelog_section_returns_only_requested_version() {
+    let changelog = r#"# Changelog
+
+## [0.2.0] - 2026-06-01
+
+### Features
+
+- new API
+
+## [0.1.0] - 2026-05-01
+
+- old API
+"#;
+
+    let section = extract_changelog_section(changelog, "0.2.0").unwrap();
+    assert!(section.contains("new API"));
+    assert!(!section.contains("old API"));
   }
 }

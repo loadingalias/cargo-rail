@@ -159,7 +159,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     comment: "Sort deps alphabetically (default: true)",
   },
   // =========================================================================
-  // [release] section - 11 fields
+  // [release] section - 13 fields
   // =========================================================================
   FieldSpec {
     section: "release",
@@ -190,6 +190,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "create_github_release",
     default_toml: "false",
     comment: "Create GitHub releases via gh CLI",
+  },
+  FieldSpec {
+    section: "release",
+    key: "push",
+    default_toml: "false",
+    comment: "Push release commit and tags before public publishing",
   },
   FieldSpec {
     section: "release",
@@ -226,6 +232,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "require_release_notes",
     default_toml: "true",
     comment: "Require release notes for target version before apply",
+  },
+  FieldSpec {
+    section: "release",
+    key: "release_notes_dir",
+    default_toml: "\"release-notes\"",
+    comment: "Manual release notes override directory",
   },
   // =========================================================================
   // [change-detection] section - 4 fields
@@ -326,7 +338,7 @@ mod tests {
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
-    assert_eq!(release_fields.len(), 11);
+    assert_eq!(release_fields.len(), 13);
 
     let change_detection_fields: Vec<_> = fields_for_section("change-detection").collect();
     assert_eq!(change_detection_fields.len(), 4);
@@ -341,7 +353,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      38, // 22 unify + 11 release + 4 change-detection + 1 run
+      40, // 22 unify + 13 release + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -350,7 +362,7 @@ mod tests {
   ///
   /// SYNCABLE (auto-added by `config sync`):
   /// - [unify] - 22 fields: workspace-wide dependency unification settings
-  /// - [release] - 11 fields: workspace-wide release settings
+  /// - [release] - 13 fields: workspace-wide release settings
   /// - [change-detection] - 4 fields: infra patterns, conservative fallback, and confidence profiles
   /// - [run] - 1 field: default profile selector for `cargo rail run`
   ///

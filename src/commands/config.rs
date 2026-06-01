@@ -132,12 +132,14 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
   "require_clean",
   "publish_delay",
   "create_github_release",
+  "push",
   "sign_tags",
   "changelog_path",
   "changelog_relative_to",
   "skip_changelog_for",
   "require_changelog_entries",
   "require_release_notes",
+  "release_notes_dir",
 ];
 
 /// Known keys in [change-detection] section

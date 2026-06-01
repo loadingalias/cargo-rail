@@ -58,7 +58,7 @@ pub fn run_release_plan(
   // Validate changelog paths (catches path traversal issues early)
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, release_config.require_clean)?;
+  let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, release_config)?;
 
   if json {
     let payload = serde_json::json!({
@@ -118,6 +118,11 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
+  let workspace_members = ctx.graph.workspace_members();
+  for warning in release_config.validate(workspace_members).map_err(RailError::Config)? {
+    crate::warn!("{}", warning);
+  }
+
   let validator = ReleaseValidator::new(ctx);
 
   let targets = if args.all {
@@ -147,13 +152,8 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let expected_mutation_plan = build_release_mutation_plan(
-    ctx,
-    &plan,
-    args.skip_publish,
-    args.skip_tag,
-    release_config.require_clean,
-  )?;
+  let expected_mutation_plan =
+    build_release_mutation_plan(ctx, &plan, args.skip_publish, args.skip_tag, release_config)?;
   let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
     let from_file = mutation::read_plan_file(path)?;
     if !from_file.operation_id.starts_with("release-") {
@@ -261,6 +261,13 @@ pub fn run_release_check(
   let config = ctx.config.as_ref().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+
+  let workspace_members = ctx.graph.workspace_members();
+  for warning in release_config.validate(workspace_members).map_err(RailError::Config)? {
+    if !json {
+      crate::warn!("{}", warning);
+    }
+  }
 
   let validator = ReleaseValidator::new(ctx);
 
@@ -436,7 +443,7 @@ fn build_release_mutation_plan(
   plan: &crate::release::planner::ReleasePlan,
   skip_publish: bool,
   skip_tag: bool,
-  require_clean: bool,
+  release_config: &crate::config::ReleaseConfig,
 ) -> RailResult<mutation::MutationPlan> {
   // Pre-allocate for expected actions: ~5 per crate (bump, changelog, commit, tag, publish)
   let mut actions = Vec::with_capacity(plan.crates.len() * 5);
@@ -466,11 +473,32 @@ fn build_release_mutation_plan(
         Some(format!("crate={}", crate_plan.name)),
       ));
     }
+    if release_config.push {
+      actions.push(MutationAction::new(
+        "PUSH_RELEASE_REFS",
+        crate_plan.tag_name.clone(),
+        Some("remote=origin".to_string()),
+      ));
+    }
+    if release_config.create_github_release && !skip_tag {
+      actions.push(MutationAction::new(
+        "CREATE_GITHUB_DRAFT",
+        crate_plan.tag_name.clone(),
+        Some("forge=github".to_string()),
+      ));
+    }
     if !skip_publish && crate_plan.publish {
       actions.push(MutationAction::new(
         "PUBLISH_CRATE",
         crate_plan.name.clone(),
         Some("registry=crates-io".to_string()),
+      ));
+    }
+    if release_config.create_github_release && !skip_tag {
+      actions.push(MutationAction::new(
+        "PUBLISH_GITHUB_RELEASE",
+        crate_plan.tag_name.clone(),
+        Some("forge=github".to_string()),
       ));
     }
   }
@@ -483,11 +511,18 @@ fn build_release_mutation_plan(
       "publishing to crates.io is irreversible",
     ));
   }
-  if require_clean {
+  if release_config.require_clean {
     risks.push(MutationRisk::new(
       "REQUIRE_CLEAN_WORKTREE",
       "low",
       "release requires a clean worktree",
+    ));
+  }
+  if release_config.push {
+    risks.push(MutationRisk::new(
+      "REMOTE_PUSH",
+      "medium",
+      "release commits and tags are pushed before public publishing",
     ));
   }
 

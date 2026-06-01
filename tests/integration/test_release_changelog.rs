@@ -287,6 +287,136 @@ require_clean = false
   Ok(())
 }
 
+#[test]
+fn test_release_rejects_github_release_without_owned_push() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("unsafe-gh-release", "0.1.0")?;
+  ws.write_release_config(
+    r#"require_clean = false
+create_github_release = true
+push = false
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    !output.status.success(),
+    "unsafe GitHub release config should fail\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    stdout.contains("requires push = true") || stderr.contains("requires push = true"),
+    "expected owned-push error\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_pushes_commit_and_tag_when_push_enabled() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("push-release", "0.1.0")?;
+  let remote = tempfile::TempDir::new()?;
+  git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+  ws.set_remote(remote.path().to_str().unwrap())?;
+  git(&ws.path, &["push", "-u", "origin", "main"])?;
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_clean = false
+require_release_notes = false
+push = true
+"#,
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "release should push commit and tag\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  let remote_tags = git(&ws.path, &["ls-remote", "--tags", "origin", "v0.1.1"])?;
+  assert!(
+    !remote_tags.stdout.is_empty(),
+    "remote should contain pushed release tag"
+  );
+
+  let remote_head = git(&ws.path, &["ls-remote", "origin", "refs/heads/main"])?;
+  let local_head = git(&ws.path, &["rev-parse", "HEAD"])?;
+  assert_eq!(
+    String::from_utf8_lossy(&remote_head.stdout).split_whitespace().next(),
+    Some(String::from_utf8_lossy(&local_head.stdout).trim())
+  );
+  assert!(
+    !stdout.contains("git push origin"),
+    "owned push should not print manual push follow-up"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_notes_override_satisfies_required_notes() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("manual-notes", "0.1.0")?;
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_clean = false
+require_release_notes = true
+"#,
+  )?;
+  ws.tag("v0.1.0", "Initial manual-notes")?;
+  std::fs::create_dir_all(ws.path.join("release-notes"))?;
+  std::fs::write(
+    ws.path.join("release-notes/v0.1.1.md"),
+    "## manual-notes v0.1.1\n\n- curated release notes\n",
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(
+    output.status.success(),
+    "manual release notes should satisfy required release notes\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
 /// Test release --json output format
 #[test]
 fn test_release_json_output() -> Result<()> {

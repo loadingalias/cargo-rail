@@ -190,6 +190,10 @@ impl RailConfigBuilder {
       "publish_delay = {}  # seconds between publishes\n",
       config.publish_delay
     ));
+    content.push_str(&format!(
+      "push = {}  # push release commit and tags before public publishing\n",
+      config.push
+    ));
     content.push_str(&format!("create_github_release = {}\n", config.create_github_release));
     content.push_str(&format!("sign_tags = {}\n", config.sign_tags));
     content.push_str(&format!("changelog_path = \"{}\"\n", config.changelog_path));
@@ -216,6 +220,10 @@ impl RailConfigBuilder {
     content.push_str(&format!(
       "require_release_notes = {}  # fail if target version lacks release notes\n",
       config.require_release_notes
+    ));
+    content.push_str(&format!(
+      "release_notes_dir = \"{}\"  # manual notes: v<version>.md or <tag>.md\n",
+      config.release_notes_dir
     ));
 
     self.sections.push(format!("\n[release]\n{}", content));
