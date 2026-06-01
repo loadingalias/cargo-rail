@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.4](https://github.com/loadingalias/cargo-rail/compare/v0.13.3...v0.13.4) - 2026-06-01
+
+### 🐛 Bug Fixes
+
+- **release**: avoid dry-run pre-push hooks ([15bd792](https://github.com/loadingalias/cargo-rail/commit/15bd79230413070152471550aa6cb304e1882964))
+
+### 📝 Documentation
+
+- remove completed release lane task ([d6ffcc2](https://github.com/loadingalias/cargo-rail/commit/d6ffcc2b4bb47abbf15c5e59f73139901c77aae3))
+
+
+
 ## [0.13.3](https://github.com/loadingalias/cargo-rail/compare/v0.13.2...v0.13.3) - 2026-06-01
 
 ### 🐛 Bug Fixes
