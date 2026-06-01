@@ -39,7 +39,19 @@ jobs:
       - name: Verify GitHub Release exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..24}; do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+              exit 0
+            fi
+            echo "GitHub Release $GITHUB_REF_NAME not visible yet; retrying ($attempt/24)..."
+            sleep 5
+          done
+
+          echo "GitHub Release $GITHUB_REF_NAME was not created by cargo-rail in time." >&2
+          exit 1
 
   # ==========================================================================
   # Job 2: Build and upload pre-built binaries
