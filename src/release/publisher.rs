@@ -80,7 +80,7 @@ impl<'a> ReleasePublisher<'a> {
 
       let branch = git.current_branch()?;
       let refspec = format!("HEAD:{}", branch);
-      git.run_git(&["push", "--dry-run", RELEASE_REMOTE, &refspec])?;
+      git.run_git(&["push", "--dry-run", "--no-verify", RELEASE_REMOTE, &refspec])?;
 
       if !skip_tag {
         for crate_plan in &plan.crates {

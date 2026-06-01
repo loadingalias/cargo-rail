@@ -324,6 +324,30 @@ fn test_release_pushes_commit_and_tag_when_push_enabled() -> Result<()> {
   git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
   ws.set_remote(remote.path().to_str().unwrap())?;
   git(&ws.path, &["push", "-u", "origin", "main"])?;
+
+  let hook_counter = ws.path.join(".git/pre-push-count");
+  let hook_path = ws.path.join(".git/hooks/pre-push");
+  std::fs::write(
+    &hook_path,
+    r#"#!/bin/sh
+count_file="$(dirname "$0")/../pre-push-count"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+"#,
+  )?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(&hook_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms)?;
+  }
+
   ws.write_release_config(
     r#"tag_format = "v{version}"
 require_clean = false
@@ -370,6 +394,12 @@ push = true
   assert!(
     !stdout.contains("git push origin"),
     "owned push should not print manual push follow-up"
+  );
+  let hook_runs = std::fs::read_to_string(&hook_counter)?;
+  assert_eq!(
+    hook_runs.trim(),
+    "1",
+    "release preflight must not invoke pre-push; only the real atomic push should run hooks"
   );
 
   Ok(())
