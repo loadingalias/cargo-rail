@@ -1006,7 +1006,8 @@ fn change_add_and_status_support_json_output() -> Result<()> {
   assert_eq!(json["crates"][0], "lib-a");
   assert_eq!(json["bump"], "minor");
   let created = json["path"].as_str().expect("path in payload");
-  assert!(created.contains(".changes/"));
+  let normalized_created = created.replace('\\', "/");
+  assert!(normalized_created.contains(".changes/"));
   assert!(
     created.ends_with(".md") && !created.contains("2026"),
     "created change file should use deterministic slug-hash naming: {}",
