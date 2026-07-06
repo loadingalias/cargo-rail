@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.0](https://github.com/loadingalias/cargo-rail/compare/v0.13.4...v0.14.0) - 2026-07-06
+
+### ✨ Features
+
+- **release**: add graph-aware changelog engine ([52b250f](https://github.com/loadingalias/cargo-rail/commit/52b250f2e3f80b332076b2b9c5bd09f135e015cf))
+
+
+
 ## [0.13.4](https://github.com/loadingalias/cargo-rail/compare/v0.13.3...v0.13.4) - 2026-06-01
 
 ### 🐛 Bug Fixes
