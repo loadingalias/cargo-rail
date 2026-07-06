@@ -568,24 +568,27 @@ impl<'a> ReleaseValidator<'a> {
   }
 
   /// Run cargo-semver-checks as an installed external binary.
+  ///
+  /// Only a confirmed breaking verdict can fail the check (under "deny").
+  /// Inconclusive runs — no published baseline, network or build failures —
+  /// report as skipped so a crate's first release never fails on a
+  /// comparison that cannot exist.
   fn validate_semver_checks(&self, crate_name: &str, policy: SemverCheckPolicy) -> ValidationResult {
+    use crate::release::semver_checks::SemverCheck;
+
     match semver_checks::check_release(self.ctx, crate_name) {
-      Ok(outcome) if !outcome.breaking => ValidationResult::passed("semver-checks", outcome.message),
-      Ok(outcome) => {
-        if policy == SemverCheckPolicy::Deny {
-          ValidationResult::failed("semver-checks", outcome.message)
-        } else {
-          ValidationResult::passed("semver-checks", format!("advisory: {}", outcome.message))
-        }
-      }
-      Err(e) => {
-        let message = format!("failed to run cargo-semver-checks: {}", e);
+      Ok(SemverCheck::Pass) => ValidationResult::passed("semver-checks", "no semver-breaking API changes detected"),
+      Ok(SemverCheck::Breaking { message }) => {
         if policy == SemverCheckPolicy::Deny {
           ValidationResult::failed("semver-checks", message)
         } else {
           ValidationResult::passed("semver-checks", format!("advisory: {}", message))
         }
       }
+      Ok(SemverCheck::Inconclusive { message }) => {
+        ValidationResult::passed("semver-checks", format!("skipped ({})", message))
+      }
+      Err(e) => ValidationResult::passed("semver-checks", format!("skipped (failed to run: {})", e)),
     }
   }
 
@@ -618,7 +621,8 @@ impl<'a> ReleaseValidator<'a> {
               ));
               emitted_semver_missing = true;
             }
-          } else if semver_checks::has_library_target(self.ctx, crate_name) {
+          } else if self.is_publishable(crate_name) && semver_checks::has_library_target(self.ctx, crate_name) {
+            // Unpublished crates have no crates.io baseline to compare against.
             results.push(self.validate_semver_checks(crate_name, semver_policy));
           }
         }

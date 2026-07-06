@@ -51,7 +51,7 @@ cargo rail unify
 ### Release Workflow
 
 Use `change` for reviewed release intent and `release` for checks, version bumps, changelogs, tags, remote push,
-GitHub Releases, and publishing.
+forge releases, and publishing.
 
 ```bash
 cargo rail release check
@@ -61,7 +61,7 @@ cargo rail release run cargo-rail --bump auto --check
 cargo rail release run cargo-rail --bump auto --yes
 ```
 
-Change files live in `.rail/changes/*.md` and are consumed by `release run`:
+Change files live in `.changes/*.md` by default and are consumed by `release run`:
 
 ```markdown
 ---
@@ -74,8 +74,20 @@ Added Rust-native change files for releases.
 `--bump auto` reads change files first, then falls back to conventional commits. For monorepos, commits are
 attributed to crates through the workspace graph instead of path-only changelog globs.
 
-For an owned GitHub release, set both `push = true` and `create_github_release = true`.
-cargo-rail pushes the release commit and tag before publishing crates or making the GitHub Release public.
+Use PR mode when version bumps and changelog text should be reviewed before tags or registry side effects:
+
+```bash
+cargo rail release run cargo-rail --bump auto --pr --yes
+# after the release PR is merged, from the updated main branch:
+cargo rail release finalize cargo-rail --yes
+```
+
+Use `[release.version_groups]` for crates that must release in lockstep; cargo-rail expands the group and uses
+the highest bump any member earned.
+
+For owned GitHub or GitLab releases, set `push = true`, `create_github_release = true`, and choose
+`forge = "auto"`, `"github"`, or `"gitlab"`. cargo-rail pushes the release commit and tag before creating
+the forge release or publishing crates.
 
 ### Split / Sync
 

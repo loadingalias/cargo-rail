@@ -145,12 +145,21 @@ tag_prefix = "v"                  # Prefix for all tags
 tag_format = "{prefix}{version}"  # Tag format (single-crate: v0.1.0)
 require_clean = true              # Require clean worktree
 publish_delay = 5                 # Seconds between crate publishes
-create_github_release = false     # Let CI create GitHub release
+create_github_release = false     # Create forge releases via gh/glab when true
+forge = "auto"                    # Release creation: auto, github, gitlab
 sign_tags = true                  # GPG sign tags
-changelog_path = "CHANGELOG.md"   # Changelog file path
-changelog_relative_to = "crate"   # "crate" or "workspace"
-skip_changelog_for = []           # Crates to skip changelog generation
 require_changelog_entries = false # Require changelog entries before release
+pre_1_breaking_bump = "minor"     # --bump auto: breaking on 0.x is "minor" or "major"
+unconventional_commits = "warn"   # Non-conventional commits: "allow", "warn", "deny"
+semver_check = "warn"             # cargo-semver-checks policy: "off", "warn", "deny"
+change_dir = ".changes"           # Pending release intent files
+require_change_files = false      # Require change-file coverage: true, false, or [crates]
+
+[release.changelog]
+path = "CHANGELOG.md"             # Changelog file path
+relative_to = "crate"             # "crate" or "workspace"
+group_order = ["breaking", "feat", "fix", "perf", "docs", "deps", "other"]
+fallback = "other"                # Unlisted commit types land here; "skip" drops them
 
 # ============================================================================
 # PER-CRATE CONFIGURATION

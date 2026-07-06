@@ -35,6 +35,9 @@ Use:
 
 ```toml
 [release]
+# git-cliff's filter_unconventional silently drops unparseable commits;
+# fallback = "skip" below does the same. "deny" goes further and fails
+# `release check` — use "warn" or "allow" to match git-cliff exactly.
 unconventional_commits = "deny"
 
 [release.changelog]
@@ -110,6 +113,9 @@ include_paths = ["crates/*/src/**"]
 exclude_paths = ["crates/*/benches/**"]
 ```
 
+Filters are authoritative: a commit scope can claim an otherwise
+unattributed commit, but never one whose files the filters excluded.
+
 ## release-plz Mapping
 
 release-plz's workspace changelog settings become workspace defaults:
@@ -138,5 +144,11 @@ cargo rail release run --all --bump auto --check
 cargo rail release check --all --extended
 ```
 
+Like release-plz, `--bump auto --all` only releases crates with
+release-worthy changes; everything else is listed under `Skipped:` with the
+reason and the tag range it was measured against.
+
 `release check --extended` uses an installed `cargo-semver-checks` binary when
-available. It is never added as a cargo-rail dependency.
+available. It is never added as a cargo-rail dependency, and an inconclusive
+run (for example a first release with no published baseline) reports as
+skipped — it never escalates a bump or fails the release.

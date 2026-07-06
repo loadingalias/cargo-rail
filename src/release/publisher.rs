@@ -1,6 +1,6 @@
-//! Release execution and publishing to crates.io and GitHub (for now)
+//! Release execution and publishing to crates.io and forge releases.
 
-use crate::config::ReleaseConfig;
+use crate::config::{ReleaseConfig, ReleaseForgeConfig};
 use crate::error::{RailError, RailResult};
 use crate::release::changelog::detect_github_repo;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
@@ -16,6 +16,28 @@ use std::time::Duration;
 
 const GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES: usize = 120_000;
 const RELEASE_REMOTE: &str = "origin";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseForge {
+  Github,
+  Gitlab,
+}
+
+impl ReleaseForge {
+  fn name(self) -> &'static str {
+    match self {
+      Self::Github => "GitHub",
+      Self::Gitlab => "GitLab",
+    }
+  }
+
+  fn binary(self) -> &'static str {
+    match self {
+      Self::Github => "gh",
+      Self::Gitlab => "glab",
+    }
+  }
+}
 
 /// Release publisher
 pub struct ReleasePublisher<'a> {
@@ -41,19 +63,22 @@ impl<'a> ReleasePublisher<'a> {
     if self.release_config.create_github_release && !self.release_config.push {
       return Err(RailError::with_help(
         "invalid release config: create_github_release requires push",
-        "set [release].push = true so cargo-rail owns the pushed tag before creating a GitHub Release",
+        "set [release].push = true so cargo-rail owns the pushed tag before creating a forge release",
       ));
     }
 
     if self.release_config.create_github_release && !skip_tag {
-      if !process::succeeds("gh", &["--version"], None) {
+      let forge = self.detect_release_forge()?;
+      let binary = forge.binary();
+      if !process::succeeds(binary, &["--version"], None) {
         return Err(RailError::with_help(
-          "GitHub releases enabled but gh CLI was not found",
-          "install gh from https://cli.github.com/ or set create_github_release = false",
+          format!("{} releases enabled but {} CLI was not found", forge.name(), binary),
+          format!("install {} or set create_github_release = false", binary),
         ));
       }
 
-      if !process::succeeds("gh", &["auth", "status"], Some(self.ctx.workspace_root())) {
+      if forge == ReleaseForge::Github && !process::succeeds("gh", &["auth", "status"], Some(self.ctx.workspace_root()))
+      {
         return Err(RailError::with_help(
           "GitHub CLI is not authenticated",
           "run 'gh auth login' or provide GITHUB_TOKEN in CI",
@@ -61,9 +86,10 @@ impl<'a> ReleasePublisher<'a> {
       }
 
       for crate_plan in &plan.crates {
-        if self.github_release_exists(&crate_plan.tag_name) {
+        if self.forge_release_exists(forge, &crate_plan.tag_name) {
           warnings.push(format!(
-            "GitHub release '{}' already exists; cargo-rail will reuse it",
+            "{} release '{}' already exists; cargo-rail will reuse it",
+            forge.name(),
             crate_plan.tag_name
           ));
         }
@@ -135,7 +161,7 @@ impl<'a> ReleasePublisher<'a> {
 
       progress!("  changelog");
       self.update_changelog(crate_plan)?;
-      self.validate_release_notes_size(crate_plan)?;
+      self.validate_release_notes_size(crate_plan, skip_tag)?;
       if !consumed_change_files {
         self.consume_change_files(plan)?;
         consumed_change_files = true;
@@ -156,9 +182,10 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     if self.release_config.create_github_release && !skip_tag {
+      let forge = self.detect_release_forge()?;
       for crate_plan in &plan.crates {
-        progress!("  github draft: {}", crate_plan.tag_name);
-        self.create_github_release_draft(crate_plan)?;
+        progress!("  {} release: {}", forge.name().to_lowercase(), crate_plan.tag_name);
+        self.create_forge_release(forge, crate_plan)?;
       }
     }
 
@@ -178,9 +205,9 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     if self.release_config.create_github_release && !skip_tag {
+      let forge = self.detect_release_forge()?;
       for crate_plan in &plan.crates {
-        progress!("  github publish: {}", crate_plan.tag_name);
-        self.publish_github_release(crate_plan)?;
+        self.publish_forge_release(forge, crate_plan)?;
       }
     }
 
@@ -194,6 +221,147 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     Ok(())
+  }
+
+  /// Prepare a release pull request: mutations only, no tags or publish.
+  pub fn execute_pr(&self, plan: &ReleasePlan) -> RailResult<()> {
+    self.preflight_pr()?;
+    let branch = release_branch_name(plan)?;
+    let git = self.ctx.git()?.git();
+    git.run_git(&["checkout", "-B", &branch])?;
+
+    let mut consumed_change_files = false;
+    for crate_plan in &plan.crates {
+      progress!(
+        "  version: {} -> {}",
+        crate_plan.current_version,
+        crate_plan.new_version
+      );
+      self.bump_crate_version(crate_plan)?;
+
+      if !crate_plan.affected_dependents.is_empty() {
+        self.update_dependents(crate_plan)?;
+      }
+
+      self.update_changelog(crate_plan)?;
+      if !consumed_change_files {
+        self.consume_change_files(plan)?;
+        consumed_change_files = true;
+      }
+      self.update_lockfile_for_crate(&crate_plan.name)?;
+    }
+
+    git.stage_all()?;
+    git.commit(&format!("chore(release): prepare {}", branch))?;
+    git.run_git(&["push", "-u", RELEASE_REMOTE, &branch])?;
+    self.open_release_pr(plan, &branch)?;
+    progress!("release PR ready: {}", branch);
+    Ok(())
+  }
+
+  /// Finalize an already-merged release PR: tags, push, publish, forge releases.
+  pub fn execute_finalize(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<()> {
+    let warnings = self.preflight_check(plan, skip_tag)?;
+    for warning in &warnings {
+      warn!("{}", warning);
+    }
+
+    for crate_plan in &plan.crates {
+      self.validate_release_notes_size(crate_plan, skip_tag)?;
+    }
+
+    if !skip_tag {
+      for crate_plan in &plan.crates {
+        progress!("  tag: {}", crate_plan.tag_name);
+        self.create_tag(crate_plan)?;
+      }
+    }
+
+    if self.release_config.push {
+      progress!("  pushing release refs");
+      self.push_release_refs(plan, skip_tag)?;
+    }
+
+    if self.release_config.create_github_release && !skip_tag {
+      let forge = self.detect_release_forge()?;
+      for crate_plan in &plan.crates {
+        progress!("  {} release: {}", forge.name().to_lowercase(), crate_plan.tag_name);
+        self.create_forge_release(forge, crate_plan)?;
+      }
+    }
+
+    for (i, crate_plan) in plan.crates.iter().enumerate() {
+      if !skip_publish && crate_plan.publish {
+        progress!("  publishing {}...", crate_plan.name);
+        self.publish_crate(crate_plan)?;
+        if i + 1 < plan.crates.len() {
+          thread::sleep(Duration::from_secs(self.release_config.publish_delay));
+        }
+      }
+    }
+
+    if self.release_config.create_github_release && !skip_tag {
+      let forge = self.detect_release_forge()?;
+      for crate_plan in &plan.crates {
+        self.publish_forge_release(forge, crate_plan)?;
+      }
+    }
+
+    progress!("\nrelease finalize complete");
+    Ok(())
+  }
+
+  fn preflight_pr(&self) -> RailResult<()> {
+    let git = self.ctx.git()?.git();
+    if !git.has_remote(RELEASE_REMOTE)? {
+      return Err(RailError::with_help(
+        "release PR mode requires remote 'origin'",
+        "add an origin remote before running 'cargo rail release run --pr'",
+      ));
+    }
+    if !process::succeeds("gh", &["--version"], None) {
+      return Err(RailError::with_help(
+        "release PR mode requires gh CLI",
+        "install gh from https://cli.github.com/ or run the release without --pr",
+      ));
+    }
+    Ok(())
+  }
+
+  fn open_release_pr(&self, plan: &ReleasePlan, branch: &str) -> RailResult<()> {
+    let body_path = self.write_release_pr_body(plan, branch)?;
+    let output = process::run(
+      "gh",
+      &[
+        "pr",
+        "create",
+        "--title",
+        &format!("Release {}", branch.trim_start_matches("rail/release-")),
+        "--body-file",
+        body_path
+          .to_str()
+          .ok_or_else(|| RailError::message("release PR body path is not valid UTF-8"))?,
+        "--head",
+        branch,
+      ],
+      Some(self.ctx.workspace_root()),
+    )?;
+    if !output.status.success() {
+      return Err(RailError::message(format!(
+        "gh pr create failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+      )));
+    }
+    Ok(())
+  }
+
+  fn write_release_pr_body(&self, plan: &ReleasePlan, branch: &str) -> RailResult<PathBuf> {
+    let dir = self.ctx.workspace_root().join("target/cargo-rail/release-pr");
+    fs::create_dir_all(&dir).map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
+    let path = dir.join(format!("{}.md", sanitize_filename(branch)));
+    fs::write(&path, release_pr_body(plan))
+      .map_err(|e| RailError::message(format!("failed to write {}: {}", path.display(), e)))?;
+    Ok(path)
   }
 
   /// Bump version in Cargo.toml
@@ -388,13 +556,23 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
-  /// Create a draft GitHub release targeting the exact pushed commit.
-  fn create_github_release_draft(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    if self.github_release_exists(&plan.tag_name) {
-      progress!("  github release already exists: {}", plan.tag_name);
+  fn create_forge_release(&self, forge: ReleaseForge, plan: &CrateReleasePlan) -> RailResult<()> {
+    if self.forge_release_exists(forge, &plan.tag_name) {
+      progress!(
+        "  {} release already exists: {}",
+        forge.name().to_lowercase(),
+        plan.tag_name
+      );
       return Ok(());
     }
+    match forge {
+      ReleaseForge::Github => self.create_github_release_draft(plan),
+      ReleaseForge::Gitlab => self.create_gitlab_release(plan),
+    }
+  }
 
+  /// Create a draft GitHub release targeting the exact pushed commit.
+  fn create_github_release_draft(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     let target = self.tag_target_commit(&plan.tag_name)?;
     let notes_file = self.write_release_notes_temp(plan)?;
     let output = process::run(
@@ -428,6 +606,35 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
+  fn create_gitlab_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    let notes_file = self.write_release_notes_temp(plan)?;
+    let args = gitlab_release_create_args(
+      &plan.tag_name,
+      &format!("{} v{}", plan.name, plan.new_version),
+      notes_file
+        .to_str()
+        .ok_or_else(|| RailError::message("release notes path is not valid UTF-8"))?,
+    );
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = process::run("glab", &borrowed, Some(self.ctx.workspace_root()))?;
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr);
+      return Err(RailError::message(format!(
+        "glab release create failed for {}: {}",
+        plan.tag_name,
+        stderr.trim()
+      )));
+    }
+    Ok(())
+  }
+
+  fn publish_forge_release(&self, forge: ReleaseForge, plan: &CrateReleasePlan) -> RailResult<()> {
+    match forge {
+      ReleaseForge::Github => self.publish_github_release(plan),
+      ReleaseForge::Gitlab => Ok(()),
+    }
+  }
+
   fn publish_github_release(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     let output = process::run(
       "gh",
@@ -447,8 +654,34 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
-  fn github_release_exists(&self, tag_name: &str) -> bool {
-    process::succeeds("gh", &["release", "view", tag_name], Some(self.ctx.workspace_root()))
+  fn forge_release_exists(&self, forge: ReleaseForge, tag_name: &str) -> bool {
+    match forge {
+      ReleaseForge::Github => process::succeeds("gh", &["release", "view", tag_name], Some(self.ctx.workspace_root())),
+      ReleaseForge::Gitlab => {
+        process::succeeds("glab", &["release", "view", tag_name], Some(self.ctx.workspace_root()))
+      }
+    }
+  }
+
+  fn detect_release_forge(&self) -> RailResult<ReleaseForge> {
+    match self.release_config.forge {
+      ReleaseForgeConfig::Github => return Ok(ReleaseForge::Github),
+      ReleaseForgeConfig::Gitlab => return Ok(ReleaseForge::Gitlab),
+      ReleaseForgeConfig::Auto => {}
+    }
+
+    let output = process::run(
+      "git",
+      &["config", "--get", "remote.origin.url"],
+      Some(self.ctx.workspace_root()),
+    )?;
+    let remote = String::from_utf8_lossy(&output.stdout);
+    detect_release_forge_from_remote(remote.trim()).ok_or_else(|| {
+      RailError::with_help(
+        "could not detect release forge from origin remote",
+        "set [release].forge = \"github\" or \"gitlab\"; Gitea release creation is not supported",
+      )
+    })
   }
 
   fn remote_tag_exists(&self, tag_name: &str) -> RailResult<bool> {
@@ -464,8 +697,8 @@ impl<'a> ReleasePublisher<'a> {
     self.ctx.git()?.git().run_git_stdout(&["rev-list", "-n", "1", tag_name])
   }
 
-  fn validate_release_notes_size(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-    if !self.release_config.create_github_release {
+  fn validate_release_notes_size(&self, plan: &CrateReleasePlan, skip_tag: bool) -> RailResult<()> {
+    if !self.release_config.create_github_release || skip_tag || self.detect_release_forge()? != ReleaseForge::Github {
       return Ok(());
     }
 
@@ -593,6 +826,59 @@ fn sanitize_filename(value: &str) -> String {
     .collect()
 }
 
+fn release_branch_name(plan: &ReleasePlan) -> RailResult<String> {
+  let json = serde_json::to_string(plan)
+    .map_err(|e| RailError::message(format!("failed to serialize release plan for branch hash: {}", e)))?;
+  Ok(format!("rail/release-{}", short_hash(&json)))
+}
+
+fn detect_release_forge_from_remote(remote: &str) -> Option<ReleaseForge> {
+  let lower = remote.to_ascii_lowercase();
+  if lower.contains("github.com") {
+    Some(ReleaseForge::Github)
+  } else if lower.contains("gitlab.com") {
+    Some(ReleaseForge::Gitlab)
+  } else {
+    None
+  }
+}
+
+fn gitlab_release_create_args(tag: &str, title: &str, notes_file: &str) -> Vec<String> {
+  vec![
+    "release".to_string(),
+    "create".to_string(),
+    tag.to_string(),
+    "--name".to_string(),
+    title.to_string(),
+    "--notes-file".to_string(),
+    notes_file.to_string(),
+  ]
+}
+
+fn short_hash(value: &str) -> String {
+  let mut hash = 0xcbf29ce484222325_u64;
+  for byte in value.as_bytes() {
+    hash ^= u64::from(*byte);
+    hash = hash.wrapping_mul(0x100000001b3);
+  }
+  format!("{:08x}", hash & 0xffff_ffff)
+}
+
+fn release_pr_body(plan: &ReleasePlan) -> String {
+  let mut out = plan.format_summary_with_flags(true, true);
+  out.push_str("\n## Changelog Bodies\n\n");
+  for crate_plan in &plan.crates {
+    out.push_str(&format!("### {} v{}\n\n", crate_plan.name, crate_plan.new_version));
+    if crate_plan.changelog_body.trim().is_empty() {
+      out.push_str("_No generated changelog entries._\n\n");
+    } else {
+      out.push_str(crate_plan.changelog_body.trim());
+      out.push_str("\n\n");
+    }
+  }
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -615,5 +901,55 @@ mod tests {
     let section = extract_changelog_section(changelog, "0.2.0").unwrap();
     assert!(section.contains("new API"));
     assert!(!section.contains("old API"));
+  }
+
+  #[test]
+  fn release_branch_name_is_stable() {
+    let plan = ReleasePlan {
+      plan_contract_version: 2,
+      canonical_crate_order: Vec::new(),
+      crates: Vec::new(),
+      summary: crate::release::planner::ReleaseSummary {
+        total_crates: 0,
+        crates_to_publish: 0,
+        crates_to_tag: 0,
+      },
+      change_files_to_delete: Vec::new(),
+      skipped: Vec::new(),
+    };
+    assert_eq!(release_branch_name(&plan).unwrap(), release_branch_name(&plan).unwrap());
+    assert!(release_branch_name(&plan).unwrap().starts_with("rail/release-"));
+  }
+
+  #[test]
+  fn detects_release_forge_from_common_remotes() {
+    assert_eq!(
+      detect_release_forge_from_remote("git@github.com:org/repo.git"),
+      Some(ReleaseForge::Github)
+    );
+    assert_eq!(
+      detect_release_forge_from_remote("https://gitlab.com/org/repo.git"),
+      Some(ReleaseForge::Gitlab)
+    );
+    assert_eq!(
+      detect_release_forge_from_remote("https://git.example/org/repo.git"),
+      None
+    );
+  }
+
+  #[test]
+  fn gitlab_release_create_args_match_glab_cli() {
+    assert_eq!(
+      gitlab_release_create_args("v1.0.0", "crate v1.0.0", "/tmp/notes.md"),
+      vec![
+        "release",
+        "create",
+        "v1.0.0",
+        "--name",
+        "crate v1.0.0",
+        "--notes-file",
+        "/tmp/notes.md"
+      ]
+    );
   }
 }

@@ -1,7 +1,7 @@
 //! `cargo rail release` - Release automation
 
 use crate::commands::common::{OutputFormat, enforce_safety_gate};
-use crate::config::CommitPolicy;
+use crate::config::{CommitPolicy, ReleaseForgeConfig};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::release::planner::{DependentPolicy, ReleasePlanner};
@@ -80,7 +80,10 @@ pub fn run_release_plan(
       println!("Publish delay: {}s between crates", release_config.publish_delay);
     }
     if release_config.create_github_release && !skip_tag {
-      println!("GitHub releases: enabled");
+      println!(
+        "Forge releases: enabled ({})",
+        release_forge_detail(release_config.forge)
+      );
     }
     if release_config.sign_tags && !skip_tag {
       println!("Tag signing: enabled");
@@ -105,6 +108,8 @@ pub struct ReleasePublishArgs {
   pub skip_publish: bool,
   /// Skip creating git tags.
   pub skip_tag: bool,
+  /// Prepare a release PR branch without tags or publish.
+  pub pr: bool,
   /// Expand explicit crate selection to include the full dependent closure.
   pub include_dependents: bool,
   /// Skip interactive confirmation prompts.
@@ -143,6 +148,8 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   let planner = ReleasePlanner::new(ctx, release_config);
   let plan = planner.plan(targets, &bump_request, policy)?;
   let target_crates = plan.canonical_crate_order.clone();
+  let effective_skip_publish = args.skip_publish || args.pr;
+  let effective_skip_tag = args.skip_tag || args.pr;
   validator.validate(&target_crates, release_config.require_clean)?;
 
   // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
@@ -154,7 +161,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
   let expected_mutation_plan =
-    build_release_mutation_plan(ctx, &plan, args.skip_publish, args.skip_tag, release_config)?;
+    build_release_mutation_plan(ctx, &plan, effective_skip_publish, effective_skip_tag, release_config)?;
   let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
     let from_file = mutation::read_plan_file(path)?;
     if !from_file.operation_id.starts_with("release-") {
@@ -176,10 +183,13 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     expected_mutation_plan
   };
 
-  println!("{}", plan.format_summary_with_flags(args.skip_publish, args.skip_tag));
+  println!(
+    "{}",
+    plan.format_summary_with_flags(effective_skip_publish, effective_skip_tag)
+  );
 
   enforce_safety_gate(
-    "release apply",
+    if args.pr { "release PR" } else { "release apply" },
     args.yes,
     args.plan_path.as_deref(),
     io::stdin().is_terminal(),
@@ -190,11 +200,15 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     println!("\nthis will:");
     println!("  - modify Cargo.toml (version bumps)");
     println!("  - update changelogs");
-    println!("  - create git commits");
-    if !args.skip_tag {
+    if args.pr {
+      println!("  - create and push a release PR branch");
+    } else {
+      println!("  - create git commits");
+    }
+    if !effective_skip_tag {
       println!("  - create {} tag(s)", plan.crates.len());
     }
-    if !args.skip_publish {
+    if !effective_skip_publish {
       println!("  - publish to crates.io (irreversible)");
     }
 
@@ -206,8 +220,8 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
 
   validator.validate_apply_preconditions(
     &plan,
-    args.skip_publish,
-    args.skip_tag,
+    effective_skip_publish,
+    effective_skip_tag,
     release_config.require_clean,
     release_config.require_release_notes,
   )?;
@@ -225,7 +239,11 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   crate::progress!("receipt: {}", plan_receipt.display());
 
   let publisher = ReleasePublisher::new(ctx, release_config);
-  publisher.execute(&plan, args.skip_publish, args.skip_tag)?;
+  if args.pr {
+    publisher.execute_pr(&plan)?;
+  } else {
+    publisher.execute(&plan, args.skip_publish, args.skip_tag)?;
+  }
 
   let apply_receipt = mutation::write_receipt(
     ctx.workspace_root(),
@@ -316,19 +334,20 @@ pub fn run_release_check(
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
-  let commit_diagnostics = if release_config.unconventional_commits == CommitPolicy::Allow {
-    Vec::new()
-  } else {
-    let planner = ReleasePlanner::new(ctx, release_config);
-    planner.diagnose_commits(&target_crates)?
-  };
-  let missing_change_files = {
-    let planner = ReleasePlanner::new(ctx, release_config);
-    planner.missing_change_file_coverage(&target_crates)?
-  };
+  // One attribution pass covers commit diagnostics and change-file coverage.
+  let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
+  let commit_diagnostics = insights.commit_diagnostics;
+  let missing_change_files = insights.missing_change_files;
+  let shallow_repository = insights.shallow_repository;
   let has_commit_diagnostic_failures =
     release_config.unconventional_commits == CommitPolicy::Deny && !commit_diagnostics.is_empty();
   let has_change_file_failures = !missing_change_files.is_empty();
+  let has_shallow_failures = shallow_repository;
+
+  if !json && shallow_repository {
+    println!("\nrelease history:");
+    println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
+  }
 
   if !json && !commit_diagnostics.is_empty() {
     let label = if has_commit_diagnostic_failures {
@@ -346,7 +365,10 @@ pub fn run_release_check(
   if !json && !missing_change_files.is_empty() {
     println!("\nmissing change files:");
     for crate_name in &missing_change_files {
-      println!("  {}: code changes require .rail/changes coverage", crate_name);
+      println!(
+        "  {}: code changes require {} coverage",
+        crate_name, release_config.change_dir
+      );
     }
   }
 
@@ -425,7 +447,7 @@ pub fn run_release_check(
   if json {
     let mut payload = serde_json::json!({
       "action": "check",
-      "status": if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures { "failed" } else { "passed" },
+      "status": if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures { "failed" } else { "passed" },
       "crates": results,
       "count": results.len()
     });
@@ -455,25 +477,36 @@ pub fn run_release_check(
     if !missing_change_files.is_empty() {
       payload["missing_change_files"] = serde_json::json!(missing_change_files);
     }
+    if shallow_repository {
+      payload["release_history"] = serde_json::json!({
+        "shallow_repository": true,
+        "help": "fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0"
+      });
+    }
 
-    let exit_code = if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
-      2
-    } else {
-      0
-    };
-    let result = if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
-      "failed"
-    } else {
-      "success"
-    };
+    let exit_code =
+      if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures {
+        2
+      } else {
+        0
+      };
+    let result =
+      if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures {
+        "failed"
+      } else {
+        "success"
+      };
     let output = crate::output::machine_json_envelope("release", "validate", result, exit_code, payload);
 
     println!(
       "{}",
       serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
     );
-  } else if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
-    return Err(RailError::message(if has_change_file_failures {
+  } else if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures
+  {
+    return Err(RailError::message(if has_shallow_failures {
+      "release history check failed"
+    } else if has_change_file_failures {
       "change file coverage failed"
     } else if has_commit_diagnostic_failures {
       "commit diagnostics failed"
@@ -484,11 +517,78 @@ pub fn run_release_check(
     println!("\nall checks passed");
   }
 
-  if (has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures) && json {
+  if (has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures)
+    && json
+  {
     return Err(RailError::ExitWithCode { code: 2 });
   }
 
   Ok(())
+}
+
+/// Finalize a merged release PR by tagging, pushing, publishing, and creating forge releases.
+#[allow(clippy::too_many_arguments)]
+pub fn run_release_finalize(
+  ctx: &WorkspaceContext,
+  crate_names: Option<Vec<String>>,
+  all: bool,
+  skip_publish: bool,
+  skip_tag: bool,
+  include_dependents: bool,
+  yes: bool,
+  format: OutputFormat,
+) -> RailResult<()> {
+  let json = format.is_json();
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
+  let release_config = ctx
+    .config
+    .as_ref()
+    .map(|config| &config.release)
+    .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+
+  let workspace_members = ctx.graph.workspace_members();
+  for warning in release_config.validate(workspace_members).map_err(RailError::Config)? {
+    if !json {
+      crate::warn!("{}", warning);
+    }
+  }
+
+  let targets = if all {
+    None
+  } else if crate_names.is_some() {
+    crate_names
+  } else {
+    return Err(RailError::with_help(
+      "must specify crate name(s) or --all",
+      "cargo rail release finalize my-crate\ncargo rail release finalize --all",
+    ));
+  };
+  let planner = ReleasePlanner::new(ctx, release_config);
+  let plan = planner.finalize_plan(targets, dependent_policy(include_dependents))?;
+  let target_crates = plan.canonical_crate_order.clone();
+  let validator = ReleaseValidator::new(ctx);
+  validator.validate(&target_crates, release_config.require_clean)?;
+  if let Some(warning) = validator.validate_branch(yes)? {
+    crate::warn!("{}", warning);
+  }
+
+  if json {
+    let payload = serde_json::json!({
+      "release_plan": plan,
+      "finalize": true,
+    });
+    let output = crate::output::machine_json_envelope("release", "finalize", "pending_changes", 1, payload);
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    return Err(RailError::CheckHasPendingChanges);
+  }
+
+  println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
+  enforce_safety_gate("release finalize", yes, None, io::stdin().is_terminal())?;
+  let publisher = ReleasePublisher::new(ctx, release_config);
+  publisher.execute_finalize(&plan, skip_publish, skip_tag)
 }
 
 fn dependent_policy(include_dependents: bool) -> DependentPolicy {
@@ -543,9 +643,9 @@ fn build_release_mutation_plan(
     }
     if release_config.create_github_release && !skip_tag {
       actions.push(MutationAction::new(
-        "CREATE_GITHUB_DRAFT",
+        "CREATE_FORGE_RELEASE",
         crate_plan.tag_name.clone(),
-        Some("forge=github".to_string()),
+        Some(format!("forge={}", release_forge_detail(release_config.forge))),
       ));
     }
     if !skip_publish && crate_plan.publish {
@@ -557,9 +657,9 @@ fn build_release_mutation_plan(
     }
     if release_config.create_github_release && !skip_tag {
       actions.push(MutationAction::new(
-        "PUBLISH_GITHUB_RELEASE",
+        "PUBLISH_FORGE_RELEASE",
         crate_plan.tag_name.clone(),
-        Some("forge=github".to_string()),
+        Some(format!("forge={}", release_forge_detail(release_config.forge))),
       ));
     }
   }
@@ -596,6 +696,14 @@ fn build_release_mutation_plan(
   )];
 
   mutation::build_plan(ctx, "release", actions, risks, trace)
+}
+
+fn release_forge_detail(forge: ReleaseForgeConfig) -> &'static str {
+  match forge {
+    ReleaseForgeConfig::Auto => "auto",
+    ReleaseForgeConfig::Github => "github",
+    ReleaseForgeConfig::Gitlab => "gitlab",
+  }
 }
 
 /// Initialize release configuration

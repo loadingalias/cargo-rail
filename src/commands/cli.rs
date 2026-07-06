@@ -135,6 +135,8 @@ Examples:
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
+  cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
+  cargo rail release finalize --all             # Tag/publish after the release PR merges
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
@@ -145,7 +147,14 @@ const CHANGE_HELP: &str = "\
 Examples:
   cargo rail change add rail-core --bump minor --message \"Added auto bump planning\"
   cargo rail change add rail-core rail-cli --bump patch --message \"Fixed release notes\"
-  cargo rail change status";
+  cargo rail change add rail-core --bump patch --name fix-parser
+  cargo rail change status
+  cargo rail change status --format json
+
+Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
+Change files are consumed (deleted in the release commit) when released.
+Consumption is all-or-nothing: a release plan that covers only some of a
+file's crates is rejected so no pending intent is ever lost.";
 
 const INIT_HELP: &str = "\
 Examples:
@@ -634,6 +643,9 @@ pub enum ReleaseCommand {
     /// Skip git tag creation
     #[arg(long)]
     skip_tag: bool,
+    /// Prepare a release PR branch instead of tagging or publishing
+    #[arg(long)]
+    pr: bool,
     /// Expand explicit crate selection to include the full dependent closure
     #[arg(long)]
     include_dependents: bool,
@@ -662,6 +674,30 @@ pub enum ReleaseCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: OutputFormat,
   },
+  /// Finalize a merged release PR (tag, push, publish)
+  Finalize {
+    /// Crate name(s) to finalize (required unless --all)
+    #[arg(conflicts_with = "all", value_name = "CRATE")]
+    crate_names: Vec<String>,
+    /// Finalize all workspace crates with release notes for their current versions
+    #[arg(short, long)]
+    all: bool,
+    /// Skip publishing to crates.io
+    #[arg(long)]
+    skip_publish: bool,
+    /// Skip git tag creation
+    #[arg(long)]
+    skip_tag: bool,
+    /// Expand explicit crate selection to include the full dependent closure and version groups
+    #[arg(long)]
+    include_dependents: bool,
+    /// Skip confirmation prompts and allow non-default branch
+    #[arg(short = 'y', long)]
+    yes: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
 }
 
 /// Subcommands for `cargo rail change`
@@ -675,12 +711,22 @@ pub enum ChangeCommand {
     /// Bump level for the covered crate(s): patch, minor, major
     #[arg(long)]
     bump: String,
-    /// User-facing changelog entry body
+    /// User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
     #[arg(long, short = 'm')]
     message: Option<String>,
+    /// Override the generated filename slug
+    #[arg(long, value_name = "SLUG")]
+    name: Option<String>,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
   },
   /// Show pending change files
-  Status,
+  Status {
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: OutputFormat,
+  },
 }
 
 fn get_styles() -> clap::builder::Styles {
@@ -703,9 +749,13 @@ impl Commands {
       },
       Commands::Release { command } => match command {
         ReleaseCommand::Init { .. } => false,
-        ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
+        ReleaseCommand::Run { format, .. }
+        | ReleaseCommand::Check { format, .. }
+        | ReleaseCommand::Finalize { format, .. } => format.is_json_like(),
       },
-      Commands::Change { .. } => false,
+      Commands::Change { command } => match command {
+        ChangeCommand::Add { format, .. } | ChangeCommand::Status { format } => format.is_json_like(),
+      },
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }
@@ -729,9 +779,15 @@ impl Commands {
       } => *format = OutputFormat::Json,
       Commands::Split { .. } => {}
       Commands::Release {
-        command: ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. },
+        command:
+          ReleaseCommand::Run { format, .. }
+          | ReleaseCommand::Check { format, .. }
+          | ReleaseCommand::Finalize { format, .. },
       } => *format = OutputFormat::Json,
       Commands::Release { .. } => {}
+      Commands::Change {
+        command: ChangeCommand::Add { format, .. } | ChangeCommand::Status { format },
+      } => *format = OutputFormat::Json,
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }

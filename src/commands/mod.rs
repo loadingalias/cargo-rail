@@ -61,7 +61,7 @@ pub use graph::run_graph;
 pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
-pub use release::{run_release_check, run_release_init, run_release_plan, run_release_publish};
+pub use release::{run_release_check, run_release_finalize, run_release_init, run_release_plan, run_release_publish};
 pub use run::run_run;
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
@@ -306,8 +306,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         crate_names,
         bump,
         message,
-      } => run_change_add(ctx, crate_names, bump, message),
-      cli::ChangeCommand::Status => run_change_status(ctx),
+        name,
+        format,
+      } => run_change_add(ctx, crate_names, bump, message, name, format),
+      cli::ChangeCommand::Status { format } => run_change_status(ctx, format),
     },
 
     // Release
@@ -328,6 +330,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         plan,
         skip_publish,
         skip_tag,
+        pr,
         include_dependents,
         yes,
         format,
@@ -349,6 +352,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
               bump,
               skip_publish,
               skip_tag,
+              pr,
               include_dependents,
               yes,
               plan_path: plan,
@@ -369,6 +373,22 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
           Some(crate_names)
         };
         run_release_check(ctx, names, all, extended, include_dependents, format)
+      }
+      cli::ReleaseCommand::Finalize {
+        crate_names,
+        all,
+        skip_publish,
+        skip_tag,
+        include_dependents,
+        yes,
+        format,
+      } => {
+        let names = if all || crate_names.is_empty() {
+          None
+        } else {
+          Some(crate_names)
+        };
+        release::run_release_finalize(ctx, names, all, skip_publish, skip_tag, include_dependents, yes, format)
       }
     },
 

@@ -158,7 +158,7 @@ Options:
           - json:         Machine-readable JSON output
           - github:       GitHub Actions output format for $GITHUB_OUTPUT
           - github-debug: GitHub Actions output with embedded planner contract for debugging
-          
+
           [default: text]
 
   -o, --output <PATH>
@@ -169,7 +169,7 @@ Options:
 
       --confidence-profile <PROFILE>
           Planner confidence profile override (strict|balanced|fast)
-          
+
           [possible values: strict, balanced, fast]
 
   -h, --help
@@ -225,7 +225,7 @@ Options:
           Possible values:
           - text: Human-readable text output (default)
           - json: Machine-readable JSON output
-          
+
           [default: text]
 
       --workspace-root <PATH>
@@ -298,7 +298,7 @@ Usage: cargo rail init [OPTIONS]
 Options:
   -o, --output <OUTPUT>
           Output path for rail.toml
-          
+
           [default: .config/rail.toml]
 
   -q, --quiet
@@ -455,7 +455,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -h, --help
@@ -511,7 +511,7 @@ Options:
           - theirs: Use the remote/split repo version (--theirs)
           - manual: Attempt automatic merge; create conflict markers if conflicts exist (default)
           - union:  Combine both versions line-by-line (union merge)
-          
+
           [default: manual]
 
   -c, --check
@@ -537,7 +537,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -h, --help
@@ -567,10 +567,11 @@ Publish releases (version bump, changelog, tag, publish)
 Usage: cargo rail release [OPTIONS] <COMMAND>
 
 Commands:
-  init   Configure release settings
-  run    Execute release (plan or publish)
-  check  Validate release readiness
-  help   Print this message or the help of the given subcommand(s)
+  init      Configure release settings
+  run       Execute release (plan or publish)
+  check     Validate release readiness
+  finalize  Finalize a merged release PR (tag, push, publish)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
@@ -600,6 +601,8 @@ Examples:
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
+  cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
+  cargo rail release finalize --all             # Tag/publish after the release PR merges
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
@@ -651,7 +654,7 @@ Options:
 
       --bump <BUMP>
           Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
-          
+
           [default: patch]
 
       --json
@@ -675,6 +678,9 @@ Options:
       --skip-tag
           Skip git tag creation
 
+      --pr
+          Prepare a release PR branch instead of tagging or publishing
+
       --include-dependents
           Expand explicit crate selection to include the full dependent closure
 
@@ -692,7 +698,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -h, --help
@@ -745,11 +751,73 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail release finalize
+
+```
+Finalize a merged release PR (tag, push, publish)
+
+Usage: cargo rail release finalize [OPTIONS] [CRATE]...
+
+Arguments:
+  [CRATE]...
+          Crate name(s) to finalize (required unless --all)
+
+Options:
+  -a, --all
+          Finalize all workspace crates with release notes for their current versions
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --skip-publish
+          Skip publishing to crates.io
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --skip-tag
+          Skip git tag creation
+
+      --include-dependents
+          Expand explicit crate selection to include the full dependent closure and version groups
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -y, --yes
+          Skip confirmation prompts and allow non-default branch
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+
+          [default: text]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -794,7 +862,14 @@ Options:
 Examples:
   cargo rail change add rail-core --bump minor --message "Added auto bump planning"
   cargo rail change add rail-core rail-cli --bump patch --message "Fixed release notes"
+  cargo rail change add rail-core --bump patch --name fix-parser
   cargo rail change status
+  cargo rail change status --format json
+
+Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
+Change files are consumed (deleted in the release commit) when released.
+Consumption is all-or-nothing: a release plan that covers only some of a
+file's crates is rejected so no pending intent is ever lost.
 ```
 
 ---
@@ -807,17 +882,50 @@ Create a pending change file
 Usage: cargo rail change add [OPTIONS] --bump <BUMP> [CRATE]...
 
 Arguments:
-  [CRATE]...  Crate name(s) covered by this change
+  [CRATE]...
+          Crate name(s) covered by this change
 
 Options:
-      --bump <BUMP>            Bump level for the covered crate(s): patch, minor, major
-  -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output in JSON format (shorthand for -f json)
-  -m, --message <MESSAGE>      User-facing changelog entry body
-      --config <PATH>          Path to rail.toml config file (bypass search order)
-      --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
+      --bump <BUMP>
+          Bump level for the covered crate(s): patch, minor, major
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+  -m, --message <MESSAGE>
+          User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --name <SLUG>
+          Override the generated filename slug
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+
+          [default: text]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -830,12 +938,37 @@ Show pending change files
 Usage: cargo rail change status [OPTIONS]
 
 Options:
-  -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output in JSON format (shorthand for -f json)
-      --config <PATH>          Path to rail.toml config file (bypass search order)
-      --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:          Human-readable text output (default)
+          - json:          Machine-readable JSON output
+          - names-only:    Names only, one per line
+          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
+          - github:        GitHub Actions output format for $GITHUB_OUTPUT
+          - github-matrix: GitHub Actions matrix format for strategy.matrix
+          - jsonl:         JSON Lines format (one object per line)
+
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -883,7 +1016,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -h, --help
@@ -967,7 +1100,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -q, --quiet
@@ -1012,7 +1145,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -q, --quiet
@@ -1057,7 +1190,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -q, --quiet
@@ -1116,7 +1249,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
       --json
@@ -1171,7 +1304,7 @@ Options:
 
       --confidence-profile <PROFILE>
           Planner confidence profile override (strict|balanced|fast)
-          
+
           [possible values: strict, balanced, fast]
 
   -f, --format <FORMAT>
@@ -1185,7 +1318,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -h, --help
@@ -1230,7 +1363,7 @@ Options:
           - github:        GitHub Actions output format for $GITHUB_OUTPUT
           - github-matrix: GitHub Actions matrix format for strategy.matrix
           - jsonl:         JSON Lines format (one object per line)
-          
+
           [default: text]
 
   -q, --quiet
@@ -1295,7 +1428,7 @@ Options:
 
       --confidence-profile <PROFILE>
           Planner confidence profile override (strict|balanced|fast)
-          
+
           [possible values: strict, balanced, fast]
 
       --dot
@@ -1329,7 +1462,7 @@ Usage: cargo rail completions [OPTIONS] <SHELL>
 Arguments:
   <SHELL>
           Shell to generate completions for
-          
+
           [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:

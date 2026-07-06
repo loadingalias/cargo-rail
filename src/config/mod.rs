@@ -21,7 +21,7 @@ mod unify;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
-  Pre1BreakingBump, ReleaseConfig, RequireChangeFiles, SemverCheckPolicy,
+  Pre1BreakingBump, ReleaseConfig, ReleaseForgeConfig, RequireChangeFiles, SemverCheckPolicy,
 };
 pub use run::{RunConfig, RunProfile, is_builtin_profile};
 pub use split::{CratePath, CrateSplitConfig, CrateSyncConfig, SplitConfig, SplitMode, WorkspaceMode};

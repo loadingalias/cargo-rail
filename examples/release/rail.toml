@@ -1,5 +1,5 @@
 # cargo-rail configuration
-# Release-focused example with full [release] section.
+# Release-focused example: change files, auto bumps, and a shaped changelog.
 
 # targets = []  # optional: set for multi-target validation
 
@@ -9,8 +9,40 @@ tag_format = "{crate}-{prefix}{version}"  # e.g. my-crate-v1.0.0 (with tag_prefi
 require_clean = true
 publish_delay = 5  # seconds between publishes
 create_github_release = false
+forge = "auto"  # auto, github, gitlab
 sign_tags = false
-changelog_path = "CHANGELOG.md"
-changelog_relative_to = "crate"  # crate = per-crate, workspace = single file
-skip_changelog_for = []
 require_changelog_entries = false
+require_release_notes = true
+
+# --bump auto policies
+pre_1_breaking_bump = "minor"    # breaking change on 0.x: "minor" or "major"
+unconventional_commits = "warn"  # commits that fail conventional parsing: "allow", "warn", "deny"
+semver_check = "warn"            # cargo-semver-checks (external binary): "off", "warn", "deny"
+change_dir = ".changes"          # pending release intent files; use "changes" for a visible dir
+require_change_files = false     # true, false, or ["crate-a", "crate-b"]
+
+# Lockstep groups: every member releases at the max bump any member earned
+# [release.version_groups]
+# core = ["rail-core", "rail-graph", "rail-git"]
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"  # "crate" = one changelog per crate, "workspace" = shared file
+entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"
+emoji = true
+group_order = ["breaking", "feat", "fix", "perf", "docs", "deps", "other"]
+fallback = "other"  # unlisted commit types land here; "skip" drops them
+
+[release.changelog.filters]
+skip_types = ["chore", "ci"]  # breaking commits always render, even for skipped types
+skip_scopes = []
+
+# Custom section: map extra commit types to a shared heading
+# [[release.changelog.groups]]
+# types = ["sec", "security"]
+# title = "Security"
+
+# Per-crate overrides inherit anything they don't set
+# [crates.my-crate.changelog]
+# path = "HISTORY.md"
+# emoji = false

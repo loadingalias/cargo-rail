@@ -132,16 +132,19 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
   "require_clean",
   "publish_delay",
   "create_github_release",
+  "forge",
   "push",
   "sign_tags",
   "changelog",
   "require_changelog_entries",
   "require_release_notes",
   "release_notes_dir",
+  "change_dir",
   "pre_1_breaking_bump",
   "unconventional_commits",
   "semver_check",
   "require_change_files",
+  "version_groups",
 ];
 
 /// Known keys in [release.changelog] section

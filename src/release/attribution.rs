@@ -121,12 +121,14 @@ impl<'a> CommitAttributor<'a> {
     for entry in entries {
       let mut crates: Vec<String> = Vec::new();
       let mut code_crates: Vec<String> = Vec::new();
+      let mut any_file_filtered = false;
 
       for file in &entry.files {
         let Some(workspace_path) = self.ctx.to_workspace_path(file) else {
           continue;
         };
         if !path_filters.allows(&workspace_path) {
+          any_file_filtered = true;
           continue;
         }
         let Some(owner) = self.ctx.graph.file_to_crate(&workspace_path) else {
@@ -141,13 +143,16 @@ impl<'a> CommitAttributor<'a> {
       }
 
       // Scope narrowing: an explicit crate-name scope wins over file paths.
+      // A scope may claim an otherwise unattributed commit (e.g. one that
+      // only touches workspace infrastructure), but never one whose files
+      // were excluded by path filters — filters stay authoritative.
       let parsed = parse_subject(&entry.subject, entry.body.as_deref());
       if let Some(scope) = parsed.scope
         && self.members.contains(scope)
       {
         crates.retain(|c| c == scope);
         code_crates.retain(|c| c == scope);
-        if crates.is_empty() {
+        if crates.is_empty() && !any_file_filtered {
           crates.push(scope.to_string());
         }
       }

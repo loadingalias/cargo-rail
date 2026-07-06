@@ -64,6 +64,7 @@ remove_unused = true             # Auto-remove them
 [release]
 tag_format = "{crate}-{prefix}{version}"
 create_github_release = false
+forge = "auto"
 
 [change-detection]
 infrastructure = [".github/**", "justfile"]
@@ -241,7 +242,8 @@ Release automation settings for versioning, tagging, and publishing.
 | `tag_format` | `string` | `"{crate}-{prefix}{version}"` | Tag template. Available variables:<br>• `{crate}` - Crate name<br>• `{version}` - Version number<br>• `{prefix}` - Value of `tag_prefix` |
 | `require_clean` | `bool` | `true` | Require clean working directory before release operations. |
 | `publish_delay` | `u64` | `5` | Delay between crate publishes in seconds. Allows crates.io to propagate dependencies. |
-| `create_github_release` | `bool` | `false` | Create GitHub Releases via `gh`. Requires `push = true`; cargo-rail pushes the tag first, creates a draft release, publishes registries, then publishes the GitHub Release. |
+| `create_github_release` | `bool` | `false` | Create forge releases via `gh` or `glab`. Requires `push = true`; cargo-rail pushes the tag first. GitHub releases are created as drafts and published after crates publish; GitLab releases are created directly. |
+| `forge` | `enum` | `"auto"` | Release-creation provider when release creation is enabled: `"auto"`, `"github"`, or `"gitlab"`. Auto detects GitHub/GitLab from `origin`; Gitea release creation is not supported. |
 | `push` | `bool` | `false` | Push release commits and tags to `origin` before public publishing. Uses an atomic push for the branch and release tags. |
 | `sign_tags` | `bool` | `false` | Sign git tags with GPG or SSH. Requires git signing to be configured. |
 
@@ -255,6 +257,7 @@ require_clean = true
 publish_delay = 10
 push = true
 create_github_release = true
+forge = "auto"
 sign_tags = true
 ```
 
@@ -265,10 +268,27 @@ sign_tags = true
 | `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
 | `require_release_notes` | `bool` | `true` | If `true`, preflight fails release apply when the target version has no release notes (`## [<version>]`) and changelog generation produces no entries. Set to `false` to allow note-less releases. |
 | `release_notes_dir` | `string` | `"release-notes"` | Directory for manual release body overrides. `v<version>.md` or `<tag>.md` takes precedence over generated notes. |
+| `change_dir` | `string` | `".changes"` | Workspace-relative directory for pending release intent files. Set `change_dir = "changes"` if the team prefers a visible directory. |
 | `pre_1_breaking_bump` | `enum` | `"minor"` | How `--bump auto` maps breaking changes for `0.x` crates: `"minor"` or `"major"`. |
 | `unconventional_commits` | `enum` | `"warn"` | Policy for commits that do not parse as conventional commits: `"allow"`, `"warn"`, or `"deny"`. |
-| `semver_check` | `enum` | `"warn"` | Optional `cargo-semver-checks` policy for `release check --extended`: `"off"`, `"warn"`, or `"deny"`. |
-| `require_change_files` | `bool` or `string[]` | `false` | Require `.rail/changes/*.md` coverage for all crates or selected crates. |
+| `semver_check` | `enum` | `"warn"` | Optional `cargo-semver-checks` policy: `"off"`, `"warn"`, or `"deny"`. Only publishable library crates are checked. A confirmed breaking verdict escalates `--bump auto` to major and fails `release check --extended` under `"deny"`; inconclusive runs (no published baseline, network or build failure) report as skipped and never escalate or fail. |
+| `require_change_files` | `bool` or `string[]` | `false` | Require `.changes/*.md` coverage, or the configured `change_dir`, for all crates or selected crates. Coverage honors `[release.changelog.filters]`, so crates whose only changes sit in excluded paths are not gated. Consumption is all-or-nothing: a release plan covering only some of a change file's crates is rejected so no pending intent is lost. |
+| `version_groups` | `table` | `{}` | Named lockstep groups under `[release.version_groups]`. Group members must be workspace crates and may belong to at most one group. |
+
+#### [release.version_groups]
+
+Use version groups when a set of crates must always release together at the
+same bump level:
+
+```toml
+[release.version_groups]
+core = ["rail-core", "rail-graph", "rail-git"]
+```
+
+With `--bump auto`, cargo-rail computes each member's signal, uses the maximum
+level for the whole group, and plans group-only members with
+`version group <name> -> <level>`. Explicit partial releases are rejected by
+default; pass `--include-dependents` to expand the selection to the whole group.
 
 #### [release.changelog]
 
@@ -286,14 +306,28 @@ Workspace changelog defaults. Per-crate overrides live under
 | `commit_url` | `string?` | inferred | Commit URL template with `{sha}`. |
 | `pr_url` | `string?` | inferred | Pull-request URL template with `{pr}`. |
 
+GitHub remotes infer `commit_url` and `pr_url` automatically. For GitLab or
+self-hosted forges, set explicit templates:
+
+```toml
+[release.changelog]
+commit_url = "https://gitlab.com/org/repo/-/commit/{sha}"
+pr_url = "https://gitlab.com/org/repo/-/merge_requests/{pr}"
+```
+
 #### [release.changelog.filters]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `skip_types` | `string[]` | `[]` | Commit types omitted from changelog output. |
+| `skip_types` | `string[]` | `[]` | Commit types omitted from changelog output. Breaking commits are exempt — they always render. |
 | `skip_scopes` | `string[]` | `[]` | Commit scopes omitted from changelog output. |
 | `include_paths` | `string[]` | `[]` | Optional attribution include globs. Empty means all resolver-owned crate paths. |
 | `exclude_paths` | `string[]` | `[]` | Optional attribution exclude globs. |
+
+Path filters are authoritative: a commit scope naming a workspace crate can
+claim an otherwise unattributed commit (for example one that only touches
+workspace infrastructure), but never one whose files were excluded by
+`include_paths`/`exclude_paths`.
 
 **Example:**
 
@@ -301,6 +335,7 @@ Workspace changelog defaults. Per-crate overrides live under
 [release]
 require_changelog_entries = true
 release_notes_dir = "release-notes"
+change_dir = ".changes"
 pre_1_breaking_bump = "minor"
 unconventional_commits = "warn"
 semver_check = "warn"
@@ -330,12 +365,14 @@ require_clean = true
 publish_delay = 5
 push = false
 create_github_release = false
+forge = "auto"
 sign_tags = false
 
 # Changelog
 require_changelog_entries = false
 require_release_notes = true
 release_notes_dir = "release-notes"
+change_dir = ".changes"
 pre_1_breaking_bump = "minor"
 unconventional_commits = "warn"
 semver_check = "warn"
@@ -361,7 +398,8 @@ exclude_paths = []
 - In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
 - For single-crate workspaces, use `tag_format = "v{version}"`
 - `relative_to = "workspace"` under `[release.changelog]` is useful for unified changelogs
-- `create_github_release = true` with `push = false` is rejected because GitHub may create a tag from the wrong commit.
+- `create_github_release = true` with `push = false` is rejected because forges may create a tag from the wrong commit.
+- With `forge = "gitlab"`, release creation uses `glab release create`. Gitea release creation is unsupported; tags and registry publish still work.
 - Put curated release notes in `release-notes/v1.2.3.md` when generated notes are too large or too noisy.
 
 ---
@@ -772,12 +810,14 @@ require_clean = true
 publish_delay = 5
 push = true
 create_github_release = true
+forge = "auto"
 sign_tags = true
 
 # Changelog
 require_changelog_entries = true
 require_release_notes = true
 release_notes_dir = "release-notes"
+change_dir = ".changes"
 pre_1_breaking_bump = "minor"
 unconventional_commits = "warn"
 semver_check = "warn"
@@ -926,6 +966,7 @@ require_clean = true
 require_changelog_entries = true
 require_release_notes = true
 create_github_release = true
+forge = "auto"
 sign_tags = true
 
 [change-detection]
@@ -1048,6 +1089,7 @@ tag_format = "{crate}-{prefix}{version}"
 require_changelog_entries = true
 require_release_notes = true
 create_github_release = true
+forge = "auto"
 
 [release.changelog]
 path = "CHANGELOG.md"

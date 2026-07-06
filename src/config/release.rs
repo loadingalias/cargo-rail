@@ -3,6 +3,7 @@
 use crate::config::unify::default_true;
 use crate::error::ConfigError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Release configuration (workspace-wide defaults)
@@ -25,9 +26,16 @@ pub struct ReleaseConfig {
   #[serde(default = "default_publish_delay")]
   pub publish_delay: u64,
 
-  /// Create GitHub releases via gh CLI (default: false)
+  /// Create forge releases via the configured external CLI (default: false).
+  ///
+  /// The field name is retained for the original GitHub-only config surface;
+  /// `forge` selects GitHub (`gh`) or GitLab (`glab`) for new configurations.
   #[serde(default)]
   pub create_github_release: bool,
+
+  /// Forge release provider used when release creation is enabled.
+  #[serde(default)]
+  pub forge: ReleaseForgeConfig,
 
   /// Push release commit and tags to the git remote before public publishing.
   #[serde(default)]
@@ -51,9 +59,16 @@ pub struct ReleaseConfig {
   /// Directory containing manual release note overrides.
   ///
   /// If `release-notes/v1.2.3.md` or `release-notes/<tag>.md` exists, cargo-rail
-  /// uses it as the GitHub release body instead of generated changelog text.
+  /// uses it as the forge release body instead of generated changelog text.
   #[serde(default = "default_release_notes_dir")]
   pub release_notes_dir: String,
+
+  /// Directory containing pending change files (default: ".changes").
+  ///
+  /// Relative to the workspace root. The removed `.rail/changes` path is not
+  /// accepted; cargo-rail reports a migration guard if old files still exist.
+  #[serde(default = "default_change_dir")]
+  pub change_dir: String,
 
   /// How `--bump auto` maps breaking changes for pre-1.0 crates (default: "minor").
   ///
@@ -82,13 +97,18 @@ pub struct ReleaseConfig {
   #[serde(default)]
   pub semver_check: SemverCheckPolicy,
 
-  /// Require change files (`.rail/changes/*.md`) to cover released crates.
+  /// Require change files to cover released crates.
   ///
   /// - `false` (default): change files are optional
   /// - `true`: every released crate with code changes needs a covering change file
   /// - `["crate-a", ...]`: only the listed crates are gated
   #[serde(default)]
   pub require_change_files: RequireChangeFiles,
+
+  /// Lockstep version groups. Each named group lists workspace members that
+  /// must be released together at the maximum bump level any member earns.
+  #[serde(default)]
+  pub version_groups: BTreeMap<String, Vec<String>>,
 
   /// Changelog location and shape (workspace defaults).
   ///
@@ -105,15 +125,18 @@ impl Default for ReleaseConfig {
       require_clean: true,
       publish_delay: default_publish_delay(),
       create_github_release: false,
+      forge: ReleaseForgeConfig::default(),
       push: false,
       sign_tags: false,
       require_changelog_entries: false,
       require_release_notes: true,
       release_notes_dir: default_release_notes_dir(),
+      change_dir: default_change_dir(),
       pre_1_breaking_bump: Pre1BreakingBump::default(),
       unconventional_commits: CommitPolicy::default(),
       semver_check: SemverCheckPolicy::default(),
       require_change_files: RequireChangeFiles::default(),
+      version_groups: BTreeMap::new(),
       changelog: ChangelogShape::default(),
     }
   }
@@ -153,9 +176,11 @@ impl ReleaseConfig {
     if self.create_github_release && !self.push {
       return Err(ConfigError::InvalidField {
         field: "release.create_github_release".to_string(),
-        reason: "create_github_release = true requires push = true so cargo-rail owns the pushed tag".to_string(),
+        reason: "create_github_release = true requires push = true so cargo-rail owns the pushed tag before creating a forge release".to_string(),
       });
     }
+
+    validate_change_dir(&self.change_dir)?;
 
     if let RequireChangeFiles::Crates(crates) = &self.require_change_files {
       for crate_name in crates {
@@ -170,9 +195,47 @@ impl ReleaseConfig {
       }
     }
 
+    self.validate_version_groups(workspace_members)?;
+
     self.changelog.filters.validate("release.changelog.filters")?;
 
     Ok(warnings)
+  }
+
+  fn validate_version_groups(&self, workspace_members: &[String]) -> Result<(), ConfigError> {
+    let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+    for (group_name, members) in &self.version_groups {
+      if group_name.trim().is_empty() {
+        return Err(ConfigError::InvalidField {
+          field: "release.version_groups".to_string(),
+          reason: "version group names cannot be empty".to_string(),
+        });
+      }
+      if members.is_empty() {
+        return Err(ConfigError::InvalidField {
+          field: format!("release.version_groups.{}", group_name),
+          reason: "version groups must contain at least one crate".to_string(),
+        });
+      }
+      for crate_name in members {
+        if !workspace_members.contains(crate_name) {
+          return Err(ConfigError::InvalidField {
+            field: format!("release.version_groups.{}", group_name),
+            reason: format!("unknown workspace crate '{}'", crate_name),
+          });
+        }
+        if let Some(previous) = owners.insert(crate_name, group_name) {
+          return Err(ConfigError::InvalidField {
+            field: "release.version_groups".to_string(),
+            reason: format!(
+              "crate '{}' belongs to multiple version groups: {}, {}",
+              crate_name, previous, group_name
+            ),
+          });
+        }
+      }
+    }
+    Ok(())
   }
 }
 
@@ -211,6 +274,19 @@ pub enum SemverCheckPolicy {
   Warn,
   /// Fail checks when a planned bump is below detected API breakage
   Deny,
+}
+
+/// Forge release provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseForgeConfig {
+  /// Detect provider from `origin`.
+  #[default]
+  Auto,
+  /// GitHub via `gh`.
+  Github,
+  /// GitLab via `glab`.
+  Gitlab,
 }
 
 /// Which crates require change-file coverage
@@ -443,6 +519,20 @@ fn default_release_notes_dir() -> String {
   "release-notes".to_string()
 }
 
+fn default_change_dir() -> String {
+  crate::release::change_files::DEFAULT_CHANGE_DIR.to_string()
+}
+
+fn validate_change_dir(change_dir: &str) -> Result<(), ConfigError> {
+  if let Some(reason) = crate::release::change_files::change_dir_validation_error(change_dir) {
+    return Err(ConfigError::InvalidField {
+      field: "release.change_dir".to_string(),
+      reason: reason.to_string(),
+    });
+  }
+  Ok(())
+}
+
 fn validate_globs(field_prefix: &str, key: &str, patterns: &[String]) -> Result<(), ConfigError> {
   for pattern in patterns {
     if let Err(e) = glob::Pattern::new(pattern) {
@@ -525,7 +615,10 @@ mod tests {
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
     assert_eq!(config.unconventional_commits, CommitPolicy::Warn);
     assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
+    assert_eq!(config.forge, ReleaseForgeConfig::Auto);
+    assert_eq!(config.change_dir, ".changes");
     assert!(!config.require_change_files.is_enabled());
+    assert!(config.version_groups.is_empty());
     assert!(config.require_release_notes);
   }
 
@@ -535,11 +628,15 @@ mod tests {
       pre_1_breaking_bump = "major"
       unconventional_commits = "deny"
       semver_check = "off"
+      change_dir = "changes"
+      forge = "gitlab"
     "#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
     assert_eq!(config.unconventional_commits, CommitPolicy::Deny);
     assert_eq!(config.semver_check, SemverCheckPolicy::Off);
+    assert_eq!(config.change_dir, "changes");
+    assert_eq!(config.forge, ReleaseForgeConfig::Gitlab);
   }
 
   #[test]
@@ -607,5 +704,36 @@ mod tests {
 
     let err = config.validate(&["crate-a".to_string()]).unwrap_err();
     assert!(err.to_string().contains("requires push = true"));
+  }
+
+  #[test]
+  fn test_change_dir_rejects_legacy_path() {
+    let config = ReleaseConfig {
+      change_dir: ".rail/changes".to_string(),
+      ..ReleaseConfig::default()
+    };
+
+    let err = config.validate(&["crate-a".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("removed"));
+  }
+
+  #[test]
+  fn test_version_groups_validate_unknown_and_duplicate_members() {
+    let mut config = ReleaseConfig::default();
+    config
+      .version_groups
+      .insert("core".to_string(), vec!["real".to_string(), "ghost".to_string()]);
+    let err = config.validate(&["real".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("ghost"));
+
+    let mut config = ReleaseConfig::default();
+    config
+      .version_groups
+      .insert("core".to_string(), vec!["real".to_string()]);
+    config
+      .version_groups
+      .insert("cli".to_string(), vec!["real".to_string()]);
+    let err = config.validate(&["real".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("multiple version groups"));
   }
 }

@@ -189,7 +189,13 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     section: "release",
     key: "create_github_release",
     default_toml: "false",
-    comment: "Create GitHub releases via gh CLI",
+    comment: "Create forge releases via gh/glab CLI",
+  },
+  FieldSpec {
+    section: "release",
+    key: "forge",
+    default_toml: "\"auto\"",
+    comment: "Release creation provider: auto, github, gitlab",
   },
   FieldSpec {
     section: "release",
@@ -223,6 +229,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   },
   FieldSpec {
     section: "release",
+    key: "change_dir",
+    default_toml: "\".changes\"",
+    comment: "Pending release intent file directory",
+  },
+  FieldSpec {
+    section: "release",
     key: "pre_1_breaking_bump",
     default_toml: "\"minor\"",
     comment: "Auto bump for breaking changes on 0.x crates: minor or major",
@@ -243,7 +255,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     section: "release",
     key: "require_change_files",
     default_toml: "false",
-    comment: "Require .rail/changes coverage: false, true, or [crate]",
+    comment: "Require change-file coverage: false, true, or [crate]",
   },
   // =========================================================================
   // [release.changelog] section - 6 fields
@@ -412,7 +424,7 @@ mod tests {
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
-    assert_eq!(release_fields.len(), 14);
+    assert_eq!(release_fields.len(), 16);
 
     let changelog_fields: Vec<_> = fields_for_section("release.changelog").collect();
     assert_eq!(changelog_fields.len(), 6);
@@ -433,7 +445,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      51, // 22 unify + 14 release + 6 changelog + 4 filters + 4 change-detection + 1 run
+      53, // 22 unify + 16 release + 6 changelog + 4 filters + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -442,7 +454,7 @@ mod tests {
   ///
   /// SYNCABLE (auto-added by `config sync`):
   /// - [unify] - 22 fields: workspace-wide dependency unification settings
-  /// - [release] - 14 fields: workspace-wide release settings
+  /// - [release] - 16 fields: workspace-wide release settings
   /// - [release.changelog] - 6 fields: changelog location/rendering defaults
   /// - [release.changelog.filters] - 4 fields: changelog commit/path filters
   /// - [change-detection] - 4 fields: infra patterns, conservative fallback, and confidence profiles

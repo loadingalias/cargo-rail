@@ -198,6 +198,10 @@ impl RailConfigBuilder {
       config.push
     ));
     content.push_str(&format!("create_github_release = {}\n", config.create_github_release));
+    content.push_str(&format!(
+      "forge = \"{}\"  # auto | github | gitlab\n",
+      forge(config.forge)
+    ));
     content.push_str(&format!("sign_tags = {}\n", config.sign_tags));
     content.push_str(&format!(
       "require_changelog_entries = {}\n",
@@ -210,6 +214,10 @@ impl RailConfigBuilder {
     content.push_str(&format!(
       "release_notes_dir = \"{}\"  # manual notes: v<version>.md or <tag>.md\n",
       config.release_notes_dir
+    ));
+    content.push_str(&format!(
+      "change_dir = \"{}\"  # pending release intent files\n",
+      config.change_dir
     ));
     content.push_str(&format!(
       "pre_1_breaking_bump = \"{}\"  # minor keeps 0.x breaking changes pre-1.0\n",
@@ -426,6 +434,14 @@ fn semver_policy(value: SemverCheckPolicy) -> &'static str {
     SemverCheckPolicy::Off => "off",
     SemverCheckPolicy::Warn => "warn",
     SemverCheckPolicy::Deny => "deny",
+  }
+}
+
+fn forge(value: crate::config::ReleaseForgeConfig) -> &'static str {
+  match value {
+    crate::config::ReleaseForgeConfig::Auto => "auto",
+    crate::config::ReleaseForgeConfig::Github => "github",
+    crate::config::ReleaseForgeConfig::Gitlab => "gitlab",
   }
 }
 
