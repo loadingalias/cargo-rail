@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/loadingalias/cargo-rail/compare/v0.14.0...v0.15.0) - 2026-07-06
+
+### ✨ Features
+
+- **release**: add changelog engine ([1f535c0](https://github.com/loadingalias/cargo-rail/commit/1f535c0131e6d24a377c4a555445b32ccca68e16))
+
+### ✅ Testing
+
+- make change path assertion portable ([8966a23](https://github.com/loadingalias/cargo-rail/commit/8966a23c439f7df9aaff489afc5b9cffdeb41333))
+
+
+
 ## [0.14.0](https://github.com/loadingalias/cargo-rail/compare/v0.13.4...v0.14.0) - 2026-07-06
 
 ### ✨ Features
