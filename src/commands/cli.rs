@@ -134,11 +134,18 @@ Examples:
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
+  cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
   cargo rail release run --all --bump patch     # Release all crates
   cargo rail release run my-crate --skip-publish  # Tag only, no crates.io";
+
+const CHANGE_HELP: &str = "\
+Examples:
+  cargo rail change add rail-core --bump minor --message \"Added auto bump planning\"
+  cargo rail change add rail-core rail-cli --bump patch --message \"Fixed release notes\"
+  cargo rail change status";
 
 const INIT_HELP: &str = "\
 Examples:
@@ -375,6 +382,14 @@ pub enum Commands {
     command: ReleaseCommand,
   },
 
+  /// Manage pending release intent files
+  #[command(after_long_help = CHANGE_HELP)]
+  Change {
+    /// Change subcommand
+    #[command(subcommand)]
+    command: ChangeCommand,
+  },
+
   /// Clean generated artifacts (cache, backups, reports)
   #[command(after_long_help = CLEAN_HELP)]
   Clean {
@@ -604,7 +619,7 @@ pub enum ReleaseCommand {
     /// Release all workspace crates
     #[arg(short, long)]
     all: bool,
-    /// Version bump [major, minor, patch, prerelease, release, or "x.y.z"]
+    /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
     #[arg(long, default_value = "patch")]
     bump: String,
     /// Dry-run mode: preview release plan
@@ -649,6 +664,25 @@ pub enum ReleaseCommand {
   },
 }
 
+/// Subcommands for `cargo rail change`
+#[derive(Subcommand)]
+pub enum ChangeCommand {
+  /// Create a pending change file
+  Add {
+    /// Crate name(s) covered by this change
+    #[arg(value_name = "CRATE")]
+    crate_names: Vec<String>,
+    /// Bump level for the covered crate(s): patch, minor, major
+    #[arg(long)]
+    bump: String,
+    /// User-facing changelog entry body
+    #[arg(long, short = 'm')]
+    message: Option<String>,
+  },
+  /// Show pending change files
+  Status,
+}
+
 fn get_styles() -> clap::builder::Styles {
   clap::builder::Styles::styled()
 }
@@ -671,6 +705,7 @@ impl Commands {
         ReleaseCommand::Init { .. } => false,
         ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => format.is_json_like(),
       },
+      Commands::Change { .. } => false,
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }

@@ -1,7 +1,10 @@
 //! High-level TOML document builders
 
 use super::format::{TomlFormatter, TomlValue};
-use crate::config::{ChangeDetectionConfig, ConfidenceProfile, ReleaseConfig, RunConfig, UnifyConfig};
+use crate::config::{
+  ChangeDetectionConfig, ChangelogRelativeTo, CommitPolicy, ConfidenceProfile, Pre1BreakingBump, ReleaseConfig,
+  RequireChangeFiles, RunConfig, SemverCheckPolicy, UnifyConfig,
+};
 use crate::error::RailResult;
 
 /// Rail config builder
@@ -196,23 +199,6 @@ impl RailConfigBuilder {
     ));
     content.push_str(&format!("create_github_release = {}\n", config.create_github_release));
     content.push_str(&format!("sign_tags = {}\n", config.sign_tags));
-    content.push_str(&format!("changelog_path = \"{}\"\n", config.changelog_path));
-    let changelog_relative_str = match config.changelog_relative_to {
-      crate::config::ChangelogRelativeTo::Crate => "crate",
-      crate::config::ChangelogRelativeTo::Workspace => "workspace",
-    };
-    content.push_str(&format!(
-      "changelog_relative_to = \"{}\"  # crate = per-crate, workspace = single file\n",
-      changelog_relative_str
-    ));
-    if config.skip_changelog_for.is_empty() {
-      content.push_str("skip_changelog_for = []\n");
-    } else {
-      content.push_str(&format!(
-        "skip_changelog_for = {}\n",
-        self.formatter.array_string(&config.skip_changelog_for, None)
-      ));
-    }
     content.push_str(&format!(
       "require_changelog_entries = {}\n",
       config.require_changelog_entries
@@ -225,8 +211,60 @@ impl RailConfigBuilder {
       "release_notes_dir = \"{}\"  # manual notes: v<version>.md or <tag>.md\n",
       config.release_notes_dir
     ));
+    content.push_str(&format!(
+      "pre_1_breaking_bump = \"{}\"  # minor keeps 0.x breaking changes pre-1.0\n",
+      pre_1_breaking_bump(config.pre_1_breaking_bump)
+    ));
+    content.push_str(&format!(
+      "unconventional_commits = \"{}\"  # allow | warn | deny\n",
+      commit_policy(config.unconventional_commits)
+    ));
+    content.push_str(&format!(
+      "semver_check = \"{}\"  # off | warn | deny\n",
+      semver_policy(config.semver_check)
+    ));
+    content.push_str(&format!(
+      "require_change_files = {}  # false | true | [\"crate-name\"]\n",
+      require_change_files(&config.require_change_files, &self.formatter)
+    ));
 
     self.sections.push(format!("\n[release]\n{}", content));
+
+    let mut changelog = String::new();
+    changelog.push_str(&format!("path = \"{}\"\n", config.changelog.path));
+    changelog.push_str(&format!(
+      "relative_to = \"{}\"  # crate = per-crate, workspace = single file\n",
+      changelog_relative_to(config.changelog.relative_to)
+    ));
+    changelog.push_str(&format!("entry_format = \"{}\"\n", config.changelog.entry_format));
+    changelog.push_str(&format!("emoji = {}\n", config.changelog.emoji));
+    changelog.push_str(&format!(
+      "group_order = {}\n",
+      self.formatter.array_string(&config.changelog.group_order, None)
+    ));
+    changelog.push_str(&format!("fallback = \"{}\"\n", config.changelog.fallback));
+    changelog.push_str("\n[release.changelog.filters]\n");
+    changelog.push_str(&format!(
+      "skip_types = {}\n",
+      self.formatter.array_string(&config.changelog.filters.skip_types, None)
+    ));
+    changelog.push_str(&format!(
+      "skip_scopes = {}\n",
+      self.formatter.array_string(&config.changelog.filters.skip_scopes, None)
+    ));
+    changelog.push_str(&format!(
+      "include_paths = {}\n",
+      self
+        .formatter
+        .array_string(&config.changelog.filters.include_paths, None)
+    ));
+    changelog.push_str(&format!(
+      "exclude_paths = {}\n",
+      self
+        .formatter
+        .array_string(&config.changelog.filters.exclude_paths, None)
+    ));
+    self.sections.push(format!("\n[release.changelog]\n{}", changelog));
     self
   }
 
@@ -358,6 +396,43 @@ impl RailConfigBuilder {
   /// Build final TOML string
   pub fn build(&self) -> RailResult<String> {
     Ok(self.sections.join("\n"))
+  }
+}
+
+fn changelog_relative_to(value: ChangelogRelativeTo) -> &'static str {
+  match value {
+    ChangelogRelativeTo::Crate => "crate",
+    ChangelogRelativeTo::Workspace => "workspace",
+  }
+}
+
+fn pre_1_breaking_bump(value: Pre1BreakingBump) -> &'static str {
+  match value {
+    Pre1BreakingBump::Minor => "minor",
+    Pre1BreakingBump::Major => "major",
+  }
+}
+
+fn commit_policy(value: CommitPolicy) -> &'static str {
+  match value {
+    CommitPolicy::Allow => "allow",
+    CommitPolicy::Warn => "warn",
+    CommitPolicy::Deny => "deny",
+  }
+}
+
+fn semver_policy(value: SemverCheckPolicy) -> &'static str {
+  match value {
+    SemverCheckPolicy::Off => "off",
+    SemverCheckPolicy::Warn => "warn",
+    SemverCheckPolicy::Deny => "deny",
+  }
+}
+
+fn require_change_files(value: &RequireChangeFiles, formatter: &TomlFormatter) -> String {
+  match value {
+    RequireChangeFiles::All(enabled) => enabled.to_string(),
+    RequireChangeFiles::Crates(crates) => formatter.array_string(crates, None),
   }
 }
 

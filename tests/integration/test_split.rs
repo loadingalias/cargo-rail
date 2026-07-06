@@ -305,8 +305,10 @@ root = "."
 [release]
 tag_prefix = "v"
 tag_format = "v{version}"
-changelog_path = "CHANGELOG.md"
 require_clean = false
+
+[release.changelog]
+path = "CHANGELOG.md"
 "#,
   )?;
 

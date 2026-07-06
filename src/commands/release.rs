@@ -1,12 +1,13 @@
 //! `cargo rail release` - Release automation
 
 use crate::commands::common::{OutputFormat, enforce_safety_gate};
+use crate::config::CommitPolicy;
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::release::planner::{DependentPolicy, ReleasePlanner};
 use crate::release::publisher::ReleasePublisher;
 use crate::release::validator::ReleaseValidator;
-use crate::release::version::BumpType;
+use crate::release::version::BumpRequest;
 use crate::workspace::WorkspaceContext;
 use std::io::{self, IsTerminal};
 
@@ -27,7 +28,7 @@ pub fn run_release_plan(
     crate::output::set_json_mode(true);
   }
 
-  let bump_type = bump.parse::<BumpType>()?;
+  let bump_request = bump.parse::<BumpRequest>()?;
 
   let workspace_members = ctx.graph.workspace_members();
   let validator = ReleaseValidator::new(ctx);
@@ -38,7 +39,7 @@ pub fn run_release_plan(
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
-  // Validate release config (tag_format, skip_changelog_for)
+  // Validate release config (tag format, changelog shape, release policies)
   let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
 
   // Print warnings
@@ -48,7 +49,7 @@ pub fn run_release_plan(
 
   let policy = dependent_policy(include_dependents);
   let planner = ReleasePlanner::new(ctx, release_config);
-  let plan = planner.plan(target_crates, &bump_type, policy)?;
+  let plan = planner.plan(target_crates, &bump_request, policy)?;
   let target_crates = plan.canonical_crate_order.clone();
 
   if release_config.require_clean {
@@ -136,11 +137,11 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     ));
   };
 
-  let bump_type = args.bump.parse::<BumpType>()?;
+  let bump_request = args.bump.parse::<BumpRequest>()?;
 
   let policy = dependent_policy(args.include_dependents);
   let planner = ReleasePlanner::new(ctx, release_config);
-  let plan = planner.plan(targets, &bump_type, policy)?;
+  let plan = planner.plan(targets, &bump_request, policy)?;
   let target_crates = plan.canonical_crate_order.clone();
   validator.validate(&target_crates, release_config.require_clean)?;
 
@@ -315,6 +316,40 @@ pub fn run_release_check(
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
 
+  let commit_diagnostics = if release_config.unconventional_commits == CommitPolicy::Allow {
+    Vec::new()
+  } else {
+    let planner = ReleasePlanner::new(ctx, release_config);
+    planner.diagnose_commits(&target_crates)?
+  };
+  let missing_change_files = {
+    let planner = ReleasePlanner::new(ctx, release_config);
+    planner.missing_change_file_coverage(&target_crates)?
+  };
+  let has_commit_diagnostic_failures =
+    release_config.unconventional_commits == CommitPolicy::Deny && !commit_diagnostics.is_empty();
+  let has_change_file_failures = !missing_change_files.is_empty();
+
+  if !json && !commit_diagnostics.is_empty() {
+    let label = if has_commit_diagnostic_failures {
+      "commit diagnostics failed"
+    } else {
+      "commit diagnostics"
+    };
+    println!("\n{}:", label);
+    for (crate_name, diagnostics) in &commit_diagnostics {
+      for diagnostic in diagnostics {
+        println!("  {}: {}", crate_name, diagnostic.describe());
+      }
+    }
+  }
+  if !json && !missing_change_files.is_empty() {
+    println!("\nmissing change files:");
+    for crate_name in &missing_change_files {
+      println!("  {}: code changes require .rail/changes coverage", crate_name);
+    }
+  }
+
   let mut results = Vec::with_capacity(target_crates.len());
   for crate_name in &target_crates {
     // For explicitly named crates, check publishability and report
@@ -345,7 +380,7 @@ pub fn run_release_check(
       println!("\nrunning extended checks...");
     }
 
-    let ext_results = validator.validate_extended(&target_crates);
+    let ext_results = validator.validate_extended(&target_crates, release_config.semver_check);
 
     for (crate_name, checks) in ext_results {
       let mut crate_checks = Vec::with_capacity(checks.len());
@@ -390,7 +425,7 @@ pub fn run_release_check(
   if json {
     let mut payload = serde_json::json!({
       "action": "check",
-      "status": if has_extended_failures { "failed" } else { "passed" },
+      "status": if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures { "failed" } else { "passed" },
       "crates": results,
       "count": results.len()
     });
@@ -409,21 +444,47 @@ pub fn run_release_check(
       payload["extended"] = serde_json::json!(extended_results);
     }
 
-    let exit_code = if has_extended_failures { 2 } else { 0 };
-    let result = if has_extended_failures { "failed" } else { "success" };
+    if !commit_diagnostics.is_empty() {
+      payload["commit_diagnostics"] = serde_json::json!(
+        commit_diagnostics
+          .iter()
+          .map(|(name, diagnostics)| serde_json::json!({"crate": name, "diagnostics": diagnostics}))
+          .collect::<Vec<_>>()
+      );
+    }
+    if !missing_change_files.is_empty() {
+      payload["missing_change_files"] = serde_json::json!(missing_change_files);
+    }
+
+    let exit_code = if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
+      2
+    } else {
+      0
+    };
+    let result = if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
+      "failed"
+    } else {
+      "success"
+    };
     let output = crate::output::machine_json_envelope("release", "validate", result, exit_code, payload);
 
     println!(
       "{}",
       serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
     );
-  } else if has_extended_failures {
-    return Err(RailError::message("extended validation failed"));
+  } else if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures {
+    return Err(RailError::message(if has_change_file_failures {
+      "change file coverage failed"
+    } else if has_commit_diagnostic_failures {
+      "commit diagnostics failed"
+    } else {
+      "extended validation failed"
+    }));
   } else {
     println!("\nall checks passed");
   }
 
-  if has_extended_failures && json {
+  if (has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures) && json {
     return Err(RailError::ExitWithCode { code: 2 });
   }
 
@@ -606,6 +667,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
       crate_config.changelog = Some(ChangelogConfig {
         path: Some(path),
         skip: false,
+        ..ChangelogConfig::default()
       });
     }
   }
@@ -626,6 +688,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
   for name in &new_crates {
     println!("  {}", name);
   }
+  print_changelog_migration_hint(workspace_root);
 
   let config_toml = toml_edit::ser::to_string_pretty(&config)
     .map_err(|e| crate::error::RailError::message(format!("config serialization failed: {}", e)))?;
@@ -645,4 +708,17 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
   }
 
   Ok(())
+}
+
+fn print_changelog_migration_hint(workspace_root: &std::path::Path) {
+  let existing: Vec<_> = ["cliff.toml", "release-plz.toml"]
+    .into_iter()
+    .filter(|path| workspace_root.join(path).exists())
+    .collect();
+  if existing.is_empty() {
+    return;
+  }
+
+  println!("\nfound existing changelog/release config: {}", existing.join(", "));
+  println!("migration guide: docs/migrate-git-cliff.md");
 }

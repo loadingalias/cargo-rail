@@ -107,14 +107,26 @@ impl TomlEditor {
   /// Ensure a section (table) exists, creating if needed.
   /// Returns true if the section was created, false if it already existed.
   pub fn ensure_section(&mut self, section: &str) -> bool {
-    if self.doc.contains_key(section) {
-      return false;
+    let mut created = false;
+    let mut current = self.doc.as_item_mut();
+
+    for part in section.split('.') {
+      let Some(table) = current.as_table_mut() else {
+        return created;
+      };
+
+      if !table.contains_key(part) {
+        table.insert(part, Item::Table(Table::new()));
+        created = true;
+      }
+
+      let Some(next) = table.get_mut(part) else {
+        return created;
+      };
+      current = next;
     }
 
-    // Add a blank line before the new section for readability
-    let table = self.doc.as_table_mut();
-    table.insert(section, Item::Table(Table::new()));
-    true
+    created
   }
 
   /// Set a value at path from a raw TOML string, with an optional inline comment.

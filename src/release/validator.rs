@@ -1,10 +1,10 @@
 //! Pre-release validation checks
 
-use crate::config::{ChangelogRelativeTo, ReleaseConfig};
+use crate::config::{ChangelogRelativeTo, ReleaseConfig, SemverCheckPolicy};
 use crate::error::{RailError, RailResult};
-use crate::release::changelog::ChangelogGenerator;
 use crate::release::planner::ReleasePlan;
 use crate::release::process;
+use crate::release::semver_checks;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use std::fs;
@@ -288,8 +288,6 @@ impl<'a> ReleaseValidator<'a> {
   /// - changelog already contains `## [<version>]`, or
   /// - generated changelog entries for this release are non-empty.
   fn validate_release_notes(&self, plan: &ReleasePlan) -> RailResult<()> {
-    let generator = ChangelogGenerator::new(self.ctx.workspace_root());
-
     for crate_plan in &plan.crates {
       if !crate_plan.generate_changelog {
         continue;
@@ -303,17 +301,7 @@ impl<'a> ReleaseValidator<'a> {
         continue;
       }
 
-      let crate_dir = crate_plan
-        .manifest_path
-        .parent()
-        .ok_or_else(|| RailError::message("Invalid manifest path"))?;
-      let generated = generator.generate(
-        crate_plan.changelog_range_start.as_deref(),
-        &crate_plan.changelog_range_end,
-        Some(&[crate_dir]),
-      )?;
-
-      if generated.trim().is_empty() {
+      if crate_plan.changelog_body.trim().is_empty() {
         return Err(RailError::with_help(
           format!(
             "no release notes for {} v{} in {}",
@@ -579,17 +567,62 @@ impl<'a> ReleaseValidator<'a> {
     }
   }
 
-  /// Run extended validation checks (dry-run publish, MSRV)
+  /// Run cargo-semver-checks as an installed external binary.
+  fn validate_semver_checks(&self, crate_name: &str, policy: SemverCheckPolicy) -> ValidationResult {
+    match semver_checks::check_release(self.ctx, crate_name) {
+      Ok(outcome) if !outcome.breaking => ValidationResult::passed("semver-checks", outcome.message),
+      Ok(outcome) => {
+        if policy == SemverCheckPolicy::Deny {
+          ValidationResult::failed("semver-checks", outcome.message)
+        } else {
+          ValidationResult::passed("semver-checks", format!("advisory: {}", outcome.message))
+        }
+      }
+      Err(e) => {
+        let message = format!("failed to run cargo-semver-checks: {}", e);
+        if policy == SemverCheckPolicy::Deny {
+          ValidationResult::failed("semver-checks", message)
+        } else {
+          ValidationResult::passed("semver-checks", format!("advisory: {}", message))
+        }
+      }
+    }
+  }
+
+  /// Run extended validation checks (dry-run publish, MSRV, optional semver checks)
   ///
   /// Runs all checks without fail-fast and returns grouped validation results.
-  pub fn validate_extended(&self, crate_names: &[String]) -> Vec<(String, Vec<ValidationResult>)> {
+  pub fn validate_extended(
+    &self,
+    crate_names: &[String],
+    semver_policy: SemverCheckPolicy,
+  ) -> Vec<(String, Vec<ValidationResult>)> {
+    let semver_available =
+      semver_policy == SemverCheckPolicy::Off || semver_checks::is_available(self.ctx.workspace_root());
+    let mut emitted_semver_missing = false;
+
     crate_names
       .iter()
       .map(|crate_name| {
-        let results = vec![
+        let mut results = vec![
           self.validate_publish_dry_run(crate_name),
           self.validate_msrv(crate_name),
         ];
+
+        if semver_policy != SemverCheckPolicy::Off {
+          if !semver_available {
+            if !emitted_semver_missing {
+              results.push(ValidationResult::passed(
+                "semver-checks",
+                "cargo-semver-checks not installed (skipped; install with: cargo install cargo-semver-checks)",
+              ));
+              emitted_semver_missing = true;
+            }
+          } else if semver_checks::has_library_target(self.ctx, crate_name) {
+            results.push(self.validate_semver_checks(crate_name, semver_policy));
+          }
+        }
+
         (crate_name.clone(), results)
       })
       .collect()
@@ -602,11 +635,6 @@ impl<'a> ReleaseValidator<'a> {
   /// - Resolved paths are within workspace bounds
   pub fn validate_changelog_paths(&self, crate_names: &[String], release_config: &ReleaseConfig) -> RailResult<()> {
     for crate_name in crate_names {
-      // Skip if changelog is disabled for this crate
-      if release_config.skip_changelog_for.iter().any(|c| c == crate_name) {
-        continue;
-      }
-
       // Check per-crate skip setting
       if let Some(config) = &self.ctx.config
         && let Some(crate_config) = config.crates.get(crate_name)
@@ -635,19 +663,23 @@ impl<'a> ReleaseValidator<'a> {
 
     let manifest_path = package.manifest_path.as_std_path();
 
-    // Get changelog path from per-crate config or global config
-    let changelog_relative_path = self
+    let changelog_config = self
       .ctx
       .config
       .as_ref()
       .and_then(|c| c.crates.get(crate_name))
-      .and_then(|c| c.changelog.as_ref())
+      .and_then(|c| c.changelog.as_ref());
+
+    let changelog_relative_path = changelog_config
       .and_then(|ch| ch.path.as_ref())
       .map(|p| p.to_string_lossy().to_string())
-      .unwrap_or_else(|| release_config.changelog_path.clone());
+      .unwrap_or_else(|| release_config.changelog.path.clone());
+    let relative_to = changelog_config
+      .and_then(|ch| ch.relative_to)
+      .unwrap_or(release_config.changelog.relative_to);
 
-    // Resolve based on changelog_relative_to setting
-    let changelog_path = match release_config.changelog_relative_to {
+    // Resolve based on release.changelog.relative_to or per-crate override.
+    let changelog_path = match relative_to {
       ChangelogRelativeTo::Crate => manifest_path
         .parent()
         .ok_or_else(|| RailError::message("Invalid manifest path"))?

@@ -19,6 +19,8 @@
 //!
 //! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
 
+/// Intent-file management.
+pub mod change;
 /// Clean up workspace artifacts
 pub mod clean;
 /// CLI argument definitions (clap structs) - internal, not part of stable API.
@@ -47,9 +49,10 @@ pub mod sync;
 /// Workspace dependency unification commands
 pub mod unify;
 
+pub use change::{run_change_add, run_change_status};
 pub use clean::run_clean;
 #[doc(hidden)]
-pub use cli::{CargoCli, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
+pub use cli::{CargoCli, ChangeCommand, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
 pub use common::OutputFormat;
 pub use config::{
   StrictnessMode, run_config_locate, run_config_print, run_config_sync, run_config_validate_standalone,
@@ -297,6 +300,15 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         format,
       },
     ),
+
+    Commands::Change { command } => match command {
+      cli::ChangeCommand::Add {
+        crate_names,
+        bump,
+        message,
+      } => run_change_add(ctx, crate_names, bump, message),
+      cli::ChangeCommand::Status => run_change_status(ctx),
+    },
 
     // Release
     Commands::Release { command } => match command {

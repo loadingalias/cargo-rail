@@ -16,10 +16,13 @@
 //! - `publisher`: Actual publishing to crates.io and GitHub
 //! - `validator`: Pre-release validation checks
 
+pub mod attribution;
+pub mod change_files;
 pub mod changelog;
 pub mod planner;
 mod process;
 pub mod publisher;
+pub(crate) mod semver_checks;
 pub mod validator;
 pub mod version;
 

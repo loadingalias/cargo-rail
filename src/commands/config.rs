@@ -134,13 +134,32 @@ const KNOWN_RELEASE_KEYS: &[&str] = &[
   "create_github_release",
   "push",
   "sign_tags",
-  "changelog_path",
-  "changelog_relative_to",
-  "skip_changelog_for",
+  "changelog",
   "require_changelog_entries",
   "require_release_notes",
   "release_notes_dir",
+  "pre_1_breaking_bump",
+  "unconventional_commits",
+  "semver_check",
+  "require_change_files",
 ];
+
+/// Known keys in [release.changelog] section
+const KNOWN_RELEASE_CHANGELOG_KEYS: &[&str] = &[
+  "path",
+  "relative_to",
+  "entry_format",
+  "emoji",
+  "group_order",
+  "fallback",
+  "groups",
+  "filters",
+  "commit_url",
+  "pr_url",
+];
+
+/// Known keys in [release.changelog.filters] section
+const KNOWN_RELEASE_CHANGELOG_FILTER_KEYS: &[&str] = &["skip_types", "skip_scopes", "include_paths", "exclude_paths"];
 
 /// Known keys in [change-detection] section
 const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &[
@@ -432,9 +451,21 @@ pub fn run_config_validate_standalone(
       if let Err(e) = config.run.validate() {
         errors.push(ValidationIssue::new("run", e.to_string()));
       }
+      if let Err(e) = config.release.changelog.filters.validate("release.changelog.filters") {
+        errors.push(ValidationIssue::new("release.changelog.filters", e.to_string()));
+      }
 
       // Validate per-crate split config
       for (crate_name, crate_config) in &config.crates {
+        if let Some(changelog_cfg) = &crate_config.changelog
+          && let Some(filters) = &changelog_cfg.filters
+          && let Err(e) = filters.validate(&format!("crates.{}.changelog.filters", crate_name))
+        {
+          errors.push(ValidationIssue::new(
+            format!("crates.{}.changelog.filters", crate_name),
+            e.to_string(),
+          ));
+        }
         if let Some(split_cfg) = &crate_config.split {
           if split_cfg.remote.is_empty() {
             errors.push(ValidationIssue::new(
@@ -592,6 +623,39 @@ fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<Validatio
 
         if key == "run" {
           check_run_nested_keys(table, warnings);
+        }
+        if key == "release" {
+          check_release_nested_keys(table, warnings);
+        }
+      }
+    }
+  }
+}
+
+fn check_release_nested_keys(table: &toml_edit::Table, warnings: &mut Vec<ValidationIssue>) {
+  if let Some(changelog_item) = table.get("changelog")
+    && let Some(changelog_table) = changelog_item.as_table()
+  {
+    let known: HashSet<&str> = KNOWN_RELEASE_CHANGELOG_KEYS.iter().copied().collect();
+    for (key, value) in changelog_table.iter() {
+      if !known.contains(key) {
+        warnings.push(ValidationIssue::new(
+          "release",
+          format!("unknown key '{}' in [release.changelog] section", key),
+        ));
+      }
+
+      if key == "filters"
+        && let Some(filters) = value.as_table()
+      {
+        let known_filters: HashSet<&str> = KNOWN_RELEASE_CHANGELOG_FILTER_KEYS.iter().copied().collect();
+        for (filter_key, _) in filters.iter() {
+          if !known_filters.contains(filter_key) {
+            warnings.push(ValidationIssue::new(
+              "release",
+              format!("unknown key '{}' in [release.changelog.filters] section", filter_key),
+            ));
+          }
         }
       }
     }
@@ -984,9 +1048,16 @@ mod tests {
     let known: BTreeSet<&str> = KNOWN_RELEASE_KEYS.iter().copied().collect();
     let from_schema: BTreeSet<&str> = schema::fields_for_section("release").map(|field| field.key).collect();
 
-    assert_eq!(
-      known, from_schema,
-      "KNOWN_RELEASE_KEYS must stay in sync with schema::SYNCABLE_FIELDS for [release]"
+    for field in from_schema {
+      assert!(
+        known.contains(field),
+        "KNOWN_RELEASE_KEYS must include schema field [release].{}",
+        field
+      );
+    }
+    assert!(
+      known.contains("changelog"),
+      "KNOWN_RELEASE_KEYS must include nested [release.changelog] table"
     );
   }
 }

@@ -37,20 +37,6 @@ pub struct ReleaseConfig {
   #[serde(default)]
   pub sign_tags: bool,
 
-  /// Default changelog path for all crates (default: "CHANGELOG.md")
-  #[serde(default = "default_changelog_path")]
-  pub changelog_path: String,
-
-  /// What changelog paths are relative to (default: "crate")
-  /// - "crate": Paths are relative to each crate's directory
-  /// - "workspace": Paths are relative to workspace root
-  #[serde(default)]
-  pub changelog_relative_to: ChangelogRelativeTo,
-
-  /// Crates that should not generate changelog entries
-  #[serde(default)]
-  pub skip_changelog_for: Vec<String>,
-
   /// If true, error when there are no changelog entries for a crate
   #[serde(default)]
   pub require_changelog_entries: bool,
@@ -68,6 +54,47 @@ pub struct ReleaseConfig {
   /// uses it as the GitHub release body instead of generated changelog text.
   #[serde(default = "default_release_notes_dir")]
   pub release_notes_dir: String,
+
+  /// How `--bump auto` maps breaking changes for pre-1.0 crates (default: "minor").
+  ///
+  /// - "minor": breaking change on 0.x bumps minor (0.3.1 -> 0.4.0)
+  /// - "major": breaking change on 0.x bumps major (0.3.1 -> 1.0.0)
+  #[serde(default)]
+  pub pre_1_breaking_bump: Pre1BreakingBump,
+
+  /// How to treat commits that do not parse as conventional commits (default: "warn").
+  ///
+  /// - "allow": ignore silently
+  /// - "warn": report in `release check` and plan output
+  /// - "deny": fail `release check` when the release range contains them
+  #[serde(default)]
+  pub unconventional_commits: CommitPolicy,
+
+  /// cargo-semver-checks integration policy (default: "warn").
+  ///
+  /// Requires the `cargo-semver-checks` binary; it is invoked as an external
+  /// tool, never vendored. Missing binary downgrades to an advisory note.
+  ///
+  /// - "off": never run
+  /// - "warn": escalate `--bump auto` and report findings
+  /// - "deny": additionally fail `release check` when a planned bump is
+  ///   below what detected API breakage requires
+  #[serde(default)]
+  pub semver_check: SemverCheckPolicy,
+
+  /// Require change files (`.rail/changes/*.md`) to cover released crates.
+  ///
+  /// - `false` (default): change files are optional
+  /// - `true`: every released crate with code changes needs a covering change file
+  /// - `["crate-a", ...]`: only the listed crates are gated
+  #[serde(default)]
+  pub require_change_files: RequireChangeFiles,
+
+  /// Changelog location and shape (workspace defaults).
+  ///
+  /// Every key can be overridden per crate under `[crates.NAME.changelog]`.
+  #[serde(default)]
+  pub changelog: ChangelogShape,
 }
 
 impl Default for ReleaseConfig {
@@ -80,12 +107,14 @@ impl Default for ReleaseConfig {
       create_github_release: false,
       push: false,
       sign_tags: false,
-      changelog_path: default_changelog_path(),
-      changelog_relative_to: ChangelogRelativeTo::default(),
-      skip_changelog_for: Vec::new(),
       require_changelog_entries: false,
       require_release_notes: true,
       release_notes_dir: default_release_notes_dir(),
+      pre_1_breaking_bump: Pre1BreakingBump::default(),
+      unconventional_commits: CommitPolicy::default(),
+      semver_check: SemverCheckPolicy::default(),
+      require_change_files: RequireChangeFiles::default(),
+      changelog: ChangelogShape::default(),
     }
   }
 }
@@ -128,19 +157,212 @@ impl ReleaseConfig {
       });
     }
 
-    // Validate skip_changelog_for - check that all crate names exist
-    for crate_name in &self.skip_changelog_for {
-      if !workspace_members.contains(crate_name) {
-        warnings.push(format!(
-          "release.skip_changelog_for contains unknown crate '{}'. \
-                    Available crates: {}",
-          crate_name,
-          workspace_members.join(", ")
-        ));
+    if let RequireChangeFiles::Crates(crates) = &self.require_change_files {
+      for crate_name in crates {
+        if !workspace_members.contains(crate_name) {
+          warnings.push(format!(
+            "release.require_change_files contains unknown crate '{}'. \
+                        Available crates: {}",
+            crate_name,
+            workspace_members.join(", ")
+          ));
+        }
       }
     }
 
+    self.changelog.filters.validate("release.changelog.filters")?;
+
     Ok(warnings)
+  }
+}
+
+/// How `--bump auto` maps breaking changes on pre-1.0 versions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pre1BreakingBump {
+  /// Breaking change on 0.x bumps minor (semver-compatible for 0.x)
+  #[default]
+  Minor,
+  /// Breaking change on 0.x bumps major (graduates to 1.0.0)
+  Major,
+}
+
+/// Policy for commits that fail conventional-commit parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitPolicy {
+  /// Ignore silently
+  Allow,
+  /// Report as diagnostics (default)
+  #[default]
+  Warn,
+  /// Fail `release check`
+  Deny,
+}
+
+/// Policy for cargo-semver-checks integration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SemverCheckPolicy {
+  /// Never run cargo-semver-checks
+  Off,
+  /// Escalate auto bumps and report findings (default)
+  #[default]
+  Warn,
+  /// Fail checks when a planned bump is below detected API breakage
+  Deny,
+}
+
+/// Which crates require change-file coverage
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequireChangeFiles {
+  /// Gate all crates (true) or none (false)
+  All(bool),
+  /// Gate only the listed crates
+  Crates(Vec<String>),
+}
+
+impl Default for RequireChangeFiles {
+  fn default() -> Self {
+    Self::All(false)
+  }
+}
+
+impl RequireChangeFiles {
+  /// Whether the gate applies to `crate_name`
+  pub fn applies_to(&self, crate_name: &str) -> bool {
+    match self {
+      Self::All(enabled) => *enabled,
+      Self::Crates(crates) => crates.iter().any(|c| c == crate_name),
+    }
+  }
+
+  /// Whether the gate applies to any crate at all
+  pub fn is_enabled(&self) -> bool {
+    match self {
+      Self::All(enabled) => *enabled,
+      Self::Crates(crates) => !crates.is_empty(),
+    }
+  }
+}
+
+/// Changelog location and shape (`[release.changelog]`)
+///
+/// Declarative: sections, ordering, and entry rendering are configured with
+/// placeholder templates, never a template engine. All keys have per-crate
+/// overrides in `[crates.NAME.changelog]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangelogShape {
+  /// Changelog file path (default: "CHANGELOG.md")
+  #[serde(default = "default_changelog_path")]
+  pub path: String,
+
+  /// What changelog paths are relative to (default: "crate")
+  /// - "crate": relative to each crate's directory
+  /// - "workspace": relative to the workspace root
+  #[serde(default)]
+  pub relative_to: ChangelogRelativeTo,
+
+  /// Entry line template. Placeholders render with their separators and
+  /// collapse to nothing when empty:
+  /// - {scope}: "**scope**: " when the commit has a scope
+  /// - {breaking}: "\[**breaking**\] " for breaking changes
+  /// - {description}: the commit description
+  /// - {prs}: " #12 #34" (linked when a PR URL is known)
+  /// - {sha}: short commit SHA
+  /// - {sha_link}: short SHA linked to the commit when a commit URL is known
+  /// - {type}: the parsed commit type
+  #[serde(default = "default_entry_format")]
+  pub entry_format: String,
+
+  /// Render emoji in section headers (default: true)
+  #[serde(default = "default_true")]
+  pub emoji: bool,
+
+  /// Section render order, by commit type. Types absent from this list fall
+  /// through to `fallback`. Breaking commits always classify as "breaking".
+  #[serde(default = "default_group_order")]
+  pub group_order: Vec<String>,
+
+  /// Where unlisted or unknown commit types go: a type key from
+  /// `group_order`, or "skip" to drop them (default: "other")
+  #[serde(default = "default_fallback")]
+  pub fallback: String,
+
+  /// Custom commit types and section overrides. Each entry maps one or more
+  /// commit types to a shared section.
+  #[serde(default)]
+  pub groups: Vec<GroupSpec>,
+
+  /// Commit filters applied before grouping
+  #[serde(default)]
+  pub filters: ChangelogFilters,
+
+  /// Commit link template with a {sha} placeholder
+  /// (default: inferred from a GitHub `origin` remote)
+  #[serde(default)]
+  pub commit_url: Option<String>,
+
+  /// Pull-request link template with a {pr} placeholder
+  /// (default: inferred from a GitHub `origin` remote)
+  #[serde(default)]
+  pub pr_url: Option<String>,
+}
+
+impl Default for ChangelogShape {
+  fn default() -> Self {
+    Self {
+      path: default_changelog_path(),
+      relative_to: ChangelogRelativeTo::default(),
+      entry_format: default_entry_format(),
+      emoji: true,
+      group_order: default_group_order(),
+      fallback: default_fallback(),
+      groups: Vec::new(),
+      filters: ChangelogFilters::default(),
+      commit_url: None,
+      pr_url: None,
+    }
+  }
+}
+
+/// A custom changelog section: one or more commit types rendered together
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupSpec {
+  /// Commit types that map to this section (e.g. ["sec", "security"])
+  pub types: Vec<String>,
+  /// Section title (e.g. "Security")
+  pub title: String,
+  /// Section emoji (omit to inherit none)
+  #[serde(default)]
+  pub emoji: Option<String>,
+}
+
+/// Commit filters applied before grouping
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChangelogFilters {
+  /// Commit types to drop entirely (e.g. ["chore", "ci"])
+  #[serde(default)]
+  pub skip_types: Vec<String>,
+  /// Commit scopes to drop entirely (e.g. ["internal"])
+  #[serde(default)]
+  pub skip_scopes: Vec<String>,
+  /// If non-empty, only commits touching paths matching one of these glob
+  /// patterns are attributed to changelogs.
+  #[serde(default)]
+  pub include_paths: Vec<String>,
+  /// Commits touching only paths matching these glob patterns are excluded
+  /// from changelog attribution.
+  #[serde(default)]
+  pub exclude_paths: Vec<String>,
+}
+
+impl ChangelogFilters {
+  /// Validate glob path filters.
+  pub fn validate(&self, field_prefix: &str) -> Result<(), ConfigError> {
+    validate_globs(field_prefix, "include_paths", &self.include_paths)?;
+    validate_globs(field_prefix, "exclude_paths", &self.exclude_paths)
   }
 }
 
@@ -152,27 +374,48 @@ pub struct CrateReleaseConfig {
   pub publish: bool,
 }
 
-/// Changelog configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-crate changelog configuration (`[crates.NAME.changelog]`)
+///
+/// Every field is optional; absent fields inherit `[release.changelog]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangelogConfig {
   /// Path to changelog file
   /// Relative to crate directory (default) or workspace root depending on `relative_to`
   pub path: Option<PathBuf>,
+  /// Override what `path` is relative to for this crate
+  pub relative_to: Option<ChangelogRelativeTo>,
   /// Exclude this crate from changelog generation?
   #[serde(default)]
   pub skip: bool,
+  /// Override the entry line template for this crate
+  pub entry_format: Option<String>,
+  /// Override emoji rendering for this crate
+  pub emoji: Option<bool>,
+  /// Override the section order for this crate
+  pub group_order: Option<Vec<String>>,
+  /// Override the fallback section for this crate
+  pub fallback: Option<String>,
+  /// Additional custom sections for this crate (extend workspace groups)
+  #[serde(default)]
+  pub groups: Vec<GroupSpec>,
+  /// Override commit filters for this crate
+  pub filters: Option<ChangelogFilters>,
+  /// Override commit link template with a {sha} placeholder
+  pub commit_url: Option<String>,
+  /// Override pull-request link template with a {pr} placeholder
+  pub pr_url: Option<String>,
 }
 
-/// What the changelog_path is relative to
+/// What the changelog path is relative to
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangelogRelativeTo {
   /// Relative to each crate's directory (default)
-  /// With this, `changelog_path = "CHANGELOG.md"` creates `crates/foo/CHANGELOG.md`
+  /// With this, `path = "CHANGELOG.md"` creates `crates/foo/CHANGELOG.md`
   #[default]
   Crate,
   /// Relative to workspace root
-  /// With this, `changelog_path = "CHANGELOG.md"` creates `./CHANGELOG.md`
+  /// With this, `path = "CHANGELOG.md"` creates `./CHANGELOG.md`
   Workspace,
 }
 
@@ -200,6 +443,37 @@ fn default_release_notes_dir() -> String {
   "release-notes".to_string()
 }
 
+fn validate_globs(field_prefix: &str, key: &str, patterns: &[String]) -> Result<(), ConfigError> {
+  for pattern in patterns {
+    if let Err(e) = glob::Pattern::new(pattern) {
+      return Err(ConfigError::InvalidGlobPattern {
+        pattern: format!("{}.{} = {}", field_prefix, key, pattern),
+        message: e.to_string(),
+      });
+    }
+  }
+  Ok(())
+}
+
+fn default_entry_format() -> String {
+  "- {scope}{breaking}{description}{prs} ({sha_link})".to_string()
+}
+
+fn default_fallback() -> String {
+  "other".to_string()
+}
+
+/// Default section order: breaking first, features and fixes next, remaining
+/// built-in types alphabetically (matches deterministic render order).
+pub(crate) fn default_group_order() -> Vec<String> {
+  [
+    "breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style", "test",
+  ]
+  .iter()
+  .map(|s| (*s).to_string())
+  .collect()
+}
+
 // Tests
 
 #[cfg(test)]
@@ -207,43 +481,107 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_changelog_relative_to_default() {
+  fn changelog_shape_defaults() {
+    let shape = ChangelogShape::default();
+    assert_eq!(shape.path, "CHANGELOG.md");
+    assert_eq!(shape.relative_to, ChangelogRelativeTo::Crate);
+    assert!(shape.emoji);
+    assert_eq!(shape.fallback, "other");
+    assert_eq!(shape.group_order.first().map(String::as_str), Some("breaking"));
+    assert!(shape.groups.is_empty());
+  }
+
+  #[test]
+  fn changelog_shape_parses_nested_table() {
+    let toml = r#"
+      [changelog]
+      path = "docs/CHANGELOG.md"
+      relative_to = "workspace"
+      emoji = false
+      group_order = ["breaking", "feat", "sec"]
+      fallback = "skip"
+
+      [[changelog.groups]]
+      types = ["sec", "security"]
+      title = "Security"
+      emoji = "🔒"
+
+      [changelog.filters]
+      skip_types = ["chore"]
+    "#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.changelog.path, "docs/CHANGELOG.md");
+    assert_eq!(config.changelog.relative_to, ChangelogRelativeTo::Workspace);
+    assert!(!config.changelog.emoji);
+    assert_eq!(config.changelog.fallback, "skip");
+    assert_eq!(config.changelog.groups.len(), 1);
+    assert_eq!(config.changelog.groups[0].types, vec!["sec", "security"]);
+    assert_eq!(config.changelog.filters.skip_types, vec!["chore"]);
+  }
+
+  #[test]
+  fn release_policy_defaults() {
     let config = ReleaseConfig::default();
-    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
+    assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
+    assert_eq!(config.unconventional_commits, CommitPolicy::Warn);
+    assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
+    assert!(!config.require_change_files.is_enabled());
+    assert!(config.require_release_notes);
   }
 
   #[test]
-  fn test_changelog_relative_to_parsing() {
-    // Test "crate" value
-    let toml = r#"changelog_relative_to = "crate""#;
-    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
-
-    // Test "workspace" value
-    let toml = r#"changelog_relative_to = "workspace""#;
-    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Workspace);
-  }
-
-  #[test]
-  fn test_changelog_relative_to_full_config() {
+  fn release_policies_parse() {
     let toml = r#"
-      changelog_path = "docs/CHANGELOG.md"
-      changelog_relative_to = "workspace"
+      pre_1_breaking_bump = "major"
+      unconventional_commits = "deny"
+      semver_check = "off"
     "#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.changelog_path, "docs/CHANGELOG.md");
-    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Workspace);
+    assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
+    assert_eq!(config.unconventional_commits, CommitPolicy::Deny);
+    assert_eq!(config.semver_check, SemverCheckPolicy::Off);
   }
 
   #[test]
-  fn test_changelog_relative_to_defaults_to_crate() {
-    // When not specified, should default to "crate"
-    let toml = r#"
-      changelog_path = "CHANGELOG.md"
-    "#;
+  fn require_change_files_forms() {
+    let toml = r#"require_change_files = true"#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.changelog_relative_to, ChangelogRelativeTo::Crate);
+    assert!(config.require_change_files.applies_to("anything"));
+
+    let toml = r#"require_change_files = ["core"]"#;
+    let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
+    assert!(config.require_change_files.applies_to("core"));
+    assert!(!config.require_change_files.applies_to("cli"));
+    assert!(config.require_change_files.is_enabled());
+  }
+
+  #[test]
+  fn require_change_files_unknown_crate_warns() {
+    let config = ReleaseConfig {
+      require_change_files: RequireChangeFiles::Crates(vec!["ghost".to_string()]),
+      ..ReleaseConfig::default()
+    };
+    let warnings = config.validate(&["real".to_string()]).unwrap();
+    assert!(warnings.iter().any(|w| w.contains("ghost")));
+  }
+
+  #[test]
+  fn crate_changelog_overrides_parse() {
+    let toml = r#"
+      path = "HISTORY.md"
+      relative_to = "workspace"
+      emoji = false
+      group_order = ["feat"]
+      commit_url = "https://example.com/{sha}"
+    "#;
+    let config: ChangelogConfig = toml_edit::de::from_str(toml).unwrap();
+    assert_eq!(config.path, Some(PathBuf::from("HISTORY.md")));
+    assert_eq!(config.relative_to, Some(ChangelogRelativeTo::Workspace));
+    assert_eq!(config.emoji, Some(false));
+    assert_eq!(config.group_order, Some(vec!["feat".to_string()]));
+    assert_eq!(config.commit_url.as_deref(), Some("https://example.com/{sha}"));
+    assert!(config.fallback.is_none());
+    assert!(!config.skip);
   }
 
   #[test]

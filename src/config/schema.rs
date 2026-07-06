@@ -159,7 +159,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     comment: "Sort deps alphabetically (default: true)",
   },
   // =========================================================================
-  // [release] section - 13 fields
+  // [release] section - 14 fields
   // =========================================================================
   FieldSpec {
     section: "release",
@@ -205,24 +205,6 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   },
   FieldSpec {
     section: "release",
-    key: "changelog_path",
-    default_toml: "\"CHANGELOG.md\"",
-    comment: "Default changelog filename",
-  },
-  FieldSpec {
-    section: "release",
-    key: "changelog_relative_to",
-    default_toml: "\"crate\"",
-    comment: "Changelog path base: crate or workspace",
-  },
-  FieldSpec {
-    section: "release",
-    key: "skip_changelog_for",
-    default_toml: "[]",
-    comment: "Crates to skip changelog generation",
-  },
-  FieldSpec {
-    section: "release",
     key: "require_changelog_entries",
     default_toml: "false",
     comment: "Error if no changelog entries for release",
@@ -238,6 +220,96 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "release_notes_dir",
     default_toml: "\"release-notes\"",
     comment: "Manual release notes override directory",
+  },
+  FieldSpec {
+    section: "release",
+    key: "pre_1_breaking_bump",
+    default_toml: "\"minor\"",
+    comment: "Auto bump for breaking changes on 0.x crates: minor or major",
+  },
+  FieldSpec {
+    section: "release",
+    key: "unconventional_commits",
+    default_toml: "\"warn\"",
+    comment: "Commit diagnostic policy: allow, warn, deny",
+  },
+  FieldSpec {
+    section: "release",
+    key: "semver_check",
+    default_toml: "\"warn\"",
+    comment: "cargo-semver-checks policy: off, warn, deny",
+  },
+  FieldSpec {
+    section: "release",
+    key: "require_change_files",
+    default_toml: "false",
+    comment: "Require .rail/changes coverage: false, true, or [crate]",
+  },
+  // =========================================================================
+  // [release.changelog] section - 6 fields
+  // =========================================================================
+  FieldSpec {
+    section: "release.changelog",
+    key: "path",
+    default_toml: "\"CHANGELOG.md\"",
+    comment: "Default changelog filename",
+  },
+  FieldSpec {
+    section: "release.changelog",
+    key: "relative_to",
+    default_toml: "\"crate\"",
+    comment: "Changelog path base: crate or workspace",
+  },
+  FieldSpec {
+    section: "release.changelog",
+    key: "entry_format",
+    default_toml: "\"- {scope}{breaking}{description}{prs} ({sha_link})\"",
+    comment: "Entry placeholders: scope, breaking, description, prs, sha, sha_link, type",
+  },
+  FieldSpec {
+    section: "release.changelog",
+    key: "emoji",
+    default_toml: "true",
+    comment: "Render emoji in changelog section headers",
+  },
+  FieldSpec {
+    section: "release.changelog",
+    key: "group_order",
+    default_toml: "[\"breaking\", \"feat\", \"fix\", \"build\", \"chore\", \"ci\", \"deps\", \"docs\", \"other\", \"perf\", \"refactor\", \"style\", \"test\"]",
+    comment: "Commit type section order",
+  },
+  FieldSpec {
+    section: "release.changelog",
+    key: "fallback",
+    default_toml: "\"other\"",
+    comment: "Fallback section for unlisted types, or skip",
+  },
+  // =========================================================================
+  // [release.changelog.filters] section - 4 fields
+  // =========================================================================
+  FieldSpec {
+    section: "release.changelog.filters",
+    key: "skip_types",
+    default_toml: "[]",
+    comment: "Commit types to omit from changelog output",
+  },
+  FieldSpec {
+    section: "release.changelog.filters",
+    key: "skip_scopes",
+    default_toml: "[]",
+    comment: "Commit scopes to omit from changelog output",
+  },
+  FieldSpec {
+    section: "release.changelog.filters",
+    key: "include_paths",
+    default_toml: "[]",
+    comment: "Optional changelog attribution include globs",
+  },
+  FieldSpec {
+    section: "release.changelog.filters",
+    key: "exclude_paths",
+    default_toml: "[]",
+    comment: "Optional changelog attribution exclude globs",
   },
   // =========================================================================
   // [change-detection] section - 4 fields
@@ -323,8 +395,10 @@ mod tests {
     let secs = sections();
     assert_eq!(secs[0], "unify");
     assert_eq!(secs[1], "release");
-    assert_eq!(secs[2], "change-detection");
-    assert_eq!(secs[3], "run");
+    assert_eq!(secs[2], "release.changelog");
+    assert_eq!(secs[3], "release.changelog.filters");
+    assert_eq!(secs[4], "change-detection");
+    assert_eq!(secs[5], "run");
     // No duplicates
     let mut unique = secs.clone();
     unique.dedup();
@@ -338,7 +412,13 @@ mod tests {
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
-    assert_eq!(release_fields.len(), 13);
+    assert_eq!(release_fields.len(), 14);
+
+    let changelog_fields: Vec<_> = fields_for_section("release.changelog").collect();
+    assert_eq!(changelog_fields.len(), 6);
+
+    let changelog_filter_fields: Vec<_> = fields_for_section("release.changelog.filters").collect();
+    assert_eq!(changelog_filter_fields.len(), 4);
 
     let change_detection_fields: Vec<_> = fields_for_section("change-detection").collect();
     assert_eq!(change_detection_fields.len(), 4);
@@ -353,7 +433,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      40, // 22 unify + 13 release + 4 change-detection + 1 run
+      51, // 22 unify + 14 release + 6 changelog + 4 filters + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -362,7 +442,9 @@ mod tests {
   ///
   /// SYNCABLE (auto-added by `config sync`):
   /// - [unify] - 22 fields: workspace-wide dependency unification settings
-  /// - [release] - 13 fields: workspace-wide release settings
+  /// - [release] - 14 fields: workspace-wide release settings
+  /// - [release.changelog] - 6 fields: changelog location/rendering defaults
+  /// - [release.changelog.filters] - 4 fields: changelog commit/path filters
   /// - [change-detection] - 4 fields: infra patterns, conservative fallback, and confidence profiles
   /// - [run] - 1 field: default profile selector for `cargo rail run`
   ///
@@ -404,8 +486,15 @@ mod tests {
 
     // [release] critical fields
     assert!(field_keys.contains(&("release", "tag_format")));
-    assert!(field_keys.contains(&("release", "changelog_path")));
     assert!(field_keys.contains(&("release", "require_release_notes")));
+    assert!(field_keys.contains(&("release", "pre_1_breaking_bump")));
+    assert!(field_keys.contains(&("release", "unconventional_commits")));
+    assert!(field_keys.contains(&("release", "semver_check")));
+    assert!(field_keys.contains(&("release.changelog", "path")));
+    assert!(field_keys.contains(&("release.changelog", "entry_format")));
+    assert!(field_keys.contains(&("release.changelog.filters", "skip_types")));
+    assert!(field_keys.contains(&("release.changelog.filters", "include_paths")));
+    assert!(field_keys.contains(&("release.changelog.filters", "exclude_paths")));
 
     // [change-detection] field
     assert!(field_keys.contains(&("change-detection", "infrastructure")));

@@ -21,6 +21,7 @@ Commands:
   split        (Advanced) Split a crate to a standalone repository with git history
   sync         (Advanced) Sync changes between monorepo and split repos
   release      Publish releases (version bump, changelog, tag, publish)
+  change       Manage pending release intent files
   clean        Clean generated artifacts (cache, backups, reports)
   config       Configuration management
   hash         Hash and compare planner contracts
@@ -598,6 +599,7 @@ Examples:
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
+  cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
@@ -648,7 +650,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --bump <BUMP>
-          Version bump [major, minor, patch, prerelease, release, or "x.y.z"]
+          Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
           
           [default: patch]
 
@@ -754,6 +756,86 @@ Options:
 
   -V, --version
           Print version
+```
+
+---
+
+## cargo rail change
+
+```
+Manage pending release intent files
+
+Usage: cargo rail change [OPTIONS] <COMMAND>
+
+Commands:
+  add     Create a pending change file
+  status  Show pending change files
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output in JSON format (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail change add rail-core --bump minor --message "Added auto bump planning"
+  cargo rail change add rail-core rail-cli --bump patch --message "Fixed release notes"
+  cargo rail change status
+```
+
+---
+
+### cargo rail change add
+
+```
+Create a pending change file
+
+Usage: cargo rail change add [OPTIONS] --bump <BUMP> [CRATE]...
+
+Arguments:
+  [CRATE]...  Crate name(s) covered by this change
+
+Options:
+      --bump <BUMP>            Bump level for the covered crate(s): patch, minor, major
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output in JSON format (shorthand for -f json)
+  -m, --message <MESSAGE>      User-facing changelog entry body
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+---
+
+### cargo rail change status
+
+```
+Show pending change files
+
+Usage: cargo rail change status [OPTIONS]
+
+Options:
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output in JSON format (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ---

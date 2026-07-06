@@ -190,6 +190,33 @@ impl SystemGit {
     Ok(commits)
   }
 
+  /// One-pass commit log with per-commit changed files
+  ///
+  /// Returns entries newest-first for `from..to` (or the full history of
+  /// `to` when `from` is `None`), skipping merge commits. One git subprocess
+  /// regardless of how many crates consume the result — this is the
+  /// changelog-attribution workhorse.
+  pub fn log_with_files(&self, from: Option<&str>, to: &str) -> RailResult<Vec<LogEntry>> {
+    let range;
+    let range_arg = if let Some(from) = from {
+      range = format!("{}..{}", from, to);
+      &range
+    } else {
+      to
+    };
+
+    let output = self.run_git(&[
+      "log",
+      "--no-merges",
+      "-z",
+      "--name-only",
+      "--format=%x01%H%x02%s%x02%b%x02",
+      range_arg,
+    ])?;
+
+    parse_log_with_files(&output.stdout)
+  }
+
   /// Get commit metadata for a single SHA
   ///
   /// Uses `git log -1 --format` for efficient single-commit lookup.
@@ -561,6 +588,65 @@ impl SystemGit {
 /// - T: Type changed
 /// - U: Unmerged
 /// - X: Unknown
+///
+/// One commit from [`SystemGit::log_with_files`]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+  /// Full commit SHA
+  pub sha: String,
+  /// Commit subject line
+  pub subject: String,
+  /// Commit body (trimmed), if any
+  pub body: Option<String>,
+  /// Paths changed by this commit, relative to the repository root
+  pub files: Vec<PathBuf>,
+}
+
+/// Parse `git log -z --name-only --format=%x01%H%x02%s%x02%b%x02` output
+///
+/// Record layout: `\x01` + sha + `\x02` + subject + `\x02` + body + `\x02` +
+/// NUL (+ `\n` when files follow) + NUL-terminated file paths. Bodies may
+/// contain newlines; the trailing `\x02` before the NUL delimits them.
+fn parse_log_with_files(output: &[u8]) -> RailResult<Vec<LogEntry>> {
+  let text = String::from_utf8_lossy(output);
+  let mut entries = Vec::new();
+
+  for record in text.split('\x01') {
+    if record.is_empty() {
+      continue;
+    }
+
+    let Some((sha, rest)) = record.split_once('\x02') else {
+      continue;
+    };
+    let Some((subject, rest)) = rest.split_once('\x02') else {
+      continue;
+    };
+    // The body may contain any text except \x02; the last \x02 in the
+    // record closes it and the file list follows.
+    let Some((body_raw, files_raw)) = rest.rsplit_once('\x02') else {
+      continue;
+    };
+
+    let body = body_raw.trim();
+    let files = files_raw
+      .trim_start_matches(['\0', '\n'])
+      .split('\0')
+      .filter(|f| !f.is_empty())
+      .map(PathBuf::from)
+      .collect();
+
+    entries.push(LogEntry {
+      sha: sha.trim().to_string(),
+      subject: subject.trim().to_string(),
+      body: (!body.is_empty()).then(|| body.to_string()),
+      files,
+    });
+  }
+
+  Ok(entries)
+}
+
 fn parse_name_status_output_z(output: &[u8]) -> RailResult<Vec<(PathBuf, char)>> {
   let mut files = Vec::new();
 
@@ -690,6 +776,44 @@ mod tests {
   /// Helper to get the git repository root
   fn find_git_root() -> PathBuf {
     env::current_dir().unwrap()
+  }
+
+  #[test]
+  fn parse_log_with_files_round_trips_records() {
+    // Two commits: one with a body and two files, one bodyless with one file.
+    let raw = b"\x01aaaa1111\x02feat: add planner\x02Longer body\nwith newlines\x02\x00\nsrc/lib.rs\x00src/main.rs\x00\x01bbbb2222\x02fix: typo\x02\x02\x00\nREADME.md\x00";
+    let entries = parse_log_with_files(raw).unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].sha, "aaaa1111");
+    assert_eq!(entries[0].subject, "feat: add planner");
+    assert_eq!(entries[0].body.as_deref(), Some("Longer body\nwith newlines"));
+    assert_eq!(
+      entries[0].files,
+      vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")]
+    );
+    assert_eq!(entries[1].sha, "bbbb2222");
+    assert_eq!(entries[1].body, None);
+    assert_eq!(entries[1].files, vec![PathBuf::from("README.md")]);
+  }
+
+  #[test]
+  fn parse_log_with_files_handles_empty_file_lists() {
+    // A commit with no files (e.g. empty commit) ends after the format NUL.
+    let raw = b"\x01cccc3333\x02chore: empty\x02\x02\x00";
+    let entries = parse_log_with_files(raw).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].files.is_empty());
+  }
+
+  #[test]
+  fn log_with_files_reads_real_history() {
+    let git = SystemGit::open(&find_git_root()).unwrap();
+    let entries = git.log_with_files(None, "HEAD").unwrap();
+    assert!(!entries.is_empty());
+    let first = &entries[0];
+    assert_eq!(first.sha.len(), 40);
+    assert!(!first.subject.is_empty());
   }
 
   #[test]

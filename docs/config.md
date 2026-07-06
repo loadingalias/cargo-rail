@@ -262,22 +262,61 @@ sign_tags = true
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `changelog_path` | `string` | `"CHANGELOG.md"` | Default changelog filename for all crates. |
-| `changelog_relative_to` | `enum` | `"crate"` | What changelog paths are relative to:<br>• `"crate"` - Relative to each crate's directory<br>• `"workspace"` - Relative to workspace root |
-| `skip_changelog_for` | `string[]` | `[]` | Crate names that should not generate changelog entries. |
 | `require_changelog_entries` | `bool` | `false` | If `true`, error when there are no changelog entries for a crate being released. |
 | `require_release_notes` | `bool` | `true` | If `true`, preflight fails release apply when the target version has no release notes (`## [<version>]`) and changelog generation produces no entries. Set to `false` to allow note-less releases. |
 | `release_notes_dir` | `string` | `"release-notes"` | Directory for manual release body overrides. `v<version>.md` or `<tag>.md` takes precedence over generated notes. |
+| `pre_1_breaking_bump` | `enum` | `"minor"` | How `--bump auto` maps breaking changes for `0.x` crates: `"minor"` or `"major"`. |
+| `unconventional_commits` | `enum` | `"warn"` | Policy for commits that do not parse as conventional commits: `"allow"`, `"warn"`, or `"deny"`. |
+| `semver_check` | `enum` | `"warn"` | Optional `cargo-semver-checks` policy for `release check --extended`: `"off"`, `"warn"`, or `"deny"`. |
+| `require_change_files` | `bool` or `string[]` | `false` | Require `.rail/changes/*.md` coverage for all crates or selected crates. |
+
+#### [release.changelog]
+
+Workspace changelog defaults. Per-crate overrides live under
+`[crates.NAME.changelog]`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `path` | `string` | `"CHANGELOG.md"` | Default changelog filename. |
+| `relative_to` | `enum` | `"crate"` | Path base: `"crate"` or `"workspace"`. |
+| `entry_format` | `string` | `"- {scope}{breaking}{description}{prs} ({sha_link})"` | Entry placeholders: `{scope}`, `{breaking}`, `{description}`, `{prs}`, `{sha}`, `{sha_link}`, `{type}`. |
+| `emoji` | `bool` | `true` | Render emoji in section headers. |
+| `group_order` | `string[]` | built-ins | Commit type section order. |
+| `fallback` | `string` | `"other"` | Type key from `group_order`, or `"skip"`. |
+| `commit_url` | `string?` | inferred | Commit URL template with `{sha}`. |
+| `pr_url` | `string?` | inferred | Pull-request URL template with `{pr}`. |
+
+#### [release.changelog.filters]
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `skip_types` | `string[]` | `[]` | Commit types omitted from changelog output. |
+| `skip_scopes` | `string[]` | `[]` | Commit scopes omitted from changelog output. |
+| `include_paths` | `string[]` | `[]` | Optional attribution include globs. Empty means all resolver-owned crate paths. |
+| `exclude_paths` | `string[]` | `[]` | Optional attribution exclude globs. |
 
 **Example:**
 
 ```toml
 [release]
-changelog_path = "CHANGELOG.md"
-changelog_relative_to = "crate"
-skip_changelog_for = ["internal-utils"]
 require_changelog_entries = true
 release_notes_dir = "release-notes"
+pre_1_breaking_bump = "minor"
+unconventional_commits = "warn"
+semver_check = "warn"
+require_change_files = false
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"
+group_order = ["breaking", "feat", "fix", "perf", "docs", "deps", "other"]
+fallback = "other"
+
+[release.changelog.filters]
+skip_types = ["chore", "ci"]
+skip_scopes = []
+include_paths = []
+exclude_paths = []
 ```
 
 **Complete Example:**
@@ -294,19 +333,34 @@ create_github_release = false
 sign_tags = false
 
 # Changelog
-changelog_path = "CHANGELOG.md"
-changelog_relative_to = "crate"
-skip_changelog_for = []
 require_changelog_entries = false
 require_release_notes = true
 release_notes_dir = "release-notes"
+pre_1_breaking_bump = "minor"
+unconventional_commits = "warn"
+semver_check = "warn"
+require_change_files = false
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"
+entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"
+emoji = true
+group_order = ["breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style", "test"]
+fallback = "other"
+
+[release.changelog.filters]
+skip_types = []
+skip_scopes = []
+include_paths = []
+exclude_paths = []
 ```
 
 **Notes:**
 
 - In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
 - For single-crate workspaces, use `tag_format = "v{version}"`
-- `changelog_relative_to = "workspace"` is useful for unified changelogs
+- `relative_to = "workspace"` under `[release.changelog]` is useful for unified changelogs
 - `create_github_release = true` with `push = false` is rejected because GitHub may create a tag from the wrong commit.
 - Put curated release notes in `release-notes/v1.2.3.md` when generated notes are too large or too noisy.
 
@@ -626,14 +680,23 @@ Per-crate changelog configuration.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `path` | `PathBuf` | | Custom changelog path for this crate. Overrides workspace-level `changelog_path`. Interpreted according to `release.changelog_relative_to`. |
+| `path` | `PathBuf` | | Custom changelog path for this crate. Overrides `[release.changelog] path`. |
+| `relative_to` | `enum` | inherited | Path base: `"crate"` or `"workspace"`. |
 | `skip` | `bool` | `false` | Exclude this crate from changelog generation entirely. |
+| `entry_format` | `string` | inherited | Override entry rendering for this crate. |
+| `emoji` | `bool` | inherited | Override section-header emoji rendering. |
+| `group_order` | `string[]` | inherited | Override section order. |
+| `fallback` | `string` | inherited | Override fallback section or `"skip"`. |
+| `filters` | `table` | inherited | Override changelog filters for this crate. |
+| `commit_url` | `string?` | inherited | Override commit URL template. |
+| `pr_url` | `string?` | inherited | Override pull-request URL template. |
 
 **Example:**
 
 ```toml
 [crates.my-lib.changelog]
 path = "CHANGES.md"       # Use CHANGES.md instead of CHANGELOG.md
+relative_to = "crate"
 skip = false
 
 [crates.private-crate.changelog]
@@ -712,12 +775,27 @@ create_github_release = true
 sign_tags = true
 
 # Changelog
-changelog_path = "CHANGELOG.md"
-changelog_relative_to = "crate"
-skip_changelog_for = []
 require_changelog_entries = true
 require_release_notes = true
 release_notes_dir = "release-notes"
+pre_1_breaking_bump = "minor"
+unconventional_commits = "warn"
+semver_check = "warn"
+require_change_files = false
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"
+entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"
+emoji = true
+group_order = ["breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style", "test"]
+fallback = "other"
+
+[release.changelog.filters]
+skip_types = []
+skip_scopes = []
+include_paths = []
+exclude_paths = []
 
 # Change detection
 [change-detection]
@@ -970,7 +1048,13 @@ tag_format = "{crate}-{prefix}{version}"
 require_changelog_entries = true
 require_release_notes = true
 create_github_release = true
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"
 ```
+
+For git-cliff parser/group migration, see `docs/migrate-git-cliff.md`.
 
 ## Environment Variables
 
@@ -982,5 +1066,6 @@ Note: `cargo rail config validate` defaults to strict mode in CI (detected via `
 
 - [Commands Reference](./commands.md) - All cargo-rail commands
 - [Migration Guide](./migrate-hakari.md) - Migrating from cargo-hakari
+- [git-cliff/release-plz Migration](./migrate-git-cliff.md) - Migrating changelog and release config
 - [Troubleshooting](./troubleshooting.md) - Diagnose planner and executor decisions
 - [README](../README.md) - Project overview and quick start

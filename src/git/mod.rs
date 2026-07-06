@@ -19,6 +19,7 @@ pub mod ops;
 pub mod system;
 
 pub use defaults::detect_default_base_ref;
+pub use ops::LogEntry;
 pub use system::{CommitInfo, SystemGit, init_repo};
 
 /// Create a properly-configured git command for any repository path.

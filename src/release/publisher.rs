@@ -2,7 +2,7 @@
 
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
-use crate::release::changelog::ChangelogGenerator;
+use crate::release::changelog::detect_github_repo;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
 use crate::release::process;
 use crate::release::version::VersionBumper;
@@ -117,6 +117,7 @@ impl<'a> ReleasePublisher<'a> {
       warn!("{}", warning);
     }
 
+    let mut consumed_change_files = false;
     for (i, crate_plan) in plan.crates.iter().enumerate() {
       progress!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
 
@@ -135,6 +136,10 @@ impl<'a> ReleasePublisher<'a> {
       progress!("  changelog");
       self.update_changelog(crate_plan)?;
       self.validate_release_notes_size(crate_plan)?;
+      if !consumed_change_files {
+        self.consume_change_files(plan)?;
+        consumed_change_files = true;
+      }
 
       progress!("  commit");
       self.commit_version_bump(crate_plan)?;
@@ -239,25 +244,24 @@ impl<'a> ReleasePublisher<'a> {
     Ok(())
   }
 
+  fn consume_change_files(&self, plan: &ReleasePlan) -> RailResult<()> {
+    for path in &plan.change_files_to_delete {
+      if path.exists() {
+        fs::remove_file(path)
+          .map_err(|e| RailError::message(format!("failed to remove change file {}: {}", path.display(), e)))?;
+      }
+    }
+    Ok(())
+  }
+
   /// Update or create CHANGELOG.md
   fn update_changelog(&self, plan: &CrateReleasePlan) -> RailResult<()> {
     if !plan.generate_changelog {
       return Ok(());
     }
 
-    // Find previous tag for this crate
-    let previous_tag = self.find_previous_tag(plan)?;
-
-    // Get crate directory for path filtering
-    let crate_dir = plan
-      .manifest_path
-      .parent()
-      .ok_or_else(|| RailError::message("Invalid manifest path"))?;
-
-    // Generate changelog
-    let generator = ChangelogGenerator::new(self.ctx.workspace_root());
-    let github_repo = generator.github_repo().cloned();
-    let new_entries = generator.generate(previous_tag.as_deref(), "HEAD", Some(&[crate_dir]))?;
+    let github_repo = detect_github_repo(self.ctx.workspace_root());
+    let new_entries = plan.changelog_body.as_str();
 
     // Read existing changelog or create new
     let existing = if plan.changelog_path.exists() {
@@ -281,8 +285,8 @@ impl<'a> ReleasePublisher<'a> {
 
     // Add new version with today's date
     let date = self.get_current_date();
-    updated.push_str(&self.format_version_header(plan, previous_tag.as_deref(), &date, github_repo.as_ref()));
-    updated.push_str(&new_entries);
+    updated.push_str(&self.format_version_header(plan, plan.previous_tag.as_deref(), &date, github_repo.as_ref()));
+    updated.push_str(new_entries);
     updated.push('\n');
 
     if new_entries.trim().is_empty() {
@@ -551,24 +555,6 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     format!("## [{}] - {}\n\n", plan.new_version, date)
-  }
-
-  /// Find previous tag for a crate
-  fn find_previous_tag(&self, plan: &CrateReleasePlan) -> RailResult<Option<String>> {
-    let workspace_members = self.ctx.graph.workspace_members();
-    let is_single_crate = workspace_members.len() == 1;
-
-    let pattern = if is_single_crate {
-      format!("{}*", self.release_config.tag_prefix)
-    } else {
-      self
-        .release_config
-        .tag_format
-        .replace("{crate}", &plan.name)
-        .replace("{version}", "*")
-    };
-
-    self.ctx.git()?.git().find_latest_tag(&pattern)
   }
 }
 

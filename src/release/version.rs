@@ -1,7 +1,10 @@
 //! Version bumping and Cargo.toml manipulation
 
+use crate::config::Pre1BreakingBump;
 use crate::error::{RailError, RailResult};
+use crate::release::changelog::ParsedSubject;
 use semver::Version;
+use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -120,6 +123,99 @@ impl BumpType {
       }
       Self::Exact(version) => version.clone(),
     }
+  }
+}
+
+/// How the user asked versions to be computed
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BumpRequest {
+  /// One bump applied to every target crate
+  Explicit(BumpType),
+  /// Per-crate inference: change files first, then conventional commits
+  /// since each crate's previous release tag
+  Auto,
+}
+
+impl FromStr for BumpRequest {
+  type Err = RailError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    if s.eq_ignore_ascii_case("auto") {
+      Ok(Self::Auto)
+    } else {
+      s.parse::<BumpType>().map(Self::Explicit)
+    }
+  }
+}
+
+/// Semver impact level, ordered so `max()` folds commit history
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BumpLevel {
+  /// Bug fixes and performance improvements
+  Patch,
+  /// New features
+  Minor,
+  /// Breaking changes
+  Major,
+}
+
+impl BumpLevel {
+  /// Map a level to a concrete bump, honoring the pre-1.0 breaking policy
+  pub fn to_bump_type(self, current: &Version, pre_1_breaking: Pre1BreakingBump) -> BumpType {
+    match self {
+      Self::Major if current.major == 0 && pre_1_breaking == Pre1BreakingBump::Minor => BumpType::Minor,
+      Self::Major => BumpType::Major,
+      Self::Minor => BumpType::Minor,
+      Self::Patch => BumpType::Patch,
+    }
+  }
+
+  /// String form used in plan output and change files
+  pub fn as_str(&self) -> &'static str {
+    match self {
+      Self::Patch => "patch",
+      Self::Minor => "minor",
+      Self::Major => "major",
+    }
+  }
+}
+
+impl FromStr for BumpLevel {
+  type Err = RailError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s.to_lowercase().as_str() {
+      "patch" => Ok(Self::Patch),
+      "minor" => Ok(Self::Minor),
+      "major" => Ok(Self::Major),
+      _ => Err(RailError::with_help(
+        format!("invalid bump level: {}", s),
+        "use 'patch', 'minor', or 'major'",
+      )),
+    }
+  }
+}
+
+impl std::fmt::Display for BumpLevel {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+/// Semver impact of one conventional commit
+///
+/// Fixed semantics regardless of custom changelog groups: breaking → major,
+/// feat → minor, fix/perf → patch, everything else (including custom types
+/// and unconventional commits) → no bump.
+pub fn commit_bump_level(parsed: &ParsedSubject<'_>) -> Option<BumpLevel> {
+  if parsed.breaking {
+    return Some(BumpLevel::Major);
+  }
+  match parsed.commit_type? {
+    "feat" => Some(BumpLevel::Minor),
+    "fix" | "perf" => Some(BumpLevel::Patch),
+    _ => None,
   }
 }
 

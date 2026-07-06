@@ -286,6 +286,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
       changelog: split.changelog_path.map(|path| ChangelogConfig {
         path: Some(path),
         skip: false,
+        ..ChangelogConfig::default()
       }),
       sync: None,
     };
