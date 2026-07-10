@@ -14,10 +14,10 @@ fn main() {
   let CargoCli::Rail(mut cli) = CargoCli::parse();
 
   // Apply global --json flag to command format fields
-  if cli.json {
-    if let Err(error) = cli.command.apply_json_override() {
-      error.exit();
-    }
+  if cli.json
+    && let Err(error) = cli.command.apply_json_override()
+  {
+    error.exit();
   }
 
   // Initialize output control (quiet mode)

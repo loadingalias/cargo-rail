@@ -1,8 +1,10 @@
 //! Utility functions for cross-platform path handling and hashing
 
+use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::RailConfig;
 use crate::error::RailResult;
@@ -39,13 +41,47 @@ pub fn file_fingerprint(path: &Path) -> String {
   }
 }
 
+/// Compute a content fingerprint after normalizing text line endings.
+///
+/// Git may materialize the same text as LF or CRLF according to checkout
+/// configuration. Configuration identities must describe the parsed text, not
+/// the platform's checkout filter.
+fn text_file_fingerprint(path: &Path) -> String {
+  match fs::read(path) {
+    Ok(bytes) => {
+      let normalized = normalize_line_endings(&bytes);
+      format!("fnv1a64:{:016x}", fnv1a64(&normalized))
+    }
+    Err(_) => "none".to_string(),
+  }
+}
+
+fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
+  if !bytes.contains(&b'\r') {
+    return Cow::Borrowed(bytes);
+  }
+
+  let mut normalized = Vec::with_capacity(bytes.len());
+  let mut index = 0;
+  while index < bytes.len() {
+    if bytes[index] == b'\r' {
+      normalized.push(b'\n');
+      index += usize::from(bytes.get(index + 1) == Some(&b'\n'));
+    } else {
+      normalized.push(bytes[index]);
+    }
+    index += 1;
+  }
+  Cow::Owned(normalized)
+}
+
 /// Compute a fingerprint for the rail.toml configuration file
 ///
 /// Searches standard config locations and emits the fingerprint,
 /// or `"none"` when no config file is found.
 pub fn config_fingerprint(workspace_root: &Path) -> String {
   RailConfig::find_config_path(workspace_root)
-    .map(|p| file_fingerprint(&p))
+    .map(|p| text_file_fingerprint(&p))
     .unwrap_or_else(|| "none".to_string())
 }
 
@@ -58,8 +94,127 @@ pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
     .iter()
     .map(|name| workspace_root.join(name))
     .find(|p| p.exists())
-    .map(|p| file_fingerprint(&p))
+    .map(|p| text_file_fingerprint(&p))
     .unwrap_or_else(|| "none".to_string())
+}
+
+/// Canonicalize an existing path and return a form suitable for both Rust and
+/// external tools on the current platform.
+///
+/// Windows canonicalization adds a verbatim `\\?\` prefix. That representation
+/// is safe for Win32 APIs but is not accepted consistently by Git for Windows,
+/// and it does not compare lexically with ordinary absolute paths.
+pub fn canonicalize_existing(path: &Path) -> io::Result<PathBuf> {
+  fs::canonicalize(path).map(simplify_canonical_path)
+}
+
+/// Resolve a possibly missing path through its nearest existing ancestor.
+///
+/// Existing ancestors are canonicalized, so symlink escapes remain visible;
+/// only a normalized, non-existent suffix is appended afterward.
+pub fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
+  let absolute = if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    std::env::current_dir()?.join(path)
+  };
+  let normalized = normalize_absolute_path(&absolute)?;
+  if fs::symlink_metadata(&normalized).is_ok() {
+    return canonicalize_existing(&normalized);
+  }
+
+  let mut ancestor = normalized.as_path();
+  let mut suffix = Vec::<OsString>::new();
+  loop {
+    match fs::symlink_metadata(ancestor) {
+      Ok(_) => break,
+      Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        let name = ancestor.file_name().ok_or_else(|| {
+          io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path '{}' has no existing ancestor", path.display()),
+          )
+        })?;
+        suffix.push(name.to_os_string());
+        ancestor = ancestor.parent().ok_or_else(|| {
+          io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path '{}' has no existing ancestor", path.display()),
+          )
+        })?;
+      }
+      Err(error) => return Err(error),
+    }
+  }
+
+  let mut resolved = canonicalize_existing(ancestor)?;
+  for component in suffix.iter().rev() {
+    resolved.push(component);
+  }
+  Ok(resolved)
+}
+
+/// Return `path` relative to `root` after resolving both representations.
+pub fn path_relative_to(root: &Path, path: &Path) -> io::Result<PathBuf> {
+  let root = canonicalize_existing(root)?;
+  let path = canonicalize_allow_missing(path)?;
+  path.strip_prefix(&root).map(Path::to_path_buf).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("path '{}' is outside root '{}'", path.display(), root.display()),
+    )
+  })
+}
+
+fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+      Component::RootDir => normalized.push(component.as_os_str()),
+      Component::CurDir => {}
+      Component::ParentDir => {
+        if !normalized.pop() {
+          return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path '{}' escapes the filesystem root", path.display()),
+          ));
+        }
+      }
+      Component::Normal(part) => normalized.push(part),
+    }
+  }
+  Ok(normalized)
+}
+
+#[cfg(not(windows))]
+fn simplify_canonical_path(path: PathBuf) -> PathBuf {
+  path
+}
+
+#[cfg(windows)]
+fn simplify_canonical_path(path: PathBuf) -> PathBuf {
+  use std::path::Prefix;
+
+  let mut components = path.components();
+  let Some(Component::Prefix(prefix)) = components.next() else {
+    return path;
+  };
+  let mut simplified = match prefix.kind() {
+    Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive).to_ascii_uppercase())),
+    Prefix::VerbatimUNC(server, share) => {
+      let mut raw = OsString::from(r"\\");
+      raw.push(server);
+      raw.push(r"\");
+      raw.push(share);
+      PathBuf::from(raw)
+    }
+    _ => return path,
+  };
+  for component in components {
+    simplified.push(component.as_os_str());
+  }
+  simplified
 }
 
 // ============================================================================
@@ -215,6 +370,60 @@ mod tests {
   fn test_file_fingerprint_missing_file() {
     let result = file_fingerprint(Path::new("/nonexistent/path/to/file"));
     assert_eq!(result, "none");
+  }
+
+  #[test]
+  fn test_text_fingerprint_ignores_checkout_line_endings() {
+    let temp = tempfile::tempdir().unwrap();
+    let lf = temp.path().join("lf.toml");
+    let crlf = temp.path().join("crlf.toml");
+    fs::write(&lf, b"[workspace]\nroot = \".\"\n").unwrap();
+    fs::write(&crlf, b"[workspace]\r\nroot = \".\"\r\n").unwrap();
+
+    assert_eq!(text_file_fingerprint(&lf), text_file_fingerprint(&crlf));
+    assert_ne!(file_fingerprint(&lf), file_fingerprint(&crlf));
+  }
+
+  #[test]
+  fn test_path_relative_to_resolves_existing_and_missing_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("existing.txt"), b"content").unwrap();
+
+    assert_eq!(
+      path_relative_to(&root, &root.join("existing.txt")).unwrap(),
+      PathBuf::from("existing.txt")
+    );
+    assert_eq!(
+      path_relative_to(&root, &root.join("new/child.txt")).unwrap(),
+      PathBuf::from("new/child.txt")
+    );
+    assert!(path_relative_to(&root, temp.path()).is_err());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn test_path_relative_to_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file.txt"), b"outside").unwrap();
+    symlink(&outside, root.join("escape")).unwrap();
+
+    assert!(path_relative_to(&root, &root.join("escape/file.txt")).is_err());
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_canonical_paths_are_external_tool_compatible_on_windows() {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical = canonicalize_existing(temp.path()).unwrap();
+    assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
   }
 
   #[test]

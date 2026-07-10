@@ -7,6 +7,7 @@ use crate::release::planner::{CrateReleasePlan, ReleasePlan};
 use crate::release::process;
 use crate::release::state::{ReleaseMode, ReleaseState, ReleaseStatus, StepStatus, validate_state_path};
 use crate::release::version::VersionBumper;
+use crate::utils::canonicalize_existing;
 use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
 use chrono::Local;
@@ -731,12 +732,12 @@ impl<'a> ReleasePublisher<'a> {
 
   fn stage_planned_paths(&self, planned_paths: &[PathBuf], control_paths: &[PathBuf]) -> RailResult<()> {
     let git = self.ctx.git()?.git();
-    let canonical_git_root = fs::canonicalize(&git.worktree_root)?;
+    let canonical_git_root = canonicalize_existing(&git.worktree_root)?;
     let planned: BTreeSet<PathBuf> = planned_paths.iter().cloned().collect();
     let mut allowed = planned.clone();
     for path in control_paths {
       let relative = if path.is_absolute() {
-        let canonical = fs::canonicalize(path)?;
+        let canonical = canonicalize_existing(path)?;
         let Ok(relative) = canonical.strip_prefix(&canonical_git_root) else {
           continue;
         };

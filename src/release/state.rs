@@ -3,6 +3,7 @@
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::release::planner::ReleasePlan;
+use crate::utils::canonicalize_existing;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -171,8 +172,8 @@ impl ReleaseState {
 }
 
 pub(crate) fn validate_state_path(root: &Path, path: &Path) -> RailResult<PathBuf> {
-  let canonical = std::fs::canonicalize(path)?;
-  let dir = std::fs::canonicalize(state_dir(root))?;
+  let canonical = canonicalize_existing(path)?;
+  let dir = canonicalize_existing(&state_dir(root))?;
   if canonical.parent().is_none_or(|parent| parent != dir) {
     return Err(RailError::message(format!(
       "release state '{}' is outside the workspace release-state directory",

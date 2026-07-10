@@ -1,6 +1,6 @@
 //! Integration tests for `cargo rail hash` and `cargo rail diff-hash`.
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::{Result, anyhow};
 use std::process::Command;
 
@@ -35,6 +35,7 @@ fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
   let clone_root = tempfile::tempdir()?;
   let clone_path = clone_root.path().join("different-checkout-root");
   let clone = Command::new("git")
+    .args(["-c", "core.autocrlf=true"])
     .arg("clone")
     .arg(&ws.path)
     .arg(&clone_path)
@@ -42,6 +43,14 @@ fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
   if !clone.status.success() {
     return Err(anyhow!("git clone failed: {}", String::from_utf8_lossy(&clone.stderr)));
   }
+  git(&clone_path, &["config", "core.autocrlf", "true"])?;
+  let dirty = git(&clone_path, &["diff", "--name-only"])?;
+  assert!(dirty.stdout.is_empty(), "line-ending checkout must remain Git-clean");
+  assert_ne!(
+    std::fs::read(ws.path.join(".config/rail.toml"))?,
+    std::fs::read(clone_path.join(".config/rail.toml"))?,
+    "fixture must exercise Git's platform line-ending conversion"
+  );
 
   let source_hash = run_cargo_rail(&ws.path, &["rail", "hash", "--since", "HEAD~1", "--format", "json"])?;
   let clone_hash = run_cargo_rail(&clone_path, &["rail", "hash", "--since", "HEAD~1", "--format", "json"])?;
@@ -49,10 +58,6 @@ fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
 
   let source_identity: serde_json::Value = serde_json::from_slice(&source_hash.stdout)?;
   let clone_identity: serde_json::Value = serde_json::from_slice(&clone_hash.stdout)?;
-  assert_eq!(
-    source_identity["identity"], clone_identity["identity"],
-    "checkout location must not affect plan identity"
-  );
   assert!(
     source_identity["identity"]
       .as_str()
@@ -109,7 +114,12 @@ fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
   )?;
   assert!(diff.status.success(), "portable diff-hash should succeed");
   let diff_json: serde_json::Value = serde_json::from_slice(&diff.stdout)?;
-  assert_eq!(diff_json["equal"], true);
+  assert_eq!(
+    source_identity["identity"], clone_identity["identity"],
+    "checkout location must not affect plan identity\nsource files: {:#}\nclone files: {:#}\nportable diff: {diff_json:#}",
+    source_json["files"], clone_json["files"]
+  );
+  assert_eq!(diff_json["equal"], true, "portable diff: {diff_json:#}");
   assert_eq!(diff_json["changes"], serde_json::json!([]));
 
   Ok(())

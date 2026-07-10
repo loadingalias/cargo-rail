@@ -21,13 +21,21 @@ pub(crate) struct GitTreeEntry {
 impl SystemGit {
   /// Normalize a path to be relative to the work tree
   ///
-  /// If the path is absolute, strips the work tree prefix.
-  /// If the path is already relative or stripping fails, returns the path as-is.
-  fn normalize_path<'a>(&self, path: &'a Path) -> &'a Path {
+  /// If the path is absolute, resolve both representations before stripping the
+  /// worktree prefix. This handles Windows drive casing, separators, and the
+  /// verbatim prefix returned by `canonicalize` without accepting outside paths.
+  fn normalize_path(&self, path: &Path) -> RailResult<PathBuf> {
     if path.is_absolute() {
-      path.strip_prefix(&self.worktree_root).unwrap_or(path)
+      utils::path_relative_to(&self.worktree_root, path).map_err(|error| {
+        RailError::message(format!(
+          "failed to make '{}' relative to git worktree '{}': {}",
+          path.display(),
+          self.worktree_root.display(),
+          error
+        ))
+      })
     } else {
-      path
+      Ok(path.to_path_buf())
     }
   }
 
@@ -117,8 +125,8 @@ impl SystemGit {
     since_sha: Option<&str>,
     until_ref: &str,
   ) -> RailResult<Vec<CommitInfo>> {
-    let relative_path = self.normalize_path(path);
-    let git_path = relative_path.to_str().unwrap_or("");
+    let relative_path = self.normalize_path(path)?;
+    let git_path = utils::path_to_git_format(&relative_path);
 
     let mut args = vec!["log", "--reverse", "--format=%H"];
     let range_arg;
@@ -133,7 +141,7 @@ impl SystemGit {
 
     // Add path filter
     args.push("--");
-    args.push(git_path);
+    args.push(&git_path);
 
     let output = self.run_git(&args)?;
     let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -166,8 +174,12 @@ impl SystemGit {
     // Normalize all paths
     let relative_paths: Vec<String> = paths
       .iter()
-      .map(|path| self.normalize_path(path).to_str().unwrap_or("").to_string())
-      .collect();
+      .map(|path| {
+        self
+          .normalize_path(path)
+          .map(|relative| utils::path_to_git_format(&relative))
+      })
+      .collect::<RailResult<_>>()?;
 
     let mut args = vec!["log", "--reverse", "--format=%H"];
     let range_arg;
@@ -294,8 +306,8 @@ impl SystemGit {
 
   /// Read exact tree entries under `path` without materializing the worktree.
   pub(crate) fn collect_tree_entries(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<GitTreeEntry>> {
-    let normalized = self.normalize_path(path);
-    let path_arg = normalized.to_string_lossy();
+    let normalized = self.normalize_path(path)?;
+    let path_arg = utils::path_to_git_format(&normalized);
     let output = self.run_git(&["ls-tree", "-r", "-z", "--full-tree", commit_sha, "--", &path_arg])?;
     let mut entries = Vec::new();
     for record in output
@@ -523,8 +535,8 @@ impl SystemGit {
 
     // Write all requests to stdin
     for (commit_sha, path) in items {
-      let relative_path = self.normalize_path(path);
-      let git_path = utils::path_to_git_format(relative_path);
+      let relative_path = self.normalize_path(path)?;
+      let git_path = utils::path_to_git_format(&relative_path);
       let spec = format!("{}:{}\n", commit_sha, git_path);
       stdin
         .write_all(spec.as_bytes())

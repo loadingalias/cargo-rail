@@ -7,6 +7,7 @@
 //! - Zero-copy parsing where possible
 
 use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::utils;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -89,10 +90,11 @@ impl SystemGit {
   ///
   /// Returns [`GitError::RepoNotFound`] if `path` is not inside a git repository.
   pub fn open(path: &Path) -> RailResult<Self> {
+    let repo_path = utils::canonicalize_existing(path).unwrap_or_else(|_| path.to_path_buf());
     // Get repo metadata in one subprocess call
     let output = Command::new("git")
       .arg("-C")
-      .arg(path)
+      .arg(&repo_path)
       .args(["rev-parse", "--show-toplevel"])
       .output()
       .context("Failed to execute git rev-parse")?;
@@ -100,18 +102,17 @@ impl SystemGit {
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
       if stderr.contains("not a git repository") {
-        return Err(RailError::Git(GitError::RepoNotFound {
-          path: path.to_path_buf(),
-        }));
+        return Err(RailError::Git(GitError::RepoNotFound { path: repo_path }));
       }
       return Err(RailError::message(format!("Failed to open git repository: {}", stderr)));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let worktree_root = normalize_git_path(stdout.trim());
+    let reported_root = normalize_git_path(stdout.trim());
+    let worktree_root = utils::canonicalize_existing(&reported_root).unwrap_or(reported_root);
 
     Ok(Self {
-      repo_path: path.to_path_buf(),
+      repo_path,
       worktree_root,
     })
   }
@@ -423,15 +424,16 @@ impl SystemGit {
     Ok(())
   }
 
-  fn normalize_repo_path<'a>(&self, path: &'a Path) -> RailResult<&'a Path> {
+  fn normalize_repo_path(&self, path: &Path) -> RailResult<PathBuf> {
     if !path.is_absolute() {
-      return Ok(path);
+      return Ok(path.to_path_buf());
     }
-    path.strip_prefix(&self.worktree_root).map_err(|_| {
+    utils::path_relative_to(&self.worktree_root, path).map_err(|error| {
       RailError::message(format!(
-        "path '{}' is outside git worktree '{}'",
+        "path '{}' is outside git worktree '{}': {}",
         path.display(),
-        self.worktree_root.display()
+        self.worktree_root.display(),
+        error
       ))
     })
   }
@@ -656,5 +658,37 @@ mod tests {
     assert_ne!(first, changed);
     assert!(first.len() >= 40);
     assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_git_accepts_windows_canonical_paths_at_process_boundaries() {
+    let temp = tempfile::TempDir::new().unwrap();
+    init_repo(temp.path(), "main").unwrap();
+    let git = SystemGit::open(temp.path()).unwrap();
+    git.set_config("user.name", "Test User").unwrap();
+    git.set_config("user.email", "test@example.com").unwrap();
+    let file = temp.path().join("tracked.txt");
+    fs::write(&file, "before\n").unwrap();
+    git.stage_all().unwrap();
+    git.commit("initial").unwrap();
+
+    let verbatim_root = fs::canonicalize(temp.path()).unwrap();
+    let verbatim_file = fs::canonicalize(&file).unwrap();
+    let git = SystemGit::open(&verbatim_root).unwrap();
+    assert_eq!(
+      git
+        .get_commits_touching_path(&verbatim_file, None, "HEAD")
+        .unwrap()
+        .len(),
+      1
+    );
+
+    fs::write(&file, "after\n").unwrap();
+    git.stage_paths(&[verbatim_file]).unwrap();
+    assert_eq!(
+      git.run_git_stdout(&["diff", "--cached", "--name-only"]).unwrap(),
+      "tracked.txt"
+    );
   }
 }

@@ -286,8 +286,8 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn validate_conflict_receipt_path(&self, receipt_path: &Path) -> RailResult<PathBuf> {
-    let path = std::fs::canonicalize(receipt_path)?;
-    let dir = std::fs::canonicalize(self.conflict_receipt_dir())?;
+    let path = utils::canonicalize_existing(receipt_path)?;
+    let dir = utils::canonicalize_existing(&self.conflict_receipt_dir())?;
     if path.parent().is_none_or(|parent| parent != dir) {
       return Err(crate::error::RailError::message(format!(
         "sync receipt '{}' is outside the workspace receipt directory",
@@ -1132,8 +1132,8 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {
 
 /// Read the crate identity from a workspace-owned conflict receipt.
 pub fn conflict_receipt_crate(workspace_root: &Path, receipt_path: &Path) -> RailResult<String> {
-  let path = std::fs::canonicalize(receipt_path)?;
-  let dir = std::fs::canonicalize(workspace_root.join("target/cargo-rail/receipts"))?;
+  let path = utils::canonicalize_existing(receipt_path)?;
+  let dir = utils::canonicalize_existing(&workspace_root.join("target/cargo-rail/receipts"))?;
   if path.parent().is_none_or(|parent| parent != dir) {
     return Err(crate::error::RailError::message(format!(
       "sync receipt '{}' is outside the workspace receipt directory",

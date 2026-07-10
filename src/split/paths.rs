@@ -2,9 +2,9 @@
 
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
-use std::ffi::OsString;
+use crate::utils;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Validated filesystem roots owned by one split target.
 ///
@@ -214,7 +214,7 @@ impl SplitPathCapabilities {
 }
 
 fn canonical_existing(path: &Path, label: &str) -> RailResult<PathBuf> {
-  fs::canonicalize(path).map_err(|error| {
+  utils::canonicalize_existing(path).map_err(|error| {
     RailError::with_help(
       format!("invalid {} '{}': {}", label, path.display(), error),
       "use an existing path that stays within the configured repository boundary",
@@ -223,53 +223,12 @@ fn canonical_existing(path: &Path, label: &str) -> RailResult<PathBuf> {
 }
 
 fn resolve_allow_missing(path: &Path, label: &str) -> RailResult<PathBuf> {
-  let absolute = if path.is_absolute() {
-    path.to_path_buf()
-  } else {
-    std::env::current_dir()?.join(path)
-  };
-  let normalized = normalize_absolute(&absolute)?;
-  match fs::symlink_metadata(&normalized) {
-    Ok(_) => return canonical_existing(&normalized, label),
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-    Err(error) => {
-      return Err(boundary_error(
-        label,
-        &normalized,
-        &format!("cannot be inspected: {}", error),
-      ));
-    }
-  }
-
-  let mut ancestor = normalized.as_path();
-  let mut suffix = Vec::<OsString>::new();
-  loop {
-    match fs::symlink_metadata(ancestor) {
-      Ok(_) => break,
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-        let name = ancestor
-          .file_name()
-          .ok_or_else(|| boundary_error(label, &normalized, "has no existing ancestor"))?;
-        suffix.push(name.to_os_string());
-        ancestor = ancestor
-          .parent()
-          .ok_or_else(|| boundary_error(label, &normalized, "has no existing ancestor"))?;
-      }
-      Err(error) => {
-        return Err(boundary_error(
-          label,
-          &normalized,
-          &format!("cannot be inspected: {}", error),
-        ));
-      }
-    }
-  }
-
-  let mut resolved = canonical_existing(ancestor, label)?;
-  for component in suffix.iter().rev() {
-    resolved.push(component);
-  }
-  Ok(resolved)
+  utils::canonicalize_allow_missing(path).map_err(|error| {
+    RailError::with_help(
+      format!("invalid {} '{}': {}", label, path.display(), error),
+      "use a path that stays within the configured repository boundary",
+    )
+  })
 }
 
 fn nearest_existing_ancestor(path: &Path) -> RailResult<&Path> {
@@ -291,24 +250,6 @@ fn nearest_existing_ancestor(path: &Path) -> RailResult<&Path> {
       }
     }
   }
-}
-
-fn normalize_absolute(path: &Path) -> RailResult<PathBuf> {
-  let mut normalized = PathBuf::new();
-  for component in path.components() {
-    match component {
-      Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-      Component::RootDir => normalized.push(component.as_os_str()),
-      Component::CurDir => {}
-      Component::ParentDir => {
-        if !normalized.pop() {
-          return Err(boundary_error("path", path, "escapes the filesystem root"));
-        }
-      }
-      Component::Normal(part) => normalized.push(part),
-    }
-  }
-  Ok(normalized)
 }
 
 fn reject_overlap(left_label: &str, left: &Path, right_label: &str, right: &Path) -> RailResult<()> {

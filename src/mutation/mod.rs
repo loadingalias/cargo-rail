@@ -7,7 +7,7 @@
 
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
-use crate::utils::{config_fingerprint, file_fingerprint, toolchain_fingerprint};
+use crate::utils::{canonicalize_existing, config_fingerprint, file_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -349,11 +349,11 @@ pub fn validate_pre_apply_with_allowed_paths(
   }
   let mut current = capture_pre_apply_checks(ctx)?;
   if !allowed_paths.is_empty() {
-    let git_root = fs::canonicalize(&ctx.git()?.git().worktree_root)?;
+    let git_root = canonicalize_existing(&ctx.git()?.git().worktree_root)?;
     let mut allowed = BTreeSet::new();
     for path in allowed_paths {
       if path.is_absolute() {
-        let canonical = fs::canonicalize(path)?;
+        let canonical = canonicalize_existing(path)?;
         if let Ok(relative) = canonical.strip_prefix(&git_root) {
           allowed.insert(relative.to_path_buf());
         }
@@ -618,14 +618,14 @@ pub fn validate_changed_paths_with_allowed_paths(
   allowed_paths: &[PathBuf],
 ) -> RailResult<()> {
   let git = ctx.git()?.git();
-  let canonical_git_root = fs::canonicalize(&git.worktree_root)?;
+  let canonical_git_root = canonicalize_existing(&git.worktree_root)?;
   let mut allowed: BTreeSet<_> = expected_paths(plan)
     .into_iter()
     .chain(declared_input_paths(plan))
     .collect();
   for path in allowed_paths {
     let relative = if path.is_absolute() {
-      let canonical = fs::canonicalize(path)?;
+      let canonical = canonicalize_existing(path)?;
       let Ok(relative) = canonical.strip_prefix(&canonical_git_root) else {
         continue;
       };

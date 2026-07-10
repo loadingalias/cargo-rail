@@ -10,6 +10,7 @@ use crate::release::planner::{DependentPolicy, ReleasePlanner};
 use crate::release::publisher::ReleasePublisher;
 use crate::release::validator::ReleaseValidator;
 use crate::release::version::BumpRequest;
+use crate::utils;
 use crate::workspace::WorkspaceContext;
 use std::io::{self, IsTerminal};
 
@@ -973,14 +974,15 @@ fn release_declared_inputs(
   paths
     .into_iter()
     .map(|path| {
-      let relative = path.strip_prefix(git_root).map_err(|_| {
+      let relative = utils::path_relative_to(git_root, &path).map_err(|error| {
         RailError::message(format!(
-          "release input '{}' is outside git worktree '{}'",
+          "release input '{}' is outside git worktree '{}': {}",
           path.display(),
-          git_root.display()
+          git_root.display(),
+          error
         ))
       })?;
-      MutationInput::capture(git, git_root, relative.to_path_buf())
+      MutationInput::capture(git, git_root, relative)
     })
     .collect()
 }
@@ -996,14 +998,15 @@ fn release_mutation(
   } else {
     ctx.workspace_root().join(path)
   };
-  let relative = absolute.strip_prefix(git_root).map_err(|_| {
+  let relative = utils::path_relative_to(git_root, &absolute).map_err(|error| {
     RailError::message(format!(
-      "release path '{}' is outside git worktree '{}'",
+      "release path '{}' is outside git worktree '{}': {}",
       absolute.display(),
-      git_root.display()
+      git_root.display(),
+      error
     ))
   })?;
-  Ok(ExpectedMutation::capture(git_root, relative.to_path_buf(), effect))
+  Ok(ExpectedMutation::capture(git_root, relative, effect))
 }
 
 fn collect_release_objects(
