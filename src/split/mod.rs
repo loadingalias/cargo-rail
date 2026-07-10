@@ -8,5 +8,8 @@
 
 /// Split engine implementation
 pub mod engine;
+/// Repository-boundary validation for split and sync mutations.
+pub mod paths;
 
 pub use engine::{SplitEngine, SplitParams};
+pub use paths::SplitPathCapabilities;

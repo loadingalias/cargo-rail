@@ -4,7 +4,7 @@ use crate::config::Pre1BreakingBump;
 use crate::error::{RailError, RailResult};
 use crate::release::changelog::ParsedSubject;
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -149,7 +149,7 @@ impl FromStr for BumpRequest {
 }
 
 /// Semver impact level, ordered so `max()` folds commit history
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BumpLevel {
   /// Bug fixes and performance improvements

@@ -1,6 +1,6 @@
 //! Integration tests for plan/apply flows and graph introspection.
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
 use tempfile::TempDir;
 
@@ -169,6 +169,7 @@ tag_format = "v{version}"
 require_clean = false
 "#,
   )?;
+  ws.commit("Configure release plan test")?;
 
   let check = run_cargo_rail(
     &ws.path,
@@ -210,6 +211,104 @@ require_clean = false
     "release apply --plan should succeed.\nstdout:\n{}\nstderr:\n{}",
     String::from_utf8_lossy(&apply.stdout),
     String::from_utf8_lossy(&apply.stderr)
+  );
+
+  let apply_receipt = std::fs::read_dir(ws.path.join("target/cargo-rail/receipts"))?
+    .filter_map(Result::ok)
+    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+    .filter_map(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+    .find(|receipt| receipt["operation"] == "release" && receipt["phase"] == "apply")
+    .expect("release apply receipt");
+  assert_eq!(apply_receipt["plan"]["contract_version"], 2);
+  assert!(
+    apply_receipt["verified_inputs"]["worktree_fingerprint"]
+      .as_str()
+      .is_some_and(|fingerprint| fingerprint.starts_with("git-object:"))
+  );
+  assert!(
+    apply_receipt["applied_actions"]
+      .as_array()
+      .is_some_and(|actions| !actions.is_empty())
+  );
+  assert!(
+    apply_receipt["resulting_objects"]
+      .as_array()
+      .is_some_and(|objects| objects.iter().any(|object| object["kind"] == "commit"))
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_plan_rejects_unreviewed_file_before_mutation() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("release-authority", "0.1.0")?;
+  ws.write_release_config(
+    r#"tag_prefix = "v"
+tag_format = "v{version}"
+require_clean = false
+"#,
+  )?;
+  let config_head = ws.commit("Configure release")?;
+
+  let check = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--check",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--skip-tag",
+      "--json",
+    ],
+  )?;
+  assert_eq!(check.status.code(), Some(1));
+  let plan_dir = TempDir::new()?;
+  let plan_path = plan_dir.path().join("release-plan.json");
+  std::fs::write(&plan_path, &check.stdout)?;
+
+  let unreviewed = ws.path.join("unreviewed.txt");
+  std::fs::write(&unreviewed, "must not enter the release commit\n")?;
+  let apply = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--skip-tag",
+      "--yes",
+      "--plan",
+      plan_path.to_string_lossy().as_ref(),
+    ],
+  )?;
+
+  assert!(
+    !apply.status.success(),
+    "release must reject post-approval worktree drift"
+  );
+  let stderr = String::from_utf8_lossy(&apply.stderr);
+  assert!(
+    stderr.contains("worktree changed") && stderr.contains("unreviewed.txt"),
+    "error must identify the unreviewed path\nstderr:\n{}",
+    stderr
+  );
+  let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+  assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), config_head);
+  assert!(
+    unreviewed.exists(),
+    "rejected input should be left untouched for recovery"
+  );
+  assert!(
+    !String::from_utf8_lossy(&git(&ws.path, &["ls-tree", "-r", "--name-only", "HEAD"])?.stdout)
+      .contains("unreviewed.txt"),
+    "unreviewed file must never be committed"
   );
 
   Ok(())

@@ -9,6 +9,56 @@ use std::process::Command;
 const GOLDEN_PLAN_JSON: &str = include_str!("../fixtures/plan/plan_json.golden");
 const GOLDEN_PLAN_GITHUB: &str = include_str!("../fixtures/plan/plan_github.golden");
 const GOLDEN_PLAN_GITHUB_DEBUG: &str = include_str!("../fixtures/plan/plan_github_debug.golden");
+const PLAN_V3_SCHEMA: &str = include_str!("../../schemas/plan-v3.schema.json");
+
+#[test]
+fn test_plan_schema_command_matches_published_schema() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-schema-command")?;
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--schema"])?;
+
+  assert!(
+    output.status.success(),
+    "plan --schema should not require workspace metadata"
+  );
+  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V3_SCHEMA);
+  assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_json_validates_against_published_schema() -> Result<()> {
+  let ws = setup_golden_workspace("plan-schema-validation")?;
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--since", "origin/main", "--format", "json"],
+  )?;
+  assert!(output.status.success(), "plan json should succeed");
+
+  let schema: Value = serde_json::from_str(PLAN_V3_SCHEMA)?;
+  let instance: Value = serde_json::from_slice(&output.stdout)?;
+  let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid planner schema: {error}"))?;
+  let errors: Vec<_> = validator
+    .iter_errors(&instance)
+    .map(|error| error.to_string())
+    .collect();
+  assert!(
+    errors.is_empty(),
+    "planner output failed its published schema: {errors:#?}"
+  );
+
+  let mut invalid = instance;
+  invalid
+    .as_object_mut()
+    .ok_or_else(|| anyhow!("plan output is not an object"))?
+    .remove("scope");
+  assert!(
+    !validator.is_valid(&invalid),
+    "schema must reject a contract missing a required field"
+  );
+
+  Ok(())
+}
 
 #[test]
 fn test_plan_json_contract_and_impact() -> Result<()> {
@@ -66,13 +116,14 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   );
   assert_eq!(
     json["scope"]["scope_contract_version"],
-    serde_json::Value::Number(1.into())
+    serde_json::Value::Number(2.into())
   );
   assert_eq!(
     json["scope"]["mode"],
     serde_json::Value::String("workspace".to_string())
   );
   assert_eq!(json["scope"]["crates"], serde_json::json!([]));
+  assert_eq!(json["scope"]["cargo_args"], serde_json::json!(["--workspace"]));
 
   assert_eq!(json["surfaces"]["build"]["enabled"], serde_json::Value::Bool(true));
   assert_eq!(json["surfaces"]["test"]["enabled"], serde_json::Value::Bool(true));
@@ -1366,17 +1417,28 @@ fn test_plan_github_projections() -> Result<()> {
     .collect();
 
   // All projection keys must be present
-  let expected_keys = ["build", "test", "bench", "docs", "infra", "base_ref", "scope_json"];
+  let expected_keys = [
+    "build",
+    "test",
+    "bench",
+    "docs",
+    "infra",
+    "base_ref",
+    "cargo_args",
+    "scope_json",
+  ];
   for key in expected_keys {
     assert!(kv.contains_key(key), "missing key: {}", key);
   }
 
   assert_eq!(kv["base_ref"], "origin/main");
+  assert_eq!(kv["cargo_args"], "--workspace");
 
   let scope_json: Value = serde_json::from_str(&kv["scope_json"])?;
   assert_eq!(scope_json["mode"], serde_json::json!("workspace"));
   assert_eq!(scope_json["crates"], serde_json::json!([]));
-  assert_eq!(scope_json["scope_contract_version"], serde_json::json!(1));
+  assert_eq!(scope_json["cargo_args"], serde_json::json!(["--workspace"]));
+  assert_eq!(scope_json["scope_contract_version"], serde_json::json!(2));
   assert_eq!(scope_json["resolved_head"], serde_json::json!("WORKTREE"));
   assert!(
     !kv.contains_key("plan_json"),
@@ -1438,7 +1500,16 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
     .ok_or_else(|| anyhow!("missing scope_json key in github output"))?;
   let scope_json: Value = serde_json::from_str(scope_json_raw)?;
 
-  let ordered_keys = ["build", "test", "bench", "docs", "infra", "base_ref", "scope_json"];
+  let ordered_keys = [
+    "build",
+    "test",
+    "bench",
+    "docs",
+    "infra",
+    "base_ref",
+    "cargo_args",
+    "scope_json",
+  ];
 
   let mut lines = Vec::new();
   for key in ordered_keys {
@@ -1486,6 +1557,7 @@ fn normalize_plan_github_debug_output(stdout: &str) -> Result<String> {
     "docs",
     "infra",
     "base_ref",
+    "cargo_args",
     "scope_json",
     "plan_json",
   ];

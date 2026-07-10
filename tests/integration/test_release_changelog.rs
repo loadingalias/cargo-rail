@@ -57,6 +57,28 @@ fn file_url(path: &Path) -> String {
   }
 }
 
+fn run_release_with_fault(cwd: &Path, args: &[&str], fault: &str) -> Result<std::process::Output> {
+  Ok(
+    Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+      .current_dir(cwd)
+      .env("GIT_CONFIG_COUNT", "2")
+      .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+      .env("GIT_CONFIG_VALUE_0", "false")
+      .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+      .env("GIT_CONFIG_VALUE_1", "false")
+      .env("CARGO_RAIL_RELEASE_FAIL_AFTER", fault)
+      .args(args)
+      .output()?,
+  )
+}
+
+fn only_release_state(workspace: &Path) -> Result<PathBuf> {
+  std::fs::read_dir(workspace.join("target/cargo-rail/releases"))?
+    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    .find(|path| path.extension().is_some_and(|extension| extension == "json"))
+    .ok_or_else(|| anyhow::anyhow!("missing release state"))
+}
+
 #[test]
 fn release_plan_works_on_single_crate_repo() -> Result<()> {
   // Test that release plan works on a split repo (single-crate, non-workspace)
@@ -520,6 +542,55 @@ fn release_plan_auto_reports_skipped_crates_with_reason() -> Result<()> {
     "summary should count skipped crates\nstdout:\n{}",
     stdout
   );
+
+  Ok(())
+}
+
+#[test]
+fn release_plan_auto_noops_when_all_crates_are_skipped() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-auto-noop")?;
+  write_release_config(&ws, "")?;
+
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  tag_release(&ws, "lib-a", "0.1.0")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "--all", "--bump", "auto", "--check"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(
+    output.status.success(),
+    "check mode should succeed when there are no planned release mutations\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    stdout.contains("No release-worthy changes detected."),
+    "no-op check output should explain that nothing will be applied\nstdout:\n{}",
+    stdout
+  );
+  assert!(
+    !stdout.contains("Changes detected."),
+    "no-op check output must not report pending changes\nstdout:\n{}",
+    stdout
+  );
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail", "release", "run", "--all", "--bump", "auto", "--check", "--format", "json",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)?;
+
+  assert!(output.status.success(), "json no-op check should succeed\n{}", stdout);
+  assert_eq!(json["result"], serde_json::json!("no_changes"));
+  assert_eq!(json["exit_code"], serde_json::json!(0));
+  assert_eq!(json["mutation_plan"]["actions"], serde_json::json!([]));
 
   Ok(())
 }
@@ -1024,6 +1095,138 @@ fn change_add_and_status_support_json_output() -> Result<()> {
   assert_eq!(json["crates"][0]["bump"], "minor");
   assert_eq!(json["files"][0]["intents"][0]["crate"], "lib-a");
   assert_eq!(json["files"][0]["intents"][0]["bump"], "minor");
+
+  Ok(())
+}
+
+#[test]
+fn change_status_names_only_is_empty_without_pending_files() -> Result<()> {
+  let ws = TestWorkspace::new_named("change-names-only-empty")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "change", "status", "--format", "names-only"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(output.status.success(), "change status should succeed\n{}", stdout);
+  assert_eq!(stdout, "", "names-only should be empty when no change files exist");
+
+  Ok(())
+}
+
+#[test]
+fn change_status_names_only_lists_pending_change_paths() -> Result<()> {
+  let ws = TestWorkspace::new_named("change-names-only-pending")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "change",
+      "add",
+      "lib-a",
+      "--bump",
+      "minor",
+      "--message",
+      "Added names-only change status.",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "change add should succeed\n{}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  let output = run_cargo_rail(&ws.path, &["rail", "change", "status", "--format", "names-only"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(output.status.success(), "change status should succeed\n{}", stdout);
+  let lines: Vec<_> = stdout.lines().collect();
+  assert_eq!(lines.len(), 1, "one pending file should be listed\n{}", stdout);
+  assert!(
+    lines[0].starts_with(".changes/"),
+    "path should be workspace-relative: {}",
+    lines[0]
+  );
+  assert!(
+    lines[0].ends_with(".md"),
+    "path should name a markdown change file: {}",
+    lines[0]
+  );
+  assert!(
+    !stdout.contains("no pending change files"),
+    "names-only should not include human status text"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn change_check_required_fails_when_changed_crate_lacks_change_file() -> Result<()> {
+  let ws = TestWorkspace::new_named("change-check-missing")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() -> bool { true }")?;
+  ws.commit("Change lib-a source")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "change", "check", "--merge-base", "--required"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "missing change file should fail as a check result\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(stdout.contains("missing change files"), "stdout:\n{}", stdout);
+  assert!(stdout.contains("lib-a"), "stdout:\n{}", stdout);
+
+  Ok(())
+}
+
+#[test]
+fn change_check_required_passes_when_changed_crate_has_change_file() -> Result<()> {
+  let ws = TestWorkspace::new_named("change-check-covered")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  git(&ws.path, &["branch", "origin/main"])?;
+
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() -> bool { true }")?;
+  ws.commit("Change lib-a source")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "change",
+      "add",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--message",
+      "Documented the source change.",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "change add should succeed\n{}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "change", "check", "--since", "origin/main", "--required"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(output.status.success(), "change check should pass\n{}", stdout);
+  assert!(stdout.contains("change files: ok"), "stdout:\n{}", stdout);
 
   Ok(())
 }
@@ -1979,6 +2182,55 @@ push = true
 }
 
 #[test]
+fn test_release_resume_reconciles_push_that_completed_before_failure() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("push-resume", "0.1.0")?;
+  let remote = tempfile::TempDir::new()?;
+  git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+  ws.set_remote(remote.path().to_str().unwrap())?;
+  git(&ws.path, &["push", "-u", "origin", "main"])?;
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_clean = false
+require_release_notes = false
+push = true
+"#,
+  )?;
+
+  let interrupted = run_release_with_fault(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+    "push",
+  )?;
+  assert!(!interrupted.status.success());
+  let state_path = only_release_state(&ws.path)?;
+  let remote_before = git(&ws.path, &["ls-remote", "origin", "refs/heads/main"])?;
+
+  let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+  assert!(
+    resumed.status.success(),
+    "resume stderr:\n{}",
+    String::from_utf8_lossy(&resumed.stderr)
+  );
+  let remote_after = git(&ws.path, &["ls-remote", "origin", "refs/heads/main"])?;
+  assert_eq!(
+    remote_before.stdout, remote_after.stdout,
+    "resume should reconcile, not create another commit"
+  );
+  let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+  assert_eq!(state["status"], "complete");
+  Ok(())
+}
+
+#[test]
 fn test_release_notes_override_satisfies_required_notes() -> Result<()> {
   let ws = TestWorkspace::new_single_crate("manual-notes", "0.1.0")?;
   ws.write_release_config(
@@ -2512,6 +2764,96 @@ fn test_release_check_extended_json() -> Result<()> {
 }
 
 // Release Safety Tests (Branch Detection)
+
+#[test]
+fn test_release_resume_reconciles_tag_created_before_failure() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-resume-tag")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial release")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn resumed() {}")?;
+  ws.commit("feat: resumable release")?;
+
+  let interrupted = run_release_with_fault(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+    "tag",
+  )?;
+  assert!(!interrupted.status.success());
+  assert!(String::from_utf8_lossy(&interrupted.stderr).contains("cargo rail release resume"));
+  let state_path = only_release_state(&ws.path)?;
+  let before = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
+
+  let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+  assert!(
+    resumed.status.success(),
+    "resume failed:\n{}",
+    String::from_utf8_lossy(&resumed.stderr)
+  );
+  let after = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
+  assert_eq!(
+    before.stdout, after.stdout,
+    "resume must not duplicate the release commit"
+  );
+  let tags = git(&ws.path, &["tag", "--list", "v0.1.1"])?;
+  assert_eq!(String::from_utf8_lossy(&tags.stdout).lines().count(), 1);
+  let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+  assert_eq!(state["status"], "complete");
+  Ok(())
+}
+
+#[test]
+fn test_release_abort_restores_local_state_before_remote_side_effects() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-abort-local")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial release")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn abortable() {}")?;
+  let initial = ws.commit("feat: abortable release")?;
+
+  let interrupted = run_release_with_fault(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+    "commit:lib-a",
+  )?;
+  assert!(!interrupted.status.success());
+  let state_path = only_release_state(&ws.path)?;
+  let aborted = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+  )?;
+  assert!(
+    aborted.status.success(),
+    "abort stderr:\n{}",
+    String::from_utf8_lossy(&aborted.stderr)
+  );
+  let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+  assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), initial);
+  assert!(!String::from_utf8_lossy(&git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout).contains("v0.1.1"));
+  let manifest = std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?;
+  assert!(manifest.contains("version = \"0.1.0\""));
+  Ok(())
+}
 
 /// Test that release apply requires explicit confirmation in non-interactive mode
 #[test]

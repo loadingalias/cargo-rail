@@ -4,4 +4,5 @@ bench=false
 docs=false
 infra=false
 base_ref=origin/main
-scope_json={"crates":[],"mode":"workspace","resolved_base":"origin/main","resolved_head":"WORKTREE","scope_contract_version":1,"surfaces":{"bench":false,"build":true,"docs":false,"infra":false,"test":true}}
+cargo_args=--workspace
+scope_json={"cargo_args":["--workspace"],"crates":[],"mode":"workspace","resolved_base":"origin/main","resolved_head":"WORKTREE","scope_contract_version":2,"surfaces":{"bench":false,"build":true,"docs":false,"infra":false,"test":true}}

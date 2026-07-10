@@ -19,8 +19,10 @@ fn test_git_notes_basic_flow() -> Result<()> {
   let mut store = MappingStore::new("test-crate".to_string());
 
   // Record some mappings
-  store.record_mapping(&sha1, "remote_sha_1")?;
-  store.record_mapping(&sha2, "remote_sha_2")?;
+  let remote_1 = "1111111111111111111111111111111111111111";
+  let remote_2 = "2222222222222222222222222222222222222222";
+  store.record_mapping(&sha1, remote_1)?;
+  store.record_mapping(&sha2, remote_2)?;
 
   // Save to git notes
   store.save(repo_path)?;
@@ -34,8 +36,8 @@ fn test_git_notes_basic_flow() -> Result<()> {
   let mut loaded_store = MappingStore::new("test-crate".to_string());
   loaded_store.load(repo_path)?;
 
-  assert_eq!(loaded_store.get_mapping(&sha1)?, Some("remote_sha_1".to_string()));
-  assert_eq!(loaded_store.get_mapping(&sha2)?, Some("remote_sha_2".to_string()));
+  assert_eq!(loaded_store.get_mapping(&sha1)?, Some(remote_1.to_string()));
+  assert_eq!(loaded_store.get_mapping(&sha2)?, Some(remote_2.to_string()));
 
   Ok(())
 }
@@ -73,7 +75,7 @@ fn test_git_notes_conflict_resolution() -> Result<()> {
   // Remote side: Add mapping for target_sha -> remote_val
   {
     let mut store = MappingStore::new("test-crate".to_string());
-    store.record_mapping(&target_sha, "remote_val")?;
+    store.record_mapping(&target_sha, "1111111111111111111111111111111111111111")?;
     store.save(remote_path)?;
     // We need to push these notes to the remote's refs/notes/rail/test-crate
     // But here we are acting ON the remote repo directly, so save() wrote to local refs.
@@ -83,35 +85,24 @@ fn test_git_notes_conflict_resolution() -> Result<()> {
   // Local side: Add mapping for target_sha -> local_val (CONFLICT!)
   {
     let mut store = MappingStore::new("test-crate".to_string());
-    store.record_mapping(&target_sha, "local_val")?;
+    store.record_mapping(&target_sha, "2222222222222222222222222222222222222222")?;
     store.save(local_path)?;
   }
 
   // 4. Try to fetch/merge notes in local repo
   let store = MappingStore::new("test-crate".to_string());
 
-  // This should trigger the conflict resolution logic (union merge)
-  store.fetch_notes(local_path, "origin")?;
+  // Divergent one-to-many mappings require an operator decision. They must not
+  // be concatenated into a value later consumed as a commit ID.
+  let error = store.fetch_notes(local_path, "origin").unwrap_err();
+  assert!(error.to_string().contains("maps to both"), "unexpected error: {error}");
 
-  // 5. Verify both mappings exist (union merge keeps both lines in the note)
-  // Note: MappingStore::load reads the note. If it has multiple lines, it might pick one or fail parsing?
-  // Let's check MappingStore::load implementation.
-  // It reads `git notes show`. If union merge happened, the note content will be the concatenation.
-  // "remote_val\nlocal_val" or similar.
-  // MappingStore::load does `let target_sha = note_content.trim();`.
-  // If there are multiple lines, `trim()` might keep them or if it expects a single SHA it might be weird.
-  // But for the purpose of robustness, we just want to ensure `fetch_notes` didn't crash and merged successfully.
-
-  // Let's check the actual note content
-  let output = git(
-    local_path,
-    &["notes", "--ref=refs/notes/rail/test-crate", "show", &target_sha],
-  )?;
-  let content = String::from_utf8_lossy(&output.stdout);
-
-  println!("Merged note content:\n{}", content);
-  assert!(content.contains("remote_val"));
-  assert!(content.contains("local_val"));
+  let mut loaded = MappingStore::new("test-crate".to_string());
+  loaded.load(local_path)?;
+  assert_eq!(
+    loaded.get_mapping(&target_sha)?,
+    Some("2222222222222222222222222222222222222222".to_string())
+  );
 
   Ok(())
 }

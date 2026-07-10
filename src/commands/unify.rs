@@ -616,9 +616,15 @@ pub fn run_unify_apply(
   no_report: bool,
   report_path: Option<std::path::PathBuf>,
   plan_path: Option<std::path::PathBuf>,
+  format: UnifyOutputFormat,
 ) -> RailResult<()> {
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
+
+  let json = format.is_json();
+  if json {
+    crate::output::set_json_mode(true);
+  }
 
   // Create analyzer (config comes from rail.toml via ctx)
   let analyzer = UnifyAnalyzer::new(ctx)?;
@@ -642,7 +648,22 @@ pub fn run_unify_apply(
   }
 
   if !plan.has_planned_changes(msrv_write_needed) {
-    println!("nothing to unify");
+    if json {
+      let output = crate::output::machine_json_envelope(
+        "unify",
+        "apply",
+        "unchanged",
+        0,
+        serde_json::json!({
+          "dependencies": 0,
+          "members": 0,
+          "portable": false,
+        }),
+      );
+      println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+      println!("nothing to unify");
+    }
     return Ok(());
   }
 
@@ -666,13 +687,8 @@ pub fn run_unify_apply(
         "use a plan generated from 'cargo rail unify --check -f json'".to_string(),
       ));
     }
-    mutation::validate_pre_apply(ctx, &from_file)?;
-    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
-      return Err(RailError::with_help(
-        "provided plan does not match current requested unify operation".to_string(),
-        "regenerate the plan and re-run apply with --plan".to_string(),
-      ));
-    }
+    mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
+    mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
     from_file
   } else {
     mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
@@ -816,9 +832,12 @@ pub fn run_unify_apply(
     writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
   }
 
+  let msrv_warning = plan.computed_msrv.as_ref().and_then(|msrv| msrv.warning.clone());
   if let Some(ref msrv) = plan.computed_msrv {
     // Show warning if workspace mode has compatibility issues
-    if let Some(ref warning) = msrv.warning {
+    if let Some(ref warning) = msrv.warning
+      && !json
+    {
       crate::warn!("{}", warning);
     }
     if msrv_write_needed {
@@ -832,6 +851,7 @@ pub fn run_unify_apply(
     }
   }
 
+  let mut written_report_path = None;
   if !no_report {
     let actual_report_path = report_path.unwrap_or_else(|| {
       ctx
@@ -842,29 +862,9 @@ pub fn run_unify_apply(
     });
     UnifyReport::write_to_file(&plan, &actual_report_path)?;
     progress!("report: {}", actual_report_path.display());
+    written_report_path = Some(actual_report_path);
   }
 
-  // Summary
-  println!(
-    "\nunified {} dependencies across {} members",
-    plan.workspace_deps.len(),
-    plan.member_edits.len()
-  );
-  if !plan.transitive_pins.is_empty() {
-    println!("  {} transitives pinned", plan.transitive_pins.len());
-  }
-  if !plan.duplicates_cleaned.is_empty() {
-    println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
-  }
-  if !plan.pruned_features.is_empty() {
-    println!("  {} dead features pruned (empty no-ops)", plan.pruned_features.len());
-  }
-  if !plan.optional_features.is_empty() {
-    println!(
-      "  {} optional features detected (user-facing, preserved)",
-      plan.optional_features.len()
-    );
-  }
   // Count undeclared feature fixes
   let features_fixed: usize = plan
     .member_edits
@@ -875,48 +875,68 @@ pub fn run_unify_apply(
       _ => None,
     })
     .sum();
-  if features_fixed > 0 {
-    let crates_fixed: std::collections::HashSet<_> = plan
-      .member_edits
-      .iter()
-      .filter(|(_, edits)| {
-        edits
-          .iter()
-          .any(|e| matches!(e, crate::cargo::MemberEdit::AddFeatures { .. }))
-      })
-      .map(|(name, _)| name)
-      .collect();
-    println!(
-      "  {} undeclared features fixed across {} crates",
-      features_fixed,
-      crates_fixed.len()
-    );
-  }
-  if let Some(ref msrv) = plan.computed_msrv {
-    use crate::cargo::MsrvSourceUsed;
-    let source_desc = match msrv.source_used {
-      MsrvSourceUsed::Deps => format!(
-        "from deps: {}",
-        msrv.contributors.first().unwrap_or(&"unknown".to_string())
-      ),
-      MsrvSourceUsed::Workspace => "preserved from workspace".to_string(),
-      MsrvSourceUsed::MaxWorkspace => "from workspace (higher than deps)".to_string(),
-      MsrvSourceUsed::MaxDeps => format!(
-        "from deps: {}",
-        msrv.contributors.first().unwrap_or(&"unknown".to_string())
-      ),
-    };
-    println!(
-      "  rust-version = {}.{}.{} ({})",
-      msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
-    );
-  }
+  let crates_fixed = plan
+    .member_edits
+    .values()
+    .filter(|edits| {
+      edits
+        .iter()
+        .any(|e| matches!(e, crate::cargo::MemberEdit::AddFeatures { .. }))
+    })
+    .count();
 
-  println!("\nnext: cargo check && cargo test");
+  if !json {
+    println!(
+      "\nunified {} dependencies across {} members",
+      plan.workspace_deps.len(),
+      plan.member_edits.len()
+    );
+    if !plan.transitive_pins.is_empty() {
+      println!("  {} transitives pinned", plan.transitive_pins.len());
+    }
+    if !plan.duplicates_cleaned.is_empty() {
+      println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
+    }
+    if !plan.pruned_features.is_empty() {
+      println!("  {} dead features pruned (empty no-ops)", plan.pruned_features.len());
+    }
+    if !plan.optional_features.is_empty() {
+      println!(
+        "  {} optional features detected (user-facing, preserved)",
+        plan.optional_features.len()
+      );
+    }
+    if features_fixed > 0 {
+      println!(
+        "  {} undeclared features fixed across {} crates",
+        features_fixed, crates_fixed
+      );
+    }
+    if let Some(ref msrv) = plan.computed_msrv {
+      use crate::cargo::MsrvSourceUsed;
+      let source_desc = match msrv.source_used {
+        MsrvSourceUsed::Deps => format!(
+          "from deps: {}",
+          msrv.contributors.first().unwrap_or(&"unknown".to_string())
+        ),
+        MsrvSourceUsed::Workspace => "preserved from workspace".to_string(),
+        MsrvSourceUsed::MaxWorkspace => "from workspace (higher than deps)".to_string(),
+        MsrvSourceUsed::MaxDeps => format!(
+          "from deps: {}",
+          msrv.contributors.first().unwrap_or(&"unknown".to_string())
+        ),
+      };
+      println!(
+        "  rust-version = {}.{}.{} ({})",
+        msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
+      );
+    }
 
-  // Show undo hint if backup was created
-  if let Some(backup_id) = created_backup_id {
-    println!("undo: cargo rail unify undo  (backup: {})", backup_id);
+    println!("\nnext: cargo check && cargo test");
+
+    if let Some(ref backup_id) = created_backup_id {
+      println!("undo: cargo rail unify undo  (backup: {})", backup_id);
+    }
   }
 
   let apply_receipt = mutation::write_receipt(
@@ -931,6 +951,31 @@ pub fn run_unify_apply(
     ],
   )?;
   progress!("receipt: {}", apply_receipt.display());
+
+  if json {
+    let warnings = msrv_warning.into_iter().collect::<Vec<_>>();
+    let output = crate::output::machine_json_envelope(
+      "unify",
+      "apply",
+      "applied",
+      0,
+      serde_json::json!({
+        "dependencies": plan.workspace_deps.len(),
+        "members": plan.member_edits.len(),
+        "transitives_pinned": plan.transitive_pins.len(),
+        "duplicates_resolved": plan.duplicates_cleaned.len(),
+        "features_pruned": plan.pruned_features.len(),
+        "optional_features_preserved": plan.optional_features.len(),
+        "undeclared_features_fixed": features_fixed,
+        "backup_id": created_backup_id,
+        "report_path": written_report_path,
+        "plan_receipt": plan_receipt,
+        "apply_receipt": apply_receipt,
+        "warnings": warnings,
+      }),
+    );
+    println!("{}", serde_json::to_string_pretty(&output)?);
+  }
 
   Ok(())
 }

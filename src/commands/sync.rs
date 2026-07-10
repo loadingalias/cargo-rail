@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
+use crate::commands::common::{SplitSyncConfigBuilder, TextJsonOutputFormat, enforce_safety_gate};
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
@@ -39,12 +39,14 @@ pub struct SyncArgs {
   pub check: bool,
   /// Apply from a previously generated mutation plan file
   pub plan_path: Option<PathBuf>,
+  /// Resume from a durable manual-conflict receipt.
+  pub resume: Option<PathBuf>,
   /// Allow running on dirty worktree (uncommitted changes)
   pub allow_dirty: bool,
   /// Skip confirmation prompts (for CI/automation)
   pub yes: bool,
   /// Output format
-  pub format: OutputFormat,
+  pub format: TextJsonOutputFormat,
 }
 
 /// Run the sync command
@@ -54,6 +56,10 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   // JSON mode enables structured error output and suppresses progress
   if json {
     crate::output::set_json_mode(true);
+  }
+
+  if let Some(receipt) = args.resume.as_deref() {
+    return run_sync_resume(ctx, receipt, json);
   }
 
   // Dirty worktree check (unless --allow-dirty or --check mode)
@@ -205,13 +211,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         "generate a sync plan using 'cargo rail sync --check -f json'".to_string(),
       ));
     }
-    mutation::validate_pre_apply(ctx, &from_file)?;
-    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
-      return Err(RailError::with_help(
-        "provided sync plan does not match current requested operation",
-        "regenerate the sync plan and rerun with --plan",
-      ));
-    }
+    mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
+    mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
     from_file
   } else {
     mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
@@ -233,26 +234,61 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
   // Execute syncs and collect per-crate results
   let configs_for_exec = configs.clone();
-  let crate_results: Vec<CrateSyncResult> = if config_count > 1 && args.all {
-    progress!("syncing {} crates...", config_count);
+  let crate_results: Vec<CrateSyncResult> =
+    if config_count > 1 && args.all && matches!(direction, SyncDirection::MonoToRemote) {
+      progress!("syncing {} crates...", config_count);
 
-    let strategy = args.strategy;
-    let results: Vec<RailResult<CrateSyncResult>> = configs_for_exec
-      .into_par_iter()
-      .map(|(sync_config, target_exists)| {
+      let strategy = args.strategy;
+      let results: Vec<RailResult<CrateSyncResult>> = configs_for_exec
+        .into_par_iter()
+        .map(|(sync_config, target_exists)| {
+          let crate_name = sync_config.crate_name.clone();
+
+          if !target_exists {
+            progress!("  {} skipped (run split first)", crate_name);
+            return Ok(CrateSyncResult {
+              crate_name,
+              result: SyncResult::default(),
+              skipped: true,
+            });
+          }
+
+          progress!("  {}", crate_name);
+          let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
+
+          let result = match direction {
+            SyncDirection::MonoToRemote => engine.sync_to_remote()?,
+            SyncDirection::RemoteToMono => engine.sync_from_remote()?,
+            SyncDirection::Both => engine.sync_bidirectional()?,
+            SyncDirection::None => SyncResult::default(),
+          };
+
+          Ok(CrateSyncResult {
+            crate_name,
+            result,
+            skipped: false,
+          })
+        })
+        .collect();
+
+      results.into_iter().collect::<RailResult<Vec<_>>>()?
+    } else {
+      let mut results = Vec::new();
+      for (sync_config, target_exists) in configs_for_exec {
         let crate_name = sync_config.crate_name.clone();
 
         if !target_exists {
-          progress!("  {} skipped (run split first)", crate_name);
-          return Ok(CrateSyncResult {
+          progress!("{} skipped (run split first)", crate_name);
+          results.push(CrateSyncResult {
             crate_name,
             result: SyncResult::default(),
             skipped: true,
           });
+          continue;
         }
 
-        progress!("  {}", crate_name);
-        let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
+        progress!("syncing {}...", crate_name);
+        let mut engine = SyncEngine::new(ctx, sync_config, args.strategy)?;
 
         let result = match direction {
           SyncDirection::MonoToRemote => engine.sync_to_remote()?,
@@ -260,55 +296,31 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
           SyncDirection::Both => engine.sync_bidirectional()?,
           SyncDirection::None => SyncResult::default(),
         };
+        let conflicted = result.status == crate::sync::SyncStatus::Conflicted;
 
-        Ok(CrateSyncResult {
+        results.push(CrateSyncResult {
           crate_name,
           result,
           skipped: false,
-        })
-      })
-      .collect();
-
-    results.into_iter().collect::<RailResult<Vec<_>>>()?
-  } else {
-    let mut results = Vec::new();
-    for (sync_config, target_exists) in configs_for_exec {
-      let crate_name = sync_config.crate_name.clone();
-
-      if !target_exists {
-        progress!("{} skipped (run split first)", crate_name);
-        results.push(CrateSyncResult {
-          crate_name,
-          result: SyncResult::default(),
-          skipped: true,
         });
-        continue;
+        if conflicted {
+          break;
+        }
       }
-
-      progress!("syncing {}...", crate_name);
-      let mut engine = SyncEngine::new(ctx, sync_config, args.strategy)?;
-
-      let result = match direction {
-        SyncDirection::MonoToRemote => engine.sync_to_remote()?,
-        SyncDirection::RemoteToMono => engine.sync_from_remote()?,
-        SyncDirection::Both => engine.sync_bidirectional()?,
-        SyncDirection::None => SyncResult::default(),
-      };
-
-      results.push(CrateSyncResult {
-        crate_name,
-        result,
-        skipped: false,
-      });
-    }
-    results
-  };
+      results
+    };
 
   // Print summary
   print_sync_summary(&crate_results, json)?;
   let post_heads = collect_sync_heads(ctx.workspace_root(), &configs);
   let audit_path = write_sync_audit_artifact(ctx.workspace_root(), &configs, &crate_results, &pre_heads, &post_heads)?;
   progress!("sync audit: {}", audit_path.display());
+  if crate_results
+    .iter()
+    .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted)
+  {
+    return Err(RailError::ExitWithCode { code: 1 });
+  }
   let apply_receipt = mutation::write_receipt(
     ctx.workspace_root(),
     "sync",
@@ -322,6 +334,40 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   )?;
   progress!("receipt: {}", apply_receipt.display());
 
+  Ok(())
+}
+
+fn run_sync_resume(ctx: &WorkspaceContext, receipt: &Path, json: bool) -> RailResult<()> {
+  let crate_name = crate::sync::engine::conflict_receipt_crate(ctx.workspace_root(), receipt)?;
+  let configs = SplitSyncConfigBuilder::new(ctx)?
+    .with_crate_or_all(Some(crate_name.clone()), false)?
+    .validate()?
+    .build_sync_configs()?;
+  let (config, target_exists) = configs
+    .into_iter()
+    .next()
+    .ok_or_else(|| RailError::message(format!("no sync configuration for '{}'", crate_name)))?;
+  if !target_exists {
+    return Err(RailError::with_help(
+      format!("split target for '{}' no longer exists", crate_name),
+      "restore the split worktree before resuming",
+    ));
+  }
+
+  let mut engine = SyncEngine::new(ctx, config, ConflictStrategy::Manual)?;
+  let result = engine.resume_from_receipt(receipt)?;
+  let results = vec![CrateSyncResult {
+    crate_name,
+    result,
+    skipped: false,
+  }];
+  print_sync_summary(&results, json)?;
+  if results
+    .iter()
+    .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted)
+  {
+    return Err(RailError::ExitWithCode { code: 1 });
+  }
   Ok(())
 }
 
@@ -342,6 +388,8 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
           "crate": r.crate_name,
           "commits_synced": r.result.commits_synced,
           "conflicts": conflicts,
+          "status": if r.result.status == crate::sync::SyncStatus::Conflicted { "conflicted" } else { "complete" },
+          "conflict_receipt": r.result.conflict_receipt,
           "skipped": r.skipped
         })
       })
@@ -350,6 +398,9 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
     let total_commits: usize = results.iter().map(|r| r.result.commits_synced).sum();
     let total_conflicts: usize = results.iter().map(|r| r.result.conflicts.len()).sum();
 
+    let conflicted = results
+      .iter()
+      .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted);
     let payload = serde_json::json!({
       "command": "sync",
       "crates": crates,
@@ -360,7 +411,13 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
         "crates_skipped": results.iter().filter(|r| r.skipped).count()
       }
     });
-    let output = crate::output::machine_json_envelope("sync", "apply", "success", 0, payload);
+    let output = crate::output::machine_json_envelope(
+      "sync",
+      "apply",
+      if conflicted { "conflicted" } else { "success" },
+      if conflicted { 1 } else { 0 },
+      payload,
+    );
     println!("{}", serde_json::to_string_pretty(&output)?);
     return Ok(());
   }
@@ -369,6 +426,9 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
   let active_results: Vec<_> = results.iter().filter(|r| !r.skipped).collect();
   let total_commits: usize = active_results.iter().map(|r| r.result.commits_synced).sum();
   let total_conflicts: usize = active_results.iter().map(|r| r.result.conflicts.len()).sum();
+  let conflicted = active_results
+    .iter()
+    .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted);
 
   // Per-crate details (only if multiple crates or conflicts)
   if active_results.len() > 1 || total_conflicts > 0 {
@@ -405,7 +465,17 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
 
   // Summary line
   let commit_word = if total_commits == 1 { "commit" } else { "commits" };
-  if total_conflicts > 0 {
+  if conflicted {
+    println!(
+      "sync conflicted: {} unresolved path(s); no conflicted commit was created",
+      total_conflicts
+    );
+    for result in &active_results {
+      if let Some(receipt) = &result.result.conflict_receipt {
+        println!("resume: cargo rail sync --resume {}", receipt.display());
+      }
+    }
+  } else if total_conflicts > 0 {
     let conflict_word = if total_conflicts == 1 { "conflict" } else { "conflicts" };
     println!(
       "sync complete: {} {}, {} {}",

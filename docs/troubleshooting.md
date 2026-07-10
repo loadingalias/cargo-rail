@@ -16,6 +16,7 @@ Check:
 - `surfaces.*.reasons`
 - `scope.mode`
 - `scope.crates`
+- `scope.cargo_args`
 
 Use `scope` for execution decisions. Use `impact` for diagnostic context.
 
@@ -43,25 +44,42 @@ git fetch --unshallow --tags
 
 In GitHub Actions, use `fetch-depth: 0` for release jobs.
 
-### Release failed after the release commit
+### Release execution stopped
 
-`release run` applies local mutations before public side effects. If a failure
-happens after the release commit is created but before publish completes, the
-repository may already contain:
+`release run` and `release finalize` print a durable state path before their
+first side effect. Resume that exact plan after any local, network, registry, or
+forge failure:
 
-- bumped manifests,
-- changelog sections for the target versions,
-- consumed change files in the release commit,
-- some local or pushed tags, depending on where the failure happened.
+```bash
+cargo rail release resume target/cargo-rail/releases/release-<id>.json
+```
 
-Re-run the same command first. cargo-rail checks existing versions and tags, so
-an idempotent retry is usually the clean path after a transient registry,
-network, or forge failure.
+Resume reconciles commits, tags, pushed refs, forge releases, and published
+crate versions before advancing. It never replans from already-bumped manifests
+or republishes an unobserved in-progress crate version.
 
-Revert only when the release should not happen. Reverting the release commit
-brings consumed change files back because they are normal tracked files in that
-commit. If tags were already pushed for a release you are abandoning, delete
-those tags deliberately before opening a new release plan.
+If no remote, forge, or registry side effect has started, abandon the release
+and restore its original local commit with:
+
+```bash
+cargo rail release abort target/cargo-rail/releases/release-<id>.json --yes
+```
+
+Abort refuses once an external side effect may exist; resume is the safe path
+from that point.
+
+### Sync stopped for manual conflict resolution
+
+Manual sync conflicts exit with status `1`, leave the merged files on the
+`cargo-rail-sync-<crate>` recovery branch, and print a receipt path. Resolve all
+listed files, remove every conflict marker, then commit through the receipt:
+
+```bash
+cargo rail sync --resume target/cargo-rail/receipts/sync-conflict-<crate>-<id>.json
+```
+
+Resume verifies the branch, parent commit, owned paths, and marker-free content
+before committing. Do not commit the conflict manually.
 
 ### Release PR finalize failed
 

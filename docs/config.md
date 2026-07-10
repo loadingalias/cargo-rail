@@ -241,7 +241,7 @@ Release automation settings for versioning, tagging, and publishing.
 | `tag_prefix` | `string` | `"v"` | Git tag prefix. Used via `{prefix}` placeholder in `tag_format`. |
 | `tag_format` | `string` | `"{crate}-{prefix}{version}"` | Tag template. Available variables:<br>• `{crate}` - Crate name<br>• `{version}` - Version number<br>• `{prefix}` - Value of `tag_prefix` |
 | `require_clean` | `bool` | `true` | Require clean working directory before release operations. |
-| `publish_delay` | `u64` | `5` | Delay between crate publishes in seconds. Allows crates.io to propagate dependencies. |
+| `publish_delay` | `u64` | `5` | Maximum registry-convergence polling interval in seconds. |
 | `create_github_release` | `bool` | `false` | Create forge releases via `gh` or `glab`. Requires `push = true`; cargo-rail pushes the tag first. GitHub releases are created as drafts and published after crates publish; GitLab releases are created directly. |
 | `forge` | `enum` | `"auto"` | Release-creation provider when release creation is enabled: `"auto"`, `"github"`, or `"gitlab"`. Auto detects GitHub/GitLab from `origin`; Gitea release creation is not supported. |
 | `push` | `bool` | `false` | Push release commits and tags to `origin` before public publishing. Uses an atomic push for the branch and release tags. |
@@ -274,6 +274,10 @@ sign_tags = true
 | `semver_check` | `enum` | `"warn"` | Optional `cargo-semver-checks` policy: `"off"`, `"warn"`, or `"deny"`. Only publishable library crates are checked. A confirmed breaking verdict escalates `--bump auto` to major and fails `release check --extended` under `"deny"`; inconclusive runs (no published baseline, network or build failure) report as skipped and never escalate or fail. |
 | `require_change_files` | `bool` or `string[]` | `false` | Require `.changes/*.md` coverage, or the configured `change_dir`, for all crates or selected crates. Coverage honors `[release.changelog.filters]`, so crates whose only changes sit in excluded paths are not gated. Consumption is all-or-nothing: a release plan covering only some of a change file's crates is rejected so no pending intent is lost. |
 | `version_groups` | `table` | `{}` | Named lockstep groups under `[release.version_groups]`. Group members must be workspace crates and may belong to at most one group. |
+
+Use `cargo rail change check --merge-base` to run the same coverage gate before
+release planning; add `--required` to require a change file for every changed
+crate regardless of `require_change_files`.
 
 #### [release.version_groups]
 
@@ -521,6 +525,7 @@ For a full end-to-end operating guide (local + CI + trust checklist), see:
 | `docs` | `"true"` when docs surface is enabled |
 | `infra` | `"true"` when infra surface is enabled |
 | `base_ref` | Resolved baseline ref used for change detection |
+| `cargo_args` | Cargo package selection from `scope` (`--workspace`, `-p crate ...`, or empty) |
 | `scope_json` | Compact execution handoff emitted by the planner |
 
 Use `cargo rail plan -f github-debug` when you also need `plan_json` for debugging or incident review.
@@ -592,7 +597,7 @@ User-defined profile schema:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `surfaces` | `string[]` | yes | Built-in run surfaces to execute: `build`, `test`, `bench`, `docs`. **Note:** `infra` and custom surfaces (defined in `[change-detection.custom]`) are planner outputs for CI job gating, not profile inputs. |
-| `run_args` | `string[]` | no | Args prepended before CLI `RUN_ARGS`. |
+| `run_args` | `string[]` | no | Args prepended before CLI `RUN_ARGS`. For test surfaces these are test-binary arguments; cargo-rail inserts `--`. |
 | `since` | `string?` | no | Default `--since` baseline when CLI does not pass `--since`/`--merge-base`. |
 | `merge_base` | `bool?` | no | Default merge-base mode when CLI does not pass `--since`/`--merge-base`. |
 
@@ -628,6 +633,11 @@ surfaces = ["bench"]
 run_args = ["--", "--bench", "critical", "{cargo_args}"]
 since = "{base_ref}"
 ```
+
+Test runner options are intentionally not inferred from `run_args`. Pass one portable `--test-filter`, Cargo-only options
+with repeated `--cargo-test-arg`, and nextest-only options with repeated `--nextest-arg`. Trailing `RUN_ARGS` are always
+test-binary arguments for the test surface. Backend-specific options select their matching backend in `auto` mode and fail
+before execution if they conflict with `--test-runner` or the backend is unavailable.
 
 ---
 
@@ -756,6 +766,7 @@ cargo rail sync my-lib --from-remote  # Split repo → monorepo (PR branch)
 - **Idempotent**: Uses git-notes to track synced commits; re-running only processes new commits
 - **PR branch protection**: `--from-remote` creates `cargo-rail-sync-<crate>` branch, never commits to main
 - **Conflict resolution**: `--strategy` controls merge behavior (`manual`, `ours`, `theirs`, `union`)
+- **Recoverable manual conflicts**: unresolved content exits `1` without a commit; resolve the receipt paths and run `cargo rail sync --resume <receipt>`
 
 ---
 

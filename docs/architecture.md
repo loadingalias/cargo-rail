@@ -49,6 +49,8 @@ Commands do not reload metadata independently.
 6. project execution scope
 
 `impact` is diagnostic. `scope` is the execution handoff.
+The scope carries the selected mode, selected crates, and ready-to-pass
+`cargo_args` so runners do not reconstruct Cargo invocation state.
 
 ## Unify Pipeline
 
@@ -58,6 +60,19 @@ Commands do not reload metadata independently.
 2. analyzes resolved dependencies
 3. computes a mutation plan
 4. applies lossless TOML edits
+
+## Mutation Authority
+
+Mutation plans are executable contracts, not summaries. Contract v2 binds `HEAD`,
+the complete dirty-path snapshot, declared read-only inputs, structured action
+payloads, and each authorized file mutation. Apply rejects drift immediately before
+the first write. Release commits stage only currently changed authorized paths;
+sync commits stage only the paths owned by the source commit.
+
+Split and sync parameters carry validated path capabilities. Source workspace,
+Git worktree, crate, target, and temporary roots are canonicalized before use;
+overlapping repositories and symlink escapes are rejected before mutation and
+revalidated at each filesystem destination.
 
 ## Design Choices
 

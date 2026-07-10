@@ -110,6 +110,7 @@ pub(crate) struct ExecutionScope {
   pub(crate) resolved_head: String,
   pub(crate) mode: ExecutionScopeMode,
   pub(crate) crates: Vec<String>,
+  pub(crate) cargo_args: Vec<String>,
   pub(crate) surfaces: BTreeMap<String, bool>,
 }
 
@@ -161,7 +162,8 @@ const RC_CONFIDENCE_STRICT_OWNER_EXPANSION: &str = "CONFIDENCE_STRICT_OWNER_EXPA
 const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIVE";
 const RC_BOT_PR_CONFIDENCE_OVERRIDE: &str = "BOT_PR_CONFIDENCE_OVERRIDE";
 const PLAN_CONTRACT_VERSION: u32 = 3;
-const SCOPE_CONTRACT_VERSION: u32 = 1;
+const SCOPE_CONTRACT_VERSION: u32 = 2;
+const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v3.schema.json");
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +183,11 @@ fn to_json<T: serde::Serialize>(value: &T) -> RailResult<String> {
 
 fn to_json_pretty<T: serde::Serialize>(value: &T) -> RailResult<String> {
   serde_json::to_string_pretty(value).map_err(json_err)
+}
+
+/// Print the JSON Schema for the current planner contract.
+pub fn print_plan_schema() {
+  print!("{}", PLAN_SCHEMA_JSON);
 }
 
 /// Run the plan command.
@@ -627,6 +634,7 @@ fn build_execution_scope(
   } else {
     (ExecutionScopeMode::Crates, crates)
   };
+  let cargo_args = cargo_args_for_scope(mode, &crates);
 
   ExecutionScope {
     scope_contract_version: SCOPE_CONTRACT_VERSION,
@@ -634,7 +642,19 @@ fn build_execution_scope(
     resolved_head: resolved_head.to_string(),
     mode,
     crates,
+    cargo_args,
     surfaces: scope_surfaces(surfaces),
+  }
+}
+
+fn cargo_args_for_scope(mode: ExecutionScopeMode, crates: &[String]) -> Vec<String> {
+  match mode {
+    ExecutionScopeMode::Empty => Vec::new(),
+    ExecutionScopeMode::Workspace => vec!["--workspace".to_string()],
+    ExecutionScopeMode::Crates => crates
+      .iter()
+      .flat_map(|crate_name| ["-p".to_string(), crate_name.clone()])
+      .collect(),
   }
 }
 
@@ -995,6 +1015,7 @@ fn format_github(output: &PlanOutput, debug: bool) -> RailResult<String> {
   let _ = writeln!(out, "docs={}", surface_enabled(output, "docs"));
   let _ = writeln!(out, "infra={}", surface_enabled(output, "infra"));
   let _ = writeln!(out, "base_ref={}", output.inputs.refs.resolved_base);
+  let _ = writeln!(out, "cargo_args={}", output.scope.cargo_args.join(" "));
   let _ = writeln!(out, "scope_json={}", scope_json);
   if let Some(plan_json) = plan_json {
     let _ = writeln!(out, "plan_json={}", plan_json);

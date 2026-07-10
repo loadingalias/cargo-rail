@@ -13,13 +13,13 @@ use crate::release::version::{BumpLevel, BumpRequest, commit_bump_level};
 use crate::workspace::WorkspaceContext;
 use rustc_hash::FxHashMap;
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A plan for releasing one or more crates
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleasePlan {
   /// Contract version for release plan schema.
   pub plan_contract_version: u32,
@@ -36,7 +36,7 @@ pub struct ReleasePlan {
 }
 
 /// A target crate excluded from an auto-bump release plan
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedCrate {
   /// Crate name
   pub name: String,
@@ -69,7 +69,7 @@ pub struct ReleaseCheckInsights {
 }
 
 /// Release plan for a single crate
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateReleasePlan {
   /// Crate name
   pub name: String,
@@ -125,7 +125,7 @@ pub struct CrateReleasePlan {
 }
 
 /// One commit included in a crate release plan.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedCommit {
   /// Full commit SHA.
   pub sha: String,
@@ -144,7 +144,7 @@ pub struct PlannedCommit {
 }
 
 /// A synthesized dependency update entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyUpdate {
   /// Dependency crate name.
   pub name: String,
@@ -153,7 +153,7 @@ pub struct DependencyUpdate {
 }
 
 /// One change-file entry included in a crate release plan.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedChangeEntry {
   /// Source change file path.
   pub path: PathBuf,
@@ -164,7 +164,7 @@ pub struct PlannedChangeEntry {
 }
 
 /// Summary statistics for a release plan
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseSummary {
   /// Total number of crates in the plan
   pub total_crates: usize,

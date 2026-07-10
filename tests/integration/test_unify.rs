@@ -15,6 +15,36 @@ use tempfile::TempDir;
 // Core Unification Tests
 
 #[test]
+fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-json-apply")?;
+  workspace.add_crate("crate-a", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.commit("Add shared dependency")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "JSON apply should succeed. stderr:\n{stderr}");
+  assert!(
+    stderr.is_empty(),
+    "JSON success must not leak progress or warnings: {stderr}"
+  );
+
+  let value: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(value["schema_version"], 1);
+  assert_eq!(value["command"], "unify");
+  assert_eq!(value["mode"], "apply");
+  assert_eq!(value["result"], "applied");
+  assert_eq!(value["exit_code"], 0);
+  assert_eq!(value["dependencies"], 1);
+  assert_eq!(value["members"], 2);
+  assert!(value["plan_receipt"].is_string());
+  assert!(value["apply_receipt"].is_string());
+
+  Ok(())
+}
+
+#[test]
 fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
   // This tests the operational order fix: dependencies that resolve to the same
   // version should NOT trigger multi-version warnings, even if their version
@@ -2084,7 +2114,7 @@ fn test_unify_apply_writes_mutation_receipts() -> Result<()> {
     let content = std::fs::read_to_string(&receipt_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
-    assert_eq!(json["contract_version"], 1);
+    assert_eq!(json["contract_version"], 2);
     assert!(json.get("operation_id").is_some());
     assert!(json["plan"]["inputs_fingerprint"].is_string());
     assert!(json["plan"]["resolved_refs"].is_object());

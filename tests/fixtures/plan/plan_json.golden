@@ -43,11 +43,14 @@
     "git_shallow_clone": false
   },
   "scope": {
+    "cargo_args": [
+      "--workspace"
+    ],
     "crates": [],
     "mode": "workspace",
     "resolved_base": "origin/main",
     "resolved_head": "WORKTREE",
-    "scope_contract_version": 1,
+    "scope_contract_version": 2,
     "surfaces": {
       "bench": false,
       "build": true,

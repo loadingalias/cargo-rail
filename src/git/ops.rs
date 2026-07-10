@@ -7,6 +7,17 @@ use crate::progress;
 use crate::utils;
 use std::path::{Path, PathBuf};
 
+/// One exact entry from a Git tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitTreeEntry {
+  /// Git file mode (`100644`, `100755`, `120000`, or `160000`).
+  pub mode: String,
+  /// Object ID referenced by the tree entry.
+  pub object_id: String,
+  /// Repository-relative entry path.
+  pub path: PathBuf,
+}
+
 impl SystemGit {
   /// Normalize a path to be relative to the work tree
   ///
@@ -281,6 +292,46 @@ impl SystemGit {
     Ok(results)
   }
 
+  /// Read exact tree entries under `path` without materializing the worktree.
+  pub(crate) fn collect_tree_entries(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<GitTreeEntry>> {
+    let normalized = self.normalize_path(path);
+    let path_arg = normalized.to_string_lossy();
+    let output = self.run_git(&["ls-tree", "-r", "-z", "--full-tree", commit_sha, "--", &path_arg])?;
+    let mut entries = Vec::new();
+    for record in output
+      .stdout
+      .split(|byte| *byte == 0)
+      .filter(|record| !record.is_empty())
+    {
+      let tab = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| RailError::message("invalid git ls-tree record: missing path separator"))?;
+      let metadata = String::from_utf8_lossy(&record[..tab]);
+      let mut fields = metadata.split_whitespace();
+      let mode = fields
+        .next()
+        .ok_or_else(|| RailError::message("invalid git ls-tree record: missing mode"))?;
+      let _kind = fields
+        .next()
+        .ok_or_else(|| RailError::message("invalid git ls-tree record: missing object kind"))?;
+      let object_id = fields
+        .next()
+        .ok_or_else(|| RailError::message("invalid git ls-tree record: missing object ID"))?;
+      if fields.next().is_some() {
+        return Err(RailError::message("invalid git ls-tree record: unexpected metadata"));
+      }
+      let path =
+        std::str::from_utf8(&record[tab + 1..]).map_err(|_| RailError::message("git tree path is not valid UTF-8"))?;
+      entries.push(GitTreeEntry {
+        mode: mode.to_string(),
+        object_id: object_id.to_string(),
+        path: PathBuf::from(path),
+      });
+    }
+    Ok(entries)
+  }
+
   /// Add a remote repository
   pub fn add_remote(&self, name: &str, url: &str) -> RailResult<()> {
     match self.run_git(&["remote", "add", name, url]) {
@@ -386,9 +437,10 @@ impl SystemGit {
     author_email: &str,
     timestamp: i64,
     parent_shas: &[String],
+    changed_paths: &[PathBuf],
   ) -> RailResult<String> {
-    // Stage all changes
-    self.run_git(&["add", "-A"])?;
+    // Stage only the paths explicitly owned by this synthesized commit.
+    self.stage_paths(changed_paths)?;
 
     // Write tree
     let tree_output = self.run_git(&["write-tree"])?;

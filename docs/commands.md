@@ -9,7 +9,15 @@
 ## cargo rail
 
 ```
-The rail subcommand
+Monorepo orchestration for Rust workspaces.
+
+Quick start:
+  cargo rail init              # Generate .config/rail.toml (default)
+  cargo rail plan              # Build deterministic change plan
+  cargo rail run               # Execute planner-selected surfaces
+  cargo rail unify --check     # Preview dependency unification
+
+Docs: https://github.com/loadingalias/cargo-rail
 
 Usage: cargo rail [OPTIONS] <COMMAND>
 
@@ -24,19 +32,30 @@ Commands:
   change       Manage pending release intent files
   clean        Clean generated artifacts (cache, backups, reports)
   config       Configuration management
-  hash         Hash and compare planner contracts
-  diff-hash    Explain why two planner hashes differ
+  hash         Compute a portable planner identity (not a cache key)
+  diff-hash    Explain why two portable planner identities differ
   graph        Planner reasoning graph for explainability
   completions  Generate shell completions
   help         Print this message or the help of the given subcommand(s)
 
 Options:
-  -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output in JSON format (shorthand for -f json)
-      --config <PATH>          Path to rail.toml config file (bypass search order)
-      --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -50,7 +69,7 @@ Usage: cargo rail run [OPTIONS] [-- <RUN_ARGS>...]
 
 Arguments:
   [RUN_ARGS]...
-          Pass additional arguments to the selected runner
+          Pass harness args after `--` for tests; runner args for other surfaces
 
 Options:
   -q, --quiet
@@ -60,7 +79,7 @@ Options:
           Git ref to compare against (auto-detects default branch)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --merge-base
           Use merge-base with default branch (better for feature branches)
@@ -98,6 +117,25 @@ Options:
       --skip-nextest
           Disable automatic use of cargo-nextest
 
+      --test-runner <TEST_RUNNER>
+          Test runner backend (auto selects nextest when available)
+
+          Possible values:
+          - auto:    Prefer nextest when installed and otherwise use Cargo
+          - cargo:   Require `cargo test`
+          - nextest: Require `cargo nextest run`
+
+          [default: auto]
+
+      --cargo-test-arg <ARG>
+          Pass an option only to `cargo test` (repeatable)
+
+      --nextest-arg <ARG>
+          Pass an option only to `cargo nextest run` (repeatable)
+
+      --test-filter <FILTER>
+          Portable test-name filter placed before the test-binary separator
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -113,7 +151,10 @@ Examples:
   cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
   cargo rail run --all --surface test         # Force full test run
   cargo rail run --dry-run --print-cmd        # Preview exact execution
-  cargo rail run -- --nocapture               # Pass args to underlying runner
+  cargo rail run --test-filter parser         # Portable test-name filter
+  cargo rail run --cargo-test-arg=--all-features --test-runner cargo
+  cargo rail run --nextest-arg=-P --nextest-arg=commit
+  cargo rail run -- --nocapture               # Pass harness args after --
 ```
 
 ---
@@ -136,7 +177,7 @@ Options:
           Start ref (for SHA pair mode)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -172,6 +213,9 @@ Options:
 
           [possible values: strict, balanced, fast]
 
+      --schema
+          Print the versioned planner JSON Schema and exit
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -185,6 +229,7 @@ Examples:
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
   cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --schema                  # Print the versioned JSON Schema
   cargo rail plan -f json                   # Full machine-readable contract
   cargo rail plan -f github                 # Compact GitHub Actions key=value output
   cargo rail plan -f github-debug           # GitHub Actions output plus plan_json
@@ -211,7 +256,7 @@ Options:
           Dry-run mode: preview changes without modifying files
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -279,7 +324,7 @@ Options:
       --list                   List available backups instead of restoring
   -q, --quiet                  Suppress progress messages (for CI/automation)
       --backup-id <BACKUP_ID>  Specific backup ID to restore (defaults to most recent)
-      --json                   Output in JSON format (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -308,7 +353,7 @@ Options:
           Overwrite existing configuration
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
   -c, --check
           Dry-run mode: preview generated config without writing
@@ -351,7 +396,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -393,7 +438,7 @@ Arguments:
 Options:
   -c, --check                  Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output in JSON format (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -421,7 +466,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --remote <REMOTE>
           Override remote repository
@@ -448,13 +493,10 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text:       Human-readable text output (default)
+          - json:       Machine-readable JSON output
+          - names-only: Names only, one per line
+          - jsonl:      JSON Lines format (one object per line)
 
           [default: text]
 
@@ -486,7 +528,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --remote <REMOTE>
           Override remote repository
@@ -520,6 +562,9 @@ Options:
       --plan <PATH>
           Apply from a previously generated mutation plan file
 
+      --resume <RECEIPT>
+          Resume a manually resolved sync conflict receipt
+
       --allow-dirty
           Allow running on dirty worktree (uncommitted changes)
 
@@ -530,13 +575,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -571,6 +611,8 @@ Commands:
   run       Execute release (plan or publish)
   check     Validate release readiness
   finalize  Finalize a merged release PR (tag, push, publish)
+  resume    Resume an interrupted release from its durable state file
+  abort     Abort an active release that has not reached remote side effects
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -578,7 +620,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -625,7 +667,7 @@ Arguments:
 Options:
   -c, --check                  Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output in JSON format (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -658,7 +700,7 @@ Options:
           [default: patch]
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
   -c, --check
           Dry-run mode: preview release plan
@@ -691,13 +733,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -732,7 +769,7 @@ Options:
           Run extended validation (cargo publish --dry-run, MSRV check)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -744,13 +781,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -785,7 +817,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --skip-publish
           Skip publishing to crates.io
@@ -809,13 +841,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -824,6 +851,49 @@ Options:
 
   -V, --version
           Print version
+```
+
+---
+
+### cargo rail release resume
+
+```
+Resume an interrupted release from its durable state file
+
+Usage: cargo rail release resume [OPTIONS] <STATE>
+
+Arguments:
+  <STATE>  State path printed by the interrupted release
+
+Options:
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+---
+
+### cargo rail release abort
+
+```
+Abort an active release that has not reached remote side effects
+
+Usage: cargo rail release abort [OPTIONS] <STATE>
+
+Arguments:
+  <STATE>  State path printed by the active release
+
+Options:
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+  -y, --yes                    Confirm restoration of the pre-release local state
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 ---
@@ -838,6 +908,7 @@ Usage: cargo rail change [OPTIONS] <COMMAND>
 Commands:
   add     Create a pending change file
   status  Show pending change files
+  check   Check that changed crates have pending change files
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -845,7 +916,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -865,6 +936,8 @@ Examples:
   cargo rail change add rail-core --bump patch --name fix-parser
   cargo rail change status
   cargo rail change status --format json
+  cargo rail change check --merge-base --required
+  cargo rail change check --since origin/main --format json
 
 Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
 Change files are consumed (deleted in the release commit) when released.
@@ -893,7 +966,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
   -m, --message <MESSAGE>
           User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
@@ -908,13 +981,9 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text:       Human-readable text output (default)
+          - json:       Machine-readable JSON output
+          - names-only: Names only, one per line
 
           [default: text]
 
@@ -942,13 +1011,9 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text:       Human-readable text output (default)
+          - json:       Machine-readable JSON output
+          - names-only: Names only, one per line
 
           [default: text]
 
@@ -956,13 +1021,64 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail change check
+
+```
+Check that changed crates have pending change files
+
+Usage: cargo rail change check [OPTIONS]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --since <REF>
+          Compare against this git ref
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --merge-base
+          Compare from the merge-base with the default branch
+
+      --all
+          Scan the full reachable history
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --required
+          Require coverage for every changed crate, ignoring release.require_change_files
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:       Human-readable text output (default)
+          - json:       Machine-readable JSON output
+          - names-only: Names only, one per line
+
+          [default: text]
 
   -h, --help
           Print help (see a summary with '-h')
@@ -991,7 +1107,7 @@ Options:
           Prune old backups
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1009,13 +1125,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1054,7 +1165,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1093,13 +1204,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1107,7 +1213,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1138,13 +1244,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1152,7 +1253,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1183,13 +1284,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1197,7 +1293,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --strict
           Treat warnings as errors (auto-enabled in CI)
@@ -1242,18 +1338,13 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1273,7 +1364,7 @@ Options:
 ## cargo rail hash
 
 ```
-Hash and compare planner contracts
+Compute a portable planner identity (not a cache key)
 
 Usage: cargo rail hash [OPTIONS]
 
@@ -1288,7 +1379,7 @@ Options:
           Start ref (for SHA pair mode)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1311,13 +1402,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1328,9 +1414,9 @@ Options:
           Print version
 
 Examples:
-  cargo rail hash                          # Hash current planner contract
-  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
-  cargo rail hash -f json                  # Structured hash output
+  cargo rail hash                          # Portable identity of the current plan
+  cargo rail hash --merge-base             # Identity for the merge-base comparison
+  cargo rail hash -f json                  # Structured identity metadata
   cargo rail diff-hash plan-a.json plan-b.json
   cargo rail diff-hash plan-a.json plan-b.json -f json
 ```
@@ -1340,7 +1426,7 @@ Examples:
 ## cargo rail diff-hash
 
 ```
-Explain why two planner hashes differ
+Explain why two portable planner identities differ
 
 Usage: cargo rail diff-hash [OPTIONS] <A> <B>
 
@@ -1356,13 +1442,8 @@ Options:
           Output format
 
           Possible values:
-          - text:          Human-readable text output (default)
-          - json:          Machine-readable JSON output
-          - names-only:    Names only, one per line
-          - cargo-args:    Cargo -p flag format: -p crate1 -p crate2
-          - github:        GitHub Actions output format for $GITHUB_OUTPUT
-          - github-matrix: GitHub Actions matrix format for strategy.matrix
-          - jsonl:         JSON Lines format (one object per line)
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
 
           [default: text]
 
@@ -1370,7 +1451,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1385,9 +1466,9 @@ Options:
           Print version
 
 Examples:
-  cargo rail hash                          # Hash current planner contract
-  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
-  cargo rail hash -f json                  # Structured hash output
+  cargo rail hash                          # Portable identity of the current plan
+  cargo rail hash --merge-base             # Identity for the merge-base comparison
+  cargo rail hash -f json                  # Structured identity metadata
   cargo rail diff-hash plan-a.json plan-b.json
   cargo rail diff-hash plan-a.json plan-b.json -f json
 ```
@@ -1412,7 +1493,7 @@ Options:
           Start ref (for SHA pair mode)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1470,7 +1551,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output in JSON format (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)

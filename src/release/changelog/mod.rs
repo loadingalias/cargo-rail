@@ -18,7 +18,7 @@ use crate::config::{ChangelogConfig, ChangelogShape, GroupSpec};
 use crate::error::{ConfigError, RailError, RailResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -63,7 +63,7 @@ pub struct CommitRef<'a> {
 }
 
 /// A diagnostic for a commit that does not classify cleanly
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitDiagnostic {
   /// Short commit SHA
   pub sha: String,
@@ -74,7 +74,7 @@ pub struct CommitDiagnostic {
 }
 
 /// Why a commit was flagged
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommitIssue {
   /// Subject does not match `type(scope)!: description`

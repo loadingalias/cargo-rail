@@ -232,15 +232,8 @@ impl TomlFormatter {
     let mut current = doc.as_item_mut();
 
     for part in parts {
-      if let Some(table) = current.as_table_mut() {
-        if let Some(next) = table.get_mut(part) {
-          current = next;
-        } else {
-          return None;
-        }
-      } else {
-        return None;
-      }
+      let table = current.as_table_mut()?;
+      current = table.get_mut(part)?;
     }
 
     current.as_table_mut()

@@ -190,7 +190,7 @@ impl RailConfigBuilder {
     ));
     content.push_str(&format!("require_clean = {}\n", config.require_clean));
     content.push_str(&format!(
-      "publish_delay = {}  # seconds between publishes\n",
+      "publish_delay = {}  # maximum registry polling interval in seconds\n",
       config.publish_delay
     ));
     content.push_str(&format!(

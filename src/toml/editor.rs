@@ -85,15 +85,10 @@ impl TomlEditor {
     let mut current = self.doc.as_item();
 
     for part in parts {
-      if let Some(table) = current.as_table() {
-        current = table.get(part)?;
-      } else {
-        // We can't easily return &Item from InlineTable because it returns &Value
-        // and we can't construct a temporary &Item.
-        // For now, we only support navigating standard tables for `get`.
-        // If we hit an inline table, we stop.
-        return None;
-      }
+      // Inline tables expose values rather than items, so dotted navigation only
+      // traverses standard tables.
+      let table = current.as_table()?;
+      current = table.get(part)?;
     }
 
     Some(current)
@@ -182,11 +177,8 @@ impl TomlEditor {
     let mut current = self.doc.as_item_mut();
 
     for part in parts {
-      if let Some(table) = current.as_table_mut() {
-        current = table.get_mut(part)?;
-      } else {
-        return None;
-      }
+      let table = current.as_table_mut()?;
+      current = table.get_mut(part)?;
     }
 
     Some(current)

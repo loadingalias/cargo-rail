@@ -10,6 +10,7 @@ mod test_hash;
 mod test_init;
 mod test_msrv;
 mod test_nested_workspace;
+mod test_output_contracts;
 mod test_plan;
 mod test_plan_apply;
 mod test_plan_classification_corpus;

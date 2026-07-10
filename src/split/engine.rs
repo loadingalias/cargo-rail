@@ -10,13 +10,16 @@ use crate::git::git_cmd_for_path;
 use crate::git::mappings::MappingStore;
 use crate::git::{CommitInfo, SystemGit};
 use crate::progress;
+use crate::split::SplitPathCapabilities;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use crate::workspace::files::{AuxiliaryFiles, ProjectFiles};
 use glob::Pattern;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 
 /// Runtime parameters for a split operation
@@ -42,10 +45,12 @@ pub struct SplitParams {
   pub include: Vec<String>,
   /// Files/directories to exclude (glob patterns)
   pub exclude: Vec<String>,
+  /// Validated source/target path authority for all filesystem mutations.
+  pub path_capabilities: SplitPathCapabilities,
 }
 
-/// Pre-fetched files for a commit: (file_path, content)
-type PrefetchedFiles = Vec<(PathBuf, Vec<u8>)>;
+/// Pre-fetched exact Git tree entries for a commit.
+type PrefetchedFiles = Vec<crate::git::ops::GitTreeEntry>;
 
 /// Maximum number of commits to prefetch at once
 /// This bounds memory usage to O(window_size × avg_commit_size) instead of O(total_commits × avg_commit_size)
@@ -64,11 +69,13 @@ struct RecreateCommitParams<'a> {
   last_recreated_sha: Option<&'a str>,
   /// Pre-fetched files (if available from parallel prefetch)
   prefetched_files: Option<&'a PrefetchedFiles>,
+  path_capabilities: &'a SplitPathCapabilities,
 }
 
 /// Parameters for creating a git commit
 struct CommitParams<'a> {
   repo_path: &'a Path,
+  tree_sha: &'a str,
   message: &'a str,
   author_name: &'a str,
   author_email: &'a str,
@@ -194,7 +201,7 @@ impl<'a> SplitEngine<'a> {
         let mut all_files = Vec::with_capacity(32);
 
         for crate_path in paths.iter() {
-          match git.collect_tree_files(&commit.sha, crate_path) {
+          match git.collect_tree_entries(&commit.sha, crate_path) {
             Ok(files) => all_files.extend(files),
             Err(_) => {
               // If we can't collect files, skip this commit in prefetch
@@ -218,12 +225,14 @@ impl<'a> SplitEngine<'a> {
     manifest_path: &Path,
     crate_name: &str,
     target_has_workspace: bool,
+    path_capabilities: &SplitPathCapabilities,
   ) -> RailResult<()> {
+    let manifest_path = path_capabilities.authorize_target(manifest_path)?;
     if !manifest_path.exists() {
       return Ok(());
     }
 
-    let content = std::fs::read_to_string(manifest_path)?;
+    let content = std::fs::read_to_string(&manifest_path)?;
     let context = TransformContext {
       crate_name: crate_name.to_string(),
       workspace_root: self.ctx.workspace_root().to_path_buf(),
@@ -250,59 +259,53 @@ impl<'a> SplitEngine<'a> {
           .ctx
           .git()?
           .git()
-          .collect_tree_files(&params.commit.sha, crate_path)?;
+          .collect_tree_entries(&params.commit.sha, crate_path)?;
         files.extend(collected);
       }
       std::borrow::Cow::Owned(files)
     };
 
-    // Handle "dirty history" - commits where the path was deleted or didn't exist yet
-    // This commonly happens when:
-    // - A crate was temporarily removed and later restored
-    // - Files were moved/renamed in a way that deleted the old path
-    // - The crate didn't exist at the start of the filtered history
-    if all_files.is_empty() {
-      return Ok(None);
-    }
-
-    // Write files to target repo, applying transforms
-    for (file_path, content_bytes) in all_files.iter() {
+    let mut target_entries = Vec::with_capacity(all_files.len());
+    for entry in all_files.iter() {
       let target_path = match params.mode {
-        SplitMode::Single => {
-          // For single mode, move files to root (strip crate path prefix)
-          // Find matching prefix first to avoid unnecessary PathBuf clone
-          let relative = params
-            .crate_paths
-            .iter()
-            .find_map(|crate_path| file_path.strip_prefix(crate_path).ok().map(Path::to_path_buf))
-            .unwrap_or_else(|| file_path.clone());
-          params.target_repo_path.join(relative)
-        }
-        SplitMode::Combined => {
-          // For combined mode, preserve paths
-          params.target_repo_path.join(file_path)
-        }
+        SplitMode::Single => params
+          .crate_paths
+          .iter()
+          .find_map(|crate_path| entry.path.strip_prefix(crate_path).ok().map(Path::to_path_buf))
+          .unwrap_or_else(|| entry.path.clone()),
+        SplitMode::Combined => entry.path.clone(),
       };
+      params.path_capabilities.authorize_target(&target_path)?;
 
-      // Create parent directories
-      if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent)?;
-      }
-
-      // Write file content
-      std::fs::write(&target_path, content_bytes)?;
-
-      // Apply Cargo.toml transformation if applicable
-      if file_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        // Determine if target will have a workspace structure:
-        // - Single mode: always standalone (no workspace)
-        // - Combined + Standalone: no workspace
-        // - Combined + Workspace: has workspace
+      let object_id = if entry.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        let content = self
+          .ctx
+          .git()?
+          .git()
+          .read_files_bulk(&[(&params.commit.sha, entry.path.as_path())])?
+          .into_iter()
+          .next()
+          .ok_or_else(|| RailError::message(format!("manifest '{}' has no blob", entry.path.display())))?;
+        let content = String::from_utf8(content)
+          .map_err(|_| RailError::message(format!("manifest '{}' is not valid UTF-8", entry.path.display())))?;
         let target_has_workspace =
           *params.mode == SplitMode::Combined && *params.workspace_mode == WorkspaceMode::Workspace;
-        self.apply_manifest_transform(&target_path, params.crate_name, target_has_workspace)?;
-      }
+        let context = TransformContext {
+          crate_name: params.crate_name.to_string(),
+          workspace_root: self.ctx.workspace_root().to_path_buf(),
+          target_has_workspace,
+        };
+        let transformed = self.transform.transform_to_split(&content, &context)?;
+        self.write_target_blob(params.target_repo_path, transformed.as_bytes())?
+      } else {
+        entry.object_id.clone()
+      };
+      target_entries.push((entry.mode.clone(), object_id, target_path));
     }
+
+    // A fresh index per snapshot makes absence authoritative: deleted and
+    // renamed files cannot leak forward from the previous worktree.
+    let tree_sha = self.write_exact_tree(params.target_repo_path, &target_entries)?;
 
     // Create commit using git command for determinism
     // Map parent SHAs from monorepo to split repo
@@ -321,8 +324,10 @@ impl<'a> SplitEngine<'a> {
       mapped_parents.push(sha.to_string());
     }
 
+    params.path_capabilities.validate_target_repository()?;
     let sha = self.create_git_commit(&CommitParams {
       repo_path: params.target_repo_path,
+      tree_sha: &tree_sha,
       message: &params.commit.message,
       author_name: &params.commit.author,
       author_email: &params.commit.author_email,
@@ -337,26 +342,6 @@ impl<'a> SplitEngine<'a> {
   /// Create a git commit using git commands for determinism
   /// Uses git commit-tree for full control over parents
   fn create_git_commit(&self, params: &CommitParams) -> RailResult<String> {
-    // Stage all files
-    let add_output = Self::run_git_in_repo(params.repo_path, &["add", "-A"])?;
-    if !add_output.status.success() {
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git add".to_string(),
-        stderr: String::from_utf8_lossy(&add_output.stderr).trim().to_string(),
-      }));
-    }
-
-    // Write the tree
-    let output = Self::run_git_in_repo(params.repo_path, &["write-tree"])?;
-    if !output.status.success() {
-      return Err(RailError::Git(GitError::CommandFailed {
-        command: "git write-tree".to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-      }));
-    }
-
-    let tree_sha = String::from_utf8(output.stdout)?.trim().to_string();
-
     // Prepare environment for deterministic commit
     let author_date = format!("{} +0000", params.timestamp);
     let commit_date = format!("{} +0000", params.timestamp);
@@ -371,7 +356,7 @@ impl<'a> SplitEngine<'a> {
       .env("GIT_COMMITTER_EMAIL", params.committer_email)
       .env("GIT_COMMITTER_DATE", &commit_date)
       .arg("commit-tree")
-      .arg(&tree_sha)
+      .arg(params.tree_sha)
       .arg("-m")
       .arg(params.message);
 
@@ -402,7 +387,102 @@ impl<'a> SplitEngine<'a> {
       }));
     }
 
+    let reset_output = Self::run_git_in_repo(params.repo_path, &["reset", "--hard", &commit_sha])?;
+    if !reset_output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git reset --hard".to_string(),
+        stderr: String::from_utf8_lossy(&reset_output.stderr).trim().to_string(),
+      }));
+    }
+
     Ok(commit_sha)
+  }
+
+  fn write_target_blob(&self, repo_path: &Path, content: &[u8]) -> RailResult<String> {
+    let mut child = git_cmd_for_path(repo_path)
+      .args(["hash-object", "-w", "--stdin"])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .context("Failed to start git hash-object")?;
+    child
+      .stdin
+      .take()
+      .ok_or_else(|| RailError::message("git hash-object stdin was unavailable"))?
+      .write_all(content)
+      .context("Failed to write transformed blob")?;
+    let output = child.wait_with_output().context("Failed to finish git hash-object")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git hash-object -w --stdin".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+      }));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+  }
+
+  fn write_exact_tree(&self, repo_path: &Path, entries: &[(String, String, PathBuf)]) -> RailResult<String> {
+    let index_path = repo_path
+      .join(".git")
+      .join(format!("cargo-rail-index-{}", std::process::id()));
+    let _ = std::fs::remove_file(&index_path);
+    let mut read_tree = git_cmd_for_path(repo_path);
+    let output = read_tree
+      .env("GIT_INDEX_FILE", &index_path)
+      .args(["read-tree", "--empty"])
+      .output()
+      .context("Failed to initialize exact-tree index")?;
+    if !output.status.success() {
+      return Err(RailError::message(format!(
+        "git read-tree --empty failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+      )));
+    }
+
+    if !entries.is_empty() {
+      let mut child = git_cmd_for_path(repo_path)
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["update-index", "-z", "--index-info"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to start git update-index")?;
+      let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| RailError::message("git update-index stdin was unavailable"))?;
+      for (mode, object_id, path) in entries {
+        let path = path
+          .to_str()
+          .ok_or_else(|| RailError::message(format!("split path '{}' is not valid UTF-8", path.display())))?;
+        write!(stdin, "{} {}\t{}\0", mode, object_id, path).context("Failed to populate exact-tree index")?;
+      }
+      drop(stdin);
+      let output = child.wait_with_output().context("Failed to finish git update-index")?;
+      if !output.status.success() {
+        let _ = std::fs::remove_file(&index_path);
+        return Err(RailError::message(format!(
+          "git update-index --index-info failed: {}",
+          String::from_utf8_lossy(&output.stderr).trim()
+        )));
+      }
+    }
+
+    let output = git_cmd_for_path(repo_path)
+      .env("GIT_INDEX_FILE", &index_path)
+      .arg("write-tree")
+      .output()
+      .context("Failed to write exact split tree")?;
+    let _ = std::fs::remove_file(&index_path);
+    if !output.status.success() {
+      return Err(RailError::message(format!(
+        "git write-tree failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+      )));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
   }
 
   fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> RailResult<std::process::Output> {
@@ -420,6 +500,14 @@ impl<'a> SplitEngine<'a> {
 
   /// Execute a split operation (idempotent - re-runs sync new commits only)
   pub fn split(&self, config: &SplitParams) -> RailResult<()> {
+    let target = config.path_capabilities.authorize_target(&config.target_repo_path)?;
+    if target != config.path_capabilities.target_root() {
+      return Err(RailError::message(
+        "runtime split target does not match the validated path capability",
+      ));
+    }
+    config.path_capabilities.validate_crate_paths(&config.crate_paths)?;
+    config.path_capabilities.validate_target_repository()?;
     progress!("🚂 Splitting crate: {}", config.crate_name);
     progress!("   Mode: {:?}", config.mode);
     progress!("   Target: {}", config.target_repo_path.display());
@@ -456,7 +544,8 @@ impl<'a> SplitEngine<'a> {
     }
 
     // Create or reuse target repo
-    self.ensure_target_repo(&config.target_repo_path)?;
+    self.ensure_target_repo(&config.path_capabilities)?;
+    self.import_source_objects(&config.target_repo_path)?;
 
     // Discover workspace-level auxiliary files from workspace
     let aux_files = AuxiliaryFiles::discover(self.ctx.workspace_root())?;
@@ -511,7 +600,13 @@ impl<'a> SplitEngine<'a> {
       match config.mode {
         SplitMode::Single => {
           let crate_path = &config.crate_paths[0];
-          self.split_single_crate(crate_path, &config.target_repo_path, &aux_files, &config.crate_name)?;
+          self.split_single_crate(
+            crate_path,
+            &config.target_repo_path,
+            &aux_files,
+            &config.crate_name,
+            &config.path_capabilities,
+          )?;
         }
         SplitMode::Combined => {
           self.split_combined_crates(
@@ -520,6 +615,7 @@ impl<'a> SplitEngine<'a> {
             &aux_files,
             &config.crate_name,
             &config.workspace_mode,
+            &config.path_capabilities,
           )?;
         }
       }
@@ -597,6 +693,7 @@ impl<'a> SplitEngine<'a> {
             mapping_store: &mapping_store,
             last_recreated_sha: last_recreated_sha.as_deref(),
             prefetched_files: prefetched,
+            path_capabilities: &config.path_capabilities,
           })?;
 
           // Handle skipped commits (dirty history - path didn't exist at this commit)
@@ -634,15 +731,15 @@ impl<'a> SplitEngine<'a> {
       // Create workspace Cargo.toml if in workspace mode
       if config.mode == SplitMode::Combined && config.workspace_mode == WorkspaceMode::Workspace {
         progress!("   Creating workspace Cargo.toml...");
-        self.create_workspace_cargo_toml(&config.crate_paths, &config.target_repo_path)?;
+        self.create_workspace_cargo_toml(&config.crate_paths, &config.target_repo_path, &config.path_capabilities)?;
       }
 
       // Copy workspace config files and project files to the final state
       let has_files = !aux_files.is_empty() || project_files.count() > 0 || !additional_files.is_empty();
       if has_files {
         progress!("   Copying workspace configs and project files...");
-        aux_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
-        project_files.copy_to_split(self.ctx.workspace_root(), &config.target_repo_path)?;
+        aux_files.copy_to_split(&config.path_capabilities)?;
+        project_files.copy_to_split(&config.path_capabilities)?;
 
         // Copy additional files from include patterns
         if !additional_files.is_empty() {
@@ -651,8 +748,8 @@ impl<'a> SplitEngine<'a> {
             additional_files.len()
           );
           for rel_path in &additional_files {
-            let source = self.ctx.workspace_root().join(rel_path);
-            let target = config.target_repo_path.join(rel_path);
+            let source = config.path_capabilities.authorize_source(rel_path)?;
+            let target = config.path_capabilities.authorize_target(rel_path)?;
 
             // Skip files that match exclude patterns
             let path_str = rel_path.to_string_lossy();
@@ -671,6 +768,7 @@ impl<'a> SplitEngine<'a> {
         }
 
         // Create a final commit if any files were added
+        config.path_capabilities.validate_target_repository()?;
         let target_git = SystemGit::open(&config.target_repo_path)?;
         target_git.stage_all()?;
 
@@ -740,9 +838,10 @@ impl<'a> SplitEngine<'a> {
   }
 
   /// Ensure target repository exists and is initialized
-  fn ensure_target_repo(&self, target_path: &Path) -> RailResult<()> {
+  fn ensure_target_repo(&self, paths: &SplitPathCapabilities) -> RailResult<()> {
+    let target_path = paths.authorize_target(paths.target_root())?;
     if !target_path.exists() {
-      std::fs::create_dir_all(target_path)
+      std::fs::create_dir_all(&target_path)
         .with_context(|| format!("Failed to create target directory: {}", target_path.display()))?;
     }
 
@@ -752,12 +851,32 @@ impl<'a> SplitEngine<'a> {
       progress!("   Initializing git repository at {}", target_path.display());
 
       // Initialize using system git with main as default branch
-      crate::git::init_repo(target_path, "main")?;
+      paths.validate_target_repository()?;
+      crate::git::init_repo(&target_path, "main")?;
 
       // Configure git identity from source repository
-      self.configure_git_identity(target_path)?;
+      paths.validate_target_repository()?;
+      self.configure_git_identity(&target_path)?;
     }
 
+    Ok(())
+  }
+
+  /// Import the source object graph once so reconstructed trees can reuse blob
+  /// object IDs directly. This replaces per-file copy/hash subprocesses.
+  fn import_source_objects(&self, target_path: &Path) -> RailResult<()> {
+    let source = self
+      .ctx
+      .workspace_root()
+      .to_str()
+      .ok_or_else(|| RailError::message("source repository path is not valid UTF-8"))?;
+    let output = Self::run_git_in_repo(target_path, &["fetch", "--quiet", "--no-tags", source, "HEAD"])?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git fetch source objects".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+      }));
+    }
     Ok(())
   }
 
@@ -791,23 +910,24 @@ impl<'a> SplitEngine<'a> {
     target_repo_path: &Path,
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
+    path_capabilities: &SplitPathCapabilities,
   ) -> RailResult<()> {
     let source_path = self.ctx.workspace_root().join(crate_path);
 
     // Copy source files
     progress!("   Copying source files from {}", crate_path.display());
-    self.copy_directory_recursive(&source_path, target_repo_path)?;
+    self.copy_directory_recursive(&source_path, target_repo_path, path_capabilities)?;
 
     // Transform Cargo.toml manifest
     // Single mode is always standalone (no workspace)
     progress!("   Transforming Cargo.toml");
     let manifest_path = target_repo_path.join("Cargo.toml");
-    self.apply_manifest_transform(&manifest_path, crate_name, false)?;
+    self.apply_manifest_transform(&manifest_path, crate_name, false, path_capabilities)?;
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
       progress!("   Copying auxiliary files");
-      aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
+      aux_files.copy_to_split(path_capabilities)?;
     }
 
     Ok(())
@@ -821,6 +941,7 @@ impl<'a> SplitEngine<'a> {
     aux_files: &AuxiliaryFiles,
     crate_name: &str,
     workspace_mode: &WorkspaceMode,
+    path_capabilities: &SplitPathCapabilities,
   ) -> RailResult<()> {
     // Determine if target will have a workspace structure
     let target_has_workspace = *workspace_mode == WorkspaceMode::Workspace;
@@ -831,29 +952,29 @@ impl<'a> SplitEngine<'a> {
 
       progress!("   Copying {} to {}", crate_path.display(), crate_path.display());
 
-      // Create parent directories
-      if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent)?;
-      }
-
-      self.copy_directory_recursive(&source_path, &target_path)?;
+      self.copy_directory_recursive(&source_path, &target_path, path_capabilities)?;
 
       // Transform Cargo.toml manifest
       let manifest_path = target_path.join("Cargo.toml");
-      self.apply_manifest_transform(&manifest_path, crate_name, target_has_workspace)?;
+      self.apply_manifest_transform(&manifest_path, crate_name, target_has_workspace, path_capabilities)?;
     }
 
     // Copy auxiliary files
     if !aux_files.is_empty() {
       progress!("   Copying auxiliary files");
-      aux_files.copy_to_split(self.ctx.workspace_root(), target_repo_path)?;
+      aux_files.copy_to_split(path_capabilities)?;
     }
 
     Ok(())
   }
 
   /// Create a workspace Cargo.toml for combined mode with workspace_mode = Workspace
-  fn create_workspace_cargo_toml(&self, crate_paths: &[PathBuf], target_repo_path: &Path) -> RailResult<()> {
+  fn create_workspace_cargo_toml(
+    &self,
+    crate_paths: &[PathBuf],
+    target_repo_path: &Path,
+    path_capabilities: &SplitPathCapabilities,
+  ) -> RailResult<()> {
     // Extract workspace members from crate paths
     let members: Vec<String> = crate_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
 
@@ -939,7 +1060,7 @@ impl<'a> SplitEngine<'a> {
     doc.remove("build-dependencies");
 
     // Write to target repo
-    let target_toml = target_repo_path.join("Cargo.toml");
+    let target_toml = path_capabilities.authorize_target(&target_repo_path.join("Cargo.toml"))?;
     std::fs::write(&target_toml, doc.to_string())?;
 
     progress!("   Created workspace Cargo.toml with {} members", members.len());
@@ -948,13 +1069,24 @@ impl<'a> SplitEngine<'a> {
   }
 
   /// Recursively copy a directory, excluding .git
-  fn copy_directory_recursive(&self, source: &Path, target: &Path) -> RailResult<()> {
-    copy_directory_recursive_impl(source, target)
+  fn copy_directory_recursive(
+    &self,
+    source: &Path,
+    target: &Path,
+    path_capabilities: &SplitPathCapabilities,
+  ) -> RailResult<()> {
+    copy_directory_recursive_impl(source, target, path_capabilities)
   }
 }
 
 /// Helper function to recursively copy a directory, excluding .git
-fn copy_directory_recursive_impl(source: &Path, target: &Path) -> RailResult<()> {
+fn copy_directory_recursive_impl(
+  source: &Path,
+  target: &Path,
+  path_capabilities: &SplitPathCapabilities,
+) -> RailResult<()> {
+  let source = path_capabilities.authorize_source(source)?;
+  let target = path_capabilities.authorize_target(target)?;
   if !source.exists() {
     return Err(RailError::message(format!(
       "Source path does not exist: {}",
@@ -970,7 +1102,7 @@ fn copy_directory_recursive_impl(source: &Path, target: &Path) -> RailResult<()>
     return Ok(());
   }
 
-  std::fs::create_dir_all(target)?;
+  std::fs::create_dir_all(&target)?;
 
   for entry in std::fs::read_dir(source)? {
     let entry = entry?;
@@ -986,9 +1118,11 @@ fn copy_directory_recursive_impl(source: &Path, target: &Path) -> RailResult<()>
     let target_path = target.join(&file_name);
 
     if file_type.is_dir() {
-      copy_directory_recursive_impl(&source_path, &target_path)?;
+      copy_directory_recursive_impl(&source_path, &target_path, path_capabilities)?;
     } else {
-      std::fs::copy(&source_path, &target_path)?;
+      let source_path = path_capabilities.authorize_source(&source_path)?;
+      let target_path = path_capabilities.authorize_target(&target_path)?;
+      std::fs::copy(source_path, target_path)?;
     }
   }
 
@@ -1028,7 +1162,8 @@ mod tests {
     let ctx = WorkspaceContext::build(&workspace_root).unwrap();
     let engine = SplitEngine::new(&ctx).unwrap();
 
-    engine.copy_directory_recursive(&source, &target).unwrap();
+    let paths = SplitPathCapabilities::new(&source, &source, &[PathBuf::from(".")], &target).unwrap();
+    engine.copy_directory_recursive(&source, &target, &paths).unwrap();
 
     // Verify files copied
     assert!(target.join("Cargo.toml").exists());

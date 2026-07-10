@@ -633,14 +633,6 @@ paths = [{{ crate = "crates/dirty-lib" }}]
     String::from_utf8_lossy(&output.stderr)
   );
 
-  // Check stderr mentions skipped commits (progress output goes to stderr)
-  let stderr = String::from_utf8_lossy(&output.stderr);
-  assert!(
-    stderr.contains("Skipped") && stderr.contains("dirty history"),
-    "Should mention skipped commits due to dirty history. stderr: {}",
-    stderr
-  );
-
   // Verify the split repo exists and has files
   assert!(
     split_dir.path().join("Cargo.toml").exists(),
@@ -665,15 +657,125 @@ paths = [{{ crate = "crates/dirty-lib" }}]
 
   assert!(log.contains("Add dirty-lib"), "Should contain initial add commit");
   assert!(log.contains("Update dirty-lib v1"), "Should contain v1 update");
-  // The deletion commit should be skipped (no files at that point)
   assert!(
-    !log.contains("Remove dirty-lib"),
-    "Should NOT contain deletion commit. Log:\n{}",
+    log.contains("Remove dirty-lib"),
+    "deletion must be preserved. Log:\n{}",
     log
   );
   assert!(log.contains("Restore dirty-lib"), "Should contain restore commit");
   assert!(log.contains("Update dirty-lib v3"), "Should contain v3 update");
 
+  let deletion = git(
+    split_dir.path(),
+    &[
+      "log",
+      "--format=%H",
+      "--fixed-strings",
+      "--grep=Remove dirty-lib temporarily",
+    ],
+  )?;
+  let deletion_sha = String::from_utf8_lossy(&deletion.stdout).trim().to_string();
+  let deletion_tree = git(split_dir.path(), &["ls-tree", "-r", "--name-only", &deletion_sha])?;
+  assert!(
+    deletion_tree.stdout.is_empty(),
+    "the historical deletion snapshot must contain no stale crate files"
+  );
+
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_split_history_preserves_rename_delete_mode_symlink_and_exact_final_tree() -> Result<()> {
+  use std::os::unix::fs::{PermissionsExt, symlink};
+
+  let ws = TestWorkspace::new_named("split-exact-tree-history")?;
+  ws.add_crate("exact-tree", "0.1.0", &[])?;
+  let crate_root = ws.path.join("crates/exact-tree");
+  std::fs::write(crate_root.join("src/old.rs"), "pub const VALUE: u8 = 1;\n")?;
+  std::fs::write(crate_root.join("tool.sh"), "#!/bin/sh\nexit 0\n")?;
+  ws.commit("Add historical files")?;
+
+  let tool = crate_root.join("tool.sh");
+  let mut permissions = std::fs::metadata(&tool)?.permissions();
+  permissions.set_mode(0o755);
+  std::fs::set_permissions(&tool, permissions)?;
+  std::fs::write(crate_root.join("src/old.rs"), "pub const VALUE: u8 = 2;\n")?;
+  ws.commit("Modify file and make tool executable")?;
+
+  std::fs::rename(crate_root.join("src/old.rs"), crate_root.join("src/new.rs"))?;
+  symlink("new.rs", crate_root.join("src/link.rs"))?;
+  ws.commit("Rename file and add symlink")?;
+
+  std::fs::remove_file(&tool)?;
+  ws.commit("Delete executable tool")?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.exact-tree.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/exact-tree" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "exact-tree", "--yes", "--allow-dirty"],
+  )?;
+  assert!(
+    output.status.success(),
+    "split stderr:\n{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let rename_commit = git(
+    split_dir.path(),
+    &[
+      "log",
+      "--format=%H",
+      "--fixed-strings",
+      "--grep=Rename file and add symlink",
+    ],
+  )?;
+  let rename_commit = String::from_utf8_lossy(&rename_commit.stdout).trim().to_string();
+  let rename_tree = git(split_dir.path(), &["ls-tree", "-r", &rename_commit])?;
+  let rename_tree = String::from_utf8_lossy(&rename_tree.stdout);
+  assert!(rename_tree.contains("120000 blob") && rename_tree.contains("src/link.rs"));
+  assert!(rename_tree.contains("100755 blob") && rename_tree.contains("tool.sh"));
+  assert!(rename_tree.contains("src/new.rs"));
+  assert!(!rename_tree.contains("src/old.rs"));
+
+  assert!(!split_dir.path().join("tool.sh").exists());
+  assert!(!split_dir.path().join("src/old.rs").exists());
+  assert_eq!(
+    std::fs::read_link(split_dir.path().join("src/link.rs"))?,
+    std::path::PathBuf::from("new.rs")
+  );
+
+  let source_tree = git(
+    &ws.path,
+    &["ls-tree", "-r", "--name-only", "HEAD", "--", "crates/exact-tree"],
+  )?;
+  let source_owned = String::from_utf8_lossy(&source_tree.stdout)
+    .lines()
+    .map(|path| path.trim_start_matches("crates/exact-tree/").to_string())
+    .collect::<std::collections::BTreeSet<_>>();
+  let target_tree = git(split_dir.path(), &["ls-tree", "-r", "--name-only", "HEAD"])?;
+  let target_owned = String::from_utf8_lossy(&target_tree.stdout)
+    .lines()
+    .filter(|path| matches!(*path, "Cargo.toml" | "README.md") || path.starts_with("src/"))
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+  assert_eq!(
+    target_owned, source_owned,
+    "final owned tree must equal the source subtree"
+  );
   Ok(())
 }
 
@@ -801,6 +903,87 @@ paths = [{{ crate = "crates/allow-dirty-lib" }}]
   assert!(
     split_dir.path().join("Cargo.toml").exists(),
     "Split repo should be created"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_split_rejects_target_inside_source_repository() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-target-boundary")?;
+  ws.add_crate("boundary-lib", "0.1.0", &[])?;
+  let source_head = ws.commit("Add boundary-lib")?;
+  let target = ws.path.join("split-target");
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.boundary-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/boundary-lib" }}]
+"#,
+    target.display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "boundary-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(!output.status.success());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("split target") && stderr.contains("overlaps") && stderr.contains("source worktree"),
+    "boundary error should identify both roots\nstderr:\n{}",
+    stderr
+  );
+  assert!(!target.exists(), "rejected target must not be created");
+  let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+  assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), source_head);
+
+  Ok(())
+}
+
+#[test]
+fn test_split_rejects_crate_path_outside_workspace() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-crate-boundary")?;
+  ws.add_crate("boundary-lib", "0.1.0", &[])?;
+  ws.commit("Add boundary-lib")?;
+  let outside_root = TempDir::new()?;
+  let outside = outside_root.path().join("outside-crate");
+  std::fs::create_dir(&outside)?;
+  std::fs::write(
+    outside.join("Cargo.toml"),
+    "[package]\nname='outside'\nversion='0.1.0'\n",
+  )?;
+  let target_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.boundary-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "{}" }}]
+"#,
+    target_dir.path().display().to_string().replace('\\', "\\\\"),
+    outside.display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "boundary-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(!output.status.success());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("split crate path") && stderr.contains("escapes the source workspace"),
+    "crate boundary error should explain the escape\nstderr:\n{}",
+    stderr
   );
 
   Ok(())

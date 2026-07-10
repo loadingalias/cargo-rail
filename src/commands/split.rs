@@ -2,7 +2,7 @@
 
 use std::io::IsTerminal;
 
-use crate::commands::common::{OutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
+use crate::commands::common::{SplitOutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
 use crate::config::RailConfig;
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
@@ -31,15 +31,15 @@ pub struct SplitRunArgs {
   /// Skip confirmation prompts (for CI/automation)
   pub yes: bool,
   /// Output format
-  pub format: OutputFormat,
+  pub format: SplitOutputFormat,
 }
 
 /// Run the split command
 pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
-  let json = args.format.is_json();
+  let machine = args.format != SplitOutputFormat::Text;
 
   // JSON mode enables structured error output and suppresses progress
-  if json {
+  if args.format.is_json_like() {
     crate::output::set_json_mode(true);
   }
 
@@ -62,7 +62,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
   // Check mode: show plan
   if args.check {
     match args.format {
-      OutputFormat::Json => {
+      SplitOutputFormat::Json => {
         let crates: Vec<_> = configs
           .iter()
           .map(|config| {
@@ -89,12 +89,12 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         let output = crate::output::machine_json_envelope("split", "check", "pending_changes", 1, payload);
         println!("{}", serde_json::to_string_pretty(&output)?);
       }
-      OutputFormat::NamesOnly => {
+      SplitOutputFormat::NamesOnly => {
         for config in &configs {
           println!("{}", config.crate_name);
         }
       }
-      OutputFormat::JsonLines => {
+      SplitOutputFormat::JsonLines => {
         for config in &configs {
           let obj = serde_json::json!({
             "crate_name": config.crate_name,
@@ -106,8 +106,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           println!("{}", serde_json::to_string(&obj)?);
         }
       }
-      _ => {
-        // Text, GitHub, GitHubMatrix all fall back to text output
+      SplitOutputFormat::Text => {
         println!("split plan:\n");
         for config in &configs {
           println!("  {}", config.crate_name);
@@ -132,11 +131,11 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     "split apply",
     args.yes,
     args.plan_path.as_deref(),
-    std::io::stdin().is_terminal() && !json,
+    std::io::stdin().is_terminal() && !machine,
   )?;
 
   // Interactive confirmation (unless --yes)
-  if !args.yes && std::io::stdin().is_terminal() && !json {
+  if !args.yes && std::io::stdin().is_terminal() && !machine {
     println!("splitting {} crate(s):\n", config_count);
     for config in &configs {
       println!("  {} -> {}", config.crate_name, config.target_repo_path.display());
@@ -156,13 +155,8 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         "generate a split plan using 'cargo rail split run --check -f json'".to_string(),
       ));
     }
-    mutation::validate_pre_apply(ctx, &from_file)?;
-    if from_file.inputs_fingerprint != expected_mutation_plan.inputs_fingerprint {
-      return Err(RailError::with_help(
-        "provided split plan does not match current requested operation",
-        "regenerate the split plan and rerun with --plan",
-      ));
-    }
+    mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
+    mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
     from_file
   } else {
     mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
@@ -181,6 +175,17 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     )],
   )?;
   progress!("receipt: {}", plan_receipt.display());
+
+  let output_crates: Vec<_> = configs
+    .iter()
+    .map(|config| {
+      serde_json::json!({
+        "crate_name": config.crate_name,
+        "target_repo": config.target_repo_path,
+        "status": "applied",
+      })
+    })
+    .collect();
 
   // Execute splits
   if config_count > 1 && args.all {
@@ -205,7 +210,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     }
   }
 
-  println!("split complete");
   let apply_receipt = mutation::write_receipt(
     ctx.workspace_root(),
     "split",
@@ -218,6 +222,30 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     ],
   )?;
   progress!("receipt: {}", apply_receipt.display());
+
+  match args.format {
+    SplitOutputFormat::Text => println!("split complete"),
+    SplitOutputFormat::Json => {
+      let payload = serde_json::json!({
+        "crates": output_crates,
+        "count": output_crates.len(),
+      });
+      let output = crate::output::machine_json_envelope("split", "apply", "success", 0, payload);
+      println!("{}", serde_json::to_string_pretty(&output)?);
+    }
+    SplitOutputFormat::NamesOnly => {
+      for item in &output_crates {
+        if let Some(crate_name) = item["crate_name"].as_str() {
+          println!("{}", crate_name);
+        }
+      }
+    }
+    SplitOutputFormat::JsonLines => {
+      for item in &output_crates {
+        println!("{}", serde_json::to_string(item)?);
+      }
+    }
+  }
   Ok(())
 }
 

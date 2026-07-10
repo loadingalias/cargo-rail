@@ -5,6 +5,7 @@
 
 use crate::error::{RailResult, ResultExt};
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -23,10 +24,20 @@ pub enum ConflictStrategy {
 }
 
 /// Information about a conflict
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictClass {
+  /// Both sides changed the same content and Git could not merge it cleanly.
+  Content,
+}
+
+/// One unresolved conflict that requires operator resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictInfo {
   /// Path to the conflicted file
   pub file_path: PathBuf,
+  /// Stable machine-readable conflict classification.
+  pub class: ConflictClass,
 }
 
 /// Result of a merge operation

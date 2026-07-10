@@ -5,14 +5,16 @@ use crate::error::{RailError, RailResult};
 use crate::release::changelog::detect_github_repo;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
 use crate::release::process;
+use crate::release::state::{ReleaseMode, ReleaseState, ReleaseStatus, StepStatus, validate_state_path};
 use crate::release::version::VersionBumper;
 use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
 use chrono::Local;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES: usize = 120_000;
 const RELEASE_REMOTE: &str = "origin";
@@ -136,95 +138,47 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   /// Execute a release plan
-  pub fn execute(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<()> {
+  pub fn execute(
+    &self,
+    plan: &ReleasePlan,
+    skip_publish: bool,
+    skip_tag: bool,
+    planned_paths: &[PathBuf],
+    control_paths: &[PathBuf],
+  ) -> RailResult<()> {
     // Run pre-flight checks
     let warnings = self.preflight_check(plan, skip_tag)?;
     for warning in &warnings {
       warn!("{}", warning);
     }
 
-    let mut consumed_change_files = false;
-    for (i, crate_plan) in plan.crates.iter().enumerate() {
-      progress!("[{}/{}] {}", i + 1, plan.crates.len(), crate_plan.name);
-
-      progress!(
-        "  version: {} -> {}",
-        crate_plan.current_version,
-        crate_plan.new_version
-      );
-      self.bump_crate_version(crate_plan)?;
-
-      if !crate_plan.affected_dependents.is_empty() {
-        progress!("  updating {} dependents", crate_plan.affected_dependents.len());
-        self.update_dependents(crate_plan)?;
-      }
-
-      progress!("  changelog");
-      self.update_changelog(crate_plan)?;
-      self.validate_release_notes_size(crate_plan, skip_tag)?;
-      if !consumed_change_files {
-        self.consume_change_files(plan)?;
-        consumed_change_files = true;
-      }
-
-      progress!("  commit");
-      self.commit_version_bump(crate_plan)?;
-
-      if !skip_tag {
-        progress!("  tag: {}", crate_plan.tag_name);
-        self.create_tag(crate_plan)?;
-      }
-    }
-
-    if self.release_config.push {
-      progress!("  pushing release refs");
-      self.push_release_refs(plan, skip_tag)?;
-    }
-
-    if self.release_config.create_github_release && !skip_tag {
-      let forge = self.detect_release_forge()?;
-      for crate_plan in &plan.crates {
-        progress!("  {} release: {}", forge.name().to_lowercase(), crate_plan.tag_name);
-        self.create_forge_release(forge, crate_plan)?;
-      }
-    }
-
-    for (i, crate_plan) in plan.crates.iter().enumerate() {
-      if !skip_publish && crate_plan.publish {
-        progress!("  publishing {}...", crate_plan.name);
-        self.publish_crate(crate_plan)?;
-
-        if i + 1 < plan.crates.len() {
-          let delay = self.release_config.publish_delay;
-          progress!("  waiting {}s...", delay);
-          thread::sleep(Duration::from_secs(delay));
-        }
-      } else if !crate_plan.publish {
-        progress!("  skipped publish (publish = false) for {}", crate_plan.name);
-      }
-    }
-
-    if self.release_config.create_github_release && !skip_tag {
-      let forge = self.detect_release_forge()?;
-      for crate_plan in &plan.crates {
-        self.publish_forge_release(forge, crate_plan)?;
-      }
-    }
-
-    progress!("\nrelease complete");
-
-    if !skip_tag && !self.release_config.push {
-      let branch = self.ctx.git()?.current_branch().unwrap_or_else(|_| "main".to_string());
-      progress!("\nnext:");
-      progress!("  git push origin {}", branch);
-      progress!("  git push origin --tags");
+    let git = self.ctx.git()?.git();
+    let (mut state, state_path) = ReleaseState::create(
+      self.ctx.workspace_root(),
+      ReleaseMode::Run,
+      plan.clone(),
+      self.release_config.clone(),
+      skip_publish,
+      skip_tag,
+      git.head_commit()?,
+      git.current_branch()?,
+      planned_paths.to_vec(),
+      control_paths.to_vec(),
+    )?;
+    progress!("release state: {}", state_path.display());
+    if let Err(error) = self.execute_state(&mut state, &state_path) {
+      return Err(error.context(format!(
+        "release is recoverable from '{}'\nresume with: cargo rail release resume {}",
+        state_path.display(),
+        state_path.display()
+      )));
     }
 
     Ok(())
   }
 
   /// Prepare a release pull request: mutations only, no tags or publish.
-  pub fn execute_pr(&self, plan: &ReleasePlan) -> RailResult<()> {
+  pub fn execute_pr(&self, plan: &ReleasePlan, planned_paths: &[PathBuf], control_paths: &[PathBuf]) -> RailResult<()> {
     self.preflight_pr()?;
     let branch = release_branch_name(plan)?;
     let git = self.ctx.git()?.git();
@@ -251,7 +205,7 @@ impl<'a> ReleasePublisher<'a> {
       self.update_lockfile_for_crate(&crate_plan.name)?;
     }
 
-    git.stage_all()?;
+    self.stage_planned_paths(planned_paths, control_paths)?;
     git.commit(&format!("chore(release): prepare {}", branch))?;
     git.run_git(&["push", "-u", RELEASE_REMOTE, &branch])?;
     self.open_release_pr(plan, &branch)?;
@@ -266,48 +220,314 @@ impl<'a> ReleasePublisher<'a> {
       warn!("{}", warning);
     }
 
-    for crate_plan in &plan.crates {
-      self.validate_release_notes_size(crate_plan, skip_tag)?;
+    let git = self.ctx.git()?.git();
+    let (mut state, state_path) = ReleaseState::create(
+      self.ctx.workspace_root(),
+      ReleaseMode::Finalize,
+      plan.clone(),
+      self.release_config.clone(),
+      skip_publish,
+      skip_tag,
+      git.head_commit()?,
+      git.current_branch()?,
+      Vec::new(),
+      Vec::new(),
+    )?;
+    progress!("release state: {}", state_path.display());
+    self.execute_state(&mut state, &state_path)
+  }
+
+  /// Resume a previously interrupted release without replanning mutated inputs.
+  pub fn resume(&self, state_path: &std::path::Path) -> RailResult<()> {
+    let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
+    let mut state = ReleaseState::load(&state_path)?;
+    if state.status != ReleaseStatus::Active {
+      return Err(RailError::message(format!(
+        "release state is {:?}, not active",
+        state.status
+      )));
+    }
+    if serde_json::to_value(&state.release_config)? != serde_json::to_value(self.release_config)? {
+      return Err(RailError::with_help(
+        "release configuration changed since execution began",
+        "restore the original release configuration before resuming; the persisted side-effect contract cannot change mid-release",
+      ));
+    }
+    if self.ctx.git()?.git().current_branch()? != state.branch {
+      return Err(RailError::with_help(
+        format!("release resume requires branch '{}'", state.branch),
+        format!("git switch {}", state.branch),
+      ));
+    }
+    progress!("resuming release state: {}", state_path.display());
+    self.execute_state(&mut state, &state_path)
+  }
+
+  /// Abort an active release while it is still entirely local.
+  pub fn abort(&self, state_path: &std::path::Path) -> RailResult<()> {
+    let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
+    let mut state = ReleaseState::load(&state_path)?;
+    if state.status != ReleaseStatus::Active {
+      return Err(RailError::message(format!("release state is {:?}", state.status)));
+    }
+    let irreversible = step_may_have_side_effect(&state.push)
+      || state.crates.iter().any(|crate_state| {
+        step_may_have_side_effect(&crate_state.forge_draft)
+          || step_may_have_side_effect(&crate_state.publication)
+          || step_may_have_side_effect(&crate_state.forge_publication)
+      });
+    if irreversible {
+      return Err(RailError::with_help(
+        "release abort refused because a remote or registry side effect may already exist",
+        format!(
+          "resume with 'cargo rail release resume {}'; cargo-rail will reconcile the external state",
+          state_path.display()
+        ),
+      ));
     }
 
-    if !skip_tag {
-      for crate_plan in &plan.crates {
-        progress!("  tag: {}", crate_plan.tag_name);
-        self.create_tag(crate_plan)?;
+    let git = self.ctx.git()?.git();
+    if git.current_branch()? != state.branch {
+      return Err(RailError::with_help(
+        format!("release abort requires branch '{}'", state.branch),
+        format!("git switch {}", state.branch),
+      ));
+    }
+    self.ensure_only_release_paths_changed(&state)?;
+    for (crate_plan, crate_state) in state.plan.crates.iter().zip(&state.crates) {
+      if crate_state.tag.status != StepStatus::Pending && self.local_tag_target(&crate_plan.tag_name)?.is_some() {
+        git.run_git(&["tag", "-d", &crate_plan.tag_name])?;
       }
     }
+    git.run_git(&["reset", "--hard", &state.initial_head])?;
+    self.clean_untracked_planned_paths(&state)?;
+    state.status = ReleaseStatus::Aborted;
+    state.save(&state_path)?;
+    progress!("release aborted and restored to {}", state.initial_head);
+    Ok(())
+  }
 
-    if self.release_config.push {
-      progress!("  pushing release refs");
-      self.push_release_refs(plan, skip_tag)?;
+  fn execute_state(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    self.reconcile_local_steps(state, state_path)?;
+    self.reconcile_push(state, state_path)?;
+    self.reconcile_forge_drafts(state, state_path)?;
+    self.reconcile_publications(state, state_path)?;
+    self.reconcile_forge_publications(state, state_path)?;
+    state.status = ReleaseStatus::Complete;
+    state.save(state_path)?;
+    progress!("\nrelease complete");
+
+    if !state.skip_tag && !self.release_config.push {
+      progress!("\nnext:");
+      progress!("  git push origin {}", state.branch);
+      progress!("  git push origin --tags");
     }
+    Ok(())
+  }
 
-    if self.release_config.create_github_release && !skip_tag {
-      let forge = self.detect_release_forge()?;
-      for crate_plan in &plan.crates {
-        progress!("  {} release: {}", forge.name().to_lowercase(), crate_plan.tag_name);
-        self.create_forge_release(forge, crate_plan)?;
+  fn reconcile_local_steps(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    for crate_plan in state.plan.crates.clone() {
+      let index = state.crate_index(&crate_plan.name)?;
+      if !state.crates[index].commit.is_complete() {
+        let expected_subject = format!("chore(release): {} v{}", crate_plan.name, crate_plan.new_version);
+        if state.crates[index].commit.status == StepStatus::InProgress {
+          let expected_parent = state.crates[index]
+            .commit
+            .object
+            .as_deref()
+            .ok_or_else(|| RailError::message("in-progress release commit has no recorded parent"))?;
+          let head = self.ctx.git()?.git().head_commit()?;
+          let subject = self.ctx.git()?.git().run_git_stdout(&["log", "-1", "--format=%s"])?;
+          let parent = self
+            .ctx
+            .git()?
+            .git()
+            .run_git_stdout(&["rev-parse", "HEAD^"])
+            .unwrap_or_default();
+          if head != expected_parent && parent == expected_parent && subject == expected_subject {
+            state.crates[index].commit.status = StepStatus::Complete;
+            state.crates[index].commit.object = Some(head);
+            state.save(state_path)?;
+          } else {
+            self.restore_interrupted_local_step(state)?;
+          }
+        }
+
+        if !state.crates[index].commit.is_complete() {
+          state.crates[index].commit.status = StepStatus::InProgress;
+          state.crates[index].commit.object = Some(self.ctx.git()?.git().head_commit()?);
+          state.save(state_path)?;
+          progress!(
+            "  version: {} -> {}",
+            crate_plan.current_version,
+            crate_plan.new_version
+          );
+          self.bump_crate_version(&crate_plan)?;
+          if !crate_plan.affected_dependents.is_empty() {
+            self.update_dependents(&crate_plan)?;
+          }
+          self.update_changelog(&crate_plan)?;
+          self.validate_release_notes_size(&crate_plan, state.skip_tag)?;
+          if !state.crates.iter().any(|crate_state| crate_state.commit.is_complete()) {
+            self.consume_change_files(&state.plan)?;
+          }
+          self.commit_version_bump(&crate_plan, &state.planned_paths, &state.control_paths)?;
+          let commit = self.ctx.git()?.git().head_commit()?;
+          fault_after("commit", &crate_plan.name)?;
+          state.crates[index].commit.status = StepStatus::Complete;
+          state.crates[index].commit.object = Some(commit);
+          state.save(state_path)?;
+        }
       }
-    }
 
-    for (i, crate_plan) in plan.crates.iter().enumerate() {
-      if !skip_publish && crate_plan.publish {
-        progress!("  publishing {}...", crate_plan.name);
-        self.publish_crate(crate_plan)?;
-        if i + 1 < plan.crates.len() {
-          thread::sleep(Duration::from_secs(self.release_config.publish_delay));
+      if !state.crates[index].tag.is_complete() {
+        let expected = state.crates[index]
+          .commit
+          .object
+          .clone()
+          .ok_or_else(|| RailError::message(format!("release commit missing for '{}'", crate_plan.name)))?;
+        if let Some(existing) = self.local_tag_target(&crate_plan.tag_name)? {
+          if existing != expected {
+            return Err(RailError::message(format!(
+              "tag '{}' points to {}, expected {}",
+              crate_plan.tag_name, existing, expected
+            )));
+          }
+          state.crates[index].tag.status = StepStatus::Complete;
+          state.crates[index].tag.object = Some(existing);
+          state.save(state_path)?;
+        } else {
+          state.crates[index].tag.status = StepStatus::InProgress;
+          state.save(state_path)?;
+          self.create_tag(&crate_plan)?;
+          fault_after("tag", &crate_plan.tag_name)?;
+          state.crates[index].tag.status = StepStatus::Complete;
+          state.crates[index].tag.object = Some(expected);
+          state.save(state_path)?;
         }
       }
     }
+    Ok(())
+  }
 
-    if self.release_config.create_github_release && !skip_tag {
-      let forge = self.detect_release_forge()?;
-      for crate_plan in &plan.crates {
-        self.publish_forge_release(forge, crate_plan)?;
-      }
+  fn reconcile_push(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    if !self.release_config.push {
+      state.push.status = StepStatus::Complete;
+      state.save(state_path)?;
+      return Ok(());
     }
+    if state.push.is_complete() {
+      return Ok(());
+    }
+    if self.remote_release_matches(state)? {
+      state.push.status = StepStatus::Complete;
+      state.push.object = Some(self.ctx.git()?.git().head_commit()?);
+      state.save(state_path)?;
+      return Ok(());
+    }
+    state.push.status = StepStatus::InProgress;
+    state.save(state_path)?;
+    self.push_release_refs(&state.plan, state.skip_tag)?;
+    fault_after("push", RELEASE_REMOTE)?;
+    state.push.status = StepStatus::Complete;
+    state.push.object = Some(self.ctx.git()?.git().head_commit()?);
+    state.save(state_path)
+  }
 
-    progress!("\nrelease finalize complete");
+  fn reconcile_forge_drafts(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    if !self.release_config.create_github_release || state.skip_tag {
+      for crate_state in &mut state.crates {
+        crate_state.forge_draft.status = StepStatus::Complete;
+        crate_state.forge_publication.status = StepStatus::Complete;
+      }
+      state.save(state_path)?;
+      return Ok(());
+    }
+    let forge = self.detect_release_forge()?;
+    for crate_plan in state.plan.crates.clone() {
+      let index = state.crate_index(&crate_plan.name)?;
+      if state.crates[index].forge_draft.is_complete() {
+        continue;
+      }
+      if self.existing_forge_release_matches(forge, &crate_plan)? {
+        state.crates[index].forge_draft.status = StepStatus::Complete;
+        state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
+        state.save(state_path)?;
+        continue;
+      }
+      state.crates[index].forge_draft.status = StepStatus::InProgress;
+      state.save(state_path)?;
+      self.create_forge_release(forge, &crate_plan)?;
+      fault_after("forge_draft", &crate_plan.tag_name)?;
+      state.crates[index].forge_draft.status = StepStatus::Complete;
+      state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
+      if forge == ReleaseForge::Gitlab {
+        state.crates[index].forge_publication.status = StepStatus::Complete;
+      }
+      state.save(state_path)?;
+    }
+    Ok(())
+  }
+
+  fn reconcile_publications(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    for crate_plan in state.plan.crates.clone() {
+      let index = state.crate_index(&crate_plan.name)?;
+      if state.crates[index].publication.is_complete() {
+        if !crate_plan.publish {
+          progress!("  skipped publish (publish = false) for {}", crate_plan.name);
+        }
+        continue;
+      }
+      if self.registry_version_exists(&crate_plan) {
+        state.crates[index].publication.status = StepStatus::Complete;
+        state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+        state.save(state_path)?;
+        continue;
+      }
+      if state.crates[index].publication.status == StepStatus::InProgress {
+        self.wait_for_registry(&crate_plan)?;
+        state.crates[index].publication.status = StepStatus::Complete;
+        state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+        state.save(state_path)?;
+        continue;
+      }
+      state.crates[index].publication.status = StepStatus::InProgress;
+      state.save(state_path)?;
+      progress!("  publishing {}...", crate_plan.name);
+      self.publish_crate(&crate_plan)?;
+      fault_after("publish", &crate_plan.name)?;
+      self.wait_for_registry(&crate_plan)?;
+      state.crates[index].publication.status = StepStatus::Complete;
+      state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+      state.save(state_path)?;
+    }
+    Ok(())
+  }
+
+  fn reconcile_forge_publications(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    if !self.release_config.create_github_release || state.skip_tag {
+      return Ok(());
+    }
+    let forge = self.detect_release_forge()?;
+    for crate_plan in state.plan.crates.clone() {
+      let index = state.crate_index(&crate_plan.name)?;
+      if state.crates[index].forge_publication.is_complete() {
+        continue;
+      }
+      if forge == ReleaseForge::Github && self.github_release_is_published(&crate_plan.tag_name)? {
+        state.crates[index].forge_publication.status = StepStatus::Complete;
+        state.crates[index].forge_publication.object = Some(crate_plan.tag_name.clone());
+        state.save(state_path)?;
+        continue;
+      }
+      state.crates[index].forge_publication.status = StepStatus::InProgress;
+      state.save(state_path)?;
+      self.publish_forge_release(forge, &crate_plan)?;
+      fault_after("forge_publish", &crate_plan.tag_name)?;
+      state.crates[index].forge_publication.status = StepStatus::Complete;
+      state.crates[index].forge_publication.object = Some(crate_plan.tag_name.clone());
+      state.save(state_path)?;
+    }
     Ok(())
   }
 
@@ -490,18 +710,65 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   /// Commit version bump and changelog
-  fn commit_version_bump(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+  fn commit_version_bump(
+    &self,
+    plan: &CrateReleasePlan,
+    planned_paths: &[PathBuf],
+    control_paths: &[PathBuf],
+  ) -> RailResult<()> {
     let message = format!("chore(release): {} v{}", plan.name, plan.new_version);
 
     // Update Cargo.lock to reflect the new version
     // Use targeted update to only update this crate, not external dependencies
     self.update_lockfile_for_crate(&plan.name)?;
 
-    // Stage all changes and commit
-    self.ctx.git()?.git().stage_all()?;
+    // Refuse any mutation outside the approved path set, then stage only that set.
+    self.stage_planned_paths(planned_paths, control_paths)?;
     self.ctx.git()?.git().commit(&message)?;
 
     Ok(())
+  }
+
+  fn stage_planned_paths(&self, planned_paths: &[PathBuf], control_paths: &[PathBuf]) -> RailResult<()> {
+    let git = self.ctx.git()?.git();
+    let canonical_git_root = fs::canonicalize(&git.worktree_root)?;
+    let planned: BTreeSet<PathBuf> = planned_paths.iter().cloned().collect();
+    let mut allowed = planned.clone();
+    for path in control_paths {
+      let relative = if path.is_absolute() {
+        let canonical = fs::canonicalize(path)?;
+        let Ok(relative) = canonical.strip_prefix(&canonical_git_root) else {
+          continue;
+        };
+        relative.to_path_buf()
+      } else {
+        path.clone()
+      };
+      allowed.insert(relative);
+    }
+    let changed_paths = git.changed_paths()?;
+    let unexpected = changed_paths
+      .iter()
+      .filter(|path| !allowed.contains(*path))
+      .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+      return Err(RailError::with_help(
+        format!(
+          "release produced unplanned worktree changes: {}",
+          unexpected
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+        ),
+        "restore the unexpected paths, regenerate the release plan, and retry",
+      ));
+    }
+    let to_stage = changed_paths
+      .into_iter()
+      .filter(|path| planned.contains(path))
+      .collect::<Vec<_>>();
+    git.stage_paths(&to_stage)
   }
 
   /// Create git tag
@@ -682,6 +949,179 @@ impl<'a> ReleasePublisher<'a> {
         "set [release].forge = \"github\" or \"gitlab\"; Gitea release creation is not supported",
       )
     })
+  }
+
+  fn local_tag_target(&self, tag_name: &str) -> RailResult<Option<String>> {
+    let git = self.ctx.git()?.git();
+    if !git.run_git_check(&["rev-parse", "--verify", "--quiet", &format!("refs/tags/{}", tag_name)]) {
+      return Ok(None);
+    }
+    git.run_git_stdout(&["rev-list", "-n", "1", tag_name]).map(Some)
+  }
+
+  fn remote_release_matches(&self, state: &ReleaseState) -> RailResult<bool> {
+    let expected_head = self.ctx.git()?.git().head_commit()?;
+    let Some(remote_head) = self.remote_ref_target(&format!("refs/heads/{}", state.branch))? else {
+      return Ok(false);
+    };
+    if remote_head != expected_head {
+      return Ok(false);
+    }
+    if !state.skip_tag {
+      for crate_plan in &state.plan.crates {
+        let Some(remote_tag) = self.remote_ref_target(&format!("refs/tags/{}^{{}}", crate_plan.tag_name))? else {
+          return Ok(false);
+        };
+        let expected = self
+          .local_tag_target(&crate_plan.tag_name)?
+          .ok_or_else(|| RailError::message(format!("local tag '{}' is missing", crate_plan.tag_name)))?;
+        if remote_tag != expected {
+          return Err(RailError::message(format!(
+            "remote tag '{}' points to {}, expected {}",
+            crate_plan.tag_name, remote_tag, expected
+          )));
+        }
+      }
+    }
+    Ok(true)
+  }
+
+  fn remote_ref_target(&self, git_ref: &str) -> RailResult<Option<String>> {
+    let output = self.ctx.git()?.git().run_git(&["ls-remote", RELEASE_REMOTE, git_ref])?;
+    Ok(
+      String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string),
+    )
+  }
+
+  fn registry_version_exists(&self, plan: &CrateReleasePlan) -> bool {
+    let spec = format!("{}@{}", plan.name, plan.new_version);
+    process::succeeds("cargo", &["info", &spec], Some(self.ctx.workspace_root()))
+  }
+
+  fn wait_for_registry(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    let max_delay = self.release_config.publish_delay.clamp(1, 10);
+    let timeout = Duration::from_secs((max_delay * 12).max(30));
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_secs(1);
+    loop {
+      if self.registry_version_exists(plan) {
+        return Ok(());
+      }
+      if Instant::now() >= deadline {
+        return Err(RailError::with_help(
+          format!(
+            "{} v{} was published but did not become observable within {:?}",
+            plan.name, plan.new_version, timeout
+          ),
+          "resume the release later; cargo-rail will observe the existing version before taking another side effect",
+        ));
+      }
+      progress!("  waiting {:?} for registry convergence...", delay);
+      thread::sleep(delay);
+      delay = (delay * 2).min(Duration::from_secs(max_delay));
+    }
+  }
+
+  fn github_release_is_published(&self, tag_name: &str) -> RailResult<bool> {
+    let output = process::run(
+      "gh",
+      &["release", "view", tag_name, "--json", "isDraft"],
+      Some(self.ctx.workspace_root()),
+    )?;
+    if !output.status.success() {
+      return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+      .map_err(|error| RailError::message(format!("invalid gh release JSON: {}", error)))?;
+    Ok(value.get("isDraft").and_then(serde_json::Value::as_bool) == Some(false))
+  }
+
+  fn existing_forge_release_matches(&self, forge: ReleaseForge, plan: &CrateReleasePlan) -> RailResult<bool> {
+    if !self.forge_release_exists(forge, &plan.tag_name) {
+      return Ok(false);
+    }
+    if forge == ReleaseForge::Gitlab {
+      return Ok(true);
+    }
+    let output = process::run(
+      "gh",
+      &["release", "view", &plan.tag_name, "--json", "targetCommitish"],
+      Some(self.ctx.workspace_root()),
+    )?;
+    if !output.status.success() {
+      return Err(RailError::message(format!(
+        "failed to inspect existing GitHub release '{}'",
+        plan.tag_name
+      )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+      .map_err(|error| RailError::message(format!("invalid gh release JSON: {}", error)))?;
+    let target = value
+      .get("targetCommitish")
+      .and_then(serde_json::Value::as_str)
+      .unwrap_or_default();
+    let expected = self.tag_target_commit(&plan.tag_name)?;
+    if !target.is_empty() && target != expected && target != plan.tag_name {
+      return Err(RailError::message(format!(
+        "existing GitHub release '{}' targets '{}', expected '{}'",
+        plan.tag_name, target, expected
+      )));
+    }
+    Ok(true)
+  }
+
+  fn ensure_only_release_paths_changed(&self, state: &ReleaseState) -> RailResult<()> {
+    let allowed = state
+      .planned_paths
+      .iter()
+      .chain(&state.control_paths)
+      .cloned()
+      .collect::<BTreeSet<_>>();
+    let unexpected = self
+      .ctx
+      .git()?
+      .git()
+      .changed_paths()?
+      .into_iter()
+      .filter(|path| !allowed.contains(path))
+      .collect::<Vec<_>>();
+    if unexpected.is_empty() {
+      return Ok(());
+    }
+    Err(RailError::with_help(
+      format!(
+        "release recovery found unrelated changes: {}",
+        unexpected
+          .iter()
+          .map(|path| path.display().to_string())
+          .collect::<Vec<_>>()
+          .join(", ")
+      ),
+      "commit or restore unrelated work before resuming or aborting the release",
+    ))
+  }
+
+  fn restore_interrupted_local_step(&self, state: &ReleaseState) -> RailResult<()> {
+    self.ensure_only_release_paths_changed(state)?;
+    self.ctx.git()?.git().run_git(&["reset", "--hard", "HEAD"])?;
+    self.clean_untracked_planned_paths(state)
+  }
+
+  fn clean_untracked_planned_paths(&self, state: &ReleaseState) -> RailResult<()> {
+    let git = self.ctx.git()?.git();
+    for path in &state.planned_paths {
+      let Some(path) = path.to_str() else {
+        return Err(RailError::message(format!(
+          "release path '{}' is not valid UTF-8",
+          path.display()
+        )));
+      };
+      git.run_git(&["clean", "-f", "--", path])?;
+    }
+    Ok(())
   }
 
   fn remote_tag_exists(&self, tag_name: &str) -> RailResult<bool> {
@@ -877,6 +1317,21 @@ fn release_pr_body(plan: &ReleasePlan) -> String {
     }
   }
   out
+}
+
+fn step_may_have_side_effect(step: &crate::release::state::Step) -> bool {
+  step.status == StepStatus::InProgress || step.object.is_some()
+}
+
+fn fault_after(step: &str, subject: &str) -> RailResult<()> {
+  let Ok(requested) = std::env::var("CARGO_RAIL_RELEASE_FAIL_AFTER") else {
+    return Ok(());
+  };
+  let point = format!("{}:{}", step, subject);
+  if requested == step || requested == point {
+    return Err(RailError::message(format!("injected release failure after {}", point)));
+  }
+  Ok(())
 }
 
 #[cfg(test)]

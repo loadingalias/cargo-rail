@@ -5,9 +5,10 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{OutputFormat, PlanOutputFormat, UnifyOutputFormat};
+use super::common::{ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat};
 use crate::sync::ConflictStrategy;
-use clap::{CommandFactory, Parser, Subcommand};
+use crate::test::runner::TestRunnerPreference;
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
@@ -30,7 +31,8 @@ Docs: https://github.com/loadingalias/cargo-rail";
 #[command(bin_name = "cargo")]
 #[command(styles = get_styles())]
 pub enum CargoCli {
-  /// The rail subcommand
+  /// Monorepo orchestration for Rust workspaces
+  #[command(about = "Monorepo orchestration for Rust workspaces", long_about = MAIN_HELP)]
   Rail(RailCli),
 }
 
@@ -49,7 +51,7 @@ pub struct RailCli {
   #[arg(long, short, global = true)]
   pub quiet: bool,
 
-  /// Output in JSON format (shorthand for -f json)
+  /// Output as JSON where supported; rejected otherwise (shorthand for -f json)
   #[arg(long, global = true)]
   pub json: bool,
 
@@ -76,7 +78,10 @@ Examples:
   cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
   cargo rail run --all --surface test         # Force full test run
   cargo rail run --dry-run --print-cmd        # Preview exact execution
-  cargo rail run -- --nocapture               # Pass args to underlying runner";
+  cargo rail run --test-filter parser         # Portable test-name filter
+  cargo rail run --cargo-test-arg=--all-features --test-runner cargo
+  cargo rail run --nextest-arg=-P --nextest-arg=commit
+  cargo rail run -- --nocapture               # Pass harness args after --";
 
 const PLAN_HELP: &str = "\
 Examples:
@@ -86,6 +91,7 @@ Examples:
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
   cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --schema                  # Print the versioned JSON Schema
   cargo rail plan -f json                   # Full machine-readable contract
   cargo rail plan -f github                 # Compact GitHub Actions key=value output
   cargo rail plan -f github-debug           # GitHub Actions output plus plan_json";
@@ -150,6 +156,8 @@ Examples:
   cargo rail change add rail-core --bump patch --name fix-parser
   cargo rail change status
   cargo rail change status --format json
+  cargo rail change check --merge-base --required
+  cargo rail change check --since origin/main --format json
 
 Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
 Change files are consumed (deleted in the release commit) when released.
@@ -182,9 +190,9 @@ Examples:
 
 const HASH_HELP: &str = "\
 Examples:
-  cargo rail hash                          # Hash current planner contract
-  cargo rail hash --merge-base             # Hash planner contract at merge-base comparison
-  cargo rail hash -f json                  # Structured hash output
+  cargo rail hash                          # Portable identity of the current plan
+  cargo rail hash --merge-base             # Identity for the merge-base comparison
+  cargo rail hash -f json                  # Structured identity metadata
   cargo rail diff-hash plan-a.json plan-b.json
   cargo rail diff-hash plan-a.json plan-b.json -f json";
 
@@ -252,9 +260,26 @@ pub enum Commands {
     #[arg(long)]
     ignore_bin_crates: bool,
     /// Disable automatic use of cargo-nextest
-    #[arg(long)]
+    #[arg(long, conflicts_with = "test_runner")]
     skip_nextest: bool,
-    /// Pass additional arguments to the selected runner
+    /// Test runner backend (auto selects nextest when available)
+    #[arg(long, value_enum, default_value = "auto")]
+    test_runner: TestRunnerPreference,
+    /// Pass an option only to `cargo test` (repeatable)
+    #[arg(long = "cargo-test-arg", value_name = "ARG", allow_hyphen_values = true)]
+    cargo_test_args: Vec<String>,
+    /// Pass an option only to `cargo nextest run` (repeatable)
+    #[arg(
+      long = "nextest-arg",
+      value_name = "ARG",
+      allow_hyphen_values = true,
+      conflicts_with = "skip_nextest"
+    )]
+    nextest_args: Vec<String>,
+    /// Portable test-name filter placed before the test-binary separator
+    #[arg(long, value_name = "FILTER")]
+    test_filter: Option<String>,
+    /// Pass harness args after `--` for tests; runner args for other surfaces
     #[arg(last = true)]
     run_args: Vec<String>,
   },
@@ -286,6 +311,9 @@ pub enum Commands {
     /// Planner confidence profile override (strict|balanced|fast)
     #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
     confidence_profile: Option<String>,
+    /// Print the versioned planner JSON Schema and exit
+    #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "output", "explain", "confidence_profile"])]
+    schema: bool,
   },
 
   /// Unify workspace dependencies (replaces workspace-hack crates)
@@ -372,6 +400,13 @@ pub enum Commands {
     /// Apply from a previously generated mutation plan file
     #[arg(long, value_name = "PATH", conflicts_with = "check")]
     plan: Option<PathBuf>,
+    /// Resume a manually resolved sync conflict receipt
+    #[arg(
+      long,
+      value_name = "RECEIPT",
+      conflicts_with_all = ["crate_name", "all", "remote", "from_remote", "to_remote", "check", "plan"]
+    )]
+    resume: Option<PathBuf>,
     /// Allow running on dirty worktree (uncommitted changes)
     #[arg(long)]
     allow_dirty: bool,
@@ -380,7 +415,7 @@ pub enum Commands {
     yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
 
   /// Publish releases (version bump, changelog, tag, publish)
@@ -416,7 +451,7 @@ pub enum Commands {
     check: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
 
   /// Configuration management
@@ -428,7 +463,7 @@ pub enum Commands {
     command: ConfigCommand,
   },
 
-  /// Hash and compare planner contracts
+  /// Compute a portable planner identity (not a cache key)
   #[command(after_long_help = HASH_HELP)]
   Hash {
     /// Git ref to compare against (auto-detects default branch)
@@ -448,10 +483,10 @@ pub enum Commands {
     confidence_profile: Option<String>,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
 
-  /// Explain why two planner hashes differ
+  /// Explain why two portable planner identities differ
   #[command(after_long_help = HASH_HELP)]
   DiffHash {
     /// First planner JSON path
@@ -460,7 +495,7 @@ pub enum Commands {
     b: PathBuf,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
 
   /// Planner reasoning graph for explainability
@@ -508,7 +543,7 @@ pub enum ConfigCommand {
   Locate {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
   /// Print the effective configuration with defaults
   ///
@@ -518,7 +553,7 @@ pub enum ConfigCommand {
   Print {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
   /// Validate the configuration file
   ///
@@ -528,7 +563,7 @@ pub enum ConfigCommand {
   Validate {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
     /// Treat warnings as errors (auto-enabled in CI)
     #[arg(long, conflicts_with = "no_strict")]
     strict: bool,
@@ -549,7 +584,7 @@ pub enum ConfigCommand {
     check: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
 }
 
@@ -604,7 +639,7 @@ pub enum SplitCommand {
     yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: SplitOutputFormat,
   },
 }
 
@@ -654,7 +689,7 @@ pub enum ReleaseCommand {
     yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
   /// Validate release readiness
   Check {
@@ -672,7 +707,7 @@ pub enum ReleaseCommand {
     include_dependents: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
   },
   /// Finalize a merged release PR (tag, push, publish)
   Finalize {
@@ -696,7 +731,22 @@ pub enum ReleaseCommand {
     yes: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: TextJsonOutputFormat,
+  },
+  /// Resume an interrupted release from its durable state file
+  Resume {
+    /// State path printed by the interrupted release
+    #[arg(value_name = "STATE")]
+    state: PathBuf,
+  },
+  /// Abort an active release that has not reached remote side effects
+  Abort {
+    /// State path printed by the active release
+    #[arg(value_name = "STATE")]
+    state: PathBuf,
+    /// Confirm restoration of the pre-release local state
+    #[arg(short = 'y', long)]
+    yes: bool,
   },
 }
 
@@ -719,13 +769,31 @@ pub enum ChangeCommand {
     name: Option<String>,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: ChangeOutputFormat,
   },
   /// Show pending change files
   Status {
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: OutputFormat,
+    format: ChangeOutputFormat,
+  },
+  /// Check that changed crates have pending change files
+  Check {
+    /// Compare against this git ref
+    #[arg(long, conflicts_with_all = ["merge_base", "all"], value_name = "REF")]
+    since: Option<String>,
+    /// Compare from the merge-base with the default branch
+    #[arg(long, conflicts_with_all = ["since", "all"])]
+    merge_base: bool,
+    /// Scan the full reachable history
+    #[arg(long, conflicts_with_all = ["since", "merge_base"])]
+    all: bool,
+    /// Require coverage for every changed crate, ignoring release.require_change_files
+    #[arg(long)]
+    required: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: ChangeOutputFormat,
   },
 }
 
@@ -741,7 +809,7 @@ impl Commands {
   pub fn is_json_format(&self) -> bool {
     match self {
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
-      Commands::Plan { format, .. } => format.is_json_like(),
+      Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
       Commands::Unify { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
@@ -749,12 +817,15 @@ impl Commands {
       },
       Commands::Release { command } => match command {
         ReleaseCommand::Init { .. } => false,
+        ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => false,
         ReleaseCommand::Run { format, .. }
         | ReleaseCommand::Check { format, .. }
         | ReleaseCommand::Finalize { format, .. } => format.is_json_like(),
       },
       Commands::Change { command } => match command {
-        ChangeCommand::Add { format, .. } | ChangeCommand::Status { format } => format.is_json_like(),
+        ChangeCommand::Add { format, .. } | ChangeCommand::Status { format } | ChangeCommand::Check { format, .. } => {
+          format.is_json_like()
+        }
       },
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
@@ -768,36 +839,68 @@ impl Commands {
     }
   }
 
-  /// Apply global --json flag by overriding format to Json
-  pub fn apply_json_override(&mut self) {
+  /// Apply global `--json` by overriding the selected command's format.
+  ///
+  /// Commands without a structured output contract reject the shorthand instead
+  /// of silently emitting text while JSON mode is enabled.
+  pub fn apply_json_override(&mut self) -> Result<(), clap::Error> {
+    let unsupported = match self {
+      Commands::Run { .. } => Some("run"),
+      Commands::Unify { command: Some(_), .. } => Some("unify undo"),
+      Commands::Split {
+        command: SplitCommand::Init { .. },
+      } => Some("split init"),
+      Commands::Release {
+        command: ReleaseCommand::Init { .. },
+      } => Some("release init"),
+      Commands::Release {
+        command: ReleaseCommand::Resume { .. },
+      } => Some("release resume"),
+      Commands::Release {
+        command: ReleaseCommand::Abort { .. },
+      } => Some("release abort"),
+      Commands::Graph { dot: true, .. } => Some("graph --dot"),
+      Commands::Completions { .. } => Some("completions"),
+      _ => None,
+    };
+    if let Some(command) = unsupported {
+      return Err(CargoCli::command().error(
+        ErrorKind::ArgumentConflict,
+        format!("--json is not supported by 'cargo rail {command}'"),
+      ));
+    }
+
     match self {
-      Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = OutputFormat::Json,
+      Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
       Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },
-      } => *format = OutputFormat::Json,
+      } => *format = SplitOutputFormat::Json,
       Commands::Split { .. } => {}
       Commands::Release {
         command:
           ReleaseCommand::Run { format, .. }
           | ReleaseCommand::Check { format, .. }
           | ReleaseCommand::Finalize { format, .. },
-      } => *format = OutputFormat::Json,
+      } => *format = TextJsonOutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Change {
-        command: ChangeCommand::Add { format, .. } | ChangeCommand::Status { format },
-      } => *format = OutputFormat::Json,
+        command:
+          ChangeCommand::Add { format, .. } | ChangeCommand::Status { format } | ChangeCommand::Check { format, .. },
+      } => *format = ChangeOutputFormat::Json,
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }
         | ConfigCommand::Validate { format, .. }
-        | ConfigCommand::Sync { format, .. } => *format = OutputFormat::Json,
+        | ConfigCommand::Sync { format, .. } => *format = TextJsonOutputFormat::Json,
       },
-      Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => *format = OutputFormat::Json,
+      Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Graph { .. } => {}
       _ => {}
     }
+
+    Ok(())
   }
 }
 

@@ -33,9 +33,9 @@ fi
 
 # Determine comparison ref
 if [ -n "${RAIL_SINCE:-}" ]; then
-  PLAN_ARGS="--since $RAIL_SINCE"
+  PLAN_ARGS=(--since "$RAIL_SINCE")
 else
-  PLAN_ARGS="--merge-base"
+  PLAN_ARGS=(--merge-base)
 fi
 
 echo "Running Tests"
@@ -61,13 +61,18 @@ fi
 # Smart mode: Use cargo-rail for change detection
 echo "Change Detection Plan:"
 echo ""
-"${RAIL_CMD[@]}" plan $PLAN_ARGS --explain
+"${RAIL_CMD[@]}" plan "${PLAN_ARGS[@]}" --explain
 echo ""
 
 echo "Testing affected crates..."
 if [ "$MODE" = "commit" ]; then
   # CI mode: force commit profile and nextest JUnit output path.
-  "${RAIL_CMD[@]}" run $PLAN_ARGS --surface test -- -P "$NEXTEST_PROFILE" --config-file .config/nextest.toml
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test \
+    --test-runner nextest \
+    --nextest-arg=-P \
+    --nextest-arg="$NEXTEST_PROFILE" \
+    --nextest-arg=--config-file \
+    --nextest-arg=.config/nextest.toml
 else
-  "${RAIL_CMD[@]}" run $PLAN_ARGS --surface test
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test
 fi

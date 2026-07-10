@@ -1,6 +1,6 @@
 //! `cargo rail config` - Configuration management commands
 
-use crate::commands::common::OutputFormat;
+use crate::commands::common::TextJsonOutputFormat;
 use crate::config::{ConfigLoadResult, RailConfig, schema};
 use crate::error::{RailError, RailResult};
 use crate::toml::TomlEditor;
@@ -197,7 +197,7 @@ struct LocateResult {
 pub fn run_config_locate(
   workspace_root: &Path,
   config_override: Option<&Path>,
-  format: OutputFormat,
+  format: TextJsonOutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
 
@@ -282,7 +282,11 @@ pub fn run_config_locate(
 ///
 /// Shows what cargo-rail will actually use: user settings plus defaults
 /// for any fields not explicitly set.
-pub fn run_config_print(workspace_root: &Path, config_override: Option<&Path>, format: OutputFormat) -> RailResult<()> {
+pub fn run_config_print(
+  workspace_root: &Path,
+  config_override: Option<&Path>,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
   let json = format.is_json();
 
   if json {
@@ -376,7 +380,7 @@ fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) 
 pub fn run_config_validate_standalone(
   workspace_root: &Path,
   config_override: Option<&Path>,
-  format: OutputFormat,
+  format: TextJsonOutputFormat,
   strictness: StrictnessMode,
 ) -> RailResult<()> {
   let json = format.is_json();
@@ -748,7 +752,7 @@ pub fn run_config_sync(
   workspace_root: &Path,
   config_override: Option<&Path>,
   check: bool,
-  format: OutputFormat,
+  format: TextJsonOutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
 

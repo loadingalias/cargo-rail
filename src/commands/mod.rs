@@ -49,11 +49,11 @@ pub mod sync;
 /// Workspace dependency unification commands
 pub mod unify;
 
-pub use change::{run_change_add, run_change_status};
+pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_change_status};
 pub use clean::run_clean;
 #[doc(hidden)]
 pub use cli::{CargoCli, ChangeCommand, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
-pub use common::OutputFormat;
+pub use common::{ChangeOutputFormat, SplitOutputFormat, TextJsonOutputFormat};
 pub use config::{
   StrictnessMode, run_config_locate, run_config_print, run_config_sync, run_config_validate_standalone,
 };
@@ -91,6 +91,11 @@ pub fn try_dispatch_pre_context(
   json: bool,
 ) -> RailResult<PreContextDispatch> {
   match cmd {
+    Commands::Plan { schema: true, .. } => {
+      plan::print_plan_schema();
+      Ok(PreContextDispatch::Handled)
+    }
+
     Commands::Init { output, force, check } => {
       init::run_init_standalone(workspace_root, &output, force, check, json)?;
       Ok(PreContextDispatch::Handled)
@@ -170,6 +175,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       explain,
       ignore_bin_crates,
       skip_nextest,
+      test_runner,
+      cargo_test_args,
+      nextest_args,
+      test_filter,
       run_args,
     } => run_run(
       ctx,
@@ -185,6 +194,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         explain,
         ignore_bin_crates,
         skip_nextest,
+        test_runner,
+        cargo_test_args,
+        nextest_args,
+        test_filter,
         run_args,
       },
     ),
@@ -198,6 +211,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       output,
       explain,
       confidence_profile,
+      schema: _,
     } => run_plan(
       ctx,
       PlanOptions {
@@ -234,7 +248,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       } else if check {
         run_unify_analyze(ctx, show_diff, explain, format, output.as_ref())
       } else {
-        run_unify_apply(ctx, backup, skip_report, report_path, plan)
+        run_unify_apply(ctx, backup, skip_report, report_path, plan, format)
       }
     }
 
@@ -281,6 +295,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       strategy,
       check,
       plan,
+      resume,
       allow_dirty,
       yes,
       format,
@@ -295,6 +310,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         strategy,
         check,
         plan_path: plan,
+        resume,
         allow_dirty,
         yes,
         format,
@@ -310,6 +326,22 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         format,
       } => run_change_add(ctx, crate_names, bump, message, name, format),
       cli::ChangeCommand::Status { format } => run_change_status(ctx, format),
+      cli::ChangeCommand::Check {
+        since,
+        merge_base,
+        all,
+        required,
+        format,
+      } => run_change_check(
+        ctx,
+        ChangeCheckOptions {
+          since,
+          merge_base,
+          all,
+          required,
+          format,
+        },
+      ),
     },
 
     // Release
@@ -356,6 +388,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
               include_dependents,
               yes,
               plan_path: plan,
+              format,
             },
           )
         }
@@ -390,6 +423,8 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         };
         release::run_release_finalize(ctx, names, all, skip_publish, skip_tag, include_dependents, yes, format)
       }
+      cli::ReleaseCommand::Resume { state } => release::run_release_resume(ctx, &state),
+      cli::ReleaseCommand::Abort { state, yes } => release::run_release_abort(ctx, &state, yes),
     },
 
     // Clean

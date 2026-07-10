@@ -8,7 +8,7 @@ use crate::commands::common::format_preview_list;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::progress;
-use crate::test::runner::select_runner;
+use crate::test::runner::{TestCommandArgs, TestRunnerPreference, select_runner};
 use crate::workspace::WorkspaceContext;
 use std::collections::HashSet;
 use std::fs;
@@ -40,6 +40,14 @@ pub struct RunOptions {
   pub ignore_bin_crates: bool,
   /// Disable automatic use of cargo-nextest for test surface.
   pub skip_nextest: bool,
+  /// Test runner backend preference.
+  pub test_runner: TestRunnerPreference,
+  /// Options passed only to `cargo test`.
+  pub cargo_test_args: Vec<String>,
+  /// Options passed only to `cargo nextest run`.
+  pub nextest_args: Vec<String>,
+  /// Portable test-name filter.
+  pub test_filter: Option<String>,
   /// Pass additional arguments to the surface runner.
   pub run_args: Vec<String>,
 }
@@ -404,7 +412,18 @@ fn run_test_surface(
     return Ok(());
   }
 
-  let runner = select_runner(!opts.skip_nextest);
+  let test_args = TestCommandArgs {
+    cargo: opts.cargo_test_args.clone(),
+    nextest: opts.nextest_args.clone(),
+    filter: opts.test_filter.clone(),
+    harness: run_args.to_vec(),
+  };
+  let preference = if opts.skip_nextest {
+    TestRunnerPreference::Cargo
+  } else {
+    opts.test_runner
+  };
+  let runner = select_runner(preference, &test_args)?;
   progress!("testing {} crates ({})", targets.len(), runner.name());
   if targets.len() <= 12 {
     for target in targets {
@@ -414,7 +433,7 @@ fn run_test_surface(
     progress!("targets: {}", format_preview_list(targets, 12));
   }
 
-  let mut cmd = runner.build_command(targets, run_args);
+  let mut cmd = runner.build_command(targets, &test_args)?;
   run_or_print_command(opts, workspace_root, "test", &mut cmd)
 }
 
@@ -533,6 +552,10 @@ fn write_run_decision_receipt(
       "all": opts.all,
       "run_args_requested": opts.run_args,
       "run_args_effective": effective.run_args,
+      "test_runner": opts.test_runner,
+      "cargo_test_args": opts.cargo_test_args,
+      "nextest_args": opts.nextest_args,
+      "test_filter": opts.test_filter,
       "dry_run": opts.dry_run,
     },
     "execution": {

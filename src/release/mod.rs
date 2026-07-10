@@ -23,6 +23,7 @@ pub mod planner;
 mod process;
 pub mod publisher;
 pub(crate) mod semver_checks;
+pub(crate) mod state;
 pub mod validator;
 pub mod version;
 

@@ -5,8 +5,42 @@
 
 use std::process::Command;
 
+use clap::ValueEnum;
+use serde::Serialize;
+
+use crate::error::{RailError, RailResult};
+
 fn cargo_command() -> Command {
   Command::new("cargo")
+}
+
+/// User preference for the test execution backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunnerPreference {
+  /// Prefer nextest when installed and otherwise use Cargo.
+  #[default]
+  Auto,
+  /// Require `cargo test`.
+  Cargo,
+  /// Require `cargo nextest run`.
+  Nextest,
+}
+
+/// Structured arguments for one test invocation.
+///
+/// Backend options are deliberately separate. The filter and harness arguments
+/// have equivalent positions in both Cargo and nextest command lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestCommandArgs {
+  /// Options understood only by `cargo test`.
+  pub cargo: Vec<String>,
+  /// Options understood only by `cargo nextest run`.
+  pub nextest: Vec<String>,
+  /// Optional portable test-name filter.
+  pub filter: Option<String>,
+  /// Arguments forwarded to the selected test binary after `--`.
+  pub harness: Vec<String>,
 }
 
 /// Test runner variants
@@ -19,7 +53,7 @@ pub enum TestRunner {
 }
 
 impl TestRunner {
-  /// Get the name of this test runner
+  /// Human-readable backend command name.
   pub fn name(&self) -> &str {
     match self {
       Self::CargoTest => "cargo test",
@@ -27,7 +61,7 @@ impl TestRunner {
     }
   }
 
-  /// Check if this test runner is available in the environment
+  /// Return whether the backend is available in the current environment.
   pub fn is_available(&self) -> bool {
     match self {
       Self::CargoTest => true, // cargo is always available
@@ -40,12 +74,16 @@ impl TestRunner {
     }
   }
 
-  /// Build a command to run tests for the given packages
-  pub fn build_command(&self, packages: &[String], args: &[String]) -> Command {
+  /// Build a command to run tests for the given packages.
+  pub fn build_command(&self, packages: &[String], args: &TestCommandArgs) -> RailResult<Command> {
     let mut cmd = cargo_command();
 
     match self {
       Self::CargoTest => {
+        if !args.nextest.is_empty() {
+          return Err(backend_argument_error("nextest", self.name()));
+        }
+
         cmd.arg("test");
 
         // Add package filters for each affected crate
@@ -53,13 +91,20 @@ impl TestRunner {
           cmd.arg("-p").arg(pkg);
         }
 
-        // Add user-provided test arguments
-        if !args.is_empty() {
+        cmd.args(&args.cargo);
+        if let Some(filter) = &args.filter {
+          cmd.arg(filter);
+        }
+        if !args.harness.is_empty() {
           cmd.arg("--");
-          cmd.args(args);
+          cmd.args(&args.harness);
         }
       }
       Self::Nextest => {
+        if !args.cargo.is_empty() {
+          return Err(backend_argument_error("Cargo test", self.name()));
+        }
+
         cmd.arg("nextest").arg("run");
 
         // Add package filters for each affected crate
@@ -67,24 +112,73 @@ impl TestRunner {
           cmd.arg("-p").arg(pkg);
         }
 
-        // Add user-provided test arguments
-        cmd.args(args);
+        cmd.args(&args.nextest);
+        if let Some(filter) = &args.filter {
+          cmd.arg(filter);
+        }
+        if !args.harness.is_empty() {
+          cmd.arg("--");
+          cmd.args(&args.harness);
+        }
       }
     }
 
-    cmd
+    Ok(cmd)
   }
 }
 
-/// Select the appropriate test runner based on preferences and availability
-///
-/// If prefer_nextest is true and nextest is available, use it.
-/// Otherwise, fall back to cargo test.
-pub fn select_runner(prefer_nextest: bool) -> TestRunner {
-  if prefer_nextest && TestRunner::Nextest.is_available() {
-    TestRunner::Nextest
+fn backend_argument_error(argument_backend: &str, selected_backend: &str) -> RailError {
+  RailError::with_help(
+    format!("{} options cannot be used with {}", argument_backend, selected_backend),
+    "select the matching --test-runner or remove the backend-specific options",
+  )
+}
+
+/// Select the test runner without silently reinterpreting backend arguments.
+pub fn select_runner(preference: TestRunnerPreference, args: &TestCommandArgs) -> RailResult<TestRunner> {
+  resolve_runner(preference, args, TestRunner::Nextest.is_available())
+}
+
+fn resolve_runner(
+  preference: TestRunnerPreference,
+  args: &TestCommandArgs,
+  nextest_available: bool,
+) -> RailResult<TestRunner> {
+  if !args.cargo.is_empty() && !args.nextest.is_empty() {
+    return Err(RailError::with_help(
+      "Cargo test and nextest options cannot be combined",
+      "select one backend and pass options only for that backend",
+    ));
+  }
+
+  match preference {
+    TestRunnerPreference::Cargo => {
+      if !args.nextest.is_empty() {
+        return Err(backend_argument_error("nextest", TestRunner::CargoTest.name()));
+      }
+      Ok(TestRunner::CargoTest)
+    }
+    TestRunnerPreference::Nextest => {
+      if !args.cargo.is_empty() {
+        return Err(backend_argument_error("Cargo test", TestRunner::Nextest.name()));
+      }
+      require_nextest(nextest_available)
+    }
+    TestRunnerPreference::Auto if !args.cargo.is_empty() => Ok(TestRunner::CargoTest),
+    TestRunnerPreference::Auto if !args.nextest.is_empty() => require_nextest(nextest_available),
+    TestRunnerPreference::Auto if nextest_available => Ok(TestRunner::Nextest),
+    TestRunnerPreference::Auto => Ok(TestRunner::CargoTest),
+  }
+}
+
+fn require_nextest(available: bool) -> RailResult<TestRunner> {
+  if available {
+    Ok(TestRunner::Nextest)
   } else {
-    TestRunner::CargoTest
+    Err(RailError::with_help(
+      "cargo-nextest is required by the selected test options but is not available",
+      "install cargo-nextest or select --test-runner cargo",
+    ))
   }
 }
 
@@ -103,14 +197,33 @@ mod tests {
   fn test_cargo_test_command_building() {
     let runner = TestRunner::CargoTest;
     let packages = vec!["crate-a".to_string(), "crate-b".to_string()];
-    let args = vec!["--nocapture".to_string()];
+    let args = TestCommandArgs {
+      cargo: vec!["--all-features".to_string()],
+      filter: Some("selected_test".to_string()),
+      harness: vec!["--nocapture".to_string(), "--test-threads=1".to_string()],
+      ..TestCommandArgs::default()
+    };
 
-    let cmd = runner.build_command(&packages, &args);
+    let cmd = runner
+      .build_command(&packages, &args)
+      .expect("Cargo arguments should render");
 
-    // Convert command to string for inspection
-    let cmd_str = format!("{:?}", cmd);
-    assert!(cmd_str.contains("cargo"));
-    assert!(cmd_str.contains("test"));
+    assert_eq!(cmd.get_program(), "cargo");
+    assert_eq!(
+      command_args(&cmd),
+      [
+        "test",
+        "-p",
+        "crate-a",
+        "-p",
+        "crate-b",
+        "--all-features",
+        "selected_test",
+        "--",
+        "--nocapture",
+        "--test-threads=1",
+      ]
+    );
   }
 
   #[test]
@@ -120,19 +233,90 @@ mod tests {
   }
 
   #[test]
-  fn test_select_runner_fallback() {
-    // Should always return a valid runner
-    let runner = select_runner(false);
-    assert_eq!(runner, TestRunner::CargoTest);
+  fn test_nextest_command_building() {
+    let runner = TestRunner::Nextest;
+    let packages = vec!["crate-a".to_string()];
+    let args = TestCommandArgs {
+      nextest: vec!["-P".to_string(), "commit".to_string()],
+      filter: Some("selected_test".to_string()),
+      harness: vec!["--nocapture".to_string()],
+      ..TestCommandArgs::default()
+    };
+
+    let cmd = runner
+      .build_command(&packages, &args)
+      .expect("nextest arguments should render");
+
+    assert_eq!(cmd.get_program(), "cargo");
+    assert_eq!(
+      command_args(&cmd),
+      [
+        "nextest",
+        "run",
+        "-p",
+        "crate-a",
+        "-P",
+        "commit",
+        "selected_test",
+        "--",
+        "--nocapture",
+      ]
+    );
   }
 
   #[test]
-  fn test_select_runner_with_nextest_preference() {
-    let runner = select_runner(true);
-    // Should return either nextest (if available) or cargo test (fallback)
-    assert!(
-      runner == TestRunner::Nextest || runner == TestRunner::CargoTest,
-      "Runner should be either nextest or cargo test"
+  fn test_auto_selection_never_reinterprets_backend_options() {
+    let cargo_args = TestCommandArgs {
+      cargo: vec!["--all-features".to_string()],
+      ..TestCommandArgs::default()
+    };
+    let nextest_args = TestCommandArgs {
+      nextest: vec!["-P".to_string(), "commit".to_string()],
+      ..TestCommandArgs::default()
+    };
+
+    assert_eq!(
+      resolve_runner(TestRunnerPreference::Auto, &cargo_args, true).expect("Cargo options select Cargo"),
+      TestRunner::CargoTest
     );
+    assert_eq!(
+      resolve_runner(TestRunnerPreference::Auto, &nextest_args, true).expect("nextest is available"),
+      TestRunner::Nextest
+    );
+    let error = resolve_runner(TestRunnerPreference::Auto, &nextest_args, false)
+      .expect_err("nextest options must not fall back to Cargo");
+    assert!(error.to_string().contains("cargo-nextest is required"));
+  }
+
+  #[test]
+  fn test_selection_rejects_mixed_or_mismatched_backend_options() {
+    let mixed = TestCommandArgs {
+      cargo: vec!["--all-features".to_string()],
+      nextest: vec!["-P".to_string(), "commit".to_string()],
+      ..TestCommandArgs::default()
+    };
+    let nextest_only = TestCommandArgs {
+      nextest: vec!["-P".to_string(), "commit".to_string()],
+      ..TestCommandArgs::default()
+    };
+
+    let mixed_error =
+      resolve_runner(TestRunnerPreference::Auto, &mixed, true).expect_err("mixed backend options must be rejected");
+    assert!(mixed_error.to_string().contains("cannot be combined"));
+
+    let mismatch_error = resolve_runner(TestRunnerPreference::Cargo, &nextest_only, true)
+      .expect_err("nextest options must not be rendered by Cargo");
+    assert!(
+      mismatch_error
+        .to_string()
+        .contains("nextest options cannot be used with cargo test")
+    );
+  }
+
+  fn command_args(command: &Command) -> Vec<String> {
+    command
+      .get_args()
+      .map(|arg| arg.to_string_lossy().into_owned())
+      .collect()
   }
 }

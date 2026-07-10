@@ -1,5 +1,5 @@
 use cargo_rail::backup::{BackupManager, BackupMetadata};
-use cargo_rail::commands::{OutputFormat, run_clean};
+use cargo_rail::commands::{TextJsonOutputFormat, run_clean};
 use cargo_rail::workspace::WorkspaceContext;
 use std::fs;
 use tempfile::TempDir;
@@ -101,7 +101,7 @@ fn test_clean_all() {
   assert_eq!(manager.list_backups().unwrap().len(), 5);
 
   // Run clean (no flags = clean all)
-  run_clean(&ctx, false, false, false, false, OutputFormat::default()).unwrap();
+  run_clean(&ctx, false, false, false, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify artifacts removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -116,7 +116,7 @@ fn test_clean_cache_only() {
   let ctx = WorkspaceContext::build(temp.path()).unwrap();
 
   // Run clean --cache
-  run_clean(&ctx, true, false, false, false, OutputFormat::default()).unwrap();
+  run_clean(&ctx, true, false, false, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify cache removed, others remain
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -132,7 +132,7 @@ fn test_clean_reports_only() {
   let ctx = WorkspaceContext::build(temp.path()).unwrap();
 
   // Run clean --reports
-  run_clean(&ctx, false, false, true, false, OutputFormat::default()).unwrap();
+  run_clean(&ctx, false, false, true, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify reports removed, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -148,7 +148,7 @@ fn test_clean_backups_prune() {
   let ctx = WorkspaceContext::build(temp.path()).unwrap();
 
   // Run clean --backups (should prune to default 3)
-  run_clean(&ctx, false, true, false, false, OutputFormat::default()).unwrap();
+  run_clean(&ctx, false, true, false, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify backups pruned, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -164,7 +164,7 @@ fn test_clean_default() {
   let ctx = WorkspaceContext::build(temp.path()).unwrap();
 
   // Run clean (no flags) -> should clean everything now
-  run_clean(&ctx, false, false, false, false, OutputFormat::default()).unwrap();
+  run_clean(&ctx, false, false, false, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify everything removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());

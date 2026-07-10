@@ -157,6 +157,90 @@ fn test_sync_from_remote_basic() -> Result<()> {
 }
 
 #[test]
+fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() -> Result<()> {
+  let (ws, split_dir) = setup_split_scenario("manual-conflict-lib")?;
+
+  ws.modify_file(
+    "manual-conflict-lib",
+    "src/lib.rs",
+    "pub fn value() -> &'static str {\n  \"mono\"\n}\n",
+  )?;
+  ws.commit("Conflicting monorepo edit")?;
+  let recovery_parent = git(&ws.path, &["rev-parse", "HEAD"])?;
+  let recovery_parent = String::from_utf8_lossy(&recovery_parent.stdout).trim().to_string();
+
+  std::fs::write(
+    split_dir.path().join("src/lib.rs"),
+    "pub fn value() -> &'static str {\n  \"split\"\n}\n",
+  )?;
+  git(split_dir.path(), &["add", "src/lib.rs"])?;
+  git(split_dir.path(), &["commit", "-m", "Conflicting split edit"])?;
+
+  let conflicted = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "sync",
+      "manual-conflict-lib",
+      "--from-remote",
+      "--yes",
+      "--allow-dirty",
+    ],
+  )?;
+  assert_eq!(
+    conflicted.status.code(),
+    Some(1),
+    "manual conflict must use exit code 1"
+  );
+  let stdout = String::from_utf8_lossy(&conflicted.stdout);
+  assert!(stdout.contains("sync conflicted"), "stdout:\n{stdout}");
+
+  let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+  assert_eq!(
+    String::from_utf8_lossy(&head.stdout).trim(),
+    recovery_parent,
+    "unresolved content must never be committed"
+  );
+  let conflicted_path = ws.path.join("crates/manual-conflict-lib/src/lib.rs");
+  let content = std::fs::read_to_string(&conflicted_path)?;
+  assert!(
+    content.contains("<<<<<<<"),
+    "manual worktree should preserve merge markers"
+  );
+
+  let receipts = ws.path.join("target/cargo-rail/receipts");
+  let receipt = std::fs::read_dir(&receipts)?
+    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    .find(|path| {
+      path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("sync-conflict-manual-conflict-lib-"))
+    })
+    .ok_or_else(|| anyhow::anyhow!("missing sync conflict receipt"))?;
+  let receipt_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+  assert_eq!(receipt_json["status"], "conflicted");
+  assert_eq!(receipt_json["conflicts"][0]["class"], "content");
+
+  std::fs::write(
+    &conflicted_path,
+    "pub fn value() -> &'static str {\n  \"resolved\"\n}\n",
+  )?;
+  let resumed = run_cargo_rail(&ws.path, &["rail", "sync", "--resume", receipt.to_str().unwrap()])?;
+  assert!(
+    resumed.status.success(),
+    "resume failed:\n{}",
+    String::from_utf8_lossy(&resumed.stderr)
+  );
+  let log = git(&ws.path, &["log", "-1", "--format=%B"])?;
+  assert!(String::from_utf8_lossy(&log.stdout).contains("Rail-Origin: remote@"));
+  let receipt_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+  assert_eq!(receipt_json["status"], "resolved");
+  assert!(!std::fs::read_to_string(conflicted_path)?.contains("<<<<<<<"));
+
+  Ok(())
+}
+
+#[test]
 fn test_sync_from_remote_creates_pr_branch() -> Result<()> {
   let (ws, split_dir) = setup_split_scenario("mylib")?;
 

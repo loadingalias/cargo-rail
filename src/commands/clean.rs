@@ -1,7 +1,7 @@
 //! `cargo rail clean` - Remove generated artifacts (cache, backups, reports).
 
 use crate::backup::BackupManager;
-use crate::commands::OutputFormat;
+use crate::commands::TextJsonOutputFormat;
 use crate::config::UnifyConfig;
 use crate::error::{RailError, RailResult};
 use crate::progress;
@@ -40,7 +40,7 @@ pub fn run_clean(
   backups: bool,
   reports: bool,
   check: bool,
-  format: OutputFormat,
+  format: TextJsonOutputFormat,
 ) -> RailResult<()> {
   let json = format.is_json();
 

@@ -4,6 +4,7 @@
 //! and project files (README, LICENSE) into split repositories with appropriate fallback logic.
 
 use crate::error::{RailResult, ResultExt};
+use crate::split::SplitPathCapabilities;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,13 +57,14 @@ impl AuxiliaryFiles {
   }
 
   /// Copy discovered auxiliary files to split repo
-  pub fn copy_to_split(&self, _workspace_root: &Path, target_repo_root: &Path) -> RailResult<()> {
+  pub fn copy_to_split(&self, paths: &SplitPathCapabilities) -> RailResult<()> {
     if self.files.is_empty() {
       return Ok(());
     }
 
     for file in &self.files {
-      let target_path = target_repo_root.join(&file.target_path);
+      let source_path = paths.authorize_source(&file.source_path)?;
+      let target_path = paths.authorize_target(&file.target_path)?;
 
       // Create parent directories if needed
       if let Some(parent) = target_path.parent() {
@@ -71,13 +73,8 @@ impl AuxiliaryFiles {
       }
 
       // Copy the file
-      fs::copy(&file.source_path, &target_path).with_context(|| {
-        format!(
-          "Failed to copy {} to {}",
-          file.source_path.display(),
-          target_path.display()
-        )
-      })?;
+      fs::copy(&source_path, &target_path)
+        .with_context(|| format!("Failed to copy {} to {}", source_path.display(), target_path.display()))?;
     }
 
     Ok(())
@@ -128,22 +125,23 @@ impl ProjectFiles {
   }
 
   /// Copy discovered project files to split repo
-  pub fn copy_to_split(&self, _workspace_root: &Path, target_repo_root: &Path) -> RailResult<()> {
+  pub fn copy_to_split(&self, paths: &SplitPathCapabilities) -> RailResult<()> {
     if self.files.is_empty() {
       return Ok(());
     }
 
     for file in &self.files {
-      let target_path = target_repo_root.join(&file.target_path);
+      let source_path = paths.authorize_source(&file.source_path)?;
+      let target_path = paths.authorize_target(&file.target_path)?;
+
+      if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+          .with_context(|| format!("Failed to create directory for {}", target_path.display()))?;
+      }
 
       // Copy the file
-      fs::copy(&file.source_path, &target_path).with_context(|| {
-        format!(
-          "Failed to copy {} to {}",
-          file.source_path.display(),
-          target_path.display()
-        )
-      })?;
+      fs::copy(&source_path, &target_path)
+        .with_context(|| format!("Failed to copy {} to {}", source_path.display(), target_path.display()))?;
     }
 
     Ok(())
@@ -206,7 +204,9 @@ mod tests {
     fs::write(workspace_root.join("rust-toolchain.toml"), "channel = \"stable\"").unwrap();
 
     let aux_files = AuxiliaryFiles::discover(&workspace_root).unwrap();
-    aux_files.copy_to_split(&workspace_root, &split_root).unwrap();
+    let paths =
+      SplitPathCapabilities::new(&workspace_root, &workspace_root, &[PathBuf::from(".")], &split_root).unwrap();
+    aux_files.copy_to_split(&paths).unwrap();
 
     // Verify file was copied
     assert!(split_root.join("rust-toolchain.toml").exists());
@@ -228,7 +228,9 @@ mod tests {
     fs::write(workspace_root.join(".cargo/config.toml"), "[build]\nrustflags = []").unwrap();
 
     let aux_files = AuxiliaryFiles::discover(&workspace_root).unwrap();
-    aux_files.copy_to_split(&workspace_root, &split_root).unwrap();
+    let paths =
+      SplitPathCapabilities::new(&workspace_root, &workspace_root, &[PathBuf::from(".")], &split_root).unwrap();
+    aux_files.copy_to_split(&paths).unwrap();
 
     // Verify directory and file were created
     assert!(split_root.join(".cargo").exists());

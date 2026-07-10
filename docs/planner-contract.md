@@ -1,0 +1,32 @@
+# Planner Machine Contract
+
+`cargo rail plan -f json` is a versioned API for CI and other tooling. Validate it with the schema shipped in this repository:
+
+```bash
+cargo rail plan --schema > plan.schema.json
+cargo rail plan --merge-base -f json > plan.json
+```
+
+The current contract is planner v3, scope v2, inside machine-output envelope v1. Its source of truth is [`schemas/plan-v3.schema.json`](../schemas/plan-v3.schema.json). The schema command does not load workspace metadata, so consumers can install or validate the contract before opening a repository.
+
+## Compatibility
+
+- Adding an optional field is backward-compatible.
+- Removing a field, changing its type or meaning, making an optional field required, or changing a reason code is breaking and requires a new planner contract version and schema file.
+- Envelope and nested contracts version independently. Consumers must check every version they depend on.
+- Trace `code` values are stable machine identifiers. `description` is for people and may be clarified without changing behavior.
+- Unsupported output formats fail argument parsing with exit code `2`; commands never fall back to text.
+
+Successful JSON commands write one JSON value to stdout and keep progress off stderr. Check modes retain the CLI exit convention: `0` means clean, `1` means changes are required, and `2` means an error.
+
+## Portable Plan Identity
+
+`cargo rail hash` emits `plan-v1:sha256:<digest>`. The digest uses canonical JSON over the execution-relevant planner fields:
+
+- planner contract version;
+- refs, config and toolchain fingerprints, and confidence profile;
+- repository-relative files, impact, scope, surface decisions, and trace reasons.
+
+Path separators are normalized to `/`. Absolute paths, drive-qualified paths, and `..` components are rejected. Local diagnostics—`inputs.workspace_root`, the machine envelope, and `reproducibility` metadata—are excluded, so equivalent clones at different checkout paths have the same identity.
+
+This identity compares planner decisions. It is **not a cache key**. A future cache identity must additionally bind source contents, the actual compiler, target, features, command, and an explicit environment allowlist before reuse can be safe.

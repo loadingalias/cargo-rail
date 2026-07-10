@@ -1,7 +1,10 @@
 //! `cargo rail change` - intent-file management.
 
-use crate::commands::common::OutputFormat;
+use crate::commands::common::ChangeOutputFormat;
+use crate::config::{ChangelogConfig, ChangelogFilters, ReleaseConfig};
 use crate::error::{RailError, RailResult};
+use crate::git::detect_default_base_ref;
+use crate::release::attribution::{AttributedHistory, CommitAttributor};
 use crate::release::change_files::{PendingChangeSet, parse_change_file, render_change_content, write_change_file};
 use crate::release::version::BumpLevel;
 use crate::workspace::WorkspaceContext;
@@ -12,6 +15,21 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Options for `cargo rail change check`.
+#[derive(Debug, Clone, Default)]
+pub struct ChangeCheckOptions {
+  /// Git ref to compare against.
+  pub since: Option<String>,
+  /// Compare from merge-base with the default branch.
+  pub merge_base: bool,
+  /// Scan full reachable history.
+  pub all: bool,
+  /// Require every changed crate to have a change file.
+  pub required: bool,
+  /// Output format.
+  pub format: ChangeOutputFormat,
+}
+
 /// Add a pending change file.
 pub fn run_change_add(
   ctx: &WorkspaceContext,
@@ -19,7 +37,7 @@ pub fn run_change_add(
   bump: String,
   message: Option<String>,
   name: Option<String>,
-  format: OutputFormat,
+  format: ChangeOutputFormat,
 ) -> RailResult<()> {
   if format.is_json() {
     crate::output::set_json_mode(true);
@@ -87,7 +105,7 @@ pub fn run_change_add(
 }
 
 /// Print pending change-file status.
-pub fn run_change_status(ctx: &WorkspaceContext, format: OutputFormat) -> RailResult<()> {
+pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> RailResult<()> {
   if format.is_json() {
     crate::output::set_json_mode(true);
   }
@@ -121,6 +139,13 @@ pub fn run_change_status(ctx: &WorkspaceContext, format: OutputFormat) -> RailRe
     return Ok(());
   }
 
+  if format == ChangeOutputFormat::NamesOnly {
+    for file in &pending.files {
+      println!("{}", display_change_path(ctx, &file.path));
+    }
+    return Ok(());
+  }
+
   if pending.is_empty() {
     println!("no pending change files");
     return Ok(());
@@ -147,6 +172,228 @@ pub fn run_change_status(ctx: &WorkspaceContext, format: OutputFormat) -> RailRe
     }
   }
   Ok(())
+}
+
+/// Check changed crates for pending change-file coverage.
+pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> RailResult<()> {
+  if options.format.is_json() {
+    crate::output::set_json_mode(true);
+  }
+  let default_release_config;
+  let release_config = if let Some(config) = ctx.config.as_ref() {
+    &config.release
+  } else {
+    default_release_config = ReleaseConfig::default();
+    &default_release_config
+  };
+
+  let workspace_members = ctx.graph.workspace_members();
+  let base = resolve_change_check_base(ctx, &options)?;
+  let pending = PendingChangeSet::load(ctx.workspace_root(), &release_config.change_dir, workspace_members)?;
+  let changed_code_crates = changed_code_crates(ctx, release_config, base.as_deref(), workspace_members)?;
+  let covered_crates: Vec<_> = changed_code_crates
+    .iter()
+    .filter(|crate_name| pending.covers(crate_name))
+    .cloned()
+    .collect();
+  let missing_change_files: Vec<_> = changed_code_crates
+    .iter()
+    .filter(|crate_name| !pending.covers(crate_name))
+    .filter(|crate_name| options.required || release_config.require_change_files.applies_to(crate_name.as_str()))
+    .cloned()
+    .collect();
+
+  match options.format {
+    ChangeOutputFormat::Text => print_change_check_text(
+      base.as_deref(),
+      options.required,
+      &changed_code_crates,
+      &covered_crates,
+      &missing_change_files,
+    ),
+    ChangeOutputFormat::Json => print_change_check_json(
+      base.as_deref(),
+      options.required,
+      &release_config.change_dir,
+      &changed_code_crates,
+      &covered_crates,
+      &missing_change_files,
+    )?,
+    ChangeOutputFormat::NamesOnly => {
+      for crate_name in &missing_change_files {
+        println!("{}", crate_name);
+      }
+    }
+  }
+
+  if missing_change_files.is_empty() {
+    Ok(())
+  } else if options.format.is_json() {
+    Err(RailError::ExitWithCode { code: 1 })
+  } else {
+    Err(RailError::CheckHasPendingChanges)
+  }
+}
+
+fn display_change_path(ctx: &WorkspaceContext, path: &Path) -> String {
+  let relative = path.strip_prefix(ctx.workspace_root()).unwrap_or(path);
+  crate::utils::path_to_git_format(relative)
+}
+
+fn resolve_change_check_base(ctx: &WorkspaceContext, options: &ChangeCheckOptions) -> RailResult<Option<String>> {
+  if options.all {
+    return Ok(None);
+  }
+
+  let git = ctx.git()?.git();
+  if options.merge_base {
+    let default_branch = detect_default_base_ref(git)?;
+    return Ok(Some(git.get_merge_base(&default_branch, "HEAD")?));
+  }
+
+  if let Some(since) = &options.since {
+    return Ok(Some(since.clone()));
+  }
+
+  detect_default_base_ref(git).map(Some)
+}
+
+fn changed_code_crates(
+  ctx: &WorkspaceContext,
+  release_config: &ReleaseConfig,
+  base: Option<&str>,
+  workspace_members: &[String],
+) -> RailResult<Vec<String>> {
+  let attributor = CommitAttributor::new(ctx);
+  let mut histories: BTreeMap<HistoryKey, AttributedHistory> = BTreeMap::new();
+  let mut changed = Vec::new();
+
+  for crate_name in workspace_members {
+    let changelog_config = ctx
+      .config
+      .as_ref()
+      .and_then(|config| config.crates.get(crate_name))
+      .and_then(|crate_config| crate_config.changelog.as_ref());
+    let filters = effective_changelog_filters(&release_config.changelog.filters, changelog_config);
+    let history = history_for_change_check(&mut histories, &attributor, base, filters)?;
+    if history.has_code_changes(crate_name) {
+      changed.push(crate_name.clone());
+    }
+  }
+
+  changed.sort();
+  Ok(changed)
+}
+
+fn history_for_change_check<'a>(
+  histories: &'a mut BTreeMap<HistoryKey, AttributedHistory>,
+  attributor: &CommitAttributor<'_>,
+  base: Option<&str>,
+  filters: &ChangelogFilters,
+) -> RailResult<&'a AttributedHistory> {
+  let key = HistoryKey::new(base, filters);
+  if !histories.contains_key(&key) {
+    let history = attributor.history_with_filters(base, "HEAD", Some(filters))?;
+    histories.insert(key.clone(), history);
+  }
+
+  histories
+    .get(&key)
+    .ok_or_else(|| RailError::message("internal error: missing cached change-check history"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HistoryKey {
+  base: Option<String>,
+  skip_types: Vec<String>,
+  skip_scopes: Vec<String>,
+  include_paths: Vec<String>,
+  exclude_paths: Vec<String>,
+}
+
+impl HistoryKey {
+  fn new(base: Option<&str>, filters: &ChangelogFilters) -> Self {
+    Self {
+      base: base.map(str::to_string),
+      skip_types: filters.skip_types.clone(),
+      skip_scopes: filters.skip_scopes.clone(),
+      include_paths: filters.include_paths.clone(),
+      exclude_paths: filters.exclude_paths.clone(),
+    }
+  }
+}
+
+fn effective_changelog_filters<'a>(
+  workspace_filters: &'a ChangelogFilters,
+  overrides: Option<&'a ChangelogConfig>,
+) -> &'a ChangelogFilters {
+  overrides
+    .and_then(|config| config.filters.as_ref())
+    .unwrap_or(workspace_filters)
+}
+
+fn print_change_check_text(
+  base: Option<&str>,
+  required_override: bool,
+  changed_code_crates: &[String],
+  covered_crates: &[String],
+  missing_change_files: &[String],
+) {
+  println!("change check");
+  println!("base: {}", base.unwrap_or("<all history>"));
+  if required_override {
+    println!("required: all changed crates");
+  } else {
+    println!("required: release.require_change_files");
+  }
+  println!("changed code crates: {}", list_or_none(changed_code_crates));
+  println!("covered crates: {}", list_or_none(covered_crates));
+
+  if missing_change_files.is_empty() {
+    println!("change files: ok");
+  } else {
+    println!("missing change files:");
+    for crate_name in missing_change_files {
+      println!("  {}", crate_name);
+    }
+  }
+}
+
+fn print_change_check_json(
+  base: Option<&str>,
+  required_override: bool,
+  change_dir: &str,
+  changed_code_crates: &[String],
+  covered_crates: &[String],
+  missing_change_files: &[String],
+) -> RailResult<()> {
+  let status = if missing_change_files.is_empty() {
+    "success"
+  } else {
+    "check_failed"
+  };
+  let exit_code = if missing_change_files.is_empty() { 0 } else { 1 };
+  let payload = serde_json::json!({
+    "action": "check",
+    "base": base,
+    "head": "HEAD",
+    "required": if required_override { "all" } else { "configured" },
+    "change_dir": change_dir,
+    "changed_code_crates": changed_code_crates,
+    "covered_crates": covered_crates,
+    "missing_change_files": missing_change_files,
+  });
+  let envelope = crate::output::machine_json_envelope("change", "check", status, exit_code, payload);
+  println!("{}", serde_json::to_string_pretty(&envelope)?);
+  Ok(())
+}
+
+fn list_or_none(items: &[String]) -> String {
+  if items.is_empty() {
+    "none".to_string()
+  } else {
+    items.join(", ")
+  }
 }
 
 struct EditedChange {

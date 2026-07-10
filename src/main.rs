@@ -15,7 +15,9 @@ fn main() {
 
   // Apply global --json flag to command format fields
   if cli.json {
-    cli.command.apply_json_override();
+    if let Err(error) = cli.command.apply_json_override() {
+      error.exit();
+    }
   }
 
   // Initialize output control (quiet mode)

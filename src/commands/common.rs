@@ -31,11 +31,31 @@ pub(crate) fn format_preview_list<T: AsRef<str>>(items: &[T], preview_limit: usi
   }
 }
 
-/// Standard output format for all commands
-///
-/// Supports both simple (text/json) and specialized formats (GitHub Actions, JSONL, etc.)
+/// Output format for commands that support only human text and JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum OutputFormat {
+pub enum TextJsonOutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+}
+
+impl TextJsonOutputFormat {
+  /// Check if this format is JSON.
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+
+  /// Check if this format is structured output.
+  pub fn is_json_like(&self) -> bool {
+    self.is_json()
+  }
+}
+
+/// Output format for `cargo rail split run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum SplitOutputFormat {
   /// Human-readable text output (default)
   #[default]
   Text,
@@ -44,32 +64,45 @@ pub enum OutputFormat {
   /// Names only, one per line
   #[value(name = "names-only", alias = "names")]
   NamesOnly,
-  /// Cargo -p flag format: -p crate1 -p crate2
-  #[value(name = "cargo-args", alias = "cargo")]
-  CargoArgs,
-  /// GitHub Actions output format for $GITHUB_OUTPUT
-  #[value(name = "github")]
-  GitHub,
-  /// GitHub Actions matrix format for strategy.matrix
-  #[value(name = "github-matrix")]
-  GitHubMatrix,
   /// JSON Lines format (one object per line)
   #[value(name = "jsonl", alias = "json-lines")]
   JsonLines,
 }
 
-impl OutputFormat {
-  /// Check if this format is JSON
+impl SplitOutputFormat {
+  /// Check if this format is JSON.
   pub fn is_json(&self) -> bool {
     matches!(self, Self::Json)
   }
 
-  /// Check if this format is a JSON-like structured format
-  ///
-  /// Returns true for any format that produces structured output (json, jsonl, github, github-matrix).
-  /// Used to enable JSON mode which suppresses progress messages.
+  /// Check if this format is structured output.
   pub fn is_json_like(&self) -> bool {
-    matches!(self, Self::Json | Self::JsonLines | Self::GitHub | Self::GitHubMatrix)
+    matches!(self, Self::Json | Self::JsonLines)
+  }
+}
+
+/// Output format for `cargo rail change`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum ChangeOutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+  /// Names only, one per line
+  #[value(name = "names-only", alias = "names")]
+  NamesOnly,
+}
+
+impl ChangeOutputFormat {
+  /// Check if this format is JSON.
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+
+  /// Check if this format is JSON-like structured output.
+  pub fn is_json_like(&self) -> bool {
+    self.is_json()
   }
 }
 
@@ -257,6 +290,13 @@ impl<'a> SplitSyncConfigBuilder<'a> {
       } else {
         split_config.target_repo_path(self.ctx.workspace_root())
       };
+      let path_capabilities = crate::split::SplitPathCapabilities::new(
+        self.ctx.workspace_root(),
+        &self.ctx.git()?.git().worktree_root,
+        &crate_paths,
+        &target_repo_path,
+      )?;
+      let target_repo_path = path_capabilities.target_root().to_path_buf();
 
       configs.push(SplitParams {
         crate_name: split_config.name.clone(),
@@ -268,6 +308,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         remote_url: Some(remote),
         include: split_config.include.clone(),
         exclude: split_config.exclude.clone(),
+        path_capabilities,
       });
     }
 
@@ -292,6 +333,13 @@ impl<'a> SplitSyncConfigBuilder<'a> {
       } else {
         split_config.target_repo_path(self.ctx.workspace_root())
       };
+      let path_capabilities = crate::split::SplitPathCapabilities::new(
+        self.ctx.workspace_root(),
+        &self.ctx.git()?.git().worktree_root,
+        &crate_paths,
+        &target_repo_path,
+      )?;
+      let target_repo_path = path_capabilities.target_root().to_path_buf();
 
       let target_exists = target_repo_path.exists();
 
@@ -304,6 +352,7 @@ impl<'a> SplitSyncConfigBuilder<'a> {
           target_repo_path,
           branch: split_config.branch.clone(),
           remote_url: remote,
+          path_capabilities,
         },
         target_exists,
       ));

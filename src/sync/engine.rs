@@ -9,9 +9,11 @@ use crate::error::RailResult;
 use crate::git::SystemGit;
 use crate::git::mappings::MappingStore;
 use crate::progress;
-use crate::sync::conflict::{ConflictInfo, ConflictResolver, ConflictStrategy};
+use crate::split::SplitPathCapabilities;
+use crate::sync::conflict::{ConflictClass, ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -32,15 +34,40 @@ pub struct SyncConfig {
   pub branch: String,
   /// Remote repository URL
   pub remote_url: String,
+  /// Validated source/target/temporary mutation authority.
+  pub path_capabilities: SplitPathCapabilities,
 }
 
 /// Result of a sync operation
-#[derive(Default)]
 pub struct SyncResult {
   /// Number of commits synced
   pub commits_synced: usize,
   /// Conflicts encountered during sync
   pub conflicts: Vec<ConflictInfo>,
+  /// Terminal status for this invocation.
+  pub status: SyncStatus,
+  /// Durable recovery receipt when manual resolution is required.
+  pub conflict_receipt: Option<PathBuf>,
+}
+
+impl Default for SyncResult {
+  fn default() -> Self {
+    Self {
+      commits_synced: 0,
+      conflicts: Vec::new(),
+      status: SyncStatus::Complete,
+      conflict_receipt: None,
+    }
+  }
+}
+
+/// Operator-visible sync terminal status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+  /// All selected work was committed.
+  Complete,
+  /// Work is preserved on a branch but requires manual resolution.
+  Conflicted,
 }
 
 /// Direction of synchronization
@@ -61,8 +88,27 @@ pub enum SyncDirection {
 pub struct ConflictResolutionResult {
   /// Conflict information for files that had merge conflicts
   pub conflicts: Vec<ConflictInfo>,
+  /// Paths already materialized by a merge strategy and not to overwrite.
+  pub resolved_files: Vec<PathBuf>,
   /// Changed files from the commit (cached to avoid redundant git calls)
   pub changed_files: Vec<(PathBuf, char)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncConflictReceipt {
+  schema_version: u32,
+  status: String,
+  crate_name: String,
+  branch: String,
+  expected_head: String,
+  remote_commit: String,
+  message: String,
+  author: String,
+  author_email: String,
+  timestamp: i64,
+  commit_paths: Vec<PathBuf>,
+  conflicts: Vec<ConflictInfo>,
+  resulting_commit: Option<String>,
 }
 
 /// Bidirectional sync engine
@@ -84,11 +130,19 @@ pub struct SyncEngine<'a> {
 impl<'a> SyncEngine<'a> {
   /// Create a new sync engine
   pub fn new(ctx: &'a WorkspaceContext, config: SyncConfig, conflict_strategy: ConflictStrategy) -> RailResult<Self> {
+    let target = config.path_capabilities.authorize_target(&config.target_repo_path)?;
+    if target != config.path_capabilities.target_root() {
+      return Err(crate::error::RailError::message(
+        "runtime sync target does not match the validated path capability",
+      ));
+    }
+    config.path_capabilities.validate_crate_paths(&config.crate_paths)?;
+    config.path_capabilities.validate_target_repository()?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
     let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
-    let temp_dir = std::env::temp_dir().join(format!(
+    let temp_dir = config.path_capabilities.authorize_temporary(Path::new(&format!(
       "cargo-rail-conflicts-{}-{}-{}",
       config.crate_name,
       std::process::id(),
@@ -96,7 +150,7 @@ impl<'a> SyncEngine<'a> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_nanos()
-    ));
+    )))?;
     std::fs::create_dir_all(&temp_dir)?;
     let conflict_resolver = ConflictResolver::new(conflict_strategy, temp_dir);
 
@@ -118,6 +172,129 @@ impl<'a> SyncEngine<'a> {
       self.loaded_repos.insert(repo_path.to_path_buf());
     }
     Ok(())
+  }
+
+  /// Commit operator-resolved work from a durable conflict receipt, then
+  /// continue with any remaining remote commits.
+  pub fn resume_from_receipt(&mut self, receipt_path: &Path) -> RailResult<SyncResult> {
+    let receipt_path = self.validate_conflict_receipt_path(receipt_path)?;
+    let bytes = std::fs::read(&receipt_path)?;
+    let mut receipt: SyncConflictReceipt = serde_json::from_slice(&bytes)
+      .map_err(|error| crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error)))?;
+    if receipt.schema_version != 1 || receipt.status != "conflicted" {
+      return Err(crate::error::RailError::message(
+        "sync conflict receipt is not an active version-1 conflict",
+      ));
+    }
+    if receipt.crate_name != self.config.crate_name {
+      return Err(crate::error::RailError::message(format!(
+        "sync receipt is for crate '{}', not '{}'",
+        receipt.crate_name, self.config.crate_name
+      )));
+    }
+
+    let git = self.ctx.git()?.git();
+    let branch = git.current_branch()?;
+    if branch != receipt.branch {
+      return Err(crate::error::RailError::with_help(
+        format!(
+          "sync resume requires branch '{}'; current branch is '{}'",
+          receipt.branch, branch
+        ),
+        format!("git switch {}", receipt.branch),
+      ));
+    }
+    let head = git.head_commit()?;
+    if head != receipt.expected_head {
+      return Err(crate::error::RailError::with_help(
+        "sync recovery branch moved after the conflict was recorded",
+        "inspect the branch history and restart sync; cargo-rail will not commit against an unverified parent",
+      ));
+    }
+
+    for conflict in &receipt.conflicts {
+      let path = self
+        .config
+        .path_capabilities
+        .authorize_source_mutation(&conflict.file_path)?;
+      let content = std::fs::read(&path)?;
+      if contains_conflict_markers(&content) {
+        return Err(crate::error::RailError::with_help(
+          format!(
+            "unresolved conflict markers remain in '{}'",
+            conflict.file_path.display()
+          ),
+          "resolve every marker in the receipt before resuming",
+        ));
+      }
+    }
+
+    let expected = receipt
+      .commit_paths
+      .iter()
+      .cloned()
+      .collect::<std::collections::BTreeSet<_>>();
+    let unexpected = git
+      .changed_paths()?
+      .into_iter()
+      .filter(|path| !expected.contains(path))
+      .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+      return Err(crate::error::RailError::with_help(
+        format!(
+          "sync resume found unrelated changes: {}",
+          unexpected
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+        ),
+        "commit or restore unrelated work before resuming",
+      ));
+    }
+
+    let commit = git.create_commit_with_metadata(
+      &receipt.message,
+      &receipt.author,
+      &receipt.author_email,
+      receipt.timestamp,
+      std::slice::from_ref(&receipt.expected_head),
+      &receipt.commit_paths,
+    )?;
+    self.mapping_store.record_mapping(&commit, &receipt.remote_commit)?;
+    self.mapping_store.save(self.ctx.workspace_root())?;
+    receipt.status = "resolved".to_string();
+    receipt.resulting_commit = Some(commit);
+    write_json_atomic(&receipt_path, &receipt)?;
+
+    let mut remaining = self.sync_from_remote()?;
+    remaining.commits_synced += 1;
+    Ok(remaining)
+  }
+
+  fn write_conflict_receipt(&self, receipt: SyncConflictReceipt) -> RailResult<PathBuf> {
+    let dir = self.conflict_receipt_dir();
+    std::fs::create_dir_all(&dir)?;
+    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let path = dir.join(format!("sync-conflict-{}-{}.json", self.config.crate_name, nonce));
+    write_json_atomic(&path, &receipt)?;
+    Ok(path)
+  }
+
+  fn conflict_receipt_dir(&self) -> PathBuf {
+    self.ctx.workspace_root().join("target/cargo-rail/receipts")
+  }
+
+  fn validate_conflict_receipt_path(&self, receipt_path: &Path) -> RailResult<PathBuf> {
+    let path = std::fs::canonicalize(receipt_path)?;
+    let dir = std::fs::canonicalize(self.conflict_receipt_dir())?;
+    if path.parent().is_none_or(|parent| parent != dir) {
+      return Err(crate::error::RailError::message(format!(
+        "sync receipt '{}' is outside the workspace receipt directory",
+        receipt_path.display()
+      )));
+    }
+    Ok(path)
   }
 
   /// Get the appropriate branch reference (origin/branch for remotes, just branch for local)
@@ -223,6 +400,7 @@ impl<'a> SyncEngine<'a> {
       return Ok(SyncResult {
         commits_synced: synced_count,
         conflicts: Vec::new(),
+        ..SyncResult::default()
       });
     }
 
@@ -245,6 +423,7 @@ impl<'a> SyncEngine<'a> {
     Ok(SyncResult {
       commits_synced: synced_count,
       conflicts: Vec::new(),
+      ..SyncResult::default()
     })
   }
 
@@ -308,6 +487,7 @@ impl<'a> SyncEngine<'a> {
       return Ok(SyncResult {
         commits_synced: 0,
         conflicts: Vec::new(),
+        ..SyncResult::default()
       });
     }
 
@@ -346,7 +526,16 @@ impl<'a> SyncEngine<'a> {
 
       // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
       // Using HashSet<&Path> for O(1) membership testing - borrows from resolution.conflicts, no clones
-      let resolved_files: HashSet<&Path> = resolution.conflicts.iter().map(|c| c.file_path.as_path()).collect();
+      let resolved_files: HashSet<&Path> = resolution.resolved_files.iter().map(PathBuf::as_path).collect();
+
+      let mut commit_paths = resolution
+        .changed_files
+        .iter()
+        .filter_map(|(remote_path, _)| self.map_remote_path_to_mono(remote_path).ok())
+        .chain(resolution.resolved_files.iter().cloned())
+        .collect::<Vec<_>>();
+      commit_paths.sort();
+      commit_paths.dedup();
 
       // Apply commit to mono (skipping already-resolved files, reusing cached changed_files)
       let mono_sha = self.apply_remote_commit_to_mono(
@@ -355,7 +544,39 @@ impl<'a> SyncEngine<'a> {
         &resolved_files,
         &current_mono_head,
         &resolution.changed_files,
+        resolution.conflicts.is_empty(),
       )?;
+
+      if !resolution.conflicts.is_empty() {
+        let branch = pr_branch
+          .as_deref()
+          .ok_or_else(|| crate::error::RailError::message("conflicted sync has no recovery branch"))?;
+        let receipt = self.write_conflict_receipt(SyncConflictReceipt {
+          schema_version: 1,
+          status: "conflicted".to_string(),
+          crate_name: self.config.crate_name.clone(),
+          branch: branch.to_string(),
+          expected_head: current_mono_head.clone(),
+          remote_commit: commit.sha.clone(),
+          message: format!("{}\n\nRail-Origin: remote@{}", commit.message.trim(), commit.sha),
+          author: commit.author.clone(),
+          author_email: commit.author_email.clone(),
+          timestamp: commit.timestamp,
+          commit_paths,
+          conflicts: resolution.conflicts.clone(),
+          resulting_commit: None,
+        })?;
+        progress!("   sync paused with unresolved conflicts on branch '{}'", branch);
+        progress!("   resolve the listed paths, then run:");
+        progress!("   cargo rail sync --resume {}", receipt.display());
+        return Ok(SyncResult {
+          commits_synced: count,
+          conflicts: resolution.conflicts,
+          status: SyncStatus::Conflicted,
+          conflict_receipt: Some(receipt),
+        });
+      }
+      let mono_sha = mono_sha.ok_or_else(|| crate::error::RailError::message("clean sync did not create a commit"))?;
 
       // Extend conflicts AFTER apply (resolved_files borrows from resolution.conflicts)
       if !resolution.conflicts.is_empty() {
@@ -401,6 +622,7 @@ impl<'a> SyncEngine<'a> {
     Ok(SyncResult {
       commits_synced: synced_count,
       conflicts,
+      ..SyncResult::default()
     })
   }
 
@@ -429,6 +651,8 @@ impl<'a> SyncEngine<'a> {
         Ok(SyncResult {
           commits_synced: to_remote.commits_synced + from_remote.commits_synced,
           conflicts: from_remote.conflicts,
+          status: from_remote.status,
+          conflict_receipt: from_remote.conflict_receipt,
         })
       }
       (false, false) => {
@@ -436,6 +660,7 @@ impl<'a> SyncEngine<'a> {
         Ok(SyncResult {
           commits_synced: 0,
           conflicts: Vec::new(),
+          ..SyncResult::default()
         })
       }
     }
@@ -497,7 +722,7 @@ impl<'a> SyncEngine<'a> {
     // Handle deletions
     for (mono_path, _) in &deletions {
       let remote_path = self.map_mono_path_to_remote(mono_path)?;
-      let full_remote_path = self.config.target_repo_path.join(&remote_path);
+      let full_remote_path = self.config.path_capabilities.authorize_target(&remote_path)?;
       if full_remote_path.exists() {
         std::fs::remove_file(&full_remote_path)?;
       }
@@ -520,7 +745,7 @@ impl<'a> SyncEngine<'a> {
     for (idx, (mono_path, _)) in modifications.iter().enumerate() {
       let content = &file_contents[idx];
       let remote_path = self.map_mono_path_to_remote(mono_path)?;
-      let full_remote_path = self.config.target_repo_path.join(&remote_path);
+      let full_remote_path = self.config.path_capabilities.authorize_target(&remote_path)?;
 
       // Create parent directories
       if let Some(parent) = full_remote_path.parent() {
@@ -550,6 +775,12 @@ impl<'a> SyncEngine<'a> {
     let message = format!("{}\n\nRail-Origin: mono@{}", commit.message.trim(), commit.sha);
 
     let parent_shas = vec![current_remote_head.to_string()];
+    let mut commit_paths = relevant_files
+      .iter()
+      .map(|(mono_path, _)| self.map_mono_path_to_remote(mono_path))
+      .collect::<RailResult<Vec<_>>>()?;
+    commit_paths.sort();
+    commit_paths.dedup();
 
     let new_commit_sha = remote_git.create_commit_with_metadata(
       &message,
@@ -557,6 +788,7 @@ impl<'a> SyncEngine<'a> {
       &commit.author_email,
       commit.timestamp,
       &parent_shas,
+      &commit_paths,
     )?;
 
     Ok(new_commit_sha)
@@ -569,7 +801,8 @@ impl<'a> SyncEngine<'a> {
     resolved_files: &HashSet<&Path>,
     current_mono_head: &str,
     changed_files: &[(PathBuf, char)], // Pre-fetched from resolve_conflicts to avoid duplicate subprocess call
-  ) -> RailResult<String> {
+    create_commit: bool,
+  ) -> RailResult<Option<String>> {
     // Use pre-fetched changed_files (already retrieved in resolve_conflicts_for_commit)
 
     // Filter and separate files by operation type
@@ -602,7 +835,7 @@ impl<'a> SyncEngine<'a> {
 
     // Handle deletions
     for (_, mono_path, _) in &deletions {
-      let full_mono_path = self.ctx.workspace_root().join(mono_path);
+      let full_mono_path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
       if full_mono_path.exists() {
         std::fs::remove_file(&full_mono_path)?;
       }
@@ -624,7 +857,7 @@ impl<'a> SyncEngine<'a> {
     // Apply files to mono
     for (idx, (remote_path, mono_path, _)) in modifications.iter().enumerate() {
       let content = &file_contents[idx];
-      let full_mono_path = self.ctx.workspace_root().join(mono_path);
+      let full_mono_path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
 
       // Create parent directories
       if let Some(parent) = full_mono_path.parent() {
@@ -652,6 +885,17 @@ impl<'a> SyncEngine<'a> {
     let message = format!("{}\n\nRail-Origin: remote@{}", commit.message.trim(), commit.sha);
 
     let parent_shas = vec![current_mono_head.to_string()];
+    let mut commit_paths = relevant_files
+      .iter()
+      .map(|(_, mono_path, _)| mono_path.clone())
+      .chain(resolved_files.iter().map(|path| (*path).to_path_buf()))
+      .collect::<Vec<_>>();
+    commit_paths.sort();
+    commit_paths.dedup();
+
+    if !create_commit {
+      return Ok(None);
+    }
 
     let new_commit_sha = self.ctx.git()?.git().create_commit_with_metadata(
       &message,
@@ -659,9 +903,10 @@ impl<'a> SyncEngine<'a> {
       &commit.author_email,
       commit.timestamp,
       &parent_shas,
+      &commit_paths,
     )?;
 
-    Ok(new_commit_sha)
+    Ok(Some(new_commit_sha))
   }
 
   fn map_mono_path_to_remote(&self, mono_path: &Path) -> RailResult<PathBuf> {
@@ -733,7 +978,7 @@ impl<'a> SyncEngine<'a> {
     let mut conflicting_files = Vec::with_capacity(changed_files.len());
     for (remote_path, _) in &changed_files {
       let mono_path = self.map_remote_path_to_mono(remote_path)?;
-      let full_mono_path = self.ctx.workspace_root().join(&mono_path);
+      let full_mono_path = self.config.path_capabilities.authorize_source_mutation(&mono_path)?;
 
       // Skip if file doesn't exist in monorepo (new file, no conflict)
       if !full_mono_path.exists() {
@@ -754,6 +999,7 @@ impl<'a> SyncEngine<'a> {
 
     // Pre-allocate conflicts vec now that we know the size
     let mut conflicts = Vec::with_capacity(conflicting_files.len());
+    let mut resolved_files = Vec::with_capacity(conflicting_files.len());
 
     // Bulk read base and incoming versions for all conflicting files
     // Uses references to avoid cloning SHA and paths for each file
@@ -800,30 +1046,28 @@ impl<'a> SyncEngine<'a> {
         Ok(crate::sync::conflict::MergeResult::Success) => {
           // Merged successfully - add to resolved files to prevent overwriting
           progress!("      ✅ Auto-merged {}", mono_path.display());
-          conflicts.push(ConflictInfo {
-            file_path: mono_path.clone(),
-          });
+          resolved_files.push(mono_path.clone());
         }
         Ok(crate::sync::conflict::MergeResult::Conflicts(_paths)) => {
           conflicts.push(ConflictInfo {
             file_path: mono_path.clone(),
+            class: ConflictClass::Content,
           });
+          resolved_files.push(mono_path.clone());
         }
-        Ok(crate::sync::conflict::MergeResult::Failed(_msg)) => {
-          conflicts.push(ConflictInfo {
-            file_path: mono_path.clone(),
-          });
+        Ok(crate::sync::conflict::MergeResult::Failed(message)) => {
+          return Err(crate::error::RailError::with_help(
+            format!("failed to merge '{}': {}", mono_path.display(), message),
+            "the sync branch and worktree were preserved; correct the underlying Git merge failure and retry",
+          ));
         }
-        Err(_e) => {
-          conflicts.push(ConflictInfo {
-            file_path: mono_path.clone(),
-          });
-        }
+        Err(error) => return Err(error.context(format!("merging '{}'", mono_path.display()))),
       }
     }
 
     Ok(ConflictResolutionResult {
       conflicts,
+      resolved_files,
       changed_files,
     })
   }
@@ -869,4 +1113,34 @@ impl<'a> SyncEngine<'a> {
 
     Ok(!relevant_commits.is_empty())
   }
+}
+
+fn contains_conflict_markers(content: &[u8]) -> bool {
+  content
+    .split(|byte| *byte == b'\n')
+    .any(|line| line.starts_with(b"<<<<<<<") || line.starts_with(b"=======") || line.starts_with(b">>>>>>>"))
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {
+  let bytes = serde_json::to_vec_pretty(value)
+    .map_err(|error| crate::error::RailError::message(format!("failed to serialize sync receipt: {}", error)))?;
+  let temporary = path.with_extension("json.tmp");
+  std::fs::write(&temporary, bytes)?;
+  std::fs::rename(&temporary, path)?;
+  Ok(())
+}
+
+/// Read the crate identity from a workspace-owned conflict receipt.
+pub fn conflict_receipt_crate(workspace_root: &Path, receipt_path: &Path) -> RailResult<String> {
+  let path = std::fs::canonicalize(receipt_path)?;
+  let dir = std::fs::canonicalize(workspace_root.join("target/cargo-rail/receipts"))?;
+  if path.parent().is_none_or(|parent| parent != dir) {
+    return Err(crate::error::RailError::message(format!(
+      "sync receipt '{}' is outside the workspace receipt directory",
+      receipt_path.display()
+    )));
+  }
+  let receipt: SyncConflictReceipt = serde_json::from_slice(&std::fs::read(path)?)
+    .map_err(|error| crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error)))?;
+  Ok(receipt.crate_name)
 }

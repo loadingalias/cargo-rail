@@ -420,6 +420,110 @@ fn test_runner_all_skip_nextest() -> Result<()> {
 }
 
 #[test]
+fn test_runner_cargo_backend_renders_typed_arguments_in_exact_order() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-cargo-typed-arguments")?;
+  ws.add_crate("typed-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "test",
+      "--dry-run",
+      "--cargo-test-arg=--all-features",
+      "--test-filter",
+      "selected_test",
+      "--",
+      "--nocapture",
+      "--test-threads=1",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "typed Cargo invocation should render");
+  assert!(
+    stdout.contains("test: cargo test -p typed-crate --all-features selected_test -- --nocapture --test-threads=1"),
+    "Cargo options, filter, separator, and harness args must keep their domains. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_nextest_backend_renders_typed_arguments_in_exact_order() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-nextest-typed-arguments")?;
+  ws.add_crate("typed-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "test",
+      "--dry-run",
+      "--test-runner",
+      "nextest",
+      "--nextest-arg=-P",
+      "--nextest-arg=default",
+      "--test-filter",
+      "selected_test",
+      "--",
+      "--nocapture",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+
+  assert!(output.status.success(), "typed nextest invocation should render");
+  assert!(
+    stdout.contains("test: cargo nextest run -p typed-crate -P default selected_test -- --nocapture"),
+    "nextest options, filter, separator, and harness args must keep their domains. Output:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_runner_rejects_backend_argument_mismatch_before_spawn() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-backend-argument-mismatch")?;
+  ws.add_crate("typed-crate", "0.1.0", &[])?;
+  ws.commit("Add crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "test",
+      "--dry-run",
+      "--test-runner",
+      "cargo",
+      "--nextest-arg=-P",
+    ],
+  )?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert_eq!(output.status.code(), Some(2), "backend mismatch is a usage error");
+  assert!(
+    stderr.contains("nextest options cannot be used with cargo test"),
+    "diagnostic should name both incompatible domains. Stderr:\n{}",
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_runner_build_surface_uses_planner_selected_packages() -> Result<()> {
   let ws = TestWorkspace::new_named("test-run-build-selected-packages")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;

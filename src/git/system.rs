@@ -8,7 +8,7 @@
 
 use crate::error::{GitError, RailError, RailResult, ResultExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Normalize a path from git output to a platform-native path.
 ///
@@ -33,6 +33,20 @@ fn normalize_git_path(path: &str) -> PathBuf {
   // For non-MSYS paths or non-Windows, use the path directly.
   // PathBuf handles forward slashes correctly on all platforms.
   PathBuf::from(path)
+}
+
+fn parse_nul_paths(bytes: &[u8]) -> Vec<PathBuf> {
+  bytes
+    .split(|byte| *byte == 0)
+    .filter(|raw| !raw.is_empty())
+    .map(|raw| PathBuf::from(String::from_utf8_lossy(raw).into_owned()))
+    .collect()
+}
+
+fn is_generated_target_path(path: &Path) -> bool {
+  path
+    .components()
+    .any(|component| component.as_os_str() == std::ffi::OsStr::new("target"))
 }
 
 /// Information about a git commit
@@ -166,6 +180,55 @@ impl SystemGit {
   pub fn dirty_files(&self) -> RailResult<Vec<String>> {
     let output = self.run_git_stdout(&["status", "--porcelain"])?;
     Ok(output.lines().map(|s| s.to_string()).collect())
+  }
+
+  /// Return every tracked or untracked path whose worktree content differs from `HEAD`.
+  ///
+  /// Paths are repository-relative and sorted. Ignored files are intentionally excluded:
+  /// they are outside Git's mutation boundary unless a command declares them explicitly.
+  pub fn changed_paths(&self) -> RailResult<Vec<PathBuf>> {
+    let tracked = self.run_git(&["diff", "--name-only", "-z", "HEAD"])?;
+    let mut paths = parse_nul_paths(&tracked.stdout);
+    let untracked = self.run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    paths.extend(
+      parse_nul_paths(&untracked.stdout)
+        .into_iter()
+        .filter(|path| !is_generated_target_path(path)),
+    );
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+  }
+
+  /// Hash bytes with the repository's configured Git object format.
+  pub(crate) fn hash_bytes(&self, bytes: &[u8]) -> RailResult<String> {
+    use std::io::Write as _;
+
+    let mut cmd = self.git_cmd();
+    cmd
+      .args(["hash-object", "--stdin"])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped());
+    let mut child = cmd
+      .spawn()
+      .map_err(|error| RailError::message(format!("failed to start git hash-object: {}", error)))?;
+    child
+      .stdin
+      .take()
+      .ok_or_else(|| RailError::message("git hash-object stdin was unavailable"))?
+      .write_all(bytes)
+      .map_err(|error| RailError::message(format!("failed to write git hash input: {}", error)))?;
+    let output = child
+      .wait_with_output()
+      .map_err(|error| RailError::message(format!("failed to read git hash-object output: {}", error)))?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git hash-object --stdin".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+      }));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
   /// Create a safe git command with isolated environment
@@ -337,6 +400,42 @@ impl SystemGit {
     Ok(())
   }
 
+  /// Stage exactly the supplied repository paths, including deletions.
+  pub fn stage_paths(&self, paths: &[PathBuf]) -> RailResult<()> {
+    if paths.is_empty() {
+      return Ok(());
+    }
+
+    let mut cmd = self.git_cmd();
+    cmd.args(["add", "-A", "--"]);
+    for path in paths {
+      cmd.arg(self.normalize_repo_path(path)?);
+    }
+    let output = cmd
+      .output()
+      .map_err(|e| RailError::message(format!("failed to stage planned paths: {}", e)))?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git add -A -- <planned-paths>".to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+      }));
+    }
+    Ok(())
+  }
+
+  fn normalize_repo_path<'a>(&self, path: &'a Path) -> RailResult<&'a Path> {
+    if !path.is_absolute() {
+      return Ok(path);
+    }
+    path.strip_prefix(&self.worktree_root).map_err(|_| {
+      RailError::message(format!(
+        "path '{}' is outside git worktree '{}'",
+        path.display(),
+        self.worktree_root.display()
+      ))
+    })
+  }
+
   /// Check if there are staged changes
   pub fn has_staged_changes(&self) -> RailResult<bool> {
     // git diff --cached --quiet returns 1 if there are changes
@@ -461,6 +560,7 @@ pub fn init_repo(path: &std::path::Path, initial_branch: &str) -> RailResult<()>
 mod tests {
   use super::*;
   use std::ffi::OsStr;
+  use std::fs;
   use std::sync::{Mutex, OnceLock};
 
   static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -519,5 +619,42 @@ mod tests {
         std::env::remove_var(key);
       },
     }
+  }
+
+  #[test]
+  fn test_stage_paths_never_stages_unplanned_files() {
+    let temp = tempfile::TempDir::new().unwrap();
+    init_repo(temp.path(), "main").unwrap();
+    let git = SystemGit::open(temp.path()).unwrap();
+    git.set_config("user.name", "Test User").unwrap();
+    git.set_config("user.email", "test@example.com").unwrap();
+    fs::write(temp.path().join("planned.txt"), "before\n").unwrap();
+    fs::write(temp.path().join("unplanned.txt"), "before\n").unwrap();
+    git.stage_all().unwrap();
+    git.commit("initial").unwrap();
+
+    fs::write(temp.path().join("planned.txt"), "after\n").unwrap();
+    fs::write(temp.path().join("unplanned.txt"), "after\n").unwrap();
+    git.stage_paths(&[PathBuf::from("planned.txt")]).unwrap();
+
+    let staged = git.run_git_stdout(&["diff", "--cached", "--name-only"]).unwrap();
+    assert_eq!(staged, "planned.txt");
+    assert_eq!(
+      git.changed_paths().unwrap(),
+      vec![PathBuf::from("planned.txt"), PathBuf::from("unplanned.txt")]
+    );
+  }
+
+  #[test]
+  fn test_hash_bytes_uses_stable_git_object_ids() {
+    let git = SystemGit::open(Path::new(".")).unwrap();
+    let first = git.hash_bytes(b"approved inputs").unwrap();
+    let repeated = git.hash_bytes(b"approved inputs").unwrap();
+    let changed = git.hash_bytes(b"different inputs").unwrap();
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, changed);
+    assert!(first.len() >= 40);
+    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
   }
 }

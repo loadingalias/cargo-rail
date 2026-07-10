@@ -22,7 +22,7 @@ pub struct ReleaseConfig {
   #[serde(default = "default_true")]
   pub require_clean: bool,
 
-  /// Delay between crate publishes in seconds (default: 5)
+  /// Maximum registry-convergence polling interval in seconds (default: 5)
   #[serde(default = "default_publish_delay")]
   pub publish_delay: u64,
 

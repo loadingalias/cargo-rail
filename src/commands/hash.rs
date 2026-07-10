@@ -1,13 +1,15 @@
 //! `cargo rail hash` and `cargo rail diff-hash` introspection commands.
 
-use crate::commands::common::OutputFormat;
+use crate::commands::common::TextJsonOutputFormat;
 use crate::commands::plan::{PlanOptions, build_plan_output};
 use crate::error::{RailError, RailResult};
-use crate::utils::fnv1a64;
 use crate::workspace::WorkspaceContext;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+const PLAN_IDENTITY_CONTRACT_VERSION: u32 = 1;
 
 /// Options for `cargo rail hash`.
 pub struct HashOptions {
@@ -22,7 +24,7 @@ pub struct HashOptions {
   /// Planner confidence profile override.
   pub confidence_profile: Option<String>,
   /// Output format.
-  pub format: OutputFormat,
+  pub format: TextJsonOutputFormat,
 }
 
 /// Run the `hash` command.
@@ -45,16 +47,21 @@ pub fn run_hash(ctx: &WorkspaceContext, opts: HashOptions) -> RailResult<()> {
   let plan = build_plan_output(ctx, &plan_opts)?;
   let plan_json = serde_json::to_value(&plan)
     .map_err(|e| RailError::message(format!("failed to serialize plan for hashing: {}", e)))?;
-  let canonical = canonical_json(&plan_json);
-  let hash = format!("fnv1a64:{:016x}", fnv1a64(canonical.as_bytes()));
+  let portable = portable_plan_value(&plan_json)?;
+  let identity = identity_for_portable_plan(&portable);
 
   if opts.format.is_json() {
     let payload = serde_json::json!({
       "command": "hash",
-      "algorithm": "fnv1a64",
-      "hash": hash,
-      "inputs_fingerprint": plan.inputs.config_fingerprint.clone(),
+      "algorithm": "sha256",
+      "identity": identity,
+      "hash": identity,
+      "identity_contract_version": PLAN_IDENTITY_CONTRACT_VERSION,
+      "config_fingerprint": plan.inputs.config_fingerprint.clone(),
       "plan_contract_version": plan.plan_contract_version,
+      "portable": true,
+      "cache_key": false,
+      "excluded_local_fields": ["inputs.workspace_root", "reproducibility"],
       "refs": plan.inputs.refs,
     });
     let out = crate::output::machine_json_envelope("hash", "inspect", "success", 0, payload);
@@ -63,35 +70,40 @@ pub fn run_hash(ctx: &WorkspaceContext, opts: HashOptions) -> RailResult<()> {
       serde_json::to_string_pretty(&out).map_err(|e| RailError::message(format!("failed to render JSON: {}", e)))?
     );
   } else {
-    println!("{}", hash);
+    println!("{}", identity);
   }
 
   Ok(())
 }
 
 /// Run the `diff-hash` command.
-pub fn run_diff_hash(a: PathBuf, b: PathBuf, format: OutputFormat) -> RailResult<()> {
+pub fn run_diff_hash(a: PathBuf, b: PathBuf, format: TextJsonOutputFormat) -> RailResult<()> {
   if format.is_json_like() {
     crate::output::set_json_mode(true);
   }
 
-  let a_json = read_json_file(&a)?;
-  let b_json = read_json_file(&b)?;
+  let a_json = portable_plan_value(&read_json_file(&a)?)?;
+  let b_json = portable_plan_value(&read_json_file(&b)?)?;
 
-  let a_hash = format!("fnv1a64:{:016x}", fnv1a64(canonical_json(&a_json).as_bytes()));
-  let b_hash = format!("fnv1a64:{:016x}", fnv1a64(canonical_json(&b_json).as_bytes()));
+  let a_identity = identity_for_portable_plan(&a_json);
+  let b_identity = identity_for_portable_plan(&b_json);
 
   let mut changes = Vec::new();
   collect_diffs(&a_json, &b_json, "$", &mut changes, 64);
-  let equal = a_hash == b_hash;
+  let equal = a_identity == b_identity;
 
   if format.is_json() {
     let payload = serde_json::json!({
       "command": "diff-hash",
       "a": a.display().to_string(),
       "b": b.display().to_string(),
-      "hash_a": a_hash,
-      "hash_b": b_hash,
+      "identity_a": a_identity,
+      "identity_b": b_identity,
+      "hash_a": a_identity,
+      "hash_b": b_identity,
+      "identity_contract_version": PLAN_IDENTITY_CONTRACT_VERSION,
+      "portable": true,
+      "cache_key": false,
       "equal": equal,
       "changes": changes,
     });
@@ -101,12 +113,12 @@ pub fn run_diff_hash(a: PathBuf, b: PathBuf, format: OutputFormat) -> RailResult
       serde_json::to_string_pretty(&out).map_err(|e| RailError::message(format!("failed to render JSON: {}", e)))?
     );
   } else if equal {
-    println!("hashes match");
-    println!("  {}", a_hash);
+    println!("plan identities match");
+    println!("  {}", a_identity);
   } else {
-    println!("hash mismatch");
-    println!("  a: {}", a_hash);
-    println!("  b: {}", b_hash);
+    println!("plan identity mismatch");
+    println!("  a: {}", a_identity);
+    println!("  b: {}", b_identity);
     if changes.is_empty() {
       println!("  no structural diff paths found");
     } else {
@@ -124,6 +136,93 @@ fn read_json_file(path: &Path) -> RailResult<Value> {
   let content = std::fs::read_to_string(path)
     .map_err(|e| RailError::message(format!("failed to read '{}': {}", path.display(), e)))?;
   serde_json::from_str(&content).map_err(|e| RailError::message(format!("invalid JSON '{}': {}", path.display(), e)))
+}
+
+fn identity_for_portable_plan(value: &Value) -> String {
+  use std::fmt::Write as _;
+
+  let digest = Sha256::digest(canonical_json(value).as_bytes());
+  let mut hex = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    let _ = write!(hex, "{byte:02x}");
+  }
+  format!("plan-v{}:sha256:{}", PLAN_IDENTITY_CONTRACT_VERSION, hex)
+}
+
+fn portable_plan_value(value: &Value) -> RailResult<Value> {
+  let plan = value
+    .as_object()
+    .ok_or_else(|| RailError::message("planner contract must be a JSON object"))?;
+
+  let mut portable = serde_json::Map::new();
+  for key in ["plan_contract_version", "files", "impact", "scope", "surfaces", "trace"] {
+    let field = plan
+      .get(key)
+      .ok_or_else(|| RailError::message(format!("planner contract is missing '{}'", key)))?;
+    portable.insert(key.to_string(), field.clone());
+  }
+
+  let inputs = plan
+    .get("inputs")
+    .and_then(Value::as_object)
+    .ok_or_else(|| RailError::message("planner contract is missing object 'inputs'"))?;
+  let mut portable_inputs = serde_json::Map::new();
+  for key in [
+    "refs",
+    "config_fingerprint",
+    "toolchain_fingerprint",
+    "confidence_profile",
+    "confidence_profile_source",
+  ] {
+    let field = inputs
+      .get(key)
+      .ok_or_else(|| RailError::message(format!("planner inputs are missing '{}'", key)))?;
+    portable_inputs.insert(key.to_string(), field.clone());
+  }
+  portable.insert("inputs".to_string(), Value::Object(portable_inputs));
+
+  normalize_repository_paths(&mut portable)?;
+  Ok(Value::Object(portable))
+}
+
+fn normalize_repository_paths(plan: &mut serde_json::Map<String, Value>) -> RailResult<()> {
+  if let Some(files) = plan.get_mut("files").and_then(Value::as_array_mut) {
+    for file in files {
+      normalize_path_field(file, "path")?;
+    }
+  }
+  if let Some(trace) = plan.get_mut("trace").and_then(Value::as_array_mut) {
+    for reason in trace {
+      normalize_path_field(reason, "file")?;
+    }
+  }
+  Ok(())
+}
+
+fn normalize_path_field(value: &mut Value, field: &str) -> RailResult<()> {
+  let Some(path) = value.get_mut(field) else {
+    return Ok(());
+  };
+  let Some(path_str) = path.as_str() else {
+    return Err(RailError::message(format!(
+      "planner field '{}' must be a string",
+      field
+    )));
+  };
+  let normalized = path_str.replace('\\', "/");
+  let drive_absolute = normalized.as_bytes().get(1) == Some(&b':');
+  if normalized.starts_with('/')
+    || normalized.starts_with("//")
+    || drive_absolute
+    || normalized.split('/').any(|component| component == "..")
+  {
+    return Err(RailError::message(format!(
+      "planner path '{}' is not repository-relative",
+      path_str
+    )));
+  }
+  *path = Value::String(normalized);
+  Ok(())
 }
 
 fn canonical_json(value: &Value) -> String {

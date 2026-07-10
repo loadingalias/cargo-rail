@@ -183,7 +183,7 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     section: "release",
     key: "publish_delay",
     default_toml: "5",
-    comment: "Seconds between crate publishes",
+    comment: "Maximum registry polling interval in seconds",
   },
   FieldSpec {
     section: "release",

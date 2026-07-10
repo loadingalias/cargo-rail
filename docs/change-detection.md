@@ -28,8 +28,9 @@ Use `plan` when you want the contract. Use `run` when you want execution.
 - `trace` tells you why
 - `impact` is diagnostic
 - `scope` is the execution handoff
+- `scope.cargo_args` is the Cargo package selection for that handoff
 
-If another tool needs package selection, use `scope`, not `impact`.
+If another tool needs package selection, use `scope.cargo_args`, not `impact`.
 
 ## Config
 
@@ -62,6 +63,8 @@ benchmarks = ["benches/**", "perf/**"]
   if: steps.rail.outputs.build == 'true' || steps.rail.outputs.test == 'true'
   run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --profile ci
 ```
+
+For raw `cargo rail plan -f github`, the `cargo_args` output is ready to pass to Cargo. The GitHub Action publishes the same value as `cargo-args`.
 
 ## Validate
 

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = { workspace = true }
 license = "MIT"
 authors = ["loadingalias"]
-description = "Graph-aware testing, dependency unification, and crate extraction for Rust monorepos"
+description = "Graph-aware CI, dependency unification, changesets-style releases, and crate split/sync for Rust workspaces"
 repository = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
@@ -14,7 +14,7 @@ categories = [
     "development-tools::testing",
     "command-line-utilities",
 ]
-keywords = ["monorepo", "workspace", "hakari", "release", "cicd"]
+keywords = ["monorepo", "workspace", "changesets", "release", "cicd"]
 readme = "README.md"
 exclude = [
     "docs/",
@@ -48,9 +48,11 @@ winnow = "1.0.1"
 chrono = "0.4.44"
 glob = "0.3.3"
 rustc-hash = "2.1.2"
+sha2 = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0.102"
+jsonschema = { version = "0.47.0", default-features = false }
 tempfile = "3.27.0"
 
 [workspace.lints.rust]

@@ -276,12 +276,12 @@ verify_workflows() {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 main() {
-  check_dependencies
-
   if [ "$VERIFY_ONLY" = true ]; then
     verify_workflows
     exit 0
   fi
+
+  check_dependencies
 
   if [ "$UPDATE_LOCK" = true ]; then
     update_lock_file
