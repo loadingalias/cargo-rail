@@ -662,21 +662,11 @@ impl<'a> ReleasePublisher<'a> {
       )
     };
 
-    // Prepend new version section
-    let mut updated = String::new();
-    let lines: Vec<&str> = existing.lines().collect();
-
-    // Add header
-    if let Some(header) = lines.first() {
-      updated.push_str(header);
-      updated.push_str("\n\n");
-    }
-
-    // Add new version with today's date
+    // Build the new release section.
     let date = self.get_current_date();
-    updated.push_str(&self.format_version_header(plan, plan.previous_tag.as_deref(), &date, github_repo.as_ref()));
-    updated.push_str(new_entries);
-    updated.push('\n');
+    let mut release = self.format_version_header(plan, plan.previous_tag.as_deref(), &date, github_repo.as_ref());
+    release.push_str(new_entries);
+    release.push('\n');
 
     if new_entries.trim().is_empty() {
       if self.release_config.require_changelog_entries {
@@ -688,13 +678,7 @@ impl<'a> ReleasePublisher<'a> {
       return Ok(());
     }
 
-    // Add rest of existing changelog
-    if lines.len() > 1 {
-      for line in &lines[1..] {
-        updated.push_str(line);
-        updated.push('\n');
-      }
-    }
+    let updated = insert_changelog_release(&existing, &release);
 
     // Auto-create parent directories if they don't exist
     if let Some(parent) = plan.changelog_path.parent()
@@ -1232,6 +1216,37 @@ impl<'a> ReleasePublisher<'a> {
   }
 }
 
+fn insert_changelog_release(existing: &str, release: &str) -> String {
+  let lines: Vec<&str> = existing.lines().collect();
+  let first_release = lines
+    .iter()
+    .position(|line| line.starts_with("## ["))
+    .unwrap_or(lines.len());
+  let mut updated = String::new();
+
+  if let Some(header) = lines.first() {
+    updated.push_str(header);
+    updated.push_str("\n\n");
+  }
+  for line in lines.iter().take(first_release).skip(1) {
+    updated.push_str(line);
+    updated.push('\n');
+  }
+  if !updated.is_empty() && !updated.ends_with("\n\n") {
+    updated.push('\n');
+  }
+  updated.push_str(release.trim_start_matches('\n'));
+  if !updated.ends_with('\n') {
+    updated.push('\n');
+  }
+  for line in lines.iter().skip(first_release) {
+    updated.push_str(line);
+    updated.push('\n');
+  }
+
+  updated
+}
+
 fn extract_changelog_section(changelog: &str, version: &str) -> Option<String> {
   let needle = format!("## [{}]", version);
   let mut section = String::new();
@@ -1357,6 +1372,19 @@ mod tests {
     let section = extract_changelog_section(changelog, "0.2.0").unwrap();
     assert!(section.contains("new API"));
     assert!(!section.contains("old API"));
+  }
+
+  #[test]
+  fn changelog_release_follows_the_preamble() {
+    let existing = "# Changelog\n\nThis file records user-visible changes.\n\n## [0.15.0] - 2026-06-01\n\n- old\n";
+    let release = "## [0.16.0] - 2026-07-11\n\n- new\n\n";
+
+    let updated = insert_changelog_release(existing, release);
+
+    let preamble = updated.find("This file records user-visible changes.").unwrap();
+    let current = updated.find("## [0.16.0]").unwrap();
+    let previous = updated.find("## [0.15.0]").unwrap();
+    assert!(preamble < current && current < previous, "{}", updated);
   }
 
   #[test]

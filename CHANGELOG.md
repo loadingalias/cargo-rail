@@ -1,5 +1,7 @@
 # Changelog
 
+This file records user-visible changes. Git tags and [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases) retain the complete release history.
+
 ## [0.16.0](https://github.com/loadingalias/cargo-rail/compare/v0.15.0...v0.16.0) - 2026-07-11
 
 - Added Cargo-ready planner scope args, automation-safe change status output, and a commit-time change-file coverage check.
@@ -30,10 +32,6 @@
 ### Documentation
 
 - **release**: record v0.16 library API breaks ([3595b4f](https://github.com/loadingalias/cargo-rail/commit/3595b4f1f4c0e6c4f89f4b66688a597bbad0f61b))
-
-
-
-This file records user-visible changes. Git tags and [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases) retain the complete release history.
 
 ## [0.15.0](https://github.com/loadingalias/cargo-rail/compare/v0.14.0...v0.15.0) - 2026-07-06
 
