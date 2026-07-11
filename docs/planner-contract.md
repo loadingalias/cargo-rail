@@ -7,7 +7,7 @@ cargo rail plan --schema > plan.schema.json
 cargo rail plan --merge-base -f json > plan.json
 ```
 
-The current contract is planner v3, scope v2, inside machine-output envelope v1. Its source of truth is [`schemas/plan-v3.schema.json`](../schemas/plan-v3.schema.json). The schema command does not load workspace metadata, so consumers can install or validate the contract before opening a repository.
+The current output contains planner contract v3 and scope contract v2 inside machine envelope v1. [`schemas/plan-v3.schema.json`](../schemas/plan-v3.schema.json) defines the contract. `plan --schema` does not load workspace metadata, so consumers can validate compatibility before opening a repository.
 
 ## Compatibility
 
@@ -27,6 +27,6 @@ Successful JSON commands write one JSON value to stdout and keep progress off st
 - refs, config and toolchain fingerprints, and confidence profile;
 - repository-relative files, impact, scope, surface decisions, and trace reasons.
 
-Path separators are normalized to `/`. Absolute paths, drive-qualified paths, and `..` components are rejected. Local diagnostics—`inputs.workspace_root`, the machine envelope, and `reproducibility` metadata—are excluded, so equivalent clones at different checkout paths have the same identity.
+Path separators are normalized to `/`. Absolute paths, drive-qualified paths, and `..` components are rejected. Local diagnostics such as `inputs.workspace_root`, the machine envelope, and `reproducibility` metadata are excluded, so equivalent clones at different checkout paths have the same identity. Config and toolchain fingerprints normalize LF and CRLF line endings.
 
 This identity compares planner decisions. It is **not a cache key**. A future cache identity must additionally bind source contents, the actual compiler, target, features, command, and an explicit environment allowlist before reuse can be safe.

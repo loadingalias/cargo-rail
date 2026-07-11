@@ -1,14 +1,15 @@
 # Migrate from cargo-hakari
 
-`cargo-rail unify` replaces the workspace-hack flow with one config file and one command.
+`cargo-rail unify` replaces the generated workspace-hack crate with explicit transitive pins in the root or a selected workspace member. The resolved graph remains inspectable through normal Cargo manifests.
 
-## Minimal Migration
+## Migration
 
-1. remove the workspace-hack crate
-2. remove `hakari.toml`
-3. enable transitive pinning in `rail.toml`
-4. run `cargo rail unify --check`
-5. apply with `cargo rail unify`
+1. Create a branch and record the current `cargo tree` output and build timing.
+2. Remove workspace-hack dependencies, the hack crate's workspace member entry, and `hakari.toml`.
+3. Enable transitive pinning in `rail.toml`.
+4. Run `cargo rail unify --check --explain` and review each planned pin.
+5. Apply with `cargo rail unify`.
+6. Run the workspace build and test suite, then compare `cargo tree --duplicates` with the baseline.
 
 ## Config
 
@@ -21,7 +22,7 @@ pin_transitives = true
 
 ```bash
 cargo rail init
-cargo rail unify --check
+cargo rail unify --check --explain
 cargo rail unify
 ```
 
@@ -38,3 +39,5 @@ cargo rail unify
 ```bash
 cargo rail unify undo
 ```
+
+`unify undo` restores cargo-rail's latest manifest backup. Use version control to restore the removed workspace-hack files.

@@ -1,6 +1,6 @@
 # Unify Example
 
-Use `unify` to keep workspace dependencies consistent.
+`unify` plans manifest changes from the resolved dependency graph. It can centralize shared declarations, remove unused edges, prune dead features, repair borrowed features, derive MSRV, and pin fragmented transitive features.
 
 ## Quick Start
 
@@ -22,6 +22,8 @@ detect_unused = true
 msrv = true
 pin_transitives = false
 ```
+
+Keep `pin_transitives = false` unless replacing a workspace-hack crate. Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest backup.
 
 ## Reference
 

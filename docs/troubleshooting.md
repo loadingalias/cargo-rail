@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Use this when planner or runner behavior is not what you expected.
+Start with the planner trace. It records the base ref, file classification, ownership, graph expansion, surface decisions, and execution scope.
 
 ## Why did this run?
 
@@ -24,11 +24,11 @@ Use `scope` for execution decisions. Use `impact` for diagnostic context.
 
 Check these in order:
 
-1. wrong base ref
-2. wrong surface or profile
-3. confidence profile behavior
-4. path classification or custom rules
-5. binary-only crate filtering via `--ignore-bin-crates`
+1. Confirm the base ref contains the intended comparison range.
+2. Confirm the requested surface or profile.
+3. Inspect confidence-profile expansion.
+4. Inspect path classification and custom rules.
+5. Check binary-only filtering when `--ignore-bin-crates` is set.
 
 ## Common mistakes
 
@@ -44,7 +44,7 @@ git fetch --unshallow --tags
 
 In GitHub Actions, use `fetch-depth: 0` for release jobs.
 
-### Release execution stopped
+### Interrupted release
 
 `release run` and `release finalize` print a durable state path before their
 first side effect. Resume that exact plan after any local, network, registry, or
@@ -68,7 +68,7 @@ cargo rail release abort target/cargo-rail/releases/release-<id>.json --yes
 Abort refuses once an external side effect may exist; resume is the safe path
 from that point.
 
-### Sync stopped for manual conflict resolution
+### Manual sync conflict
 
 Manual sync conflicts exit with status `1`, leave the merged files on the
 `cargo-rail-sync-<crate>` recovery branch, and print a receipt path. Resolve all
@@ -81,7 +81,7 @@ cargo rail sync --resume target/cargo-rail/receipts/sync-conflict-<crate>-<id>.j
 Resume verifies the branch, parent commit, owned paths, and marker-free content
 before committing. Do not commit the conflict manually.
 
-### Release PR finalize failed
+### Release PR finalization
 
 `release finalize` expects the version bumps and changelog sections created by
 `release run --pr` to already be present in the current checkout. Merge the

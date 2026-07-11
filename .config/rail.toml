@@ -60,12 +60,27 @@ publish_delay = 5
 push = true
 create_github_release = true
 sign_tags = true
-changelog_path = "CHANGELOG.md"
-changelog_relative_to = "crate"  # "crate" or "workspace" (default: crate)
-skip_changelog_for = []
-require_changelog_entries = false
+require_changelog_entries = true
 require_release_notes = true
 release_notes_dir = "release-notes"
+change_dir = ".changes"
+pre_1_breaking_bump = "minor"
+unconventional_commits = "deny"
+semver_check = "warn"
+require_change_files = true
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "crate"
+emoji = false
+group_order = ["breaking", "feat", "fix", "perf", "docs", "deps"]
+fallback = "skip"
+
+[release.changelog.filters]
+skip_types = ["build", "chore", "ci", "refactor", "style", "test"]
+skip_scopes = []
+include_paths = []
+exclude_paths = []
 
 
 [change-detection]

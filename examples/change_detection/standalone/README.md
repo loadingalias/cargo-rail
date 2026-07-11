@@ -1,6 +1,6 @@
 # Change Detection: Standalone
 
-Use this pattern when `cargo-rail` should handle both planning and execution.
+Use this pattern when CI should pass planner-selected package arguments directly to Cargo without a repository-specific task runner.
 
 ## Local Example
 
@@ -13,16 +13,22 @@ cargo rail run --merge-base --dry-run --print-cmd
 ## CI Example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v4
+- uses: loadingalias/cargo-rail-action@v5
   id: rail
+  with:
+    version: 0.16.0
 
-- name: Run selected tests
+- name: Test selected packages
   if: steps.rail.outputs.test == 'true'
-  run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --surface test
+  env:
+    CARGO_ARGS: ${{ steps.rail.outputs.cargo-args }}
+  run: cargo test $CARGO_ARGS
 
-- name: Run selected build
+- name: Build selected packages
   if: steps.rail.outputs.build == 'true'
-  run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --surface build
+  env:
+    CARGO_ARGS: ${{ steps.rail.outputs.cargo-args }}
+  run: cargo build $CARGO_ARGS
 ```
 
 ## Built-in Surfaces
@@ -32,3 +38,5 @@ cargo rail run --merge-base --dry-run --print-cmd
 - `bench`
 - `docs`
 - `infra` for gating only
+
+Use `cargo rail run` instead when profiles, test-runner selection, or decision receipts should be owned by cargo-rail.

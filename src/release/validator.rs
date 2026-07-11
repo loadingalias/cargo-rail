@@ -223,7 +223,7 @@ impl<'a> ReleaseValidator<'a> {
       }
     }
 
-    if !skip_publish {
+    if !skip_publish && plan.crates.iter().any(|crate_plan| crate_plan.publish) {
       let output = process::run(
         "cargo",
         &["search", "serde", "--limit", "1"],

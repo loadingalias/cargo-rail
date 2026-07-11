@@ -1,10 +1,8 @@
-# Migrating From git-cliff or release-plz
+# Migrate from git-cliff or release-plz
 
-cargo-rail owns per-crate release planning inside a Rust workspace. It does
-not embed git-cliff's template engine. The migration target is declarative
-`rail.toml` config plus optional change files.
+cargo-rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and reviewed change files. It uses fixed changelog placeholders and groups instead of git-cliff's Tera templates.
 
-## Basic git-cliff Mapping
+## git-cliff mapping
 
 ```toml
 # cliff.toml
@@ -116,7 +114,7 @@ exclude_paths = ["crates/*/benches/**"]
 Filters are authoritative: a commit scope can claim an otherwise
 unattributed commit, but never one whose files the filters excluded.
 
-## release-plz Mapping
+## release-plz mapping
 
 release-plz's workspace changelog settings become workspace defaults:
 

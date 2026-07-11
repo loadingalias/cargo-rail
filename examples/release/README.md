@@ -1,7 +1,6 @@
 # Release Example
 
-Use `change` for reviewed release intent and `release` for checks, version
-bumps, changelogs, tags, forge releases, and publish ordering.
+`change` records reviewed bump intent. `release` turns that intent into manifest updates, changelogs, tags, forge releases, and dependency-ordered publishes.
 
 ## Quick Start
 
@@ -19,9 +18,9 @@ crate's previous tag. Change files are consumed in the release commit;
 consumption is all-or-nothing, so a plan covering only some of a file's
 crates is rejected.
 
-## Review-First Release
+## Release PR
 
-Use PR mode when the release diff needs review before any tag or publish:
+PR mode separates repository mutations from external release side effects:
 
 ```bash
 cargo rail release run my-crate --bump auto --pr --yes

@@ -1,17 +1,15 @@
 # Configuration Reference
 
-> Complete reference for all rail.toml configuration options. Kept in sync with source defaults and CLI behavior.
+`rail.toml` configures dependency analysis, releases, change detection, execution profiles, and split repositories.
 
-## Overview
-
-cargo-rail uses `rail.toml` for workspace-level configuration. This file controls:
+The file controls:
 
 - **Dependency unification** (`cargo rail unify`)
 - **Release automation** (`cargo rail release`)
 - **Change planning + execution** (`cargo rail plan`, `cargo rail run`)
 - **Crate splitting** (`cargo rail split`)
 
-### Configuration File Location
+## File discovery
 
 Configuration files are searched in order:
 
@@ -22,7 +20,7 @@ Configuration files are searched in order:
 
 The first file found is used. All paths are relative to the workspace root.
 
-### Generating Configuration
+## Generate a file
 
 Generate a default configuration file:
 
@@ -33,11 +31,11 @@ cargo rail init --check            # Preview without writing
 cargo rail init --force            # Overwrite existing config
 ```
 
-## Quick Start
+## Start with defaults
 
-### Minimal Configuration
+### Minimal configuration
 
-cargo-rail works with sensible defaults. An empty file is valid; add options only when you need them:
+An empty file is valid. Add targets when analysis must include platforms unavailable on the current host:
 
 ```toml
 # Minimal config (optional): set targets if you want multi-target validation.
@@ -45,7 +43,7 @@ cargo-rail works with sensible defaults. An empty file is valid; add options onl
 targets = ["x86_64-unknown-linux-gnu"]
 ```
 
-### Typical Configuration
+### Workspace configuration
 
 ```toml
 # Multi-target workspace with unify enabled
@@ -70,11 +68,9 @@ forge = "auto"
 infrastructure = [".github/**", "justfile"]
 ```
 
-## Complete Reference
+## Option reference
 
-### Top-Level Options
-
-Configuration options at the workspace root level.
+### Top-level options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -85,7 +81,7 @@ Configuration options at the workspace root level.
 | `run` | `table` | `{}` | Run profile settings for `cargo rail run` (see below) |
 | `crates` | `table` | `{}` | Per-crate configuration (see below) |
 
-**Example:**
+Example:
 
 ```toml
 targets = [
@@ -97,9 +93,9 @@ targets = [
 
 ---
 
-### [unify] Configuration
+### `[unify]`
 
-Controls workspace dependency unification behavior. All options are optional with sensible defaults.
+Controls workspace dependency analysis and manifest rewrites. Every option is optional.
 
 #### Core Options
 
@@ -114,11 +110,11 @@ Controls workspace dependency unification behavior. All options are optional wit
 | `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
 | `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
 | `detect_undeclared_features` | `bool` | `true` | Detect crates that rely on Cargo's feature unification to "borrow" features from other workspace members. These crates will fail when built standalone after unification. Reports as warnings (or auto-fixes if `fix_undeclared_features` is enabled). |
-| `fix_undeclared_features` | `bool` | `true` | Auto-fix undeclared feature dependencies by adding missing features to each crate's Cargo.toml. Produces a cleaner graph where standalone builds work correctly. Requires `detect_undeclared_features = true`. |
+| `fix_undeclared_features` | `bool` | `true` | Add borrowed features to the member manifest that uses them, allowing the crate to build without another workspace member enabling those features. Requires `detect_undeclared_features = true`. |
 | `skip_undeclared_patterns` | `string[]` | `["default", "std", "alloc", "*_backend", "*_impl"]` | Patterns for features to skip in undeclared feature detection. Supports glob patterns. Default patterns filter out features that are typically not actionable (standard library features, internal implementation details). |
 | `max_backups` | `usize` | `3` | Maximum number of backup archives to keep. Older backups are automatically cleaned up after successful operations. Set to `0` to disable backup creation entirely. |
 
-**Example:**
+Example:
 
 ```toml
 [unify]
@@ -144,7 +140,7 @@ max_backups = 5
 | `exact_pin_handling` | `enum` | `"warn"` | How to handle exact version pins like `=0.8.0`:<br>• `"skip"` - Exclude exact-pinned deps from unification<br>• `"preserve"` - Keep the exact pin operator in workspace.dependencies<br>• `"warn"` - Convert to caret (`^`) but emit a warning |
 | `major_version_conflict` | `enum` | `"warn"` | How to handle major version conflicts (e.g., `serde = "1.0"` and `serde = "2.0"`):<br>• `"warn"` - Skip unification, emit warning (both versions stay in graph)<br>• `"bump"` - Force unify to highest resolved version (may break code) |
 
-**Example:**
+Example:
 
 ```toml
 [unify]
@@ -153,10 +149,10 @@ exact_pin_handling = "preserve"
 major_version_conflict = "bump"
 ```
 
-**Notes:**
+Operational notes:
 
-- In my experience, `major_version_conflict = "bump"` works in most cases; some may require code fixes
-- Use `"warn"` for safety, `"bump"` for the leanest build graph
+- `major_version_conflict = "warn"` preserves incompatible major versions.
+- `major_version_conflict = "bump"` selects the highest resolved major and may require source changes.
 - If `[workspace.package].rust-version` is missing but root `[package].rust-version` is present, `unify` uses it as the baseline and writes it to `[workspace.package].rust-version` (consider enabling `enforce_msrv_inheritance` to avoid drift)
 
 #### Dependency Selection
@@ -168,7 +164,7 @@ major_version_conflict = "bump"
 | `exclude` | `string[]` | `[]` | Dependencies to skip from unification (safety hatch). Useful for platform-specific or problematic dependencies. For workspace-member dependency cohorts, excluding one member excludes the full cohort atomically to prevent local-vs-registry splits. |
 | `include` | `string[]` | `[]` | Force-include specific dependencies in unification, even if they're single-use. Workspace-member cohorts are auto-included by cargo-rail to avoid threshold-based cohort splits. |
 
-**Example:**
+Example:
 
 ```toml
 [unify]
@@ -178,18 +174,18 @@ exclude = ["openssl", "windows-sys"]  # Platform-specific
 include = ["my-special-dep"]          # Force include
 ```
 
-**Workspace-member cohort rule:** cargo-rail unifies connected workspace-member dependency sets atomically. A partial outcome (some members local, siblings from crates.io) is blocked automatically.
+Workspace-member cohorts are unified atomically. cargo-rail rejects a result that would leave some connected members local and resolve sibling members from a registry.
 
 #### Transitive Pinning
 
-Advanced feature for replacing workspace-hack crates. Only enable if you currently use `cargo-hakari`.
+Enable transitive pinning only when replacing `cargo-hakari` or another workspace-hack crate.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pin_transitives` | `bool` | `false` | Pin transitive-only dependencies with fragmented features. This is cargo-rail's workspace-hack replacement. When enabled, transitive deps with multiple feature sets are pinned in `workspace.dependencies`. |
 | `transitive_host` | `string` | `"root"` | Where to put pinned transitive dev-dependencies:<br>• `"root"` - Use workspace root `Cargo.toml`<br>• `"crates/foo"` - Use specific member crate (relative path from workspace root) |
 
-**Example:**
+Example:
 
 ```toml
 [unify]
@@ -197,7 +193,7 @@ pin_transitives = true
 transitive_host = "root"
 ```
 
-**Complete Example:**
+All `[unify]` options:
 
 ```toml
 [unify]
@@ -230,7 +226,7 @@ transitive_host = "root"
 
 ---
 
-### [release] Configuration
+### `[release]`
 
 Release automation settings for versioning, tagging, and publishing.
 
@@ -247,7 +243,7 @@ Release automation settings for versioning, tagging, and publishing.
 | `push` | `bool` | `false` | Push release commits and tags to `origin` before public publishing. Uses an atomic push for the branch and release tags. |
 | `sign_tags` | `bool` | `false` | Sign git tags with GPG or SSH. Requires git signing to be configured. |
 
-**Example:**
+Example:
 
 ```toml
 [release]
@@ -333,7 +329,7 @@ claim an otherwise unattributed commit (for example one that only touches
 workspace infrastructure), but never one whose files were excluded by
 `include_paths`/`exclude_paths`.
 
-**Example:**
+Example:
 
 ```toml
 [release]
@@ -358,7 +354,7 @@ include_paths = []
 exclude_paths = []
 ```
 
-**Complete Example:**
+Workspace release defaults:
 
 ```toml
 [release]
@@ -397,7 +393,7 @@ include_paths = []
 exclude_paths = []
 ```
 
-**Notes:**
+Operational notes:
 
 - In monorepos, use `{crate}` in `tag_format` to avoid tag collisions
 - For single-crate workspaces, use `tag_format = "v{version}"`
@@ -408,7 +404,7 @@ exclude_paths = []
 
 ---
 
-### [change-detection] Configuration
+### `[change-detection]`
 
 Settings for planner path classification.
 
@@ -418,9 +414,9 @@ Settings for planner path classification.
 | `unknown_file_policy` | `enum` | `"strict"` | Unknown-file policy:<br>• `"docs"` - keep unknown files docs-only<br>• `"owned_build_test"` - crate-owned unknown files enable `build` + `test`<br>• `"workspace_infra"` - non-crate unknown files enable `infra`<br>• `"strict"` - crate-owned unknown files enable `build` + `test`; everything else enables `infra` |
 | `confidence_profile` | `enum` | `"balanced"` | Planner confidence profile:<br>• `"strict"` - expands crate-owned changes to conservative `build` + `test` with transitive seeding<br>• `"balanced"` - default behavior<br>• `"fast"` - disables conservative transitive surface seeding for speed |
 | `bot_pr_confidence_profile` | `enum?` | `unset` | Optional profile override applied only for bot-authored GitHub pull requests (for example set to `"strict"`). |
-| `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces in `cargo rail plan` output. **Important:** Custom surfaces are plan OUTPUTS for CI gating—they cannot be used in `[run.profile.X].surfaces`. Category names must use ASCII letters/digits with `_` or `-` (for example `verify_models`, `bench-extended`). |
+| `custom` | `table<string, string[]>` | `{}` | Custom path patterns. Emits `custom:<name>` surfaces for CI gating. Custom surfaces are invalid in `[run.profile.X].surfaces`. Names accept ASCII letters, digits, `_`, and `-`. |
 
-**Default Infrastructure Patterns:**
+Default infrastructure patterns:
 
 ```toml
 infrastructure = [
@@ -442,7 +438,7 @@ infrastructure = [
 ]
 ```
 
-**Example:**
+Example:
 
 ```toml
 [change-detection]
@@ -461,7 +457,7 @@ benchmarks = ["benches/**", "perf/**"]
 docs = ["docs/**", "*.md"]
 ```
 
-#### Custom Surfaces vs Built-in Surfaces
+#### Built-in and custom surfaces
 
 Custom surfaces serve a different purpose than built-in surfaces:
 
@@ -472,30 +468,32 @@ Custom surfaces serve a different purpose than built-in surfaces:
 | Appears in plan output | ✅ Yes | ✅ Yes |
 | Use in CI job gating | ✅ Yes | ✅ Yes (via `scope_json.surfaces` or action `custom_<name>` outputs) |
 
-**Why this distinction?** Built-in surfaces map to cargo commands (`cargo build`, `cargo test`, etc.). Custom surfaces are arbitrary categories for CI decision-making—they don't map to cargo commands, so they can't be "executed" by `cargo rail run`.
+Built-in surfaces map to Cargo commands. Custom surfaces classify repository-specific work for CI gates and have no command for `cargo rail run` to execute.
 
 Custom surfaces are additive. If a path also matches a built-in classification such as
 `infra`, `docs`, or `bench`, `cargo rail plan` enables both the built-in surface and the
 matching `custom:<name>` surface(s). Custom routing is an overlay, not a replacement for
 core planner semantics.
 
-**CI gating pattern for custom surfaces:**
+Custom-surface gate:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v4
+- uses: loadingalias/cargo-rail-action@v5
   id: rail
+  with:
+    version: 0.16.0
 
 - name: Run benchmark suite
   if: steps.rail.outputs.custom_benchmarks == 'true' || steps.rail.outputs.infra == 'true'
   run: cargo bench
 ```
 
-#### Planner-First GitHub Actions Integration
+#### GitHub Actions outputs
 
-Use `cargo rail plan -f github` as the CI source of truth:
+Write planner outputs directly to `$GITHUB_OUTPUT`:
 
 ```yaml
-- uses: actions/checkout@v4
+- uses: actions/checkout@v6
   with:
     fetch-depth: 0
 
@@ -512,10 +510,9 @@ Use `cargo rail plan -f github` as the CI source of truth:
   run: cargo rail run --merge-base --surface docs
 ```
 
-For a full end-to-end operating guide (local + CI + trust checklist), see:
-[docs/change-detection.md](change-detection.md).
+See [Change Detection](change-detection.md) for planner behavior and validation commands.
 
-**`plan -f github` outputs:**
+`plan -f github` outputs:
 
 | Output | Description |
 |--------|-------------|
@@ -530,10 +527,9 @@ For a full end-to-end operating guide (local + CI + trust checklist), see:
 
 Use `cargo rail plan -f github-debug` when you also need `plan_json` for debugging or incident review.
 
-#### Decision Receipt Artifact (Recommended)
+#### Decision receipts
 
-`cargo rail run` writes a deterministic decision receipt under `target/cargo-rail/receipts/`.
-Upload it in CI so incident/debug review can answer "why this ran" without log spelunking:
+`cargo rail run` writes a decision receipt under `target/cargo-rail/receipts/`. Upload receipts when CI investigations need the exact plan and command selection:
 
 ```yaml
 - name: Run targeted surfaces
@@ -541,14 +537,14 @@ Upload it in CI so incident/debug review can answer "why this ran" without log s
 
 - name: Upload rail receipts
   if: always()
-  uses: actions/upload-artifact@v4
+  uses: actions/upload-artifact@v6
   with:
     name: cargo-rail-receipts
     path: target/cargo-rail/receipts/*.json
     if-no-files-found: ignore
 ```
 
-#### Migration from Coarse Outputs to Surfaces
+#### Replace coarse outputs
 
 | Legacy pattern | Planner-first replacement |
 |----------------|---------------------------|
@@ -570,7 +566,7 @@ Planner outputs support four formats:
 
 ---
 
-### [run] Configuration
+### `[run]`
 
 Execution profile configuration for `cargo rail run`.
 
@@ -634,14 +630,14 @@ run_args = ["--", "--bench", "critical", "{cargo_args}"]
 since = "{base_ref}"
 ```
 
-Test runner options are intentionally not inferred from `run_args`. Pass one portable `--test-filter`, Cargo-only options
+Test runner options are not inferred from `run_args`. Pass one portable `--test-filter`, Cargo-only options
 with repeated `--cargo-test-arg`, and nextest-only options with repeated `--nextest-arg`. Trailing `RUN_ARGS` are always
 test-binary arguments for the test surface. Backend-specific options select their matching backend in `auto` mode and fail
 before execution if they conflict with `--test-runner` or the backend is unavailable.
 
 ---
 
-### [crates.NAME] Configuration
+### `[crates.NAME]`
 
 Per-crate configuration. Replace `NAME` with the actual crate name from `Cargo.toml`.
 
@@ -659,7 +655,7 @@ Crate splitting and syncing configuration. Enables extracting crates to separate
 | `include` | `string[]` | no | Additional files/directories to include in the split (e.g., `["LICENSE", "README.md"]`) |
 | `exclude` | `string[]` | no | Files/directories to exclude from the split |
 
-**Choosing a Mode:**
+Split modes:
 
 | Scenario | Mode | Result |
 |----------|------|--------|
@@ -667,7 +663,7 @@ Crate splitting and syncing configuration. Enables extracting crates to separate
 | Group related utility crates | `combined` + `standalone` | Preserves directory structure, independent crates |
 | Extract as sub-workspace | `combined` + `workspace` | Root Cargo.toml with `[workspace]` |
 
-**Single Crate Example:**
+Single-crate example:
 
 ```toml
 [crates.my-lib.split]
@@ -681,7 +677,7 @@ include = ["LICENSE", "README.md"]
 exclude = ["*.tmp"]
 ```
 
-**Combined Workspace Example:**
+Combined-workspace example:
 
 ```toml
 [crates.utils.split]
@@ -697,7 +693,7 @@ paths = [
 include = ["LICENSE"]
 ```
 
-**Local Testing:**
+Local-path example:
 
 ```toml
 [crates.test-crate.split]
@@ -715,7 +711,7 @@ Per-crate release configuration. Overrides workspace-level release defaults.
 |--------|------|---------|-------------|
 | `publish` | `bool` | `true` | Enable/disable publishing for this crate. Overrides `Cargo.toml` `publish` field. |
 
-**Example:**
+Example:
 
 ```toml
 [crates.internal-utils.release]
@@ -739,7 +735,7 @@ Per-crate changelog configuration.
 | `commit_url` | `string?` | inherited | Override commit URL template. |
 | `pr_url` | `string?` | inherited | Override pull-request URL template. |
 
-**Example:**
+Example:
 
 ```toml
 [crates.my-lib.changelog]
@@ -761,16 +757,16 @@ cargo rail sync my-lib --to-remote    # Monorepo → split repo
 cargo rail sync my-lib --from-remote  # Split repo → monorepo (PR branch)
 ```
 
-**Key behaviors:**
+Sync behavior:
 
-- **Idempotent**: Uses git-notes to track synced commits; re-running only processes new commits
-- **PR branch protection**: `--from-remote` creates `cargo-rail-sync-<crate>` branch, never commits to main
-- **Conflict resolution**: `--strategy` controls merge behavior (`manual`, `ours`, `theirs`, `union`)
-- **Recoverable manual conflicts**: unresolved content exits `1` without a commit; resolve the receipt paths and run `cargo rail sync --resume <receipt>`
+- Git notes track mapped commits; repeated runs process only new commits.
+- `--from-remote` creates `cargo-rail-sync-<crate>` instead of committing to the current main branch.
+- `--strategy` selects `manual`, `ours`, `theirs`, or `union` three-way merge behavior.
+- Unresolved content exits `1` without committing. Resolve the receipt paths and run `cargo rail sync --resume <receipt>`.
 
 ---
 
-## Complete Configuration Example
+## Full configuration example
 
 ```toml
 # Complete rail.toml showing all available options
@@ -893,11 +889,11 @@ publish = false
 skip = true
 ```
 
-## Configuration Recipes
+## Recipes
 
-### Minimal (Defaults)
+### Minimal defaults
 
-Let cargo-rail handle everything with sensible defaults:
+Set only the target platforms that must be analyzed:
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu"]
@@ -913,9 +909,9 @@ pin_transitives = true
 transitive_host = "root"
 ```
 
-### Aggressive Version Unification
+### Cross-major version unification
 
-Force unification to highest versions, accept breaking changes:
+Select the highest resolved major. Review and fix source compatibility after apply:
 
 ```toml
 [unify]
@@ -924,9 +920,9 @@ strict_version_compat = false
 exact_pin_handling = "preserve"
 ```
 
-### Conservative (Minimal Changes)
+### Report without cleanup
 
-Disable automatic cleanup and MSRV management:
+Keep unused-dependency detection while disabling removal, feature pruning, and MSRV writes:
 
 ```toml
 [unify]
@@ -955,9 +951,9 @@ exclude = [
 ]
 ```
 
-### Full CI Setup
+### CI and release setup
 
-Complete configuration for automated releases and testing:
+CI and release configuration:
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu"]
@@ -1022,7 +1018,7 @@ paths = [{ crate = "crates/server" }]
 
 ## Validation
 
-cargo-rail provides comprehensive configuration validation via `cargo rail config validate`:
+`cargo rail config validate` checks syntax, known keys, and cross-field constraints:
 
 ```bash
 cargo rail config validate              # Validate rail.toml
@@ -1036,9 +1032,9 @@ cargo rail config validate -f json      # JSON output for CI integration
 1. **Syntax** - TOML parse errors with line/column information
 2. **Unknown keys** - Typos like `mrsv_source` instead of `msrv_source`
 3. **Semantic validation** - Split config requirements, target triple formats
-4. **Deprecation warnings** - Future-proofing for config migrations
+4. **Deprecation warnings** - Options scheduled for removal or replacement
 
-### CI Auto-Strict Mode
+### CI strict mode
 
 By default, validation runs in **strict mode** when CI is detected (via `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` environment variables):
 
@@ -1047,7 +1043,7 @@ By default, validation runs in **strict mode** when CI is detected (via `CI`, `G
 
 Override with `--strict` or `--no-strict` flags.
 
-### Example CI Usage
+### GitHub Actions example
 
 ```yaml
 # .github/workflows/ci.yml
@@ -1056,7 +1052,7 @@ Override with `--strict` or `--no-strict` flags.
   # Auto-strict in CI - fails on unknown keys
 ```
 
-### Common Validation Errors
+### Validation errors
 
 | Error | Cause |
 |-------|-------|
@@ -1091,7 +1087,7 @@ cargo rail unify
 
 ### From release-plz
 
-cargo-rail provides similar functionality with tighter integration:
+Map release-plz workspace settings to cargo-rail release defaults:
 
 ```toml
 # release-plz.toml → rail.toml
@@ -1113,7 +1109,7 @@ For git-cliff parser/group migration, see `docs/migrate-git-cliff.md`.
 
 No cargo-rail-specific environment variables are required. For reproducibility, configuration is file-based.
 
-Note: `cargo rail config validate` defaults to strict mode in CI (detected via `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI`).
+`cargo rail config validate` defaults to strict mode when `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` is set.
 
 ## See Also
 

@@ -1,21 +1,21 @@
 # Architecture
 
-`cargo-rail` is a CLI-first monorepo tool for Rust development. The architecture is simple on purpose.
+`cargo-rail` is a library-backed CLI. Commands share one workspace snapshot and use explicit plans for filesystem, git, and release mutations.
 
-## Core Rule
+## Workspace snapshot
 
 Build `WorkspaceContext` once and pass it by reference everywhere else.
 
-That context owns:
+The context owns:
 
 - git state
-- cargo metadata state (resolved)
+- resolved Cargo metadata
 - workspace dependency graph
 - loaded config
 
 Commands do not reload metadata independently.
 
-## Main Layers
+## Modules
 
 | Layer | Purpose |
 |---|---|
@@ -29,59 +29,50 @@ Commands do not reload metadata independently.
 | `split/` / `sync/` | repository extraction and bidirectional sync |
 | `toml/` | lossless manifest editing |
 
-## Data Flow
+## Command flow
 
-1. Parse CLI
-2. Initialize output mode
-3. Handle early commands that do not need full context
-4. Build `WorkspaceContext`
-5. Dispatch the selected command
+1. Parse CLI arguments.
+2. Initialize text or machine output.
+3. Handle commands that do not need workspace metadata.
+4. Build `WorkspaceContext` once.
+5. Dispatch the command with a shared reference.
 
-## Planner Pipeline
+## Planner pipeline
 
 `cargo rail plan` follows a fixed path:
 
-1. collect changed files
-2. classify file kinds and custom surfaces
-3. resolve file ownership
-4. compute graph impact
-5. emit trace and surface decisions
-6. project execution scope
+1. Collect changed files.
+2. Classify built-in and custom surfaces.
+3. Resolve crate ownership.
+4. Walk reverse dependencies to calculate impact.
+5. Record stable reason codes and surface decisions.
+6. Project the result into execution scope.
 
-`impact` is diagnostic. `scope` is the execution handoff.
-The scope carries the selected mode, selected crates, and ready-to-pass
-`cargo_args` so runners do not reconstruct Cargo invocation state.
+`impact` explains the graph calculation. `scope` carries the selected mode, crates, surfaces, and `cargo_args` used by runners.
 
-## Unify Pipeline
+## Unify pipeline
 
 `cargo rail unify`:
 
-1. loads cargo metadata
-2. analyzes resolved dependencies
-3. computes a mutation plan
-4. applies lossless TOML edits
+1. Load resolved metadata for the configured targets.
+2. Analyze versions, features, MSRV, and unused edges.
+3. Build a deterministic mutation plan.
+4. Revalidate the plan and apply lossless TOML edits.
 
-## Mutation Authority
+## Mutation authority
 
-Mutation plans are executable contracts, not summaries. Contract v2 binds `HEAD`,
-the complete dirty-path snapshot, declared read-only inputs, structured action
-payloads, and each authorized file mutation. Apply rejects drift immediately before
-the first write. Release commits stage only currently changed authorized paths;
-sync commits stage only the paths owned by the source commit.
+Mutation contract v2 binds `HEAD`, the dirty-path snapshot, declared read-only inputs, structured actions, and every authorized file mutation. Apply rechecks that state immediately before the first write. Release commits stage only changed authorized paths. Sync commits stage only paths owned by the source commit.
 
-Split and sync parameters carry validated path capabilities. Source workspace,
-Git worktree, crate, target, and temporary roots are canonicalized before use;
-overlapping repositories and symlink escapes are rejected before mutation and
-revalidated at each filesystem destination.
+Split and sync canonicalize the source workspace, worktree, crate, target, and temporary roots. They reject overlapping repositories and symlink escapes before mutation and revalidate each destination before writing.
 
-## Design Choices
+## Dependency choices
 
-- system git instead of libgit2
-- petgraph directly instead of another abstraction layer
-- lossless TOML editing so manifests keep comments and formatting
-- thin `main.rs`, with logic in the library crate
+- System `git` handles repository operations and three-way merges.
+- `petgraph` provides graph storage and traversal without a project-specific graph abstraction.
+- `toml_edit` preserves manifest comments and formatting.
+- `main.rs` handles startup and error reporting; production behavior remains in the library.
 
-## Where to Change Things
+## Code map
 
 | Change | File or module |
 |---|---|
@@ -92,3 +83,5 @@ revalidated at each filesystem destination.
 | graph algorithms | `src/graph/` |
 | unify behavior | `src/cargo/` |
 | config parsing | `src/config/` |
+| release planning and state | `src/release/` |
+| split and sync mutations | `src/split/`, `src/sync/` |

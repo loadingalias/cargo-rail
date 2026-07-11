@@ -2,7 +2,7 @@
 
 Use this pattern when your repo already has `just`, `make`, `xtask`, or scripts.
 
-`cargo-rail` decides what changed. Your task runner decides how to run it.
+`cargo-rail` emits crate and surface scope. The task runner maps that scope to repository-specific commands.
 
 ## Local Example
 
@@ -23,8 +23,10 @@ fi
 ## CI Example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v4
+- uses: loadingalias/cargo-rail-action@v5
   id: rail
+  with:
+    version: 0.16.0
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'

@@ -1,6 +1,6 @@
 # Change Detection
 
-`cargo-rail` classifies changed files into surfaces and then projects an execution scope.
+`cargo-rail` maps changed files to workspace crates, includes affected dependents, classifies CI surfaces, and emits the package scope that should run.
 
 ## Surfaces
 
@@ -12,7 +12,7 @@
 | `docs` | documentation-only work changed |
 | `infra` | CI, scripts, tooling, or workspace-level operations changed |
 
-## Basic Commands
+## Plan and run
 
 ```bash
 cargo rail plan --merge-base --explain
@@ -22,7 +22,7 @@ cargo rail run --merge-base --surface test
 
 Use `plan` when you want the contract. Use `run` when you want execution.
 
-## Important Outputs
+## Execution outputs
 
 - `surfaces` tells you which surfaces are active
 - `trace` tells you why
@@ -53,18 +53,22 @@ benchmarks = ["benches/**", "perf/**"]
 | `balanced` | default tradeoff |
 | `fast` | minimize execution expansion |
 
-## Common CI Pattern
+## GitHub Actions
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v4
+- uses: loadingalias/cargo-rail-action@v5
   id: rail
+  with:
+    version: 0.16.0
 
-- name: Run selected CI profile
-  if: steps.rail.outputs.build == 'true' || steps.rail.outputs.test == 'true'
-  run: cargo rail run --since "${{ steps.rail.outputs.base-ref }}" --profile ci
+- name: Test selected packages
+  if: steps.rail.outputs.test == 'true'
+  env:
+    CARGO_ARGS: ${{ steps.rail.outputs.cargo-args }}
+  run: cargo test $CARGO_ARGS
 ```
 
-For raw `cargo rail plan -f github`, the `cargo_args` output is ready to pass to Cargo. The GitHub Action publishes the same value as `cargo-args`.
+Raw `cargo rail plan -f github` writes the same package selection as `cargo_args`. `@v5` selects the action contract; `version` selects the installed cargo-rail release.
 
 ## Validate
 

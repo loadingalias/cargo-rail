@@ -1,15 +1,15 @@
 # Config Example
 
-This directory contains a complete `rail.toml`.
+[`rail.toml`](rail.toml) shows every major configuration section in one file. Copy only the sections the workspace needs.
 
-## Use It
+## Validate it
 
 ```bash
 cargo rail init
 cargo rail config validate --strict
 ```
 
-Or copy the example into your workspace:
+To use it as a starting point:
 
 ```bash
 cp examples/config/rail.toml .config/rail.toml

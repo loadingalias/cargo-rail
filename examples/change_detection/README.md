@@ -1,6 +1,6 @@
 # Change Detection Examples
 
-Choose one pattern:
+Choose the execution owner:
 
 - [`with-task-runner/`](with-task-runner/) if your repo already has `just`, `make`, `xtask`, or scripts
 - [`standalone/`](standalone/) if you want `cargo-rail` to plan and execute directly
@@ -12,7 +12,7 @@ cargo rail plan --merge-base --explain
 cargo rail run --merge-base --surface test
 ```
 
-Use `scope` for execution. Use `impact` for explanation.
+`scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced that selection.
 
 ## Config Shape
 
