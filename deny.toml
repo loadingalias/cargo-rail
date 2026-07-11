@@ -28,9 +28,11 @@ wildcards = "allow"
 highlight = "all"
 
 skip = [
-  # Low-level system dependencies - acceptable to have multiple versions
-  # petgraph depends on hashbrown v0.15, while indexmap uses v0.16
+  # petgraph 0.8.3 requires hashbrown 0.15; current indexmap and tooling use
+  # hashbrown 0.17. Both lines are required until petgraph publishes its
+  # hashbrown 0.16 update.
   "hashbrown",
+  "foldhash",
 ]
 
 [sources]
