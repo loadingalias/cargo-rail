@@ -14,11 +14,22 @@ on:
   push:
     tags:
       - v[0-9]+.*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to verify and publish
+        required: true
+        type: string
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   verify-release:
@@ -31,13 +42,22 @@ jobs:
       matrix: ${{ steps.targets.outputs.matrix }}
       target_count: ${{ steps.targets.outputs.count }}
       version: ${{ steps.release.outputs.version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
       - name: Checkout exact tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Bind tag, commit, version, and target matrix
         id: release
@@ -46,12 +66,18 @@ jobs:
           set -euo pipefail
 
           head_sha="$(git rev-parse HEAD)"
-          tag_sha="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
-          if [ "$head_sha" != "$GITHUB_SHA" ] || [ "$tag_sha" != "$GITHUB_SHA" ]; then
-            echo "Release ref does not resolve to the checked-out GitHub event SHA." >&2
-            echo "HEAD=$head_sha tag=$tag_sha event=$GITHUB_SHA" >&2
+          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [ "$head_sha" != "$tag_sha" ]; then
+            echo "Release tag does not resolve to the checked-out commit." >&2
+            echo "HEAD=$head_sha tag=$tag_sha" >&2
             exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "Release tag does not resolve to the GitHub push event SHA." >&2
+            echo "tag=$tag_sha event=$GITHUB_SHA" >&2
+            exit 1
+          fi
+          echo "release_sha=$tag_sha" >> "$GITHUB_OUTPUT"
 
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import os
@@ -60,7 +86,7 @@ jobs:
 
           manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
           version = manifest["package"]["version"]
-          tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          tag_version = os.environ["RELEASE_TAG"].removeprefix("v")
           if version != tag_version:
               raise SystemExit(f"tag v{tag_version} does not match Cargo package version {version}")
 
@@ -90,13 +116,13 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in {1..24}; do
-            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+            if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"; then
               exit 0
             fi
-            echo "GitHub Release $GITHUB_REF_NAME not visible yet; retrying ($attempt/24)..."
+            echo "GitHub Release $RELEASE_TAG not visible yet; retrying ($attempt/24)..."
             sleep 5
           done
-          echo "GitHub Release $GITHUB_REF_NAME was not created by cargo-rail in time." >&2
+          echo "GitHub Release $RELEASE_TAG was not created by cargo-rail in time." >&2
           exit 1
 
       - name: Install MSRV toolchain
@@ -134,7 +160,7 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
         with:
           shared-key: cargo-rail-release-gate-v1
-          key: ${{ github.sha }}
+          key: ${{ steps.release.outputs.release_sha }}
 
       - name: Verify action pins
         run: just verify-actions
@@ -179,11 +205,13 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ needs.verify-release.outputs.release_sha }}
 
       - name: Verify checkout identity
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        env:
+          RELEASE_SHA: ${{ needs.verify-release.outputs.release_sha }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
@@ -245,7 +273,7 @@ jobs:
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
           test -n "$binary"
           chmod +x "$binary"
-          test "$("$binary" --version)" = "cargo-rail $VERSION"
+          test "$("$binary" rail --version)" = "cargo-rail $VERSION"
 
       - name: Smoke-test zip archive
         if: matrix.archive == 'zip'
@@ -262,7 +290,7 @@ jobs:
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
           }
-          $actual = (& $binary.FullName --version).Trim()
+          $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {
             throw "archive smoke test failed: $actual"
           }
@@ -310,6 +338,8 @@ jobs:
           fi
 
       - name: Generate checksum manifests
+        env:
+          RELEASE_SHA: ${{ needs.verify-release.outputs.release_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -330,8 +360,8 @@ jobs:
 
           payload = {
               "tool": "cargo-rail",
-              "tag": os.environ["GITHUB_REF_NAME"],
-              "source_commit": os.environ["GITHUB_SHA"],
+              "tag": os.environ["RELEASE_TAG"],
+              "source_commit": os.environ["RELEASE_SHA"],
               "entries": entries,
           }
           pathlib.Path("SHA256SUMS.json").write_text(
@@ -359,5 +389,5 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(cargo-rail-*.tar.* cargo-rail-*.zip)
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             "${files[@]}" SHA256SUMS SHA256SUMS.json --clobber
