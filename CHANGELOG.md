@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.16.0](https://github.com/loadingalias/cargo-rail/compare/v0.15.0...v0.16.0) - 2026-07-11
+
+- Added Cargo-ready planner scope args, automation-safe change status output, and a commit-time change-file coverage check.
+
+- Changed public Rust APIs for mutation contracts, release execution, split/sync safety, and test-runner selection; downstream library users must update constructors and method calls.
+
+- Made command output formats exact, published the planner v3 JSON Schema, and added checkout-independent plan identities.
+
+- Curated the historical changelog and required reviewed release intent for future releases.
+
+- Bounded release, split, and sync mutations to approved repository paths, made sync conflicts resumable, and preserved exact split history and mappings.
+
+- Skipped crates.io preflight checks when every crate in a release plan has publishing disabled.
+
+- Made releases resumable, verified and distributed the exact tagged commit, and made Cargo, nextest, filter, and test-harness arguments backend-correct.
+
+- Fixed Windows path normalization for release, split, sync, and portable planner identities.
+
+### Features
+
+- **workspace**: make control-plane operations verifiable and recoverable ([6bd64fb](https://github.com/loadingalias/cargo-rail/commit/6bd64fb6f028bee13a372ff23d4f4b789a5562b3))
+
+### Bug Fixes
+
+- **release**: harden release readiness and curate history ([3679801](https://github.com/loadingalias/cargo-rail/commit/367980186587210735bbecf9a7b6e3485cf2985b))
+- **git**: normalize Windows paths at repository boundaries ([7936232](https://github.com/loadingalias/cargo-rail/commit/793623232c23e25d2f92734ca673421052c40b4a))
+
+### Documentation
+
+- **release**: record v0.16 library API breaks ([3595b4f](https://github.com/loadingalias/cargo-rail/commit/3595b4f1f4c0e6c4f89f4b66688a597bbad0f61b))
+
+
+
 This file records user-visible changes. Git tags and [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases) retain the complete release history.
 
 ## [0.15.0](https://github.com/loadingalias/cargo-rail/compare/v0.14.0...v0.15.0) - 2026-07-06
