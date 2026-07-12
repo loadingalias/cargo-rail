@@ -1,5 +1,23 @@
 # Changelog
 
+
+## [0.17.1](https://github.com/loadingalias/cargo-rail/compare/v0.17.0...v0.17.1) - 2026-07-12
+
+- Fixed unify graph verification to compare pre- and post-edit metadata with the same target platform filter. Cargo-synthesized optional-dependency features are no longer treated as writable manifest feature keys.
+
+- Allowed release abort to reconcile an atomic push rejected before any remote refs changed. Increased the strict nextest leak deadline to avoid false failures from loaded macOS process teardown while continuing to fail persistent inherited-process leaks.
+
+- Kept immutable release recovery from being blocked by Clippy lints added after a tag was published. Normal tag-triggered releases still require a clean Clippy run.
+
+- Synchronized upgrade policy, aligned CI and examples with cargo-rail-action v5.1.0, removed deprecated Intel macOS distribution, tightened dependency checks, and reduced CI duplication while preserving Linux, Windows, ARM, MSRV, and cross-OS test coverage.
+
+### Bug Fixes
+
+- **release**: recover locally rejected atomic pushes ([7340378](https://github.com/loadingalias/cargo-rail/commit/73403782bdf8921097c168f6911e2b3f00947d50))
+- **workspace**: harden graph cleanup and release readiness ([3c8b7d4](https://github.com/loadingalias/cargo-rail/commit/3c8b7d410d12701c4207ee4e745578c34a5371c0))
+- **release**: recover immutable tags from lint drift ([a10f176](https://github.com/loadingalias/cargo-rail/commit/a10f1763e3d0d54f0c982880304913dcd3d24808))
+
+
 ## [0.17.0](https://github.com/loadingalias/cargo-rail/compare/v0.16.0...v0.17.0) - 2026-07-12
 
 - Made `cargo rail unify` faster and more exact with shared indexed Cargo metadata, workspace-only compiler evidence, source-derived feature checks, and compilation-unit cache reuse. Analysis now covers configured targets, default/no-default/all-feature builds, conditional feature selections, generated and macro-expanded source, every Cargo target kind, and target-scoped declarations.
