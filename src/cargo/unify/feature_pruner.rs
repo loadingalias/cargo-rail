@@ -1,45 +1,72 @@
-//! Dead and optional feature scanning
+//! Feature reachability planning.
 //!
-//! Analyzes workspace features using resolved cargo metadata to find:
-//! - Dead features (empty no-ops) that can be safely removed
-//! - Optional features (user-facing API, not removed)
+//! Removes only private features outside the deterministic root closure and
+//! reports inactive forwarding features retained as published API.
 
 use crate::cargo::feature_scanner::FeatureScanner;
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
-use crate::cargo::unify_types::{MemberEdit, OptionalFeature, PrunedFeature};
-use crate::config::UnifyConfig;
+use crate::cargo::unify_types::{MemberEdit, OptionalFeature, PrunedFeature, ReachableFeature};
+use crate::compiler::cfg_eval::TargetCfgSet;
+use crate::config::{ConsumerScope, UnifyConfig};
 use crate::progress;
 use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Scans for dead and optional features in workspace crates
 pub struct FeaturePruner<'a> {
   metadata: &'a MultiTargetMetadata,
   config: &'a UnifyConfig,
+  target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
 }
 
 impl<'a> FeaturePruner<'a> {
   /// Create a new feature pruner
-  pub fn new(metadata: &'a MultiTargetMetadata, config: &'a UnifyConfig) -> Self {
-    Self { metadata, config }
+  pub fn new(
+    metadata: &'a MultiTargetMetadata,
+    config: &'a UnifyConfig,
+    target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
+  ) -> Self {
+    Self {
+      metadata,
+      config,
+      target_cfg_sets,
+    }
   }
 
-  /// Detect dead and optional features using resolved cargo metadata
+  /// Detect unreachable private and inactive published features.
   ///
   /// Returns two lists:
-  /// - `pruned`: Truly dead features (empty no-ops) that can be safely removed
-  /// - `optional`: Features not enabled but enable something (user-facing API, don't remove)
+  /// - `pruned`: private features outside the root closure
+  /// - `optional`: inactive published forwarding features retained as API
   ///
   /// Features matching `preserve_features` patterns in config are excluded from pruning.
-  pub fn scan(&self) -> (Vec<PrunedFeature>, Vec<OptionalFeature>) {
+  pub fn scan(&self) -> (Vec<PrunedFeature>, Vec<OptionalFeature>, Vec<ReachableFeature>) {
     let mut pruned = Vec::new();
     let mut optional = Vec::new();
+    let mut reachable = Vec::new();
 
     // Analyze workspace using resolved metadata
-    let results = FeatureScanner::analyze_workspace(self.metadata);
+    let results = FeatureScanner::analyze_workspace(
+      self.metadata,
+      |feature| self.config.should_preserve_feature(feature),
+      self.config.consumer_scope == ConsumerScope::Workspace,
+      self.target_cfg_sets,
+    );
 
     // Collect dead and optional features
     for result in &results {
+      reachable.extend(
+        result
+          .reachability_paths
+          .iter()
+          .map(|(feature_name, proof)| ReachableFeature {
+            crate_name: Arc::from(result.crate_name.as_str()),
+            feature_name: Arc::from(feature_name.as_str()),
+            root_kind: proof.root_kind,
+            path: proof.path.iter().map(|feature| Arc::from(feature.as_str())).collect(),
+          }),
+      );
       // Truly dead features (empty no-ops), excluding preserved features
       for feature_name in &result.dead_features {
         // Skip features that match preserve_features patterns
@@ -49,6 +76,15 @@ impl<'a> FeaturePruner<'a> {
         pruned.push(PrunedFeature {
           crate_name: Arc::from(result.crate_name.as_str()),
           feature_name: Arc::from(feature_name.as_str()),
+          declared_edges: self
+            .metadata
+            .workspace_packages()
+            .find(|package| package.name == result.crate_name)
+            .and_then(|package| package.features.get(feature_name))
+            .into_iter()
+            .flatten()
+            .map(|edge| Arc::from(edge.as_str()))
+            .collect(),
         });
       }
 
@@ -58,7 +94,6 @@ impl<'a> FeaturePruner<'a> {
         let enables: Vec<Arc<str>> = self
           .metadata
           .workspace_packages()
-          .iter()
           .find(|p| p.name == result.crate_name)
           .and_then(|p| p.features.get(feature_name))
           .map(|v| v.iter().map(|s| Arc::from(s.as_str())).collect())
@@ -89,7 +124,26 @@ impl<'a> FeaturePruner<'a> {
       }
     }
 
-    (pruned, optional)
+    pruned.sort_by(|left, right| {
+      left
+        .crate_name
+        .cmp(&right.crate_name)
+        .then_with(|| left.feature_name.cmp(&right.feature_name))
+    });
+    optional.sort_by(|left, right| {
+      left
+        .crate_name
+        .cmp(&right.crate_name)
+        .then_with(|| left.feature_name.cmp(&right.feature_name))
+    });
+    reachable.sort_by(|left, right| {
+      left
+        .crate_name
+        .cmp(&right.crate_name)
+        .then_with(|| left.feature_name.cmp(&right.feature_name))
+    });
+
+    (pruned, optional, reachable)
   }
 
   /// Generate removal edits for pruned features

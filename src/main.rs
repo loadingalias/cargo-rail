@@ -11,6 +11,10 @@ use cargo_rail::workspace;
 use clap::Parser;
 
 fn main() {
+  if let Some(exit_code) = cargo_rail::compiler::wrapper::run_if_requested() {
+    std::process::exit(exit_code);
+  }
+
   let CargoCli::Rail(mut cli) = CargoCli::parse();
 
   // Apply global --json flag to command format fields

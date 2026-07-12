@@ -50,6 +50,7 @@ major_version_conflict = "bump"   # Major conflicts: warn (skip), bump (force hi
 
 # Feature management
 prune_dead_features = true        # Remove features never enabled (default: true)
+consumer_scope = "open"           # Use "workspace" only for a closed private consumer graph
 preserve_features = []            # Features to preserve from pruning (glob patterns)
 detect_undeclared_features = true # Detect borrowed features (default: true)
 fix_undeclared_features = true    # Auto-fix borrowed features (default: true)
@@ -57,6 +58,7 @@ skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]
 
 # Unused dependency detection
 detect_unused = true              # Detect unused dependencies (default: true)
+compiler_diag_cache = true        # Reuse compiler evidence when its full identity matches
 remove_unused = true              # Auto-remove unused deps (default: true)
 
 # MSRV computation

@@ -54,7 +54,8 @@ targets = [
 
 [unify]
 msrv = true                      # Compute MSRV from dependencies
-prune_dead_features = true       # Remove unused features
+prune_dead_features = true       # Analyze unused features
+consumer_scope = "open"          # Use "workspace" to authorize closed-world cleanup
 detect_unused = true             # Find unused dependencies
 compiler_diag_cache = true       # Reuse rustc diagnostics across runs
 remove_unused = true             # Auto-remove them
@@ -104,10 +105,11 @@ Controls workspace dependency analysis and manifest rewrites. Every option is op
 | `msrv` | `bool` | `true` | Compute and write MSRV to `[workspace.package].rust-version` (written as `major.minor.patch`). The MSRV is determined by `msrv_source`. |
 | `enforce_msrv_inheritance` | `bool` | `false` | Ensure every workspace member inherits MSRV by setting `[package].rust-version = { workspace = true }` in each member's `Cargo.toml`. This makes `[workspace.package].rust-version` actually apply across the workspace. |
 | `msrv_source` | `enum` | `"max"` | How to compute the final MSRV:<br>• `"deps"` - Use maximum from dependencies only (original behavior)<br>• `"workspace"` - Preserve existing rust-version, warn if deps need higher<br>• `"max"` - Take max(workspace, deps) - your explicit setting wins if higher |
-| `detect_unused` | `bool` | `true` | Detect unused dependencies using two signals: (1) declared deps absent from the resolved cargo graph, and (2) rustc `unused_crate_dependencies` diagnostics for deps that resolve but are never referenced in source. Optional deps and deps behind unconfigured target constraints are conservatively skipped. |
-| `compiler_diag_cache` | `bool` | `true` | Cache target-aware rustc `unused_crate_dependencies` diagnostics in `target/cargo-rail/cache/compiler-diags-v1.json` and reuse them across runs. Disable to force fresh compiler checks each run. |
+| `detect_unused` | `bool` | `true` | Detect unused dependencies from the resolved Cargo graph and workspace-only rustc `unused_crate_dependencies` evidence. Checks cover configured targets plus default, no-default, all-feature, and source-derived conditional feature selections. Removal requires complete evidence for the declaration's exact kind and target scope. |
+| `compiler_diag_cache` | `bool` | `true` | Cache target- and feature-aware rustc evidence in `target/cargo-rail/cache/compiler-diags-v1.json`. Entries bind the compiler, source, manifest, target, feature selection, and Cargo freshness, so stale compilation units are recollected. Disable to force fresh compiler checks each run. |
 | `remove_unused` | `bool` | `true` | Automatically remove unused dependencies during unification. Requires `detect_unused = true`. |
-| `prune_dead_features` | `bool` | `true` | Remove features that are never enabled in the resolved dependency graph across all targets. Only prunes empty no-ops (`feature = []`). Features with actual dependencies are preserved. |
+| `prune_dead_features` | `bool` | `true` | Analyze feature reachability. Destructive pruning also requires `consumer_scope = "workspace"`. |
+| `consumer_scope` | `enum` | `"open"` | Consumer boundary for `publish = false` packages. `"open"` preserves dormant configuration; `"workspace"` asserts that workspace consumers are complete and permits verified removal. Published packages always remain open-world. |
 | `preserve_features` | `string[]` | `[]` | Features to preserve from dead feature pruning. Supports glob patterns (e.g., `"unstable-*"`, `"bench*"`). Use this to keep features intended for future use or external consumers. |
 | `detect_undeclared_features` | `bool` | `true` | Detect crates that rely on Cargo's feature unification to "borrow" features from other workspace members. These crates will fail when built standalone after unification. Reports as warnings (or auto-fixes if `fix_undeclared_features` is enabled). |
 | `fix_undeclared_features` | `bool` | `true` | Add borrowed features to the member manifest that uses them, allowing the crate to build without another workspace member enabling those features. Requires `detect_undeclared_features = true`. |
@@ -125,6 +127,7 @@ detect_unused = true
 compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
+consumer_scope = "open"  # Set to "workspace" only for a closed monorepo consumer graph
 preserve_features = ["future-api", "unstable-*"]  # Keep these from pruning
 detect_undeclared_features = true  # Catch borrowed features
 fix_undeclared_features = true    # Auto-fix them (default)
@@ -205,7 +208,11 @@ detect_unused = true
 compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
+consumer_scope = "open"  # "workspace" authorizes closed-world cleanup for private packages
 preserve_features = []  # Glob patterns to preserve from pruning
+detect_undeclared_features = true
+fix_undeclared_features = true
+skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]
 max_backups = 3
 
 # Version handling
@@ -788,6 +795,7 @@ detect_unused = true
 compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
+consumer_scope = "open"
 preserve_features = []  # Glob patterns: ["unstable-*", "future-api"]
 detect_undeclared_features = true  # Catch borrowed features
 fix_undeclared_features = true     # Auto-fix them
@@ -965,6 +973,7 @@ detect_unused = true
 compiler_diag_cache = true
 remove_unused = true
 prune_dead_features = true
+consumer_scope = "open"
 
 [release]
 tag_prefix = "v"

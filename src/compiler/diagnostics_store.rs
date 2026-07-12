@@ -4,13 +4,22 @@ use crate::compiler::model::{
   COLLECTOR_VERSION, COMPILER_DIAG_CACHE_VERSION, CompilerDiagCacheFile, CompilerDiagEntry, CompilerDiagKey,
 };
 use crate::error::RailResult;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_CACHE_ENTRIES: usize = 4096;
+const MAX_CACHE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Persistent compiler diagnostics store.
 pub struct CompilerDiagnosticsStore {
   path: PathBuf,
   cache: CompilerDiagCacheFile,
   dirty: bool,
+  prior_by_configuration: HashMap<String, (u64, CompilerDiagKey, u32)>,
+  cached_packages: HashSet<String>,
+  discarded_reason: Option<&'static str>,
 }
 
 impl CompilerDiagnosticsStore {
@@ -22,17 +31,27 @@ impl CompilerDiagnosticsStore {
       .join("cache")
       .join("compiler-diags-v1.json");
 
-    let cache = std::fs::read_to_string(&path)
-      .ok()
-      .and_then(|raw| serde_json::from_str::<CompilerDiagCacheFile>(&raw).ok())
+    let raw = std::fs::read_to_string(&path).ok();
+    let parsed = raw.as_deref().map(serde_json::from_str::<CompilerDiagCacheFile>);
+    let discarded_reason = match parsed.as_ref() {
+      Some(Err(_)) => Some("cache_unreadable"),
+      Some(Ok(file)) if file.version != COMPILER_DIAG_CACHE_VERSION => Some("schema_changed"),
+      _ => None,
+    };
+    let cache = parsed
+      .and_then(Result::ok)
       .filter(|file| file.version == COMPILER_DIAG_CACHE_VERSION)
       .unwrap_or_default();
-
-    Self {
+    let mut store = Self {
       path,
       cache,
       dirty: false,
-    }
+      prior_by_configuration: HashMap::new(),
+      cached_packages: HashSet::new(),
+      discarded_reason,
+    };
+    store.rebuild_index();
+    store
   }
 
   /// Return cached entry for the exact key.
@@ -44,9 +63,70 @@ impl CompilerDiagnosticsStore {
       .filter(|entry| entry.collector_version == COLLECTOR_VERSION)
   }
 
+  /// Explain why an exact semantic key was not reusable.
+  pub fn miss_reason(&self, key: &CompilerDiagKey) -> &'static str {
+    if let Some(reason) = self.discarded_reason {
+      return reason;
+    }
+    let Some((_, prior, collector_version)) = self.prior_by_configuration.get(&configuration_id(key)) else {
+      return if self.cached_packages.contains(&key.package_id.to_string()) {
+        "configuration_not_cached"
+      } else {
+        "cold_cache"
+      };
+    };
+    if *collector_version != COLLECTOR_VERSION {
+      "collector_changed"
+    } else if prior.rustc_version != key.rustc_version
+      || prior.cargo_version != key.cargo_version
+      || prior.host_triple != key.host_triple
+    {
+      "toolchain_changed"
+    } else if prior.lock_fingerprint != key.lock_fingerprint {
+      "lockfile_changed"
+    } else if prior.manifest_fingerprint != key.manifest_fingerprint {
+      "manifest_changed"
+    } else if prior.source_fingerprint != key.source_fingerprint {
+      "source_changed"
+    } else if prior.compiler_env_fingerprint != key.compiler_env_fingerprint {
+      "compiler_environment_changed"
+    } else if prior.cargo_config_fingerprint != key.cargo_config_fingerprint {
+      "cargo_config_changed"
+    } else {
+      "semantic_key_changed"
+    }
+  }
+
+  /// Return prior evidence when the source tree is the only changed semantic
+  /// input. Cargo's fresh-unit markers can then authorize exact unit reuse.
+  pub fn prior_for_source_change(&self, key: &CompilerDiagKey) -> Option<&CompilerDiagEntry> {
+    let (_, prior, collector_version) = self.prior_by_configuration.get(&configuration_id(key))?;
+    if *collector_version != COLLECTOR_VERSION
+      || prior.package_id != key.package_id
+      || prior.target != key.target
+      || prior.features != key.features
+      || prior.rustc_version != key.rustc_version
+      || prior.cargo_version != key.cargo_version
+      || prior.host_triple != key.host_triple
+      || prior.lock_fingerprint != key.lock_fingerprint
+      || prior.manifest_fingerprint != key.manifest_fingerprint
+      || prior.compiler_env_fingerprint != key.compiler_env_fingerprint
+      || prior.cargo_config_fingerprint != key.cargo_config_fingerprint
+      || prior.source_fingerprint == key.source_fingerprint
+    {
+      return None;
+    }
+    self.cache.entries.get(&prior.stable_id())
+  }
+
   /// Upsert one entry.
   pub fn put(&mut self, entry: CompilerDiagEntry) {
     let id = entry.key.stable_id();
+    self.cached_packages.insert(entry.key.package_id.to_string());
+    self.prior_by_configuration.insert(
+      configuration_id(&entry.key),
+      (entry.generated_at_unix_ms, entry.key.clone(), entry.collector_version),
+    );
     self.cache.entries.insert(id, entry);
     self.dirty = true;
   }
@@ -61,9 +141,77 @@ impl CompilerDiagnosticsStore {
       std::fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string(&self.cache)?;
-    std::fs::write(&self.path, json)?;
+    self.prune();
+    let temporary_path = self.path.with_extension(format!("tmp-{}", std::process::id()));
+    let temporary = std::fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&temporary_path)?;
+    let mut writer = BufWriter::new(temporary);
+    serde_json::to_writer(&mut writer, &self.cache)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    if let Err(error) = std::fs::rename(&temporary_path, &self.path) {
+      if error.kind() != std::io::ErrorKind::AlreadyExists {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error.into());
+      }
+      std::fs::remove_file(&self.path)?;
+      std::fs::rename(&temporary_path, &self.path)?;
+    }
     self.dirty = false;
     Ok(())
   }
+
+  fn prune(&mut self) {
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|duration| duration.as_millis() as u64)
+      .unwrap_or(0);
+    self
+      .cache
+      .entries
+      .retain(|_, entry| now.saturating_sub(entry.generated_at_unix_ms) <= MAX_CACHE_AGE_MS);
+    if self.cache.entries.len() <= MAX_CACHE_ENTRIES {
+      return;
+    }
+    let mut by_age: Vec<_> = self
+      .cache
+      .entries
+      .iter()
+      .map(|(key, entry)| (entry.generated_at_unix_ms, key.clone()))
+      .collect();
+    by_age.sort_unstable();
+    for (_, key) in by_age.into_iter().take(self.cache.entries.len() - MAX_CACHE_ENTRIES) {
+      self.cache.entries.remove(&key);
+    }
+  }
+
+  fn rebuild_index(&mut self) {
+    for entry in self.cache.entries.values() {
+      self.cached_packages.insert(entry.key.package_id.to_string());
+      let id = configuration_id(&entry.key);
+      let replace = self
+        .prior_by_configuration
+        .get(&id)
+        .is_none_or(|(generated, _, _)| *generated < entry.generated_at_unix_ms);
+      if replace {
+        self.prior_by_configuration.insert(
+          id,
+          (entry.generated_at_unix_ms, entry.key.clone(), entry.collector_version),
+        );
+      }
+    }
+  }
+}
+
+fn configuration_id(key: &CompilerDiagKey) -> String {
+  format!(
+    "{}\u{1f}{}\u{1f}{}",
+    key.package_id,
+    key.target.as_str(),
+    key.features.label()
+  )
 }

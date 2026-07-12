@@ -4,36 +4,65 @@
 //! We load metadata per target (in parallel) and cache it for reuse.
 
 use crate::error::RailResult;
-use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
+use cargo_metadata::{Metadata, MetadataCommand, Node, Package, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use semver::Version;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct TargetMetadataEntry {
-  metadata: Metadata,
-  package_id_index: HashMap<PackageId, usize>,
+  metadata: Arc<Metadata>,
+  package_id_index: FxHashMap<PackageId, usize>,
+  resolve_node_index: FxHashMap<PackageId, usize>,
+}
+
+/// Resolved identities for one dependency declaration across platform targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDependency {
+  /// Opaque Cargo package IDs selected by the resolver.
+  pub package_ids: std::collections::BTreeSet<PackageId>,
+  /// Library crate names passed to rustc.
+  pub crate_names: std::collections::BTreeSet<String>,
 }
 
 impl TargetMetadataEntry {
-  fn new(metadata: Metadata) -> Self {
+  fn new(metadata: Arc<Metadata>) -> Self {
     let package_id_index = metadata
       .packages
       .iter()
       .enumerate()
       .map(|(idx, pkg)| (pkg.id.clone(), idx))
       .collect();
+    let resolve_node_index = metadata
+      .resolve
+      .as_ref()
+      .map(|resolve| {
+        resolve
+          .nodes
+          .iter()
+          .enumerate()
+          .map(|(index, node)| (node.id.clone(), index))
+          .collect()
+      })
+      .unwrap_or_default();
 
     Self {
       metadata,
       package_id_index,
+      resolve_node_index,
     }
   }
 
   fn package_by_id(&self, id: &PackageId) -> Option<&Package> {
     self.package_id_index.get(id).map(|&idx| &self.metadata.packages[idx])
+  }
+
+  fn resolve_node_by_id(&self, id: &PackageId) -> Option<&Node> {
+    let resolve = self.metadata.resolve.as_ref()?;
+    self.resolve_node_index.get(id).map(|&index| &resolve.nodes[index])
   }
 }
 
@@ -44,29 +73,47 @@ impl TargetMetadataEntry {
 /// the maximal feature set problem.
 #[derive(Clone)]
 pub struct MultiTargetMetadata {
+  /// Canonical workspace metadata loaded once by [`crate::workspace::WorkspaceContext`].
+  workspace_metadata: Arc<Metadata>,
   /// Metadata per target (or "default" if no targets specified)
   /// Uses FxHashMap for faster String key lookups
   cache: FxHashMap<String, TargetMetadataEntry>,
+  /// Indices of canonical workspace packages in `workspace_metadata.packages`.
+  workspace_package_indices: Vec<usize>,
+  /// Resolved package IDs by workspace member and rustc crate name.
+  direct_dependencies_by_member: FxHashMap<PackageId, FxHashMap<String, std::collections::BTreeSet<PackageId>>>,
+  /// Package and normalized library names by resolved package ID.
+  package_names: FxHashMap<PackageId, String>,
+  library_names: FxHashMap<PackageId, String>,
 }
 
 impl MultiTargetMetadata {
   /// Load metadata for all targets in parallel
-  pub fn load_parallel(workspace_root: &Path, targets: &[String]) -> RailResult<Self> {
-    let workspace_root = workspace_root.to_path_buf();
+  pub fn load_parallel(workspace_metadata: Arc<Metadata>, targets: &[String]) -> RailResult<Self> {
+    let workspace_root = workspace_metadata.workspace_root.as_std_path().to_path_buf();
+    let workspace_member_ids: HashSet<&PackageId> = workspace_metadata.workspace_members.iter().collect();
+    let workspace_package_indices = workspace_metadata
+      .packages
+      .iter()
+      .enumerate()
+      .filter_map(|(index, package)| workspace_member_ids.contains(&package.id).then_some(index))
+      .collect();
 
-    // If no targets specified, load default metadata
+    // The canonical workspace metadata is already the default-target result.
     if targets.is_empty() {
-      let metadata = Self::load_single_target(&workspace_root, None)?;
       let mut cache = FxHashMap::default();
-      cache.insert(String::from("default"), TargetMetadataEntry::new(metadata));
-      return Ok(Self { cache });
+      cache.insert(
+        String::from("default"),
+        TargetMetadataEntry::new(Arc::clone(&workspace_metadata)),
+      );
+      return Ok(Self::from_entries(workspace_metadata, workspace_package_indices, cache));
     }
 
     // Load all targets in parallel using Rayon
-    let results: Vec<RailResult<(String, Metadata)>> = targets
+    let results: Vec<RailResult<(String, Arc<Metadata>)>> = targets
       .par_iter()
       .map(|target| {
-        let metadata = Self::load_single_target(&workspace_root, Some(target))?;
+        let metadata = Arc::new(Self::load_single_target(&workspace_root, Some(target))?);
         Ok((target.clone(), metadata))
       })
       .collect();
@@ -78,7 +125,70 @@ impl MultiTargetMetadata {
       cache.insert(target, TargetMetadataEntry::new(metadata));
     }
 
-    Ok(Self { cache })
+    Ok(Self::from_entries(workspace_metadata, workspace_package_indices, cache))
+  }
+
+  fn from_entries(
+    workspace_metadata: Arc<Metadata>,
+    workspace_package_indices: Vec<usize>,
+    cache: FxHashMap<String, TargetMetadataEntry>,
+  ) -> Self {
+    use cargo_metadata::TargetKind;
+
+    let mut direct_dependencies_by_member: FxHashMap<
+      PackageId,
+      FxHashMap<String, std::collections::BTreeSet<PackageId>>,
+    > = FxHashMap::default();
+    for &package_index in &workspace_package_indices {
+      let package_id = &workspace_metadata.packages[package_index].id;
+      let dependencies = direct_dependencies_by_member.entry(package_id.clone()).or_default();
+      for entry in cache.values() {
+        if let Some(node) = entry.resolve_node_by_id(package_id) {
+          for dependency in &node.deps {
+            dependencies
+              .entry(dependency.name.clone())
+              .or_default()
+              .insert(dependency.pkg.clone());
+          }
+        }
+      }
+    }
+
+    let mut package_names = FxHashMap::default();
+    let mut library_names = FxHashMap::default();
+    for entry in cache.values() {
+      for package in &entry.metadata.packages {
+        let lib_name = package
+          .targets
+          .iter()
+          .find(|target| {
+            target.kind.iter().any(|kind| {
+              matches!(
+                kind,
+                TargetKind::Lib
+                  | TargetKind::RLib
+                  | TargetKind::DyLib
+                  | TargetKind::CDyLib
+                  | TargetKind::StaticLib
+                  | TargetKind::ProcMacro
+              )
+            })
+          })
+          .map(|target| target.name.as_str())
+          .unwrap_or(package.name.as_str());
+        package_names.insert(package.id.clone(), package.name.to_string());
+        library_names.insert(package.id.clone(), lib_name.replace('-', "_"));
+      }
+    }
+
+    Self {
+      workspace_metadata,
+      cache,
+      workspace_package_indices,
+      direct_dependencies_by_member,
+      package_names,
+      library_names,
+    }
   }
 
   /// Load metadata for a single target
@@ -128,12 +238,7 @@ impl MultiTargetMetadata {
 
   /// Get metadata for a specific target
   pub fn get(&self, target: &str) -> Option<&Metadata> {
-    self.cache.get(target).map(|e| &e.metadata)
-  }
-
-  /// Get metadata for any target (useful when they should all be the same)
-  pub fn any(&self) -> Option<&Metadata> {
-    self.cache.values().next().map(|e| &e.metadata)
+    self.cache.get(target).map(|entry| entry.metadata.as_ref())
   }
 
   /// Get all targets we have metadata for (sorted for deterministic output)
@@ -143,9 +248,105 @@ impl MultiTargetMetadata {
     targets
   }
 
-  /// Get workspace packages (same across all targets)
-  pub fn workspace_packages(&self) -> Vec<&Package> {
-    self.any().map(|m| m.workspace_packages()).unwrap_or_default()
+  /// Borrow the Cargo metadata snapshot for one configured target.
+  pub(crate) fn metadata_for_target(&self, target: &str) -> Option<&Metadata> {
+    self.cache.get(target).map(|entry| entry.metadata.as_ref())
+  }
+
+  /// Iterate canonical workspace packages without allocating.
+  pub fn workspace_packages(&self) -> impl ExactSizeIterator<Item = &Package> + Clone {
+    self
+      .workspace_package_indices
+      .iter()
+      .map(|&index| &self.workspace_metadata.packages[index])
+  }
+
+  /// Resolve one manifest declaration to exact package IDs and rustc crate names.
+  ///
+  /// `package_name` is the dependency's `package` value (or its key when not
+  /// renamed). `alias` is the Cargo.toml key only for renamed dependencies.
+  pub fn resolve_dependency(
+    &self,
+    member: &PackageId,
+    package_name: &str,
+    alias: Option<&str>,
+  ) -> Option<ResolvedDependency> {
+    let dependencies = self.direct_dependencies_by_member.get(member)?;
+    let normalized_alias = alias.map(|alias| alias.replace('-', "_"));
+    let mut package_ids = std::collections::BTreeSet::new();
+    let mut crate_names = std::collections::BTreeSet::new();
+
+    for (crate_name, resolved_packages) in dependencies {
+      for package_id in resolved_packages {
+        if self.package_names.get(package_id).map(String::as_str) != Some(package_name) {
+          continue;
+        }
+        let expected_crate_name = normalized_alias
+          .as_deref()
+          .or_else(|| self.library_names.get(package_id).map(String::as_str));
+        if expected_crate_name != Some(crate_name) {
+          continue;
+        }
+        package_ids.insert(package_id.clone());
+        crate_names.insert(crate_name.clone());
+      }
+    }
+
+    (!package_ids.is_empty()).then_some(ResolvedDependency {
+      package_ids,
+      crate_names,
+    })
+  }
+
+  /// Features Cargo resolved for exact package identities across the platform matrix.
+  pub fn resolved_features_for(&self, package_ids: &std::collections::BTreeSet<PackageId>) -> BTreeSet<String> {
+    let mut features = BTreeSet::new();
+    for entry in self.cache.values() {
+      for package_id in package_ids {
+        if let Some(node) = entry.resolve_node_by_id(package_id) {
+          features.extend(node.features.iter().map(ToString::to_string));
+        }
+      }
+    }
+    features
+  }
+
+  /// Local feature closure enabled by a dependency's `default` feature.
+  pub fn default_feature_closure_for(&self, package_ids: &std::collections::BTreeSet<PackageId>) -> BTreeSet<String> {
+    let mut closure = BTreeSet::new();
+    let mut pending = vec!["default".to_string()];
+    while let Some(feature) = pending.pop() {
+      if !closure.insert(feature.clone()) {
+        continue;
+      }
+      for entry in self.cache.values() {
+        for package_id in package_ids {
+          let Some(package) = entry.package_by_id(package_id) else {
+            continue;
+          };
+          let Some(edges) = package.features.get(&feature) else {
+            continue;
+          };
+          for edge in edges {
+            if !edge.starts_with("dep:") && !edge.contains('/') && package.features.contains_key(edge) {
+              pending.push(edge.clone());
+            }
+          }
+        }
+      }
+    }
+    closure
+  }
+
+  /// Whether an exact resolved package declares a native `links` contract.
+  pub fn package_has_links(&self, package_ids: &std::collections::BTreeSet<PackageId>) -> bool {
+    self.cache.values().any(|entry| {
+      package_ids.iter().any(|package_id| {
+        entry
+          .package_by_id(package_id)
+          .is_some_and(|package| package.links.is_some())
+      })
+    })
   }
 
   /// Get all versions of a dependency across targets (includes transitive deps)
@@ -744,46 +945,6 @@ pub enum MsrvSourceUsed {
   MaxWorkspace,
   /// Used max of workspace and deps (deps was higher)
   MaxDeps,
-}
-
-impl MultiTargetMetadata {
-  /// Build a mapping from package name to library name
-  ///
-  /// In Rust, a crate's package name (in Cargo.toml) can differ from its
-  /// library name (what you `use` in code). For example:
-  /// - Package: `mopa-maintained`
-  /// - Library: `mopa` (what you write as `use mopa::...`)
-  ///
-  /// The resolved dependency graph uses library names, but Cargo.toml uses
-  /// package names. This mapping allows correct lookup when detecting unused deps.
-  ///
-  /// Produces a map where:
-  /// - Key: package name (e.g., "mopa-maintained")
-  /// - Value: library name normalized with underscores (e.g., "mopa")
-  pub fn package_to_lib_name_map(&self) -> HashMap<String, String> {
-    use cargo_metadata::TargetKind;
-
-    let mut map = HashMap::new();
-
-    for entry in self.cache.values() {
-      let metadata = &entry.metadata;
-      for pkg in &metadata.packages {
-        // Find the lib target to get the actual library name
-        let lib_name = pkg
-          .targets
-          .iter()
-          .find(|t| t.kind.contains(&TargetKind::Lib))
-          .map(|t| t.name.clone())
-          .unwrap_or_else(|| pkg.name.to_string());
-
-        // Normalize to match cargo's internal format (underscores)
-        let normalized_lib = lib_name.replace('-', "_");
-        map.insert(pkg.name.to_string(), normalized_lib);
-      }
-    }
-
-    map
-  }
 }
 
 #[cfg(test)]

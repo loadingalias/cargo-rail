@@ -2,6 +2,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Defines which consumers may activate private workspace configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsumerScope {
+  /// Consumers may exist outside this workspace; dormant configuration is preserved.
+  #[default]
+  Open,
+  /// This workspace is the complete consumer universe for `publish = false` packages.
+  Workspace,
+}
+
+impl ConsumerScope {
+  /// Stable configuration spelling.
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Open => "open",
+      Self::Workspace => "workspace",
+    }
+  }
+}
+
 /// Unify configuration - controls workspace dependency unification behavior
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifyConfig {
@@ -76,6 +98,14 @@ pub struct UnifyConfig {
   /// This produces the absolute leanest feature set for the workspace.
   #[serde(default = "default_true")]
   pub prune_dead_features: bool,
+
+  /// Consumer boundary used by destructive feature and optional-dependency pruning.
+  ///
+  /// `open` reports dormant configuration without removing it. `workspace`
+  /// authorizes removal from `publish = false` packages after complete
+  /// reachability and post-edit graph verification.
+  #[serde(default)]
+  pub consumer_scope: ConsumerScope,
 
   /// Features to preserve from dead feature pruning (glob patterns supported)
   /// Use this to keep features intended for future use or external consumers.
@@ -167,6 +197,7 @@ impl Default for UnifyConfig {
       enforce_msrv_inheritance: false,
       msrv_source: MsrvSource::default(),
       prune_dead_features: true,
+      consumer_scope: ConsumerScope::default(),
       preserve_features: Vec::new(),
       strict_version_compat: true,
       exact_pin_handling: ExactPinHandling::default(),
@@ -450,6 +481,7 @@ mod tests {
     assert!(config.detect_unused); // Default: true
     assert!(config.compiler_diag_cache); // Default: true
     assert!(config.remove_unused); // Default: true
+    assert_eq!(config.consumer_scope, ConsumerScope::Open);
   }
 
   #[test]
@@ -512,6 +544,21 @@ mod tests {
     let toml = r#"prune_dead_features = false"#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.prune_dead_features);
+  }
+
+  #[test]
+  fn test_consumer_scope_requires_explicit_workspace_contract() {
+    let default = UnifyConfig::default();
+    assert_eq!(default.consumer_scope, ConsumerScope::Open);
+
+    let config: UnifyConfig = toml_edit::de::from_str("consumer_scope = \"workspace\"").unwrap();
+    assert_eq!(config.consumer_scope, ConsumerScope::Workspace);
+
+    let invalid = toml_edit::de::from_str::<UnifyConfig>("consumer_scope = \"private\"");
+    assert!(
+      invalid.is_err(),
+      "unknown trust boundaries must fail configuration parsing"
+    );
   }
 
   #[test]

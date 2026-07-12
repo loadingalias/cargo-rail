@@ -140,13 +140,28 @@ pub struct DuplicateCleanup {
   pub selected_version: Arc<str>,
 }
 
-/// Record of a truly dead feature (empty no-op) that can be safely pruned
+/// Record of a private feature proven unreachable from every feature root.
 #[derive(Debug, Clone)]
 pub struct PrunedFeature {
   /// Crate that declared the feature
   pub crate_name: Arc<str>,
   /// Feature name that was pruned
   pub feature_name: Arc<str>,
+  /// Manifest edges removed with the unreachable feature declaration.
+  pub declared_edges: Vec<Arc<str>>,
+}
+
+/// Root-to-feature path proving why a declared feature is retained.
+#[derive(Debug, Clone)]
+pub struct ReachableFeature {
+  /// Crate declaring the feature.
+  pub crate_name: Arc<str>,
+  /// Reachable feature name.
+  pub feature_name: Arc<str>,
+  /// Semantic root category.
+  pub root_kind: &'static str,
+  /// Member-local path from root to feature.
+  pub path: Vec<Arc<str>>,
 }
 
 /// Record of an optional feature that's not currently enabled but enables something
@@ -183,8 +198,43 @@ pub struct UnusedDep {
   pub dep_name: Arc<str>,
   /// Kind of dependency (normal, dev, build)
   pub kind: DepKind,
+  /// Cargo target constraint of the exact declaration, if any.
+  pub target: Option<Arc<str>>,
   /// Why this dependency was flagged as unused
   pub reason: UnusedReason,
+  /// Deterministic evidence certificate authorizing the removal decision.
+  pub proof: DependencyProof,
+}
+
+/// Portable proof certificate for one dependency-removal decision.
+#[derive(Debug, Clone)]
+pub struct DependencyProof {
+  /// Certificate schema version.
+  pub schema_version: u32,
+  /// Cargo package IDs resolved for the declaration.
+  pub package_ids: Vec<Arc<str>>,
+  /// rustc crate names observed for the declaration.
+  pub crate_names: Vec<Arc<str>>,
+  /// Evidence source (`compiler` or `resolved_graph`).
+  pub evidence_source: &'static str,
+  /// Number of applicable configurations.
+  pub applicable_configurations: usize,
+  /// Number of complete applicable configurations.
+  pub complete_configurations: usize,
+  /// Configurations containing positive usage evidence.
+  pub used_observations: usize,
+  /// Configurations containing exhaustive unused evidence.
+  pub unused_observations: usize,
+  /// Configurations with incomplete evidence.
+  pub incomplete_observations: usize,
+  /// Exact compiler-evidence cache hits contributing to the decision.
+  pub cache_hits: usize,
+  /// Compiler configurations recollected during this analysis.
+  pub cache_misses: usize,
+  /// Stable reasons why evidence could not be reused.
+  pub cache_miss_reasons: Vec<Arc<str>>,
+  /// Named uncertainties that would block this decision.
+  pub uncertainties: Vec<Arc<str>>,
 }
 
 /// Reason a dependency was flagged as unused
@@ -238,6 +288,8 @@ pub struct UndeclaredFeature {
   /// Which workspace members provide the borrowed features
   /// Shows where the feature is coming from (for transparency)
   pub borrowed_from: Vec<Arc<str>>,
+  /// Workspace-relative source paths whose diagnostics require the feature.
+  pub required_by: Vec<Arc<str>>,
 }
 
 /// Subject area for a per-dependency decision entry.
@@ -355,6 +407,8 @@ pub struct UnificationPlan {
   pub duplicates_cleaned: Vec<DuplicateCleanup>,
   /// Truly dead features (empty no-ops) that can be safely pruned
   pub pruned_features: Vec<PrunedFeature>,
+  /// Deterministic explanations for retained reachable features.
+  pub reachable_features: Vec<ReachableFeature>,
   /// Optional features that are not enabled but provide user-facing functionality
   /// These should NOT be removed, only reported for awareness
   pub optional_features: Vec<OptionalFeature>,
@@ -764,6 +818,7 @@ mod tests {
       dep_kind: DepKind::Normal,
       target: None,
       borrowed_from: vec![arc("other-crate")],
+      required_by: vec![],
     };
 
     assert_eq!(&*uf.member, "my-crate");
@@ -787,6 +842,7 @@ mod tests {
       dep_kind: DepKind::Normal,
       target: Some(arc("cfg(unix)")),
       borrowed_from: vec![arc("unix-crate")],
+      required_by: vec![],
     };
 
     assert_eq!(uf.target.as_deref(), Some("cfg(unix)"));
@@ -803,6 +859,7 @@ mod tests {
       dep_kind: DepKind::Dev,
       target: None,
       borrowed_from: vec![arc("main-crate")],
+      required_by: vec![],
     };
 
     assert_eq!(uf.dep_kind, DepKind::Dev);
@@ -822,6 +879,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -856,6 +914,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -908,6 +967,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -920,6 +980,7 @@ mod tests {
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![arc("other-crate")],
+        required_by: vec![],
       }],
       dependency_decisions: vec![],
     };
@@ -942,6 +1003,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -954,6 +1016,7 @@ mod tests {
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![arc("other-crate")],
+        required_by: vec![],
       }],
       dependency_decisions: vec![],
     };
@@ -1017,6 +1080,7 @@ mod tests {
       dep_kind: DepKind::Dev,
       target: Some(arc("cfg(windows)")),
       borrowed_from: vec![arc("source-crate")],
+      required_by: vec![],
     };
 
     let cloned = uf.clone();
@@ -1039,6 +1103,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -1051,6 +1116,7 @@ mod tests {
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![arc("other-crate"), arc("third-crate")],
+        required_by: vec![],
       }],
       dependency_decisions: vec![],
     };
@@ -1076,6 +1142,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![],
       version_mismatches: vec![],
       unused_deps: vec![],
@@ -1088,6 +1155,7 @@ mod tests {
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![], // Empty - shouldn't show "borrowed from"
+        required_by: vec![],
       }],
       dependency_decisions: vec![],
     };
@@ -1114,6 +1182,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: vec![],
       pruned_features: vec![],
+      reachable_features: vec![],
       optional_features: vec![OptionalFeature {
         crate_name: arc("crate-a"),
         feature_name: arc("serde"),

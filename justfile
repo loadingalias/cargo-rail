@@ -34,6 +34,9 @@ build-all:
 build-release-all:
     cargo build --workspace --all-targets --all-features --release
 
+bench-unify packages="25" runs="10":
+    @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
+
 # CI Commands (for GitHub Actions)
 
 ci-check:

@@ -19,9 +19,11 @@ msrv_source = "workspace"  # deps | workspace | max
 enforce_msrv_inheritance = false  # Ensure members inherit workspace rust-version
 
 detect_unused = true
+compiler_diag_cache = true  # reuse evidence only while compiler/input identities match
 remove_unused = true  # requires detect_unused = true
 
 prune_dead_features = true
+consumer_scope = "open"  # use "workspace" only for a closed private consumer graph
 preserve_features = []  # glob patterns to keep from pruning
 detect_undeclared_features = true
 fix_undeclared_features = true  # requires detect_undeclared_features = true

@@ -54,10 +54,8 @@ fn add_crate_with_manifest(workspace: &TestWorkspace, name: &str, manifest: &str
 
 #[test]
 fn test_undeclared_features_basic_detection() -> Result<()> {
-  // Use tokio which is NOT in the default workspace.dependencies
-  // crate-a requests tokio with ["macros", "rt"]
-  // crate-b requests tokio with ["rt"] only but resolves ["macros", "rt"] due to unification
-  // crate-b should have undeclared feature "macros"
+  // crate-a requests serde's derive feature while crate-b relies on it without
+  // declaring it. rustc names the gated feature in the standalone diagnostic.
 
   let workspace = create_fresh_workspace_with_undeclared_detection()?;
 
@@ -71,9 +69,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { version = "1.0", features = ["macros", "rt"] }
+serde = { version = "1.0", features = ["derive"] }
 "#,
-    "pub fn a() {}",
+    "#[derive(serde::Serialize)] pub struct A;",
   )?;
 
   // crate-b with only rt feature - will borrow "macros" from crate-a
@@ -86,22 +84,82 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { version = "1.0", features = ["rt"] }
+serde = "1.0"
 "#,
-    "pub fn b() {}",
+    "#[derive(serde::Serialize)] pub struct B;",
   )?;
-
   workspace.commit("Add crates with feature borrowing")?;
 
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let standalone = std::process::Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["check", "-p", "crate-b"])
+    .output()?;
+  assert!(
+    !standalone.status.success(),
+    "fixture must fail without the borrowed feature\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&standalone.stdout),
+    String::from_utf8_lossy(&standalone.stderr)
+  );
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // Should detect undeclared features (crate-b borrowing "macros" from crate-a)
+  // Should detect crate-b borrowing "derive" from crate-a.
   // or should show fix count if fix_undeclared_features is enabled
   assert!(
     stdout.contains("Undeclared features") || stdout.contains("undeclared") || stdout.contains("features to fix"),
     "Should detect undeclared features.\nOutput:\n{}",
     stdout
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_undeclared_features_ignores_declared_but_unresolved_provider_feature() -> Result<()> {
+  let workspace = create_fresh_workspace_with_undeclared_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-a",
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+optional-macros = ["tokio/macros"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt"] }
+"#,
+    "pub fn a() {}",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-b",
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt"] }
+"#,
+    "pub fn b() {}",
+  )?;
+  workspace.commit("Declare an inactive provider feature")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should not invent causality from an inactive declaration\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = fs::read_to_string(workspace.path.join("crates/crate-b/Cargo.toml"))?;
+  assert!(
+    !manifest.contains("macros"),
+    "an unresolved provider feature must not be added to another member\n{manifest}"
   );
 
   Ok(())
@@ -326,9 +384,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { version = "1.0", features = ["macros", "rt"] }
+serde = { version = "1.0", features = ["derive"] }
 "#,
-    "pub fn a() {}",
+    "#[derive(serde::Serialize)] pub struct A;",
   )?;
 
   add_crate_with_manifest(
@@ -340,9 +398,22 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { version = "1.0", features = ["rt"] }
+serde = "1.0"
 "#,
-    "pub fn b() {}",
+    "#[derive(serde::Serialize)] pub struct B;",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-c",
+    r#"[package]
+name = "crate-c"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+"#,
+    "#[derive(serde::Serialize)] pub struct C;",
   )?;
 
   workspace.commit("Add crates for JSON decision test")?;
@@ -355,7 +426,7 @@ tokio = { version = "1.0", features = ["rt"] }
 
   assert!(
     decisions.iter().any(|decision| {
-      decision["dep_name"] == "tokio"
+      decision["dep_name"] == "serde"
         && decision["subject"] == "workspace_dependency"
         && decision["reasons"].as_array().is_some_and(|reasons| {
           reasons
@@ -369,7 +440,7 @@ tokio = { version = "1.0", features = ["rt"] }
 
   assert!(
     decisions.iter().any(|decision| {
-      decision["dep_name"] == "tokio"
+      decision["dep_name"] == "serde"
         && decision["subject"] == "undeclared_feature_fix"
         && decision["member"] == "crate-b"
         && decision["reasons"]
@@ -377,6 +448,25 @@ tokio = { version = "1.0", features = ["rt"] }
           .is_some_and(|reasons| reasons.iter().any(|reason| reason["code"] == "undeclared_feature_fix"))
     }),
     "undeclared feature fixes should be exposed as dependency decisions.\nJSON:\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+  let certificates = json["proof_certificates"]
+    .as_array()
+    .expect("proof_certificates should be an array");
+  assert!(
+    certificates.iter().any(|certificate| {
+      certificate["member"] == "crate-b"
+        && certificate["subject"]["declaration"] == "serde"
+        && certificate["decision"] == "add_features"
+        && certificate["evidence_source"] == "standalone_compiler_causality"
+        && certificate["borrowed_from"]
+          .as_array()
+          .is_some_and(|providers| providers == &[Value::from("crate-a"), Value::from("crate-c")])
+        && certificate["required_by"]
+          .as_array()
+          .is_some_and(|paths| paths.iter().any(|path| path == "crates/crate-b/src/lib.rs"))
+    }),
+    "undeclared feature fixes require a causal proof certificate.\nJSON:\n{}",
     serde_json::to_string_pretty(&json)?
   );
 
@@ -446,6 +536,141 @@ tokio = { version = "1.0", features = ["macros"] }
       stdout
     );
   }
+
+  Ok(())
+}
+
+#[test]
+fn test_undeclared_features_target_specific_fix_restores_standalone_build() -> Result<()> {
+  let workspace = create_fresh_workspace_with_undeclared_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-a",
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+serde = { version = "1", features = ["derive"] }
+"#,
+    "pub fn a() {}",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-b",
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[target.'cfg(target_family = "unix")'.dependencies]
+serde = "1"
+"#,
+    "#[cfg(unix)]\n#[derive(serde::Serialize)]\npub struct BorrowedDerive;\n",
+  )?;
+  workspace.commit("Add target-specific borrowed derive feature")?;
+
+  let before = std::process::Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["check", "-p", "crate-b"])
+    .output()?;
+  assert!(
+    !before.status.success(),
+    "the fixture must prove the standalone failure before repair\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&before.stdout),
+    String::from_utf8_lossy(&before.stderr)
+  );
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "target-specific causal repair should verify\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = fs::read_to_string(workspace.path.join("crates/crate-b/Cargo.toml"))?;
+  let parsed: toml_edit::DocumentMut = manifest.parse()?;
+  let serde = &parsed["target"]["cfg(target_family = \"unix\")"]["dependencies"]["serde"];
+  assert!(
+    serde.to_string().contains("derive"),
+    "borrowed feature must stay in the matching target section\n{manifest}"
+  );
+  assert!(
+    parsed.get("dependencies").is_none(),
+    "repair must not widen a target-specific feature to an unconditional dependency\n{manifest}"
+  );
+
+  let after = std::process::Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["check", "-p", "crate-b"])
+    .output()?;
+  assert!(
+    after.status.success(),
+    "standalone build must pass after repair\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&after.stdout),
+    String::from_utf8_lossy(&after.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_undeclared_features_never_widens_target_provider_to_unconditional_consumer() -> Result<()> {
+  let workspace = create_fresh_workspace_with_undeclared_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-a",
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+serde = { version = "1", features = ["derive"] }
+"#,
+    "pub fn a() {}",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "crate-b",
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+serde = "1"
+"#,
+    "#[derive(serde::Serialize)] pub struct BorrowedDerive;\n",
+  )?;
+  workspace.commit("Add platform lender and unconditional consumer")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert!(
+    json["proof_certificates"].as_array().is_some_and(|certificates| {
+      !certificates.iter().any(|certificate| {
+        certificate["member"] == "crate-b"
+          && certificate["subject"]["kind"] == "dependency_features"
+          && certificate["subject"]["declaration"] == "serde"
+      })
+    }),
+    "a platform provider must never authorize an unconditional feature repair\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+  assert!(
+    json["issues"].as_array().is_some_and(|issues| {
+      issues.iter().any(|issue| {
+        issue["dep_name"] == "serde"
+          && issue["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not authorize widening"))
+      })
+    }),
+    "the non-widening decision must expose a named uncertainty\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
 
   Ok(())
 }

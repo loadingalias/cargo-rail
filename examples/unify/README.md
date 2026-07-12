@@ -18,12 +18,14 @@ cargo rail unify
 detect_undeclared_features = true
 fix_undeclared_features = true
 prune_dead_features = true
+consumer_scope = "open"
 detect_unused = true
+compiler_diag_cache = true
 msrv = true
 pin_transitives = false
 ```
 
-Keep `pin_transitives = false` unless replacing a workspace-hack crate. Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest backup.
+Keep `pin_transitives = false` unless replacing a workspace-hack crate. Keep `consumer_scope = "open"` for libraries or private packages with consumers outside the workspace; set it to `"workspace"` only when the workspace is the complete consumer graph. Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest backup.
 
 ## Reference
 

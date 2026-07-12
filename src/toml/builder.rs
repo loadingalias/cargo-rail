@@ -124,6 +124,10 @@ impl RailConfigBuilder {
 
     // === Feature analysis ===
     content.push_str(&format!("\nprune_dead_features = {}\n", config.prune_dead_features));
+    content.push_str(&format!(
+      "consumer_scope = \"{}\"  # open | workspace\n",
+      config.consumer_scope.as_str()
+    ));
     if config.preserve_features.is_empty() {
       content.push_str("preserve_features = []  # glob patterns to keep from pruning\n");
     } else {

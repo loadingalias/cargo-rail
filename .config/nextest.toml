@@ -7,6 +7,13 @@ test-threads = "num-cpus"
 slow-timeout = { period = "30s", terminate-after = 4 }
 retries = 0
 
+[test-groups]
+cargo-subprocess = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary(integration) & test(/test_(unify|unused_detection|undeclared_features)/)'
+test-group = 'cargo-subprocess'
+
 [profile.commit]
 status-level = "fail"
 success-output = "never"
@@ -15,6 +22,10 @@ fail-fast = false
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 4 }
 retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
+
+[[profile.commit.overrides]]
+filter = 'binary(integration) & test(/test_(unify|unused_detection|undeclared_features)/)'
+test-group = 'cargo-subprocess'
 
 [profile.commit.junit]
 path = "junit.xml"

@@ -111,6 +111,7 @@ const KNOWN_UNIFY_KEYS: &[&str] = &[
   "msrv_source",
   "enforce_msrv_inheritance",
   "prune_dead_features",
+  "consumer_scope",
   "preserve_features",
   "strict_version_compat",
   "exact_pin_handling",

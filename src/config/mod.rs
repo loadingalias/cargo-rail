@@ -25,7 +25,9 @@ pub use release::{
 };
 pub use run::{RunConfig, RunProfile, is_builtin_profile};
 pub use split::{CratePath, CrateSplitConfig, CrateSyncConfig, SplitConfig, SplitMode, WorkspaceMode};
-pub use unify::{ExactPinHandling, MajorVersionConflict, MsrvSource, TransitiveFeatureHost, UnifyConfig};
+pub use unify::{
+  ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvSource, TransitiveFeatureHost, UnifyConfig,
+};
 
 use crate::error::{ConfigError, RailError, RailResult};
 use serde::{Deserialize, Serialize};

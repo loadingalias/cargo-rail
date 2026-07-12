@@ -1,7 +1,7 @@
 //! Exact target cfg expression evaluation using rustc-provided cfg sets.
 
 use crate::error::{RailError, RailResult, ResultExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -31,6 +31,22 @@ impl TargetCfgSet {
     match value {
       Some(value) => self.key_values.get(key).is_some_and(|values| values.contains(value)),
       None => self.flags.contains(key),
+    }
+  }
+
+  fn predicate_applicability(&self, key: &str, value: Option<&str>) -> CfgApplicability {
+    if key == "feature" {
+      return CfgApplicability::Maybe;
+    }
+    if self.matches_predicate(key, value) {
+      return CfgApplicability::Yes;
+    }
+    if key.starts_with("target_") || key == "panic" || (value.is_none() && matches!(key, "unix" | "windows")) {
+      CfgApplicability::No
+    } else {
+      // Build scripts and caller-provided rustflags can define custom cfgs that
+      // are absent from bare `rustc --print cfg` output.
+      CfgApplicability::Maybe
     }
   }
 
@@ -96,12 +112,112 @@ pub fn target_constraint_matches_target(target_constraint: &str, target: &str, c
   eval_expr(&expr, cfg_set)
 }
 
-#[derive(Debug)]
+/// Return whether a source cfg expression can apply to at least one configured
+/// platform, treating feature and unknown custom cfg predicates as unresolved.
+///
+/// This is deliberately fail-closed for cleanup: malformed expressions,
+/// missing cfg sets, and build-script-defined predicates all return `true`.
+#[must_use]
+pub(crate) fn cfg_expression_may_apply<'a>(
+  expression: &str,
+  configured_cfgs: impl Iterator<Item = Option<&'a TargetCfgSet>>,
+) -> bool {
+  let mut parser = CfgParser::new(expression);
+  let Ok(parsed) = parser.parse_expr() else {
+    return true;
+  };
+  if parser.has_remaining_tokens() {
+    return true;
+  }
+
+  configured_cfgs
+    .into_iter()
+    .any(|cfg| cfg.is_none_or(|cfg| eval_applicability(&parsed, cfg) != CfgApplicability::No))
+}
+
+#[derive(Debug, Clone)]
 enum CfgExpr {
   Predicate { key: String, value: Option<String> },
   All(Vec<CfgExpr>),
   Any(Vec<CfgExpr>),
   Not(Box<CfgExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfgApplicability {
+  No,
+  Maybe,
+  Yes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct FeatureAssignment {
+  enabled: BTreeSet<String>,
+  disabled: BTreeSet<String>,
+}
+
+/// Produce minimal deterministic feature sets that can make a cfg expression true.
+///
+/// Non-feature predicates are left to the platform matrix. Contradictory
+/// feature branches are discarded.
+pub(crate) fn feature_selections_for_cfg(expression: &str) -> Vec<Vec<String>> {
+  let mut parser = CfgParser::new(expression);
+  let Ok(parsed) = parser.parse_expr() else {
+    return Vec::new();
+  };
+  if parser.has_remaining_tokens() {
+    return Vec::new();
+  }
+  let mut assignments = assignments_for(&parsed, true);
+  assignments.sort();
+  assignments.dedup();
+  assignments
+    .into_iter()
+    .filter(|assignment| assignment.enabled.is_disjoint(&assignment.disabled))
+    .map(|assignment| assignment.enabled.into_iter().collect())
+    .collect()
+}
+
+fn assignments_for(expression: &CfgExpr, desired: bool) -> Vec<FeatureAssignment> {
+  match expression {
+    CfgExpr::Predicate { key, value } if key == "feature" => {
+      let Some(feature) = value else {
+        return Vec::new();
+      };
+      let mut assignment = FeatureAssignment::default();
+      if desired {
+        assignment.enabled.insert(feature.clone());
+      } else {
+        assignment.disabled.insert(feature.clone());
+      }
+      vec![assignment]
+    }
+    CfgExpr::Predicate { .. } => vec![FeatureAssignment::default()],
+    CfgExpr::Not(inner) => assignments_for(inner, !desired),
+    CfgExpr::All(items) if desired => combine_assignments(items.iter().map(|item| assignments_for(item, true))),
+    CfgExpr::Any(items) if !desired => combine_assignments(items.iter().map(|item| assignments_for(item, false))),
+    CfgExpr::All(items) => items.iter().flat_map(|item| assignments_for(item, false)).collect(),
+    CfgExpr::Any(items) => items.iter().flat_map(|item| assignments_for(item, true)).collect(),
+  }
+}
+
+fn combine_assignments(parts: impl Iterator<Item = Vec<FeatureAssignment>>) -> Vec<FeatureAssignment> {
+  let mut combined = vec![FeatureAssignment::default()];
+  for alternatives in parts {
+    let mut next = Vec::new();
+    for left in &combined {
+      for right in &alternatives {
+        let mut merged = left.clone();
+        merged.enabled.extend(right.enabled.iter().cloned());
+        merged.disabled.extend(right.disabled.iter().cloned());
+        if merged.enabled.is_disjoint(&merged.disabled) {
+          next.push(merged);
+        }
+      }
+    }
+    combined = next;
+  }
+  combined
 }
 
 fn eval_expr(expr: &CfgExpr, cfg: &TargetCfgSet) -> bool {
@@ -110,6 +226,39 @@ fn eval_expr(expr: &CfgExpr, cfg: &TargetCfgSet) -> bool {
     CfgExpr::All(items) => items.iter().all(|item| eval_expr(item, cfg)),
     CfgExpr::Any(items) => items.iter().any(|item| eval_expr(item, cfg)),
     CfgExpr::Not(item) => !eval_expr(item, cfg),
+  }
+}
+
+fn eval_applicability(expr: &CfgExpr, cfg: &TargetCfgSet) -> CfgApplicability {
+  match expr {
+    CfgExpr::Predicate { key, value } => cfg.predicate_applicability(key, value.as_deref()),
+    CfgExpr::All(items) => {
+      let mut result = CfgApplicability::Yes;
+      for item in items {
+        match eval_applicability(item, cfg) {
+          CfgApplicability::No => return CfgApplicability::No,
+          CfgApplicability::Maybe => result = CfgApplicability::Maybe,
+          CfgApplicability::Yes => {}
+        }
+      }
+      result
+    }
+    CfgExpr::Any(items) => {
+      let mut result = CfgApplicability::No;
+      for item in items {
+        match eval_applicability(item, cfg) {
+          CfgApplicability::Yes => return CfgApplicability::Yes,
+          CfgApplicability::Maybe => result = CfgApplicability::Maybe,
+          CfgApplicability::No => {}
+        }
+      }
+      result
+    }
+    CfgExpr::Not(item) => match eval_applicability(item, cfg) {
+      CfgApplicability::No => CfgApplicability::Yes,
+      CfgApplicability::Maybe => CfgApplicability::Maybe,
+      CfgApplicability::Yes => CfgApplicability::No,
+    },
   }
 }
 
@@ -321,6 +470,44 @@ mod tests {
       "x86_64-unknown-linux-gnu",
       "aarch64-apple-darwin",
       Some(&cfg)
+    ));
+  }
+
+  #[test]
+  fn test_feature_selections_cover_compound_positive_and_negative_conditions() {
+    assert_eq!(
+      feature_selections_for_cfg(r#"all(feature = "a", feature = "b", not(feature = "c"), target_arch = "x86_64")"#),
+      vec![vec!["a".to_string(), "b".to_string()]]
+    );
+  }
+
+  #[test]
+  fn test_feature_selections_choose_each_any_branch_without_unrelated_powerset() {
+    assert_eq!(
+      feature_selections_for_cfg(r#"any(feature = "z", feature = "a")"#),
+      vec![vec!["a".to_string()], vec!["z".to_string()]]
+    );
+  }
+
+  #[test]
+  fn test_feature_selections_discard_contradictory_branch() {
+    assert!(feature_selections_for_cfg(r#"all(feature = "a", not(feature = "a"))"#).is_empty());
+  }
+
+  #[test]
+  fn test_cfg_expression_applicability_is_exact_for_platform_and_conservative_for_custom_cfg() {
+    let linux = TargetCfgSet::from_test_lines(&["unix", "target_os=\"linux\""]);
+    assert!(cfg_expression_may_apply(
+      r#"all(target_os = "linux", feature = "api")"#,
+      [Some(&linux)].into_iter()
+    ));
+    assert!(!cfg_expression_may_apply(
+      r#"all(target_os = "windows", feature = "api")"#,
+      [Some(&linux)].into_iter()
+    ));
+    assert!(cfg_expression_may_apply(
+      r#"all(generated_backend, feature = "api")"#,
+      [Some(&linux)].into_iter()
     ));
   }
 }

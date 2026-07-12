@@ -23,6 +23,7 @@
 //! ```
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
+use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::{ConfigLoadResult, RailConfig};
 use crate::error::{ConfigError, GitError, RailError, RailResult};
 use crate::git::SystemGit;
@@ -44,7 +45,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct CargoState {
   /// Underlying cargo metadata
-  metadata: Metadata,
+  metadata: Arc<Metadata>,
 
   /// Cached workspace root
   workspace_root: PathBuf,
@@ -105,7 +106,7 @@ impl CargoState {
         let current_hash = compute_workspace_hash_with_members(workspace_root, &cache.metadata);
         if cache.hash == current_hash {
           // Cache hit - use cached metadata
-          return Ok(Self::from_metadata(cache.metadata));
+          return Ok(Self::from_metadata(Arc::new(cache.metadata)));
         }
       }
       // Hash mismatch or path mismatch - cache is stale, will reload below
@@ -116,13 +117,21 @@ impl CargoState {
       .manifest_path(workspace_root.join("Cargo.toml"))
       .exec()?;
 
+    let metadata = Arc::new(metadata);
+
     // Save to cache
     if let Ok(()) = fs::create_dir_all(&cache_dir) {
       let current_hash = compute_workspace_hash_with_members(workspace_root, &metadata);
-      let cache = MetadataCache {
+      #[derive(Serialize)]
+      struct MetadataCacheRef<'a> {
+        version: u32,
+        hash: u64,
+        metadata: &'a Metadata,
+      }
+      let cache = MetadataCacheRef {
         version: CACHE_VERSION,
         hash: current_hash,
-        metadata: metadata.clone(),
+        metadata: &metadata,
       };
       match serde_json::to_string(&cache) {
         Ok(json) => {
@@ -144,7 +153,7 @@ impl CargoState {
   }
 
   /// Build CargoState from metadata, constructing the package index and proc-macro cache
-  fn from_metadata(metadata: Metadata) -> Self {
+  fn from_metadata(metadata: Arc<Metadata>) -> Self {
     // Normalize path separators on Windows (cargo metadata uses forward slashes).
     // Using .components().collect() converts to platform-native separators without
     // adding the \\?\ prefix that canonicalize() would add.
@@ -203,6 +212,11 @@ impl CargoState {
   /// Get the underlying metadata (for compatibility)
   pub fn metadata(&self) -> &Metadata {
     &self.metadata
+  }
+
+  /// Clone the shared metadata handle for another workspace-level index.
+  pub(crate) fn shared_metadata(&self) -> Arc<Metadata> {
+    Arc::clone(&self.metadata)
   }
 
   /// Check if a crate is a proc-macro crate (O(1) lookup)
@@ -404,6 +418,9 @@ pub struct WorkspaceContext {
   /// This saves 150-600ms for commands that don't need multi-target analysis.
   /// Uses Mutex<Option<>> for lazy initialization with error handling.
   multi_target_metadata: Mutex<Option<Arc<MultiTargetMetadata>>>,
+
+  /// Lazy rustc cfg sets shared by target-aware analyzers.
+  target_cfg_sets: Mutex<Option<Arc<std::collections::HashMap<String, TargetCfgSet>>>>,
 }
 
 impl WorkspaceContext {
@@ -500,6 +517,7 @@ impl WorkspaceContext {
       config,
       targets,
       multi_target_metadata: Mutex::new(None),
+      target_cfg_sets: Mutex::new(None),
     })
   }
 
@@ -550,9 +568,29 @@ impl WorkspaceContext {
     if !self.targets.is_empty() {
       progress!("Loading metadata for {} target(s)...", self.targets.len());
     }
-    let metadata = Arc::new(MultiTargetMetadata::load_parallel(&self.workspace_root, &self.targets)?);
+    let metadata = Arc::new(MultiTargetMetadata::load_parallel(
+      self.cargo.shared_metadata(),
+      &self.targets,
+    )?);
     *guard = Some(Arc::clone(&metadata));
     Ok(metadata)
+  }
+
+  /// Load each target's exact rustc cfg set once for the command context.
+  pub fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
+    let mut guard = self
+      .target_cfg_sets
+      .lock()
+      .map_err(|_| RailError::message("target cfg cache lock poisoned".to_string()))?;
+    if let Some(cached) = guard.as_ref() {
+      return Ok(Arc::clone(cached));
+    }
+    let mut targets = Vec::with_capacity(self.targets.len() + 1);
+    targets.push("default");
+    targets.extend(self.targets.iter().map(String::as_str));
+    let cfg_sets = Arc::new(load_target_cfg_sets(&self.workspace_root, &targets)?);
+    *guard = Some(Arc::clone(&cfg_sets));
+    Ok(cfg_sets)
   }
 
   /// Get workspace root as Path reference (convenience)

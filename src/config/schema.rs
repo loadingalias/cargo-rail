@@ -24,7 +24,7 @@ pub struct FieldSpec {
 /// the insertion order within each section.
 pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
   // =========================================================================
-  // [unify] section - 22 fields
+  // [unify] section - 23 fields
   // =========================================================================
   FieldSpec {
     section: "unify",
@@ -85,6 +85,12 @@ pub const SYNCABLE_FIELDS: &[FieldSpec] = &[
     key: "prune_dead_features",
     default_toml: "true",
     comment: "Remove unused features (default: true)",
+  },
+  FieldSpec {
+    section: "unify",
+    key: "consumer_scope",
+    default_toml: "\"open\"",
+    comment: "Consumer boundary for destructive private-graph cleanup: open, workspace",
   },
   FieldSpec {
     section: "unify",
@@ -420,7 +426,7 @@ mod tests {
   #[test]
   fn test_fields_for_section() {
     let unify_fields: Vec<_> = fields_for_section("unify").collect();
-    assert_eq!(unify_fields.len(), 22); // 21 + compiler_diag_cache
+    assert_eq!(unify_fields.len(), 23);
     assert!(unify_fields.iter().all(|f| f.section == "unify"));
 
     let release_fields: Vec<_> = fields_for_section("release").collect();
@@ -445,7 +451,7 @@ mod tests {
     // Update this count when adding new fields
     assert_eq!(
       SYNCABLE_FIELDS.len(),
-      53, // 22 unify + 16 release + 6 changelog + 4 filters + 4 change-detection + 1 run
+      54, // 23 unify + 16 release + 6 changelog + 4 filters + 4 change-detection + 1 run
       "Total syncable fields count changed - update this test if intentional"
     );
   }
@@ -489,6 +495,7 @@ mod tests {
     assert!(field_keys.contains(&("unify", "msrv")));
     assert!(field_keys.contains(&("unify", "msrv_source")));
     assert!(field_keys.contains(&("unify", "prune_dead_features")));
+    assert!(field_keys.contains(&("unify", "consumer_scope")));
     assert!(field_keys.contains(&("unify", "preserve_features")));
     assert!(field_keys.contains(&("unify", "detect_unused")));
     assert!(field_keys.contains(&("unify", "compiler_diag_cache")));

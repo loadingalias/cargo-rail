@@ -5,17 +5,19 @@
 //! The undeclared features detection lives here.
 
 use crate::cargo::{
+  DepKind,
   manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
   multi_target_metadata::MultiTargetMetadata,
   unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyDecision,
-    UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnifyIssueKind, ValidationResult,
-    VersionMismatch,
+    DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, UndeclaredFeature, UnificationPlan, UnifiedDep,
+    UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnifyIssueKind, UnusedDep,
+    ValidationResult, VersionMismatch,
   },
 };
-use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
+use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
+use crate::config::{ConsumerScope, ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::{RailResult, ResultExt};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
@@ -42,10 +44,18 @@ pub struct UnifyAnalyzer {
   workspace_root: PathBuf,
   /// Canonical workspace root path (computed once)
   canonical_workspace_root: PathBuf,
+  /// Exact rustc cfg sets shared across target-aware unify analyses.
+  target_cfg_sets: Arc<std::collections::HashMap<String, TargetCfgSet>>,
 }
 
-type FeatureSources = FxHashMap<String, FxHashMap<String, FxHashSet<String>>>;
-type FeatureTargetSpecific = FxHashMap<String, FxHashMap<String, bool>>;
+type FeatureDomain = (String, DepKind);
+type FeatureSources = FxHashMap<FeatureDomain, FxHashMap<String, Vec<FeatureProvider>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeatureProvider {
+  member: String,
+  target: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 struct CohortDecision {
@@ -59,9 +69,10 @@ impl UnifyAnalyzer {
     // Get multi-target metadata (lazily loaded on first access)
     // Uses Arc::clone for cheap reference counting instead of cloning the entire cache
     let metadata = ctx.multi_target_metadata()?;
+    let target_cfg_sets = ctx.target_cfg_sets()?;
 
     // Parse all manifests once
-    let workspace_packages = metadata.workspace_packages();
+    let workspace_packages = ctx.cargo.workspace_members();
     let manifests = ManifestAnalyzer::parse_workspace(ctx.workspace_root(), &workspace_packages)?;
 
     // Parse existing workspace.dependencies to avoid duplicates
@@ -87,6 +98,7 @@ impl UnifyAnalyzer {
       cohort_decisions,
       workspace_root,
       canonical_workspace_root,
+      target_cfg_sets,
     })
   }
 
@@ -900,12 +912,12 @@ impl UnifyAnalyzer {
     }
 
     // Scan for dead and optional features if enabled
-    let feature_pruner = FeaturePruner::new(&self.metadata, &self.config);
-    let (pruned_features, optional_features) = if self.config.prune_dead_features {
+    let feature_pruner = FeaturePruner::new(&self.metadata, &self.config, &self.target_cfg_sets);
+    let (mut pruned_features, optional_features, reachable_features) = if self.config.prune_dead_features {
       progress!("Scanning for dead features in resolved graph...");
       feature_pruner.scan()
     } else {
-      (Vec::new(), Vec::new())
+      (Vec::new(), Vec::new(), Vec::new())
     };
 
     // Detect unused dependencies
@@ -913,25 +925,21 @@ impl UnifyAnalyzer {
       &self.workspace_root,
       &self.metadata,
       &self.manifests,
+      &self.target_cfg_sets,
+      &pruned_features,
+      self.config.consumer_scope == ConsumerScope::Workspace,
       self.config.compiler_diag_cache,
     );
-    let unused_deps = if self.config.detect_unused {
+    let mut unused_deps = if self.config.detect_unused {
       progress!("Detecting unused dependencies...");
-      unused_finder.find()
+      let unused = unused_finder.find();
+      issues.extend(unused_finder.uncertainty_issues());
+      unused
     } else {
       Vec::new()
     };
 
-    // Generate removal edits if remove_unused is enabled
-    if self.config.remove_unused && !unused_deps.is_empty() {
-      progress!(
-        "Generating removal edits for {} unused dependencies...",
-        unused_deps.len()
-      );
-      for (member, edits) in unused_finder.generate_removal_edits(&unused_deps) {
-        member_edits.entry(Arc::from(member)).or_default().extend(edits);
-      }
-    }
+    self.retain_features_with_live_optional_activations(&mut pruned_features, &unused_deps, &mut issues);
 
     // Generate removal edits for dead features (empty no-ops)
     for (crate_name, edits) in feature_pruner.generate_prune_edits(&pruned_features) {
@@ -943,10 +951,30 @@ impl UnifyAnalyzer {
     // This happens when Cargo's feature unification "borrows" features from other members
     let undeclared_features = if self.config.detect_undeclared_features {
       progress!("Checking for undeclared feature dependencies...");
-      self.detect_undeclared_features()
+      let (features, causality_issues) = self.detect_undeclared_features()?;
+      issues.extend(causality_issues);
+      features
     } else {
       Vec::new()
     };
+
+    // A causal feature repair and a dependency removal cannot target the same
+    // declaration. Feature borrowing proves the declaration participates in
+    // the resolved graph even when source linting sees no direct symbol use.
+    unused_deps.retain(|unused| {
+      !undeclared_features.iter().any(|feature| {
+        feature.member == unused.member && feature.dep_name == unused.dep_name && feature.dep_kind == unused.kind
+      })
+    });
+    if self.config.remove_unused && !unused_deps.is_empty() {
+      progress!(
+        "Generating removal edits for {} unused dependencies...",
+        unused_deps.len()
+      );
+      for (member, edits) in unused_finder.generate_removal_edits(&unused_deps) {
+        member_edits.entry(Arc::from(member)).or_default().extend(edits);
+      }
+    }
 
     // Generate fixes or warnings for undeclared features
     if self.config.fix_undeclared_features && !undeclared_features.is_empty() {
@@ -1042,6 +1070,7 @@ impl UnifyAnalyzer {
       computed_msrv,
       duplicates_cleaned,
       pruned_features,
+      reachable_features,
       optional_features,
       version_mismatches,
       unused_deps,
@@ -1080,12 +1109,7 @@ impl UnifyAnalyzer {
 
   /// Get workspace member package names
   fn workspace_member_names(&self) -> FxHashSet<String> {
-    self
-      .metadata
-      .workspace_packages()
-      .iter()
-      .map(|p| p.name.to_string())
-      .collect()
+    self.metadata.workspace_packages().map(|p| p.name.to_string()).collect()
   }
 
   /// Build workspace baseline features from [workspace.dependencies]
@@ -1105,17 +1129,55 @@ impl UnifyAnalyzer {
       .collect()
   }
 
+  fn retain_features_with_live_optional_activations(
+    &self,
+    pruned_features: &mut Vec<PrunedFeature>,
+    unused_dependencies: &[UnusedDep],
+    issues: &mut Vec<UnifyIssue>,
+  ) {
+    pruned_features.retain(|feature| {
+      let Some(member) = self
+        .manifests
+        .members
+        .iter()
+        .find(|member| member.package_name == feature.crate_name.as_ref())
+      else {
+        return false;
+      };
+      let live_activation = member.dependencies.iter().any(|(_, usages)| {
+        usages.iter().any(|usage| {
+          usage.optional
+            && feature.declared_edges.iter().any(|edge| {
+              crate::cargo::feature_scanner::feature_edge_references_dependency(edge, &usage.cargo_toml_key)
+            })
+            && !unused_dependencies.iter().any(|unused| {
+              unused.member == feature.crate_name
+                && unused.dep_name == usage.cargo_toml_key
+                && unused.kind == usage.kind
+            })
+        })
+      });
+      if !live_activation {
+        return true;
+      }
+      issues.push(UnifyIssue {
+        kind: UnifyIssueKind::General,
+        dep_name: Arc::clone(&feature.feature_name),
+        severity: IssueSeverity::Warning,
+        message: Arc::from(format!(
+          "preserved feature '{}': an activated optional dependency has positive or incomplete compiler evidence",
+          feature.feature_name
+        )),
+      });
+      false
+    });
+  }
+
   /// Track which members contribute which features (beyond workspace baseline)
   ///
-  /// Returns (feature_sources, feature_is_target_specific):
-  /// - feature_sources: dep_name -> feature -> set of members that declare it
-  /// - feature_is_target_specific: dep_name -> feature -> true if ALL declarations are target-specific
-  fn track_feature_sources(
-    &self,
-    workspace_baseline: &FxHashMap<String, FxHashSet<String>>,
-  ) -> (FeatureSources, FeatureTargetSpecific) {
+  /// Retains the exact dependency kind and target section for every provider.
+  fn track_feature_sources(&self, workspace_baseline: &FxHashMap<String, FxHashSet<String>>) -> FeatureSources {
     let mut feature_sources: FeatureSources = FxHashMap::default();
-    let mut feature_is_target_specific: FeatureTargetSpecific = FxHashMap::default();
 
     for member in &self.manifests.members {
       for (dep_key, usages) in &member.dependencies {
@@ -1127,37 +1189,39 @@ impl UnifyAnalyzer {
           let mut feats: FxHashSet<&String> = usage.unconditional_features.iter().collect();
           feats.extend(usage.conditional_features.iter());
 
-          let is_target_specific = usage.target.is_some();
-
           for feat in feats {
             // Skip features in workspace baseline (workspace policy)
             if baseline.is_some_and(|b| b.contains(feat)) {
               continue;
             }
 
-            // Clone dep_name_str once per feature instead of allocating twice
+            let domain = (dep_name_str.clone(), usage.kind);
             feature_sources
-              .entry(dep_name_str.clone())
+              .entry(domain)
               .or_default()
               .entry(feat.clone())
               .or_default()
-              .insert(member.package_name.clone());
-
-            // Track target-specificity: only consider target-specific if ALL declarations are
-            let entry = feature_is_target_specific
-              .entry(dep_name_str.clone())
-              .or_default()
-              .entry(feat.clone())
-              .or_insert(true);
-            if !is_target_specific {
-              *entry = false;
-            }
+              .push(FeatureProvider {
+                member: member.package_name.clone(),
+                target: usage.target.clone(),
+              });
           }
         }
       }
     }
 
-    (feature_sources, feature_is_target_specific)
+    for features in feature_sources.values_mut() {
+      for providers in features.values_mut() {
+        providers.sort_by(|left, right| {
+          left
+            .member
+            .cmp(&right.member)
+            .then_with(|| left.target.cmp(&right.target))
+        });
+        providers.dedup();
+      }
+    }
+    feature_sources
   }
 
   /// Detect dependencies where resolved features exceed declared features
@@ -1175,10 +1239,10 @@ impl UnifyAnalyzer {
   /// - **Conditional features**: Features declared via `[features]` table (e.g.,
   ///   `my-feature = ["dep/feat"]`) count as declared - the author made an
   ///   intentional choice.
-  fn detect_undeclared_features(&self) -> Vec<UndeclaredFeature> {
+  fn detect_undeclared_features(&self) -> RailResult<(Vec<UndeclaredFeature>, Vec<UnifyIssue>)> {
     let workspace_member_names = self.workspace_member_names();
     let workspace_baseline = self.workspace_baseline_features();
-    let (feature_sources, feature_is_target_specific) = self.track_feature_sources(&workspace_baseline);
+    let feature_sources = self.track_feature_sources(&workspace_baseline);
 
     let mut undeclared = Vec::with_capacity(16);
     let mut skipped_platform_features: Vec<(String, String, String)> = Vec::with_capacity(8);
@@ -1193,19 +1257,30 @@ impl UnifyAnalyzer {
           continue;
         }
 
-        let Some(feat_sources) = feature_sources.get(&*dep_key.name) else {
+        let Some(resolved_dependency) = self.metadata.resolve_dependency(
+          &member.package_id,
+          &dep_key.name,
+          dep_key.is_renamed().then(|| dep_key.alias()),
+        ) else {
           continue;
         };
-
-        let target_specific_map = feature_is_target_specific.get(&*dep_key.name);
+        let resolved_features = self.metadata.resolved_features_for(&resolved_dependency.package_ids);
+        let default_features = self
+          .metadata
+          .default_feature_closure_for(&resolved_dependency.package_ids);
 
         for usage in usages {
+          let domain = (dep_key.name.to_string(), usage.kind);
+          let Some(feat_sources) = feature_sources.get(&domain) else {
+            continue;
+          };
           if let Some(borrowed) = self.find_borrowed_features_for_usage(
             member,
             dep_key,
             usage,
             feat_sources,
-            target_specific_map,
+            &resolved_features,
+            &default_features,
             &mut skipped_platform_features,
           ) {
             undeclared.push(borrowed);
@@ -1228,7 +1303,69 @@ impl UnifyAnalyzer {
       );
     }
 
-    undeclared
+    skipped_platform_features.sort();
+    skipped_platform_features.dedup();
+    let causality_issues = skipped_platform_features
+      .into_iter()
+      .map(|(member, dependency, feature)| UnifyIssue {
+        kind: UnifyIssueKind::General,
+        dep_name: Arc::from(dependency.as_str()),
+        severity: IssueSeverity::Warning,
+        message: Arc::from(format!(
+          "preserved borrowed feature candidate '{feature}' for member '{member}': provider target coverage does not authorize widening the dependency declaration"
+        )),
+      })
+      .collect();
+
+    let mut by_member: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>> =
+      std::collections::BTreeMap::new();
+    for feature in &undeclared {
+      by_member
+        .entry(feature.member.to_string())
+        .or_default()
+        .entry(feature.dep_name.to_string())
+        .or_default()
+        .extend(feature.undeclared_features.iter().map(ToString::to_string));
+    }
+    let mut required = std::collections::BTreeMap::new();
+    for (member, dependencies) in by_member {
+      let candidates: Vec<_> = dependencies.into_iter().collect();
+      let missing = crate::compiler::standalone_missing_features(&self.workspace_root, &member, &candidates)?;
+      required.extend(
+        missing
+          .into_iter()
+          .map(|((dependency, feature), paths)| ((member.clone(), dependency, feature), paths)),
+      );
+    }
+    for feature in &mut undeclared {
+      feature.undeclared_features.retain(|candidate| {
+        required.contains_key(&(
+          feature.member.to_string(),
+          feature.dep_name.to_string(),
+          candidate.to_string(),
+        ))
+      });
+      feature.required_by = feature
+        .undeclared_features
+        .iter()
+        .flat_map(|candidate| {
+          required
+            .get(&(
+              feature.member.to_string(),
+              feature.dep_name.to_string(),
+              candidate.to_string(),
+            ))
+            .into_iter()
+            .flatten()
+        })
+        .map(|path| Arc::from(path.as_str()))
+        .collect();
+      feature.required_by.sort();
+      feature.required_by.dedup();
+    }
+    undeclared.retain(|feature| !feature.undeclared_features.is_empty());
+
+    Ok((undeclared, causality_issues))
   }
 
   /// Find borrowed features for a single dependency usage
@@ -1238,8 +1375,9 @@ impl UnifyAnalyzer {
     member: &crate::cargo::manifest_analyzer::ParsedManifest,
     dep_key: &crate::cargo::manifest_analyzer::DepKey,
     usage: &crate::cargo::manifest_analyzer::DepUsage,
-    feat_sources: &FxHashMap<String, FxHashSet<String>>,
-    target_specific_map: Option<&FxHashMap<String, bool>>,
+    feat_sources: &FxHashMap<String, Vec<FeatureProvider>>,
+    resolved_features: &std::collections::BTreeSet<String>,
+    default_features: &std::collections::BTreeSet<String>,
     skipped_platform_features: &mut Vec<(String, String, String)>,
   ) -> Option<UndeclaredFeature> {
     // Get this usage's declared features
@@ -1252,9 +1390,18 @@ impl UnifyAnalyzer {
     let mut borrowed_features: Vec<Arc<str>> = Vec::with_capacity(feat_sources.len());
     let mut borrowed_from_members: FxHashSet<Arc<str>> = FxHashSet::default();
 
-    for (feat, sources) in feat_sources {
+    for (feat, providers) in feat_sources {
+      if !resolved_features.contains(feat) {
+        continue;
+      }
       // Skip if this member declares the feature itself
       if declared.contains(feat) {
+        continue;
+      }
+
+      // Cargo already guarantees this feature through the dependency's own
+      // default closure; writing it explicitly would be redundant.
+      if usage.default_features && default_features.contains(feat) {
         continue;
       }
 
@@ -1263,19 +1410,20 @@ impl UnifyAnalyzer {
         continue;
       }
 
-      // Skip if feature is target-specific (all declarations have target constraints)
-      if let Some(ts_map) = target_specific_map
-        && ts_map.get(feat).copied().unwrap_or(false)
-      {
+      let compatible_providers: Vec<_> = providers
+        .iter()
+        .filter(|provider| self.provider_covers_usage_target(provider, usage.target.as_deref()))
+        .collect();
+      if compatible_providers.is_empty() {
         skipped_platform_features.push((member.package_name.clone(), dep_key.name.to_string(), feat.clone()));
         continue;
       }
 
       // This feature is borrowed from other members
       borrowed_features.push(Arc::from(feat.as_str()));
-      for source in sources {
-        if source != &member.package_name {
-          borrowed_from_members.insert(Arc::from(source.as_str()));
+      for provider in compatible_providers {
+        if provider.member != member.package_name {
+          borrowed_from_members.insert(Arc::from(provider.member.as_str()));
         }
       }
     }
@@ -1293,11 +1441,44 @@ impl UnifyAnalyzer {
       dep_name: Arc::clone(&dep_key.name),
       undeclared_features: borrowed_features,
       declared_features: declared.into_iter().map(|s| Arc::from(s.as_str())).collect(),
-      resolved_features: feat_sources.keys().map(|s| Arc::from(s.as_str())).collect(),
+      resolved_features: resolved_features.iter().map(|s| Arc::from(s.as_str())).collect(),
       dep_kind: usage.kind,
       target: usage.target.as_ref().map(|t| Arc::from(t.as_str())),
       borrowed_from,
+      required_by: Vec::new(),
     })
+  }
+
+  fn provider_covers_usage_target(&self, provider: &FeatureProvider, consumer: Option<&str>) -> bool {
+    if consumer.is_none() {
+      return provider.target.is_none();
+    }
+    if provider.target.is_none() {
+      return true;
+    }
+    let targets = self.metadata.targets();
+    let consumer_targets: std::collections::BTreeSet<_> = targets
+      .iter()
+      .copied()
+      .filter(|target| {
+        consumer.is_none_or(|constraint| {
+          target_constraint_matches_target(constraint, target, self.target_cfg_sets.get(*target))
+        })
+      })
+      .collect();
+    if consumer_targets.is_empty() {
+      return false;
+    }
+    let provider_targets: std::collections::BTreeSet<_> = targets
+      .iter()
+      .copied()
+      .filter(|target| {
+        provider.target.as_deref().is_none_or(|constraint| {
+          target_constraint_matches_target(constraint, target, self.target_cfg_sets.get(*target))
+        })
+      })
+      .collect();
+    consumer_targets.is_subset(&provider_targets)
   }
 }
 

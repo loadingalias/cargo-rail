@@ -440,6 +440,22 @@ eyre = "0.6"
     "expected one unused dependency in check output\nstdout:\n{}",
     check_stdout
   );
+  let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let proof = check_json["proof_certificates"]
+    .as_array()
+    .and_then(|certificates| {
+      certificates
+        .iter()
+        .find(|certificate| certificate["subject"]["declaration"] == "eyre")
+    })
+    .expect("unused eyre dependency proof");
+  assert_eq!(proof["schema_version"], 1);
+  assert_eq!(proof["subject"]["declaration"], "eyre");
+  assert_eq!(proof["subject"]["dependency_kind"], "normal");
+  assert_eq!(proof["decision"], "remove");
+  assert_eq!(proof["used_observations"], 0);
+  assert_eq!(proof["incomplete_observations"], 0);
+  assert_eq!(proof["applicable_configurations"], proof["complete_configurations"]);
 
   let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
@@ -610,6 +626,663 @@ pub fn hello() {}
   Ok(())
 }
 
+#[test]
+fn test_unused_detection_keeps_duplicate_package_versions_and_aliases_distinct() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "old-consumer",
+    r#"[package]
+name = "old-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn-old = { package = "syn", version = "=1.0.109" }
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "new-consumer",
+    r#"[package]
+name = "new-consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+syn-new = { package = "syn", version = "=2.0.118" }
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/new-consumer/src/lib.rs"),
+    "pub fn parses() -> bool { syn_new::parse_str::<syn_new::Type>(\"u8\").is_ok() }\n",
+  )?;
+  workspace.commit("Resolve two aliased versions of one package")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let removals: Vec<_> = json["proof_certificates"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .filter(|certificate| certificate["decision"] == "remove")
+    .filter_map(|certificate| {
+      Some((
+        certificate["member"].as_str()?,
+        certificate["subject"]["declaration"].as_str()?,
+      ))
+    })
+    .collect();
+  assert!(
+    removals.contains(&("old-consumer", "syn-old")),
+    "unused alias must be removable: {json:#}"
+  );
+  assert!(
+    !removals.contains(&("new-consumer", "syn-new")),
+    "usage of one package ID must not be attributed to another version: {json:#}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_removes_unused_renamed_declaration_by_alias() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tracing_log = { package = "log", version = "0.4" }
+"#,
+  )?;
+  workspace.commit("Add unused renamed dependency")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  let check_stdout = String::from_utf8_lossy(&check.stdout);
+  assert!(
+    check_stdout.contains("Unused dependencies flagged for removal"),
+    "{check_stdout}"
+  );
+  assert!(
+    check_stdout.contains("tracing_log"),
+    "unused dependency should be reported by its manifest alias\nstdout:\n{}",
+    check_stdout
+  );
+
+  let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply.status.success(),
+    "unify should remove the renamed declaration\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply.stdout),
+    String::from_utf8_lossy(&apply.stderr)
+  );
+
+  let manifest = fs::read_to_string(workspace.path.join("crates/test-crate/Cargo.toml"))?;
+  assert!(
+    !manifest.contains("tracing_log"),
+    "renamed dependency alias should be removed\n{}",
+    manifest
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_dependency_used_only_without_default_features() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["extra"]
+extra = []
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"#[cfg(not(feature = "extra"))]
+pub fn initialize() {
+  log::set_max_level(log::LevelFilter::Info);
+}
+"#,
+  )?;
+  workspace.commit("Use dependency only without default features")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    !stdout.contains("Remove log"),
+    "a no-default-features usage must disprove removal\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_plans_mutually_exclusive_feature_condition() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+backend-a = []
+backend-b = []
+backend-common = []
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"#[cfg(all(feature = "backend-a", feature = "backend-common", not(feature = "backend-b")))]
+pub fn initialize_backend_a() {
+  log::set_max_level(log::LevelFilter::Info);
+}
+"#,
+  )?;
+  workspace.commit("Use dependency in a mutually exclusive feature branch")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  assert!(
+    !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
+    "the planner must compile backend-a + backend-common without backend-b before authorizing removal\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_applies_independent_dev_build_and_optional_completeness() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", optional = true }
+
+[dev-dependencies]
+log = "0.4"
+
+[build-dependencies]
+cc = "1"
+"#,
+  )?;
+  fs::create_dir_all(workspace.path.join("crates/test-crate/tests"))?;
+  fs::write(
+    workspace.path.join("crates/test-crate/tests/empty.rs"),
+    "#[test] fn empty() {}\n",
+  )?;
+  workspace.commit("Add dependencies requiring separate evidence domains")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    !stdout.contains("cc in test-crate"),
+    "no build script means build evidence is incomplete\n{stdout}"
+  );
+  assert!(
+    stdout.contains("preserved normal dependency `serde` in `test-crate`"),
+    "published optional dependency must remain with an explicit reason\n{stdout}"
+  );
+  assert!(stdout.contains("optional activation reachability"), "{stdout}");
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_checks_required_feature_cargo_target_configuration() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+example-gate = []
+
+[dependencies]
+log = "0.4"
+
+[[example]]
+name = "gated"
+required-features = ["example-gate"]
+"#,
+  )?;
+  fs::create_dir_all(workspace.path.join("crates/test-crate/examples"))?;
+  fs::write(
+    workspace.path.join("crates/test-crate/examples/gated.rs"),
+    "fn main() { log::set_max_level(log::LevelFilter::Info); }\n",
+  )?;
+  workspace.commit("Use dependency from a required-features example")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  assert!(
+    !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
+    "required-features Cargo targets must contribute usage evidence\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
+  assert!(
+    cache.contains("example-gate"),
+    "the evidence cache should retain the required feature configuration\n{cache}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_dependency_used_only_by_doctest() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    r#"/// Initializes logging.
+///
+/// ```
+/// log::set_max_level(log::LevelFilter::Info);
+/// ```
+pub fn initialize() {}
+"#,
+  )?;
+  workspace.commit("Use dependency only from a doctest")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  assert!(
+    !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
+    "doctest-only usage must preserve the dependency\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_dev_dependencies_used_by_examples_and_benchmarks() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+log = "0.4"
+once_cell = "1"
+"#,
+  )?;
+  fs::create_dir_all(workspace.path.join("crates/test-crate/examples"))?;
+  fs::create_dir_all(workspace.path.join("crates/test-crate/benches"))?;
+  fs::write(
+    workspace.path.join("crates/test-crate/examples/log_usage.rs"),
+    "fn main() { log::set_max_level(log::LevelFilter::Info); }\n",
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/benches/cell_usage.rs"),
+    "use once_cell::sync::Lazy;\nstatic VALUE: Lazy<u8> = Lazy::new(|| 1);\n#[test] fn bench_domain() { assert_eq!(*VALUE, 1); }\n",
+  )?;
+  workspace.commit("Use dev dependencies in separate Cargo target domains")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert!(
+    !json["proof_certificates"].as_array().is_some_and(|certificates| {
+      certificates.iter().any(|certificate| {
+        certificate["decision"] == "remove"
+          && matches!(
+            certificate["subject"]["declaration"].as_str(),
+            Some("log" | "once_cell")
+          )
+      })
+    }),
+    "usage in any applicable dev compilation unit must disprove removal\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_dependency_used_only_by_proc_macro_expansion() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "macro-provider",
+    r#"[package]
+name = "macro-provider"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/macro-provider/src/lib.rs"),
+    r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn generate(_input: TokenStream) -> TokenStream {
+  "pub fn generated() { ::log::set_max_level(::log::LevelFilter::Info); }"
+    .parse()
+    .expect("valid generated tokens")
+}
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "consumer",
+    r#"[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macro-provider = { path = "../macro-provider" }
+log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/consumer/src/lib.rs"),
+    "macro_provider::generate!();\n",
+  )?;
+  workspace.commit("Use dependency only from procedural macro expansion")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert!(
+    !json["proof_certificates"].as_array().is_some_and(|certificates| {
+      certificates.iter().any(|certificate| {
+        certificate["member"] == "consumer"
+          && certificate["decision"] == "remove"
+          && certificate["subject"]["declaration"] == "log"
+      })
+    }),
+    "rustc expansion evidence must preserve the generated dependency use\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_dependency_used_only_by_generated_source() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/build.rs"),
+    r#"fn main() {
+  let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+  std::fs::write(output.join("generated.rs"),
+    "pub fn initialize() { log::set_max_level(log::LevelFilter::Info); }").expect("write generated source");
+}
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+  )?;
+  workspace.commit("Use dependency only from generated Rust source")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  assert!(
+    !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
+    "rustc-expanded generated usage must preserve the dependency\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_removes_unreachable_optional_only_from_private_package() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[workspace]\nroot = \".\"\n\n[unify]\ndetect_unused = true\nconsumer_scope = \"workspace\"\n",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "private-crate",
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+log = { version = "0.4", optional = true }
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "public-crate",
+    r#"[package]
+name = "public-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = { version = "0.4", optional = true }
+"#,
+  )?;
+  workspace.commit("Add private and public inactive optional dependencies")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "optional dependency cleanup should verify\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let private = fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  let public = fs::read_to_string(workspace.path.join("crates/public-crate/Cargo.toml"))?;
+  assert!(
+    !private.contains("log ="),
+    "private unreachable optional should be removed\n{private}"
+  );
+  assert!(
+    public.contains("log ="),
+    "published optional is public API and must remain\n{public}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_separates_dev_and_build_compilation_domains() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[workspace]\nroot = \".\"\n\n[unify]\ndetect_unused = true\ncompiler_diag_cache = true\n",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dev-dependencies]
+log = "0.4"
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"
+glob = "0.3"
+"#,
+  )?;
+  fs::create_dir_all(workspace.path.join("crates/test-crate/tests"))?;
+  fs::write(
+    workspace.path.join("crates/test-crate/tests/uses_log.rs"),
+    "#[test] fn uses_log() { log::set_max_level(log::LevelFilter::Info); }\n",
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/build.rs"),
+    "fn main() { let _builder = cc::Build::new(); }\n",
+  )?;
+  workspace.commit("Add independently used and unused dev/build dependencies")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  let check_stdout = String::from_utf8_lossy(&check.stdout);
+  assert!(
+    check_stdout.contains("tempfile"),
+    "unused dev evidence missing\n{check_stdout}"
+  );
+  assert!(
+    check_stdout.contains("glob"),
+    "unused build evidence missing\n{check_stdout}"
+  );
+  let evidence_cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
+  assert!(evidence_cache.contains("CustomBuild"), "{evidence_cache}");
+  assert!(evidence_cache.contains("unit_evidence"), "{evidence_cache}");
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "domain-specific cleanup should verify\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = fs::read_to_string(workspace.path.join("crates/test-crate/Cargo.toml"))?;
+  assert!(
+    manifest.contains("log ="),
+    "test-only usage must preserve log\n{manifest}"
+  );
+  assert!(
+    manifest.contains("cc ="),
+    "build-script usage must preserve cc\n{manifest}"
+  );
+  assert!(
+    !manifest.contains("tempfile ="),
+    "unused dev dependency should be removed\n{manifest}\ncheck:\n{check_stdout}"
+  );
+  assert!(
+    !manifest.contains("glob ="),
+    "unused build dependency should be removed\n{manifest}\ncheck:\n{check_stdout}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_preserves_build_dependency_with_native_links_contract() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+  let native = workspace.path.join("vendor/native-side-effect");
+  fs::create_dir_all(native.join("src"))?;
+  fs::write(
+    native.join("Cargo.toml"),
+    r#"[package]
+name = "native-side-effect"
+version = "0.1.0"
+edition = "2021"
+links = "cargo_rail_test_native"
+build = "build.rs"
+"#,
+  )?;
+  fs::write(native.join("src/lib.rs"), "pub fn marker() {}\n")?;
+  fs::write(
+    native.join("build.rs"),
+    "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+native-side-effect = { path = "../../vendor/native-side-effect" }
+"#,
+  )?;
+  fs::write(workspace.path.join("crates/test-crate/build.rs"), "fn main() {}\n")?;
+  workspace.commit("Add build dependency with a native links contract")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.code() != Some(2),
+    "analysis failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+  );
+  assert!(
+    !stdout.contains("Remove native-side-effect"),
+    "links dependencies can have required native side effects\n{stdout}"
+  );
+  assert!(
+    stdout.contains("native links contract"),
+    "preservation must name the exact safety boundary\nstdout:\n{stdout}\nstderr:\n{stderr}"
+  );
+
+  Ok(())
+}
+
 // TEST 9: Verify zero false positives with common patterns
 
 #[test]
@@ -729,6 +1402,111 @@ log = "0.4"
     cache_file.display(),
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
+  );
+  let cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  assert_eq!(
+    cache["version"], 6,
+    "per-compilation-unit evidence cache must use schema version 6"
+  );
+  let entries = cache["entries"].as_object().expect("cache entries object");
+  let entry = entries.values().next().expect("at least one cache entry");
+  assert!(
+    entry["key"]["package_id"].as_str().is_some(),
+    "cache key must retain Cargo package identity: {entry}"
+  );
+  assert_eq!(entry["key"]["target"], "default");
+  assert!(
+    entry["key"]["features"].as_str().is_some(),
+    "cache key must retain Cargo feature selection: {entry}"
+  );
+  assert!(entry["key"]["cargo_version"].is_string(), "{entry}");
+  assert!(
+    entry["evidence"]["compiled_units"].is_array(),
+    "cache must persist typed compilation-unit evidence: {entry}"
+  );
+
+  let warm = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let warm_json: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
+  let warm_cache = warm_json["evidence_cache"]
+    .as_array()
+    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
+    .expect("unused dependency cache telemetry");
+  assert!(
+    warm_cache["hits"].as_u64().is_some_and(|hits| hits > 0),
+    "warm analysis must expose exact cache reuse\n{}",
+    serde_json::to_string_pretty(&warm_json)?
+  );
+  assert_eq!(warm_cache["misses"], 0);
+
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    "pub fn changed_source_without_dependency_use() {}\n",
+  )?;
+  let invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let invalidated_json: serde_json::Value = serde_json::from_slice(&invalidated.stdout)?;
+  let invalidated_cache = invalidated_json["evidence_cache"]
+    .as_array()
+    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
+    .expect("invalidated dependency cache telemetry");
+  assert!(
+    invalidated_cache["miss_reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons.iter().any(|reason| reason
+        .as_str()
+        .is_some_and(|value| value.starts_with("source_changed=")))),
+    "source invalidation must be explicit\n{}",
+    serde_json::to_string_pretty(&invalidated_json)?
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unused_detection_checks_only_members_requiring_source_evidence() -> Result<()> {
+  let workspace = create_workspace_with_unused_detection()?;
+
+  add_crate_with_manifest(
+    &workspace,
+    "dependency",
+    r#"[package]
+name = "dependency"
+version = "0.1.0"
+edition = "2021"
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "graph-only",
+    r#"[package]
+name = "graph-only"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dependency = { path = "../dependency" }
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "source-check",
+    r#"[package]
+name = "source-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+
+  workspace.commit("Add graph-only and source-check members")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("(1 package)"),
+    "only source-check should require compiler diagnostics\nstderr:\n{}",
+    stderr
   );
 
   Ok(())

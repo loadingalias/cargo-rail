@@ -1,31 +1,94 @@
-//! Dead feature detection using resolved cargo metadata
+//! Deterministic Cargo feature reachability analysis.
 //!
-//! Detects features declared in workspace crates that are never enabled
-//! by any consumer in the resolved dependency graph across all target triples.
+//! Builds roots from package visibility, defaults, resolved configurations,
+//! workspace consumers, source cfgs, Cargo target requirements, and policy,
+//! then follows member-local feature edges.
 //!
 //! This module distinguishes between:
-//! - **Truly dead features**: Empty no-ops (`simd-accel = []`) - safe to remove
+//! - **Truly dead features**: unreachable empty no-ops in private packages
 //! - **Optional features**: Enable deps/features but not currently used - NOT safe to remove
 //!
-//! Safety checks before marking a feature as dead:
-//! 1. Not enabled in resolved dependency graph
-//! 2. Not referenced by other features in `[features]` table (internal refs)
-//! 3. Not referenced by other crates via `dep/feature` syntax (external refs)
-//! 4. Not used in source code via `#[cfg(feature = "...")]` (conditional compilation)
+//! Only features in `publish = false` packages outside that closure are
+//! removable, and only when configuration declares the workspace to be the
+//! complete consumer scope. Cycles terminate because each feature is visited once.
 
 use cargo_metadata::Package;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
 use super::multi_target_metadata::MultiTargetMetadata;
+use crate::compiler::cfg_eval::{TargetCfgSet, cfg_expression_may_apply};
+
+/// Condition-derived feature selections found in package Rust sources.
+pub(crate) fn scan_source_for_feature_selections(crate_dir: &Path) -> Vec<Vec<String>> {
+  let mut selections = BTreeSet::new();
+  for_each_rust_source(crate_dir, |content| {
+    for expression in extract_cfg_expressions(content) {
+      selections.extend(crate::compiler::cfg_eval::feature_selections_for_cfg(expression));
+    }
+  });
+  selections
+    .into_iter()
+    .filter(|selection| !selection.is_empty())
+    .collect()
+}
 
 /// Scan source files for `cfg(feature = "...")` patterns
 ///
 /// Produces the set of feature names referenced in source.
 /// This prevents pruning features that are used for conditional compilation.
-fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
+pub(crate) fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
   let mut features = HashSet::new();
+  for_each_rust_source(crate_dir, |content| extract_cfg_features(content, &mut features));
+  features
+}
+
+fn scan_applicable_source_features(
+  crate_dir: &Path,
+  targets: &[&str],
+  cfg_sets: &HashMap<String, TargetCfgSet>,
+) -> HashSet<String> {
+  let mut applicable = HashSet::new();
+  for_each_rust_source(crate_dir, |content| {
+    let mut all = HashSet::new();
+    extract_cfg_features(content, &mut all);
+    let mut expression_features = HashSet::new();
+    for expression in extract_cfg_expressions(content) {
+      let mut features = HashSet::new();
+      extract_cfg_features(expression, &mut features);
+      expression_features.extend(features.iter().cloned());
+      if cfg_expression_may_apply(expression, targets.iter().map(|target| cfg_sets.get(*target))) {
+        applicable.extend(features);
+      }
+    }
+    // Preserve references not attributable to a parsed cfg expression. This
+    // includes cfg_attr and malformed syntax, where absence is not proven.
+    applicable.extend(all.difference(&expression_features).cloned());
+  });
+  applicable
+}
+
+/// Whether a Cargo feature edge activates or configures a dependency alias.
+pub(crate) fn feature_edge_references_dependency(edge: &str, dependency: &str) -> bool {
+  edge == dependency
+    || edge.strip_prefix("dep:") == Some(dependency)
+    || edge
+      .strip_prefix(dependency)
+      .is_some_and(|suffix| suffix.starts_with('/') || suffix.starts_with("?/"))
+}
+
+fn insert_feature_roots<I, S>(roots: &mut BTreeMap<String, &'static str>, features: I, root_kind: &'static str)
+where
+  I: IntoIterator<Item = S>,
+  S: AsRef<str>,
+{
+  for feature in features {
+    roots.entry(feature.as_ref().to_string()).or_insert(root_kind);
+  }
+}
+
+fn for_each_rust_source(crate_dir: &Path, mut inspect: impl FnMut(&str)) {
   // Feature gates can be used in multiple crate targets, not only src/.
   // Scan the common Rust target roots to avoid pruning test-only features.
   for dir_name in ["src", "tests", "benches", "examples"] {
@@ -37,7 +100,7 @@ fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
     if let Ok(entries) = glob::glob(&format!("{}/**/*.rs", dir.display())) {
       for entry in entries.flatten() {
         if let Ok(content) = fs::read_to_string(&entry) {
-          extract_cfg_features(&content, &mut features);
+          inspect(&content);
         }
       }
     }
@@ -48,10 +111,40 @@ fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
   if build_script.exists()
     && let Ok(content) = fs::read_to_string(build_script)
   {
-    extract_cfg_features(&content, &mut features);
+    inspect(&content);
   }
+}
 
-  features
+fn extract_cfg_expressions(content: &str) -> Vec<&str> {
+  let mut expressions = Vec::new();
+  let mut offset = 0;
+  while let Some(relative) = content[offset..].find("cfg(") {
+    let start = offset + relative + 4;
+    let bytes = content.as_bytes();
+    let mut depth = 1usize;
+    let mut index = start;
+    let mut quoted = false;
+    while index < bytes.len() {
+      match bytes[index] {
+        b'"' if index == 0 || bytes[index - 1] != b'\\' => quoted = !quoted,
+        b'(' if !quoted => depth += 1,
+        b')' if !quoted => {
+          depth -= 1;
+          if depth == 0 {
+            expressions.push(&content[start..index]);
+            offset = index + 1;
+            break;
+          }
+        }
+        _ => {}
+      }
+      index += 1;
+    }
+    if depth != 0 {
+      break;
+    }
+  }
+  expressions
 }
 
 /// Extract feature names from `feature = "name"` patterns in source code
@@ -107,12 +200,21 @@ pub struct FeatureScanResult {
   pub declared_features: HashSet<String>,
   /// Features that are actually enabled in the resolved graph
   pub enabled_features: HashSet<String>,
-  /// Truly dead features: empty no-ops that can be safely removed
-  /// These are features with empty definitions (`feature = []`) that are never enabled
+  /// Features in `publish = false` packages unreachable from every root.
   pub dead_features: HashSet<String>,
-  /// Optional features: not enabled but enable something (deps, other features)
-  /// These are user-facing API and should NOT be removed, only reported
+  /// Inactive forwarding features retained as public API in published packages.
   pub optional_features: HashSet<String>,
+  /// Deterministic root-to-feature path for every feature proven reachable.
+  pub reachability_paths: BTreeMap<String, FeatureReachability>,
+}
+
+/// Deterministic explanation for one reachable feature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureReachability {
+  /// Semantic root that starts the path.
+  pub root_kind: &'static str,
+  /// Member-local feature path, including root and destination.
+  pub path: Vec<String>,
 }
 
 /// Analyzes workspace features using resolved cargo metadata
@@ -131,12 +233,15 @@ impl FeatureScanner {
   /// 4. It's used in source code via `#[cfg(feature = "...")]` (conditional compilation)
   ///
   /// For features that are NOT alive, we distinguish:
-  /// - **Dead features**: Empty no-ops (`feature = []`) - safe to remove
+  /// - **Dead features**: Empty no-ops in private packages - safe to remove
   /// - **Optional features**: Enable something (deps, other features) - user-facing API, don't remove
   pub fn analyze_crate(
     pkg: &Package,
     metadata: &MultiTargetMetadata,
     referenced_features: &HashMap<String, HashSet<String>>,
+    preserved_features: &HashSet<String>,
+    workspace_is_consumer_scope: bool,
+    target_cfg_sets: &HashMap<String, TargetCfgSet>,
   ) -> FeatureScanResult {
     let crate_name = pkg.name.to_string();
 
@@ -150,41 +255,60 @@ impl FeatureScanner {
     // Get features referenced by other workspace crates (even if not currently enabled)
     let externally_referenced = referenced_features.get(&crate_name).cloned().unwrap_or_default();
 
-    // Build set of features referenced internally by other features in the same crate
-    // e.g., if `production = ["api-key", "server"]`, then "api-key" is internally referenced
-    let internally_referenced = Self::build_internally_referenced_features(pkg);
-
     // Scan source code for cfg(feature = "...") patterns
     // This prevents pruning features used for conditional compilation
     let crate_dir = pkg.manifest_path.parent().map(Path::new).unwrap_or(Path::new("."));
-    let source_referenced = scan_source_for_cfg_features(crate_dir);
-
-    // Find unused features (not enabled, not externally referenced, not internally referenced,
-    // not source referenced, not "default")
-    let unused_features: HashSet<String> = declared_features
-      .difference(&enabled_features)
-      .filter(|f| *f != "default")
-      .filter(|f| !externally_referenced.contains(*f))
-      .filter(|f| !internally_referenced.contains(*f))
-      .filter(|f| !source_referenced.contains(*f))
-      .cloned()
+    let targets: Vec<_> = metadata.targets();
+    let source_referenced = scan_applicable_source_features(crate_dir, &targets, target_cfg_sets);
+    let cargo_target_required: HashSet<&str> = pkg
+      .targets
+      .iter()
+      .flat_map(|target| target.required_features.iter().map(String::as_str))
       .collect();
 
-    // Separate unused features into dead (empty) vs optional (enable something)
-    let mut dead_features = HashSet::new();
-    let mut optional_features = HashSet::new();
-
-    for feature in &unused_features {
-      if let Some(enables) = pkg.features.get(feature) {
-        if enables.is_empty() {
-          // Feature enables nothing - truly dead, safe to remove
-          dead_features.insert(feature.clone());
-        } else {
-          // Feature enables deps/other features - optional user-facing API
-          optional_features.insert(feature.clone());
-        }
+    let private_package = pkg.publish.as_ref().is_some_and(Vec::is_empty);
+    let removable_package = private_package && workspace_is_consumer_scope;
+    let mut roots = BTreeMap::new();
+    if removable_package {
+      insert_feature_roots(&mut roots, enabled_features.iter(), "resolved");
+      insert_feature_roots(&mut roots, externally_referenced.iter(), "workspace_consumer");
+      insert_feature_roots(&mut roots, source_referenced.iter(), "source_cfg");
+      insert_feature_roots(&mut roots, cargo_target_required, "cargo_target_required");
+      insert_feature_roots(&mut roots, preserved_features.iter(), "preservation_policy");
+      if declared_features.contains("default") {
+        roots.entry("default".to_string()).or_insert("default");
       }
+    } else {
+      let root_kind = if private_package {
+        "open_consumer_scope"
+      } else {
+        "published_api"
+      };
+      insert_feature_roots(&mut roots, declared_features.iter(), root_kind);
     }
+
+    let reachability_paths = Self::reachable_feature_paths(pkg, &declared_features, roots);
+    let dead_features = if removable_package {
+      declared_features
+        .iter()
+        .filter(|feature| !reachability_paths.contains_key(*feature))
+        .cloned()
+        .collect()
+    } else {
+      HashSet::new()
+    };
+
+    // Kept for the reporting contract: non-private inactive forwarding
+    // features are public API, not removal candidates.
+    let optional_features = if removable_package {
+      HashSet::new()
+    } else {
+      declared_features
+        .difference(&enabled_features)
+        .filter(|feature| pkg.features.get(*feature).is_some_and(|edges| !edges.is_empty()))
+        .cloned()
+        .collect()
+    };
 
     FeatureScanResult {
       crate_name,
@@ -192,13 +316,72 @@ impl FeatureScanner {
       enabled_features,
       dead_features,
       optional_features,
+      reachability_paths,
     }
+  }
+
+  fn reachable_feature_paths(
+    pkg: &Package,
+    declared_features: &HashSet<String>,
+    roots: BTreeMap<String, &'static str>,
+  ) -> BTreeMap<String, FeatureReachability> {
+    let mut paths = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for (root, root_kind) in roots
+      .into_iter()
+      .filter(|(feature, _)| declared_features.contains(feature))
+    {
+      paths.insert(
+        root.clone(),
+        FeatureReachability {
+          root_kind,
+          path: vec![root.clone()],
+        },
+      );
+      queue.push_back(root);
+    }
+
+    while let Some(feature) = queue.pop_front() {
+      let Some(edges) = pkg.features.get(&feature) else {
+        continue;
+      };
+      let mut internal: Vec<_> = edges
+        .iter()
+        .filter(|edge| !edge.contains('/') && !edge.starts_with("dep:"))
+        .filter(|edge| declared_features.contains(*edge))
+        .collect();
+      internal.sort_unstable();
+      for next in internal {
+        if paths.contains_key(next) {
+          continue;
+        }
+        let Some(parent) = paths.get(&feature).cloned() else {
+          continue;
+        };
+        let mut path = parent.path;
+        path.push(next.clone());
+        paths.insert(
+          next.clone(),
+          FeatureReachability {
+            root_kind: parent.root_kind,
+            path,
+          },
+        );
+        queue.push_back(next.clone());
+      }
+    }
+    paths
   }
 
   /// Analyze all workspace members for dead and optional features
   ///
   /// Returns results for crates that have dead or optional features.
-  pub fn analyze_workspace(metadata: &MultiTargetMetadata) -> Vec<FeatureScanResult> {
+  pub fn analyze_workspace(
+    metadata: &MultiTargetMetadata,
+    preserve: impl Fn(&str) -> bool,
+    workspace_is_consumer_scope: bool,
+    target_cfg_sets: &HashMap<String, TargetCfgSet>,
+  ) -> Vec<FeatureScanResult> {
     // First, build a map of all features referenced by workspace crates
     // This catches conditional features like `dep/feature` in [features] tables
     let referenced_features = Self::build_referenced_features_map(metadata);
@@ -212,12 +395,22 @@ impl FeatureScanner {
         continue;
       }
 
-      let result = Self::analyze_crate(pkg, metadata, &referenced_features);
+      let preserved_features = pkg
+        .features
+        .keys()
+        .filter(|feature| preserve(feature))
+        .cloned()
+        .collect();
+      let result = Self::analyze_crate(
+        pkg,
+        metadata,
+        &referenced_features,
+        &preserved_features,
+        workspace_is_consumer_scope,
+        target_cfg_sets,
+      );
 
-      // Include if there are dead OR optional features
-      if !result.dead_features.is_empty() || !result.optional_features.is_empty() {
-        results.push(result);
-      }
+      results.push(result);
     }
 
     results
@@ -247,31 +440,6 @@ impl FeatureScanner {
     }
 
     map
-  }
-
-  /// Build a set of features that are referenced by other features in the same crate
-  ///
-  /// For example, if `[features]` contains:
-  /// ```toml
-  /// production = ["api-key", "server"]
-  /// ```
-  /// Then "api-key" and "server" are internally referenced and should not be pruned
-  /// (even if they are empty), because removing them would break the "production" feature.
-  fn build_internally_referenced_features(pkg: &Package) -> HashSet<String> {
-    let mut referenced = HashSet::new();
-
-    for feature_deps in pkg.features.values() {
-      for dep_str in feature_deps {
-        // Skip dep/feature references (handled elsewhere) and dep:dep references
-        if dep_str.contains('/') || dep_str.starts_with("dep:") {
-          continue;
-        }
-        // This is a plain feature name reference within the same crate
-        referenced.insert(dep_str.clone());
-      }
-    }
-
-    referenced
   }
 
   /// Parse a feature reference string to extract dep name and feature
@@ -448,6 +616,14 @@ mod tests {
     features.clear();
     extract_cfg_features(r#"#[cfg_attr(feature = "serde", derive(Serialize))]"#, &mut features);
     assert!(features.contains("serde"), "should detect in cfg_attr");
+  }
+
+  #[test]
+  fn test_extract_cfg_expressions_balances_nested_conditions() {
+    assert_eq!(
+      extract_cfg_expressions(r#"#[cfg(all(feature = "a", not(feature = "b")))] fn selected() {}"#),
+      vec![r#"all(feature = "a", not(feature = "b"))"#]
+    );
   }
 
   #[test]

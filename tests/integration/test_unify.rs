@@ -21,6 +21,14 @@ fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
   workspace.add_crate("crate-b", "0.1.0", &[("tempfile", r#""3.0""#)])?;
   workspace.commit("Add shared dependency")?;
 
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert_eq!(check.status.code(), Some(1));
+  let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let check_proof = check_json["proof_fingerprint"]
+    .as_str()
+    .expect("check proof fingerprint")
+    .to_string();
+
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
@@ -40,6 +48,15 @@ fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
   assert_eq!(value["members"], 2);
   assert!(value["plan_receipt"].is_string());
   assert!(value["apply_receipt"].is_string());
+  assert!(value["graph_delta"]["added_facts"].is_u64());
+  assert!(value["graph_delta"]["removed_facts"].is_u64());
+  assert!(value["graph_delta"]["facts"].is_array());
+  assert!(
+    value["graph_delta"]["fingerprint"]
+      .as_str()
+      .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+  );
+  assert_eq!(value["proof_fingerprint"], check_proof);
 
   Ok(())
 }
@@ -310,8 +327,9 @@ root = "."
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     apply_output.status.success(),
-    "Apply should succeed.\nOutput:\n{}",
-    String::from_utf8_lossy(&apply_output.stdout)
+    "Apply should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout),
+    String::from_utf8_lossy(&apply_output.stderr)
   );
 
   // Check workspace Cargo.toml
@@ -862,8 +880,9 @@ root = "."
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     apply_output.status.success(),
-    "Apply should succeed.\nOutput:\n{}",
-    String::from_utf8_lossy(&apply_output.stdout)
+    "Apply should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply_output.stdout),
+    String::from_utf8_lossy(&apply_output.stderr)
   );
 
   // Check workspace Cargo.toml
@@ -898,6 +917,10 @@ fn test_unify_workspace_member_version_deps_always_get_path() -> Result<()> {
 
   // Workspace member that other members depend on via VERSION (Tokio-style).
   workspace.add_crate("tokio", "1.0.0", &[])?;
+  let tokio_manifest = workspace.path.join("crates/tokio/Cargo.toml");
+  let mut tokio = std::fs::read_to_string(&tokio_manifest)?;
+  tokio.push_str("\n[features]\nrt = []\n");
+  std::fs::write(&tokio_manifest, tokio)?;
   workspace.add_crate("tokio-stream", "0.1.0", &[("tokio", r#""1.0.0""#)])?;
   workspace.add_crate(
     "tokio-util",
@@ -2119,8 +2142,34 @@ fn test_unify_apply_writes_mutation_receipts() -> Result<()> {
     assert!(json["plan"]["inputs_fingerprint"].is_string());
     assert!(json["plan"]["resolved_refs"].is_object());
     assert!(json["plan"]["actions"].is_array());
+    assert!(json["plan"]["actions"].as_array().is_some_and(|actions| {
+      actions.iter().any(|action| {
+        action["code"] == "VERIFY_PROOF_SET"
+          && action["payload"]["proof_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+      })
+    }));
     assert!(json["plan"]["risks"].is_array());
     assert!(json["plan"]["trace"].is_array());
+    if json["phase"] == "apply" {
+      assert!(json["trace"].as_array().is_some_and(|trace| {
+        trace.iter().any(|entry| {
+          entry["code"] == "UNIFY_GRAPH_DELTA_VERIFIED"
+            && entry["message"]
+              .as_str()
+              .is_some_and(|message| message.contains("sha256:"))
+        })
+      }));
+      assert!(json["trace"].as_array().is_some_and(|trace| {
+        trace.iter().any(|entry| {
+          entry["code"] == "UNIFY_PROOF_SET_BOUND"
+            && entry["message"]
+              .as_str()
+              .is_some_and(|message| message.contains("sha256:"))
+        })
+      }));
+    }
   }
 
   Ok(())
@@ -2234,6 +2283,351 @@ edition.workspace = true
   let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
   assert_eq!(json["mutation_plan_available"], false);
   assert!(json["mutation_plan"].is_null());
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_dead_feature_pruning_preserves_published_api_flags() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-feature-api-safety")?;
+  workspace.add_crate("public-crate", "0.1.0", &[])?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+  )?;
+
+  std::fs::write(
+    workspace.path.join("crates/public-crate/Cargo.toml"),
+    r#"[package]
+name = "public-crate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+compatibility-flag = []
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+obsolete-internal-flag = []
+example-gate = []
+
+[[example]]
+name = "gated"
+required-features = ["example-gate"]
+"#,
+  )?;
+  std::fs::create_dir_all(workspace.path.join("crates/private-crate/examples"))?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/examples/gated.rs"),
+    "fn main() {}\n",
+  )?;
+  workspace.commit("Add public and private empty feature flags")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should safely prune only the private feature\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let public_manifest = std::fs::read_to_string(workspace.path.join("crates/public-crate/Cargo.toml"))?;
+  assert!(
+    public_manifest.contains("compatibility-flag"),
+    "published feature flags are public API and must be preserved\n{public_manifest}"
+  );
+  let private_manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  assert!(
+    !private_manifest.contains("obsolete-internal-flag"),
+    "an unreachable empty flag in a publish=false package can be removed\n{private_manifest}"
+  );
+  assert!(
+    private_manifest.contains("example-gate"),
+    "Cargo target required-features are reachability roots\n{private_manifest}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_open_consumer_scope_preserves_dormant_private_features() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-open-consumer-scope")?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+dormant-forwarder = ["dep:log"]
+
+[dependencies]
+log = { version = "0.4", optional = true }
+"#,
+  )?;
+  workspace.commit("Add dormant private configuration with open consumers")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "open-world preservation must leave a valid graph\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  assert!(
+    manifest.contains("dormant-forwarder ="),
+    "open consumer scope must preserve dormant features\n{manifest}"
+  );
+  assert!(
+    manifest.contains("log ="),
+    "open consumer scope must preserve optional dependencies\n{manifest}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_feature_reachability_prunes_unrooted_cycles_and_forwarders() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-feature-reachability")?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"[workspace]
+root = "."
+
+[unify]
+prune_dead_features = true
+consumer_scope = "workspace"
+preserve_features = ["keep-*"]
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+log = { version = "0.4", optional = true, features = ["kv"] }
+
+[features]
+default = ["rooted-parent"]
+rooted-parent = ["rooted-child"]
+rooted-child = []
+source-parent = ["source-child"]
+source-child = []
+negative-root = []
+custom-cfg-root = []
+impossible-platform-root = []
+keep-policy = []
+cycle-a = ["cycle-b"]
+cycle-b = ["cycle-a"]
+forward-only = ["dep:log"]
+weak-forward-only = ["log?/kv"]
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/src/lib.rs"),
+    r#"#[cfg(not(feature = "negative-root"))]
+pub fn active_without_feature() {}
+
+#[cfg(feature = "source-parent")]
+pub fn source_root() {}
+
+#[cfg(all(generated_backend, feature = "custom-cfg-root"))]
+pub fn generated_backend_root() {}
+
+#[cfg(all(target_os = "cargo_rail_impossible", feature = "impossible-platform-root"))]
+pub fn impossible_platform_root() {}
+"#,
+  )?;
+  workspace.commit("Add rooted and unreachable private feature components")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let repeated_check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let mut check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let mut repeated_json: serde_json::Value = serde_json::from_slice(&repeated_check.stdout)?;
+  check_json
+    .as_object_mut()
+    .expect("JSON envelope")
+    .remove("evidence_cache");
+  repeated_json
+    .as_object_mut()
+    .expect("JSON envelope")
+    .remove("evidence_cache");
+  assert_eq!(
+    check_json, repeated_json,
+    "cyclic feature reachability and certificates must be deterministic"
+  );
+  let json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let certificates = json["proof_certificates"]
+    .as_array()
+    .expect("proof_certificates should be an array");
+  assert!(
+    certificates.iter().any(|certificate| {
+      certificate["member"] == "private-crate"
+        && certificate["subject"]["declaration"] == "cycle-a"
+        && certificate["evidence_source"] == "feature_reachability"
+        && certificate["declared_edges"]
+          .as_array()
+          .is_some_and(|edges| edges.iter().any(|edge| edge == "cycle-b"))
+        && certificate["roots_checked"]
+          .as_array()
+          .is_some_and(|roots| roots.iter().any(|root| root == "source_cfg"))
+    }),
+    "feature removal requires a deterministic reachability certificate\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+  let reachability = json["feature_reachability"]
+    .as_array()
+    .expect("feature_reachability should be an array");
+  assert!(
+    reachability.iter().any(|feature| {
+      feature["member"] == "private-crate"
+        && feature["feature"] == "source-child"
+        && feature["root_kind"] == "source_cfg"
+        && feature["path"] == serde_json::json!(["source-parent", "source-child"])
+    }),
+    "every reachable feature needs its deterministic root path\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+  assert!(
+    certificates.iter().any(|certificate| {
+      certificate["member"] == "private-crate"
+        && certificate["subject"]["kind"] == "dependency"
+        && certificate["subject"]["declaration"] == "log"
+        && certificate["evidence_source"] == "compiler_optional_activation"
+        && certificate["complete_configurations"] == certificate["applicable_configurations"]
+        && certificate["unused_observations"]
+          .as_u64()
+          .is_some_and(|count| count > 0)
+    }),
+    "optional dependency removal requires complete activated compiler evidence\n{}",
+    serde_json::to_string_pretty(&json)?
+  );
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "reachability edits must pass post-edit graph verification\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  for preserved in [
+    "default =",
+    "rooted-parent =",
+    "rooted-child =",
+    "source-parent =",
+    "source-child =",
+    "negative-root =",
+    "custom-cfg-root =",
+    "keep-policy =",
+  ] {
+    assert!(
+      manifest.contains(preserved),
+      "rooted feature was removed: {preserved}\n{manifest}"
+    );
+  }
+  for unreachable in [
+    "cycle-a =",
+    "cycle-b =",
+    "forward-only =",
+    "weak-forward-only =",
+    "impossible-platform-root =",
+  ] {
+    assert!(
+      !manifest.contains(unreachable),
+      "unrooted feature component must be removed: {unreachable}\n{manifest}"
+    );
+  }
+  assert!(
+    !manifest.contains("log ="),
+    "an optional dependency activated only by unreachable features must be removed in the same verified edit\n{manifest}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_feature_pruning_preserves_compiler_observed_optional_activation() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-generated-feature-activation")?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[features]
+generated-log = ["dep:log"]
+
+[dependencies]
+log = { version = "0.4", optional = true }
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/build.rs"),
+    r#"fn main() {
+  let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+  let source = if std::env::var_os("CARGO_FEATURE_GENERATED_LOG").is_some() {
+    "pub fn generated() { log::set_max_level(log::LevelFilter::Info); }\n"
+  } else {
+    "pub fn generated() {}\n"
+  };
+  std::fs::write(output.join("generated.rs"), source).expect("write generated source");
+}
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/src/lib.rs"),
+    "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+  )?;
+  workspace.commit("Add compiler-visible generated optional feature usage")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+  assert!(
+    output.status.success(),
+    "positive activated evidence must preserve a valid feature path\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("activated optional dependency has positive or incomplete compiler evidence"),
+    "the preservation boundary must be named\n{stdout}"
+  );
+  let manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  assert!(
+    manifest.contains("generated-log ="),
+    "used activation feature was removed\n{manifest}"
+  );
+  assert!(
+    manifest.contains("log ="),
+    "compiler-observed optional dependency was removed\n{manifest}"
+  );
 
   Ok(())
 }

@@ -11,8 +11,10 @@ use crate::error::{RailError, RailResult};
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 struct UnifyTextSink {
   buffer: Option<String>,
@@ -309,6 +311,204 @@ fn dependency_decisions_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<ser
     .collect()
 }
 
+fn feature_reachability_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<serde_json::Value> {
+  plan
+    .reachable_features
+    .iter()
+    .map(|feature| {
+      serde_json::json!({
+        "member": &*feature.crate_name,
+        "feature": &*feature.feature_name,
+        "root_kind": feature.root_kind,
+        "path": feature.path.iter().map(|item| &**item).collect::<Vec<_>>(),
+      })
+    })
+    .collect()
+}
+
+fn evidence_cache_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<serde_json::Value> {
+  plan
+    .unused_deps
+    .iter()
+    .map(|unused| {
+      serde_json::json!({
+        "member": &*unused.member,
+        "dependency": &*unused.dep_name,
+        "hits": unused.proof.cache_hits,
+        "misses": unused.proof.cache_misses,
+        "miss_reasons": unused.proof.cache_miss_reasons.iter().map(|value| &**value).collect::<Vec<_>>(),
+      })
+    })
+    .collect()
+}
+
+fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_needed: bool) -> Vec<serde_json::Value> {
+  let mut certificates =
+    Vec::with_capacity(plan.unused_deps.len() + plan.pruned_features.len() + plan.undeclared_features.len());
+  certificates.extend(plan.unused_deps.iter().map(|unused| {
+    serde_json::json!({
+      "schema_version": unused.proof.schema_version,
+      "member": &*unused.member,
+      "subject": {
+        "kind": "dependency",
+        "declaration": &*unused.dep_name,
+        "package_ids": unused.proof.package_ids.iter().map(|value| &**value).collect::<Vec<_>>(),
+        "crate_names": unused.proof.crate_names.iter().map(|value| &**value).collect::<Vec<_>>(),
+        "dependency_kind": unused.kind.as_str(),
+        "target": unused.target.as_deref(),
+      },
+      "decision": "remove",
+      "evidence_source": unused.proof.evidence_source,
+      "applicable_configurations": unused.proof.applicable_configurations,
+      "complete_configurations": unused.proof.complete_configurations,
+      "used_observations": unused.proof.used_observations,
+      "unused_observations": unused.proof.unused_observations,
+      "incomplete_observations": unused.proof.incomplete_observations,
+      "uncertainties": unused.proof.uncertainties.iter().map(|value| &**value).collect::<Vec<_>>(),
+    })
+  }));
+  certificates.extend(plan.pruned_features.iter().map(|feature| {
+    serde_json::json!({
+      "schema_version": 1,
+      "member": &*feature.crate_name,
+      "subject": { "kind": "feature", "declaration": &*feature.feature_name },
+      "decision": "remove",
+      "evidence_source": "feature_reachability",
+      "roots_checked": [
+        "published_api", "default", "resolved", "workspace_consumer",
+        "source_cfg", "cargo_target_required", "preservation_policy"
+      ],
+      "declared_edges": feature.declared_edges.iter().map(|edge| &**edge).collect::<Vec<_>>(),
+      "reachable_path": [],
+      "package_visibility": "publish_false",
+      "consumer_scope": "workspace",
+      "uncertainties": [],
+    })
+  }));
+  certificates.extend(plan.undeclared_features.iter().map(|feature| {
+    serde_json::json!({
+      "schema_version": 1,
+      "member": &*feature.member,
+      "subject": {
+        "kind": "dependency_features",
+        "declaration": &*feature.dep_name,
+        "dependency_kind": feature.dep_kind.as_str(),
+        "target": feature.target.as_deref(),
+      },
+      "decision": "add_features",
+      "features": feature.undeclared_features.iter().map(|value| &**value).collect::<Vec<_>>(),
+      "evidence_source": "standalone_compiler_causality",
+      "borrowed_from": feature.borrowed_from.iter().map(|value| &**value).collect::<Vec<_>>(),
+      "required_by": feature.required_by.iter().map(|value| &**value).collect::<Vec<_>>(),
+      "uncertainties": [],
+    })
+  }));
+  certificates.extend(plan.workspace_deps.iter().map(|dependency| {
+    serde_json::json!({
+      "schema_version": 1,
+      "member": serde_json::Value::Null,
+      "subject": { "kind": "workspace_dependency", "declaration": &*dependency.name },
+      "decision": "unify",
+      "evidence_source": "cargo_resolve_and_manifest_intersection",
+      "version_requirement": dependency.version_req.to_string(),
+      "features": dependency.features.iter().map(|feature| &**feature).collect::<Vec<_>>(),
+      "default_features": dependency.default_features,
+      "used_by": dependency.used_by.iter().map(|member| &**member).collect::<Vec<_>>(),
+      "target": dependency.target.as_deref(),
+      "path_dependency": dependency.path.is_some(),
+      "uncertainties": [],
+    })
+  }));
+  for (member, edits) in &plan.member_edits {
+    certificates.extend(edits.iter().filter_map(|edit| match edit {
+      crate::cargo::MemberEdit::UseWorkspace {
+        dep_name,
+        dep_kind,
+        target,
+        local_features,
+        is_optional,
+      } => Some(serde_json::json!({
+        "schema_version": 1,
+        "member": &**member,
+        "subject": {
+          "kind": "dependency_declaration",
+          "declaration": &**dep_name,
+          "dependency_kind": dep_kind.as_str(),
+          "target": target.as_deref(),
+        },
+        "decision": "use_workspace",
+        "evidence_source": "cargo_resolve_and_manifest_identity",
+        "local_features": local_features.iter().map(|feature| &**feature).collect::<Vec<_>>(),
+        "optional": is_optional,
+        "uncertainties": [],
+      })),
+      crate::cargo::MemberEdit::EnforceMsrvInheritance => Some(serde_json::json!({
+        "schema_version": 1,
+        "member": &**member,
+        "subject": { "kind": "package_msrv", "declaration": "package.rust-version" },
+        "decision": "inherit_workspace",
+        "evidence_source": "computed_workspace_msrv",
+        "uncertainties": [],
+      })),
+      crate::cargo::MemberEdit::RemoveDep { .. }
+      | crate::cargo::MemberEdit::RemoveFeature { .. }
+      | crate::cargo::MemberEdit::AddFeatures { .. } => None,
+    }));
+  }
+  certificates.extend(plan.transitive_pins.iter().map(|dependency| {
+    serde_json::json!({
+      "schema_version": 1,
+      "member": serde_json::Value::Null,
+      "subject": { "kind": "transitive_dependency", "declaration": &*dependency.name },
+      "decision": "pin",
+      "evidence_source": "resolved_fragmented_feature_sets",
+      "version": dependency.version.to_string(),
+      "features": dependency.features.iter().map(|feature| &**feature).collect::<Vec<_>>(),
+      "uncertainties": [],
+    })
+  }));
+  if msrv_write_needed && let Some(msrv) = &plan.computed_msrv {
+    certificates.push(serde_json::json!({
+      "schema_version": 1,
+      "member": serde_json::Value::Null,
+      "subject": { "kind": "workspace_msrv", "declaration": "workspace.package.rust-version" },
+      "decision": "write",
+      "evidence_source": "resolved_dependency_msrv",
+      "version": msrv.version.to_string(),
+      "contributors": msrv.contributors,
+      "uncertainties": [],
+    }));
+  }
+  certificates.sort_by(|left, right| {
+    left["member"]
+      .as_str()
+      .cmp(&right["member"].as_str())
+      .then_with(|| left["subject"]["kind"].as_str().cmp(&right["subject"]["kind"].as_str()))
+      .then_with(|| {
+        left["subject"]["declaration"]
+          .as_str()
+          .cmp(&right["subject"]["declaration"].as_str())
+      })
+      .then_with(|| left.to_string().cmp(&right.to_string()))
+  });
+  certificates
+}
+
+fn proof_set_fingerprint(certificates: &[serde_json::Value]) -> String {
+  let encoded = serde_json::Value::Array(certificates.to_vec()).to_string();
+  sha256_fingerprint(encoded.as_bytes())
+}
+
+fn sha256_fingerprint(bytes: &[u8]) -> String {
+  let digest = Sha256::digest(bytes);
+  let mut fingerprint = String::with_capacity("sha256:".len() + digest.len() * 2);
+  fingerprint.push_str("sha256:");
+  for byte in digest {
+    let _ = write!(fingerprint, "{byte:02x}");
+  }
+  fingerprint
+}
+
 /// Analyze workspace dependencies (check mode)
 pub fn run_unify_analyze(
   ctx: &WorkspaceContext,
@@ -339,6 +539,8 @@ pub fn run_unify_analyze(
 
   // JSON output mode (but still honor exit codes)
   if json {
+    let proof_certificates = proof_certificates_to_json(&plan, msrv_write_needed);
+    let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
     let (actions, risks, trace) = build_unify_mutation_parts(&plan, msrv_write_needed, false, true, output);
     let mutation_plan = if ctx.has_git() {
       Some(mutation::build_plan(
@@ -411,6 +613,10 @@ pub fn run_unify_analyze(
         "message": &*i.message,
       })).collect::<Vec<_>>(),
       "dependency_decisions": dependency_decisions_to_json(&plan),
+      "feature_reachability": feature_reachability_to_json(&plan),
+      "evidence_cache": evidence_cache_to_json(&plan),
+      "proof_fingerprint": proof_fingerprint,
+      "proof_certificates": proof_certificates,
       "action_plan": canonical_actions,
       "reason_codes": reason_codes,
       "mutation_plan_available": mutation_plan.is_some(),
@@ -610,6 +816,371 @@ pub fn run_unify_analyze(
 }
 
 /// Execute dependency unification
+struct ManifestTransaction {
+  originals: Vec<(std::path::PathBuf, Vec<u8>)>,
+}
+
+#[derive(Debug, Default)]
+struct ResolvedGraphSnapshot {
+  facts: std::collections::BTreeMap<String, BTreeSet<String>>,
+  adjacency: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Debug)]
+struct VerifiedGraphDelta {
+  added: usize,
+  removed: usize,
+  fingerprint: String,
+  facts: Vec<String>,
+}
+
+fn resolved_graph_snapshot(metadata: &cargo_metadata::Metadata) -> RailResult<ResolvedGraphSnapshot> {
+  let workspace_ids: std::collections::HashSet<_> = metadata.workspace_members.iter().collect();
+  let workspace_root = metadata.workspace_root.as_std_path();
+  let mut package_by_id = std::collections::HashMap::with_capacity(metadata.packages.len());
+  let mut snapshot = ResolvedGraphSnapshot::default();
+  for package in &metadata.packages {
+    let identity = if workspace_ids.contains(&package.id) {
+      format!("workspace:{}@{}", package.name, package.version)
+    } else if let Some(source) = &package.source {
+      format!("{}#{}@{}", source, package.name, package.version)
+    } else {
+      let package_dir = package
+        .manifest_path
+        .parent()
+        .map(|path| path.as_std_path())
+        .unwrap_or_else(|| package.manifest_path.as_std_path());
+      let portable_path = relative_path(workspace_root, package_dir)
+        .map(|path| crate::utils::path_to_git_format(&path))
+        .unwrap_or_else(|| crate::utils::file_fingerprint(package.manifest_path.as_std_path()));
+      format!("path:{portable_path}#{}@{}", package.name, package.version)
+    };
+    package_by_id.insert(package.id.to_string(), (identity.clone(), package.name.to_string()));
+    snapshot.facts.insert(
+      format!("package|{identity}"),
+      BTreeSet::from([package.name.to_string()]),
+    );
+  }
+
+  let resolve = metadata
+    .resolve
+    .as_ref()
+    .ok_or_else(|| RailError::message("Cargo returned no resolve graph".to_string()))?;
+  for node in &resolve.nodes {
+    let Some((from_identity, from_name)) = package_by_id.get(&node.id.to_string()) else {
+      continue;
+    };
+    for feature in &node.features {
+      snapshot.facts.insert(
+        format!("feature|{from_identity}|{feature}"),
+        BTreeSet::from([from_name.clone()]),
+      );
+    }
+    for dependency in &node.deps {
+      let Some((to_identity, to_name)) = package_by_id.get(&dependency.pkg.to_string()) else {
+        continue;
+      };
+      let mut domains: Vec<_> = dependency
+        .dep_kinds
+        .iter()
+        .map(|domain| {
+          format!(
+            "{:?}:{}",
+            domain.kind,
+            domain.target.as_ref().map(ToString::to_string).unwrap_or_default()
+          )
+        })
+        .collect();
+      domains.sort();
+      snapshot.facts.insert(
+        format!(
+          "edge|{from_identity}|{}|{to_identity}|{}",
+          dependency.name,
+          domains.join(",")
+        ),
+        BTreeSet::from([from_name.clone(), to_name.clone(), dependency.name.clone()]),
+      );
+      snapshot
+        .adjacency
+        .entry(from_name.clone())
+        .or_default()
+        .insert(to_name.clone());
+    }
+  }
+  Ok(snapshot)
+}
+
+fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+  use std::path::Component;
+
+  let base: Vec<_> = base.components().collect();
+  let target: Vec<_> = target.components().collect();
+  let common = base
+    .iter()
+    .zip(&target)
+    .take_while(|(left, right)| left == right)
+    .count();
+  if common == 0 {
+    return None;
+  }
+  let mut relative = PathBuf::new();
+  for component in &base[common..] {
+    if matches!(component, Component::Normal(_)) {
+      relative.push("..");
+    }
+  }
+  for component in &target[common..] {
+    relative.push(component.as_os_str());
+  }
+  Some(relative)
+}
+
+fn authorized_graph_names(plan: &crate::cargo::UnificationPlan) -> BTreeSet<String> {
+  let mut names = BTreeSet::new();
+  names.extend(plan.workspace_deps.iter().map(|dependency| dependency.name.to_string()));
+  names.extend(
+    plan
+      .transitive_pins
+      .iter()
+      .map(|dependency| dependency.name.to_string()),
+  );
+  for dependency in &plan.unused_deps {
+    names.insert(dependency.member.to_string());
+    names.insert(dependency.dep_name.to_string());
+  }
+  for feature in &plan.undeclared_features {
+    names.insert(feature.member.to_string());
+    names.insert(feature.dep_name.to_string());
+  }
+  for feature in &plan.pruned_features {
+    names.insert(feature.crate_name.to_string());
+    for edge in &feature.declared_edges {
+      let dependency = edge
+        .strip_prefix("dep:")
+        .unwrap_or(edge)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default();
+      if !dependency.is_empty() {
+        names.insert(dependency.to_string());
+      }
+    }
+  }
+  names
+}
+
+fn graph_name_closure(
+  roots: &BTreeSet<String>,
+  before: &ResolvedGraphSnapshot,
+  after: &ResolvedGraphSnapshot,
+) -> BTreeSet<String> {
+  let mut closure = roots.clone();
+  let mut pending: Vec<_> = roots.iter().cloned().collect();
+  while let Some(name) = pending.pop() {
+    for next in before
+      .adjacency
+      .get(&name)
+      .into_iter()
+      .chain(after.adjacency.get(&name))
+      .flatten()
+    {
+      if closure.insert(next.clone()) {
+        pending.push(next.clone());
+      }
+    }
+  }
+  closure
+}
+
+impl ManifestTransaction {
+  fn capture(
+    ctx: &WorkspaceContext,
+    plan: &crate::cargo::UnificationPlan,
+    msrv_write_needed: bool,
+  ) -> RailResult<Self> {
+    let mut paths = std::collections::BTreeSet::new();
+    if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
+      paths.insert(ctx.workspace_root().join("Cargo.toml"));
+    }
+    for member in plan.member_edits.keys() {
+      if let Some(path) = plan.member_paths.get(member) {
+        paths.insert(path.clone());
+      }
+    }
+    if !plan.transitive_pins.is_empty() {
+      paths.insert(transitive_pins_host_manifest_path(ctx)?);
+    }
+    let mut originals = Vec::with_capacity(paths.len());
+    for path in paths {
+      originals.push((
+        path.clone(),
+        std::fs::read(&path)
+          .map_err(|error| RailError::message(format!("capturing {} before unify apply: {error}", path.display())))?,
+      ));
+    }
+    Ok(Self { originals })
+  }
+
+  fn restore(&self) -> RailResult<()> {
+    for (path, content) in &self.originals {
+      std::fs::write(path, content).map_err(|error| {
+        RailError::message(format!(
+          "restoring {} after failed verification: {error}",
+          path.display()
+        ))
+      })?;
+    }
+    Ok(())
+  }
+}
+
+fn verify_applied_unify_graph(
+  ctx: &WorkspaceContext,
+  plan: &crate::cargo::UnificationPlan,
+) -> RailResult<VerifiedGraphDelta> {
+  let target_metadata = ctx.multi_target_metadata()?;
+  let targets = target_metadata.targets();
+  let mut verified_feature_edits = std::collections::BTreeSet::new();
+  let authorized_names = authorized_graph_names(plan);
+  let mut delta_lines = BTreeSet::new();
+  let mut added = 0usize;
+  let mut removed = 0usize;
+  for target in targets {
+    let before_metadata = target_metadata
+      .metadata_for_target(target)
+      .ok_or_else(|| RailError::message(format!("missing pre-edit metadata for target `{target}`")))?;
+    let before = resolved_graph_snapshot(before_metadata)?;
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command.current_dir(ctx.workspace_root());
+    if target != "default" {
+      command.env("CARGO_BUILD_TARGET", target);
+    }
+    let metadata = command
+      .exec()
+      .map_err(|error| RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}")))?;
+    let after = resolved_graph_snapshot(&metadata)?;
+    let closure = graph_name_closure(&authorized_names, &before, &after);
+    for (fact, participants) in after.facts.iter().filter(|(fact, _)| !before.facts.contains_key(*fact)) {
+      if participants.is_disjoint(&closure) {
+        return Err(RailError::message(format!(
+          "unplanned graph addition on `{target}` outside the authorized dependency closure: {fact}"
+        )));
+      }
+      added += 1;
+      delta_lines.insert(format!("{target}|+|{fact}"));
+    }
+    for (fact, participants) in before.facts.iter().filter(|(fact, _)| !after.facts.contains_key(*fact)) {
+      if participants.is_disjoint(&closure) {
+        return Err(RailError::message(format!(
+          "unplanned graph removal on `{target}` outside the authorized dependency closure: {fact}"
+        )));
+      }
+      removed += 1;
+      delta_lines.insert(format!("{target}|-|{fact}"));
+    }
+    let resolve = metadata
+      .resolve
+      .as_ref()
+      .ok_or_else(|| RailError::message(format!("Cargo returned no resolve graph for target `{target}`")))?;
+
+    for unused in &plan.unused_deps {
+      let Some(package) = metadata
+        .packages
+        .iter()
+        .find(|package| package.name.as_ref() == &*unused.member)
+      else {
+        return Err(RailError::message(format!(
+          "workspace member `{}` disappeared after removing `{}`",
+          unused.member, unused.dep_name
+        )));
+      };
+      let declaration_remains = package.dependencies.iter().any(|dependency| {
+        let declaration_name = dependency.rename.as_deref().unwrap_or(dependency.name.as_ref());
+        let kind_matches = matches!(
+          (unused.kind, dependency.kind),
+          (crate::cargo::DepKind::Normal, cargo_metadata::DependencyKind::Normal)
+            | (crate::cargo::DepKind::Dev, cargo_metadata::DependencyKind::Development)
+            | (crate::cargo::DepKind::Build, cargo_metadata::DependencyKind::Build)
+        );
+        declaration_name == &*unused.dep_name
+          && kind_matches
+          && dependency.target.as_ref().map(ToString::to_string).as_deref() == unused.target.as_deref()
+      });
+      if declaration_remains {
+        return Err(RailError::message(format!(
+          "removed {} dependency `{}` still exists for `{}` in target scope {:?}",
+          unused.kind.as_str(),
+          unused.dep_name,
+          unused.member,
+          unused.target
+        )));
+      }
+    }
+
+    for undeclared in &plan.undeclared_features {
+      let Some(package) = metadata
+        .packages
+        .iter()
+        .find(|package| package.name.as_ref() == &*undeclared.member)
+      else {
+        continue;
+      };
+      let Some(member_node) = resolve.nodes.iter().find(|node| node.id == package.id) else {
+        continue;
+      };
+      let crate_name = undeclared.dep_name.replace('-', "_");
+      let Some(dependency) = member_node.deps.iter().find(|dependency| dependency.name == crate_name) else {
+        continue;
+      };
+      let Some(dependency_node) = resolve.nodes.iter().find(|node| node.id == dependency.pkg) else {
+        continue;
+      };
+      for feature in &undeclared.undeclared_features {
+        if dependency_node
+          .features
+          .iter()
+          .any(|resolved| resolved.as_str() == &**feature)
+        {
+          verified_feature_edits.insert((
+            undeclared.member.to_string(),
+            undeclared.dep_name.to_string(),
+            feature.to_string(),
+          ));
+        }
+      }
+    }
+  }
+
+  for undeclared in &plan.undeclared_features {
+    for feature in &undeclared.undeclared_features {
+      let key = (
+        undeclared.member.to_string(),
+        undeclared.dep_name.to_string(),
+        feature.to_string(),
+      );
+      if !verified_feature_edits.contains(&key) {
+        return Err(RailError::message(format!(
+          "feature `{}/{}` did not resolve for `{}` after the planned edit",
+          undeclared.dep_name, feature, undeclared.member
+        )));
+      }
+    }
+  }
+  let facts: Vec<_> = delta_lines.into_iter().collect();
+  let mut encoded = String::new();
+  for line in &facts {
+    encoded.push_str(&line);
+    encoded.push('\n');
+  }
+  Ok(VerifiedGraphDelta {
+    added,
+    removed,
+    fingerprint: sha256_fingerprint(encoded.as_bytes()),
+    facts,
+  })
+}
+
+/// Apply a verified dependency-unification plan transactionally.
 pub fn run_unify_apply(
   ctx: &WorkspaceContext,
   backup: bool,
@@ -635,6 +1206,8 @@ pub fn run_unify_apply(
   } else {
     false
   };
+  let proof_certificates = proof_certificates_to_json(&plan, msrv_write_needed);
+  let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
 
   // Check for blockers
   if plan.has_blocking_issues() {
@@ -700,10 +1273,13 @@ pub fn run_unify_apply(
     "plan",
     "planned",
     mutation_plan.clone(),
-    vec![MutationTrace::new(
-      "UNIFY_PLAN_CREATED",
-      "created deterministic unify mutation plan",
-    )],
+    vec![
+      MutationTrace::new("UNIFY_PLAN_CREATED", "created deterministic unify mutation plan"),
+      MutationTrace::new(
+        "UNIFY_PROOF_SET_BOUND",
+        format!("bound portable proof set {proof_fingerprint}"),
+      ),
+    ],
   )?;
   progress!("receipt: {}", plan_receipt.display());
 
@@ -754,6 +1330,7 @@ pub fn run_unify_apply(
 
   let sort_mode = ctx.config.as_ref().map(|c| c.unify.sort_dependencies).unwrap_or(true);
   let writer = ManifestWriter::new().with_dependency_sort(sort_mode);
+  let manifest_transaction = ManifestTransaction::capture(ctx, &plan, msrv_write_needed)?;
 
   if !plan.workspace_deps.is_empty() {
     progress!("writing [workspace.dependencies]...");
@@ -851,6 +1428,49 @@ pub fn run_unify_apply(
     }
   }
 
+  progress!("verifying planned Cargo graph...");
+  let graph_delta = match verify_applied_unify_graph(ctx, &plan) {
+    Ok(delta) => delta,
+    Err(error) => {
+      manifest_transaction.restore()?;
+      return Err(RailError::with_help(
+        format!("unify graph verification failed: {error}"),
+        "all modified manifests were restored; regenerate the plan after resolving the reported graph mismatch"
+          .to_string(),
+      ));
+    }
+  };
+  progress!(
+    "  Authorized graph delta: {} addition(s), {} removal(s), {}",
+    graph_delta.added,
+    graph_delta.removed,
+    graph_delta.fingerprint
+  );
+
+  let repaired_members: BTreeSet<_> = plan
+    .member_edits
+    .iter()
+    .filter(|(_, edits)| {
+      edits
+        .iter()
+        .any(|edit| matches!(edit, crate::cargo::MemberEdit::AddFeatures { .. }))
+    })
+    .map(|(member, _)| member.as_ref())
+    .collect();
+  if !repaired_members.is_empty() {
+    progress!("verifying standalone feature repairs...");
+    for member in repaired_members {
+      if let Err(error) = crate::compiler::verify_standalone_member(ctx.workspace_root(), member) {
+        manifest_transaction.restore()?;
+        return Err(RailError::with_help(
+          format!("unify standalone verification failed: {error}"),
+          "all modified manifests were restored; the proposed feature repair did not make the member self-contained"
+            .to_string(),
+        ));
+      }
+    }
+  }
+
   let mut written_report_path = None;
   if !no_report {
     let actual_report_path = report_path.unwrap_or_else(|| {
@@ -898,7 +1518,7 @@ pub fn run_unify_apply(
       println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
     }
     if !plan.pruned_features.is_empty() {
-      println!("  {} dead features pruned (empty no-ops)", plan.pruned_features.len());
+      println!("  {} unreachable private features pruned", plan.pruned_features.len());
     }
     if !plan.optional_features.is_empty() {
       println!(
@@ -947,6 +1567,17 @@ pub fn run_unify_apply(
     mutation_plan,
     vec![
       MutationTrace::new("UNIFY_APPLY_STARTED", "started applying unify plan"),
+      MutationTrace::new(
+        "UNIFY_GRAPH_DELTA_VERIFIED",
+        format!(
+          "authorized graph delta: {} addition(s), {} removal(s), {}",
+          graph_delta.added, graph_delta.removed, graph_delta.fingerprint
+        ),
+      ),
+      MutationTrace::new(
+        "UNIFY_PROOF_SET_BOUND",
+        format!("applied portable proof set {proof_fingerprint}"),
+      ),
       MutationTrace::new("UNIFY_APPLY_COMPLETED", "completed unify apply"),
     ],
   )?;
@@ -971,6 +1602,13 @@ pub fn run_unify_apply(
         "report_path": written_report_path,
         "plan_receipt": plan_receipt,
         "apply_receipt": apply_receipt,
+        "graph_delta": {
+          "added_facts": graph_delta.added,
+          "removed_facts": graph_delta.removed,
+          "fingerprint": graph_delta.fingerprint,
+          "facts": graph_delta.facts,
+        },
+        "proof_fingerprint": proof_fingerprint,
         "warnings": warnings,
       }),
     );
@@ -1082,8 +1720,45 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
     for unused in &plan.unused_deps {
       outln!(sink, "  {} in {}", unused.dep_name, unused.member);
       outln!(sink, "    reason: {:?}", unused.reason);
+      outln!(
+        sink,
+        "    proof: {}/{} applicable configurations complete; {} unused; {} used; {} incomplete",
+        unused.proof.complete_configurations,
+        unused.proof.applicable_configurations,
+        unused.proof.unused_observations,
+        unused.proof.used_observations,
+        unused.proof.incomplete_observations
+      );
+      outln!(
+        sink,
+        "    cache: {} hit; {} miss{}{}",
+        unused.proof.cache_hits,
+        unused.proof.cache_misses,
+        if unused.proof.cache_misses == 1 { "" } else { "es" },
+        if unused.proof.cache_miss_reasons.is_empty() {
+          String::new()
+        } else {
+          format!(" ({})", unused.proof.cache_miss_reasons.join(", "))
+        }
+      );
       outln!(sink);
     }
+  }
+
+  if !plan.reachable_features.is_empty() {
+    outln!(sink, "Feature reachability:");
+    outln!(sink);
+    for feature in &plan.reachable_features {
+      outln!(
+        sink,
+        "  {} in {}: {} ({})",
+        feature.feature_name,
+        feature.crate_name,
+        feature.path.join(" -> "),
+        feature.root_kind
+      );
+    }
+    outln!(sink);
   }
 
   // Explain pruned features
@@ -1092,7 +1767,10 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
     outln!(sink);
     for pruned in &plan.pruned_features {
       outln!(sink, "  [features].{} in {}", pruned.feature_name, pruned.crate_name);
-      outln!(sink, "    reason: empty feature (no dependencies, no sub-features)");
+      outln!(sink, "    reason: unreachable from every feature root");
+      if !pruned.declared_edges.is_empty() {
+        outln!(sink, "    removed edges: {}", pruned.declared_edges.join(", "));
+      }
       outln!(sink);
     }
   }
@@ -1118,13 +1796,8 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
     }
   }
 
-  // Explain undeclared features that remain warnings instead of fixes.
-  let has_feature_fixes = plan
-    .dependency_decisions
-    .iter()
-    .any(|decision| decision.subject == crate::cargo::UnifyDecisionSubject::UndeclaredFeatureFix);
-  if !plan.undeclared_features.is_empty() && !has_feature_fixes {
-    outln!(sink, "Undeclared features detected:");
+  if !plan.undeclared_features.is_empty() {
+    outln!(sink, "Undeclared feature causality:");
     outln!(sink);
     for uf in &plan.undeclared_features {
       outln!(sink, "  {} in {}", uf.dep_name, uf.member);
@@ -1132,9 +1805,15 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
       if !uf.borrowed_from.is_empty() {
         outln!(sink, "    borrowed from: {}", uf.borrowed_from.join(", "));
       }
+      if !uf.required_by.is_empty() {
+        outln!(sink, "    required by: {}", uf.required_by.join(", "));
+      }
+      if let Some(target) = &uf.target {
+        outln!(sink, "    target: {}", target);
+      }
       outln!(
         sink,
-        "    reason: features enabled via resolver but not declared in Cargo.toml"
+        "    reason: standalone compiler failure names a feature currently supplied by another member"
       );
       outln!(sink);
     }
@@ -1261,6 +1940,20 @@ fn build_unify_mutation_parts(
   let mut actions = Vec::with_capacity(8); // Typically few distinct action types
   let mut risks = Vec::with_capacity(4);
   let mut trace = Vec::with_capacity(8);
+  let proof_certificates = proof_certificates_to_json(plan, msrv_write_needed);
+  let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
+
+  actions.push(
+    MutationAction::new(
+      "VERIFY_PROOF_SET",
+      "portable unify proof certificates",
+      Some(proof_fingerprint.clone()),
+    )
+    .with_payload(serde_json::json!({
+      "schema_version": 1,
+      "proof_fingerprint": proof_fingerprint,
+    })),
+  );
 
   if !plan.workspace_deps.is_empty() {
     actions.push(MutationAction::new(
@@ -1405,6 +2098,7 @@ mod tests {
       computed_msrv: None,
       duplicates_cleaned: Vec::new(),
       pruned_features: Vec::new(),
+      reachable_features: Vec::new(),
       optional_features: Vec::new(),
       version_mismatches: Vec::new(),
       unused_deps: Vec::new(),
@@ -1439,6 +2133,18 @@ mod tests {
     assert_eq!(json[0]["reasons"][0]["code"], "undeclared_feature_fix");
     assert_eq!(json[0]["reasons"][0]["features"][0], "macros");
     assert_eq!(json[0]["reasons"][0]["borrowed_from"][0], "crate-a");
+  }
+
+  #[test]
+  fn test_relative_path_distinguishes_portable_sibling_path_dependencies() {
+    assert_eq!(
+      relative_path(Path::new("/checkout/workspace"), Path::new("/checkout/vendor/alpha")),
+      Some(PathBuf::from("../vendor/alpha"))
+    );
+    assert_eq!(
+      relative_path(Path::new("/checkout/workspace"), Path::new("/checkout/vendor/beta")),
+      Some(PathBuf::from("../vendor/beta"))
+    );
   }
 
   #[test]

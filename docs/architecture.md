@@ -54,10 +54,14 @@ Commands do not reload metadata independently.
 
 `cargo rail unify`:
 
-1. Load resolved metadata for the configured targets.
-2. Analyze versions, features, MSRV, and unused edges.
-3. Build a deterministic mutation plan.
-4. Revalidate the plan and apply lossless TOML edits.
+1. Load the host metadata once, then resolve configured targets in parallel into one indexed workspace model.
+2. Derive the rustc target cfg sets and source-referenced feature selections needed to exercise conditional code.
+3. Collect workspace-only compiler evidence, reusing diagnostics only when the compiler, source, manifest, target, and feature-selection identity still match.
+4. Analyze versions, features, MSRV, undeclared features, and unused edges from the shared model.
+5. Build a deterministic mutation plan with portable proof certificates for graph-removing decisions.
+6. Revalidate exact declaration scopes and the resulting Cargo graph before applying lossless TOML edits.
+
+The compiler wrapper passes dependency linting only to workspace compilation units. Registry, git, build-script, and proc-macro units keep Cargo's normal arguments, avoiding failures in third-party code. Open-world packages preserve public feature and optional-dependency surfaces; `consumer_scope = "workspace"` explicitly authorizes closed-world cleanup for non-published packages.
 
 ## Mutation authority
 

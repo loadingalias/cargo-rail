@@ -3,9 +3,10 @@
 //! This module handles ALL manifest parsing and analysis
 
 use crate::error::{RailResult, ResultExt};
-use cargo_metadata::DependencyKind as MetadataDepKind;
+use cargo_metadata::{DependencyKind as MetadataDepKind, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,7 +128,7 @@ struct ParsedDepTable {
 }
 
 /// Type of dependency (normal, dev, or build)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DepKind {
   /// Normal runtime dependency
   Normal,
@@ -135,6 +136,18 @@ pub enum DepKind {
   Dev,
   /// Build-time dependency
   Build,
+}
+
+impl DepKind {
+  /// Stable machine-readable dependency domain.
+  #[must_use]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Normal => "normal",
+      Self::Dev => "development",
+      Self::Build => "build",
+    }
+  }
 }
 
 impl From<MetadataDepKind> for DepKind {
@@ -151,10 +164,16 @@ impl From<MetadataDepKind> for DepKind {
 /// Parsed manifest for a workspace member
 #[derive(Debug)]
 pub struct ParsedManifest {
+  /// Opaque Cargo package identity.
+  pub package_id: PackageId,
   /// Path to the Cargo.toml
   pub path: PathBuf,
   /// Package name
   pub package_name: String,
+  /// Feature names declared by this package.
+  pub declared_features: BTreeSet<String>,
+  /// Feature selections required by Cargo targets such as examples and binaries.
+  pub required_feature_selections: BTreeSet<Vec<String>>,
   /// All dependencies with their usages (Vec because same dep can appear in multiple sections)
   pub dependencies: HashMap<DepKey, Vec<DepUsage>>,
 }
@@ -203,7 +222,17 @@ impl ManifestAnalyzer {
       .par_iter()
       .map(|pkg| {
         let manifest_path = pkg.manifest_path.as_std_path();
-        Self::parse_single_manifest(manifest_path, &pkg.name)
+        let required_feature_selections = pkg
+          .targets
+          .iter()
+          .filter(|target| !target.required_features.is_empty())
+          .map(|target| {
+            let mut features = target.required_features.clone();
+            features.sort_unstable();
+            features
+          })
+          .collect();
+        Self::parse_single_manifest(manifest_path, &pkg.id, &pkg.name, required_feature_selections)
       })
       .collect();
 
@@ -255,7 +284,12 @@ impl ManifestAnalyzer {
   }
 
   /// Parse a single manifest file
-  fn parse_single_manifest(manifest_path: &Path, package_name: &str) -> RailResult<ParsedManifest> {
+  fn parse_single_manifest(
+    manifest_path: &Path,
+    package_id: &PackageId,
+    package_name: &str,
+    required_feature_selections: BTreeSet<Vec<String>>,
+  ) -> RailResult<ParsedManifest> {
     let content =
       std::fs::read_to_string(manifest_path).with_context(|| format!("Failed to read {}", manifest_path.display()))?;
 
@@ -305,7 +339,9 @@ impl ManifestAnalyzer {
     // 1. "dep:name" - explicit dep activation (Rust 2021+)
     // 2. "name" - implicit optional dep activation (when name matches an optional dep)
     // 3. "name/feat" - dep with specific feature enabled
+    let mut declared_features = BTreeSet::new();
     if let Some(features_table) = doc.get("features").and_then(|f| f.as_table()) {
+      declared_features.extend(features_table.iter().map(|(name, _)| name.to_string()));
       for (_feature_name, feature_value) in features_table {
         if let Some(feature_list) = feature_value.as_array() {
           for item in feature_list {
@@ -351,8 +387,11 @@ impl ManifestAnalyzer {
     }
 
     Ok(ParsedManifest {
+      package_id: package_id.clone(),
       path: manifest_path.to_path_buf(),
       package_name: package_name.to_string(),
+      declared_features,
+      required_feature_selections,
       dependencies,
     })
   }
