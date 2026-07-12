@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.17.0](https://github.com/loadingalias/cargo-rail/compare/v0.16.0...v0.17.0) - 2026-07-12
+
+- Made `cargo rail unify` faster and more exact with shared indexed Cargo metadata, workspace-only compiler evidence, source-derived feature checks, and compilation-unit cache reuse. Analysis now covers configured targets, default/no-default/all-feature builds, conditional feature selections, generated and macro-expanded source, every Cargo target kind, and target-scoped declarations.
+  
+  Graph-removing decisions now carry deterministic proof certificates with repository-relative paths normalized across platforms. Apply verifies the exact declaration edits and resulting portable Cargo graph before writing. Closed-world cleanup of dormant private features and optional dependencies requires the explicit `consumer_scope = "workspace"` contract; published feature APIs remain preserved.
+
+- Fixed release archive verification and added recovery for an existing immutable tag.
+
+- Restored the changelog introduction, preserved it above future releases, updated dependencies and CI action pins, and documented unavoidable duplicate graph dependencies.
+
+### Features
+
+- **unify**: add compiler-backed graph cleanup ([74ae271](https://github.com/loadingalias/cargo-rail/commit/74ae27107f4325a59a2010fe70333647da19fd07))
+
+### Bug Fixes
+
+- **unify**: normalize proof paths on Windows ([eee5446](https://github.com/loadingalias/cargo-rail/commit/eee54464d5779c0389e36680c7ce1976249456b4))
+- **release**: finish patch release housekeeping ([9c355e3](https://github.com/loadingalias/cargo-rail/commit/9c355e30bc9d73de1c244e44c780cf60d29e28be))
+- **release**: recover immutable release assets ([5608728](https://github.com/loadingalias/cargo-rail/commit/56087284d869818f6d37713ff4e6cc8e2722280d))
+
+
+
 This file records user-visible changes. Git tags and [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases) retain the complete release history.
 
 ## [0.16.0](https://github.com/loadingalias/cargo-rail/compare/v0.15.0...v0.16.0) - 2026-07-11
