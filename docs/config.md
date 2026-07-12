@@ -485,10 +485,10 @@ core planner semantics.
 Custom-surface gate:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5
+- uses: loadingalias/cargo-rail-action@v5.0.0
   id: rail
   with:
-    version: 0.16.0
+    version: 0.17.0
 
 - name: Run benchmark suite
   if: steps.rail.outputs.custom_benchmarks == 'true' || steps.rail.outputs.infra == 'true'

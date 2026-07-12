@@ -171,7 +171,10 @@ jobs:
       - name: Verify formatting
         run: cargo +stable fmt --all -- --check
 
+      # Recovery rebuilds an immutable tag. Rolling Clippy lints belong to the
+      # pre-tag gate and must not make a previously published source stop shipping.
       - name: Verify Clippy
+        if: github.event_name != 'workflow_dispatch'
         run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Verify tests

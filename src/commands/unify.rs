@@ -1169,7 +1169,7 @@ fn verify_applied_unify_graph(
   let facts: Vec<_> = delta_lines.into_iter().collect();
   let mut encoded = String::new();
   for line in &facts {
-    encoded.push_str(&line);
+    encoded.push_str(line);
     encoded.push('\n');
   }
   Ok(VerifiedGraphDelta {

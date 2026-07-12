@@ -56,10 +56,10 @@ benchmarks = ["benches/**", "perf/**"]
 ## GitHub Actions
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5
+- uses: loadingalias/cargo-rail-action@v5.0.0
   id: rail
   with:
-    version: 0.16.0
+    version: 0.17.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
