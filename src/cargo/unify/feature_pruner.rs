@@ -4,6 +4,7 @@
 //! reports inactive forwarding features retained as published API.
 
 use crate::cargo::feature_scanner::FeatureScanner;
+use crate::cargo::manifest_analyzer::ManifestAnalyzer;
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::{MemberEdit, OptionalFeature, PrunedFeature, ReachableFeature};
 use crate::compiler::cfg_eval::TargetCfgSet;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 /// Scans for dead and optional features in workspace crates
 pub struct FeaturePruner<'a> {
   metadata: &'a MultiTargetMetadata,
+  manifests: &'a ManifestAnalyzer,
   config: &'a UnifyConfig,
   target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
 }
@@ -24,11 +26,13 @@ impl<'a> FeaturePruner<'a> {
   /// Create a new feature pruner
   pub fn new(
     metadata: &'a MultiTargetMetadata,
+    manifests: &'a ManifestAnalyzer,
     config: &'a UnifyConfig,
     target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
   ) -> Self {
     Self {
       metadata,
+      manifests,
       config,
       target_cfg_sets,
     }
@@ -56,6 +60,12 @@ impl<'a> FeaturePruner<'a> {
 
     // Collect dead and optional features
     for result in &results {
+      let explicit_features = self
+        .manifests
+        .members
+        .iter()
+        .find(|member| member.package_name == result.crate_name)
+        .map(|member| &member.declared_features);
       reachable.extend(
         result
           .reachability_paths
@@ -69,6 +79,12 @@ impl<'a> FeaturePruner<'a> {
       );
       // Truly dead features (empty no-ops), excluding preserved features
       for feature_name in &result.dead_features {
+        // Cargo synthesizes a feature for each optional dependency that is not
+        // referenced through `dep:`. There is no manifest feature key for the
+        // writer to remove; unused-dependency analysis owns that declaration.
+        if !explicit_features.is_some_and(|features| features.contains(feature_name)) {
+          continue;
+        }
         // Skip features that match preserve_features patterns
         if self.config.should_preserve_feature(feature_name) {
           continue;

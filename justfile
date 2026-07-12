@@ -1,24 +1,17 @@
 check:
     @scripts/check/check.sh
 
+fix:
+    @scripts/check/check.sh --fix
+
 test crate="":
     @scripts/test/test.sh "{{ crate }}"
 
 build:
-    @echo "Change Detection Plan:"
-    @echo ""
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
-    @echo ""
-    @echo "Building affected crates..."
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build
+    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build --explain
 
 build-release:
-    @echo "Change Detection Plan:"
-    @echo ""
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
-    @echo ""
-    @echo "Building affected crates (release)..."
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build -- --release
+    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build --explain -- --release
 
 # Full Workspace Commands (no change detection)
 
@@ -29,10 +22,7 @@ test-all:
     @scripts/test/test.sh --all
 
 build-all:
-    cargo build --workspace --all-targets --all-features
-
-build-release-all:
-    cargo build --workspace --all-targets --all-features --release
+    cargo build --workspace --all-targets --all-features --locked
 
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
@@ -40,30 +30,17 @@ bench-unify packages="25" runs="10":
 # CI Commands (for GitHub Actions)
 
 ci-check:
-    @scripts/check/check.sh --ci
-
-ci-test:
-    @scripts/test/test.sh
-
-ci-build:
-    @cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --since "${RAIL_SINCE:-HEAD~1}" --surface build
+    @scripts/check/check.sh --all
 
 # Explainability
 
 plan:
-    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
-
-why:
-    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base --explain
+    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
 
 dry-run surface="test":
-    cargo run --quiet --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
+    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
 
 # Maintenance
-
-update:
-    cargo update --workspace
-    cargo upgrade --recursive
 
 gen-docs:
     @scripts/docs/generate.sh

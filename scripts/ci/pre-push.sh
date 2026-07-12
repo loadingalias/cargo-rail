@@ -2,9 +2,10 @@
 # Pre-push hook: runs quality checks before allowing push
 # Symlink this to .git/hooks/pre-push or run: ln -sf ../../scripts/ci/pre-push.sh .git/hooks/pre-push
 
-set -e
+set -euo pipefail
 
 echo "Running pre-push checks..."
 just check
+just test
 
 echo "All checks passed."

@@ -31,6 +31,19 @@ cargo rail init --check            # Preview without writing
 cargo rail init --force            # Overwrite existing config
 ```
 
+## Upgrade an existing file
+
+Run the synchronizer after every cargo-rail upgrade:
+
+```bash
+cargo rail config sync --check     # Preview new fields and detected targets
+cargo rail config sync             # Materialize them without replacing user values
+cargo rail config validate --strict
+```
+
+Review the sync diff before running mutation commands. Explicit policy keeps an
+older workspace from silently inheriting a newly introduced default.
+
 ## Start with defaults
 
 ### Minimal configuration
@@ -485,10 +498,10 @@ core planner semantics.
 Custom-surface gate:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5.0.0
+- uses: loadingalias/cargo-rail-action@v5.1.0
   id: rail
   with:
-    version: 0.17.0
+    version: 0.17.1
 
 - name: Run benchmark suite
   if: steps.rail.outputs.custom_benchmarks == 'true' || steps.rail.outputs.infra == 'true'

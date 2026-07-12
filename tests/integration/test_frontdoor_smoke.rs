@@ -44,12 +44,6 @@ fn test_documented_frontdoor_commands_smoke() -> Result<()> {
       justfile_snippet: None,
     },
     SmokeCase {
-      name: "just build plan",
-      args: &["rail", "plan", "--merge-base", "--explain"],
-      readme_snippet: None,
-      justfile_snippet: Some("rail plan --merge-base --explain"),
-    },
-    SmokeCase {
       name: "just build run",
       args: &["rail", "run", "--merge-base", "--surface", "build", "--dry-run"],
       readme_snippet: None,
@@ -68,13 +62,7 @@ fn test_documented_frontdoor_commands_smoke() -> Result<()> {
         "--release",
       ],
       readme_snippet: None,
-      justfile_snippet: Some("rail run --merge-base --surface build -- --release"),
-    },
-    SmokeCase {
-      name: "just ci-build",
-      args: &["rail", "run", "--since", "HEAD~1", "--surface", "build", "--dry-run"],
-      readme_snippet: None,
-      justfile_snippet: Some("rail run --since \"${RAIL_SINCE:-HEAD~1}\" --surface build"),
+      justfile_snippet: Some("rail run --merge-base --surface build --explain -- --release"),
     },
     SmokeCase {
       name: "just plan",

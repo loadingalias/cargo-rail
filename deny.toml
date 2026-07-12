@@ -1,7 +1,9 @@
 [graph]
 targets = [
   "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
   "x86_64-pc-windows-msvc",
   "aarch64-apple-darwin",
   "aarch64-pc-windows-msvc",
@@ -24,18 +26,18 @@ confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
 
 skip = [
   # petgraph 0.8.3 requires hashbrown 0.15; current indexmap and tooling use
   # hashbrown 0.17. Both lines are required until petgraph publishes its
   # hashbrown 0.16 update.
-  "hashbrown",
-  "foldhash",
+  "hashbrown@0.15.5",
+  "foldhash@0.1.5",
 ]
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

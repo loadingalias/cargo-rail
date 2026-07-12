@@ -24,7 +24,7 @@ unknown_file_policy = "strict"
 [change-detection.custom]
 themes = ["runtime/themes/**"]
 queries = ["runtime/queries/**"]
-docs = ["docs/**", "book/**"]
+book = ["book/**"]
 
 # Run profiles are optional when using external task runner
 # Include them for fallback or local convenience

@@ -249,7 +249,7 @@ verify_workflows() {
     if [ -n "$issues" ]; then
       unpinned+=("$file")
       echo "❌ UNPINNED: $(basename "$file")"
-      echo "$issues" | sed 's/^/     /'
+      printf '     %s\n' "${issues//$'\n'/$'\n     '}"
       echo ""
     fi
   done

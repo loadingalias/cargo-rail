@@ -8,51 +8,29 @@ inputs:
     description: Additional cache key suffix
     required: false
     default: ""
+  install-nextest:
+    description: Install cargo-nextest for jobs that execute tests
+    required: false
+    default: "true"
 
 runs:
   using: composite
   steps:
-    # Install cargo tools FIRST, before Rust toolchain installation
-    # This prevents Windows issues where massive toolchain updates interfere with cargo bin directory
     - name: Install just
       uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
       with:
         tool: just
 
     - name: Install cargo-nextest
+      if: inputs.install-nextest == 'true'
       uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
       with:
         tool: cargo-nextest
 
-    - name: Install cargo-deny
-      uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
-      with:
-        tool: cargo-deny
-
-    - name: Install cargo-audit
-      uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
-      with:
-        tool: cargo-audit
-
-    - name: Install cargo-semver-checks
-      uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
-      with:
-        tool: cargo-semver-checks
-
-    - name: Install git-cliff
-      uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
-      with:
-        tool: git-cliff
-
-    - name: Install cargo-rail
-      uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
-      with:
-        tool: cargo-rail@0.10.1
-
-    - name: Install Rust Nightly Toolchain
+    - name: Install Rust Stable Toolchain
       uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # master
       with:
-        toolchain: nightly
+        toolchain: stable
         components: clippy, rustfmt
 
     - name: Setup Rust Cache
@@ -66,8 +44,7 @@ runs:
         # - Separate caches per workflow and target triple via 'key' input
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # Shared prefix: stable across commits (invalidates on bump)
-        shared-key: "cargo-rail-v1"
+        shared-key: "cargo-rail-v2"
 
         # Workflow and platform-specific suffix: commit-ubuntu-latest, commit-macos-14, etc.
         # Ensures each workflow and platform maintains separate cache

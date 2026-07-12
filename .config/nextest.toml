@@ -5,6 +5,7 @@ failure-output = "immediate"
 fail-fast = false
 test-threads = "num-cpus"
 slow-timeout = { period = "30s", terminate-after = 4 }
+leak-timeout = { period = "500ms", result = "fail" }
 retries = 0
 
 [test-groups]
@@ -21,7 +22,8 @@ failure-output = "immediate-final"
 fail-fast = false
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 4 }
-retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
+leak-timeout = { period = "500ms", result = "fail" }
+retries = 0
 
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_(unify|unused_detection|undeclared_features)/)'

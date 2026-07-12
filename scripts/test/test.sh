@@ -4,7 +4,7 @@ set -euo pipefail
 # Smart Test Runner
 #
 # Uses cargo-rail for intelligent change detection.
-# Always shows the plan before executing.
+# Uses a single planner/executor invocation in smart mode.
 #
 # Usage:
 #   ./test.sh              # Smart: test affected crates only
@@ -19,7 +19,7 @@ set -euo pipefail
 # On Windows, `cargo nextest` cannot rebuild `target/debug/cargo-rail.exe`
 # while that exact binary is still running via `cargo run`.
 RAIL_BOOTSTRAP_TARGET_DIR="${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}"
-RAIL_CMD=(cargo run --quiet --target-dir "$RAIL_BOOTSTRAP_TARGET_DIR" -- rail)
+RAIL_CMD=(cargo run --quiet --locked --target-dir "$RAIL_BOOTSTRAP_TARGET_DIR" -- rail)
 
 ARG="${1:-}"
 MODE="${CARGO_RAIL_TEST_MODE:-local}"
@@ -46,7 +46,7 @@ echo ""
 if [ "$ARG" = "--all" ]; then
   echo "Full workspace test (--all)"
   echo ""
-  cargo nextest run --workspace -P "$NEXTEST_PROFILE" --all-features --config-file .config/nextest.toml
+  cargo nextest run --workspace -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml
   exit 0
 fi
 
@@ -54,25 +54,19 @@ fi
 if [ -n "$ARG" ]; then
   echo "Testing specific crate: $ARG"
   echo ""
-  cargo nextest run -p "$ARG" -P "$NEXTEST_PROFILE" --all-features --config-file .config/nextest.toml
+  cargo nextest run -p "$ARG" -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml
   exit 0
 fi
-
-# Smart mode: Use cargo-rail for change detection
-echo "Change Detection Plan:"
-echo ""
-"${RAIL_CMD[@]}" plan "${PLAN_ARGS[@]}" --explain
-echo ""
 
 echo "Testing affected crates..."
 if [ "$MODE" = "commit" ]; then
   # CI mode: force commit profile and nextest JUnit output path.
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test \
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test --explain \
     --test-runner nextest \
     --nextest-arg=-P \
     --nextest-arg="$NEXTEST_PROFILE" \
     --nextest-arg=--config-file \
     --nextest-arg=.config/nextest.toml
 else
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test --explain
 fi

@@ -1053,7 +1053,7 @@ fn verify_applied_unify_graph(
     let mut command = cargo_metadata::MetadataCommand::new();
     command.current_dir(ctx.workspace_root());
     if target != "default" {
-      command.env("CARGO_BUILD_TARGET", target);
+      command.other_options(vec![String::from("--filter-platform"), target.to_string()]);
     }
     let metadata = command
       .exec()

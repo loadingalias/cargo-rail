@@ -3,13 +3,13 @@
 
 # targets = []  # optional: set for multi-target validation
 
-[crates.my_crate.split]
-remote = "git@github.com:your-org/my_crate.git"
+[crates.my-crate.split]
+remote = "git@github.com:your-org/my-crate.git"
 branch = "main"
 mode = "single"             # single | combined
 workspace_mode = "standalone" # standalone | workspace
 paths = [
-  { crate = "crates/my_crate" },
+  { crate = "crates/my-crate" },
 ]
 include = []
 exclude = []

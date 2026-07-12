@@ -36,11 +36,11 @@ merge_base = true
 # CI: build + test
 [run.profile.ci]
 surfaces = ["build", "test"]
-run_args = ["--workspace", "{cargo_args}"]
+run_args = ["{cargo_args}"]
 merge_base = true
 
 # Nightly: full validation
 [run.profile.nightly]
 surfaces = ["build", "test", "docs", "bench"]
-run_args = ["--workspace", "{cargo_args}"]
+run_args = ["{cargo_args}"]
 merge_base = true

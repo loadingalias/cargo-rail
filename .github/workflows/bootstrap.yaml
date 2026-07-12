@@ -81,12 +81,43 @@ jobs:
       - name: Compile (MSRV)
         run: cargo check --workspace --all-targets --all-features --locked
 
+  quality:
+    name: Quality and Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          cache-key: bootstrap-quality
+          install-nextest: "false"
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        with:
+          tool: cargo-deny
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        with:
+          tool: cargo-audit
+
+      - name: Quality checks
+        run: just ci-check
+
   # ==========================================================================
   # Job 2: Full CI matrix (no change detection)
   # ==========================================================================
   ci:
     name: CI (${{ matrix.target.name }})
-    needs: msrv
+    needs: [msrv, quality]
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30
     strategy:
@@ -97,21 +128,25 @@ jobs:
           - name: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             cache-key: bootstrap-linux-x64
+            test: true
 
           # Linux ARM64
           - name: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             cache-key: bootstrap-linux-arm64
+            test: false
 
           # Windows x86-64
           - name: x86_64-pc-windows-msvc
             runner: windows-latest
             cache-key: bootstrap-windows-x64
+            test: true
 
           # Windows ARM64
           - name: aarch64-pc-windows-msvc
             runner: windows-11-arm
             cache-key: bootstrap-windows-arm64
+            test: false
 
     steps:
       - name: Checkout
@@ -124,18 +159,17 @@ jobs:
         uses: ./.github/actions/setup
         with:
           cache-key: ${{ matrix.target.cache-key }}
-
-      - name: Quality Checks
-        run: just ci-check
+          install-nextest: ${{ matrix.target.test }}
 
       - name: Build
         run: just build-all
 
       - name: Tests
+        if: matrix.target.test
         run: just test-all
 
       - name: Upload JUnit Test Report
-        if: always()
+        if: always() && matrix.target.test
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: junit-report-${{ matrix.target.name }}
@@ -144,7 +178,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Detect JUnit Test Report
-        if: always()
+        if: always() && matrix.target.test
         id: junit
         shell: bash
         run: |

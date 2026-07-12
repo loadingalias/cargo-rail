@@ -28,8 +28,9 @@ targets = [
 # Consolidates workspace dependencies, fixes undeclared features, prunes dead
 # features, detects unused deps, and computes MSRV.
 #
-# Replaces: cargo-hakari, cargo-udeps, cargo-machete, cargo-shear,
-#           cargo-features-manager, cargo-msrv, cargo-sort
+# Replaces the dependency-graph workflows provided by cargo-hakari,
+# cargo-udeps, cargo-machete, cargo-shear, cargo-unused-features,
+# cargo-autoinherit, cargo-msrv, and cargo-sort.
 
 [unify]
 # Core unification
@@ -126,13 +127,13 @@ merge_base = true
 # CI profile
 [run.profile.ci]
 surfaces = ["build", "test"]
-run_args = ["--workspace", "{cargo_args}"]
+run_args = ["{cargo_args}"]
 merge_base = true
 
 # Nightly profile
 [run.profile.nightly]
 surfaces = ["build", "test", "docs", "bench"]
-run_args = ["--workspace", "{cargo_args}"]
+run_args = ["{cargo_args}"]
 merge_base = true
 
 # ============================================================================
@@ -160,6 +161,7 @@ require_change_files = false      # Require change-file coverage: true, false, o
 [release.changelog]
 path = "CHANGELOG.md"             # Changelog file path
 relative_to = "crate"             # "crate" or "workspace"
+entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"
 group_order = ["breaking", "feat", "fix", "perf", "docs", "deps", "other"]
 fallback = "other"                # Unlisted commit types land here; "skip" drops them
 

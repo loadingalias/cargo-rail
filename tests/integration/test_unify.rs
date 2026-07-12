@@ -2400,6 +2400,107 @@ log = { version = "0.4", optional = true }
 }
 
 #[test]
+fn test_unify_graph_verification_uses_the_same_platform_filter_before_and_after() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-platform-filter-verification")?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  workspace.add_crate("unrelated", "0.1.0", &[])?;
+  workspace.add_crate("windows-only", "0.1.0", &[])?;
+
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    r#"targets = ["x86_64-unknown-linux-gnu"]
+
+[workspace]
+root = "."
+
+[unify]
+consumer_scope = "workspace"
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+obsolete = []
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/unrelated/Cargo.toml"),
+    r#"[package]
+name = "unrelated"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+windows-only = { path = "../windows-only" }
+"#,
+  )?;
+  workspace.commit("Add a platform-filtered graph beside a dead private feature")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "pre- and post-edit graph verification must use the same platform filter\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  assert!(
+    !manifest.contains("obsolete ="),
+    "the verified feature edit should be applied\n{manifest}"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_does_not_prune_cargo_synthetic_optional_features() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-synthetic-optional-feature")?;
+  workspace.add_crate("private-crate", "0.1.0", &[])?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/Cargo.toml"),
+    r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+log = { version = "0.4", optional = true }
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/private-crate/README.md"),
+    "The optional `log` integration is part of this crate's documented contract.\n",
+  )?;
+  workspace.commit("Add a documented implicit optional dependency feature")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  assert!(
+    output.status.success(),
+    "Cargo-synthesized optional dependency features are not writable manifest keys\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let manifest = std::fs::read_to_string(workspace.path.join("crates/private-crate/Cargo.toml"))?;
+  assert!(
+    manifest.contains("log ="),
+    "the documented optional dependency should remain\n{manifest}"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_unify_feature_reachability_prunes_unrooted_cycles_and_forwarders() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-feature-reachability")?;
   workspace.add_crate("private-crate", "0.1.0", &[])?;

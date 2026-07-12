@@ -186,7 +186,7 @@ Examples:
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
   cargo rail config sync --check        # Preview config updates
-  cargo rail config sync                # Add missing fields, sync targets";
+  cargo rail config sync                # Run after upgrades; add fields and sync targets";
 
 const HASH_HELP: &str = "\
 Examples:
@@ -571,7 +571,7 @@ pub enum ConfigCommand {
     #[arg(long, conflicts_with = "strict")]
     no_strict: bool,
   },
-  /// Sync configuration: add missing fields and update targets
+  /// Sync configuration after upgrades: add missing fields and update targets
   ///
   /// Scans the workspace for target triples and adds any missing config
   /// fields with their default values. Preserves all existing settings,

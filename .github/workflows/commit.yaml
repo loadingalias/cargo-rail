@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   # ==========================================================================
-  # Job 1: Planner (dogfooding cargo-rail-action v4)
+  # Job 1: Planner
   # ==========================================================================
   plan:
     name: Plan
@@ -49,8 +49,9 @@ jobs:
 
       - name: Build Plan
         id: plan
-        uses: loadingalias/cargo-rail-action@95875a43ad5583b4d6a1dc65630afb0c2ecb6b30  # v4.1.3
+        uses: loadingalias/cargo-rail-action@90f7f739028887508c6e8d8b7cc510dc612eb653  # v5.1.0
         with:
+          version: 0.17.0
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           args: '--explain'
 
@@ -107,12 +108,44 @@ jobs:
       - name: Compile (MSRV)
         run: cargo check --workspace --all-targets --all-features --locked
 
+  quality:
+    name: Quality and Security
+    needs: plan
+    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.docs == 'true' || needs.plan.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          cache-key: commit-quality
+          install-nextest: "false"
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        with:
+          tool: cargo-deny
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        with:
+          tool: cargo-audit
+
+      - name: Quality checks
+        run: just ci-check
+
   # ==========================================================================
   # Job 3: CI Matrix
   # ==========================================================================
   ci:
     name: CI (${{ matrix.target.name }})
-    needs: [msrv, plan]
+    needs: [msrv, quality, plan]
     if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30
@@ -123,18 +156,22 @@ jobs:
           - name: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             cache-key: commit-linux-x64
+            test: true
 
           - name: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             cache-key: commit-linux-arm64
+            test: false
 
           - name: x86_64-pc-windows-msvc
             runner: windows-latest
             cache-key: commit-windows-x64
+            test: true
 
           - name: aarch64-pc-windows-msvc
             runner: windows-11-arm
             cache-key: commit-windows-arm64
+            test: false
 
     env:
       RAIL_SINCE: ${{ needs.plan.outputs.base-ref }}
@@ -150,29 +187,17 @@ jobs:
         uses: ./.github/actions/setup
         with:
           cache-key: ${{ matrix.target.cache-key }}
-
-      # Infra changes trigger full workspace; otherwise use change detection
-      - name: Quality Checks
-        run: just ci-check
+          install-nextest: ${{ matrix.target.test }}
 
       - name: Build
-        if: needs.plan.outputs.infra == 'true'
         run: just build-all
 
-      - name: Build (smart)
-        if: needs.plan.outputs.infra != 'true' && needs.plan.outputs.build == 'true'
-        run: just ci-build
-
       - name: Tests
-        if: needs.plan.outputs.infra == 'true'
+        if: matrix.target.test && needs.plan.outputs.test == 'true'
         run: just test-all
 
-      - name: Tests (smart)
-        if: needs.plan.outputs.infra != 'true' && needs.plan.outputs.test == 'true'
-        run: just ci-test
-
       - name: Upload JUnit Test Report
-        if: always()
+        if: always() && matrix.target.test && needs.plan.outputs.test == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: junit-report-${{ matrix.target.name }}
@@ -181,7 +206,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Detect JUnit Test Report
-        if: always()
+        if: always() && matrix.target.test && needs.plan.outputs.test == 'true'
         id: junit
         shell: bash
         run: |

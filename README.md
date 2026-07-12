@@ -13,8 +13,8 @@ One binary. One `rail.toml`. No hosted service, workspace-hack crate, embedded g
 | Replace | With |
 | --- | --- |
 | `cargo-hakari`, dependency-unification scripts | `cargo rail unify` |
-| `cargo-udeps`, `cargo-shear`, `cargo-machete` | Built-in unused-dependency detection and removal |
-| `cargo-features-manager`, `cargo-msrv`, feature-audit scripts | Dead-feature pruning, borrowed-feature repair, and MSRV enforcement |
+| `cargo-udeps`, `cargo-shear`, `cargo-machete` | Built-in compiler-backed unused-dependency detection and removal |
+| `cargo-unused-features`, `cargo-features-manager`, `cargo-autoinherit`, `cargo-msrv`, feature-audit scripts | Dead-feature pruning, borrowed-feature repair, inheritance enforcement, and MSRV computation |
 | `release-plz`, `cargo-release`, `git-cliff` | `cargo rail change` + `cargo rail release` |
 | `dorny/paths-filter`, path globs, package-selection scripts | `cargo rail plan` + `cargo rail run` |
 | Hand-maintained publish ordering | Dependency-ordered workspace releases |
@@ -27,9 +27,12 @@ These are not disconnected wrappers. Every workflow consumes the same resolved w
 ```bash
 cargo install cargo-rail
 cargo rail init
+cargo rail config sync
 ```
 
-Pre-built archives, SHA-256 checksums, and signed provenance are available from [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases). `cargo-binstall cargo-rail` is supported.
+Pre-built archives for Linux, Windows, and Apple Silicon macOS, SHA-256 checksums, and signed provenance are available from [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases). `cargo-binstall cargo-rail` is supported.
+
+Run `cargo rail config sync` after every cargo-rail upgrade. It materializes new policy fields and detected targets without overwriting existing choices; review the diff, then run `cargo rail config validate --strict`.
 
 ## Unify
 

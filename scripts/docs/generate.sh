@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_FILE="$REPO_ROOT/docs/commands.md"
-BINARY="$REPO_ROOT/target/release/cargo-rail"
+BINARY="$REPO_ROOT/target/debug/cargo-rail"
 
 CHECK_MODE=false
 
@@ -42,8 +42,8 @@ done
 ensure_binary() {
   # Always build (cargo is incremental and will no-op when up to date).
   # This prevents regenerating docs from a stale binary.
-  echo "Building cargo-rail (release)..."
-  cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
+  echo "Building cargo-rail..."
+  cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

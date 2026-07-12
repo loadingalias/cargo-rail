@@ -16,6 +16,9 @@ just check
 just test
 ```
 
+`just check` is read-only. Run `just fix` when you explicitly want rustfmt and
+Clippy to rewrite the worktree.
+
 Use the full variants after changing features, dependency resolution, or target-specific behavior:
 
 ```bash
@@ -27,6 +30,13 @@ just test-all
 
 ```bash
 just gen-docs
+```
+
+Changes to unify performance must include the workload and before/after numbers.
+The repository benchmark accepts package and run counts:
+
+```bash
+just bench-unify 25 10
 ```
 
 ## Change requirements

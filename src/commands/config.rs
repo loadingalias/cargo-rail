@@ -739,7 +739,7 @@ struct ConfigSyncResult {
   has_changes: bool,
 }
 
-/// Sync configuration: add missing fields and update targets
+/// Sync configuration after upgrades: add missing fields and update targets
 ///
 /// This command ensures rail.toml has all known configuration fields
 /// without overwriting existing user values. It also syncs target triples

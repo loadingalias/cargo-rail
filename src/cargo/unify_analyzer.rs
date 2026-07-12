@@ -912,7 +912,7 @@ impl UnifyAnalyzer {
     }
 
     // Scan for dead and optional features if enabled
-    let feature_pruner = FeaturePruner::new(&self.metadata, &self.config, &self.target_cfg_sets);
+    let feature_pruner = FeaturePruner::new(&self.metadata, &self.manifests, &self.config, &self.target_cfg_sets);
     let (mut pruned_features, optional_features, reachable_features) = if self.config.prune_dead_features {
       progress!("Scanning for dead features in resolved graph...");
       feature_pruner.scan()

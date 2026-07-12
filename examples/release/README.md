@@ -10,13 +10,14 @@ cargo rail change status
 cargo rail release check my-crate --extended
 cargo rail release run my-crate --bump auto --check
 cargo rail release run my-crate --bump auto --yes
-git push origin main --follow-tags
 ```
 
 `--bump auto` reads change files first, then conventional commits since each
 crate's previous tag. Change files are consumed in the release commit;
 consumption is all-or-nothing, so a plan covering only some of a file's
 crates is rejected.
+
+With `push = true`, `release run` pushes its verified release commit and tags. Do not add a second push step.
 
 ## Release PR
 

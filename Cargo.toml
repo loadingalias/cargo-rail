@@ -16,15 +16,15 @@ categories = [
 ]
 keywords = ["monorepo", "workspace", "changesets", "release", "cicd"]
 readme = "README.md"
-exclude = [
-    "docs/",
-    "tests/",
-    ".github/",
-    ".config/",
-    "examples/",
-    "scripts/",
-    "distribution/",
-    "backlog/",
+include = [
+    "/src/**/*.rs",
+    "/schemas/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
 ]
 
 [workspace]

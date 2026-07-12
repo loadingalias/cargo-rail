@@ -4,6 +4,7 @@
 #
 # Commands:
 #   cargo rail init           - Generate this config
+#   cargo rail config sync    - Materialize fields added by an upgrade
 #   cargo rail plan           - Build a deterministic change plan
 #   cargo rail run            - Execute planner-selected surfaces
 #   cargo rail unify          - Unify workspace dependencies
@@ -50,6 +51,8 @@ fix_undeclared_features = true  # Auto-fix borrowed features (default: true)
 skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]  # Features to skip in undeclared detection (glob patterns)
 sort_dependencies = true  # Sort deps alphabetically (default: true)
 enforce_msrv_inheritance = false  # Ensure members inherit workspace rust-version
+consumer_scope = "open"  # Consumer boundary for destructive private-graph cleanup: open, workspace
+compiler_diag_cache = true  # Cache rustc source diagnostics for faster repeated unify runs (default: true)
 
 
 [release]
@@ -68,6 +71,7 @@ pre_1_breaking_bump = "minor"
 unconventional_commits = "deny"
 semver_check = "warn"
 require_change_files = true
+forge = "auto"  # Release creation provider: auto, github, gitlab
 
 [release.changelog]
 path = "CHANGELOG.md"
@@ -75,6 +79,7 @@ relative_to = "crate"
 emoji = false
 group_order = ["breaking", "feat", "fix", "perf", "docs", "deps"]
 fallback = "skip"
+entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"  # Entry placeholders: scope, breaking, description, prs, sha, sha_link, type
 
 [release.changelog.filters]
 skip_types = ["build", "chore", "ci", "refactor", "style", "test"]

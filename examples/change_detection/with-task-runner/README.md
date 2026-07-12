@@ -14,8 +14,7 @@ if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
   if echo "$SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
     cargo xtask test --workspace
   elif echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
-    mapfile -t CRATES < <(echo "$SCOPE" | jq -r '.crates[]')
-    cargo xtask test "${CRATES[@]}"
+    echo "$SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
   fi
 fi
 ```
@@ -23,10 +22,10 @@ fi
 ## CI Example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5.0.0
+- uses: loadingalias/cargo-rail-action@v5.1.0
   id: rail
   with:
-    version: 0.17.0
+    version: 0.17.1
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'
@@ -37,8 +36,7 @@ fi
     if [ "$MODE" = "workspace" ]; then
       cargo xtask test --workspace
     elif [ "$MODE" = "crates" ]; then
-      mapfile -t CRATES < <(echo "$SCOPE_JSON" | jq -r '.crates[]')
-      cargo xtask test "${CRATES[@]}"
+      echo "$SCOPE_JSON" | jq -r '.crates[]' | xargs cargo xtask test
     fi
 ```
 

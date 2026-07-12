@@ -1157,7 +1157,7 @@ Commands:
   locate    Print the path to the active config file
   print     Print the effective configuration with defaults
   validate  Validate the configuration file
-  sync      Sync configuration: add missing fields and update targets
+  sync      Sync configuration after upgrades: add missing fields and update targets
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1185,7 +1185,7 @@ Examples:
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
   cargo rail config sync --check        # Preview config updates
-  cargo rail config sync                # Add missing fields, sync targets
+  cargo rail config sync                # Run after upgrades; add fields and sync targets
 ```
 
 ---
@@ -1319,7 +1319,7 @@ Options:
 ### cargo rail config sync
 
 ```
-Sync configuration: add missing fields and update targets
+Sync configuration after upgrades: add missing fields and update targets
 
 Scans the workspace for target triples and adds any missing config fields with their default values. Preserves all existing settings, comments, and formatting.
 
