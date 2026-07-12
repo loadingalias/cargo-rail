@@ -551,7 +551,7 @@ name = "crate-a"
 version = "0.1.0"
 edition.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 serde = { version = "1", features = ["derive"] }
 "#,
     "pub fn a() {}",
@@ -564,10 +564,10 @@ name = "crate-b"
 version = "0.1.0"
 edition.workspace = true
 
-[target.'cfg(target_family = "unix")'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 serde = "1"
 "#,
-    "#[cfg(unix)]\n#[derive(serde::Serialize)]\npub struct BorrowedDerive;\n",
+    "#[cfg(any(unix, windows))]\n#[derive(serde::Serialize)]\npub struct BorrowedDerive;\n",
   )?;
   workspace.commit("Add target-specific borrowed derive feature")?;
 
@@ -591,7 +591,7 @@ serde = "1"
   );
   let manifest = fs::read_to_string(workspace.path.join("crates/crate-b/Cargo.toml"))?;
   let parsed: toml_edit::DocumentMut = manifest.parse()?;
-  let serde = &parsed["target"]["cfg(target_family = \"unix\")"]["dependencies"]["serde"];
+  let serde = &parsed["target"]["cfg(any(unix, windows))"]["dependencies"]["serde"];
   assert!(
     serde.to_string().contains("derive"),
     "borrowed feature must stay in the matching target section\n{manifest}"

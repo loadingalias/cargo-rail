@@ -393,11 +393,9 @@ pub fn standalone_missing_features(
       .filter(|span| span["is_primary"] == true)
       .filter_map(|span| span["file_name"].as_str())
       .map(|path| {
-        Path::new(path)
-          .strip_prefix(workspace_root)
-          .unwrap_or_else(|_| Path::new(path))
-          .to_string_lossy()
-          .into_owned()
+        let path = Path::new(path);
+        let relative = path.strip_prefix(workspace_root).unwrap_or(path);
+        crate::utils::path_to_git_format(relative)
       })
       .collect();
     for (dependency, features) in candidates {

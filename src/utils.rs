@@ -331,16 +331,7 @@ pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> O
 /// Git expects paths with forward slashes, even on Windows.
 /// This function converts backslashes to forward slashes for use in Git commands.
 pub fn path_to_git_format(path: &Path) -> String {
-  // On Windows, convert backslashes to forward slashes
-  // On Unix, this is a no-op since paths already use forward slashes
-  #[cfg(target_os = "windows")]
-  {
-    path.to_string_lossy().replace('\\', "/")
-  }
-  #[cfg(not(target_os = "windows"))]
-  {
-    path.to_string_lossy().to_string()
-  }
+  path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]
@@ -452,26 +443,20 @@ mod tests {
   }
 
   #[test]
-  fn test_path_to_git_format_unix() {
-    #[cfg(not(target_os = "windows"))]
-    {
-      let path = PathBuf::from("/home/user/repo/src/main.rs");
-      assert_eq!(path_to_git_format(&path), "/home/user/repo/src/main.rs");
+  fn test_path_to_git_format_preserves_forward_slashes() {
+    let path = PathBuf::from("/home/user/repo/src/main.rs");
+    assert_eq!(path_to_git_format(&path), "/home/user/repo/src/main.rs");
 
-      let path = PathBuf::from("./relative/path.rs");
-      assert_eq!(path_to_git_format(&path), "./relative/path.rs");
-    }
+    let path = PathBuf::from("./relative/path.rs");
+    assert_eq!(path_to_git_format(&path), "./relative/path.rs");
   }
 
   #[test]
-  fn test_path_to_git_format_windows() {
-    #[cfg(target_os = "windows")]
-    {
-      let path = PathBuf::from("C:\\Users\\test\\repo\\src\\main.rs");
-      assert_eq!(path_to_git_format(&path), "C:/Users/test/repo/src/main.rs");
+  fn test_path_to_git_format_normalizes_backslashes_on_every_host() {
+    let path = PathBuf::from("C:\\Users\\test\\repo\\src\\main.rs");
+    assert_eq!(path_to_git_format(&path), "C:/Users/test/repo/src/main.rs");
 
-      let path = PathBuf::from("..\\relative\\path.rs");
-      assert_eq!(path_to_git_format(&path), "../relative/path.rs");
-    }
+    let path = PathBuf::from("..\\relative\\path.rs");
+    assert_eq!(path_to_git_format(&path), "../relative/path.rs");
   }
 }
