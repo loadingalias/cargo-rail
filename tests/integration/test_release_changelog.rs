@@ -2231,6 +2231,72 @@ push = true
 }
 
 #[test]
+fn test_release_abort_reconciles_push_rejected_by_local_hook() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("push-abort", "0.1.0")?;
+  let remote = tempfile::TempDir::new()?;
+  git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+  ws.set_remote(remote.path().to_str().unwrap())?;
+  git(&ws.path, &["push", "-u", "origin", "main"])?;
+  let initial = git(&ws.path, &["rev-parse", "HEAD"])?;
+  let initial = String::from_utf8_lossy(&initial.stdout).trim().to_string();
+
+  let hook_path = ws.path.join(".git/hooks/pre-push");
+  std::fs::write(&hook_path, "#!/bin/sh\nexit 1\n")?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(&hook_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms)?;
+  }
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_clean = false
+require_release_notes = false
+push = true
+"#,
+  )?;
+
+  let interrupted = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  assert!(
+    !interrupted.status.success(),
+    "local pre-push hook should reject release push"
+  );
+  let state_path = only_release_state(&ws.path)?;
+
+  let aborted = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+  )?;
+  assert!(
+    aborted.status.success(),
+    "abort stderr:\n{}",
+    String::from_utf8_lossy(&aborted.stderr)
+  );
+  assert_eq!(
+    git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
+    format!("{}\n", initial).as_bytes()
+  );
+  assert!(git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout.is_empty());
+  assert!(std::fs::read_to_string(ws.path.join("Cargo.toml"))?.contains("version = \"0.1.0\""));
+
+  Ok(())
+}
+
+#[test]
 fn test_release_notes_override_satisfies_required_notes() -> Result<()> {
   let ws = TestWorkspace::new_single_crate("manual-notes", "0.1.0")?;
   ws.write_release_config(

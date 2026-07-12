@@ -271,7 +271,8 @@ impl<'a> ReleasePublisher<'a> {
     if state.status != ReleaseStatus::Active {
       return Err(RailError::message(format!("release state is {:?}", state.status)));
     }
-    let irreversible = step_may_have_side_effect(&state.push)
+    let push_is_proven_absent = state.push.status == StepStatus::InProgress && self.remote_push_is_absent(&state)?;
+    let irreversible = (!push_is_proven_absent && step_may_have_side_effect(&state.push))
       || state.crates.iter().any(|crate_state| {
         step_may_have_side_effect(&crate_state.forge_draft)
           || step_may_have_side_effect(&crate_state.publication)
@@ -965,6 +966,24 @@ impl<'a> ReleasePublisher<'a> {
             "remote tag '{}' points to {}, expected {}",
             crate_plan.tag_name, remote_tag, expected
           )));
+        }
+      }
+    }
+    Ok(true)
+  }
+
+  fn remote_push_is_absent(&self, state: &ReleaseState) -> RailResult<bool> {
+    let remote_head = self.remote_ref_target(&format!("refs/heads/{}", state.branch))?;
+    if remote_head.as_deref() != Some(state.initial_head.as_str()) {
+      return Ok(false);
+    }
+    if !state.skip_tag {
+      for crate_plan in &state.plan.crates {
+        if self
+          .remote_ref_target(&format!("refs/tags/{}", crate_plan.tag_name))?
+          .is_some()
+        {
+          return Ok(false);
         }
       }
     }
