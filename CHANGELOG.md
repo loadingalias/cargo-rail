@@ -2,6 +2,16 @@
 
 
 
+
+## [0.17.3](https://github.com/loadingalias/cargo-rail/compare/v0.17.2...v0.17.3) - 2026-07-14
+
+- Fixed crates.io publication checks so local workspace packages cannot masquerade as published versions. Release publishing now targets crates.io explicitly, requires the committed lockfile, rejects dirty package contents, and excludes Finder metadata.
+
+### Bug Fixes
+
+- **release**: verify crates.io publication explicitly ([1bd5c68](https://github.com/loadingalias/cargo-rail/commit/1bd5c68efe44ca4e9c39616bae1f568a5d11d20d))
+
+
 ## [0.17.2](https://github.com/loadingalias/cargo-rail/compare/v0.17.1...v0.17.2) - 2026-07-14
 
 - Fixed release Git operations to preserve the caller environment for hooks, expose standard cargo-rail release context, and retain complete hook diagnostics. Removed the hook-bypassing push dry run while keeping one atomic branch-and-tag push.
