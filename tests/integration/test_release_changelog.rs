@@ -327,6 +327,153 @@ fn run_with_path_prefix(ws: &TestWorkspace, prefix: &Path, args: &[&str]) -> Res
 }
 
 #[cfg(unix)]
+fn registry_shadow_cargo_shim(log_path: &Path, published_path: &Path) -> Result<tempfile::TempDir> {
+  use std::os::unix::fs::PermissionsExt;
+
+  let real_cargo = Command::new("sh").args(["-c", "command -v cargo"]).output()?;
+  let real_cargo = String::from_utf8_lossy(&real_cargo.stdout).trim().to_string();
+  let dir = tempfile::TempDir::new()?;
+  let path = dir.path().join("cargo");
+  std::fs::write(
+    &path,
+    format!(
+      r#"#!/bin/sh
+echo "$*" >> "{}"
+
+if [ "$1" = "search" ]; then
+  exit 0
+fi
+
+if [ "$1" = "info" ]; then
+  case " $* " in
+    *" --registry crates-io "*)
+      if [ -f "{}" ]; then
+        exit 0
+      fi
+      exit 101
+      ;;
+  esac
+
+  # Recreate Cargo's local-workspace shadowing: an unqualified lookup of the
+  # version being released succeeds even though the registry lacks it.
+  exit 0
+fi
+
+if [ "$1" = "publish" ]; then
+  case " $* " in
+    *" --allow-dirty "*)
+      echo "publish must reject dirty package contents" >&2
+      exit 1
+      ;;
+  esac
+  case " $* " in
+    *" --locked "*) ;;
+    *)
+      echo "publish must use the committed lockfile" >&2
+      exit 1
+      ;;
+  esac
+  case " $* " in
+    *" --registry crates-io "*) ;;
+    *)
+      echo "publish must explicitly target crates.io" >&2
+      exit 1
+      ;;
+  esac
+  touch "{}"
+  exit 0
+fi
+
+exec "{}" "$@"
+"#,
+      log_path.display(),
+      published_path.display(),
+      published_path.display(),
+      real_cargo
+    ),
+  )?;
+  let mut perms = std::fs::metadata(&path)?.permissions();
+  perms.set_mode(0o755);
+  std::fs::set_permissions(&path, perms)?;
+  Ok(dir)
+}
+
+#[cfg(unix)]
+#[test]
+fn release_publish_ignores_local_workspace_shadow_and_targets_crates_io() -> Result<()> {
+  let ws = TestWorkspace::new_single_crate("registry-shadow", "0.1.0")?;
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_changelog_entries = false
+require_clean = false
+require_release_notes = false
+semver_check = "off"
+sign_tags = false
+push = false
+create_github_release = false
+publish_delay = 1
+"#,
+  )?;
+  ws.commit("Configure releases")?;
+  ws.tag("v0.1.0", "Release registry-shadow 0.1.0")?;
+
+  let shim_state = tempfile::TempDir::new()?;
+  let log_path = shim_state.path().join("cargo.log");
+  let published_path = shim_state.path().join("published");
+  let shim = registry_shadow_cargo_shim(&log_path, &published_path)?;
+  let output = run_with_path_prefix(
+    &ws,
+    shim.path(),
+    &["rail", "release", "run", "registry-shadow", "--bump", "patch", "--yes"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    output.status.success(),
+    "release should publish despite an unqualified local lookup succeeding\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  let log = std::fs::read_to_string(&log_path)?;
+  assert!(
+    log
+      .lines()
+      .any(|line| line == "info --registry crates-io registry-shadow@0.1.1"),
+    "registry reconciliation must bypass the local workspace package\ncargo calls:\n{}",
+    log
+  );
+  let publishes = log
+    .lines()
+    .filter(|line| line.starts_with("publish "))
+    .collect::<Vec<_>>();
+  assert_eq!(
+    publishes,
+    vec!["publish --locked --registry crates-io"],
+    "the release must publish exactly once with fail-closed arguments\ncargo calls:\n{}",
+    log
+  );
+  assert!(published_path.exists(), "the registry shim should record a publication");
+
+  Ok(())
+}
+
+#[test]
+fn release_package_excludes_finder_metadata() -> Result<()> {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let manifest: toml_edit::DocumentMut = std::fs::read_to_string(root.join("Cargo.toml"))?.parse()?;
+  let include = manifest["package"]["include"]
+    .as_array()
+    .ok_or_else(|| anyhow::anyhow!("package.include must be an array"))?;
+
+  assert!(
+    include.iter().any(|value| value.as_str() == Some("!**/.DS_Store")),
+    "package.include must exclude Finder metadata even when tests are included"
+  );
+  Ok(())
+}
+
+#[cfg(unix)]
 fn gh_shim(log_path: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
   use std::os::unix::fs::PermissionsExt;
 

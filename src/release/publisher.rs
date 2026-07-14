@@ -794,7 +794,11 @@ impl<'a> ReleasePublisher<'a> {
       .parent()
       .ok_or_else(|| RailError::message("Invalid manifest path"))?;
 
-    let output = process::run("cargo", &["publish", "--allow-dirty"], Some(crate_dir))?;
+    let output = process::run(
+      "cargo",
+      &["publish", "--locked", "--registry", "crates-io"],
+      Some(crate_dir),
+    )?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1000,7 +1004,11 @@ impl<'a> ReleasePublisher<'a> {
 
   fn registry_version_exists(&self, plan: &CrateReleasePlan) -> bool {
     let spec = format!("{}@{}", plan.name, plan.new_version);
-    process::succeeds("cargo", &["info", &spec], Some(self.ctx.workspace_root()))
+    process::succeeds(
+      "cargo",
+      &["info", "--registry", "crates-io", &spec],
+      Some(self.ctx.workspace_root()),
+    )
   }
 
   fn wait_for_registry(&self, plan: &CrateReleasePlan) -> RailResult<()> {

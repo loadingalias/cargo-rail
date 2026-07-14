@@ -25,6 +25,7 @@ include = [
     "/README.md",
     "/LICENSE",
     "/CHANGELOG.md",
+    "!**/.DS_Store",
 ]
 
 [workspace]
