@@ -405,9 +405,9 @@ impl fmt::Display for GitError {
       GitError::CommandFailed { command, stderr } => {
         let stderr = stderr.trim();
         if stderr.is_empty() {
-          write!(f, "git {} failed", command)
+          write!(f, "{} failed", command)
         } else {
-          write!(f, "git {} failed: {}", command, stderr)
+          write!(f, "{} failed: {}", command, stderr)
         }
       }
       GitError::RepoNotFound { path } => {
@@ -439,6 +439,20 @@ impl fmt::Display for GitError {
 
 /// Result type alias for cargo-rail
 pub type RailResult<T> = Result<T, RailError>;
+
+/// Preserve both subprocess streams in an existing Git error diagnostic.
+pub(crate) fn git_command_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+  let stdout = String::from_utf8_lossy(stdout);
+  let stderr = String::from_utf8_lossy(stderr);
+  let stdout = stdout.trim_end();
+  let stderr = stderr.trim_end();
+  match (stdout.is_empty(), stderr.is_empty()) {
+    (true, true) => String::new(),
+    (false, true) => stdout.to_string(),
+    (true, false) => stderr.to_string(),
+    (false, false) => format!("stdout:\n{}\nstderr:\n{}", stdout, stderr),
+  }
+}
 
 /// Helper trait to add context to Results
 pub trait ResultExt<T> {

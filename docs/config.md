@@ -277,6 +277,19 @@ forge = "auto"
 sign_tags = true
 ```
 
+#### Release Hook Context
+
+cargo-rail never bypasses Git hooks. Git commands inherit the caller environment, except repository-redirection variables such as `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE`, which cargo-rail removes to preserve the selected workspace boundary.
+
+For every cargo-rail-owned release push, including release PR branches, cargo-rail adds:
+
+```text
+CARGO_RAIL_OPERATION=release
+CARGO_RAIL_RELEASE_PUSH=1
+```
+
+Release commits receive `CARGO_RAIL_OPERATION=release`. Hooks can use these variables to distinguish a release operation from an ordinary developer commit or push. The final branch-and-tag push remains one atomic Git invocation, so `pre-push` runs exactly once.
+
 #### Changelog Options
 
 | Option | Type | Default | Description |

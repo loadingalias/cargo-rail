@@ -22,55 +22,45 @@ pub use defaults::detect_default_base_ref;
 pub use ops::LogEntry;
 pub use system::{CommitInfo, SystemGit, init_repo};
 
-/// Create a properly-configured git command for any repository path.
+/// Create a properly configured Git command for a repository path.
 ///
-/// This provides the same environment isolation as `SystemGit::git_cmd()` but
-/// can be used standalone when you don't need a full `SystemGit` instance.
-///
-/// Features:
-/// - Isolated environment (clears and whitelists only essential vars)
-/// - Preserves PATH, HOME, and auth-related variables (SSH_AUTH_SOCK, etc.)
-/// - Sets safe git config overrides (protocol.version=2, etc.)
+/// Commands inherit the caller environment so credentials, signing agents,
+/// toolchains, caches, proxies, and hooks behave exactly as they do for a
+/// direct Git invocation. Repository-redirection variables are removed because
+/// cargo-rail owns the repository boundary through `git -C <path>`.
 pub(crate) fn git_cmd_for_path(repo_path: &Path) -> Command {
   let mut cmd = Command::new("git");
-
-  // Set working directory
   cmd.arg("-C").arg(repo_path);
+  sanitize_git_environment(&mut cmd);
 
-  // Isolated environment (don't trust global config)
-  cmd.env_clear();
-
-  // Always preserve PATH for process execution.
-  if let Some(path) = std::env::var_os("PATH") {
-    cmd.env("PATH", path);
-  }
-
-  // Preserve common home directory variables for git config/credentials.
-  for key in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
-    if let Some(val) = std::env::var_os(key) {
-      cmd.env(key, val);
-    }
-  }
-
-  // Preserve common auth-related variables so fetch/push work with SSH agents.
-  for key in [
-    "SSH_AUTH_SOCK",
-    "SSH_ASKPASS",
-    "DISPLAY",
-    "GIT_ASKPASS",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_TERMINAL_PROMPT",
-  ] {
-    if let Some(val) = std::env::var_os(key) {
-      cmd.env(key, val);
-    }
-  }
-
-  // Force safe behavior (override user config)
+  // Stable machine-facing behavior without disabling user configuration.
   cmd.arg("-c").arg("protocol.version=2");
   cmd.arg("-c").arg("advice.detachedHead=false");
   cmd.arg("-c").arg("core.quotePath=false"); // Don't escape non-ASCII
 
   cmd
+}
+
+fn sanitize_git_environment(cmd: &mut Command) {
+  // Git documents these as repository-local or repository-selection inputs.
+  // Inheriting them would let an ambient shell override the explicit -C path.
+  for key in [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_QUARANTINE_PATH",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+  ] {
+    cmd.env_remove(key);
+  }
 }

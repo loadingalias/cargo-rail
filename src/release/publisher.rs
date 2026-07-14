@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 const GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES: usize = 120_000;
 const RELEASE_REMOTE: &str = "origin";
+const RELEASE_OPERATION_ENV: &[(&str, &str)] = &[("CARGO_RAIL_OPERATION", "release")];
+const RELEASE_PUSH_ENV: &[(&str, &str)] = &[("CARGO_RAIL_OPERATION", "release"), ("CARGO_RAIL_RELEASE_PUSH", "1")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReleaseForge {
@@ -107,10 +109,6 @@ impl<'a> ReleasePublisher<'a> {
         ));
       }
 
-      let branch = git.current_branch()?;
-      let refspec = format!("HEAD:{}", branch);
-      git.run_git(&["push", "--dry-run", "--no-verify", RELEASE_REMOTE, &refspec])?;
-
       if !skip_tag {
         for crate_plan in &plan.crates {
           if self.remote_tag_exists(&crate_plan.tag_name)? {
@@ -183,7 +181,7 @@ impl<'a> ReleasePublisher<'a> {
     self.preflight_pr()?;
     let branch = release_branch_name(plan)?;
     let git = self.ctx.git()?.git();
-    git.run_git(&["checkout", "-B", &branch])?;
+    git.run_git_observable_with_env(&["checkout", "-B", &branch], RELEASE_OPERATION_ENV)?;
 
     let mut consumed_change_files = false;
     for crate_plan in &plan.crates {
@@ -207,8 +205,8 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     self.stage_planned_paths(planned_paths, control_paths)?;
-    git.commit(&format!("chore(release): prepare {}", branch))?;
-    git.run_git(&["push", "-u", RELEASE_REMOTE, &branch])?;
+    git.commit_with_env(&format!("chore(release): prepare {}", branch), RELEASE_OPERATION_ENV)?;
+    git.run_git_observable_with_env(&["push", "-u", RELEASE_REMOTE, &branch], RELEASE_PUSH_ENV)?;
     self.open_release_pr(plan, &branch)?;
     progress!("release PR ready: {}", branch);
     Ok(())
@@ -710,7 +708,7 @@ impl<'a> ReleasePublisher<'a> {
 
     // Refuse any mutation outside the approved path set, then stage only that set.
     self.stage_planned_paths(planned_paths, control_paths)?;
-    self.ctx.git()?.git().commit(&message)?;
+    self.ctx.git()?.git().commit_with_env(&message, RELEASE_OPERATION_ENV)?;
 
     Ok(())
   }
@@ -785,7 +783,7 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    git.run_git(&borrowed)?;
+    git.run_git_observable_with_env(&borrowed, RELEASE_PUSH_ENV)?;
     Ok(())
   }
 

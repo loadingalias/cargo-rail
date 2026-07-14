@@ -3,13 +3,15 @@
 //! Uses git plumbing commands for all operations. Optimized for:
 //! - Batch processing (cat-file --batch, rev-list --format=raw)
 //! - Metadata caching (repo paths, HEAD, branch)
-//! - Safe subprocess execution (isolated environment)
+//! - Safe subprocess execution (inherited caller environment with bounded repository state)
 //! - Zero-copy parsing where possible
 
-use crate::error::{GitError, RailError, RailResult, ResultExt};
+use super::{git_cmd_for_path, sanitize_git_environment};
+use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::utils;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// Normalize a path from git output to a platform-native path.
 ///
@@ -92,9 +94,7 @@ impl SystemGit {
   pub fn open(path: &Path) -> RailResult<Self> {
     let repo_path = utils::canonicalize_existing(path).unwrap_or_else(|_| path.to_path_buf());
     // Get repo metadata in one subprocess call
-    let output = Command::new("git")
-      .arg("-C")
-      .arg(&repo_path)
+    let output = git_cmd_for_path(&repo_path)
       .args(["rev-parse", "--show-toplevel"])
       .output()
       .context("Failed to execute git rev-parse")?;
@@ -226,57 +226,15 @@ impl SystemGit {
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git hash-object --stdin".to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
-  /// Create a safe git command with isolated environment
-  ///
-  /// - Sets working directory to repo path
-  /// - Clears environment variables
-  /// - Whitelists only essential variables (PATH, HOME, auth-related vars)
-  /// - Adds safe configuration overrides
+  /// Create a Git command bounded to this repository.
   pub(crate) fn git_cmd(&self) -> Command {
-    let mut cmd = Command::new("git");
-
-    // Set working directory
-    cmd.arg("-C").arg(&self.repo_path);
-
-    // Isolated environment (don't trust global config)
-    cmd.env_clear();
-    // Always preserve PATH for process execution.
-    if let Some(path) = std::env::var_os("PATH") {
-      cmd.env("PATH", path);
-    }
-    // Preserve common home directory variables for git config/credentials.
-    for key in ["HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"] {
-      if let Some(val) = std::env::var_os(key) {
-        cmd.env(key, val);
-      }
-    }
-    // Preserve common auth-related variables so fetch/push work with SSH agents and askpass.
-    for key in [
-      "SSH_AUTH_SOCK",
-      "SSH_ASKPASS",
-      "DISPLAY",
-      "GIT_ASKPASS",
-      "GIT_SSH",
-      "GIT_SSH_COMMAND",
-      "GIT_TERMINAL_PROMPT",
-    ] {
-      if let Some(val) = std::env::var_os(key) {
-        cmd.env(key, val);
-      }
-    }
-
-    // Force safe behavior (override user config)
-    cmd.arg("-c").arg("protocol.version=2");
-    cmd.arg("-c").arg("advice.detachedHead=false");
-    cmd.arg("-c").arg("core.quotePath=false"); // Don't escape non-ASCII
-
-    cmd
+    git_cmd_for_path(&self.repo_path)
   }
 
   /// Run a git command and return the output or error
@@ -296,13 +254,39 @@ impl SystemGit {
       .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
 
     if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
         command: format!("git {}", args.join(" ")),
-        stderr: stderr.to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
 
+    Ok(output)
+  }
+
+  /// Run a user-facing Git command while preserving its output.
+  ///
+  /// Human output is streamed as it arrives and retained for errors. JSON and
+  /// quiet modes retain the same structured capture without writing raw child
+  /// output into the command's output stream.
+  pub(crate) fn run_git_observable(&self, args: &[&str]) -> RailResult<Output> {
+    self.run_git_observable_with_env(args, &[])
+  }
+
+  /// Run a user-facing Git command with operation-specific hook context.
+  pub(crate) fn run_git_observable_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> RailResult<Output> {
+    let mut cmd = self.git_cmd();
+    cmd.args(args);
+    for (key, value) in env {
+      cmd.env(key, value);
+    }
+
+    let output = observable_output(&mut cmd).with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: format!("git {}", args.join(" ")),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
     Ok(output)
   }
 
@@ -328,36 +312,6 @@ impl SystemGit {
     }
   }
 
-  /// Run a git command with a custom error builder
-  ///
-  /// This allows using specific GitError variants while still getting
-  /// the boilerplate reduction benefits.
-  ///
-  /// Example:
-  /// ```text
-  /// git.run_git_with_error(&["push", "-u", "origin", "main"], |stderr| {
-  ///   RailError::Git(GitError::PushFailed { ... })
-  /// })?;
-  /// ```
-  pub(crate) fn run_git_with_error<F>(&self, args: &[&str], error_fn: F) -> RailResult<std::process::Output>
-  where
-    F: FnOnce(&str) -> RailError,
-  {
-    let mut cmd = self.git_cmd();
-    cmd.args(args);
-
-    let output = cmd
-      .output()
-      .with_context(|| format!("Failed to execute git {}", args.join(" ")))?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(error_fn(&stderr));
-    }
-
-    Ok(output)
-  }
-
   /// Check if a tag exists
   pub fn tag_exists(&self, tag_name: &str) -> RailResult<bool> {
     let ref_name = format!("refs/tags/{}", tag_name);
@@ -378,13 +332,10 @@ impl SystemGit {
         // Exit code 1 means key not found (not an error)
         Ok(None)
       }
-      Ok(output) => {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(RailError::Git(GitError::CommandFailed {
-          command: format!("git config --get {}", key),
-          stderr: stderr.to_string(),
-        }))
-      }
+      Ok(output) => Err(RailError::Git(GitError::CommandFailed {
+        command: format!("git config --get {}", key),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      })),
       Err(e) => Err(RailError::message(format!("Failed to get git config {}: {}", key, e))),
     }
   }
@@ -418,7 +369,7 @@ impl SystemGit {
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git add -A -- <planned-paths>".to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
     Ok(())
@@ -446,7 +397,12 @@ impl SystemGit {
 
   /// Create a commit with the given message
   pub fn commit(&self, message: &str) -> RailResult<String> {
-    self.run_git(&["commit", "-m", message])?;
+    self.commit_with_env(message, &[])
+  }
+
+  /// Create a commit with operation-specific hook context.
+  pub(crate) fn commit_with_env(&self, message: &str, env: &[(&str, &str)]) -> RailResult<String> {
+    self.run_git_observable_with_env(&["commit", "-m", message], env)?;
     // Return the new commit SHA
     self.run_git_stdout(&["rev-parse", "HEAD"])
   }
@@ -472,13 +428,12 @@ impl SystemGit {
 
     cmd.arg(name);
 
-    let output = cmd.output().context("Failed to run git tag")?;
+    let output = observable_output(&mut cmd).context("Failed to run git tag")?;
 
     if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
         command: format!("git tag {}", name),
-        stderr: stderr.to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
 
@@ -535,11 +490,62 @@ impl SystemGit {
   }
 }
 
+pub(crate) fn observable_output(cmd: &mut Command) -> io::Result<Output> {
+  cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+  let mut child = cmd.spawn()?;
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| io::Error::other("Git stdout pipe was unavailable"))?;
+  let stderr = child
+    .stderr
+    .take()
+    .ok_or_else(|| io::Error::other("Git stderr pipe was unavailable"))?;
+  let stream = !crate::output::is_json_mode() && !crate::output::is_quiet();
+
+  let (status, stdout, stderr) = std::thread::scope(|scope| {
+    let stdout_task = scope.spawn(move || capture_pipe(stdout, io::stdout(), stream));
+    let stderr_task = scope.spawn(move || capture_pipe(stderr, io::stderr(), stream));
+    let status = child.wait();
+    if status.is_err() {
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+    let stdout = stdout_task
+      .join()
+      .map_err(|_| io::Error::other("Git stdout reader panicked"))??;
+    let stderr = stderr_task
+      .join()
+      .map_err(|_| io::Error::other("Git stderr reader panicked"))??;
+    Ok::<_, io::Error>((status?, stdout, stderr))
+  })?;
+
+  Ok(Output { status, stdout, stderr })
+}
+
+fn capture_pipe<R: Read, W: Write>(mut reader: R, mut writer: W, mut stream: bool) -> io::Result<Vec<u8>> {
+  let mut captured = Vec::new();
+  let mut buffer = [0_u8; 8 * 1024];
+  loop {
+    let read = reader.read(&mut buffer)?;
+    if read == 0 {
+      break;
+    }
+    captured.extend_from_slice(&buffer[..read]);
+    if stream && (writer.write_all(&buffer[..read]).and_then(|()| writer.flush())).is_err() {
+      stream = false;
+    }
+  }
+  Ok(captured)
+}
+
 /// Initialize a new git repository at the given path
 ///
 /// This is a standalone function since it creates a new repo (no existing SystemGit).
 pub fn init_repo(path: &std::path::Path, initial_branch: &str) -> RailResult<()> {
-  let output = Command::new("git")
+  let mut command = Command::new("git");
+  sanitize_git_environment(&mut command);
+  let output = command
     .arg("init")
     .arg("--initial-branch")
     .arg(initial_branch)
@@ -548,10 +554,9 @@ pub fn init_repo(path: &std::path::Path, initial_branch: &str) -> RailResult<()>
     .context("Failed to run git init")?;
 
   if !output.status.success() {
-    let stderr = String::from_utf8_lossy(&output.stderr);
     return Err(RailError::Git(GitError::CommandFailed {
       command: "git init".to_string(),
-      stderr: stderr.to_string(),
+      stderr: git_command_diagnostics(&output.stdout, &output.stderr),
     }));
   }
 
@@ -563,63 +568,19 @@ mod tests {
   use super::*;
   use std::ffi::OsStr;
   use std::fs;
-  use std::sync::{Mutex, OnceLock};
-
-  static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-  fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-  }
-
-  fn command_has_env_value(cmd: &Command, key: &str, value: &str) -> bool {
-    cmd
-      .get_envs()
-      .any(|(k, v)| k == OsStr::new(key) && v == Some(OsStr::new(value)))
-  }
 
   #[test]
-  fn test_git_cmd_preserves_ssh_auth_sock_when_set() {
-    let _guard = lock_env();
-    let key = "SSH_AUTH_SOCK";
-    let prev = std::env::var_os(key);
-
-    unsafe {
-      std::env::set_var(key, "cargo-rail-test-sock");
-    }
+  fn test_git_cmd_removes_repository_redirection_environment() {
     let git = SystemGit::open(Path::new(".")).unwrap();
     let cmd = git.git_cmd();
-    assert!(command_has_env_value(&cmd, key, "cargo-rail-test-sock"));
-
-    match prev {
-      Some(v) => unsafe {
-        std::env::set_var(key, v);
-      },
-      None => unsafe {
-        std::env::remove_var(key);
-      },
-    }
-  }
-
-  #[test]
-  fn test_git_cmd_preserves_git_ssh_command_when_set() {
-    let _guard = lock_env();
-    let key = "GIT_SSH_COMMAND";
-    let prev = std::env::var_os(key);
-
-    unsafe {
-      std::env::set_var(key, "ssh -o BatchMode=yes");
-    }
-    let git = SystemGit::open(Path::new(".")).unwrap();
-    let cmd = git.git_cmd();
-    assert!(command_has_env_value(&cmd, key, "ssh -o BatchMode=yes"));
-
-    match prev {
-      Some(v) => unsafe {
-        std::env::set_var(key, v);
-      },
-      None => unsafe {
-        std::env::remove_var(key);
-      },
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"] {
+      assert!(
+        cmd
+          .get_envs()
+          .any(|(configured, value)| configured == OsStr::new(key) && value.is_none()),
+        "{} must not override cargo-rail's repository boundary",
+        key
+      );
     }
   }
 

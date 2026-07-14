@@ -5,7 +5,7 @@
 
 use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SplitMode, WorkspaceMode};
-use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::git::git_cmd_for_path;
 use crate::git::mappings::MappingStore;
 use crate::git::{CommitInfo, SystemGit};
@@ -369,10 +369,9 @@ impl<'a> SplitEngine<'a> {
     let output = cmd.output().context("Failed to run git commit-tree")?;
 
     if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git commit-tree".to_string(),
-        stderr: stderr.to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
 
@@ -383,7 +382,7 @@ impl<'a> SplitEngine<'a> {
     if !update_output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git update-ref HEAD".to_string(),
-        stderr: String::from_utf8_lossy(&update_output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&update_output.stdout, &update_output.stderr),
       }));
     }
 
@@ -391,7 +390,7 @@ impl<'a> SplitEngine<'a> {
     if !reset_output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git reset --hard".to_string(),
-        stderr: String::from_utf8_lossy(&reset_output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&reset_output.stdout, &reset_output.stderr),
       }));
     }
 
@@ -416,7 +415,7 @@ impl<'a> SplitEngine<'a> {
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git hash-object -w --stdin".to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -874,7 +873,7 @@ impl<'a> SplitEngine<'a> {
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git fetch source objects".to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
     Ok(())

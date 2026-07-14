@@ -3,8 +3,9 @@
 //! Maps commits between monorepo and split repos using git-notes.
 //! Notes are stored at `refs/notes/rail/{crate_name}`.
 
-use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::git::git_cmd_for_path;
+use crate::git::system::observable_output;
 use crate::{progress, warn};
 use rustc_hash::FxHashMap;
 use std::io::Write;
@@ -180,7 +181,7 @@ impl MappingStore {
         if !stderr.contains("already has a note") {
           return Err(RailError::Git(GitError::CommandFailed {
             command: String::from("git notes add"),
-            stderr: stderr.into_owned(),
+            stderr: git_command_diagnostics(&output.stdout, &output.stderr),
           }));
         }
       }
@@ -257,16 +258,14 @@ impl MappingStore {
     progress!("   Pushing git-notes to remote '{}'...", remote);
 
     retry_operation(|| {
-      let output = git_cmd_for_path(repo_path)
-        .args(["push", remote, &notes_ref])
-        .output()
-        .context("Failed to push git-notes")?;
+      let mut command = git_cmd_for_path(repo_path);
+      command.args(["push", remote, &notes_ref]);
+      let output = observable_output(&mut command).context("Failed to push git-notes")?;
 
       if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(RailError::Git(GitError::CommandFailed {
           command: String::from("git push notes"),
-          stderr: stderr.into_owned(),
+          stderr: git_command_diagnostics(&output.stdout, &output.stderr),
         }));
       }
       Ok(())
@@ -300,7 +299,7 @@ impl MappingStore {
 
         return Err(RailError::Git(GitError::CommandFailed {
           command: String::from("git fetch notes"),
-          stderr: stderr.into_owned(),
+          stderr: git_command_diagnostics(&output.stdout, &output.stderr),
         }));
       }
       Ok(())
@@ -346,7 +345,7 @@ impl MappingStore {
       if !fetch_stderr.contains("couldn't find remote ref") {
         return Err(RailError::Git(GitError::CommandFailed {
           command: String::from("git fetch notes for validation"),
-          stderr: fetch_stderr.into_owned(),
+          stderr: git_command_diagnostics(&fetch_output.stdout, &fetch_output.stderr),
         }));
       }
       return Ok(()); // No remote notes
@@ -496,10 +495,9 @@ fn read_blobs_batch(repo_path: &Path, entries: &[(&str, &str)]) -> RailResult<Ve
   let output = child.wait_with_output().context("Failed to read git cat-file output")?;
 
   if !output.status.success() {
-    let stderr = String::from_utf8_lossy(&output.stderr);
     return Err(RailError::Git(GitError::CommandFailed {
       command: String::from("git cat-file --batch"),
-      stderr: stderr.into_owned(),
+      stderr: git_command_diagnostics(&output.stdout, &output.stderr),
     }));
   }
 

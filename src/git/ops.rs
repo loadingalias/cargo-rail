@@ -2,7 +2,7 @@
 
 use super::SystemGit;
 use super::system::CommitInfo;
-use crate::error::{GitError, RailError, RailResult, ResultExt};
+use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::progress;
 use crate::utils;
 use std::path::{Path, PathBuf};
@@ -250,9 +250,14 @@ impl SystemGit {
     let format = "%H%n%an%n%ae%n%at%n%cn%n%ce%n%ct%n%P%n%B";
     let format_arg = format!("--format={}", format);
 
-    let output = self.run_git_with_error(&["log", "-1", &format_arg, sha], |_| {
-      RailError::Git(GitError::CommitNotFound { sha: sha.to_string() })
-    })?;
+    let output = self
+      .run_git(&["log", "-1", &format_arg, sha])
+      .map_err(|error| match error {
+        RailError::Git(GitError::CommandFailed { .. }) => {
+          RailError::Git(GitError::CommitNotFound { sha: sha.to_string() })
+        }
+        other => other,
+      })?;
 
     parse_commit_output(&output.stdout)
   }
@@ -386,13 +391,16 @@ impl SystemGit {
   pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> RailResult<()> {
     progress!("   Pushing to remote '{}'...", remote_name);
 
-    self.run_git_with_error(&["push", "-u", remote_name, branch], |stderr| {
-      RailError::Git(GitError::PushFailed {
-        remote: remote_name.to_string(),
-        branch: branch.to_string(),
-        reason: stderr.to_string(),
-      })
-    })?;
+    if let Err(error) = self.run_git_observable(&["push", "-u", remote_name, branch]) {
+      return match error {
+        RailError::Git(GitError::CommandFailed { stderr, .. }) => Err(RailError::Git(GitError::PushFailed {
+          remote: remote_name.to_string(),
+          branch: branch.to_string(),
+          reason: stderr,
+        })),
+        other => Err(other),
+      };
+    }
 
     progress!("   ✅ Pushed to {}/{}", remote_name, branch);
     Ok(())
@@ -422,7 +430,7 @@ impl SystemGit {
 
   /// Checkout a branch
   pub fn checkout_branch(&self, branch_name: &str) -> RailResult<()> {
-    self.run_git(&["checkout", branch_name])?;
+    self.run_git_observable(&["checkout", branch_name])?;
     Ok(())
   }
 
@@ -481,10 +489,9 @@ impl SystemGit {
     let output = cmd.output().context("Failed to create commit")?;
 
     if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git commit-tree".to_string(),
-        stderr: stderr.to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
 
@@ -511,22 +518,20 @@ impl SystemGit {
   /// Output order matches input order. Missing files produce empty byte vectors.
   pub fn read_files_bulk(&self, items: &[(&str, &Path)]) -> RailResult<Vec<Vec<u8>>> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     if items.is_empty() {
       return Ok(vec![]);
     }
 
     // Start cat-file --batch process
-    let mut child = Command::new("git")
-      .arg("-C")
-      .arg(&self.repo_path)
+    let mut command = self.git_cmd();
+    command
       .args(["cat-file", "--batch"])
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .spawn()
-      .context("Failed to spawn git cat-file")?;
+      .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to spawn git cat-file")?;
 
     let mut stdin = child
       .stdin
@@ -549,10 +554,9 @@ impl SystemGit {
     let output = child.wait_with_output().context("Failed to read git cat-file output")?;
 
     if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git cat-file --batch".to_string(),
-        stderr: stderr.to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
       }));
     }
 

@@ -79,6 +79,36 @@ fn only_release_state(workspace: &Path) -> Result<PathBuf> {
     .ok_or_else(|| anyhow::anyhow!("missing release state"))
 }
 
+fn push_release_workspace(crate_name: &str) -> Result<(TestWorkspace, tempfile::TempDir)> {
+  let ws = TestWorkspace::new_single_crate(crate_name, "0.1.0")?;
+  let remote = tempfile::TempDir::new()?;
+  git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+  ws.set_remote(remote.path().to_str().unwrap())?;
+  git(&ws.path, &["push", "-u", "origin", "main"])?;
+  ws.write_release_config(
+    r#"tag_format = "v{version}"
+require_clean = false
+require_release_notes = false
+push = true
+"#,
+  )?;
+  Ok((ws, remote))
+}
+
+fn install_pre_push_hook(ws: &TestWorkspace, script: &str) -> Result<()> {
+  let hook_path = ws.path.join(".git/hooks/pre-push");
+  std::fs::write(&hook_path, script)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(&hook_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms)?;
+  }
+  Ok(())
+}
+
 #[test]
 fn release_plan_works_on_single_crate_repo() -> Result<()> {
   // Test that release plan works on a split repo (single-crate, non-workspace)
@@ -853,6 +883,17 @@ fn release_pr_mode_round_trips_to_finalize_on_merge_commit() -> Result<()> {
   assert!(output.status.success(), "bare remote init failed");
   ws.set_remote(remote.to_str().unwrap())?;
   git(&ws.path, &["push", "-u", "origin", "main"])?;
+  install_pre_push_hook(
+    &ws,
+    r#"#!/bin/sh
+context_file="$(dirname "$0")/../release-pr-hook-context"
+printf '%s:%s\n' "${CARGO_RAIL_RELEASE_PUSH:-}" "${CARGO_RAIL_OPERATION:-}" >> "$context_file"
+if [ "${CARGO_RAIL_RELEASE_PUSH:-}" != "1" ] || [ "${CARGO_RAIL_OPERATION:-}" != "release" ]; then
+  echo "release PR push did not provide cargo-rail hook context" >&2
+  exit 1
+fi
+"#,
+  )?;
 
   run_cargo_rail(
     &ws.path,
@@ -899,6 +940,11 @@ fn release_pr_mode_round_trips_to_finalize_on_merge_commit() -> Result<()> {
   assert!(!ws.path.join(".changes").exists() || std::fs::read_dir(ws.path.join(".changes"))?.next().is_none());
   assert!(std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?.contains("version = \"0.2.0\""));
   assert!(std::fs::read_to_string(&gh_log)?.contains("pr create"));
+  assert_eq!(
+    std::fs::read_to_string(ws.path.join(".git/release-pr-hook-context"))?,
+    "1:release\n",
+    "the cargo-rail-owned release PR push must provide the standard hook context"
+  );
 
   git(&ws.path, &["checkout", "main"])?;
   git(&ws.path, &["merge", "--no-ff", &branch, "-m", "Merge release PR"])?;
@@ -2095,16 +2141,11 @@ forge = "gitlab"
 
 #[test]
 fn test_release_pushes_commit_and_tag_when_push_enabled() -> Result<()> {
-  let ws = TestWorkspace::new_single_crate("push-release", "0.1.0")?;
-  let remote = tempfile::TempDir::new()?;
-  git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
-  ws.set_remote(remote.path().to_str().unwrap())?;
-  git(&ws.path, &["push", "-u", "origin", "main"])?;
+  let (ws, _remote) = push_release_workspace("push-release")?;
 
   let hook_counter = ws.path.join(".git/pre-push-count");
-  let hook_path = ws.path.join(".git/hooks/pre-push");
-  std::fs::write(
-    &hook_path,
+  install_pre_push_hook(
+    &ws,
     r#"#!/bin/sh
 count_file="$(dirname "$0")/../pre-push-count"
 count=0
@@ -2113,28 +2154,30 @@ if [ -f "$count_file" ]; then
 fi
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
-"#,
-  )?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut perms = std::fs::metadata(&hook_path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&hook_path, perms)?;
-  }
-
-  ws.write_release_config(
-    r#"tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
-push = true
+if [ "${CARGO_RAIL_TEST_INHERITED:-}" != "from-caller" ]; then
+  echo "missing inherited caller environment" >&2
+  exit 1
+fi
+if [ "${CARGO_RAIL_RELEASE_PUSH:-}" != "1" ]; then
+  echo "missing CARGO_RAIL_RELEASE_PUSH" >&2
+  exit 1
+fi
+if [ "${CARGO_RAIL_OPERATION:-}" != "release" ]; then
+  echo "missing CARGO_RAIL_OPERATION" >&2
+  exit 1
+fi
+echo "release hook context accepted"
 "#,
   )?;
 
-  let output = run_cargo_rail(
-    &ws.path,
-    &[
+  let trace_dir = tempfile::TempDir::new()?;
+  let trace_path = trace_dir.path().join("git-trace.log");
+  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .env("CARGO_RAIL_TEST_INHERITED", "from-caller")
+    .env("GIT_DIR", ws.path.join("ambient-wrong-repository"))
+    .env("GIT_TRACE", &trace_path)
+    .args([
       "rail",
       "release",
       "run",
@@ -2143,8 +2186,8 @@ push = true
       "patch",
       "--skip-publish",
       "--yes",
-    ],
-  )?;
+    ])
+    .output()?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -2171,11 +2214,119 @@ push = true
     !stdout.contains("git push origin"),
     "owned push should not print manual push follow-up"
   );
+  assert!(
+    stdout.contains("release hook context accepted"),
+    "successful hook diagnostics should stream to stdout\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
   let hook_runs = std::fs::read_to_string(&hook_counter)?;
   assert_eq!(
     hook_runs.trim(),
     "1",
     "release preflight must not invoke pre-push; only the real atomic push should run hooks"
+  );
+  let trace = std::fs::read_to_string(&trace_path)?;
+  assert!(
+    trace.contains("push --atomic"),
+    "release must retain its atomic push\n{}",
+    trace
+  );
+  assert!(
+    !trace.contains("--no-verify"),
+    "cargo-rail must never bypass repository hooks\n{}",
+    trace
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_hook_failure_streams_and_preserves_both_output_streams() -> Result<()> {
+  let (ws, _remote) = push_release_workspace("push-hook-diagnostics")?;
+  install_pre_push_hook(
+    &ws,
+    r#"#!/bin/sh
+echo "hook stdout: release intent was rejected"
+echo "hook stderr: policy details" >&2
+exit 1
+"#,
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert_eq!(output.status.code(), Some(2), "rejected release push must fail");
+  assert!(
+    stdout.contains("hook stdout: release intent was rejected"),
+    "hook stdout should stream while Git runs\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+  assert!(
+    stderr.contains("hook stdout: release intent was rejected") && stderr.contains("hook stderr: policy details"),
+    "the final Git error must preserve both streams\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    stderr
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_release_hook_failure_json_captures_structured_diagnostics() -> Result<()> {
+  let (ws, _remote) = push_release_workspace("push-hook-json")?;
+  install_pre_push_hook(
+    &ws,
+    r#"#!/bin/sh
+echo "hook stdout: machine-readable release rejection"
+echo "hook stderr: machine-readable policy details" >&2
+exit 1
+"#,
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "--all",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+      "--json",
+    ],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let json: serde_json::Value = serde_json::from_str(&stdout)
+    .unwrap_or_else(|error| panic!("release failure must remain valid JSON: {}\n{}", error, stdout));
+
+  assert_eq!(output.status.code(), Some(2), "rejected release push must fail");
+  let message = json["message"].as_str().unwrap_or_default();
+  assert!(
+    message.contains("stdout:\nhook stdout: machine-readable release rejection"),
+    "JSON errors must retain and label Git stdout\n{}",
+    stdout
+  );
+  assert!(
+    message.contains("stderr:\nhook stderr: machine-readable policy details"),
+    "JSON errors must retain and label Git stderr\n{}",
+    stdout
   );
 
   Ok(())
