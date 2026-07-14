@@ -1,6 +1,16 @@
 # Changelog
 
 
+
+## [0.17.2](https://github.com/loadingalias/cargo-rail/compare/v0.17.1...v0.17.2) - 2026-07-14
+
+- Fixed release Git operations to preserve the caller environment for hooks, expose standard cargo-rail release context, and retain complete hook diagnostics. Removed the hook-bypassing push dry run while keeping one atomic branch-and-tag push.
+
+### Bug Fixes
+
+- **release**: preserve hook context and diagnostics ([61da35d](https://github.com/loadingalias/cargo-rail/commit/61da35d4da0964618d95d0de2031a6516003bf84))
+
+
 ## [0.17.1](https://github.com/loadingalias/cargo-rail/compare/v0.17.0...v0.17.1) - 2026-07-12
 
 - Fixed unify graph verification to compare pre- and post-edit metadata with the same target platform filter. Cargo-synthesized optional-dependency features are no longer treated as writable manifest feature keys.
