@@ -45,6 +45,7 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 "#,
     )?;
+    std::fs::write(path.join(".gitignore"), "target/\n")?;
 
     // Create .config/rail.toml for tests
     std::fs::create_dir_all(path.join(".config"))?;
@@ -112,6 +113,7 @@ authors = ["Test Author"]
         crate_name, version
       ),
     )?;
+    std::fs::write(path.join(".gitignore"), "target/\n")?;
 
     // Create src/lib.rs
     std::fs::create_dir_all(path.join("src"))?;
@@ -326,6 +328,7 @@ impl NestedWorkspace {
     std::fs::create_dir_all(git_root.join("docs"))?;
     std::fs::write(git_root.join("docs/README.md"), "# Project Docs\n")?;
     std::fs::write(git_root.join("README.md"), "# Root README\n")?;
+    std::fs::write(git_root.join(".gitignore"), "target/\n")?;
 
     // Create workspace in subdirectory
     std::fs::create_dir_all(&workspace_root)?;

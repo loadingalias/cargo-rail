@@ -6,7 +6,7 @@
 //! - Safe subprocess execution (inherited caller environment with bounded repository state)
 //! - Zero-copy parsing where possible
 
-use super::{git_cmd_for_path, sanitize_git_environment};
+use super::{git_cmd_for_path, git_command, sanitize_git_environment};
 use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::utils;
 use std::io::{self, Read, Write};
@@ -205,6 +205,7 @@ impl SystemGit {
   pub(crate) fn hash_bytes(&self, bytes: &[u8]) -> RailResult<String> {
     use std::io::Write as _;
 
+    crate::instrumentation::record_hash(bytes.len());
     let mut cmd = self.git_cmd();
     cmd
       .args(["hash-object", "--stdin"])
@@ -246,7 +247,16 @@ impl SystemGit {
   ///
   /// Example: `git.run_git(&["status", "--short"])?`
   pub(crate) fn run_git(&self, args: &[&str]) -> RailResult<std::process::Output> {
-    let mut cmd = self.git_cmd();
+    self.run_git_in(&self.repo_path, args)
+  }
+
+  /// Run a path-reporting Git command from the repository worktree root.
+  pub(crate) fn run_git_at_worktree_root(&self, args: &[&str]) -> RailResult<std::process::Output> {
+    self.run_git_in(&self.worktree_root, args)
+  }
+
+  fn run_git_in(&self, path: &Path, args: &[&str]) -> RailResult<std::process::Output> {
+    let mut cmd = git_cmd_for_path(path);
     cmd.args(args);
 
     let output = cmd
@@ -543,7 +553,7 @@ fn capture_pipe<R: Read, W: Write>(mut reader: R, mut writer: W, mut stream: boo
 ///
 /// This is a standalone function since it creates a new repo (no existing SystemGit).
 pub fn init_repo(path: &std::path::Path, initial_branch: &str) -> RailResult<()> {
-  let mut command = Command::new("git");
+  let mut command = git_command();
   sanitize_git_environment(&mut command);
   let output = command
     .arg("init")

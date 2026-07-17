@@ -29,6 +29,7 @@ use crate::error::{ConfigError, GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use crate::progress;
+use crate::source::GitWorktreeCapture;
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -106,6 +107,7 @@ impl CargoState {
         let current_hash = compute_workspace_hash_with_members(workspace_root, &cache.metadata);
         if cache.hash == current_hash {
           // Cache hit - use cached metadata
+          crate::instrumentation::record_cargo_metadata_cache_hit();
           return Ok(Self::from_metadata(Arc::new(cache.metadata)));
         }
       }
@@ -113,6 +115,7 @@ impl CargoState {
     }
 
     // Cache miss or mismatch - load fresh metadata
+    crate::instrumentation::record_cargo_metadata_load(false);
     let metadata = MetadataCommand::new()
       .manifest_path(workspace_root.join("Cargo.toml"))
       .exec()?;
@@ -279,6 +282,7 @@ fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadat
   const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 
   let mut hash = FNV_OFFSET_BASIS;
+  crate::instrumentation::record_hash_operation();
 
   fn hash_file(hash: &mut u64, path: &Path, fnv_prime: u64) {
     let Ok(mut file) = fs::File::open(path) else {
@@ -287,6 +291,7 @@ fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadat
       // This avoids "accidental cache hit" if a file becomes unreadable.
       *hash ^= 0xff;
       *hash = hash.wrapping_mul(fnv_prime);
+      crate::instrumentation::record_hash_input_bytes(1);
       return;
     };
 
@@ -295,6 +300,8 @@ fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadat
       if n == 0 {
         break;
       }
+      crate::instrumentation::record_hash_input_bytes(n);
+      crate::instrumentation::record_hashed_file_bytes_read(n);
       for byte in &buffer[..n] {
         *hash ^= *byte as u64;
         *hash = hash.wrapping_mul(fnv_prime);
@@ -402,6 +409,9 @@ pub struct WorkspaceContext {
   /// Cargo metadata and workspace info (Arc for cheap cloning across threads)
   pub cargo: Arc<CargoState>,
 
+  /// Immutable source captured before Cargo metadata can create generated state.
+  source_capture: Option<Arc<GitWorktreeCapture>>,
+
   /// Dependency graph (built from cargo metadata)
   /// Wrapped in Arc for efficient sharing across threads/commands
   pub graph: Arc<WorkspaceGraph>,
@@ -443,12 +453,32 @@ impl WorkspaceContext {
   /// - Config load: <5ms (or None if not found)
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
+    Self::build_inner(workspace_root, false)
+  }
+
+  /// Build a context and optionally capture WORKTREE source before metadata loading.
+  #[doc(hidden)]
+  pub fn build_with_source_capture(workspace_root: &Path, capture_source: bool) -> RailResult<Self> {
+    Self::build_inner(workspace_root, capture_source)
+  }
+
+  fn build_inner(workspace_root: &Path, capture_source: bool) -> RailResult<Self> {
     // Load git state when available. Cargo-only commands such as `unify --check`
     // must work in source sandboxes that intentionally omit `.git`.
     let git = match GitState::open(workspace_root) {
       Ok(git) => Some(Arc::new(git)),
       Err(RailError::Git(GitError::RepoNotFound { .. })) => None,
       Err(err) => return Err(err),
+    };
+
+    let source_capture = if capture_source {
+      git
+        .as_ref()
+        .map(|state| GitWorktreeCapture::capture(state.git()))
+        .transpose()?
+        .map(Arc::new)
+    } else {
+      None
     };
 
     // Load cargo state
@@ -513,6 +543,7 @@ impl WorkspaceContext {
       workspace_root,
       git,
       cargo,
+      source_capture,
       graph,
       config,
       targets,
@@ -545,6 +576,11 @@ impl WorkspaceContext {
   /// Return true when this workspace is inside a Git repository.
   pub fn has_git(&self) -> bool {
     self.git.is_some()
+  }
+
+  /// Return source captured before metadata loading, when requested by dispatch.
+  pub fn source_capture(&self) -> Option<&GitWorktreeCapture> {
+    self.source_capture.as_deref()
   }
 
   /// Get multi-target metadata, loading lazily on first access.

@@ -63,6 +63,10 @@ pub struct RailCli {
   #[arg(long, global = true, value_name = "PATH")]
   pub workspace_root: Option<PathBuf>,
 
+  /// Write diagnostic performance counters to this JSON file
+  #[arg(long, global = true, value_name = "PATH", hide = true)]
+  pub diagnostics_file: Option<PathBuf>,
+
   /// The subcommand to execute
   #[command(subcommand)]
   pub command: Commands,
@@ -531,6 +535,19 @@ pub enum Commands {
     #[arg(value_enum, value_name = "SHELL")]
     shell: Shell,
   },
+}
+
+impl Commands {
+  /// Return whether dispatch needs source captured before metadata loading.
+  #[doc(hidden)]
+  pub fn requires_worktree_source_capture(&self) -> bool {
+    match self {
+      Self::Run { all, .. } => !all,
+      Self::Plan { from, to, schema, .. } => !schema && !(from.is_some() && to.is_some()),
+      Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
+      _ => false,
+    }
+  }
 }
 
 /// Subcommands for `cargo rail config`

@@ -27,6 +27,9 @@ build-all:
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
+gen-fixture members output:
+    @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
+
 # CI Commands (for GitHub Actions)
 
 ci-check:

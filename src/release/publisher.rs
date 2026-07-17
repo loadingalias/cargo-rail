@@ -1337,11 +1337,7 @@ fn gitlab_release_create_args(tag: &str, title: &str, notes_file: &str) -> Vec<S
 }
 
 fn short_hash(value: &str) -> String {
-  let mut hash = 0xcbf29ce484222325_u64;
-  for byte in value.as_bytes() {
-    hash ^= u64::from(*byte);
-    hash = hash.wrapping_mul(0x100000001b3);
-  }
+  let hash = crate::utils::fnv1a64(value.as_bytes());
   format!("{:08x}", hash & 0xffff_ffff)
 }
 

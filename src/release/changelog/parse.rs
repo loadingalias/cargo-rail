@@ -9,7 +9,6 @@ use winnow::ascii::{space0, till_line_ending};
 use winnow::combinator::{opt, preceded, terminated};
 use winnow::token::{take_till, take_until};
 
-// Winnow 0.7.x uses Result, not PResult
 type PResult<T> = winnow::error::Result<T>;
 
 /// A parsed conventional commit subject
@@ -220,6 +219,15 @@ mod tests {
     let parsed = parse_subject("this is: not conventional", None);
     assert_eq!(parsed.commit_type, None);
     assert_eq!(parsed.description, "this is: not conventional");
+  }
+
+  #[test]
+  fn subject_with_unclosed_scope_is_unconventional() {
+    let subject = "feat(parser: missing close";
+    let parsed = parse_subject(subject, None);
+    assert_eq!(parsed.commit_type, None);
+    assert_eq!(parsed.scope, None);
+    assert_eq!(parsed.description, subject);
   }
 
   #[test]

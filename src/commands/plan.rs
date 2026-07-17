@@ -11,6 +11,7 @@ use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::{ConfidenceProfile, UnknownFilePolicy};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
+use crate::source::SourceSnapshot;
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use serde::Serialize;
@@ -39,14 +40,67 @@ pub struct PlanOptions {
   pub confidence_profile: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedRefs {
-  since: Option<String>,
-  from: Option<String>,
-  to: Option<String>,
-  merge_base: bool,
-  resolved_base: String,
-  resolved_head: String,
+#[derive(Debug)]
+enum ResolvedRefs {
+  Objects {
+    from: String,
+    to: String,
+  },
+  Worktree {
+    since: Option<String>,
+    merge_base: bool,
+    base: String,
+  },
+}
+
+impl ResolvedRefs {
+  fn resolved_base(&self) -> &str {
+    match self {
+      Self::Objects { from, .. } => from,
+      Self::Worktree { base, .. } => base,
+    }
+  }
+
+  fn resolved_head(&self) -> &str {
+    match self {
+      Self::Objects { to, .. } => to,
+      Self::Worktree { .. } => "WORKTREE",
+    }
+  }
+
+  fn git_merge_base(&self) -> Option<String> {
+    match self {
+      Self::Worktree {
+        merge_base: true, base, ..
+      } => Some(base.clone()),
+      Self::Objects { .. } | Self::Worktree { .. } => None,
+    }
+  }
+
+  fn into_plan_refs(self) -> PlanRefs {
+    match self {
+      Self::Objects { from, to } => PlanRefs {
+        since: None,
+        resolved_base: from.clone(),
+        resolved_head: to.clone(),
+        from: Some(from),
+        to: Some(to),
+        merge_base: false,
+      },
+      Self::Worktree {
+        since,
+        merge_base,
+        base,
+      } => PlanRefs {
+        since,
+        from: None,
+        to: None,
+        merge_base,
+        resolved_base: base,
+        resolved_head: "WORKTREE".to_string(),
+      },
+    }
+  }
 }
 
 #[derive(Debug, Serialize)]
@@ -417,11 +471,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   let surfaces = build_surfaces(&surface_refs, &configured_custom_surfaces);
 
   // Compute reproducibility metadata
-  let git_merge_base = if refs.merge_base {
-    Some(refs.resolved_base.clone())
-  } else {
-    None
-  };
+  let git_merge_base = refs.git_merge_base();
 
   let impact = PlanImpact {
     direct_crates: direct_crates.into_iter().collect(),
@@ -433,21 +483,14 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     &execution_transitive_crates,
     &surfaces,
     ctx.cargo.metadata().workspace_packages().len(),
-    &refs.resolved_base,
-    &refs.resolved_head,
+    refs.resolved_base(),
+    refs.resolved_head(),
   );
 
   let output = PlanOutput {
     plan_contract_version: PLAN_CONTRACT_VERSION,
     inputs: PlanInputs {
-      refs: PlanRefs {
-        since: refs.since,
-        from: refs.from,
-        to: refs.to,
-        merge_base: refs.merge_base,
-        resolved_base: refs.resolved_base,
-        resolved_head: refs.resolved_head,
-      },
+      refs: refs.into_plan_refs(),
       workspace_root: ctx.workspace_root().display().to_string(),
       config_fingerprint: config_fingerprint(ctx.workspace_root()),
       toolchain_fingerprint: toolchain_fingerprint(ctx.workspace_root()),
@@ -777,15 +820,21 @@ fn summarize_surface_reason(output: &PlanOutput, surface: &str) -> Option<String
 }
 
 fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<ResolvedRefs> {
-  if let (Some(from), Some(to)) = (&opts.from, &opts.to) {
-    return Ok(ResolvedRefs {
-      since: opts.since.clone(),
-      from: Some(from.clone()),
-      to: Some(to.clone()),
-      merge_base: opts.merge_base,
-      resolved_base: from.clone(),
-      resolved_head: to.clone(),
-    });
+  match (&opts.from, &opts.to) {
+    (Some(from), Some(to)) => {
+      if opts.since.is_some() || opts.merge_base {
+        return Err(RailError::message(
+          "--from/--to cannot be combined with --since or --merge-base",
+        ));
+      }
+      return Ok(ResolvedRefs::Objects {
+        from: from.clone(),
+        to: to.clone(),
+      });
+    }
+    (Some(_), None) => return Err(RailError::message("--from requires --to")),
+    (None, Some(_)) => return Err(RailError::message("--to requires --from")),
+    (None, None) => {}
   }
 
   let resolved_base = if opts.merge_base {
@@ -797,26 +846,40 @@ fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<Resolv
     detect_default_base_ref(ctx.git()?.git())?
   };
 
-  Ok(ResolvedRefs {
+  Ok(ResolvedRefs::Worktree {
     since: opts.since.clone(),
-    from: opts.from.clone(),
-    to: opts.to.clone(),
     merge_base: opts.merge_base,
-    resolved_base,
-    resolved_head: "WORKTREE".to_string(),
+    base: resolved_base,
   })
 }
 
 fn collect_changed_files(ctx: &WorkspaceContext, refs: &ResolvedRefs) -> RailResult<Vec<String>> {
-  let raw = if let (Some(from), Some(to)) = (refs.from.as_deref(), refs.to.as_deref()) {
-    ctx.git()?.git().get_changed_files_between(from, Some(to))?
-  } else {
-    ctx.git()?.git().get_changed_files_between(&refs.resolved_base, None)?
+  let raw_paths: Vec<PathBuf> = match refs {
+    ResolvedRefs::Objects { from, to } => ctx
+      .git()?
+      .git()
+      .get_changed_files_between(from, Some(to))?
+      .into_iter()
+      .map(|(path, _)| path)
+      .collect(),
+    ResolvedRefs::Worktree { base, .. } => {
+      let changes = if let Some(capture) = ctx.source_capture() {
+        capture.changes_from(ctx.git()?.git(), base)?
+      } else {
+        let (_snapshot, changes) = SourceSnapshot::capture_git_worktree(ctx.git()?.git(), base)?;
+        changes
+      };
+      changes
+        .entries()
+        .iter()
+        .map(|change| change.path.as_path().to_path_buf())
+        .collect()
+    }
   };
 
-  let mut files: Vec<String> = raw
+  let mut files: Vec<String> = raw_paths
     .into_iter()
-    .filter_map(|(git_path, _)| ctx.to_workspace_path(&git_path))
+    .filter_map(|git_path| ctx.to_workspace_path(&git_path))
     .map(|p| crate::utils::path_to_git_format(&p))
     .collect();
 

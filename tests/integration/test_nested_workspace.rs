@@ -28,7 +28,12 @@ fn test_plan_from_nested_workspace_strips_workspace_prefix() -> Result<()> {
     .as_array()
     .ok_or_else(|| anyhow!("files should be an array"))?;
 
-  assert_eq!(files.len(), 1, "expected one changed file");
+  assert_eq!(
+    files.len(),
+    1,
+    "expected one changed file: {files:#?}\n{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
   assert_eq!(
     files[0]["path"],
     Value::String("crates/lib-a/src/lib.rs".to_string()),

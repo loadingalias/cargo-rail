@@ -4,8 +4,9 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
-use cargo_rail::commands::{self, CargoCli, PreContextDispatch};
-use cargo_rail::error::{RailError, print_error};
+use cargo_rail::commands::{self, CargoCli, PreContextDispatch, RailCli};
+use cargo_rail::error::{RailError, RailResult, print_error};
+use cargo_rail::instrumentation::DiagnosticSession;
 use cargo_rail::workspace;
 
 use clap::Parser;
@@ -24,6 +25,22 @@ fn main() {
     error.exit();
   }
 
+  let diagnostics = match DiagnosticSession::start(cli.diagnostics_file.take()) {
+    Ok(diagnostics) => diagnostics,
+    Err(error) => exit_with_error(error),
+  };
+  let result = run(cli);
+  let diagnostics_result = diagnostics.finish();
+
+  if let Err(error) = result {
+    exit_with_error(error);
+  }
+  if let Err(error) = diagnostics_result {
+    exit_with_error(error);
+  }
+}
+
+fn run(cli: RailCli) -> RailResult<()> {
   // Initialize output control (quiet mode)
   cargo_rail::output::init(cli.quiet);
 
@@ -40,18 +57,18 @@ fn main() {
     } else {
       match std::env::current_dir() {
         Ok(cwd) => cwd.join(root),
-        Err(e) => {
-          cargo_rail::error!("failed to get current directory: {}", e);
-          std::process::exit(1);
+        Err(error) => {
+          cargo_rail::error!("failed to get current directory: {}", error);
+          return Err(RailError::ExitWithCode { code: 1 });
         }
       }
     }
   } else {
     match std::env::current_dir() {
       Ok(dir) => dir,
-      Err(e) => {
-        cargo_rail::error!("failed to get current directory: {}", e);
-        std::process::exit(1);
+      Err(error) => {
+        cargo_rail::error!("failed to get current directory: {}", error);
+        return Err(RailError::ExitWithCode { code: 1 });
       }
     }
   };
@@ -60,21 +77,17 @@ fn main() {
   let config_override = cli.config.as_deref();
 
   let command = match commands::try_dispatch_pre_context(cli.command, &workspace_root, config_override, cli.json) {
-    Ok(PreContextDispatch::Handled) => return,
+    Ok(PreContextDispatch::Handled) => return Ok(()),
     Ok(PreContextDispatch::NeedsContext(cmd)) => cmd,
-    Err(e) => exit_with_error(e),
+    Err(error) => return Err(error),
   };
 
   // Build workspace context (single-load pattern)
-  let ctx = match workspace::WorkspaceContext::build(&workspace_root) {
-    Ok(ctx) => ctx,
-    Err(e) => exit_with_error(e),
-  };
+  let capture_source = command.requires_worktree_source_capture();
+  let ctx = workspace::WorkspaceContext::build_with_source_capture(&workspace_root, capture_source)?;
 
   // Dispatch to command handler
-  if let Err(e) = commands::dispatch(command, &ctx) {
-    exit_with_error(e);
-  }
+  commands::dispatch(command, &ctx)
 }
 
 fn exit_with_error(err: RailError) -> ! {

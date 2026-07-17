@@ -140,6 +140,131 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
 }
 
 #[test]
+fn test_explicit_object_range_ignores_head_index_worktree_and_untracked_state() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-object-range-isolation")?;
+  ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(ws.path.join("crates/demo/hidden.txt"), "stable\n")?;
+  generate_lockfile(&ws)?;
+  let from = ws.commit("add demo")?;
+
+  ws.modify_file("demo", "src/lib.rs", "pub fn historical_change() -> bool { true }\n")?;
+  let to = ws.commit("historical range change")?;
+
+  std::fs::write(ws.path.join("crates/demo/head_only.rs"), "// later HEAD state\n")?;
+  ws.commit("later HEAD change")?;
+
+  let plan_args = [
+    "rail",
+    "plan",
+    "--from",
+    from.as_str(),
+    "--to",
+    to.as_str(),
+    "--format",
+    "json",
+  ];
+  let hash_args = [
+    "rail",
+    "hash",
+    "--from",
+    from.as_str(),
+    "--to",
+    to.as_str(),
+    "--format",
+    "json",
+  ];
+  let graph_args = ["rail", "graph", "--from", from.as_str(), "--to", to.as_str()];
+
+  let clean_plan = run_cargo_rail(&ws.path, &plan_args)?;
+  let clean_hash = run_cargo_rail(&ws.path, &hash_args)?;
+  let clean_graph = run_cargo_rail(&ws.path, &graph_args)?;
+  assert!(clean_plan.status.success(), "clean historical plan should succeed");
+  assert!(clean_hash.status.success(), "clean historical hash should succeed");
+  assert!(clean_graph.status.success(), "clean historical graph should succeed");
+
+  let plan: Value = serde_json::from_slice(&clean_plan.stdout)?;
+  assert_eq!(plan["inputs"]["refs"]["from"], from);
+  assert_eq!(plan["inputs"]["refs"]["to"], to);
+  assert_eq!(plan["inputs"]["refs"]["resolved_base"], from);
+  assert_eq!(plan["inputs"]["refs"]["resolved_head"], to);
+  let planned_paths = plan["files"]
+    .as_array()
+    .expect("files should be an array")
+    .iter()
+    .filter_map(|file| file["path"].as_str())
+    .collect::<Vec<_>>();
+  assert_eq!(planned_paths, ["crates/demo/src/lib.rs"]);
+
+  git(
+    &ws.path,
+    &["update-index", "--assume-unchanged", "crates/demo/hidden.txt"],
+  )?;
+  std::fs::write(ws.path.join("crates/demo/staged_only.rs"), "// index state\n")?;
+  git(&ws.path, &["add", "crates/demo/staged_only.rs"])?;
+  ws.modify_file("demo", "README.md", "# unstaged worktree state\n")?;
+  std::fs::write(ws.path.join("crates/demo/untracked_only.rs"), "// untracked state\n")?;
+
+  let dirty_plan = run_cargo_rail(&ws.path, &plan_args)?;
+  let dirty_hash = run_cargo_rail(&ws.path, &hash_args)?;
+  let dirty_graph = run_cargo_rail(&ws.path, &graph_args)?;
+  assert!(dirty_plan.status.success(), "dirty historical plan should succeed");
+  assert!(dirty_hash.status.success(), "dirty historical hash should succeed");
+  assert!(dirty_graph.status.success(), "dirty historical graph should succeed");
+  assert_eq!(
+    dirty_plan.stdout, clean_plan.stdout,
+    "dirty state changed historical plan"
+  );
+  assert_eq!(
+    dirty_hash.stdout, clean_hash.stdout,
+    "dirty state changed historical identity"
+  );
+  assert_eq!(
+    dirty_graph.stdout, clean_graph.stdout,
+    "dirty state changed historical graph"
+  );
+
+  let option_shaped_ref = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--from=--cached", "--to", "HEAD", "--format", "json"],
+  )?;
+  assert!(
+    !option_shaped_ref.status.success(),
+    "an option-shaped ref must not turn an object comparison into an index diff"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_plan_worktree_includes_untracked_non_ignored_files() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-untracked-worktree")?;
+  ws.add_crate("demo", "0.1.0", &[])?;
+  generate_lockfile(&ws)?;
+  std::fs::write(ws.path.join(".gitignore"), "crates/demo/src/ignored.rs\n")?;
+  ws.commit("Add demo crate and ignore policy")?;
+
+  std::fs::write(ws.path.join("crates/demo/src/untracked.rs"), "pub fn untracked() {}\n")?;
+  std::fs::write(ws.path.join("crates/demo/src/ignored.rs"), "pub fn ignored() {}\n")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  let files: Vec<_> = json["files"]
+    .as_array()
+    .expect("files should be an array")
+    .iter()
+    .filter_map(|file| file["path"].as_str())
+    .collect();
+  assert_eq!(files, ["crates/demo/src/untracked.rs"]);
+  assert_eq!(json["impact"]["direct_crates"], serde_json::json!(["demo"]));
+  Ok(())
+}
+
+#[test]
 fn test_plan_json_golden_output() -> Result<()> {
   let ws = setup_golden_workspace("plan-json-golden")?;
 
@@ -386,6 +511,7 @@ fn test_plan_partial_workspace_scope_uses_crates_mode() -> Result<()> {
 fn test_plan_json_deterministic_output() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-deterministic")?;
   ws.add_crate("det-a", "0.1.0", &[])?;
+  generate_lockfile(&ws)?;
   ws.commit("add crate")?;
 
   git(&ws.path, &["branch", "origin/main"])?;
@@ -422,6 +548,7 @@ fn test_plan_json_deterministic_output() -> Result<()> {
 fn test_plan_github_deterministic_output() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-gh-deterministic")?;
   ws.add_crate("det-gh-a", "0.1.0", &[])?;
+  generate_lockfile(&ws)?;
   ws.commit("add crate")?;
 
   git(&ws.path, &["branch", "origin/main"])?;
@@ -1457,6 +1584,19 @@ fn setup_golden_workspace(name: &str) -> Result<TestWorkspace> {
   git(&ws.path, &["branch", "origin/main"])?;
   ws.modify_file("lib-a", "src/lib.rs", "pub fn hello() -> i32 { 42 }")?;
   Ok(ws)
+}
+
+fn generate_lockfile(ws: &TestWorkspace) -> Result<()> {
+  let output = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  assert!(
+    output.status.success(),
+    "offline lockfile generation failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  Ok(())
 }
 
 fn normalize_plan_json_output(stdout: &str) -> Result<String> {

@@ -22,6 +22,11 @@ pub use defaults::detect_default_base_ref;
 pub use ops::LogEntry;
 pub use system::{CommitInfo, SystemGit, init_repo};
 
+pub(crate) fn git_command() -> Command {
+  crate::instrumentation::record_git_subprocess();
+  Command::new("git")
+}
+
 /// Create a properly configured Git command for a repository path.
 ///
 /// Commands inherit the caller environment so credentials, signing agents,
@@ -29,7 +34,7 @@ pub use system::{CommitInfo, SystemGit, init_repo};
 /// direct Git invocation. Repository-redirection variables are removed because
 /// cargo-rail owns the repository boundary through `git -C <path>`.
 pub(crate) fn git_cmd_for_path(repo_path: &Path) -> Command {
-  let mut cmd = Command::new("git");
+  let mut cmd = git_command();
   cmd.arg("-C").arg(repo_path);
   sanitize_git_environment(&mut cmd);
 

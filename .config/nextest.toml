@@ -12,7 +12,7 @@ retries = 0
 cargo-subprocess = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_(unify|unused_detection|undeclared_features)/)'
+filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
 [profile.commit]
@@ -26,7 +26,7 @@ leak-timeout = { period = "2s", result = "fail" }
 retries = 0
 
 [[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_(unify|unused_detection|undeclared_features)/)'
+filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
 [profile.commit.junit]

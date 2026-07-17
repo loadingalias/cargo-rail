@@ -206,6 +206,7 @@ impl MultiTargetMetadata {
     // IMPORTANT: NO --all-features! We want cargo's default resolution
     // Features come from manifest analysis (intersection of unconditional)
 
+    crate::instrumentation::record_cargo_metadata_load(target.is_some());
     let metadata = cmd.exec().map_err(|e| {
       if let Some(t) = target {
         let err_str = e.to_string();

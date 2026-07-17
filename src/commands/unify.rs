@@ -500,6 +500,7 @@ fn proof_set_fingerprint(certificates: &[serde_json::Value]) -> String {
 }
 
 fn sha256_fingerprint(bytes: &[u8]) -> String {
+  crate::instrumentation::record_hash(bytes.len());
   let digest = Sha256::digest(bytes);
   let mut fingerprint = String::with_capacity("sha256:".len() + digest.len() * 2);
   fingerprint.push_str("sha256:");
@@ -1055,6 +1056,7 @@ fn verify_applied_unify_graph(
     if target != "default" {
       command.other_options(vec![String::from("--filter-platform"), target.to_string()]);
     }
+    crate::instrumentation::record_cargo_metadata_load(target != "default");
     let metadata = command
       .exec()
       .map_err(|error| RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}")))?;

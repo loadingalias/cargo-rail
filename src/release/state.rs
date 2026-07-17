@@ -195,10 +195,6 @@ fn complete_step(object: Option<String>) -> Step {
 }
 
 fn short_hash(bytes: &[u8]) -> String {
-  let mut hash = 0xcbf29ce484222325_u64;
-  for byte in bytes {
-    hash ^= u64::from(*byte);
-    hash = hash.wrapping_mul(0x100000001b3);
-  }
+  let hash = crate::utils::fnv1a64(bytes);
   format!("{:016x}", hash)
 }

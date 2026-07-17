@@ -9,29 +9,22 @@ results="${CARGO_RAIL_BENCH_RESULTS:-$repo_root/target/benchmarks/unify/$(date -
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-unify-bench.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
 
-for tool in hyperfine jq cargo; do
+for tool in hyperfine jq cargo git; do
   command -v "$tool" >/dev/null || { echo "missing required benchmark tool: $tool" >&2; exit 2; }
 done
 [[ -x "$binary" ]] || { echo "build the release binary first: cargo build --release" >&2; exit 2; }
-mkdir -p "$results" "$fixture/.config" "$fixture/crates"
+mkdir -p "$results"
 results="$(cd "$(dirname "$results")" && pwd)/$(basename "$results")"
 
-{
-  printf '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n\n[workspace.package]\nedition = "2024"\nrust-version = "1.95"\n'
-} >"$fixture/Cargo.toml"
-printf '[workspace]\nroot = "."\n\n[unify]\ndetect_unused = true\ncompiler_diag_cache = true\n' >"$fixture/.config/rail.toml"
+"$repo_root/scripts/fixtures/generate-workspace.sh" "$packages" "$fixture"
+printf '\n[unify]\ndetect_unused = true\ncompiler_diag_cache = true\n' >>"$fixture/.config/rail.toml"
 
 dependencies=(anyhow log once_cell regex semver serde serde_json tempfile thiserror toml_edit)
 for ((index = 0; index < packages; index++)); do
   member="$(printf 'member-%04d' "$index")"
-  mkdir -p "$fixture/crates/$member/src"
-  {
-    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition.workspace = true\nrust-version.workspace = true\n\n[dependencies]\n' "$member"
-    for dependency in "${dependencies[@]}"; do
-      printf '%s = "*"\n' "$dependency"
-    done
-  } >"$fixture/crates/$member/Cargo.toml"
-  printf 'pub fn member_%04d() -> usize { %d }\n' "$index" "$index" >"$fixture/crates/$member/src/lib.rs"
+  for dependency in "${dependencies[@]}"; do
+    printf '%s = "*"\n' "$dependency" >>"$fixture/crates/$member/Cargo.toml"
+  done
 done
 
 (cd "$fixture" && cargo generate-lockfile --quiet)

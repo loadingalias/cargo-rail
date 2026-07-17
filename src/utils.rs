@@ -22,6 +22,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
   const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
   const FNV_PRIME: u64 = 0x100000001b3;
 
+  crate::instrumentation::record_hash(bytes.len());
   let mut hash = FNV_OFFSET_BASIS;
   for byte in bytes {
     hash ^= *byte as u64;
@@ -36,7 +37,10 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// or `"none"` when the file cannot be read.
 pub fn file_fingerprint(path: &Path) -> String {
   match fs::read(path) {
-    Ok(bytes) => format!("fnv1a64:{:016x}", fnv1a64(&bytes)),
+    Ok(bytes) => {
+      crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+      format!("fnv1a64:{:016x}", fnv1a64(&bytes))
+    }
     Err(_) => "none".to_string(),
   }
 }
@@ -49,6 +53,7 @@ pub fn file_fingerprint(path: &Path) -> String {
 fn text_file_fingerprint(path: &Path) -> String {
   match fs::read(path) {
     Ok(bytes) => {
+      crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
       let normalized = normalize_line_endings(&bytes);
       format!("fnv1a64:{:016x}", fnv1a64(&normalized))
     }

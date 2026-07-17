@@ -88,14 +88,11 @@ impl SystemGit {
   /// Uses `git diff --name-status` which is optimized for listing changes.
   /// Typically <100ms even for large diffs with 1000s of files.
   pub fn get_changed_files_between(&self, base_ref: &str, head_ref: Option<&str>) -> RailResult<Vec<(PathBuf, char)>> {
-    let mut args = vec!["diff", "--name-status", base_ref];
-    let head_owned;
+    let mut args = vec!["diff", "--name-status", "-z", "--end-of-options", base_ref];
     if let Some(head) = head_ref {
-      head_owned = head.to_string();
-      args.push(&head_owned);
+      args.push(head);
     }
-
-    args.insert(2, "-z");
+    args.push("--");
     let output = self.run_git(&args)?;
     parse_name_status_output_z(&output.stdout)
   }
@@ -517,14 +514,33 @@ impl SystemGit {
   ///
   /// Output order matches input order. Missing files produce empty byte vectors.
   pub fn read_files_bulk(&self, items: &[(&str, &Path)]) -> RailResult<Vec<Vec<u8>>> {
-    use std::io::Write;
-    use std::process::Stdio;
-
     if items.is_empty() {
       return Ok(vec![]);
     }
 
-    // Start cat-file --batch process
+    let mut requests = Vec::with_capacity(items.len());
+    for (commit_sha, path) in items {
+      let relative_path = self.normalize_path(path)?;
+      let git_path = utils::path_to_git_format(&relative_path);
+      requests.push(format!("{}:{}", commit_sha, git_path));
+    }
+    self.read_batch_objects(&requests, true)
+  }
+
+  /// Read exact blob object IDs in one `git cat-file --batch` subprocess.
+  pub(crate) fn read_blobs_bulk(&self, object_ids: &[&str]) -> RailResult<Vec<Vec<u8>>> {
+    let requests: Vec<String> = object_ids.iter().map(|object_id| (*object_id).to_string()).collect();
+    self.read_batch_objects(&requests, false)
+  }
+
+  fn read_batch_objects(&self, requests: &[String], missing_as_empty: bool) -> RailResult<Vec<Vec<u8>>> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    if requests.is_empty() {
+      return Ok(Vec::new());
+    }
+
     let mut command = self.git_cmd();
     command
       .args(["cat-file", "--batch"])
@@ -538,21 +554,15 @@ impl SystemGit {
       .take()
       .ok_or_else(|| RailError::message("Failed to open stdin"))?;
 
-    // Write all requests to stdin
-    for (commit_sha, path) in items {
-      let relative_path = self.normalize_path(path)?;
-      let git_path = utils::path_to_git_format(&relative_path);
-      let spec = format!("{}:{}\n", commit_sha, git_path);
+    for request in requests {
       stdin
-        .write_all(spec.as_bytes())
+        .write_all(request.as_bytes())
+        .and_then(|()| stdin.write_all(b"\n"))
         .context("Failed to write to git cat-file stdin")?;
     }
 
-    drop(stdin); // Close stdin to signal we're done
-
-    // Read output
+    drop(stdin);
     let output = child.wait_with_output().context("Failed to read git cat-file output")?;
-
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git cat-file --batch".to_string(),
@@ -560,15 +570,10 @@ impl SystemGit {
       }));
     }
 
-    // Parse batch output
-    // Format: "<sha> <type> <size>\n<content>\n"
-    // Or for missing files: "<spec> missing\n"
-    let mut results = Vec::with_capacity(items.len());
+    let mut results = Vec::with_capacity(requests.len());
     let stdout = &output.stdout[..];
     let mut pos = 0;
-
-    for _ in 0..items.len() {
-      // Read header line
+    for request in requests {
       let line_end = stdout[pos..]
         .iter()
         .position(|&b| b == b'\n')
@@ -576,42 +581,43 @@ impl SystemGit {
       let header = &stdout[pos..pos + line_end];
       pos += line_end + 1;
 
-      // Check if file is missing
       if header.ends_with(b" missing") {
-        results.push(vec![]);
-        continue;
+        if missing_as_empty {
+          results.push(Vec::new());
+          continue;
+        }
+        return Err(RailError::message(format!("Git object '{}' is missing", request)));
       }
 
-      // Parse size from header: "<sha> <type> <size>"
-      let parts: Vec<&[u8]> = header.split(|&b| b == b' ').collect();
-      if parts.len() < 3 {
+      let mut parts = header.split(|&b| b == b' ');
+      let _object_id = parts.next();
+      let object_type = parts.next();
+      let size = parts.next();
+      if parts.next().is_some() || object_type != Some(b"blob".as_slice()) {
         return Err(RailError::message(format!(
           "Invalid cat-file header: {}",
           String::from_utf8_lossy(header)
         )));
       }
-
-      let size_str = String::from_utf8_lossy(parts[2]);
+      let size = size.ok_or_else(|| RailError::message("Invalid cat-file header: missing object size"))?;
+      let size_str = String::from_utf8_lossy(size);
       let size: usize = size_str
         .parse()
         .map_err(|_| RailError::message(format!("Invalid size in cat-file output: {}", size_str)))?;
 
-      // Read content
       if pos + size > stdout.len() {
         return Err(RailError::message("Unexpected end of cat-file output"));
       }
-
       let content = stdout[pos..pos + size].to_vec();
       pos += size;
-
-      // Skip trailing newline
-      if pos < stdout.len() && stdout[pos] == b'\n' {
-        pos += 1;
+      if stdout.get(pos) != Some(&b'\n') {
+        return Err(RailError::message(
+          "Invalid cat-file output: missing content terminator",
+        ));
       }
-
+      pos += 1;
       results.push(content);
     }
-
     Ok(results)
   }
 

@@ -8,6 +8,15 @@ use std::process::Command;
 fn test_hash_json_is_deterministic_for_same_inputs() -> Result<()> {
   let ws = TestWorkspace::new_named("hash-deterministic")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
+  let lockfile = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  assert!(
+    lockfile.status.success(),
+    "offline lockfile generation failed: {}",
+    String::from_utf8_lossy(&lockfile.stderr)
+  );
   ws.commit("Add lib-a")?;
 
   let out1 = run_cargo_rail(&ws.path, &["rail", "hash", "--since", "HEAD~1", "-f", "json"])?;

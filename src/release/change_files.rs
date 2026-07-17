@@ -430,11 +430,7 @@ fn truncate_slug(mut slug: String) -> String {
 }
 
 fn hash4(content: &str) -> String {
-  let mut hash = 0xcbf29ce484222325_u64;
-  for byte in content.as_bytes() {
-    hash ^= u64::from(*byte);
-    hash = hash.wrapping_mul(0x100000001b3);
-  }
+  let hash = crate::utils::fnv1a64(content.as_bytes());
   format!("{:04x}", hash & 0xffff)
 }
 

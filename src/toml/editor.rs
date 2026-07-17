@@ -296,6 +296,34 @@ mod tests {
   }
 
   #[test]
+  fn test_editor_set_preserves_unrelated_formatting() {
+    let mut file = NamedTempFile::new().unwrap();
+    use std::io::Write;
+    let original = r#"# package metadata
+[package] # retained table comment
+name = "old"
+version = '0.1.0' # retained value comment
+
+[package.metadata.'cargo-rail']
+values = [
+  "one", # retained array comment
+  "two",
+]
+"#;
+    write!(file, "{original}").unwrap();
+
+    let mut editor = TomlEditor::open(file.path()).unwrap();
+    assert!(!editor.has_changes());
+
+    editor.set("package.name", "new").unwrap();
+
+    assert_eq!(
+      editor.doc.to_string(),
+      original.replacen("name = \"old\"", "name = \"new\"", 1)
+    );
+  }
+
+  #[test]
   fn test_editor_array_push() {
     let mut file = NamedTempFile::new().unwrap();
     use std::io::Write;

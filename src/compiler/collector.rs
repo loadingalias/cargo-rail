@@ -813,6 +813,7 @@ fn cargo_identity(workspace_root: &Path) -> RailResult<String> {
 
 fn source_tree_fingerprint(member_dir: &Path) -> String {
   let mut hash: u64 = 0xcbf29ce484222325;
+  crate::instrumentation::record_hash_operation();
   let mut roots = vec![
     member_dir.join("src"),
     member_dir.join("tests"),
@@ -891,6 +892,7 @@ fn hash_path_metadata(base: &Path, path: &Path, hash: &mut u64) {
 
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
   const FNV_PRIME: u64 = 0x100000001b3;
+  crate::instrumentation::record_hash_input_bytes(bytes.len());
   for byte in bytes {
     *hash ^= u64::from(*byte);
     *hash = hash.wrapping_mul(FNV_PRIME);

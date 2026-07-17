@@ -161,14 +161,18 @@ impl WorkspaceGraph {
     let mut visited = HashSet::new();
     let mut stack = vec![start_node];
     let mut dependents = HashSet::new();
+    let mut node_visits = 0;
+    let mut edge_visits = 0;
 
     while let Some(node_idx) = stack.pop() {
       if !visited.insert(node_idx) {
         continue;
       }
+      node_visits += 1;
 
       // Add all incoming neighbors (things that depend on this)
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
+        edge_visits += 1;
         let neighbor = &self.graph[neighbor_idx];
 
         // Only include workspace members; skip clone if already in set
@@ -179,6 +183,7 @@ impl WorkspaceGraph {
         stack.push(neighbor_idx);
       }
     }
+    crate::instrumentation::record_graph_traversal(node_visits, edge_visits);
 
     let mut result: Vec<_> = dependents.into_iter().collect();
     result.sort();
@@ -191,13 +196,16 @@ impl WorkspaceGraph {
   pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node = self.find_node(crate_name)?;
     let mut dependents = Vec::new();
+    let mut edge_visits = 0;
 
     for neighbor_idx in self.graph.neighbors_directed(node, Direction::Incoming) {
+      edge_visits += 1;
       let neighbor = &self.graph[neighbor_idx];
       if neighbor.is_workspace_member {
         dependents.push(neighbor.name.clone());
       }
     }
+    crate::instrumentation::record_graph_traversal(1, edge_visits);
 
     dependents.sort();
     Ok(dependents)
@@ -231,6 +239,8 @@ impl WorkspaceGraph {
     let mut visited = HashSet::new();
     let mut stack = start_nodes;
     let mut dependents = HashSet::new();
+    let mut node_visits = 0;
+    let mut edge_visits = 0;
 
     // Pre-compute start node indices for fast lookup
     let start_node_set: HashSet<NodeIndex> = stack.iter().copied().collect();
@@ -239,9 +249,11 @@ impl WorkspaceGraph {
       if !visited.insert(node_idx) {
         continue;
       }
+      node_visits += 1;
 
       // Add all incoming neighbors (things that depend on this)
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
+        edge_visits += 1;
         let neighbor = &self.graph[neighbor_idx];
 
         // Only include workspace members not in original set; skip clone if already in set
@@ -255,6 +267,7 @@ impl WorkspaceGraph {
         stack.push(neighbor_idx);
       }
     }
+    crate::instrumentation::record_graph_traversal(node_visits, edge_visits);
 
     Ok(dependents)
   }
@@ -286,9 +299,13 @@ impl WorkspaceGraph {
     }
 
     let mut pairs = Vec::new();
+    let mut node_visits = 0;
+    let mut edge_visits = 0;
 
     while let Some((node_idx, start_node)) = stack.pop() {
+      node_visits += 1;
       for neighbor_idx in self.graph.neighbors_directed(node_idx, Direction::Incoming) {
+        edge_visits += 1;
         let state = (neighbor_idx, start_node);
         if !visited.insert(state) {
           continue;
@@ -302,6 +319,7 @@ impl WorkspaceGraph {
         stack.push(state);
       }
     }
+    crate::instrumentation::record_graph_traversal(node_visits, edge_visits);
 
     pairs.sort();
     Ok(pairs)
@@ -359,6 +377,8 @@ impl WorkspaceGraph {
         }
       }
     }
+
+    crate::instrumentation::record_graph_traversal(subgraph.node_count(), subgraph.edge_count());
 
     // Now run toposort on the workspace-only subgraph
     let sorted = toposort(&subgraph, None).map_err(|cycle| {

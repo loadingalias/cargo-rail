@@ -7,7 +7,6 @@ use crate::error::{RailResult, ResultExt};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Strategy for resolving conflicts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -94,7 +93,7 @@ impl ConflictResolver {
     std::fs::write(&temp_incoming, incoming_content).context("Failed to write incoming file for merge")?;
 
     // Build git merge-file command with strategy
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::git::git_command();
     cmd.arg("merge-file");
 
     match self.strategy {

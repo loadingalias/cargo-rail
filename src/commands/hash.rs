@@ -141,7 +141,9 @@ fn read_json_file(path: &Path) -> RailResult<Value> {
 fn identity_for_portable_plan(value: &Value) -> String {
   use std::fmt::Write as _;
 
-  let digest = Sha256::digest(canonical_json(value).as_bytes());
+  let canonical = canonical_json(value);
+  crate::instrumentation::record_hash(canonical.len());
+  let digest = Sha256::digest(canonical.as_bytes());
   let mut hex = String::with_capacity(digest.len() * 2);
   for byte in digest {
     let _ = write!(hex, "{byte:02x}");

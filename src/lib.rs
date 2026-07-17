@@ -23,12 +23,17 @@ pub mod error;
 pub mod git;
 /// Dependency graph analysis.
 pub mod graph;
+/// Diagnostic-only performance instrumentation.
+#[doc(hidden)]
+pub mod instrumentation;
 /// Deterministic mutation plan/apply framework.
 pub mod mutation;
 /// Centralized output control (quiet mode, progress messages).
 pub mod output;
 /// Release planning and publishing.
 pub mod release;
+/// Canonical Git-backed or filesystem-backed source state.
+pub mod source;
 /// Crate extraction to standalone repos.
 pub mod split;
 /// Bidirectional monorepo sync.
