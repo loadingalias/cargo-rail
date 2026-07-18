@@ -15,7 +15,7 @@ Quick start:
   cargo rail init              # Generate .config/rail.toml (default)
   cargo rail plan              # Build deterministic change plan
   cargo rail run               # Execute planner-selected surfaces
-  cargo rail unify --check     # Preview dependency unification
+  cargo rail unify --check     # Check for pending dependency changes (exit 1)
 
 Docs: https://github.com/loadingalias/cargo-rail
 
@@ -253,7 +253,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
   -c, --check
-          Dry-run mode: preview changes without modifying files
+          Check for pending changes without modifying files (exit 1 when pending)
 
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
@@ -301,7 +301,7 @@ Options:
           Print version
 
 Examples:
-  cargo rail unify --check                # Preview changes (CI mode)
+  cargo rail unify --check                # Check for pending changes (exit 1)
   cargo rail unify --check --explain      # Show why each decision was made
   cargo rail unify --check -f json -o out.json  # Write JSON output to file
   cargo rail unify                        # Apply changes
@@ -355,11 +355,11 @@ Options:
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
-  -c, --check
-          Dry-run mode: preview generated config without writing
-
       --config <PATH>
           Path to rail.toml config file (bypass search order)
+
+      --dry-run
+          Preview generated config without writing
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
@@ -372,7 +372,7 @@ Options:
 
 Examples:
   cargo rail init                       # Generate .config/rail.toml
-  cargo rail init --check               # Preview generated config
+  cargo rail init --dry-run             # Preview generated config
   cargo rail init -o rail.toml          # Custom output path
   cargo rail init --force               # Overwrite existing config
 ```
@@ -416,8 +416,8 @@ and 'unify' before using split/sync.
 
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
-  cargo rail split init my-crate --check  # Preview generated config
-  cargo rail split run my-crate --check   # Preview the split
+  cargo rail split init my-crate --dry-run  # Preview generated config
+  cargo rail split run my-crate --check   # Check for a pending split (exit 1)
   cargo rail split run my-crate           # Execute the split
   cargo rail split run my-crate --yes     # Non-interactive apply confirmation
   cargo rail split run --all              # Split all configured crates
@@ -436,7 +436,7 @@ Arguments:
   [CRATE]...  Crate name(s) to configure
 
 Options:
-  -c, --check                  Preview generated config without writing
+      --dry-run                Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
       --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
       --config <PATH>          Path to rail.toml config file (bypass search order)
@@ -472,7 +472,7 @@ Options:
           Override remote repository
 
   -c, --check
-          Dry-run mode: preview changes
+          Check for pending split changes (exit 1 when pending)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -557,7 +557,7 @@ Options:
           [default: manual]
 
   -c, --check
-          Dry-run mode: preview changes without executing
+          Check for pending changes without executing (exit 1 when pending)
 
       --plan <PATH>
           Apply from a previously generated mutation plan file
@@ -636,9 +636,10 @@ Options:
 
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release init my-crate --dry-run    # Preview generated config
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
-  cargo rail release run my-crate --check       # Preview release plan
+  cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
@@ -665,7 +666,7 @@ Arguments:
   [CRATE]...  Crate name(s) to configure (optional)
 
 Options:
-  -c, --check                  Preview generated config without writing
+      --dry-run                Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
       --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
       --config <PATH>          Path to rail.toml config file (bypass search order)
@@ -703,7 +704,7 @@ Options:
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
   -c, --check
-          Dry-run mode: preview release plan
+          Check for a pending release plan (exit 1 when pending)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1116,7 +1117,7 @@ Options:
           Clean generated reports
 
   -c, --check
-          Dry-run mode: preview what would be cleaned
+          Check for pending cleanup without deleting files (exit 1 when pending)
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
@@ -1141,7 +1142,7 @@ Examples:
   cargo rail clean --cache              # Clean metadata cache only
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --check              # Preview what would be cleaned
+  cargo rail clean --check              # Check for pending cleanup (exit 1)
 ```
 
 ---
@@ -1157,7 +1158,8 @@ Commands:
   locate    Print the path to the active config file
   print     Print the effective configuration with defaults
   validate  Validate the configuration file
-  sync      Sync configuration after upgrades: add missing fields and update targets
+  explain   Explain effective values, defaults, sources, and deprecations
+  migrate   Apply explicit semantic configuration migrations
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1184,8 +1186,9 @@ Examples:
   cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
-  cargo rail config sync --check        # Preview config updates
-  cargo rail config sync                # Run after upgrades; add fields and sync targets
+  cargo rail config explain             # Explain effective values and sources
+  cargo rail config migrate --check     # Check for pending semantic migrations
+  cargo rail config migrate             # Apply explicit semantic migrations
 ```
 
 ---
@@ -1316,20 +1319,56 @@ Options:
 
 ---
 
-### cargo rail config sync
+### cargo rail config explain
 
 ```
-Sync configuration after upgrades: add missing fields and update targets
+Explain effective values, defaults, sources, and deprecations
 
-Scans the workspace for target triples and adds any missing config fields with their default values. Preserves all existing settings, comments, and formatting.
-
-Use this after upgrading cargo-rail to get new configuration options.
-
-Usage: cargo rail config sync [OPTIONS]
+Usage: cargo rail config explain [OPTIONS]
 
 Options:
-  -c, --check
-          Preview changes without modifying rail.toml
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail config migrate
+
+```
+Apply explicit semantic configuration migrations
+
+This never adds coded defaults. It only performs reviewed migrations for deprecated fields while preserving unrelated TOML formatting.
+
+Usage: cargo rail config migrate [OPTIONS]
+
+Options:
+      --check
+          Check for pending migrations without modifying rail.toml
 
   -q, --quiet
           Suppress progress messages (for CI/automation)

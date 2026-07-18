@@ -11,6 +11,6 @@ pub mod format;
 
 // Re-exports
 #[doc(hidden)]
-pub use builder::{RailConfigBuilder, WorkspaceDepsBuilder};
+pub use builder::WorkspaceDepsBuilder;
 pub use editor::TomlEditor;
 pub use format::TomlFormatter;

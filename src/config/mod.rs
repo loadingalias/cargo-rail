@@ -13,7 +13,7 @@
 mod change_detection;
 mod release;
 mod run;
-pub mod schema;
+pub(crate) mod schema;
 mod split;
 mod unify;
 
@@ -21,12 +21,13 @@ mod unify;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
-  Pre1BreakingBump, ReleaseConfig, ReleaseForgeConfig, RequireChangeFiles, SemverCheckPolicy,
+  Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, RequireChangeFiles, SemverCheckPolicy,
 };
-pub use run::{RunConfig, RunProfile, is_builtin_profile};
-pub use split::{CratePath, CrateSplitConfig, CrateSyncConfig, SplitConfig, SplitMode, WorkspaceMode};
+pub use run::{RunBaseline, RunConfig, RunProfile, is_builtin_profile};
+pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use unify::{
-  ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvSource, TransitiveFeatureHost, UnifyConfig,
+  ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource, TransitiveFeatureHost,
+  TransitivePinning, UnifyConfig,
 };
 
 use crate::error::{ConfigError, RailError, RailResult};
@@ -37,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 /// Configuration for cargo-rail
 /// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RailConfig {
   /// Target triples for multi-platform validation (workspace-wide)
   /// Detected via `cargo rail init`, used by multiple commands
@@ -69,8 +70,6 @@ pub struct CrateConfig {
   pub release: Option<CrateReleaseConfig>,
   /// Changelog configuration for this crate
   pub changelog: Option<ChangelogConfig>,
-  /// Sync configuration for this crate (reserved for future use)
-  pub sync: Option<CrateSyncConfig>,
 }
 
 /// Result of attempting to load configuration
@@ -93,6 +92,14 @@ impl RailConfig {
     let bytes = fs::read(path).map_err(|error| format!("failed to read file: {error}"))?;
     let content = std::str::from_utf8(&bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
     let config = toml_edit::de::from_str(content).map_err(|error| error.to_string())?;
+    let doc: toml_edit::DocumentMut = content
+      .parse()
+      .map_err(|error: toml_edit::TomlError| error.to_string())?;
+    for deprecation in schema::present_deprecations(&doc) {
+      if let Some(message) = deprecation.spec.deprecation {
+        crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);
+      }
+    }
     Ok((config, bytes))
   }
 

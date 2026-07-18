@@ -635,7 +635,7 @@ impl WorkspaceContext {
       // Validate change-detection glob patterns
       cfg.change_detection.validate().map_err(RailError::Config)?;
 
-      // Validate unify config (e.g., transitive_host path)
+      // Validate unify config (e.g., the transitive pinning host path).
       cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
 
       // Validate run profile schema.

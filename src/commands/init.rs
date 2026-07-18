@@ -3,22 +3,16 @@
 //! Auto-detects workspace structure, toolchain settings, and generates
 //! a sensible .config/rail.toml with smart defaults.
 
-use crate::config::{RailConfig, UnifyConfig};
 use crate::error::{RailError, RailResult};
 use crate::progress;
-use crate::toml::RailConfigBuilder;
+use crate::toml::TomlFormatter;
 use crate::workspace::WorkspaceContext;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Generate rail.toml configuration
-pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, check: bool, json: bool) -> RailResult<()> {
-  run_init_impl(ctx.workspace_root(), output_path, force, check, json)
-}
-
-/// Auto-detect reasonable unify defaults
-fn default_unify_config() -> UnifyConfig {
-  UnifyConfig::default()
+pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, dry_run: bool, json: bool) -> RailResult<()> {
+  run_init_impl(ctx.workspace_root(), output_path, force, dry_run, json)
 }
 
 /// Detect target triples across config files in the workspace
@@ -33,15 +27,14 @@ fn detect_targets(workspace_root: &Path) -> Vec<String> {
   crate::targets::detect_targets(workspace_root).unwrap_or_default()
 }
 
-fn build_rail_config(targets: Vec<String>) -> RailConfig {
-  RailConfig {
-    targets,
-    unify: default_unify_config(),
-    release: crate::config::ReleaseConfig::default(),
-    change_detection: crate::config::ChangeDetectionConfig::default(),
-    run: crate::config::RunConfig::default(),
-    crates: Default::default(),
+fn build_sparse_config(targets: &[String]) -> String {
+  let mut content =
+    String::from("# cargo-rail configuration\n# Documentation: https://github.com/loadingalias/cargo-rail\n");
+  if !targets.is_empty() {
+    content.push_str("\n# Additional supported Cargo target-resolution views detected from repository files.\n");
+    content.push_str(&format!("targets = {}\n", TomlFormatter::new().array_targets(targets)));
   }
+  content
 }
 
 /// Check if config file already exists at any location
@@ -62,18 +55,7 @@ fn ensure_output_dir(output_path: &Path) -> RailResult<()> {
 
 /// Write config file atomically
 fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
-  let temp_path = config_path.with_extension("toml.tmp");
-
-  fs::write(&temp_path, content).map_err(|e| {
-    RailError::with_help(
-      format!("failed to write {}: {}", temp_path.display(), e),
-      "check file permissions",
-    )
-  })?;
-
-  fs::rename(&temp_path, config_path).map_err(|e| RailError::message(format!("failed to finalize config: {}", e)))?;
-
-  Ok(())
+  crate::utils::write_file_atomic(config_path, content.as_bytes())
 }
 
 /// Check if this is a valid Cargo workspace
@@ -91,22 +73,22 @@ fn is_cargo_workspace(workspace_root: &Path) -> bool {
 }
 
 /// Shared implementation for both run_init and run_init_standalone
-fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: bool, json: bool) -> RailResult<()> {
+fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run: bool, json: bool) -> RailResult<()> {
   let config_path = workspace_root.join(output_path);
 
   // Warn if not a Cargo workspace (skip warnings in quiet/JSON mode)
-  if !is_cargo_workspace(workspace_root) && !check && !json && !crate::output::is_quiet() {
+  if !is_cargo_workspace(workspace_root) && !dry_run && !json && !crate::output::is_quiet() {
     crate::warn!("no Cargo workspace detected in {}", workspace_root.display());
     eprintln!("         cargo-rail works best with Cargo workspaces\n");
   }
 
   // Check if target path already exists
-  // In --check mode, we just preview - so existence doesn't matter
-  if config_path.exists() && !check {
+  // In --dry-run mode, we just preview, so existence doesn't matter.
+  if config_path.exists() && !dry_run {
     if !force {
       return Err(RailError::with_help(
         format!("configuration exists: {}", config_path.display()),
-        "use --force to overwrite, or use --check to preview what would be generated",
+        "use --force to overwrite, or use --dry-run to preview what would be generated",
       ));
     }
     if !json {
@@ -114,35 +96,25 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, check: b
     }
   } else if let Some(existing) = check_existing_config(workspace_root) {
     // A config exists elsewhere - warn but allow writing to different path
-    if !check && !json && !crate::output::is_quiet() {
+    if !dry_run && !json && !crate::output::is_quiet() {
       crate::note!("existing config found at {}", existing.display());
       eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
     }
   }
 
   let detected_targets = detect_targets(workspace_root);
-  let config = build_rail_config(detected_targets.clone());
+  let toml_content = build_sparse_config(&detected_targets);
 
-  let toml_content = RailConfigBuilder::new()
-    .header()
-    .targets(&config.targets)
-    .unify(&config.unify)
-    .release(&config.release)
-    .change_detection(&config.change_detection)
-    .run(&config.run)
-    .splits_template()
-    .build()?;
-
-  if check {
+  if dry_run {
     if json {
       let payload = serde_json::json!({
         "command": "init",
-        "check": true,
+        "dry_run": true,
         "config_path": config_path.display().to_string(),
         "targets_detected": detected_targets,
         "content": toml_content
       });
-      let output = crate::output::machine_json_envelope("init", "check", "success", 0, payload);
+      let output = crate::output::machine_json_envelope("init", "dry_run", "success", 0, payload);
       println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
     } else {
       println!("{}", toml_content);
@@ -174,45 +146,29 @@ pub fn run_init_standalone(
   workspace_root: &Path,
   output_path: &str,
   force: bool,
-  check: bool,
+  dry_run: bool,
   json: bool,
 ) -> RailResult<()> {
-  run_init_impl(workspace_root, output_path, force, check, json)
+  run_init_impl(workspace_root, output_path, force, dry_run, json)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::ReleaseConfig;
 
   #[test]
-  fn test_serialize_config_with_builder() {
-    let config = RailConfig {
-      targets: vec![],
-      unify: UnifyConfig::default(),
-      release: ReleaseConfig::default(),
-      change_detection: crate::config::ChangeDetectionConfig::default(),
-      run: crate::config::RunConfig::default(),
-      crates: Default::default(),
-    };
-
-    let toml = RailConfigBuilder::new()
-      .header()
-      .targets(&config.targets)
-      .unify(&config.unify)
-      .release(&config.release)
-      .change_detection(&config.change_detection)
-      .run(&config.run)
-      .splits_template()
-      .build()
-      .unwrap();
-
-    // Should contain section headers
-    assert!(toml.contains("[unify]"));
-    assert!(toml.contains("[change-detection]"));
-
-    // Should contain helpful comments
+  fn sparse_config_omits_coded_defaults() {
+    let toml = build_sparse_config(&[]);
     assert!(toml.contains("cargo-rail configuration"));
     assert!(toml.contains("Documentation:"));
+    assert!(!toml.contains("[unify]"));
+    assert!(!toml.contains("[release]"));
+  }
+
+  #[test]
+  fn sparse_config_writes_detected_targets() {
+    let toml = build_sparse_config(&["wasm32-unknown-unknown".to_string()]);
+    assert!(toml.contains("targets = ["));
+    assert!(toml.contains("wasm32-unknown-unknown"));
   }
 }

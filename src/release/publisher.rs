@@ -1,6 +1,6 @@
 //! Release execution and publishing to crates.io and forge releases.
 
-use crate::config::{ReleaseConfig, ReleaseForgeConfig};
+use crate::config::{ReleaseConfig, ReleaseRemoteEffects};
 use crate::error::{RailError, RailResult};
 use crate::release::changelog::detect_github_repo;
 use crate::release::planner::{CrateReleasePlan, ReleasePlan};
@@ -65,20 +65,13 @@ impl<'a> ReleasePublisher<'a> {
     let mut warnings = Vec::new();
     let git = self.ctx.git()?.git();
 
-    if self.release_config.create_github_release && !self.release_config.push {
-      return Err(RailError::with_help(
-        "invalid release config: create_github_release requires push",
-        "set [release].push = true so cargo-rail owns the pushed tag before creating a forge release",
-      ));
-    }
-
-    if self.release_config.create_github_release && !skip_tag {
+    if self.release_config.remote_effects.creates_forge_release() && !skip_tag {
       let forge = self.detect_release_forge()?;
       let binary = forge.binary();
       if !process::succeeds(binary, &["--version"], None) {
         return Err(RailError::with_help(
           format!("{} releases enabled but {} CLI was not found", forge.name(), binary),
-          format!("install {} or set create_github_release = false", binary),
+          format!("install {} or set release.remote_effects = \"push\"", binary),
         ));
       }
 
@@ -101,11 +94,11 @@ impl<'a> ReleasePublisher<'a> {
       }
     }
 
-    if self.release_config.push {
+    if self.release_config.remote_effects.pushes() {
       if !git.has_remote(RELEASE_REMOTE)? {
         return Err(RailError::with_help(
           "release push enabled but remote 'origin' does not exist",
-          "add an origin remote or set [release].push = false",
+          "add an origin remote or set [release].remote_effects = \"none\"",
         ));
       }
 
@@ -317,7 +310,7 @@ impl<'a> ReleasePublisher<'a> {
     state.save(state_path)?;
     progress!("\nrelease complete");
 
-    if !state.skip_tag && !self.release_config.push {
+    if !state.skip_tag && !self.release_config.remote_effects.pushes() {
       progress!("\nnext:");
       progress!("  git push origin {}", state.branch);
       progress!("  git push origin --tags");
@@ -411,7 +404,7 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn reconcile_push(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
-    if !self.release_config.push {
+    if !self.release_config.remote_effects.pushes() {
       state.push.status = StepStatus::Complete;
       state.save(state_path)?;
       return Ok(());
@@ -435,7 +428,7 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn reconcile_forge_drafts(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
-    if !self.release_config.create_github_release || state.skip_tag {
+    if !self.release_config.remote_effects.creates_forge_release() || state.skip_tag {
       for crate_state in &mut state.crates {
         crate_state.forge_draft.status = StepStatus::Complete;
         crate_state.forge_publication.status = StepStatus::Complete;
@@ -505,7 +498,7 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn reconcile_forge_publications(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
-    if !self.release_config.create_github_release || state.skip_tag {
+    if !self.release_config.remote_effects.creates_forge_release() || state.skip_tag {
       return Ok(());
     }
     let forge = self.detect_release_forge()?;
@@ -919,10 +912,15 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn detect_release_forge(&self) -> RailResult<ReleaseForge> {
-    match self.release_config.forge {
-      ReleaseForgeConfig::Github => return Ok(ReleaseForge::Github),
-      ReleaseForgeConfig::Gitlab => return Ok(ReleaseForge::Gitlab),
-      ReleaseForgeConfig::Auto => {}
+    match self.release_config.remote_effects {
+      ReleaseRemoteEffects::Github => return Ok(ReleaseForge::Github),
+      ReleaseRemoteEffects::Gitlab => return Ok(ReleaseForge::Gitlab),
+      ReleaseRemoteEffects::Auto => {}
+      ReleaseRemoteEffects::None | ReleaseRemoteEffects::Push => {
+        return Err(RailError::message(
+          "forge release creation is not authorized by release.remote_effects",
+        ));
+      }
     }
 
     let output = process::run(
@@ -934,7 +932,7 @@ impl<'a> ReleasePublisher<'a> {
     detect_release_forge_from_remote(remote.trim()).ok_or_else(|| {
       RailError::with_help(
         "could not detect release forge from origin remote",
-        "set [release].forge = \"github\" or \"gitlab\"; Gitea release creation is not supported",
+        "set [release].remote_effects = \"github\" or \"gitlab\"; Gitea release creation is not supported",
       )
     })
   }
@@ -1146,7 +1144,10 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn validate_release_notes_size(&self, plan: &CrateReleasePlan, skip_tag: bool) -> RailResult<()> {
-    if !self.release_config.create_github_release || skip_tag || self.detect_release_forge()? != ReleaseForge::Github {
+    if !self.release_config.remote_effects.creates_forge_release()
+      || skip_tag
+      || self.detect_release_forge()? != ReleaseForge::Github
+    {
       return Ok(());
     }
 

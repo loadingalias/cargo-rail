@@ -27,12 +27,12 @@ These are not disconnected wrappers. Every workflow consumes the same resolved w
 ```bash
 cargo install cargo-rail
 cargo rail init
-cargo rail config sync
+cargo rail config validate --strict
 ```
 
 Pre-built archives for Linux, Windows, and Apple Silicon macOS, SHA-256 checksums, and signed provenance are available from [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases). `cargo-binstall cargo-rail` is supported.
 
-Run `cargo rail config sync` after every cargo-rail upgrade. It materializes new policy fields and detected targets without overwriting existing choices; review the diff, then run `cargo rail config validate --strict`.
+After an upgrade, run `cargo rail config migrate --check`. Exit 1 means an explicit semantic migration is available; review it, apply it with `cargo rail config migrate`, then validate. Coded defaults are never copied into `rail.toml`.
 
 ## Unify
 

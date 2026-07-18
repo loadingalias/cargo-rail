@@ -6,7 +6,7 @@
 
 ```bash
 cargo rail init
-cargo rail config sync
+cargo rail config migrate --check
 cargo rail unify --check
 cargo rail unify --check --explain
 cargo rail unify
@@ -16,19 +16,13 @@ cargo rail unify
 
 ```toml
 [unify]
-detect_undeclared_features = true
-fix_undeclared_features = true
-prune_dead_features = true
 consumer_scope = "open"
-detect_unused = true
-compiler_diag_cache = true
-msrv = true
-pin_transitives = false
+msrv_policy = { mode = "compute", source = "workspace" }
 ```
 
-Keep `pin_transitives = false` unless replacing a workspace-hack crate. Keep `consumer_scope = "open"` for libraries or private packages with consumers outside the workspace; set it to `"workspace"` only when the workspace is the complete consumer graph. Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest backup.
+Omit `transitive_pinning` unless replacing a workspace-hack crate. Keep `consumer_scope = "open"` for libraries or private packages with consumers outside the workspace; set it to `"workspace"` only when the workspace is the complete consumer graph. Diagnostics are unconditional. `--check` writes nothing and exits 1 for pending edits; running without `--check` applies proven edits. Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest backup.
 
-The compiler-evidence cache binds the compiler, source tree, manifests, target, Cargo target kind, and feature selection. Repeated analysis reuses only compilation units whose full identity and Cargo freshness still match.
+Compiler evidence caching and deterministic manifest ordering are internal correctness mechanisms, not configuration.
 
 ## Reference
 

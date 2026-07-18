@@ -1,6 +1,6 @@
 //! Integration tests for MSRV (rust-version) computation
 //!
-//! Tests the msrv_source configuration:
+//! Tests the MSRV source policy:
 //! - "deps" mode: use maximum from dependencies only
 //! - "workspace" mode: preserve existing, warn if deps need higher
 //! - "max" mode: take max(workspace, deps)
@@ -38,12 +38,11 @@ serde = {{ version = "1.0", features = ["derive"] }}
   Ok(workspace)
 }
 
-/// Helper to create rail.toml with specific msrv_source
+/// Helper to create rail.toml with a specific MSRV source
 fn write_rail_config(workspace: &TestWorkspace, msrv_source: &str) -> Result<()> {
   let config = format!(
     r#"[unify]
-msrv = true
-msrv_source = "{}"
+msrv_policy = {{ mode = "compute", source = "{}" }}
 "#,
     msrv_source
   );
@@ -125,11 +124,11 @@ fn test_msrv_source_deps_uses_dependency_version() -> Result<()> {
 
 #[test]
 fn test_msrv_disabled_skips_computation() -> Result<()> {
-  // Test that msrv = false skips MSRV computation entirely
+  // A disabled policy skips MSRV computation entirely.
   let workspace = create_workspace_with_rust_version("1.70.0")?;
 
   let config = r#"[unify]
-msrv = false
+msrv_policy = { mode = "disabled" }
 "#;
   std::fs::create_dir_all(workspace.path.join(".config"))?;
   std::fs::write(workspace.path.join(".config/rail.toml"), config)?;
@@ -154,12 +153,12 @@ msrv = false
 
 #[test]
 fn test_msrv_default_is_max_mode() -> Result<()> {
-  // Test that the default msrv_source is "max"
+  // The default source policy is "max".
   let workspace = create_workspace_with_rust_version("1.75.0")?;
 
-  // Create config without msrv_source (use default)
+  // Omit `source` to exercise the coded default.
   let config = r#"[unify]
-msrv = true
+msrv_policy = { mode = "compute" }
 "#;
   std::fs::create_dir_all(workspace.path.join(".config"))?;
   std::fs::write(workspace.path.join(".config/rail.toml"), config)?;
@@ -174,7 +173,7 @@ msrv = true
   // Should complete successfully
   assert!(
     output.status.success(),
-    "Should complete with default msrv_source.\nStdout:\n{}\nStderr:\n{}",
+    "Should complete with the default MSRV source.\nStdout:\n{}\nStderr:\n{}",
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
   );
@@ -212,8 +211,7 @@ authors = ["Test Author"]
   workspace.commit("Use package-only rust-version baseline")?;
 
   let config = r#"[unify]
-msrv = true
-msrv_source = "workspace"
+msrv_policy = { mode = "compute", source = "workspace" }
 "#;
   std::fs::create_dir_all(workspace.path.join(".config"))?;
   std::fs::write(workspace.path.join(".config/rail.toml"), config)?;
@@ -244,9 +242,7 @@ fn test_msrv_enforce_inheritance_sets_members_to_workspace() -> Result<()> {
   let workspace = create_workspace_with_rust_version("1.72.0")?;
 
   let config = r#"[unify]
-msrv = true
-msrv_source = "workspace"
-enforce_msrv_inheritance = true
+msrv_policy = { mode = "compute", source = "workspace", inherit = true }
 "#;
   std::fs::create_dir_all(workspace.path.join(".config"))?;
   std::fs::write(workspace.path.join(".config/rail.toml"), config)?;

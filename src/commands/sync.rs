@@ -35,7 +35,7 @@ pub struct SyncArgs {
   pub to_remote: bool,
   /// Conflict resolution strategy
   pub strategy: ConflictStrategy,
-  /// Dry-run mode: preview changes without executing
+  /// Check for pending changes without executing
   pub check: bool,
   /// Apply from a previously generated mutation plan file
   pub plan_path: Option<PathBuf>,

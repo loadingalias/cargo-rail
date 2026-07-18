@@ -401,7 +401,7 @@ pub struct UnificationPlan {
   pub validation_results: Vec<ValidationResult>,
   /// Issues detected during analysis
   pub issues: Vec<UnifyIssue>,
-  /// Computed MSRV from dependency graph (if msrv = true in config)
+  /// Computed MSRV from the dependency graph when the configured policy enables it.
   pub computed_msrv: Option<ComputedMsrv>,
   /// Duplicate versions that were silently cleaned up
   pub duplicates_cleaned: Vec<DuplicateCleanup>,
@@ -683,38 +683,6 @@ impl UnificationPlan {
       }
     }
 
-    // Show undeclared features - only as warnings if NOT being auto-fixed
-    // Check if we have AddFeatures edits (which means fix_undeclared_features is enabled)
-    let has_feature_fixes = self
-      .member_edits
-      .values()
-      .any(|edits| edits.iter().any(|e| matches!(e, MemberEdit::AddFeatures { .. })));
-
-    if !self.undeclared_features.is_empty() && !has_feature_fixes {
-      // Warn mode: show all undeclared features as warnings
-      s.push_str(&format!(
-        "\n⚠️  Undeclared features detected (will break standalone builds): {}\n",
-        self.undeclared_features.len()
-      ));
-      for uf in &self.undeclared_features {
-        let borrowed_from_str = if uf.borrowed_from.is_empty() {
-          String::new()
-        } else {
-          format!(" (borrowed from {})", uf.borrowed_from.join(", "))
-        };
-        s.push_str(&format!(
-          "  - {}/{}: [{}]{}\n",
-          uf.member,
-          uf.dep_name,
-          uf.undeclared_features.join(", "),
-          borrowed_from_str
-        ));
-      }
-      s.push_str("  These crates rely on feature unification from other workspace members.\n");
-      s.push_str("  After unification, standalone builds (cargo test -p <crate>) will fail.\n");
-      s.push_str("  Fix: Set fix_undeclared_features = true in rail.toml to auto-fix.\n");
-    }
-
     s
   }
 }
@@ -956,42 +924,6 @@ mod tests {
   }
 
   #[test]
-  fn test_summary_undeclared_warning_when_no_fixes() {
-    let plan = UnificationPlan {
-      workspace_deps: vec![],
-      member_edits: FxHashMap::default(),
-      member_paths: FxHashMap::default(),
-      transitive_pins: vec![],
-      validation_results: vec![],
-      issues: vec![],
-      computed_msrv: None,
-      duplicates_cleaned: vec![],
-      pruned_features: vec![],
-      reachable_features: vec![],
-      optional_features: vec![],
-      version_mismatches: vec![],
-      unused_deps: vec![],
-      undeclared_features: vec![UndeclaredFeature {
-        member: arc("my-crate"),
-        dep_name: arc("backoff"),
-        undeclared_features: vec![arc("futures")],
-        declared_features: vec![],
-        resolved_features: vec![arc("futures")],
-        dep_kind: DepKind::Normal,
-        target: None,
-        borrowed_from: vec![arc("other-crate")],
-        required_by: vec![],
-      }],
-      dependency_decisions: vec![],
-    };
-
-    // No AddFeatures edits = warn mode
-    let summary = plan.summary();
-    assert!(summary.contains("⚠️  Undeclared features detected"));
-    assert!(summary.contains("fix_undeclared_features = true"));
-  }
-
-  #[test]
   fn test_summary_no_undeclared_warning_when_fixes_present() {
     let mut plan = UnificationPlan {
       workspace_deps: vec![],
@@ -1089,82 +1021,6 @@ mod tests {
     assert_eq!(uf.undeclared_features, cloned.undeclared_features);
     assert_eq!(uf.target, cloned.target);
     assert_eq!(uf.borrowed_from, cloned.borrowed_from);
-  }
-
-  #[test]
-  fn test_summary_shows_borrowed_from_in_undeclared_warning() {
-    let plan = UnificationPlan {
-      workspace_deps: vec![],
-      member_edits: FxHashMap::default(),
-      member_paths: FxHashMap::default(),
-      transitive_pins: vec![],
-      validation_results: vec![],
-      issues: vec![],
-      computed_msrv: None,
-      duplicates_cleaned: vec![],
-      pruned_features: vec![],
-      reachable_features: vec![],
-      optional_features: vec![],
-      version_mismatches: vec![],
-      unused_deps: vec![],
-      undeclared_features: vec![UndeclaredFeature {
-        member: arc("my-crate"),
-        dep_name: arc("tokio"),
-        undeclared_features: vec![arc("macros"), arc("rt")],
-        declared_features: vec![],
-        resolved_features: vec![arc("macros"), arc("rt")],
-        dep_kind: DepKind::Normal,
-        target: None,
-        borrowed_from: vec![arc("other-crate"), arc("third-crate")],
-        required_by: vec![],
-      }],
-      dependency_decisions: vec![],
-    };
-
-    // No AddFeatures edits = warn mode with borrowed_from
-    let summary = plan.summary();
-    assert!(summary.contains("⚠️  Undeclared features detected"));
-    assert!(summary.contains("my-crate/tokio"));
-    assert!(summary.contains("macros"));
-    assert!(summary.contains("rt"));
-    assert!(summary.contains("(borrowed from other-crate, third-crate)"));
-  }
-
-  #[test]
-  fn test_summary_borrowed_from_empty_not_shown() {
-    let plan = UnificationPlan {
-      workspace_deps: vec![],
-      member_edits: FxHashMap::default(),
-      member_paths: FxHashMap::default(),
-      transitive_pins: vec![],
-      validation_results: vec![],
-      issues: vec![],
-      computed_msrv: None,
-      duplicates_cleaned: vec![],
-      pruned_features: vec![],
-      reachable_features: vec![],
-      optional_features: vec![],
-      version_mismatches: vec![],
-      unused_deps: vec![],
-      undeclared_features: vec![UndeclaredFeature {
-        member: arc("my-crate"),
-        dep_name: arc("backoff"),
-        undeclared_features: vec![arc("futures")],
-        declared_features: vec![],
-        resolved_features: vec![arc("futures")],
-        dep_kind: DepKind::Normal,
-        target: None,
-        borrowed_from: vec![], // Empty - shouldn't show "borrowed from"
-        required_by: vec![],
-      }],
-      dependency_decisions: vec![],
-    };
-
-    let summary = plan.summary();
-    assert!(summary.contains("my-crate/backoff"));
-    assert!(summary.contains("futures"));
-    // Should NOT contain "borrowed from" when empty
-    assert!(!summary.contains("borrowed from"));
   }
 
   #[test]

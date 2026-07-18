@@ -15,7 +15,7 @@
 
 ```toml
 [unify]
-pin_transitives = true
+transitive_pinning = { host = "root" }
 ```
 
 ## Commands

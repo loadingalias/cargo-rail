@@ -1,4 +1,4 @@
-//! Integration tests for `cargo rail config` commands (locate, print, validate, sync)
+//! Integration tests for `cargo rail config` commands (locate, print, validate, explain, migrate)
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
@@ -218,32 +218,55 @@ fn test_config_validate_valid_config() -> Result<()> {
 }
 
 #[test]
-fn test_config_validate_strict_accepts_sort_dependencies() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-strict-sort-deps")?;
+fn test_config_validate_accepts_empty_config() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-empty")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
 
   let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-sort_dependencies = true
-"#,
-  )?;
+  fs::write(&config_path, "")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
-  assert!(
-    output.status.success(),
-    "strict config validation should accept unify.sort_dependencies"
-  );
+  assert!(output.status.success(), "an empty rail.toml must be valid");
 
   let stdout = String::from_utf8_lossy(&output.stdout);
   let json: serde_json::Value = serde_json::from_str(&stdout)?;
   assert_eq!(json["valid"], true);
   assert_eq!(json["errors"], serde_json::Value::Array(vec![]));
   assert_eq!(json["warnings"], serde_json::Value::Array(vec![]));
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_warns_for_deprecated_implementation_toggles() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-deprecated-toggles")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    "[unify]\ncompiler_diag_cache = false\nsort_dependencies = false\n",
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict", "-f", "json"])?;
+  assert!(
+    output.status.success(),
+    "deprecated compatibility input should warn locally"
+  );
+
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let warnings = json["warnings"].as_array().expect("warnings array");
+  assert!(warnings.iter().any(|warning| {
+    warning["message"]
+      .as_str()
+      .is_some_and(|message| message.contains("unify.compiler_diag_cache") && message.contains("config migrate"))
+  }));
+  assert!(warnings.iter().any(|warning| {
+    warning["message"]
+      .as_str()
+      .is_some_and(|message| message.contains("unify.sort_dependencies") && message.contains("config migrate"))
+  }));
 
   Ok(())
 }
@@ -522,7 +545,7 @@ unexpected = true
     errors
       .iter()
       .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown key 'unexpected' in [run.profile.ci] section")),
+      .any(|msg| msg.contains("unknown configuration key 'run.profile.ci.unexpected'")),
     "expected strict unknown-key error. Output:\n{}",
     stdout
   );
@@ -600,363 +623,348 @@ run_args = ["--manifest-path", "{bad_token}/Cargo.toml"]
   Ok(())
 }
 
-// Config Sync Tests
+// Config Explain Tests
 
 #[test]
-fn test_config_sync_adds_missing_fields() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-adds-fields")?;
+fn test_config_explain_json_reports_effective_default_and_source() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-explain-json")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
 
-  // Create minimal config (missing most fields)
   let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["x86_64-unknown-linux-gnu"]
+  fs::write(&config_path, "[unify]\nmsrv_policy = { mode = \"disabled\" }\n")?;
 
-[unify]
-msrv = true
-"#,
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+  assert!(output.status.success(), "config explain should succeed");
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["command"], "config");
+  assert_eq!(json["action"], "explain");
+
+  let fields = json["fields"].as_array().expect("fields array");
+  let msrv = fields
+    .iter()
+    .find(|field| field["path"] == "unify.msrv_policy.mode")
+    .expect("unify.msrv_policy.mode explanation");
+  assert_eq!(msrv["effective"], "disabled");
+  assert_eq!(msrv["default"], "compute");
+  assert!(
+    msrv["source"]
+      .as_str()
+      .is_some_and(|source| source.ends_with(".config/rail.toml")),
+    "configured source should identify rail.toml"
+  );
+  assert_eq!(msrv["classification"], "project_policy");
+  assert!(msrv["why"].as_str().is_some_and(|why| !why.is_empty()));
+
+  let consumer_scope = fields
+    .iter()
+    .find(|field| field["path"] == "unify.consumer_scope")
+    .expect("unify.consumer_scope explanation");
+  assert_eq!(consumer_scope["effective"], "open");
+  assert_eq!(consumer_scope["default"], "open");
+  assert_eq!(consumer_scope["source"], "default");
+
+  Ok(())
+}
+
+#[test]
+fn test_config_explain_text_uses_same_field_values_as_json() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-explain-text")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
   )?;
 
-  // Run config sync
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "explain"])?;
+  assert!(output.status.success());
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(stdout.contains("unify.msrv_policy.mode"));
+  assert!(stdout.contains("effective: disabled"));
+  assert!(stdout.contains("default: compute"));
+  assert!(stdout.contains("source:"));
 
-  assert!(output.status.success(), "config sync should succeed");
+  Ok(())
+}
 
-  // Verify new fields were added
-  let config = fs::read_to_string(&config_path)?;
-  assert!(config.contains("msrv_source"), "msrv_source should be added");
-  assert!(
-    config.contains("preserve_features"),
-    "preserve_features should be added"
-  );
-  assert!(
-    config.contains("prune_dead_features"),
-    "prune_dead_features should be added"
-  );
-  assert!(config.contains("tag_format"), "tag_format should be added to [release]");
-  assert!(
-    config.contains("require_release_notes"),
-    "require_release_notes should be added to [release]"
-  );
+#[test]
+fn test_config_explain_marks_removed_input_as_ineffective() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-explain-removed")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    "[unify]\ncompiler_diag_cache = false\n",
+  )?;
 
-  // Verify existing value preserved
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+  assert!(output.status.success());
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let field = json["fields"]
+    .as_array()
+    .and_then(|fields| fields.iter().find(|field| field["path"] == "unify.compiler_diag_cache"))
+    .expect("removed field explanation");
+  assert_eq!(field["configured"], false);
+  assert_eq!(field["effective"], serde_json::Value::Null);
+  assert_eq!(field["default"], serde_json::Value::Null);
+  assert_eq!(field["classification"], "implementation_detail");
   assert!(
-    config.contains("msrv = true"),
-    "existing msrv value should be preserved"
-  );
-  assert!(
-    config.contains("x86_64-unknown-linux-gnu"),
-    "existing target should be preserved"
+    field["deprecation"]
+      .as_str()
+      .is_some_and(|message| message.contains("config migrate"))
   );
 
   Ok(())
 }
 
 #[test]
-fn test_config_sync_preserves_user_values() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-preserves-values")?;
+fn test_config_explain_attributes_legacy_policy_to_config() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-explain-legacy-policy")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
+  fs::write(ws.path.join(".config/rail.toml"), "[release]\npush = true\n")?;
 
-  // Create config with custom values
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["wasm32-unknown-unknown"]
-
-[unify]
-msrv = false
-msrv_source = "workspace"
-max_backups = 10
-exclude = ["some-dep"]
-
-[release]
-tag_prefix = "release-"
-sign_tags = true
-"#,
-  )?;
-
-  // Run config sync
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
-  assert!(output.status.success(), "config sync should succeed");
-
-  // Verify user values preserved
-  let config = fs::read_to_string(&config_path)?;
-  assert!(config.contains("msrv = false"), "user msrv=false should be preserved");
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+  assert!(output.status.success());
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let field = json["fields"]
+    .as_array()
+    .and_then(|fields| fields.iter().find(|field| field["path"] == "release.remote_effects"))
+    .expect("effective release policy explanation");
+  assert_eq!(field["effective"], "push");
   assert!(
-    config.contains(r#"msrv_source = "workspace""#),
-    "user msrv_source should be preserved"
-  );
-  assert!(
-    config.contains("max_backups = 10"),
-    "user max_backups should be preserved"
-  );
-  assert!(
-    config.contains(r#"tag_prefix = "release-""#),
-    "user tag_prefix should be preserved"
-  );
-  assert!(
-    config.contains("sign_tags = true"),
-    "user sign_tags should be preserved"
+    field["source"]
+      .as_str()
+      .is_some_and(|source| source.ends_with(".config/rail.toml")),
+    "legacy compatibility input must be attributed to rail.toml"
   );
 
   Ok(())
 }
 
+// Config Migrate Tests
+
 #[test]
-fn test_config_sync_check_mode_does_not_modify() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-check-mode")?;
+fn test_config_migrate_check_is_read_only_and_exits_one() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-check")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
 
-  // Create minimal config
   let config_path = ws.path.join(".config").join("rail.toml");
-  let original_config = r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-msrv = true
-"#;
+  let original_config = "[unify]\ncompiler_diag_cache = false\nsort_dependencies = false\n";
   fs::write(&config_path, original_config)?;
 
-  // Run config sync --check
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync", "--check"])?;
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
+  assert_eq!(output.status.code(), Some(1), "pending migration must exit 1");
 
-  // Should exit with code 1 (changes needed)
-  assert!(
-    !output.status.success(),
-    "config sync --check should exit 1 when changes needed"
-  );
-
-  // File should NOT be modified
   let config_after = fs::read_to_string(&config_path)?;
-  assert_eq!(
-    original_config, config_after,
-    "config should not be modified in check mode"
-  );
+  assert_eq!(original_config, config_after, "--check must not modify rail.toml");
 
-  Ok(())
-}
-
-#[test]
-fn test_config_sync_idempotent() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-idempotent")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  // Run config sync twice
-  let output1 = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
-  assert!(output1.status.success(), "first sync should succeed");
-
-  let output2 = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
-  assert!(output2.status.success(), "second sync should succeed");
-
-  // Second run should report "up to date"
-  let stdout = String::from_utf8_lossy(&output2.stdout);
-  assert!(stdout.contains("up to date"), "second run should report 'up to date'");
-
-  Ok(())
-}
-
-#[test]
-fn test_config_sync_detects_yaml_targets() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-yaml-targets")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  // Create minimal config
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-msrv = true
-"#,
-  )?;
-
-  // Add GitHub workflow with targets
-  let workflows_dir = ws.path.join(".github").join("workflows");
-  fs::create_dir_all(&workflows_dir)?;
-  fs::write(
-    workflows_dir.join("ci.yml"),
-    r#"name: CI
-jobs:
-  build:
-    strategy:
-      matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
-"#,
-  )?;
-
-  // Run config sync --check to preview
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync", "--check"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
-
-  // Should detect new targets
-  assert!(
-    stdout.contains("aarch64-apple-darwin"),
-    "should detect aarch64-apple-darwin from YAML"
-  );
-  assert!(
-    stdout.contains("x86_64-pc-windows-msvc"),
-    "should detect x86_64-pc-windows-msvc from YAML"
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_sync_preserves_existing_targets() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-preserves-targets")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  // Create config with user-specified target
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["wasm32-unknown-unknown"]
-
-[unify]
-msrv = true
-"#,
-  )?;
-
-  // Run config sync (no external targets to detect)
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
-  assert!(output.status.success(), "config sync should succeed");
-
-  // Verify user target preserved
-  let config = fs::read_to_string(&config_path)?;
-  assert!(
-    config.contains("wasm32-unknown-unknown"),
-    "user-specified target should be preserved"
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_sync_json_output() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-json")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  // Create minimal config
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-msrv = true
-"#,
-  )?;
-
-  // Run config sync with JSON output
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync", "-f", "json"])?;
-  assert!(output.status.success(), "config sync -f json should succeed");
-
-  // Verify JSON structure
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
   assert_eq!(json["command"], "config");
-  assert_eq!(json["action"], "sync");
-  let config_path = json["config_path"].as_str().expect("config_path should be a string");
-  assert!(
-    config_path.ends_with("rail.toml"),
-    "config_path should point to rail.toml"
-  );
-  let fields_added = json["fields_added"]
-    .as_array()
-    .expect("fields_added should be an array");
-  assert!(
-    !fields_added.is_empty(),
-    "sync should add missing config fields for the minimal test config"
-  );
-  assert_eq!(
-    json["has_changes"].as_bool(),
-    Some(true),
-    "sync should report changes for the minimal test config"
-  );
+  assert_eq!(json["action"], "migrate");
+  assert_eq!(json["has_changes"], true);
+  let changes = json["changes"].as_array().expect("changes array");
+  assert_eq!(changes.len(), 2);
+  assert!(changes.iter().all(|change| change["kind"] == "remove"));
 
   Ok(())
 }
 
 #[test]
-fn test_config_sync_with_config_flag() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-with-flag")?;
+fn test_config_migrate_applies_explicit_renames_and_removals() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-apply")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
-  ws.remove_config()?;
 
-  let custom_config = ws.path.join("custom-rail.toml");
+  let config_path = ws.path.join(".config").join("rail.toml");
   fs::write(
-    &custom_config,
-    r#"targets = ["x86_64-unknown-linux-gnu"]
+    &config_path,
+    r#"[workspace]
+root = "."
+
+[toolchain]
+channel = "stable"
 
 [unify]
+compiler_diag_cache = false
+sort_dependencies = false
+prune_dead_features = false
+detect_unused = false
+remove_unused = false
+detect_undeclared_features = false
+fix_undeclared_features = false
+pin_transitives = true
+transitive_host = "root"
 msrv = true
+msrv_source = "workspace"
+enforce_msrv_inheritance = true
+
+[release]
+push = true
+create_github_release = true
+forge = "gitlab"
+
+[change-detection]
+conservative_unclassified_owner_fallback = true
+bot_pr_confidence_profile = "strict"
+
+[run.profile.ci]
+surfaces = ["build", "test"]
+merge_base = true
+
+[run.profile.local]
+surfaces = ["test"]
+since = "HEAD~1"
+
+[crates.demo.sync]
 "#,
   )?;
 
-  let output = run_cargo_rail(&ws.path, &["rail", "--config", "custom-rail.toml", "config", "sync"])?;
-  assert!(output.status.success(), "config sync with --config should succeed");
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert!(output.status.success(), "config migrate should apply known migrations");
 
-  let synced = fs::read_to_string(&custom_config)?;
-  assert!(synced.contains("[release]"), "sync should update override config file");
+  let migrated = fs::read_to_string(&config_path)?;
+  assert!(!migrated.contains("compiler_diag_cache"));
+  assert!(!migrated.contains("sort_dependencies"));
+  assert!(!migrated.contains("prune_dead_features"));
+  assert!(!migrated.contains("detect_unused"));
+  assert!(!migrated.contains("remove_unused"));
+  assert!(!migrated.contains("detect_undeclared_features"));
+  assert!(!migrated.contains("fix_undeclared_features"));
+  assert!(!migrated.contains("pin_transitives"));
+  assert!(!migrated.contains("transitive_host"));
+  assert!(migrated.contains("transitive_pinning = { host = \"root\" }"));
+  assert!(!migrated.contains("msrv_source"));
+  assert!(!migrated.contains("enforce_msrv_inheritance"));
+  assert!(migrated.contains("msrv_policy = { mode = \"compute\", source = \"workspace\", inherit = true }"));
+  assert!(!migrated.contains("create_github_release"));
+  assert!(!migrated.contains("push ="));
+  assert!(!migrated.contains("forge ="));
+  assert!(migrated.contains("remote_effects = \"gitlab\""));
+  assert!(!migrated.contains("bot_pr_confidence_profile"));
+  assert!(!migrated.contains("[workspace]"));
+  assert!(!migrated.contains("[toolchain]"));
+  assert!(!migrated.contains("[crates.demo.sync]"));
+  assert!(!migrated.contains("conservative_unclassified_owner_fallback"));
+  assert!(migrated.contains("unknown_file_policy = \"owned_build_test\""));
+  assert!(!migrated.contains("merge_base"));
+  assert!(migrated.contains("baseline = { kind = \"merge-base\" }"));
+  assert!(!migrated.contains("since ="));
+  assert!(migrated.contains("baseline = { kind = \"since\", reference = \"HEAD~1\" }"));
+
+  let second = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check"])?;
+  assert!(second.status.success(), "applied migrations must be idempotent");
+
+  Ok(())
+}
+
+#[test]
+fn test_config_migrate_normalizes_legacy_policy_values_without_overriding_explicit_policy() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-policy-values")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  let config_path = ws.path.join(".config/rail.toml");
+
+  fs::write(&config_path, "[change-detection]\nunknown_file_policy = true\n")?;
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert!(output.status.success());
+  assert!(fs::read_to_string(&config_path)?.contains("unknown_file_policy = \"owned_build_test\""));
+
+  fs::write(
+    &config_path,
+    "[change-detection]\nunknown_file_policy = \"workspace_infra\"\nconservative_unclassified_owner_fallback = false\n",
+  )?;
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert!(output.status.success());
+  let migrated = fs::read_to_string(&config_path)?;
+  assert!(migrated.contains("unknown_file_policy = \"workspace_infra\""));
+  assert!(!migrated.contains("conservative_unclassified_owner_fallback"));
+
+  Ok(())
+}
+
+#[test]
+fn test_config_migrate_reports_default_equivalents_as_omitted() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-default-equivalents")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  let config_path = ws.path.join(".config/rail.toml");
+  let original = r#"[unify]
+pin_transitives = false
+msrv = true
+msrv_source = "max"
+enforce_msrv_inheritance = false
+
+[release]
+push = false
+create_github_release = false
+
+[run.profile.ci]
+surfaces = ["test"]
+merge_base = false
+"#;
+  fs::write(&config_path, original)?;
+
+  let check = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
+  assert_eq!(check.status.code(), Some(1));
+  assert_eq!(fs::read_to_string(&config_path)?, original);
+  let json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let replacements: Vec<_> = json["changes"]
+    .as_array()
+    .expect("migration changes")
+    .iter()
+    .filter_map(|change| change["replacement"].as_str())
+    .collect();
+  assert!(!replacements.is_empty());
   assert!(
-    !ws.path.join(".config").join("rail.toml").exists(),
-    "sync should not require default config path"
+    replacements
+      .iter()
+      .all(|replacement| replacement.starts_with("field omitted ("))
+  );
+
+  let apply = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert!(apply.status.success());
+  assert_eq!(
+    fs::read_to_string(&config_path)?.trim_start(),
+    "[run.profile.ci]\nsurfaces = [\"test\"]\n"
   );
 
   Ok(())
 }
 
 #[test]
-fn test_config_sync_with_missing_config_flag_fails() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-with-missing-flag")?;
+fn test_config_migrate_refuses_invalid_legacy_release_effects() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-invalid-release-effects")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
-  ws.remove_config()?;
+  let config_path = ws.path.join(".config/rail.toml");
+  let original = "[release]\ncreate_github_release = true\npush = false\n";
+  fs::write(&config_path, original)?;
 
-  let output = run_cargo_rail(&ws.path, &["rail", "--config", "missing.toml", "config", "sync"])?;
-  assert!(!output.status.success(), "sync with missing --config should fail");
-
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert_eq!(output.status.code(), Some(2));
+  assert_eq!(fs::read_to_string(&config_path)?, original);
   let stderr = String::from_utf8_lossy(&output.stderr);
-  assert!(
-    stderr.contains("specified config file not found"),
-    "expected missing override error. stderr:\n{}",
-    stderr
-  );
+  assert!(stderr.contains("choose one explicit policy"));
 
   Ok(())
 }
 
 #[test]
-fn test_config_sync_no_config_fails() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-sync-no-config")?;
+fn test_config_migrate_refuses_conflicting_legacy_run_baseline() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-invalid-run-baseline")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
-  ws.remove_config()?;
+  let config_path = ws.path.join(".config/rail.toml");
+  let original = "[run.profile.ci]\nsurfaces = [\"test\"]\nsince = \"HEAD~1\"\nmerge_base = true\n";
+  fs::write(&config_path, original)?;
 
-  // Run config sync
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "sync"])?;
-
-  // Should fail
-  assert!(!output.status.success(), "config sync should fail without config");
-
-  // Should suggest running init
-  let stderr = String::from_utf8_lossy(&output.stderr);
-  assert!(
-    stderr.contains("cargo rail init"),
-    "should suggest running 'cargo rail init'"
-  );
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert_eq!(output.status.code(), Some(2));
+  assert_eq!(fs::read_to_string(&config_path)?, original);
+  assert!(String::from_utf8_lossy(&output.stderr).contains("selects one baseline mode"));
 
   Ok(())
 }

@@ -39,6 +39,7 @@ fn test_hash_json_is_deterministic_for_same_inputs() -> Result<()> {
 fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
   let ws = TestWorkspace::new_named("hash-portable-source")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
+  std::fs::write(ws.path.join(".config/rail.toml"), "[unify]\ninclude_paths = false\n")?;
   ws.commit("Add lib-a")?;
 
   let clone_root = tempfile::tempdir()?;

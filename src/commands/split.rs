@@ -22,7 +22,7 @@ pub struct SplitRunArgs {
   pub all: bool,
   /// Override remote repository URL
   pub remote: Option<String>,
-  /// Dry-run mode: preview changes without executing
+  /// Check for pending changes without executing
   pub check: bool,
   /// Apply from a previously generated mutation plan file
   pub plan_path: Option<std::path::PathBuf>,
@@ -257,7 +257,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 }
 
 /// Initialize split configuration for crates
-pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
+pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_run: bool) -> RailResult<()> {
   ctx.snapshot()?;
   use crate::config::RailConfig;
   use std::fs;
@@ -324,7 +324,6 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
         skip: false,
         ..ChangelogConfig::default()
       }),
-      sync: None,
     };
 
     config.crates.insert(split.name, crate_config);
@@ -332,7 +331,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check
 
   let config_toml = serialize_splits_config(&config)?;
 
-  if check {
+  if dry_run {
     println!("{}", config_toml);
   } else {
     let config_path =

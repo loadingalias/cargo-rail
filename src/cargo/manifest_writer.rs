@@ -28,12 +28,6 @@ impl ManifestWriter {
     }
   }
 
-  /// Sets whether to sort dependencies when writing manifests
-  pub fn with_dependency_sort(mut self, sort: bool) -> Self {
-    self.formatter.sort_dependencies = sort;
-    self
-  }
-
   /// Write unified dependencies to workspace Cargo.toml
   ///
   /// IMPORTANT: This MERGES new deps with existing workspace.dependencies.

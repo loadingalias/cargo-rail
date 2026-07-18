@@ -13,7 +13,6 @@ infrastructure = [
   "Cargo.lock",
 ]
 confidence_profile = "balanced"
-bot_pr_confidence_profile = "strict"
 unknown_file_policy = "strict"
 
 # Custom surfaces (optional)
@@ -31,16 +30,16 @@ nightly = "nightly"
 # Local development: just tests
 [run.profile.local]
 surfaces = ["test"]
-merge_base = true
+baseline = { kind = "merge-base" }
 
 # CI: build + test
 [run.profile.ci]
 surfaces = ["build", "test"]
 run_args = ["{cargo_args}"]
-merge_base = true
+baseline = { kind = "merge-base" }
 
 # Nightly: full validation
 [run.profile.nightly]
 surfaces = ["build", "test", "docs", "bench"]
 run_args = ["{cargo_args}"]
-merge_base = true
+baseline = { kind = "merge-base" }

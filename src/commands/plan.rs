@@ -214,7 +214,6 @@ const RC_CONFIDENCE_PROFILE_BALANCED: &str = "CONFIDENCE_PROFILE_BALANCED";
 const RC_CONFIDENCE_PROFILE_FAST: &str = "CONFIDENCE_PROFILE_FAST";
 const RC_CONFIDENCE_STRICT_OWNER_EXPANSION: &str = "CONFIDENCE_STRICT_OWNER_EXPANSION";
 const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIVE";
-const RC_BOT_PR_CONFIDENCE_OVERRIDE: &str = "BOT_PR_CONFIDENCE_OVERRIDE";
 const PLAN_CONTRACT_VERSION: u32 = 3;
 const SCOPE_CONTRACT_VERSION: u32 = 2;
 const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v3.schema.json");
@@ -224,7 +223,6 @@ const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 struct EffectiveConfidenceProfile {
   profile: ConfidenceProfile,
   source: &'static str,
-  bot_override: bool,
 }
 
 fn json_err(error: serde_json::Error) -> RailError {
@@ -300,18 +298,6 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     None,
     &[] as &[String],
   );
-
-  if confidence.bot_override {
-    push_trace(
-      &mut trace,
-      &mut surface_refs,
-      RC_BOT_PR_CONFIDENCE_OVERRIDE,
-      None,
-      None,
-      None,
-      &[] as &[String],
-    );
-  }
 
   for path in &changed_files {
     let file_kind = classify_path(Path::new(path));
@@ -576,35 +562,18 @@ fn unknown_surfaces_for_path(policy: UnknownFilePolicy, owners: &[String]) -> &'
 fn resolve_confidence_profile(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<EffectiveConfidenceProfile> {
   if let Some(raw) = opts.confidence_profile.as_deref() {
     let profile = parse_confidence_profile(raw)?;
-    return Ok(EffectiveConfidenceProfile {
-      profile,
-      source: "cli",
-      bot_override: false,
-    });
+    return Ok(EffectiveConfidenceProfile { profile, source: "cli" });
   }
 
   let mut profile = ConfidenceProfile::default();
   let mut source = "default";
-  let mut bot_override = false;
 
   if let Some(config) = ctx.config() {
     profile = config.change_detection.confidence_profile;
     source = "config";
-
-    if let Some(bot_profile) = config.change_detection.bot_pr_confidence_profile
-      && is_bot_authored_pull_request()
-    {
-      profile = bot_profile;
-      source = "bot_pr_policy";
-      bot_override = true;
-    }
   }
 
-  Ok(EffectiveConfidenceProfile {
-    profile,
-    source,
-    bot_override,
-  })
+  Ok(EffectiveConfidenceProfile { profile, source })
 }
 
 fn parse_confidence_profile(value: &str) -> RailResult<ConfidenceProfile> {
@@ -633,18 +602,6 @@ fn profile_reason_code(profile: ConfidenceProfile) -> &'static str {
     ConfidenceProfile::Balanced => RC_CONFIDENCE_PROFILE_BALANCED,
     ConfidenceProfile::Fast => RC_CONFIDENCE_PROFILE_FAST,
   }
-}
-
-fn is_bot_authored_pull_request() -> bool {
-  let event = std::env::var("GITHUB_EVENT_NAME").ok();
-  let is_pr_event = matches!(event.as_deref(), Some("pull_request") | Some("pull_request_target"));
-  if !is_pr_event {
-    return false;
-  }
-
-  std::env::var("GITHUB_ACTOR")
-    .map(|actor| actor.ends_with("[bot]"))
-    .unwrap_or(false)
 }
 
 fn validate_surface_reason_invariants(output: &PlanOutput) -> RailResult<()> {
@@ -766,7 +723,6 @@ fn reason_description(code: &str) -> &'static str {
     RC_CONFIDENCE_PROFILE_FAST => "Fast confidence profile active",
     RC_CONFIDENCE_STRICT_OWNER_EXPANSION => "Strict mode expands owned crates",
     RC_CONFIDENCE_FAST_SKIP_TRANSITIVE => "Fast mode skips transitive expansion",
-    RC_BOT_PR_CONFIDENCE_OVERRIDE => "Bot PR confidence override applied",
     _ => "Planner reason",
   }
 }

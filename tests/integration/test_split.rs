@@ -483,13 +483,13 @@ root = "."
 "#,
   )?;
 
-  // Run split init with --check
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "init", "--check"])?;
+  // Run split init with --dry-run.
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "init", "--dry-run"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   assert!(
     output.status.success(),
-    "split init --check should succeed. stderr: {}",
+    "split init --dry-run should succeed. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
   assert!(

@@ -44,6 +44,7 @@ fn scale_fixtures_are_deterministic_and_cargo_valid() -> Result<()> {
     assert_eq!(revision(&first, "HEAD")?, revision(&second, "HEAD")?);
     assert_eq!(revision(&first, "HEAD^{tree}")?, revision(&second, "HEAD^{tree}")?);
     assert!(git(&first, &["status", "--porcelain"])?.stdout.is_empty());
+    assert!(std::fs::read(first.join(".config/rail.toml"))?.is_empty());
 
     let changed = git(&first, &["diff", "--name-only", "HEAD~1", "HEAD"])?;
     assert_eq!(String::from_utf8(changed.stdout)?, "crates/member-0000/src/lib.rs\n");
@@ -84,6 +85,11 @@ fn scale_fixtures_are_deterministic_and_cargo_valid() -> Result<()> {
     ensure!(
       output.status.success(),
       "cargo-rail rejected the {member_count}-member fixture: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+      output.stderr.is_empty(),
+      "cargo-rail warned for the {member_count}-member fixture: {}",
       String::from_utf8_lossy(&output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;

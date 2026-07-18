@@ -10,18 +10,10 @@ use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 use std::fs;
 
-/// Helper to create a workspace with detect_unused enabled
+/// Helper to create a workspace for unconditional unused-dependency diagnostics.
 fn create_workspace_with_unused_detection() -> Result<TestWorkspace> {
   let workspace = TestWorkspace::new()?;
-
-  // Enable detect_unused in config
-  let config = r#"[workspace]
-root = "."
-
-[unify]
-detect_unused = true
-"#;
-  fs::write(workspace.path.join(".config/rail.toml"), config)?;
+  fs::write(workspace.path.join(".config/rail.toml"), "")?;
 
   Ok(workspace)
 }
@@ -328,9 +320,6 @@ fn test_unused_detection_target_specific_unconfigured_not_flagged() -> Result<()
 
   // Config with only linux target (no windows)
   let config = r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[unify]
-detect_unused = true
 "#;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
 
@@ -534,12 +523,7 @@ fn test_unused_detection_multi_target_union() -> Result<()> {
   let workspace = create_workspace_with_unused_detection()?;
 
   // Config with multiple targets
-  let config = r#"[workspace]
-root = "."
-targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
-
-[unify]
-detect_unused = true
+  let config = r#"targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
 "#;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
 
@@ -1101,7 +1085,7 @@ fn test_unused_detection_removes_unreachable_optional_only_from_private_package(
   let workspace = create_workspace_with_unused_detection()?;
   fs::write(
     workspace.path.join(".config/rail.toml"),
-    "[workspace]\nroot = \".\"\n\n[unify]\ndetect_unused = true\nconsumer_scope = \"workspace\"\n",
+    "[unify]\nconsumer_scope = \"workspace\"\n",
   )?;
   add_crate_with_manifest(
     &workspace,
@@ -1154,10 +1138,7 @@ log = { version = "0.4", optional = true }
 #[test]
 fn test_unused_detection_separates_dev_and_build_compilation_domains() -> Result<()> {
   let workspace = create_workspace_with_unused_detection()?;
-  fs::write(
-    workspace.path.join(".config/rail.toml"),
-    "[workspace]\nroot = \".\"\n\n[unify]\ndetect_unused = true\ncompiler_diag_cache = true\n",
-  )?;
+  fs::write(workspace.path.join(".config/rail.toml"), "")?;
   add_crate_with_manifest(
     &workspace,
     "test-crate",
@@ -1513,14 +1494,10 @@ log = "0.4"
 }
 
 #[test]
-fn test_unused_detection_compiler_diag_cache_disabled_does_not_write_cache_file() -> Result<()> {
+fn test_deprecated_compiler_diag_cache_toggle_cannot_disable_correct_caching() -> Result<()> {
   let workspace = TestWorkspace::new()?;
 
-  let config = r#"[workspace]
-root = "."
-
-[unify]
-detect_unused = true
+  let config = r#"[unify]
 compiler_diag_cache = false
 "#;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
@@ -1551,10 +1528,15 @@ log = "0.4"
 
   let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
   assert!(
-    !cache_file.exists(),
-    "compiler diagnostics cache should not exist when disabled at {}\nstdout:\n{}\nstderr:\n{}",
+    cache_file.exists(),
+    "deprecated implementation input must not disable correct caching at {}\nstdout:\n{}\nstderr:\n{}",
     cache_file.display(),
     String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("config migrate"),
+    "compatibility parsing must emit an actionable warning\nstderr:\n{}",
     String::from_utf8_lossy(&output.stderr)
   );
 

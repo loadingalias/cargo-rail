@@ -1257,7 +1257,7 @@ core-member = "0.1.0"
   Ok(())
 }
 
-// Config Options: include, pin_transitives, include_renamed
+// Config options: include, transitive pinning, include_renamed
 
 /// Test include config forces specific dependencies to be included
 #[test]
@@ -1322,9 +1322,9 @@ include = ["serde"]
   Ok(())
 }
 
-/// Test pin_transitives config option
+/// Test typed transitive pinning policy
 #[test]
-fn test_unify_pin_transitives() -> Result<()> {
+fn test_unify_transitive_pinning() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-pin-trans")?;
 
   // Create a crate with a transitive-only dependency scenario
@@ -1352,22 +1352,22 @@ pub fn hello() {}
   )?;
   workspace.commit("Add crate")?;
 
-  // Configure rail.toml with pin_transitives
+  // Configure rail.toml with transitive pinning
   std::fs::write(
     workspace.path.join("rail.toml"),
     r#"[unify]
-pin_transitives = true
-msrv = false
+transitive_pinning = { host = "root" }
+msrv_policy = { mode = "disabled" }
 "#,
   )?;
 
-  // Run unify with pin_transitives config (single crate = no unification needed)
+  // Run unify with transitive pinning config (single crate = no unification needed)
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
 
   // No unification opportunities with single crate, so exit 0
   assert!(
     output.status.success(),
-    "unify with pin_transitives config and no changes should exit 0. stderr: {}",
+    "unify with transitive pinning config and no changes should exit 0. stderr: {}",
     String::from_utf8_lossy(&output.stderr)
   );
 
@@ -1409,7 +1409,7 @@ pub fn hello() {}
     workspace.path.join("rail.toml"),
     r#"[unify]
 include_renamed = true
-msrv = false
+msrv_policy = { mode = "disabled" }
 "#,
   )?;
 
@@ -1514,6 +1514,10 @@ fn test_unify_renamed_dependencies_hard_blocker() -> Result<()> {
   // With the bug fix, renamed deps (package = "...") are now properly separated
   // from direct deps of the same package. This prevents feature confusion.
   workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+  std::fs::write(
+    workspace.path.join("crates/crate-a/src/lib.rs"),
+    "pub fn require_serde<T: serde::Serialize>(_value: &T) {}",
+  )?;
 
   // Manually create crate-b with renamed serde
   let crate_b_path = workspace.path.join("crates/crate-b");
@@ -1534,7 +1538,7 @@ serde_crate = { package = "serde", version = "1.0" }
 
   std::fs::write(
     crate_b_path.join("src/lib.rs"),
-    "pub fn hello() -> &'static str { \"Hello\" }",
+    "pub fn require_serde<T: serde_crate::Serialize>(_value: &T) {}",
   )?;
 
   workspace.commit("Add crates with renamed dependency")?;
@@ -1542,13 +1546,9 @@ serde_crate = { package = "serde", version = "1.0" }
   // Configure rail.toml (include_renamed = false by default)
   std::fs::write(
     workspace.path.join("rail.toml"),
-    r#"[workspace]
-root = "."
-
-[unify]
+    r#"[unify]
 include_renamed = false
-detect_unused = false
-msrv = false
+msrv_policy = { mode = "disabled" }
 "#,
   )?;
 
@@ -2320,7 +2320,7 @@ fn test_unify_dead_feature_pruning_preserves_published_api_flags() -> Result<()>
   workspace.add_crate("private-crate", "0.1.0", &[])?;
   std::fs::write(
     workspace.path.join(".config/rail.toml"),
-    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+    "[unify]\nconsumer_scope = \"workspace\"\n",
   )?;
 
   std::fs::write(
@@ -2490,7 +2490,7 @@ fn test_unify_does_not_prune_cargo_synthetic_optional_features() -> Result<()> {
   workspace.add_crate("private-crate", "0.1.0", &[])?;
   std::fs::write(
     workspace.path.join(".config/rail.toml"),
-    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+    "[unify]\nconsumer_scope = \"workspace\"\n",
   )?;
   std::fs::write(
     workspace.path.join("crates/private-crate/Cargo.toml"),
@@ -2532,11 +2532,7 @@ fn test_unify_feature_reachability_prunes_unrooted_cycles_and_forwarders() -> Re
   workspace.add_crate("private-crate", "0.1.0", &[])?;
   std::fs::write(
     workspace.path.join(".config/rail.toml"),
-    r#"[workspace]
-root = "."
-
-[unify]
-prune_dead_features = true
+    r#"[unify]
 consumer_scope = "workspace"
 preserve_features = ["keep-*"]
 "#,
@@ -2697,7 +2693,7 @@ fn test_unify_feature_pruning_preserves_compiler_observed_optional_activation() 
   workspace.add_crate("private-crate", "0.1.0", &[])?;
   std::fs::write(
     workspace.path.join(".config/rail.toml"),
-    "[workspace]\nroot = \".\"\n\n[unify]\nconsumer_scope = \"workspace\"\n",
+    "[unify]\nconsumer_scope = \"workspace\"\n",
   )?;
   std::fs::write(
     workspace.path.join("crates/private-crate/Cargo.toml"),

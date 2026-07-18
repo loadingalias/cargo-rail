@@ -55,7 +55,8 @@ pub use clean::run_clean;
 pub use cli::{CargoCli, ChangeCommand, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
 pub use common::{ChangeOutputFormat, SplitOutputFormat, TextJsonOutputFormat};
 pub use config::{
-  StrictnessMode, run_config_locate, run_config_print, run_config_sync, run_config_validate_standalone,
+  StrictnessMode, run_config_explain, run_config_locate, run_config_migrate, run_config_print,
+  run_config_validate_standalone,
 };
 pub use graph::run_graph;
 pub use hash::{run_diff_hash, run_hash};
@@ -96,8 +97,8 @@ pub fn try_dispatch_pre_context(
       Ok(PreContextDispatch::Handled)
     }
 
-    Commands::Init { output, force, check } => {
-      init::run_init_standalone(workspace_root, &output, force, check, json)?;
+    Commands::Init { output, force, dry_run } => {
+      init::run_init_standalone(workspace_root, &output, force, dry_run, json)?;
       Ok(PreContextDispatch::Handled)
     }
 
@@ -110,9 +111,9 @@ pub fn try_dispatch_pre_context(
     }
 
     Commands::Config {
-      command: cli::ConfigCommand::Sync { check, format },
+      command: cli::ConfigCommand::Migrate { check, format },
     } => {
-      config::run_config_sync(workspace_root, config_override, check, format)?;
+      config::run_config_migrate(workspace_root, config_override, check, format)?;
       Ok(PreContextDispatch::Handled)
     }
 
@@ -145,6 +146,13 @@ pub fn try_dispatch_pre_context(
       command: cli::ConfigCommand::Print { format },
     } => {
       config::run_config_print(workspace_root, config_override, format)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Config {
+      command: cli::ConfigCommand::Explain { format },
+    } => {
+      config::run_config_explain(workspace_root, config_override, format)?;
       Ok(PreContextDispatch::Handled)
     }
 
@@ -254,13 +262,13 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
 
     // Split/Sync
     Commands::Split { command } => match command {
-      cli::SplitCommand::Init { crate_names, check } => {
+      cli::SplitCommand::Init { crate_names, dry_run } => {
         let crates = if crate_names.is_empty() {
           None
         } else {
           Some(crate_names)
         };
-        run_split_init(ctx, crates, check)
+        run_split_init(ctx, crates, dry_run)
       }
       cli::SplitCommand::Run {
         crate_name,
@@ -346,13 +354,13 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
 
     // Release
     Commands::Release { command } => match command {
-      cli::ReleaseCommand::Init { crate_names, check } => {
+      cli::ReleaseCommand::Init { crate_names, dry_run } => {
         let crates = if crate_names.is_empty() {
           None
         } else {
           Some(crate_names)
         };
-        run_release_init(ctx, crates, check)
+        run_release_init(ctx, crates, dry_run)
       }
       cli::ReleaseCommand::Run {
         crate_names,
@@ -440,8 +448,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     Commands::Config { command } => match command {
       cli::ConfigCommand::Locate { .. } => unreachable!("Config locate should be handled before dispatch"),
       cli::ConfigCommand::Print { .. } => unreachable!("Config print should be handled before dispatch"),
+      cli::ConfigCommand::Explain { .. } => unreachable!("Config explain should be handled before dispatch"),
       cli::ConfigCommand::Validate { .. } => unreachable!("Config validate should be handled before dispatch"),
-      cli::ConfigCommand::Sync { .. } => unreachable!("Config sync should be handled before dispatch"),
+      cli::ConfigCommand::Migrate { .. } => unreachable!("Config migrate should be handled before dispatch"),
     },
 
     Commands::Hash {

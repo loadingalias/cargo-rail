@@ -1347,8 +1347,7 @@ pub fn run_unify_apply(
     created_backup_id = Some(backup_id);
   }
 
-  let sort_mode = ctx.config().map(|c| c.unify.sort_dependencies).unwrap_or(true);
-  let writer = ManifestWriter::new().with_dependency_sort(sort_mode);
+  let writer = ManifestWriter::new();
   let manifest_transaction = ManifestTransaction::capture(ctx, &plan, msrv_write_needed)?;
 
   if !plan.workspace_deps.is_empty() {
@@ -1892,7 +1891,10 @@ fn workspace_msrv_write_needed(workspace_root: &std::path::Path, msrv: &semver::
 }
 
 fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std::path::PathBuf> {
-  let transitive_host_setting = ctx.config().map(|c| &c.unify.transitive_host);
+  let transitive_host_setting = ctx
+    .config()
+    .and_then(|config| config.unify.transitive_pinning.as_ref())
+    .map(|pinning| &pinning.host);
   let is_root_host = matches!(
     transitive_host_setting,
     None | Some(crate::config::TransitiveFeatureHost::Root)
@@ -1905,10 +1907,10 @@ fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std:
     let members = ctx.graph().workspace_members();
     if members.is_empty() {
       return Err(RailError::with_help(
-        "transitive_host = \"root\" is incompatible with virtual workspaces".to_string(),
-        "Virtual workspaces cannot have [dev-dependencies]. Set transitive_host to a workspace member path in your rail.toml:\n  \
+        "transitive pinning host `root` is incompatible with virtual workspaces".to_string(),
+        "Virtual workspaces cannot have [dev-dependencies]. Set transitive_pinning.host to a workspace member path in your rail.toml:\n  \
            [unify]\n  \
-           transitive_host = \"crates/some-crate\""
+           transitive_pinning = { host = \"crates/some-crate\" }"
           .to_string(),
       ));
     }

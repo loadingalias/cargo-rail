@@ -46,17 +46,11 @@ pub struct CompilerDiagnosticsCollector<'a> {
   lock_fingerprint: String,
   compiler_env_fingerprint: String,
   cargo_config_fingerprint: String,
-  enable_cache: bool,
 }
 
 impl<'a> CompilerDiagnosticsCollector<'a> {
   /// Create a new collector for a workspace-level analysis pass.
-  pub fn new(
-    workspace_root: &'a Path,
-    manifests: &'a ManifestAnalyzer,
-    targets: Vec<&'a str>,
-    enable_cache: bool,
-  ) -> RailResult<Self> {
+  pub fn new(workspace_root: &'a Path, manifests: &'a ManifestAnalyzer, targets: Vec<&'a str>) -> RailResult<Self> {
     let (rustc_version, host_triple) = rustc_identity(workspace_root)?;
     let cargo_version = cargo_identity(workspace_root)?;
     let lock_fingerprint = file_fingerprint(&workspace_root.join("Cargo.lock"));
@@ -73,7 +67,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       lock_fingerprint,
       compiler_env_fingerprint,
       cargo_config_fingerprint,
-      enable_cache,
     })
   }
 
@@ -87,9 +80,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       return Ok(HashMap::new());
     }
 
-    let mut store = self
-      .enable_cache
-      .then(|| CompilerDiagnosticsStore::load(self.workspace_root));
+    let mut store = CompilerDiagnosticsStore::load(self.workspace_root);
     let key_inputs = self.build_key_inputs(&members);
     let manifest_to_member = build_manifest_member_index(&self.manifests.members);
     let member_ids: HashMap<&str, &PackageId> = self
@@ -110,9 +101,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       .collect();
 
     for (member, target, features, key) in key_inputs {
-      if let Some(store) = store.as_ref()
-        && let Some(entry) = store.get(&key)
-      {
+      if let Some(entry) = store.get(&key) {
         cache_by_member.entry(member.to_string()).or_default().hits += 1;
         update_candidate_survivors(
           &mut surviving_unused,
@@ -128,8 +117,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         continue;
       }
 
-      let reason = store.as_ref().map_or("cache_disabled", |store| store.miss_reason(&key));
-      if let Some(prior) = store.as_ref().and_then(|store| store.prior_for_source_change(&key)) {
+      let reason = store.miss_reason(&key);
+      if let Some(prior) = store.prior_for_source_change(&key) {
         prior_source_evidence.insert(
           (
             member.to_string(),
@@ -295,15 +284,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         );
 
         record_target_evidence(&mut result, &manifests_member.package_id, &entry.evidence);
-        if let Some(store) = store.as_mut() {
-          store.put(entry);
-        }
+        store.put(entry);
       }
     }
 
-    if let Some(store) = store.as_mut() {
-      store.flush()?;
-    }
+    store.flush()?;
     if skipped_member_targets > 0 {
       progress!(
         "  Skipped {} target-package check{} after dependencies were proven used",

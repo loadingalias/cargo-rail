@@ -1,11 +1,11 @@
 //! `cargo rail config` - Configuration management commands
 
 use crate::commands::common::TextJsonOutputFormat;
-use crate::config::{ConfigLoadResult, RailConfig, schema};
+use crate::config::{RailConfig, schema};
 use crate::error::{RailError, RailResult};
 use crate::toml::TomlEditor;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn print_config_json<T: Serialize>(mode: &str, result: &str, exit_code: i32, payload: &T) -> RailResult<()> {
@@ -86,98 +86,6 @@ fn is_ci_environment() -> bool {
     || std::env::var("GITLAB_CI").is_ok()
     || std::env::var("CIRCLECI").is_ok()
 }
-
-/// Known top-level keys in rail.toml
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-  "targets",
-  "unify",
-  "release",
-  "change-detection",
-  "run",
-  "crates",
-  "workspace",
-  "toolchain",
-];
-
-/// Known keys in [unify] section
-const KNOWN_UNIFY_KEYS: &[&str] = &[
-  "include_paths",
-  "include_renamed",
-  "pin_transitives",
-  "transitive_host",
-  "exclude",
-  "include",
-  "msrv",
-  "msrv_source",
-  "enforce_msrv_inheritance",
-  "prune_dead_features",
-  "consumer_scope",
-  "preserve_features",
-  "strict_version_compat",
-  "exact_pin_handling",
-  "major_version_conflict",
-  "detect_unused",
-  "compiler_diag_cache",
-  "remove_unused",
-  "detect_undeclared_features",
-  "fix_undeclared_features",
-  "skip_undeclared_patterns",
-  "max_backups",
-  "sort_dependencies",
-];
-
-/// Known keys in [release] section
-const KNOWN_RELEASE_KEYS: &[&str] = &[
-  "tag_prefix",
-  "tag_format",
-  "require_clean",
-  "publish_delay",
-  "create_github_release",
-  "forge",
-  "push",
-  "sign_tags",
-  "changelog",
-  "require_changelog_entries",
-  "require_release_notes",
-  "release_notes_dir",
-  "change_dir",
-  "pre_1_breaking_bump",
-  "unconventional_commits",
-  "semver_check",
-  "require_change_files",
-  "version_groups",
-];
-
-/// Known keys in [release.changelog] section
-const KNOWN_RELEASE_CHANGELOG_KEYS: &[&str] = &[
-  "path",
-  "relative_to",
-  "entry_format",
-  "emoji",
-  "group_order",
-  "fallback",
-  "groups",
-  "filters",
-  "commit_url",
-  "pr_url",
-];
-
-/// Known keys in [release.changelog.filters] section
-const KNOWN_RELEASE_CHANGELOG_FILTER_KEYS: &[&str] = &["skip_types", "skip_scopes", "include_paths", "exclude_paths"];
-
-/// Known keys in [change-detection] section
-const KNOWN_CHANGE_DETECTION_KEYS: &[&str] = &[
-  "infrastructure",
-  "custom",
-  "unknown_file_policy",
-  "confidence_profile",
-  "bot_pr_confidence_profile",
-];
-
-/// Known keys in [run] section
-const KNOWN_RUN_KEYS: &[&str] = &["default_profile", "profile", "workflow"];
-/// Known keys in [run.profile.<name>] section
-const KNOWN_RUN_PROFILE_KEYS: &[&str] = &["surfaces", "run_args", "since", "merge_base"];
 
 // Config Locate
 
@@ -328,6 +236,191 @@ pub fn run_config_print(
   Ok(())
 }
 
+/// One effective configuration value and its provenance.
+#[derive(Debug, Serialize)]
+struct ExplainedField {
+  path: String,
+  configured: Option<serde_json::Value>,
+  effective: serde_json::Value,
+  default: Option<serde_json::Value>,
+  source: String,
+  classification: &'static str,
+  why: &'static str,
+  deprecation: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ExplainResult {
+  command: &'static str,
+  action: &'static str,
+  config_path: String,
+  fields: Vec<ExplainedField>,
+}
+
+/// Explain effective configuration values, defaults, and provenance.
+pub fn run_config_explain(
+  workspace_root: &Path,
+  config_override: Option<&Path>,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
+  let json = format.is_json();
+  if json {
+    crate::output::set_json_mode(true);
+  }
+
+  let config_path = resolve_config_path(workspace_root, config_override)?;
+  let (config, bytes) = RailConfig::load_path_with_bytes(&config_path)?;
+  let content = std::str::from_utf8(&bytes)
+    .map_err(|error| RailError::message(format!("{} is not valid UTF-8: {error}", config_path.display())))?;
+  let configured: serde_json::Value = toml_edit::de::from_str(content)
+    .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())))?;
+  let configured_doc: toml_edit::DocumentMut = content
+    .parse()
+    .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
+  let deprecations: BTreeMap<_, _> = schema::present_deprecations(&configured_doc)
+    .into_iter()
+    .map(|deprecation| (deprecation.path, deprecation.spec))
+    .collect();
+  let effective = serde_json::to_value(&config).map_err(|error| RailError::message(error.to_string()))?;
+  let defaults = serde_json::to_value(RailConfig::default()).map_err(|error| RailError::message(error.to_string()))?;
+
+  let configured = flatten_json(&configured);
+  let effective = flatten_json(&effective);
+  let defaults = flatten_json(&defaults);
+  let paths: BTreeSet<_> = effective
+    .keys()
+    .chain(configured.keys())
+    .filter(|path| schema::field_spec(path).is_some())
+    .cloned()
+    .collect();
+
+  let fields = paths
+    .into_iter()
+    .filter_map(|path| {
+      let field_spec = schema::field_spec(&path)?;
+      let spec = deprecations.get(&path).copied().unwrap_or(field_spec);
+      let configured_value = configured.get(&path).cloned();
+      let effective_value = effective.get(&path).cloned().unwrap_or(serde_json::Value::Null);
+      let compatibility_source = has_compatibility_source(&path, &configured);
+      let source = if configured_value.is_some() || compatibility_source {
+        config_path.display().to_string()
+      } else {
+        "default".to_string()
+      };
+      let default = defaults.get(&path).cloned();
+      Some(ExplainedField {
+        path,
+        configured: configured_value,
+        effective: effective_value,
+        default,
+        source,
+        classification: spec.classification.as_str(),
+        why: spec.why,
+        deprecation: spec.deprecation,
+      })
+    })
+    .collect();
+
+  let result = ExplainResult {
+    command: "config",
+    action: "explain",
+    config_path: config_path.display().to_string(),
+    fields,
+  };
+  if json {
+    print_config_json("explain", "success", 0, &result)
+  } else {
+    println!("config: {}", config_path.display());
+    for field in &result.fields {
+      println!("\n{}", field.path);
+      println!(
+        "  configured: {}",
+        field
+          .configured
+          .as_ref()
+          .map(display_json_value)
+          .unwrap_or("none".to_string())
+      );
+      println!("  effective: {}", display_json_value(&field.effective));
+      println!(
+        "  default: {}",
+        field
+          .default
+          .as_ref()
+          .map(display_json_value)
+          .unwrap_or("none".to_string())
+      );
+      println!("  source: {}", field.source);
+      println!("  classification: {}", field.classification);
+      println!("  why: {}", field.why);
+      if let Some(deprecation) = field.deprecation {
+        println!("  deprecation: {}", deprecation);
+      }
+    }
+    Ok(())
+  }
+}
+
+fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json::Value>) -> bool {
+  let contains_any = |paths: &[&str]| paths.iter().any(|path| configured.contains_key(*path));
+  match path {
+    "change-detection.unknown_file_policy" => {
+      configured.contains_key("change-detection.conservative_unclassified_owner_fallback")
+    }
+    "release.remote_effects" => contains_any(&["release.push", "release.create_github_release", "release.forge"]),
+    path if path.starts_with("unify.transitive_pinning.") => {
+      contains_any(&["unify.pin_transitives", "unify.transitive_host"])
+    }
+    path if path.starts_with("unify.msrv_policy.") => {
+      contains_any(&["unify.msrv", "unify.msrv_source", "unify.enforce_msrv_inheritance"])
+    }
+    path if path.starts_with("run.profile.") && path.contains(".baseline.") => {
+      let Some((profile, _)) = path.rsplit_once(".baseline.") else {
+        return false;
+      };
+      configured.contains_key(&format!("{profile}.since")) || configured.contains_key(&format!("{profile}.merge_base"))
+    }
+    _ => false,
+  }
+}
+
+fn flatten_json(value: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+  fn visit(value: &serde_json::Value, path: &str, fields: &mut BTreeMap<String, serde_json::Value>) {
+    match value {
+      serde_json::Value::Object(object) if !object.is_empty() => {
+        for (key, value) in object {
+          let child = if path.is_empty() {
+            key.clone()
+          } else {
+            format!("{path}.{key}")
+          };
+          visit(value, &child, fields);
+        }
+      }
+      serde_json::Value::Array(array) if !array.is_empty() && array.iter().all(serde_json::Value::is_object) => {
+        for (index, value) in array.iter().enumerate() {
+          visit(value, &format!("{path}.{index}"), fields);
+        }
+      }
+      _ if !path.is_empty() => {
+        fields.insert(path.to_string(), value.clone());
+      }
+      _ => {}
+    }
+  }
+
+  let mut fields = BTreeMap::new();
+  visit(value, "", &mut fields);
+  fields
+}
+
+fn display_json_value(value: &serde_json::Value) -> String {
+  match value {
+    serde_json::Value::String(value) => value.clone(),
+    other => other.to_string(),
+  }
+}
+
 /// Load config from explicit path or search, returning both config and path
 fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<(RailConfig, PathBuf)> {
   if let Some(explicit_path) = config_override {
@@ -344,12 +437,7 @@ fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) 
       )));
     }
 
-    let content = std::fs::read_to_string(&path)
-      .map_err(|e| RailError::message(format!("failed to read {}: {}", path.display(), e)))?;
-
-    let config: RailConfig = toml_edit::de::from_str(&content)
-      .map_err(|e| RailError::message(format!("failed to parse {}: {}", path.display(), e)))?;
-
+    let (config, _) = RailConfig::load_path_with_bytes(&path)?;
     return Ok((config, path));
   }
 
@@ -361,15 +449,8 @@ fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) 
     )
   })?;
 
-  match RailConfig::try_load(workspace_root) {
-    ConfigLoadResult::Loaded(config) => Ok((*config, config_path)),
-    ConfigLoadResult::ParseError { path, message } => Err(RailError::message(format!(
-      "failed to parse {}: {}",
-      path.display(),
-      message
-    ))),
-    ConfigLoadResult::NotFound => Err(RailError::message("config file not found".to_string())),
-  }
+  let (config, _) = RailConfig::load_path_with_bytes(&config_path)?;
+  Ok((config, config_path))
 }
 
 // Config Validate
@@ -447,10 +528,20 @@ pub fn run_config_validate_standalone(
   // Check for unknown keys (only if parsing succeeded)
   if let Ok(doc) = &raw_doc {
     check_unknown_keys(doc, &mut warnings);
+    for deprecation in schema::present_deprecations(doc) {
+      if let Some(message) = deprecation.spec.deprecation {
+        warnings.push(ValidationIssue::new(
+          "compatibility",
+          format!("{}: {}", deprecation.path, message),
+        ));
+      }
+    }
   }
 
   // Try to load and validate semantically
-  match parse_config_from_path(&config_path) {
+  let parsed_config = toml_edit::de::from_str::<RailConfig>(&content)
+    .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())));
+  match parsed_config {
     Ok(config) => {
       // Validate change detection config
       if let Err(e) = config.change_detection.validate() {
@@ -598,158 +689,58 @@ fn extract_toml_error_location(err: &str) -> Option<(usize, usize)> {
 
 /// Check for unknown keys in the TOML document
 fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<ValidationIssue>) {
-  let known_top: HashSet<&str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
-
-  for (key, item) in doc.iter() {
-    if !known_top.contains(key) {
-      warnings.push(ValidationIssue::new(
-        "config",
-        format!("unknown top-level key '{}'", key),
-      ));
-      continue;
-    }
-
-    // Check nested keys
-    if let Some(table) = item.as_table() {
-      let known_keys: Option<HashSet<&str>> = match key {
-        "unify" => Some(KNOWN_UNIFY_KEYS.iter().copied().collect()),
-        "release" => Some(KNOWN_RELEASE_KEYS.iter().copied().collect()),
-        "change-detection" => Some(KNOWN_CHANGE_DETECTION_KEYS.iter().copied().collect()),
-        "run" => Some(KNOWN_RUN_KEYS.iter().copied().collect()),
-        _ => None, // crates, workspace, toolchain have dynamic keys
+  fn visit(table: &toml_edit::Table, prefix: &str, warnings: &mut Vec<ValidationIssue>) {
+    for (key, item) in table {
+      let path = if prefix.is_empty() {
+        key.to_string()
+      } else {
+        format!("{prefix}.{key}")
       };
-
-      if let Some(known) = known_keys {
-        for (nested_key, _) in table.iter() {
-          if !known.contains(nested_key) {
-            warnings.push(ValidationIssue::new(
-              key,
-              format!("unknown key '{}' in [{}] section", nested_key, key),
-            ));
-          }
-        }
-
-        if key == "run" {
-          check_run_nested_keys(table, warnings);
-        }
-        if key == "release" {
-          check_release_nested_keys(table, warnings);
-        }
-      }
-    }
-  }
-}
-
-fn check_release_nested_keys(table: &toml_edit::Table, warnings: &mut Vec<ValidationIssue>) {
-  if let Some(changelog_item) = table.get("changelog")
-    && let Some(changelog_table) = changelog_item.as_table()
-  {
-    let known: HashSet<&str> = KNOWN_RELEASE_CHANGELOG_KEYS.iter().copied().collect();
-    for (key, value) in changelog_table.iter() {
-      if !known.contains(key) {
+      if !schema::is_known_path(&path) {
+        let section = path.split('.').next().unwrap_or("config");
         warnings.push(ValidationIssue::new(
-          "release",
-          format!("unknown key '{}' in [release.changelog] section", key),
-        ));
-      }
-
-      if key == "filters"
-        && let Some(filters) = value.as_table()
-      {
-        let known_filters: HashSet<&str> = KNOWN_RELEASE_CHANGELOG_FILTER_KEYS.iter().copied().collect();
-        for (filter_key, _) in filters.iter() {
-          if !known_filters.contains(filter_key) {
-            warnings.push(ValidationIssue::new(
-              "release",
-              format!("unknown key '{}' in [release.changelog.filters] section", filter_key),
-            ));
-          }
-        }
-      }
-    }
-  }
-}
-
-fn check_run_nested_keys(table: &toml_edit::Table, warnings: &mut Vec<ValidationIssue>) {
-  if let Some(profile_item) = table.get("profile")
-    && let Some(profile_table) = profile_item.as_table()
-  {
-    let known: HashSet<&str> = KNOWN_RUN_PROFILE_KEYS.iter().copied().collect();
-    for (profile_name, profile_value) in profile_table.iter() {
-      let Some(profile_cfg) = profile_value.as_table() else {
-        warnings.push(ValidationIssue::new(
-          "run",
-          format!("run.profile.{} must be a table", profile_name),
+          section,
+          format!("unknown configuration key '{path}'"),
         ));
         continue;
-      };
+      }
 
-      for (profile_key, _) in profile_cfg.iter() {
-        if !known.contains(profile_key) {
-          warnings.push(ValidationIssue::new(
-            "run",
-            format!(
-              "unknown key '{}' in [run.profile.{}] section",
-              profile_key, profile_name
-            ),
-          ));
+      if let Some(child) = item.as_table() {
+        visit(child, &path, warnings);
+      } else if let Some(array) = item.as_array_of_tables() {
+        for (index, child) in array.iter().enumerate() {
+          visit(child, &format!("{path}.{index}"), warnings);
         }
       }
     }
   }
+
+  visit(doc.as_table(), "", warnings);
 }
 
-// Config Sync
+// Config Migrate
 
-/// Result of target sync operation
+/// One explicit semantic configuration migration.
 #[derive(Debug, Clone, Serialize)]
-pub struct TargetSyncResult {
-  /// Targets added during sync
-  pub added: Vec<String>,
-  /// Targets removed during sync
-  pub removed: Vec<String>,
-  /// Total targets after sync
-  pub total: usize,
+struct MigrationChange {
+  kind: &'static str,
+  path: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  replacement: Option<String>,
+  message: &'static str,
 }
 
-impl TargetSyncResult {
-  /// Check if any targets were added or removed
-  pub fn has_changes(&self) -> bool {
-    !self.added.is_empty() || !self.removed.is_empty()
-  }
-}
-
-/// Result of field sync operation
-#[derive(Debug, Clone, Serialize)]
-pub struct FieldChange {
-  /// TOML path of the field (e.g., "unify.msrv_source")
-  pub path: String,
-  /// Default value that was inserted
-  pub value: String,
-}
-
-/// Complete sync result for JSON output
 #[derive(Serialize)]
-struct ConfigSyncResult {
+struct ConfigMigrateResult {
   command: &'static str,
   action: &'static str,
   config_path: String,
-  fields_added: Vec<FieldChange>,
-  targets: Option<TargetSyncResult>,
+  changes: Vec<MigrationChange>,
   has_changes: bool,
 }
 
-/// Sync configuration after upgrades: add missing fields and update targets
-///
-/// This command ensures rail.toml has all known configuration fields
-/// without overwriting existing user values. It also syncs target triples
-/// from workspace configuration files (rust-toolchain.toml, .cargo/config.toml, etc.)
-///
-/// Exit codes:
-/// - 0: Config is up to date (no changes needed or changes applied)
-/// - 1: Changes detected (--check mode only)
-/// - 2: Error
-pub fn run_config_sync(
+/// Apply only versioned semantic migrations; never materialize defaults.
+pub fn run_config_migrate(
   workspace_root: &Path,
   config_override: Option<&Path>,
   check: bool,
@@ -761,97 +752,513 @@ pub fn run_config_sync(
     crate::output::set_json_mode(true);
   }
 
-  // Find existing config
   let config_path = resolve_config_path(workspace_root, config_override)?;
-
   let mut editor = TomlEditor::open(&config_path)?;
-  let mut fields_added: Vec<FieldChange> = Vec::new();
+  let mut changes = Vec::new();
 
-  // Add missing fields from schema
-  for field in schema::SYNCABLE_FIELDS {
-    let path = format!("{}.{}", field.section, field.key);
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.compiler_diag_cache",
+    "Compiler evidence caching is now automatic.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.sort_dependencies",
+    "Dependency edits are now always deterministic.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.prune_dead_features",
+    "Dead-feature diagnostics are unconditional; deletion still requires closed-consumer proof.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.detect_unused",
+    "Unused-dependency diagnostics are now unconditional.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.remove_unused",
+    "Read-only checks and explicit apply now define the mutation boundary.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.detect_undeclared_features",
+    "Borrowed-feature diagnostics are now unconditional.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "unify.fix_undeclared_features",
+    "Read-only checks and explicit apply now define the mutation boundary.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "change-detection.bot_pr_confidence_profile",
+    "Provider identity no longer changes planner policy.",
+  );
+  migrate_unify_typed_policies(&mut editor, &mut changes)?;
+  migrate_release_remote_effects(&mut editor, &mut changes)?;
+  migrate_run_profile_baselines(&mut editor, &mut changes)?;
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "workspace",
+    "The reserved workspace table had no behavior.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "toolchain",
+    "The reserved toolchain table had no behavior.",
+  );
+  migrate_unknown_file_policy(&mut editor, &mut changes)?;
+  migrate_reserved_sync_tables(&mut editor, &mut changes);
 
-    // Ensure section exists
-    editor.ensure_section(field.section);
-
-    // Check if field exists
-    if !editor.contains_path(&path) {
-      editor.set_raw_with_comment(&path, field.default_toml, Some(field.comment))?;
-      fields_added.push(FieldChange {
-        path: path.clone(),
-        value: field.default_toml.to_string(),
-      });
-    }
-  }
-
-  // Sync targets from workspace
-  let targets_result = sync_targets(&mut editor, workspace_root)?;
-
-  // Check for changes
-  let has_changes = !fields_added.is_empty() || targets_result.as_ref().is_some_and(|t| t.has_changes());
+  let migrated = editor.doc().to_string();
+  toml_edit::de::from_str::<RailConfig>(&migrated)
+    .map_err(|error| RailError::message(format!("migrated configuration is invalid: {error}")))?;
+  let has_changes = !changes.is_empty();
 
   if check {
-    // Preview mode
     if json {
-      let result = ConfigSyncResult {
+      let result = ConfigMigrateResult {
         command: "config",
-        action: "sync",
+        action: "migrate",
         config_path: config_path.display().to_string(),
-        fields_added,
-        targets: targets_result,
+        changes,
         has_changes,
       };
       print_config_json(
-        "sync",
+        "migrate",
         if has_changes { "pending_changes" } else { "success" },
         if has_changes { 1 } else { 0 },
         &result,
       )?;
     } else {
-      print_sync_preview(&config_path, &fields_added, &targets_result, has_changes);
+      print_migrations(&config_path, &changes, true);
     }
 
     if has_changes {
-      // Exit with code 1 to indicate changes are needed
       return Err(RailError::CheckHasPendingChanges);
     }
-  } else {
-    // Apply mode
-    if !has_changes {
-      if json {
-        let result = ConfigSyncResult {
-          command: "config",
-          action: "sync",
-          config_path: config_path.display().to_string(),
-          fields_added: vec![],
-          targets: targets_result,
-          has_changes: false,
-        };
-        print_config_json("sync", "success", 0, &result)?;
-      } else {
-        println!("config: {} (up to date)", config_path.display());
-      }
-      return Ok(());
-    }
+    return Ok(());
+  }
 
+  if has_changes {
     editor.write()?;
-
-    if json {
-      let result = ConfigSyncResult {
-        command: "config",
-        action: "sync",
-        config_path: config_path.display().to_string(),
-        fields_added,
-        targets: targets_result,
-        has_changes: true,
-      };
-      print_config_json("sync", "applied", 0, &result)?;
-    } else {
-      print_sync_applied(&config_path, &fields_added, &targets_result);
-    }
+  }
+  if json {
+    let result = ConfigMigrateResult {
+      command: "config",
+      action: "migrate",
+      config_path: config_path.display().to_string(),
+      changes,
+      has_changes,
+    };
+    print_config_json("migrate", if has_changes { "applied" } else { "success" }, 0, &result)?;
+  } else if has_changes {
+    print_migrations(&config_path, &changes, false);
+  } else {
+    println!("config: {} (no migrations pending)", config_path.display());
   }
 
   Ok(())
+}
+
+fn migrate_removed_field(
+  editor: &mut TomlEditor,
+  changes: &mut Vec<MigrationChange>,
+  path: &str,
+  message: &'static str,
+) {
+  if editor.remove(path) {
+    changes.push(MigrationChange {
+      kind: "remove",
+      path: path.to_string(),
+      replacement: None,
+      message,
+    });
+  }
+}
+
+fn migrate_unknown_file_policy(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
+  const OLD: &str = "change-detection.conservative_unclassified_owner_fallback";
+  const NEW: &str = "change-detection.unknown_file_policy";
+  if let Some(item) = editor.get(OLD) {
+    let enabled = item
+      .as_bool()
+      .ok_or_else(|| RailError::message(format!("{OLD} must be a boolean before it can be migrated")))?;
+    let mapped = if enabled { "owned_build_test" } else { "docs" };
+    let replacement = match editor.get(NEW) {
+      Some(item) => display_toml_item(item),
+      None => {
+        editor.set(NEW, mapped)?;
+        format!("\"{mapped}\"")
+      }
+    };
+    editor.remove(OLD);
+    changes.push(MigrationChange {
+      kind: "rename",
+      path: OLD.to_string(),
+      replacement: Some(format!("{NEW} = {replacement}")),
+      message: "The legacy alias was removed; an existing explicit policy takes precedence.",
+    });
+  }
+
+  if let Some(enabled) = editor.get(NEW).and_then(toml_edit::Item::as_bool) {
+    let replacement = if enabled { "owned_build_test" } else { "docs" };
+    editor.set(NEW, replacement)?;
+    changes.push(MigrationChange {
+      kind: "replace",
+      path: NEW.to_string(),
+      replacement: Some(format!("{NEW} = \"{replacement}\"")),
+      message: "The legacy boolean is now an explicit unknown-file policy.",
+    });
+  }
+  Ok(())
+}
+
+fn migrate_release_remote_effects(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
+  const NEW: &str = "release.remote_effects";
+  const LEGACY: &[&str] = &["release.push", "release.create_github_release", "release.forge"];
+  let present: Vec<_> = LEGACY
+    .iter()
+    .copied()
+    .filter(|path| editor.contains_path(path))
+    .collect();
+  if present.is_empty() {
+    return Ok(());
+  }
+
+  let replacement = if let Some(item) = editor.get(NEW) {
+    format!("{NEW} = {}", display_toml_item(item))
+  } else {
+    let push = legacy_bool(editor, "release.push")?.unwrap_or(false);
+    let create_release = legacy_bool(editor, "release.create_github_release")?.unwrap_or(false);
+    if create_release && !push {
+      return Err(RailError::with_help(
+        "cannot migrate release.create_github_release = true with release.push = false",
+        "choose one explicit policy first: set release.push = true to create a forge release, or set release.create_github_release = false",
+      ));
+    }
+    let forge = editor
+      .get("release.forge")
+      .map(|item| {
+        item
+          .as_str()
+          .map(str::to_string)
+          .ok_or_else(|| RailError::message("release.forge must be a string before it can be migrated"))
+      })
+      .transpose()?
+      .unwrap_or_else(|| "auto".to_string());
+    let remote_effects = if create_release {
+      match forge.as_str() {
+        "auto" | "github" | "gitlab" => forge,
+        value => {
+          return Err(RailError::message(format!(
+            "release.forge has unsupported value '{value}'"
+          )));
+        }
+      }
+    } else if push {
+      "push".to_string()
+    } else {
+      "none".to_string()
+    };
+    if remote_effects == "none" {
+      "field omitted (remote effects default to \"none\")".to_string()
+    } else {
+      editor.set(NEW, remote_effects.as_str())?;
+      format!("{NEW} = \"{remote_effects}\"")
+    }
+  };
+
+  for path in present {
+    editor.remove(path);
+    changes.push(MigrationChange {
+      kind: "merge",
+      path: path.to_string(),
+      replacement: Some(replacement.clone()),
+      message: "The legacy release-effect matrix is now one typed policy.",
+    });
+  }
+  Ok(())
+}
+
+fn migrate_unify_typed_policies(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
+  let Some(unify) = editor
+    .doc_mut()
+    .get_mut("unify")
+    .and_then(toml_edit::Item::as_table_mut)
+  else {
+    return Ok(());
+  };
+
+  let legacy_transitive: Vec<_> = ["pin_transitives", "transitive_host"]
+    .into_iter()
+    .filter(|key| unify.contains_key(key))
+    .collect();
+  if !legacy_transitive.is_empty() {
+    let replacement = if let Some(item) = unify.get("transitive_pinning") {
+      format!("unify.transitive_pinning = {}", display_toml_item(item))
+    } else {
+      let enabled = legacy_table_bool(unify, "pin_transitives")?.unwrap_or(false);
+      let host = unify
+        .get("transitive_host")
+        .map(|item| {
+          item
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RailError::message("unify.transitive_host must be a string before it can be migrated"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| "root".to_string());
+      if enabled {
+        let mut policy = toml_edit::InlineTable::new();
+        policy.insert("host", host.into());
+        let value = toml_edit::Value::InlineTable(policy);
+        let replacement = value.to_string();
+        unify.insert("transitive_pinning", toml_edit::Item::Value(value));
+        format!("unify.transitive_pinning = {replacement}")
+      } else {
+        "field omitted (transitive pinning defaults to disabled)".to_string()
+      }
+    };
+    for key in legacy_transitive {
+      unify.remove(key);
+      changes.push(MigrationChange {
+        kind: "merge",
+        path: format!("unify.{key}"),
+        replacement: Some(replacement.clone()),
+        message: "The legacy enable/host pair is now one typed pinning policy.",
+      });
+    }
+  }
+
+  let legacy_msrv: Vec<_> = ["msrv", "msrv_source", "enforce_msrv_inheritance"]
+    .into_iter()
+    .filter(|key| unify.contains_key(key))
+    .collect();
+  if !legacy_msrv.is_empty() {
+    let replacement = if let Some(item) = unify.get("msrv_policy") {
+      format!("unify.msrv_policy = {}", display_toml_item(item))
+    } else {
+      let enabled = legacy_table_bool(unify, "msrv")?.unwrap_or(true);
+      let inherit = legacy_table_bool(unify, "enforce_msrv_inheritance")?.unwrap_or(false);
+      if !enabled && inherit {
+        return Err(RailError::with_help(
+          "cannot migrate enforce_msrv_inheritance = true with msrv = false",
+          "choose one explicit policy first: enable MSRV computation or disable inheritance",
+        ));
+      }
+      let source = unify
+        .get("msrv_source")
+        .map(|item| {
+          item
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RailError::message("unify.msrv_source must be a string before it can be migrated"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| "max".to_string());
+      if !matches!(source.as_str(), "deps" | "workspace" | "max") {
+        return Err(RailError::message(format!(
+          "unify.msrv_source has unsupported value '{source}'"
+        )));
+      }
+
+      if enabled && source == "max" && !inherit {
+        "field omitted (MSRV compute/max defaults apply)".to_string()
+      } else {
+        let mut policy = toml_edit::InlineTable::new();
+        policy.insert("mode", (if enabled { "compute" } else { "disabled" }).into());
+        if enabled {
+          policy.insert("source", source.into());
+          if inherit {
+            policy.insert("inherit", true.into());
+          }
+        }
+        let value = toml_edit::Value::InlineTable(policy);
+        let replacement = value.to_string();
+        unify.insert("msrv_policy", toml_edit::Item::Value(value));
+        format!("unify.msrv_policy = {replacement}")
+      }
+    };
+    for key in legacy_msrv {
+      unify.remove(key);
+      changes.push(MigrationChange {
+        kind: "merge",
+        path: format!("unify.{key}"),
+        replacement: Some(replacement.clone()),
+        message: "The legacy MSRV booleans and source are now one typed policy.",
+      });
+    }
+  }
+
+  if unify.is_empty() {
+    editor.doc_mut().as_table_mut().remove("unify");
+  }
+  Ok(())
+}
+
+fn legacy_table_bool(table: &toml_edit::Table, key: &str) -> RailResult<Option<bool>> {
+  table
+    .get(key)
+    .map(|item| {
+      item
+        .as_bool()
+        .ok_or_else(|| RailError::message(format!("unify.{key} must be a boolean before it can be migrated")))
+    })
+    .transpose()
+}
+
+fn migrate_run_profile_baselines(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
+  let profile_names: Vec<String> = editor
+    .doc()
+    .get("run")
+    .and_then(toml_edit::Item::as_table)
+    .and_then(|run| run.get("profile"))
+    .and_then(toml_edit::Item::as_table)
+    .map(|profiles| profiles.iter().map(|(name, _)| name.to_string()).collect())
+    .unwrap_or_default();
+
+  for profile_name in profile_names {
+    let profile = editor
+      .doc_mut()
+      .get_mut("run")
+      .and_then(toml_edit::Item::as_table_mut)
+      .and_then(|run| run.get_mut("profile"))
+      .and_then(toml_edit::Item::as_table_mut)
+      .and_then(|profiles| profiles.get_mut(&profile_name))
+      .and_then(toml_edit::Item::as_table_mut)
+      .ok_or_else(|| RailError::message(format!("run.profile.{profile_name} must be a table")))?;
+    let has_since = profile.contains_key("since");
+    let has_merge_base = profile.contains_key("merge_base");
+    if !has_since && !has_merge_base {
+      continue;
+    }
+
+    let since = profile
+      .get("since")
+      .map(|item| {
+        item
+          .as_str()
+          .map(str::to_string)
+          .ok_or_else(|| RailError::message(format!("run.profile.{profile_name}.since must be a string")))
+      })
+      .transpose()?;
+    let merge_base = profile
+      .get("merge_base")
+      .map(|item| {
+        item
+          .as_bool()
+          .ok_or_else(|| RailError::message(format!("run.profile.{profile_name}.merge_base must be a boolean")))
+      })
+      .transpose()?;
+    if since.is_some() && merge_base == Some(true) && !profile.contains_key("baseline") {
+      return Err(RailError::with_help(
+        format!("cannot migrate conflicting baseline in run.profile.{profile_name}"),
+        "remove either since or merge_base = true so the profile selects one baseline mode",
+      ));
+    }
+
+    let replacement = if let Some(item) = profile.get("baseline") {
+      format!("run.profile.{profile_name}.baseline = {}", display_toml_item(item))
+    } else if let Some(reference) = since {
+      let mut baseline = toml_edit::InlineTable::new();
+      baseline.insert("kind", "since".into());
+      baseline.insert("reference", reference.into());
+      let value = toml_edit::Value::InlineTable(baseline);
+      let replacement = value.to_string();
+      profile.insert("baseline", toml_edit::Item::Value(value));
+      format!("run.profile.{profile_name}.baseline = {replacement}")
+    } else if merge_base == Some(true) {
+      let mut baseline = toml_edit::InlineTable::new();
+      baseline.insert("kind", "merge-base".into());
+      let value = toml_edit::Value::InlineTable(baseline);
+      let replacement = value.to_string();
+      profile.insert("baseline", toml_edit::Item::Value(value));
+      format!("run.profile.{profile_name}.baseline = {replacement}")
+    } else {
+      "field omitted (the profile has no baseline by default)".to_string()
+    };
+
+    for key in ["since", "merge_base"] {
+      if profile.remove(key).is_some() {
+        changes.push(MigrationChange {
+          kind: "merge",
+          path: format!("run.profile.{profile_name}.{key}"),
+          replacement: Some(replacement.clone()),
+          message: "The legacy baseline pair is now one typed policy.",
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+fn legacy_bool(editor: &TomlEditor, path: &str) -> RailResult<Option<bool>> {
+  editor
+    .get(path)
+    .map(|item| {
+      item
+        .as_bool()
+        .ok_or_else(|| RailError::message(format!("{path} must be a boolean before it can be migrated")))
+    })
+    .transpose()
+}
+
+fn display_toml_item(item: &toml_edit::Item) -> String {
+  item
+    .as_value()
+    .map(ToString::to_string)
+    .unwrap_or_else(|| item.to_string())
+}
+
+fn migrate_reserved_sync_tables(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) {
+  let crate_names: Vec<String> = editor
+    .doc()
+    .get("crates")
+    .and_then(toml_edit::Item::as_table)
+    .map(|crates| crates.iter().map(|(name, _)| name.to_string()).collect())
+    .unwrap_or_default();
+  for crate_name in crate_names {
+    let path = format!("crates.{crate_name}.sync");
+    migrate_removed_field(
+      editor,
+      changes,
+      &path,
+      "The reserved per-crate sync table had no behavior.",
+    );
+  }
+}
+
+fn print_migrations(config_path: &Path, changes: &[MigrationChange], check: bool) {
+  println!("config: {}", config_path.display());
+  if changes.is_empty() {
+    println!("no migrations pending");
+    return;
+  }
+  println!();
+  for change in changes {
+    let verb = if check { "would migrate" } else { "migrated" };
+    if let Some(replacement) = &change.replacement {
+      println!("{verb}: {} -> {}", change.path, replacement);
+    } else {
+      println!("{verb}: {} ({})", change.path, change.message);
+    }
+  }
+  if check {
+    println!("\nrun without --check to apply");
+  }
 }
 
 fn resolve_config_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<PathBuf> {
@@ -876,196 +1283,4 @@ fn resolve_config_path(workspace_root: &Path, config_override: Option<&Path>) ->
       "run 'cargo rail init' first to create a configuration file".to_string(),
     )
   })
-}
-
-fn parse_config_from_path(config_path: &Path) -> RailResult<RailConfig> {
-  let content = std::fs::read_to_string(config_path)
-    .map_err(|e| RailError::message(format!("failed to read {}: {}", config_path.display(), e)))?;
-  toml_edit::de::from_str::<RailConfig>(&content)
-    .map_err(|e| RailError::message(format!("failed to parse {}: {}", config_path.display(), e)))
-}
-
-/// Sync targets from workspace into config
-///
-/// This performs a **union merge**: existing user-configured targets are preserved,
-/// and newly detected targets are added. Targets are never removed automatically.
-fn sync_targets(editor: &mut TomlEditor, workspace_root: &Path) -> RailResult<Option<TargetSyncResult>> {
-  use crate::targets::detect_targets_excluding;
-  use crate::toml::TomlFormatter;
-  use toml_edit::{DocumentMut, Item};
-
-  // All possible config file locations to exclude from target detection
-  let config_paths = [
-    workspace_root.join("rail.toml"),
-    workspace_root.join(".rail.toml"),
-    workspace_root.join(".cargo").join("rail.toml"),
-    workspace_root.join(".config").join("rail.toml"),
-  ];
-  let exclude_refs: Vec<&Path> = config_paths.iter().map(|p| p.as_path()).collect();
-
-  // Detect targets in workspace, excluding all possible rail.toml locations
-  let detected: BTreeSet<String> = detect_targets_excluding(workspace_root, &exclude_refs)?
-    .into_iter()
-    .collect();
-
-  // Get existing targets from config
-  let existing: BTreeSet<String> = editor
-    .doc()
-    .get("targets")
-    .and_then(|v| v.as_array())
-    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-    .unwrap_or_default();
-
-  // Union merge: keep existing + add detected
-  // This preserves user-configured targets and adds any newly discovered ones
-  let merged: BTreeSet<String> = existing.union(&detected).cloned().collect();
-
-  // Calculate what's actually new (targets in merged but not in existing)
-  let added: Vec<_> = merged.difference(&existing).cloned().collect();
-
-  // If nothing new to add, return None
-  if added.is_empty() {
-    return Ok(None);
-  }
-
-  // Use TomlFormatter for proper multiline formatting with tier grouping
-  let formatter = TomlFormatter::new();
-  let targets_vec: Vec<String> = merged.iter().cloned().collect();
-  let formatted_array = formatter.array_targets(&targets_vec);
-
-  // Parse the formatted array back into a TOML value
-  let parse_str = format!("targets = {}", formatted_array);
-  let parsed: DocumentMut = parse_str
-    .parse()
-    .map_err(|e| RailError::message(format!("Failed to format targets: {}", e)))?;
-
-  // Extract the value and insert it
-  if let Some(value) = parsed.get("targets").and_then(|item| item.as_value()) {
-    editor.doc_mut()["targets"] = Item::Value(value.clone());
-  }
-
-  Ok(Some(TargetSyncResult {
-    added,
-    removed: vec![], // We never remove targets automatically
-    total: merged.len(),
-  }))
-}
-
-/// Print sync preview (--check mode)
-fn print_sync_preview(
-  config_path: &Path,
-  fields_added: &[FieldChange],
-  targets: &Option<TargetSyncResult>,
-  has_changes: bool,
-) {
-  println!("config: {}", config_path.display());
-  println!();
-
-  if !fields_added.is_empty() {
-    println!("would add:");
-    for field in fields_added {
-      println!("  [{}] = {}", field.path, field.value);
-    }
-    println!();
-  }
-
-  if let Some(t) = targets {
-    if t.has_changes() {
-      println!("targets:");
-      for target in &t.added {
-        println!("  + {}", target);
-      }
-      for target in &t.removed {
-        println!("  - {}", target);
-      }
-      println!();
-    } else {
-      println!("targets: in sync ({} targets)", t.total);
-    }
-  } else {
-    // No target detection result means they were already in sync
-    println!("targets: in sync");
-  }
-
-  if has_changes {
-    println!();
-    println!("run without --check to apply");
-  }
-}
-
-/// Print sync applied result
-fn print_sync_applied(config_path: &Path, fields_added: &[FieldChange], targets: &Option<TargetSyncResult>) {
-  println!("synced: {}", config_path.display());
-  println!();
-
-  if !fields_added.is_empty() {
-    println!("added {} field(s):", fields_added.len());
-    for field in fields_added {
-      println!("  [{}] = {}", field.path, field.value);
-    }
-    println!();
-  }
-
-  if let Some(t) = targets {
-    if t.has_changes() {
-      println!("targets:");
-      for target in &t.added {
-        println!("  + {}", target);
-      }
-      for target in &t.removed {
-        println!("  - {}", target);
-      }
-      println!("  total: {} targets", t.total);
-    } else {
-      println!("targets: in sync ({} targets)", t.total);
-    }
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn test_known_unify_keys_match_schema_fields() {
-    let known: BTreeSet<&str> = KNOWN_UNIFY_KEYS.iter().copied().collect();
-    let from_schema: BTreeSet<&str> = schema::fields_for_section("unify").map(|field| field.key).collect();
-
-    assert_eq!(
-      known, from_schema,
-      "KNOWN_UNIFY_KEYS must stay in sync with schema::SYNCABLE_FIELDS for [unify]"
-    );
-  }
-
-  #[test]
-  fn test_known_run_keys_cover_schema_fields() {
-    let known: BTreeSet<&str> = KNOWN_RUN_KEYS.iter().copied().collect();
-    let from_schema: BTreeSet<&str> = schema::fields_for_section("run").map(|field| field.key).collect();
-
-    for field in from_schema {
-      assert!(
-        known.contains(field),
-        "KNOWN_RUN_KEYS must include schema field [run].{}",
-        field
-      );
-    }
-  }
-
-  #[test]
-  fn test_known_release_keys_match_schema_fields() {
-    let known: BTreeSet<&str> = KNOWN_RELEASE_KEYS.iter().copied().collect();
-    let from_schema: BTreeSet<&str> = schema::fields_for_section("release").map(|field| field.key).collect();
-
-    for field in from_schema {
-      assert!(
-        known.contains(field),
-        "KNOWN_RELEASE_KEYS must include schema field [release].{}",
-        field
-      );
-    }
-    assert!(
-      known.contains("changelog"),
-      "KNOWN_RELEASE_KEYS must include nested [release.changelog] table"
-    );
-  }
 }

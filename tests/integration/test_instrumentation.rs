@@ -224,10 +224,7 @@ fn unify_diagnostics_distinguish_base_and_target_metadata_loads() -> Result<()> 
   ws.add_crate("demo", "0.1.0", &[])?;
   std::fs::write(
     ws.path.join(".config/rail.toml"),
-    format!(
-      "targets = [\"{}\"]\n\n[unify]\ndetect_unused = false\ndetect_undeclared_features = false\nmsrv = false\n",
-      host_target()?
-    ),
+    format!("targets = [\"{}\"]\n\n[unify]\nmsrv = false\n", host_target()?),
   )?;
   ws.commit("Add target fixture")?;
 

@@ -38,7 +38,6 @@ If another tool needs package selection, use `scope.cargo_args`, not `impact`.
 [change-detection]
 infrastructure = [".github/**", "scripts/**", "Cargo.lock", "rust-toolchain.toml"]
 confidence_profile = "balanced"
-bot_pr_confidence_profile = "strict"
 unknown_file_policy = "strict"
 
 [change-detection.custom]

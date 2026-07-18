@@ -2,7 +2,7 @@
 
 use crate::error::ConfigError;
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 const BUILTIN_PROFILE_NAMES: &[&str] = &["local", "ci", "nightly"];
 const SUPPORTED_SURFACES: &[&str] = &["build", "test", "bench", "docs"];
@@ -24,7 +24,7 @@ pub struct RunConfig {
 }
 
 /// A named run profile.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct RunProfile {
   /// Surfaces executed by this profile.
   #[serde(default)]
@@ -32,12 +32,62 @@ pub struct RunProfile {
   /// Arguments prepended to command-line `RUN_ARGS`.
   #[serde(default)]
   pub run_args: Vec<String>,
-  /// Optional baseline reference if CLI doesn't provide `--since`/`--merge-base`.
+  /// Optional baseline policy if the CLI does not provide one.
   #[serde(default)]
-  pub since: Option<String>,
-  /// Optional merge-base behavior if CLI doesn't provide `--since`.
-  #[serde(default)]
-  pub merge_base: Option<bool>,
+  pub baseline: Option<RunBaseline>,
+}
+
+/// One valid baseline policy for a run profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RunBaseline {
+  /// Use one explicit Git reference or supported placeholder.
+  Since {
+    /// Git reference or `{base_ref}` placeholder.
+    reference: String,
+  },
+  /// Resolve the merge base against the default branch.
+  MergeBase,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RunProfileInput {
+  surfaces: Vec<String>,
+  run_args: Vec<String>,
+  baseline: Option<RunBaseline>,
+  since: Option<String>,
+  merge_base: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for RunProfile {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let input = RunProfileInput::deserialize(deserializer)?;
+    if input.baseline.is_some() && (input.since.is_some() || input.merge_base.is_some()) {
+      return Err(de::Error::custom(
+        "run profile baseline cannot be combined with deprecated since or merge_base; run `cargo rail config migrate`",
+      ));
+    }
+    if input.since.is_some() && input.merge_base == Some(true) {
+      return Err(de::Error::custom(
+        "deprecated run profile since and merge_base = true are mutually exclusive",
+      ));
+    }
+    let baseline = input.baseline.or_else(|| {
+      input
+        .since
+        .map(|reference| RunBaseline::Since { reference })
+        .or_else(|| (input.merge_base == Some(true)).then_some(RunBaseline::MergeBase))
+    });
+    Ok(Self {
+      surfaces: input.surfaces,
+      run_args: input.run_args,
+      baseline,
+    })
+  }
 }
 
 impl RunConfig {
@@ -135,18 +185,11 @@ impl RunProfile {
       }
     }
 
-    if self.since.is_some() && self.merge_base == Some(true) {
-      return Err(ConfigError::InvalidField {
-        field: format!("run.profile.{}", profile_name),
-        reason: "`since` and `merge_base = true` are mutually exclusive".to_string(),
-      });
-    }
-
-    if let Some(since) = &self.since {
+    if let Some(RunBaseline::Since { reference }) = &self.baseline {
       validate_tokens(
-        since,
+        reference,
         ALLOWED_SINCE_TOKENS,
-        &format!("run.profile.{}.since", profile_name),
+        &format!("run.profile.{}.baseline.reference", profile_name),
       )?;
     }
 
@@ -264,12 +307,35 @@ mod tests {
       "custom".to_string(),
       RunProfile {
         surfaces: vec!["test".to_string()],
-        since: Some("{cargo_args}".to_string()),
+        baseline: Some(RunBaseline::Since {
+          reference: "{cargo_args}".to_string(),
+        }),
         ..RunProfile::default()
       },
     );
     let err = cfg.validate().expect_err("unknown since token should fail validation");
     assert!(err.to_string().contains("unknown token '{cargo_args}'"));
+  }
+
+  #[test]
+  fn baseline_type_cannot_represent_conflicting_modes() {
+    let err = toml_edit::de::from_str::<RunProfile>("surfaces = [\"test\"]\nsince = \"HEAD~1\"\nmerge_base = true\n")
+      .unwrap_err();
+    assert!(err.to_string().contains("mutually exclusive"));
+  }
+
+  #[test]
+  fn valid_legacy_baselines_map_to_typed_policy() {
+    let profile: RunProfile = toml_edit::de::from_str("surfaces = [\"test\"]\nmerge_base = true\n").unwrap();
+    assert_eq!(profile.baseline, Some(RunBaseline::MergeBase));
+
+    let profile: RunProfile = toml_edit::de::from_str("surfaces = [\"test\"]\nsince = \"HEAD~1\"\n").unwrap();
+    assert_eq!(
+      profile.baseline,
+      Some(RunBaseline::Since {
+        reference: "HEAD~1".to_string()
+      })
+    );
   }
 
   #[test]

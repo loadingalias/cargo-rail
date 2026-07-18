@@ -1189,13 +1189,7 @@ fn test_plan_unclassified_owner_fallback_can_be_disabled() -> Result<()> {
 
   std::fs::write(
     ws.path.join(".config/rail.toml"),
-    r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-
-[change-detection]
+    r#"[change-detection]
 conservative_unclassified_owner_fallback = false
 "#,
   )?;
@@ -1469,20 +1463,14 @@ fn test_plan_confidence_profile_fast_disables_transitive_build_test() -> Result<
 }
 
 #[test]
-fn test_plan_bot_pr_policy_override_to_strict() -> Result<()> {
+fn test_deprecated_bot_pr_policy_is_warning_backed_and_ignored() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-bot-policy")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("add crate")?;
 
   std::fs::write(
     ws.path.join(".config/rail.toml"),
-    r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-
-[change-detection]
+    r#"[change-detection]
 confidence_profile = "fast"
 bot_pr_confidence_profile = "strict"
 "#,
@@ -1509,16 +1497,15 @@ bot_pr_confidence_profile = "strict"
   assert!(output.status.success(), "plan should succeed");
 
   let json: Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(
-    json["inputs"]["confidence_profile"],
-    Value::String("strict".to_string())
-  );
+  assert_eq!(json["inputs"]["confidence_profile"], Value::String("fast".to_string()));
   assert_eq!(
     json["inputs"]["confidence_profile_source"],
-    Value::String("bot_pr_policy".to_string())
+    Value::String("config".to_string())
   );
-  assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(true));
-  assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(true));
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("config migrate"),
+    "deprecated provider policy must produce actionable migration guidance"
+  );
 
   Ok(())
 }

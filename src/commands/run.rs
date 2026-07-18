@@ -247,8 +247,11 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
     .and_then(|cfg| cfg.run.profiles.get(profile_name.as_str()))
   {
     profile_run_args = cfg_profile.run_args.clone();
-    profile_since = cfg_profile.since.clone();
-    profile_merge_base = cfg_profile.merge_base.unwrap_or(false);
+    match &cfg_profile.baseline {
+      Some(crate::config::RunBaseline::Since { reference }) => profile_since = Some(reference.clone()),
+      Some(crate::config::RunBaseline::MergeBase) => profile_merge_base = true,
+      None => {}
+    }
     dedup_surfaces(cfg_profile.surfaces.clone())
   } else if let Some(builtin_surfaces) = builtin_profile_surfaces(profile_name.as_str()) {
     builtin_surfaces

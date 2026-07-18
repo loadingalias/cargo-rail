@@ -62,12 +62,6 @@ pub struct ChangeDetectionConfig {
   /// Confidence profile used by planner unless explicitly overridden by CLI.
   #[serde(default)]
   pub confidence_profile: ConfidenceProfile,
-
-  /// Optional confidence profile override for bot-authored pull requests.
-  ///
-  /// When set, planner applies this profile only in bot-authored PR contexts.
-  #[serde(default)]
-  pub bot_pr_confidence_profile: Option<ConfidenceProfile>,
 }
 
 impl Default for ChangeDetectionConfig {
@@ -77,7 +71,6 @@ impl Default for ChangeDetectionConfig {
       custom: FxHashMap::default(),
       unknown_file_policy: default_unknown_file_policy(),
       confidence_profile: ConfidenceProfile::default(),
-      bot_pr_confidence_profile: None,
     }
   }
 }
@@ -186,7 +179,6 @@ mod tests {
       custom,
       unknown_file_policy: UnknownFilePolicy::Strict,
       confidence_profile: ConfidenceProfile::Balanced,
-      bot_pr_confidence_profile: None,
     };
     assert!(cfg.validate().is_ok());
   }
@@ -200,7 +192,6 @@ mod tests {
       custom,
       unknown_file_policy: UnknownFilePolicy::Strict,
       confidence_profile: ConfidenceProfile::Balanced,
-      bot_pr_confidence_profile: None,
     };
     assert!(cfg.validate().is_err());
   }

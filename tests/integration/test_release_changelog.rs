@@ -89,7 +89,7 @@ fn push_release_workspace(crate_name: &str) -> Result<(TestWorkspace, tempfile::
     r#"tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
-push = true
+remote_effects = "push"
 "#,
   )?;
   Ok((ws, remote))
@@ -409,8 +409,6 @@ require_clean = false
 require_release_notes = false
 semver_check = "off"
 sign_tags = false
-push = false
-create_github_release = false
 publish_delay = 1
 "#,
   )?;
@@ -2161,7 +2159,7 @@ push = false
     stderr
   );
   assert!(
-    stdout.contains("requires push = true") || stderr.contains("requires push = true"),
+    stdout.contains("requires release.push = true") || stderr.contains("requires release.push = true"),
     "expected owned-push error\nstdout:\n{}\nstderr:\n{}",
     stdout,
     stderr
@@ -2179,9 +2177,7 @@ fn test_release_creates_gitlab_release_with_glab() -> Result<()> {
 tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
-push = true
-create_github_release = true
-forge = "gitlab"
+remote_effects = "gitlab"
 "#,
   )?;
   ws.tag("v0.1.0", "Initial release")?;
@@ -2243,9 +2239,7 @@ fn test_release_errors_when_gitlab_forge_binary_missing() -> Result<()> {
 tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
-push = true
-create_github_release = true
-forge = "gitlab"
+remote_effects = "gitlab"
 "#,
   )?;
   ws.tag("v0.1.0", "Initial release")?;
@@ -2278,7 +2272,7 @@ forge = "gitlab"
   );
   assert!(
     combined.contains("GitLab releases enabled but glab CLI was not found")
-      && combined.contains("install glab or set create_github_release = false"),
+      && combined.contains("install glab or set release.remote_effects = \"push\""),
     "output:\n{}",
     combined
   );
@@ -2490,7 +2484,7 @@ fn test_release_resume_reconciles_push_that_completed_before_failure() -> Result
     r#"tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
-push = true
+remote_effects = "push"
 "#,
   )?;
 
@@ -2552,7 +2546,7 @@ fn test_release_abort_reconciles_push_rejected_by_local_hook() -> Result<()> {
     r#"tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
-push = true
+remote_effects = "push"
 "#,
   )?;
 

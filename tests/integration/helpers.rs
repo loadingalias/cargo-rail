@@ -49,15 +49,7 @@ serde = { version = "1.0", features = ["derive"] }
 
     // Create .config/rail.toml for tests
     std::fs::create_dir_all(path.join(".config"))?;
-    std::fs::write(
-      path.join(".config/rail.toml"),
-      r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-"#,
-    )?;
+    std::fs::write(path.join(".config/rail.toml"), "")?;
 
     // Create .config/nextest.toml with commit profile for CI compatibility
     std::fs::write(
@@ -145,15 +137,7 @@ mod tests {{
 
     // Create .config/rail.toml
     std::fs::create_dir_all(path.join(".config"))?;
-    std::fs::write(
-      path.join(".config/rail.toml"),
-      r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-"#,
-    )?;
+    std::fs::write(path.join(".config/rail.toml"), "")?;
 
     git(&path, &["add", "."])?;
     git(&path, &["commit", "-m", "Initial single-crate setup"])?;
@@ -253,13 +237,7 @@ mod tests {{
     let mut existing = if config_path.exists() {
       std::fs::read_to_string(&config_path)?
     } else {
-      r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-"#
-      .to_string()
+      String::new()
     };
 
     if let Some(idx) = existing.find("[release]") {
@@ -348,15 +326,7 @@ edition = "2021"
 
     // Create .config/rail.toml
     std::fs::create_dir_all(workspace_root.join(".config"))?;
-    std::fs::write(
-      workspace_root.join(".config/rail.toml"),
-      r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-"#,
-    )?;
+    std::fs::write(workspace_root.join(".config/rail.toml"), "")?;
 
     // Initial commit from git root
     git(&git_root, &["add", "."])?;

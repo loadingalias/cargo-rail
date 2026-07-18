@@ -839,7 +839,7 @@ impl UnifyAnalyzer {
     }
 
     // Handle transitive fragmentation
-    let transitive_pins = if self.config.pin_transitives {
+    let transitive_pins = if self.config.transitive_pinning.is_some() {
       TransitivePlanner::new(&self.metadata).find_pins()
     } else {
       Vec::new()
@@ -864,11 +864,9 @@ impl UnifyAnalyzer {
     }
 
     // Compute MSRV if enabled
-    let computed_msrv = if self.config.msrv {
+    let computed_msrv = if let Some(source) = self.config.msrv_policy.source() {
       progress!("Computing MSRV from dependency graph...");
-      self
-        .metadata
-        .compute_msrv_with_config(&self.workspace_root, self.config.msrv_source)
+      self.metadata.compute_msrv_with_config(&self.workspace_root, source)
     } else {
       None
     };
@@ -878,23 +876,14 @@ impl UnifyAnalyzer {
     // This is only safe when we have (or will write) `[workspace.package].rust-version`.
     // When msrv is disabled or cannot be computed, `rust-version = { workspace = true }`
     // would cause Cargo to error if the workspace value is absent.
-    if self.config.enforce_msrv_inheritance {
-      if !self.config.msrv {
+    if self.config.msrv_policy.inherits() {
+      if computed_msrv.is_none() {
         issues.push(UnifyIssue {
           kind: UnifyIssueKind::General,
           dep_name: Arc::from("rust-version"),
           severity: IssueSeverity::Warning,
           message: Arc::from(
-            "enforce_msrv_inheritance is enabled but unify.msrv is false; skipping MSRV inheritance enforcement",
-          ),
-        });
-      } else if computed_msrv.is_none() {
-        issues.push(UnifyIssue {
-          kind: UnifyIssueKind::General,
-          dep_name: Arc::from("rust-version"),
-          severity: IssueSeverity::Warning,
-          message: Arc::from(
-            "enforce_msrv_inheritance is enabled but no workspace MSRV could be determined; skipping MSRV inheritance enforcement",
+            "MSRV inheritance is enabled but no workspace MSRV could be determined; skipping inheritance enforcement",
           ),
         });
       } else {
@@ -911,14 +900,11 @@ impl UnifyAnalyzer {
       }
     }
 
-    // Scan for dead and optional features if enabled
+    // Diagnostics are unconditional. Destructive feature edits still require
+    // the explicit closed-consumer proof carried by `consumer_scope`.
     let feature_pruner = FeaturePruner::new(&self.metadata, &self.manifests, &self.config, &self.target_cfg_sets);
-    let (mut pruned_features, optional_features, reachable_features) = if self.config.prune_dead_features {
-      progress!("Scanning for dead features in resolved graph...");
-      feature_pruner.scan()
-    } else {
-      (Vec::new(), Vec::new(), Vec::new())
-    };
+    progress!("Scanning for dead features in resolved graph...");
+    let (mut pruned_features, optional_features, reachable_features) = feature_pruner.scan();
 
     // Detect unused dependencies
     let unused_finder = UnusedDepFinder::new(
@@ -928,16 +914,10 @@ impl UnifyAnalyzer {
       &self.target_cfg_sets,
       &pruned_features,
       self.config.consumer_scope == ConsumerScope::Workspace,
-      self.config.compiler_diag_cache,
     );
-    let mut unused_deps = if self.config.detect_unused {
-      progress!("Detecting unused dependencies...");
-      let unused = unused_finder.find();
-      issues.extend(unused_finder.uncertainty_issues());
-      unused
-    } else {
-      Vec::new()
-    };
+    progress!("Detecting unused dependencies...");
+    let mut unused_deps = unused_finder.find();
+    issues.extend(unused_finder.uncertainty_issues());
 
     self.retain_features_with_live_optional_activations(&mut pruned_features, &unused_deps, &mut issues);
 
@@ -949,14 +929,9 @@ impl UnifyAnalyzer {
     // Detect undeclared features
     // Find cases where a crate uses features that it didn't declare in Cargo.toml
     // This happens when Cargo's feature unification "borrows" features from other members
-    let undeclared_features = if self.config.detect_undeclared_features {
-      progress!("Checking for undeclared feature dependencies...");
-      let (features, causality_issues) = self.detect_undeclared_features()?;
-      issues.extend(causality_issues);
-      features
-    } else {
-      Vec::new()
-    };
+    progress!("Checking for undeclared feature dependencies...");
+    let (undeclared_features, causality_issues) = self.detect_undeclared_features()?;
+    issues.extend(causality_issues);
 
     // A causal feature repair and a dependency removal cannot target the same
     // declaration. Feature borrowing proves the declaration participates in
@@ -966,7 +941,7 @@ impl UnifyAnalyzer {
         feature.member == unused.member && feature.dep_name == unused.dep_name && feature.dep_kind == unused.kind
       })
     });
-    if self.config.remove_unused && !unused_deps.is_empty() {
+    if !unused_deps.is_empty() {
       progress!(
         "Generating removal edits for {} unused dependencies...",
         unused_deps.len()
@@ -976,8 +951,7 @@ impl UnifyAnalyzer {
       }
     }
 
-    // Generate fixes or warnings for undeclared features
-    if self.config.fix_undeclared_features && !undeclared_features.is_empty() {
+    if !undeclared_features.is_empty() {
       progress!(
         "Generating fixes for {} undeclared feature issues...",
         undeclared_features.len()
@@ -1007,33 +981,6 @@ impl UnifyAnalyzer {
             borrowed_from: uf.borrowed_from.clone(),
           },
         );
-      }
-    } else {
-      // Add issues for undeclared features (warn mode)
-      for uf in &undeclared_features {
-        let undeclared_str: Vec<&str> = uf.undeclared_features.iter().map(|s| &**s).collect();
-        let declared_str = if uf.declared_features.is_empty() {
-          "none".to_string()
-        } else {
-          let strs: Vec<&str> = uf.declared_features.iter().map(|s| &**s).collect();
-          strs.join(", ")
-        };
-        issues.push(UnifyIssue {
-          kind: UnifyIssueKind::General,
-          dep_name: Arc::clone(&uf.dep_name),
-          severity: IssueSeverity::Warning,
-          message: Arc::from(format!(
-            "{} uses {} features [{}] but only declares [{}]. \
-             This crate relies on feature unification from other workspace members. \
-             After unification, standalone builds will fail. \
-             Fix: Add the missing features to {}'s Cargo.toml.",
-            uf.member,
-            uf.dep_name,
-            undeclared_str.join(", "),
-            declared_str,
-            uf.member,
-          )),
-        });
       }
     }
 

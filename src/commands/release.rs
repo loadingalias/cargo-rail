@@ -1,7 +1,7 @@
 //! `cargo rail release` - Release automation
 
 use crate::commands::common::{TextJsonOutputFormat, enforce_safety_gate};
-use crate::config::{CommitPolicy, ReleaseForgeConfig};
+use crate::config::{CommitPolicy, ReleaseRemoteEffects};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{
   self, ExpectedMutation, MutationAction, MutationEffect, MutationInput, MutationObject, MutationRisk, MutationTrace,
@@ -102,10 +102,10 @@ pub fn run_release_plan(
     if !skip_publish && plan.summary.crates_to_publish > 1 {
       println!("Publish delay: {}s between crates", release_config.publish_delay);
     }
-    if release_config.create_github_release && !skip_tag {
+    if release_config.remote_effects.creates_forge_release() && !skip_tag {
       println!(
         "Forge releases: enabled ({})",
-        release_forge_detail(release_config.forge)
+        release_forge_detail(release_config.remote_effects)
       );
     }
     if release_config.sign_tags && !skip_tag {
@@ -871,7 +871,7 @@ fn build_release_mutation_plan(
     );
     actions.push(MutationAction::new("OPEN_RELEASE_PR", "origin", None));
   } else {
-    if release_config.push {
+    if release_config.remote_effects.pushes() {
       actions.push(
         MutationAction::new("PUSH_RELEASE_REFS", "origin", None).with_payload(serde_json::json!({
           "remote": "origin",
@@ -883,11 +883,11 @@ fn build_release_mutation_plan(
         })),
       );
     }
-    if release_config.create_github_release && !skip_tag {
+    if release_config.remote_effects.creates_forge_release() && !skip_tag {
       for crate_plan in &plan.crates {
         actions.push(
           MutationAction::new("CREATE_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-            serde_json::json!({ "forge": release_forge_detail(release_config.forge), "tag": crate_plan.tag_name }),
+            serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
           ),
         );
       }
@@ -900,11 +900,11 @@ fn build_release_mutation_plan(
         );
       }
     }
-    if release_config.create_github_release && !skip_tag {
+    if release_config.remote_effects.creates_forge_release() && !skip_tag {
       for crate_plan in &plan.crates {
         actions.push(
           MutationAction::new("PUBLISH_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-            serde_json::json!({ "forge": release_forge_detail(release_config.forge), "tag": crate_plan.tag_name }),
+            serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
           ),
         );
       }
@@ -926,7 +926,7 @@ fn build_release_mutation_plan(
       "release rejects worktree changes outside explicitly planned paths",
     ));
   }
-  if !actions.is_empty() && (release_config.push || pr) {
+  if !actions.is_empty() && (release_config.remote_effects.pushes() || pr) {
     risks.push(MutationRisk::new(
       "REMOTE_PUSH",
       "medium",
@@ -1050,16 +1050,17 @@ fn collect_release_objects(
   Ok(objects)
 }
 
-fn release_forge_detail(forge: ReleaseForgeConfig) -> &'static str {
-  match forge {
-    ReleaseForgeConfig::Auto => "auto",
-    ReleaseForgeConfig::Github => "github",
-    ReleaseForgeConfig::Gitlab => "gitlab",
+fn release_forge_detail(remote_effects: ReleaseRemoteEffects) -> &'static str {
+  match remote_effects {
+    ReleaseRemoteEffects::Auto => "auto",
+    ReleaseRemoteEffects::Github => "github",
+    ReleaseRemoteEffects::Gitlab => "gitlab",
+    ReleaseRemoteEffects::None | ReleaseRemoteEffects::Push => "none",
   }
 }
 
 /// Initialize release configuration
-pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
+pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_run: bool) -> RailResult<()> {
   ctx.snapshot()?;
   use crate::config::{ChangelogConfig, CrateReleaseConfig, RailConfig};
   use std::fs;
@@ -1154,7 +1155,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, che
   let config_toml = toml_edit::ser::to_string_pretty(&config)
     .map_err(|e| crate::error::RailError::message(format!("config serialization failed: {}", e)))?;
 
-  if check {
+  if dry_run {
     println!("\n{}", config_toml);
   } else {
     let config_path =

@@ -1,467 +1,12 @@
-//! High-level TOML document builders
+//! Deterministic Cargo manifest section builders.
 
 use super::format::{TomlFormatter, TomlValue};
-use crate::config::{
-  ChangeDetectionConfig, ChangelogRelativeTo, CommitPolicy, ConfidenceProfile, Pre1BreakingBump, ReleaseConfig,
-  RequireChangeFiles, RunConfig, SemverCheckPolicy, UnifyConfig,
-};
 use crate::error::RailResult;
 
-/// Rail config builder
-pub struct RailConfigBuilder {
-  formatter: TomlFormatter,
-  sections: Vec<String>,
-}
-
-impl Default for RailConfigBuilder {
-  fn default() -> Self {
-    Self {
-      formatter: TomlFormatter::new(),
-      sections: Vec::new(),
-    }
-  }
-}
-
-impl RailConfigBuilder {
-  /// Create a new builder
-  pub fn new() -> Self {
-    Self::default()
-  }
-
-  /// Add header comments
-  pub fn header(&mut self) -> &mut Self {
-    self.sections.push(
-      r#"# cargo-rail configuration
-# Documentation: https://github.com/loadingalias/cargo-rail
-"#
-      .to_string(),
-    );
-    self
-  }
-
-  /// Add targets (workspace-wide, top-level field - must be FIRST after header)
-  pub fn targets(&mut self, targets: &[String]) -> &mut Self {
-    let mut content = String::new();
-    if targets.is_empty() {
-      content.push_str(
-        "# targets = []  # optional: set for multi-target validation; `cargo rail init` can auto-detect from *.toml and .github/workflows\n",
-      );
-    } else {
-      content.push_str(
-        "# Targets for multi-platform validation (runs `cargo metadata --filter-platform <target>` per target)\n",
-      );
-      content.push_str(&format!("targets = {}\n", self.formatter.array_simple(targets)));
-    }
-    self.sections.push(content);
-    self
-  }
-
-  /// Add unify section with logical groupings
-  pub fn unify(&mut self, config: &UnifyConfig) -> &mut Self {
-    let mut content = String::new();
-
-    // === Basic ===
-    content.push_str(&format!("include_paths = {}\n", config.include_paths));
-    content.push_str(&format!("include_renamed = {}\n", config.include_renamed));
-
-    // === Transitive pinning (workspace-hack replacement) ===
-    content.push_str(&format!(
-      "\npin_transitives = {}  # enable for hakari/workspace-hack users\n",
-      config.pin_transitives
-    ));
-    match &config.transitive_host {
-      crate::config::TransitiveFeatureHost::Root => {
-        content.push_str("transitive_host = \"root\"  # only used if pin_transitives = true\n");
-      }
-      crate::config::TransitiveFeatureHost::Path(path) => {
-        content.push_str(&format!("transitive_host = \"{}\"\n", path));
-      }
-    }
-
-    // === Conflict handling ===
-    content.push_str(&format!("\nstrict_version_compat = {}\n", config.strict_version_compat));
-    let exact_pin_str = match config.exact_pin_handling {
-      crate::config::ExactPinHandling::Skip => "skip",
-      crate::config::ExactPinHandling::Preserve => "preserve",
-      crate::config::ExactPinHandling::Warn => "warn",
-    };
-    content.push_str(&format!("exact_pin_handling = \"{}\"\n", exact_pin_str));
-    let major_conflict_str = match config.major_version_conflict {
-      crate::config::MajorVersionConflict::Warn => "warn",
-      crate::config::MajorVersionConflict::Bump => "bump",
-    };
-    content.push_str(&format!(
-      "major_version_conflict = \"{}\"  # warn = skip, bump = force highest\n",
-      major_conflict_str
-    ));
-
-    // === MSRV ===
-    content.push_str(&format!("\nmsrv = {}\n", config.msrv));
-    let msrv_source_str = match config.msrv_source {
-      crate::config::MsrvSource::Deps => "deps",
-      crate::config::MsrvSource::Workspace => "workspace",
-      crate::config::MsrvSource::Max => "max",
-    };
-    content.push_str(&format!(
-      "msrv_source = \"{}\"  # deps | workspace | max\n",
-      msrv_source_str
-    ));
-    content.push_str(&format!(
-      "enforce_msrv_inheritance = {}  # Ensure members inherit workspace rust-version\n",
-      config.enforce_msrv_inheritance
-    ));
-
-    // === Unused detection ===
-    content.push_str(&format!("\ndetect_unused = {}\n", config.detect_unused));
-    content.push_str(&format!(
-      "compiler_diag_cache = {}  # reuse rustc diagnostics across runs\n",
-      config.compiler_diag_cache
-    ));
-    content.push_str(&format!(
-      "remove_unused = {}  # requires detect_unused = true\n",
-      config.remove_unused
-    ));
-
-    // === Feature analysis ===
-    content.push_str(&format!("\nprune_dead_features = {}\n", config.prune_dead_features));
-    content.push_str(&format!(
-      "consumer_scope = \"{}\"  # open | workspace\n",
-      config.consumer_scope.as_str()
-    ));
-    if config.preserve_features.is_empty() {
-      content.push_str("preserve_features = []  # glob patterns to keep from pruning\n");
-    } else {
-      content.push_str(&format!(
-        "preserve_features = {}\n",
-        self.formatter.array_string(&config.preserve_features, None)
-      ));
-    }
-    content.push_str(&format!(
-      "detect_undeclared_features = {}\n",
-      config.detect_undeclared_features
-    ));
-    content.push_str(&format!(
-      "fix_undeclared_features = {}  # requires detect_undeclared_features = true\n",
-      config.fix_undeclared_features
-    ));
-    if config.skip_undeclared_patterns.is_empty() {
-      content.push_str("skip_undeclared_patterns = []\n");
-    } else {
-      content.push_str(&format!(
-        "skip_undeclared_patterns = {}\n",
-        self.formatter.array_string(&config.skip_undeclared_patterns, None)
-      ));
-    }
-
-    // === Safety hatches ===
-    if config.exclude.is_empty() {
-      content.push_str("\nexclude = []  # excluding one workspace member excludes its whole member cohort\n");
-    } else {
-      content.push_str(&format!(
-        "\nexclude = {}\n",
-        self.formatter.array_string(&config.exclude, None)
-      ));
-    }
-    if config.include.is_empty() {
-      content.push_str("include = []  # workspace-member cohorts are auto-included\n");
-    } else {
-      content.push_str(&format!(
-        "include = {}\n",
-        self.formatter.array_string(&config.include, None)
-      ));
-    }
-    content.push_str(&format!("max_backups = {}\n", config.max_backups));
-
-    // === Formatting ===
-    content.push_str(&format!(
-      "sort_dependencies = {}  # false to preserve existing order\n",
-      config.sort_dependencies
-    ));
-
-    self.sections.push(format!("[unify]\n{}", content));
-
-    self
-  }
-
-  /// Add release section
-  pub fn release(&mut self, config: &ReleaseConfig) -> &mut Self {
-    let mut content = String::new();
-
-    content.push_str(&format!("tag_prefix = \"{}\"\n", config.tag_prefix));
-    content.push_str(&format!(
-      "tag_format = \"{}\"  # e.g. my-crate-v1.0.0 (with tag_prefix = \"v\")\n",
-      config.tag_format
-    ));
-    content.push_str(&format!("require_clean = {}\n", config.require_clean));
-    content.push_str(&format!(
-      "publish_delay = {}  # maximum registry polling interval in seconds\n",
-      config.publish_delay
-    ));
-    content.push_str(&format!(
-      "push = {}  # push release commit and tags before public publishing\n",
-      config.push
-    ));
-    content.push_str(&format!("create_github_release = {}\n", config.create_github_release));
-    content.push_str(&format!(
-      "forge = \"{}\"  # auto | github | gitlab\n",
-      forge(config.forge)
-    ));
-    content.push_str(&format!("sign_tags = {}\n", config.sign_tags));
-    content.push_str(&format!(
-      "require_changelog_entries = {}\n",
-      config.require_changelog_entries
-    ));
-    content.push_str(&format!(
-      "require_release_notes = {}  # fail if target version lacks release notes\n",
-      config.require_release_notes
-    ));
-    content.push_str(&format!(
-      "release_notes_dir = \"{}\"  # manual notes: v<version>.md or <tag>.md\n",
-      config.release_notes_dir
-    ));
-    content.push_str(&format!(
-      "change_dir = \"{}\"  # pending release intent files\n",
-      config.change_dir
-    ));
-    content.push_str(&format!(
-      "pre_1_breaking_bump = \"{}\"  # minor keeps 0.x breaking changes pre-1.0\n",
-      pre_1_breaking_bump(config.pre_1_breaking_bump)
-    ));
-    content.push_str(&format!(
-      "unconventional_commits = \"{}\"  # allow | warn | deny\n",
-      commit_policy(config.unconventional_commits)
-    ));
-    content.push_str(&format!(
-      "semver_check = \"{}\"  # off | warn | deny\n",
-      semver_policy(config.semver_check)
-    ));
-    content.push_str(&format!(
-      "require_change_files = {}  # false | true | [\"crate-name\"]\n",
-      require_change_files(&config.require_change_files, &self.formatter)
-    ));
-
-    self.sections.push(format!("\n[release]\n{}", content));
-
-    let mut changelog = String::new();
-    changelog.push_str(&format!("path = \"{}\"\n", config.changelog.path));
-    changelog.push_str(&format!(
-      "relative_to = \"{}\"  # crate = per-crate, workspace = single file\n",
-      changelog_relative_to(config.changelog.relative_to)
-    ));
-    changelog.push_str(&format!("entry_format = \"{}\"\n", config.changelog.entry_format));
-    changelog.push_str(&format!("emoji = {}\n", config.changelog.emoji));
-    changelog.push_str(&format!(
-      "group_order = {}\n",
-      self.formatter.array_string(&config.changelog.group_order, None)
-    ));
-    changelog.push_str(&format!("fallback = \"{}\"\n", config.changelog.fallback));
-    changelog.push_str("\n[release.changelog.filters]\n");
-    changelog.push_str(&format!(
-      "skip_types = {}\n",
-      self.formatter.array_string(&config.changelog.filters.skip_types, None)
-    ));
-    changelog.push_str(&format!(
-      "skip_scopes = {}\n",
-      self.formatter.array_string(&config.changelog.filters.skip_scopes, None)
-    ));
-    changelog.push_str(&format!(
-      "include_paths = {}\n",
-      self
-        .formatter
-        .array_string(&config.changelog.filters.include_paths, None)
-    ));
-    changelog.push_str(&format!(
-      "exclude_paths = {}\n",
-      self
-        .formatter
-        .array_string(&config.changelog.filters.exclude_paths, None)
-    ));
-    self.sections.push(format!("\n[release.changelog]\n{}", changelog));
-    self
-  }
-
-  /// Add change-detection section
-  pub fn change_detection(&mut self, config: &ChangeDetectionConfig) -> &mut Self {
-    let mut content = String::new();
-
-    content.push_str("# Paths that trigger full workspace rebuild\n");
-    content.push_str(&format!(
-      "infrastructure = {}\n",
-      self.formatter.array_string(&config.infrastructure, None)
-    ));
-    content.push_str(&format!(
-      "unknown_file_policy = \"{}\"\n",
-      match config.unknown_file_policy {
-        crate::config::UnknownFilePolicy::Docs => "docs",
-        crate::config::UnknownFilePolicy::OwnedBuildTest => "owned_build_test",
-        crate::config::UnknownFilePolicy::WorkspaceInfra => "workspace_infra",
-        crate::config::UnknownFilePolicy::Strict => "strict",
-      }
-    ));
-    let confidence_profile = match config.confidence_profile {
-      ConfidenceProfile::Strict => "strict",
-      ConfidenceProfile::Balanced => "balanced",
-      ConfidenceProfile::Fast => "fast",
-    };
-    content.push_str(&format!("confidence_profile = \"{}\"\n", confidence_profile));
-    let bot_profile = match config.bot_pr_confidence_profile.unwrap_or(ConfidenceProfile::Strict) {
-      ConfidenceProfile::Strict => "strict",
-      ConfidenceProfile::Balanced => "balanced",
-      ConfidenceProfile::Fast => "fast",
-    };
-    content.push_str(&format!(
-      "bot_pr_confidence_profile = \"{}\"  # optional bot PR override\n",
-      bot_profile
-    ));
-
-    if !config.custom.is_empty() {
-      content.push_str("\n[change-detection.custom]\n");
-      let mut categories: Vec<_> = config.custom.iter().collect();
-      categories.sort_by_key(|(a, _)| *a);
-
-      for (category, patterns) in categories {
-        content.push_str(&format!(
-          "{} = {}\n",
-          category,
-          self.formatter.array_string(patterns, None)
-        ));
-      }
-    }
-
-    self.sections.push(format!("\n[change-detection]\n{}", content));
-    self
-  }
-
-  /// Add run profile section.
-  pub fn run(&mut self, config: &RunConfig) -> &mut Self {
-    let mut content = String::new();
-
-    content.push_str(&format!(
-      "default_profile = \"{}\"\n",
-      config.default_profile.as_deref().unwrap_or("local")
-    ));
-
-    if !config.workflow.is_empty() {
-      content.push_str("\n[run.workflow]\n");
-      let mut workflows: Vec<_> = config.workflow.iter().collect();
-      workflows.sort_by_key(|(a, _)| *a);
-      for (workflow, profile) in workflows {
-        content.push_str(&format!("{} = \"{}\"\n", workflow, profile));
-      }
-    }
-
-    if !config.profiles.is_empty() {
-      let mut profiles: Vec<_> = config.profiles.iter().collect();
-      profiles.sort_by_key(|(a, _)| *a);
-      for (profile_name, profile) in profiles {
-        content.push_str(&format!("\n[run.profile.{}]\n", profile_name));
-        content.push_str(&format!(
-          "surfaces = {}\n",
-          self.formatter.array_string(&profile.surfaces, None)
-        ));
-        if !profile.run_args.is_empty() {
-          content.push_str(&format!(
-            "run_args = {}\n",
-            self.formatter.array_string(&profile.run_args, None)
-          ));
-        }
-        if let Some(since) = &profile.since {
-          content.push_str(&format!("since = \"{}\"\n", since));
-        }
-        if let Some(merge_base) = profile.merge_base {
-          content.push_str(&format!("merge_base = {}\n", merge_base));
-        }
-      }
-    } else {
-      content.push_str("\n# Optional workflow -> profile mapping:\n");
-      content.push_str("# [run.workflow]\n");
-      content.push_str("# commit = \"ci\"\n");
-      content.push_str("# nightly = \"nightly\"\n");
-      content.push_str("\n# Optional user-defined run profiles:\n");
-      content.push_str("# [run.profile.ci]\n");
-      content.push_str("# surfaces = [\"build\", \"test\"]\n");
-      content.push_str("# merge_base = true\n");
-      content.push_str("\n# [run.profile.docs_custom]\n");
-      content.push_str("# surfaces = [\"docs\"]\n");
-      content.push_str("# run_args = [\"--workspace\", \"{cargo_args}\"]\n");
-      content.push_str("# since = \"{base_ref}\"\n");
-    }
-
-    self.sections.push(format!("\n[run]\n{}", content));
-    self
-  }
-
-  /// Add splits template
-  pub fn splits_template(&mut self) -> &mut Self {
-    let content = r#"
-# Per-crate configuration: run 'cargo rail split init <crate>' to generate
-# [crates.my-crate.split]
-# remote = "git@github.com:org/my-crate.git"
-# branch = "main"
-# mode = "single"
-# paths = [{ crate = "crates/my-crate" }]
-"#;
-    self.sections.push(content.to_string());
-    self
-  }
-
-  /// Build final TOML string
-  pub fn build(&self) -> RailResult<String> {
-    Ok(self.sections.join("\n"))
-  }
-}
-
-fn changelog_relative_to(value: ChangelogRelativeTo) -> &'static str {
-  match value {
-    ChangelogRelativeTo::Crate => "crate",
-    ChangelogRelativeTo::Workspace => "workspace",
-  }
-}
-
-fn pre_1_breaking_bump(value: Pre1BreakingBump) -> &'static str {
-  match value {
-    Pre1BreakingBump::Minor => "minor",
-    Pre1BreakingBump::Major => "major",
-  }
-}
-
-fn commit_policy(value: CommitPolicy) -> &'static str {
-  match value {
-    CommitPolicy::Allow => "allow",
-    CommitPolicy::Warn => "warn",
-    CommitPolicy::Deny => "deny",
-  }
-}
-
-fn semver_policy(value: SemverCheckPolicy) -> &'static str {
-  match value {
-    SemverCheckPolicy::Off => "off",
-    SemverCheckPolicy::Warn => "warn",
-    SemverCheckPolicy::Deny => "deny",
-  }
-}
-
-fn forge(value: crate::config::ReleaseForgeConfig) -> &'static str {
-  match value {
-    crate::config::ReleaseForgeConfig::Auto => "auto",
-    crate::config::ReleaseForgeConfig::Github => "github",
-    crate::config::ReleaseForgeConfig::Gitlab => "gitlab",
-  }
-}
-
-fn require_change_files(value: &RequireChangeFiles, formatter: &TomlFormatter) -> String {
-  match value {
-    RequireChangeFiles::All(enabled) => enabled.to_string(),
-    RequireChangeFiles::Crates(crates) => formatter.array_string(crates, None),
-  }
-}
-
-/// Cargo.toml workspace dependencies builder
+/// Builder for a deterministic `[workspace.dependencies]` section.
 pub struct WorkspaceDepsBuilder {
   formatter: TomlFormatter,
-  deps: Vec<(String, String, Option<String>)>, // Name, Value (formatted), Optional comment
-  /// Whether to sort dependencies alphabetically (default: true)
-  pub sort_dependencies: bool,
+  deps: Vec<(String, String, Option<String>)>,
 }
 
 impl Default for WorkspaceDepsBuilder {
@@ -469,31 +14,23 @@ impl Default for WorkspaceDepsBuilder {
     Self {
       formatter: TomlFormatter::new(),
       deps: Vec::new(),
-      sort_dependencies: true,
     }
   }
 }
 
 impl WorkspaceDepsBuilder {
-  /// Create a new builder
+  /// Create an empty builder.
   pub fn new() -> Self {
     Self::default()
   }
 
-  /// Set whether to sort dependencies alphabetically (default: true)
-  pub fn with_dependency_sort(mut self, sort: bool) -> Self {
-    self.sort_dependencies = sort;
-    self.formatter.sort_dependencies = sort;
-    self
-  }
-
-  /// Add dependency
+  /// Add a dependency value.
   pub fn add(&mut self, name: &str, value: &str) -> &mut Self {
     self.deps.push((name.to_string(), value.to_string(), None));
     self
   }
 
-  /// Add dependency with comment
+  /// Add a dependency value with an inline comment.
   pub fn add_with_comment(&mut self, name: &str, value: &str, comment: &str) -> &mut Self {
     self
       .deps
@@ -501,36 +38,32 @@ impl WorkspaceDepsBuilder {
     self
   }
 
-  /// Add dependency with inline table
+  /// Add a dependency represented by an inline table.
   pub fn add_table(&mut self, name: &str, pairs: &[(String, TomlValue)]) -> &mut Self {
     let value = self.formatter.inline_table(pairs);
     self.deps.push((name.to_string(), value, None));
     self
   }
 
-  /// Add dependency with inline table and comment
+  /// Add an inline-table dependency with an inline comment.
   pub fn add_table_with_comment(&mut self, name: &str, pairs: &[(String, TomlValue)], comment: &str) -> &mut Self {
     let value = self.formatter.inline_table(pairs);
     self.deps.push((name.to_string(), value, Some(comment.to_string())));
     self
   }
 
-  /// Build [workspace.dependencies] section
+  /// Build the `[workspace.dependencies]` section in lexical dependency order.
   pub fn build(&self) -> RailResult<String> {
     let mut content = String::from("\n[workspace.dependencies]\n");
-
-    // Use indices + sorting to avoid cloning the entire Vec
     let mut indices: Vec<usize> = (0..self.deps.len()).collect();
-    if self.sort_dependencies {
-      indices.sort_by(|&a, &b| self.deps[a].0.cmp(&self.deps[b].0));
-    }
+    indices.sort_by(|&left, &right| self.deps[left].0.cmp(&self.deps[right].0));
 
-    for idx in indices {
-      let (name, value, comment) = &self.deps[idx];
-      if let Some(c) = comment {
-        content.push_str(&format!("{} = {}  # {}\n", name, value, c));
+    for index in indices {
+      let (name, value, comment) = &self.deps[index];
+      if let Some(comment) = comment {
+        content.push_str(&format!("{name} = {value}  # {comment}\n"));
       } else {
-        content.push_str(&format!("{} = {}\n", name, value));
+        content.push_str(&format!("{name} = {value}\n"));
       }
     }
 
@@ -541,75 +74,13 @@ impl WorkspaceDepsBuilder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::RailConfig;
 
   #[test]
-  fn test_rail_config_builder() {
-    let mut builder = RailConfigBuilder::new();
-    let config = RailConfig {
-      targets: vec!["x86_64-unknown-linux-gnu".to_string()],
-      unify: UnifyConfig::default(),
-      release: ReleaseConfig::default(),
-      change_detection: crate::config::ChangeDetectionConfig::default(),
-      run: crate::config::RunConfig::default(),
-      crates: Default::default(),
-    };
-
-    let output = builder
-      .header()
-      .targets(&config.targets)
-      .unify(&config.unify)
-      .release(&config.release)
-      .change_detection(&config.change_detection)
-      .run(&config.run)
-      .splits_template()
-      .build()
-      .unwrap();
-
-    assert!(output.contains("targets"));
-    assert!(output.contains("[unify]"));
-    assert!(output.contains("[release]"));
-    assert!(output.contains("[change-detection]"));
-    assert!(output.contains("[run]"));
-    assert!(output.contains("[crates.my-crate.split]"));
-  }
-
-  #[test]
-  fn test_change_detection_custom_categories_are_sorted() {
-    use rustc_hash::FxHashMap;
-
-    let mut builder = RailConfigBuilder::new();
-    let mut custom = FxHashMap::default();
-    custom.insert("zeta".to_string(), vec!["z/**".to_string()]);
-    custom.insert("alpha".to_string(), vec!["a/**".to_string()]);
-    let config = ChangeDetectionConfig {
-      infrastructure: vec![".github/**".to_string()],
-      custom,
-      unknown_file_policy: crate::config::UnknownFilePolicy::Strict,
-      confidence_profile: ConfidenceProfile::Balanced,
-      bot_pr_confidence_profile: None,
-    };
-
-    let output = builder.header().change_detection(&config).build().unwrap();
-    let alpha_idx = output.find("alpha = [\"a/**\"]").unwrap();
-    let zeta_idx = output.find("zeta = [\"z/**\"]").unwrap();
-    assert!(alpha_idx < zeta_idx);
-  }
-
-  #[test]
-  fn test_workspace_deps_builder() {
+  fn workspace_dependencies_are_always_sorted() {
     let mut builder = WorkspaceDepsBuilder::new();
-    builder.add("anyhow", "\"1.0\"");
-    builder.add_table(
-      "serde",
-      &[
-        ("version".to_string(), TomlValue::String("1.0".to_string())),
-        ("features".to_string(), TomlValue::Array(vec!["derive".to_string()])),
-      ],
-    );
+    builder.add("zeta", "\"1\"").add("alpha", "\"2\"");
 
-    let output = builder.build().unwrap();
-    assert!(output.contains("anyhow = \"1.0\""));
-    assert!(output.contains("serde = { version = \"1.0\", features = [\"derive\"] }"));
+    let output = builder.build().expect("valid workspace dependency table");
+    assert!(output.find("alpha").unwrap() < output.find("zeta").unwrap());
   }
 }

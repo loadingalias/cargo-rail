@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::RailConfig;
-use crate::error::RailResult;
+use crate::error::{RailError, RailResult};
 
 // ============================================================================
 // Hashing and Fingerprinting
@@ -78,6 +78,63 @@ pub(crate) fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
     index += 1;
   }
   Cow::Owned(normalized)
+}
+
+/// Atomically replace a file without following a predictable temporary path.
+///
+/// The temporary file is created exclusively in the destination directory, so
+/// a concurrent process cannot pre-create a symlink at the chosen path and the
+/// final rename stays on the same filesystem.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> {
+  let parent = destination_parent(path);
+  let mut temporary = tempfile::Builder::new()
+    .prefix(".cargo-rail-")
+    .suffix(".tmp")
+    .tempfile_in(parent)
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to create temporary file in {}: {error}",
+        parent.display()
+      ))
+    })?;
+
+  if let Ok(metadata) = fs::symlink_metadata(path)
+    && metadata.file_type().is_file()
+  {
+    temporary
+      .as_file()
+      .set_permissions(metadata.permissions())
+      .map_err(|error| {
+        RailError::message(format!(
+          "failed to preserve permissions for {}: {error}",
+          path.display()
+        ))
+      })?;
+  }
+  temporary
+    .write_all(contents)
+    .and_then(|()| temporary.as_file().sync_all())
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to write temporary file for {}: {error}",
+        path.display()
+      ))
+    })?;
+  temporary.persist(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to atomically replace {}: {}",
+      path.display(),
+      error.error
+    ))
+  })?;
+  Ok(())
+}
+
+fn destination_parent(path: &Path) -> &Path {
+  path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."))
 }
 
 /// Compute a fingerprint for the rail.toml configuration file
@@ -366,6 +423,12 @@ mod tests {
   fn test_file_fingerprint_missing_file() {
     let result = file_fingerprint(Path::new("/nonexistent/path/to/file"));
     assert_eq!(result, "none");
+  }
+
+  #[test]
+  fn atomic_writes_use_current_directory_for_bare_filenames() {
+    assert_eq!(destination_parent(Path::new("rail.toml")), Path::new("."));
+    assert_eq!(destination_parent(Path::new("config/rail.toml")), Path::new("config"));
   }
 
   #[test]

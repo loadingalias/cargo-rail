@@ -169,13 +169,6 @@ pub enum WorkspaceMode {
   Workspace,
 }
 
-/// Per-crate sync configuration.
-///
-/// **Note:** Reserved for future use. Currently has no effect.
-/// Will hold sync-specific settings like conflict strategies, exclusion patterns, etc.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CrateSyncConfig {}
-
 /// Helper to build SplitConfig from crate name and CrateSplitConfig
 pub fn build_split_config(
   name: String,

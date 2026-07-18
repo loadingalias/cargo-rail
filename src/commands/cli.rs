@@ -19,7 +19,7 @@ Quick start:
   cargo rail init              # Generate .config/rail.toml (default)
   cargo rail plan              # Build deterministic change plan
   cargo rail run               # Execute planner-selected surfaces
-  cargo rail unify --check     # Preview dependency unification
+  cargo rail unify --check     # Check for pending dependency changes (exit 1)
 
 Docs: https://github.com/loadingalias/cargo-rail";
 
@@ -102,7 +102,7 @@ Examples:
 
 const UNIFY_HELP: &str = "\
 Examples:
-  cargo rail unify --check                # Preview changes (CI mode)
+  cargo rail unify --check                # Check for pending changes (exit 1)
   cargo rail unify --check --explain      # Show why each decision was made
   cargo rail unify --check -f json -o out.json  # Write JSON output to file
   cargo rail unify                        # Apply changes
@@ -118,8 +118,8 @@ and 'unify' before using split/sync.
 
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
-  cargo rail split init my-crate --check  # Preview generated config
-  cargo rail split run my-crate --check   # Preview the split
+  cargo rail split init my-crate --dry-run  # Preview generated config
+  cargo rail split run my-crate --check   # Check for a pending split (exit 1)
   cargo rail split run my-crate           # Execute the split
   cargo rail split run my-crate --yes     # Non-interactive apply confirmation
   cargo rail split run --all              # Split all configured crates";
@@ -138,9 +138,10 @@ Examples:
 const RELEASE_HELP: &str = "\
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
+  cargo rail release init my-crate --dry-run    # Preview generated config
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
-  cargo rail release run my-crate --check       # Preview release plan
+  cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Release (patch bump)
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
@@ -171,7 +172,7 @@ file's crates is rejected so no pending intent is ever lost.";
 const INIT_HELP: &str = "\
 Examples:
   cargo rail init                       # Generate .config/rail.toml
-  cargo rail init --check               # Preview generated config
+  cargo rail init --dry-run             # Preview generated config
   cargo rail init -o rail.toml          # Custom output path
   cargo rail init --force               # Overwrite existing config";
 
@@ -181,7 +182,7 @@ Examples:
   cargo rail clean --cache              # Clean metadata cache only
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --check              # Preview what would be cleaned";
+  cargo rail clean --check              # Check for pending cleanup (exit 1)";
 
 const CONFIG_HELP: &str = "\
 Examples:
@@ -189,8 +190,9 @@ Examples:
   cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
   cargo rail config validate -f json    # JSON output for CI
-  cargo rail config sync --check        # Preview config updates
-  cargo rail config sync                # Run after upgrades; add fields and sync targets";
+  cargo rail config explain             # Explain effective values and sources
+  cargo rail config migrate --check     # Check for pending semantic migrations
+  cargo rail config migrate             # Apply explicit semantic migrations";
 
 const HASH_HELP: &str = "\
 Examples:
@@ -326,7 +328,7 @@ pub enum Commands {
     /// Subcommand (undo)
     #[command(subcommand)]
     command: Option<UnifyCommand>,
-    /// Dry-run mode: preview changes without modifying files
+    /// Check for pending changes without modifying files (exit 1 when pending)
     #[arg(long, short = 'c')]
     check: bool,
     /// Apply from a previously generated mutation plan file
@@ -364,9 +366,9 @@ pub enum Commands {
     /// Overwrite existing configuration
     #[arg(long)]
     force: bool,
-    /// Dry-run mode: preview generated config without writing
-    #[arg(long, short = 'c')]
-    check: bool,
+    /// Preview generated config without writing
+    #[arg(long)]
+    dry_run: bool,
   },
 
   /// (Advanced) Split a crate to a standalone repository with git history
@@ -398,7 +400,7 @@ pub enum Commands {
     /// Conflict resolution strategy
     #[arg(long, default_value_t, value_enum)]
     strategy: ConflictStrategy,
-    /// Dry-run mode: preview changes without executing
+    /// Check for pending changes without executing (exit 1 when pending)
     #[arg(long, short = 'c')]
     check: bool,
     /// Apply from a previously generated mutation plan file
@@ -450,7 +452,7 @@ pub enum Commands {
     /// Clean generated reports
     #[arg(long)]
     reports: bool,
-    /// Dry-run mode: preview what would be cleaned
+    /// Check for pending cleanup without deleting files (exit 1 when pending)
     #[arg(long, short = 'c')]
     check: bool,
     /// Output format
@@ -604,16 +606,19 @@ pub enum ConfigCommand {
     #[arg(long, conflicts_with = "strict")]
     no_strict: bool,
   },
-  /// Sync configuration after upgrades: add missing fields and update targets
+  /// Explain effective values, defaults, sources, and deprecations
+  Explain {
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
+  /// Apply explicit semantic configuration migrations
   ///
-  /// Scans the workspace for target triples and adds any missing config
-  /// fields with their default values. Preserves all existing settings,
-  /// comments, and formatting.
-  ///
-  /// Use this after upgrading cargo-rail to get new configuration options.
-  Sync {
-    /// Preview changes without modifying rail.toml
-    #[arg(long, short = 'c')]
+  /// This never adds coded defaults. It only performs reviewed migrations
+  /// for deprecated fields while preserving unrelated TOML formatting.
+  Migrate {
+    /// Check for pending migrations without modifying rail.toml
+    #[arg(long)]
     check: bool,
     /// Output format
     #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -644,8 +649,8 @@ pub enum SplitCommand {
     #[arg(value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Preview generated config without writing
-    #[arg(long, short = 'c')]
-    check: bool,
+    #[arg(long)]
+    dry_run: bool,
   },
   /// Execute split operation
   Run {
@@ -658,7 +663,7 @@ pub enum SplitCommand {
     /// Override remote repository
     #[arg(long)]
     remote: Option<String>,
-    /// Dry-run mode: preview changes
+    /// Check for pending split changes (exit 1 when pending)
     #[arg(long, short = 'c')]
     check: bool,
     /// Apply from a previously generated mutation plan file
@@ -685,8 +690,8 @@ pub enum ReleaseCommand {
     #[arg(value_name = "CRATE")]
     crate_names: Vec<String>,
     /// Preview generated config without writing
-    #[arg(long, short = 'c')]
-    check: bool,
+    #[arg(long)]
+    dry_run: bool,
   },
   /// Execute release (plan or publish)
   Run {
@@ -699,7 +704,7 @@ pub enum ReleaseCommand {
     /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
     #[arg(long, default_value = "patch")]
     bump: String,
-    /// Dry-run mode: preview release plan
+    /// Check for a pending release plan (exit 1 when pending)
     #[arg(long, short = 'c')]
     check: bool,
     /// Apply from a previously generated mutation plan file
@@ -863,8 +868,9 @@ impl Commands {
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }
+        | ConfigCommand::Explain { format }
         | ConfigCommand::Validate { format, .. }
-        | ConfigCommand::Sync { format, .. } => format.is_json_like(),
+        | ConfigCommand::Migrate { format, .. } => format.is_json_like(),
       },
       Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => format.is_json_like(),
       Commands::Graph { dot, .. } => !dot,
@@ -925,8 +931,9 @@ impl Commands {
       Commands::Config { command } => match command {
         ConfigCommand::Locate { format }
         | ConfigCommand::Print { format }
+        | ConfigCommand::Explain { format }
         | ConfigCommand::Validate { format, .. }
-        | ConfigCommand::Sync { format, .. } => *format = TextJsonOutputFormat::Json,
+        | ConfigCommand::Migrate { format, .. } => *format = TextJsonOutputFormat::Json,
       },
       Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Graph { .. } => {}

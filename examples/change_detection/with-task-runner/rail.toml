@@ -17,7 +17,6 @@ infrastructure = [
   "Cargo.lock",
 ]
 confidence_profile = "balanced"
-bot_pr_confidence_profile = "strict"
 unknown_file_policy = "strict"
 
 # Custom surfaces for non-Rust assets
@@ -33,8 +32,8 @@ default_profile = "local"
 
 [run.profile.local]
 surfaces = ["test"]
-merge_base = true
+baseline = { kind = "merge-base" }
 
 [run.profile.ci]
 surfaces = ["build", "test"]
-merge_base = true
+baseline = { kind = "merge-base" }

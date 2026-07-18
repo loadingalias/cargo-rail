@@ -2,12 +2,12 @@
 
 use crate::config::unify::default_true;
 use crate::error::ConfigError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Release configuration (workspace-wide defaults)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReleaseConfig {
   /// Git tag prefix (default: "v")
   #[serde(default = "default_tag_prefix")]
@@ -26,20 +26,9 @@ pub struct ReleaseConfig {
   #[serde(default = "default_publish_delay")]
   pub publish_delay: u64,
 
-  /// Create forge releases via the configured external CLI (default: false).
-  ///
-  /// The field name is retained for the original GitHub-only config surface;
-  /// `forge` selects GitHub (`gh`) or GitLab (`glab`) for new configurations.
+  /// Authorized remote effects after local release preparation.
   #[serde(default)]
-  pub create_github_release: bool,
-
-  /// Forge release provider used when release creation is enabled.
-  #[serde(default)]
-  pub forge: ReleaseForgeConfig,
-
-  /// Push release commit and tags to the git remote before public publishing.
-  #[serde(default)]
-  pub push: bool,
+  pub remote_effects: ReleaseRemoteEffects,
 
   /// Sign git tags with GPG/SSH (default: false)
   #[serde(default)]
@@ -124,9 +113,7 @@ impl Default for ReleaseConfig {
       tag_format: default_tag_format(),
       require_clean: true,
       publish_delay: default_publish_delay(),
-      create_github_release: false,
-      forge: ReleaseForgeConfig::default(),
-      push: false,
+      remote_effects: ReleaseRemoteEffects::default(),
       sign_tags: false,
       require_changelog_entries: false,
       require_release_notes: true,
@@ -171,13 +158,6 @@ impl ReleaseConfig {
                 Tags may not be identifiable."
           .to_string(),
       );
-    }
-
-    if self.create_github_release && !self.push {
-      return Err(ConfigError::InvalidField {
-        field: "release.create_github_release".to_string(),
-        reason: "create_github_release = true requires push = true so cargo-rail owns the pushed tag before creating a forge release".to_string(),
-      });
     }
 
     validate_change_dir(&self.change_dir)?;
@@ -276,17 +256,150 @@ pub enum SemverCheckPolicy {
   Deny,
 }
 
-/// Forge release provider.
+/// Remote effects authorized after local release preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ReleaseForgeConfig {
-  /// Detect provider from `origin`.
+pub enum ReleaseRemoteEffects {
+  /// Keep release effects local.
+  #[default]
+  None,
+  /// Push the release commit and tags without creating a forge release.
+  Push,
+  /// Push and detect the forge provider from `origin`.
+  Auto,
+  /// Push and create a GitHub release via `gh`.
+  Github,
+  /// Push and create a GitLab release via `glab`.
+  Gitlab,
+}
+
+impl ReleaseRemoteEffects {
+  /// Whether the policy authorizes pushing the release commit and tags.
+  pub const fn pushes(self) -> bool {
+    !matches!(self, Self::None)
+  }
+
+  /// Whether the policy authorizes creating a forge release.
+  pub const fn creates_forge_release(self) -> bool {
+    matches!(self, Self::Auto | Self::Github | Self::Gitlab)
+  }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct ReleaseConfigInput {
+  tag_prefix: String,
+  tag_format: String,
+  require_clean: bool,
+  publish_delay: u64,
+  remote_effects: Option<ReleaseRemoteEffects>,
+  create_github_release: Option<bool>,
+  forge: Option<LegacyReleaseForge>,
+  push: Option<bool>,
+  sign_tags: bool,
+  require_changelog_entries: bool,
+  require_release_notes: bool,
+  release_notes_dir: String,
+  change_dir: String,
+  pre_1_breaking_bump: Pre1BreakingBump,
+  unconventional_commits: CommitPolicy,
+  semver_check: SemverCheckPolicy,
+  require_change_files: RequireChangeFiles,
+  version_groups: BTreeMap<String, Vec<String>>,
+  changelog: ChangelogShape,
+}
+
+impl Default for ReleaseConfigInput {
+  fn default() -> Self {
+    let config = ReleaseConfig::default();
+    Self {
+      tag_prefix: config.tag_prefix,
+      tag_format: config.tag_format,
+      require_clean: config.require_clean,
+      publish_delay: config.publish_delay,
+      remote_effects: None,
+      create_github_release: None,
+      forge: None,
+      push: None,
+      sign_tags: config.sign_tags,
+      require_changelog_entries: config.require_changelog_entries,
+      require_release_notes: config.require_release_notes,
+      release_notes_dir: config.release_notes_dir,
+      change_dir: config.change_dir,
+      pre_1_breaking_bump: config.pre_1_breaking_bump,
+      unconventional_commits: config.unconventional_commits,
+      semver_check: config.semver_check,
+      require_change_files: config.require_change_files,
+      version_groups: config.version_groups,
+      changelog: config.changelog,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LegacyReleaseForge {
   #[default]
   Auto,
-  /// GitHub via `gh`.
   Github,
-  /// GitLab via `glab`.
   Gitlab,
+}
+
+impl<'de> Deserialize<'de> for ReleaseConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let input = ReleaseConfigInput::deserialize(deserializer)?;
+    let has_legacy = input.create_github_release.is_some() || input.forge.is_some() || input.push.is_some();
+    if input.remote_effects.is_some() && has_legacy {
+      return Err(de::Error::custom(
+        "release.remote_effects cannot be combined with deprecated release.push, release.create_github_release, or release.forge; run `cargo rail config migrate`",
+      ));
+    }
+
+    let remote_effects = if let Some(remote_effects) = input.remote_effects {
+      remote_effects
+    } else {
+      let push = input.push.unwrap_or(false);
+      let create_release = input.create_github_release.unwrap_or(false);
+      if create_release && !push {
+        return Err(de::Error::custom(
+          "deprecated release.create_github_release = true requires release.push = true before it can be migrated",
+        ));
+      }
+      if create_release {
+        match input.forge.unwrap_or_default() {
+          LegacyReleaseForge::Auto => ReleaseRemoteEffects::Auto,
+          LegacyReleaseForge::Github => ReleaseRemoteEffects::Github,
+          LegacyReleaseForge::Gitlab => ReleaseRemoteEffects::Gitlab,
+        }
+      } else if push {
+        ReleaseRemoteEffects::Push
+      } else {
+        ReleaseRemoteEffects::None
+      }
+    };
+
+    Ok(Self {
+      tag_prefix: input.tag_prefix,
+      tag_format: input.tag_format,
+      require_clean: input.require_clean,
+      publish_delay: input.publish_delay,
+      remote_effects,
+      sign_tags: input.sign_tags,
+      require_changelog_entries: input.require_changelog_entries,
+      require_release_notes: input.require_release_notes,
+      release_notes_dir: input.release_notes_dir,
+      change_dir: input.change_dir,
+      pre_1_breaking_bump: input.pre_1_breaking_bump,
+      unconventional_commits: input.unconventional_commits,
+      semver_check: input.semver_check,
+      require_change_files: input.require_change_files,
+      version_groups: input.version_groups,
+      changelog: input.changelog,
+    })
+  }
 }
 
 /// Which crates require change-file coverage
@@ -615,7 +728,7 @@ mod tests {
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
     assert_eq!(config.unconventional_commits, CommitPolicy::Warn);
     assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
-    assert_eq!(config.forge, ReleaseForgeConfig::Auto);
+    assert_eq!(config.remote_effects, ReleaseRemoteEffects::None);
     assert_eq!(config.change_dir, ".changes");
     assert!(!config.require_change_files.is_enabled());
     assert!(config.version_groups.is_empty());
@@ -629,14 +742,24 @@ mod tests {
       unconventional_commits = "deny"
       semver_check = "off"
       change_dir = "changes"
-      forge = "gitlab"
+      remote_effects = "gitlab"
     "#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
     assert_eq!(config.unconventional_commits, CommitPolicy::Deny);
     assert_eq!(config.semver_check, SemverCheckPolicy::Off);
     assert_eq!(config.change_dir, "changes");
-    assert_eq!(config.forge, ReleaseForgeConfig::Gitlab);
+    assert_eq!(config.remote_effects, ReleaseRemoteEffects::Gitlab);
+  }
+
+  #[test]
+  fn valid_legacy_release_effects_map_to_typed_policy() {
+    let config: ReleaseConfig =
+      toml_edit::de::from_str("push = true\ncreate_github_release = true\nforge = \"github\"\n").unwrap();
+    assert_eq!(config.remote_effects, ReleaseRemoteEffects::Github);
+
+    let config: ReleaseConfig = toml_edit::de::from_str("push = true\n").unwrap();
+    assert_eq!(config.remote_effects, ReleaseRemoteEffects::Push);
   }
 
   #[test]
@@ -695,15 +818,9 @@ mod tests {
   }
 
   #[test]
-  fn test_github_release_requires_owned_push() {
-    let config = ReleaseConfig {
-      create_github_release: true,
-      push: false,
-      ..ReleaseConfig::default()
-    };
-
-    let err = config.validate(&["crate-a".to_string()]).unwrap_err();
-    assert!(err.to_string().contains("requires push = true"));
+  fn legacy_forge_release_without_push_cannot_be_constructed() {
+    let err = toml_edit::de::from_str::<ReleaseConfig>("create_github_release = true\npush = false\n").unwrap_err();
+    assert!(err.to_string().contains("requires release.push = true"));
   }
 
   #[test]

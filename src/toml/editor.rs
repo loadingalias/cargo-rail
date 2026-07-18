@@ -94,9 +94,35 @@ impl TomlEditor {
     Some(current)
   }
 
-  /// Check if a key exists at the given path (e.g., "unify.msrv_source")
+  /// Check if a key exists at the given path (e.g., "unify.msrv_policy")
   pub fn contains_path(&self, path: &str) -> bool {
     self.get(path).is_some()
+  }
+
+  /// Remove an existing key at a dotted table path.
+  ///
+  /// Returns `true` only when a key was removed. Empty parent tables are
+  /// removed as well; unrelated formatting is left untouched.
+  pub fn remove(&mut self, path: &str) -> bool {
+    fn remove_from(table: &mut Table, parts: &[&str]) -> bool {
+      let Some((part, remaining)) = parts.split_first() else {
+        return false;
+      };
+      if remaining.is_empty() {
+        return table.remove(part).is_some();
+      }
+
+      let removed = table
+        .get_mut(part)
+        .and_then(Item::as_table_mut)
+        .is_some_and(|child| remove_from(child, remaining));
+      if removed && table.get(part).and_then(Item::as_table).is_some_and(Table::is_empty) {
+        table.remove(part);
+      }
+      removed
+    }
+
+    remove_from(self.doc.as_table_mut(), &path.split('.').collect::<Vec<_>>())
   }
 
   /// Ensure a section (table) exists, creating if needed.
@@ -197,15 +223,7 @@ impl TomlEditor {
   /// Write changes (atomic via temp file)
   pub fn write(self) -> RailResult<()> {
     self.validate()?;
-
-    let content = self.doc.to_string();
-    let temp_path = self.path.with_extension("toml.tmp");
-
-    fs::write(&temp_path, content).map_err(|e| RailError::message(format!("Failed to write temp file: {}", e)))?;
-
-    fs::rename(&temp_path, &self.path).map_err(|e| RailError::message(format!("Failed to rename temp file: {}", e)))?;
-
-    Ok(())
+    crate::utils::write_file_atomic(&self.path, self.doc.to_string().as_bytes())
   }
 
   /// Write with backup (.bak file)
@@ -390,5 +408,36 @@ infrastructure = [".github/**"]
     assert!(editor.contains_path("package.name"));
     assert!(editor.contains_path("change-detection.infrastructure"));
     assert!(!editor.contains_path("change-detection.custom"));
+  }
+
+  #[test]
+  fn test_remove_prunes_empty_parent_tables() {
+    let mut file = NamedTempFile::new().unwrap();
+    use std::io::Write;
+    writeln!(file, "[crates.demo.sync]").unwrap();
+
+    let mut editor = TomlEditor::open(file.path()).unwrap();
+    assert!(editor.remove("crates.demo.sync"));
+    assert!(editor.doc().is_empty());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn test_write_does_not_follow_legacy_predictable_temp_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("rail.toml");
+    let victim = directory.path().join("victim");
+    fs::write(&config, "value = \"old\"\n").unwrap();
+    fs::write(&victim, "untouched\n").unwrap();
+    symlink(&victim, config.with_extension("toml.tmp")).unwrap();
+
+    let mut editor = TomlEditor::open(&config).unwrap();
+    editor.set("value", "new").unwrap();
+    editor.write().unwrap();
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched\n");
+    assert!(fs::read_to_string(&config).unwrap().contains("new"));
   }
 }

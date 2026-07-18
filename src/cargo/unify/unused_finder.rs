@@ -26,7 +26,6 @@ pub struct UnusedDepFinder<'a> {
   target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
   unreachable_features: HashMap<String, BTreeSet<String>>,
   workspace_is_consumer_scope: bool,
-  enable_compiler_diag_cache: bool,
 }
 
 struct DependencyDeclaration<'a> {
@@ -44,7 +43,6 @@ impl<'a> UnusedDepFinder<'a> {
     target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
     pruned_features: &[crate::cargo::unify_types::PrunedFeature],
     workspace_is_consumer_scope: bool,
-    enable_compiler_diag_cache: bool,
   ) -> Self {
     let mut unreachable_features: HashMap<String, BTreeSet<String>> = HashMap::new();
     for feature in pruned_features {
@@ -60,7 +58,6 @@ impl<'a> UnusedDepFinder<'a> {
       target_cfg_sets,
       unreachable_features,
       workspace_is_consumer_scope,
-      enable_compiler_diag_cache,
     }
   }
 
@@ -367,12 +364,7 @@ impl<'a> UnusedDepFinder<'a> {
     }
 
     let targets = self.metadata.targets();
-    let collector = match CompilerDiagnosticsCollector::new(
-      self.workspace_root,
-      self.manifests,
-      targets,
-      self.enable_compiler_diag_cache,
-    ) {
+    let collector = match CompilerDiagnosticsCollector::new(self.workspace_root, self.manifests, targets) {
       Ok(collector) => collector,
       Err(error) => {
         crate::warn!(

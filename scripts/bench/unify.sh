@@ -17,7 +17,6 @@ mkdir -p "$results"
 results="$(cd "$(dirname "$results")" && pwd)/$(basename "$results")"
 
 "$repo_root/scripts/fixtures/generate-workspace.sh" "$packages" "$fixture"
-printf '\n[unify]\ndetect_unused = true\ncompiler_diag_cache = true\n' >>"$fixture/.config/rail.toml"
 
 dependencies=(anyhow log once_cell regex semver serde serde_json tempfile thiserror toml_edit)
 for ((index = 0; index < packages; index++)); do

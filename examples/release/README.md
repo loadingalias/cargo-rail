@@ -17,7 +17,7 @@ crate's previous tag. Change files are consumed in the release commit;
 consumption is all-or-nothing, so a plan covering only some of a file's
 crates is rejected.
 
-With `push = true`, `release run` pushes its verified release commit and tags. Do not add a second push step.
+With `remote_effects = "push"`, `release run` pushes its verified release commit and tags. Use `"auto"`, `"github"`, or `"gitlab"` to push and create a forge release. Do not add a second push step.
 
 ## Release PR
 

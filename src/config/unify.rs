@@ -1,6 +1,6 @@
 //! Unify configuration - controls workspace dependency unification behavior
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Defines which consumers may activate private workspace configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ impl ConsumerScope {
 }
 
 /// Unify configuration - controls workspace dependency unification behavior
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnifyConfig {
   /// Handle path dependencies? (default: true)
   /// If false, path dependencies are excluded from unification
@@ -37,17 +37,9 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub include_renamed: bool,
 
-  /// Pin transitive-only deps with fragmented features? (default: false)
-  /// This is cargo-rail's workspace-hack replacement
-  /// When enabled, transitive deps with multiple feature sets are pinned in workspace.dependencies
-  /// Only enable if your project uses cargo-hakari or a workspace-hack crate
-  #[serde(default)]
-  pub pin_transitives: bool,
-
-  /// Where to put pinned transitive dev-deps? (default: "root")
-  /// Options: "root" or a path like "crates/foo"
-  #[serde(default = "default_transitive_host")]
-  pub transitive_host: TransitiveFeatureHost,
+  /// Workspace-hack-style transitive pinning and its owning manifest.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub transitive_pinning: Option<TransitivePinning>,
 
   /// Dependencies to exclude from unification (safety hatch)
   ///
@@ -69,35 +61,9 @@ pub struct UnifyConfig {
   #[serde(default = "default_max_backups")]
   pub max_backups: usize,
 
-  /// Compute and write MSRV to workspace manifest? (default: true)
-  /// When enabled, cargo-rail computes the maximum rust-version from all
-  /// resolved dependencies and writes it to [workspace.package].rust-version
-  #[serde(default = "default_true")]
-  pub msrv: bool,
-
-  /// Enforce MSRV inheritance on workspace members (default: false)
-  ///
-  /// When enabled, `cargo rail unify` ensures every workspace member's Cargo.toml
-  /// has `package.rust-version = { workspace = true }`, so that
-  /// `[workspace.package].rust-version` is actually enforced across the workspace.
-  ///
-  /// Note: this requires `msrv = true` and a workspace MSRV that exists or can be computed.
+  /// MSRV computation and inheritance policy.
   #[serde(default)]
-  pub enforce_msrv_inheritance: bool,
-
-  /// How to determine the final MSRV value (default: "max")
-  /// - "deps": Use maximum from dependencies only (original behavior)
-  /// - "workspace": Preserve existing rust-version, warn if deps need higher
-  /// - "max": Take max(workspace, deps) - explicit workspace setting wins if higher
-  #[serde(default)]
-  pub msrv_source: MsrvSource,
-
-  /// Prune features not referenced in source code? (default: true)
-  /// When enabled, analyzes the resolved dependency graph to detect features
-  /// that are declared but never enabled by any consumer across all targets.
-  /// This produces the absolute leanest feature set for the workspace.
-  #[serde(default = "default_true")]
-  pub prune_dead_features: bool,
+  pub msrv_policy: MsrvPolicy,
 
   /// Consumer boundary used by destructive feature and optional-dependency pruning.
   ///
@@ -133,54 +99,11 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub major_version_conflict: MajorVersionConflict,
 
-  /// Detect unused dependencies in workspace members (default: true)
-  /// When enabled, uses two signals:
-  /// - Graph-level: declared deps absent from the resolved cargo graph.
-  /// - Source-level: rustc `unused_crate_dependencies` diagnostics for deps
-  ///   that are resolved but never referenced in source.
-  ///
-  /// Optional deps and deps behind unconfigured target constraints are
-  /// conservatively skipped to avoid false positives.
-  #[serde(default = "default_true")]
-  pub detect_unused: bool,
-
-  /// Cache compiler diagnostics for target-aware unused-dependency detection (default: true)
-  /// When enabled, rustc unused-crate diagnostics are persisted in
-  /// `target/cargo-rail/cache/compiler-diags-v1.json` and reused across runs.
-  #[serde(default = "default_true")]
-  pub compiler_diag_cache: bool,
-
-  /// Automatically remove unused dependencies when applying (default: true)
-  /// Requires detect_unused = true. When enabled, unused deps are removed
-  /// from member Cargo.toml files during unify.
-  #[serde(default = "default_true")]
-  pub remove_unused: bool,
-
-  /// Detect undeclared feature dependencies (default: true)
-  /// When enabled, compares resolved features against declared features in Cargo.toml
-  /// to find crates that rely on Cargo's feature unification to "borrow" features
-  /// from other workspace members. After unification, standalone builds of these
-  /// crates will fail. Reports as warnings to help fix before unification.
-  #[serde(default = "default_true")]
-  pub detect_undeclared_features: bool,
-
-  /// Auto-fix undeclared feature dependencies (default: true)
-  /// When enabled (and detect_undeclared_features is true), automatically adds
-  /// missing features to each crate's Cargo.toml instead of just warning.
-  /// This produces a cleaner graph where standalone builds work correctly.
-  #[serde(default = "default_true")]
-  pub fix_undeclared_features: bool,
-
   /// Patterns for features to skip in undeclared feature detection (glob supported)
   /// Default: ["default", "std", "alloc", "*_backend", "*_impl"]
   /// These are features that are typically not actionable or are implementation details.
   #[serde(default = "default_skip_undeclared_patterns")]
   pub skip_undeclared_patterns: Vec<String>,
-
-  /// Sort dependencies alphabetically when writing Cargo.toml files (default: true)
-  /// When false, preserves existing order and appends new deps at end.
-  #[serde(default = "default_true")]
-  pub sort_dependencies: bool,
 }
 
 impl Default for UnifyConfig {
@@ -188,27 +111,17 @@ impl Default for UnifyConfig {
     Self {
       include_paths: default_include_paths(),
       include_renamed: false,
-      pin_transitives: false,
-      transitive_host: default_transitive_host(),
+      transitive_pinning: None,
       exclude: Vec::new(),
       include: Vec::new(),
       max_backups: default_max_backups(),
-      msrv: true,
-      enforce_msrv_inheritance: false,
-      msrv_source: MsrvSource::default(),
-      prune_dead_features: true,
+      msrv_policy: MsrvPolicy::default(),
       consumer_scope: ConsumerScope::default(),
       preserve_features: Vec::new(),
       strict_version_compat: true,
       exact_pin_handling: ExactPinHandling::default(),
       major_version_conflict: MajorVersionConflict::default(),
-      detect_unused: true,
-      compiler_diag_cache: true,
-      remove_unused: true,
-      detect_undeclared_features: true,
-      fix_undeclared_features: true,
       skip_undeclared_patterns: default_skip_undeclared_patterns(),
-      sort_dependencies: true,
     }
   }
 }
@@ -261,17 +174,17 @@ impl UnifyConfig {
   /// Validate unify configuration against the workspace
   ///
   /// Checks:
-  /// - transitive_host path exists if configured as a path (not "root")
-  /// - transitive_host path contains a Cargo.toml (is a valid crate/workspace)
+  /// - transitive pinning host path exists if configured as a path (not "root")
+  /// - transitive pinning host path contains a Cargo.toml
   pub fn validate(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
-    // Only validate if pin_transitives is enabled and transitive_host is a path
-    if self.pin_transitives
-      && let TransitiveFeatureHost::Path(p) = &self.transitive_host
+    if let Some(TransitivePinning {
+      host: TransitiveFeatureHost::Path(p),
+    }) = &self.transitive_pinning
     {
       // Check for path traversal (security/consistency)
       if p.contains("..") {
         return Err(crate::error::ConfigError::InvalidValue {
-          field: "unify.transitive_host".to_string(),
+          field: "unify.transitive_pinning.host".to_string(),
           message: format!("path '{}' contains '..' traversal, which is not allowed", p),
         });
       }
@@ -279,7 +192,7 @@ impl UnifyConfig {
       // Check path is not absolute
       if std::path::Path::new(p).is_absolute() {
         return Err(crate::error::ConfigError::InvalidValue {
-          field: "unify.transitive_host".to_string(),
+          field: "unify.transitive_pinning.host".to_string(),
           message: format!("path '{}' is absolute, must be relative to workspace root", p),
         });
       }
@@ -288,7 +201,7 @@ impl UnifyConfig {
       let full_path = workspace_root.join(p);
       if !full_path.exists() {
         return Err(crate::error::ConfigError::InvalidValue {
-          field: "unify.transitive_host".to_string(),
+          field: "unify.transitive_pinning.host".to_string(),
           message: format!("path '{}' does not exist", p),
         });
       }
@@ -297,7 +210,7 @@ impl UnifyConfig {
       let cargo_toml = full_path.join("Cargo.toml");
       if !cargo_toml.exists() {
         return Err(crate::error::ConfigError::InvalidValue {
-          field: "unify.transitive_host".to_string(),
+          field: "unify.transitive_pinning.host".to_string(),
           message: format!("path '{}' does not contain a Cargo.toml", p),
         });
       }
@@ -369,7 +282,7 @@ pub enum MajorVersionConflict {
 }
 
 /// Configuration for where to add dev-dependencies when consolidating transitive features
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TransitiveFeatureHost {
   /// Use workspace root Cargo.toml (default)
   #[default]
@@ -420,6 +333,168 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
   }
 }
 
+/// Enabled workspace-hack-style transitive pinning policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitivePinning {
+  /// Manifest that owns the generated transitive dev-dependencies.
+  #[serde(default)]
+  pub host: TransitiveFeatureHost,
+}
+
+/// MSRV computation and member-inheritance policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MsrvPolicy {
+  /// Do not compute or write workspace MSRV.
+  Disabled,
+  /// Compute workspace MSRV from the selected authoritative sources.
+  Compute {
+    /// Inputs used to choose the final version.
+    #[serde(default)]
+    source: MsrvSource,
+    /// Whether members inherit the computed workspace value.
+    #[serde(default)]
+    inherit: bool,
+  },
+}
+
+impl Default for MsrvPolicy {
+  fn default() -> Self {
+    Self::Compute {
+      source: MsrvSource::default(),
+      inherit: false,
+    }
+  }
+}
+
+impl MsrvPolicy {
+  /// Source policy when computation is enabled.
+  pub const fn source(self) -> Option<MsrvSource> {
+    match self {
+      Self::Disabled => None,
+      Self::Compute { source, .. } => Some(source),
+    }
+  }
+
+  /// Whether workspace members must inherit the computed value.
+  pub const fn inherits(self) -> bool {
+    matches!(self, Self::Compute { inherit: true, .. })
+  }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct UnifyConfigInput {
+  include_paths: bool,
+  include_renamed: bool,
+  transitive_pinning: Option<TransitivePinning>,
+  pin_transitives: Option<bool>,
+  transitive_host: Option<TransitiveFeatureHost>,
+  exclude: Vec<String>,
+  include: Vec<String>,
+  max_backups: usize,
+  msrv_policy: Option<MsrvPolicy>,
+  msrv: Option<bool>,
+  enforce_msrv_inheritance: Option<bool>,
+  msrv_source: Option<MsrvSource>,
+  consumer_scope: ConsumerScope,
+  preserve_features: Vec<String>,
+  strict_version_compat: bool,
+  exact_pin_handling: ExactPinHandling,
+  major_version_conflict: MajorVersionConflict,
+  skip_undeclared_patterns: Vec<String>,
+}
+
+impl Default for UnifyConfigInput {
+  fn default() -> Self {
+    let config = UnifyConfig::default();
+    Self {
+      include_paths: config.include_paths,
+      include_renamed: config.include_renamed,
+      transitive_pinning: None,
+      pin_transitives: None,
+      transitive_host: None,
+      exclude: config.exclude,
+      include: config.include,
+      max_backups: config.max_backups,
+      msrv_policy: None,
+      msrv: None,
+      enforce_msrv_inheritance: None,
+      msrv_source: None,
+      consumer_scope: config.consumer_scope,
+      preserve_features: config.preserve_features,
+      strict_version_compat: config.strict_version_compat,
+      exact_pin_handling: config.exact_pin_handling,
+      major_version_conflict: config.major_version_conflict,
+      skip_undeclared_patterns: config.skip_undeclared_patterns,
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for UnifyConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let input = UnifyConfigInput::deserialize(deserializer)?;
+    let has_legacy_transitive = input.pin_transitives.is_some() || input.transitive_host.is_some();
+    if input.transitive_pinning.is_some() && has_legacy_transitive {
+      return Err(de::Error::custom(
+        "unify.transitive_pinning cannot be combined with deprecated pin_transitives or transitive_host; run `cargo rail config migrate`",
+      ));
+    }
+    let transitive_pinning = input.transitive_pinning.or_else(|| {
+      input.pin_transitives.unwrap_or(false).then(|| TransitivePinning {
+        host: input.transitive_host.unwrap_or_default(),
+      })
+    });
+
+    let has_legacy_msrv =
+      input.msrv.is_some() || input.enforce_msrv_inheritance.is_some() || input.msrv_source.is_some();
+    if input.msrv_policy.is_some() && has_legacy_msrv {
+      return Err(de::Error::custom(
+        "unify.msrv_policy cannot be combined with deprecated msrv, msrv_source, or enforce_msrv_inheritance; run `cargo rail config migrate`",
+      ));
+    }
+    let msrv_policy = if let Some(policy) = input.msrv_policy {
+      policy
+    } else {
+      let enabled = input.msrv.unwrap_or(true);
+      let inherit = input.enforce_msrv_inheritance.unwrap_or(false);
+      if !enabled && inherit {
+        return Err(de::Error::custom(
+          "deprecated enforce_msrv_inheritance = true cannot be combined with msrv = false",
+        ));
+      }
+      if enabled {
+        MsrvPolicy::Compute {
+          source: input.msrv_source.unwrap_or_default(),
+          inherit,
+        }
+      } else {
+        MsrvPolicy::Disabled
+      }
+    };
+
+    Ok(Self {
+      include_paths: input.include_paths,
+      include_renamed: input.include_renamed,
+      transitive_pinning,
+      exclude: input.exclude,
+      include: input.include,
+      max_backups: input.max_backups,
+      msrv_policy,
+      consumer_scope: input.consumer_scope,
+      preserve_features: input.preserve_features,
+      strict_version_compat: input.strict_version_compat,
+      exact_pin_handling: input.exact_pin_handling,
+      major_version_conflict: input.major_version_conflict,
+      skip_undeclared_patterns: input.skip_undeclared_patterns,
+    })
+  }
+}
+
 // Default Functions
 
 fn default_max_backups() -> usize {
@@ -428,10 +503,6 @@ fn default_max_backups() -> usize {
 
 fn default_include_paths() -> bool {
   true
-}
-
-fn default_transitive_host() -> TransitiveFeatureHost {
-  TransitiveFeatureHost::Root
 }
 
 pub(crate) fn default_true() -> bool {
@@ -445,25 +516,6 @@ fn default_skip_undeclared_patterns() -> Vec<String> {
 
 // Tests
 
-#[test]
-fn test_transitive_feature_host_path() {
-  // Test that path format works with simplified config
-  let toml = r#"
-      include_paths = true
-      include_renamed = false
-      pin_transitives = false
-      transitive_host = "path/to/crate"
-      exclude = []
-      include = []
-    "#;
-
-  let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-  assert_eq!(
-    config.transitive_host,
-    TransitiveFeatureHost::Path("path/to/crate".to_string())
-  );
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -473,14 +525,10 @@ mod tests {
     let config = UnifyConfig::default();
     assert!(config.include_paths); // Default: true
     assert!(!config.include_renamed); // Default: false
-    assert!(!config.pin_transitives); // Default: false (only true for hakari users)
-    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
+    assert!(config.transitive_pinning.is_none());
     assert!(config.exclude.is_empty());
     assert!(config.include.is_empty());
-    assert!(config.msrv); // Default: true
-    assert!(config.detect_unused); // Default: true
-    assert!(config.compiler_diag_cache); // Default: true
-    assert!(config.remove_unused); // Default: true
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
     assert_eq!(config.consumer_scope, ConsumerScope::Open);
   }
 
@@ -517,33 +565,49 @@ mod tests {
     "#;
 
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
+    assert_eq!(
+      config.transitive_pinning,
+      Some(TransitivePinning {
+        host: TransitiveFeatureHost::Root
+      })
+    );
     assert!(config.include_paths);
-    assert!(config.pin_transitives);
   }
 
   #[test]
   fn test_unify_config_default_transitive_host() {
     let config = UnifyConfig::default();
-    assert_eq!(config.transitive_host, TransitiveFeatureHost::Root);
-    assert!(!config.pin_transitives); // Default is false (opt-in for hakari users)
+    assert!(config.transitive_pinning.is_none());
   }
 
   #[test]
-  fn test_prune_dead_features_default() {
-    let config = UnifyConfig::default();
-    assert!(config.prune_dead_features); // Default: true
+  fn typed_unify_policies_parse_without_invalid_combinations() {
+    let config: UnifyConfig = toml_edit::de::from_str(
+      r#"
+      transitive_pinning = { host = "crates/host" }
+      msrv_policy = { mode = "compute", source = "workspace", inherit = true }
+      "#,
+    )
+    .unwrap();
+    assert_eq!(
+      config.transitive_pinning,
+      Some(TransitivePinning {
+        host: TransitiveFeatureHost::Path("crates/host".to_string())
+      })
+    );
+    assert_eq!(
+      config.msrv_policy,
+      MsrvPolicy::Compute {
+        source: MsrvSource::Workspace,
+        inherit: true
+      }
+    );
   }
 
   #[test]
-  fn test_prune_dead_features_parsing() {
-    let toml = r#"prune_dead_features = true"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.prune_dead_features);
-
-    let toml = r#"prune_dead_features = false"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.prune_dead_features);
+  fn invalid_legacy_msrv_combination_cannot_be_constructed() {
+    let error = toml_edit::de::from_str::<UnifyConfig>("msrv = false\nenforce_msrv_inheritance = true\n").unwrap_err();
+    assert!(error.to_string().contains("cannot be combined"));
   }
 
   #[test]
@@ -589,28 +653,14 @@ mod tests {
   }
 
   #[test]
-  fn test_detect_unused_default() {
-    let config = UnifyConfig::default();
-    assert!(config.detect_unused); // Default: true
-    assert!(config.compiler_diag_cache); // Default: true
-    assert!(config.remove_unused); // Default: true
-  }
-
-  #[test]
   fn test_new_config_options_parsing() {
     let toml = r#"
       strict_version_compat = false
       exact_pin_handling = "preserve"
-      detect_unused = true
-      compiler_diag_cache = false
-      remove_unused = true
     "#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
     assert!(!config.strict_version_compat);
     assert_eq!(config.exact_pin_handling, ExactPinHandling::Preserve);
-    assert!(config.detect_unused);
-    assert!(!config.compiler_diag_cache);
-    assert!(config.remove_unused);
   }
 
   #[test]
@@ -647,8 +697,9 @@ mod tests {
   fn test_transitive_host_validate_root() {
     // Root should always be valid
     let config = UnifyConfig {
-      pin_transitives: true,
-      transitive_host: TransitiveFeatureHost::Root,
+      transitive_pinning: Some(TransitivePinning {
+        host: TransitiveFeatureHost::Root,
+      }),
       ..Default::default()
     };
     let workspace = std::env::current_dir().unwrap();
@@ -657,12 +708,7 @@ mod tests {
 
   #[test]
   fn test_transitive_host_validate_valid_path() {
-    // src/ exists and doesn't have a Cargo.toml - but pin_transitives=false skips validation
-    let config = UnifyConfig {
-      pin_transitives: false,
-      transitive_host: TransitiveFeatureHost::Path("src".to_string()),
-      ..Default::default()
-    };
+    let config = UnifyConfig::default();
     let workspace = std::env::current_dir().unwrap();
     assert!(config.validate(&workspace).is_ok());
   }
@@ -670,8 +716,9 @@ mod tests {
   #[test]
   fn test_transitive_host_validate_nonexistent_path() {
     let config = UnifyConfig {
-      pin_transitives: true,
-      transitive_host: TransitiveFeatureHost::Path("nonexistent/path".to_string()),
+      transitive_pinning: Some(TransitivePinning {
+        host: TransitiveFeatureHost::Path("nonexistent/path".to_string()),
+      }),
       ..Default::default()
     };
     let workspace = std::env::current_dir().unwrap();
@@ -684,8 +731,9 @@ mod tests {
   #[test]
   fn test_transitive_host_validate_path_traversal() {
     let config = UnifyConfig {
-      pin_transitives: true,
-      transitive_host: TransitiveFeatureHost::Path("../somewhere".to_string()),
+      transitive_pinning: Some(TransitivePinning {
+        host: TransitiveFeatureHost::Path("../somewhere".to_string()),
+      }),
       ..Default::default()
     };
     let workspace = std::env::current_dir().unwrap();
@@ -790,28 +838,28 @@ mod tests {
   #[test]
   fn test_msrv_source_default() {
     let config = UnifyConfig::default();
-    assert_eq!(config.msrv_source, MsrvSource::Max);
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
   }
 
   #[test]
   fn test_msrv_source_parsing_deps() {
     let toml = r#"msrv_source = "deps""#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.msrv_source, MsrvSource::Deps);
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Deps));
   }
 
   #[test]
   fn test_msrv_source_parsing_workspace() {
     let toml = r#"msrv_source = "workspace""#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.msrv_source, MsrvSource::Workspace);
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Workspace));
   }
 
   #[test]
   fn test_msrv_source_parsing_max() {
     let toml = r#"msrv_source = "max""#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert_eq!(config.msrv_source, MsrvSource::Max);
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
   }
 
   #[test]
@@ -821,8 +869,7 @@ mod tests {
       msrv_source = "workspace"
     "#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.msrv);
-    assert_eq!(config.msrv_source, MsrvSource::Workspace);
+    assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Workspace));
   }
 
   #[test]
@@ -832,89 +879,7 @@ mod tests {
       msrv_source = "deps"
     "#;
     let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.msrv);
-    assert_eq!(config.msrv_source, MsrvSource::Deps);
-  }
-
-  #[test]
-  fn test_detect_undeclared_features_default() {
-    let config = UnifyConfig::default();
-    assert!(config.detect_undeclared_features); // Default: true
-  }
-
-  #[test]
-  fn test_fix_undeclared_features_default() {
-    let config = UnifyConfig::default();
-    assert!(config.fix_undeclared_features); // Default: true
-  }
-
-  #[test]
-  fn test_detect_undeclared_features_parsing_true() {
-    let toml = r#"detect_undeclared_features = true"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.detect_undeclared_features);
-  }
-
-  #[test]
-  fn test_detect_undeclared_features_parsing_false() {
-    let toml = r#"detect_undeclared_features = false"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.detect_undeclared_features);
-  }
-
-  #[test]
-  fn test_fix_undeclared_features_parsing_true() {
-    let toml = r#"fix_undeclared_features = true"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.fix_undeclared_features);
-  }
-
-  #[test]
-  fn test_fix_undeclared_features_parsing_false() {
-    let toml = r#"fix_undeclared_features = false"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.fix_undeclared_features);
-  }
-
-  #[test]
-  fn test_undeclared_features_both_options() {
-    let toml = r#"
-      detect_undeclared_features = true
-      fix_undeclared_features = false
-    "#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.detect_undeclared_features);
-    assert!(!config.fix_undeclared_features);
-  }
-
-  #[test]
-  fn test_undeclared_features_with_other_options() {
-    let toml = r#"
-      detect_unused = true
-      remove_unused = true
-      detect_undeclared_features = true
-      fix_undeclared_features = true
-      prune_dead_features = false
-    "#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.detect_unused);
-    assert!(config.remove_unused);
-    assert!(config.detect_undeclared_features);
-    assert!(config.fix_undeclared_features);
-    assert!(!config.prune_dead_features);
-  }
-
-  #[test]
-  fn test_undeclared_features_detect_disabled_fix_enabled() {
-    // Edge case: fix enabled but detect disabled
-    // This is a valid config but fix won't do anything if detect is off
-    let toml = r#"
-      detect_undeclared_features = false
-      fix_undeclared_features = true
-    "#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.detect_undeclared_features);
-    assert!(config.fix_undeclared_features);
+    assert_eq!(config.msrv_policy, MsrvPolicy::Disabled);
   }
 
   // skip_undeclared_patterns Tests
@@ -1028,40 +993,5 @@ mod tests {
     assert!(!config.should_skip_undeclared_feature("default"));
     assert!(!config.should_skip_undeclared_feature("std"));
     assert!(!config.should_skip_undeclared_feature("anything"));
-  }
-
-  // sort_dependencies Tests
-
-  #[test]
-  fn test_sort_dependencies_default() {
-    let config = UnifyConfig::default();
-    assert!(config.sort_dependencies); // Default is true (alphabetical)
-  }
-
-  #[test]
-  fn test_sort_dependencies_parsing_true() {
-    let toml = r#"sort_dependencies = true"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.sort_dependencies);
-  }
-
-  #[test]
-  fn test_sort_dependencies_parsing_false() {
-    let toml = r#"sort_dependencies = false"#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(!config.sort_dependencies);
-  }
-
-  #[test]
-  fn test_sort_dependencies_with_other_options() {
-    let toml = r#"
-      detect_unused = true
-      remove_unused = true
-      sort_dependencies = false
-    "#;
-    let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-    assert!(config.detect_unused);
-    assert!(config.remove_unused);
-    assert!(!config.sort_dependencies);
   }
 }

@@ -59,13 +59,7 @@ printf '%s\n' \
   'license = "MIT"' \
   >"$destination/Cargo.toml"
 
-printf '%s\n' \
-  '[workspace]' \
-  'root = "."' \
-  '' \
-  '[toolchain]' \
-  'channel = "stable"' \
-  >"$destination/.config/rail.toml"
+touch "$destination/.config/rail.toml"
 
 printf '%s\n' 'target/' >"$destination/.gitignore"
 printf '%s\n' '* text eol=lf -filter -ident -working-tree-encoding' >"$destination/.gitattributes"

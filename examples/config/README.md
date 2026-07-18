@@ -6,11 +6,12 @@
 
 ```bash
 cargo rail init
-cargo rail config sync
+cargo rail config migrate --check
+cargo rail config explain
 cargo rail config validate --strict
 ```
 
-`cargo rail init` writes the minimal detected configuration. Run `config sync` after every cargo-rail upgrade so new fields and detected targets are explicit before CI or mutation commands run.
+`cargo rail init` writes only detected non-default choices. After an upgrade, `config migrate --check` reports explicit semantic migrations without changing the file; it never adds coded defaults.
 
 ## Reference
 

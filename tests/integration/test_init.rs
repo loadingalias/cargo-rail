@@ -18,15 +18,13 @@ fn test_init_creates_config() -> Result<()> {
   let config_path = &ws.path.join(".config/rail.toml");
   assert!(config_path.exists(), "config file should be created");
 
-  // Verify config is valid TOML and contains expected sections
+  // Init writes only detected choices that differ from coded defaults.
   let config_content = std::fs::read_to_string(config_path)?;
-  assert!(config_content.contains("[unify]"));
-  assert!(config_content.contains("[release]"));
-  assert!(config_content.contains("[change-detection]"));
-  assert!(config_content.contains("[run]"));
-  assert!(config_content.contains("[run.workflow]"));
-  assert!(config_content.contains("[run.profile.ci]"));
-  assert!(config_content.contains("{cargo_args}"));
+  assert!(config_content.contains("cargo-rail configuration"));
+  assert!(!config_content.contains("[unify]"));
+  assert!(!config_content.contains("[release]"));
+  assert!(!config_content.contains("[change-detection]"));
+  assert!(!config_content.contains("[run]"));
 
   Ok(())
 }
@@ -57,23 +55,26 @@ fn test_init_respects_force_flag() -> Result<()> {
 }
 
 #[test]
-fn test_init_check_mode() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-check")?;
+fn test_init_dry_run_mode() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-dry-run")?;
   ws.remove_config()?; // Remove default config for init test
 
-  // Run init with --check
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--check"])?;
+  // `--dry-run` previews execution; `--check` is reserved for read-only checks.
+  let output = run_cargo_rail(&ws.path, &["rail", "init", "--dry-run"])?;
 
   // Verify success
-  assert!(output.status.success(), "check mode should succeed");
+  assert!(output.status.success(), "dry-run mode should succeed");
 
   // Verify config was NOT created
   let config_path = &ws.path.join(".config/rail.toml");
-  assert!(!config_path.exists(), "config file should NOT be created in check mode");
+  assert!(
+    !config_path.exists(),
+    "config file should NOT be created in dry-run mode"
+  );
 
   // Verify output shows config
   let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.contains("[unify]"));
+  assert!(stdout.contains("cargo-rail configuration"));
 
   Ok(())
 }
@@ -161,27 +162,27 @@ fn test_init_generated_config_passes_strict_validate() -> Result<()> {
 }
 
 #[test]
-fn test_init_generated_config_sync_check_is_idempotent() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-sync-idempotent")?;
+fn test_init_generated_config_migrate_check_is_idempotent() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-migrate-idempotent")?;
   ws.remove_config()?;
 
   let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
   assert!(init_output.status.success(), "init should succeed");
 
-  let sync_check_output = run_cargo_rail(&ws.path, &["rail", "config", "sync", "--check", "-f", "json"])?;
+  let migrate_check_output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
   assert!(
-    sync_check_output.status.success(),
-    "fresh init config should be sync-idempotent. stdout:\n{}\nstderr:\n{}",
-    String::from_utf8_lossy(&sync_check_output.stdout),
-    String::from_utf8_lossy(&sync_check_output.stderr)
+    migrate_check_output.status.success(),
+    "fresh init config should need no migration. stdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&migrate_check_output.stdout),
+    String::from_utf8_lossy(&migrate_check_output.stderr)
   );
 
   Ok(())
 }
 
 #[test]
-fn test_init_all_fields_present() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-all-fields")?;
+fn test_init_omits_default_sections_and_templates() -> Result<()> {
+  let ws = TestWorkspace::new_named("init-sparse")?;
   ws.remove_config()?; // Remove default config for init test
 
   // Run init
@@ -189,13 +190,10 @@ fn test_init_all_fields_present() -> Result<()> {
 
   let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
 
-  // Verify ALL config sections are present
-  assert!(config_content.contains("[unify]"));
-  assert!(config_content.contains("[release]"));
-  assert!(config_content.contains("[change-detection]"));
-
-  // Split/Sync example should use [crates.<name>.split] format
-  assert!(config_content.contains("[crates.my-crate.split]"));
+  assert!(!config_content.contains("[unify]"));
+  assert!(!config_content.contains("[release]"));
+  assert!(!config_content.contains("[change-detection]"));
+  assert!(!config_content.contains("[crates.my-crate.split]"));
 
   Ok(())
 }

@@ -1,41 +1,16 @@
-# cargo-rail configuration
-# Unify-focused example with full [unify] section.
-
-# targets = []  # optional: set for multi-target validation
+# Unify policy: every entry differs from cargo-rail's coded defaults.
 
 [unify]
-include_paths = true
-include_renamed = false
+include_renamed = true
+major_version_conflict = "bump"
+msrv_policy = { mode = "compute", source = "workspace", inherit = true }
 
-pin_transitives = false  # enable for hakari/workspace-hack users
-transitive_host = "root"  # only used if pin_transitives = true
+# Enable only when this private workspace is the complete consumer graph.
+consumer_scope = "workspace"
+preserve_features = ["unstable-*", "bench*"]
 
-strict_version_compat = true
-exact_pin_handling = "warn"
-major_version_conflict = "warn"  # warn = skip, bump = force highest
+# Workspace-hack replacement: enabling it also selects its host.
+transitive_pinning = { host = "root" }
 
-msrv = true
-msrv_source = "workspace"  # deps | workspace | max
-enforce_msrv_inheritance = false  # Ensure members inherit workspace rust-version
-
-detect_unused = true
-compiler_diag_cache = true  # reuse evidence only while compiler/input identities match
-remove_unused = true  # requires detect_unused = true
-
-prune_dead_features = true
-consumer_scope = "open"  # use "workspace" only for a closed private consumer graph
-preserve_features = []  # glob patterns to keep from pruning
-detect_undeclared_features = true
-fix_undeclared_features = true  # requires detect_undeclared_features = true
-skip_undeclared_patterns = [
-  "default",
-  "std",
-  "alloc",
-  "*_backend",
-  "*_impl",
-]
-
-exclude = []  # excluding one workspace member excludes its whole member cohort
-include = []  # workspace-member cohorts are auto-included
-max_backups = 3
-sort_dependencies = false  # false to preserve existing order
+# Workspace-member cohorts remain atomic when these safety hatches are used.
+exclude = ["platform-specific-dep"]

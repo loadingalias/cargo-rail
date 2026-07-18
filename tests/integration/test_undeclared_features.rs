@@ -4,15 +4,14 @@
 //! 1. Correctly identifies features borrowed from other workspace members
 //! 2. Respects workspace baseline (features in [workspace.dependencies])
 //! 3. Uses skip_undeclared_patterns correctly
-//! 4. Auto-fixes undeclared features when configured
+//! 4. Plans fixes for undeclared features at the normal apply boundary
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 
-/// Helper to create a workspace with undeclared feature detection enabled
-/// and NO pre-existing workspace.dependencies (fresh workspace)
+/// Helper to create a workspace with no pre-existing workspace dependencies.
 fn create_fresh_workspace_with_undeclared_detection() -> Result<TestWorkspace> {
   let workspace = TestWorkspace::new()?;
 
@@ -30,11 +29,7 @@ authors = ["Test Author"]
 "#,
   )?;
 
-  // Enable detect_undeclared_features and fix_undeclared_features
-  let config = r#"[unify]
-detect_undeclared_features = true
-fix_undeclared_features = true
-"#;
+  let config = "";
   fs::create_dir_all(workspace.path.join(".config"))?;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
 
@@ -105,7 +100,7 @@ serde = "1.0"
   let stdout = String::from_utf8_lossy(&output.stdout);
 
   // Should detect crate-b borrowing "derive" from crate-a.
-  // or should show fix count if fix_undeclared_features is enabled
+  // The read-only plan should show the required fix.
   assert!(
     stdout.contains("Undeclared features") || stdout.contains("undeclared") || stdout.contains("features to fix"),
     "Should detect undeclared features.\nOutput:\n{}",
@@ -189,11 +184,7 @@ serde = { version = "1.0", features = ["derive"] }
 "#;
   fs::write(workspace.path.join("Cargo.toml"), workspace_toml)?;
 
-  // Config with undeclared detection
-  let config = r#"[unify]
-detect_undeclared_features = true
-fix_undeclared_features = false
-"#;
+  let config = "";
   fs::create_dir_all(workspace.path.join(".config"))?;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
 
@@ -252,8 +243,6 @@ fn test_undeclared_features_skip_patterns() -> Result<()> {
 
   // Config with custom skip patterns
   let config = r#"[unify]
-detect_undeclared_features = true
-fix_undeclared_features = false
 skip_undeclared_patterns = ["default", "std", "alloc"]
 "#;
   fs::create_dir_all(workspace.path.join(".config"))?;
@@ -312,7 +301,7 @@ serde = { version = "1.0", default-features = false }
 
 #[test]
 fn test_undeclared_features_auto_fix() -> Result<()> {
-  // When fix_undeclared_features = true, undeclared features should be added
+  // Applying the unify plan adds the causally required features.
   // to the member's Cargo.toml
 
   let workspace = create_fresh_workspace_with_undeclared_detection()?;
@@ -481,10 +470,7 @@ fn test_undeclared_features_conditional_features_respected() -> Result<()> {
 
   let workspace = TestWorkspace::new()?;
 
-  let config = r#"[unify]
-detect_undeclared_features = true
-fix_undeclared_features = false
-"#;
+  let config = "";
   fs::create_dir_all(workspace.path.join(".config"))?;
   fs::write(workspace.path.join(".config/rail.toml"), config)?;
 
