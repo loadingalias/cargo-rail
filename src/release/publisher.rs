@@ -576,7 +576,7 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn write_release_pr_body(&self, plan: &ReleasePlan, branch: &str) -> RailResult<PathBuf> {
-    let dir = self.ctx.workspace_root().join("target/cargo-rail/release-pr");
+    let dir = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("release-pr");
     fs::create_dir_all(&dir).map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
     let path = dir.join(format!("{}.md", sanitize_filename(branch)));
     fs::write(&path, release_pr_body(plan))
@@ -730,7 +730,7 @@ impl<'a> ReleasePublisher<'a> {
       };
       allowed.insert(relative);
     }
-    let changed_paths = git.changed_paths()?;
+    let changed_paths = self.ctx.changed_source_paths()?;
     let unexpected = changed_paths
       .iter()
       .filter(|path| !allowed.contains(*path))
@@ -1092,9 +1092,7 @@ impl<'a> ReleasePublisher<'a> {
       .collect::<BTreeSet<_>>();
     let unexpected = self
       .ctx
-      .git()?
-      .git()
-      .changed_paths()?
+      .changed_source_paths()?
       .into_iter()
       .filter(|path| !allowed.contains(path))
       .collect::<Vec<_>>();
@@ -1172,7 +1170,7 @@ impl<'a> ReleasePublisher<'a> {
   }
 
   fn write_release_notes_temp(&self, plan: &CrateReleasePlan) -> RailResult<PathBuf> {
-    let dir = self.ctx.workspace_root().join("target/cargo-rail/release-notes");
+    let dir = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("release-notes");
     fs::create_dir_all(&dir).map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
     let path = dir.join(format!("{}.md", sanitize_filename(&plan.tag_name)));
     fs::write(&path, self.release_notes(plan)?)

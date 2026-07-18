@@ -3,26 +3,37 @@
 //! Capture implementations may use Git objects or filesystem reads, but both
 //! produce the same sorted tree representation. Host roots and Git object IDs
 //! are deliberately excluded because they are lookup context, not source identity.
+//! Git worktree capture verifies that Git state, exact source bytes, and file
+//! metadata remain stable across the capture window and fails on concurrent drift.
+//! Filesystem capture walks one declared root twice, applies only caller-supplied
+//! subtree exclusions, and never follows directory symlinks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
+use crate::utils;
 
-/// A normalized UTF-8 path relative to the repository root.
+const GIT_CAPTURE_DRIFT_HELP: &str = "retry after concurrent filesystem and Git operations have finished";
+const FILESYSTEM_CAPTURE_DRIFT_HELP: &str = "retry after concurrent filesystem operations have finished";
+
+/// A normalized UTF-8 path relative to the logical source root.
 ///
-/// Paths use `/` separators, contain no root, prefix, or parent component, and
-/// never represent the repository root itself.
+/// The source root is the Git worktree for Git-backed capture and the declared
+/// Cargo package or workspace root for filesystem-backed capture. Paths use `/`
+/// separators, contain no root, prefix, or parent component, and never represent
+/// the source root itself.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryPath(String);
 
 impl RepositoryPath {
-  /// Normalize and validate a repository-relative path.
+  /// Normalize and validate a source-root-relative path.
   ///
   /// # Errors
   ///
@@ -35,13 +46,13 @@ impl RepositoryPath {
           Component::CurDir => continue,
           Component::ParentDir => {
             return Err(RailError::message(format!(
-              "repository path '{}' must not contain '..'",
+              "source path '{}' must not contain '..'",
               path.display()
             )));
           }
           Component::Prefix(_) | Component::RootDir => {
             return Err(RailError::message(format!(
-              "repository path '{}' must be relative",
+              "source path '{}' must be relative",
               path.display()
             )));
           }
@@ -50,7 +61,7 @@ impl RepositoryPath {
       };
       let component = component
         .to_str()
-        .ok_or_else(|| RailError::message(format!("repository path '{}' is not valid UTF-8", path.display())))?;
+        .ok_or_else(|| RailError::message(format!("source path '{}' is not valid UTF-8", path.display())))?;
       if !normalized.is_empty() {
         normalized.push('/');
       }
@@ -58,7 +69,7 @@ impl RepositoryPath {
     }
 
     if normalized.is_empty() {
-      return Err(RailError::message("repository path must identify an entry"));
+      return Err(RailError::message("source path must identify an entry"));
     }
     Ok(Self(normalized))
   }
@@ -106,7 +117,7 @@ impl fmt::Display for ContentDigest {
   }
 }
 
-/// Canonical state of one repository entry.
+/// Canonical state of one source entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SourceEntryKind {
   /// Exact regular-file contents and executable mode.
@@ -127,10 +138,10 @@ pub enum SourceEntryKind {
   Deleted,
 }
 
-/// One canonical repository-relative source entry.
+/// One canonical source-root-relative entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceTreeEntry {
-  /// Canonical repository-relative path.
+  /// Canonical source-root-relative path.
   pub path: RepositoryPath,
   /// File, symlink, or deletion state.
   pub kind: SourceEntryKind,
@@ -141,7 +152,7 @@ impl SourceTreeEntry {
   ///
   /// # Errors
   ///
-  /// Returns an error when `path` is not canonicalizable as a repository path.
+  /// Returns an error when `path` is not canonicalizable as a source path.
   pub fn regular_file(path: &Path, digest: ContentDigest, executable: bool) -> RailResult<Self> {
     Ok(Self {
       path: RepositoryPath::new(path)?,
@@ -171,7 +182,7 @@ impl SourceTreeEntry {
   ///
   /// # Errors
   ///
-  /// Returns an error when `path` is not canonicalizable as a repository path.
+  /// Returns an error when `path` is not canonicalizable as a source path.
   pub fn deleted(path: &Path) -> RailResult<Self> {
     Ok(Self {
       path: RepositoryPath::new(path)?,
@@ -290,7 +301,7 @@ impl ChangeProvenance {
 /// One final base-to-worktree path change with layer provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceChange {
-  /// Canonical repository-relative path changed in the final tree.
+  /// Canonical source-root-relative path changed in the final tree.
   pub path: RepositoryPath,
   /// Final effect at this path.
   pub kind: SourceChangeKind,
@@ -311,23 +322,130 @@ impl ChangeSet {
   }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SourceExclusions(Vec<RepositoryPath>);
+
+impl SourceExclusions {
+  pub(crate) fn from_absolute_roots(git: &SystemGit, roots: &[PathBuf]) -> RailResult<Self> {
+    let mut exclusions = Self::default();
+    exclusions.extend_absolute_roots(git, roots)?;
+    Ok(exclusions)
+  }
+
+  fn from_filesystem_roots(filesystem_root: &Path, roots: &[PathBuf]) -> RailResult<Self> {
+    let filesystem_root = utils::canonicalize_existing(filesystem_root)?;
+    let mut exclusions = Self::default();
+    for root in roots {
+      let root = if root.is_absolute() {
+        root.clone()
+      } else {
+        filesystem_root.join(root)
+      };
+      match resolve_exclusion_root(&filesystem_root, &root)? {
+        ResolvedExclusionRoot::Outside => {}
+        ResolvedExclusionRoot::Boundary => {
+          return Err(RailError::with_help(
+            format!(
+              "ignored source root '{}' resolves to the filesystem source root",
+              root.display()
+            ),
+            "ignore only generated subdirectories or select a narrower source root",
+          ));
+        }
+        ResolvedExclusionRoot::Descendant(path) => exclusions.insert(path),
+      }
+    }
+    Ok(exclusions)
+  }
+
+  fn extend_absolute_roots(&mut self, git: &SystemGit, roots: &[PathBuf]) -> RailResult<()> {
+    let worktree_root = utils::canonicalize_existing(&git.worktree_root)?;
+    for root in roots {
+      match resolve_exclusion_root(&worktree_root, root)? {
+        ResolvedExclusionRoot::Outside => {}
+        ResolvedExclusionRoot::Boundary => {
+          return Err(RailError::with_help(
+            format!(
+              "generated-state root '{}' resolves to the Git worktree root",
+              root.display()
+            ),
+            "configure Cargo build output below or outside the repository root",
+          ));
+        }
+        ResolvedExclusionRoot::Descendant(path) => self.insert(path),
+      }
+    }
+    self.0.sort_unstable();
+    Ok(())
+  }
+
+  fn insert(&mut self, path: RepositoryPath) {
+    if self.contains(&path) {
+      return;
+    }
+    self.0.retain(|existing| !path_is_within(existing, &path));
+    self.0.push(path);
+    self.0.sort_unstable();
+  }
+
+  fn contains(&self, path: &RepositoryPath) -> bool {
+    self.0.iter().any(|root| path_is_within(path, root))
+  }
+
+  pub(crate) fn contains_path(&self, path: &Path) -> RailResult<bool> {
+    Ok(self.contains(&RepositoryPath::new(path)?))
+  }
+}
+
+enum ResolvedExclusionRoot {
+  Outside,
+  Boundary,
+  Descendant(RepositoryPath),
+}
+
+fn resolve_exclusion_root(boundary: &Path, root: &Path) -> RailResult<ResolvedExclusionRoot> {
+  if let Ok(relative) = root.strip_prefix(boundary) {
+    if relative.as_os_str().is_empty() {
+      return Ok(ResolvedExclusionRoot::Boundary);
+    }
+    if let Ok(relative) = RepositoryPath::new(relative) {
+      return Ok(ResolvedExclusionRoot::Descendant(relative));
+    }
+  }
+
+  let resolved_root = utils::canonicalize_allow_missing(root)?;
+  let Ok(relative) = resolved_root.strip_prefix(boundary) else {
+    return Ok(ResolvedExclusionRoot::Outside);
+  };
+  if relative.as_os_str().is_empty() {
+    return Ok(ResolvedExclusionRoot::Boundary);
+  }
+  Ok(ResolvedExclusionRoot::Descendant(RepositoryPath::new(relative)?))
+}
+
+fn path_is_within(path: &RepositoryPath, root: &RepositoryPath) -> bool {
+  path == root || path.as_path().starts_with(root.as_path())
+}
+
 /// Canonical source state and the backend that captured it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSnapshot {
   /// Source captured from Git object and worktree state.
   GitBacked(SourceTree),
-  /// Source captured directly from declared filesystem roots.
+  /// Source captured directly from one declared filesystem root.
   FilesystemBacked(SourceTree),
 }
 
-/// One immutable pre-metadata Git worktree capture.
+/// One immutable Git worktree capture.
 ///
-/// The canonical tree and layer state are captured together so later planner
-/// views cannot mistake Cargo or cargo-rail outputs for source inputs.
+/// The canonical tree and layer state are captured together. Workspace-aware
+/// callers additionally exclude their resolved generated-state roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeCapture {
   snapshot: SourceSnapshot,
-  status: WorktreeStatus,
+  state: GitCaptureState,
+  filesystem: Vec<FilesystemObservation>,
+  exclusions: SourceExclusions,
 }
 
 impl GitWorktreeCapture {
@@ -335,17 +453,43 @@ impl GitWorktreeCapture {
   ///
   /// # Errors
   ///
-  /// Returns an error when Git state is malformed, a path is not canonical
-  /// UTF-8, an index is unmerged, an entry type is unsupported, or a file
-  /// cannot be read completely.
+  /// Returns an error when Git state is malformed or changes during capture, a
+  /// path is not canonical UTF-8, an index is unmerged, an entry type is
+  /// unsupported, or source bytes or metadata cannot be read consistently.
   pub fn capture(git: &SystemGit) -> RailResult<Self> {
-    let index = read_index(git)?;
-    let status = read_worktree_status(git)?;
-    let tree = capture_final_tree(git, index, &status.untracked)?;
+    Self::capture_excluding(git, &[])
+  }
+
+  pub(crate) fn capture_excluding(git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<Self> {
+    let exclusions = SourceExclusions::from_absolute_roots(git, generated_roots)?;
+    let state = read_git_capture_state(git, &exclusions)?;
+    let (tree, filesystem) = capture_final_tree(git, &state.index, &state.status.untracked)?;
+    ensure_git_capture_state_unchanged(git, &state, &exclusions)?;
+    validate_filesystem_observations(&git.worktree_root, &tree, &filesystem)?;
     Ok(Self {
       snapshot: SourceSnapshot::GitBacked(tree),
-      status,
+      state,
+      filesystem,
+      exclusions,
     })
+  }
+
+  pub(crate) fn exclude_generated_roots(&mut self, git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<()> {
+    self.exclusions.extend_absolute_roots(git, generated_roots)?;
+    self.snapshot.retain(|entry| !self.exclusions.contains(&entry.path));
+    self.state.index.retain(|entry| !self.exclusions.contains(&entry.path));
+    self
+      .state
+      .status
+      .provenance
+      .retain(|path, _| !self.exclusions.contains(path));
+    self
+      .state
+      .status
+      .untracked
+      .retain(|path| !self.exclusions.contains(path));
+    self.filesystem.retain(|entry| !self.exclusions.contains(&entry.path));
+    Ok(())
   }
 
   /// Return the immutable canonical source snapshot.
@@ -360,17 +504,22 @@ impl GitWorktreeCapture {
   /// Returns an error when `base` cannot be resolved or Git emits malformed or
   /// unsupported diff state.
   pub fn changes_from(&self, git: &SystemGit, base: &str) -> RailResult<ChangeSet> {
-    let mut final_changes = read_diff(git, base, None)?;
-    if !self.status.untracked.is_empty() {
-      let base_tree = capture_git_tree(git, base)?;
-      final_changes = merge_untracked_changes(final_changes, &self.status.untracked, &base_tree, self.snapshot.tree())?;
+    let mut final_changes = read_diff(git, base, None, &self.exclusions)?;
+    if !self.state.status.untracked.is_empty() {
+      let base_tree = capture_git_tree(git, base, &self.exclusions)?;
+      final_changes = merge_untracked_changes(
+        final_changes,
+        &self.state.status.untracked,
+        &base_tree,
+        self.snapshot.tree(),
+      )?;
     }
 
-    let mut provenance = self.status.provenance.clone();
+    let mut provenance = self.state.status.provenance.clone();
     if provenance.is_empty() {
       mark_provenance(&mut provenance, &final_changes, ChangeLayer::Committed);
     } else {
-      let committed = read_diff(git, base, Some("HEAD"))?;
+      let committed = read_diff(git, base, Some("HEAD"), &self.exclusions)?;
       mark_provenance(&mut provenance, &committed, ChangeLayer::Committed);
       for change in &final_changes {
         if !provenance.contains_key(&change.path) {
@@ -393,6 +542,57 @@ impl SourceSnapshot {
     }
   }
 
+  fn retain(&mut self, mut predicate: impl FnMut(&SourceTreeEntry) -> bool) {
+    match self {
+      Self::GitBacked(tree) | Self::FilesystemBacked(tree) => tree.0.retain(&mut predicate),
+    }
+  }
+
+  /// Capture one declared Cargo package or workspace root without Git.
+  ///
+  /// The walk is bounded to `root`. Each path in `ignored_roots` excludes that
+  /// exact subtree; relative paths are resolved from `root`, and paths outside
+  /// `root` have no effect. Git ignore files and ambient ignore configuration
+  /// are deliberately not interpreted.
+  ///
+  /// Symbolic links are retained as entries and never traversed. The complete
+  /// walk is repeated, including exact file hashing and metadata checks, and no
+  /// snapshot is returned if the two captures differ.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when `root` is not a readable directory, an ignored root
+  /// would exclude the entire source boundary, a path or link target is not
+  /// UTF-8, an entry type is unsupported, or source state changes during capture.
+  pub fn capture_filesystem(root: &Path, ignored_roots: &[PathBuf]) -> RailResult<Self> {
+    let root = utils::canonicalize_existing(root).map_err(|error| {
+      RailError::message(format!(
+        "failed to resolve filesystem source root '{}': {}",
+        root.display(),
+        error
+      ))
+    })?;
+    let metadata = fs::symlink_metadata(&root).map_err(|error| {
+      RailError::message(format!(
+        "failed to inspect filesystem source root '{}': {}",
+        root.display(),
+        error
+      ))
+    })?;
+    if !metadata.is_dir() {
+      return Err(RailError::with_help(
+        format!("filesystem source root '{}' is not a directory", root.display()),
+        "select a Cargo package or workspace directory",
+      ));
+    }
+
+    let exclusions = SourceExclusions::from_filesystem_roots(&root, ignored_roots)?;
+    let captured = capture_filesystem_tree(&root, &exclusions)?;
+    let repeated = capture_filesystem_tree(&root, &exclusions)?;
+    ensure_filesystem_tree_unchanged(&captured, &repeated)?;
+    Ok(Self::FilesystemBacked(captured.tree))
+  }
+
   /// Capture the final Git worktree and changes from `base` to that tree.
   ///
   /// The final tree is built from the current index, tracked filesystem state,
@@ -401,9 +601,9 @@ impl SourceSnapshot {
   ///
   /// # Errors
   ///
-  /// Returns an error when Git state is malformed, a source path is not
-  /// canonical UTF-8, an index is unmerged, an entry type is unsupported, or a
-  /// file cannot be read completely.
+  /// Returns an error when Git state is malformed or changes during capture, a
+  /// source path is not canonical UTF-8, an index is unmerged, an entry type is
+  /// unsupported, or source bytes or metadata cannot be read consistently.
   pub fn capture_git_worktree(git: &SystemGit, base: &str) -> RailResult<(Self, ChangeSet)> {
     let capture = GitWorktreeCapture::capture(git)?;
     let changes = capture.changes_from(git, base)?;
@@ -417,7 +617,7 @@ enum IndexKind {
   Symlink,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexEntry {
   path: RepositoryPath,
   object_id: String,
@@ -445,12 +645,118 @@ struct WorktreeStatus {
   untracked: Vec<RepositoryPath>,
 }
 
-fn read_index(git: &SystemGit) -> RailResult<Vec<IndexEntry>> {
-  let output = git.run_git_at_worktree_root(&["ls-files", "-v", "--stage", "-z"])?;
-  parse_index(&output.stdout)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCaptureState {
+  head: String,
+  index: Vec<IndexEntry>,
+  status: WorktreeStatus,
 }
 
-fn parse_index(output: &[u8]) -> RailResult<Vec<IndexEntry>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemEntryType {
+  RegularFile,
+  Symlink,
+  Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesystemMetadata {
+  entry_type: FilesystemEntryType,
+  len: u64,
+  modified: SystemTime,
+  readonly: bool,
+  #[cfg(unix)]
+  device: u64,
+  #[cfg(unix)]
+  inode: u64,
+  #[cfg(unix)]
+  mode: u32,
+  #[cfg(unix)]
+  changed_seconds: i64,
+  #[cfg(unix)]
+  changed_nanoseconds: i64,
+  #[cfg(windows)]
+  file_attributes: u32,
+  #[cfg(windows)]
+  creation_time: u64,
+  #[cfg(windows)]
+  last_write_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilesystemObservation {
+  path: RepositoryPath,
+  index_kind: Option<IndexKind>,
+  metadata: FilesystemMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryObservation {
+  path: PathBuf,
+  metadata: FilesystemMetadata,
+}
+
+#[derive(Debug)]
+struct CapturedFilesystemTree {
+  tree: SourceTree,
+  files: Vec<FilesystemObservation>,
+  directories: Vec<DirectoryObservation>,
+}
+
+#[derive(Debug)]
+struct CapturedFilesystemEntry {
+  entry: SourceTreeEntry,
+  observation: FilesystemObservation,
+}
+
+fn read_git_capture_state(git: &SystemGit, exclusions: &SourceExclusions) -> RailResult<GitCaptureState> {
+  Ok(GitCaptureState {
+    head: git.head_commit()?,
+    index: read_index(git, exclusions)?,
+    status: read_worktree_status(git, exclusions)?,
+  })
+}
+
+fn ensure_git_capture_state_unchanged(
+  git: &SystemGit,
+  expected: &GitCaptureState,
+  exclusions: &SourceExclusions,
+) -> RailResult<()> {
+  // Read status first so a Git filter or filesystem monitor that mutates the
+  // index or HEAD is still observed by the subsequent identity reads.
+  let status = read_worktree_status(git, exclusions)?;
+  let index = read_index(git, exclusions)?;
+  let head = git.head_commit()?;
+  if head != expected.head {
+    return Err(capture_drift_error("Git HEAD changed during source capture"));
+  }
+  if index != expected.index {
+    return Err(capture_drift_error("Git index changed during source capture"));
+  }
+  if status != expected.status {
+    return Err(capture_drift_error("Git worktree status changed during source capture"));
+  }
+  Ok(())
+}
+
+fn capture_drift_error(message: impl Into<String>) -> RailError {
+  RailError::with_help(message, GIT_CAPTURE_DRIFT_HELP)
+}
+
+fn filesystem_capture_drift_error(message: impl Into<String>) -> RailError {
+  RailError::with_help(message, FILESYSTEM_CAPTURE_DRIFT_HELP)
+}
+
+fn capture_drift_error_with_help(message: impl Into<String>, help: &'static str) -> RailError {
+  RailError::with_help(message, help)
+}
+
+fn read_index(git: &SystemGit, exclusions: &SourceExclusions) -> RailResult<Vec<IndexEntry>> {
+  let output = git.run_git_at_worktree_root(&["ls-files", "-v", "--stage", "-z"])?;
+  parse_index(&output.stdout, exclusions)
+}
+
+fn parse_index(output: &[u8], exclusions: &SourceExclusions) -> RailResult<Vec<IndexEntry>> {
   let mut entries = Vec::new();
   for record in output.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
     let flag = *record
@@ -482,6 +788,9 @@ fn parse_index(output: &[u8]) -> RailResult<Vec<IndexEntry>> {
     let raw_path =
       std::str::from_utf8(&record[tab + 1..]).map_err(|_| RailError::message("git index path is not valid UTF-8"))?;
     let path = RepositoryPath::new(Path::new(raw_path))?;
+    if exclusions.contains(&path) {
+      continue;
+    }
     if flag.is_ascii_lowercase() {
       return Err(RailError::with_help(
         format!("cannot capture assume-unchanged index entry '{}'", path),
@@ -524,12 +833,12 @@ fn parse_index(output: &[u8]) -> RailResult<Vec<IndexEntry>> {
   Ok(entries)
 }
 
-fn read_worktree_status(git: &SystemGit) -> RailResult<WorktreeStatus> {
+fn read_worktree_status(git: &SystemGit, exclusions: &SourceExclusions) -> RailResult<WorktreeStatus> {
   let output = git.run_git_at_worktree_root(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
-  parse_worktree_status(&output.stdout)
+  parse_worktree_status(&output.stdout, exclusions)
 }
 
-fn parse_worktree_status(output: &[u8]) -> RailResult<WorktreeStatus> {
+fn parse_worktree_status(output: &[u8], exclusions: &SourceExclusions) -> RailResult<WorktreeStatus> {
   let mut status = WorktreeStatus::default();
   let mut records = output.split(|byte| *byte == 0).filter(|record| !record.is_empty());
   while let Some(record) = records.next() {
@@ -540,7 +849,7 @@ fn parse_worktree_status(output: &[u8]) -> RailResult<WorktreeStatus> {
         if fields.len() != 9 || fields[1].len() != 2 {
           return Err(RailError::message("invalid Git porcelain-v2 ordinary record"));
         }
-        mark_status_path(&mut status, fields[8], fields[1])?;
+        mark_status_path(&mut status, fields[8], fields[1], exclusions)?;
       }
       Some(b'2') => {
         let fields: Vec<&str> = text.splitn(10, ' ').collect();
@@ -552,11 +861,14 @@ fn parse_worktree_status(output: &[u8]) -> RailResult<WorktreeStatus> {
           .ok_or_else(|| RailError::message("invalid Git porcelain-v2 rename record: missing original path"))?;
         let original =
           std::str::from_utf8(original).map_err(|_| RailError::message("Git rename source path is not valid UTF-8"))?;
-        mark_status_path(&mut status, fields[9], fields[1])?;
-        mark_status_path(&mut status, original, fields[1])?;
+        mark_status_path(&mut status, fields[9], fields[1], exclusions)?;
+        mark_status_path(&mut status, original, fields[1], exclusions)?;
       }
       Some(b'?') if record.get(1) == Some(&b' ') => {
         let path = RepositoryPath::new(Path::new(&text[2..]))?;
+        if exclusions.contains(&path) {
+          continue;
+        }
         status
           .provenance
           .entry(path.clone())
@@ -566,6 +878,9 @@ fn parse_worktree_status(output: &[u8]) -> RailResult<WorktreeStatus> {
       }
       Some(b'u') => {
         let path = text.splitn(11, ' ').nth(10).unwrap_or("unknown");
+        if RepositoryPath::new(Path::new(path)).is_ok_and(|path| exclusions.contains(&path)) {
+          continue;
+        }
         return Err(RailError::with_help(
           format!("cannot capture worktree with unmerged path '{}'", path),
           "resolve the index conflict and stage the resolution before retrying",
@@ -579,8 +894,16 @@ fn parse_worktree_status(output: &[u8]) -> RailResult<WorktreeStatus> {
   Ok(status)
 }
 
-fn mark_status_path(status: &mut WorktreeStatus, raw_path: &str, xy: &str) -> RailResult<()> {
+fn mark_status_path(
+  status: &mut WorktreeStatus,
+  raw_path: &str,
+  xy: &str,
+  exclusions: &SourceExclusions,
+) -> RailResult<()> {
   let path = RepositoryPath::new(Path::new(raw_path))?;
+  if exclusions.contains(&path) {
+    return Ok(());
+  }
   let bytes = xy.as_bytes();
   let provenance = status.provenance.entry(path).or_default();
   if bytes[0] != b'.' {
@@ -592,9 +915,185 @@ fn mark_status_path(status: &mut WorktreeStatus, raw_path: &str, xy: &str) -> Ra
   Ok(())
 }
 
-fn capture_final_tree(git: &SystemGit, index: Vec<IndexEntry>, untracked: &[RepositoryPath]) -> RailResult<SourceTree> {
+fn capture_filesystem_tree(root: &Path, exclusions: &SourceExclusions) -> RailResult<CapturedFilesystemTree> {
+  let mut entries = Vec::new();
+  let mut files = Vec::new();
+  let mut directories = Vec::new();
+  let mut pending_directories = vec![PathBuf::new()];
+  let mut validated_directories = BTreeSet::new();
+
+  while let Some(relative_directory) = pending_directories.pop() {
+    let absolute_directory = root.join(&relative_directory);
+    let display_path = if relative_directory.as_os_str().is_empty() {
+      Path::new(".")
+    } else {
+      relative_directory.as_path()
+    };
+    let before = fs::symlink_metadata(&absolute_directory).map_err(|error| {
+      filesystem_capture_drift_error(format!(
+        "source directory '{}' changed during capture: {}",
+        display_path.display(),
+        error
+      ))
+    })?;
+    let before = FilesystemMetadata::from_metadata(display_path, &before)?;
+    if before.entry_type != FilesystemEntryType::Directory {
+      return Err(filesystem_capture_drift_error(format!(
+        "source directory '{}' changed type during capture",
+        display_path.display()
+      )));
+    }
+
+    let mut children = Vec::new();
+    let directory = fs::read_dir(&absolute_directory).map_err(|error| {
+      RailError::message(format!(
+        "failed to read source directory '{}': {}",
+        display_path.display(),
+        error
+      ))
+    })?;
+    for child in directory {
+      let child = child.map_err(|error| {
+        RailError::message(format!(
+          "failed to read an entry in source directory '{}': {}",
+          display_path.display(),
+          error
+        ))
+      })?;
+      children.push(relative_directory.join(child.file_name()));
+    }
+    children.sort_unstable();
+
+    let after = fs::symlink_metadata(&absolute_directory).map_err(|error| {
+      filesystem_capture_drift_error(format!(
+        "source directory '{}' changed during capture: {}",
+        display_path.display(),
+        error
+      ))
+    })?;
+    let after = FilesystemMetadata::from_metadata(display_path, &after)?;
+    if before != after {
+      return Err(filesystem_capture_drift_error(format!(
+        "source directory metadata for '{}' changed during capture",
+        display_path.display()
+      )));
+    }
+    directories.push(DirectoryObservation {
+      path: relative_directory,
+      metadata: before,
+    });
+
+    for child in children.into_iter().rev() {
+      let path = RepositoryPath::new(&child)?;
+      if exclusions.contains(&path) {
+        continue;
+      }
+      let absolute = root.join(&child);
+      let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+        filesystem_capture_drift_error(format!("source '{}' changed during capture: {}", path, error))
+      })?;
+      if metadata.is_dir() {
+        pending_directories.push(child);
+        continue;
+      }
+      let captured = capture_filesystem_entry(
+        root,
+        &path,
+        None,
+        &mut validated_directories,
+        FILESYSTEM_CAPTURE_DRIFT_HELP,
+      )?
+      .ok_or_else(|| filesystem_capture_drift_error(format!("source '{}' disappeared during capture", path)))?;
+      entries.push(captured.entry);
+      files.push(captured.observation);
+    }
+  }
+
+  files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+  directories.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+  Ok(CapturedFilesystemTree {
+    tree: SourceTree::new(entries)?,
+    files,
+    directories,
+  })
+}
+
+fn ensure_filesystem_tree_unchanged(
+  expected: &CapturedFilesystemTree,
+  current: &CapturedFilesystemTree,
+) -> RailResult<()> {
+  if expected.tree != current.tree {
+    let path = expected
+      .tree
+      .entries()
+      .iter()
+      .zip(current.tree.entries())
+      .find(|(left, right)| left != right)
+      .map(|(left, right)| left.path.clone().min(right.path.clone()))
+      .or_else(|| {
+        expected
+          .tree
+          .entries()
+          .get(current.tree.entries().len())
+          .or_else(|| current.tree.entries().get(expected.tree.entries().len()))
+          .map(|entry| entry.path.clone())
+      });
+    let message = path.map_or_else(
+      || "filesystem source tree changed during capture".to_string(),
+      |path| format!("source file '{}' changed during capture", path),
+    );
+    return Err(filesystem_capture_drift_error(message));
+  }
+
+  if let Some(observation) = expected
+    .files
+    .iter()
+    .zip(&current.files)
+    .find_map(|(left, right)| (left != right).then_some(left))
+  {
+    return Err(filesystem_capture_drift_error(format!(
+      "source metadata for '{}' changed during capture",
+      observation.path
+    )));
+  }
+  if expected.files.len() != current.files.len() {
+    return Err(filesystem_capture_drift_error(
+      "filesystem source files changed during capture",
+    ));
+  }
+
+  if let Some(observation) = expected
+    .directories
+    .iter()
+    .zip(&current.directories)
+    .find_map(|(left, right)| (left != right).then_some(left))
+  {
+    return Err(filesystem_capture_drift_error(format!(
+      "source directory metadata for '{}' changed during capture",
+      if observation.path.as_os_str().is_empty() {
+        Path::new(".")
+      } else {
+        observation.path.as_path()
+      }
+      .display()
+    )));
+  }
+  if expected.directories.len() != current.directories.len() {
+    return Err(filesystem_capture_drift_error(
+      "filesystem source directories changed during capture",
+    ));
+  }
+  Ok(())
+}
+
+fn capture_final_tree(
+  git: &SystemGit,
+  index: &[IndexEntry],
+  untracked: &[RepositoryPath],
+) -> RailResult<(SourceTree, Vec<FilesystemObservation>)> {
   let mut entries = Vec::with_capacity(index.len() + untracked.len());
   let mut sparse = Vec::new();
+  let mut filesystem = Vec::with_capacity(index.len() + untracked.len());
   let mut validated_directories = BTreeSet::new();
 
   for indexed in index {
@@ -603,16 +1102,27 @@ fn capture_final_tree(git: &SystemGit, index: Vec<IndexEntry>, untracked: &[Repo
       &indexed.path,
       Some(indexed.kind),
       &mut validated_directories,
+      GIT_CAPTURE_DRIFT_HELP,
     )? {
-      Some(entry) => entries.push(entry),
+      Some(captured) => {
+        entries.push(captured.entry);
+        filesystem.push(captured.observation);
+      }
       None if indexed.skip_worktree => sparse.push(indexed),
       None => {}
     }
   }
   for path in untracked {
-    let entry = capture_filesystem_entry(&git.worktree_root, path, None, &mut validated_directories)?
-      .ok_or_else(|| RailError::message(format!("untracked source '{}' disappeared during capture", path)))?;
-    entries.push(entry);
+    let captured = capture_filesystem_entry(
+      &git.worktree_root,
+      path,
+      None,
+      &mut validated_directories,
+      GIT_CAPTURE_DRIFT_HELP,
+    )?
+    .ok_or_else(|| RailError::message(format!("untracked source '{}' disappeared during capture", path)))?;
+    entries.push(captured.entry);
+    filesystem.push(captured.observation);
   }
 
   if !sparse.is_empty() {
@@ -620,16 +1130,16 @@ fn capture_final_tree(git: &SystemGit, index: Vec<IndexEntry>, untracked: &[Repo
     let blobs = git.read_blobs_bulk(&object_ids)?;
     for (indexed, bytes) in sparse.into_iter().zip(blobs) {
       crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
-      entries.push(entry_from_bytes(indexed.path, indexed.kind, &bytes)?);
+      entries.push(entry_from_bytes(indexed.path.clone(), indexed.kind, &bytes)?);
     }
   }
 
-  SourceTree::new(entries)
+  Ok((SourceTree::new(entries)?, filesystem))
 }
 
-fn capture_git_tree(git: &SystemGit, revision: &str) -> RailResult<SourceTree> {
+fn capture_git_tree(git: &SystemGit, revision: &str, exclusions: &SourceExclusions) -> RailResult<SourceTree> {
   let output = git.run_git_at_worktree_root(&["ls-tree", "-r", "-z", "--full-tree", "--end-of-options", revision])?;
-  let objects = parse_git_tree(&output.stdout)?;
+  let objects = parse_git_tree(&output.stdout, exclusions)?;
   let object_ids: Vec<&str> = objects.iter().map(|entry| entry.object_id.as_str()).collect();
   let blobs = git.read_blobs_bulk(&object_ids)?;
   let mut entries = Vec::with_capacity(objects.len());
@@ -640,7 +1150,7 @@ fn capture_git_tree(git: &SystemGit, revision: &str) -> RailResult<SourceTree> {
   SourceTree::new(entries)
 }
 
-fn parse_git_tree(output: &[u8]) -> RailResult<Vec<GitTreeEntry>> {
+fn parse_git_tree(output: &[u8], exclusions: &SourceExclusions) -> RailResult<Vec<GitTreeEntry>> {
   let mut entries = Vec::new();
   for record in output.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
     let tab = record
@@ -665,6 +1175,9 @@ fn parse_git_tree(output: &[u8]) -> RailResult<Vec<GitTreeEntry>> {
     let raw_path =
       std::str::from_utf8(&record[tab + 1..]).map_err(|_| RailError::message("Git tree path is not valid UTF-8"))?;
     let path = RepositoryPath::new(Path::new(raw_path))?;
+    if exclusions.contains(&path) {
+      continue;
+    }
     let kind = match (mode, object_type) {
       ("100644", "blob") => IndexKind::RegularFile { executable: false },
       ("100755", "blob") => IndexKind::RegularFile { executable: true },
@@ -696,7 +1209,8 @@ fn capture_filesystem_entry(
   path: &RepositoryPath,
   index_kind: Option<IndexKind>,
   validated_directories: &mut BTreeSet<PathBuf>,
-) -> RailResult<Option<SourceTreeEntry>> {
+  drift_help: &'static str,
+) -> RailResult<Option<CapturedFilesystemEntry>> {
   reject_symlink_ancestors(root, path, validated_directories)?;
   let absolute = root.join(path.as_path());
   let metadata = match fs::symlink_metadata(&absolute) {
@@ -709,13 +1223,13 @@ fn capture_filesystem_entry(
       )));
     }
   };
+  let before = FilesystemMetadata::from_metadata(path.as_path(), &metadata)?;
 
-  if metadata.file_type().is_symlink() {
+  let entry = if metadata.file_type().is_symlink() {
     let target = fs::read_link(&absolute)
       .map_err(|error| RailError::message(format!("failed to read symlink '{}': {}", path, error)))?;
-    return SourceTreeEntry::symlink(path.as_path(), &target).map(Some);
-  }
-  if metadata.is_file() {
+    SourceTreeEntry::symlink(path.as_path(), &target)?
+  } else if metadata.is_file() {
     let bytes = fs::read(&absolute)
       .map_err(|error| RailError::message(format!("failed to read source file '{}': {}", path, error)))?;
     crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
@@ -724,17 +1238,152 @@ fn capture_filesystem_entry(
     if matches!(index_kind, Some(IndexKind::Symlink)) {
       let target = std::str::from_utf8(&bytes)
         .map_err(|_| RailError::message(format!("symlink target at '{}' is not valid UTF-8", path)))?;
-      return SourceTreeEntry::symlink(path.as_path(), Path::new(target)).map(Some);
+      let entry = SourceTreeEntry::symlink(path.as_path(), Path::new(target))?;
+      return finish_filesystem_capture(&absolute, path, index_kind, before, entry, drift_help).map(Some);
     }
 
     let executable = executable_mode(&metadata, index_kind);
-    return SourceTreeEntry::regular_file(path.as_path(), ContentDigest::sha256(&bytes), executable).map(Some);
-  }
+    SourceTreeEntry::regular_file(path.as_path(), ContentDigest::sha256(&bytes), executable)?
+  } else {
+    return Err(RailError::with_help(
+      format!("cannot capture unsupported filesystem object '{}'", path),
+      "replace it with a regular file or symbolic link before retrying",
+    ));
+  };
 
-  Err(RailError::with_help(
-    format!("cannot capture unsupported filesystem object '{}'", path),
-    "replace it with a regular file or symbolic link before retrying",
-  ))
+  finish_filesystem_capture(&absolute, path, index_kind, before, entry, drift_help).map(Some)
+}
+
+fn finish_filesystem_capture(
+  absolute: &Path,
+  path: &RepositoryPath,
+  index_kind: Option<IndexKind>,
+  before: FilesystemMetadata,
+  entry: SourceTreeEntry,
+  drift_help: &'static str,
+) -> RailResult<CapturedFilesystemEntry> {
+  let after = fs::symlink_metadata(absolute).map_err(|error| {
+    capture_drift_error_with_help(
+      format!("source '{}' changed while it was being read: {}", path, error),
+      drift_help,
+    )
+  })?;
+  let after = FilesystemMetadata::from_metadata(path.as_path(), &after)?;
+  if before != after {
+    return Err(capture_drift_error_with_help(
+      format!("source metadata for '{}' changed while it was being read", path),
+      drift_help,
+    ));
+  }
+  Ok(CapturedFilesystemEntry {
+    entry,
+    observation: FilesystemObservation {
+      path: path.clone(),
+      index_kind,
+      metadata: before,
+    },
+  })
+}
+
+impl FilesystemMetadata {
+  fn from_metadata(path: &Path, metadata: &fs::Metadata) -> RailResult<Self> {
+    let entry_type = if metadata.file_type().is_symlink() {
+      FilesystemEntryType::Symlink
+    } else if metadata.is_file() {
+      FilesystemEntryType::RegularFile
+    } else if metadata.is_dir() {
+      FilesystemEntryType::Directory
+    } else {
+      return Err(RailError::with_help(
+        format!("cannot capture unsupported filesystem object '{}'", path.display()),
+        "replace it with a regular file or symbolic link before retrying",
+      ));
+    };
+    let modified = metadata.modified().map_err(|error| {
+      RailError::message(format!(
+        "failed to read source metadata for '{}': {}",
+        path.display(),
+        error
+      ))
+    })?;
+
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::MetadataExt as _;
+      Ok(Self {
+        entry_type,
+        len: metadata.len(),
+        modified,
+        readonly: metadata.permissions().readonly(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+      })
+    }
+
+    #[cfg(windows)]
+    {
+      use std::os::windows::fs::MetadataExt as _;
+      Ok(Self {
+        entry_type,
+        len: metadata.len(),
+        modified,
+        readonly: metadata.permissions().readonly(),
+        file_attributes: metadata.file_attributes(),
+        creation_time: metadata.creation_time(),
+        last_write_time: metadata.last_write_time(),
+      })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+      Ok(Self {
+        entry_type,
+        len: metadata.len(),
+        modified,
+        readonly: metadata.permissions().readonly(),
+      })
+    }
+  }
+}
+
+fn validate_filesystem_observations(
+  root: &Path,
+  tree: &SourceTree,
+  observations: &[FilesystemObservation],
+) -> RailResult<()> {
+  let mut validated_directories = BTreeSet::new();
+  for expected in observations {
+    let current = capture_filesystem_entry(
+      root,
+      &expected.path,
+      expected.index_kind,
+      &mut validated_directories,
+      GIT_CAPTURE_DRIFT_HELP,
+    )?
+    .ok_or_else(|| capture_drift_error(format!("source '{}' disappeared during capture", expected.path)))?;
+    let captured = tree_entry(tree, &expected.path).ok_or_else(|| {
+      RailError::message(format!(
+        "captured source '{}' is absent from the final tree",
+        expected.path
+      ))
+    })?;
+    if current.entry.kind != captured.kind {
+      return Err(capture_drift_error(format!(
+        "source file '{}' changed during capture",
+        expected.path
+      )));
+    }
+    if current.observation.metadata != expected.metadata {
+      return Err(capture_drift_error(format!(
+        "source metadata for '{}' changed during capture",
+        expected.path
+      )));
+    }
+  }
+  Ok(())
 }
 
 fn reject_symlink_ancestors(
@@ -806,7 +1455,12 @@ fn entry_from_bytes(path: RepositoryPath, kind: IndexKind, bytes: &[u8]) -> Rail
   }
 }
 
-fn read_diff(git: &SystemGit, base: &str, head: Option<&str>) -> RailResult<Vec<ParsedChange>> {
+fn read_diff(
+  git: &SystemGit,
+  base: &str,
+  head: Option<&str>,
+  exclusions: &SourceExclusions,
+) -> RailResult<Vec<ParsedChange>> {
   let mut args = vec![
     "diff",
     "--name-status",
@@ -822,7 +1476,20 @@ fn read_diff(git: &SystemGit, base: &str, head: Option<&str>) -> RailResult<Vec<
   }
   args.push("--");
   let output = git.run_git_at_worktree_root(&args)?;
-  parse_name_status(&output.stdout)
+  let mut changes = parse_name_status(&output.stdout)?;
+  changes.retain(|change| !exclusions.contains(&change.path));
+  for change in &mut changes {
+    let related_path = match &change.relation {
+      Some(ChangeRelation::RenamedFrom(path) | ChangeRelation::RenamedTo(path) | ChangeRelation::CopiedFrom(path)) => {
+        Some(path)
+      }
+      None => None,
+    };
+    if related_path.is_some_and(|path| exclusions.contains(path)) {
+      change.relation = None;
+    }
+  }
+  Ok(changes)
 }
 
 fn parse_name_status(output: &[u8]) -> RailResult<Vec<ParsedChange>> {
@@ -1168,11 +1835,121 @@ mod tests {
   }
 
   #[test]
+  fn capture_rejects_head_index_and_status_drift_independently() {
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::git::init_repo(temp.path(), "main").unwrap();
+    let git = SystemGit::open(temp.path()).unwrap();
+    git.set_config("user.name", "Test User").unwrap();
+    git.set_config("user.email", "test@example.com").unwrap();
+    fs::write(temp.path().join("tracked.txt"), "before\n").unwrap();
+    git.stage_all().unwrap();
+    git.commit("initial").unwrap();
+    let exclusions = SourceExclusions::default();
+
+    let clean = read_git_capture_state(&git, &exclusions).unwrap();
+    fs::write(temp.path().join("untracked.txt"), "untracked\n").unwrap();
+    let error = ensure_git_capture_state_unchanged(&git, &clean, &exclusions).unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("Git worktree status changed during source capture")
+    );
+    fs::remove_file(temp.path().join("untracked.txt")).unwrap();
+
+    let clean = read_git_capture_state(&git, &exclusions).unwrap();
+    fs::write(temp.path().join("tracked.txt"), "staged\n").unwrap();
+    git.stage_all().unwrap();
+    let error = ensure_git_capture_state_unchanged(&git, &clean, &exclusions).unwrap_err();
+    assert!(error.to_string().contains("Git index changed during source capture"));
+
+    let staged = read_git_capture_state(&git, &exclusions).unwrap();
+    git.commit("change HEAD").unwrap();
+    let error = ensure_git_capture_state_unchanged(&git, &staged, &exclusions).unwrap_err();
+    assert!(error.to_string().contains("Git HEAD changed during source capture"));
+  }
+
+  #[test]
+  fn capture_rejects_exact_content_and_metadata_drift() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = RepositoryPath::new(Path::new("source.txt")).unwrap();
+    let absolute = temp.path().join(path.as_path());
+    fs::write(&absolute, "before!!\n").unwrap();
+
+    let captured = capture_filesystem_entry(temp.path(), &path, None, &mut BTreeSet::new(), GIT_CAPTURE_DRIFT_HELP)
+      .unwrap()
+      .unwrap();
+    let tree = SourceTree::new(vec![captured.entry]).unwrap();
+    let observations = vec![captured.observation];
+    fs::write(&absolute, "after!!!\n").unwrap();
+    let error = validate_filesystem_observations(temp.path(), &tree, &observations).unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("source file 'source.txt' changed during capture")
+    );
+
+    fs::write(&absolute, "stable\n").unwrap();
+    let captured = capture_filesystem_entry(temp.path(), &path, None, &mut BTreeSet::new(), GIT_CAPTURE_DRIFT_HELP)
+      .unwrap()
+      .unwrap();
+    let tree = SourceTree::new(vec![captured.entry]).unwrap();
+    let observations = vec![captured.observation];
+    let original_permissions = fs::metadata(&absolute).unwrap().permissions();
+    let mut changed_permissions = original_permissions.clone();
+    changed_permissions.set_readonly(true);
+    fs::set_permissions(&absolute, changed_permissions).unwrap();
+    let error = validate_filesystem_observations(temp.path(), &tree, &observations).unwrap_err();
+    fs::set_permissions(&absolute, original_permissions).unwrap();
+    assert!(
+      error
+        .to_string()
+        .contains("source metadata for 'source.txt' changed during capture")
+    );
+  }
+
+  #[test]
+  fn filesystem_capture_comparison_rejects_exact_tree_and_directory_drift() {
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::write(temp.path().join("source.txt"), "before!!\n").unwrap();
+    let exclusions = SourceExclusions::default();
+
+    let captured = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
+    fs::write(temp.path().join("source.txt"), "after!!!\n").unwrap();
+    let changed = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
+    let error = ensure_filesystem_tree_unchanged(&captured, &changed).unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("source file 'source.txt' changed during capture")
+    );
+    assert_eq!(error.help_message().as_deref(), Some(FILESYSTEM_CAPTURE_DRIFT_HELP));
+
+    let captured = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
+    fs::create_dir(temp.path().join("new-empty-directory")).unwrap();
+    let changed = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
+    let error = ensure_filesystem_tree_unchanged(&captured, &changed).unwrap_err();
+    assert!(error.to_string().contains("source directory"));
+    assert!(error.to_string().contains("changed during capture"));
+  }
+
+  #[test]
+  fn filesystem_capture_rejects_ignoring_the_declared_root() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let error = SourceSnapshot::capture_filesystem(temp.path(), &[PathBuf::from(".")]).unwrap_err();
+    assert!(error.to_string().contains("resolves to the filesystem source root"));
+    assert_eq!(
+      error.help_message().as_deref(),
+      Some("ignore only generated subdirectories or select a narrower source root")
+    );
+  }
+
+  #[test]
   fn index_parser_retains_modes_and_rejects_unmerged_entries() {
     let parsed = parse_index(
       b"H 100644 1111111111111111111111111111111111111111 0\tsrc/lib.rs\0\
         S 100755 2222222222222222222222222222222222222222 0\tbin/tool\0\
         H 120000 3333333333333333333333333333333333333333 0\tcurrent\0",
+      &SourceExclusions::default(),
     )
     .unwrap();
     assert_eq!(parsed.len(), 3);
@@ -1182,10 +1959,18 @@ mod tests {
     assert!(parsed[1].skip_worktree);
     assert_eq!(parsed[2].kind, IndexKind::Symlink);
 
-    let error = parse_index(b"H 100644 1111111111111111111111111111111111111111 2\tsrc/lib.rs\0").unwrap_err();
+    let error = parse_index(
+      b"H 100644 1111111111111111111111111111111111111111 2\tsrc/lib.rs\0",
+      &SourceExclusions::default(),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("unmerged index entry 'src/lib.rs'"));
 
-    let error = parse_index(b"h 100644 1111111111111111111111111111111111111111 0\tsrc/lib.rs\0").unwrap_err();
+    let error = parse_index(
+      b"h 100644 1111111111111111111111111111111111111111 0\tsrc/lib.rs\0",
+      &SourceExclusions::default(),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("assume-unchanged index entry 'src/lib.rs'"));
   }
 
@@ -1197,6 +1982,7 @@ mod tests {
         1 MM N... 100644 100644 100644 a b both.rs\0\
         2 R. N... 100644 100644 100644 a b R100 new.rs\0old.rs\0\
         ? untracked.rs\0",
+      &SourceExclusions::default(),
     )
     .unwrap();
 

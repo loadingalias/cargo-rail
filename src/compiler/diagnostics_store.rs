@@ -25,9 +25,7 @@ pub struct CompilerDiagnosticsStore {
 impl CompilerDiagnosticsStore {
   /// Load diagnostics store from `target/cargo-rail/cache/compiler-diags-v1.json`.
   pub fn load(workspace_root: &Path) -> Self {
-    let path = workspace_root
-      .join("target")
-      .join("cargo-rail")
+    let path = crate::workspace::cargo_rail_state_root(workspace_root)
       .join("cache")
       .join("compiler-diags-v1.json");
 

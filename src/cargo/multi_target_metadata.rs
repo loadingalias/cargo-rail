@@ -419,14 +419,14 @@ impl MultiTargetMetadata {
 
   /// Check if a dependency is transitive-only (never in direct deps)
   pub fn is_transitive_only(&self, dep_name: &str) -> bool {
-    // Check all workspace packages to see if any directly depend on this
-    let is_direct_dep = self.cache.values().any(|entry| {
-      entry
-        .metadata
-        .workspace_packages()
-        .iter()
-        .any(|pkg| pkg.dependencies.iter().any(|dep| dep.name == dep_name))
-    });
+    // A declaration is not necessarily active: optional and target-specific
+    // entries may be absent from this resolution. Follow exact resolved edges.
+    let is_direct_dep = self
+      .direct_dependencies_by_member
+      .values()
+      .flat_map(|dependencies| dependencies.values())
+      .flatten()
+      .any(|package_id| self.package_names.get(package_id).is_some_and(|name| name == dep_name));
 
     if is_direct_dep {
       return false;
@@ -950,7 +950,95 @@ pub enum MsrvSourceUsed {
 
 #[cfg(test)]
 mod tests {
+  use std::path::Path;
+
   use super::*;
+
+  fn write_test_package(root: &Path, relative: &str, name: &str, dependencies: &str) {
+    let package_root = root.join(relative);
+    std::fs::create_dir_all(package_root.join("src")).expect("test package directory should be created");
+    std::fs::write(
+      package_root.join("Cargo.toml"),
+      format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n{dependencies}"),
+    )
+    .expect("test package manifest should be written");
+    std::fs::write(package_root.join("src/lib.rs"), "pub fn value() {}\n")
+      .expect("test package source should be written");
+  }
+
+  #[test]
+  fn transitive_classification_uses_resolved_edges_not_optional_declarations() {
+    let workspace = tempfile::tempdir().expect("test workspace should be created");
+    std::fs::write(
+      workspace.path().join("Cargo.toml"),
+      "[workspace]\nresolver = \"3\"\nmembers = [\"app\"]\n\
+       exclude = [\"vendor/middle\", \"vendor/shared\"]\n",
+    )
+    .expect("workspace manifest should be written");
+    write_test_package(workspace.path(), "vendor/shared", "shared", "");
+    write_test_package(
+      workspace.path(),
+      "vendor/middle",
+      "middle",
+      "[dependencies]\nshared = { path = \"../shared\" }\n",
+    );
+    write_test_package(
+      workspace.path(),
+      "app",
+      "app",
+      "[dependencies]\n\
+       middle_alias = { package = \"middle\", path = \"../vendor/middle\" }\n\
+       shared = { path = \"../vendor/shared\", optional = true }\n",
+    );
+
+    let metadata = MetadataCommand::new()
+      .current_dir(workspace.path())
+      .other_options(vec!["--offline".into()])
+      .exec()
+      .expect("adversarial workspace metadata should load");
+    let app = metadata
+      .workspace_packages()
+      .into_iter()
+      .find(|package| package.name == "app")
+      .expect("app should be a workspace package");
+    let shared = metadata
+      .packages
+      .iter()
+      .find(|package| package.name == "shared")
+      .expect("shared should be resolved");
+    let resolve = metadata
+      .resolve
+      .as_ref()
+      .expect("full metadata should include a resolve graph");
+    let app_node = resolve
+      .nodes
+      .iter()
+      .find(|node| node.id == app.id)
+      .expect("app should have a resolve node");
+
+    assert!(
+      app
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.name == "shared" && dependency.optional),
+      "fixture must contain the disabled optional declaration"
+    );
+    assert!(
+      app_node.deps.iter().all(|dependency| dependency.pkg != shared.id),
+      "disabled optional declaration must not resolve as an app edge"
+    );
+
+    let metadata = MultiTargetMetadata::load_parallel(Arc::new(metadata), &[])
+      .expect("multi-target metadata should use the canonical resolution");
+    assert!(
+      metadata.is_transitive_only("shared"),
+      "shared is reached only through middle in the resolved graph"
+    );
+    assert!(
+      !metadata.is_transitive_only("middle"),
+      "renamed direct dependencies must remain direct by exact package identity"
+    );
+  }
 
   #[test]
   fn test_parse_rust_version_full() {

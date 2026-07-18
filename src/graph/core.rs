@@ -14,30 +14,52 @@
 //!
 //! - **Directed Graph**: `A → B` means "A depends on B"
 //! - **Nodes**: Packages (workspace members + dependencies)
-//! - **Edges**: Dependency relationships (normal/dev/build)
-//! - **Index**: Fast lookups by crate name / package ID
+//! - **Edges**: Resolved aliases with independent kind and target semantics
+//! - **Index**: Exact package IDs for graph work; package names only for user selection
 //! - **Algorithms**: Shortest paths, reachability, transitive closure
 //! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
 
-use crate::error::{RailError, RailResult};
-use cargo_metadata::DependencyKind;
-use petgraph::Direction;
-use petgraph::algo::toposort;
-use petgraph::graph::{DiGraph, NodeIndex};
-use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use cargo_metadata::cargo_platform::Platform;
+use cargo_metadata::{DependencyKind, PackageId, Source};
+use petgraph::Direction;
+use petgraph::algo::toposort;
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef as _;
+use rustc_hash::FxHashMap;
+use semver::Version;
+
+use crate::error::{RailError, RailResult};
+
 /// A package node in the dependency graph.
 #[derive(Debug, Clone)]
 pub struct PackageNode {
-  /// Package name
+  /// Cargo's exact package identity.
+  pub id: PackageId,
+  /// Package name.
   pub name: String,
-  /// Path to Cargo.toml
+  /// Package version.
+  pub version: Version,
+  /// Package source, or `None` for a local package.
+  pub source: Option<Source>,
+  /// Path to `Cargo.toml`.
   pub manifest_path: PathBuf,
-  /// Whether this is a workspace member
+  /// Whether this is a workspace member.
   pub is_workspace_member: bool,
+}
+
+/// One resolved dependency relationship between two exact packages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyEdge {
+  /// Dependency name visible to Rust code, including Cargo renames.
+  pub name: String,
+  /// Compilation domain for this relationship.
+  pub kind: DependencyKind,
+  /// Target condition for this relationship, if any.
+  pub target: Option<Platform>,
 }
 
 /// Workspace dependency graph.
@@ -46,14 +68,14 @@ pub struct PackageNode {
 pub struct WorkspaceGraph {
   /// The dependency graph (petgraph DiGraph)
   /// Nodes: PackageNode
-  /// Edges: DependencyKind (Normal, Dev, Build)
-  graph: DiGraph<PackageNode, DependencyKind>,
+  /// Edges: resolved dependency alias + kind + target
+  graph: DiGraph<PackageNode, DependencyEdge>,
 
-  /// Index: package name → node index (FxHashMap for faster String hashing)
-  name_to_node: FxHashMap<String, NodeIndex>,
+  /// Primary index: exact Cargo package ID → node index.
+  id_to_node: FxHashMap<PackageId, NodeIndex>,
 
-  /// Workspace members only (subset of graph nodes) - for O(1) membership checks
-  workspace_members: HashSet<String>,
+  /// User-facing workspace-name lookup. Multiple exact members may share a name.
+  workspace_name_index: FxHashMap<String, Vec<NodeIndex>>,
 
   /// Pre-sorted workspace member names - avoids repeated sort on each call
   sorted_members: Vec<String>,
@@ -61,11 +83,11 @@ pub struct WorkspaceGraph {
   /// Workspace root directory (for converting absolute paths to relative)
   workspace_root: PathBuf,
 
-  /// Path cache: workspace-relative directory → owning crate name
+  /// Path cache: workspace-relative directory → exact graph node
   /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
   /// Uses RwLock instead of RefCell for Send/Sync compatibility
   /// Stores workspace-relative paths to support deleted files (no canonicalize needed)
-  path_cache: RwLock<Option<FxHashMap<PathBuf, String>>>,
+  path_cache: RwLock<Option<FxHashMap<PathBuf, NodeIndex>>>,
 }
 
 impl WorkspaceGraph {
@@ -78,9 +100,8 @@ impl WorkspaceGraph {
   pub fn from_metadata(metadata: &cargo_metadata::Metadata) -> RailResult<Self> {
     // Build petgraph
     let mut graph = DiGraph::new();
-    let mut name_to_node = FxHashMap::default();
+    let mut workspace_name_index: FxHashMap<String, Vec<NodeIndex>> = FxHashMap::default();
     let mut id_to_node = FxHashMap::default();
-    let mut workspace_members = HashSet::new();
 
     // Get workspace member IDs
     let workspace_pkg_ids: HashSet<_> = metadata.workspace_packages().iter().map(|pkg| pkg.id.clone()).collect();
@@ -88,36 +109,77 @@ impl WorkspaceGraph {
     // Add all packages as nodes (workspace + dependencies)
     for package in &metadata.packages {
       let crate_name = package.name.as_ref().to_string();
+      let is_workspace_member = workspace_pkg_ids.contains(&package.id);
 
       let node = PackageNode {
+        id: package.id.clone(),
         name: crate_name.clone(),
+        version: package.version.clone(),
+        source: package.source.clone(),
         manifest_path: package.manifest_path.clone().into_std_path_buf(),
-        is_workspace_member: workspace_pkg_ids.contains(&package.id),
+        is_workspace_member,
       };
 
       let node_idx = graph.add_node(node);
-      name_to_node.insert(package.name.as_ref().to_string(), node_idx);
-      id_to_node.insert(package.id.clone(), node_idx);
+      if id_to_node.insert(package.id.clone(), node_idx).is_some() {
+        return Err(RailError::message(format!(
+          "Cargo metadata contains duplicate package ID '{}'",
+          package.id
+        )));
+      }
 
-      if workspace_pkg_ids.contains(&package.id) {
-        workspace_members.insert(package.name.as_ref().to_string());
+      if is_workspace_member {
+        workspace_name_index.entry(crate_name).or_default().push(node_idx);
       }
     }
 
-    // Add dependency edges
-    for package in &metadata.packages {
-      let from_idx = id_to_node[&package.id];
+    for matches in workspace_name_index.values_mut() {
+      matches.sort_by(|left, right| graph[*left].id.repr.cmp(&graph[*right].id.repr));
+    }
 
-      for dep in &package.dependencies {
-        // Find the resolved dependency
-        if let Some(to_idx) = name_to_node.get(dep.name.as_str()) {
-          graph.add_edge(from_idx, *to_idx, dep.kind);
+    // Build only from Cargo's exact resolved graph. Package.dependencies is
+    // declaration metadata and cannot identify exact resolved destinations or
+    // combined kind/target variants.
+    if let Some(resolve) = &metadata.resolve {
+      for node in &resolve.nodes {
+        let Some(&from_idx) = id_to_node.get(&node.id) else {
+          return Err(RailError::message(format!(
+            "Cargo resolve node '{}' is missing from the package graph",
+            node.id
+          )));
+        };
+
+        for dependency in &node.deps {
+          let Some(&to_idx) = id_to_node.get(&dependency.pkg) else {
+            return Err(RailError::message(format!(
+              "Cargo resolve dependency '{}' from '{}' points to unknown package '{}'",
+              dependency.name, node.id, dependency.pkg
+            )));
+          };
+          if dependency.dep_kinds.is_empty() {
+            return Err(RailError::message(format!(
+              "Cargo resolve dependency '{}' from '{}' has no kind or target semantics",
+              dependency.name, node.id
+            )));
+          }
+
+          for dep_kind in &dependency.dep_kinds {
+            graph.add_edge(
+              from_idx,
+              to_idx,
+              DependencyEdge {
+                name: dependency.name.clone(),
+                kind: dep_kind.kind,
+                target: dep_kind.target.clone(),
+              },
+            );
+          }
         }
       }
     }
 
     // Pre-sort workspace members once at construction
-    let mut sorted_members: Vec<String> = workspace_members.iter().cloned().collect();
+    let mut sorted_members: Vec<String> = workspace_name_index.keys().cloned().collect();
     sorted_members.sort();
 
     // Store workspace root for path normalization
@@ -125,8 +187,8 @@ impl WorkspaceGraph {
 
     let graph = Self {
       graph,
-      name_to_node,
-      workspace_members,
+      id_to_node,
+      workspace_name_index,
       sorted_members,
       workspace_root,
       path_cache: RwLock::new(None),
@@ -143,6 +205,35 @@ impl WorkspaceGraph {
     &self.sorted_members
   }
 
+  /// Get a package node by Cargo's exact package identity.
+  pub fn package(&self, package_id: &PackageId) -> Option<&PackageNode> {
+    self.id_to_node.get(package_id).map(|&node| &self.graph[node])
+  }
+
+  /// Resolve a user-supplied package name to one exact package.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the name is missing or matches multiple package IDs.
+  pub fn workspace_package_by_name(&self, package_name: &str) -> RailResult<&PackageNode> {
+    self.find_node(package_name).map(|node| &self.graph[node])
+  }
+
+  /// Iterate over every resolved semantic edge from one exact package to another.
+  ///
+  /// The iterator is empty when either package is unknown or no relationship exists.
+  /// Parallel alias, dependency-kind, and target variants are returned independently.
+  pub fn dependency_edges<'a>(
+    &'a self,
+    from: &PackageId,
+    to: &PackageId,
+  ) -> impl Iterator<Item = &'a DependencyEdge> + 'a {
+    let endpoints = self.id_to_node.get(from).copied().zip(self.id_to_node.get(to).copied());
+    endpoints
+      .into_iter()
+      .flat_map(move |(from, to)| self.graph.edges_connecting(from, to).map(|edge| edge.weight()))
+  }
+
   /// Get transitive reverse dependencies (all workspace crates that depend on this one).
   ///
   /// Uses petgraph DFS for efficient traversal.
@@ -156,7 +247,16 @@ impl WorkspaceGraph {
   /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
   pub fn transitive_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let start_node = self.find_node(crate_name)?;
+    Ok(self.transitive_dependents_from(start_node))
+  }
 
+  /// Get transitive workspace dependents of one exact package.
+  pub fn transitive_dependents_by_id(&self, package_id: &PackageId) -> RailResult<Vec<String>> {
+    let start_node = self.find_node_by_id(package_id)?;
+    Ok(self.transitive_dependents_from(start_node))
+  }
+
+  fn transitive_dependents_from(&self, start_node: NodeIndex) -> Vec<String> {
     // DFS in reverse direction (incoming edges)
     let mut visited = HashSet::new();
     let mut stack = vec![start_node];
@@ -187,7 +287,7 @@ impl WorkspaceGraph {
 
     let mut result: Vec<_> = dependents.into_iter().collect();
     result.sort();
-    Ok(result)
+    result
   }
 
   /// Get direct workspace dependents for a crate.
@@ -195,20 +295,34 @@ impl WorkspaceGraph {
   /// Returns only workspace members with an immediate dependency edge to `crate_name`.
   pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let node = self.find_node(crate_name)?;
-    let mut dependents = Vec::new();
+    Ok(self.direct_dependents_from(node))
+  }
+
+  /// Get direct workspace dependents of one exact package.
+  pub fn direct_dependents_by_id(&self, package_id: &PackageId) -> RailResult<Vec<String>> {
+    let node = self.find_node_by_id(package_id)?;
+    Ok(self.direct_dependents_from(node))
+  }
+
+  fn direct_dependents_from(&self, node: NodeIndex) -> Vec<String> {
+    let mut dependent_nodes = HashSet::new();
     let mut edge_visits = 0;
 
     for neighbor_idx in self.graph.neighbors_directed(node, Direction::Incoming) {
       edge_visits += 1;
       let neighbor = &self.graph[neighbor_idx];
       if neighbor.is_workspace_member {
-        dependents.push(neighbor.name.clone());
+        dependent_nodes.insert(neighbor_idx);
       }
     }
     crate::instrumentation::record_graph_traversal(1, edge_visits);
 
-    dependents.sort();
-    Ok(dependents)
+    let mut result: Vec<_> = dependent_nodes
+      .into_iter()
+      .map(|node_idx| self.graph[node_idx].name.clone())
+      .collect();
+    result.sort();
+    result
   }
 
   /// Get transitive reverse dependencies for multiple crates in a single traversal.
@@ -221,19 +335,20 @@ impl WorkspaceGraph {
   /// O(V + E) regardless of input set size. Significantly faster than N separate
   /// traversals for large input sets.
   pub fn transitive_dependents_of_set(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<String>> {
-    if crate_names.is_empty() {
+    let package_ids = self.resolve_package_names(crate_names)?;
+    self.transitive_dependents_of_ids(&package_ids)
+  }
+
+  /// Get transitive workspace dependents of exact packages in one traversal.
+  pub fn transitive_dependents_of_ids(&self, package_ids: &HashSet<PackageId>) -> RailResult<HashSet<String>> {
+    if package_ids.is_empty() {
       return Ok(HashSet::new());
     }
 
-    // Find all start nodes
-    let start_nodes: Vec<NodeIndex> = crate_names
+    let start_nodes: Vec<NodeIndex> = package_ids
       .iter()
-      .filter_map(|name| self.name_to_node.get(name).copied())
-      .collect();
-
-    if start_nodes.is_empty() {
-      return Ok(HashSet::new());
-    }
+      .map(|package_id| self.find_node_by_id(package_id))
+      .collect::<RailResult<_>>()?;
 
     // Single BFS/DFS from all start nodes
     let mut visited = HashSet::new();
@@ -278,18 +393,23 @@ impl WorkspaceGraph {
   /// If a dependent is reachable from multiple input crates, one pair is returned per
   /// originating crate. Output is sorted lexicographically by `(depends_on, dependent)`.
   pub fn transitive_dependent_pairs_of_set(&self, crate_names: &HashSet<String>) -> RailResult<Vec<(String, String)>> {
-    if crate_names.is_empty() {
+    let package_ids = self.resolve_package_names(crate_names)?;
+    self.transitive_dependent_pairs_of_ids(&package_ids)
+  }
+
+  /// Get exact-package reverse dependency pairs in one traversal.
+  pub fn transitive_dependent_pairs_of_ids(
+    &self,
+    package_ids: &HashSet<PackageId>,
+  ) -> RailResult<Vec<(String, String)>> {
+    if package_ids.is_empty() {
       return Ok(Vec::new());
     }
 
-    let start_nodes: Vec<NodeIndex> = crate_names
+    let start_nodes: Vec<NodeIndex> = package_ids
       .iter()
-      .filter_map(|name| self.name_to_node.get(name).copied())
-      .collect();
-
-    if start_nodes.is_empty() {
-      return Ok(Vec::new());
-    }
+      .map(|package_id| self.find_node_by_id(package_id))
+      .collect::<RailResult<_>>()?;
 
     let mut visited: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
     let mut stack = Vec::with_capacity(start_nodes.len());
@@ -341,39 +461,36 @@ impl WorkspaceGraph {
     // Build a subgraph with only workspace members
     // This is critical: external dependencies can have cycles (e.g., serde/serde_derive in dev deps),
     // but workspace members should never have cycles (Cargo enforces this)
-    let mut subgraph = DiGraph::<&PackageNode, DependencyKind>::new();
-    let mut name_to_subgraph_idx = FxHashMap::default();
+    let mut subgraph = DiGraph::<&PackageNode, ()>::new();
+    let mut node_to_subgraph_idx = FxHashMap::default();
 
     // Add only workspace member nodes
-    for (name, &idx) in &self.name_to_node {
-      let node = &self.graph[idx];
+    for graph_idx in self.graph.node_indices() {
+      let node = &self.graph[graph_idx];
       if node.is_workspace_member {
         let subgraph_idx = subgraph.add_node(node);
-        name_to_subgraph_idx.insert(name.clone(), subgraph_idx);
+        node_to_subgraph_idx.insert(graph_idx, subgraph_idx);
       }
     }
 
     // Add edges between workspace members only
     // IMPORTANT: Skip dev-dependencies as they don't affect publish order
     // (dev-deps can have cycles, including self-references for feature-gated test utils)
-    for (from_name, &from_subgraph_idx) in &name_to_subgraph_idx {
-      let from_graph_idx = self.name_to_node[from_name];
-
-      // Check all outgoing edges from this workspace member
-      for neighbor_graph_idx in self.graph.neighbors_directed(from_graph_idx, Direction::Outgoing) {
+    for (&from_graph_idx, &from_subgraph_idx) in &node_to_subgraph_idx {
+      // Check every semantic edge. Multiple kind/target variants may connect
+      // the same packages, but publish topology needs only one non-dev edge.
+      for edge in self.graph.edges_directed(from_graph_idx, Direction::Outgoing) {
+        let neighbor_graph_idx = edge.target();
         let neighbor_node = &self.graph[neighbor_graph_idx];
 
         // Only add edge if the neighbor is also a workspace member
         if neighbor_node.is_workspace_member
-          && let Some(&to_subgraph_idx) = name_to_subgraph_idx.get(&neighbor_node.name)
-          && let Some(edge) = self.graph.find_edge(from_graph_idx, neighbor_graph_idx)
-          && let Some(&kind) = self.graph.edge_weight(edge)
+          && let Some(&to_subgraph_idx) = node_to_subgraph_idx.get(&neighbor_graph_idx)
+          && edge.weight().kind != DependencyKind::Development
+          && from_graph_idx != neighbor_graph_idx
+          && subgraph.find_edge(from_subgraph_idx, to_subgraph_idx).is_none()
         {
-          // Skip dev-dependencies - they don't affect publish order and can have cycles
-          // Also skip self-references (crate depending on itself for test features)
-          if kind != DependencyKind::Development && from_name != &neighbor_node.name {
-            subgraph.add_edge(from_subgraph_idx, to_subgraph_idx, kind);
-          }
+          subgraph.add_edge(from_subgraph_idx, to_subgraph_idx, ());
         }
       }
     }
@@ -406,6 +523,15 @@ impl WorkspaceGraph {
   ///
   /// Works for deleted files - does not require the file to exist on disk.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
+    self.file_to_package(file_path).map(|package| package.name.clone())
+  }
+
+  /// Map a file path to its exact owning workspace package.
+  pub(crate) fn file_to_package(&self, file_path: &Path) -> Option<&PackageNode> {
+    self.file_owner_node(file_path).map(|node| &self.graph[node])
+  }
+
+  fn file_owner_node(&self, file_path: &Path) -> Option<NodeIndex> {
     // Filter out VCS directories (git, jj, etc.)
     if Self::should_ignore_path(file_path) {
       return None;
@@ -423,22 +549,22 @@ impl WorkspaceGraph {
 
     // Check the file's directory first
     if let Some(parent) = current.parent() {
-      if let Some(crate_name) = cache_ref.get(parent) {
-        return Some(crate_name.clone());
+      if let Some(&node) = cache_ref.get(parent) {
+        return Some(node);
       }
       current = parent;
     }
 
     // Walk up looking for parent directories
     while let Some(parent) = current.parent() {
-      if let Some(crate_name) = cache_ref.get(parent) {
-        return Some(crate_name.clone());
+      if let Some(&node) = cache_ref.get(parent) {
+        return Some(node);
       }
       current = parent;
     }
 
     // Check root directory (for root-level crate)
-    cache_ref.get(Path::new("")).cloned()
+    cache_ref.get(Path::new("")).copied()
   }
 
   /// Convert a path to workspace-relative.
@@ -465,15 +591,68 @@ impl WorkspaceGraph {
       .collect()
   }
 
+  /// Map files to exact owning workspace packages.
+  pub(crate) fn files_to_package_ids(&self, file_paths: &[impl AsRef<Path>]) -> HashSet<PackageId> {
+    file_paths
+      .iter()
+      .filter_map(|path| self.file_to_package(path.as_ref()))
+      .map(|package| package.id.clone())
+      .collect()
+  }
+
   /// Find node index by crate name.
   fn find_node(&self, crate_name: &str) -> RailResult<NodeIndex> {
-    self.name_to_node.get(crate_name).copied().ok_or_else(|| {
-      RailError::message(format!(
+    let Some(matches) = self.workspace_name_index.get(crate_name) else {
+      return Err(RailError::message(format!(
         "Crate '{}' not found. Available workspace crates: {}",
         crate_name,
         self.workspace_members().join(", ")
-      ))
-    })
+      )));
+    };
+
+    if let [node] = matches.as_slice() {
+      return Ok(*node);
+    }
+
+    let candidates = matches
+      .iter()
+      .map(|&node| {
+        let package = &self.graph[node];
+        let source = package
+          .source
+          .as_ref()
+          .map(ToString::to_string)
+          .unwrap_or_else(|| "path".to_string());
+        format!(
+          "  - {} {} | id: {} | source: {} | manifest: {}",
+          package.name,
+          package.version,
+          package.id,
+          source,
+          package.manifest_path.display()
+        )
+      })
+      .collect::<Vec<_>>()
+      .join("\n");
+    Err(RailError::with_help(
+      format!("Package name '{}' is ambiguous", crate_name),
+      format!("Use an exact Cargo package ID. Candidates:\n{candidates}"),
+    ))
+  }
+
+  fn find_node_by_id(&self, package_id: &PackageId) -> RailResult<NodeIndex> {
+    self
+      .id_to_node
+      .get(package_id)
+      .copied()
+      .ok_or_else(|| RailError::message(format!("Package ID '{}' not found in the resolved graph", package_id)))
+  }
+
+  fn resolve_package_names(&self, package_names: &HashSet<String>) -> RailResult<HashSet<PackageId>> {
+    package_names
+      .iter()
+      .map(|name| self.find_node(name).map(|node| self.graph[node].id.clone()))
+      .collect()
   }
 
   /// Check if a path should be ignored (VCS directories, build artifacts, etc.)
@@ -503,10 +682,9 @@ impl WorkspaceGraph {
   fn build_path_cache(&self) {
     let mut cache = FxHashMap::default();
 
-    for crate_name in &self.workspace_members {
-      if let Some(node_idx) = self.name_to_node.get(crate_name) {
-        let node = &self.graph[*node_idx];
-
+    for node_idx in self.graph.node_indices() {
+      let node = &self.graph[node_idx];
+      if node.is_workspace_member {
         // Get crate root (parent of Cargo.toml) as workspace-relative path
         if let Some(crate_root) = node.manifest_path.parent() {
           // Convert to workspace-relative path
@@ -519,7 +697,7 @@ impl WorkspaceGraph {
             crate_root.to_path_buf()
           };
 
-          cache.insert(relative_root, crate_name.clone());
+          cache.insert(relative_root, node_idx);
         }
       }
     }
@@ -534,37 +712,69 @@ impl WorkspaceGraph {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-  use std::path::PathBuf;
+  use std::path::{Path, PathBuf};
   use std::sync::RwLock;
+
+  use cargo_metadata::{MetadataCommand, PackageId, PackageName, Source};
+  use semver::Version;
+
+  use super::*;
 
   fn test_graph(edges: &[(&str, &str)]) -> WorkspaceGraph {
     let mut graph = DiGraph::new();
+    let mut id_to_node = FxHashMap::default();
     let mut name_to_node = FxHashMap::default();
-    let mut workspace_members = HashSet::new();
+    let mut workspace_name_index = FxHashMap::default();
 
     for name in ["a", "b", "c", "d"] {
+      let id = PackageId {
+        repr: format!("path+file:///tmp/workspace/crates/{name}#{name}@0.1.0"),
+      };
       let node = graph.add_node(PackageNode {
+        id: id.clone(),
         name: name.to_string(),
+        version: Version::new(0, 1, 0),
+        source: None,
         manifest_path: PathBuf::from(format!("crates/{name}/Cargo.toml")),
         is_workspace_member: true,
       });
+      id_to_node.insert(id, node);
       name_to_node.insert(name.to_string(), node);
-      workspace_members.insert(name.to_string());
+      workspace_name_index.insert(name.to_string(), vec![node]);
     }
 
     for (from, to) in edges {
-      graph.add_edge(name_to_node[*from], name_to_node[*to], DependencyKind::Normal);
+      graph.add_edge(
+        name_to_node[*from],
+        name_to_node[*to],
+        DependencyEdge {
+          name: (*to).to_string(),
+          kind: DependencyKind::Normal,
+          target: None,
+        },
+      );
     }
 
     WorkspaceGraph {
       graph,
-      name_to_node,
-      workspace_members,
+      id_to_node,
+      workspace_name_index,
       sorted_members: vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
       workspace_root: PathBuf::from("/tmp/workspace"),
       path_cache: RwLock::new(None),
     }
+  }
+
+  fn write_test_package(root: &Path, relative: &str, name: &str, version: &str, dependencies: &str) {
+    let package_root = root.join(relative);
+    std::fs::create_dir_all(package_root.join("src")).expect("test package directory should be created");
+    std::fs::write(
+      package_root.join("Cargo.toml"),
+      format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2024\"\n\n{dependencies}"),
+    )
+    .expect("test package manifest should be written");
+    std::fs::write(package_root.join("src/lib.rs"), "pub fn value() {}\n")
+      .expect("test package source should be written");
   }
 
   #[test]
@@ -657,12 +867,21 @@ mod tests {
   }
 
   #[test]
-  fn test_transitive_dependent_pairs_of_set_is_sorted_and_preserves_seed_provenance() {
+  fn test_transitive_dependent_pairs_of_ids_is_sorted_and_preserves_seed_provenance() {
     let graph = test_graph(&[("b", "a"), ("c", "a"), ("d", "b"), ("d", "c")]);
-    let seeds = HashSet::from(["a".to_string(), "c".to_string()]);
+    let seeds = ["a", "c"]
+      .into_iter()
+      .map(|name| {
+        graph
+          .workspace_package_by_name(name)
+          .expect("seed should be unique")
+          .id
+          .clone()
+      })
+      .collect();
 
     let pairs = graph
-      .transitive_dependent_pairs_of_set(&seeds)
+      .transitive_dependent_pairs_of_ids(&seeds)
       .expect("pair traversal should succeed");
 
     assert_eq!(
@@ -673,6 +892,293 @@ mod tests {
         ("a".to_string(), "d".to_string()),
         ("c".to_string(), "d".to_string()),
       ]
+    );
+  }
+
+  #[test]
+  fn direct_dependents_collapse_parallel_semantic_edges() {
+    let mut graph = test_graph(&[("b", "a")]);
+    graph.graph.add_edge(
+      graph.workspace_name_index["b"][0],
+      graph.workspace_name_index["a"][0],
+      DependencyEdge {
+        name: "a_alias".into(),
+        kind: DependencyKind::Development,
+        target: None,
+      },
+    );
+
+    assert_eq!(
+      graph
+        .direct_dependents_by_id(&graph.workspace_package_by_name("a").expect("a should be unique").id)
+        .expect("parallel edge traversal should succeed"),
+      vec!["b"]
+    );
+  }
+
+  #[test]
+  fn package_name_lookup_distinguishes_unique_and_missing_names() {
+    let graph = test_graph(&[]);
+    let package = graph.workspace_package_by_name("a").expect("a should resolve uniquely");
+    assert_eq!(package.name, "a");
+    assert_eq!(package.version, Version::new(0, 1, 0));
+
+    let error = graph
+      .workspace_package_by_name("missing")
+      .expect_err("unknown names must fail");
+    assert_eq!(
+      error.to_string(),
+      "Crate 'missing' not found. Available workspace crates: a, b, c, d"
+    );
+  }
+
+  #[test]
+  fn graph_preserves_same_name_packages_by_exact_package_id() {
+    let mut metadata = MetadataCommand::new()
+      .current_dir(env!("CARGO_MANIFEST_DIR"))
+      .no_deps()
+      .other_options(vec!["--offline".into(), "--locked".into()])
+      .exec()
+      .expect("workspace metadata should load");
+    let template = metadata
+      .packages
+      .first()
+      .expect("workspace metadata should contain cargo-rail")
+      .clone();
+
+    let first_id = PackageId {
+      repr: "registry+https://github.com/rust-lang/crates.io-index#shared@1.0.0".into(),
+    };
+    let second_id = PackageId {
+      repr: "registry+https://github.com/rust-lang/crates.io-index#shared@2.0.0".into(),
+    };
+    let source = Source {
+      repr: "registry+https://github.com/rust-lang/crates.io-index".into(),
+    };
+
+    let mut first = template.clone();
+    first.id = first_id.clone();
+    first.name = PackageName::new("shared".into());
+    first.version = Version::new(1, 0, 0);
+    first.source = Some(source.clone());
+    first.manifest_path = cargo_metadata::camino::Utf8PathBuf::from("/registry/shared-1.0.0/Cargo.toml");
+
+    let mut second = template;
+    second.id = second_id.clone();
+    second.name = PackageName::new("shared".into());
+    second.version = Version::new(2, 0, 0);
+    second.source = Some(source.clone());
+    second.manifest_path = cargo_metadata::camino::Utf8PathBuf::from("/registry/shared-2.0.0/Cargo.toml");
+
+    metadata.packages = vec![first, second];
+    metadata.workspace_members.clear();
+    let graph = WorkspaceGraph::from_metadata(&metadata).expect("graph should preserve duplicate package names");
+
+    assert_eq!(graph.graph.node_count(), 2);
+    assert_eq!(graph.id_to_node.len(), 2);
+
+    let first = graph
+      .package(&first_id)
+      .expect("first package ID should remain addressable");
+    assert_eq!(first.id, first_id);
+    assert_eq!(first.name, "shared");
+    assert_eq!(first.version, Version::new(1, 0, 0));
+    assert_eq!(first.source.as_ref(), Some(&source));
+    assert_eq!(first.manifest_path, PathBuf::from("/registry/shared-1.0.0/Cargo.toml"));
+
+    let second = graph
+      .package(&second_id)
+      .expect("second package ID should remain addressable");
+    assert_eq!(second.id, second_id);
+    assert_eq!(second.name, "shared");
+    assert_eq!(second.version, Version::new(2, 0, 0));
+    assert_eq!(second.source.as_ref(), Some(&source));
+    assert_eq!(second.manifest_path, PathBuf::from("/registry/shared-2.0.0/Cargo.toml"));
+
+    metadata.workspace_members = vec![first_id.clone(), second_id.clone()];
+    let ambiguous_graph =
+      WorkspaceGraph::from_metadata(&metadata).expect("synthetic duplicate-name workspace should remain representable");
+    let error = ambiguous_graph
+      .workspace_package_by_name("shared")
+      .expect_err("duplicate package names must be rejected at the name boundary");
+    assert_eq!(error.to_string(), "Package name 'shared' is ambiguous");
+    let help = error.help_message().expect("ambiguity should list exact candidates");
+    let first_position = help
+      .find(first_id.repr.as_str())
+      .expect("first candidate identity should be rendered");
+    let second_position = help
+      .find(second_id.repr.as_str())
+      .expect("second candidate identity should be rendered");
+    assert!(
+      first_position < second_position,
+      "candidate identities must be ordered deterministically: {help}"
+    );
+    for expected in [
+      first_id.to_string(),
+      second_id.to_string(),
+      "shared 1.0.0".to_string(),
+      "shared 2.0.0".to_string(),
+      source.to_string(),
+      "/registry/shared-1.0.0/Cargo.toml".to_string(),
+      "/registry/shared-2.0.0/Cargo.toml".to_string(),
+    ] {
+      assert!(
+        help.contains(&expected),
+        "candidate help is missing {expected:?}: {help}"
+      );
+    }
+
+    metadata.packages[1].id = first_id.clone();
+    let error = match WorkspaceGraph::from_metadata(&metadata) {
+      Ok(_) => panic!("duplicate package IDs must be rejected"),
+      Err(error) => error,
+    };
+    assert!(
+      error
+        .to_string()
+        .contains(&format!("duplicate package ID '{first_id}'"))
+    );
+  }
+
+  #[test]
+  fn resolved_edges_preserve_exact_destination_alias_and_parallel_semantics() {
+    let workspace = tempfile::tempdir().expect("test workspace should be created");
+    std::fs::write(
+      workspace.path().join("Cargo.toml"),
+      "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\"]\nexclude = [\"vendor/shared-v1\"]\n",
+    )
+    .expect("workspace manifest should be written");
+
+    write_test_package(workspace.path(), "vendor/shared-v1", "shared", "1.0.0", "");
+    write_test_package(workspace.path(), "crates/shared-v2", "shared", "2.0.0", "");
+    write_test_package(
+      workspace.path(),
+      "crates/consumer-one",
+      "consumer-one",
+      "0.1.0",
+      "[dependencies]\nshared_alias = { package = \"shared\", path = \"../../vendor/shared-v1\" }\n",
+    );
+    write_test_package(
+      workspace.path(),
+      "crates/consumer-two",
+      "consumer-two",
+      "0.1.0",
+      "[dependencies]\nshared_alias = { package = \"shared\", path = \"../shared-v2\" }\n\
+       [dev-dependencies]\nshared_alias = { package = \"shared\", path = \"../shared-v2\" }\n\
+       [build-dependencies]\nshared_alias = { package = \"shared\", path = \"../shared-v2\" }\n\
+       [target.'cfg(windows)'.dependencies]\n\
+       shared_alias = { package = \"shared\", path = \"../shared-v2\" }\n",
+    );
+
+    let mut metadata = MetadataCommand::new()
+      .current_dir(workspace.path())
+      .other_options(vec!["--offline".into()])
+      .exec()
+      .expect("adversarial workspace metadata should load");
+    let package_id = |name: &str, version: Version| {
+      metadata
+        .packages
+        .iter()
+        .find(|package| package.name == name && package.version == version)
+        .map(|package| package.id.clone())
+        .unwrap_or_else(|| panic!("missing {name} package"))
+    };
+    let consumer_one = package_id("consumer-one", Version::new(0, 1, 0));
+    let consumer_two = package_id("consumer-two", Version::new(0, 1, 0));
+    let shared_v1 = package_id("shared", Version::new(1, 0, 0));
+    let shared_v2 = package_id("shared", Version::new(2, 0, 0));
+
+    let resolve = metadata
+      .resolve
+      .as_ref()
+      .expect("full metadata should contain a resolve graph");
+    let consumer_two_resolve = resolve
+      .nodes
+      .iter()
+      .find(|node| node.id == consumer_two)
+      .expect("consumer-two should have a resolve node");
+    let resolved_dependency = consumer_two_resolve
+      .deps
+      .iter()
+      .find(|dependency| dependency.pkg == shared_v2)
+      .expect("consumer-two should resolve shared v2");
+    assert_eq!(resolved_dependency.name, "shared_alias");
+    assert_eq!(resolved_dependency.dep_kinds.len(), 4);
+
+    let shared_v1_index = metadata
+      .packages
+      .iter()
+      .position(|package| package.id == shared_v1)
+      .expect("shared v1 package should exist");
+    let shared_v1_package = metadata.packages.remove(shared_v1_index);
+    metadata.packages.push(shared_v1_package);
+
+    let graph = WorkspaceGraph::from_metadata(&metadata).expect("resolved graph should build");
+    let semantic_edges = |from: &PackageId, to: &PackageId| {
+      let mut edges: Vec<_> = graph
+        .dependency_edges(from, to)
+        .map(|edge| {
+          (
+            edge.name.clone(),
+            edge.kind.to_string(),
+            edge.target.as_ref().map(ToString::to_string),
+          )
+        })
+        .collect();
+      edges.sort();
+      edges
+    };
+
+    assert_eq!(
+      semantic_edges(&consumer_one, &shared_v1),
+      vec![("shared_alias".into(), "normal".into(), None)]
+    );
+    assert!(semantic_edges(&consumer_one, &shared_v2).is_empty());
+    assert!(semantic_edges(&consumer_two, &shared_v1).is_empty());
+    assert_eq!(
+      semantic_edges(&consumer_two, &shared_v2),
+      vec![
+        ("shared_alias".into(), "build".into(), None),
+        ("shared_alias".into(), "dev".into(), None),
+        ("shared_alias".into(), "normal".into(), None),
+        ("shared_alias".into(), "normal".into(), Some("cfg(windows)".into())),
+      ]
+    );
+
+    assert_eq!(
+      graph
+        .direct_dependents_by_id(&shared_v1)
+        .expect("shared v1 should remain independently traversable"),
+      vec!["consumer-one"]
+    );
+    assert_eq!(
+      graph
+        .direct_dependents_by_id(&shared_v2)
+        .expect("shared v2 should remain independently traversable"),
+      vec!["consumer-two"]
+    );
+    assert_eq!(
+      graph
+        .workspace_package_by_name("shared")
+        .expect("the workspace member must win over an external package with the same name")
+        .id,
+      shared_v2
+    );
+
+    let publish_order = graph
+      .publish_order()
+      .expect("parallel semantic edges should preserve publish ordering");
+    let shared_position = publish_order
+      .iter()
+      .position(|name| name == "shared")
+      .expect("shared should be published");
+    let consumer_position = publish_order
+      .iter()
+      .position(|name| name == "consumer-two")
+      .expect("consumer-two should be published");
+    assert!(
+      shared_position < consumer_position,
+      "dependencies must be published first"
     );
   }
 }

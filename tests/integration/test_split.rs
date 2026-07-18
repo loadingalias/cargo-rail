@@ -862,6 +862,56 @@ paths = [{{ crate = "crates/safety-lib" }}]
   Ok(())
 }
 
+#[test]
+fn test_split_dirty_check_excludes_exact_generated_roots_without_hiding_named_source_paths() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-generated-state-boundary")?;
+  ws.add_crate("boundary-lib", "0.1.0", &[])?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.boundary-lib.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+paths = [{{ crate = "crates/boundary-lib" }}]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  let status = std::process::Command::new(env!("CARGO"))
+    .args(["generate-lockfile", "--offline"])
+    .current_dir(&ws.path)
+    .status()?;
+  assert!(status.success(), "fixture lockfile generation failed");
+  ws.commit("Configure exact generated-state boundary")?;
+
+  let generated = ws.path.join("target/debug/generated.rlib");
+  std::fs::create_dir_all(generated.parent().expect("generated fixture must have a parent"))?;
+  std::fs::write(&generated, "Cargo output\n")?;
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "boundary-lib", "--yes"])?;
+  assert!(
+    output.status.success(),
+    "resolved Cargo output must not dirty split: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let source = ws.path.join("docs/target/intentional.txt");
+  std::fs::create_dir_all(source.parent().expect("source fixture must have a parent"))?;
+  std::fs::write(&source, "intentional source\n")?;
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "boundary-lib", "--yes"])?;
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("docs/target/intentional.txt"),
+    "named source path must remain inside the dirty boundary: {stderr}"
+  );
+  Ok(())
+}
+
 /// Test that --allow-dirty bypasses the dirty worktree check
 #[test]
 fn test_split_allow_dirty_bypasses_check() -> Result<()> {

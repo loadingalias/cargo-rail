@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::Result;
@@ -6,6 +6,7 @@ use cargo_rail::git::SystemGit;
 #[cfg(unix)]
 use cargo_rail::source::SourceEntryKind;
 use cargo_rail::source::{ChangeLayer, ChangeRelation, SourceChange, SourceChangeKind, SourceSnapshot};
+use cargo_rail::workspace::WorkspaceContext;
 use serde_json::Value;
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail};
@@ -30,6 +31,106 @@ fn change<'a>(changes: &'a [SourceChange], path: &str) -> &'a SourceChange {
     .iter()
     .find(|change| change.path.as_str() == path)
     .unwrap_or_else(|| panic!("missing change {path:?}: {changes:#?}"))
+}
+
+#[test]
+fn filesystem_capture_stays_within_its_declared_root_and_uses_only_explicit_ignores() -> Result<()> {
+  let root = tempfile::TempDir::new()?;
+  let workspace = root.path().join("workspace");
+  for (path, content) in [
+    ("Cargo.toml", "[workspace]\nmembers = [\"crates/demo\"]\n"),
+    (".gitignore", "ambient-ignored/\ntarget/\n"),
+    ("ambient-ignored/source.txt", "still source without Git\n"),
+    (
+      "crates/demo/Cargo.toml",
+      "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    ),
+    ("crates/demo/src/lib.rs", "pub fn value() -> u8 { 1 }\n"),
+    ("docs/target/example.txt", "intentional source\n"),
+    ("target/debug/generated.rlib", "Cargo output\n"),
+    ("custom-output/generated.txt", "declared output\n"),
+  ] {
+    let path = workspace.join(path);
+    std::fs::create_dir_all(path.parent().expect("fixture file must have a parent"))?;
+    std::fs::write(path, content)?;
+  }
+  std::fs::write(root.path().join("outside-secret.txt"), "outside the declared root\n")?;
+
+  let snapshot =
+    SourceSnapshot::capture_filesystem(&workspace, &[PathBuf::from("target"), workspace.join("custom-output")])?;
+  assert!(matches!(snapshot, SourceSnapshot::FilesystemBacked(_)));
+  assert_eq!(
+    snapshot
+      .tree()
+      .entries()
+      .iter()
+      .map(|entry| entry.path.as_str())
+      .collect::<Vec<_>>(),
+    [
+      ".gitignore",
+      "Cargo.toml",
+      "ambient-ignored/source.txt",
+      "crates/demo/Cargo.toml",
+      "crates/demo/src/lib.rs",
+      "docs/target/example.txt",
+    ]
+  );
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_capture_records_directory_symlinks_without_following_them() -> Result<()> {
+  use std::os::unix::fs::symlink;
+
+  let root = tempfile::TempDir::new()?;
+  let workspace = root.path().join("workspace");
+  let outside = root.path().join("outside");
+  std::fs::create_dir_all(&workspace)?;
+  std::fs::create_dir_all(&outside)?;
+  std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n")?;
+  std::fs::write(outside.join("secret.txt"), "must not be read\n")?;
+  symlink(&outside, workspace.join("external"))?;
+
+  let snapshot = SourceSnapshot::capture_filesystem(&workspace, &[])?;
+  let external = snapshot
+    .tree()
+    .entries()
+    .iter()
+    .find(|entry| entry.path.as_str() == "external")
+    .expect("directory symlink must be retained as a source entry");
+  assert_eq!(
+    external.kind,
+    SourceEntryKind::Symlink {
+      target: outside.to_string_lossy().into_owned()
+    }
+  );
+  assert!(
+    snapshot
+      .tree()
+      .entries()
+      .iter()
+      .all(|entry| entry.path.as_str() != "external/secret.txt")
+  );
+  Ok(())
+}
+
+#[test]
+fn cargo_aware_filesystem_capture_rejects_a_live_git_workspace() -> Result<()> {
+  let workspace = TestWorkspace::new_named("filesystem-capture-with-git")?;
+  workspace.add_crate("demo", "0.1.0", &[])?;
+  let context = WorkspaceContext::build(&workspace.path)?;
+
+  let error = context.capture_filesystem_source().unwrap_err();
+  assert_eq!(
+    error.to_string(),
+    "filesystem-backed source capture is only available without Git"
+  );
+  assert_eq!(
+    error.help_message().as_deref(),
+    Some("use the Git-backed worktree capture for repositories")
+  );
+  Ok(())
 }
 
 #[test]
@@ -203,6 +304,147 @@ fn git_worktree_capture_builds_one_final_tree_and_provenance_rich_changes() -> R
   Ok(())
 }
 
+#[test]
+fn plan_excludes_ignored_and_default_generated_state_without_hiding_named_source_paths() -> Result<()> {
+  let ws = TestWorkspace::new_named("source-generated-state-default")?;
+  ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  ws.commit("Add generated-state fixture")?;
+
+  for (path, content) in [
+    ("target/debug/generated.rlib", "cargo output\n"),
+    ("target/cargo-rail/metadata.json", "cargo-rail output\n"),
+    ("ignored-state/generated.txt", "ignored output\n"),
+    ("docs/target/example.txt", "intentional source\n"),
+  ] {
+    let path = ws.path.join(path);
+    std::fs::create_dir_all(path.parent().expect("fixture path must have a parent"))?;
+    std::fs::write(path, content)?;
+  }
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: stdout={} stderr={}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let plan: Value = serde_json::from_slice(&output.stdout)?;
+  let paths = plan["files"]
+    .as_array()
+    .expect("files should be an array")
+    .iter()
+    .map(|file| file["path"].as_str().expect("planned path should be a string"))
+    .collect::<Vec<_>>();
+  assert_eq!(paths, ["docs/target/example.txt"]);
+  Ok(())
+}
+
+#[test]
+fn plan_excludes_exact_custom_cargo_and_cargo_rail_roots_without_blanket_target_filtering() -> Result<()> {
+  let ws = TestWorkspace::new_named("source-generated-state-custom")?;
+  ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  std::fs::create_dir_all(ws.path.join(".cargo"))?;
+  std::fs::write(
+    ws.path.join(".cargo/config.toml"),
+    "[build]\ntarget-dir = \"cargo-output\"\nbuild-dir = \"cargo-build\"\n",
+  )?;
+  ws.commit("Configure a custom Cargo target directory")?;
+
+  for (path, content) in [
+    ("cargo-output/debug/generated.rlib", "custom Cargo output\n"),
+    ("cargo-build/debug/intermediate.rmeta", "custom Cargo build state\n"),
+    ("target/cargo-rail/receipts/generated.json", "cargo-rail output\n"),
+    ("target/intentional.txt", "intentional source\n"),
+  ] {
+    let path = ws.path.join(path);
+    std::fs::create_dir_all(path.parent().expect("fixture path must have a parent"))?;
+    std::fs::write(path, content)?;
+  }
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: stdout={} stderr={}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let plan: Value = serde_json::from_slice(&output.stdout)?;
+  let paths = plan["files"]
+    .as_array()
+    .expect("files should be an array")
+    .iter()
+    .map(|file| file["path"].as_str().expect("planned path should be a string"))
+    .collect::<Vec<_>>();
+  assert_eq!(paths, ["target/intentional.txt"]);
+  Ok(())
+}
+
+#[test]
+fn historical_plan_excludes_resolved_generated_roots_without_reading_worktree_state() -> Result<()> {
+  let ws = TestWorkspace::new_named("source-generated-state-history")?;
+  ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  let base = ws.commit("Add historical generated-state fixture")?;
+
+  for (path, content) in [
+    ("target/debug/generated.rlib", "committed Cargo output\n"),
+    ("target/cargo-rail/metadata.json", "committed cargo-rail output\n"),
+    ("docs/target/example.txt", "committed intentional source\n"),
+  ] {
+    let path = ws.path.join(path);
+    std::fs::create_dir_all(path.parent().expect("fixture path must have a parent"))?;
+    std::fs::write(path, content)?;
+  }
+  let head = ws.commit("Commit historical generated and source paths")?;
+  std::fs::write(ws.path.join("untracked.txt"), "must not enter object comparison\n")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "plan", "--from", &base, "--to", &head, "--format", "json"],
+  )?;
+  assert!(output.status.success());
+  let plan: Value = serde_json::from_slice(&output.stdout)?;
+  let paths = plan["files"]
+    .as_array()
+    .expect("files should be an array")
+    .iter()
+    .map(|file| file["path"].as_str().expect("planned path should be a string"))
+    .collect::<Vec<_>>();
+  assert_eq!(paths, ["docs/target/example.txt"]);
+  Ok(())
+}
+
+#[test]
+fn generated_root_filter_drops_cross_boundary_rename_relations() -> Result<()> {
+  let ws = TestWorkspace::new_named("source-generated-state-rename")?;
+  let crate_root = ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  std::fs::write(crate_root.join("moved.txt"), "move into generated state\n")?;
+  let base = ws.commit("Add generated-boundary rename fixture")?;
+
+  std::fs::create_dir_all(ws.path.join("target/debug"))?;
+  git(&ws.path, &["mv", "crates/demo/moved.txt", "target/debug/moved.txt"])?;
+
+  let ctx = WorkspaceContext::build_with_source_capture(&ws.path, true)?;
+  let capture = ctx.source_capture().expect("source capture should be present");
+  let changes = capture.changes_from(ctx.git()?.git(), &base)?;
+  assert_eq!(changes.entries().len(), 1);
+  assert_eq!(changes.entries()[0].path.as_str(), "crates/demo/moved.txt");
+  assert_eq!(changes.entries()[0].kind, SourceChangeKind::Deleted);
+  assert_eq!(changes.entries()[0].relation, None);
+  assert!(
+    !capture
+      .snapshot()
+      .tree()
+      .entries()
+      .iter()
+      .any(|entry| entry.path.as_str().starts_with("target/"))
+  );
+  Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn git_worktree_capture_rejects_symlinked_parent_escape() -> Result<()> {
@@ -357,5 +599,66 @@ fn plan_rejects_a_unix_socket_without_reading_it() -> Result<()> {
     &output,
     "cannot capture unsupported filesystem object 'crates/demo/tracked-socket'",
     "replace it with a regular file or symbolic link before retrying",
+  )
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_rejects_exact_file_drift_during_capture() -> Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let ws = TestWorkspace::new_named("source-capture-drift")?;
+  let crate_root = ws.add_crate("demo", "0.1.0", &[])?;
+  std::fs::write(crate_root.join("a-victim.txt"), "before!!\n")?;
+  ws.commit("Add deterministic capture-drift fixture")?;
+
+  let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
+  assert!(real_git.status.success(), "failed to resolve the real Git executable");
+  let real_git = String::from_utf8(real_git.stdout)?.trim().to_string();
+
+  let wrapper_dir = ws.path.join(".git/rail-test-bin");
+  std::fs::create_dir_all(&wrapper_dir)?;
+  let wrapper = wrapper_dir.join("git");
+  std::fs::write(
+    &wrapper,
+    r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "ls-files" ]; then
+    count=0
+    if [ -f "$CARGO_RAIL_TEST_DRIFT_COUNTER" ]; then
+      IFS= read -r count < "$CARGO_RAIL_TEST_DRIFT_COUNTER"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$CARGO_RAIL_TEST_DRIFT_COUNTER"
+    if [ "$count" -eq 2 ]; then
+      printf 'after!!!\n' > "$CARGO_RAIL_TEST_DRIFT_FILE"
+    fi
+    break
+  fi
+done
+exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
+"#,
+  )?;
+  let mut permissions = std::fs::metadata(&wrapper)?.permissions();
+  permissions.set_mode(0o755);
+  std::fs::set_permissions(&wrapper, permissions)?;
+
+  let path = std::env::join_paths(
+    std::iter::once(wrapper_dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+  )?;
+  let counter = ws.path.join(".git/rail-drift-count");
+
+  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .env("PATH", path)
+    .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
+    .env("CARGO_RAIL_TEST_DRIFT_COUNTER", counter)
+    .env("CARGO_RAIL_TEST_DRIFT_FILE", crate_root.join("a-victim.txt"))
+    .args(["rail", "plan", "--since", "HEAD", "--format", "json"])
+    .output()?;
+  assert_actionable_capture_error(
+    &output,
+    "source file 'crates/demo/a-victim.txt' changed during capture",
+    "retry after concurrent filesystem and Git operations have finished",
   )
 }

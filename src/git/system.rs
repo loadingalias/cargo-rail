@@ -46,12 +46,6 @@ fn parse_nul_paths(bytes: &[u8]) -> Vec<PathBuf> {
     .collect()
 }
 
-fn is_generated_target_path(path: &Path) -> bool {
-  path
-    .components()
-    .any(|component| component.as_os_str() == std::ffi::OsStr::new("target"))
-}
-
 /// Information about a git commit
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -191,11 +185,7 @@ impl SystemGit {
     let tracked = self.run_git(&["diff", "--name-only", "-z", "HEAD"])?;
     let mut paths = parse_nul_paths(&tracked.stdout);
     let untracked = self.run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-    paths.extend(
-      parse_nul_paths(&untracked.stdout)
-        .into_iter()
-        .filter(|path| !is_generated_target_path(path)),
-    );
+    paths.extend(parse_nul_paths(&untracked.stdout));
     paths.sort();
     paths.dedup();
     Ok(paths)

@@ -234,8 +234,9 @@ impl<'a> SyncEngine<'a> {
       .iter()
       .cloned()
       .collect::<std::collections::BTreeSet<_>>();
-    let unexpected = git
-      .changed_paths()?
+    let unexpected = self
+      .ctx
+      .changed_source_paths()?
       .into_iter()
       .filter(|path| !expected.contains(path))
       .collect::<Vec<_>>();
@@ -282,7 +283,7 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn conflict_receipt_dir(&self) -> PathBuf {
-    self.ctx.workspace_root().join("target/cargo-rail/receipts")
+    crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("receipts")
   }
 
   fn validate_conflict_receipt_path(&self, receipt_path: &Path) -> RailResult<PathBuf> {
@@ -707,12 +708,7 @@ impl<'a> SyncEngine<'a> {
     // Filter to only files in configured crate path scope.
     let relevant_files: Vec<_> = changed_files
       .into_iter()
-      .filter(|(path, _)| {
-        // Skip files that shouldn't be synced (target dir, etc.)
-        let path_str = path.to_string_lossy();
-        let should_exclude = path_str.contains("/target/") || path_str.contains("\\target\\");
-        self.mono_path_in_scope(path) && !should_exclude
-      })
+      .filter(|(path, _)| self.mono_path_in_scope(path))
       .collect();
 
     // Separate deletions from additions/modifications
@@ -810,13 +806,6 @@ impl<'a> SyncEngine<'a> {
       .iter()
       .filter_map(|(remote_path, change_type)| {
         let mono_path = self.map_remote_path_to_mono(remote_path).ok()?;
-
-        // Skip files excluded by Cargo (target, etc.)
-        let path_str = mono_path.to_string_lossy();
-        let should_exclude = path_str.contains("/target/") || path_str.contains("\\target\\");
-        if should_exclude {
-          return None;
-        }
 
         // Skip files that were already resolved by conflict resolution (O(1) HashSet lookup)
         if resolved_files.contains(mono_path.as_path()) {
@@ -1133,7 +1122,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {
 /// Read the crate identity from a workspace-owned conflict receipt.
 pub fn conflict_receipt_crate(workspace_root: &Path, receipt_path: &Path) -> RailResult<String> {
   let path = utils::canonicalize_existing(receipt_path)?;
-  let dir = utils::canonicalize_existing(&workspace_root.join("target/cargo-rail/receipts"))?;
+  let dir = utils::canonicalize_existing(&crate::workspace::cargo_rail_state_root(workspace_root).join("receipts"))?;
   if path.parent().is_none_or(|parent| parent != dir) {
     return Err(crate::error::RailError::message(format!(
       "sync receipt '{}' is outside the workspace receipt directory",

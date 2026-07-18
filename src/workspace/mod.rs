@@ -8,6 +8,8 @@
 //!
 //! Built once at startup, passed by reference to all commands.
 
+use std::path::{Path, PathBuf};
+
 /// Change impact analysis
 pub mod change_analyzer;
 /// Unified workspace context (includes optional GitState and CargoState)
@@ -25,3 +27,8 @@ pub use context::{CargoState, GitState, WorkspaceContext};
 
 // Re-export view types
 pub use view::{CrateInfo, WorkspaceView};
+
+/// Return the workspace-owned root for generated cargo-rail state.
+pub(crate) fn cargo_rail_state_root(workspace_root: &Path) -> PathBuf {
+  workspace_root.join("target").join("cargo-rail")
+}

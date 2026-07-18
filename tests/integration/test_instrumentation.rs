@@ -74,7 +74,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
       .as_u64()
       .is_some_and(|bytes| bytes > 0)
   );
-  assert_eq!(counters["git_subprocesses"], 4);
+  assert_eq!(counters["git_subprocesses"], 8);
   assert_eq!(counters["graph_traversals"], 2);
   assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 4));
   assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 2));

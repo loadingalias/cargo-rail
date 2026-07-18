@@ -44,9 +44,15 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
   }
 
   // Dirty worktree check (unless --allow-dirty or --check mode)
-  if !args.check && !args.allow_dirty && ctx.git()?.git().is_dirty()? {
-    let files = ctx.git()?.git().dirty_files()?;
-    return Err(RailError::Git(GitError::DirtyWorktree { files }));
+  if !args.check && !args.allow_dirty {
+    let files = ctx
+      .changed_source_paths()?
+      .into_iter()
+      .map(|path| path.display().to_string())
+      .collect::<Vec<_>>();
+    if !files.is_empty() {
+      return Err(RailError::Git(GitError::DirtyWorktree { files }));
+    }
   }
 
   let builder = SplitSyncConfigBuilder::new(ctx)?

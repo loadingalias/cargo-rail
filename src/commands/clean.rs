@@ -156,12 +156,9 @@ pub fn run_clean(
 }
 
 fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) {
-  let cache_path = ctx
-    .workspace_root
-    .join("target")
-    .join("cargo-rail")
-    .join("metadata.json");
-  let compiler_cache_dir = ctx.workspace_root.join("target").join("cargo-rail").join("cache");
+  let state_root = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
+  let cache_path = state_root.join("metadata.json");
+  let compiler_cache_dir = state_root.join("cache");
 
   if cache_path.exists() {
     artifacts.cache_files.push(cache_path.display().to_string());
@@ -173,7 +170,7 @@ fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifact
 }
 
 fn collect_report_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) {
-  let report_dir = ctx.workspace_root.join("target").join("cargo-rail");
+  let report_dir = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
   if report_dir.exists()
     && let Ok(entries) = fs::read_dir(&report_dir)
   {
@@ -220,12 +217,9 @@ fn collect_backup_artifacts(
 }
 
 fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
-  let cache_path = ctx
-    .workspace_root
-    .join("target")
-    .join("cargo-rail")
-    .join("metadata.json");
-  let compiler_cache_dir = ctx.workspace_root.join("target").join("cargo-rail").join("cache");
+  let state_root = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
+  let cache_path = state_root.join("metadata.json");
+  let compiler_cache_dir = state_root.join("cache");
   let mut cleaned_paths = Vec::new();
 
   if cache_path.exists() {
@@ -254,7 +248,7 @@ fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
 }
 
 fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
-  let report_dir = ctx.workspace_root.join("target").join("cargo-rail");
+  let report_dir = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
   let mut cleaned = Vec::new();
 
   if report_dir.exists() {

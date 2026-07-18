@@ -527,7 +527,7 @@ fn write_run_decision_receipt(
   skipped_surfaces: &[String],
   targets: DecisionTargets<'_>,
 ) -> RailResult<std::path::PathBuf> {
-  let dir = ctx.workspace_root().join("target").join("cargo-rail").join("receipts");
+  let dir = crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("receipts");
   fs::create_dir_all(&dir)?;
   let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
   let path = dir.join(format!("run-decision-{}.json", nonce));

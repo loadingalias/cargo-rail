@@ -47,7 +47,7 @@ pub fn create_backup_id() -> BackupId {
 /// Get the backup root directory for a workspace.
 #[doc(hidden)]
 pub fn get_backup_root(workspace_root: &Path) -> PathBuf {
-  workspace_root.join("target").join("cargo-rail").join("backups")
+  crate::workspace::cargo_rail_state_root(workspace_root).join("backups")
 }
 
 /// Get the path to a specific backup directory.

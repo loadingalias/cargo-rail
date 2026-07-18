@@ -184,7 +184,7 @@ pub(crate) fn validate_state_path(root: &Path, path: &Path) -> RailResult<PathBu
 }
 
 fn state_dir(root: &Path) -> PathBuf {
-  root.join("target/cargo-rail/releases")
+  crate::workspace::cargo_rail_state_root(root).join("releases")
 }
 
 fn complete_step(object: Option<String>) -> Step {

@@ -1475,13 +1475,8 @@ pub fn run_unify_apply(
 
   let mut written_report_path = None;
   if !no_report {
-    let actual_report_path = report_path.unwrap_or_else(|| {
-      ctx
-        .workspace_root()
-        .join("target")
-        .join("cargo-rail")
-        .join("unify-report.md")
-    });
+    let actual_report_path = report_path
+      .unwrap_or_else(|| crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("unify-report.md"));
     UnifyReport::write_to_file(&plan, &actual_report_path)?;
     progress!("report: {}", actual_report_path.display());
     written_report_path = Some(actual_report_path);

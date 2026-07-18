@@ -56,10 +56,10 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
-  // Map files → crates (uses interior mutability for cache)
-  let direct_crates = graph.files_to_crates(changed_files);
+  // Map files → exact packages (uses interior mutability for cache)
+  let direct_package_ids = graph.files_to_package_ids(changed_files);
 
-  if direct_crates.is_empty() {
+  if direct_package_ids.is_empty() {
     // No workspace crates affected (e.g., README, LICENSE, etc.)
     return Ok(AffectedAnalysis {
       changed_files: changed_files.iter().map(|p| p.as_ref().display().to_string()).collect(),
@@ -71,10 +71,15 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
+  let direct_crates: HashSet<String> = direct_package_ids
+    .iter()
+    .filter_map(|package_id| graph.package(package_id).map(|package| package.name.clone()))
+    .collect();
+
   // Get all transitive dependents in a single traversal
   // This is O(V+E) regardless of how many direct crates there are,
   // vs O(N × (V+E)) if we called transitive_dependents() for each crate
-  let all_dependents = graph.transitive_dependents_of_set(&direct_crates)?;
+  let all_dependents = graph.transitive_dependents_of_ids(&direct_package_ids)?;
 
   // Build test targets (direct + dependents)
   let mut test_targets = direct_crates.clone();

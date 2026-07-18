@@ -5,7 +5,6 @@ use crate::error::{RailError, RailResult};
 use crate::release::planner::ReleasePlan;
 use crate::release::process;
 use crate::release::semver_checks;
-use crate::utils;
 use crate::workspace::WorkspaceContext;
 use std::fs;
 use std::path::PathBuf;
@@ -73,14 +72,7 @@ impl<'a> ReleaseValidator<'a> {
       }
     }
 
-    // 3. Check for uncommitted changes in crate directories
-    if require_clean {
-      for crate_name in crate_names {
-        self.check_crate_uncommitted_changes(crate_name)?;
-      }
-    }
-
-    // 4. Check for path dependencies
+    // 3. Check for path dependencies
     for crate_name in crate_names {
       self.check_path_dependencies(crate_name)?;
     }
@@ -131,49 +123,10 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Check if working directory is clean (no uncommitted changes)
   fn check_clean_working_directory(&self) -> RailResult<()> {
-    if self.ctx.git()?.git().is_dirty()? {
+    if !self.ctx.changed_source_paths()?.is_empty() {
       return Err(RailError::with_help(
         "Working directory has uncommitted changes",
         "Commit or stash your changes before releasing, or set require_clean = false in [release] section of rail.toml",
-      ));
-    }
-
-    Ok(())
-  }
-
-  /// Check for uncommitted changes in specific crate directory
-  fn check_crate_uncommitted_changes(&self, crate_name: &str) -> RailResult<()> {
-    let package = self
-      .ctx
-      .cargo
-      .get_package(crate_name)
-      .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
-
-    let crate_dir = package
-      .manifest_path
-      .parent()
-      .ok_or_else(|| RailError::message("Invalid manifest path"))?;
-    let relative_path = crate_dir
-      .as_std_path()
-      .strip_prefix(self.ctx.workspace_root())
-      .unwrap_or_else(|_| crate_dir.as_std_path());
-    let git_path = {
-      let path = utils::path_to_git_format(relative_path);
-      if path.is_empty() { ".".to_string() } else { path }
-    };
-
-    // Check for changes in this directory
-    let output = self
-      .ctx
-      .git()?
-      .git()
-      .run_git(&["status", "--porcelain", "--", &git_path])?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-      return Err(RailError::with_help(
-        format!("Crate '{}' has uncommitted changes", crate_name),
-        "Commit changes before releasing",
       ));
     }
 

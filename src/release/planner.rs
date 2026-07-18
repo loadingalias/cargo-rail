@@ -11,6 +11,7 @@ use crate::release::process;
 use crate::release::semver_checks::{self, SemverCheck};
 use crate::release::version::{BumpLevel, BumpRequest, commit_bump_level};
 use crate::workspace::WorkspaceContext;
+use cargo_metadata::PackageId;
 use rustc_hash::FxHashMap;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -262,10 +263,11 @@ impl<'a> ReleasePlanner<'a> {
 
     let planned_crates: HashSet<String> = crate_plans.iter().map(|plan| plan.name.clone()).collect();
     for plan in &mut crate_plans {
+      let package_id = self.workspace_package_id(&plan.name)?;
       plan.affected_dependents = self
         .ctx
         .graph
-        .direct_dependents(&plan.name)?
+        .direct_dependents_by_id(package_id)?
         .into_iter()
         .filter(|dependent| planned_crates.contains(dependent))
         .collect();
@@ -451,10 +453,11 @@ impl<'a> ReleasePlanner<'a> {
 
     let planned_crates: HashSet<String> = crate_plans.iter().map(|plan| plan.name.clone()).collect();
     for plan in &mut crate_plans {
+      let package_id = self.workspace_package_id(&plan.name)?;
       plan.affected_dependents = self
         .ctx
         .graph
-        .direct_dependents(&plan.name)?
+        .direct_dependents_by_id(package_id)?
         .into_iter()
         .filter(|dependent| planned_crates.contains(dependent))
         .collect();
@@ -938,14 +941,8 @@ impl<'a> ReleasePlanner<'a> {
     let Some(targets) = crate_names else {
       return Ok(all_ordered);
     };
-    let workspace_members = self.ctx.graph.workspace_members();
     for crate_name in &targets {
-      if !workspace_members.contains(crate_name) {
-        return Err(RailError::with_help(
-          format!("crate '{}' not found", crate_name),
-          format!("available: {}", workspace_members.join(", ")),
-        ));
-      }
+      self.workspace_package_id(crate_name)?;
     }
 
     let requested: HashSet<String> = targets.into_iter().collect();
@@ -954,7 +951,8 @@ impl<'a> ReleasePlanner<'a> {
       self.reject_partial_version_groups(&requested)?;
     }
 
-    let dependents = self.ctx.graph.transitive_dependents_of_set(&requested)?;
+    let requested_ids = self.workspace_package_ids(&requested)?;
+    let dependents = self.ctx.graph.transitive_dependents_of_ids(&requested_ids)?;
     if !dependents.is_empty() && dependent_policy == DependentPolicy::RejectPartialClosure {
       let mut missing: Vec<String> = dependents.into_iter().collect();
       missing.sort();
@@ -972,7 +970,8 @@ impl<'a> ReleasePlanner<'a> {
       loop {
         let before = selected.len();
         self.expand_selected_version_groups(&mut selected);
-        let dependents = self.ctx.graph.transitive_dependents_of_set(&selected)?;
+        let selected_ids = self.workspace_package_ids(&selected)?;
+        let dependents = self.ctx.graph.transitive_dependents_of_ids(&selected_ids)?;
         selected.extend(dependents);
         self.expand_selected_version_groups(&mut selected);
         if selected.len() == before {
@@ -988,6 +987,21 @@ impl<'a> ReleasePlanner<'a> {
         .filter(|name| requested.contains(name))
         .collect(),
     )
+  }
+
+  fn workspace_package_id(&self, crate_name: &str) -> RailResult<&PackageId> {
+    self
+      .ctx
+      .graph
+      .workspace_package_by_name(crate_name)
+      .map(|package| &package.id)
+  }
+
+  fn workspace_package_ids(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<PackageId>> {
+    crate_names
+      .iter()
+      .map(|crate_name| self.workspace_package_id(crate_name).cloned())
+      .collect()
   }
 
   fn version_group_for(&self, crate_name: &str) -> Option<(&str, &[String])> {

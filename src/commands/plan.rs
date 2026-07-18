@@ -11,9 +11,9 @@ use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::{ConfidenceProfile, UnknownFilePolicy};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
-use crate::source::SourceSnapshot;
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
+use cargo_metadata::PackageId;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
@@ -283,7 +283,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   let mut planned_files = Vec::with_capacity(changed_file_count);
   let mut direct_crates: BTreeSet<String> = BTreeSet::new();
-  let mut build_test_seed_crates: BTreeSet<String> = BTreeSet::new();
+  let mut direct_package_ids: HashSet<PackageId> = HashSet::new();
+  let mut build_test_seed_package_ids: HashSet<PackageId> = HashSet::new();
   let unknown_policy = unknown_file_policy(ctx);
 
   push_trace(
@@ -311,8 +312,11 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   for path in &changed_files {
     let file_kind = classify_path(Path::new(path));
     let custom_surfaces = custom_surfaces_for_path(path, &custom_patterns);
-    let mut owners: Vec<String> = ctx.graph.files_to_crates(&[Path::new(path)]).into_iter().collect();
-    owners.sort();
+    let owner = ctx.graph.file_to_package(Path::new(path));
+    let owners: Vec<String> = owner.iter().map(|package| package.name.clone()).collect();
+    if let Some(package) = owner {
+      direct_package_ids.insert(package.id.clone());
+    }
 
     for owner in &owners {
       direct_crates.insert(owner.clone());
@@ -405,8 +409,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       );
     }
 
-    if should_seed_build_test_transitive {
-      build_test_seed_crates.extend(owners.iter().cloned());
+    if should_seed_build_test_transitive && let Some(package) = owner {
+      build_test_seed_package_ids.insert(package.id.clone());
     }
 
     push_trace(
@@ -454,9 +458,9 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     });
   }
 
-  let transitive_crates = compute_transitive_impact(ctx, &direct_crates)?;
-  let execution_transitive_pairs = compute_transitive_impact_pairs(ctx, &build_test_seed_crates)?;
-  let execution_transitive_crates = if build_test_seed_crates == direct_crates {
+  let transitive_crates = compute_transitive_impact(ctx, &direct_package_ids)?;
+  let execution_transitive_pairs = compute_transitive_impact_pairs(ctx, &build_test_seed_package_ids)?;
+  let execution_transitive_crates = if build_test_seed_package_ids == direct_package_ids {
     transitive_crates.clone()
   } else {
     execution_transitive_pairs
@@ -855,19 +859,20 @@ fn resolve_refs(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<Resolv
 
 fn collect_changed_files(ctx: &WorkspaceContext, refs: &ResolvedRefs) -> RailResult<Vec<String>> {
   let raw_paths: Vec<PathBuf> = match refs {
-    ResolvedRefs::Objects { from, to } => ctx
-      .git()?
-      .git()
-      .get_changed_files_between(from, Some(to))?
-      .into_iter()
-      .map(|(path, _)| path)
-      .collect(),
+    ResolvedRefs::Objects { from, to } => ctx.exclude_generated_source_paths(
+      ctx
+        .git()?
+        .git()
+        .get_changed_files_between(from, Some(to))?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect(),
+    )?,
     ResolvedRefs::Worktree { base, .. } => {
       let changes = if let Some(capture) = ctx.source_capture() {
         capture.changes_from(ctx.git()?.git(), base)?
       } else {
-        let (_snapshot, changes) = SourceSnapshot::capture_git_worktree(ctx.git()?.git(), base)?;
-        changes
+        ctx.capture_worktree_source()?.changes_from(ctx.git()?.git(), base)?
       };
       changes
         .entries()
@@ -906,11 +911,10 @@ fn owner_scope(path: &str, owners: &[String]) -> String {
   }
 }
 
-fn compute_transitive_impact(ctx: &WorkspaceContext, direct_crates: &BTreeSet<String>) -> RailResult<Vec<String>> {
-  let direct_set: HashSet<String> = direct_crates.iter().cloned().collect();
+fn compute_transitive_impact(ctx: &WorkspaceContext, direct_ids: &HashSet<PackageId>) -> RailResult<Vec<String>> {
   let mut transitive: Vec<String> = ctx
     .graph
-    .transitive_dependents_of_set(&direct_set)?
+    .transitive_dependents_of_ids(direct_ids)?
     .into_iter()
     .collect();
   transitive.sort();
@@ -920,10 +924,9 @@ fn compute_transitive_impact(ctx: &WorkspaceContext, direct_crates: &BTreeSet<St
 
 fn compute_transitive_impact_pairs(
   ctx: &WorkspaceContext,
-  direct_crates: &BTreeSet<String>,
+  direct_ids: &HashSet<PackageId>,
 ) -> RailResult<Vec<(String, String)>> {
-  let direct_set: HashSet<String> = direct_crates.iter().cloned().collect();
-  ctx.graph.transitive_dependent_pairs_of_set(&direct_set)
+  ctx.graph.transitive_dependent_pairs_of_ids(direct_ids)
 }
 
 fn emit_transitive_build_test_trace(

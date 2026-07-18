@@ -474,7 +474,7 @@ pub fn write_receipt_with_objects(
     resulting_objects,
   };
 
-  let dir = workspace_root.join("target").join("cargo-rail").join("receipts");
+  let dir = crate::workspace::cargo_rail_state_root(workspace_root).join("receipts");
   fs::create_dir_all(&dir)?;
 
   let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
@@ -563,13 +563,15 @@ fn sanitize_for_filename(input: &str) -> String {
 fn capture_pre_apply_checks(ctx: &WorkspaceContext) -> RailResult<MutationPreApplyChecks> {
   let workspace_root = ctx.workspace_root();
   let git = ctx.git()?.git();
-  let changed_paths = git.changed_paths()?;
+  let changed_paths = ctx.changed_source_paths()?;
   Ok(MutationPreApplyChecks {
     git_head: ctx.git()?.git().head_commit()?,
     config_fingerprint: config_fingerprint(workspace_root),
     toolchain_fingerprint: toolchain_fingerprint(workspace_root),
     lock_fingerprint: file_fingerprint(&workspace_root.join("Cargo.lock")),
-    metadata_fingerprint: file_fingerprint(&workspace_root.join("target/cargo-rail/metadata.json")),
+    metadata_fingerprint: file_fingerprint(
+      &crate::workspace::cargo_rail_state_root(workspace_root).join("metadata.json"),
+    ),
     worktree_fingerprint: fingerprint_changed_paths(git, &git.worktree_root, &changed_paths)?,
     changed_paths,
   })
@@ -635,7 +637,7 @@ pub fn validate_changed_paths_with_allowed_paths(
     };
     allowed.insert(relative);
   }
-  let changed = git.changed_paths()?;
+  let changed = ctx.changed_source_paths()?;
   let unexpected: Vec<_> = changed.into_iter().filter(|path| !allowed.contains(path)).collect();
   if unexpected.is_empty() {
     return Ok(());

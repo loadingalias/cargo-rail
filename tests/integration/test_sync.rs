@@ -127,6 +127,34 @@ fn test_sync_to_remote_basic() -> Result<()> {
 }
 
 #[test]
+fn test_sync_preserves_committed_source_paths_named_target() -> Result<()> {
+  let (ws, split_dir) = setup_split_scenario("target-named-source")?;
+  std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
+  let source = ws.path.join("crates/target-named-source/docs/target/example.txt");
+  std::fs::create_dir_all(source.parent().expect("source fixture must have a parent"))?;
+  std::fs::write(&source, "intentional source\n")?;
+  ws.commit("Add target-named source path")?;
+
+  run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "sync",
+      "target-named-source",
+      "--to-remote",
+      "--yes",
+      "--allow-dirty",
+    ],
+  )?;
+
+  assert_eq!(
+    std::fs::read_to_string(split_dir.path().join("docs/target/example.txt"))?,
+    "intentional source\n"
+  );
+  Ok(())
+}
+
+#[test]
 fn test_sync_from_remote_basic() -> Result<()> {
   let (ws, split_dir) = setup_split_scenario("mylib")?;
 

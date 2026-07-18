@@ -10,6 +10,8 @@
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
+use cargo_rail::source::SourceSnapshot;
+use cargo_rail::workspace::WorkspaceContext;
 use tempfile::TempDir;
 
 // Core Unification Tests
@@ -2232,7 +2234,8 @@ fn test_unify_apply_from_plan_file() -> Result<()> {
 #[test]
 fn test_unify_check_json_runs_without_git_repository() -> Result<()> {
   let root = TempDir::new()?;
-  let workspace_root = root.path();
+  let workspace_root = root.path().join("workspace");
+  std::fs::create_dir_all(&workspace_root)?;
 
   std::fs::write(
     workspace_root.join("Cargo.toml"),
@@ -2244,6 +2247,15 @@ resolver = "2"
 edition = "2021"
 "#,
   )?;
+  std::fs::write(workspace_root.join(".gitignore"), "ambient-ignored/\ntarget/\n")?;
+  std::fs::create_dir_all(workspace_root.join("ambient-ignored"))?;
+  std::fs::write(
+    workspace_root.join("ambient-ignored/source.txt"),
+    "explicit filesystem policy keeps this source\n",
+  )?;
+  std::fs::create_dir_all(workspace_root.join("target/debug"))?;
+  std::fs::write(workspace_root.join("target/debug/generated.rlib"), "generated\n")?;
+  std::fs::write(root.path().join("outside-secret.txt"), "outside the Cargo workspace\n")?;
   std::fs::create_dir_all(workspace_root.join(".config"))?;
   std::fs::write(
     workspace_root.join(".config/rail.toml"),
@@ -2272,7 +2284,21 @@ edition.workspace = true
     "test workspace must not have a git repo"
   );
 
-  let output = run_cargo_rail(workspace_root, &["rail", "unify", "--check", "-f", "json"])?;
+  let context = WorkspaceContext::build(&workspace_root)?;
+  assert!(!context.has_git());
+  let snapshot = context.capture_filesystem_source()?;
+  assert!(matches!(snapshot, SourceSnapshot::FilesystemBacked(_)));
+  let source_paths = snapshot
+    .tree()
+    .entries()
+    .iter()
+    .map(|entry| entry.path.as_str())
+    .collect::<Vec<_>>();
+  assert!(source_paths.contains(&"ambient-ignored/source.txt"));
+  assert!(source_paths.iter().all(|path| !path.starts_with("target/")));
+  assert!(source_paths.iter().all(|path| *path != "outside-secret.txt"));
+
+  let output = run_cargo_rail(&workspace_root, &["rail", "unify", "--check", "-f", "json"])?;
   assert!(
     output.status.success(),
     "unify --check should not require git.\nstdout:\n{}\nstderr:\n{}",

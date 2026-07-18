@@ -29,7 +29,7 @@ use crate::error::{ConfigError, GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use crate::progress;
-use crate::source::GitWorktreeCapture;
+use crate::source::{GitWorktreeCapture, SourceExclusions, SourceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -82,7 +82,7 @@ impl CargoState {
   /// Uses a content-based cache (FNV-1a hash of workspace Cargo.toml/Cargo.lock + all workspace member Cargo.toml)
   /// stored in `target/cargo-rail/metadata.json` to speed up subsequent loads.
   fn load(workspace_root: &Path) -> RailResult<Self> {
-    let cache_dir = workspace_root.join("target").join("cargo-rail");
+    let cache_dir = super::cargo_rail_state_root(workspace_root);
     let cache_file = cache_dir.join("metadata.json");
 
     // Try to load from cache
@@ -396,8 +396,10 @@ impl GitState {
 /// Uses Arc for efficient sharing across threads and parallel operations.
 /// Cloning is extremely cheap (just increments Arc refcounts).
 pub struct WorkspaceContext {
-  /// Cargo workspace root (Cargo.toml location)
-  /// Note: In most cases, git repo root == workspace root. Access git root via `ctx.git()?.repo_root()` if needed.
+  /// Cargo workspace root (`Cargo.toml` location).
+  ///
+  /// When Git is present, this root is validated as equal to or below the Git
+  /// worktree. Access the repository root through [`WorkspaceContext::git`].
   pub workspace_root: PathBuf,
 
   /// Git state and operations, when the workspace is inside a Git repository.
@@ -408,6 +410,9 @@ pub struct WorkspaceContext {
 
   /// Cargo metadata and workspace info (Arc for cheap cloning across threads)
   pub cargo: Arc<CargoState>,
+
+  /// Validated repository-relative path to the Cargo workspace, when nested.
+  workspace_prefix: Option<PathBuf>,
 
   /// Immutable source captured before Cargo metadata can create generated state.
   source_capture: Option<Arc<GitWorktreeCapture>>,
@@ -443,6 +448,9 @@ impl WorkspaceContext {
   ///
   /// Returns [`RailError::Message`] if `cargo metadata` fails (e.g., invalid `Cargo.toml`).
   ///
+  /// Returns [`RailError::Message`] if Cargo discovers a workspace outside the
+  /// Git worktree opened from `workspace_root`.
+  ///
   /// Returns [`RailError::Config`] if `rail.toml` exists but fails to parse.
   ///
   /// # Performance
@@ -471,12 +479,12 @@ impl WorkspaceContext {
       Err(err) => return Err(err),
     };
 
-    let source_capture = if capture_source {
+    let initial_generated_roots = [super::cargo_rail_state_root(workspace_root)];
+    let mut source_capture = if capture_source {
       git
         .as_ref()
-        .map(|state| GitWorktreeCapture::capture(state.git()))
+        .map(|state| GitWorktreeCapture::capture_excluding(state.git(), &initial_generated_roots))
         .transpose()?
-        .map(Arc::new)
     } else {
       None
     };
@@ -485,22 +493,30 @@ impl WorkspaceContext {
     let cargo = Arc::new(CargoState::load(workspace_root)?);
     let workspace_root = cargo.workspace_root().to_path_buf();
 
-    // Validate git repo root and workspace_root match (or warn if they differ)
-    // Canonicalize both paths to handle Windows short (8.3) vs long path formats
-    if let Some(git) = git.as_ref() {
-      let git_root_canonical = git
-        .repo_root()
-        .canonicalize()
-        .unwrap_or_else(|_| git.repo_root().to_path_buf());
-      let workspace_root_canonical = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
+    // Repository paths are the authority for Git-backed capture and mutation.
+    // A Cargo workspace may be nested inside that boundary, but never contain it
+    // or escape it. Capture this relation once so every path consumer agrees.
+    let workspace_prefix = git
+      .as_ref()
+      .map(|git| {
+        crate::utils::path_relative_to(git.repo_root(), &workspace_root).map_err(|error| {
+          RailError::with_help(
+            format!(
+              "Cargo workspace root '{}' is outside Git worktree '{}': {}",
+              workspace_root.display(),
+              git.repo_root().display(),
+              error
+            ),
+            "select a Cargo workspace contained by this repository, or run outside the nested Git worktree",
+          )
+        })
+      })
+      .transpose()?
+      .filter(|prefix| !prefix.as_os_str().is_empty());
 
-      if git_root_canonical != workspace_root_canonical {
-        crate::warn!(
-          "git repo root ({}) differs from Cargo workspace root ({})",
-          git.repo_root().display(),
-          workspace_root.display()
-        );
-      }
+    if let (Some(capture), Some(git)) = (source_capture.as_mut(), git.as_ref()) {
+      let generated_roots = validated_generated_source_roots(git.repo_root(), &workspace_root, &cargo)?;
+      capture.exclude_generated_roots(git.git(), &generated_roots)?;
     }
 
     // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
@@ -543,7 +559,8 @@ impl WorkspaceContext {
       workspace_root,
       git,
       cargo,
-      source_capture,
+      workspace_prefix,
+      source_capture: source_capture.map(Arc::new),
       graph,
       config,
       targets,
@@ -579,8 +596,71 @@ impl WorkspaceContext {
   }
 
   /// Return source captured before metadata loading, when requested by dispatch.
+  ///
+  /// Ignored paths, the resolved Cargo target/build directories, and
+  /// workspace-owned cargo-rail state are absent from this capture.
   pub fn source_capture(&self) -> Option<&GitWorktreeCapture> {
     self.source_capture.as_deref()
+  }
+
+  pub(crate) fn capture_worktree_source(&self) -> RailResult<GitWorktreeCapture> {
+    let git = self.git()?;
+    let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
+    GitWorktreeCapture::capture_excluding(git.git(), &generated_roots)
+  }
+
+  /// Capture this declared Cargo workspace directly from the filesystem.
+  ///
+  /// The exact Cargo target/build directories and workspace-owned cargo-rail
+  /// state are excluded. Git ignore files are not interpreted, so this remains
+  /// deterministic in source archives and sandboxes without repository state.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when this context has a Git backend; callers must use the
+  /// Git-backed capture so repository metadata and ignore policy remain authoritative.
+  ///
+  /// Returns an error when the workspace cannot be walked consistently or a
+  /// generated-state root would exclude the complete workspace boundary.
+  pub fn capture_filesystem_source(&self) -> RailResult<SourceSnapshot> {
+    if self.has_git() {
+      return Err(RailError::with_help(
+        "filesystem-backed source capture is only available without Git",
+        "use the Git-backed worktree capture for repositories",
+      ));
+    }
+    SourceSnapshot::capture_filesystem(
+      &self.workspace_root,
+      &generated_source_roots(&self.workspace_root, &self.cargo),
+    )
+  }
+
+  /// Return current non-generated source paths that differ from `HEAD`.
+  pub(crate) fn changed_source_paths(&self) -> RailResult<Vec<PathBuf>> {
+    let git = self.git()?.git();
+    Ok(
+      self
+        .capture_worktree_source()?
+        .changes_from(git, "HEAD")?
+        .entries()
+        .iter()
+        .map(|change| change.path.as_path().to_path_buf())
+        .collect(),
+    )
+  }
+
+  pub(crate) fn exclude_generated_source_paths(&self, paths: Vec<PathBuf>) -> RailResult<Vec<PathBuf>> {
+    let git = self.git()?;
+    let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
+    let exclusions = SourceExclusions::from_absolute_roots(git.git(), &generated_roots)?;
+    paths
+      .into_iter()
+      .filter_map(|path| match exclusions.contains_path(&path) {
+        Ok(true) => None,
+        Ok(false) => Some(Ok(path)),
+        Err(error) => Some(Err(error)),
+      })
+      .collect()
   }
 
   /// Get multi-target metadata, loading lazily on first access.
@@ -634,7 +714,7 @@ impl WorkspaceContext {
     &self.workspace_root
   }
 
-  /// Get the relative path from git root to workspace root.
+  /// Get the validated relative path from the Git root to the Cargo workspace.
   ///
   /// Returns `Some(prefix)` if workspace is nested inside git repo (e.g., "codex-rs"),
   /// or `None` if they're the same directory.
@@ -642,32 +722,7 @@ impl WorkspaceContext {
   /// This is used to strip the prefix from git-relative paths so they can be
   /// matched against workspace-relative paths (e.g., for crate membership).
   pub fn workspace_prefix(&self) -> Option<PathBuf> {
-    let git_root = self.git.as_ref()?.repo_root();
-
-    // On Windows, paths from different sources may have incompatible representations:
-    // - Forward vs backslash separators (C:/foo vs C:\foo)
-    // - 8.3 short names vs long names (RUNNER~1 vs runneradmin)
-    // - Case differences (on case-insensitive filesystems)
-    //
-    // We must canonicalize both paths to get a consistent representation.
-    // Note: canonicalize() adds \\?\ prefix on Windows, but strip_prefix handles this
-    // correctly when both paths have the same prefix.
-    let git_root_canonical = git_root.canonicalize().unwrap_or_else(|_| git_root.to_path_buf());
-    let workspace_canonical = self
-      .workspace_root
-      .canonicalize()
-      .unwrap_or_else(|_| self.workspace_root.clone());
-
-    // If workspace is nested inside git repo, compute the relative prefix
-    if let Ok(prefix) = workspace_canonical.strip_prefix(&git_root_canonical) {
-      if prefix.as_os_str().is_empty() {
-        None // Same directory
-      } else {
-        Some(prefix.to_path_buf())
-      }
-    } else {
-      None
-    }
+    self.workspace_prefix.clone()
   }
 
   /// Convert a git-relative path to a workspace-relative path.
@@ -677,16 +732,67 @@ impl WorkspaceContext {
   ///
   /// Returns `None` if the path doesn't belong to this workspace.
   pub fn to_workspace_path(&self, git_path: &Path) -> Option<PathBuf> {
-    if let Some(prefix) = self.workspace_prefix() {
+    if let Some(prefix) = &self.workspace_prefix {
       // Git always uses forward slashes, but PathBuf::from converts to platform separators.
       // On Windows, this causes strip_prefix to fail when git_path has / but prefix has \.
       // Normalize git_path by rebuilding through components to use platform separators.
       let normalized = git_path.components().collect::<PathBuf>();
-      normalized.strip_prefix(&prefix).ok().map(|p| p.to_path_buf())
+      normalized.strip_prefix(prefix).ok().map(|p| p.to_path_buf())
     } else {
       Some(git_path.to_path_buf())
     }
   }
+}
+
+fn validated_generated_source_roots(
+  git_root: &Path,
+  workspace_root: &Path,
+  cargo: &CargoState,
+) -> RailResult<Vec<PathBuf>> {
+  validate_cargo_output_root(
+    "target",
+    git_root,
+    workspace_root,
+    cargo.metadata().target_directory.as_std_path(),
+  )?;
+  if let Some(build_directory) = &cargo.metadata().build_directory {
+    validate_cargo_output_root("build", git_root, workspace_root, build_directory.as_std_path())?;
+  }
+  Ok(generated_source_roots(workspace_root, cargo))
+}
+
+fn generated_source_roots(workspace_root: &Path, cargo: &CargoState) -> Vec<PathBuf> {
+  let mut roots = vec![
+    super::cargo_rail_state_root(workspace_root),
+    cargo.metadata().target_directory.as_std_path().to_path_buf(),
+  ];
+  if let Some(build_directory) = &cargo.metadata().build_directory {
+    roots.push(build_directory.as_std_path().to_path_buf());
+  }
+  roots
+}
+
+fn validate_cargo_output_root(
+  kind: &str,
+  git_root: &Path,
+  workspace_root: &Path,
+  output_root: &Path,
+) -> RailResult<()> {
+  let git_root = crate::utils::canonicalize_existing(git_root)?;
+  let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+  let output_root = crate::utils::canonicalize_allow_missing(output_root)?;
+  if output_root.starts_with(&git_root) && workspace_root.starts_with(&output_root) {
+    return Err(RailError::with_help(
+      format!(
+        "Cargo {} directory '{}' contains Cargo workspace root '{}'",
+        kind,
+        output_root.display(),
+        workspace_root.display()
+      ),
+      "configure Cargo build output in a dedicated directory below or outside the repository",
+    ));
+  }
+  Ok(())
 }
 
 #[cfg(test)]

@@ -63,9 +63,15 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   }
 
   // Dirty worktree check (unless --allow-dirty or --check mode)
-  if !args.check && !args.allow_dirty && ctx.git()?.git().is_dirty()? {
-    let files = ctx.git()?.git().dirty_files()?;
-    return Err(RailError::Git(GitError::DirtyWorktree { files }));
+  if !args.check && !args.allow_dirty {
+    let files = ctx
+      .changed_source_paths()?
+      .into_iter()
+      .map(|path| path.display().to_string())
+      .collect::<Vec<_>>();
+    if !files.is_empty() {
+      return Err(RailError::Git(GitError::DirtyWorktree { files }));
+    }
   }
 
   let builder = SplitSyncConfigBuilder::new(ctx)?
@@ -634,7 +640,7 @@ fn write_sync_audit_artifact(
   pre_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
   post_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
 ) -> RailResult<PathBuf> {
-  let dir = workspace_root.join("target").join("cargo-rail").join("receipts");
+  let dir = crate::workspace::cargo_rail_state_root(workspace_root).join("receipts");
   std::fs::create_dir_all(&dir)?;
   let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
   let path = dir.join(format!("sync-audit-{}.json", nonce));
