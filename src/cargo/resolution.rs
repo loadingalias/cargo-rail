@@ -21,6 +21,7 @@ use crate::compiler::cfg_eval::{TargetCfgSet, cargo_target_constraint_matches};
 use crate::error::{RailError, RailResult};
 use crate::graph::WorkspaceGraph;
 use crate::source::ContentDigest;
+use crate::utils::canonicalize_existing;
 
 const MAX_CARGO_CONFIG_INCLUDE_DEPTH: usize = 64;
 const CREDENTIAL_CAPABILITY_KEY: &str = "cargo-rail-credential-capability-v1";
@@ -1573,7 +1574,7 @@ fn capture_custom_target(path: &Path) -> RailResult<CustomTargetSpecification> {
       "replace it with a regular JSON file before snapshot capture",
     ));
   }
-  let canonical = path.canonicalize().map_err(|error| {
+  let canonical = canonicalize_existing(path).map_err(|error| {
     RailError::message(format!(
       "failed to resolve custom target specification '{}': {error}",
       path.display()
@@ -2252,7 +2253,7 @@ fn wrapped_rustc_identity(
 
 impl CargoConfigSnapshot {
   pub(crate) fn capture(cargo_current_dir: &Path) -> RailResult<Self> {
-    let cargo_current_dir = cargo_current_dir.canonicalize().map_err(|error| {
+    let cargo_current_dir = canonicalize_existing(cargo_current_dir).map_err(|error| {
       RailError::message(format!(
         "Failed to resolve Cargo current directory '{}' for configuration identity: {error}",
         cargo_current_dir.display()
@@ -2339,7 +2340,7 @@ fn capture_credential_capabilities(
     append_frame(framed, b"credential-capabilities", &serde_json::to_vec(&capabilities)?);
     return Ok((capabilities, None));
   };
-  let canonical = path.canonicalize().map_err(|error| {
+  let canonical = canonicalize_existing(&path).map_err(|error| {
     RailError::message(format!(
       "Failed to resolve Cargo credentials file for capability capture: {error}"
     ))
@@ -2462,7 +2463,7 @@ fn capture_config_file(
       path.display()
     )));
   }
-  let canonical = path.canonicalize().map_err(|error| {
+  let canonical = canonicalize_existing(path).map_err(|error| {
     RailError::message(format!(
       "Failed to resolve Cargo configuration '{}': {error}",
       path.display()
@@ -3023,8 +3024,7 @@ mod tests {
     assert_eq!(
       provenance.as_deref(),
       Some(
-        legacy
-          .canonicalize()
+        canonicalize_existing(&legacy)
           .expect("legacy credentials should canonicalize")
           .as_path()
       )
@@ -3142,6 +3142,31 @@ mod tests {
     );
   }
 
+  #[test]
+  fn cargo_config_provenance_uses_snapshot_canonical_path_representation() {
+    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
+    let cargo_dir = workspace.path().join(".cargo");
+    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
+    fs::write(
+      cargo_dir.join("config.toml"),
+      "[build]\nrustflags = [\"--cfg\", \"snapshot\"]\n",
+    )
+    .expect("Cargo config should be written");
+
+    let captured = CargoConfigSnapshot::capture(workspace.path()).expect("Cargo config capture should succeed");
+    let source_root = canonicalize_existing(workspace.path()).expect("workspace should canonicalize");
+    let repository_paths = captured
+      .repository_config_paths(&source_root)
+      .expect("repository config paths should normalize");
+
+    assert!(
+      repository_paths
+        .iter()
+        .any(|path| path.as_str() == ".cargo/config.toml"),
+      "repository Cargo config was not recognized under snapshot root: {repository_paths:?}"
+    );
+  }
+
   #[cfg(unix)]
   #[test]
   fn target_identity_resolves_effective_tools_and_cargo_flag_fixed_point() {
@@ -3195,9 +3220,7 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
       target.runner(),
       Some(
         [
-          workspace
-            .path()
-            .canonicalize()
+          canonicalize_existing(workspace.path())
             .expect("workspace should canonicalize")
             .join("tools/cfg-runner")
             .into_os_string(),
@@ -3209,9 +3232,7 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
     assert_eq!(
       target.linker(),
       Some(
-        workspace
-          .path()
-          .canonicalize()
+        canonicalize_existing(workspace.path())
           .expect("workspace should canonicalize")
           .join("tools/exact-linker")
           .as_os_str()
@@ -3264,7 +3285,7 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
     assert_eq!(target.name(), "custom-target");
     assert_eq!(
       target.path(),
-      path.canonicalize().expect("target path should canonicalize")
+      canonicalize_existing(&path).expect("target path should canonicalize")
     );
     assert_eq!(target.bytes(), bytes);
     assert_eq!(target.digest(), ContentDigest::sha256(bytes));
@@ -3375,9 +3396,7 @@ linker = "linker-b"
     .expect("wrapper should be selected");
     assert_eq!(
       wrapper,
-      workspace
-        .path()
-        .canonicalize()
+      canonicalize_existing(workspace.path())
         .expect("workspace should canonicalize")
         .join("tools/wrapper")
         .into_os_string()
@@ -3585,9 +3604,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
         .get(OsStr::new("CARGO_RAIL_RELATIVE_TEST"))
         .and_then(Option::as_deref),
       Some(
-        workspace
-          .path()
-          .canonicalize()
+        canonicalize_existing(workspace.path())
           .expect("workspace should canonicalize")
           .join("tools")
           .as_os_str()
@@ -3616,8 +3633,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
     assert_eq!(
       selected.as_deref(),
       Some(
-        target_path
-          .canonicalize()
+        canonicalize_existing(&target_path)
           .expect("custom target should canonicalize")
           .as_path()
       )
