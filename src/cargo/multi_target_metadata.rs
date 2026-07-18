@@ -3,8 +3,9 @@
 //! This replaces the old WorkspaceMetadata that was confused about --all-features.
 //! We load metadata per target (in parallel) and cache it for reuse.
 
+use crate::cargo::resolution::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, ResolutionViews};
 use crate::error::RailResult;
-use cargo_metadata::{Metadata, MetadataCommand, Node, Package, PackageId};
+use cargo_metadata::{Metadata, Node, Package, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use semver::Version;
@@ -89,8 +90,9 @@ pub struct MultiTargetMetadata {
 
 impl MultiTargetMetadata {
   /// Load metadata for all targets in parallel
-  pub fn load_parallel(workspace_metadata: Arc<Metadata>, targets: &[String]) -> RailResult<Self> {
-    let workspace_root = workspace_metadata.workspace_root.as_std_path().to_path_buf();
+  pub(crate) fn load_parallel(resolution_views: &ResolutionViews, targets: &[String]) -> RailResult<Self> {
+    let base = resolution_views.view(ResolutionRequest::default())?;
+    let workspace_metadata = base.shared_metadata();
     let workspace_member_ids: HashSet<&PackageId> = workspace_metadata.workspace_members.iter().collect();
     let workspace_package_indices = workspace_metadata
       .packages
@@ -113,8 +115,13 @@ impl MultiTargetMetadata {
     let results: Vec<RailResult<(String, Arc<Metadata>)>> = targets
       .par_iter()
       .map(|target| {
-        let metadata = Arc::new(Self::load_single_target(&workspace_root, Some(target))?);
-        Ok((target.clone(), metadata))
+        let request = ResolutionRequest::new(
+          ResolutionPackages::Workspace,
+          ResolutionFeatures::Default,
+          Some(target.clone()),
+        )?;
+        let view = resolution_views.view(request)?;
+        Ok((target.clone(), view.shared_metadata()))
       })
       .collect();
 
@@ -189,52 +196,6 @@ impl MultiTargetMetadata {
       package_names,
       library_names,
     }
-  }
-
-  /// Load metadata for a single target
-  fn load_single_target(workspace_root: &Path, target: Option<&str>) -> RailResult<Metadata> {
-    let manifest_path = workspace_root.join("Cargo.toml");
-
-    let mut cmd = MetadataCommand::new();
-    cmd.manifest_path(&manifest_path);
-
-    // Add target filtering if specified
-    if let Some(target_triple) = target {
-      cmd.other_options(vec![String::from("--filter-platform"), String::from(target_triple)]);
-    }
-
-    // IMPORTANT: NO --all-features! We want cargo's default resolution
-    // Features come from manifest analysis (intersection of unconditional)
-
-    crate::instrumentation::record_cargo_metadata_load(target.is_some());
-    let metadata = cmd.exec().map_err(|e| {
-      if let Some(t) = target {
-        let err_str = e.to_string();
-        // Detect missing target scenario
-        if err_str.contains("error[E0463]")
-          || err_str.contains("can't find crate")
-          || err_str.contains("target may not be installed")
-        {
-          crate::error::RailError::with_help(
-            format!("Target '{}' is not installed on this machine", t),
-            format!(
-              "Install the target with: rustup target add {}\n\
-               Or remove it from rail.toml [targets] if not needed for this workspace.",
-              t
-            ),
-          )
-        } else {
-          crate::error::RailError::with_help(
-            format!("Failed to load cargo metadata for target '{}'", t),
-            format!("Error: {}\n\nCheck that the target is valid and installed.", e),
-          )
-        }
-      } else {
-        crate::error::RailError::with_help("Failed to load cargo metadata".to_string(), format!("Error: {}", e))
-      }
-    })?;
-
-    Ok(metadata)
   }
 
   /// Get metadata for a specific target
@@ -952,7 +913,10 @@ pub enum MsrvSourceUsed {
 mod tests {
   use std::path::Path;
 
+  use cargo_metadata::MetadataCommand;
+
   use super::*;
+  use crate::graph::WorkspaceGraph;
 
   fn write_test_package(root: &Path, relative: &str, name: &str, dependencies: &str) {
     let package_root = root.join(relative);
@@ -1028,7 +992,11 @@ mod tests {
       "disabled optional declaration must not resolve as an app edge"
     );
 
-    let metadata = MultiTargetMetadata::load_parallel(Arc::new(metadata), &[])
+    let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
+    let metadata = Arc::new(metadata);
+    let graph = Arc::new(WorkspaceGraph::from_metadata(&metadata).expect("canonical graph should build"));
+    let resolution_views = ResolutionViews::new(workspace_root.clone(), workspace_root, Arc::clone(&metadata), graph);
+    let metadata = MultiTargetMetadata::load_parallel(&resolution_views, &[])
       .expect("multi-target metadata should use the canonical resolution");
     assert!(
       metadata.is_transitive_only("shared"),

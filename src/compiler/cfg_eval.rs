@@ -1,22 +1,32 @@
 //! Exact target cfg expression evaluation using rustc-provided cfg sets.
 
-use crate::error::{RailError, RailResult, ResultExt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+
+use cargo_metadata::cargo_platform::{Cfg, Platform};
+
+use crate::error::{RailError, RailResult, ResultExt};
 
 /// Parsed cfg flags and key/value sets for one target triple.
 #[derive(Debug, Clone, Default)]
 pub struct TargetCfgSet {
   flags: HashSet<String>,
   key_values: HashMap<String, HashSet<String>>,
+  cargo_cfg: Vec<Cfg>,
+  malformed_cargo_cfg: Option<String>,
 }
 
 impl TargetCfgSet {
-  fn from_rustc_output(output: &str) -> Self {
+  pub(crate) fn from_rustc_output(output: &str) -> Self {
     let mut set = Self::default();
 
     for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+      match line.parse::<Cfg>() {
+        Ok(cfg) => set.cargo_cfg.push(cfg),
+        Err(_) if set.malformed_cargo_cfg.is_none() => set.malformed_cargo_cfg = Some(line.to_string()),
+        Err(_) => {}
+      }
       if let Some((key, value)) = parse_key_value(line) {
         set.key_values.entry(key).or_default().insert(value);
       } else {
@@ -54,6 +64,26 @@ impl TargetCfgSet {
   pub(crate) fn from_test_lines(lines: &[&str]) -> Self {
     Self::from_rustc_output(&lines.join("\n"))
   }
+}
+
+/// Evaluate one Cargo `[target.'cfg(...)']` key against an exact rustc cfg set.
+///
+/// Unlike the compatibility query used by dependency analysis, malformed Cargo
+/// configuration is an error rather than a silent non-match.
+pub(crate) fn cargo_target_constraint_matches(
+  target_constraint: &str,
+  target: &str,
+  cfg_set: &TargetCfgSet,
+) -> RailResult<bool> {
+  let platform = target_constraint
+    .parse::<Platform>()
+    .map_err(|_| RailError::message(format!("malformed Cargo target cfg key '{target_constraint}'")))?;
+  if let Some(line) = &cfg_set.malformed_cargo_cfg {
+    return Err(RailError::message(format!(
+      "rustc returned malformed target cfg '{line}'"
+    )));
+  }
+  Ok(platform.matches(target, &cfg_set.cargo_cfg))
 }
 
 /// Load `rustc --print cfg` for each configured target.
@@ -351,16 +381,16 @@ impl<'a> CfgParser<'a> {
   fn parse_string_literal(&mut self) -> Result<String, ()> {
     self.skip_ws();
     self.expect_char('"')?;
-    let start = self.pos;
+    let start = self.pos - 1;
+    let mut escaped = false;
     while let Some(c) = self.peek_char() {
-      if c == '"' {
-        let value = std::str::from_utf8(&self.input[start..self.pos])
-          .map(str::to_string)
-          .map_err(|_| ())?;
-        self.pos += 1;
+      self.pos += 1;
+      if c == '"' && !escaped {
+        let literal = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| ())?;
+        let value = serde_json::from_str(literal).map_err(|_| ())?;
         return Ok(value);
       }
-      self.pos += 1;
+      escaped = c == '\\' && !escaped;
     }
     Err(())
   }
@@ -406,10 +436,7 @@ fn parse_key_value(line: &str) -> Option<(String, String)> {
   if !(value.starts_with('"') && value.ends_with('"')) {
     return None;
   }
-  Some((
-    key.to_string(),
-    value.trim_start_matches('"').trim_end_matches('"').to_string(),
-  ))
+  serde_json::from_str(value).ok().map(|value| (key.to_string(), value))
 }
 
 #[cfg(test)]
@@ -471,6 +498,25 @@ mod tests {
       "aarch64-apple-darwin",
       Some(&cfg)
     ));
+  }
+
+  #[test]
+  fn cargo_target_constraint_uses_cargos_complete_cfg_grammar() {
+    let cfg = TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\"\n");
+    assert!(
+      cargo_target_constraint_matches(
+        r#"cfg(all(true, unix, not(false), target_os = "linux"))"#,
+        "x86_64-unknown-linux-gnu",
+        &cfg,
+      )
+      .expect("Cargo cfg expression should parse")
+    );
+    assert!(cargo_target_constraint_matches("cfg(all(unix)", "target", &cfg).is_err());
+
+    let malformed_cfg = TargetCfgSet::from_rustc_output("unix\nnot a cfg value\n");
+    let error = cargo_target_constraint_matches("cfg(unix)", "target", &malformed_cfg)
+      .expect_err("malformed rustc cfg output must fail closed for Cargo matching");
+    assert!(error.to_string().contains("rustc returned malformed target cfg"));
   }
 
   #[test]

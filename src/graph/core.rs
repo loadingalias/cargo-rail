@@ -17,11 +17,11 @@
 //! - **Edges**: Resolved aliases with independent kind and target semantics
 //! - **Index**: Exact package IDs for graph work; package names only for user selection
 //! - **Algorithms**: Shortest paths, reachability, transitive closure
-//! - **Path cache**: File → owning crate mapping (lazy, interior mutability)
+//! - **Ownership index**: Longest package-root prefix → exact workspace package
 
 use std::collections::HashSet;
+use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
 use cargo_metadata::cargo_platform::Platform;
 use cargo_metadata::{DependencyKind, PackageId, Source};
@@ -62,6 +62,159 @@ pub struct DependencyEdge {
   pub target: Option<Platform>,
 }
 
+struct OwnershipIndex {
+  workspace_root: PathBuf,
+  workspace_roots: FxHashMap<PathBuf, NodeIndex>,
+  external_roots: FxHashMap<PathBuf, NodeIndex>,
+}
+
+impl OwnershipIndex {
+  fn from_graph(graph: &DiGraph<PackageNode, DependencyEdge>, workspace_root: &Path) -> RailResult<Self> {
+    let workspace_root = Self::normalize_absolute(workspace_root).ok_or_else(|| {
+      RailError::message(format!(
+        "Cargo workspace root '{}' is not an absolute normalizable path",
+        workspace_root.display()
+      ))
+    })?;
+    let mut index = Self {
+      workspace_root,
+      workspace_roots: FxHashMap::default(),
+      external_roots: FxHashMap::default(),
+    };
+    for node_idx in graph.node_indices() {
+      let package = &graph[node_idx];
+      if !package.is_workspace_member {
+        continue;
+      }
+      let package_root = package.manifest_path.parent().ok_or_else(|| {
+        RailError::message(format!(
+          "Workspace package '{}' has no manifest parent directory",
+          package.id
+        ))
+      })?;
+      let normalized_root = index.normalize_package_root(package_root).ok_or_else(|| {
+        RailError::message(format!(
+          "Workspace package '{}' root '{}' cannot be normalized against workspace root '{}'",
+          package.id,
+          package_root.display(),
+          index.workspace_root.display()
+        ))
+      })?;
+      if let Ok(relative) = normalized_root.strip_prefix(&index.workspace_root) {
+        Self::insert_root(&mut index.workspace_roots, relative.to_path_buf(), node_idx, graph)?;
+      } else {
+        Self::insert_root(&mut index.external_roots, normalized_root, node_idx, graph)?;
+      }
+    }
+    Ok(index)
+  }
+
+  fn owner(&self, file_path: &Path) -> Option<NodeIndex> {
+    if file_path.is_absolute() {
+      let normalized = Self::normalize_absolute(file_path)?;
+      if let Ok(relative) = normalized.strip_prefix(&self.workspace_root) {
+        Self::longest_owner(&self.workspace_roots, relative)
+      } else {
+        Self::longest_owner(&self.external_roots, &normalized)
+      }
+    } else {
+      let relative = Self::normalize_relative(file_path)?;
+      Self::longest_owner(&self.workspace_roots, &relative)
+    }
+  }
+
+  fn longest_owner(roots: &FxHashMap<PathBuf, NodeIndex>, file_path: &Path) -> Option<NodeIndex> {
+    for root in file_path.parent()?.ancestors() {
+      if let Some(&owner) = roots.get(root) {
+        let package_relative = file_path.strip_prefix(root).ok()?;
+        return (!Self::should_ignore_path(package_relative)).then_some(owner);
+      }
+    }
+    None
+  }
+
+  fn insert_root(
+    roots: &mut FxHashMap<PathBuf, NodeIndex>,
+    root: PathBuf,
+    node_idx: NodeIndex,
+    graph: &DiGraph<PackageNode, DependencyEdge>,
+  ) -> RailResult<()> {
+    if let Some(existing_idx) = roots.insert(root.clone(), node_idx) {
+      let existing = &graph[existing_idx];
+      let package = &graph[node_idx];
+      let mut package_ids = [existing.id.to_string(), package.id.to_string()];
+      package_ids.sort_unstable();
+      return Err(RailError::message(format!(
+        "Packages '{}' and '{}' claim the same workspace package root '{}'",
+        package_ids[0],
+        package_ids[1],
+        root.display()
+      )));
+    }
+    Ok(())
+  }
+
+  fn should_ignore_path(path: &Path) -> bool {
+    path.components().any(|component| {
+      matches!(
+        component,
+        Component::Normal(name)
+          if matches!(
+            name.to_str(),
+            Some(".git" | ".jj" | ".hg" | ".svn" | "target" | "node_modules" | ".cache" | "tmp" | ".tmp")
+          )
+      )
+    })
+  }
+
+  fn normalize_package_root(&self, package_root: &Path) -> Option<PathBuf> {
+    if package_root.is_absolute() {
+      Self::normalize_absolute(package_root)
+    } else {
+      let relative = Self::normalize_relative(package_root)?;
+      Self::normalize_absolute(&self.workspace_root.join(relative))
+    }
+  }
+
+  fn normalize_relative(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+      match component {
+        Component::Normal(segment) => normalized.push(segment),
+        Component::CurDir => {}
+        Component::ParentDir => {
+          if !normalized.pop() {
+            return None;
+          }
+        }
+        Component::Prefix(_) | Component::RootDir => return None,
+      }
+    }
+    Some(normalized)
+  }
+
+  fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+      return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+      match component {
+        Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+        Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+        Component::CurDir => {}
+        Component::ParentDir => {
+          if !normalized.pop() {
+            return None;
+          }
+        }
+        Component::Normal(segment) => normalized.push(segment),
+      }
+    }
+    Some(normalized)
+  }
+}
+
 /// Workspace dependency graph.
 ///
 /// Built from cargo_metadata, using petgraph for efficient traversals.
@@ -80,14 +233,8 @@ pub struct WorkspaceGraph {
   /// Pre-sorted workspace member names - avoids repeated sort on each call
   sorted_members: Vec<String>,
 
-  /// Workspace root directory (for converting absolute paths to relative)
-  workspace_root: PathBuf,
-
-  /// Path cache: workspace-relative directory → exact graph node
-  /// Built eagerly during graph construction (saves 10-50ms on first file lookup)
-  /// Uses RwLock instead of RefCell for Send/Sync compatibility
-  /// Stores workspace-relative paths to support deleted files (no canonicalize needed)
-  path_cache: RwLock<Option<FxHashMap<PathBuf, NodeIndex>>>,
+  /// Immutable longest-prefix index derived from exact workspace package roots.
+  ownership_index: OwnershipIndex,
 }
 
 impl WorkspaceGraph {
@@ -95,7 +242,7 @@ impl WorkspaceGraph {
   ///
   /// # Performance
   /// - Graph construction: 10-50ms
-  /// - Path cache: built eagerly (10-50ms)
+  /// - Ownership index: built once from workspace package roots
   /// - **Does not reload metadata** (use existing from CargoState)
   pub fn from_metadata(metadata: &cargo_metadata::Metadata) -> RailResult<Self> {
     // Build petgraph
@@ -185,19 +332,15 @@ impl WorkspaceGraph {
     // Store workspace root for path normalization
     let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
 
-    let graph = Self {
+    let ownership_index = OwnershipIndex::from_graph(&graph, &workspace_root)?;
+
+    Ok(Self {
       graph,
       id_to_node,
       workspace_name_index,
       sorted_members,
-      workspace_root,
-      path_cache: RwLock::new(None),
-    };
-
-    // Build path cache eagerly instead of lazily (saves 10-50ms on first file lookup)
-    graph.build_path_cache();
-
-    Ok(graph)
+      ownership_index,
+    })
   }
 
   /// Get all workspace member crate names (pre-sorted).
@@ -514,12 +657,12 @@ impl WorkspaceGraph {
 
   /// Map a file path to its owning crate.
   ///
-  /// O(1) lookups using pre-built path cache.
+  /// O(d) longest-prefix lookup where d is the path's component depth.
   /// Filters out VCS directories (.git, .jj) and other non-source paths.
   ///
   /// Accepts both:
   /// - Workspace-relative paths (e.g., "crates/foo/src/lib.rs")
-  /// - Absolute paths (will be converted to workspace-relative)
+  /// - Absolute paths under any exact workspace package root
   ///
   /// Works for deleted files - does not require the file to exist on disk.
   pub fn file_to_crate(&self, file_path: &Path) -> Option<String> {
@@ -532,55 +675,7 @@ impl WorkspaceGraph {
   }
 
   fn file_owner_node(&self, file_path: &Path) -> Option<NodeIndex> {
-    // Filter out VCS directories (git, jj, etc.)
-    if Self::should_ignore_path(file_path) {
-      return None;
-    }
-
-    // Normalize to workspace-relative path
-    let relative_path = self.to_workspace_relative(file_path)?;
-
-    // If the lock is poisoned (another thread panicked), return None gracefully
-    let cache = self.path_cache.read().ok()?;
-    let cache_ref = cache.as_ref()?;
-
-    // Walk up directory tree looking for a crate root
-    let mut current = relative_path.as_path();
-
-    // Check the file's directory first
-    if let Some(parent) = current.parent() {
-      if let Some(&node) = cache_ref.get(parent) {
-        return Some(node);
-      }
-      current = parent;
-    }
-
-    // Walk up looking for parent directories
-    while let Some(parent) = current.parent() {
-      if let Some(&node) = cache_ref.get(parent) {
-        return Some(node);
-      }
-      current = parent;
-    }
-
-    // Check root directory (for root-level crate)
-    cache_ref.get(Path::new("")).copied()
-  }
-
-  /// Convert a path to workspace-relative.
-  ///
-  /// Handles:
-  /// - Already relative paths: returned as-is
-  /// - Absolute paths: strips workspace root prefix
-  /// - Paths that don't exist: works without filesystem access
-  fn to_workspace_relative(&self, path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-      // Try to strip workspace root prefix
-      path.strip_prefix(&self.workspace_root).ok().map(PathBuf::from)
-    } else {
-      // Already relative - assume it's workspace-relative
-      Some(path.to_path_buf())
-    }
+    self.ownership_index.owner(file_path)
   }
 
   /// Map multiple files to owning crates.
@@ -654,66 +749,11 @@ impl WorkspaceGraph {
       .map(|name| self.find_node(name).map(|node| self.graph[node].id.clone()))
       .collect()
   }
-
-  /// Check if a path should be ignored (VCS directories, build artifacts, etc.)
-  fn should_ignore_path(path: &Path) -> bool {
-    path.components().any(|component| {
-      if let std::path::Component::Normal(name) = component {
-        let name_str = name.to_string_lossy();
-        // Ignore VCS directories
-        matches!(
-          name_str.as_ref(),
-          ".git" | ".jj" | ".hg" | ".svn" |
-          // Ignore build/target directories
-          "target" | "node_modules" |
-          // Ignore common temp/cache dirs
-          ".cache" | "tmp" | ".tmp"
-        )
-      } else {
-        false
-      }
-    })
-  }
-
-  /// Build path-to-crate mapping cache.
-  ///
-  /// Maps each workspace crate's root directory (workspace-relative) to its name.
-  /// Uses workspace-relative paths to support deleted files (no canonicalize needed).
-  fn build_path_cache(&self) {
-    let mut cache = FxHashMap::default();
-
-    for node_idx in self.graph.node_indices() {
-      let node = &self.graph[node_idx];
-      if node.is_workspace_member {
-        // Get crate root (parent of Cargo.toml) as workspace-relative path
-        if let Some(crate_root) = node.manifest_path.parent() {
-          // Convert to workspace-relative path
-          let relative_root = if crate_root.is_absolute() {
-            crate_root
-              .strip_prefix(&self.workspace_root)
-              .map(PathBuf::from)
-              .unwrap_or_else(|_| crate_root.to_path_buf())
-          } else {
-            crate_root.to_path_buf()
-          };
-
-          cache.insert(relative_root, node_idx);
-        }
-      }
-    }
-
-    // If the lock is poisoned (another thread panicked), skip cache update
-    // The cache will be rebuilt on next access attempt
-    if let Ok(mut guard) = self.path_cache.write() {
-      *guard = Some(cache);
-    }
-  }
 }
 
 #[cfg(test)]
 mod tests {
   use std::path::{Path, PathBuf};
-  use std::sync::RwLock;
 
   use cargo_metadata::{MetadataCommand, PackageId, PackageName, Source};
   use semver::Version;
@@ -755,13 +795,15 @@ mod tests {
       );
     }
 
+    let workspace_root = PathBuf::from("/tmp/workspace");
+    let ownership_index =
+      OwnershipIndex::from_graph(&graph, &workspace_root).expect("synthetic ownership index should build");
     WorkspaceGraph {
       graph,
       id_to_node,
       workspace_name_index,
       sorted_members: vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
-      workspace_root: PathBuf::from("/tmp/workspace"),
-      path_cache: RwLock::new(None),
+      ownership_index,
     }
   }
 
@@ -781,87 +823,87 @@ mod tests {
   fn test_should_ignore_path() {
     // VCS directories
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".git")),
+      OwnershipIndex::should_ignore_path(Path::new(".git")),
       ".git should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".git/objects")),
+      OwnershipIndex::should_ignore_path(Path::new(".git/objects")),
       ".git/objects should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("foo/.git/bar")),
+      OwnershipIndex::should_ignore_path(Path::new("foo/.git/bar")),
       "nested .git should be ignored"
     );
 
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".jj")),
+      OwnershipIndex::should_ignore_path(Path::new(".jj")),
       ".jj should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".jj/repo")),
+      OwnershipIndex::should_ignore_path(Path::new(".jj/repo")),
       ".jj/repo should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("src/.jj/file")),
+      OwnershipIndex::should_ignore_path(Path::new("src/.jj/file")),
       "nested .jj should be ignored"
     );
 
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".hg")),
+      OwnershipIndex::should_ignore_path(Path::new(".hg")),
       ".hg should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".svn")),
+      OwnershipIndex::should_ignore_path(Path::new(".svn")),
       ".svn should be ignored"
     );
 
     // Build/dependency directories
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("target")),
+      OwnershipIndex::should_ignore_path(Path::new("target")),
       "target should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("target/debug")),
+      OwnershipIndex::should_ignore_path(Path::new("target/debug")),
       "target/debug should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("node_modules")),
+      OwnershipIndex::should_ignore_path(Path::new("node_modules")),
       "node_modules should be ignored"
     );
 
     // Cache/temp directories
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".cache")),
+      OwnershipIndex::should_ignore_path(Path::new(".cache")),
       ".cache should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new("tmp")),
+      OwnershipIndex::should_ignore_path(Path::new("tmp")),
       "tmp should be ignored"
     );
     assert!(
-      WorkspaceGraph::should_ignore_path(Path::new(".tmp")),
+      OwnershipIndex::should_ignore_path(Path::new(".tmp")),
       ".tmp should be ignored"
     );
 
     // Normal paths should NOT be ignored
     assert!(
-      !WorkspaceGraph::should_ignore_path(Path::new("src")),
+      !OwnershipIndex::should_ignore_path(Path::new("src")),
       "src should not be ignored"
     );
     assert!(
-      !WorkspaceGraph::should_ignore_path(Path::new("src/main.rs")),
+      !OwnershipIndex::should_ignore_path(Path::new("src/main.rs")),
       "src/main.rs should not be ignored"
     );
     assert!(
-      !WorkspaceGraph::should_ignore_path(Path::new("Cargo.toml")),
+      !OwnershipIndex::should_ignore_path(Path::new("Cargo.toml")),
       "Cargo.toml should not be ignored"
     );
     assert!(
-      !WorkspaceGraph::should_ignore_path(Path::new("crates/foo/src/lib.rs")),
+      !OwnershipIndex::should_ignore_path(Path::new("crates/foo/src/lib.rs")),
       "crate files should not be ignored"
     );
     assert!(
-      !WorkspaceGraph::should_ignore_path(Path::new("README.md")),
+      !OwnershipIndex::should_ignore_path(Path::new("README.md")),
       "README.md should not be ignored"
     );
   }
@@ -930,6 +972,32 @@ mod tests {
       error.to_string(),
       "Crate 'missing' not found. Available workspace crates: a, b, c, d"
     );
+  }
+
+  #[test]
+  fn duplicate_workspace_package_roots_fail_graph_construction() {
+    let mut metadata = MetadataCommand::new()
+      .current_dir(env!("CARGO_MANIFEST_DIR"))
+      .no_deps()
+      .other_options(vec!["--offline".into(), "--locked".into()])
+      .exec()
+      .expect("workspace metadata should load");
+    let mut duplicate = (*metadata
+      .workspace_packages()
+      .first()
+      .expect("workspace metadata should contain cargo-rail"))
+    .clone();
+    duplicate.id = PackageId {
+      repr: "path+file:///duplicate-root#duplicate-root@0.1.0".to_string(),
+    };
+    duplicate.name = PackageName::new("duplicate-root".into());
+    metadata.workspace_members.push(duplicate.id.clone());
+    metadata.packages.push(duplicate);
+
+    let error = WorkspaceGraph::from_metadata(&metadata)
+      .err()
+      .expect("two exact packages cannot own the same root");
+    assert!(error.to_string().contains("same workspace package root"), "{error}");
   }
 
   #[test]

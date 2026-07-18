@@ -4,7 +4,8 @@
 //!
 //! WorkspaceContext eliminates redundant metadata/config/graph loads by building
 //! all workspace-level data structures once in main.rs, then passing by reference
-//! to all commands.
+//! to all commands. Snapshot-aware callers use an explicit constructor so current
+//! commands do not pay capture cost before their ordered migration.
 //!
 //! # Performance Impact
 //!
@@ -23,13 +24,17 @@
 //! ```
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
+use crate::cargo::resolution::{
+  ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, capture_target_identities,
+};
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
-use crate::config::{ConfigLoadResult, RailConfig};
-use crate::error::{ConfigError, GitError, RailError, RailResult};
+use crate::config::RailConfig;
+use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use crate::progress;
 use crate::source::{GitWorktreeCapture, SourceExclusions, SourceSnapshot};
+use crate::workspace::snapshot::{CapturedRailConfig, WorkspaceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -153,6 +158,16 @@ impl CargoState {
     }
 
     Ok(Self::from_metadata(metadata))
+  }
+
+  fn load_fresh(workspace_root: &Path, cargo_current_dir: &Path, cargo_program: &std::ffi::OsStr) -> RailResult<Self> {
+    crate::instrumentation::record_cargo_metadata_load(false);
+    let metadata = MetadataCommand::new()
+      .cargo_path(PathBuf::from(cargo_program))
+      .current_dir(cargo_current_dir)
+      .manifest_path(workspace_root.join("Cargo.toml"))
+      .exec()?;
+    Ok(Self::from_metadata(Arc::new(metadata)))
   }
 
   /// Build CargoState from metadata, constructing the package index and proc-macro cache
@@ -421,6 +436,12 @@ pub struct WorkspaceContext {
   /// Wrapped in Arc for efficient sharing across threads/commands
   pub graph: Arc<WorkspaceGraph>,
 
+  /// Canonical base resolution plus exact lazy derived resolution views.
+  resolution_views: Arc<ResolutionViews>,
+
+  /// Complete authoritative snapshot when requested during context construction.
+  snapshot: Option<WorkspaceSnapshot>,
+
   /// Rail configuration (rail.toml)
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
@@ -461,16 +482,41 @@ impl WorkspaceContext {
   /// - Config load: <5ms (or None if not found)
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, false)
+    Self::build_inner(workspace_root, ContextCapture::None)
   }
 
   /// Build a context and optionally capture WORKTREE source before metadata loading.
   #[doc(hidden)]
   pub fn build_with_source_capture(workspace_root: &Path, capture_source: bool) -> RailResult<Self> {
-    Self::build_inner(workspace_root, capture_source)
+    let capture = if capture_source {
+      ContextCapture::Worktree
+    } else {
+      ContextCapture::None
+    };
+    Self::build_inner(workspace_root, capture)
   }
 
-  fn build_inner(workspace_root: &Path, capture_source: bool) -> RailResult<Self> {
+  /// Build a context with one complete immutable workspace snapshot.
+  ///
+  /// Existing commands do not use this constructor until their ordered snapshot
+  /// migration. It performs exact source, Cargo configuration, Cargo/rustc/rustdoc
+  /// and compiler-wrapper identity, target configuration, manifest, lockfile,
+  /// and base-resolution capture without loading target metadata views.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when any authoritative input is unreadable, malformed,
+  /// outside the captured source boundary, contains a credential-bearing Cargo
+  /// configuration URL, or changes during capture. Cargo, rustc, rustdoc, and
+  /// configured compiler-wrapper identity commands must also succeed.
+  pub fn build_with_snapshot(workspace_root: &Path) -> RailResult<Self> {
+    Self::build_inner(workspace_root, ContextCapture::Snapshot)
+  }
+
+  fn build_inner(workspace_root: &Path, capture: ContextCapture) -> RailResult<Self> {
+    let cargo_current_dir = std::env::current_dir()
+      .map_err(|error| RailError::message(format!("failed to determine Cargo metadata current directory: {error}")))?;
+
     // Load git state when available. Cargo-only commands such as `unify --check`
     // must work in source sandboxes that intentionally omit `.git`.
     let git = match GitState::open(workspace_root) {
@@ -480,7 +526,7 @@ impl WorkspaceContext {
     };
 
     let initial_generated_roots = [super::cargo_rail_state_root(workspace_root)];
-    let mut source_capture = if capture_source {
+    let mut source_capture = if capture != ContextCapture::None {
       git
         .as_ref()
         .map(|state| GitWorktreeCapture::capture_excluding(state.git(), &initial_generated_roots))
@@ -489,8 +535,18 @@ impl WorkspaceContext {
       None
     };
 
+    let resolution_inputs = if capture == ContextCapture::Snapshot {
+      Some(ResolutionViews::capture_inputs(&cargo_current_dir)?)
+    } else {
+      None
+    };
+
     // Load cargo state
-    let cargo = Arc::new(CargoState::load(workspace_root)?);
+    let cargo = Arc::new(if let Some(inputs) = &resolution_inputs {
+      CargoState::load_fresh(workspace_root, &cargo_current_dir, inputs.toolchain.cargo_program())?
+    } else {
+      CargoState::load(workspace_root)?
+    });
     let workspace_root = cargo.workspace_root().to_path_buf();
 
     // Repository paths are the authority for Git-backed capture and mutation.
@@ -522,18 +578,40 @@ impl WorkspaceContext {
     // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
-    // Load optional config - but ERROR on parse failures
-    // If a config file exists but is broken, that's a user error we must report
-    let config = match RailConfig::try_load(&workspace_root) {
-      ConfigLoadResult::Loaded(cfg) => Some(Arc::new(*cfg)),
-      ConfigLoadResult::NotFound => None,
-      ConfigLoadResult::ParseError { path, message } => {
-        return Err(RailError::Config(ConfigError::ParseError { path, message }));
+    let resolution_views = Arc::new(if let Some(inputs) = resolution_inputs.clone() {
+      ResolutionViews::new_with_inputs(
+        workspace_root.clone(),
+        cargo_current_dir.clone(),
+        cargo.shared_metadata(),
+        Arc::clone(&graph),
+        inputs,
+      )
+    } else {
+      ResolutionViews::new(
+        workspace_root.clone(),
+        cargo_current_dir,
+        cargo.shared_metadata(),
+        Arc::clone(&graph),
+      )
+    });
+
+    // Discover once and retain the exact parsed bytes for snapshot coherence.
+    let config_path = RailConfig::find_config_path(&workspace_root);
+    let (config, rail_config) = match config_path {
+      Some(path) => {
+        let (parsed, bytes) = RailConfig::load_path_with_bytes(&path)?;
+        let parsed = Arc::new(parsed);
+        (
+          Some(Arc::clone(&parsed)),
+          Some(CapturedRailConfig::new(path, bytes, parsed)),
+        )
       }
+      None => (None, None),
     };
 
     // Validate configured targets against rustc's canonical target list
-    if let Some(ref cfg) = config
+    if capture != ContextCapture::Snapshot
+      && let Some(ref cfg) = config
       && !cfg.targets.is_empty()
     {
       crate::targets::validate_targets(&cfg.targets)?;
@@ -555,6 +633,42 @@ impl WorkspaceContext {
     // The metadata is only loaded when unify actually needs it (saves 150-600ms for other commands)
     let targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
 
+    let snapshot = if let Some(inputs) = resolution_inputs {
+      let source = match (&source_capture, &git) {
+        (Some(capture), Some(_)) => capture.shared_snapshot(),
+        (None, None) => Arc::new(SourceSnapshot::capture_filesystem(
+          &workspace_root,
+          &generated_source_roots(&workspace_root, &cargo),
+        )?),
+        _ => {
+          return Err(RailError::message(
+            "workspace snapshot source backend is inconsistent with repository state",
+          ));
+        }
+      };
+      let source_root = git.as_ref().map_or(workspace_root.as_path(), |git| git.repo_root());
+      let base_resolution = resolution_views.view(ResolutionRequest::default())?;
+      let target_identities = capture_target_identities(resolution_views.cargo_current_dir(), &targets, &inputs)?;
+      let snapshot = WorkspaceSnapshot::capture(
+        source_root,
+        source,
+        cargo.metadata(),
+        rail_config,
+        inputs.clone(),
+        target_identities,
+        base_resolution,
+      )?;
+      if let (Some(capture), Some(git)) = (&source_capture, &git) {
+        capture.validate_unchanged(git.git())?;
+      }
+      let current_inputs = ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?;
+      validate_resolution_inputs_unchanged(&inputs, &current_inputs)?;
+      snapshot.validate_external_targets_unchanged()?;
+      Some(snapshot)
+    } else {
+      None
+    };
+
     Ok(Self {
       workspace_root,
       git,
@@ -562,6 +676,8 @@ impl WorkspaceContext {
       workspace_prefix,
       source_capture: source_capture.map(Arc::new),
       graph,
+      resolution_views,
+      snapshot,
       config,
       targets,
       multi_target_metadata: Mutex::new(None),
@@ -685,11 +801,33 @@ impl WorkspaceContext {
       progress!("Loading metadata for {} target(s)...", self.targets.len());
     }
     let metadata = Arc::new(MultiTargetMetadata::load_parallel(
-      self.cargo.shared_metadata(),
+      &self.resolution_views,
       &self.targets,
     )?);
     *guard = Some(Arc::clone(&metadata));
     Ok(metadata)
+  }
+
+  /// Return the exact lazy Cargo resolution for one package/feature/target request.
+  pub fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
+    self.resolution_views.view(request)
+  }
+
+  /// Return the authoritative snapshot captured by [`Self::build_with_snapshot`].
+  ///
+  /// Other constructors intentionally avoid this work until command consumers
+  /// migrate in the ordered improvement program.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when this context was built by another constructor.
+  pub fn snapshot(&self) -> RailResult<&WorkspaceSnapshot> {
+    self.snapshot.as_ref().ok_or_else(|| {
+      RailError::with_help(
+        "workspace context was built without authoritative snapshot capture",
+        "construct it with WorkspaceContext::build_with_snapshot",
+      )
+    })
   }
 
   /// Load each target's exact rustc cfg set once for the command context.
@@ -742,6 +880,29 @@ impl WorkspaceContext {
       Some(git_path.to_path_buf())
     }
   }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContextCapture {
+  None,
+  Worktree,
+  Snapshot,
+}
+
+fn validate_resolution_inputs_unchanged(initial: &ResolutionInputs, current: &ResolutionInputs) -> RailResult<()> {
+  if current.cargo_config != initial.cargo_config {
+    return Err(RailError::with_help(
+      "Cargo configuration changed while constructing the workspace snapshot",
+      "retry after Cargo configuration and environment changes have stopped",
+    ));
+  }
+  if current.toolchain != initial.toolchain {
+    return Err(RailError::with_help(
+      "Cargo, rustc, rustdoc, or compiler-wrapper identity changed while constructing the workspace snapshot",
+      "retry after toolchain updates and overrides have stopped",
+    ));
+  }
+  Ok(())
 }
 
 fn validated_generated_source_roots(

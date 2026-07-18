@@ -12,10 +12,12 @@ mod test_instrumentation;
 mod test_msrv;
 mod test_nested_workspace;
 mod test_output_contracts;
+mod test_ownership_index;
 mod test_plan;
 mod test_plan_apply;
 mod test_plan_classification_corpus;
 mod test_release_changelog;
+mod test_resolution_view;
 mod test_run;
 #[cfg(unix)]
 mod test_scale_fixture;
@@ -26,3 +28,4 @@ mod test_undeclared_features;
 mod test_unify;
 mod test_unify_undo;
 mod test_unused_detection;
+mod test_workspace_snapshot;

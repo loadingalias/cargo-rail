@@ -12,6 +12,7 @@ pub mod manifest_analyzer;
 mod manifest_ops; // Internal - used only by manifest_writer and cargo_transform
 pub mod manifest_writer;
 pub mod multi_target_metadata;
+pub mod resolution;
 mod unify; // Internal - implementation details for UnifyAnalyzer
 pub mod unify_analyzer;
 pub mod unify_report;
@@ -23,6 +24,10 @@ pub use feature_scanner::{FeatureScanResult, FeatureScanner};
 pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;
 pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MsrvSourceUsed, MultiTargetMetadata};
+pub use resolution::{
+  CargoConfigSnapshot, CargoConfigSource, CustomTargetSpecification, ResolutionFeatures, ResolutionPackages,
+  ResolutionRequest, ResolutionView, TargetIdentity, TargetSpecificationIdentity, ToolchainIdentity,
+};
 pub use unify_analyzer::UnifyAnalyzer;
 pub use unify_report::UnifyReport;
 pub use unify_types::{

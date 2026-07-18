@@ -89,6 +89,22 @@ pub enum ConfigLoadResult {
 }
 
 impl RailConfig {
+  fn parse_path(path: &Path) -> Result<(Self, Vec<u8>), String> {
+    let bytes = fs::read(path).map_err(|error| format!("failed to read file: {error}"))?;
+    let content = std::str::from_utf8(&bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
+    let config = toml_edit::de::from_str(content).map_err(|error| error.to_string())?;
+    Ok((config, bytes))
+  }
+
+  pub(crate) fn load_path_with_bytes(path: &Path) -> RailResult<(Self, Vec<u8>)> {
+    Self::parse_path(path).map_err(|message| {
+      RailError::Config(ConfigError::ParseError {
+        path: path.to_path_buf(),
+        message,
+      })
+    })
+  }
+
   /// Find config file in search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
   ///
   /// On Windows, this handles path canonicalization issues (UNC paths, 8.3 short names)
@@ -183,21 +199,11 @@ impl RailConfig {
       None => return ConfigLoadResult::NotFound,
     };
 
-    let content = match fs::read_to_string(&config_path) {
-      Ok(c) => c,
-      Err(e) => {
-        return ConfigLoadResult::ParseError {
-          path: config_path,
-          message: format!("failed to read file: {}", e),
-        };
-      }
-    };
-
-    match toml_edit::de::from_str(&content) {
-      Ok(config) => ConfigLoadResult::Loaded(Box::new(config)),
-      Err(e) => ConfigLoadResult::ParseError {
+    match Self::parse_path(&config_path) {
+      Ok((config, _)) => ConfigLoadResult::Loaded(Box::new(config)),
+      Err(message) => ConfigLoadResult::ParseError {
         path: config_path,
-        message: e.to_string(),
+        message,
       },
     }
   }

@@ -1,10 +1,11 @@
 //! Workspace context and state management
 //!
-//! This module unifies optional Git, Cargo, and Graph into a single WorkspaceContext.
+//! This module unifies optional Git, Cargo, graph, configuration, and one
+//! explicitly requested immutable snapshot in a single `WorkspaceContext`.
 //!
 //! # Architecture
 //!
-//! WorkspaceContext = optional GitState + CargoState + DependencyGraph + Config
+//! WorkspaceContext = optional GitState + CargoState + DependencyGraph + Config + optional WorkspaceSnapshot
 //!
 //! Built once at startup, passed by reference to all commands.
 
@@ -16,6 +17,8 @@ pub mod change_analyzer;
 pub mod context;
 /// File path utilities
 pub mod files;
+/// Immutable authoritative workspace capture.
+pub mod snapshot;
 /// High-level façade for crate information queries
 pub mod view;
 
@@ -24,6 +27,7 @@ pub use change_analyzer::ChangeImpact;
 
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};
+pub use snapshot::{LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotPackage, WorkspaceSnapshot};
 
 // Re-export view types
 pub use view::{CrateInfo, WorkspaceView};

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
@@ -442,7 +443,7 @@ pub enum SourceSnapshot {
 /// callers additionally exclude their resolved generated-state roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeCapture {
-  snapshot: SourceSnapshot,
+  snapshot: Arc<SourceSnapshot>,
   state: GitCaptureState,
   filesystem: Vec<FilesystemObservation>,
   exclusions: SourceExclusions,
@@ -467,7 +468,7 @@ impl GitWorktreeCapture {
     ensure_git_capture_state_unchanged(git, &state, &exclusions)?;
     validate_filesystem_observations(&git.worktree_root, &tree, &filesystem)?;
     Ok(Self {
-      snapshot: SourceSnapshot::GitBacked(tree),
+      snapshot: Arc::new(SourceSnapshot::GitBacked(tree)),
       state,
       filesystem,
       exclusions,
@@ -476,7 +477,7 @@ impl GitWorktreeCapture {
 
   pub(crate) fn exclude_generated_roots(&mut self, git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<()> {
     self.exclusions.extend_absolute_roots(git, generated_roots)?;
-    self.snapshot.retain(|entry| !self.exclusions.contains(&entry.path));
+    Arc::make_mut(&mut self.snapshot).retain(|entry| !self.exclusions.contains(&entry.path));
     self.state.index.retain(|entry| !self.exclusions.contains(&entry.path));
     self
       .state
@@ -495,6 +496,15 @@ impl GitWorktreeCapture {
   /// Return the immutable canonical source snapshot.
   pub fn snapshot(&self) -> &SourceSnapshot {
     &self.snapshot
+  }
+
+  pub(crate) fn shared_snapshot(&self) -> Arc<SourceSnapshot> {
+    Arc::clone(&self.snapshot)
+  }
+
+  pub(crate) fn validate_unchanged(&self, git: &SystemGit) -> RailResult<()> {
+    ensure_git_capture_state_unchanged(git, &self.state, &self.exclusions)?;
+    validate_filesystem_observations(&git.worktree_root, self.snapshot.tree(), &self.filesystem)
   }
 
   /// Derive sorted changes from `base` without recapturing the final tree.
@@ -607,7 +617,8 @@ impl SourceSnapshot {
   pub fn capture_git_worktree(git: &SystemGit, base: &str) -> RailResult<(Self, ChangeSet)> {
     let capture = GitWorktreeCapture::capture(git)?;
     let changes = capture.changes_from(git, base)?;
-    Ok((capture.snapshot, changes))
+    let snapshot = Arc::try_unwrap(capture.snapshot).unwrap_or_else(|shared| shared.as_ref().clone());
+    Ok((snapshot, changes))
   }
 }
 

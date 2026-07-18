@@ -36,12 +36,12 @@ pub struct AffectedAnalysis {
 /// Analyze which crates are affected by file changes.
 ///
 /// Algorithm:
-/// 1. Map files → owning crates (O(n) with path cache)
+/// 1. Map files → owning crates through the immutable longest-prefix index
 /// 2. Single reverse traversal from all direct crates to find dependents (O(V+E))
 /// 3. Union direct crates + dependents for test targets
 ///
 /// # Performance
-/// O(n + V + E) where n = files, V = vertices, E = edges.
+/// O(n × d + V + E) where n = files, d = maximum path depth, V = vertices, E = edges.
 /// Typically <50ms for <100 crates. The single traversal approach is
 /// significantly faster than O(N × (V+E)) when many crates are directly affected.
 pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> RailResult<AffectedAnalysis> {
@@ -56,7 +56,7 @@ pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> Ra
     });
   }
 
-  // Map files → exact packages (uses interior mutability for cache)
+  // Map files → exact packages through the immutable ownership index.
   let direct_package_ids = graph.files_to_package_ids(changed_files);
 
   if direct_package_ids.is_empty() {

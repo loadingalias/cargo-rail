@@ -3,11 +3,11 @@
 //! Path-glob attribution (git-cliff, release-plz) silently drops tags,
 //! misroutes cross-cutting commits, and cannot express scope intent. This
 //! module attributes each commit to its owning crates through the same
-//! resolver-backed path cache the planner uses for test selection:
+//! resolver-backed ownership index the planner uses for test selection:
 //!
 //! 1. One `git log --name-only` subprocess per release range (not per crate).
-//! 2. Each changed file maps to its owning crate via the pre-built O(1)
-//!    path cache ([`crate::graph::WorkspaceGraph::file_to_crate`]).
+//! 2. Each changed file maps to its owning crate via the immutable longest-prefix
+//!    index ([`crate::graph::WorkspaceGraph::file_to_crate`]).
 //! 3. A commit scope naming a workspace crate narrows attribution to that
 //!    crate — scope is an explicit human signal; files are the fallback truth.
 
@@ -97,8 +97,8 @@ impl<'a> CommitAttributor<'a> {
 
   /// Attribute all commits in `from..to` (full history when `from` is `None`)
   ///
-  /// One git subprocess for the whole range; attribution is O(files) hash
-  /// lookups against the pre-built path cache.
+  /// One git subprocess for the whole range; attribution performs at most one
+  /// hash lookup per path component against the immutable ownership index.
   pub fn history(&self, from: Option<&str>, to: &str) -> RailResult<AttributedHistory> {
     self.history_with_filters(from, to, None)
   }
