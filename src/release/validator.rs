@@ -62,7 +62,7 @@ impl<'a> ReleaseValidator<'a> {
     }
 
     // 2. Validate crates exist in workspace
-    let workspace_members = self.ctx.graph.workspace_members();
+    let workspace_members = self.ctx.graph().workspace_members();
     for crate_name in crate_names {
       if !workspace_members.contains(crate_name) {
         return Err(RailError::with_help(
@@ -137,7 +137,7 @@ impl<'a> ReleaseValidator<'a> {
   pub fn validate_publishable(&self, crate_name: &str) -> RailResult<()> {
     let package = self
       .ctx
-      .cargo
+      .cargo()
       .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
@@ -271,7 +271,7 @@ impl<'a> ReleaseValidator<'a> {
   }
 
   fn release_notes_override_exists(&self, crate_plan: &crate::release::planner::CrateReleasePlan) -> bool {
-    let Some(config) = self.ctx.config.as_ref() else {
+    let Some(config) = self.ctx.config() else {
       return false;
     };
     let dir = self.ctx.workspace_root().join(&config.release.release_notes_dir);
@@ -292,7 +292,7 @@ impl<'a> ReleaseValidator<'a> {
 
     let package = self
       .ctx
-      .cargo
+      .cargo()
       .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
@@ -331,7 +331,7 @@ impl<'a> ReleaseValidator<'a> {
   /// rail.toml takes precedence: if it explicitly sets `publish = true`,
   /// that overrides Cargo.toml's `publish = false`.
   pub fn is_publishable(&self, crate_name: &str) -> bool {
-    let package = match self.ctx.cargo.get_package(crate_name) {
+    let package = match self.ctx.cargo().get_package(crate_name) {
       Some(pkg) => pkg,
       None => return false,
     };
@@ -342,7 +342,7 @@ impl<'a> ReleaseValidator<'a> {
     // Check rail.toml - takes precedence if set
     let publish_from_config = self
       .ctx
-      .config
+      .config()
       .as_ref()
       .and_then(|c| c.crates.get(crate_name))
       .and_then(|c| c.release.as_ref())
@@ -356,13 +356,13 @@ impl<'a> ReleaseValidator<'a> {
   ///
   /// Returns `None` if the crate is publishable.
   pub fn unpublishable_reason(&self, crate_name: &str) -> Option<String> {
-    let package = match self.ctx.cargo.get_package(crate_name) {
+    let package = match self.ctx.cargo().get_package(crate_name) {
       Some(pkg) => pkg,
       None => return Some(format!("crate '{}' not found", crate_name)),
     };
 
     // Check rail.toml first (takes precedence)
-    if let Some(config) = &self.ctx.config
+    if let Some(config) = self.ctx.config()
       && let Some(crate_config) = config.crates.get(crate_name)
       && let Some(release_config) = &crate_config.release
     {
@@ -387,7 +387,7 @@ impl<'a> ReleaseValidator<'a> {
   ///
   /// Produces `(publishable_crates, skipped_with_reason)` for workspace members.
   pub fn publishable_members(&self) -> (Vec<String>, Vec<(String, String)>) {
-    let all_members = self.ctx.graph.workspace_members();
+    let all_members = self.ctx.graph().workspace_members();
     let member_count = all_members.len();
     let mut publishable = Vec::with_capacity(member_count);
     let mut skipped = Vec::with_capacity(member_count / 4); // Most crates are publishable
@@ -411,7 +411,7 @@ impl<'a> ReleaseValidator<'a> {
   /// - Package size limits
   /// - Files that would be excluded
   pub fn validate_publish_dry_run(&self, crate_name: &str) -> ValidationResult {
-    let package = match self.ctx.cargo.get_package(crate_name) {
+    let package = match self.ctx.cargo().get_package(crate_name) {
       Some(pkg) => pkg,
       None => return ValidationResult::failed("publish-dry-run", format!("crate '{}' not found", crate_name)),
     };
@@ -452,7 +452,7 @@ impl<'a> ReleaseValidator<'a> {
   /// If the workspace manifest has `rust-version`, this runs `cargo check`
   /// with that toolchain to ensure compatibility.
   pub fn validate_msrv(&self, crate_name: &str) -> ValidationResult {
-    let package = match self.ctx.cargo.get_package(crate_name) {
+    let package = match self.ctx.cargo().get_package(crate_name) {
       Some(pkg) => pkg,
       None => return ValidationResult::failed("msrv", format!("crate '{}' not found", crate_name)),
     };
@@ -593,7 +593,7 @@ impl<'a> ReleaseValidator<'a> {
   pub fn validate_changelog_paths(&self, crate_names: &[String], release_config: &ReleaseConfig) -> RailResult<()> {
     for crate_name in crate_names {
       // Check per-crate skip setting
-      if let Some(config) = &self.ctx.config
+      if let Some(config) = self.ctx.config()
         && let Some(crate_config) = config.crates.get(crate_name)
         && let Some(changelog_cfg) = &crate_config.changelog
         && changelog_cfg.skip
@@ -614,7 +614,7 @@ impl<'a> ReleaseValidator<'a> {
   fn resolve_changelog_path(&self, crate_name: &str, release_config: &ReleaseConfig) -> RailResult<PathBuf> {
     let package = self
       .ctx
-      .cargo
+      .cargo()
       .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
@@ -622,7 +622,7 @@ impl<'a> ReleaseValidator<'a> {
 
     let changelog_config = self
       .ctx
-      .config
+      .config()
       .as_ref()
       .and_then(|c| c.crates.get(crate_name))
       .and_then(|c| c.changelog.as_ref());

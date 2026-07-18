@@ -36,6 +36,7 @@ pub struct SplitRunArgs {
 
 /// Run the split command
 pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
+  ctx.snapshot()?;
   let machine = args.format != SplitOutputFormat::Text;
 
   // JSON mode enables structured error output and suppresses progress
@@ -257,6 +258,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 
 /// Initialize split configuration for crates
 pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
+  ctx.snapshot()?;
   use crate::config::RailConfig;
   use std::fs;
 
@@ -365,7 +367,7 @@ fn detect_workspace_splits(
   use crate::config::{CratePath, SplitConfig, SplitMode, WorkspaceMode};
 
   let workspace_root = ctx.workspace_root();
-  let members = ctx.cargo.workspace_members();
+  let members = ctx.cargo().workspace_members();
 
   let mut splits = Vec::new();
 

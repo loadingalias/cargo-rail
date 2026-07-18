@@ -538,6 +538,22 @@ pub enum Commands {
 }
 
 impl Commands {
+  /// Return whether this command consumes one authoritative workspace snapshot.
+  #[doc(hidden)]
+  pub fn requires_workspace_snapshot(&self) -> bool {
+    match self {
+      Self::Run { .. }
+      | Self::Unify { .. }
+      | Self::Split { .. }
+      | Self::Sync { .. }
+      | Self::Release { .. }
+      | Self::Change { .. } => true,
+      Self::Plan { from, to, schema, .. } => !schema && !(from.is_some() && to.is_some()),
+      Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
+      _ => false,
+    }
+  }
+
   /// Return whether dispatch needs source captured before metadata loading.
   #[doc(hidden)]
   pub fn requires_worktree_source_capture(&self) -> bool {

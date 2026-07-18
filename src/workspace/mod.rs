@@ -27,7 +27,9 @@ pub use change_analyzer::ChangeImpact;
 
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};
-pub use snapshot::{LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotPackage, WorkspaceSnapshot};
+pub use snapshot::{
+  LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotId, SnapshotPackage, WorkspaceSnapshot,
+};
 
 // Re-export view types
 pub use view::{CrateInfo, WorkspaceView};

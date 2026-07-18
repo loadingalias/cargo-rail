@@ -27,20 +27,21 @@ use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::resolution::{
   ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, capture_target_identities,
 };
-use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
+use crate::compiler::cfg_eval::TargetCfgSet;
 use crate::config::RailConfig;
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
-use crate::progress;
-use crate::source::{GitWorktreeCapture, SourceExclusions, SourceSnapshot};
-use crate::workspace::snapshot::{CapturedRailConfig, WorkspaceSnapshot};
+use crate::source::{
+  ContentDigest, GitWorktreeCapture, RepositoryPath, SourceEntryKind, SourceExclusions, SourceSnapshot,
+};
+use crate::workspace::snapshot::{CapturedLockfile, CapturedRailConfig, DerivedViews, WorkspaceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // Cargo State (merged from cargo_state.rs)
 
@@ -160,13 +161,28 @@ impl CargoState {
     Ok(Self::from_metadata(metadata))
   }
 
-  fn load_fresh(workspace_root: &Path, cargo_current_dir: &Path, cargo_program: &std::ffi::OsStr) -> RailResult<Self> {
+  fn load_fresh(
+    workspace_root: &Path,
+    cargo_current_dir: &Path,
+    cargo_program: &std::ffi::OsStr,
+    credential_sensitive: bool,
+  ) -> RailResult<Self> {
     crate::instrumentation::record_cargo_metadata_load(false);
     let metadata = MetadataCommand::new()
       .cargo_path(PathBuf::from(cargo_program))
       .current_dir(cargo_current_dir)
       .manifest_path(workspace_root.join("Cargo.toml"))
-      .exec()?;
+      .exec()
+      .map_err(|error| {
+        if credential_sensitive {
+          RailError::with_help(
+            "Cargo metadata failed while credential capabilities were active",
+            "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
+          )
+        } else {
+          error.into()
+        }
+      })?;
     Ok(Self::from_metadata(Arc::new(metadata)))
   }
 
@@ -424,7 +440,7 @@ pub struct WorkspaceContext {
   git: Option<Arc<GitState>>,
 
   /// Cargo metadata and workspace info (Arc for cheap cloning across threads)
-  pub cargo: Arc<CargoState>,
+  cargo: Arc<CargoState>,
 
   /// Validated repository-relative path to the Cargo workspace, when nested.
   workspace_prefix: Option<PathBuf>,
@@ -434,10 +450,10 @@ pub struct WorkspaceContext {
 
   /// Dependency graph (built from cargo metadata)
   /// Wrapped in Arc for efficient sharing across threads/commands
-  pub graph: Arc<WorkspaceGraph>,
+  graph: Arc<WorkspaceGraph>,
 
-  /// Canonical base resolution plus exact lazy derived resolution views.
-  resolution_views: Arc<ResolutionViews>,
+  /// One exact lazy derived-view owner shared with the snapshot when present.
+  derived_views: Arc<DerivedViews>,
 
   /// Complete authoritative snapshot when requested during context construction.
   snapshot: Option<WorkspaceSnapshot>,
@@ -445,18 +461,7 @@ pub struct WorkspaceContext {
   /// Rail configuration (rail.toml)
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
-  pub config: Option<Arc<RailConfig>>,
-
-  /// Configured targets for lazy multi-target metadata loading
-  targets: Vec<String>,
-
-  /// Lazy-loaded multi-target metadata (only loaded when unify needs it)
-  /// This saves 150-600ms for commands that don't need multi-target analysis.
-  /// Uses Mutex<Option<>> for lazy initialization with error handling.
-  multi_target_metadata: Mutex<Option<Arc<MultiTargetMetadata>>>,
-
-  /// Lazy rustc cfg sets shared by target-aware analyzers.
-  target_cfg_sets: Mutex<Option<Arc<std::collections::HashMap<String, TargetCfgSet>>>>,
+  config: Option<Arc<RailConfig>>,
 }
 
 impl WorkspaceContext {
@@ -543,7 +548,12 @@ impl WorkspaceContext {
 
     // Load cargo state
     let cargo = Arc::new(if let Some(inputs) = &resolution_inputs {
-      CargoState::load_fresh(workspace_root, &cargo_current_dir, inputs.toolchain.cargo_program())?
+      CargoState::load_fresh(
+        workspace_root,
+        &cargo_current_dir,
+        inputs.toolchain.cargo_program(),
+        inputs.cargo_config.has_credential_capability(),
+      )?
     } else {
       CargoState::load(workspace_root)?
     });
@@ -570,10 +580,13 @@ impl WorkspaceContext {
       .transpose()?
       .filter(|prefix| !prefix.as_os_str().is_empty());
 
-    if let (Some(capture), Some(git)) = (source_capture.as_mut(), git.as_ref()) {
+    let generated_lockfile = if let (Some(capture), Some(git)) = (source_capture.as_mut(), git.as_ref()) {
       let generated_roots = validated_generated_source_roots(git.repo_root(), &workspace_root, &cargo)?;
       capture.exclude_generated_roots(git.git(), &generated_roots)?;
-    }
+      stabilize_cargo_generated_lockfile(capture, git, &workspace_root, &generated_roots)?
+    } else {
+      None
+    };
 
     // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
@@ -632,8 +645,16 @@ impl WorkspaceContext {
     // Store targets for lazy multi-target metadata loading
     // The metadata is only loaded when unify actually needs it (saves 150-600ms for other commands)
     let targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
+    let derived_views = Arc::new(DerivedViews::new(
+      workspace_root.clone(),
+      targets.clone(),
+      Arc::clone(&resolution_views),
+    ));
 
     let snapshot = if let Some(inputs) = resolution_inputs {
+      let generated_lock_marker = generated_lockfile
+        .as_ref()
+        .map(|lockfile| (lockfile.path().to_path_buf(), ContentDigest::sha256(lockfile.bytes())));
       let source = match (&source_capture, &git) {
         (Some(capture), Some(_)) => capture.shared_snapshot(),
         (None, None) => Arc::new(SourceSnapshot::capture_filesystem(
@@ -647,23 +668,27 @@ impl WorkspaceContext {
         }
       };
       let source_root = git.as_ref().map_or(workspace_root.as_path(), |git| git.repo_root());
-      let base_resolution = resolution_views.view(ResolutionRequest::default())?;
-      let target_identities = capture_target_identities(resolution_views.cargo_current_dir(), &targets, &inputs)?;
+      let target_identities = capture_target_identities(derived_views.cargo_current_dir(), &targets, &inputs)?;
       let snapshot = WorkspaceSnapshot::capture(
         source_root,
         source,
-        cargo.metadata(),
+        Arc::clone(&cargo),
         rail_config,
+        generated_lockfile,
         inputs.clone(),
         target_identities,
-        base_resolution,
+        Arc::clone(&derived_views),
       )?;
       if let (Some(capture), Some(git)) = (&source_capture, &git) {
         capture.validate_unchanged(git.git())?;
       }
+      snapshot.validate_authoritative_files_unchanged()?;
       let current_inputs = ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?;
       validate_resolution_inputs_unchanged(&inputs, &current_inputs)?;
       snapshot.validate_external_targets_unchanged()?;
+      if let Some((path, digest)) = generated_lock_marker {
+        write_generated_lock_marker(&workspace_root, &path, digest)?;
+      }
       Some(snapshot)
     } else {
       None
@@ -676,12 +701,9 @@ impl WorkspaceContext {
       workspace_prefix,
       source_capture: source_capture.map(Arc::new),
       graph,
-      resolution_views,
+      derived_views,
       snapshot,
       config,
-      targets,
-      multi_target_metadata: Mutex::new(None),
-      target_cfg_sets: Mutex::new(None),
     })
   }
 
@@ -689,12 +711,39 @@ impl WorkspaceContext {
   ///
   /// Use this in commands that require rail.toml configuration.
   pub fn require_config(&self) -> RailResult<&Arc<RailConfig>> {
-    self.config.as_ref().ok_or_else(|| {
+    self.config().ok_or_else(|| {
       crate::error::RailError::message(format!(
         "No rail.toml found in: {}\nSearched: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml\nRun 'cargo rail init' to create one.",
         self.workspace_root.display()
       ))
     })
+  }
+
+  /// Return the parsed rail configuration from the authoritative snapshot when present.
+  pub fn config(&self) -> Option<&Arc<RailConfig>> {
+    self
+      .snapshot
+      .as_ref()
+      .and_then(WorkspaceSnapshot::shared_config)
+      .or(self.config.as_ref())
+  }
+
+  /// Return Cargo state paired with the authoritative snapshot metadata.
+  pub fn cargo(&self) -> &CargoState {
+    self
+      .snapshot
+      .as_ref()
+      .map(WorkspaceSnapshot::cargo)
+      .unwrap_or(&self.cargo)
+  }
+
+  /// Return the exact dependency graph owned by the authoritative base resolution.
+  pub fn graph(&self) -> &WorkspaceGraph {
+    self
+      .snapshot
+      .as_ref()
+      .map(|snapshot| snapshot.base_resolution().graph())
+      .unwrap_or(&self.graph)
   }
 
   /// Return Git state for commands that require repository history.
@@ -786,31 +835,20 @@ impl WorkspaceContext {
   ///
   /// The metadata is cached after first load - subsequent calls return the cached value.
   pub fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
-    // Lock briefly to check if already loaded
-    let mut guard = self
-      .multi_target_metadata
-      .lock()
-      .map_err(|_| RailError::message("Lock poisoned".to_string()))?;
-
-    if let Some(ref cached) = *guard {
-      return Ok(Arc::clone(cached));
+    if let Some(snapshot) = &self.snapshot {
+      snapshot.multi_target_metadata()
+    } else {
+      self.derived_views.multi_target_metadata()
     }
-
-    // Not loaded yet - load now
-    if !self.targets.is_empty() {
-      progress!("Loading metadata for {} target(s)...", self.targets.len());
-    }
-    let metadata = Arc::new(MultiTargetMetadata::load_parallel(
-      &self.resolution_views,
-      &self.targets,
-    )?);
-    *guard = Some(Arc::clone(&metadata));
-    Ok(metadata)
   }
 
   /// Return the exact lazy Cargo resolution for one package/feature/target request.
   pub fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
-    self.resolution_views.view(request)
+    if let Some(snapshot) = &self.snapshot {
+      snapshot.resolution_view(request)
+    } else {
+      self.derived_views.resolution_view(request)
+    }
   }
 
   /// Return the authoritative snapshot captured by [`Self::build_with_snapshot`].
@@ -830,21 +868,27 @@ impl WorkspaceContext {
     })
   }
 
+  /// Return the authoritative snapshot identity when this context owns one.
+  #[doc(hidden)]
+  pub fn snapshot_id(&self) -> Option<crate::workspace::SnapshotId> {
+    self.snapshot.as_ref().map(WorkspaceSnapshot::id)
+  }
+
+  pub(crate) fn validate_snapshot_unchanged(&self) -> RailResult<()> {
+    let snapshot = self.snapshot()?;
+    if let (Some(capture), Some(git)) = (&self.source_capture, &self.git) {
+      capture.validate_unchanged(git.git())?;
+    }
+    snapshot.validate_live_authoritative_inputs()
+  }
+
   /// Load each target's exact rustc cfg set once for the command context.
   pub fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
-    let mut guard = self
-      .target_cfg_sets
-      .lock()
-      .map_err(|_| RailError::message("target cfg cache lock poisoned".to_string()))?;
-    if let Some(cached) = guard.as_ref() {
-      return Ok(Arc::clone(cached));
+    if let Some(snapshot) = &self.snapshot {
+      snapshot.target_cfg_sets()
+    } else {
+      self.derived_views.target_cfg_sets()
     }
-    let mut targets = Vec::with_capacity(self.targets.len() + 1);
-    targets.push("default");
-    targets.extend(self.targets.iter().map(String::as_str));
-    let cfg_sets = Arc::new(load_target_cfg_sets(&self.workspace_root, &targets)?);
-    *guard = Some(Arc::clone(&cfg_sets));
-    Ok(cfg_sets)
   }
 
   /// Get workspace root as Path reference (convenience)
@@ -933,6 +977,135 @@ fn generated_source_roots(workspace_root: &Path, cargo: &CargoState) -> Vec<Path
   roots
 }
 
+fn stabilize_cargo_generated_lockfile(
+  initial: &mut GitWorktreeCapture,
+  git: &GitState,
+  workspace_root: &Path,
+  generated_roots: &[PathBuf],
+) -> RailResult<Option<CapturedLockfile>> {
+  let lockfile = workspace_root.join("Cargo.lock");
+  let lockfile_metadata = match fs::symlink_metadata(&lockfile) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  };
+  if !lockfile_metadata.file_type().is_file() {
+    return Ok(None);
+  }
+  let relative = crate::utils::path_relative_to(git.repo_root(), &lockfile)?;
+  let relative = RepositoryPath::new(&relative)?;
+  let initially_captured = initial
+    .snapshot()
+    .tree()
+    .entries()
+    .binary_search_by(|entry| entry.path.cmp(&relative))
+    .is_ok();
+  if initially_captured {
+    if initial.is_untracked(&relative) {
+      let bytes = fs::read(&lockfile)?;
+      let digest = ContentDigest::sha256(&bytes);
+      if generated_lock_marker_matches(workspace_root, digest)? {
+        initial.exclude_generated_roots(git.git(), std::slice::from_ref(&lockfile))?;
+        initial.validate_unchanged(git.git())?;
+        return Ok(Some(CapturedLockfile::new(lockfile, bytes)));
+      }
+    }
+    return Ok(None);
+  }
+
+  let repeated = GitWorktreeCapture::capture_excluding(git.git(), generated_roots)?;
+  let repeated_digest = repeated
+    .snapshot()
+    .tree()
+    .entries()
+    .binary_search_by(|entry| entry.path.cmp(&relative))
+    .ok()
+    .and_then(|index| match repeated.snapshot().tree().entries()[index].kind {
+      SourceEntryKind::RegularFile { digest, .. } => Some(digest),
+      _ => None,
+    });
+  let Some(repeated_digest) = repeated_digest else {
+    return Ok(None);
+  };
+  let bytes = fs::read(&lockfile)?;
+  if repeated_digest != ContentDigest::sha256(&bytes) {
+    return Err(RailError::with_help(
+      "Cargo-generated lockfile changed after source capture",
+      "retry after workspace input changes have stopped",
+    ));
+  }
+  initial.exclude_generated_roots(git.git(), std::slice::from_ref(&lockfile))?;
+  initial.validate_unchanged(git.git()).map_err(|_| {
+    RailError::with_help(
+      "workspace source changed while Cargo generated a missing lockfile",
+      "retry after source changes have stopped; Cargo.lock may be retained as the resolved workspace lock",
+    )
+  })?;
+  Ok(Some(CapturedLockfile::new(lockfile, bytes)))
+}
+
+fn generated_lock_marker_path(workspace_root: &Path) -> PathBuf {
+  super::cargo_rail_state_root(workspace_root).join("generated-lockfile-v1")
+}
+
+fn generated_lock_marker_value(workspace_root: &Path, digest: ContentDigest) -> RailResult<Vec<u8>> {
+  let workspace = workspace_root
+    .to_str()
+    .ok_or_else(|| RailError::message("workspace root is not valid UTF-8 for generated lockfile provenance"))?;
+  let mut marker = Vec::from(&b"cargo-rail-generated-lockfile-v1\0"[..]);
+  marker.extend_from_slice(&(workspace.len() as u64).to_le_bytes());
+  marker.extend_from_slice(workspace.as_bytes());
+  marker.extend_from_slice(digest.as_bytes());
+  Ok(marker)
+}
+
+fn generated_lock_marker_matches(workspace_root: &Path, digest: ContentDigest) -> RailResult<bool> {
+  let marker = generated_lock_marker_path(workspace_root);
+  let metadata = match fs::symlink_metadata(&marker) {
+    Ok(metadata) if metadata.file_type().is_file() => metadata,
+    Ok(_) => return Ok(false),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    Err(error) => return Err(error.into()),
+  };
+  let expected = generated_lock_marker_value(workspace_root, digest)?;
+  let expected_len = u64::try_from(expected.len())
+    .map_err(|_| RailError::message("generated lockfile marker length exceeds the supported range"))?;
+  if metadata.len() != expected_len {
+    return Ok(false);
+  }
+  let mut actual = Vec::with_capacity(expected.len());
+  fs::File::open(marker)?
+    .take(expected_len.saturating_add(1))
+    .read_to_end(&mut actual)?;
+  Ok(actual == expected)
+}
+
+fn write_generated_lock_marker(workspace_root: &Path, lockfile: &Path, digest: ContentDigest) -> RailResult<()> {
+  if lockfile != workspace_root.join("Cargo.lock") {
+    return Err(RailError::message(format!(
+      "refusing to mark unexpected generated lockfile '{}'",
+      lockfile.display()
+    )));
+  }
+  let marker = generated_lock_marker_path(workspace_root);
+  if fs::symlink_metadata(&marker).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+    return Err(RailError::message(format!(
+      "generated lockfile marker '{}' is not a regular file",
+      marker.display()
+    )));
+  }
+  let parent = marker
+    .parent()
+    .ok_or_else(|| RailError::message("generated lockfile marker has no parent directory"))?;
+  fs::create_dir_all(parent)?;
+  fs::write(&marker, generated_lock_marker_value(workspace_root, digest)?).map_err(|error| {
+    RailError::message(format!(
+      "failed to write generated lockfile marker '{}': {error}",
+      marker.display()
+    ))
+  })
+}
+
 fn validate_cargo_output_root(
   kind: &str,
   git_root: &Path,
@@ -981,13 +1154,13 @@ mod tests {
 
     // Cargo state should be initialized
     assert_eq!(
-      ctx.cargo.workspace_root(),
+      ctx.cargo().workspace_root(),
       &ctx.workspace_root,
       "Cargo workspace root should match"
     );
 
     // Should find cargo-rail in workspace
-    let packages = ctx.cargo.workspace_members();
+    let packages = ctx.cargo().workspace_members();
     assert!(!packages.is_empty(), "Should have workspace packages");
     assert!(
       packages.iter().any(|p| p.name == "cargo-rail"),
@@ -995,7 +1168,7 @@ mod tests {
     );
 
     // Graph should be initialized
-    let members = ctx.graph.workspace_members();
+    let members = ctx.graph().workspace_members();
     assert!(!members.is_empty(), "Graph should have workspace members");
     assert!(
       members.contains(&"cargo-rail".to_string()),
@@ -1004,7 +1177,7 @@ mod tests {
 
     // Config may or may not be loaded depending on workspace
     // Just verify it's an Option
-    let _ = ctx.config.as_ref();
+    let _ = ctx.config();
   }
 
   #[test]
@@ -1030,12 +1203,12 @@ mod tests {
     let ctx = WorkspaceContext::build(&current_dir).unwrap();
 
     // Should be able to access cargo metadata
-    let metadata = ctx.cargo.metadata();
+    let metadata = ctx.cargo().metadata();
     let packages = metadata.workspace_packages();
     assert!(!packages.is_empty(), "Should have packages");
 
     // Should be able to get specific package
-    let cargo_rail = ctx.cargo.get_package("cargo-rail");
+    let cargo_rail = ctx.cargo().get_package("cargo-rail");
     assert!(cargo_rail.is_some(), "Should find cargo-rail package");
 
     let pkg = cargo_rail.unwrap();
@@ -1048,8 +1221,13 @@ mod tests {
     let ctx = WorkspaceContext::build(&current_dir).unwrap();
 
     // Graph should be consistent with cargo metadata
-    let graph_members = ctx.graph.workspace_members();
-    let cargo_packages: Vec<_> = ctx.cargo.workspace_members().iter().map(|p| p.name.as_str()).collect();
+    let graph_members = ctx.graph().workspace_members();
+    let cargo_packages: Vec<_> = ctx
+      .cargo()
+      .workspace_members()
+      .iter()
+      .map(|p| p.name.as_str())
+      .collect();
 
     for member in graph_members {
       assert!(

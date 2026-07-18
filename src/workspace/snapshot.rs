@@ -1,19 +1,52 @@
 //! Immutable authoritative inputs for one Cargo workspace capture.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cargo_metadata::{Metadata, PackageId, Source};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
+use crate::cargo::MultiTargetMetadata;
 use crate::cargo::resolution::{
-  CargoConfigSnapshot, ResolutionInputs, ResolutionView, TargetIdentity, ToolchainIdentity, credential_bearing_url,
+  CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, TargetIdentity,
+  ToolchainIdentity, credential_bearing_url,
 };
+use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
 use crate::source::{ContentDigest, RepositoryPath, SourceEntryKind, SourceSnapshot};
+use crate::workspace::context::CargoState;
+
+const SNAPSHOT_ID_VERSION: u32 = 1;
+
+/// Versioned SHA-256 identity of canonical authoritative workspace inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotId {
+  version: u32,
+  digest: ContentDigest,
+}
+
+impl SnapshotId {
+  /// Return the framing schema version used for this identity.
+  pub fn version(self) -> u32 {
+    self.version
+  }
+
+  /// Return the raw SHA-256 digest.
+  pub fn digest(self) -> ContentDigest {
+    self.digest
+  }
+}
+
+impl fmt::Display for SnapshotId {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "v{}-sha256-{}", self.version, self.digest)
+  }
+}
 
 /// Exact bytes of one authoritative workspace file.
 pub struct SnapshotFile {
@@ -147,11 +180,20 @@ impl SnapshotPackage {
 
 /// One coherent immutable capture of authoritative workspace inputs.
 ///
-/// Derived Cargo metadata views are deliberately absent. Selected target
-/// specifications and effective tool settings are authoritative inputs, while
-/// the base resolution is the exact view already loaded for the owning context.
-/// Host paths retained as provenance are location context, not portable identity.
+/// Derived Cargo metadata views are cached lazily and never contribute to the
+/// snapshot identity. Selected target specifications and effective tool
+/// settings are authoritative inputs, while the base resolution is the exact
+/// view already loaded for the owning context. Repository-owned paths use
+/// logical identities; external paths remain identity inputs when their
+/// location changes Cargo or compiler behavior.
 pub struct WorkspaceSnapshot {
+  id: SnapshotId,
+  source_root: PathBuf,
+  configuration_fingerprint: String,
+  toolchain_fingerprint: String,
+  cargo_config_identity: Arc<[u8]>,
+  toolchain_identity: Arc<[u8]>,
+  cargo: Arc<CargoState>,
   source: Arc<SourceSnapshot>,
   manifests: Vec<SnapshotFile>,
   lockfile: Option<LockfileSnapshot>,
@@ -162,12 +204,104 @@ pub struct WorkspaceSnapshot {
   toolchain: ToolchainIdentity,
   targets: Vec<TargetIdentity>,
   base_resolution: Arc<ResolutionView>,
+  derived: Arc<DerivedViews>,
+}
+
+pub(crate) struct DerivedViews {
+  workspace_root: PathBuf,
+  analysis_targets: Vec<String>,
+  resolutions: Arc<ResolutionViews>,
+  multi_target_metadata: OnceLock<Result<Arc<MultiTargetMetadata>, SnapshotViewError>>,
+  target_cfg_sets: OnceLock<Result<Arc<std::collections::HashMap<String, TargetCfgSet>>, SnapshotViewError>>,
+}
+
+impl DerivedViews {
+  pub(crate) fn new(workspace_root: PathBuf, analysis_targets: Vec<String>, resolutions: Arc<ResolutionViews>) -> Self {
+    Self {
+      workspace_root,
+      analysis_targets,
+      resolutions,
+      multi_target_metadata: OnceLock::new(),
+      target_cfg_sets: OnceLock::new(),
+    }
+  }
+
+  pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
+    self.resolutions.view(request)
+  }
+
+  pub(crate) fn cargo_current_dir(&self) -> &Path {
+    self.resolutions.cargo_current_dir()
+  }
+
+  pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
+    cached_snapshot_view(self.multi_target_metadata.get_or_init(|| {
+      if !self.analysis_targets.is_empty() {
+        crate::progress!("Loading metadata for {} target(s)...", self.analysis_targets.len());
+      }
+      MultiTargetMetadata::load_parallel(&self.resolutions, &self.analysis_targets)
+        .map(Arc::new)
+        .map_err(SnapshotViewError::capture)
+    }))
+  }
+
+  pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
+    cached_snapshot_view(self.target_cfg_sets.get_or_init(|| {
+      let mut targets = Vec::with_capacity(self.analysis_targets.len() + 1);
+      targets.push("default");
+      targets.extend(self.analysis_targets.iter().map(String::as_str));
+      load_target_cfg_sets(&self.workspace_root, &targets)
+        .map(Arc::new)
+        .map_err(SnapshotViewError::capture)
+    }))
+  }
+}
+
+#[derive(Clone)]
+struct SnapshotViewError {
+  message: String,
+  help: Option<String>,
+}
+
+impl SnapshotViewError {
+  fn capture(error: RailError) -> Self {
+    Self {
+      message: error.to_string(),
+      help: error.help_message(),
+    }
+  }
+
+  fn to_error(&self) -> RailError {
+    self.help.as_ref().map_or_else(
+      || RailError::message(self.message.clone()),
+      |help| RailError::with_help(self.message.clone(), help.clone()),
+    )
+  }
 }
 
 pub(crate) struct CapturedRailConfig {
   path: PathBuf,
   bytes: Vec<u8>,
   config: Arc<RailConfig>,
+}
+
+pub(crate) struct CapturedLockfile {
+  path: PathBuf,
+  bytes: Vec<u8>,
+}
+
+impl CapturedLockfile {
+  pub(crate) fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+    Self { path, bytes }
+  }
+
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  pub(crate) fn bytes(&self) -> &[u8] {
+    &self.bytes
+  }
 }
 
 impl CapturedRailConfig {
@@ -177,16 +311,29 @@ impl CapturedRailConfig {
 }
 
 impl WorkspaceSnapshot {
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn capture(
     source_root: &Path,
-    source: Arc<SourceSnapshot>,
-    metadata: &Metadata,
+    mut source: Arc<SourceSnapshot>,
+    cargo: Arc<CargoState>,
     rail_config: Option<CapturedRailConfig>,
+    generated_lockfile: Option<CapturedLockfile>,
     resolution_inputs: ResolutionInputs,
     targets: Vec<TargetIdentity>,
-    base_resolution: Arc<ResolutionView>,
+    derived: Arc<DerivedViews>,
   ) -> RailResult<Self> {
+    let metadata = cargo.metadata();
     let source_root = crate::utils::canonicalize_existing(source_root)?;
+    let mut partitioned_source_paths = resolution_inputs
+      .cargo_config
+      .repository_config_paths(&source_root)?
+      .into_iter()
+      .collect::<BTreeSet<_>>();
+    let lockfile_path = source_root_for_lockfile(metadata)?;
+    partitioned_source_paths.insert(relative_path(&source_root, &lockfile_path)?);
+    if !partitioned_source_paths.is_empty() {
+      Arc::make_mut(&mut source).retain(|entry| !partitioned_source_paths.contains(&entry.path));
+    }
     let root_manifest = source_root_for_workspace_manifest(source_root.as_path(), metadata)?;
     let mut manifest_paths = BTreeMap::new();
     manifest_paths.insert(relative_path(&source_root, &root_manifest)?, root_manifest);
@@ -231,12 +378,21 @@ impl WorkspaceSnapshot {
       .into_values()
       .map(|path| capture_required_file(&source, &source_root, &path, "Cargo manifest"))
       .collect::<RailResult<Vec<_>>>()?;
-    let lockfile = capture_optional_file(
-      &source,
-      &source_root,
-      &source_root_for_lockfile(metadata)?,
-      "Cargo lockfile",
-    )?
+    let source_lockfile = capture_optional_file(&source, &source_root, &lockfile_path, "Cargo lockfile")?;
+    let lockfile = match (source_lockfile, generated_lockfile) {
+      (Some(file), None) => Some(file),
+      (None, Some(captured)) => Some(capture_generated_lockfile(&source_root, metadata, captured)?),
+      (None, None) => None,
+      (Some(file), Some(captured)) => {
+        if file.bytes() != captured.bytes {
+          return Err(RailError::with_help(
+            "Cargo-generated lockfile changed while the workspace snapshot was being captured",
+            "retry after workspace input changes have stopped",
+          ));
+        }
+        Some(file)
+      }
+    }
     .map(LockfileSnapshot::from_file)
     .transpose()?;
     let (rail_config, config) = rail_config
@@ -257,7 +413,33 @@ impl WorkspaceSnapshot {
       .map_or((None, None), |(file, config)| (Some(file), Some(config)));
 
     let packages = package_snapshots(metadata, &workspace_members, &package_locations, lockfile.as_ref())?;
+    let base_resolution = derived.resolution_view(ResolutionRequest::default())?;
+    let cargo_config_identity = resolution_inputs
+      .cargo_config
+      .portable_snapshot_identity(&source_root)?;
+    let toolchain_identity = resolution_inputs.toolchain.portable_snapshot_identity(&source_root)?;
+    let configuration_fingerprint = snapshot_configuration_fingerprint(rail_config.as_ref(), &cargo_config_identity);
+    let toolchain_fingerprint = format!("sha256:{}", ContentDigest::sha256(&toolchain_identity));
+    let excluded_paths = BTreeSet::new();
+    let id = compute_snapshot_id(
+      &source,
+      &manifests,
+      lockfile.as_ref(),
+      rail_config.as_ref(),
+      &cargo_config_identity,
+      &toolchain_identity,
+      &source_root,
+      &targets,
+      &excluded_paths,
+    )?;
     Ok(Self {
+      id,
+      source_root,
+      configuration_fingerprint,
+      toolchain_fingerprint,
+      cargo_config_identity: cargo_config_identity.into(),
+      toolchain_identity: toolchain_identity.into(),
+      cargo,
       source,
       manifests,
       lockfile,
@@ -268,12 +450,55 @@ impl WorkspaceSnapshot {
       toolchain: resolution_inputs.toolchain,
       targets,
       base_resolution,
+      derived,
     })
+  }
+
+  /// Return the portable identity of this exact authoritative capture.
+  pub fn id(&self) -> SnapshotId {
+    self.id
+  }
+
+  pub(crate) fn configuration_fingerprint(&self) -> &str {
+    &self.configuration_fingerprint
+  }
+
+  pub(crate) fn toolchain_fingerprint(&self) -> &str {
+    &self.toolchain_fingerprint
+  }
+
+  pub(crate) fn lockfile_fingerprint(&self) -> String {
+    self
+      .lockfile()
+      .map(|lockfile| format!("sha256:{}", lockfile.file().digest()))
+      .unwrap_or_else(|| "absent".to_string())
+  }
+
+  pub(crate) fn id_excluding_paths(&self, paths: &BTreeSet<PathBuf>) -> RailResult<SnapshotId> {
+    let paths = paths
+      .iter()
+      .map(|path| RepositoryPath::new(path))
+      .collect::<RailResult<BTreeSet<_>>>()?;
+    compute_snapshot_id(
+      &self.source,
+      &self.manifests,
+      self.lockfile.as_ref(),
+      self.rail_config.as_ref(),
+      &self.cargo_config_identity,
+      &self.toolchain_identity,
+      &self.source_root,
+      &self.targets,
+      &paths,
+    )
   }
 
   /// Return the backend-independent canonical source capture.
   pub fn source(&self) -> &SourceSnapshot {
     &self.source
+  }
+
+  pub(crate) fn cargo(&self) -> &Arc<CargoState> {
+    &self.cargo
   }
 
   /// Return root and local-package manifests in logical path order.
@@ -294,6 +519,10 @@ impl WorkspaceSnapshot {
   /// Return the parsed cargo-rail configuration paired with the lossless bytes.
   pub fn config(&self) -> Option<&RailConfig> {
     self.config.as_deref()
+  }
+
+  pub(crate) fn shared_config(&self) -> Option<&Arc<RailConfig>> {
+    self.config.as_ref()
   }
 
   /// Return effective non-secret Cargo configuration inputs and provenance.
@@ -321,12 +550,268 @@ impl WorkspaceSnapshot {
     &self.base_resolution
   }
 
+  pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
+    self.derived.resolution_view(request)
+  }
+
+  pub(crate) fn cargo_current_dir(&self) -> &Path {
+    self.derived.cargo_current_dir()
+  }
+
+  pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
+    self.derived.multi_target_metadata()
+  }
+
+  pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
+    self.derived.target_cfg_sets()
+  }
+
   pub(crate) fn validate_external_targets_unchanged(&self) -> RailResult<()> {
     self
       .targets
       .iter()
       .try_for_each(TargetIdentity::validate_custom_specification_unchanged)
   }
+
+  pub(crate) fn validate_live_authoritative_inputs(&self) -> RailResult<()> {
+    self.validate_resolution_environment_unchanged()?;
+    self.validate_authoritative_files_unchanged()?;
+    self.validate_external_targets_unchanged()
+  }
+
+  pub(crate) fn validate_authoritative_files_unchanged(&self) -> RailResult<()> {
+    for file in self
+      .manifests
+      .iter()
+      .chain(self.lockfile.iter().map(LockfileSnapshot::file))
+      .chain(self.rail_config.iter())
+    {
+      let path = self.source_root.join(file.path().as_path());
+      let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        RailError::message(format!(
+          "failed to revalidate authoritative snapshot file '{}': {error}",
+          file.path()
+        ))
+      })?;
+      if !metadata.file_type().is_file() {
+        return Err(RailError::with_help(
+          format!(
+            "authoritative snapshot file '{}' is no longer a regular file",
+            file.path()
+          ),
+          "retry after workspace input changes have stopped",
+        ));
+      }
+      let bytes = fs::read(&path).map_err(|error| {
+        RailError::message(format!(
+          "failed to revalidate authoritative snapshot file '{}': {error}",
+          file.path()
+        ))
+      })?;
+      if ContentDigest::sha256(&bytes) != file.digest() {
+        return Err(RailError::with_help(
+          format!("authoritative snapshot file '{}' changed after capture", file.path()),
+          "retry after workspace input changes have stopped",
+        ));
+      }
+    }
+    Ok(())
+  }
+
+  pub(crate) fn validate_resolution_environment_unchanged(&self) -> RailResult<()> {
+    let current = ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?;
+    if current.cargo_config != self.cargo_config || current.toolchain != self.toolchain {
+      return Err(RailError::with_help(
+        "Cargo configuration or toolchain identity changed after workspace snapshot capture",
+        "retry after workspace inputs and toolchain updates have stopped",
+      ));
+    }
+    Ok(())
+  }
+}
+
+fn capture_generated_lockfile(
+  source_root: &Path,
+  metadata: &Metadata,
+  captured: CapturedLockfile,
+) -> RailResult<SnapshotFile> {
+  let expected = source_root_for_lockfile(metadata)?;
+  let file_type = fs::symlink_metadata(&captured.path)
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to inspect generated Cargo lockfile '{}': {error}",
+        captured.path.display()
+      ))
+    })?
+    .file_type();
+  if !file_type.is_file() {
+    return Err(RailError::with_help(
+      format!(
+        "generated Cargo lockfile '{}' is not a regular file",
+        captured.path.display()
+      ),
+      "replace the lockfile symlink or special entry with a regular file and retry",
+    ));
+  }
+  let path = crate::utils::canonicalize_existing(&captured.path)?;
+  if path != crate::utils::canonicalize_existing(&expected)? {
+    return Err(RailError::message(format!(
+      "generated Cargo lockfile '{}' does not match workspace lockfile '{}'",
+      path.display(),
+      expected.display()
+    )));
+  }
+  let current = fs::read(&path).map_err(|error| {
+    RailError::message(format!(
+      "failed to revalidate generated Cargo lockfile '{}': {error}",
+      path.display()
+    ))
+  })?;
+  if current != captured.bytes {
+    return Err(RailError::with_help(
+      "Cargo-generated lockfile changed while the workspace snapshot was being captured",
+      "retry after workspace input changes have stopped",
+    ));
+  }
+  Ok(SnapshotFile {
+    path: relative_path(source_root, &path)?,
+    digest: ContentDigest::sha256(&captured.bytes),
+    bytes: captured.bytes.into(),
+  })
+}
+
+fn cached_snapshot_view<T>(value: &Result<Arc<T>, SnapshotViewError>) -> RailResult<Arc<T>> {
+  value.as_ref().map(Arc::clone).map_err(SnapshotViewError::to_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_snapshot_id(
+  source: &SourceSnapshot,
+  manifests: &[SnapshotFile],
+  lockfile: Option<&LockfileSnapshot>,
+  rail_config: Option<&SnapshotFile>,
+  cargo_config_identity: &[u8],
+  toolchain_identity: &[u8],
+  source_root: &Path,
+  targets: &[TargetIdentity],
+  excluded_paths: &BTreeSet<RepositoryPath>,
+) -> RailResult<SnapshotId> {
+  let mut identity = SnapshotIdentityHasher::new(b"cargo-rail-workspace-snapshot\0");
+  identity.frame(b"version", &SNAPSHOT_ID_VERSION.to_le_bytes());
+
+  for entry in source.tree().entries() {
+    if excluded_paths.contains(&entry.path) {
+      continue;
+    }
+    let mut framed = Vec::new();
+    append_identity_frame(&mut framed, b"path", entry.path.as_str().as_bytes());
+    match &entry.kind {
+      SourceEntryKind::RegularFile { digest, executable } => {
+        append_identity_frame(&mut framed, b"kind", b"regular-file");
+        append_identity_frame(&mut framed, b"content", digest.as_bytes());
+        append_identity_frame(&mut framed, b"executable", &[u8::from(*executable)]);
+      }
+      SourceEntryKind::Symlink { target } => {
+        append_identity_frame(&mut framed, b"kind", b"symlink");
+        append_identity_frame(&mut framed, b"target", target.as_bytes());
+      }
+      SourceEntryKind::Deleted => {
+        return Err(RailError::message(format!(
+          "workspace snapshot source tree contains deleted entry '{}'",
+          entry.path
+        )));
+      }
+    }
+    identity.frame(b"source-entry", &framed);
+  }
+
+  for manifest in manifests {
+    identity.snapshot_file(b"manifest", manifest);
+  }
+  match lockfile {
+    Some(lockfile) => identity.snapshot_file(b"lockfile", lockfile.file()),
+    None => identity.frame(b"lockfile", b"absent"),
+  }
+  match rail_config {
+    Some(config) => identity.snapshot_file(b"rail-config", config),
+    None => identity.frame(b"rail-config", b"absent"),
+  }
+
+  identity.frame(b"cargo-config", cargo_config_identity);
+  identity.frame(b"toolchain", toolchain_identity);
+  for target in targets {
+    identity.frame(b"target", &target.portable_snapshot_identity(source_root)?);
+  }
+
+  Ok(SnapshotId {
+    version: SNAPSHOT_ID_VERSION,
+    digest: identity.finish(),
+  })
+}
+
+struct SnapshotIdentityHasher {
+  hasher: Sha256,
+  input_bytes: usize,
+}
+
+impl SnapshotIdentityHasher {
+  fn new(domain: &[u8]) -> Self {
+    let mut identity = Self {
+      hasher: Sha256::new(),
+      input_bytes: 0,
+    };
+    identity.update(domain);
+    identity
+  }
+
+  fn frame(&mut self, tag: &[u8], value: &[u8]) {
+    self.update(&(tag.len() as u64).to_le_bytes());
+    self.update(tag);
+    self.update(&(value.len() as u64).to_le_bytes());
+    self.update(value);
+  }
+
+  fn snapshot_file(&mut self, tag: &[u8], file: &SnapshotFile) {
+    let mut framed = Vec::new();
+    append_identity_frame(&mut framed, b"path", file.path().as_str().as_bytes());
+    append_identity_frame(&mut framed, b"content", file.digest().as_bytes());
+    self.frame(tag, &framed);
+  }
+
+  fn update(&mut self, bytes: &[u8]) {
+    self.hasher.update(bytes);
+    self.input_bytes = self.input_bytes.saturating_add(bytes.len());
+  }
+
+  fn finish(self) -> ContentDigest {
+    crate::instrumentation::record_hash_operation();
+    crate::instrumentation::record_hash_input_bytes(self.input_bytes);
+    ContentDigest::from_sha256_bytes(self.hasher.finalize().into())
+  }
+}
+
+fn snapshot_configuration_fingerprint(rail_config: Option<&SnapshotFile>, cargo_config_identity: &[u8]) -> String {
+  let mut identity = Vec::from(&b"cargo-rail-snapshot-configuration-v1\0"[..]);
+  match rail_config {
+    Some(config) => {
+      let mut framed = Vec::new();
+      let normalized = crate::utils::normalize_line_endings(config.bytes());
+      let digest = ContentDigest::sha256(&normalized);
+      append_identity_frame(&mut framed, b"path", config.path().as_str().as_bytes());
+      append_identity_frame(&mut framed, b"content", digest.as_bytes());
+      append_identity_frame(&mut identity, b"rail-config", &framed);
+    }
+    None => append_identity_frame(&mut identity, b"rail-config", b"absent"),
+  }
+  append_identity_frame(&mut identity, b"cargo-config", cargo_config_identity);
+  format!("sha256:{}", ContentDigest::sha256(&identity))
+}
+
+fn append_identity_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
+  output.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+  output.extend_from_slice(tag);
+  output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+  output.extend_from_slice(value);
 }
 
 impl LockfileSnapshot {

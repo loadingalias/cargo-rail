@@ -63,9 +63,15 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 1);
-  assert_eq!(counters["cargo_metadata_loads"], 0);
-  assert_eq!(counters["cargo_metadata_cache_hits"], 1);
+  assert_eq!(counters["schema_version"], 2);
+  assert!(
+    counters["snapshot_id"]
+      .as_str()
+      .is_some_and(|identity| identity.starts_with("v1-sha256-")),
+    "current plan commands must expose one versioned authoritative identity"
+  );
+  assert_eq!(counters["cargo_metadata_loads"], 1);
+  assert_eq!(counters["cargo_metadata_cache_hits"], 0);
   assert_eq!(counters["target_view_loads"], 0);
   assert!(counters["hash_operations"].as_u64().is_some_and(|count| count >= 3));
   assert!(counters["hash_input_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
@@ -74,10 +80,141 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
       .as_u64()
       .is_some_and(|bytes| bytes > 0)
   );
-  assert_eq!(counters["git_subprocesses"], 8);
+  assert_eq!(counters["git_subprocesses"], 11);
   assert_eq!(counters["graph_traversals"], 2);
   assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 4));
   assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 2));
+  Ok(())
+}
+
+#[test]
+fn unchanged_plan_and_run_share_snapshot_without_native_or_target_reloads() -> Result<()> {
+  let ws = TestWorkspace::new_named("diagnostic-shared-snapshot")?;
+  ws.add_crate("member", "0.1.0", &[])?;
+  let lockfile = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  ensure!(lockfile.status.success(), "offline lockfile generation failed");
+  ws.commit("Add shared snapshot fixture")?;
+
+  let output_dir = TempDir::new()?;
+  let plan_diagnostics = output_dir.path().join("plan.json");
+  let run_diagnostics = output_dir.path().join("run.json");
+  let plan = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "--diagnostics-file",
+      plan_diagnostics.to_str().context("non-UTF-8 plan diagnostics path")?,
+      "plan",
+      "--since",
+      "HEAD",
+      "--format",
+      "json",
+    ],
+  )?;
+  ensure!(plan.status.success(), "plan snapshot fixture failed");
+  let run = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "--diagnostics-file",
+      run_diagnostics.to_str().context("non-UTF-8 run diagnostics path")?,
+      "run",
+      "--all",
+      "--surface",
+      "build",
+      "--dry-run",
+    ],
+  )?;
+  ensure!(run.status.success(), "run snapshot fixture failed");
+
+  let plan = read_counters(&plan_diagnostics)?;
+  let run = read_counters(&run_diagnostics)?;
+  assert_eq!(plan["snapshot_id"], run["snapshot_id"]);
+  for counters in [&plan, &run] {
+    assert_eq!(counters["cargo_metadata_loads"], 1);
+    assert_eq!(counters["cargo_metadata_cache_hits"], 0);
+    assert_eq!(counters["target_view_loads"], 0);
+  }
+  Ok(())
+}
+
+#[test]
+fn snapshot_identity_records_credential_capability_not_raw_token_material() -> Result<()> {
+  let ws = TestWorkspace::new_named("diagnostic-credential-capability")?;
+  ws.add_crate("member", "0.1.0", &[])?;
+  let cargo_home = TempDir::new()?;
+  let cargo_config_dir = ws.path.join(".cargo");
+  std::fs::create_dir_all(&cargo_config_dir)?;
+  let credential_config = cargo_config_dir.join("config.toml");
+  std::fs::write(
+    &credential_config,
+    "[registries.private]\ntoken = \"first-private-token\"\n",
+  )?;
+  let lockfile = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  ensure!(lockfile.status.success(), "offline lockfile generation failed");
+  ws.commit("Add credential capability fixture")?;
+
+  let output_dir = TempDir::new()?;
+  let first_diagnostics = output_dir.path().join("first.json");
+  let second_diagnostics = output_dir.path().join("second.json");
+  let run = |diagnostics: &Path| -> Result<std::process::Output> {
+    Ok(
+      Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        .current_dir(&ws.path)
+        .env("CARGO_HOME", cargo_home.path())
+        .args([
+          "rail",
+          "--diagnostics-file",
+          diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+          "plan",
+          "--since",
+          "HEAD",
+          "--format",
+          "json",
+        ])
+        .output()?,
+    )
+  };
+
+  let first = run(&first_diagnostics)?;
+  ensure!(
+    first.status.success(),
+    "first capability plan failed: stdout={} stderr={}",
+    String::from_utf8_lossy(&first.stdout),
+    String::from_utf8_lossy(&first.stderr)
+  );
+  std::fs::write(
+    &credential_config,
+    "[registries.private]\ntoken = \"different-private-token\"\n",
+  )?;
+  let second = run(&second_diagnostics)?;
+  ensure!(
+    second.status.success(),
+    "second capability plan failed: stdout={} stderr={}",
+    String::from_utf8_lossy(&second.stdout),
+    String::from_utf8_lossy(&second.stderr)
+  );
+
+  let first_counters = read_counters(&first_diagnostics)?;
+  let second_counters = read_counters(&second_diagnostics)?;
+  assert_eq!(first_counters["snapshot_id"], second_counters["snapshot_id"]);
+  for bytes in [
+    first.stdout,
+    first.stderr,
+    second.stdout,
+    second.stderr,
+    std::fs::read(first_diagnostics)?,
+    std::fs::read(second_diagnostics)?,
+  ] {
+    let rendered = String::from_utf8_lossy(&bytes);
+    assert!(!rendered.contains("private-token"), "raw credential escaped capture");
+  }
   Ok(())
 }
 

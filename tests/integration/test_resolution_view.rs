@@ -52,13 +52,13 @@ provider = { path = "../provider", optional = true }
   )?;
   workspace.commit("Add resolution view fixture")?;
 
-  let context = WorkspaceContext::build(&workspace.path)?;
-  let provider = context.graph.workspace_package_by_name("provider")?.id.clone();
-  let consumer_a = context.graph.workspace_package_by_name("consumer-a")?.id.clone();
-  let consumer_b = context.graph.workspace_package_by_name("consumer-b")?.id.clone();
+  let context = WorkspaceContext::build_with_snapshot(&workspace.path)?;
+  let provider = context.graph().workspace_package_by_name("provider")?.id.clone();
+  let consumer_a = context.graph().workspace_package_by_name("consumer-a")?.id.clone();
+  let consumer_b = context.graph().workspace_package_by_name("consumer-b")?.id.clone();
 
   let base = context.resolution_view(ResolutionRequest::default())?;
-  assert!(std::ptr::eq(base.graph(), context.graph.as_ref()));
+  assert!(std::ptr::eq(base.graph(), context.graph()));
   assert_eq!(base.graph().dependency_edges(&consumer_a, &provider).count(), 1);
   assert_eq!(base.graph().dependency_edges(&consumer_b, &provider).count(), 1);
 
@@ -141,6 +141,23 @@ provider = { path = "../provider", optional = true }
 }
 
 #[test]
+fn native_default_resolution_remains_available_without_snapshot_capture() -> Result<()> {
+  let workspace = TestWorkspace::new_named("native-resolution-fast-path")?;
+  workspace.add_crate("member", "0.1.0", &[])?;
+  workspace.commit("Add native resolution member")?;
+
+  let context = WorkspaceContext::build(&workspace.path)?;
+  let first = context.resolution_view(ResolutionRequest::default())?;
+  let second = context.resolution_view(ResolutionRequest::default())?;
+
+  assert!(Arc::ptr_eq(&first, &second));
+  assert!(std::ptr::eq(first.metadata(), context.cargo().metadata()));
+  assert!(std::ptr::eq(first.graph(), context.graph()));
+  assert!(context.snapshot_id().is_none());
+  Ok(())
+}
+
+#[test]
 fn resolution_view_rejects_inexact_package_and_credential_url_identity() -> Result<()> {
   let workspace = TestWorkspace::new_named("resolution-view-fail-closed")?;
   workspace.add_crate("member", "0.1.0", &[])?;
@@ -164,8 +181,8 @@ fn resolution_view_rejects_inexact_package_and_credential_url_identity() -> Resu
   );
   assert!(combined.contains("credentials in URL-valued setting"), "{combined}");
 
-  let context = WorkspaceContext::build(&workspace.path)?;
-  let member = context.graph.workspace_package_by_name("member")?.id.clone();
+  let context = WorkspaceContext::build_with_snapshot(&workspace.path)?;
+  let member = context.graph().workspace_package_by_name("member")?.id.clone();
   let unknown = cargo_metadata::PackageId {
     repr: "path+file:///missing#unknown@0.1.0".to_string(),
   };
@@ -180,6 +197,6 @@ fn resolution_view_rejects_inexact_package_and_credential_url_identity() -> Resu
     Err(error) => error,
   };
   assert!(error.to_string().contains("is not an exact workspace member"));
-  assert!(context.graph.package(&member).is_some());
+  assert!(context.graph().package(&member).is_some());
   Ok(())
 }

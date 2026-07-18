@@ -72,14 +72,14 @@ impl UnifyAnalyzer {
     let target_cfg_sets = ctx.target_cfg_sets()?;
 
     // Parse all manifests once
-    let workspace_packages = ctx.cargo.workspace_members();
+    let workspace_packages = ctx.cargo().workspace_members();
     let manifests = ManifestAnalyzer::parse_workspace(ctx.workspace_root(), &workspace_packages)?;
 
     // Parse existing workspace.dependencies to avoid duplicates
     let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;
 
     // Build config from context, then enforce workspace-member cohort semantics.
-    let base_config = ctx.config.as_ref().map(|c| c.unify.clone()).unwrap_or_default();
+    let base_config = ctx.config().map(|c| c.unify.clone()).unwrap_or_default();
     let workspace_member_names: FxHashSet<Arc<str>> = workspace_packages
       .iter()
       .map(|pkg| Arc::from(pkg.name.as_str()))

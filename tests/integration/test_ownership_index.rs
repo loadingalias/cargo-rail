@@ -36,16 +36,18 @@ license = "MIT"
   let context = WorkspaceContext::build(&workspace.path)?;
 
   assert_eq!(
-    context.graph.file_to_crate(Path::new("crates/outer/src/lib.rs")),
+    context.graph().file_to_crate(Path::new("crates/outer/src/lib.rs")),
     Some("outer".to_string())
   );
   assert_eq!(
-    context.graph.file_to_crate(Path::new("crates/outer/nested/src/lib.rs")),
+    context
+      .graph()
+      .file_to_crate(Path::new("crates/outer/nested/src/lib.rs")),
     Some("nested".to_string())
   );
   assert_eq!(
     context
-      .graph
+      .graph()
       .file_to_crate(Path::new("crates/outer/nested/../src/deleted.rs")),
     Some("outer".to_string()),
     "lexical parent components must be normalized before longest-prefix lookup"
@@ -54,23 +56,23 @@ license = "MIT"
   let deleted_absolute = workspace.path.join("crates/outer/nested/src/deleted.rs");
   assert!(!deleted_absolute.exists());
   assert_eq!(
-    context.graph.file_to_crate(&deleted_absolute),
+    context.graph().file_to_crate(&deleted_absolute),
     Some("nested".to_string()),
     "ownership must not require the queried path to exist"
   );
   assert_eq!(
-    context.graph.file_to_crate(&workspace.path.join("../outside.rs")),
+    context.graph().file_to_crate(&workspace.path.join("../outside.rs")),
     None,
     "absolute paths escaping the workspace must not acquire an owner"
   );
   assert_eq!(
-    context.graph.file_to_crate(Path::new("crates/outerish/src/lib.rs")),
+    context.graph().file_to_crate(Path::new("crates/outerish/src/lib.rs")),
     None,
     "prefixes must end at path-component boundaries"
   );
   assert_eq!(
     context
-      .graph
+      .graph()
       .file_to_crate(Path::new("crates/outer/nested/target/generated.rs")),
     None,
     "ignored generated directories must remain unowned"
@@ -84,11 +86,11 @@ fn ownership_maps_root_package_files() -> Result<()> {
   let context = WorkspaceContext::build(&workspace.path)?;
 
   assert_eq!(
-    context.graph.file_to_crate(Path::new("src/deleted.rs")),
+    context.graph().file_to_crate(Path::new("src/deleted.rs")),
     Some("root-package".to_string())
   );
   assert_eq!(
-    context.graph.file_to_crate(Path::new("Cargo.toml")),
+    context.graph().file_to_crate(Path::new("Cargo.toml")),
     Some("root-package".to_string())
   );
   Ok(())
@@ -113,11 +115,13 @@ fn ownership_accepts_exact_absolute_roots_for_external_workspace_members() -> Re
 
   let context = WorkspaceContext::build(&workspace_root)?;
   assert_eq!(
-    context.graph.file_to_crate(&external_root.join("src/deleted.rs")),
+    context.graph().file_to_crate(&external_root.join("src/deleted.rs")),
     Some("external-member".to_string())
   );
   assert_eq!(
-    context.graph.file_to_crate(Path::new("../external-member/src/lib.rs")),
+    context
+      .graph()
+      .file_to_crate(Path::new("../external-member/src/lib.rs")),
     None,
     "workspace-relative inputs cannot escape the workspace root"
   );

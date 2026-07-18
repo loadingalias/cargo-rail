@@ -39,6 +39,7 @@ pub fn run_change_add(
   name: Option<String>,
   format: ChangeOutputFormat,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   if format.is_json() {
     crate::output::set_json_mode(true);
   }
@@ -50,7 +51,7 @@ pub fn run_change_add(
   }
   let bump = bump.parse::<BumpLevel>()?;
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   for crate_name in &crate_names {
     if !workspace_members.contains(crate_name) {
       return Err(RailError::with_help(
@@ -106,11 +107,12 @@ pub fn run_change_add(
 
 /// Print pending change-file status.
 pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> RailResult<()> {
+  ctx.snapshot()?;
   if format.is_json() {
     crate::output::set_json_mode(true);
   }
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   let pending = PendingChangeSet::load(ctx.workspace_root(), configured_change_dir(ctx), workspace_members)?;
   let summaries = pending.crate_summaries();
 
@@ -176,18 +178,19 @@ pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> 
 
 /// Check changed crates for pending change-file coverage.
 pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> RailResult<()> {
+  ctx.snapshot()?;
   if options.format.is_json() {
     crate::output::set_json_mode(true);
   }
   let default_release_config;
-  let release_config = if let Some(config) = ctx.config.as_ref() {
+  let release_config = if let Some(config) = ctx.config() {
     &config.release
   } else {
     default_release_config = ReleaseConfig::default();
     &default_release_config
   };
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   let base = resolve_change_check_base(ctx, &options)?;
   let pending = PendingChangeSet::load(ctx.workspace_root(), &release_config.change_dir, workspace_members)?;
   let changed_code_crates = changed_code_crates(ctx, release_config, base.as_deref(), workspace_members)?;
@@ -270,7 +273,7 @@ fn changed_code_crates(
 
   for crate_name in workspace_members {
     let changelog_config = ctx
-      .config
+      .config()
       .as_ref()
       .and_then(|config| config.crates.get(crate_name))
       .and_then(|crate_config| crate_config.changelog.as_ref());
@@ -407,7 +410,7 @@ fn base_intents(crate_names: Vec<String>, bump: BumpLevel) -> BTreeMap<String, B
 
 fn configured_change_dir(ctx: &WorkspaceContext) -> &str {
   ctx
-    .config
+    .config()
     .as_ref()
     .map(|config| config.release.change_dir.as_str())
     .unwrap_or(crate::release::change_files::DEFAULT_CHANGE_DIR)

@@ -98,7 +98,7 @@ impl<'a> SplitEngine<'a> {
   /// Create a new split engine from workspace context
   pub fn new(ctx: &'a WorkspaceContext) -> RailResult<Self> {
     // Build CargoTransform from context's metadata
-    let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
+    let transformer = CargoTransform::new(ctx.cargo().metadata().clone());
 
     Ok(Self {
       ctx,

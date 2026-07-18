@@ -61,7 +61,7 @@ fn text_file_fingerprint(path: &Path) -> String {
   }
 }
 
-fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
+pub(crate) fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
   if !bytes.contains(&b'\r') {
     return Cow::Borrowed(bytes);
   }

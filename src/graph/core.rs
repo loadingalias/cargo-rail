@@ -795,7 +795,7 @@ mod tests {
       );
     }
 
-    let workspace_root = PathBuf::from("/tmp/workspace");
+    let workspace_root = std::env::temp_dir().join("cargo-rail-synthetic-workspace");
     let ownership_index =
       OwnershipIndex::from_graph(&graph, &workspace_root).expect("synthetic ownership index should build");
     WorkspaceGraph {
@@ -1013,6 +1013,13 @@ mod tests {
       .first()
       .expect("workspace metadata should contain cargo-rail")
       .clone();
+    let synthetic_registry = metadata
+      .workspace_root
+      .parent()
+      .expect("workspace root should have a parent")
+      .join("cargo-rail-synthetic-registry");
+    let first_manifest_path = synthetic_registry.join("shared-1.0.0/Cargo.toml");
+    let second_manifest_path = synthetic_registry.join("shared-2.0.0/Cargo.toml");
 
     let first_id = PackageId {
       repr: "registry+https://github.com/rust-lang/crates.io-index#shared@1.0.0".into(),
@@ -1029,14 +1036,14 @@ mod tests {
     first.name = PackageName::new("shared".into());
     first.version = Version::new(1, 0, 0);
     first.source = Some(source.clone());
-    first.manifest_path = cargo_metadata::camino::Utf8PathBuf::from("/registry/shared-1.0.0/Cargo.toml");
+    first.manifest_path = first_manifest_path.clone();
 
     let mut second = template;
     second.id = second_id.clone();
     second.name = PackageName::new("shared".into());
     second.version = Version::new(2, 0, 0);
     second.source = Some(source.clone());
-    second.manifest_path = cargo_metadata::camino::Utf8PathBuf::from("/registry/shared-2.0.0/Cargo.toml");
+    second.manifest_path = second_manifest_path.clone();
 
     metadata.packages = vec![first, second];
     metadata.workspace_members.clear();
@@ -1052,7 +1059,7 @@ mod tests {
     assert_eq!(first.name, "shared");
     assert_eq!(first.version, Version::new(1, 0, 0));
     assert_eq!(first.source.as_ref(), Some(&source));
-    assert_eq!(first.manifest_path, PathBuf::from("/registry/shared-1.0.0/Cargo.toml"));
+    assert_eq!(first.manifest_path, first_manifest_path.as_std_path());
 
     let second = graph
       .package(&second_id)
@@ -1061,7 +1068,7 @@ mod tests {
     assert_eq!(second.name, "shared");
     assert_eq!(second.version, Version::new(2, 0, 0));
     assert_eq!(second.source.as_ref(), Some(&source));
-    assert_eq!(second.manifest_path, PathBuf::from("/registry/shared-2.0.0/Cargo.toml"));
+    assert_eq!(second.manifest_path, second_manifest_path.as_std_path());
 
     metadata.workspace_members = vec![first_id.clone(), second_id.clone()];
     let ambiguous_graph =
@@ -1087,8 +1094,8 @@ mod tests {
       "shared 1.0.0".to_string(),
       "shared 2.0.0".to_string(),
       source.to_string(),
-      "/registry/shared-1.0.0/Cargo.toml".to_string(),
-      "/registry/shared-2.0.0/Cargo.toml".to_string(),
+      first_manifest_path.as_std_path().display().to_string(),
+      second_manifest_path.as_std_path().display().to_string(),
     ] {
       assert!(
         help.contains(&expected),

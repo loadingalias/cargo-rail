@@ -7,7 +7,7 @@
 
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
-use crate::utils::{canonicalize_existing, config_fingerprint, file_fingerprint, toolchain_fingerprint};
+use crate::utils::{canonicalize_existing, file_fingerprint};
 use crate::workspace::WorkspaceContext;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -205,13 +205,13 @@ impl MutationTrace {
 pub struct MutationPreApplyChecks {
   /// HEAD SHA.
   pub git_head: String,
-  /// `rail.toml` fingerprint.
+  /// Effective cargo-rail and Cargo configuration fingerprint.
   pub config_fingerprint: String,
-  /// `rust-toolchain*` fingerprint.
+  /// Actual Cargo, rustc, rustdoc, and compiler-wrapper fingerprint.
   pub toolchain_fingerprint: String,
   /// `Cargo.lock` fingerprint.
   pub lock_fingerprint: String,
-  /// Cargo metadata cache fingerprint.
+  /// Authoritative workspace snapshot fingerprint.
   pub metadata_fingerprint: String,
   /// Fingerprint of every tracked or untracked worktree change.
   #[serde(default)]
@@ -363,6 +363,7 @@ pub fn validate_pre_apply_with_allowed_paths(
     }
     current.changed_paths.retain(|path| !allowed.contains(path));
     current.worktree_fingerprint = fingerprint_changed_paths(ctx.git()?.git(), &git_root, &current.changed_paths)?;
+    current.metadata_fingerprint = format!("snapshot:{}", ctx.snapshot()?.id_excluding_paths(&allowed)?);
   }
   let git = ctx.git()?.git();
   let mut changed_inputs = Vec::new();
@@ -561,17 +562,16 @@ fn sanitize_for_filename(input: &str) -> String {
 }
 
 fn capture_pre_apply_checks(ctx: &WorkspaceContext) -> RailResult<MutationPreApplyChecks> {
-  let workspace_root = ctx.workspace_root();
+  ctx.validate_snapshot_unchanged()?;
+  let snapshot = ctx.snapshot()?;
   let git = ctx.git()?.git();
   let changed_paths = ctx.changed_source_paths()?;
   Ok(MutationPreApplyChecks {
     git_head: ctx.git()?.git().head_commit()?,
-    config_fingerprint: config_fingerprint(workspace_root),
-    toolchain_fingerprint: toolchain_fingerprint(workspace_root),
-    lock_fingerprint: file_fingerprint(&workspace_root.join("Cargo.lock")),
-    metadata_fingerprint: file_fingerprint(
-      &crate::workspace::cargo_rail_state_root(workspace_root).join("metadata.json"),
-    ),
+    config_fingerprint: snapshot.configuration_fingerprint().to_string(),
+    toolchain_fingerprint: snapshot.toolchain_fingerprint().to_string(),
+    lock_fingerprint: snapshot.lockfile_fingerprint(),
+    metadata_fingerprint: format!("snapshot:{}", snapshot.id()),
     worktree_fingerprint: fingerprint_changed_paths(git, &git.worktree_root, &changed_paths)?,
     changed_paths,
   })

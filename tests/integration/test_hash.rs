@@ -124,9 +124,13 @@ fn test_plan_identity_is_portable_across_clone_paths() -> Result<()> {
   assert!(diff.status.success(), "portable diff-hash should succeed");
   let diff_json: serde_json::Value = serde_json::from_slice(&diff.stdout)?;
   assert_eq!(
-    source_identity["identity"], clone_identity["identity"],
-    "checkout location must not affect plan identity\nsource files: {:#}\nclone files: {:#}\nportable diff: {diff_json:#}",
-    source_json["files"], clone_json["files"]
+    source_identity["identity"],
+    clone_identity["identity"],
+    "checkout location must not affect plan identity\nsource config: {}\nclone config: {}\nsource files: {:#}\nclone files: {:#}\nportable diff: {diff_json:#}",
+    source_json["inputs"]["config_fingerprint"],
+    clone_json["inputs"]["config_fingerprint"],
+    source_json["files"],
+    clone_json["files"]
   );
   assert_eq!(diff_json["equal"], true, "portable diff: {diff_json:#}");
   assert_eq!(diff_json["changes"], serde_json::json!([]));

@@ -518,6 +518,7 @@ pub fn run_unify_analyze(
   format: UnifyOutputFormat,
   output: Option<&PathBuf>,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
@@ -1039,6 +1040,7 @@ fn verify_applied_unify_graph(
   ctx: &WorkspaceContext,
   plan: &crate::cargo::UnificationPlan,
 ) -> RailResult<VerifiedGraphDelta> {
+  let snapshot = ctx.snapshot()?;
   let target_metadata = ctx.multi_target_metadata()?;
   let targets = target_metadata.targets();
   let mut verified_feature_edits = std::collections::BTreeSet::new();
@@ -1052,14 +1054,28 @@ fn verify_applied_unify_graph(
       .ok_or_else(|| RailError::message(format!("missing pre-edit metadata for target `{target}`")))?;
     let before = resolved_graph_snapshot(before_metadata)?;
     let mut command = cargo_metadata::MetadataCommand::new();
-    command.current_dir(ctx.workspace_root());
+    command
+      .cargo_path(std::path::PathBuf::from(snapshot.toolchain().cargo_program()))
+      .current_dir(snapshot.cargo_current_dir())
+      .manifest_path(ctx.workspace_root().join("Cargo.toml"));
     if target != "default" {
       command.other_options(vec![String::from("--filter-platform"), target.to_string()]);
     }
+    snapshot.validate_resolution_environment_unchanged()?;
     crate::instrumentation::record_cargo_metadata_load(target != "default");
-    let metadata = command
-      .exec()
-      .map_err(|error| RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}")))?;
+    let metadata = command.exec().map_err(|error| {
+      if snapshot.cargo_config().has_credential_capability() {
+        RailError::with_help(
+          format!(
+            "resolving post-edit metadata for target '{target}' failed while credential capabilities were active"
+          ),
+          "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
+        )
+      } else {
+        RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}"))
+      }
+    })?;
+    snapshot.validate_resolution_environment_unchanged()?;
     let after = resolved_graph_snapshot(&metadata)?;
     let closure = graph_name_closure(&authorized_names, &before, &after);
     for (fact, participants) in after.facts.iter().filter(|(fact, _)| !before.facts.contains_key(*fact)) {
@@ -1191,6 +1207,7 @@ pub fn run_unify_apply(
   plan_path: Option<std::path::PathBuf>,
   format: UnifyOutputFormat,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   use crate::backup::{BackupManager, BackupMetadata};
   use std::path::PathBuf;
 
@@ -1324,13 +1341,13 @@ pub fn run_unify_apply(
     }
 
     let metadata = BackupMetadata::new("cargo rail unify");
-    let max_backups = ctx.config.as_ref().map(|c| c.unify.max_backups).unwrap_or(3);
+    let max_backups = ctx.config().map(|c| c.unify.max_backups).unwrap_or(3);
     let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
     progress!("backup: {}", backup_id);
     created_backup_id = Some(backup_id);
   }
 
-  let sort_mode = ctx.config.as_ref().map(|c| c.unify.sort_dependencies).unwrap_or(true);
+  let sort_mode = ctx.config().map(|c| c.unify.sort_dependencies).unwrap_or(true);
   let writer = ManifestWriter::new().with_dependency_sort(sort_mode);
   let manifest_transaction = ManifestTransaction::capture(ctx, &plan, msrv_write_needed)?;
 
@@ -1875,7 +1892,7 @@ fn workspace_msrv_write_needed(workspace_root: &std::path::Path, msrv: &semver::
 }
 
 fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std::path::PathBuf> {
-  let transitive_host_setting = ctx.config.as_ref().map(|c| &c.unify.transitive_host);
+  let transitive_host_setting = ctx.config().map(|c| &c.unify.transitive_host);
   let is_root_host = matches!(
     transitive_host_setting,
     None | Some(crate::config::TransitiveFeatureHost::Root)
@@ -1885,7 +1902,7 @@ fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std:
   // because virtual manifests can't have [dev-dependencies].
   if is_root_host && is_virtual_workspace(ctx.workspace_root()) {
     // Auto-select first workspace member as the host
-    let members = ctx.graph.workspace_members();
+    let members = ctx.graph().workspace_members();
     if members.is_empty() {
       return Err(RailError::with_help(
         "transitive_host = \"root\" is incompatible with virtual workspaces".to_string(),
@@ -1897,7 +1914,7 @@ fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std:
     }
 
     let first_member = &members[0];
-    if let Some(pkg) = ctx.cargo.get_package(first_member) {
+    if let Some(pkg) = ctx.cargo().get_package(first_member) {
       let member_path = pkg
         .manifest_path
         .parent()

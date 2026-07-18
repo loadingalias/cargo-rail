@@ -201,7 +201,7 @@ fn collect_backup_artifacts(
     }
   } else {
     let max_backups = ctx
-      .config
+      .config()
       .as_ref()
       .map(|c| c.unify.max_backups)
       .unwrap_or_else(|| UnifyConfig::default().max_backups);
@@ -301,7 +301,7 @@ fn clean_backups_handler(ctx: &WorkspaceContext, delete_all: bool) -> RailResult
     progress!("  removed {} backups", count);
   } else {
     let max_backups = ctx
-      .config
+      .config()
       .as_ref()
       .map(|c| c.unify.max_backups)
       .unwrap_or_else(|| UnifyConfig::default().max_backups);

@@ -24,6 +24,7 @@ pub fn run_release_plan(
   include_dependents: bool,
   format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
@@ -33,12 +34,12 @@ pub fn run_release_plan(
 
   let bump_request = bump.parse::<BumpRequest>()?;
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   let validator = ReleaseValidator::new(ctx);
 
   let target_crates = crate_names;
 
-  let config = ctx.config.as_ref().map(|c| &c.release);
+  let config = ctx.config().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
@@ -144,16 +145,17 @@ pub struct ReleasePublishArgs {
 
 /// Execute a release
 pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = args.format.is_json();
   if json {
     crate::output::set_json_mode(true);
   }
 
-  let config = ctx.config.as_ref().map(|c| &c.release);
+  let config = ctx.config().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   let mut warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
   if !json {
     for warning in &warnings {
@@ -365,6 +367,7 @@ pub fn run_release_check(
   include_dependents: bool,
   format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = format.is_json();
 
   // JSON mode enables structured error output and suppresses progress
@@ -372,11 +375,11 @@ pub fn run_release_check(
     crate::output::set_json_mode(true);
   }
 
-  let config = ctx.config.as_ref().map(|c| &c.release);
+  let config = ctx.config().map(|c| &c.release);
   let release_config =
     config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   for warning in release_config.validate(workspace_members).map_err(RailError::Config)? {
     if !json {
       crate::warn!("{}", warning);
@@ -633,18 +636,19 @@ pub fn run_release_finalize(
   yes: bool,
   format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = format.is_json();
   if json {
     crate::output::set_json_mode(true);
   }
 
   let release_config = ctx
-    .config
+    .config()
     .as_ref()
     .map(|config| &config.release)
     .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
 
-  let workspace_members = ctx.graph.workspace_members();
+  let workspace_members = ctx.graph().workspace_members();
   let mut warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
   if !json {
     for warning in &warnings {
@@ -706,8 +710,9 @@ fn dependent_policy(include_dependents: bool) -> DependentPolicy {
 
 /// Resume an interrupted release from durable state.
 pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> RailResult<()> {
+  ctx.snapshot()?;
   let release_config = ctx
-    .config
+    .config()
     .as_ref()
     .map(|config| &config.release)
     .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
@@ -716,9 +721,10 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
 
 /// Abort an active release before any external side effect has occurred.
 pub fn run_release_abort(ctx: &WorkspaceContext, state: &std::path::Path, yes: bool) -> RailResult<()> {
+  ctx.snapshot()?;
   enforce_safety_gate("release abort", yes, None, io::stdin().is_terminal())?;
   let release_config = ctx
-    .config
+    .config()
     .as_ref()
     .map(|config| &config.release)
     .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
@@ -760,7 +766,7 @@ fn build_release_mutation_plan(
         MutationEffect::Write,
       )?];
       for dependent in &crate_plan.affected_dependents {
-        let package = ctx.cargo.get_package(dependent).ok_or_else(|| {
+        let package = ctx.cargo().get_package(dependent).ok_or_else(|| {
           RailError::message(format!(
             "release plan references unknown dependent crate '{}'",
             dependent
@@ -1054,12 +1060,13 @@ fn release_forge_detail(forge: ReleaseForgeConfig) -> &'static str {
 
 /// Initialize release configuration
 pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, check: bool) -> RailResult<()> {
+  ctx.snapshot()?;
   use crate::config::{ChangelogConfig, CrateReleaseConfig, RailConfig};
   use std::fs;
 
   let requested_crates = crates;
 
-  let members = ctx.cargo.workspace_members();
+  let members = ctx.cargo().workspace_members();
   let workspace_root = ctx.workspace_root();
 
   let target_crates: Vec<_> = members

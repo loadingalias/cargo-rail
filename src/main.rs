@@ -83,8 +83,14 @@ fn run(cli: RailCli) -> RailResult<()> {
   };
 
   // Build workspace context (single-load pattern)
-  let capture_source = command.requires_worktree_source_capture();
-  let ctx = workspace::WorkspaceContext::build_with_source_capture(&workspace_root, capture_source)?;
+  let ctx = if command.requires_workspace_snapshot() {
+    workspace::WorkspaceContext::build_with_snapshot(&workspace_root)?
+  } else {
+    workspace::WorkspaceContext::build_with_source_capture(&workspace_root, command.requires_worktree_source_capture())?
+  };
+  if let Some(snapshot_id) = ctx.snapshot_id() {
+    cargo_rail::instrumentation::record_snapshot_id(snapshot_id.to_string());
+  }
 
   // Dispatch to command handler
   commands::dispatch(command, &ctx)

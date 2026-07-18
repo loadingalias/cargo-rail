@@ -10,11 +10,12 @@ use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
 struct Counters {
+  snapshot_id: OnceLock<String>,
   cargo_metadata_loads: AtomicU64,
   cargo_metadata_cache_hits: AtomicU64,
   target_view_loads: AtomicU64,
@@ -30,6 +31,7 @@ struct Counters {
 impl Counters {
   const fn new() -> Self {
     Self {
+      snapshot_id: OnceLock::new(),
       cargo_metadata_loads: AtomicU64::new(0),
       cargo_metadata_cache_hits: AtomicU64::new(0),
       target_view_loads: AtomicU64::new(0),
@@ -46,6 +48,7 @@ impl Counters {
   fn snapshot(&self) -> CounterSnapshot {
     CounterSnapshot {
       schema_version: SCHEMA_VERSION,
+      snapshot_id: self.snapshot_id.get().cloned(),
       cargo_metadata_loads: self.cargo_metadata_loads.load(Ordering::Relaxed),
       cargo_metadata_cache_hits: self.cargo_metadata_cache_hits.load(Ordering::Relaxed),
       target_view_loads: self.target_view_loads.load(Ordering::Relaxed),
@@ -63,6 +66,7 @@ impl Counters {
 #[derive(Serialize)]
 struct CounterSnapshot {
   schema_version: u32,
+  snapshot_id: Option<String>,
   cargo_metadata_loads: u64,
   cargo_metadata_cache_hits: u64,
   target_view_loads: u64,
@@ -147,6 +151,14 @@ pub(crate) fn record_cargo_metadata_load(target_view: bool) {
   add(|counters| &counters.cargo_metadata_loads, 1);
   if target_view {
     add(|counters| &counters.target_view_loads, 1);
+  }
+}
+
+/// Record the authoritative workspace identity for diagnostic-only inspection.
+#[doc(hidden)]
+pub fn record_snapshot_id(snapshot_id: String) {
+  if let Some(counters) = COUNTERS.get() {
+    let _ = counters.snapshot_id.set(snapshot_id);
   }
 }
 

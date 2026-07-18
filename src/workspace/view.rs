@@ -52,7 +52,7 @@ impl<'a> WorkspaceView<'a> {
   ///
   /// Returns `None` if the crate is not a workspace member.
   pub fn crate_info(&self, crate_name: &str) -> Option<CrateInfo> {
-    let package = self.ctx.cargo.get_package(crate_name)?;
+    let package = self.ctx.cargo().get_package(crate_name)?;
     let manifest_path = package.manifest_path.clone().into_std_path_buf();
     let crate_root = manifest_path.parent()?.to_path_buf();
 
@@ -60,7 +60,7 @@ impl<'a> WorkspaceView<'a> {
       name: crate_name.to_string(),
       crate_root,
       manifest_path,
-      is_proc_macro: self.ctx.cargo.is_proc_macro(crate_name),
+      is_proc_macro: self.ctx.cargo().is_proc_macro(crate_name),
       version: package.version.clone(),
     })
   }
@@ -69,7 +69,7 @@ impl<'a> WorkspaceView<'a> {
   pub fn all_crates(&self) -> Vec<CrateInfo> {
     self
       .ctx
-      .graph
+      .graph()
       .workspace_members()
       .iter()
       .filter_map(|name| self.crate_info(name))
@@ -78,27 +78,27 @@ impl<'a> WorkspaceView<'a> {
 
   /// Get transitive dependents of a crate (crates that depend on it)
   pub fn dependents(&self, crate_name: &str) -> crate::error::RailResult<Vec<String>> {
-    self.ctx.graph.transitive_dependents(crate_name)
+    self.ctx.graph().transitive_dependents(crate_name)
   }
 
   /// Map a file path to its owning crate name
   pub fn file_to_crate(&self, path: &std::path::Path) -> Option<String> {
-    self.ctx.graph.file_to_crate(path)
+    self.ctx.graph().file_to_crate(path)
   }
 
   /// Check if a crate is a proc-macro crate (O(1))
   pub fn is_proc_macro(&self, crate_name: &str) -> bool {
-    self.ctx.cargo.is_proc_macro(crate_name)
+    self.ctx.cargo().is_proc_macro(crate_name)
   }
 
   /// Get all proc-macro crate names
   pub fn proc_macro_crates(&self) -> &std::collections::HashSet<String> {
-    self.ctx.cargo.proc_macro_crates()
+    self.ctx.cargo().proc_macro_crates()
   }
 
   /// Get workspace members in dependency order (for publishing)
   pub fn publish_order(&self) -> crate::error::RailResult<Vec<String>> {
-    self.ctx.graph.publish_order()
+    self.ctx.graph().publish_order()
   }
 
   /// Access the underlying context (for advanced use cases)

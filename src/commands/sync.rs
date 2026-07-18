@@ -51,6 +51,7 @@ pub struct SyncArgs {
 
 /// Run the sync command
 pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
+  ctx.snapshot()?;
   let json = args.format.is_json();
 
   // JSON mode enables structured error output and suppresses progress

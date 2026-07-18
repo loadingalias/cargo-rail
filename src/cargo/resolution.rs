@@ -23,6 +23,8 @@ use crate::graph::WorkspaceGraph;
 use crate::source::ContentDigest;
 
 const MAX_CARGO_CONFIG_INCLUDE_DEPTH: usize = 64;
+const CREDENTIAL_CAPABILITY_KEY: &str = "cargo-rail-credential-capability-v1";
+const CREDENTIAL_ENV_MARKER_PREFIX: &str = "<cargo-rail-credential-capability-v1:";
 const RUSTC_ENV_PRECEDENCE: &[&str] = &["RUSTC", "CARGO_BUILD_RUSTC"];
 const RUSTDOC_ENV_PRECEDENCE: &[&str] = &["RUSTDOC", "CARGO_BUILD_RUSTDOC"];
 const RUSTC_WRAPPER_ENV_PRECEDENCE: &[&str] = &["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"];
@@ -159,6 +161,7 @@ struct ResolutionViewKey {
   request: ResolutionRequest,
   toolchain: ToolchainIdentity,
   cargo_config: ContentDigest,
+  credential_sensitive: bool,
 }
 
 /// Actual Cargo, rustc, and rustdoc programs plus compiler wrapper selection.
@@ -366,7 +369,7 @@ impl CargoConfigSource {
 
 /// Sanitized Cargo configuration inputs and their effective file merge.
 ///
-/// Known secret-named values are represented only by presence markers.
+/// Known credential-bearing values are represented only by typed capability markers.
 /// Credential-bearing URLs fail capture rather than entering this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoConfigSnapshot {
@@ -374,6 +377,8 @@ pub struct CargoConfigSnapshot {
   effective_file_settings: JsonValue,
   environment: BTreeMap<String, String>,
   provenance: Vec<CargoConfigSource>,
+  credential_capabilities: JsonValue,
+  credential_provenance: Option<PathBuf>,
 }
 
 impl CargoConfigSnapshot {
@@ -395,7 +400,7 @@ impl CargoConfigSnapshot {
 
   /// Return relevant non-secret environment settings that override files.
   ///
-  /// Secret-named variables contain only a redacted presence marker.
+  /// Secret-named variables contain only a typed redacted capability marker.
   pub fn environment(&self) -> &BTreeMap<String, String> {
     &self.environment
   }
@@ -403,6 +408,31 @@ impl CargoConfigSnapshot {
   /// Return sanitized configuration files in lowest-to-highest precedence order.
   pub fn provenance(&self) -> &[CargoConfigSource] {
     &self.provenance
+  }
+
+  /// Return typed capabilities discovered in Cargo's credentials file.
+  pub fn credential_capabilities(&self) -> &JsonValue {
+    &self.credential_capabilities
+  }
+
+  pub(crate) fn has_credential_capability(&self) -> bool {
+    contains_credential_capability(&self.effective_file_settings)
+      || !self.credential_capabilities.as_object().is_some_and(JsonMap::is_empty)
+      || self
+        .environment
+        .values()
+        .any(|value| is_credential_environment_marker(value))
+  }
+
+  pub(crate) fn repository_config_paths(&self, source_root: &Path) -> RailResult<Vec<crate::source::RepositoryPath>> {
+    self
+      .provenance
+      .iter()
+      .map(|source| source.path())
+      .chain(self.credential_provenance.iter().map(PathBuf::as_path))
+      .filter_map(|path| path.strip_prefix(source_root).ok())
+      .map(crate::source::RepositoryPath::new)
+      .collect()
   }
 
   fn config_string_with_source(&self, path: &[&str]) -> RailResult<Option<(&str, &CargoConfigSource)>> {
@@ -529,7 +559,7 @@ impl CargoConfigSnapshot {
         .environment
         .get(name)
         .map(|value| {
-          if value == "<redacted-present>" {
+          if is_credential_environment_marker(value) {
             Err(RailError::message(format!(
               "Cargo target identity cannot materialize redacted environment variable '{name}'"
             )))
@@ -539,7 +569,7 @@ impl CargoConfigSnapshot {
         })
         .transpose();
     };
-    if setting.as_str() == Some("<redacted-present>") {
+    if is_credential_capability(setting) {
       return Err(RailError::with_help(
         format!("Cargo target identity cannot apply redacted configuration value 'env.{name}'"),
         "move secret environment values out of Cargo configuration before snapshot capture",
@@ -547,14 +577,14 @@ impl CargoConfigSnapshot {
     }
     let (value, force, relative, value_path) = cargo_environment_setting(name, setting)?;
     if !force && let Some(captured) = self.environment.get(name) {
-      if captured == "<redacted-present>" {
+      if is_credential_environment_marker(captured) {
         return Err(RailError::message(format!(
           "Cargo target identity cannot materialize redacted environment variable '{name}'"
         )));
       }
       return Ok(Some(OsString::from(captured)));
     }
-    if value == "<redacted-present>" {
+    if is_credential_environment_marker(value) {
       return Err(RailError::with_help(
         format!("Cargo target identity cannot apply redacted configuration value 'env.{name}'"),
         "move secret environment values out of Cargo configuration before snapshot capture",
@@ -568,6 +598,247 @@ impl CargoConfigSnapshot {
     }
     Ok(Some(OsString::from(value)))
   }
+
+  pub(crate) fn portable_snapshot_identity(&self, source_root: &Path) -> RailResult<Vec<u8>> {
+    let mut identity = Vec::from(&b"cargo-config-snapshot-v1\0"[..]);
+    append_frame(
+      &mut identity,
+      b"effective-settings",
+      &serde_json::to_vec(&self.effective_file_settings)?,
+    );
+    append_frame(
+      &mut identity,
+      b"environment",
+      &serde_json::to_vec(&portable_environment(&self.environment, source_root)?)?,
+    );
+    append_frame(
+      &mut identity,
+      b"credential-capabilities",
+      &serde_json::to_vec(&self.credential_capabilities)?,
+    );
+    for source in &self.provenance {
+      let mut provenance = Vec::new();
+      append_frame(
+        &mut provenance,
+        b"path",
+        portable_path(source_root, source.path(), "Cargo configuration provenance")?.as_bytes(),
+      );
+      append_frame(&mut provenance, b"settings", &serde_json::to_vec(source.settings())?);
+      append_frame(&mut identity, b"provenance", &provenance);
+    }
+    Ok(identity)
+  }
+}
+
+fn portable_environment(
+  environment: &BTreeMap<String, String>,
+  source_root: &Path,
+) -> RailResult<BTreeMap<String, String>> {
+  let source_root = source_root
+    .to_str()
+    .ok_or_else(|| RailError::message("snapshot source root is not valid UTF-8 for portable Cargo environment"))?;
+  Ok(
+    environment
+      .iter()
+      .map(|(name, value)| {
+        let value = if is_credential_environment_marker(value) {
+          value.clone()
+        } else if let Some(suffix) = value.strip_prefix(source_root)
+          && (suffix.is_empty() || suffix.starts_with('/') || suffix.starts_with('\\'))
+        {
+          format!(
+            "repository:{}",
+            suffix.trim_start_matches(['/', '\\']).replace('\\', "/")
+          )
+        } else {
+          value.clone()
+        };
+        (name.clone(), value)
+      })
+      .collect(),
+  )
+}
+
+impl ToolchainIdentity {
+  pub(crate) fn portable_snapshot_identity(&self, source_root: &Path) -> RailResult<Vec<u8>> {
+    let mut identity = Vec::from(&b"toolchain-snapshot-v1\0"[..]);
+    append_os_frame(
+      &mut identity,
+      b"cargo-program",
+      self.cargo_program(),
+      source_root,
+      "Cargo program",
+    )?;
+    append_frame(&mut identity, b"cargo-version", self.cargo_verbose_version().as_bytes());
+    append_os_frame(
+      &mut identity,
+      b"rustc-program",
+      self.rustc_program(),
+      source_root,
+      "rustc program",
+    )?;
+    append_frame(&mut identity, b"rustc-version", self.rustc_verbose_version().as_bytes());
+    append_os_frame(
+      &mut identity,
+      b"rustdoc-program",
+      self.rustdoc_program(),
+      source_root,
+      "rustdoc program",
+    )?;
+    append_frame(
+      &mut identity,
+      b"rustdoc-version",
+      self.rustdoc_verbose_version().as_bytes(),
+    );
+    append_optional_os_frame(
+      &mut identity,
+      b"rustc-wrapper",
+      self.rustc_wrapper_program(),
+      source_root,
+      "rustc wrapper",
+    )?;
+    append_optional_os_frame(
+      &mut identity,
+      b"rustc-workspace-wrapper",
+      self.rustc_workspace_wrapper_program(),
+      source_root,
+      "workspace rustc wrapper",
+    )?;
+    append_frame(&mut identity, b"host-target", self.host_target().as_bytes());
+    Ok(identity)
+  }
+}
+
+impl TargetIdentity {
+  pub(crate) fn portable_snapshot_identity(&self, source_root: &Path) -> RailResult<Vec<u8>> {
+    let mut identity = Vec::from(&b"target-snapshot-v1\0"[..]);
+    match &self.specification {
+      TargetSpecificationIdentity::BuiltIn(target) => append_frame(&mut identity, b"built-in", target.as_bytes()),
+      TargetSpecificationIdentity::Custom(specification) => {
+        append_frame(&mut identity, b"custom-name", specification.name().as_bytes());
+        append_frame(
+          &mut identity,
+          b"custom-path",
+          portable_path(source_root, specification.path(), "custom target specification")?.as_bytes(),
+        );
+        append_frame(&mut identity, b"custom-content", specification.digest().as_bytes());
+      }
+    }
+    append_frame(&mut identity, b"host", &[u8::from(self.host)]);
+    append_frame(&mut identity, b"build-target", &[u8::from(self.build_target)]);
+    append_frame(&mut identity, b"analysis-target", &[u8::from(self.analysis_target)]);
+    append_string_list(&mut identity, b"cfg", &self.cfg);
+    append_optional_os_list(
+      &mut identity,
+      b"runner",
+      self.runner.as_deref(),
+      source_root,
+      "target runner",
+    )?;
+    append_optional_os_frame(
+      &mut identity,
+      b"linker",
+      self.linker.as_deref(),
+      source_root,
+      "target linker",
+    )?;
+    append_string_list(&mut identity, b"rustflags", &self.rustflags);
+    append_string_list(&mut identity, b"rustdocflags", &self.rustdocflags);
+    append_optional_string_list(
+      &mut identity,
+      b"host-artifact-rustflags",
+      self.host_artifact_rustflags.as_deref(),
+    );
+    append_optional_string_list(
+      &mut identity,
+      b"host-artifact-rustdocflags",
+      self.host_artifact_rustdocflags.as_deref(),
+    );
+    Ok(identity)
+  }
+}
+
+fn portable_path(source_root: &Path, path: &Path, description: &str) -> RailResult<String> {
+  if path.is_absolute()
+    && let Ok(relative) = path.strip_prefix(source_root)
+  {
+    let relative = crate::source::RepositoryPath::new(relative)?;
+    return Ok(format!("repository:{}", relative.as_str()));
+  }
+  path.to_str().map(|path| format!("external:{path}")).ok_or_else(|| {
+    RailError::message(format!(
+      "{description} path is not valid UTF-8 for portable snapshot identity"
+    ))
+  })
+}
+
+fn append_os_frame(
+  output: &mut Vec<u8>,
+  tag: &[u8],
+  value: &OsStr,
+  source_root: &Path,
+  description: &str,
+) -> RailResult<()> {
+  let portable = portable_path(source_root, Path::new(value), description)?;
+  append_frame(output, tag, portable.as_bytes());
+  Ok(())
+}
+
+fn append_optional_os_frame(
+  output: &mut Vec<u8>,
+  tag: &[u8],
+  value: Option<&OsStr>,
+  source_root: &Path,
+  description: &str,
+) -> RailResult<()> {
+  match value {
+    Some(value) => append_os_frame(output, tag, value, source_root, description),
+    None => {
+      append_frame(output, tag, b"absent");
+      Ok(())
+    }
+  }
+}
+
+fn append_optional_os_list(
+  output: &mut Vec<u8>,
+  tag: &[u8],
+  values: Option<&[OsString]>,
+  source_root: &Path,
+  description: &str,
+) -> RailResult<()> {
+  let mut framed = Vec::new();
+  match values {
+    Some(values) => {
+      append_frame(&mut framed, b"state", b"present");
+      for value in values {
+        append_os_frame(&mut framed, b"value", value, source_root, description)?;
+      }
+    }
+    None => append_frame(&mut framed, b"state", b"absent"),
+  }
+  append_frame(output, tag, &framed);
+  Ok(())
+}
+
+fn append_string_list(output: &mut Vec<u8>, tag: &[u8], values: &[String]) {
+  let mut framed = Vec::new();
+  for value in values {
+    append_frame(&mut framed, b"value", value.as_bytes());
+  }
+  append_frame(output, tag, &framed);
+}
+
+fn append_optional_string_list(output: &mut Vec<u8>, tag: &[u8], values: Option<&[String]>) {
+  let mut framed = Vec::new();
+  match values {
+    Some(values) => {
+      append_frame(&mut framed, b"state", b"present");
+      append_string_list(&mut framed, b"values", values);
+    }
+    None => append_frame(&mut framed, b"state", b"absent"),
+  }
+  append_frame(output, tag, &framed);
 }
 
 fn json_value_at<'a>(value: &'a JsonValue, path: &[&str]) -> Option<&'a JsonValue> {
@@ -707,6 +978,7 @@ impl ResolutionViews {
       request,
       toolchain: inputs.toolchain,
       cargo_config: inputs.cargo_config.digest,
+      credential_sensitive: inputs.cargo_config.has_credential_capability(),
     };
 
     let cell = {
@@ -743,7 +1015,8 @@ impl ResolutionViews {
     crate::instrumentation::record_cargo_metadata_load(key.request.target_filter().is_some());
     let metadata = command.exec();
     self.validate_cargo_config_unchanged(key.cargo_config)?;
-    let metadata = Arc::new(metadata.map_err(|error| resolution_load_error(&key.request, error))?);
+    let metadata =
+      Arc::new(metadata.map_err(|error| resolution_load_error(&key.request, error, key.credential_sensitive))?);
     if metadata.resolve.is_none() {
       return Err(RailError::message(
         "Cargo returned no resolve graph for a full resolution view",
@@ -909,7 +1182,11 @@ fn package_feature(package: &Package, feature: &str, package_names: &FxHashMap<&
   Ok(format!("{}/{}", package.name, feature))
 }
 
-fn resolution_load_error(request: &ResolutionRequest, error: cargo_metadata::Error) -> RailError {
+fn resolution_load_error(
+  request: &ResolutionRequest,
+  error: cargo_metadata::Error,
+  credential_sensitive: bool,
+) -> RailError {
   let message = error.to_string();
   if let Some(target) = request.target_filter()
     && (message.contains("error[E0463]")
@@ -919,6 +1196,12 @@ fn resolution_load_error(request: &ResolutionRequest, error: cargo_metadata::Err
     return RailError::with_help(
       format!("Target '{target}' is not installed on this machine"),
       format!("Install the target with: rustup target add {target}"),
+    );
+  }
+  if credential_sensitive {
+    return RailError::with_help(
+      "Failed to load exact Cargo resolution while credential capabilities were active",
+      "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
     );
   }
   request.target_filter().map_or_else(
@@ -1564,7 +1847,7 @@ fn apply_cargo_environment(command: &mut Command, cargo_config: &CargoConfigSnap
     .as_object()
     .ok_or_else(|| RailError::message("Cargo configuration key 'env' must be a table"))?;
   for (name, setting) in environment {
-    if setting.as_str() == Some("<redacted-present>") {
+    if is_credential_capability(setting) {
       return Err(RailError::with_help(
         format!("Cargo target identity cannot apply redacted configuration value 'env.{name}'"),
         "move secret environment values out of Cargo configuration before snapshot capture",
@@ -1573,7 +1856,7 @@ fn apply_cargo_environment(command: &mut Command, cargo_config: &CargoConfigSnap
     let (value, force, relative, value_path) = cargo_environment_setting(name, setting)?;
 
     if !force && let Some(captured) = cargo_config.environment.get(name) {
-      if captured == "<redacted-present>" {
+      if is_credential_environment_marker(captured) {
         if std::env::var_os(name).is_none() {
           return Err(RailError::message(format!(
             "redacted Cargo environment variable '{name}' disappeared during target identity capture"
@@ -1584,7 +1867,7 @@ fn apply_cargo_environment(command: &mut Command, cargo_config: &CargoConfigSnap
       }
       continue;
     }
-    if value == "<redacted-present>" {
+    if is_credential_environment_marker(value) {
       return Err(RailError::with_help(
         format!("Cargo target identity cannot apply redacted configuration value 'env.{name}'"),
         "move secret environment values out of Cargo configuration before snapshot capture",
@@ -1978,8 +2261,12 @@ impl CargoConfigSnapshot {
     let mut framed = Vec::from(&b"cargo-rail-resolution-config-v1\0"[..]);
     let mut stack = HashSet::new();
     let mut provenance = Vec::new();
+    let cargo_home = cargo_home(&cargo_current_dir)?;
 
-    for config_path in discovered_cargo_configs(&cargo_current_dir)?.into_iter().rev() {
+    for config_path in discovered_cargo_configs(&cargo_current_dir, &cargo_home)?
+      .into_iter()
+      .rev()
+    {
       capture_config_file(&config_path, false, 0, &mut stack, &mut framed, &mut provenance)?;
     }
     let mut effective_file_settings = JsonValue::Object(JsonMap::new());
@@ -1987,17 +2274,20 @@ impl CargoConfigSnapshot {
       merge_config_value(&mut effective_file_settings, &source.settings, "")?;
     }
     let environment = capture_relevant_environment(&effective_file_settings, &mut framed)?;
+    let (credential_capabilities, credential_provenance) = capture_credential_capabilities(&cargo_home, &mut framed)?;
 
     Ok(Self {
       digest: ContentDigest::sha256(&framed),
       effective_file_settings,
       environment,
       provenance,
+      credential_capabilities,
+      credential_provenance,
     })
   }
 }
 
-fn discovered_cargo_configs(cargo_current_dir: &Path) -> RailResult<Vec<PathBuf>> {
+fn discovered_cargo_configs(cargo_current_dir: &Path, cargo_home: &Path) -> RailResult<Vec<PathBuf>> {
   let mut configs = Vec::new();
   for directory in cargo_current_dir.ancestors() {
     if let Some(path) = cargo_config_in(&directory.join(".cargo")) {
@@ -2005,12 +2295,21 @@ fn discovered_cargo_configs(cargo_current_dir: &Path) -> RailResult<Vec<PathBuf>
     }
   }
 
-  let cargo_home = if let Some(path) = std::env::var_os("CARGO_HOME") {
+  if let Some(path) = cargo_config_in(cargo_home)
+    && !configs.contains(&path)
+  {
+    configs.push(path);
+  }
+  Ok(configs)
+}
+
+fn cargo_home(cargo_current_dir: &Path) -> RailResult<PathBuf> {
+  if let Some(path) = std::env::var_os("CARGO_HOME") {
     let path = PathBuf::from(path);
     if path.is_absolute() {
-      path
+      Ok(path)
     } else {
-      cargo_current_dir.join(path)
+      Ok(cargo_current_dir.join(path))
     }
   } else {
     default_cargo_home()?.ok_or_else(|| {
@@ -2018,14 +2317,97 @@ fn discovered_cargo_configs(cargo_current_dir: &Path) -> RailResult<Vec<PathBuf>
         "Cargo resolution identity cannot determine the default CARGO_HOME",
         "set CARGO_HOME explicitly before requesting a derived resolution view",
       )
-    })?
-  };
-  if let Some(path) = cargo_config_in(&cargo_home)
-    && !configs.contains(&path)
-  {
-    configs.push(path);
+    })
   }
-  Ok(configs)
+}
+
+fn capture_credential_capabilities(
+  cargo_home: &Path,
+  framed: &mut Vec<u8>,
+) -> RailResult<(JsonValue, Option<PathBuf>)> {
+  let legacy = cargo_home.join("credentials");
+  let toml = cargo_home.join("credentials.toml");
+  let path = if legacy.is_file() {
+    Some(legacy)
+  } else if toml.is_file() {
+    Some(toml)
+  } else {
+    None
+  };
+  let Some(path) = path else {
+    let capabilities = JsonValue::Object(JsonMap::new());
+    append_frame(framed, b"credential-capabilities", &serde_json::to_vec(&capabilities)?);
+    return Ok((capabilities, None));
+  };
+  let canonical = path.canonicalize().map_err(|error| {
+    RailError::message(format!(
+      "Failed to resolve Cargo credentials file for capability capture: {error}"
+    ))
+  })?;
+  let bytes = fs::read(&canonical).map_err(|error| {
+    RailError::message(format!(
+      "Failed to read Cargo credentials for capability capture: {error}"
+    ))
+  })?;
+  let text =
+    std::str::from_utf8(&bytes).map_err(|_| RailError::message("Cargo credentials file is not valid UTF-8"))?;
+  let document: JsonValue = toml_edit::de::from_str(text).map_err(|_| {
+    RailError::with_help(
+      "Failed to parse Cargo credentials for capability capture",
+      "fix the credentials file syntax; raw parser context is suppressed because it may contain secrets",
+    )
+  })?;
+  let capabilities = credential_file_capabilities(&document)?;
+  append_frame(framed, b"credential-capabilities", &serde_json::to_vec(&capabilities)?);
+  Ok((capabilities, Some(canonical)))
+}
+
+fn credential_file_capabilities(document: &JsonValue) -> RailResult<JsonValue> {
+  let root = document
+    .as_object()
+    .ok_or_else(|| RailError::message("Cargo credentials file is not a TOML table"))?;
+  let mut capabilities = JsonMap::new();
+  if let Some(registry) = root.get("registry").and_then(JsonValue::as_object)
+    && let Some(token) = registry.get("token")
+  {
+    validate_credential_token(token, "registry.token")?;
+    capabilities.insert(
+      "registry".to_string(),
+      serde_json::json!({"token": credential_capability_marker("token-present", &[])}),
+    );
+  }
+  if let Some(registries) = root.get("registries") {
+    let registries = registries
+      .as_object()
+      .ok_or_else(|| RailError::message("Cargo credentials key 'registries' must be a table"))?;
+    let mut captured = JsonMap::new();
+    for (name, registry) in registries {
+      let registry = registry
+        .as_object()
+        .ok_or_else(|| RailError::message(format!("Cargo credentials registry '{name}' must be a table")))?;
+      if let Some(token) = registry.get("token") {
+        validate_credential_token(token, &format!("registries.{name}.token"))?;
+        captured.insert(
+          name.clone(),
+          serde_json::json!({"token": credential_capability_marker("token-present", &[])}),
+        );
+      }
+    }
+    if !captured.is_empty() {
+      capabilities.insert("registries".to_string(), JsonValue::Object(captured));
+    }
+  }
+  Ok(JsonValue::Object(capabilities))
+}
+
+fn validate_credential_token(value: &JsonValue, path: &str) -> RailResult<()> {
+  if value.is_string() {
+    Ok(())
+  } else {
+    Err(RailError::message(format!(
+      "Cargo credentials key '{path}' must be a string"
+    )))
+  }
 }
 
 fn cargo_config_in(directory: &Path) -> Option<PathBuf> {
@@ -2194,8 +2576,10 @@ fn take_includes(document: &mut JsonValue, config_path: &Path) -> RailResult<Vec
 fn relevant_config(document: JsonValue, config_path: &Path) -> RailResult<JsonValue> {
   const RELEVANT_TOP_LEVEL: &[&str] = &[
     "build",
+    "credential-alias",
     "env",
     "host",
+    "http",
     "net",
     "patch",
     "paths",
@@ -2223,16 +2607,15 @@ fn relevant_config(document: JsonValue, config_path: &Path) -> RailResult<JsonVa
 }
 
 fn sanitize_config_value(value: &JsonValue, path: &str) -> RailResult<JsonValue> {
+  if let Some(capability) = known_credential_capability(value, path)? {
+    return Ok(capability);
+  }
   match value {
     JsonValue::Object(object) => {
       let mut sanitized = JsonMap::new();
       for (key, value) in object {
         let nested_path = format!("{path}.{key}");
-        if is_secret_name(key) {
-          sanitized.insert(key.clone(), JsonValue::String("<redacted-present>".to_string()));
-        } else {
-          sanitized.insert(key.clone(), sanitize_config_value(value, &nested_path)?);
-        }
+        sanitized.insert(key.clone(), sanitize_config_value(value, &nested_path)?);
       }
       Ok(JsonValue::Object(sanitized))
     }
@@ -2273,7 +2656,10 @@ fn capture_relevant_environment(
       continue;
     }
     if is_secret_name(name) {
-      environment.insert(name.to_string(), "<redacted-present>".to_string());
+      environment.insert(
+        name.to_string(),
+        credential_environment_marker(secret_capability_kind(name)),
+      );
       continue;
     }
     let value = value.to_str().ok_or_else(|| {
@@ -2291,6 +2677,126 @@ fn capture_relevant_environment(
   }
   append_frame(framed, b"environment", &serde_json::to_vec(&environment)?);
   Ok(environment)
+}
+
+fn known_credential_capability(value: &JsonValue, path: &str) -> RailResult<Option<JsonValue>> {
+  let field = path.rsplit('.').next().unwrap_or(path);
+  if field == "token" {
+    return Ok(Some(credential_capability_marker("token-present", &[])));
+  }
+  if field == "credential-provider" {
+    return provider_capability(value, false, path).map(Some);
+  }
+  if field == "global-credential-providers" {
+    return provider_capability(value, true, path).map(Some);
+  }
+  if path.starts_with("credential-alias.") {
+    return provider_capability(value, false, path).map(Some);
+  }
+  if is_secret_name(field) {
+    return Ok(Some(credential_capability_marker(secret_capability_kind(field), &[])));
+  }
+  Ok(None)
+}
+
+fn provider_capability(value: &JsonValue, provider_list: bool, path: &str) -> RailResult<JsonValue> {
+  let mechanisms = if provider_list {
+    value
+      .as_array()
+      .ok_or_else(|| RailError::message(format!("Cargo configuration key '{path}' must be an array")))?
+      .iter()
+      .map(|provider| {
+        provider.as_str().map(provider_mechanism).ok_or_else(|| {
+          RailError::message(format!(
+            "Cargo configuration key '{path}' contains a non-string provider"
+          ))
+        })
+      })
+      .collect::<RailResult<Vec<_>>>()?
+  } else if let Some(provider) = value.as_str() {
+    vec![provider_mechanism(provider)]
+  } else if let Some(command) = value.as_array() {
+    if command.is_empty() || command.iter().any(|argument| !argument.is_string()) {
+      return Err(RailError::message(format!(
+        "Cargo configuration key '{path}' must be a provider string or non-empty string array"
+      )));
+    }
+    vec!["external-command"]
+  } else {
+    return Err(RailError::message(format!(
+      "Cargo configuration key '{path}' must be a provider string or string array"
+    )));
+  };
+  Ok(credential_capability_marker("credential-provider", &mechanisms))
+}
+
+fn provider_mechanism(provider: &str) -> &'static str {
+  match provider {
+    "cargo:token" => "cargo-token",
+    "cargo:wincred" => "windows-credential-manager",
+    "cargo:macos-keychain" => "macos-keychain",
+    "cargo:libsecret" => "linux-secret-service",
+    _ if provider.starts_with("cargo:token-from-stdout ") => "stdout-token-command",
+    _ => "configured-provider",
+  }
+}
+
+fn secret_capability_kind(name: &str) -> &'static str {
+  let normalized = name.to_ascii_lowercase().replace('_', "-");
+  if normalized == "token" || normalized.ends_with("-token") {
+    "token-present"
+  } else if normalized.contains("password") {
+    "password-present"
+  } else if normalized.contains("private-key") {
+    "private-key-present"
+  } else if normalized.contains("credential") {
+    "credential-present"
+  } else {
+    "secret-present"
+  }
+}
+
+fn credential_capability_marker(kind: &str, mechanisms: &[&str]) -> JsonValue {
+  let mut capability = JsonMap::new();
+  capability.insert("kind".to_string(), JsonValue::String(kind.to_string()));
+  if !mechanisms.is_empty() {
+    capability.insert(
+      "mechanisms".to_string(),
+      JsonValue::Array(
+        mechanisms
+          .iter()
+          .map(|mechanism| JsonValue::String((*mechanism).to_string()))
+          .collect(),
+      ),
+    );
+  }
+  JsonValue::Object(JsonMap::from_iter([(
+    CREDENTIAL_CAPABILITY_KEY.to_string(),
+    JsonValue::Object(capability),
+  )]))
+}
+
+fn is_credential_capability(value: &JsonValue) -> bool {
+  value
+    .as_object()
+    .is_some_and(|object| object.len() == 1 && object.contains_key(CREDENTIAL_CAPABILITY_KEY))
+}
+
+fn contains_credential_capability(value: &JsonValue) -> bool {
+  is_credential_capability(value)
+    || match value {
+      JsonValue::Array(values) => values.iter().any(contains_credential_capability),
+      JsonValue::Object(values) => values.values().any(contains_credential_capability),
+      _ => false,
+    }
+}
+
+fn credential_environment_marker(kind: &str) -> String {
+  format!("{CREDENTIAL_ENV_MARKER_PREFIX}{kind}>")
+}
+
+fn is_credential_environment_marker(value: &str) -> bool {
+  value.starts_with(CREDENTIAL_ENV_MARKER_PREFIX) && value.ends_with('>')
 }
 
 fn merge_config_value(current: &mut JsonValue, incoming: &JsonValue, path: &str) -> RailResult<()> {
@@ -2417,6 +2923,7 @@ fn append_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 mod tests {
   use super::*;
 
+  #[cfg(unix)]
   fn rustc_host() -> String {
     let output = Command::new("rustc").arg("-vV").output().expect("rustc -vV should run");
     assert!(output.status.success(), "rustc -vV should succeed");
@@ -2440,18 +2947,93 @@ mod tests {
   }
 
   #[test]
-  fn secret_config_values_are_redacted_before_identity_framing() {
+  fn credential_config_values_become_typed_capabilities_before_identity_framing() {
     let value = serde_json::json!({
       "private": {
         "index": "https://example.invalid/index",
         "token": "do-not-hash-me",
         "credential-provider": ["cargo:token", "do-not-hash-me-either"]
-      }
+      },
+      "global-credential-providers": ["cargo:token", "private-provider-alias"]
     });
     let sanitized = sanitize_config_value(&value, "registries").expect("configuration should sanitize");
     let encoded = serde_json::to_string(&sanitized).expect("sanitized config should serialize");
     assert!(!encoded.contains("do-not-hash-me"));
-    assert!(encoded.contains("<redacted-present>"));
+    assert!(!encoded.contains("private-provider-alias"));
+    assert!(encoded.contains(CREDENTIAL_CAPABILITY_KEY));
+    assert!(encoded.contains("token-present"));
+    assert!(encoded.contains("external-command"));
+    assert!(encoded.contains("cargo-token"));
+    assert!(encoded.contains("configured-provider"));
+  }
+
+  #[test]
+  fn credential_alias_commands_never_enter_sanitized_config() {
+    let value = serde_json::json!(["credential-helper", "--password", "do-not-capture"]);
+    let sanitized =
+      sanitize_config_value(&value, "credential-alias.private").expect("credential alias should become a capability");
+    let encoded = serde_json::to_string(&sanitized).expect("capability should serialize");
+    assert_eq!(
+      sanitized[CREDENTIAL_CAPABILITY_KEY]["mechanisms"],
+      serde_json::json!(["external-command"])
+    );
+    assert!(!encoded.contains("credential-helper"));
+    assert!(!encoded.contains("do-not-capture"));
+  }
+
+  #[test]
+  fn cargo_credentials_capture_binds_capability_without_hashing_token_material() {
+    let cargo_home = tempfile::tempdir().expect("temporary Cargo home should be created");
+    let credentials = cargo_home.path().join("credentials.toml");
+    fs::write(&credentials, "[registry]\ntoken = \"first-raw-token\"\n")
+      .expect("first credentials file should be written");
+    let mut first_framed = Vec::new();
+    let (first, first_path) = capture_credential_capabilities(cargo_home.path(), &mut first_framed)
+      .expect("first credential capability should capture");
+
+    fs::write(&credentials, "[registry]\ntoken = \"different-raw-token\"\n")
+      .expect("second credentials file should be written");
+    let mut second_framed = Vec::new();
+    let (second, second_path) = capture_credential_capabilities(cargo_home.path(), &mut second_framed)
+      .expect("second credential capability should capture");
+
+    assert_eq!(first, second, "token values must collapse to the same capability");
+    assert_eq!(first_framed, second_framed, "raw token bytes must not affect identity");
+    assert_eq!(first_path, second_path);
+    let encoded = String::from_utf8(first_framed).expect("capability framing should be UTF-8 apart from lengths");
+    assert!(!encoded.contains("raw-token"));
+    assert!(encoded.contains("token-present"));
+  }
+
+  #[test]
+  fn legacy_cargo_credentials_file_has_cargos_documented_precedence() {
+    let cargo_home = tempfile::tempdir().expect("temporary Cargo home should be created");
+    let legacy = cargo_home.path().join("credentials");
+    fs::write(&legacy, "[registries.legacy]\ntoken = \"legacy-secret\"\n")
+      .expect("legacy credentials file should be written");
+    fs::write(
+      cargo_home.path().join("credentials.toml"),
+      "[registries.toml]\ntoken = \"toml-secret\"\n",
+    )
+    .expect("TOML credentials file should be written");
+
+    let mut framed = Vec::new();
+    let (capabilities, provenance) =
+      capture_credential_capabilities(cargo_home.path(), &mut framed).expect("credential capability should capture");
+    assert_eq!(
+      provenance.as_deref(),
+      Some(
+        legacy
+          .canonicalize()
+          .expect("legacy credentials should canonicalize")
+          .as_path()
+      )
+    );
+    assert!(capabilities.pointer("/registries/legacy/token").is_some());
+    assert!(capabilities.pointer("/registries/toml/token").is_none());
+    let encoded = String::from_utf8_lossy(&framed);
+    assert!(!encoded.contains("legacy-secret"));
+    assert!(!encoded.contains("toml-secret"));
   }
 
   #[test]
@@ -2751,6 +3333,8 @@ linker = "linker-b"
       }),
       environment: BTreeMap::from([("CARGO_ENCODED_RUSTFLAGS".to_string(), String::new())]),
       provenance: Vec::new(),
+      credential_capabilities: JsonValue::Object(JsonMap::new()),
+      credential_provenance: None,
     };
     let cfg = TargetCfgSet::from_rustc_output("unix\n");
     assert_eq!(
@@ -2898,6 +3482,8 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
       effective_file_settings: JsonValue::Object(JsonMap::new()),
       environment,
       provenance: Vec::new(),
+      credential_capabilities: JsonValue::Object(JsonMap::new()),
+      credential_provenance: None,
     };
 
     for (_, direct, precedence, config_path, default, description) in selections {
@@ -3083,6 +3669,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
         host_target: "x86_64-unknown-linux-gnu".to_string(),
       },
       cargo_config: ContentDigest::sha256(b"config-a"),
+      credential_sensitive: false,
     };
     let mut keys = HashSet::from([base.clone()]);
 
@@ -3122,10 +3709,13 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
     let mut changed = base.clone();
     changed.toolchain.host_target = "aarch64-unknown-linux-gnu".to_string();
     keys.insert(changed);
-    let mut changed = base;
+    let mut changed = base.clone();
     changed.cargo_config = ContentDigest::sha256(b"config-b");
     keys.insert(changed);
+    let mut changed = base;
+    changed.credential_sensitive = true;
+    keys.insert(changed);
 
-    assert_eq!(keys.len(), 14);
+    assert_eq!(keys.len(), 15);
   }
 }

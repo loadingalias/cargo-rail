@@ -44,7 +44,7 @@ pub(crate) fn is_available(workspace_root: &Path) -> bool {
 
 /// Whether a workspace package has a library-like public API target.
 pub(crate) fn has_library_target(ctx: &WorkspaceContext, crate_name: &str) -> bool {
-  let Some(package) = ctx.cargo.get_package(crate_name) else {
+  let Some(package) = ctx.cargo().get_package(crate_name) else {
     return false;
   };
 
@@ -66,7 +66,7 @@ pub(crate) fn has_library_target(ctx: &WorkspaceContext, crate_name: &str) -> bo
 /// Run `cargo semver-checks check-release` for one crate.
 pub(crate) fn check_release(ctx: &WorkspaceContext, crate_name: &str) -> RailResult<SemverCheck> {
   let package = ctx
-    .cargo
+    .cargo()
     .get_package(crate_name)
     .ok_or_else(|| RailError::message(format!("crate '{}' not found", crate_name)))?;
 

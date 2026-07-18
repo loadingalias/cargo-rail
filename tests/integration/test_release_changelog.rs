@@ -541,7 +541,7 @@ fn run_with_minimal_path_without_forge(ws: &TestWorkspace, args: &[&str]) -> Res
   use std::os::unix::fs::symlink;
 
   let dir = tempfile::TempDir::new()?;
-  for binary in ["cargo", "git", "rustc"] {
+  for binary in ["cargo", "git", "rustc", "rustdoc"] {
     let output = Command::new("sh")
       .args(["-c", &format!("command -v {binary}")])
       .output()?;

@@ -139,7 +139,7 @@ impl<'a> SyncEngine<'a> {
     config.path_capabilities.validate_crate_paths(&config.crate_paths)?;
     config.path_capabilities.validate_target_repository()?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
-    let transformer = CargoTransform::new(ctx.cargo.metadata().clone());
+    let transformer = CargoTransform::new(ctx.cargo().metadata().clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
     let temp_dir = config.path_capabilities.authorize_temporary(Path::new(&format!(

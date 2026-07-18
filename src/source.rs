@@ -107,6 +107,10 @@ impl ContentDigest {
   pub fn as_bytes(&self) -> &[u8; 32] {
     &self.0
   }
+
+  pub(crate) fn from_sha256_bytes(bytes: [u8; 32]) -> Self {
+    Self(bytes)
+  }
 }
 
 impl fmt::Display for ContentDigest {
@@ -502,6 +506,10 @@ impl GitWorktreeCapture {
     Arc::clone(&self.snapshot)
   }
 
+  pub(crate) fn is_untracked(&self, path: &RepositoryPath) -> bool {
+    self.state.status.untracked.binary_search(path).is_ok()
+  }
+
   pub(crate) fn validate_unchanged(&self, git: &SystemGit) -> RailResult<()> {
     ensure_git_capture_state_unchanged(git, &self.state, &self.exclusions)?;
     validate_filesystem_observations(&git.worktree_root, self.snapshot.tree(), &self.filesystem)
@@ -552,7 +560,7 @@ impl SourceSnapshot {
     }
   }
 
-  fn retain(&mut self, mut predicate: impl FnMut(&SourceTreeEntry) -> bool) {
+  pub(crate) fn retain(&mut self, mut predicate: impl FnMut(&SourceTreeEntry) -> bool) {
     match self {
       Self::GitBacked(tree) | Self::FilesystemBacked(tree) => tree.0.retain(&mut predicate),
     }

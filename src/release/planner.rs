@@ -225,7 +225,7 @@ impl<'a> ReleasePlanner<'a> {
     let mut crate_plans = Vec::with_capacity(ordered_targets.len());
     let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
     let mut histories: HashMap<HistoryKey, AttributedHistory> = HashMap::new();
-    let workspace_members = self.ctx.graph.workspace_members();
+    let workspace_members = self.ctx.graph().workspace_members();
     let pending_changes = PendingChangeSet::load(
       self.ctx.workspace_root(),
       &self.release_config.change_dir,
@@ -266,7 +266,7 @@ impl<'a> ReleasePlanner<'a> {
       let package_id = self.workspace_package_id(&plan.name)?;
       plan.affected_dependents = self
         .ctx
-        .graph
+        .graph()
         .direct_dependents_by_id(package_id)?
         .into_iter()
         .filter(|dependent| planned_crates.contains(dependent))
@@ -325,7 +325,7 @@ impl<'a> ReleasePlanner<'a> {
       PendingChangeSet::load(
         self.ctx.workspace_root(),
         &self.release_config.change_dir,
-        self.ctx.graph.workspace_members(),
+        self.ctx.graph().workspace_members(),
       )?
     } else {
       PendingChangeSet::default()
@@ -337,7 +337,7 @@ impl<'a> ReleasePlanner<'a> {
     for crate_name in crate_names {
       let changelog_config = self
         .ctx
-        .config
+        .config()
         .as_ref()
         .and_then(|config| config.crates.get(crate_name))
         .and_then(|crate_config| crate_config.changelog.as_ref());
@@ -387,7 +387,7 @@ impl<'a> ReleasePlanner<'a> {
     for crate_name in &ordered_targets {
       let package = self
         .ctx
-        .cargo
+        .cargo()
         .get_package(crate_name)
         .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
       let manifest_path = package.manifest_path.clone().into_std_path_buf();
@@ -395,7 +395,7 @@ impl<'a> ReleasePlanner<'a> {
       let previous_tag = self.find_previous_tag(crate_name)?;
       let crate_config = self
         .ctx
-        .config
+        .config()
         .as_ref()
         .and_then(|config| config.crates.get(crate_name));
       let changelog_config = crate_config.and_then(|config| config.changelog.as_ref());
@@ -456,7 +456,7 @@ impl<'a> ReleasePlanner<'a> {
       let package_id = self.workspace_package_id(&plan.name)?;
       plan.affected_dependents = self
         .ctx
-        .graph
+        .graph()
         .direct_dependents_by_id(package_id)?
         .into_iter()
         .filter(|dependent| planned_crates.contains(dependent))
@@ -491,7 +491,7 @@ impl<'a> ReleasePlanner<'a> {
     // Get crate metadata
     let package = self
       .ctx
-      .cargo
+      .cargo()
       .get_package(crate_name)
       .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
@@ -503,7 +503,7 @@ impl<'a> ReleasePlanner<'a> {
     let previous_tag = self.find_previous_tag(crate_name)?;
 
     // Get per-crate config (if any)
-    let crate_config = self.ctx.config.as_ref().and_then(|c| c.crates.get(crate_name));
+    let crate_config = self.ctx.config().and_then(|c| c.crates.get(crate_name));
 
     let changelog_config = crate_config.and_then(|c| c.changelog.as_ref());
     let changelog_path = self.resolve_changelog_path(&manifest_path, changelog_config)?;
@@ -791,7 +791,7 @@ impl<'a> ReleasePlanner<'a> {
     for plan in crate_plans {
       let package = self
         .ctx
-        .cargo
+        .cargo()
         .get_package(&plan.name)
         .ok_or_else(|| RailError::message(format!("Crate '{}' not found", plan.name)))?;
       let dependency_updates = self.dependency_updates(package, version_map);
@@ -810,7 +810,7 @@ impl<'a> ReleasePlanner<'a> {
     }
     let changelog_config = self
       .ctx
-      .config
+      .config()
       .as_ref()
       .and_then(|config| config.crates.get(&plan.name))
       .and_then(|crate_config| crate_config.changelog.as_ref());
@@ -898,7 +898,7 @@ impl<'a> ReleasePlanner<'a> {
   /// - {crate} - the crate name
   /// - {version} - the version number
   fn format_tag(&self, crate_name: &str, version: &Version) -> String {
-    let workspace_members = self.ctx.graph.workspace_members();
+    let workspace_members = self.ctx.graph().workspace_members();
     let is_single_crate = workspace_members.len() == 1;
 
     // For single-crate repos, use simple "{prefix}{version}" format
@@ -917,7 +917,7 @@ impl<'a> ReleasePlanner<'a> {
   }
 
   fn find_previous_tag(&self, crate_name: &str) -> RailResult<Option<String>> {
-    let workspace_members = self.ctx.graph.workspace_members();
+    let workspace_members = self.ctx.graph().workspace_members();
     let is_single_crate = workspace_members.len() == 1;
     let pattern = if is_single_crate {
       format!("{}*", self.release_config.tag_prefix)
@@ -937,7 +937,7 @@ impl<'a> ReleasePlanner<'a> {
     crate_names: Option<Vec<String>>,
     dependent_policy: DependentPolicy,
   ) -> RailResult<Vec<String>> {
-    let all_ordered = self.ctx.graph.publish_order()?;
+    let all_ordered = self.ctx.graph().publish_order()?;
     let Some(targets) = crate_names else {
       return Ok(all_ordered);
     };
@@ -952,7 +952,7 @@ impl<'a> ReleasePlanner<'a> {
     }
 
     let requested_ids = self.workspace_package_ids(&requested)?;
-    let dependents = self.ctx.graph.transitive_dependents_of_ids(&requested_ids)?;
+    let dependents = self.ctx.graph().transitive_dependents_of_ids(&requested_ids)?;
     if !dependents.is_empty() && dependent_policy == DependentPolicy::RejectPartialClosure {
       let mut missing: Vec<String> = dependents.into_iter().collect();
       missing.sort();
@@ -971,7 +971,7 @@ impl<'a> ReleasePlanner<'a> {
         let before = selected.len();
         self.expand_selected_version_groups(&mut selected);
         let selected_ids = self.workspace_package_ids(&selected)?;
-        let dependents = self.ctx.graph.transitive_dependents_of_ids(&selected_ids)?;
+        let dependents = self.ctx.graph().transitive_dependents_of_ids(&selected_ids)?;
         selected.extend(dependents);
         self.expand_selected_version_groups(&mut selected);
         if selected.len() == before {
@@ -992,7 +992,7 @@ impl<'a> ReleasePlanner<'a> {
   fn workspace_package_id(&self, crate_name: &str) -> RailResult<&PackageId> {
     self
       .ctx
-      .graph
+      .graph()
       .workspace_package_by_name(crate_name)
       .map(|package| &package.id)
   }
@@ -1061,7 +1061,7 @@ impl<'a> ReleasePlanner<'a> {
         .filter_map(|member| {
           self
             .ctx
-            .cargo
+            .cargo()
             .get_package(member)
             .map(|package| (member.as_str(), package.version.clone()))
         })

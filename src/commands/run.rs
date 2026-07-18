@@ -54,6 +54,7 @@ pub struct RunOptions {
 
 /// Execute `run` with planner-driven surface selection.
 pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
+  ctx.snapshot()?;
   let effective = resolve_effective_inputs(ctx, &opts)?;
   validate_executable_surfaces(&effective.surfaces)?;
   let mut plan = None;
@@ -91,7 +92,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   let test_targets = resolve_targets(ctx, &opts, scope, "test")?;
   let build_targets = resolve_targets(ctx, &opts, scope, "build")?;
   let bench_targets = resolve_targets(ctx, &opts, scope, "bench")?;
-  let workspace_package_count = ctx.cargo.metadata().workspace_packages().len();
+  let workspace_package_count = ctx.cargo().metadata().workspace_packages().len();
 
   let requested_test_surface = effective.surfaces.iter().any(|surface| surface == "test");
   let mut executed_any = false;
@@ -201,7 +202,7 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
   }
 
   let workflow_profile = if let Some(workflow) = opts.workflow.as_ref() {
-    let Some(config) = ctx.config.as_ref() else {
+    let Some(config) = ctx.config() else {
       return Err(RailError::with_help(
         format!("workflow '{}' requested but no rail.toml loaded", workflow),
         "define [run.workflow] in rail.toml or pass --profile/--surface",
@@ -222,7 +223,7 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
   };
 
   let config_default = ctx
-    .config
+    .config()
     .as_ref()
     .and_then(|cfg| cfg.run.default_profile.as_ref())
     .cloned();
@@ -241,7 +242,7 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
   let mut profile_since = None;
   let mut profile_merge_base = false;
   let surfaces = if let Some(cfg_profile) = ctx
-    .config
+    .config()
     .as_ref()
     .and_then(|cfg| cfg.run.profiles.get(profile_name.as_str()))
   {
@@ -360,7 +361,7 @@ fn resolve_targets(
   let package_scoped_surface = matches!(surface, "build" | "test" | "bench");
   let mut targets: Vec<String> = if opts.all {
     ctx
-      .cargo
+      .cargo()
       .metadata()
       .workspace_packages()
       .iter()
@@ -374,7 +375,7 @@ fn resolve_targets(
         ExecutionScopeMode::Empty => Vec::new(),
         ExecutionScopeMode::Crates => scope.crates.clone(),
         ExecutionScopeMode::Workspace => ctx
-          .cargo
+          .cargo()
           .metadata()
           .workspace_packages()
           .iter()
@@ -387,7 +388,7 @@ fn resolve_targets(
   };
 
   if opts.ignore_bin_crates && package_scoped_surface {
-    targets.retain(|crate_name| !ctx.cargo.is_binary_only(crate_name));
+    targets.retain(|crate_name| !ctx.cargo().is_binary_only(crate_name));
   }
 
   Ok(targets)

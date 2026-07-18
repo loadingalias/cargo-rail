@@ -144,7 +144,7 @@ impl<'a> ChangeImpact<'a> {
 
     // 4. Use graph to find affected crates
     let file_paths: Vec<&Path> = changed_files.iter().map(|(p, _)| p.as_path()).collect();
-    let analysis = crate::graph::analyze(&self.ctx.graph, &file_paths)?;
+    let analysis = crate::graph::analyze(self.ctx.graph(), &file_paths)?;
 
     // 5. Determine rebuild/retest requirements
     let requires_rebuild = categories.has_source_changes() || categories.has_config_changes();
@@ -227,12 +227,12 @@ mod tests {
     // cargo-rail is not a proc-macro crate
     // Use the new cached API for O(1) lookup
     assert!(
-      !ctx.cargo.is_proc_macro("cargo-rail"),
+      !ctx.cargo().is_proc_macro("cargo-rail"),
       "cargo-rail should not be detected as proc-macro crate"
     );
 
     // The proc_macro_crates set should be accessible
-    let proc_macros = ctx.cargo.proc_macro_crates();
+    let proc_macros = ctx.cargo().proc_macro_crates();
     assert!(
       !proc_macros.contains("cargo-rail"),
       "cargo-rail should not be in proc_macro_crates set"

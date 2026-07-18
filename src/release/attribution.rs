@@ -91,7 +91,7 @@ pub struct CommitAttributor<'a> {
 impl<'a> CommitAttributor<'a> {
   /// Create an attributor over the workspace graph
   pub fn new(ctx: &'a WorkspaceContext) -> Self {
-    let members = ctx.graph.workspace_members().iter().map(String::as_str).collect();
+    let members = ctx.graph().workspace_members().iter().map(String::as_str).collect();
     Self { ctx, members }
   }
 
@@ -131,7 +131,7 @@ impl<'a> CommitAttributor<'a> {
           any_file_filtered = true;
           continue;
         }
-        let Some(owner) = self.ctx.graph.file_to_crate(&workspace_path) else {
+        let Some(owner) = self.ctx.graph().file_to_crate(&workspace_path) else {
           continue;
         };
         if classify_path(&workspace_path).seeds_build_test_transitive() && !code_crates.contains(&owner) {

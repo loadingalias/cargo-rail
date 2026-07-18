@@ -996,7 +996,12 @@ fn test_plan_no_changes() -> Result<()> {
     &ws.path,
     &["rail", "plan", "--since", "origin/main", "--format", "json"],
   )?;
-  assert!(output.status.success(), "plan with no changes should succeed");
+  assert!(
+    output.status.success(),
+    "plan with no changes should succeed\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
 
   let json: Value = serde_json::from_slice(&output.stdout)?;
 

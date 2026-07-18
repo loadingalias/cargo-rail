@@ -269,10 +269,14 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
 /// Build the planner output contract without rendering it.
 pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<PlanOutput> {
   let refs = resolve_refs(ctx, opts)?;
+  let snapshot = match &refs {
+    ResolvedRefs::Worktree { .. } => Some(ctx.snapshot()?),
+    ResolvedRefs::Objects { .. } => None,
+  };
   let changed_files = collect_changed_files(ctx, &refs)?;
   let confidence = resolve_confidence_profile(ctx, opts)?;
 
-  let change_detection_config = ctx.config.as_ref().map(|config| &config.change_detection);
+  let change_detection_config = ctx.config().map(|config| &config.change_detection);
   let infrastructure_patterns = compile_infrastructure_patterns(change_detection_config);
   let custom_patterns = compile_custom_patterns(change_detection_config);
   let configured_custom_surfaces = custom_surface_names(&custom_patterns);
@@ -312,7 +316,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
   for path in &changed_files {
     let file_kind = classify_path(Path::new(path));
     let custom_surfaces = custom_surfaces_for_path(path, &custom_patterns);
-    let owner = ctx.graph.file_to_package(Path::new(path));
+    let owner = ctx.graph().file_to_package(Path::new(path));
     let owners: Vec<String> = owner.iter().map(|package| package.name.clone()).collect();
     if let Some(package) = owner {
       direct_package_ids.insert(package.id.clone());
@@ -476,6 +480,17 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   // Compute reproducibility metadata
   let git_merge_base = refs.git_merge_base();
+  let (configuration_identity, toolchain_identity) = if let Some(snapshot) = snapshot {
+    (
+      snapshot.configuration_fingerprint().to_string(),
+      snapshot.toolchain_fingerprint().to_string(),
+    )
+  } else {
+    (
+      config_fingerprint(ctx.workspace_root()),
+      toolchain_fingerprint(ctx.workspace_root()),
+    )
+  };
 
   let impact = PlanImpact {
     direct_crates: direct_crates.into_iter().collect(),
@@ -486,7 +501,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     &impact.direct_crates,
     &execution_transitive_crates,
     &surfaces,
-    ctx.cargo.metadata().workspace_packages().len(),
+    ctx.cargo().metadata().workspace_packages().len(),
     refs.resolved_base(),
     refs.resolved_head(),
   );
@@ -496,8 +511,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     inputs: PlanInputs {
       refs: refs.into_plan_refs(),
       workspace_root: ctx.workspace_root().display().to_string(),
-      config_fingerprint: config_fingerprint(ctx.workspace_root()),
-      toolchain_fingerprint: toolchain_fingerprint(ctx.workspace_root()),
+      config_fingerprint: configuration_identity.clone(),
+      toolchain_fingerprint: toolchain_identity,
       confidence_profile: confidence_profile_name(confidence.profile).to_string(),
       confidence_profile_source: confidence.source.to_string(),
     },
@@ -508,7 +523,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     trace,
     reproducibility: Reproducibility {
       cargo_rail_version: env!("CARGO_PKG_VERSION"),
-      config_hash: config_fingerprint(ctx.workspace_root()),
+      config_hash: configuration_identity,
       git_merge_base,
       git_shallow_clone: is_shallow_clone(ctx.workspace_root()),
     },
@@ -521,7 +536,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
 fn unknown_file_policy(ctx: &WorkspaceContext) -> UnknownFilePolicy {
   ctx
-    .config
+    .config()
     .as_ref()
     .map(|config| config.change_detection.unknown_file_policy)
     .unwrap_or_default()
@@ -572,7 +587,7 @@ fn resolve_confidence_profile(ctx: &WorkspaceContext, opts: &PlanOptions) -> Rai
   let mut source = "default";
   let mut bot_override = false;
 
-  if let Some(config) = &ctx.config {
+  if let Some(config) = ctx.config() {
     profile = config.change_detection.confidence_profile;
     source = "config";
 
@@ -913,7 +928,7 @@ fn owner_scope(path: &str, owners: &[String]) -> String {
 
 fn compute_transitive_impact(ctx: &WorkspaceContext, direct_ids: &HashSet<PackageId>) -> RailResult<Vec<String>> {
   let mut transitive: Vec<String> = ctx
-    .graph
+    .graph()
     .transitive_dependents_of_ids(direct_ids)?
     .into_iter()
     .collect();
@@ -926,7 +941,7 @@ fn compute_transitive_impact_pairs(
   ctx: &WorkspaceContext,
   direct_ids: &HashSet<PackageId>,
 ) -> RailResult<Vec<(String, String)>> {
-  ctx.graph.transitive_dependent_pairs_of_ids(direct_ids)
+  ctx.graph().transitive_dependent_pairs_of_ids(direct_ids)
 }
 
 fn emit_transitive_build_test_trace(
