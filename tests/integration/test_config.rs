@@ -647,12 +647,7 @@ fn test_config_explain_json_reports_effective_default_and_source() -> Result<()>
     .expect("unify.msrv_policy.mode explanation");
   assert_eq!(msrv["effective"], "disabled");
   assert_eq!(msrv["default"], "compute");
-  assert!(
-    msrv["source"]
-      .as_str()
-      .is_some_and(|source| source.ends_with(".config/rail.toml")),
-    "configured source should identify rail.toml"
-  );
+  assert_eq!(msrv["source"], json["config_path"]);
   assert_eq!(msrv["classification"], "project_policy");
   assert!(msrv["why"].as_str().is_some_and(|why| !why.is_empty()));
 
@@ -733,12 +728,7 @@ fn test_config_explain_attributes_legacy_policy_to_config() -> Result<()> {
     .and_then(|fields| fields.iter().find(|field| field["path"] == "release.remote_effects"))
     .expect("effective release policy explanation");
   assert_eq!(field["effective"], "push");
-  assert!(
-    field["source"]
-      .as_str()
-      .is_some_and(|source| source.ends_with(".config/rail.toml")),
-    "legacy compatibility input must be attributed to rail.toml"
-  );
+  assert_eq!(field["source"], json["config_path"]);
 
   Ok(())
 }
