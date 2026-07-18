@@ -1081,11 +1081,36 @@ fn ensure_filesystem_tree_unchanged(
     ));
   }
 
+  let changed_directory = expected
+    .directories
+    .iter()
+    .zip(&current.directories)
+    .find(|(left, right)| left.path != right.path)
+    .map(|(left, right)| std::cmp::min(left.path.as_path(), right.path.as_path()))
+    .or_else(|| {
+      expected
+        .directories
+        .get(current.directories.len())
+        .or_else(|| current.directories.get(expected.directories.len()))
+        .map(|observation| observation.path.as_path())
+    });
+  if let Some(path) = changed_directory {
+    return Err(filesystem_capture_drift_error(format!(
+      "source directory '{}' changed during capture",
+      if path.as_os_str().is_empty() {
+        Path::new(".")
+      } else {
+        path
+      }
+      .display()
+    )));
+  }
+
   if let Some(observation) = expected
     .directories
     .iter()
     .zip(&current.directories)
-    .find_map(|(left, right)| (left != right).then_some(left))
+    .find_map(|(left, right)| (left.metadata != right.metadata).then_some(left))
   {
     return Err(filesystem_capture_drift_error(format!(
       "source directory metadata for '{}' changed during capture",
@@ -1096,11 +1121,6 @@ fn ensure_filesystem_tree_unchanged(
       }
       .display()
     )));
-  }
-  if expected.directories.len() != current.directories.len() {
-    return Err(filesystem_capture_drift_error(
-      "filesystem source directories changed during capture",
-    ));
   }
   Ok(())
 }
@@ -1947,8 +1967,24 @@ mod tests {
     fs::create_dir(temp.path().join("new-empty-directory")).unwrap();
     let changed = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
     let error = ensure_filesystem_tree_unchanged(&captured, &changed).unwrap_err();
-    assert!(error.to_string().contains("source directory"));
-    assert!(error.to_string().contains("changed during capture"));
+    assert!(
+      error
+        .to_string()
+        .contains("source directory 'new-empty-directory' changed during capture"),
+      "{error}"
+    );
+    assert_eq!(error.help_message().as_deref(), Some(FILESYSTEM_CAPTURE_DRIFT_HELP));
+
+    fs::remove_dir(temp.path().join("new-empty-directory")).unwrap();
+    let removed = capture_filesystem_tree(temp.path(), &exclusions).unwrap();
+    let error = ensure_filesystem_tree_unchanged(&changed, &removed).unwrap_err();
+    assert!(
+      error
+        .to_string()
+        .contains("source directory 'new-empty-directory' changed during capture"),
+      "{error}"
+    );
+    assert_eq!(error.help_message().as_deref(), Some(FILESYSTEM_CAPTURE_DRIFT_HELP));
   }
 
   #[test]
