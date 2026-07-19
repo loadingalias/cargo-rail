@@ -451,7 +451,7 @@ fn test_config_validate_with_missing_config_flag_fails() -> Result<()> {
 }
 
 #[test]
-fn test_config_validate_rejects_invalid_run_profile_surface() -> Result<()> {
+fn test_config_validate_rejects_invalid_run_profile_action() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-run-invalid-surface")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
@@ -465,7 +465,7 @@ surfaces = ["not-a-surface"]
   )?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
-  assert!(!output.status.success(), "invalid run surface should fail validation");
+  assert!(!output.status.success(), "invalid run action should fail validation");
 
   let stdout = String::from_utf8_lossy(&output.stdout);
   let json: serde_json::Value = serde_json::from_str(&stdout)?;
@@ -475,8 +475,8 @@ surfaces = ["not-a-surface"]
     errors
       .iter()
       .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown surface 'not-a-surface'")),
-    "expected unknown surface error. Output:\n{}",
+      .any(|msg| msg.contains("unknown action 'not-a-surface'")),
+    "expected unknown action error. Output:\n{}",
     stdout
   );
 
@@ -508,7 +508,7 @@ surfaces = ["infra"]
     errors
       .iter()
       .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("`infra` is a planner OUTPUT")),
+      .any(|msg| msg.contains("`infra` is a planner output")),
     "expected infra planner-output error. Output:\n{}",
     stdout
   );
@@ -911,6 +911,12 @@ merge_base = false
   assert!(
     replacements
       .iter()
+      .any(|replacement| { replacement == &"run.profile.ci.actions = [\"test\"]" })
+  );
+  assert!(
+    replacements
+      .iter()
+      .filter(|replacement| !replacement.starts_with("run.profile.ci.actions"))
       .all(|replacement| replacement.starts_with("field omitted ("))
   );
 
@@ -918,7 +924,7 @@ merge_base = false
   assert!(apply.status.success());
   assert_eq!(
     fs::read_to_string(&config_path)?.trim_start(),
-    "[run.profile.ci]\nsurfaces = [\"test\"]\n"
+    "[run.profile.ci]\nactions = [\"test\"]\n"
   );
 
   Ok(())

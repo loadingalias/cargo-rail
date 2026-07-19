@@ -54,7 +54,7 @@ pub enum TestRunner {
 
 impl TestRunner {
   /// Human-readable backend command name.
-  pub fn name(&self) -> &str {
+  pub fn name(&self) -> &'static str {
     match self {
       Self::CargoTest => "cargo test",
       Self::Nextest => "cargo nextest",
@@ -77,53 +77,44 @@ impl TestRunner {
   /// Build a command to run tests for the given packages.
   pub fn build_command(&self, packages: &[String], args: &TestCommandArgs) -> RailResult<Command> {
     let mut cmd = cargo_command();
+    let (before_packages, after_packages) = self.command_argv_parts(args)?;
+    cmd.args(before_packages);
 
-    match self {
+    for pkg in packages {
+      cmd.arg("-p").arg(pkg);
+    }
+    cmd.args(after_packages);
+
+    Ok(cmd)
+  }
+
+  pub(crate) fn command_argv_parts(&self, args: &TestCommandArgs) -> RailResult<(Vec<String>, Vec<String>)> {
+    let before_packages = match self {
       Self::CargoTest => {
         if !args.nextest.is_empty() {
           return Err(backend_argument_error("nextest", self.name()));
         }
-
-        cmd.arg("test");
-
-        // Add package filters for each affected crate
-        for pkg in packages {
-          cmd.arg("-p").arg(pkg);
-        }
-
-        cmd.args(&args.cargo);
-        if let Some(filter) = &args.filter {
-          cmd.arg(filter);
-        }
-        if !args.harness.is_empty() {
-          cmd.arg("--");
-          cmd.args(&args.harness);
-        }
+        vec!["test".to_string()]
       }
       Self::Nextest => {
         if !args.cargo.is_empty() {
           return Err(backend_argument_error("Cargo test", self.name()));
         }
-
-        cmd.arg("nextest").arg("run");
-
-        // Add package filters for each affected crate
-        for pkg in packages {
-          cmd.arg("-p").arg(pkg);
-        }
-
-        cmd.args(&args.nextest);
-        if let Some(filter) = &args.filter {
-          cmd.arg(filter);
-        }
-        if !args.harness.is_empty() {
-          cmd.arg("--");
-          cmd.args(&args.harness);
-        }
+        vec!["nextest".to_string(), "run".to_string()]
       }
+    };
+
+    let mut after_packages = match self {
+      Self::CargoTest => args.cargo.clone(),
+      Self::Nextest => args.nextest.clone(),
+    };
+    after_packages.extend(args.filter.iter().cloned());
+    if !args.harness.is_empty() {
+      after_packages.push("--".to_string());
+      after_packages.extend(args.harness.iter().cloned());
     }
 
-    Ok(cmd)
+    Ok((before_packages, after_packages))
   }
 }
 

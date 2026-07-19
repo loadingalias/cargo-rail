@@ -34,7 +34,7 @@ verification = ["verification/**"]
 default_profile = "commit"
 
 [run.profile.commit]
-surfaces = ["build", "test"]
+actions = ["build", "test"]
 baseline = { kind = "merge-base" }
 
 [crates.my-crate.split]

@@ -17,10 +17,23 @@
 ```bash
 cargo rail plan --merge-base --explain
 cargo rail plan --merge-base -f json
-cargo rail run --merge-base --surface test
+cargo rail run --merge-base --action test
 ```
 
 Use `plan` when you want the contract. Use `run` when you want execution.
+
+`run` expands every enabled built-in or configured repository task into an ordered, shell-free argv action before
+executing the first action. A
+successful run or dry run writes a version-2 decision receipt under `target/cargo-rail/receipts/run-decision-*.json`.
+The receipt binds the action list to the workspace snapshot and records each action's exact argv array, logical working
+directory, selected packages/targets/features, dependencies, typed environment names, declared side effects, and
+planner trace reasons. `--dry-run` previews that same expansion without starting an action process. `--dry-run -f json`
+and `-f github` expose the same deterministic topological order to CI. Current built-ins inherit the host environment
+and are not sandboxed, so receipts mark their inputs and outputs as ambient and the actions as non-reusable.
+
+Generated repository actions declare one output owner plus separate direct argv for read-only checking and
+regeneration. Select `--generated check` to expose staleness, use the default `regenerate` mode to update files, and add
+`--explain` to see output ownership.
 
 ## Execution outputs
 

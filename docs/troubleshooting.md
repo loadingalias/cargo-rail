@@ -25,7 +25,7 @@ Use `scope` for execution decisions. Use `impact` for diagnostic context.
 Check these in order:
 
 1. Confirm the base ref contains the intended comparison range.
-2. Confirm the requested surface or profile.
+2. Confirm the requested action or profile.
 3. Inspect confidence-profile expansion.
 4. Inspect path classification and custom rules.
 5. Check binary-only filtering when `--ignore-bin-crates` is set.
@@ -94,18 +94,27 @@ git pull --ff-only
 cargo rail release finalize --all --yes
 ```
 
-### Custom surfaces in run profiles
+### Planner surfaces versus run actions
 
-Custom surfaces are planner outputs, not valid `run.profile.*.surfaces` entries.
+Custom surfaces are planner outputs, not action IDs. Use them in a configured action's `when` policy, then select that
+action from the profile.
 
 ```toml
 # wrong
 [run.profile.bench]
-surfaces = ["custom:benchmarks"]
+actions = ["custom:benchmarks"]
 
 # right
+[run.action.benchmark-report]
+argv = ["cargo", "run", "-p", "xtask", "--", "benchmark-report"]
+when = ["custom:benchmarks"]
+inputs = ["benches"]
+
+[run.action.benchmark-report.environment]
+inherit = true
+
 [run.profile.bench]
-surfaces = ["bench"]
+actions = ["bench", "benchmark-report"]
 ```
 
 ### CI/local mismatch

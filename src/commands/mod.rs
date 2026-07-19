@@ -78,7 +78,7 @@ pub enum PreContextDispatch {
   /// The command ran and the process should exit.
   Handled,
   /// The command requires a WorkspaceContext to run.
-  NeedsContext(Commands),
+  NeedsContext(Box<Commands>),
 }
 
 /// Handle commands that don't need WorkspaceContext.
@@ -161,7 +161,7 @@ pub fn try_dispatch_pre_context(
       Ok(PreContextDispatch::Handled)
     }
 
-    other => Ok(PreContextDispatch::NeedsContext(other)),
+    other => Ok(PreContextDispatch::NeedsContext(Box::new(other))),
   }
 }
 
@@ -175,10 +175,12 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       since,
       merge_base,
       all,
-      surfaces,
+      actions,
       profile,
       workflow,
       dry_run,
+      format,
+      generated,
       print_cmd,
       explain,
       ignore_bin_crates,
@@ -194,10 +196,12 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         since,
         merge_base,
         all,
-        surfaces,
+        actions,
         profile,
         workflow,
         dry_run,
+        format,
+        generated,
         print_cmd,
         explain,
         ignore_bin_crates,

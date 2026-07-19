@@ -370,8 +370,13 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
   ),
   policy("run.profile", "Defines repository-specific named action profiles."),
   policy(
+    "run.profile.<name>.actions",
+    "Selects ordered built-in or repository action IDs for a named profile.",
+  ),
+  compatibility(
     "run.profile.<name>.surfaces",
-    "Selects built-in execution surfaces for a named profile.",
+    "Preserves the old executable-surface spelling during the action migration.",
+    "Deprecated: migrate to `run.profile.<name>.actions` with `cargo rail config migrate`.",
   ),
   policy(
     "run.profile.<name>.run_args",
@@ -399,6 +404,68 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
   policy(
     "run.workflow.<name>",
     "Maps a repository workflow name to a named profile.",
+  ),
+  policy("run.action", "Defines bounded direct-argv repository actions."),
+  policy(
+    "run.action.<name>.kind",
+    "Distinguishes ordinary tasks from generated-output owners.",
+  ),
+  policy(
+    "run.action.<name>.argv",
+    "Defines the direct executable and literal regeneration argument vector.",
+  ),
+  policy(
+    "run.action.<name>.check_argv",
+    "Defines the read-only staleness check for generated outputs.",
+  ),
+  policy(
+    "run.action.<name>.dependencies",
+    "Orders prerequisites in the deterministic action graph.",
+  ),
+  policy(
+    "run.action.<name>.when",
+    "Maps planner impact surfaces to repository action selection.",
+  ),
+  policy(
+    "run.action.<name>.working_directory",
+    "Selects a repository-contained logical working directory.",
+  ),
+  policy(
+    "run.action.<name>.packages",
+    "Selects typed planner-package insertion behavior.",
+  ),
+  policy("run.action.<name>.targets", "Declares explicit Cargo target arguments."),
+  policy(
+    "run.action.<name>.features",
+    "Declares the feature domain represented by the action.",
+  ),
+  policy(
+    "run.action.<name>.inputs",
+    "Declares repository input scopes for the action contract.",
+  ),
+  policy(
+    "run.action.<name>.outputs",
+    "Declares repository outputs owned by a generated action.",
+  ),
+  policy(
+    "run.action.<name>.environment.inherit",
+    "Chooses whether a repository action inherits ambient environment state.",
+  ),
+  policy(
+    "run.action.<name>.environment.entries",
+    "Defines typed fixed, pass-through, Cargo-derived, and secret environment entries.",
+  ),
+  policy(
+    "run.action.<name>.environment.entries.<index>.kind",
+    "Selects one typed environment entry variant.",
+  ),
+  policy(
+    "run.action.<name>.environment.entries.<index>.name",
+    "Names the environment capability without exposing secret values.",
+  ),
+  policy(
+    "run.action.<name>.environment.entries.<index>.value",
+    "Defines a fixed non-secret value or a Cargo-derived value source.",
   ),
   policy("crates", "Defines per-crate policy overrides."),
   policy(

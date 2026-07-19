@@ -3,17 +3,44 @@
 use super::plan::{
   ExecutionScope, ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain,
 };
-use crate::commands::common::PlanOutputFormat;
-use crate::commands::common::format_preview_list;
+use crate::action::{
+  ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason, ActionSpec,
+  ArgvTemplate, ExpandedAction, PackageArguments,
+};
+use crate::cargo::resolution::TargetSpecificationIdentity;
+use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
+use crate::config::MAX_ACTIONS;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::progress;
 use crate::test::runner::{TestCommandArgs, TestRunnerPreference, select_runner};
 use crate::workspace::WorkspaceContext;
+use clap::ValueEnum;
+use serde::Serialize;
 use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::process::Command;
+
+/// Behavior selected for configured generated-output actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedMode {
+  /// Run each generator's read-only staleness check.
+  Check,
+  /// Update each generator's declared outputs.
+  #[default]
+  Regenerate,
+}
+
+impl GeneratedMode {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Check => "check",
+      Self::Regenerate => "regenerate",
+    }
+  }
+}
 
 /// Options for the `run` command.
 #[derive(Clone, Debug, Default)]
@@ -24,14 +51,18 @@ pub struct RunOptions {
   pub merge_base: bool,
   /// Skip planner selection and run all crates.
   pub all: bool,
-  /// Explicit surfaces to evaluate/execute.
-  pub surfaces: Vec<String>,
+  /// Explicit action IDs to evaluate or execute.
+  pub actions: Vec<String>,
   /// Named execution profile.
   pub profile: Option<String>,
   /// Named workflow mapping to a profile via `[run.workflow]`.
   pub workflow: Option<String>,
   /// Preview selected executions without running subprocesses.
   pub dry_run: bool,
+  /// Rendering contract for execution previews and CI action plans.
+  pub format: ActionOutputFormat,
+  /// Generated-output behavior.
+  pub generated: GeneratedMode,
   /// Print command(s) before execution.
   pub print_cmd: bool,
   /// Print planner explanation and selected targets.
@@ -52,11 +83,28 @@ pub struct RunOptions {
   pub run_args: Vec<String>,
 }
 
-/// Execute `run` with planner-driven surface selection.
+/// Execute `run` with planner-driven action selection.
 pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
-  ctx.snapshot()?;
+  if opts.format.is_json_like() && !opts.dry_run {
+    return Err(RailError::with_help(
+      "structured run output is a non-executing action plan",
+      "add --dry-run when using --format json or --format github",
+    ));
+  }
   let effective = resolve_effective_inputs(ctx, &opts)?;
-  validate_executable_surfaces(&effective.surfaces)?;
+  validate_executable_actions(ctx, &effective.actions)?;
+  let snapshot = ctx.snapshot()?;
+  let snapshot_id = snapshot.id().to_string();
+  let platform = snapshot.toolchain().host_target().to_string();
+  let selected_targets = snapshot
+    .targets()
+    .iter()
+    .filter(|target| target.is_build_target())
+    .map(|target| match target.specification() {
+      TargetSpecificationIdentity::BuiltIn(target) => target.clone(),
+      TargetSpecificationIdentity::Custom(target) => target.name().to_string(),
+    })
+    .collect::<Vec<_>>();
   let mut plan = None;
 
   if !opts.all {
@@ -75,7 +123,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     )?);
   }
 
-  if opts.explain {
+  if opts.explain && opts.format == ActionOutputFormat::Text {
     if let Some(ref output) = plan {
       let explain = render_plan_explain(output);
       print!("{}", explain);
@@ -93,83 +141,109 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   let build_targets = resolve_targets(ctx, &opts, scope, "build")?;
   let bench_targets = resolve_targets(ctx, &opts, scope, "bench")?;
   let workspace_package_count = ctx.cargo().metadata().workspace_packages().len();
+  let selected_features = selected_cargo_features(&effective.run_args);
+  let action_base_ref =
+    if opts.all && effective.base_ref.is_none() && actions_require_base_ref(ctx, &effective.actions, opts.generated)? {
+      Some(detect_default_base_ref(ctx.git()?.git())?)
+    } else {
+      None
+    };
+  let base_ref = effective
+    .base_ref
+    .as_deref()
+    .or(action_base_ref.as_deref())
+    .or_else(|| plan.as_ref().map(|output| output.inputs.refs.resolved_base.as_str()))
+    .unwrap_or("");
 
-  let requested_test_surface = effective.surfaces.iter().any(|surface| surface == "test");
-  let mut executed_any = false;
-  let surface_count = effective.surfaces.len();
-  let workspace_root = ctx.workspace_root();
-  let mut executed_surfaces = Vec::with_capacity(surface_count);
-  let mut skipped_surfaces = Vec::with_capacity(surface_count);
-  for surface in &effective.surfaces {
-    if !surface_enabled(&opts, scope, surface) {
-      if opts.explain || opts.dry_run {
-        println!("skip surface `{}` (not enabled by plan)", surface);
-      }
-      skipped_surfaces.push(surface.clone());
+  let requested_test_action = effective.actions.iter().any(|action| action == "test");
+  let action_count = effective.actions.len();
+  let mut skipped_actions = Vec::with_capacity(action_count);
+  let mut reasons_by_action = std::collections::BTreeMap::<String, Vec<ActionReason>>::new();
+  let mut reason_edges = std::collections::BTreeSet::new();
+  for action in &effective.actions {
+    if !action_enabled(ctx, &opts, scope, action) {
       continue;
     }
-
-    executed_any = true;
-    executed_surfaces.push(surface.clone());
-    match surface.as_str() {
-      "test" => run_test_surface(&opts, workspace_root, &test_targets, &effective.run_args)?,
-      "build" => run_workspace_surface(
-        &opts,
-        workspace_root,
-        workspace_package_count,
-        "build",
-        &["check"],
-        &build_targets,
-        &effective.run_args,
-      )?,
-      "bench" => run_workspace_surface(
-        &opts,
-        workspace_root,
-        workspace_package_count,
-        "bench",
-        &["bench"],
-        &bench_targets,
-        &effective.run_args,
-      )?,
-      "docs" => run_workspace_surface(
-        &opts,
-        workspace_root,
-        workspace_package_count,
-        "docs",
-        &["doc", "--workspace", "--no-deps"],
-        &[],
-        &effective.run_args,
-      )?,
-      unknown => {
-        return Err(RailError::with_help(
-          format!("unsupported surface '{}'", unknown),
-          "use --surface build|test|bench|docs",
-        ));
-      }
-    }
+    let reasons = action_reasons(ctx, &opts, plan.as_ref(), action, ActionKind::from_name(action))?;
+    merge_action_reasons(&mut reasons_by_action, action, reasons);
+    collect_dependency_reasons(ctx, action, &mut reasons_by_action, &mut reason_edges, &mut Vec::new())?;
   }
 
-  if !executed_any {
-    if requested_test_surface {
+  let mut steps = Vec::with_capacity(action_count);
+  let mut expanded_actions = Vec::with_capacity(action_count);
+  let mut scheduled = HashSet::new();
+  let expansion = RunExpansionContext {
+    ctx,
+    opts: &opts,
+    run_args: &effective.run_args,
+    test_targets: &test_targets,
+    build_targets: &build_targets,
+    bench_targets: &bench_targets,
+    workspace_package_count,
+    selected_targets: &selected_targets,
+    selected_features: &selected_features,
+    platform: &platform,
+    base_ref,
+  };
+  for action in &effective.actions {
+    if !action_enabled(ctx, &opts, scope, action) {
+      skipped_actions.push(action.clone());
+      steps.push(RunStep::Skipped(action.clone()));
+      continue;
+    }
+    schedule_action(
+      action,
+      &reasons_by_action,
+      &mut scheduled,
+      &mut steps,
+      &mut expanded_actions,
+      &expansion,
+    )?;
+  }
+
+  let graph = ActionGraph::new(snapshot_id, expanded_actions)?;
+  let executed_actions = graph
+    .actions()
+    .iter()
+    .map(|action| action.id().to_string())
+    .collect::<Vec<_>>();
+  let executed_any = !executed_actions.is_empty();
+  if opts.generated == GeneratedMode::Check && !graph.actions().iter().any(ExpandedAction::is_generated) {
+    return Err(RailError::with_help(
+      "--generated check selected no generated action",
+      "select a generated repository action with --action or --profile",
+    ));
+  }
+  if !opts.dry_run {
+    for action in graph.actions() {
+      action.validate_runtime_environment()?;
+    }
+  }
+  if opts.format == ActionOutputFormat::Text {
+    for step in &steps {
+      execute_run_step(step, graph.actions(), &opts, ctx)?;
+    }
+  } else {
+    render_action_plan(&graph, &steps, &opts, &effective, plan.as_ref())?;
+  }
+
+  if !executed_any && opts.format == ActionOutputFormat::Text {
+    if requested_test_action {
       println!("no test targets");
     } else {
-      println!("no surfaces to execute");
+      println!("no actions to execute");
     }
   }
 
-  let receipt_path = write_run_decision_receipt(
+  let receipt_path = write_run_decision_receipt(DecisionReceiptInput {
     ctx,
-    &opts,
-    &effective,
-    plan.as_ref(),
-    &executed_surfaces,
-    &skipped_surfaces,
-    DecisionTargets {
-      test: &test_targets,
-      build: &build_targets,
-      bench: &bench_targets,
-    },
-  )?;
+    opts: &opts,
+    effective: &effective,
+    plan: plan.as_ref(),
+    executed_actions: &executed_actions,
+    skipped_actions: &skipped_actions,
+    graph: &graph,
+  })?;
   if std::env::var_os("CI").is_some() {
     progress!("decision receipt: {}", receipt_path.display());
   }
@@ -179,25 +253,27 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
 
 #[derive(Debug, Clone)]
 struct EffectiveRunInputs {
-  surfaces: Vec<String>,
+  actions: Vec<String>,
   profile: Option<String>,
   profile_source: Option<&'static str>,
   workflow: Option<String>,
   since: Option<String>,
   merge_base: bool,
   run_args: Vec<String>,
+  base_ref: Option<String>,
 }
 
 fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailResult<EffectiveRunInputs> {
-  if !opts.surfaces.is_empty() {
+  if !opts.actions.is_empty() {
     return Ok(EffectiveRunInputs {
-      surfaces: dedup_surfaces(opts.surfaces.clone()),
+      actions: dedup_actions(opts.actions.clone()),
       profile: None,
       profile_source: None,
       workflow: None,
       since: opts.since.clone(),
       merge_base: opts.merge_base && opts.since.is_none(),
       run_args: opts.run_args.clone(),
+      base_ref: None,
     });
   }
 
@@ -205,14 +281,14 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
     let Some(config) = ctx.config() else {
       return Err(RailError::with_help(
         format!("workflow '{}' requested but no rail.toml loaded", workflow),
-        "define [run.workflow] in rail.toml or pass --profile/--surface",
+        "define [run.workflow] in rail.toml or pass --profile/--action",
       ));
     };
     let Some(mapped_profile) = config.run.workflow.get(workflow).cloned() else {
       return Err(RailError::with_help(
         format!("unknown run workflow '{}'", workflow),
         format!(
-          "define run.workflow.{} in rail.toml or pass --profile/--surface",
+          "define run.workflow.{} in rail.toml or pass --profile/--action",
           workflow
         ),
       ));
@@ -241,7 +317,7 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
   let mut profile_run_args = Vec::new();
   let mut profile_since = None;
   let mut profile_merge_base = false;
-  let surfaces = if let Some(cfg_profile) = ctx
+  let actions = if let Some(cfg_profile) = ctx
     .config()
     .as_ref()
     .and_then(|cfg| cfg.run.profiles.get(profile_name.as_str()))
@@ -252,16 +328,20 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
       Some(crate::config::RunBaseline::MergeBase) => profile_merge_base = true,
       None => {}
     }
-    dedup_surfaces(cfg_profile.surfaces.clone())
-  } else if let Some(builtin_surfaces) = builtin_profile_surfaces(profile_name.as_str()) {
-    builtin_surfaces
+    dedup_actions(cfg_profile.actions.clone())
+  } else if let Some(builtin_actions) = builtin_profile_actions(profile_name.as_str()) {
+    builtin_actions
   } else {
     return Err(RailError::with_help(
       format!("unknown run profile '{}'", profile_name),
-      "define [run.profile.<name>] in rail.toml, or use --profile local|ci|nightly, or pass --surface",
+      "define [run.profile.<name>] in rail.toml, or use --profile local|ci|nightly, or pass --action",
     ));
   };
 
+  let needs_profile_base_ref = profile_run_args.iter().any(|arg| arg.contains("{base_ref}"))
+    || profile_since
+      .as_deref()
+      .is_some_and(|reference| reference.contains("{base_ref}"));
   let mut run_args = profile_run_args;
   if let Some(token_idx) = run_args.iter().position(|arg| arg == "{cargo_args}") {
     let mut expanded = Vec::new();
@@ -273,21 +353,23 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
     run_args.extend(opts.run_args.clone());
   }
 
-  let base_ref = detect_default_base_ref(ctx.git()?.git())?;
+  let base_ref = needs_profile_base_ref
+    .then(|| ctx.git().and_then(|git| detect_default_base_ref(git.git())))
+    .transpose()?;
   let workspace_root = ctx.workspace_root().display().to_string();
   run_args = run_args
     .into_iter()
     .map(|arg| {
       arg
         .replace("{workspace_root}", &workspace_root)
-        .replace("{base_ref}", &base_ref)
+        .replace("{base_ref}", base_ref.as_deref().unwrap_or_default())
     })
     .collect();
 
   profile_since = profile_since.map(|since| {
     since
       .replace("{workspace_root}", &workspace_root)
-      .replace("{base_ref}", &base_ref)
+      .replace("{base_ref}", base_ref.as_deref().unwrap_or_default())
   });
 
   let since = opts.since.clone().or(profile_since);
@@ -298,17 +380,18 @@ fn resolve_effective_inputs(ctx: &WorkspaceContext, opts: &RunOptions) -> RailRe
   };
 
   Ok(EffectiveRunInputs {
-    surfaces,
+    actions,
     profile: Some(profile_name),
     profile_source: Some(profile_source),
     workflow: opts.workflow.clone(),
     since,
     merge_base,
     run_args,
+    base_ref,
   })
 }
 
-fn builtin_profile_surfaces(profile: &str) -> Option<Vec<String>> {
+fn builtin_profile_actions(profile: &str) -> Option<Vec<String>> {
   match profile {
     "local" => Some(vec!["test".to_string()]),
     "ci" => Some(vec!["build".to_string(), "test".to_string()]),
@@ -317,31 +400,36 @@ fn builtin_profile_surfaces(profile: &str) -> Option<Vec<String>> {
   }
 }
 
-fn validate_executable_surfaces(surfaces: &[String]) -> RailResult<()> {
-  const EXECUTABLE_SURFACES: &[&str] = &["build", "test", "bench", "docs"];
-
-  for surface in surfaces {
-    if surface == "infra" {
+fn validate_executable_actions(ctx: &WorkspaceContext, actions: &[String]) -> RailResult<()> {
+  if actions.len() > MAX_ACTIONS {
+    return Err(RailError::message(format!(
+      "run request contains {} actions; at most {MAX_ACTIONS} are allowed",
+      actions.len()
+    )));
+  }
+  for action in actions {
+    if action == "infra" {
       return Err(RailError::with_help(
-        "surface 'infra' is a planner output, not an executable run surface",
-        "gate CI on `cargo rail plan` output, or execute build|test|bench|docs",
+        "'infra' is a planner output, not an executable action ID",
+        "use infra in run.action.<name>.when or select a built-in action",
       ));
     }
 
-    if surface.starts_with("custom:") {
+    if action.starts_with("custom:") {
       return Err(RailError::with_help(
-        format!(
-          "surface '{}' is a planner output, not an executable run surface",
-          surface
-        ),
-        "extract custom surfaces from `cargo rail plan -f json` for CI gating",
+        format!("'{}' is a planner output, not an executable action ID", action),
+        "use the custom surface in run.action.<name>.when, then select that action",
       ));
     }
 
-    if !EXECUTABLE_SURFACES.contains(&surface.as_str()) {
+    if ActionKind::from_name(action).is_none()
+      && !ctx
+        .config()
+        .is_some_and(|config| config.run.actions.contains_key(action))
+    {
       return Err(RailError::with_help(
-        format!("unsupported surface '{}'", surface),
-        "use --surface build|test|bench|docs",
+        format!("unsupported action '{}'", action),
+        "use a built-in action or define [run.action.<name>]",
       ));
     }
   }
@@ -349,10 +437,10 @@ fn validate_executable_surfaces(surfaces: &[String]) -> RailResult<()> {
   Ok(())
 }
 
-fn dedup_surfaces(mut surfaces: Vec<String>) -> Vec<String> {
-  let mut seen: HashSet<String> = HashSet::with_capacity(surfaces.len());
-  surfaces.retain(|surface| seen.insert(surface.clone()));
-  surfaces
+fn dedup_actions(mut actions: Vec<String>) -> Vec<String> {
+  let mut seen: HashSet<String> = HashSet::with_capacity(actions.len());
+  actions.retain(|action| seen.insert(action.clone()));
+  actions
 }
 
 fn resolve_targets(
@@ -397,110 +485,734 @@ fn resolve_targets(
   Ok(targets)
 }
 
-fn surface_enabled(opts: &RunOptions, scope: Option<&ExecutionScope>, surface: &str) -> bool {
-  opts.all
-    || scope
-      .and_then(|scope| scope.surfaces.get(surface))
+fn action_enabled(ctx: &WorkspaceContext, opts: &RunOptions, scope: Option<&ExecutionScope>, action: &str) -> bool {
+  if opts.all {
+    return true;
+  }
+  if let Some(kind) = ActionKind::from_name(action) {
+    return kind
+      .planner_surface()
+      .and_then(|surface| scope.and_then(|scope| scope.surfaces.get(surface)))
       .copied()
-      .unwrap_or(false)
+      .unwrap_or(false);
+  }
+  ctx
+    .config()
+    .and_then(|config| config.run.actions.get(action))
+    .is_some_and(|action| {
+      action.when.iter().any(|surface| {
+        scope
+          .and_then(|scope| scope.surfaces.get(surface))
+          .copied()
+          .unwrap_or(false)
+      })
+    })
 }
 
-fn run_test_surface(
-  opts: &RunOptions,
-  workspace_root: &Path,
-  targets: &[String],
-  run_args: &[String],
-) -> RailResult<()> {
-  if targets.is_empty() {
-    println!("no test targets");
-    return Ok(());
-  }
-
-  let test_args = TestCommandArgs {
-    cargo: opts.cargo_test_args.clone(),
-    nextest: opts.nextest_args.clone(),
-    filter: opts.test_filter.clone(),
-    harness: run_args.to_vec(),
-  };
-  let preference = if opts.skip_nextest {
-    TestRunnerPreference::Cargo
-  } else {
-    opts.test_runner
-  };
-  let runner = select_runner(preference, &test_args)?;
-  progress!("testing {} crates ({})", targets.len(), runner.name());
-  if targets.len() <= 12 {
-    for target in targets {
-      progress!("  {}", target);
-    }
-  } else {
-    progress!("targets: {}", format_preview_list(targets, 12));
-  }
-
-  let mut cmd = runner.build_command(targets, &test_args)?;
-  run_or_print_command(opts, workspace_root, "test", &mut cmd)
-}
-
-fn run_workspace_surface(
-  opts: &RunOptions,
-  workspace_root: &Path,
-  workspace_package_count: usize,
-  surface: &str,
-  args: &[&str],
-  targets: &[String],
-  run_args: &[String],
-) -> RailResult<()> {
-  let package_scoped = matches!(surface, "build" | "bench");
-  if package_scoped && targets.is_empty() {
-    println!("no {} targets", surface);
-    return Ok(());
-  }
-
-  let mut cmd = Command::new("cargo");
-  cmd.args(args);
-
-  if package_scoped {
-    // Keep `--workspace` for full-workspace runs to avoid very long command lines.
-    if !opts.ignore_bin_crates && targets.len() == workspace_package_count {
-      cmd.arg("--workspace");
-    } else {
-      for target in targets {
-        cmd.arg("-p").arg(target);
+fn selected_cargo_features(arguments: &[String]) -> ActionFeatureSelection {
+  let mut features = std::collections::BTreeSet::new();
+  let mut all_features = false;
+  let mut default_features = true;
+  let mut arguments = arguments.iter();
+  while let Some(argument) = arguments.next() {
+    if argument == "--" {
+      break;
+    } else if argument == "--all-features" {
+      all_features = true;
+    } else if argument == "--no-default-features" {
+      default_features = false;
+    } else if argument == "--features" || argument == "-F" {
+      if let Some(value) = arguments.next() {
+        features.extend(split_feature_values(value));
       }
+    } else if let Some(value) = argument.strip_prefix("--features=") {
+      features.extend(split_feature_values(value));
+    } else if let Some(value) = argument.strip_prefix("-F")
+      && !value.is_empty()
+    {
+      features.extend(split_feature_values(value));
     }
   }
+  ActionFeatureSelection::requested(all_features, default_features, features.into_iter().collect())
+}
 
-  cmd.args(run_args);
+fn selected_cargo_targets(arguments: &[String], defaults: &[String]) -> Vec<String> {
+  let mut targets = std::collections::BTreeSet::new();
+  let mut arguments = arguments.iter();
+  while let Some(argument) = arguments.next() {
+    if argument == "--" {
+      break;
+    } else if argument == "--target" {
+      if let Some(value) = arguments.next() {
+        targets.insert(value.clone());
+      }
+    } else if let Some(value) = argument.strip_prefix("--target=")
+      && !value.is_empty()
+    {
+      targets.insert(value.to_string());
+    }
+  }
+  if targets.is_empty() {
+    defaults.to_vec()
+  } else {
+    targets.into_iter().collect()
+  }
+}
+
+fn split_feature_values(value: &str) -> impl Iterator<Item = String> + '_ {
+  value
+    .split(|character: char| character == ',' || character.is_ascii_whitespace())
+    .filter(|feature| !feature.is_empty())
+    .map(str::to_string)
+}
+
+enum RunStep {
+  Skipped(String),
+  NoTargets(ActionKind),
+  Action {
+    action_index: usize,
+    test_runner_name: Option<&'static str>,
+  },
+}
+
+#[derive(Serialize)]
+struct ActionPlanOutput<'a> {
+  artifact: &'static str,
+  version: u32,
+  snapshot_id: &'a str,
+  profile_requested: Option<&'a str>,
+  profile_effective: Option<&'a str>,
+  workflow_requested: Option<&'a str>,
+  workflow_effective: Option<&'a str>,
+  actions_requested: &'a [String],
+  actions_effective: &'a [String],
+  since_requested: Option<&'a str>,
+  since_effective: Option<&'a str>,
+  merge_base_requested: bool,
+  merge_base_effective: bool,
+  all: bool,
+  run_args_requested: &'a [String],
+  run_args_effective: &'a [String],
+  generated_mode: GeneratedMode,
+  actions: &'a [ExpandedAction],
+  skipped_actions: Vec<&'a str>,
+  no_target_actions: Vec<&'static str>,
+  plan: Option<&'a PlanOutput>,
+}
+
+fn render_action_plan<'a>(
+  graph: &'a ActionGraph,
+  steps: &'a [RunStep],
+  opts: &'a RunOptions,
+  effective: &'a EffectiveRunInputs,
+  plan: Option<&'a PlanOutput>,
+) -> RailResult<()> {
+  let output = ActionPlanOutput {
+    artifact: "action_plan",
+    version: 1,
+    snapshot_id: graph.snapshot_id(),
+    profile_requested: opts.profile.as_deref(),
+    profile_effective: effective.profile.as_deref(),
+    workflow_requested: opts.workflow.as_deref(),
+    workflow_effective: effective.workflow.as_deref(),
+    actions_requested: &opts.actions,
+    actions_effective: &effective.actions,
+    since_requested: opts.since.as_deref(),
+    since_effective: effective.since.as_deref(),
+    merge_base_requested: opts.merge_base,
+    merge_base_effective: effective.merge_base,
+    all: opts.all,
+    run_args_requested: &opts.run_args,
+    run_args_effective: &effective.run_args,
+    generated_mode: opts.generated,
+    actions: graph.actions(),
+    skipped_actions: steps
+      .iter()
+      .filter_map(|step| match step {
+        RunStep::Skipped(action) => Some(action.as_str()),
+        RunStep::NoTargets(_) | RunStep::Action { .. } => None,
+      })
+      .collect(),
+    no_target_actions: steps
+      .iter()
+      .filter_map(|step| match step {
+        RunStep::NoTargets(kind) => Some(kind.as_str()),
+        RunStep::Skipped(_) | RunStep::Action { .. } => None,
+      })
+      .collect(),
+    plan,
+  };
+  match opts.format {
+    ActionOutputFormat::Text => Ok(()),
+    ActionOutputFormat::Json => {
+      let payload = serde_json::to_value(&output)
+        .map_err(|error| RailError::message(format!("failed to serialize action plan: {error}")))?;
+      let envelope = crate::output::machine_json_envelope("run", "plan", "success", 0, payload);
+      let rendered = serde_json::to_string_pretty(&envelope)
+        .map_err(|error| RailError::message(format!("failed to render action plan: {error}")))?;
+      println!("{rendered}");
+      Ok(())
+    }
+    ActionOutputFormat::GitHub => {
+      use std::fmt::Write as _;
+
+      let action_ids = graph.actions().iter().map(ExpandedAction::id).collect::<Vec<_>>();
+      let ids_json = serde_json::to_string(&action_ids)
+        .map_err(|error| RailError::message(format!("failed to serialize action IDs: {error}")))?;
+      let mut rendered = String::with_capacity(ids_json.len() + graph.snapshot_id().len() + 96);
+      let _ = writeln!(rendered, "snapshot_id={}", graph.snapshot_id());
+      let _ = writeln!(rendered, "action_count={}", action_ids.len());
+      let _ = writeln!(rendered, "action_ids_json={ids_json}");
+      let _ = writeln!(rendered, "generated_mode={}", opts.generated.as_str());
+      print!("{rendered}");
+      Ok(())
+    }
+  }
+}
+
+struct RunExpansionContext<'a> {
+  ctx: &'a WorkspaceContext,
+  opts: &'a RunOptions,
+  run_args: &'a [String],
+  test_targets: &'a [String],
+  build_targets: &'a [String],
+  bench_targets: &'a [String],
+  workspace_package_count: usize,
+  selected_targets: &'a [String],
+  selected_features: &'a ActionFeatureSelection,
+  platform: &'a str,
+  base_ref: &'a str,
+}
+
+fn merge_action_reasons(
+  reasons_by_action: &mut std::collections::BTreeMap<String, Vec<ActionReason>>,
+  action: &str,
+  reasons: Vec<ActionReason>,
+) {
+  let existing = reasons_by_action.entry(action.to_string()).or_default();
+  for reason in reasons {
+    if !existing.contains(&reason) {
+      existing.push(reason);
+    }
+  }
+}
+
+fn action_dependencies(ctx: &WorkspaceContext, action: &str) -> RailResult<Vec<String>> {
+  if ActionKind::from_name(action).is_some() {
+    return Ok(Vec::new());
+  }
+  ctx
+    .config()
+    .and_then(|config| config.run.actions.get(action))
+    .map(|action| action.dependencies.clone())
+    .ok_or_else(|| RailError::message(format!("configured action '{action}' is missing")))
+}
+
+fn actions_require_base_ref(
+  ctx: &WorkspaceContext,
+  roots: &[String],
+  generated_mode: GeneratedMode,
+) -> RailResult<bool> {
+  let mut pending = roots.to_vec();
+  let mut visited = HashSet::new();
+  while let Some(action) = pending.pop() {
+    if !visited.insert(action.clone()) || ActionKind::from_name(&action).is_some() {
+      continue;
+    }
+    let config = ctx
+      .config()
+      .and_then(|config| config.run.actions.get(&action))
+      .ok_or_else(|| RailError::message(format!("configured action '{action}' is missing")))?;
+    let argv =
+      if generated_mode == GeneratedMode::Check && config.kind == crate::config::RepositoryActionKind::Generated {
+        &config.check_argv
+      } else {
+        &config.argv
+      };
+    if argv.iter().any(|argument| argument == "{base_ref}") {
+      return Ok(true);
+    }
+    pending.extend(config.dependencies.iter().cloned());
+  }
+  Ok(false)
+}
+
+fn collect_dependency_reasons(
+  ctx: &WorkspaceContext,
+  action: &str,
+  reasons_by_action: &mut std::collections::BTreeMap<String, Vec<ActionReason>>,
+  visited_edges: &mut std::collections::BTreeSet<(String, String)>,
+  stack: &mut Vec<String>,
+) -> RailResult<()> {
+  if stack.iter().any(|ancestor| ancestor == action) {
+    stack.push(action.to_string());
+    return Err(RailError::message(format!(
+      "action dependency cycle contains: {}",
+      stack.join(" -> ")
+    )));
+  }
+  stack.push(action.to_string());
+  for dependency in action_dependencies(ctx, action)? {
+    if !visited_edges.insert((action.to_string(), dependency.clone())) {
+      continue;
+    }
+    merge_action_reasons(
+      reasons_by_action,
+      &dependency,
+      vec![ActionReason::Dependency {
+        action_id: action.to_string(),
+      }],
+    );
+    collect_dependency_reasons(ctx, &dependency, reasons_by_action, visited_edges, stack)?;
+  }
+  stack.pop();
+  Ok(())
+}
+
+fn schedule_action(
+  action: &str,
+  reasons_by_action: &std::collections::BTreeMap<String, Vec<ActionReason>>,
+  scheduled: &mut HashSet<String>,
+  steps: &mut Vec<RunStep>,
+  expanded_actions: &mut Vec<ExpandedAction>,
+  expansion: &RunExpansionContext<'_>,
+) -> RailResult<()> {
+  if scheduled.contains(action) {
+    return Ok(());
+  }
+  for dependency in action_dependencies(expansion.ctx, action)? {
+    schedule_action(
+      &dependency,
+      reasons_by_action,
+      scheduled,
+      steps,
+      expanded_actions,
+      expansion,
+    )?;
+  }
+  let reasons = reasons_by_action
+    .get(action)
+    .cloned()
+    .ok_or_else(|| RailError::message(format!("action '{action}' has no authorization reason")))?;
+  steps.push(expand_selected_action(action, reasons, expanded_actions, expansion)?);
+  scheduled.insert(action.to_string());
+  Ok(())
+}
+
+fn expand_selected_action(
+  action: &str,
+  reasons: Vec<ActionReason>,
+  expanded_actions: &mut Vec<ExpandedAction>,
+  expansion: &RunExpansionContext<'_>,
+) -> RailResult<RunStep> {
+  let Some(kind) = ActionKind::from_name(action) else {
+    let config = expansion
+      .ctx
+      .config()
+      .and_then(|config| config.run.actions.get(action))
+      .ok_or_else(|| RailError::message(format!("configured action '{action}' disappeared during expansion")))?;
+    let targets = if config.packages == crate::config::RepositoryPackageSelection::None {
+      Vec::new()
+    } else {
+      expansion.build_targets.to_vec()
+    };
+    let spec = ActionSpec::repository(action, config, expansion.ctx.workspace_root())?;
+    let expanded = spec.expand(ActionExpansion {
+      selected_packages: targets,
+      use_workspace: config.packages == crate::config::RepositoryPackageSelection::WorkspaceOrSelected
+        && !expansion.opts.ignore_bin_crates
+        && expansion.build_targets.len() == expansion.workspace_package_count,
+      selected_targets: expansion.selected_targets.to_vec(),
+      selected_features: expansion.selected_features.clone(),
+      platform: expansion.platform.to_string(),
+      workspace_root: expansion.ctx.workspace_root(),
+      base_ref: expansion.base_ref,
+      check_generated: expansion.opts.generated == GeneratedMode::Check,
+      reasons,
+    })?;
+    let action_index = expanded_actions.len();
+    expanded_actions.push(expanded);
+    return Ok(RunStep::Action {
+      action_index,
+      test_runner_name: None,
+    });
+  };
+  let targets = match kind {
+    ActionKind::Test => expansion.test_targets,
+    ActionKind::Build
+    | ActionKind::Format
+    | ActionKind::Lint
+    | ActionKind::Msrv
+    | ActionKind::Package
+    | ActionKind::Distribution => expansion.build_targets,
+    ActionKind::Bench => expansion.bench_targets,
+    ActionKind::Docs | ActionKind::Audit => &[],
+    ActionKind::GeneratedArtifact | ActionKind::Repository => {
+      return Err(RailError::message(format!(
+        "internal action kind '{}' cannot be selected as a built-in",
+        kind.as_str()
+      )));
+    }
+  };
+  expand_builtin_action(kind, targets, reasons, expanded_actions, expansion)
+}
+
+fn expand_builtin_action(
+  kind: ActionKind,
+  targets: &[String],
+  reasons: Vec<ActionReason>,
+  expanded_actions: &mut Vec<ExpandedAction>,
+  expansion: &RunExpansionContext<'_>,
+) -> RailResult<RunStep> {
+  let ctx = expansion.ctx;
+  let opts = expansion.opts;
+  let run_args = expansion.run_args;
+  let workspace_package_count = expansion.workspace_package_count;
+  let package_scoped = matches!(
+    kind,
+    ActionKind::Build
+      | ActionKind::Test
+      | ActionKind::Bench
+      | ActionKind::Format
+      | ActionKind::Lint
+      | ActionKind::Msrv
+      | ActionKind::Package
+      | ActionKind::Distribution
+  );
+  if package_scoped && targets.is_empty() {
+    return Ok(RunStep::NoTargets(kind));
+  }
+
+  let mut expanded_features = expansion.selected_features.clone();
+  let mut expanded_targets = selected_cargo_targets(run_args, expansion.selected_targets);
+  let (argv, use_workspace, test_runner_name) = match kind {
+    ActionKind::Build => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["check".to_string()],
+        PackageArguments::WorkspaceOrSelected,
+        run_args.to_vec(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Bench => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["bench".to_string()],
+        PackageArguments::WorkspaceOrSelected,
+        run_args.to_vec(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Docs => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["doc".to_string(), "--workspace".to_string(), "--no-deps".to_string()],
+        PackageArguments::None,
+        run_args.to_vec(),
+      ),
+      false,
+      None,
+    ),
+    ActionKind::Format => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["fmt".to_string()],
+        PackageArguments::AllOrSelected,
+        [vec!["--check".to_string()], run_args.to_vec()].concat(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Lint => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["clippy".to_string()],
+        PackageArguments::WorkspaceOrSelected,
+        [
+          vec!["--all-targets".to_string(), "--all-features".to_string()],
+          run_args.to_vec(),
+          vec!["--".to_string(), "-D".to_string(), "warnings".to_string()],
+        ]
+        .concat(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Msrv => {
+      let msrv = ctx
+        .cargo()
+        .metadata()
+        .workspace_packages()
+        .iter()
+        .filter_map(|package| package.rust_version.as_ref())
+        .max()
+        .ok_or_else(|| {
+          RailError::with_help(
+            "the msrv action requires rust-version on at least one workspace package",
+            "set workspace.package.rust-version or package.rust-version before selecting the msrv action",
+          )
+        })?;
+      (
+        ArgvTemplate::new(
+          "cargo",
+          vec![format!("+{msrv}"), "check".to_string()],
+          PackageArguments::WorkspaceOrSelected,
+          [
+            vec![
+              "--all-targets".to_string(),
+              "--all-features".to_string(),
+              "--locked".to_string(),
+            ],
+            run_args.to_vec(),
+          ]
+          .concat(),
+        ),
+        !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+        None,
+      )
+    }
+    ActionKind::Package => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["package".to_string()],
+        PackageArguments::WorkspaceOrSelected,
+        [vec!["--locked".to_string()], run_args.to_vec()].concat(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Audit => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["deny".to_string(), "check".to_string(), "all".to_string()],
+        PackageArguments::None,
+        run_args.to_vec(),
+      ),
+      false,
+      None,
+    ),
+    ActionKind::Distribution => (
+      ArgvTemplate::new(
+        "cargo",
+        vec!["build".to_string()],
+        PackageArguments::WorkspaceOrSelected,
+        [vec!["--release".to_string(), "--locked".to_string()], run_args.to_vec()].concat(),
+      ),
+      !opts.ignore_bin_crates && targets.len() == workspace_package_count,
+      None,
+    ),
+    ActionKind::Test => {
+      let test_args = TestCommandArgs {
+        cargo: opts.cargo_test_args.clone(),
+        nextest: opts.nextest_args.clone(),
+        filter: opts.test_filter.clone(),
+        harness: run_args.to_vec(),
+      };
+      let preference = if opts.skip_nextest {
+        TestRunnerPreference::Cargo
+      } else {
+        opts.test_runner
+      };
+      let runner = select_runner(preference, &test_args)?;
+      let (before_packages, after_packages) = runner.command_argv_parts(&test_args)?;
+      expanded_features = selected_cargo_features(&after_packages);
+      expanded_targets = selected_cargo_targets(&after_packages, expansion.selected_targets);
+      (
+        ArgvTemplate::new("cargo", before_packages, PackageArguments::Selected, after_packages),
+        false,
+        Some(runner.name()),
+      )
+    }
+    ActionKind::GeneratedArtifact | ActionKind::Repository => {
+      return Err(RailError::message("repository action reached built-in expansion"));
+    }
+  };
+  let spec = ActionSpec::builtin(kind, argv);
+  if matches!(kind, ActionKind::Lint | ActionKind::Msrv) {
+    expanded_features = ActionFeatureSelection::requested(true, true, Vec::new());
+  }
+  let expanded = spec.expand(ActionExpansion {
+    selected_packages: targets.to_vec(),
+    use_workspace,
+    selected_targets: expanded_targets,
+    selected_features: expanded_features,
+    platform: expansion.platform.to_string(),
+    workspace_root: ctx.workspace_root(),
+    base_ref: expansion.base_ref,
+    check_generated: opts.generated == GeneratedMode::Check,
+    reasons,
+  })?;
+  let action_index = expanded_actions.len();
+  expanded_actions.push(expanded);
+
+  Ok(RunStep::Action {
+    action_index,
+    test_runner_name,
+  })
+}
+
+fn action_reasons(
+  ctx: &WorkspaceContext,
+  opts: &RunOptions,
+  plan: Option<&PlanOutput>,
+  action_id: &str,
+  kind: Option<ActionKind>,
+) -> RailResult<Vec<ActionReason>> {
+  if opts.all {
+    return Ok(vec![ActionReason::All]);
+  }
+  let output = plan.ok_or_else(|| RailError::message(format!("action '{action_id}' has no planner contract")))?;
+  let surfaces = if let Some(kind) = kind {
+    kind.planner_surface().into_iter().collect::<Vec<_>>()
+  } else {
+    ctx
+      .config()
+      .and_then(|config| config.run.actions.get(action_id))
+      .ok_or_else(|| RailError::message(format!("configured action '{action_id}' is missing")))?
+      .when
+      .iter()
+      .map(String::as_str)
+      .collect()
+  };
+  let reasons = surfaces
+    .into_iter()
+    .filter_map(|surface| output.surfaces.get(surface).map(|decision| (surface, decision)))
+    .filter(|(_, decision)| decision.enabled)
+    .flat_map(|(surface, decision)| {
+      decision.reasons.iter().map(move |trace_id| ActionReason::Planner {
+        surface: surface.to_string(),
+        trace_id: *trace_id,
+      })
+    })
+    .collect::<Vec<_>>();
+  if reasons.is_empty() {
+    return Err(RailError::message(format!(
+      "planner enabled '{}' action without a reason",
+      action_id
+    )));
+  }
+  Ok(reasons)
+}
+
+fn execute_run_step(
+  step: &RunStep,
+  ordered_actions: &[ExpandedAction],
+  opts: &RunOptions,
+  ctx: &WorkspaceContext,
+) -> RailResult<()> {
+  let test_runner_name = match step {
+    RunStep::Skipped(action) if opts.explain || opts.dry_run => {
+      println!("skip action `{}` (not enabled by plan)", action);
+      return Ok(());
+    }
+    RunStep::Skipped(_) => return Ok(()),
+    RunStep::NoTargets(kind) => {
+      println!("no {} targets", kind.as_str());
+      return Ok(());
+    }
+    RunStep::Action {
+      action_index,
+      test_runner_name,
+    } => (action_index, test_runner_name),
+  };
+  let (action_index, test_runner_name) = test_runner_name;
+  let expanded = ordered_actions
+    .get(*action_index)
+    .ok_or_else(|| RailError::message("action schedule references a missing expanded action"))?;
+
+  if let Some(runner_name) = test_runner_name {
+    let targets = expanded.selected_packages();
+    progress!("testing {} crates ({})", targets.len(), runner_name);
+    if targets.len() <= 12 {
+      for target in targets {
+        progress!("  {}", target);
+      }
+    } else {
+      progress!("targets: {}", format_preview_list(targets, 12));
+    }
+  }
 
   if opts.explain {
-    if package_scoped {
-      println!(
-        "surface `{}` targets ({}): {}",
-        surface,
-        targets.len(),
-        format_preview_list(targets, 12)
-      );
-    } else {
-      println!("surface `{}` targets: workspace", surface);
+    match expanded.kind() {
+      ActionKind::Build
+      | ActionKind::Bench
+      | ActionKind::Format
+      | ActionKind::Lint
+      | ActionKind::Msrv
+      | ActionKind::Package
+      | ActionKind::Distribution => println!(
+        "action `{}` targets ({}): {}",
+        expanded.id(),
+        expanded.selected_packages().len(),
+        format_preview_list(expanded.selected_packages(), 12)
+      ),
+      ActionKind::Docs => println!("action `docs` targets: workspace"),
+      ActionKind::GeneratedArtifact => println!(
+        "action `{}` owns: {}",
+        expanded.id(),
+        format_preview_list(&expanded.repository_outputs().collect::<Vec<_>>(), 12)
+      ),
+      ActionKind::Test | ActionKind::Audit | ActionKind::Repository => {}
     }
   }
 
-  run_or_print_command(opts, workspace_root, surface, &mut cmd)
+  run_or_print_action(opts, ctx, expanded)
 }
 
-fn run_or_print_command(opts: &RunOptions, workspace_root: &Path, surface: &str, cmd: &mut Command) -> RailResult<()> {
-  cmd.current_dir(workspace_root);
-
+fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &ExpandedAction) -> RailResult<()> {
   if opts.print_cmd || opts.dry_run {
-    println!("{}: {}", surface, render_command(cmd));
+    println!("{}: {}", action.id(), action.argv().join(" "));
   }
   if opts.dry_run {
     return Ok(());
   }
 
-  let status = cmd
+  let (program, arguments) = action
+    .argv()
+    .split_first()
+    .ok_or_else(|| RailError::message("expanded action argv cannot be empty"))?;
+  let mut command = Command::new(program);
+  let working_directory = action.validate_paths(ctx.workspace_root())?;
+  command.args(arguments).current_dir(&working_directory);
+  if !action.environment().inherit() {
+    command.env_clear();
+  }
+  for entry in action.environment().entries() {
+    match entry {
+      ActionEnvironmentEntry::Fixed { name, value } => {
+        command.env(name, value);
+      }
+      ActionEnvironmentEntry::Pass { name } => {
+        if let Some(value) = std::env::var_os(name) {
+          command.env(name, value);
+        }
+      }
+      ActionEnvironmentEntry::Secret { name } => {
+        let value = std::env::var_os(name).ok_or_else(|| {
+          RailError::message(format!(
+            "action '{}' secret environment capability '{name}' disappeared before execution",
+            action.id()
+          ))
+        })?;
+        command.env(name, value);
+      }
+      ActionEnvironmentEntry::Cargo { name, value } => {
+        let value = match value {
+          crate::config::CargoEnvironmentValue::WorkspaceRoot => ctx.workspace_root().as_os_str(),
+          crate::config::CargoEnvironmentValue::TargetDirectory => {
+            ctx.cargo().metadata().target_directory.as_std_path().as_os_str()
+          }
+        };
+        command.env(name, value);
+      }
+    }
+  }
+  let status = command
     .status()
-    .map_err(|error| RailError::message(format!("{} failed: {}", surface, error)))?;
+    .map_err(|error| RailError::message(format!("{} failed: {}", action.id(), error)))?;
   if !status.success() {
     return Err(RailError::ExitWithCode {
       code: status.code().unwrap_or(1),
@@ -509,74 +1221,70 @@ fn run_or_print_command(opts: &RunOptions, workspace_root: &Path, surface: &str,
   Ok(())
 }
 
-fn render_command(cmd: &Command) -> String {
-  let mut parts = Vec::new();
-  parts.push(cmd.get_program().to_string_lossy().into_owned());
-  parts.extend(cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()));
-  parts.join(" ")
+struct DecisionReceiptInput<'a> {
+  ctx: &'a WorkspaceContext,
+  opts: &'a RunOptions,
+  effective: &'a EffectiveRunInputs,
+  plan: Option<&'a PlanOutput>,
+  executed_actions: &'a [String],
+  skipped_actions: &'a [String],
+  graph: &'a ActionGraph,
 }
 
-struct DecisionTargets<'a> {
-  test: &'a [String],
-  build: &'a [String],
-  bench: &'a [String],
-}
-
-fn write_run_decision_receipt(
-  ctx: &WorkspaceContext,
-  opts: &RunOptions,
-  effective: &EffectiveRunInputs,
-  plan: Option<&PlanOutput>,
-  executed_surfaces: &[String],
-  skipped_surfaces: &[String],
-  targets: DecisionTargets<'_>,
-) -> RailResult<std::path::PathBuf> {
-  let dir = crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("receipts");
+fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std::path::PathBuf> {
+  let dir = crate::workspace::cargo_rail_state_root(input.ctx.workspace_root()).join("receipts");
   fs::create_dir_all(&dir)?;
   let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
   let path = dir.join(format!("run-decision-{}.json", nonce));
-
   let receipt = serde_json::json!({
     "artifact": "decision_receipt",
-    "version": 1,
+    "version": 2,
     "command": "run",
     "generated_at_utc": chrono::Utc::now().to_rfc3339(),
+    "snapshot_id": input.graph.snapshot_id(),
+    "actions": input.graph.actions(),
     "inputs": {
-      "profile_requested": opts.profile,
-      "profile_effective": effective.profile,
-      "profile_source": effective.profile_source,
-      "workflow_requested": opts.workflow,
-      "workflow_effective": effective.workflow,
-      "surfaces_requested": opts.surfaces,
-      "surfaces_effective": effective.surfaces,
-      "since_requested": opts.since,
-      "since_effective": effective.since,
-      "merge_base_requested": opts.merge_base,
-      "merge_base_effective": effective.merge_base,
-      "all": opts.all,
-      "run_args_requested": opts.run_args,
-      "run_args_effective": effective.run_args,
-      "test_runner": opts.test_runner,
-      "cargo_test_args": opts.cargo_test_args,
-      "nextest_args": opts.nextest_args,
-      "test_filter": opts.test_filter,
-      "dry_run": opts.dry_run,
+      "profile_requested": input.opts.profile,
+      "profile_effective": input.effective.profile,
+      "profile_source": input.effective.profile_source,
+      "workflow_requested": input.opts.workflow,
+      "workflow_effective": input.effective.workflow,
+      "actions_requested": input.opts.actions,
+      "actions_effective": input.effective.actions,
+      "since_requested": input.opts.since,
+      "since_effective": input.effective.since,
+      "merge_base_requested": input.opts.merge_base,
+      "merge_base_effective": input.effective.merge_base,
+      "all": input.opts.all,
+      "run_args_requested": input.opts.run_args,
+      "run_args_effective": input.effective.run_args,
+      "test_runner": input.opts.test_runner,
+      "cargo_test_args": input.opts.cargo_test_args,
+      "nextest_args": input.opts.nextest_args,
+      "test_filter": input.opts.test_filter,
+      "dry_run": input.opts.dry_run,
+      "format": input.opts.format,
+      "generated_mode": input.opts.generated,
     },
     "execution": {
-      "executed_surfaces": executed_surfaces,
-      "skipped_surfaces": skipped_surfaces,
-      "targets": {
-        "test": targets.test,
-        "build": targets.build,
-        "bench": targets.bench,
-      }
+      "executed_actions": input.executed_actions,
+      "skipped_actions": input.skipped_actions,
     },
-    "scope": plan.map(|output| &output.scope),
-    "plan": plan,
+    "scope": input.plan.map(|output| &output.scope),
+    "plan": input.plan,
   });
   let bytes = serde_json::to_vec_pretty(&receipt)
     .map_err(|e| RailError::message(format!("failed to serialize decision receipt: {}", e)))?;
-  fs::write(&path, bytes)
+  let mut file = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(&path)
+    .map_err(|e| RailError::message(format!("failed to create decision receipt '{}': {}", path.display(), e)))?;
+  file
+    .write_all(&bytes)
     .map_err(|e| RailError::message(format!("failed to write decision receipt '{}': {}", path.display(), e)))?;
+  file
+    .sync_all()
+    .map_err(|e| RailError::message(format!("failed to sync decision receipt '{}': {}", path.display(), e)))?;
   Ok(path)
 }

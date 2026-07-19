@@ -31,9 +31,9 @@ book = ["book/**"]
 default_profile = "local"
 
 [run.profile.local]
-surfaces = ["test"]
+actions = ["test"]
 baseline = { kind = "merge-base" }
 
 [run.profile.ci]
-surfaces = ["build", "test"]
+actions = ["build", "test"]
 baseline = { kind = "merge-base" }

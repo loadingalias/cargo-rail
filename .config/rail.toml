@@ -49,4 +49,4 @@ infrastructure = [
 default_profile = "local"
 
 [run.profile.commit]
-surfaces = ["build", "test"]
+actions = ["build", "test"]

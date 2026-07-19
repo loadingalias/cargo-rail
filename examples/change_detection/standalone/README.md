@@ -6,7 +6,7 @@ Use this pattern when CI should pass planner-selected package arguments directly
 
 ```bash
 cargo rail plan --merge-base --explain
-cargo rail run --merge-base --surface test
+cargo rail run --merge-base --action test
 cargo rail run --merge-base --dry-run --print-cmd
 ```
 
@@ -31,12 +31,19 @@ cargo rail run --merge-base --dry-run --print-cmd
   run: cargo build $CARGO_ARGS
 ```
 
-## Built-in Surfaces
+## Built-in Actions
 
 - `build`
 - `test`
 - `bench`
 - `docs`
-- `infra` for gating only
+- `format`
+- `lint`
+- `msrv`
+- `package`
+- `audit`
+- `distribution`
+
+`infra` remains a planner surface for gating configured repository actions; it is not executable itself.
 
 Use `cargo rail run` instead when profiles, test-runner selection, or decision receipts should be owned by cargo-rail.

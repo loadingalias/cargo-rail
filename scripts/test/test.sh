@@ -61,12 +61,12 @@ fi
 echo "Testing affected crates..."
 if [ "$MODE" = "commit" ]; then
   # CI mode: force commit profile and nextest JUnit output path.
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test --explain \
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --action test --explain \
     --test-runner nextest \
     --nextest-arg=-P \
     --nextest-arg="$NEXTEST_PROFILE" \
     --nextest-arg=--config-file \
     --nextest-arg=.config/nextest.toml
 else
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface test --explain
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --action test --explain
 fi

@@ -23,7 +23,11 @@ pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
   Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, RequireChangeFiles, SemverCheckPolicy,
 };
-pub use run::{RunBaseline, RunConfig, RunProfile, is_builtin_profile};
+pub(crate) use run::{BUILTIN_ACTION_NAMES, MAX_ACTIONS, first_repository_output_overlap};
+pub use run::{
+  CargoEnvironmentValue, RepositoryAction, RepositoryActionKind, RepositoryEnvironment, RepositoryEnvironmentEntry,
+  RepositoryPackageSelection, RunBaseline, RunConfig, RunProfile, is_builtin_profile,
+};
 pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use unify::{
   ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource, TransitiveFeatureHost,

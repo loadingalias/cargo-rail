@@ -5,7 +5,10 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat};
+use super::common::{
+  ActionOutputFormat, ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
+};
+use super::run::GeneratedMode;
 use crate::sync::ConflictStrategy;
 use crate::test::runner::TestRunnerPreference;
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
@@ -74,14 +77,17 @@ pub struct RailCli {
 
 const RUN_HELP: &str = "\
 Examples:
-  cargo rail run                              # Execute planner-selected test surface
+  cargo rail run                              # Execute planner-selected test action
   cargo rail run --merge-base                 # Compare from branch point (CI)
-  cargo rail run --surface build --surface test
+  cargo rail run --action build --action test
   cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
   cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
   cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
-  cargo rail run --all --surface test         # Force full test run
+  cargo rail run --all --action test          # Force full test run
   cargo rail run --dry-run --print-cmd        # Preview exact execution
+  cargo rail run --dry-run -f json            # Versioned CI action plan
+  cargo rail run --dry-run -f github          # GitHub Actions key=value plan
+  cargo rail run --action codegen --generated check
   cargo rail run --test-filter parser         # Portable test-name filter
   cargo rail run --cargo-test-arg=--all-features --test-runner cargo
   cargo rail run --nextest-arg=-P --nextest-arg=commit
@@ -232,7 +238,7 @@ Installation:
 /// Available subcommands
 #[derive(Subcommand)]
 pub enum Commands {
-  /// Execute planner-selected surfaces
+  /// Execute planner-selected actions
   #[command(after_long_help = RUN_HELP)]
   Run {
     /// Git ref to compare against (auto-detects default branch)
@@ -244,22 +250,28 @@ pub enum Commands {
     /// Skip change detection and run all workspace crates
     #[arg(long, short = 'a')]
     all: bool,
-    /// Surface(s) to execute (repeatable)
-    #[arg(long = "surface", value_name = "SURFACE")]
-    surfaces: Vec<String>,
-    /// Named profile to map to one or more surfaces
-    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["surfaces", "workflow"])]
+    /// Action(s) to execute (repeatable; --surface is a compatibility alias)
+    #[arg(long = "action", visible_alias = "surface", value_name = "ACTION")]
+    actions: Vec<String>,
+    /// Named profile to map to one or more actions
+    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["actions", "workflow"])]
     profile: Option<String>,
     /// Named workflow mapped to a profile via `[run.workflow]`
-    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["surfaces", "profile"])]
+    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["actions", "profile"])]
     workflow: Option<String>,
     /// Preview selected execution without spawning subprocesses
     #[arg(long)]
     dry_run: bool,
+    /// Dry-run action plan format (json/github require --dry-run)
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: ActionOutputFormat,
+    /// Generated-output behavior
+    #[arg(long, default_value_t, value_enum)]
+    generated: GeneratedMode,
     /// Print command(s) prior to execution
     #[arg(long)]
     print_cmd: bool,
-    /// Explain why surfaces and targets were selected
+    /// Explain why actions and targets were selected
     #[arg(long)]
     explain: bool,
     /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
@@ -285,7 +297,7 @@ pub enum Commands {
     /// Portable test-name filter placed before the test-binary separator
     #[arg(long, value_name = "FILTER")]
     test_filter: Option<String>,
-    /// Pass harness args after `--` for tests; runner args for other surfaces
+    /// Pass harness args after `--` for tests; runner args for other actions
     #[arg(last = true)]
     run_args: Vec<String>,
   },
@@ -846,6 +858,7 @@ impl Commands {
   /// Used for early JSON mode detection to suppress progress messages.
   pub fn is_json_format(&self) -> bool {
     match self {
+      Commands::Run { format, .. } => format.is_json_like(),
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
       Commands::Unify { format, .. } => format.is_json_like(),
@@ -884,7 +897,6 @@ impl Commands {
   /// of silently emitting text while JSON mode is enabled.
   pub fn apply_json_override(&mut self) -> Result<(), clap::Error> {
     let unsupported = match self {
-      Commands::Run { .. } => Some("run"),
       Commands::Unify { command: Some(_), .. } => Some("unify undo"),
       Commands::Split {
         command: SplitCommand::Init { .. },
@@ -910,6 +922,7 @@ impl Commands {
     }
 
     match self {
+      Commands::Run { format, .. } => *format = ActionOutputFormat::Json,
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
       Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,

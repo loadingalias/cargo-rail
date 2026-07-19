@@ -380,6 +380,10 @@ fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json
       };
       configured.contains_key(&format!("{profile}.since")) || configured.contains_key(&format!("{profile}.merge_base"))
     }
+    path if path.starts_with("run.profile.") && path.ends_with(".actions") => {
+      let profile = path.trim_end_matches(".actions");
+      configured.contains_key(&format!("{profile}.surfaces"))
+    }
     _ => false,
   }
 }
@@ -806,6 +810,7 @@ pub fn run_config_migrate(
   );
   migrate_unify_typed_policies(&mut editor, &mut changes)?;
   migrate_release_remote_effects(&mut editor, &mut changes)?;
+  migrate_run_profile_actions(&mut editor, &mut changes)?;
   migrate_run_profile_baselines(&mut editor, &mut changes)?;
   migrate_removed_field(
     &mut editor,
@@ -1201,6 +1206,59 @@ fn migrate_run_profile_baselines(editor: &mut TomlEditor, changes: &mut Vec<Migr
         });
       }
     }
+  }
+  Ok(())
+}
+
+fn migrate_run_profile_actions(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
+  let profile_names: Vec<String> = editor
+    .doc()
+    .get("run")
+    .and_then(toml_edit::Item::as_table)
+    .and_then(|run| run.get("profile"))
+    .and_then(toml_edit::Item::as_table)
+    .map(|profiles| profiles.iter().map(|(name, _)| name.to_string()).collect())
+    .unwrap_or_default();
+
+  for profile_name in profile_names {
+    let profile = editor
+      .doc_mut()
+      .get_mut("run")
+      .and_then(toml_edit::Item::as_table_mut)
+      .and_then(|run| run.get_mut("profile"))
+      .and_then(toml_edit::Item::as_table_mut)
+      .and_then(|profiles| profiles.get_mut(&profile_name))
+      .and_then(toml_edit::Item::as_table_mut)
+      .ok_or_else(|| RailError::message(format!("run.profile.{profile_name} must be a table")))?;
+    if !profile.contains_key("surfaces") {
+      continue;
+    }
+    if profile.contains_key("actions") {
+      return Err(RailError::with_help(
+        format!("cannot migrate conflicting selection in run.profile.{profile_name}"),
+        "remove either actions or deprecated surfaces so the profile has one ordered action list",
+      ));
+    }
+    let surfaces = profile.remove("surfaces").ok_or_else(|| {
+      RailError::message(format!(
+        "run.profile.{profile_name}.surfaces disappeared during migration"
+      ))
+    })?;
+    let replacement = surfaces
+      .as_value()
+      .map(|value| {
+        let mut value = value.clone();
+        value.decor_mut().clear();
+        value.to_string()
+      })
+      .unwrap_or_else(|| surfaces.to_string());
+    profile.insert("actions", surfaces);
+    changes.push(MigrationChange {
+      kind: "rename",
+      path: format!("run.profile.{profile_name}.surfaces"),
+      replacement: Some(format!("run.profile.{profile_name}.actions = {replacement}")),
+      message: "Executable profile selections are action IDs; planner surfaces remain impact outputs.",
+    });
   }
   Ok(())
 }

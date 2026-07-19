@@ -22,7 +22,7 @@ Docs: https://github.com/loadingalias/cargo-rail
 Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
-  run          Execute planner-selected surfaces
+  run          Execute planner-selected actions
   plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
@@ -63,13 +63,13 @@ Options:
 ## cargo rail run
 
 ```
-Execute planner-selected surfaces
+Execute planner-selected actions
 
 Usage: cargo rail run [OPTIONS] [-- <RUN_ARGS>...]
 
 Arguments:
   [RUN_ARGS]...
-          Pass harness args after `--` for tests; runner args for other surfaces
+          Pass harness args after `--` for tests; runner args for other actions
 
 Options:
   -q, --quiet
@@ -90,14 +90,16 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
-      --surface <SURFACE>
-          Surface(s) to execute (repeatable)
+      --action <ACTION>
+          Action(s) to execute (repeatable; --surface is a compatibility alias)
+
+          [alias: --surface]
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
 
       --profile <PROFILE>
-          Named profile to map to one or more surfaces
+          Named profile to map to one or more actions
 
       --workflow <WORKFLOW>
           Named workflow mapped to a profile via `[run.workflow]`
@@ -105,11 +107,30 @@ Options:
       --dry-run
           Preview selected execution without spawning subprocesses
 
+  -f, --format <FORMAT>
+          Dry-run action plan format (json/github require --dry-run)
+
+          Possible values:
+          - text:   Human-readable execution or preview output (default)
+          - json:   Versioned machine-readable action plan
+          - github: GitHub Actions key/value output containing the ordered action IDs
+
+          [default: text]
+
+      --generated <GENERATED>
+          Generated-output behavior
+
+          Possible values:
+          - check:      Run each generator's read-only staleness check
+          - regenerate: Update each generator's declared outputs
+
+          [default: regenerate]
+
       --print-cmd
           Print command(s) prior to execution
 
       --explain
-          Explain why surfaces and targets were selected
+          Explain why actions and targets were selected
 
       --ignore-bin-crates
           Ignore binary-only crates (packages with `[[bin]]` but no lib target)
@@ -143,14 +164,17 @@ Options:
           Print version
 
 Examples:
-  cargo rail run                              # Execute planner-selected test surface
+  cargo rail run                              # Execute planner-selected test action
   cargo rail run --merge-base                 # Compare from branch point (CI)
-  cargo rail run --surface build --surface test
+  cargo rail run --action build --action test
   cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
   cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
   cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
-  cargo rail run --all --surface test         # Force full test run
+  cargo rail run --all --action test          # Force full test run
   cargo rail run --dry-run --print-cmd        # Preview exact execution
+  cargo rail run --dry-run -f json            # Versioned CI action plan
+  cargo rail run --dry-run -f github          # GitHub Actions key=value plan
+  cargo rail run --action codegen --generated check
   cargo rail run --test-filter parser         # Portable test-name filter
   cargo rail run --cargo-test-arg=--all-features --test-runner cargo
   cargo rail run --nextest-arg=-P --nextest-arg=commit

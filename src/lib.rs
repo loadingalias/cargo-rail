@@ -5,6 +5,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
+pub(crate) mod action;
 /// Backup and restore for undo operations.
 pub mod backup;
 /// Cargo workspace metadata and manifest operations.

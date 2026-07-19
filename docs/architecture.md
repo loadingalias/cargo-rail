@@ -20,6 +20,7 @@ Commands do not reload metadata independently.
 | Layer | Purpose |
 |---|---|
 | `commands/` | CLI handlers and command dispatch |
+| `action` | shell-free action declarations and deterministic request expansion |
 | `workspace/` | `WorkspaceContext` construction and shared state |
 | `graph/` | dependency graph queries |
 | `cargo/` | metadata, manifests, unify logic |
@@ -49,6 +50,14 @@ Commands do not reload metadata independently.
 6. Project the result into execution scope.
 
 `impact` explains the graph calculation. `scope` carries the selected mode, crates, surfaces, and `cargo_args` used by runners.
+
+`cargo rail run` maps planner surfaces to exact built-in or repository actions before starting the first action
+process. Preview, local execution, CI JSON/GitHub plans, and the versioned decision receipt consume the same stable
+topological expansion. Only the process boundary resolves and revalidates repository paths and applies typed
+environment capabilities. The graph rejects missing snapshot identity, duplicate action IDs, unknown or repeated
+dependencies, cycles, output overlap, and path escape before execution. Generated actions have one declared owner and
+separate check/regenerate argv. Current actions remain explicitly ambient and non-reusable; they are not presented as
+hermetic or cache-safe before the later action-key phase.
 
 ## Unify pipeline
 

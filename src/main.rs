@@ -78,7 +78,7 @@ fn run(cli: RailCli) -> RailResult<()> {
 
   let command = match commands::try_dispatch_pre_context(cli.command, &workspace_root, config_override, cli.json) {
     Ok(PreContextDispatch::Handled) => return Ok(()),
-    Ok(PreContextDispatch::NeedsContext(cmd)) => cmd,
+    Ok(PreContextDispatch::NeedsContext(cmd)) => *cmd,
     Err(error) => return Err(error),
   };
 

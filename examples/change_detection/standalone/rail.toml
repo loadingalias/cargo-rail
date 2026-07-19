@@ -29,17 +29,17 @@ nightly = "nightly"
 
 # Local development: just tests
 [run.profile.local]
-surfaces = ["test"]
+actions = ["test"]
 baseline = { kind = "merge-base" }
 
 # CI: build + test
 [run.profile.ci]
-surfaces = ["build", "test"]
+actions = ["build", "test"]
 run_args = ["{cargo_args}"]
 baseline = { kind = "merge-base" }
 
 # Nightly: full validation
 [run.profile.nightly]
-surfaces = ["build", "test", "docs", "bench"]
+actions = ["build", "test", "docs", "bench"]
 run_args = ["{cargo_args}"]
 baseline = { kind = "merge-base" }

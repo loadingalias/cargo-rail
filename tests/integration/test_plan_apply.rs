@@ -319,27 +319,147 @@ fn test_run_emits_decision_receipt() -> Result<()> {
   let ws = TestWorkspace::new_named("run-decision-receipt")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add lib-a")?;
-  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
-  ws.commit("Change lib-a")?;
 
-  let out = run_cargo_rail(&ws.path, &["rail", "run", "--since", "HEAD~1", "--dry-run"])?;
+  let out = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "build",
+      "--surface",
+      "docs",
+      "--dry-run",
+    ],
+  )?;
   assert!(out.status.success(), "run dry-run should succeed");
 
   let receipts_dir = ws.path.join("target/cargo-rail/receipts");
-  let has_decision = std::fs::read_dir(&receipts_dir)?
+  let receipt_path = std::fs::read_dir(&receipts_dir)?
     .filter_map(|entry| entry.ok().map(|e| e.path()))
-    .any(|path| {
+    .find(|path| {
       path
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.starts_with("run-decision-") && n.ends_with(".json"))
         .unwrap_or(false)
-    });
+    })
+    .ok_or_else(|| anyhow::anyhow!("missing run decision receipt in {}", receipts_dir.display()))?;
+  let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
+
+  assert_eq!(receipt["artifact"], "decision_receipt");
+  assert_eq!(receipt["version"], 2);
   assert!(
-    has_decision,
-    "expected run decision receipt in {}",
-    receipts_dir.display()
+    receipt["snapshot_id"]
+      .as_str()
+      .is_some_and(|id| id.starts_with("v1-sha256-")),
+    "receipt must bind actions to the authoritative workspace snapshot"
   );
+  let platform = receipt["actions"][0]["platform"]
+    .as_str()
+    .ok_or_else(|| anyhow::anyhow!("expanded action must record its platform"))?;
+  assert_eq!(
+    receipt["actions"],
+    serde_json::json!([
+      {
+        "id": "build",
+        "kind": "build",
+        "argv": ["cargo", "check", "--workspace"],
+        "working_directory": "workspace",
+        "selected_packages": ["lib-a"],
+        "dependencies": [],
+        "reasons": [{ "kind": "all" }],
+        "package_selector": "workspace_or_selected",
+        "target_selector": "cargo_resolution",
+        "selected_targets": [platform],
+        "selected_features": { "all_features": false, "default_features": true, "named": [] },
+        "platform": platform,
+        "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
+        "outputs": [{ "kind": "ambient_process" }],
+        "environment": { "inherit": true, "entries": [] },
+        "reusable": false
+      },
+      {
+        "id": "docs",
+        "kind": "docs",
+        "argv": ["cargo", "doc", "--workspace", "--no-deps"],
+        "working_directory": "workspace",
+        "selected_packages": [],
+        "dependencies": [],
+        "reasons": [{ "kind": "all" }],
+        "package_selector": "none",
+        "target_selector": "cargo_resolution",
+        "selected_targets": [platform],
+        "selected_features": { "all_features": false, "default_features": true, "named": [] },
+        "platform": platform,
+        "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
+        "outputs": [{ "kind": "ambient_process" }],
+        "environment": { "inherit": true, "entries": [] },
+        "reusable": false
+      }
+    ]),
+    "receipt must contain the exact ordered action expansion"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_run_decision_receipt_binds_actions_to_planner_trace_reasons() -> Result<()> {
+  let ws = TestWorkspace::new_named("run-decision-receipt-planner-reasons")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate("lib-b", "0.1.0", &[])?;
+  ws.commit("Add crates")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+  ws.commit("Change lib-a")?;
+
+  let out = run_cargo_rail(
+    &ws.path,
+    &["rail", "run", "--since", "HEAD~1", "--surface", "build", "--dry-run"],
+  )?;
+  assert!(out.status.success(), "run dry-run should succeed");
+
+  let receipts_dir = ws.path.join("target/cargo-rail/receipts");
+  let receipt_path = std::fs::read_dir(&receipts_dir)?
+    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    .find(|path| {
+      path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("run-decision-") && name.ends_with(".json"))
+    })
+    .ok_or_else(|| anyhow::anyhow!("missing run decision receipt in {}", receipts_dir.display()))?;
+  let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
+
+  assert_eq!(
+    receipt["actions"][0]["argv"],
+    serde_json::json!(["cargo", "check", "-p", "lib-a"])
+  );
+  let action_reasons = receipt["actions"][0]["reasons"]
+    .as_array()
+    .ok_or_else(|| anyhow::anyhow!("action reasons must be an array"))?;
+  assert!(
+    !action_reasons.is_empty(),
+    "planner-enabled action must retain its reasons"
+  );
+  let trace_ids = receipt["plan"]["trace"]
+    .as_array()
+    .ok_or_else(|| anyhow::anyhow!("plan trace must be an array"))?
+    .iter()
+    .filter_map(|reason| reason["id"].as_u64())
+    .collect::<std::collections::BTreeSet<_>>();
+  for reason in action_reasons {
+    assert_eq!(reason["kind"], "planner");
+    assert_eq!(reason["surface"], "build");
+    let trace_id = reason["trace_id"]
+      .as_u64()
+      .ok_or_else(|| anyhow::anyhow!("planner action reason must contain a numeric trace_id"))?;
+    assert!(
+      trace_ids.contains(&trace_id),
+      "expanded action reason {trace_id} must refer to the embedded planner trace"
+    );
+  }
 
   Ok(())
 }

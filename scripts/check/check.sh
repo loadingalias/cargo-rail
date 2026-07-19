@@ -65,7 +65,7 @@ if [ "$FULL_WORKSPACE" = true ]; then
   fi
 else
   echo "Smart checks (affected crates)..."
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --surface build --explain
+  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --action build --explain
   if [ "$FIX_MODE" = true ]; then
     cargo clippy --workspace --all-targets --all-features --locked --fix --allow-dirty -- -D warnings
   else

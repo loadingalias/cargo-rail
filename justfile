@@ -8,10 +8,10 @@ test crate="":
     @scripts/test/test.sh "{{ crate }}"
 
 build:
-    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build --explain
+    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action build --explain
 
 build-release:
-    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface build --explain -- --release
+    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action build --explain -- --release
 
 # Full Workspace Commands (no change detection)
 
@@ -40,8 +40,8 @@ ci-check:
 plan:
     cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
 
-dry-run surface="test":
-    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --surface {{ surface }} --dry-run --print-cmd --explain
+dry-run action="test":
+    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action {{ action }} --dry-run --print-cmd --explain
 
 # Maintenance
 

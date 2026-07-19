@@ -402,18 +402,26 @@ pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
 
 /// Run cargo-rail CLI command
 pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
+  run_cargo_rail_with_env(cwd, args, &[])
+}
+
+/// Run cargo-rail with explicit environment overrides.
+pub fn run_cargo_rail_with_env(cwd: &Path, args: &[&str], environment: &[(&str, &str)]) -> Result<Output> {
   let cargo_rail_bin = env!("CARGO_BIN_EXE_cargo-rail");
 
-  let output = Command::new(cargo_rail_bin)
+  let mut command = Command::new(cargo_rail_bin);
+  command
     .current_dir(cwd)
     .env("GIT_CONFIG_COUNT", "2")
     .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
     .env("GIT_CONFIG_VALUE_0", "false")
     .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
     .env("GIT_CONFIG_VALUE_1", "false")
-    .args(args)
-    .output()
-    .context("Failed to run cargo-rail")?;
+    .args(args);
+  for (name, value) in environment {
+    command.env(name, value);
+  }
+  let output = command.output().context("Failed to run cargo-rail")?;
 
   Ok(output)
 }

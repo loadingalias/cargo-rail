@@ -2,7 +2,7 @@
 //!
 //! Tests the smart test runner with change detection
 
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
 
 #[test]
@@ -127,7 +127,7 @@ fn test_runner_rejects_infra_surface() -> Result<()> {
 
   assert!(!output.status.success(), "infra surface should be rejected");
   assert!(
-    combined.contains("planner output") && combined.contains("build|test|bench|docs"),
+    combined.contains("planner output") && combined.contains("run.action.<name>.when"),
     "expected planner-output rejection. Output:\n{}",
     combined
   );
@@ -492,6 +492,74 @@ fn test_runner_nextest_backend_renders_typed_arguments_in_exact_order() -> Resul
 }
 
 #[test]
+fn test_runner_builtin_actions_render_byte_exact_argv_in_request_order() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-builtin-action-argv")?;
+  let action_crate = ws.add_crate("action-crate", "0.1.0", &[])?;
+  let manifest = std::fs::read_to_string(action_crate.join("Cargo.toml"))?.replace(
+    "authors.workspace = true",
+    "authors.workspace = true\nrust-version = \"1.95\"",
+  );
+  std::fs::write(action_crate.join("Cargo.toml"), manifest)?;
+  ws.commit("Add crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--surface",
+      "build",
+      "--surface",
+      "test",
+      "--surface",
+      "bench",
+      "--surface",
+      "docs",
+      "--action",
+      "format",
+      "--action",
+      "lint",
+      "--action",
+      "msrv",
+      "--action",
+      "package",
+      "--action",
+      "audit",
+      "--action",
+      "distribution",
+      "--test-runner",
+      "cargo",
+      "--dry-run",
+    ],
+  )?;
+
+  assert!(
+    output.status.success(),
+    "built-in action preview should succeed. Stderr:\n{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert_eq!(
+    String::from_utf8(output.stdout)?,
+    concat!(
+      "build: cargo check --workspace\n",
+      "test: cargo test -p action-crate\n",
+      "bench: cargo bench --workspace\n",
+      "docs: cargo doc --workspace --no-deps\n",
+      "format: cargo fmt --all --check\n",
+      "lint: cargo clippy --workspace --all-targets --all-features -- -D warnings\n",
+      "msrv: cargo +1.95.0 check --workspace --all-targets --all-features --locked\n",
+      "package: cargo package --workspace --locked\n",
+      "audit: cargo deny check all\n",
+      "distribution: cargo build --workspace --release --locked\n",
+    ),
+    "built-in action order and argv are a byte-exact CLI contract"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_runner_rejects_backend_argument_mismatch_before_spawn() -> Result<()> {
   let ws = TestWorkspace::new_named("test-backend-argument-mismatch")?;
   ws.add_crate("typed-crate", "0.1.0", &[])?;
@@ -504,8 +572,9 @@ fn test_runner_rejects_backend_argument_mismatch_before_spawn() -> Result<()> {
       "run",
       "--all",
       "--surface",
+      "docs",
+      "--surface",
       "test",
-      "--dry-run",
       "--test-runner",
       "cargo",
       "--nextest-arg=-P",
@@ -518,6 +587,10 @@ fn test_runner_rejects_backend_argument_mismatch_before_spawn() -> Result<()> {
     stderr.contains("nextest options cannot be used with cargo test"),
     "diagnostic should name both incompatible domains. Stderr:\n{}",
     stderr
+  );
+  assert!(
+    !ws.path.join("target/doc").exists(),
+    "every action must expand successfully before an earlier subprocess can start"
   );
 
   Ok(())
@@ -901,6 +974,357 @@ fn test_runner_workspace_root_applies_to_spawned_subprocesses() -> Result<()> {
     "build command should execute via run surface. Output:\n{}",
     stdout
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_repository_generated_actions_check_regenerate_order_and_redaction() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-repository-generated-actions")?;
+  let helper = ws.add_crate("action-helper", "0.1.0", &[])?;
+  std::fs::write(
+    helper.join("src/main.rs"),
+    r#"use std::path::Path;
+
+fn main() {
+  let mut args = std::env::args().skip(1);
+  let mode = args.next().expect("mode");
+  let action = args.next().expect("action");
+  let root = std::env::var("WORKSPACE_ROOT").expect("WORKSPACE_ROOT");
+  let policy = std::env::var("ACTION_POLICY").expect("ACTION_POLICY");
+  assert!(std::env::var_os("TEST_ACTION_SECRET").is_some());
+  let output = Path::new(&root).join("generated").join(format!("{action}.txt"));
+  let cwd = std::env::current_dir().expect("current directory");
+  let expected = format!("action={action}\npolicy={policy}\ncwd={}\n", cwd.display());
+  if mode == "check" {
+    let current = std::fs::read_to_string(&output).unwrap_or_default();
+    if current != expected {
+      eprintln!("generated output is stale: {}", output.display());
+      std::process::exit(1);
+    }
+  } else {
+    std::fs::create_dir_all(output.parent().expect("output parent")).expect("create output directory");
+    std::fs::write(output, expected).expect("write generated output");
+  }
+}
+"#,
+  )?;
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[run.action.prepare]
+kind = "generated"
+argv = ["cargo", "run", "--quiet", "-p", "action-helper", "--", "regenerate", "prepare"]
+check_argv = ["cargo", "run", "--quiet", "-p", "action-helper", "--", "check", "prepare"]
+when = ["build"]
+working_directory = "crates/action-helper"
+inputs = ["Cargo.toml", "crates/action-helper/src"]
+outputs = ["generated/prepare.txt"]
+
+[run.action.prepare.environment]
+inherit = true
+entries = [
+  { kind = "fixed", name = "ACTION_POLICY", value = "typed" },
+  { kind = "cargo", name = "WORKSPACE_ROOT", value = "workspace-root" },
+  { kind = "secret", name = "TEST_ACTION_SECRET" },
+]
+
+[run.action.finish]
+kind = "generated"
+argv = ["cargo", "run", "--quiet", "-p", "action-helper", "--", "regenerate", "finish"]
+check_argv = ["cargo", "run", "--quiet", "-p", "action-helper", "--", "check", "finish"]
+dependencies = ["prepare"]
+when = ["build"]
+working_directory = "crates/action-helper"
+inputs = ["Cargo.toml", "crates/action-helper/src"]
+outputs = ["generated/finish.txt"]
+
+[run.action.finish.environment]
+inherit = true
+entries = [
+  { kind = "fixed", name = "ACTION_POLICY", value = "typed" },
+  { kind = "cargo", name = "WORKSPACE_ROOT", value = "workspace-root" },
+  { kind = "secret", name = "TEST_ACTION_SECRET" },
+]
+
+[run.profile.pipeline]
+actions = ["finish"]
+"#,
+  )?;
+  ws.commit("Add generated action pipeline")?;
+
+  const SECRET: &str = "must-not-enter-action-plans-or-receipts";
+  let regenerate = run_cargo_rail_with_env(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--profile",
+      "pipeline",
+      "--generated",
+      "regenerate",
+      "--print-cmd",
+    ],
+    &[("TEST_ACTION_SECRET", SECRET)],
+  )?;
+  let stdout = String::from_utf8_lossy(&regenerate.stdout);
+  assert!(regenerate.status.success(), "generator pipeline failed:\n{stdout}");
+  let prepare_index = stdout.find("prepare: cargo run").expect("prepare preview");
+  let finish_index = stdout.find("finish: cargo run").expect("finish preview");
+  assert!(prepare_index < finish_index, "dependency must run before its owner");
+  for action in ["prepare", "finish"] {
+    let output = std::fs::read_to_string(ws.path.join(format!("generated/{action}.txt")))?;
+    assert!(output.contains(&format!("action={action}\npolicy=typed\n")));
+    assert!(output.replace('\\', "/").contains("/crates/action-helper\n"));
+  }
+
+  let explained = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--profile",
+      "pipeline",
+      "--dry-run",
+      "--explain",
+    ],
+  )?;
+  let explained_stdout = String::from_utf8_lossy(&explained.stdout);
+  assert!(explained.status.success());
+  assert!(explained_stdout.contains("action `prepare` owns: generated/prepare.txt"));
+  assert!(explained_stdout.contains("action `finish` owns: generated/finish.txt"));
+
+  let ci_plan = run_cargo_rail_with_env(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--profile",
+      "pipeline",
+      "--generated",
+      "check",
+      "--dry-run",
+      "--format",
+      "json",
+    ],
+    &[("TEST_ACTION_SECRET", SECRET)],
+  )?;
+  assert!(ci_plan.status.success());
+  assert!(!String::from_utf8_lossy(&ci_plan.stdout).contains(SECRET));
+  let ci_plan: serde_json::Value = serde_json::from_slice(&ci_plan.stdout)?;
+  let ci_ids = ci_plan["actions"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|action| action["id"].as_str().unwrap())
+    .collect::<Vec<_>>();
+  assert_eq!(ci_ids, ["prepare", "finish"]);
+  assert!(
+    ci_plan["actions"][0]["argv"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|arg| arg == "check")
+  );
+
+  let check = run_cargo_rail_with_env(
+    &ws.path,
+    &["rail", "run", "--all", "--profile", "pipeline", "--generated", "check"],
+    &[("TEST_ACTION_SECRET", SECRET)],
+  )?;
+  assert!(check.status.success(), "fresh generated outputs should pass check");
+
+  std::fs::write(ws.path.join("generated/prepare.txt"), "stale\n")?;
+  let stale = run_cargo_rail_with_env(
+    &ws.path,
+    &["rail", "run", "--all", "--profile", "pipeline", "--generated", "check"],
+    &[("TEST_ACTION_SECRET", SECRET)],
+  )?;
+  assert_eq!(stale.status.code(), Some(1), "stale generated output must exit one");
+
+  let receipts = std::fs::read_dir(ws.path.join("target/cargo-rail/receipts"))?
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| entry.file_name().to_string_lossy().starts_with("run-decision-"))
+    .map(|entry| std::fs::read_to_string(entry.path()))
+    .collect::<std::io::Result<Vec<_>>>()?;
+  assert!(receipts.iter().any(|receipt| receipt.contains("TEST_ACTION_SECRET")));
+  assert!(receipts.iter().all(|receipt| !receipt.contains(SECRET)));
+
+  Ok(())
+}
+
+#[test]
+fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-ci-action-plan")?;
+  ws.add_crate("plan-crate", "0.1.0", &[])?;
+  ws.commit("Add plan crate")?;
+  let base = [
+    "rail",
+    "run",
+    "--all",
+    "--action",
+    "lint",
+    "--action",
+    "build",
+    "--dry-run",
+  ];
+
+  let local = run_cargo_rail(&ws.path, &base)?;
+  let local_stdout = String::from_utf8_lossy(&local.stdout);
+  assert!(local.status.success());
+  assert!(local_stdout.find("lint: cargo clippy").unwrap() < local_stdout.find("build: cargo check").unwrap());
+
+  let mut json_args = base.to_vec();
+  json_args.extend(["--format", "json"]);
+  let first_json = run_cargo_rail(&ws.path, &json_args)?;
+  let second_json = run_cargo_rail(&ws.path, &json_args)?;
+  assert!(first_json.status.success());
+  assert_eq!(
+    first_json.stdout, second_json.stdout,
+    "identical action plans must be byte stable"
+  );
+  let json: serde_json::Value = serde_json::from_slice(&first_json.stdout)?;
+  let ids = json["actions"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|action| action["id"].as_str().unwrap())
+    .collect::<Vec<_>>();
+  assert_eq!(ids, ["lint", "build"]);
+  assert_eq!(json["actions"][0]["selected_features"]["all_features"], true);
+  assert_eq!(json["actions"][1]["selected_features"]["default_features"], true);
+
+  let mut github_args = base.to_vec();
+  github_args.extend(["--format", "github"]);
+  let github = run_cargo_rail(&ws.path, &github_args)?;
+  assert!(
+    github.status.success(),
+    "GitHub action plan failed: {}",
+    String::from_utf8_lossy(&github.stderr)
+  );
+  let github_stdout = String::from_utf8_lossy(&github.stdout);
+  let github_ids = github_stdout
+    .lines()
+    .find_map(|line| line.strip_prefix("action_ids_json="))
+    .expect("GitHub action IDs");
+  assert_eq!(serde_json::from_str::<Vec<String>>(github_ids)?, ids);
+
+  let executing_json = run_cargo_rail(
+    &ws.path,
+    &["rail", "run", "--all", "--action", "build", "--format", "json"],
+  )?;
+  assert!(!executing_json.status.success());
+  assert!(
+    String::from_utf8_lossy(&executing_json.stderr).contains("dry-run")
+      || String::from_utf8_lossy(&executing_json.stdout).contains("dry-run")
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_test_action_features_follow_backend_arguments_not_harness_arguments() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-test-feature-domain")?;
+  ws.add_crate("feature-crate", "0.1.0", &[])?;
+  ws.commit("Add feature crate")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "test",
+      "--test-runner",
+      "cargo",
+      "--cargo-test-arg=--no-default-features",
+      "--cargo-test-arg=--features",
+      "--cargo-test-arg=backend-feature",
+      "--cargo-test-arg=--target=x86_64-unknown-linux-gnu",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--features",
+      "harness-feature",
+      "--target=wasm32-unknown-unknown",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "action plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let features = &json["actions"][0]["selected_features"];
+  assert_eq!(features["all_features"], false);
+  assert_eq!(features["default_features"], false);
+  assert_eq!(features["named"], serde_json::json!(["backend-feature"]));
+  assert_eq!(
+    json["actions"][0]["selected_targets"],
+    serde_json::json!(["x86_64-unknown-linux-gnu"])
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_repository_output_collision_fails_before_any_action_process() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-repository-output-collision")?;
+  ws.add_crate("collision-crate", "0.1.0", &[])?;
+  std::fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[run.action.first]
+kind = "generated"
+argv = ["definitely-not-an-executable", "regenerate"]
+check_argv = ["definitely-not-an-executable", "check"]
+when = ["build"]
+outputs = ["generated"]
+
+[run.action.second]
+kind = "generated"
+argv = ["definitely-not-an-executable", "regenerate"]
+check_argv = ["definitely-not-an-executable", "check"]
+when = ["build"]
+outputs = ["generated/nested"]
+
+[run.profile.collision]
+actions = ["first", "second"]
+"#,
+  )?;
+  ws.commit("Add colliding generated actions")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "run", "--all", "--profile", "collision"])?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(!output.status.success());
+  assert!(
+    stderr.contains("overlaps"),
+    "graph validation must report the collision: {stderr}"
+  );
+  assert!(
+    !stderr.contains("definitely-not-an-executable failed"),
+    "no action may spawn before whole-graph validation"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_all_action_preview_does_not_require_git_without_base_ref_inputs() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-all-no-git")?;
+  ws.add_crate("filesystem-crate", "0.1.0", &[])?;
+  std::fs::remove_dir_all(ws.path.join(".git"))?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "run", "--all", "--action", "build", "--dry-run"])?;
+  assert!(
+    output.status.success(),
+    "all-mode actions without base-ref inputs must work in Cargo-only trees: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert_eq!(String::from_utf8(output.stdout)?, "build: cargo check --workspace\n");
 
   Ok(())
 }

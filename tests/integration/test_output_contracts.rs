@@ -83,7 +83,6 @@ fn test_unsupported_output_formats_fail_during_cli_parsing() -> Result<()> {
 fn test_global_json_rejects_commands_without_structured_contracts() -> Result<()> {
   let ws = TestWorkspace::new_named("global-json-domains")?;
   let cases: &[(&str, &[&str])] = &[
-    ("run", &["rail", "--json", "run", "--dry-run"]),
     ("unify undo", &["rail", "--json", "unify", "undo", "--list"]),
     ("split init", &["rail", "--json", "split", "init"]),
     ("release init", &["rail", "--json", "release", "init"]),
@@ -110,6 +109,26 @@ fn test_global_json_rejects_commands_without_structured_contracts() -> Result<()
       "{command} should not write stdout on parse failure"
     );
   }
+
+  Ok(())
+}
+
+#[test]
+fn test_global_json_emits_non_executing_run_action_plan() -> Result<()> {
+  let ws = TestWorkspace::new_named("global-json-run-plan")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "--json", "run", "--all", "--action", "build", "--dry-run"],
+  )?;
+  assert!(output.status.success(), "run JSON plan failed");
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["command"], "run");
+  assert_eq!(json["mode"], "plan");
+  assert_eq!(json["artifact"], "action_plan");
+  assert_eq!(json["actions"][0]["id"], "build");
 
   Ok(())
 }

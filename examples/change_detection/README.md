@@ -9,7 +9,7 @@ Choose the execution owner:
 
 ```bash
 cargo rail plan --merge-base --explain
-cargo rail run --merge-base --surface test
+cargo rail run --merge-base --action test
 ```
 
 `scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced that selection.
