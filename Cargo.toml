@@ -17,6 +17,7 @@ categories = [
 keywords = ["monorepo", "workspace", "changesets", "release", "cicd"]
 readme = "README.md"
 include = [
+    "/build.rs",
     "/src/**/*.rs",
     "/schemas/**",
     "/tests/**",
