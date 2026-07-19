@@ -1,7 +1,7 @@
 name: Bootstrap CI (No Change Detection)
 
-# Manual trigger only - escape hatch for testing cargo-rail changes
-# without dogfooding cargo-rail-action
+# Manual exact-ref gate for planner or configuration protocol changes.
+# Bootstrap the candidate SHA, release it, then pin commit.yaml before restoring normal dogfooding.
 on:
   workflow_dispatch:
     inputs:
