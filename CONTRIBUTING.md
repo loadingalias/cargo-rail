@@ -19,10 +19,10 @@ just test
 `just check` is read-only. Run `just fix` when you explicitly want rustfmt and
 Clippy to rewrite the worktree.
 
-Use the full variants after changing features, dependency resolution, or target-specific behavior:
+`just check` is always workspace-wide. Run the full test suite after changing features, dependency resolution, or
+target-specific behavior:
 
 ```bash
-just check-all
 just test-all
 ```
 

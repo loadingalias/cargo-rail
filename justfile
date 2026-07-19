@@ -11,12 +11,9 @@ build:
     @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action build --explain
 
 build-release:
-    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action build --explain -- --release
+    cargo build --workspace --all-targets --all-features --release --locked
 
 # Full Workspace Commands (no change detection)
-
-check-all:
-    @scripts/check/check.sh --all
 
 test-all:
     @scripts/test/test.sh --all
@@ -33,7 +30,7 @@ gen-fixture members output:
 # CI Commands (for GitHub Actions)
 
 ci-check:
-    @scripts/check/check.sh --all
+    @scripts/check/check.sh
 
 # Explainability
 

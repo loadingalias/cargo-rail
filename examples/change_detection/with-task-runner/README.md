@@ -25,7 +25,7 @@ fi
 - uses: loadingalias/cargo-rail-action@v5.1.0
   id: rail
   with:
-    version: 0.17.1
+    version: 0.18.0
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'

@@ -24,6 +24,10 @@ fn test_documented_frontdoor_commands_smoke() -> Result<()> {
   let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
   let readme = std::fs::read_to_string(repo_root.join("README.md"))?;
   let justfile = std::fs::read_to_string(repo_root.join("justfile"))?;
+  assert!(
+    justfile.contains("cargo build --workspace --all-targets --all-features --release --locked"),
+    "just build-release should produce the complete release artifact set"
+  );
   let cases = [
     SmokeCase {
       name: "README plan",
@@ -48,21 +52,6 @@ fn test_documented_frontdoor_commands_smoke() -> Result<()> {
       args: &["rail", "run", "--merge-base", "--action", "build", "--dry-run"],
       readme_snippet: None,
       justfile_snippet: Some("rail run --merge-base --action build"),
-    },
-    SmokeCase {
-      name: "just build-release",
-      args: &[
-        "rail",
-        "run",
-        "--merge-base",
-        "--action",
-        "build",
-        "--dry-run",
-        "--",
-        "--release",
-      ],
-      readme_snippet: None,
-      justfile_snippet: Some("rail run --merge-base --action build --explain -- --release"),
     },
     SmokeCase {
       name: "just plan",
