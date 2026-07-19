@@ -70,9 +70,9 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
       .is_some_and(|identity| identity.starts_with("v1-sha256-")),
     "current plan commands must expose one versioned authoritative identity"
   );
-  assert_eq!(counters["cargo_metadata_loads"], 1);
+  assert_eq!(counters["cargo_metadata_loads"], 2);
   assert_eq!(counters["cargo_metadata_cache_hits"], 0);
-  assert_eq!(counters["target_view_loads"], 0);
+  assert_eq!(counters["target_view_loads"], 1);
   assert!(counters["hash_operations"].as_u64().is_some_and(|count| count >= 3));
   assert!(counters["hash_input_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
   assert!(
@@ -81,14 +81,14 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
       .is_some_and(|bytes| bytes > 0)
   );
   assert_eq!(counters["git_subprocesses"], 11);
-  assert_eq!(counters["graph_traversals"], 2);
-  assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 4));
-  assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 2));
+  assert_eq!(counters["graph_traversals"], 1);
+  assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 2));
+  assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 1));
   Ok(())
 }
 
 #[test]
-fn unchanged_plan_and_run_share_snapshot_without_native_or_target_reloads() -> Result<()> {
+fn unchanged_plan_skips_impact_resolution_while_run_binds_one_exact_host_view() -> Result<()> {
   let ws = TestWorkspace::new_named("diagnostic-shared-snapshot")?;
   ws.add_crate("member", "0.1.0", &[])?;
   let lockfile = Command::new("cargo")
@@ -133,11 +133,12 @@ fn unchanged_plan_and_run_share_snapshot_without_native_or_target_reloads() -> R
   let plan = read_counters(&plan_diagnostics)?;
   let run = read_counters(&run_diagnostics)?;
   assert_eq!(plan["snapshot_id"], run["snapshot_id"]);
-  for counters in [&plan, &run] {
-    assert_eq!(counters["cargo_metadata_loads"], 1);
-    assert_eq!(counters["cargo_metadata_cache_hits"], 0);
-    assert_eq!(counters["target_view_loads"], 0);
-  }
+  assert_eq!(plan["cargo_metadata_loads"], 1);
+  assert_eq!(plan["cargo_metadata_cache_hits"], 0);
+  assert_eq!(plan["target_view_loads"], 0);
+  assert_eq!(run["cargo_metadata_loads"], 2);
+  assert_eq!(run["cargo_metadata_cache_hits"], 0);
+  assert_eq!(run["target_view_loads"], 1);
   Ok(())
 }
 

@@ -269,24 +269,28 @@ Unify workspace dependencies (replaces workspace-hack crates)
 Usage: cargo rail unify [OPTIONS] [COMMAND]
 
 Commands:
-  undo  Restore manifests from a previous backup
-  help  Print this message or the help of the given subcommand(s)
+  doctor  Inspect Cargo resolution semantics without changing files
+  undo    Restore manifests from a previous backup
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-  -c, --check
-          Check for pending changes without modifying files (exit 1 when pending)
-
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+  -c, --check
+          Check for pending changes without modifying files (exit 1 when pending)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
       --plan <PATH>
           Apply from a previously generated mutation plan file
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
@@ -296,9 +300,6 @@ Options:
           - json: Machine-readable JSON output
 
           [default: text]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --backup
           Create backups of all modified files
@@ -333,6 +334,44 @@ Examples:
   cargo rail unify --show-diff            # Show manifest changes
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups
+```
+
+---
+
+### cargo rail unify doctor
+
+```
+Inspect Cargo resolution semantics without changing files
+
+Usage: cargo rail unify doctor [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---

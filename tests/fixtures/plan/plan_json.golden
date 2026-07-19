@@ -11,14 +11,12 @@
     }
   ],
   "impact": {
+    "build_transitive_crates": [
+      "lib-b"
+    ],
+    "development_transitive_crates": [],
     "direct_crates": [
       "lib-a"
-    ],
-    "execution_transitive_crates": [
-      "lib-b"
-    ],
-    "transitive_crates": [
-      "lib-b"
     ]
   },
   "inputs": {
@@ -36,7 +34,7 @@
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 3,
+  "plan_contract_version": 4,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",
@@ -50,70 +48,107 @@
     "mode": "workspace",
     "resolved_base": "origin/main",
     "resolved_head": "WORKTREE",
-    "scope_contract_version": 2,
-    "surfaces": {
-      "bench": false,
-      "build": true,
-      "docs": false,
-      "infra": false,
-      "test": true
-    }
+    "scope_contract_version": 3
   },
   "surfaces": {
     "bench": {
       "enabled": false,
-      "reasons": []
+      "reasons": [],
+      "scope": {
+        "cargo_args": [],
+        "crates": [],
+        "mode": "empty"
+      }
     },
     "build": {
       "enabled": true,
       "reasons": [
         3,
         4
-      ]
+      ],
+      "scope": {
+        "cargo_args": [
+          "--workspace"
+        ],
+        "crates": [],
+        "mode": "workspace"
+      }
     },
     "docs": {
       "enabled": false,
-      "reasons": []
+      "reasons": [],
+      "scope": {
+        "cargo_args": [],
+        "crates": [],
+        "mode": "empty"
+      }
     },
     "infra": {
       "enabled": false,
-      "reasons": []
+      "reasons": [],
+      "scope": {
+        "cargo_args": [],
+        "crates": [],
+        "mode": "empty"
+      }
     },
     "test": {
       "enabled": true,
       "reasons": [
         3,
         4
-      ]
+      ],
+      "scope": {
+        "cargo_args": [
+          "--workspace"
+        ],
+        "crates": [],
+        "mode": "workspace"
+      }
     }
   },
   "trace": [
     {
       "code": "CONFIDENCE_PROFILE_BALANCED",
       "description": "Balanced confidence profile active",
-      "id": 1
+      "id": 1,
+      "selected_surfaces": []
     },
     {
       "code": "FILE_OWNS_CRATE_DIRECT",
       "crate": "lib-a",
       "description": "File directly owns a crate",
       "file": "crates/lib-a/src/lib.rs",
-      "id": 2
+      "id": 2,
+      "package_id": "<PACKAGE_ID:lib-a>",
+      "selected_surfaces": []
     },
     {
       "code": "FILE_KIND_RUST_SRC",
       "description": "Rust source file changed",
       "file": "crates/lib-a/src/lib.rs",
       "id": 3,
-      "surface": "build"
+      "selected_surfaces": [
+        "build",
+        "test"
+      ]
     },
     {
+      "alias": "lib_a",
       "code": "TRANSITIVE_DEPENDS_ON_DIRECT",
       "crate": "lib-b",
       "depends_on": "lib-a",
+      "depends_on_package_id": "<PACKAGE_ID:lib-a>",
       "description": "Transitive dependency of changed crate",
+      "edge_kind": "normal",
       "id": 4,
-      "surface": "build"
+      "optional": false,
+      "package_id": "<PACKAGE_ID:lib-b>",
+      "selected_surfaces": [
+        "build",
+        "test"
+      ],
+      "uses_default_features": true
     }
   ]
 }

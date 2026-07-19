@@ -279,8 +279,8 @@ fn test_runner_auto_detect_base_ref() -> Result<()> {
 }
 
 #[test]
-fn test_runner_config_file_changes() -> Result<()> {
-  // Test that Cargo.toml changes are detected
+fn test_runner_ignores_manifest_formatting_only_changes() -> Result<()> {
+  // Formatting-only Cargo.toml changes have no compilation impact.
   let ws = TestWorkspace::new()?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add lib-a")?;
@@ -296,13 +296,12 @@ fn test_runner_config_file_changes() -> Result<()> {
   ws.commit("Modify Cargo.toml")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "run", "--since", "baseline"])?;
-  let stderr = String::from_utf8_lossy(&output.stderr);
+  let stdout = String::from_utf8_lossy(&output.stdout);
 
-  // Config changes should trigger testing
+  assert!(output.status.success(), "formatting-only plan should succeed");
   assert!(
-    stderr.contains("lib-a"),
-    "Cargo.toml changes should trigger testing. Output:\n{}",
-    stderr
+    stdout.contains("no test targets"),
+    "formatting-only Cargo.toml changes must not trigger testing. Output:\n{stdout}"
   );
 
   Ok(())
@@ -640,6 +639,215 @@ fn test_runner_build_surface_uses_planner_selected_packages() -> Result<()> {
     stdout
   );
 
+  Ok(())
+}
+
+#[test]
+fn test_runner_refines_optional_impact_for_the_action_feature_view() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-optional-feature-view")?;
+  ws.add_crate("optional-a", "0.1.0", &[])?;
+  let optional_b = ws.add_crate("optional-b", "0.1.0", &[])?;
+  std::fs::write(
+    optional_b.join("Cargo.toml"),
+    r#"[package]
+name = "optional-b"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+with-a = ["dep:optional-a"]
+
+[dependencies]
+optional-a = { path = "../optional-a", optional = true }
+"#,
+  )?;
+  ws.commit("add optional dependency")?;
+  ws.modify_file("optional-a", "src/lib.rs", "pub fn changed() {}\n")?;
+
+  let default = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "HEAD",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+    ],
+  )?;
+  assert!(default.status.success(), "default action plan failed");
+  let default: serde_json::Value = serde_json::from_slice(&default.stdout)?;
+  assert_eq!(
+    default["actions"][0]["selected_packages"],
+    serde_json::json!(["optional-a"])
+  );
+
+  let all_features = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "HEAD",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--all-features",
+    ],
+  )?;
+  assert!(
+    all_features.status.success(),
+    "all-feature action plan failed: {}",
+    String::from_utf8_lossy(&all_features.stderr)
+  );
+  let all_features: serde_json::Value = serde_json::from_slice(&all_features.stdout)?;
+  assert_eq!(
+    all_features["actions"][0]["selected_packages"],
+    serde_json::json!(["optional-a", "optional-b"])
+  );
+  assert_eq!(
+    all_features["actions"][0]["resolution_views"][0]["features"]["all_features"],
+    true
+  );
+  Ok(())
+}
+
+#[test]
+fn test_runner_refines_target_impact_for_the_action_target_view() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-target-view")?;
+  ws.add_crate("target-a", "0.1.0", &[])?;
+  let target_b = ws.add_crate("target-b", "0.1.0", &[])?;
+  std::fs::write(
+    target_b.join("Cargo.toml"),
+    r#"[package]
+name = "target-b"
+version = "0.1.0"
+edition.workspace = true
+
+[target.'thumbv7em-none-eabihf'.dependencies]
+target-a = { path = "../target-a" }
+"#,
+  )?;
+  ws.commit("add target dependency")?;
+  ws.modify_file("target-a", "src/lib.rs", "pub fn changed() {}\n")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "HEAD",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--target",
+      "thumbv7em-none-eabihf",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "target action plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(
+    json["actions"][0]["selected_packages"],
+    serde_json::json!(["target-a", "target-b"])
+  );
+  assert_eq!(
+    json["actions"][0]["resolution_views"][0]["target"],
+    "thumbv7em-none-eabihf"
+  );
+  Ok(())
+}
+
+#[test]
+fn test_runner_activates_target_only_lock_impact_in_the_action_view() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-target-lock-view")?;
+  let consumer = ws.add_crate("target-consumer", "0.1.0", &[])?;
+  ws.add_crate("target-unrelated", "0.1.0", &[])?;
+  std::fs::write(
+    consumer.join("Cargo.toml"),
+    r#"[package]
+name = "target-consumer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[target.'thumbv7em-none-eabihf'.dependencies]
+anyhow.workspace = true
+"#,
+  )?;
+  let lockfile = std::process::Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  assert!(
+    lockfile.status.success(),
+    "offline lockfile generation failed: {}",
+    String::from_utf8_lossy(&lockfile.stderr)
+  );
+  let lock_path = ws.path.join("Cargo.lock");
+  let valid_lock = std::fs::read_to_string(&lock_path)?;
+  let checksum_prefix = "checksum = \"";
+  let checksum_start = valid_lock
+    .find(checksum_prefix)
+    .map(|index| index + checksum_prefix.len())
+    .ok_or_else(|| anyhow::anyhow!("fixture lockfile has no registry checksum"))?;
+  let checksum_end = valid_lock[checksum_start..]
+    .find('"')
+    .map(|index| checksum_start + index)
+    .ok_or_else(|| anyhow::anyhow!("fixture lockfile has an unterminated checksum"))?;
+  let mut baseline_lock = valid_lock.clone();
+  baseline_lock.replace_range(checksum_start..checksum_end, &"0".repeat(checksum_end - checksum_start));
+  std::fs::write(&lock_path, baseline_lock)?;
+  ws.commit("record previous target dependency checksum")?;
+  std::fs::write(&lock_path, valid_lock)?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--since",
+      "HEAD",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--target",
+      "thumbv7em-none-eabihf",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "target lock action plan failed:\nstdout: {}\nstderr: {}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(
+    json["actions"][0]["selected_packages"],
+    serde_json::json!(["target-consumer"])
+  );
+  assert_eq!(
+    json["actions"][0]["resolution_views"][0]["target"],
+    "thumbv7em-none-eabihf"
+  );
   Ok(())
 }
 
@@ -1186,6 +1394,7 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
     "identical action plans must be byte stable"
   );
   let json: serde_json::Value = serde_json::from_slice(&first_json.stdout)?;
+  assert_eq!(json["version"], 2);
   let ids = json["actions"]
     .as_array()
     .unwrap()
@@ -1195,6 +1404,19 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
   assert_eq!(ids, ["lint", "build"]);
   assert_eq!(json["actions"][0]["selected_features"]["all_features"], true);
   assert_eq!(json["actions"][1]["selected_features"]["default_features"], true);
+  for action in json["actions"].as_array().expect("actions should be an array") {
+    let binding = action["resolution_views"]
+      .as_array()
+      .and_then(|bindings| bindings.first())
+      .expect("Cargo actions must bind an exact resolution view");
+    assert!(binding["root_package_ids"].as_array().is_some_and(|packages| {
+      packages
+        .iter()
+        .any(|package| package.as_str().is_some_and(|id| id.contains("plan-crate")))
+    }));
+    assert!(binding["target"].as_str().is_some());
+    assert!(binding["resolved_node_count"].as_u64().is_some_and(|count| count > 0));
+  }
 
   let mut github_args = base.to_vec();
   github_args.extend(["--format", "github"]);
@@ -1227,7 +1449,11 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
 #[test]
 fn test_test_action_features_follow_backend_arguments_not_harness_arguments() -> Result<()> {
   let ws = TestWorkspace::new_named("test-run-test-feature-domain")?;
-  ws.add_crate("feature-crate", "0.1.0", &[])?;
+  let feature_crate = ws.add_crate("feature-crate", "0.1.0", &[])?;
+  let manifest_path = feature_crate.join("Cargo.toml");
+  let mut manifest = std::fs::read_to_string(&manifest_path)?;
+  manifest.push_str("\n[features]\nbackend-feature = []\n");
+  std::fs::write(manifest_path, manifest)?;
   ws.commit("Add feature crate")?;
 
   let output = run_cargo_rail(
@@ -1266,6 +1492,48 @@ fn test_test_action_features_follow_backend_arguments_not_harness_arguments() ->
   assert_eq!(
     json["actions"][0]["selected_targets"],
     serde_json::json!(["x86_64-unknown-linux-gnu"])
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_build_action_uses_effective_cargo_build_target() -> Result<()> {
+  let ws = TestWorkspace::new_named("test-run-build-target")?;
+  ws.add_crate("targeted-crate", "0.1.0", &[])?;
+  std::fs::create_dir_all(ws.path.join(".cargo"))?;
+  std::fs::write(
+    ws.path.join(".cargo/config.toml"),
+    "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+  )?;
+  ws.commit("Select the Cargo build target")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "action plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(
+    json["actions"][0]["selected_targets"],
+    serde_json::json!(["wasm32-unknown-unknown"])
+  );
+  assert_eq!(
+    json["actions"][0]["resolution_views"][0]["target"],
+    "wasm32-unknown-unknown"
   );
 
   Ok(())

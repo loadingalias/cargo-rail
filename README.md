@@ -42,6 +42,7 @@ Unused-edge decisions combine Cargo's resolved graph with workspace-only rustc e
 
 ```bash
 cargo rail unify --check --explain  # inspect every decision
+cargo rail unify doctor             # inspect resolver/target/alias hazards
 cargo rail unify                    # apply the plan
 cargo rail unify undo               # restore the last backup
 ```

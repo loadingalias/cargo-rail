@@ -66,7 +66,7 @@ pub use release::{run_release_check, run_release_finalize, run_release_init, run
 pub use run::run_run;
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
-pub use unify::{run_unify_analyze, run_unify_apply, run_unify_undo};
+pub use unify::{run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_undo};
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
@@ -253,16 +253,12 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       output,
       show_diff,
       explain,
-    } => {
-      // Undo subcommand is handled before WorkspaceContext is built
-      if command.is_some() {
-        unreachable!("Undo subcommand should be handled before dispatch")
-      } else if check {
-        run_unify_analyze(ctx, show_diff, explain, format, output.as_ref())
-      } else {
-        run_unify_apply(ctx, backup, skip_report, report_path, plan, format)
-      }
-    }
+    } => match command {
+      Some(cli::UnifyCommand::Doctor { format }) => run_unify_doctor(ctx, format),
+      Some(cli::UnifyCommand::Undo { .. }) => unreachable!("Undo subcommand should be handled before dispatch"),
+      None if check => run_unify_analyze(ctx, show_diff, explain, format, output.as_ref()),
+      None => run_unify_apply(ctx, backup, skip_report, report_path, plan, format),
+    },
 
     // Split/Sync
     Commands::Split { command } => match command {

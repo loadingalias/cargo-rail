@@ -1,16 +1,20 @@
 //! `cargo rail plan` - deterministic file-first change planner.
 
+use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
 use crate::change_detection::classify::{
   FileProfile, RC_FILE_KIND_CI, RC_FILE_KIND_CUSTOM, RC_FILE_KIND_DOCS, RC_FILE_KIND_INFRA_PATTERN,
-  RC_FILE_KIND_REPO_CONFIG, RC_FILE_KIND_RUST_BENCH, RC_FILE_KIND_RUST_SRC, RC_FILE_KIND_RUST_TEST,
-  RC_FILE_KIND_SCRIPT, RC_FILE_KIND_TOML_LOCKFILE, RC_FILE_KIND_TOML_MANIFEST, RC_FILE_KIND_TOML_TOOLING,
-  RC_FILE_KIND_TOML_WORKSPACE, RC_FILE_KIND_UNCLASSIFIED, classify_path, compile_custom_patterns,
-  compile_infrastructure_patterns, custom_surface_names, custom_surfaces_for_path, matches_infrastructure_patterns,
+  RC_FILE_KIND_REPO_CONFIG, RC_FILE_KIND_RUST_BENCH, RC_FILE_KIND_RUST_BUILD_SCRIPT, RC_FILE_KIND_RUST_EXAMPLE,
+  RC_FILE_KIND_RUST_SRC, RC_FILE_KIND_RUST_TEST, RC_FILE_KIND_SCRIPT, RC_FILE_KIND_TOML_LOCKFILE,
+  RC_FILE_KIND_TOML_MANIFEST, RC_FILE_KIND_TOML_TOOLING, RC_FILE_KIND_TOML_WORKSPACE, RC_FILE_KIND_UNCLASSIFIED,
+  classify_path, compile_custom_patterns, compile_infrastructure_patterns, custom_surface_names,
+  custom_surfaces_for_path, matches_infrastructure_patterns,
 };
+use crate::change_detection::semantic::{SemanticFileChange, SemanticScope};
 use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::{ConfidenceProfile, UnknownFilePolicy};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
+use crate::graph::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use cargo_metadata::PackageId;
@@ -113,6 +117,27 @@ pub(crate) struct PlanOutput {
   pub(crate) surfaces: BTreeMap<String, SurfaceDecision>,
   pub(crate) trace: Vec<TraceReason>,
   pub(crate) reproducibility: Reproducibility,
+  #[serde(skip)]
+  semantic_seeds: HashSet<PackageId>,
+  #[serde(skip)]
+  direct_surface_packages: BTreeMap<String, BTreeSet<String>>,
+  #[serde(skip)]
+  workspace_surfaces: BTreeSet<String>,
+}
+
+impl PlanOutput {
+  pub(crate) fn has_semantic_seeds(&self) -> bool {
+    !self.semantic_seeds.is_empty()
+  }
+
+  pub(crate) fn semantic_seed_reason_ids(&self) -> Vec<u32> {
+    self
+      .trace
+      .iter()
+      .filter(|reason| reason.code == RC_SEMANTIC_INPUT_PACKAGES)
+      .map(|reason| reason.id)
+      .collect()
+  }
 }
 
 #[derive(Debug, Serialize)]
@@ -150,8 +175,8 @@ pub(crate) struct PlannedFile {
 #[derive(Debug, Serialize)]
 pub(crate) struct PlanImpact {
   pub(crate) direct_crates: Vec<String>,
-  pub(crate) transitive_crates: Vec<String>,
-  pub(crate) execution_transitive_crates: Vec<String>,
+  pub(crate) build_transitive_crates: Vec<String>,
+  pub(crate) development_transitive_crates: Vec<String>,
 }
 
 /// Execution-focused projection of the planner contract.
@@ -165,7 +190,6 @@ pub(crate) struct ExecutionScope {
   pub(crate) mode: ExecutionScopeMode,
   pub(crate) crates: Vec<String>,
   pub(crate) cargo_args: Vec<String>,
-  pub(crate) surfaces: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -180,6 +204,15 @@ pub(crate) enum ExecutionScopeMode {
 pub(crate) struct SurfaceDecision {
   pub(crate) enabled: bool,
   pub(crate) reasons: Vec<u32>,
+  pub(crate) scope: SurfaceScope,
+}
+
+/// Package selection for one planner surface.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SurfaceScope {
+  pub(crate) mode: ExecutionScopeMode,
+  pub(crate) crates: Vec<String>,
+  pub(crate) cargo_args: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,13 +221,36 @@ pub(crate) struct TraceReason {
   pub(crate) code: &'static str,
   pub(crate) description: &'static str,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) semantic_input: Option<&'static str>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) file: Option<String>,
   #[serde(rename = "crate", skip_serializing_if = "Option::is_none")]
   pub(crate) crate_name: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) package_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) depends_on: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub(crate) surface: Option<String>,
+  pub(crate) depends_on_package_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) edge_kind: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) alias: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) target_predicate: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) optional: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) uses_default_features: Option<bool>,
+  #[serde(skip_serializing_if = "is_false")]
+  pub(crate) proc_macro: bool,
+  #[serde(skip_serializing_if = "is_false")]
+  pub(crate) host: bool,
+  #[serde(skip_serializing_if = "Vec::is_empty")]
+  pub(crate) features: Vec<String>,
+  pub(crate) selected_surfaces: Vec<String>,
+  #[serde(skip_serializing_if = "Vec::is_empty")]
+  pub(crate) fallback_reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -214,9 +270,12 @@ const RC_CONFIDENCE_PROFILE_BALANCED: &str = "CONFIDENCE_PROFILE_BALANCED";
 const RC_CONFIDENCE_PROFILE_FAST: &str = "CONFIDENCE_PROFILE_FAST";
 const RC_CONFIDENCE_STRICT_OWNER_EXPANSION: &str = "CONFIDENCE_STRICT_OWNER_EXPANSION";
 const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIVE";
-const PLAN_CONTRACT_VERSION: u32 = 3;
-const SCOPE_CONTRACT_VERSION: u32 = 2;
-const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v3.schema.json");
+const RC_SEMANTIC_INPUT_UNCHANGED: &str = "SEMANTIC_INPUT_UNCHANGED";
+const RC_SEMANTIC_INPUT_PACKAGES: &str = "SEMANTIC_INPUT_PACKAGES";
+const RC_SEMANTIC_INPUT_FALLBACK: &str = "SEMANTIC_INPUT_FALLBACK";
+const PLAN_CONTRACT_VERSION: u32 = 4;
+const SCOPE_CONTRACT_VERSION: u32 = 3;
+const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v4.schema.json");
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
@@ -271,9 +330,15 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     ResolvedRefs::Worktree { .. } => Some(ctx.snapshot()?),
     ResolvedRefs::Objects { .. } => None,
   };
+  let historical_resolution_unavailable = snapshot.is_none();
   let changed_files = collect_changed_files(ctx, &refs)?;
+  let semantic_head = match &refs {
+    ResolvedRefs::Objects { to, .. } => Some(to.as_str()),
+    ResolvedRefs::Worktree { .. } => None,
+  };
+  let semantic_changes =
+    crate::change_detection::semantic::analyze(ctx, &changed_files, refs.resolved_base(), semantic_head)?;
   let confidence = resolve_confidence_profile(ctx, opts)?;
-
   let change_detection_config = ctx.config().map(|config| &config.change_detection);
   let infrastructure_patterns = compile_infrastructure_patterns(change_detection_config);
   let custom_patterns = compile_custom_patterns(change_detection_config);
@@ -285,8 +350,9 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   let mut planned_files = Vec::with_capacity(changed_file_count);
   let mut direct_crates: BTreeSet<String> = BTreeSet::new();
-  let mut direct_package_ids: HashSet<PackageId> = HashSet::new();
   let mut build_test_seed_package_ids: HashSet<PackageId> = HashSet::new();
+  let mut surface_packages = BTreeMap::<String, BTreeSet<String>>::new();
+  let mut workspace_surfaces = BTreeSet::<String>::new();
   let unknown_policy = unknown_file_policy(ctx);
 
   push_trace(
@@ -301,33 +367,57 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   for path in &changed_files {
     let file_kind = classify_path(Path::new(path));
+    let semantic_change = semantic_changes.get(path);
     let custom_surfaces = custom_surfaces_for_path(path, &custom_patterns);
     let owner = ctx.graph().file_to_package(Path::new(path));
-    let owners: Vec<String> = owner.iter().map(|package| package.name.clone()).collect();
-    if let Some(package) = owner {
-      direct_package_ids.insert(package.id.clone());
-    }
+    let semantic_workspace_packages = semantic_change
+      .and_then(|change| match &change.scope {
+        SemanticScope::Packages(packages) => Some(packages),
+        SemanticScope::None | SemanticScope::Workspace => None,
+      })
+      .into_iter()
+      .flatten()
+      .filter_map(|package_id| ctx.graph().package(package_id))
+      .filter(|package| package.is_workspace_member)
+      .collect::<Vec<_>>();
+    let owners: Vec<String> = if semantic_workspace_packages.is_empty() {
+      owner.iter().map(|package| package.name.clone()).collect()
+    } else {
+      semantic_workspace_packages
+        .iter()
+        .map(|package| package.name.clone())
+        .collect()
+    };
 
-    for owner in &owners {
-      direct_crates.insert(owner.clone());
+    if let Some(owner) = owner {
+      direct_crates.insert(owner.name.clone());
       push_trace(
         &mut trace,
         &mut surface_refs,
         RC_FILE_OWNS_CRATE_DIRECT,
         Some(path),
-        Some(owner),
+        Some(&owner.name),
         None,
         &[] as &[String],
       );
+      if let Some(reason) = trace.last_mut() {
+        reason.package_id = Some(owner.id.to_string());
+      }
     }
+    direct_crates.extend(semantic_workspace_packages.iter().map(|package| package.name.clone()));
 
-    let owner_scope = owner_scope(path, &owners);
+    let owner_scope = if owner.is_none() && !semantic_workspace_packages.is_empty() {
+      "semantic".to_string()
+    } else {
+      owner_scope(path, &owners)
+    };
 
     let mut kind_surfaces: Vec<String> = file_kind
       .default_surfaces()
       .iter()
       .map(|surface| (*surface).to_string())
       .collect();
+    apply_semantic_surface_policy(semantic_change, &mut kind_surfaces);
     let has_builtin_infra_surface = kind_surfaces.iter().any(|surface| surface == "infra");
     let extra_infra_surface =
       !has_builtin_infra_surface && matches_infrastructure_patterns(path, &infrastructure_patterns);
@@ -380,7 +470,9 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       }
     }
 
-    let baseline_transitive_seed = file_kind.seeds_build_test_transitive() || unknown_owner_build_test;
+    let baseline_transitive_seed = (file_kind.seeds_build_test_transitive()
+      && !matches!(semantic_change.map(|change| &change.scope), Some(SemanticScope::None)))
+      || unknown_owner_build_test;
     let should_seed_build_test_transitive = match confidence.profile {
       ConfidenceProfile::Strict => !owners.is_empty() || baseline_transitive_seed,
       ConfidenceProfile::Balanced => baseline_transitive_seed,
@@ -399,8 +491,43 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       );
     }
 
-    if should_seed_build_test_transitive && let Some(package) = owner {
-      build_test_seed_package_ids.insert(package.id.clone());
+    if should_seed_build_test_transitive {
+      match semantic_change.map(|change| &change.scope) {
+        Some(SemanticScope::Packages(packages)) => build_test_seed_package_ids.extend(packages.iter().cloned()),
+        Some(SemanticScope::None | SemanticScope::Workspace) => {}
+        None => {
+          if let Some(package) = owner {
+            build_test_seed_package_ids.insert(package.id.clone());
+          }
+        }
+      }
+    }
+
+    match semantic_change.map(|change| &change.scope) {
+      Some(SemanticScope::Packages(_)) => {
+        for package in &semantic_workspace_packages {
+          record_surface_scope(
+            &kind_surfaces,
+            Some(&package.name),
+            &mut surface_packages,
+            &mut workspace_surfaces,
+          );
+        }
+      }
+      Some(SemanticScope::None) => {}
+      Some(SemanticScope::Workspace) => {
+        record_surface_scope(&kind_surfaces, None, &mut surface_packages, &mut workspace_surfaces)
+      }
+      None => record_surface_scope(
+        &kind_surfaces,
+        if historical_resolution_unavailable {
+          None
+        } else {
+          owner.map(|package| package.name.as_str())
+        },
+        &mut surface_packages,
+        &mut workspace_surfaces,
+      ),
     }
 
     push_trace(
@@ -410,8 +537,31 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       Some(path),
       None,
       None,
-      &kind_surfaces,
+      if semantic_change.is_some() {
+        &[] as &[String]
+      } else {
+        &kind_surfaces
+      },
     );
+    if historical_resolution_unavailable
+      && kind_surfaces
+        .iter()
+        .any(|surface| PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()))
+      && let Some(reason) = trace.last_mut()
+    {
+      reason.fallback_reasons.push("historical_resolution_unavailable");
+    }
+
+    if let Some(change) = semantic_change {
+      push_semantic_trace(
+        &mut trace,
+        &mut surface_refs,
+        path,
+        change,
+        &semantic_workspace_packages,
+        &kind_surfaces,
+      );
+    }
 
     if extra_infra_surface {
       let infra_surfaces = vec!["infra".to_string()];
@@ -448,21 +598,73 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     });
   }
 
-  let transitive_crates = compute_transitive_impact(ctx, &direct_package_ids)?;
-  let execution_transitive_pairs = compute_transitive_impact_pairs(ctx, &build_test_seed_package_ids)?;
-  let execution_transitive_crates = if build_test_seed_package_ids == direct_package_ids {
-    transitive_crates.clone()
-  } else {
-    execution_transitive_pairs
+  let impact_views = snapshot
+    .filter(|_| !build_test_seed_package_ids.is_empty())
+    .map(|snapshot| {
+      snapshot
+        .targets()
+        .iter()
+        .filter(|target| target.is_build_target())
+        .map(|target| {
+          let target = match target.specification() {
+            TargetSpecificationIdentity::BuiltIn(target) => target.clone(),
+            TargetSpecificationIdentity::Custom(target) => target.name().to_string(),
+          };
+          ResolutionRequest::new(ResolutionPackages::Workspace, ResolutionFeatures::Default, Some(target))
+            .and_then(|request| snapshot.resolution_view(request))
+        })
+        .collect::<RailResult<Vec<_>>>()
+    })
+    .transpose()?
+    .unwrap_or_default();
+  let direct_surface_packages = surface_packages.clone();
+  let mut semantic_impact = ImpactPropagation::default();
+  if impact_views.is_empty() {
+    let active_impact_seeds = build_test_seed_package_ids
       .iter()
-      .map(|(_, dependent)| dependent.clone())
-      .collect::<BTreeSet<_>>()
-      .into_iter()
-      .collect()
-  };
-  emit_transitive_build_test_trace(&execution_transitive_pairs, &mut trace, &mut surface_refs);
+      .filter(|package_id| ctx.graph().package(package_id).is_some())
+      .cloned()
+      .collect();
+    semantic_impact.merge(ctx.graph().propagate_impact(&active_impact_seeds, false)?);
+  } else {
+    for view in impact_views {
+      let active_impact_seeds = build_test_seed_package_ids
+        .iter()
+        .filter(|package_id| view.graph().package(package_id).is_some())
+        .cloned()
+        .collect();
+      semantic_impact.merge(view.graph().propagate_impact(&active_impact_seeds, true)?);
+    }
+  }
+  if historical_resolution_unavailable {
+    for step in &mut semantic_impact.steps {
+      if !step
+        .fallbacks
+        .contains(&ImpactFallback::HistoricalResolutionUnavailable)
+      {
+        step.fallbacks.push(ImpactFallback::HistoricalResolutionUnavailable);
+      }
+      step.fallbacks.sort();
+    }
+  }
+  let build_transitive_crates = package_names(ctx, &semantic_impact.build)?;
+  let development_transitive_crates = package_names(ctx, &semantic_impact.development)?;
+  emit_semantic_impact_trace(
+    ctx,
+    &semantic_impact,
+    &mut trace,
+    &mut surface_refs,
+    &mut surface_packages,
+  )?;
 
-  let surfaces = build_surfaces(&surface_refs, &configured_custom_surfaces);
+  let workspace_members = ctx.graph().workspace_members();
+  let surfaces = build_surfaces(
+    &surface_refs,
+    &configured_custom_surfaces,
+    &surface_packages,
+    &workspace_surfaces,
+    workspace_members,
+  );
 
   // Compute reproducibility metadata
   let git_merge_base = refs.git_merge_base();
@@ -480,14 +682,12 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   let impact = PlanImpact {
     direct_crates: direct_crates.into_iter().collect(),
-    transitive_crates,
-    execution_transitive_crates: execution_transitive_crates.clone(),
+    build_transitive_crates,
+    development_transitive_crates,
   };
   let scope = build_execution_scope(
-    &impact.direct_crates,
-    &execution_transitive_crates,
     &surfaces,
-    ctx.cargo().metadata().workspace_packages().len(),
+    workspace_members.len(),
     refs.resolved_base(),
     refs.resolved_head(),
   );
@@ -513,6 +713,9 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       git_merge_base,
       git_shallow_clone: is_shallow_clone(ctx.workspace_root()),
     },
+    semantic_seeds: build_test_seed_package_ids,
+    direct_surface_packages,
+    workspace_surfaces,
   };
 
   validate_surface_reason_invariants(&output)?;
@@ -634,21 +837,29 @@ fn ensure_surface(surfaces: &mut Vec<String>, surface: &str) {
 }
 
 fn build_execution_scope(
-  direct_crates: &[String],
-  execution_transitive_crates: &[String],
   surfaces: &BTreeMap<String, SurfaceDecision>,
   workspace_package_count: usize,
   resolved_base: &str,
   resolved_head: &str,
 ) -> ExecutionScope {
-  let crates = impacted_crates_for_scope(direct_crates, execution_transitive_crates);
-  let package_scoped_surface_enabled = surfaces
+  let package_scopes = PACKAGE_SCOPED_SURFACES
     .iter()
-    .any(|(name, decision)| decision.enabled && PACKAGE_SCOPED_SURFACES.contains(&name.as_str()));
-
-  let (mode, crates) = if !package_scoped_surface_enabled {
+    .filter_map(|surface| surfaces.get(*surface))
+    .filter(|decision| decision.enabled)
+    .map(|decision| &decision.scope)
+    .collect::<Vec<_>>();
+  let workspace_selected = package_scopes
+    .iter()
+    .any(|scope| matches!(scope.mode, ExecutionScopeMode::Workspace));
+  let crates = package_scopes
+    .iter()
+    .flat_map(|scope| scope.crates.iter().cloned())
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect::<Vec<_>>();
+  let (mode, crates) = if package_scopes.is_empty() {
     (ExecutionScopeMode::Empty, Vec::new())
-  } else if crates.is_empty() || crates.len() == workspace_package_count {
+  } else if workspace_selected || crates.len() == workspace_package_count {
     (ExecutionScopeMode::Workspace, Vec::new())
   } else {
     (ExecutionScopeMode::Crates, crates)
@@ -662,7 +873,6 @@ fn build_execution_scope(
     mode,
     crates,
     cargo_args,
-    surfaces: scope_surfaces(surfaces),
   }
 }
 
@@ -677,26 +887,54 @@ fn cargo_args_for_scope(mode: ExecutionScopeMode, crates: &[String]) -> Vec<Stri
   }
 }
 
-fn impacted_crates_for_scope(direct_crates: &[String], execution_transitive_crates: &[String]) -> Vec<String> {
-  direct_crates
-    .iter()
-    .chain(execution_transitive_crates)
-    .cloned()
-    .collect::<BTreeSet<_>>()
-    .into_iter()
-    .collect()
-}
-
-fn scope_surfaces(surfaces: &BTreeMap<String, SurfaceDecision>) -> BTreeMap<String, bool> {
-  surfaces
-    .iter()
-    .map(|(name, decision)| (name.clone(), decision.enabled))
-    .collect()
-}
-
 /// Render concise planner explain text used by command surfaces that consume planning.
 pub(crate) fn render_plan_explain(output: &PlanOutput) -> String {
   format_text(output, true)
+}
+
+/// Resolve one action's packages through its exact feature and target views.
+pub(crate) fn resolve_action_packages(
+  ctx: &WorkspaceContext,
+  output: &PlanOutput,
+  surface: &str,
+  features: ResolutionFeatures,
+  targets: &[String],
+) -> RailResult<Vec<String>> {
+  if output.workspace_surfaces.contains(surface) {
+    return Ok(ctx.graph().workspace_members().to_vec());
+  }
+
+  let mut packages = output.direct_surface_packages.get(surface).cloned().unwrap_or_default();
+  if !matches!(surface, "build" | "test" | "bench") || output.semantic_seeds.is_empty() {
+    return Ok(packages.into_iter().collect());
+  }
+
+  for target in targets {
+    let request = ResolutionRequest::new(ResolutionPackages::Workspace, features.clone(), Some(target.clone()))?;
+    let view = ctx.resolution_view(request)?;
+    let active_seeds = output
+      .semantic_seeds
+      .iter()
+      .filter(|package_id| view.graph().package(package_id).is_some())
+      .cloned()
+      .collect();
+    let impact = view.graph().propagate_impact(&active_seeds, true)?;
+    let package_ids = match surface {
+      "build" => impact.build,
+      "test" | "bench" => impact.build.union(&impact.development).cloned().collect(),
+      _ => BTreeSet::new(),
+    };
+    for package_id in package_ids {
+      let package = view.graph().package(&package_id).ok_or_else(|| {
+        RailError::message(format!(
+          "action impact package '{}' is missing from its resolution view",
+          package_id
+        ))
+      })?;
+      packages.insert(package.name.clone());
+    }
+  }
+  Ok(packages.into_iter().collect())
 }
 
 fn reason_description(code: &str) -> &'static str {
@@ -704,6 +942,8 @@ fn reason_description(code: &str) -> &'static str {
     RC_FILE_KIND_RUST_SRC => "Rust source file changed",
     RC_FILE_KIND_RUST_TEST => "Rust test file changed",
     RC_FILE_KIND_RUST_BENCH => "Rust benchmark file changed",
+    RC_FILE_KIND_RUST_EXAMPLE => "Rust example file changed",
+    RC_FILE_KIND_RUST_BUILD_SCRIPT => "Cargo build script changed",
     RC_FILE_KIND_TOML_MANIFEST => "Cargo.toml changed",
     RC_FILE_KIND_TOML_WORKSPACE => "Workspace Cargo.toml changed",
     RC_FILE_KIND_TOML_TOOLING => "Tooling config changed",
@@ -723,6 +963,9 @@ fn reason_description(code: &str) -> &'static str {
     RC_CONFIDENCE_PROFILE_FAST => "Fast confidence profile active",
     RC_CONFIDENCE_STRICT_OWNER_EXPANSION => "Strict mode expands owned crates",
     RC_CONFIDENCE_FAST_SKIP_TRANSITIVE => "Fast mode skips transitive expansion",
+    RC_SEMANTIC_INPUT_UNCHANGED => "Cargo input bytes changed without changing effective build semantics",
+    RC_SEMANTIC_INPUT_PACKAGES => "Cargo semantic change localized to resolved packages",
+    RC_SEMANTIC_INPUT_FALLBACK => "Cargo semantic change requires conservative workspace impact",
     _ => "Planner reason",
   }
 }
@@ -776,10 +1019,9 @@ fn collect_active_reason_ids(output: &PlanOutput) -> Vec<u32> {
 
 fn active_surface_names(output: &PlanOutput) -> Vec<&str> {
   output
-    .scope
     .surfaces
     .iter()
-    .filter(|(_, enabled)| **enabled)
+    .filter(|(_, decision)| decision.enabled)
     .map(|(name, _)| name.as_str())
     .collect()
 }
@@ -882,48 +1124,75 @@ fn owner_scope(path: &str, owners: &[String]) -> String {
   }
 }
 
-fn compute_transitive_impact(ctx: &WorkspaceContext, direct_ids: &HashSet<PackageId>) -> RailResult<Vec<String>> {
-  let mut transitive: Vec<String> = ctx
-    .graph()
-    .transitive_dependents_of_ids(direct_ids)?
-    .into_iter()
-    .collect();
-  transitive.sort();
-
-  Ok(transitive)
+fn package_names(ctx: &WorkspaceContext, package_ids: &BTreeSet<PackageId>) -> RailResult<Vec<String>> {
+  package_ids
+    .iter()
+    .map(|package_id| {
+      ctx
+        .graph()
+        .package(package_id)
+        .map(|package| package.name.clone())
+        .ok_or_else(|| {
+          RailError::message(format!(
+            "impacted package '{}' is missing from the resolved graph",
+            package_id
+          ))
+        })
+    })
+    .collect()
 }
 
-fn compute_transitive_impact_pairs(
+fn emit_semantic_impact_trace(
   ctx: &WorkspaceContext,
-  direct_ids: &HashSet<PackageId>,
-) -> RailResult<Vec<(String, String)>> {
-  ctx.graph().transitive_dependent_pairs_of_ids(direct_ids)
-}
-
-fn emit_transitive_build_test_trace(
-  execution_transitive_pairs: &[(String, String)],
+  impact: &ImpactPropagation,
   trace: &mut Vec<TraceReason>,
   surface_refs: &mut BTreeMap<String, BTreeSet<u32>>,
-) {
-  // Use owned Strings once, reuse via slice reference
-  static BUILD_TEST_SURFACES: &[&str] = &["build", "test"];
-  let surfaces: Vec<String> = BUILD_TEST_SURFACES.iter().map(|&s| String::from(s)).collect();
-  for (depends_on, dependent) in execution_transitive_pairs {
-    push_trace(
+  surface_packages: &mut BTreeMap<String, BTreeSet<String>>,
+) -> RailResult<()> {
+  for step in &impact.steps {
+    if step.domain == ImpactDomain::Development && impact.build.contains(&step.dependent) {
+      continue;
+    }
+    let dependent = ctx.graph().package(&step.dependent).ok_or_else(|| {
+      RailError::message(format!(
+        "impacted package '{}' is missing from the resolved graph",
+        step.dependent
+      ))
+    })?;
+    let dependency = ctx.graph().package(&step.dependency).ok_or_else(|| {
+      RailError::message(format!(
+        "dependency package '{}' is missing from the resolved graph",
+        step.dependency
+      ))
+    })?;
+    let surfaces = match step.domain {
+      ImpactDomain::Build => ["build", "test"].as_slice(),
+      ImpactDomain::Development => ["test", "bench"].as_slice(),
+    };
+    for surface in surfaces {
+      surface_packages
+        .entry((*surface).to_string())
+        .or_default()
+        .insert(dependent.name.clone());
+    }
+    push_impact_trace(
       trace,
       surface_refs,
-      RC_TRANSITIVE_DEPENDS_ON_DIRECT,
-      None,
-      Some(dependent),
-      Some(depends_on),
-      &surfaces,
+      step,
+      dependent.name.as_str(),
+      dependency.name.as_str(),
+      surfaces,
     );
   }
+  Ok(())
 }
 
 fn build_surfaces(
   surface_refs: &BTreeMap<String, BTreeSet<u32>>,
   custom_surfaces: &[String],
+  surface_packages: &BTreeMap<String, BTreeSet<String>>,
+  workspace_surfaces: &BTreeSet<String>,
+  workspace_members: &[String],
 ) -> BTreeMap<String, SurfaceDecision> {
   // Use static slice and map to owned strings
   static BUILTIN_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
@@ -937,16 +1206,123 @@ fn build_surfaces(
       .map(|set| set.iter().copied().collect())
       .unwrap_or_default();
 
+    let enabled = !reasons.is_empty();
+    let crates = surface_packages
+      .get(&surface)
+      .map(|packages| packages.iter().cloned().collect::<Vec<_>>())
+      .unwrap_or_default();
+    let package_scoped = PACKAGE_SCOPED_SURFACES.contains(&surface.as_str());
+    let mode = if !enabled || !package_scoped {
+      ExecutionScopeMode::Empty
+    } else if workspace_surfaces.contains(&surface) || crates.is_empty() || crates.len() == workspace_members.len() {
+      ExecutionScopeMode::Workspace
+    } else {
+      ExecutionScopeMode::Crates
+    };
+    let crates = if matches!(mode, ExecutionScopeMode::Crates) {
+      crates
+    } else {
+      Vec::new()
+    };
+    let cargo_args = cargo_args_for_scope(mode, &crates);
     result.insert(
       surface,
       SurfaceDecision {
-        enabled: !reasons.is_empty(),
+        enabled,
         reasons,
+        scope: SurfaceScope {
+          mode,
+          crates,
+          cargo_args,
+        },
       },
     );
   }
 
   result
+}
+
+fn record_surface_scope(
+  surfaces: &[String],
+  package: Option<&str>,
+  surface_packages: &mut BTreeMap<String, BTreeSet<String>>,
+  workspace_surfaces: &mut BTreeSet<String>,
+) {
+  for surface in surfaces
+    .iter()
+    .filter(|surface| PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()))
+  {
+    if let Some(package) = package {
+      surface_packages
+        .entry(surface.clone())
+        .or_default()
+        .insert(package.to_string());
+    } else {
+      workspace_surfaces.insert(surface.clone());
+    }
+  }
+}
+
+fn apply_semantic_surface_policy(change: Option<&SemanticFileChange>, surfaces: &mut Vec<String>) {
+  if matches!(change.map(|change| &change.scope), Some(SemanticScope::None)) {
+    surfaces.retain(|surface| !PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()));
+  }
+}
+
+fn push_semantic_trace(
+  trace: &mut Vec<TraceReason>,
+  surface_refs: &mut BTreeMap<String, BTreeSet<u32>>,
+  path: &str,
+  change: &SemanticFileChange,
+  workspace_packages: &[&crate::graph::core::PackageNode],
+  surfaces: &[String],
+) {
+  let code = match change.scope {
+    SemanticScope::None => RC_SEMANTIC_INPUT_UNCHANGED,
+    SemanticScope::Packages(_) => RC_SEMANTIC_INPUT_PACKAGES,
+    SemanticScope::Workspace => RC_SEMANTIC_INPUT_FALLBACK,
+  };
+  let selected_surfaces = if matches!(change.scope, SemanticScope::Packages(_)) && workspace_packages.is_empty() {
+    surfaces
+      .iter()
+      .filter(|surface| !PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()))
+      .cloned()
+      .collect::<Vec<_>>()
+  } else {
+    surfaces.to_vec()
+  };
+  let packages = if workspace_packages.is_empty() {
+    vec![None]
+  } else {
+    workspace_packages.iter().copied().map(Some).collect()
+  };
+  for package in packages {
+    let id = (trace.len() + 1) as u32;
+    for surface in &selected_surfaces {
+      surface_refs.entry(surface.clone()).or_default().insert(id);
+    }
+    trace.push(TraceReason {
+      id,
+      code,
+      description: reason_description(code),
+      semantic_input: Some(change.input),
+      file: Some(path.to_string()),
+      crate_name: package.map(|package| package.name.clone()),
+      package_id: package.map(|package| package.id.to_string()),
+      depends_on: None,
+      depends_on_package_id: None,
+      edge_kind: None,
+      alias: None,
+      target_predicate: None,
+      optional: None,
+      uses_default_features: None,
+      proc_macro: false,
+      host: false,
+      features: Vec::new(),
+      selected_surfaces: selected_surfaces.clone(),
+      fallback_reasons: change.fallback.into_iter().collect(),
+    });
+  }
 }
 
 fn push_trace(
@@ -968,13 +1344,86 @@ fn push_trace(
     id,
     code,
     description: reason_description(code),
+    semantic_input: None,
     file: file.map(ToString::to_string),
     crate_name: crate_name.map(ToString::to_string),
+    package_id: None,
     depends_on: depends_on.map(ToString::to_string),
-    surface: surfaces.first().cloned(),
+    depends_on_package_id: None,
+    edge_kind: None,
+    alias: None,
+    target_predicate: None,
+    optional: None,
+    uses_default_features: None,
+    proc_macro: false,
+    host: false,
+    features: Vec::new(),
+    selected_surfaces: surfaces.to_vec(),
+    fallback_reasons: Vec::new(),
   });
 
   id
+}
+
+fn push_impact_trace(
+  trace: &mut Vec<TraceReason>,
+  surface_refs: &mut BTreeMap<String, BTreeSet<u32>>,
+  step: &ImpactStep,
+  dependent: &str,
+  dependency: &str,
+  surfaces: &[&str],
+) {
+  let id = (trace.len() + 1) as u32;
+  for surface in surfaces {
+    surface_refs.entry((*surface).to_string()).or_default().insert(id);
+  }
+  trace.push(TraceReason {
+    id,
+    code: RC_TRANSITIVE_DEPENDS_ON_DIRECT,
+    description: reason_description(RC_TRANSITIVE_DEPENDS_ON_DIRECT),
+    semantic_input: None,
+    file: None,
+    crate_name: Some(dependent.to_string()),
+    package_id: Some(step.dependent.to_string()),
+    depends_on: Some(dependency.to_string()),
+    depends_on_package_id: Some(step.dependency.to_string()),
+    edge_kind: Some(dependency_kind_name(step.kind).to_string()),
+    alias: Some(step.alias.clone()),
+    target_predicate: step.target.clone(),
+    optional: step.optional,
+    uses_default_features: step.uses_default_features,
+    proc_macro: step.proc_macro,
+    host: step.host,
+    features: step.features.clone(),
+    selected_surfaces: surfaces.iter().map(|surface| (*surface).to_string()).collect(),
+    fallback_reasons: step
+      .fallbacks
+      .iter()
+      .map(|fallback| fallback_reason(*fallback))
+      .collect(),
+  });
+}
+
+fn dependency_kind_name(kind: cargo_metadata::DependencyKind) -> &'static str {
+  match kind {
+    cargo_metadata::DependencyKind::Normal => "normal",
+    cargo_metadata::DependencyKind::Development => "development",
+    cargo_metadata::DependencyKind::Build => "build",
+    cargo_metadata::DependencyKind::Unknown => "unknown",
+  }
+}
+
+fn fallback_reason(fallback: ImpactFallback) -> &'static str {
+  match fallback {
+    ImpactFallback::HistoricalResolutionUnavailable => "historical_resolution_unavailable",
+    ImpactFallback::TargetUnfiltered => "target_unfiltered",
+    ImpactFallback::UnknownDependencyKind => "dependency_kind_unknown",
+    ImpactFallback::DeclarationUnknown => "declaration_unknown",
+  }
+}
+
+fn is_false(value: &bool) -> bool {
+  !value
 }
 
 fn format_text(output: &PlanOutput, explain: bool) -> String {
@@ -1033,6 +1482,62 @@ fn format_text(output: &PlanOutput, explain: bool) -> String {
     for surface in active_surfaces {
       if let Some(summary) = summarize_surface_reason(output, surface) {
         let _ = writeln!(out, "  {}: {}", surface, summary);
+      }
+    }
+    let evidence = output
+      .trace
+      .iter()
+      .filter(|reason| {
+        reason.semantic_input.is_some()
+          || reason.edge_kind.is_some()
+          || reason.package_id.is_some()
+          || !reason.fallback_reasons.is_empty()
+      })
+      .collect::<Vec<_>>();
+    if !evidence.is_empty() {
+      out.push_str("  evidence:\n");
+      for reason in evidence {
+        let _ = write!(out, "    [{}]", reason.id);
+        if let Some(input) = reason.semantic_input {
+          let _ = write!(out, " input={input}");
+        }
+        if let Some(package_id) = &reason.package_id {
+          let _ = write!(out, " package={package_id}");
+        }
+        if let Some(depends_on) = &reason.depends_on_package_id {
+          let _ = write!(out, " dependency={depends_on}");
+        }
+        if let Some(kind) = &reason.edge_kind {
+          let _ = write!(out, " kind={kind}");
+        }
+        if let Some(alias) = &reason.alias {
+          let _ = write!(out, " alias={alias}");
+        }
+        if let Some(target) = &reason.target_predicate {
+          let _ = write!(out, " target={target}");
+        }
+        if let Some(optional) = reason.optional {
+          let _ = write!(out, " optional={optional}");
+        }
+        if let Some(default_features) = reason.uses_default_features {
+          let _ = write!(out, " default-features={default_features}");
+        }
+        if !reason.features.is_empty() {
+          let _ = write!(out, " features={}", reason.features.join(","));
+        }
+        if reason.proc_macro {
+          out.push_str(" proc-macro=true");
+        }
+        if reason.host {
+          out.push_str(" host=true");
+        }
+        if !reason.selected_surfaces.is_empty() {
+          let _ = write!(out, " surfaces={}", reason.selected_surfaces.join(","));
+        }
+        if !reason.fallback_reasons.is_empty() {
+          let _ = write!(out, " fallback={}", reason.fallback_reasons.join(","));
+        }
+        out.push('\n');
       }
     }
   }

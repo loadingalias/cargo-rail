@@ -181,6 +181,43 @@ fn test_diff_hash_rejects_non_repository_relative_plan_paths() -> Result<()> {
 }
 
 #[test]
+fn test_diff_hash_removes_external_checkout_paths_from_package_ids() -> Result<()> {
+  let ws = TestWorkspace::new_named("hash-external-package-id")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(output.status.success());
+  let mut plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let trace = plan["trace"].as_array_mut().expect("trace array");
+  trace[1]["package_id"] =
+    serde_json::Value::String("path+file:///private/checkout/external#external@0.1.0".to_string());
+  let path = ws.path.join("external-plan.json");
+  std::fs::write(&path, serde_json::to_vec_pretty(&plan)?)?;
+
+  let diff = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "diff-hash",
+      path.to_string_lossy().as_ref(),
+      path.to_string_lossy().as_ref(),
+      "--format",
+      "json",
+    ],
+  )?;
+  assert!(
+    diff.status.success(),
+    "external path package IDs must remain hashable: {}",
+    String::from_utf8_lossy(&diff.stdout)
+  );
+  let json: serde_json::Value = serde_json::from_slice(&diff.stdout)?;
+  assert_eq!(json["equal"], true);
+  Ok(())
+}
+
+#[test]
 fn test_diff_hash_reports_changes_between_plan_contracts() -> Result<()> {
   let ws = TestWorkspace::new_named("diff-hash-changes")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;

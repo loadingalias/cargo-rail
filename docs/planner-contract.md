@@ -7,7 +7,22 @@ cargo rail plan --schema > plan.schema.json
 cargo rail plan --merge-base -f json > plan.json
 ```
 
-The current output contains planner contract v3 and scope contract v2 inside machine envelope v1. [`schemas/plan-v3.schema.json`](../schemas/plan-v3.schema.json) defines the contract. `plan --schema` does not load workspace metadata, so consumers can validate compatibility before opening a repository.
+The current output contains planner contract v4 and scope contract v3 inside machine envelope v1. [`schemas/plan-v4.schema.json`](../schemas/plan-v4.schema.json) defines the contract. `plan --schema` does not load workspace metadata, so consumers can validate compatibility before opening a repository.
+
+Contract v4 separates build-transitive impact from development-only impact and gives every surface its own package
+scope. `build` follows active normal, build, proc-macro, and host edges. `test` additionally includes active development
+edges; `bench` remains enabled only by benchmark work, but uses development impact when selected. Optional and
+target-conditioned edges are omitted only when an exact feature/target resolution proves them inactive.
+
+Manifest and lockfile changes are compared semantically. Formatting and metadata-only manifest edits do not schedule
+package work. Workspace dependency inheritance and resolved lockfile package/source/checksum/dependency-edge changes are localized to
+the affected closure; unknown resolver, source-replacement, parse, or declaration evidence falls back to the workspace.
+The exact changed bytes remain part of the authoritative snapshot.
+
+Each trace reason records `selected_surfaces`. Semantic reasons may also include the changed input, exact Cargo
+`PackageId`, dependency `PackageId`, edge kind, alias, target predicate, optional/default-feature state, explicit
+features, host/proc-macro role, and conservative fallback codes. Human output exposes the same evidence with
+`plan --explain`.
 
 ## Compatibility
 
@@ -27,6 +42,10 @@ Successful JSON commands write one JSON value to stdout and keep progress off st
 - refs, config and toolchain fingerprints, and confidence profile;
 - repository-relative files, impact, scope, surface decisions, and trace reasons.
 
-Path separators are normalized to `/`. Absolute paths, drive-qualified paths, and `..` components are rejected. Local diagnostics such as `inputs.workspace_root`, the machine envelope, and `reproducibility` metadata are excluded, so equivalent clones at different checkout paths have the same identity. Config and toolchain fingerprints normalize LF and CRLF line endings.
+Path separators are normalized to `/`. Absolute paths, drive-qualified paths, and `..` components are rejected. Path
+package identities inside the workspace are normalized to logical workspace-relative identities. Local diagnostics
+such as `inputs.workspace_root`, the machine envelope, and `reproducibility` metadata are excluded, so equivalent
+clones at different checkout paths have the same identity. Config and toolchain fingerprints normalize LF and CRLF
+line endings.
 
 This identity compares planner decisions. It is **not a cache key**. A future cache identity must additionally bind source contents, the actual compiler, target, features, command, and an explicit environment allowlist before reuse can be safe.

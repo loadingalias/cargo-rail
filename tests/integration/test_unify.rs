@@ -17,6 +17,47 @@ use tempfile::TempDir;
 // Core Unification Tests
 
 #[test]
+fn test_unify_doctor_reports_exact_resolution_domains_in_text_and_json() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-doctor")?;
+  workspace.add_crate("crate-a", "0.1.0", &[])?;
+  workspace.commit("Add crate")?;
+
+  let json_output = run_cargo_rail(&workspace.path, &["rail", "unify", "doctor", "--format", "json"])?;
+  assert!(
+    json_output.status.success(),
+    "unify doctor JSON should succeed: {}",
+    String::from_utf8_lossy(&json_output.stderr)
+  );
+  let value: serde_json::Value = serde_json::from_slice(&json_output.stdout)?;
+  assert_eq!(value["command"], "unify");
+  assert_eq!(value["mode"], "doctor");
+  assert!(value["cargo"]["version"].is_string());
+  assert!(value["cargo"]["channel"].is_string());
+  assert!(value["resolver"]["version"].is_string());
+  assert_eq!(value["feature_mode"]["features"], "default");
+  assert!(value["effective_overrides"]["cargo_sources"].is_array());
+  assert!(
+    value["target_domains"]
+      .as_array()
+      .is_some_and(|domains| !domains.is_empty())
+  );
+  assert_eq!(value["target_domains"][0]["target"], "default");
+  assert_eq!(value["target_domains"][0]["role"], "unfiltered");
+  assert!(value["ambiguous_aliases"].is_array());
+  assert!(value["recommended_action"]["code"].is_string());
+
+  let text_output = run_cargo_rail(&workspace.path, &["rail", "unify", "doctor"])?;
+  assert!(text_output.status.success(), "unify doctor text should succeed");
+  let text = String::from_utf8_lossy(&text_output.stdout);
+  assert!(text.contains("unify doctor"));
+  assert!(text.contains("resolver:"));
+  assert!(text.contains("target domains:"));
+  assert!(text.contains("recommended:"));
+
+  Ok(())
+}
+
+#[test]
 fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-json-apply")?;
   workspace.add_crate("crate-a", "0.1.0", &[("tempfile", r#""3.0""#)])?;
@@ -90,7 +131,6 @@ fn test_unify_resolution_based_merging_no_false_positives() -> Result<()> {
       ("anyhow", r#""^1.0.50""#),
     ],
   )?;
-
   workspace.commit("Add crates with compatible version requirements")?;
 
   // Run unify analyze
@@ -285,7 +325,7 @@ fn test_unify_inconsistent_default_features() -> Result<()> {
   let workspace = TestWorkspace::new()?;
 
   // Create crates with inconsistent default-features
-  workspace.add_crate(
+  let crate_a = workspace.add_crate(
     "crate-a",
     "0.1.0",
     &[(
@@ -294,13 +334,21 @@ fn test_unify_inconsistent_default_features() -> Result<()> {
     )],
   )?;
 
-  workspace.add_crate(
+  let crate_b = workspace.add_crate(
     "crate-b",
     "0.1.0",
     &[(
       "serde",
       r#"{ version = "1.0", default-features = false, features = ["alloc"] }"#,
     )],
+  )?;
+  std::fs::write(
+    crate_a.join("src/lib.rs"),
+    "#[derive(serde::Serialize)]\npub struct A;\n",
+  )?;
+  std::fs::write(
+    crate_b.join("src/lib.rs"),
+    "pub fn requires_serialize<T: serde::Serialize>() {}\n",
   )?;
 
   workspace.commit("Add crates with inconsistent default-features")?;
@@ -338,18 +386,23 @@ root = "."
   let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
   assert!(workspace_toml.contains("serde"), "Should include serde");
 
-  // Should enable default-features (union strategy)
+  // The shared baseline must disable defaults so crate-b can stay default-free.
   assert!(
-    workspace_toml.contains("default-features = true") || !workspace_toml.contains("default-features = false"),
-    "Should enable default-features.\nWorkspace TOML:\n{}",
+    workspace_toml.contains("default-features = false"),
+    "Should disable workspace default-features.\nWorkspace TOML:\n{}",
     workspace_toml
   );
 
-  // Should have both features
+  // Distinct features stay on the declarations that require them.
+  let crate_a_toml = std::fs::read_to_string(workspace.path.join("crates/crate-a/Cargo.toml"))?;
+  let crate_b_toml = std::fs::read_to_string(workspace.path.join("crates/crate-b/Cargo.toml"))?;
   assert!(
-    workspace_toml.contains("derive") && workspace_toml.contains("alloc"),
-    "Should have union of features.\nWorkspace TOML:\n{}",
-    workspace_toml
+    crate_a_toml.contains("derive") && crate_a_toml.contains("\"default\""),
+    "crate-a must retain derive and defaults locally:\n{crate_a_toml}"
+  );
+  assert!(
+    crate_b_toml.contains("alloc") && !crate_b_toml.contains("\"default\""),
+    "crate-b must retain alloc without defaults:\n{crate_b_toml}"
   );
 
   Ok(())
@@ -826,6 +879,68 @@ fn test_unify_local_features_calculation() -> Result<()> {
     crate_b_toml
   );
 
+  Ok(())
+}
+
+#[test]
+fn test_unify_preserves_default_features_across_target_domains() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-target-default-features")?;
+  let crate_a = workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+  let crate_b = workspace.add_crate("crate-b", "0.1.0", &[])?;
+  std::fs::write(
+    crate_a.join("src/lib.rs"),
+    "pub fn requires_serialize<T: serde::Serialize>() {}\n",
+  )?;
+  std::fs::write(
+    crate_b.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde = { version = "1.0", default-features = false }
+"#,
+  )?;
+  std::fs::write(
+    crate_b.join("src/lib.rs"),
+    "#[cfg(target_arch = \"wasm32\")]\npub fn requires_serialize<T: serde::Serialize>() {}\n",
+  )?;
+  workspace.commit("Add cross-domain default feature policy")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    output.status.success(),
+    "unify should preserve per-domain defaults:\nstdout: {}\nstderr: {}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let root = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    root.contains("default-features = false"),
+    "the workspace baseline must disable defaults when any domain does: {root}"
+  );
+  let crate_a = std::fs::read_to_string(crate_a.join("Cargo.toml"))?;
+  assert!(
+    crate_a.contains("workspace = true"),
+    "crate-a must inherit serde: {crate_a}"
+  );
+  assert!(
+    crate_a.contains("\"default\""),
+    "the default-enabled declaration must opt back in locally: {crate_a}"
+  );
+  let crate_b = std::fs::read_to_string(crate_b.join("Cargo.toml"))?;
+  assert!(
+    crate_b.contains("workspace = true"),
+    "crate-b must inherit serde: {crate_b}"
+  );
+  assert!(
+    !crate_b.contains("\"default\""),
+    "the target declaration that disabled defaults must remain disabled: {crate_b}"
+  );
   Ok(())
 }
 
@@ -1495,12 +1610,25 @@ include_renamed = true
   )?;
 
   // With include_renamed config, serde SHOULD be unified (2 users total for the package)
-  let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
-  let stdout_with = String::from_utf8_lossy(&output_with.stdout);
+  let output_with = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  let value: serde_json::Value = serde_json::from_slice(&output_with.stdout)?;
+  let serde_decision = value["dependency_decisions"]
+    .as_array()
+    .and_then(|decisions| decisions.iter().find(|decision| decision["dep_name"] == "serde"))
+    .expect("serde dependency decision should be present");
+  let feature_paths = serde_decision["reasons"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .flat_map(|reason| reason["feature_paths"].as_array().into_iter().flatten())
+    .collect::<Vec<_>>();
+  let aliases = feature_paths
+    .iter()
+    .filter_map(|path| path["alias"].as_str())
+    .collect::<std::collections::BTreeSet<_>>();
   assert!(
-    stdout_with.contains("serde"),
-    "With include_renamed config, serde should qualify (2 users total).\nOutput:\n{}",
-    stdout_with
+    aliases.contains("serde") && aliases.contains("my_serde"),
+    "feature explanations must preserve both exact Cargo.toml aliases: {feature_paths:#?}"
   );
 
   Ok(())
@@ -1956,7 +2084,11 @@ generate_report = true
   );
   assert!(
     report_content.contains("derive") && report_content.contains("rc"),
-    "Report should show unified features"
+    "Report should show member-local features"
+  );
+  assert!(
+    report_content.contains("Member-Local Features"),
+    "Report should distinguish local features from the workspace baseline"
   );
 
   Ok(())

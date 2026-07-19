@@ -74,7 +74,14 @@ The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had 
 
 ## `[unify]`
 
-`cargo rail unify --check` always performs safe diagnostics and writes nothing. It exits 1 when proven manifest edits are pending. Running without `--check` applies the plan. Compiler evidence caching and deterministic ordering are internal responsibilities and cannot be disabled.
+`cargo rail unify --check` always performs safe diagnostics and writes nothing. It exits 1 when proven manifest edits are pending. Running without `--check` applies the plan. `cargo rail unify doctor` is a cheaper read-only resolution diagnostic: it reports the selected Cargo/channel, resolver, feature mode, source and policy overrides, target domains, ambiguous aliases, and a recommended next action. Compiler evidence caching and deterministic ordering are internal responsibilities and cannot be disabled.
+
+`unify --check --explain` keeps feature evidence separated by exact manifest declaration. Each feature rule names the
+member, Cargo.toml alias, normal/development/build domain, target predicate, explicit features, default-feature state,
+and optional state. Renamed aliases do not share feature-provider evidence unless `include_renamed = true` explicitly
+selects package-level union behavior.
+When dependency domains disagree on default features, the workspace baseline disables them and declarations that need
+them opt back in through the explicit `default` feature. This preserves narrow target, development, and build domains.
 
 Unused dependencies are removed only with complete declaration-kind, target, feature, and compilation evidence. Dormant features and optional dependencies are deleted only when `consumer_scope = "workspace"` proves the private workspace is the complete consumer universe; published packages remain open-world.
 

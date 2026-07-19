@@ -359,6 +359,9 @@ fn test_run_emits_decision_receipt() -> Result<()> {
   let platform = receipt["actions"][0]["platform"]
     .as_str()
     .ok_or_else(|| anyhow::anyhow!("expanded action must record its platform"))?;
+  let package_id = receipt["actions"][0]["resolution_views"][0]["root_package_ids"][0]
+    .as_str()
+    .ok_or_else(|| anyhow::anyhow!("expanded action must bind its exact root PackageId"))?;
   assert_eq!(
     receipt["actions"],
     serde_json::json!([
@@ -374,6 +377,12 @@ fn test_run_emits_decision_receipt() -> Result<()> {
         "target_selector": "cargo_resolution",
         "selected_targets": [platform],
         "selected_features": { "all_features": false, "default_features": true, "named": [] },
+        "resolution_views": [{
+          "root_package_ids": [package_id],
+          "target": platform,
+          "features": { "all_features": false, "default_features": true, "named": [] },
+          "resolved_node_count": 1
+        }],
         "platform": platform,
         "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
         "outputs": [{ "kind": "ambient_process" }],
@@ -392,6 +401,12 @@ fn test_run_emits_decision_receipt() -> Result<()> {
         "target_selector": "cargo_resolution",
         "selected_targets": [platform],
         "selected_features": { "all_features": false, "default_features": true, "named": [] },
+        "resolution_views": [{
+          "root_package_ids": [package_id],
+          "target": platform,
+          "features": { "all_features": false, "default_features": true, "named": [] },
+          "resolved_node_count": 1
+        }],
         "platform": platform,
         "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
         "outputs": [{ "kind": "ambient_process" }],

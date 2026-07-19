@@ -168,21 +168,24 @@ impl CargoState {
     credential_sensitive: bool,
   ) -> RailResult<Self> {
     crate::instrumentation::record_cargo_metadata_load(false);
-    let metadata = MetadataCommand::new()
+    let mut command = MetadataCommand::new();
+    command
       .cargo_path(PathBuf::from(cargo_program))
       .current_dir(cargo_current_dir)
-      .manifest_path(workspace_root.join("Cargo.toml"))
-      .exec()
-      .map_err(|error| {
-        if credential_sensitive {
-          RailError::with_help(
-            "Cargo metadata failed while credential capabilities were active",
-            "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
-          )
-        } else {
-          error.into()
-        }
-      })?;
+      .manifest_path(workspace_root.join("Cargo.toml"));
+    if workspace_root.join("Cargo.lock").is_file() {
+      command.other_options(vec!["--locked".to_string()]);
+    }
+    let metadata = command.exec().map_err(|error| {
+      if credential_sensitive {
+        RailError::with_help(
+          "Cargo metadata failed while credential capabilities were active",
+          "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
+        )
+      } else {
+        error.into()
+      }
+    })?;
     Ok(Self::from_metadata(Arc::new(metadata)))
   }
 

@@ -290,6 +290,15 @@ fn decision_reasons_to_json(reasons: &[crate::cargo::UnifyDecisionReason]) -> Ve
         "features": reason.features.iter().map(|value| &**value).collect::<Vec<_>>(),
         "members": reason.members.iter().map(|value| &**value).collect::<Vec<_>>(),
         "borrowed_from": reason.borrowed_from.iter().map(|value| &**value).collect::<Vec<_>>(),
+        "feature_paths": reason.feature_paths.iter().map(|path| serde_json::json!({
+          "member": &*path.member,
+          "alias": &*path.alias,
+          "dependency_kind": path.dependency_kind.as_str(),
+          "target": path.target.as_deref(),
+          "features": path.features.iter().map(|feature| &**feature).collect::<Vec<_>>(),
+          "default_features": path.default_features,
+          "optional": path.optional,
+        })).collect::<Vec<_>>(),
       })
     })
     .collect()
@@ -508,6 +517,254 @@ fn sha256_fingerprint(bytes: &[u8]) -> String {
     let _ = write!(fingerprint, "{byte:02x}");
   }
   fingerprint
+}
+
+fn root_manifest_value(ctx: &WorkspaceContext) -> RailResult<serde_json::Value> {
+  let mut path = ctx.workspace_prefix().unwrap_or_default();
+  path.push("Cargo.toml");
+  let manifest = ctx
+    .snapshot()?
+    .manifests()
+    .iter()
+    .find(|manifest| manifest.path().as_path() == path)
+    .ok_or_else(|| RailError::message("workspace root Cargo.toml is missing from the authoritative snapshot"))?;
+  let text = std::str::from_utf8(manifest.bytes())
+    .map_err(|_| RailError::message("workspace root Cargo.toml is not valid UTF-8"))?;
+  toml_edit::de::from_str(text)
+    .map_err(|error| RailError::message(format!("failed to parse workspace resolver: {error}")))
+}
+
+fn resolver_diagnostic(root: &serde_json::Value) -> (String, String) {
+  let explicit = root
+    .get("workspace")
+    .and_then(|workspace| workspace.get("resolver"))
+    .or_else(|| root.get("package").and_then(|package| package.get("resolver")));
+  if let Some(resolver) =
+    explicit.and_then(|value| value.as_str().map(str::to_string).or_else(|| Some(value.to_string())))
+  {
+    return (resolver.trim_matches('"').to_string(), "manifest".to_string());
+  }
+  let Some(package) = root.get("package") else {
+    return ("1".to_string(), "virtual-workspace default".to_string());
+  };
+  let edition = package
+    .get("edition")
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or("2015");
+  let resolver = match edition {
+    "2024" => "3",
+    "2021" => "2",
+    _ => "1",
+  };
+  (resolver.to_string(), format!("inferred from edition {edition}"))
+}
+
+fn cargo_source_overrides(root: &serde_json::Value, cargo_config: &serde_json::Value) -> Vec<String> {
+  let mut overrides = Vec::new();
+  if let Some(patches) = root.get("patch").and_then(serde_json::Value::as_object) {
+    for (source, entries) in patches {
+      let source = if crate::cargo::resolution::credential_bearing_url(source) {
+        "<credential-bearing-url>"
+      } else {
+        source
+      };
+      if let Some(entries) = entries.as_object() {
+        overrides.extend(entries.keys().map(|name| format!("patch.{source}.{name}")));
+      }
+    }
+  }
+  if let Some(replacements) = root.get("replace").and_then(serde_json::Value::as_object) {
+    overrides.extend(replacements.keys().map(|name| format!("replace.{name}")));
+  }
+  if let Some(sources) = cargo_config.get("source").and_then(serde_json::Value::as_object) {
+    for (name, source) in sources {
+      if source.as_object().is_some_and(|source| {
+        ["replace-with", "registry", "local-registry", "directory"]
+          .iter()
+          .any(|key| source.contains_key(*key))
+      }) {
+        overrides.push(format!("source.{name}"));
+      }
+    }
+  }
+  overrides.sort();
+  overrides.dedup();
+  overrides
+}
+
+fn unify_policy_overrides(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
+  let actual = serde_json::to_value(ctx.config().map(|config| &config.unify).cloned().unwrap_or_default())?;
+  let defaults = serde_json::to_value(crate::config::UnifyConfig::default())?;
+  let Some(actual) = actual.as_object() else {
+    return Err(RailError::message("effective unify configuration is not an object"));
+  };
+  let Some(defaults) = defaults.as_object() else {
+    return Err(RailError::message("default unify configuration is not an object"));
+  };
+  Ok(
+    actual
+      .iter()
+      .filter(|(key, value)| defaults.get(*key) != Some(*value))
+      .map(|(key, _)| key.clone())
+      .collect(),
+  )
+}
+
+fn cargo_release_and_channel(verbose_version: &str) -> (String, &'static str) {
+  let release = verbose_version
+    .lines()
+    .find_map(|line| line.strip_prefix("release: "))
+    .or_else(|| {
+      verbose_version
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    })
+    .unwrap_or("unknown")
+    .to_string();
+  let channel = if release.contains("nightly") {
+    "nightly"
+  } else if release.contains("beta") {
+    "beta"
+  } else if release == "unknown" {
+    "unknown"
+  } else {
+    "stable"
+  };
+  (release, channel)
+}
+
+/// Inspect the exact Cargo resolution domains used by dependency unification.
+pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> RailResult<()> {
+  let snapshot = ctx.snapshot()?;
+  let root = root_manifest_value(ctx)?;
+  let (resolver, resolver_source) = resolver_diagnostic(&root);
+  let (cargo_version, cargo_channel) = cargo_release_and_channel(snapshot.toolchain().cargo_verbose_version());
+  let cargo_overrides = cargo_source_overrides(&root, snapshot.cargo_config().effective_file_settings());
+  let policy_overrides = unify_policy_overrides(ctx)?;
+  let ambiguous_aliases = ctx.graph().ambiguous_aliases();
+
+  // MultiTargetMetadata is deliberately backed by the same exact ResolutionView
+  // cache as planning. Doctor observes that model instead of reconstructing it.
+  let metadata = ctx.multi_target_metadata()?;
+  let host = snapshot.toolchain().host_target();
+  let metadata_targets = metadata.targets();
+  let mut target_domains = Vec::with_capacity(metadata_targets.len());
+  for target in metadata_targets {
+    let resolved_nodes = metadata
+      .get(target)
+      .and_then(|metadata| metadata.resolve.as_ref())
+      .map_or(0, |resolve| resolve.nodes.len());
+    target_domains.push(serde_json::json!({
+      "target": target,
+      "role": if target == "default" { "unfiltered" } else if target == host { "host" } else { "target" },
+      "feature_mode": "default",
+      "resolved_node_count": resolved_nodes,
+    }));
+  }
+
+  let aliases = ambiguous_aliases
+    .iter()
+    .map(|alias| {
+      serde_json::json!({
+        "member": alias.member_name,
+        "member_package_id": alias.member_id.to_string(),
+        "alias": alias.alias,
+        "candidates": alias.candidates.iter().map(|candidate| serde_json::json!({
+          "package": candidate.package_name,
+          "package_id": candidate.package_id.to_string(),
+          "domains": candidate.domains,
+        })).collect::<Vec<_>>(),
+      })
+    })
+    .collect::<Vec<_>>();
+  let (recommendation_code, recommendation) = if !aliases.is_empty() {
+    (
+      "disambiguate_aliases",
+      "make each dependency alias resolve to one PackageId per workspace member and selected target",
+    )
+  } else if resolver == "1" {
+    (
+      "upgrade_resolver",
+      "set workspace.resolver to the resolver required by the workspace edition before unifying features",
+    )
+  } else if !cargo_overrides.is_empty() {
+    (
+      "review_source_overrides",
+      "review active Cargo source overrides, then run cargo rail unify --check --explain",
+    )
+  } else {
+    ("check", "run cargo rail unify --check --explain")
+  };
+
+  if format.is_json() {
+    crate::output::set_json_mode(true);
+    let value = crate::output::machine_json_envelope(
+      "unify",
+      "doctor",
+      "success",
+      0,
+      serde_json::json!({
+        "cargo": { "version": cargo_version, "channel": cargo_channel },
+        "resolver": { "version": resolver, "source": resolver_source },
+        "feature_mode": { "packages": "workspace", "features": "default" },
+        "effective_overrides": {
+          "cargo_sources": cargo_overrides,
+          "unify_policy": policy_overrides,
+        },
+        "target_domains": target_domains,
+        "ambiguous_aliases": aliases,
+        "recommended_action": {
+          "code": recommendation_code,
+          "message": recommendation,
+        },
+      }),
+    );
+    let rendered = serde_json::to_string_pretty(&value)?;
+    return write_output(&rendered, None);
+  }
+
+  let mut rendered = String::with_capacity(512);
+  writeln!(rendered, "unify doctor\n").ok();
+  writeln!(rendered, "cargo: {cargo_version} ({cargo_channel})").ok();
+  writeln!(rendered, "resolver: {resolver} ({resolver_source})").ok();
+  writeln!(rendered, "features: workspace/default").ok();
+  writeln!(rendered, "target domains: {}", target_domains.len()).ok();
+  for target in &target_domains {
+    writeln!(
+      rendered,
+      "  {} ({}, {} resolved nodes)",
+      target["target"].as_str().unwrap_or("unknown"),
+      target["role"].as_str().unwrap_or("target"),
+      target["resolved_node_count"].as_u64().unwrap_or(0),
+    )
+    .ok();
+  }
+  writeln!(
+    rendered,
+    "cargo source overrides: {}",
+    format_preview_list(&cargo_overrides, 8)
+  )
+  .ok();
+  writeln!(
+    rendered,
+    "unify policy overrides: {}",
+    format_preview_list(&policy_overrides, 8)
+  )
+  .ok();
+  writeln!(rendered, "ambiguous aliases: {}", aliases.len()).ok();
+  for alias in &aliases {
+    writeln!(
+      rendered,
+      "  {}:{} -> {} candidates",
+      alias["member"].as_str().unwrap_or("unknown"),
+      alias["alias"].as_str().unwrap_or("unknown"),
+      alias["candidates"].as_array().map_or(0, Vec::len),
+    )
+    .ok();
+  }
+  writeln!(rendered, "recommended: {recommendation}").ok();
+  write_output(&rendered, None)
 }
 
 /// Analyze workspace dependencies (check mode)
@@ -1721,6 +1978,23 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
             format_preview_list(&reason.borrowed_from, 10)
           );
         }
+        for path in &reason.feature_paths {
+          outln!(
+            sink,
+            "      path: {}:{} [{}{}] features={} default-features={} optional={}",
+            path.member,
+            path.alias,
+            path.dependency_kind.as_str(),
+            path
+              .target
+              .as_deref()
+              .map(|target| format!(" @ {target}"))
+              .unwrap_or_default(),
+            format_preview_list(&path.features, 10),
+            path.default_features,
+            path.optional,
+          );
+        }
       }
       outln!(sink);
     }
@@ -2137,6 +2411,7 @@ mod tests {
         features: vec![arc("macros")],
         members: vec![arc("crate-b")],
         borrowed_from: vec![arc("crate-a")],
+        feature_paths: Vec::new(),
       }],
     });
 
@@ -2179,6 +2454,7 @@ mod tests {
             features: vec![arc("derive")],
             members: vec![arc("crate-a"), arc("crate-b")],
             borrowed_from: Vec::new(),
+            feature_paths: Vec::new(),
           },
           UnifyDecisionReason {
             code: UnifyDecisionCode::ExactPinWarnCaret,
@@ -2186,6 +2462,7 @@ mod tests {
             features: Vec::new(),
             members: vec![arc("crate-a"), arc("crate-b")],
             borrowed_from: Vec::new(),
+            feature_paths: Vec::new(),
           },
         ],
       },
@@ -2200,6 +2477,7 @@ mod tests {
           features: Vec::new(),
           members: vec![arc("tokio"), arc("tokio-stream"), arc("tokio-util")],
           borrowed_from: Vec::new(),
+          feature_paths: Vec::new(),
         }],
       },
       UnifyDecision {
@@ -2213,6 +2491,7 @@ mod tests {
           features: vec![arc("Win32_Foundation")],
           members: Vec::new(),
           borrowed_from: Vec::new(),
+          feature_paths: Vec::new(),
         }],
       },
       UnifyDecision {
@@ -2226,6 +2505,7 @@ mod tests {
           features: vec![arc("macros")],
           members: vec![arc("crate-c")],
           borrowed_from: vec![arc("crate-a")],
+          feature_paths: Vec::new(),
         }],
       },
     ]);

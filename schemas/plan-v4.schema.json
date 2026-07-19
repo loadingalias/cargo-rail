@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/plan-v4.schema.json",
+  "title": "cargo-rail planner contract v4",
+  "description": "Machine envelope emitted by cargo rail plan --format json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "mode",
+    "result",
+    "exit_code",
+    "plan_contract_version",
+    "inputs",
+    "files",
+    "impact",
+    "scope",
+    "surfaces",
+    "trace",
+    "reproducibility"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "command": { "const": "plan" },
+    "mode": { "const": "inspect" },
+    "result": { "const": "success" },
+    "exit_code": { "const": 0 },
+    "plan_contract_version": { "const": 4 },
+    "inputs": { "$ref": "#/$defs/inputs" },
+    "files": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/file" }
+    },
+    "impact": { "$ref": "#/$defs/impact" },
+    "scope": { "$ref": "#/$defs/execution_scope" },
+    "surfaces": { "$ref": "#/$defs/surface_decisions" },
+    "trace": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/trace_reason" }
+    },
+    "reproducibility": { "$ref": "#/$defs/reproducibility" }
+  },
+  "$defs": {
+    "nullable_string": {
+      "type": ["string", "null"]
+    },
+    "string_array": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["since", "from", "to", "merge_base", "resolved_base", "resolved_head"],
+      "properties": {
+        "since": { "$ref": "#/$defs/nullable_string" },
+        "from": { "$ref": "#/$defs/nullable_string" },
+        "to": { "$ref": "#/$defs/nullable_string" },
+        "merge_base": { "type": "boolean" },
+        "resolved_base": { "type": "string" },
+        "resolved_head": { "type": "string" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "refs",
+        "workspace_root",
+        "config_fingerprint",
+        "toolchain_fingerprint",
+        "confidence_profile",
+        "confidence_profile_source"
+      ],
+      "properties": {
+        "refs": { "$ref": "#/$defs/refs" },
+        "workspace_root": { "type": "string" },
+        "config_fingerprint": { "type": "string" },
+        "toolchain_fingerprint": { "type": "string" },
+        "confidence_profile": { "enum": ["strict", "balanced", "fast"] },
+        "confidence_profile_source": { "type": "string" }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "owners", "owner_scope"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "kind": { "type": "string" },
+        "sub_kind": { "type": "string" },
+        "custom_surfaces": { "$ref": "#/$defs/string_array" },
+        "owners": { "$ref": "#/$defs/string_array" },
+        "owner_scope": { "type": "string" }
+      }
+    },
+    "impact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direct_crates", "build_transitive_crates", "development_transitive_crates"],
+      "properties": {
+        "direct_crates": { "$ref": "#/$defs/string_array" },
+        "build_transitive_crates": { "$ref": "#/$defs/string_array" },
+        "development_transitive_crates": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "scope_mode": {
+      "enum": ["empty", "crates", "workspace"]
+    },
+    "surface_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "crates", "cargo_args"],
+      "properties": {
+        "mode": { "$ref": "#/$defs/scope_mode" },
+        "crates": { "$ref": "#/$defs/string_array" },
+        "cargo_args": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "execution_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope_contract_version", "resolved_base", "resolved_head", "mode", "crates", "cargo_args"],
+      "properties": {
+        "scope_contract_version": { "const": 3 },
+        "resolved_base": { "type": "string" },
+        "resolved_head": { "type": "string" },
+        "mode": { "$ref": "#/$defs/scope_mode" },
+        "crates": { "$ref": "#/$defs/string_array" },
+        "cargo_args": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "surface_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "reasons", "scope"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "uniqueItems": true
+        },
+        "scope": { "$ref": "#/$defs/surface_scope" }
+      }
+    },
+    "surface_decisions": {
+      "type": "object",
+      "required": ["bench", "build", "docs", "infra", "test"],
+      "additionalProperties": { "$ref": "#/$defs/surface_decision" },
+      "properties": {
+        "bench": { "$ref": "#/$defs/surface_decision" },
+        "build": { "$ref": "#/$defs/surface_decision" },
+        "docs": { "$ref": "#/$defs/surface_decision" },
+        "infra": { "$ref": "#/$defs/surface_decision" },
+        "test": { "$ref": "#/$defs/surface_decision" }
+      }
+    },
+    "trace_reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "code", "description", "selected_surfaces"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "code": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "semantic_input": { "enum": ["manifest", "workspace_manifest", "lockfile"] },
+        "file": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "crate": { "type": "string" },
+        "package_id": { "type": "string" },
+        "depends_on": { "type": "string" },
+        "depends_on_package_id": { "type": "string" },
+        "edge_kind": { "enum": ["normal", "development", "build", "unknown"] },
+        "alias": { "type": "string" },
+        "target_predicate": { "type": "string" },
+        "optional": { "type": "boolean" },
+        "uses_default_features": { "type": "boolean" },
+        "proc_macro": { "type": "boolean" },
+        "host": { "type": "boolean" },
+        "features": { "$ref": "#/$defs/string_array" },
+        "selected_surfaces": { "$ref": "#/$defs/string_array" },
+        "fallback_reasons": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "reproducibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cargo_rail_version", "config_hash", "git_shallow_clone"],
+      "properties": {
+        "cargo_rail_version": { "type": "string" },
+        "config_hash": { "type": "string" },
+        "git_merge_base": { "type": "string" },
+        "git_shallow_clone": { "type": "boolean" }
+      }
+    }
+  }
+}

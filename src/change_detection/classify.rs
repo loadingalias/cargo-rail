@@ -15,6 +15,10 @@ pub const RC_FILE_KIND_RUST_SRC: &str = "FILE_KIND_RUST_SRC";
 pub const RC_FILE_KIND_RUST_TEST: &str = "FILE_KIND_RUST_TEST";
 /// Trace code for planner-classified Rust bench files.
 pub const RC_FILE_KIND_RUST_BENCH: &str = "FILE_KIND_RUST_BENCH";
+/// Trace code for planner-classified Rust example files.
+pub const RC_FILE_KIND_RUST_EXAMPLE: &str = "FILE_KIND_RUST_EXAMPLE";
+/// Trace code for planner-classified Cargo build scripts.
+pub const RC_FILE_KIND_RUST_BUILD_SCRIPT: &str = "FILE_KIND_RUST_BUILD_SCRIPT";
 /// Trace code for planner-classified crate manifests.
 pub const RC_FILE_KIND_TOML_MANIFEST: &str = "FILE_KIND_TOML_MANIFEST";
 /// Trace code for planner-classified workspace manifests.
@@ -159,9 +163,11 @@ impl FileProfile {
   /// Planner-visible file sub kind.
   pub fn planned_sub_kind(self) -> Option<&'static str> {
     match self {
-      Self::RustSrc | Self::RustExample | Self::RustBuildScript => Some("src"),
+      Self::RustSrc => Some("src"),
       Self::RustTest => Some("test"),
       Self::RustBench => Some("bench"),
+      Self::RustExample => Some("example"),
+      Self::RustBuildScript => Some("build_script"),
       Self::TomlManifest => Some("manifest"),
       Self::TomlWorkspace => Some("workspace"),
       Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling => Some("tooling"),
@@ -174,9 +180,11 @@ impl FileProfile {
   /// Planner trace reason for the builtin classification.
   pub fn reason_code(self) -> &'static str {
     match self {
-      Self::RustSrc | Self::RustExample | Self::RustBuildScript => RC_FILE_KIND_RUST_SRC,
+      Self::RustSrc => RC_FILE_KIND_RUST_SRC,
       Self::RustTest => RC_FILE_KIND_RUST_TEST,
       Self::RustBench => RC_FILE_KIND_RUST_BENCH,
+      Self::RustExample => RC_FILE_KIND_RUST_EXAMPLE,
+      Self::RustBuildScript => RC_FILE_KIND_RUST_BUILD_SCRIPT,
       Self::TomlManifest => RC_FILE_KIND_TOML_MANIFEST,
       Self::TomlWorkspace => RC_FILE_KIND_TOML_WORKSPACE,
       Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling => RC_FILE_KIND_TOML_TOOLING,
@@ -192,9 +200,10 @@ impl FileProfile {
   /// Builtin planner surfaces implied by this profile.
   pub fn default_surfaces(self) -> &'static [&'static str] {
     match self {
-      Self::RustSrc | Self::RustExample | Self::RustBuildScript | Self::TomlManifest => BUILD_TEST_SURFACES,
+      Self::RustSrc | Self::RustBuildScript | Self::TomlManifest => BUILD_TEST_SURFACES,
       Self::RustTest => TEST_ONLY_SURFACES,
       Self::RustBench => BENCH_ONLY_SURFACES,
+      Self::RustExample => TEST_ONLY_SURFACES,
       Self::TomlWorkspace | Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling | Self::CargoLock => {
         INFRA_BUILD_TEST_SURFACES
       }
@@ -209,7 +218,6 @@ impl FileProfile {
     matches!(
       self,
       Self::RustSrc
-        | Self::RustExample
         | Self::RustBuildScript
         | Self::TomlManifest
         | Self::TomlWorkspace

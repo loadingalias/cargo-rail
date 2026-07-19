@@ -3,7 +3,7 @@
 //! Generates human-readable reports from `UnificationPlan` results.
 
 use crate::cargo::manifest_analyzer::DepKind;
-use crate::cargo::unify_types::{IssueSeverity, UnificationPlan, UnusedReason};
+use crate::cargo::unify_types::{IssueSeverity, MemberEdit, UnificationPlan, UnusedReason};
 use crate::error::RailResult;
 
 /// Generate a markdown report from the unification plan
@@ -65,6 +65,58 @@ impl UnifyReport {
           "| {} | {} | {} | {} |\n",
           dep.name, dep.version_req, features, users
         ));
+      }
+      md.push('\n');
+    }
+
+    if plan.member_edits.values().flatten().any(|edit| {
+      matches!(
+        edit,
+        MemberEdit::UseWorkspace { local_features, .. } if !local_features.is_empty()
+      )
+    }) {
+      md.push_str("## Member-Local Features\n\n");
+      md.push_str(
+        "These features remain on their exact member declaration instead of leaking into the workspace baseline.\n\n",
+      );
+      md.push_str("| Member | Dependency | Kind | Target | Features |\n");
+      md.push_str("|--------|------------|------|--------|----------|\n");
+
+      let mut members: Vec<_> = plan.member_edits.iter().collect();
+      members.sort_unstable_by_key(|(member, _)| *member);
+
+      for (member, edits) in members {
+        let mut local_edits: Vec<_> = edits
+          .iter()
+          .filter_map(|edit| match edit {
+            MemberEdit::UseWorkspace {
+              dep_name,
+              dep_kind,
+              target,
+              local_features,
+              ..
+            } if !local_features.is_empty() => Some((dep_name, dep_kind, target, local_features)),
+            _ => None,
+          })
+          .collect();
+        local_edits.sort_unstable_by(|left, right| {
+          left
+            .0
+            .cmp(right.0)
+            .then_with(|| dep_kind_label(left.1).cmp(dep_kind_label(right.1)))
+            .then_with(|| left.2.cmp(right.2))
+        });
+
+        for (dep_name, dep_kind, target, local_features) in local_edits {
+          md.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            member,
+            dep_name,
+            dep_kind_label(dep_kind),
+            target.as_deref().unwrap_or("(all)"),
+            local_features.join(", ")
+          ));
+        }
       }
       md.push('\n');
     }
@@ -134,11 +186,7 @@ impl UnifyReport {
       md.push_str("|--------|------------|------|--------|\n");
 
       for ud in &plan.unused_deps {
-        let kind_str = match ud.kind {
-          DepKind::Normal => "normal",
-          DepKind::Dev => "dev",
-          DepKind::Build => "build",
-        };
+        let kind_str = dep_kind_label(&ud.kind);
         let reason_str = match &ud.reason {
           UnusedReason::NotUsedInSource => "unused in source".to_string(),
           UnusedReason::NotInResolvedGraph => "not in resolved graph".to_string(),
@@ -180,5 +228,13 @@ impl UnifyReport {
 
     std::fs::write(path, content)?;
     Ok(())
+  }
+}
+
+const fn dep_kind_label(kind: &DepKind) -> &'static str {
+  match kind {
+    DepKind::Normal => "normal",
+    DepKind::Dev => "dev",
+    DepKind::Build => "build",
   }
 }

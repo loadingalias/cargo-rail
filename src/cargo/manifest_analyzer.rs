@@ -609,37 +609,33 @@ impl ManifestAnalyzer {
 
   /// Check if a dependency has mixed default-features settings
   ///
-  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
-  ///
-  /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
+  /// Includes every dependency kind and target domain because workspace-level
+  /// defaults cannot be disabled by a narrower inherited declaration.
   pub fn has_mixed_defaults(&self, dep: &DepKey) -> bool {
-    let unconditional_usages = self.unconditional_usages(dep);
+    let Some(usages) = self.usage_index.get(dep) else {
+      return false;
+    };
 
-    // Include ALL dep kinds - workspace deps serve all usage contexts
-    if unconditional_usages.len() < 2 {
+    if usages.len() < 2 {
       return false;
     }
 
-    // Check if all unconditional usages have the same default-features setting
-    let first_default = unconditional_usages[0].default_features;
-    !unconditional_usages.iter().all(|u| u.default_features == first_default)
+    let first_default = usages[0].default_features;
+    !usages.iter().all(|usage| usage.default_features == first_default)
   }
 
   /// Determine the default-features policy for a dependency
   ///
-  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
-  ///
-  /// **IMPORTANT**: Only considers UNCONDITIONAL usages (no target constraint).
+  /// Includes every dependency kind and target domain. If any declaration
+  /// disables defaults, the workspace baseline must disable them and opt the
+  /// other declarations back in through the explicit `default` feature.
   pub fn default_features_policy(&self, dep: &DepKey) -> Option<bool> {
-    let unconditional_usages = self.unconditional_usages(dep);
-
-    // Include ALL dep kinds - workspace deps serve all usage contexts
-    if unconditional_usages.is_empty() {
+    let usages = self.usage_index.get(dep)?;
+    if usages.is_empty() {
       return None;
     }
 
-    // If any unconditional usage has default-features = false, we must use false at root
-    if unconditional_usages.iter().any(|u| !u.default_features) {
+    if usages.iter().any(|usage| !usage.default_features) {
       Some(false)
     } else {
       Some(true)
@@ -722,11 +718,7 @@ impl ManifestAnalyzer {
   ///
   /// When include_renamed = true, check across all variants
   pub fn package_has_mixed_defaults(&self, package_name: &str) -> bool {
-    let usages: Vec<_> = self
-      .get_package_usage_sites(package_name)
-      .into_iter()
-      .filter(|u| u.target.is_none())
-      .collect();
+    let usages = self.get_package_usage_sites(package_name);
 
     if usages.len() < 2 {
       return false;
@@ -740,18 +732,13 @@ impl ManifestAnalyzer {
   ///
   /// When include_renamed = true, use conservative policy across all variants
   pub fn package_default_features_policy(&self, package_name: &str) -> Option<bool> {
-    let usages: Vec<_> = self
-      .get_package_usage_sites(package_name)
-      .into_iter()
-      .filter(|u| u.target.is_none())
-      .collect();
+    let usages = self.get_package_usage_sites(package_name);
 
     if usages.is_empty() {
       return None;
     }
 
-    // If any unconditional usage has default-features = false, we must use false
-    if usages.iter().any(|u| !u.default_features) {
+    if usages.iter().any(|usage| !usage.default_features) {
       Some(false)
     } else {
       Some(true)

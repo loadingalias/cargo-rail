@@ -24,7 +24,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use cargo_metadata::cargo_platform::Platform;
-use cargo_metadata::{DependencyKind, PackageId, Source};
+use cargo_metadata::{Dependency, DependencyKind, Package, PackageId, Source, TargetKind};
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -49,6 +49,8 @@ pub struct PackageNode {
   pub manifest_path: PathBuf,
   /// Whether this is a workspace member.
   pub is_workspace_member: bool,
+  /// Whether this package's library target is a procedural macro.
+  pub is_proc_macro: bool,
 }
 
 /// One resolved dependency relationship between two exact packages.
@@ -60,6 +62,97 @@ pub struct DependencyEdge {
   pub kind: DependencyKind,
   /// Target condition for this relationship, if any.
   pub target: Option<Platform>,
+  /// Whether the resolved declaration is optional, or `None` when declaration matching was ambiguous.
+  pub optional: Option<bool>,
+  /// Whether the declaration enables the dependency's default features.
+  pub uses_default_features: Option<bool>,
+  /// Explicit dependency features declared on this edge.
+  pub features: Vec<String>,
+}
+
+/// One exact resolved package behind an alias that is not globally unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasCandidate {
+  pub(crate) package_id: PackageId,
+  pub(crate) package_name: String,
+  pub(crate) domains: Vec<String>,
+}
+
+/// A dependency alias resolving to multiple exact packages for one member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AmbiguousAlias {
+  pub(crate) member_id: PackageId,
+  pub(crate) member_name: String,
+  pub(crate) alias: String,
+  pub(crate) candidates: Vec<AliasCandidate>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ResolvedDeclaration {
+  optional: bool,
+  uses_default_features: bool,
+  features: Vec<String>,
+}
+
+impl From<&Dependency> for ResolvedDeclaration {
+  fn from(dependency: &Dependency) -> Self {
+    let mut features = dependency.features.clone();
+    features.sort();
+    features.dedup();
+    Self {
+      optional: dependency.optional,
+      uses_default_features: dependency.uses_default_features,
+      features,
+    }
+  }
+}
+
+fn resolved_declaration(
+  package: &Package,
+  dependency_package: &PackageNode,
+  alias: &str,
+  kind: DependencyKind,
+  target: Option<&Platform>,
+) -> Option<ResolvedDeclaration> {
+  let mut matches = package.dependencies.iter().filter(|dependency| {
+    dependency_alias_matches(dependency.rename.as_deref().unwrap_or(&dependency.name), alias)
+      && dependency.name == dependency_package.name
+      && dependency.kind == kind
+      && dependency.target.as_ref() == target
+      && dependency.req.matches(&dependency_package.version)
+      && dependency_path_matches(dependency, dependency_package)
+  });
+  let first = ResolvedDeclaration::from(matches.next()?);
+  matches
+    .all(|dependency| ResolvedDeclaration::from(dependency) == first)
+    .then_some(first)
+}
+
+fn dependency_alias_matches(declared: &str, resolved: &str) -> bool {
+  declared.len() == resolved.len()
+    && declared
+      .bytes()
+      .zip(resolved.bytes())
+      .all(|(left, right)| if left == b'-' { b'_' } else { left } == right)
+}
+
+fn dependency_kind_name(kind: DependencyKind) -> &'static str {
+  match kind {
+    DependencyKind::Normal => "normal",
+    DependencyKind::Development => "development",
+    DependencyKind::Build => "build",
+    DependencyKind::Unknown => "unknown",
+  }
+}
+
+fn dependency_path_matches(dependency: &Dependency, package: &PackageNode) -> bool {
+  let Some(path) = dependency.path.as_ref() else {
+    return true;
+  };
+  package
+    .manifest_path
+    .parent()
+    .is_some_and(|package_root| package_root == path)
 }
 
 struct OwnershipIndex {
@@ -222,10 +315,10 @@ pub struct WorkspaceGraph {
   /// The dependency graph (petgraph DiGraph)
   /// Nodes: PackageNode
   /// Edges: resolved dependency alias + kind + target
-  graph: DiGraph<PackageNode, DependencyEdge>,
+  pub(super) graph: DiGraph<PackageNode, DependencyEdge>,
 
   /// Primary index: exact Cargo package ID → node index.
-  id_to_node: FxHashMap<PackageId, NodeIndex>,
+  pub(super) id_to_node: FxHashMap<PackageId, NodeIndex>,
 
   /// User-facing workspace-name lookup. Multiple exact members may share a name.
   workspace_name_index: FxHashMap<String, Vec<NodeIndex>>,
@@ -265,6 +358,10 @@ impl WorkspaceGraph {
         source: package.source.clone(),
         manifest_path: package.manifest_path.clone().into_std_path_buf(),
         is_workspace_member,
+        is_proc_macro: package
+          .targets
+          .iter()
+          .any(|target| target.is_kind(TargetKind::ProcMacro)),
       };
 
       let node_idx = graph.add_node(node);
@@ -284,6 +381,8 @@ impl WorkspaceGraph {
       matches.sort_by(|left, right| graph[*left].id.repr.cmp(&graph[*right].id.repr));
     }
 
+    let packages_by_id: FxHashMap<_, _> = metadata.packages.iter().map(|package| (&package.id, package)).collect();
+
     // Build only from Cargo's exact resolved graph. Package.dependencies is
     // declaration metadata and cannot identify exact resolved destinations or
     // combined kind/target variants.
@@ -295,6 +394,12 @@ impl WorkspaceGraph {
             node.id
           )));
         };
+        let package = packages_by_id.get(&node.id).copied().ok_or_else(|| {
+          RailError::message(format!(
+            "Cargo resolve node '{}' is missing from package metadata",
+            node.id
+          ))
+        })?;
 
         for dependency in &node.deps {
           let Some(&to_idx) = id_to_node.get(&dependency.pkg) else {
@@ -311,6 +416,13 @@ impl WorkspaceGraph {
           }
 
           for dep_kind in &dependency.dep_kinds {
+            let declaration = resolved_declaration(
+              package,
+              &graph[to_idx],
+              &dependency.name,
+              dep_kind.kind,
+              dep_kind.target.as_ref(),
+            );
             graph.add_edge(
               from_idx,
               to_idx,
@@ -318,6 +430,11 @@ impl WorkspaceGraph {
                 name: dependency.name.clone(),
                 kind: dep_kind.kind,
                 target: dep_kind.target.clone(),
+                optional: declaration.as_ref().map(|declaration| declaration.optional),
+                uses_default_features: declaration
+                  .as_ref()
+                  .map(|declaration| declaration.uses_default_features),
+                features: declaration.map(|declaration| declaration.features).unwrap_or_default(),
               },
             );
           }
@@ -341,6 +458,15 @@ impl WorkspaceGraph {
       sorted_members,
       ownership_index,
     })
+  }
+
+  /// Propagate changed package outputs through Cargo's resolved dependency domains.
+  pub(crate) fn propagate_impact(
+    &self,
+    package_ids: &HashSet<PackageId>,
+    target_filtered: bool,
+  ) -> RailResult<crate::graph::ImpactPropagation> {
+    crate::graph::impact::propagate(self, package_ids, target_filtered)
   }
 
   /// Get all workspace member crate names (pre-sorted).
@@ -375,6 +501,60 @@ impl WorkspaceGraph {
     endpoints
       .into_iter()
       .flat_map(move |(from, to)| self.graph.edges_connecting(from, to).map(|edge| edge.weight()))
+  }
+
+  /// Return aliases that resolve to more than one exact package across Cargo domains.
+  pub(crate) fn ambiguous_aliases(&self) -> Vec<AmbiguousAlias> {
+    use petgraph::visit::EdgeRef as _;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut ambiguous = Vec::new();
+    for node in self.graph.node_indices() {
+      let member = &self.graph[node];
+      if !member.is_workspace_member {
+        continue;
+      }
+      let mut aliases = BTreeMap::<String, BTreeMap<PackageId, (String, BTreeSet<String>)>>::new();
+      for edge in self.graph.edges_directed(node, Direction::Outgoing) {
+        let semantics = edge.weight();
+        let domain = match &semantics.target {
+          Some(target) => format!("{}@{}", dependency_kind_name(semantics.kind), target),
+          None => dependency_kind_name(semantics.kind).to_string(),
+        };
+        aliases
+          .entry(semantics.name.clone())
+          .or_default()
+          .entry(self.graph[edge.target()].id.clone())
+          .or_insert_with(|| (self.graph[edge.target()].name.clone(), BTreeSet::new()))
+          .1
+          .insert(domain);
+      }
+      for (alias, candidates) in aliases {
+        if candidates.len() < 2 {
+          continue;
+        }
+        ambiguous.push(AmbiguousAlias {
+          member_id: member.id.clone(),
+          member_name: member.name.clone(),
+          alias,
+          candidates: candidates
+            .into_iter()
+            .map(|(package_id, (package_name, domains))| AliasCandidate {
+              package_name,
+              package_id,
+              domains: domains.into_iter().collect(),
+            })
+            .collect(),
+        });
+      }
+    }
+    ambiguous.sort_by(|left, right| {
+      left
+        .member_id
+        .cmp(&right.member_id)
+        .then_with(|| left.alias.cmp(&right.alias))
+    });
+    ambiguous
   }
 
   /// Get transitive reverse dependencies (all workspace crates that depend on this one).
@@ -777,6 +957,7 @@ mod tests {
         source: None,
         manifest_path: PathBuf::from(format!("crates/{name}/Cargo.toml")),
         is_workspace_member: true,
+        is_proc_macro: false,
       });
       id_to_node.insert(id, node);
       name_to_node.insert(name.to_string(), node);
@@ -791,6 +972,9 @@ mod tests {
           name: (*to).to_string(),
           kind: DependencyKind::Normal,
           target: None,
+          optional: Some(false),
+          uses_default_features: Some(true),
+          features: Vec::new(),
         },
       );
     }
@@ -805,6 +989,43 @@ mod tests {
       sorted_members: vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
       ownership_index,
     }
+  }
+
+  fn add_test_edge(
+    graph: &mut WorkspaceGraph,
+    from: &str,
+    to: &str,
+    kind: DependencyKind,
+    target: Option<&str>,
+    optional: Option<bool>,
+  ) {
+    let from = graph.workspace_name_index[from][0];
+    let to = graph.workspace_name_index[to][0];
+    graph.graph.add_edge(
+      from,
+      to,
+      DependencyEdge {
+        name: graph.graph[to].name.clone(),
+        kind,
+        target: target.map(|target| target.parse().expect("test target predicate should parse")),
+        optional,
+        uses_default_features: optional.map(|_| true),
+        features: Vec::new(),
+      },
+    );
+  }
+
+  fn package_ids(graph: &WorkspaceGraph, names: &[&str]) -> HashSet<PackageId> {
+    names
+      .iter()
+      .map(|name| {
+        graph
+          .workspace_package_by_name(name)
+          .expect("test package should be unique")
+          .id
+          .clone()
+      })
+      .collect()
   }
 
   fn write_test_package(root: &Path, relative: &str, name: &str, version: &str, dependencies: &str) {
@@ -938,6 +1159,91 @@ mod tests {
   }
 
   #[test]
+  fn semantic_impact_stops_after_crossing_a_development_edge() {
+    let mut graph = test_graph(&[]);
+    add_test_edge(&mut graph, "b", "a", DependencyKind::Development, None, Some(false));
+    add_test_edge(&mut graph, "c", "b", DependencyKind::Normal, None, Some(false));
+
+    let impact = graph
+      .propagate_impact(&package_ids(&graph, &["a"]), false)
+      .expect("semantic impact should propagate");
+
+    assert!(impact.build.is_empty());
+    assert_eq!(impact.development, package_ids(&graph, &["b"]).into_iter().collect());
+    assert!(
+      impact
+        .steps
+        .iter()
+        .all(|step| step.domain == crate::graph::ImpactDomain::Development)
+    );
+  }
+
+  #[test]
+  fn semantic_impact_propagates_normal_and_build_edges_transitively() {
+    let mut graph = test_graph(&[]);
+    add_test_edge(&mut graph, "b", "a", DependencyKind::Build, None, Some(false));
+    add_test_edge(&mut graph, "c", "b", DependencyKind::Normal, None, Some(false));
+
+    let impact = graph
+      .propagate_impact(&package_ids(&graph, &["a"]), false)
+      .expect("semantic impact should propagate");
+
+    assert_eq!(impact.build, package_ids(&graph, &["b", "c"]).into_iter().collect());
+    assert!(impact.development.is_empty());
+    assert!(
+      impact
+        .steps
+        .iter()
+        .any(|step| step.kind == DependencyKind::Build && step.host)
+    );
+  }
+
+  #[test]
+  fn semantic_impact_explains_target_optional_and_proc_macro_domains() {
+    let mut graph = test_graph(&[]);
+    let a = graph.workspace_name_index["a"][0];
+    graph.graph[a].is_proc_macro = true;
+    add_test_edge(
+      &mut graph,
+      "b",
+      "a",
+      DependencyKind::Normal,
+      Some("cfg(unix)"),
+      Some(true),
+    );
+
+    let unfiltered = graph
+      .propagate_impact(&package_ids(&graph, &["a"]), false)
+      .expect("unfiltered semantic impact should propagate conservatively");
+    let step = unfiltered.steps.first().expect("impact should contain one step");
+    assert!(step.proc_macro);
+    assert!(step.host);
+    assert_eq!(step.optional, Some(true));
+    assert_eq!(step.target.as_deref(), Some("cfg(unix)"));
+    assert_eq!(step.fallbacks, vec![crate::graph::ImpactFallback::TargetUnfiltered]);
+
+    let filtered = graph
+      .propagate_impact(&package_ids(&graph, &["a"]), true)
+      .expect("filtered semantic impact should propagate");
+    assert!(filtered.steps[0].fallbacks.is_empty());
+  }
+
+  #[test]
+  fn semantic_impact_prefers_build_over_parallel_development_impact() {
+    let mut graph = test_graph(&[]);
+    add_test_edge(&mut graph, "b", "a", DependencyKind::Development, None, Some(false));
+    add_test_edge(&mut graph, "b", "a", DependencyKind::Normal, None, Some(false));
+
+    let impact = graph
+      .propagate_impact(&package_ids(&graph, &["a"]), false)
+      .expect("parallel semantic impact should propagate");
+
+    assert_eq!(impact.build, package_ids(&graph, &["b"]).into_iter().collect());
+    assert!(impact.development.is_empty());
+    assert_eq!(impact.steps.len(), 2);
+  }
+
+  #[test]
   fn direct_dependents_collapse_parallel_semantic_edges() {
     let mut graph = test_graph(&[("b", "a")]);
     graph.graph.add_edge(
@@ -947,6 +1253,9 @@ mod tests {
         name: "a_alias".into(),
         kind: DependencyKind::Development,
         target: None,
+        optional: Some(false),
+        uses_default_features: Some(true),
+        features: Vec::new(),
       },
     );
 

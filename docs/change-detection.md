@@ -27,7 +27,9 @@ executing the first action. A
 successful run or dry run writes a version-2 decision receipt under `target/cargo-rail/receipts/run-decision-*.json`.
 The receipt binds the action list to the workspace snapshot and records each action's exact argv array, logical working
 directory, selected packages/targets/features, dependencies, typed environment names, declared side effects, and
-planner trace reasons. `--dry-run` previews that same expansion without starting an action process. `--dry-run -f json`
+planner trace reasons. Cargo actions also record the exact root PackageIds and resolved-node count for every selected
+target/feature `ResolutionView`; default, all-feature, named-feature, host, and cross-target actions therefore do not
+silently share one maximal graph. `--dry-run` previews that same expansion without starting an action process. `--dry-run -f json`
 and `-f github` expose the same deterministic topological order to CI. Current built-ins inherit the host environment
 and are not sandboxed, so receipts mark their inputs and outputs as ambient and the actions as non-reusable.
 
@@ -39,11 +41,19 @@ regeneration. Select `--generated check` to expose staleness, use the default `r
 
 - `surfaces` tells you which surfaces are active
 - `trace` tells you why
-- `impact` is diagnostic
-- `scope` is the execution handoff
-- `scope.cargo_args` is the Cargo package selection for that handoff
+- `impact.build_transitive_crates` and `impact.development_transitive_crates` expose semantic graph impact
+- `scope` is the compatibility handoff across all active surfaces
+- `surfaces.NAME.scope` is the exact package selection for one surface
+- `scope.cargo_args` is the compatibility Cargo selection across active package-scoped surfaces
 
-If another tool needs package selection, use `scope.cargo_args`, not `impact`.
+If another tool executes one surface, use `surfaces.NAME.scope.cargo_args`, not `impact`. Existing integrations that
+execute all active package-scoped surfaces together may continue using `scope.cargo_args`.
+
+Worktree planning resolves Cargo's default features for every effective Cargo build target, defaulting to the host.
+Reverse impact preserves normal,
+development, build, proc-macro, optional, renamed, and target-conditioned edges. Historical object-to-object planning
+cannot ask Cargo to resolve the historical tree, so package-scoped work widens to the workspace. Current-graph edge
+evidence remains explanatory only and reports `historical_resolution_unavailable` in `trace` and `--explain`.
 
 ## Config
 

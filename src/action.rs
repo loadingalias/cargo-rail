@@ -186,8 +186,41 @@ impl ActionFeatureSelection {
     }
   }
 
-  fn named(&self) -> &[String] {
+  pub(crate) fn all_features(&self) -> bool {
+    self.all_features
+  }
+
+  pub(crate) fn default_features(&self) -> bool {
+    self.default_features
+  }
+
+  pub(crate) fn named(&self) -> &[String] {
     &self.named
+  }
+}
+
+/// Exact Cargo resolution view loaded for one action target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ActionResolutionBinding {
+  root_package_ids: Vec<String>,
+  target: Option<String>,
+  features: ActionFeatureSelection,
+  resolved_node_count: usize,
+}
+
+impl ActionResolutionBinding {
+  pub(crate) fn new(
+    root_package_ids: Vec<String>,
+    target: Option<String>,
+    features: ActionFeatureSelection,
+    resolved_node_count: usize,
+  ) -> Self {
+    Self {
+      root_package_ids,
+      target,
+      features,
+      resolved_node_count,
+    }
   }
 }
 
@@ -554,6 +587,7 @@ impl ActionSpec {
       selected_packages: expansion.selected_packages,
       selected_targets,
       selected_features,
+      resolution_views: Vec::new(),
       platform: expansion.platform,
       generated_mode,
       dependencies: self.dependencies.clone(),
@@ -672,6 +706,8 @@ pub(crate) struct ExpandedAction {
   selected_packages: Vec<String>,
   selected_targets: Vec<String>,
   selected_features: ActionFeatureSelection,
+  #[serde(skip_serializing_if = "Vec::is_empty")]
+  resolution_views: Vec<ActionResolutionBinding>,
   platform: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   generated_mode: Option<ExpandedGeneratedMode>,
@@ -696,6 +732,18 @@ impl ExpandedAction {
 
   pub(crate) fn selected_packages(&self) -> &[String] {
     &self.selected_packages
+  }
+
+  pub(crate) fn selected_targets(&self) -> &[String] {
+    &self.selected_targets
+  }
+
+  pub(crate) fn selected_features(&self) -> &ActionFeatureSelection {
+    &self.selected_features
+  }
+
+  pub(crate) fn bind_resolution_views(&mut self, bindings: Vec<ActionResolutionBinding>) {
+    self.resolution_views = bindings;
   }
 
   pub(crate) fn id(&self) -> &str {

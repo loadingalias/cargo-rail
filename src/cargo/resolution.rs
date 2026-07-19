@@ -1009,9 +1009,11 @@ impl ResolutionViews {
     if !options.features.is_empty() {
       command.features(CargoOpt::SomeFeatures(options.features));
     }
+    let mut other_options = vec!["--locked".to_string()];
     if let Some(target) = key.request.target_filter() {
-      command.other_options(vec!["--filter-platform".to_string(), target.to_string()]);
+      other_options.extend(["--filter-platform".to_string(), target.to_string()]);
     }
+    command.other_options(other_options);
 
     crate::instrumentation::record_cargo_metadata_load(key.request.target_filter().is_some());
     let metadata = command.exec();

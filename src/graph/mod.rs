@@ -9,7 +9,9 @@
 //! No guppy - we own our domain types and queries.
 
 pub mod core;
+pub(crate) mod impact;
 pub mod query;
 
 pub use core::WorkspaceGraph;
+pub(crate) use impact::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
 pub use query::{AffectedAnalysis, analyze};

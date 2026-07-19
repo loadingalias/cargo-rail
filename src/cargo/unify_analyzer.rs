@@ -11,9 +11,9 @@ use crate::cargo::{
   unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, IssueSeverity, MemberEdit, PrunedFeature, UndeclaredFeature, UnificationPlan, UnifiedDep,
-    UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnifyIssueKind, UnusedDep,
-    ValidationResult, VersionMismatch,
+    DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, PrunedFeature, UndeclaredFeature,
+    UnificationPlan, UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject,
+    UnifyIssue, UnifyIssueKind, UnusedDep, ValidationResult, VersionMismatch,
   },
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
@@ -48,13 +48,17 @@ pub struct UnifyAnalyzer {
   target_cfg_sets: Arc<std::collections::HashMap<String, TargetCfgSet>>,
 }
 
-type FeatureDomain = (String, DepKind);
+type FeatureDomain = (String, String, DepKind);
 type FeatureSources = FxHashMap<FeatureDomain, FxHashMap<String, Vec<FeatureProvider>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FeatureProvider {
   member: String,
+  alias: Arc<str>,
+  kind: DepKind,
   target: Option<String>,
+  default_features: bool,
+  optional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +104,39 @@ impl UnifyAnalyzer {
       canonical_workspace_root,
       target_cfg_sets,
     })
+  }
+
+  fn feature_enabling_paths(usages: &[&crate::cargo::manifest_analyzer::DepUsage]) -> Vec<FeatureEnablingPath> {
+    let mut paths = usages
+      .iter()
+      .map(|usage| {
+        let features = usage
+          .unconditional_features
+          .union(&usage.conditional_features)
+          .map(|feature| Arc::from(feature.as_str()))
+          .collect();
+        FeatureEnablingPath {
+          member: Arc::clone(&usage.used_by),
+          alias: Arc::clone(&usage.cargo_toml_key),
+          dependency_kind: usage.kind,
+          target: usage.target.as_deref().map(Arc::from),
+          features,
+          default_features: usage.default_features,
+          optional: usage.optional,
+        }
+      })
+      .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+      left
+        .member
+        .cmp(&right.member)
+        .then_with(|| left.alias.cmp(&right.alias))
+        .then_with(|| left.dependency_kind.cmp(&right.dependency_kind))
+        .then_with(|| left.target.cmp(&right.target))
+        .then_with(|| left.features.cmp(&right.features))
+    });
+    paths.dedup();
+    paths
   }
 
   /// Build connected cohorts of workspace members that depend on each other.
@@ -470,6 +507,7 @@ impl UnifyAnalyzer {
                 features: Vec::new(),
                 members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
                 borrowed_from: Vec::new(),
+                feature_paths: Vec::new(),
               },
             );
             continue;
@@ -561,6 +599,7 @@ impl UnifyAnalyzer {
               features: Vec::new(),
               members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
               borrowed_from: Vec::new(),
+              feature_paths: Vec::new(),
             });
           }
           ExactPinHandling::Warn => {
@@ -573,6 +612,7 @@ impl UnifyAnalyzer {
               features: Vec::new(),
               members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
               borrowed_from: Vec::new(),
+              feature_paths: Vec::new(),
             });
           }
           ExactPinHandling::Skip => {}
@@ -621,10 +661,25 @@ impl UnifyAnalyzer {
       // (for example Tokio's "full" leaking into WASM jobs via workspace.dependencies).
       //
       // Non-member deps keep existing feature/default-features unification behavior.
-      let (features, default_features, feature_reason) = if is_workspace_member_dep {
-        (std::collections::BTreeSet::new(), true, None)
+      let feature_paths = Self::feature_enabling_paths(&usage_sites);
+      let (mut features, default_features, feature_reason) = if is_workspace_member_dep {
+        (
+          std::collections::BTreeSet::new(),
+          self.manifests.default_features_policy(dep_key).unwrap_or(true),
+          Some(UnifyDecisionReason {
+            code: UnifyDecisionCode::WorkspaceMemberFeaturesLocal,
+            summary: Arc::from(
+              "Kept workspace-member features on each exact declaration so target and dependency domains stay isolated.",
+            ),
+            features: Vec::new(),
+            members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+            borrowed_from: Vec::new(),
+            feature_paths: feature_paths.clone(),
+          }),
+        )
       } else {
-        // Check for mixed defaults - use union strategy if present
+        // Default-feature policy spans every declaration because inherited
+        // declarations cannot disable a workspace-level default.
         // When include_renamed = true, check across all package variants
         let has_mixed_defaults = if self.config.include_renamed {
           self.manifests.package_has_mixed_defaults(&dep_key.name)
@@ -641,14 +696,10 @@ impl UnifyAnalyzer {
           let features = self.manifests.compute_package_union(&dep_key.name);
           // When mixed defaults detected, use default-features = true to preserve
           // features for crates that rely on them (same logic as non-include_renamed path)
-          let df = if has_mixed_defaults {
-            true
-          } else {
-            self
-              .manifests
-              .package_default_features_policy(&dep_key.name)
-              .unwrap_or(true)
-          };
+          let df = self
+            .manifests
+            .package_default_features_policy(&dep_key.name)
+            .unwrap_or(true);
           let mut feature_list: Vec<Arc<str>> = features.iter().map(|feature| Arc::from(feature.as_str())).collect();
           feature_list.sort();
           (
@@ -662,57 +713,40 @@ impl UnifyAnalyzer {
               features: feature_list,
               members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
               borrowed_from: Vec::new(),
+              feature_paths: feature_paths.clone(),
             }),
           )
         } else {
-          // Standard per-dep_key logic
+          // Standard aliases use the smallest globally safe baseline. Every
+          // declaration keeps its additional features locally.
           let intersection = self.manifests.compute_intersection(dep_key);
-
-          if has_mixed_defaults || intersection.is_empty() {
-            // Use union strategy for:
-            // 1. Mixed default-features settings
-            // 2. No common features (empty intersection)
-            // Set default-features = true (max/union strategy)
-            let union = self.manifests.compute_union(dep_key);
-            let mut feature_list: Vec<Arc<str>> = union.iter().map(|feature| Arc::from(feature.as_str())).collect();
-            feature_list.sort();
-            let summary = if has_mixed_defaults {
-              "Used union because dependency usages disagree on default-features."
-            } else {
-              "Used union because the shared feature intersection was empty."
-            };
-            (
-              union,
-              true,
-              Some(UnifyDecisionReason {
-                code: UnifyDecisionCode::FeatureUnion,
-                summary: Arc::from(summary),
-                features: feature_list,
-                members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
-                borrowed_from: Vec::new(),
-              }),
-            )
+          let mut feature_list: Vec<Arc<str>> =
+            intersection.iter().map(|feature| Arc::from(feature.as_str())).collect();
+          feature_list.sort();
+          let summary = if intersection.is_empty() {
+            "Kept the workspace feature baseline empty because no explicit feature is shared by every declaration."
+          } else if has_mixed_defaults {
+            "Used the shared feature intersection and disabled workspace defaults because declarations disagree on defaults."
           } else {
-            // Use intersection (minimal) strategy
-            // Use conservative default-features policy
-            let df = self.manifests.default_features_policy(dep_key).unwrap_or(true);
-            let mut feature_list: Vec<Arc<str>> =
-              intersection.iter().map(|feature| Arc::from(feature.as_str())).collect();
-            feature_list.sort();
-            (
-              intersection,
-              df,
-              Some(UnifyDecisionReason {
-                code: UnifyDecisionCode::FeatureIntersection,
-                summary: Arc::from("Used intersection to keep only features shared by every usage."),
-                features: feature_list,
-                members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
-                borrowed_from: Vec::new(),
-              }),
-            )
-          }
+            "Used the intersection to keep only explicit features shared by every declaration."
+          };
+          (
+            intersection,
+            self.manifests.default_features_policy(dep_key).unwrap_or(true),
+            Some(UnifyDecisionReason {
+              code: UnifyDecisionCode::FeatureIntersection,
+              summary: Arc::from(summary),
+              features: feature_list,
+              members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
+              borrowed_from: Vec::new(),
+              feature_paths: feature_paths.clone(),
+            }),
+          )
         }
       };
+      if !default_features {
+        features.remove("default");
+      }
       if let Some(reason) = feature_reason {
         decision_reasons.push(reason);
       }
@@ -754,6 +788,7 @@ impl UnifyAnalyzer {
             features: Vec::new(),
             members: entry.members.clone(),
             borrowed_from: Vec::new(),
+            feature_paths: Vec::new(),
           });
         }
       }
@@ -815,12 +850,18 @@ impl UnifyAnalyzer {
       for usage in usage_sites {
         // Compute local features (member features - workspace features)
         // Convert to Arc<str> and filter out features already in workspace
-        let local_features: Vec<Arc<str>> = usage
+        let mut local_features: Vec<Arc<str>> = usage
           .unconditional_features
           .iter()
           .filter(|f| !workspace_features.iter().any(|wf| &**wf == *f))
           .map(|f| Arc::from(f.as_str()))
           .collect();
+        if !default_features && usage.default_features && !local_features.iter().any(|feature| &**feature == "default")
+        {
+          local_features.push(Arc::from("default"));
+        }
+        local_features.sort();
+        local_features.dedup();
 
         // Use the cargo_toml_key from the usage - this is the actual key in Cargo.toml
         // For renamed deps like `old_serde = { package = "serde" }`, this is "old_serde"
@@ -859,6 +900,7 @@ impl UnifyAnalyzer {
           features: pin.features.clone(),
           members: Vec::new(),
           borrowed_from: Vec::new(),
+          feature_paths: Vec::new(),
         },
       );
     }
@@ -979,6 +1021,7 @@ impl UnifyAnalyzer {
             features: uf.undeclared_features.clone(),
             members: vec![Arc::clone(&uf.member)],
             borrowed_from: uf.borrowed_from.clone(),
+            feature_paths: uf.enabling_paths.clone(),
           },
         );
       }
@@ -1142,7 +1185,7 @@ impl UnifyAnalyzer {
               continue;
             }
 
-            let domain = (dep_name_str.clone(), usage.kind);
+            let domain = (dep_name_str.clone(), usage.cargo_toml_key.to_string(), usage.kind);
             feature_sources
               .entry(domain)
               .or_default()
@@ -1150,7 +1193,11 @@ impl UnifyAnalyzer {
               .or_default()
               .push(FeatureProvider {
                 member: member.package_name.clone(),
+                alias: Arc::clone(&usage.cargo_toml_key),
+                kind: usage.kind,
                 target: usage.target.clone(),
+                default_features: usage.default_features,
+                optional: usage.optional,
               });
           }
         }
@@ -1163,6 +1210,8 @@ impl UnifyAnalyzer {
           left
             .member
             .cmp(&right.member)
+            .then_with(|| left.alias.cmp(&right.alias))
+            .then_with(|| left.kind.cmp(&right.kind))
             .then_with(|| left.target.cmp(&right.target))
         });
         providers.dedup();
@@ -1217,7 +1266,7 @@ impl UnifyAnalyzer {
           .default_feature_closure_for(&resolved_dependency.package_ids);
 
         for usage in usages {
-          let domain = (dep_key.name.to_string(), usage.kind);
+          let domain = (dep_key.name.to_string(), dep_key.alias().to_string(), usage.kind);
           let Some(feat_sources) = feature_sources.get(&domain) else {
             continue;
           };
@@ -1336,6 +1385,7 @@ impl UnifyAnalyzer {
 
     let mut borrowed_features: Vec<Arc<str>> = Vec::with_capacity(feat_sources.len());
     let mut borrowed_from_members: FxHashSet<Arc<str>> = FxHashSet::default();
+    let mut enabling_paths = Vec::new();
 
     for (feat, providers) in feat_sources {
       if !resolved_features.contains(feat) {
@@ -1369,6 +1419,15 @@ impl UnifyAnalyzer {
       // This feature is borrowed from other members
       borrowed_features.push(Arc::from(feat.as_str()));
       for provider in compatible_providers {
+        enabling_paths.push(FeatureEnablingPath {
+          member: Arc::from(provider.member.as_str()),
+          alias: Arc::clone(&provider.alias),
+          dependency_kind: provider.kind,
+          target: provider.target.as_deref().map(Arc::from),
+          features: vec![Arc::from(feat.as_str())],
+          default_features: provider.default_features,
+          optional: provider.optional,
+        });
         if provider.member != member.package_name {
           borrowed_from_members.insert(Arc::from(provider.member.as_str()));
         }
@@ -1382,6 +1441,8 @@ impl UnifyAnalyzer {
     borrowed_features.sort();
     let mut borrowed_from: Vec<Arc<str>> = borrowed_from_members.into_iter().collect();
     borrowed_from.sort();
+    enabling_paths.sort();
+    enabling_paths.dedup();
 
     Some(UndeclaredFeature {
       member: Arc::from(member.package_name.as_str()),
@@ -1392,6 +1453,7 @@ impl UnifyAnalyzer {
       dep_kind: usage.kind,
       target: usage.target.as_ref().map(|t| Arc::from(t.as_str())),
       borrowed_from,
+      enabling_paths,
       required_by: Vec::new(),
     })
   }

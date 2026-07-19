@@ -42,7 +42,12 @@ fn write_case_file(ws: &TestWorkspace, case: &CorpusCase) -> Result<()> {
 
   if path.exists() {
     let existing = std::fs::read_to_string(&path)?;
-    std::fs::write(&path, format!("{existing}\n# planner corpus regression\n"))?;
+    let semantic_change = match case.path.as_str() {
+      "Cargo.toml" => "\n[profile.dev]\nopt-level = 1\n",
+      "crates/lib-a/Cargo.toml" => "\n[features]\nplanner-corpus = []\n",
+      _ => "\n# planner corpus regression\n",
+    };
+    std::fs::write(&path, format!("{existing}{semantic_change}"))?;
     return Ok(());
   }
 

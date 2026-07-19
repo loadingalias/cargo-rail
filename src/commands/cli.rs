@@ -337,7 +337,7 @@ pub enum Commands {
   /// Unify workspace dependencies (replaces workspace-hack crates)
   #[command(after_long_help = UNIFY_HELP)]
   Unify {
-    /// Subcommand (undo)
+    /// Subcommand (doctor or undo)
     #[command(subcommand)]
     command: Option<UnifyCommand>,
     /// Check for pending changes without modifying files (exit 1 when pending)
@@ -641,6 +641,12 @@ pub enum ConfigCommand {
 /// Subcommands for `cargo rail unify`
 #[derive(Subcommand)]
 pub enum UnifyCommand {
+  /// Inspect Cargo resolution semantics without changing files
+  Doctor {
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: UnifyOutputFormat,
+  },
   /// Restore manifests from a previous backup
   Undo {
     /// List available backups instead of restoring
@@ -861,6 +867,10 @@ impl Commands {
       Commands::Run { format, .. } => format.is_json_like(),
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
+      Commands::Unify {
+        command: Some(UnifyCommand::Doctor { format }),
+        ..
+      } => format.is_json_like(),
       Commands::Unify { format, .. } => format.is_json_like(),
       Commands::Split { command } => match command {
         SplitCommand::Init { .. } => false,
@@ -897,7 +907,10 @@ impl Commands {
   /// of silently emitting text while JSON mode is enabled.
   pub fn apply_json_override(&mut self) -> Result<(), clap::Error> {
     let unsupported = match self {
-      Commands::Unify { command: Some(_), .. } => Some("unify undo"),
+      Commands::Unify {
+        command: Some(UnifyCommand::Undo { .. }),
+        ..
+      } => Some("unify undo"),
       Commands::Split {
         command: SplitCommand::Init { .. },
       } => Some("split init"),
@@ -925,6 +938,10 @@ impl Commands {
       Commands::Run { format, .. } => *format = ActionOutputFormat::Json,
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
+      Commands::Unify {
+        command: Some(UnifyCommand::Doctor { format }),
+        ..
+      } => *format = UnifyOutputFormat::Json,
       Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
       Commands::Split {
         command: SplitCommand::Run { format, .. },

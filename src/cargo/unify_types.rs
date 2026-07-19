@@ -288,8 +288,29 @@ pub struct UndeclaredFeature {
   /// Which workspace members provide the borrowed features
   /// Shows where the feature is coming from (for transparency)
   pub borrowed_from: Vec<Arc<str>>,
+  /// Exact declarations that enabled the borrowed resolver features.
+  pub enabling_paths: Vec<FeatureEnablingPath>,
   /// Workspace-relative source paths whose diagnostics require the feature.
   pub required_by: Vec<Arc<str>>,
+}
+
+/// One manifest declaration contributing to a feature-policy decision.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FeatureEnablingPath {
+  /// Workspace member containing the declaration.
+  pub member: Arc<str>,
+  /// Cargo.toml dependency key, preserving renames.
+  pub alias: Arc<str>,
+  /// Normal, development, or build dependency domain.
+  pub dependency_kind: DepKind,
+  /// Target predicate on the declaration, when present.
+  pub target: Option<Arc<str>>,
+  /// Explicit and conditional features enabled by this declaration.
+  pub features: Vec<Arc<str>>,
+  /// Whether this declaration enables the dependency's default feature.
+  pub default_features: bool,
+  /// Whether this declaration is optional.
+  pub optional: bool,
 }
 
 /// Subject area for a per-dependency decision entry.
@@ -324,6 +345,8 @@ pub enum UnifyDecisionCode {
   FeatureIntersection,
   /// Features were widened using a union strategy.
   FeatureUnion,
+  /// Workspace-member dependency features remain local to each declaration.
+  WorkspaceMemberFeaturesLocal,
   /// Exact version pins were preserved in the workspace dependency.
   ExactPinPreserved,
   /// Exact version pins were converted to a caret requirement with a warning.
@@ -344,6 +367,7 @@ impl UnifyDecisionCode {
     match self {
       Self::FeatureIntersection => "intersection",
       Self::FeatureUnion => "union",
+      Self::WorkspaceMemberFeaturesLocal => "workspace_member_features_local",
       Self::ExactPinPreserved => "exact_pin_preserved",
       Self::ExactPinWarnCaret => "exact_pin_warn_caret",
       Self::ExactPinSkipped => "exact_pin_skipped",
@@ -367,6 +391,8 @@ pub struct UnifyDecisionReason {
   pub members: Vec<Arc<str>>,
   /// Feature providers for borrowed-feature repairs.
   pub borrowed_from: Vec<Arc<str>>,
+  /// Exact manifest paths that contributed to a feature rule.
+  pub feature_paths: Vec<FeatureEnablingPath>,
 }
 
 /// Per-dependency explainability record shared by text and JSON output.
@@ -786,6 +812,7 @@ mod tests {
       dep_kind: DepKind::Normal,
       target: None,
       borrowed_from: vec![arc("other-crate")],
+      enabling_paths: vec![],
       required_by: vec![],
     };
 
@@ -810,6 +837,7 @@ mod tests {
       dep_kind: DepKind::Normal,
       target: Some(arc("cfg(unix)")),
       borrowed_from: vec![arc("unix-crate")],
+      enabling_paths: vec![],
       required_by: vec![],
     };
 
@@ -827,6 +855,7 @@ mod tests {
       dep_kind: DepKind::Dev,
       target: None,
       borrowed_from: vec![arc("main-crate")],
+      enabling_paths: vec![],
       required_by: vec![],
     };
 
@@ -948,6 +977,7 @@ mod tests {
         dep_kind: DepKind::Normal,
         target: None,
         borrowed_from: vec![arc("other-crate")],
+        enabling_paths: vec![],
         required_by: vec![],
       }],
       dependency_decisions: vec![],
@@ -1012,6 +1042,7 @@ mod tests {
       dep_kind: DepKind::Dev,
       target: Some(arc("cfg(windows)")),
       borrowed_from: vec![arc("source-crate")],
+      enabling_paths: vec![],
       required_by: vec![],
     };
 

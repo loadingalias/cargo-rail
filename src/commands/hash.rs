@@ -168,6 +168,10 @@ fn portable_plan_value(value: &Value) -> RailResult<Value> {
     .get("inputs")
     .and_then(Value::as_object)
     .ok_or_else(|| RailError::message("planner contract is missing object 'inputs'"))?;
+  let workspace_root = inputs
+    .get("workspace_root")
+    .and_then(Value::as_str)
+    .ok_or_else(|| RailError::message("planner inputs are missing string 'workspace_root'"))?;
   let mut portable_inputs = serde_json::Map::new();
   for key in [
     "refs",
@@ -183,11 +187,11 @@ fn portable_plan_value(value: &Value) -> RailResult<Value> {
   }
   portable.insert("inputs".to_string(), Value::Object(portable_inputs));
 
-  normalize_repository_paths(&mut portable)?;
+  normalize_repository_paths(&mut portable, workspace_root)?;
   Ok(Value::Object(portable))
 }
 
-fn normalize_repository_paths(plan: &mut serde_json::Map<String, Value>) -> RailResult<()> {
+fn normalize_repository_paths(plan: &mut serde_json::Map<String, Value>, workspace_root: &str) -> RailResult<()> {
   if let Some(files) = plan.get_mut("files").and_then(Value::as_array_mut) {
     for file in files {
       normalize_path_field(file, "path")?;
@@ -196,8 +200,47 @@ fn normalize_repository_paths(plan: &mut serde_json::Map<String, Value>) -> Rail
   if let Some(trace) = plan.get_mut("trace").and_then(Value::as_array_mut) {
     for reason in trace {
       normalize_path_field(reason, "file")?;
+      normalize_package_id_field(reason, "package_id", workspace_root)?;
+      normalize_package_id_field(reason, "depends_on_package_id", workspace_root)?;
     }
   }
+  Ok(())
+}
+
+fn normalize_package_id_field(value: &mut Value, field: &str, workspace_root: &str) -> RailResult<()> {
+  let Some(package_id) = value.get_mut(field) else {
+    return Ok(());
+  };
+  let Some(package_id_str) = package_id.as_str() else {
+    return Err(RailError::message(format!(
+      "planner field '{}' must be a string",
+      field
+    )));
+  };
+  let Some(path_identity) = package_id_str.strip_prefix("path+file://") else {
+    return Ok(());
+  };
+  let Some(fragment_start) = path_identity.rfind('#') else {
+    return Err(RailError::message(format!(
+      "planner package identity '{}' has no Cargo fragment",
+      package_id_str
+    )));
+  };
+  let (path, fragment) = path_identity.split_at(fragment_start);
+  let normalized_root = workspace_root.replace('\\', "/");
+  let normalized_path = path.replace('\\', "/");
+  let relative = if normalized_path == normalized_root {
+    ""
+  } else if let Some(relative) = normalized_path
+    .strip_prefix(&normalized_root)
+    .and_then(|path| path.strip_prefix('/'))
+  {
+    relative
+  } else {
+    *package_id = Value::String(format!("path+external:///{fragment}"));
+    return Ok(());
+  };
+  *package_id = Value::String(format!("path+workspace:///{relative}{fragment}"));
   Ok(())
 }
 

@@ -26,6 +26,7 @@
 
 pub mod classify;
 pub mod presentation;
+pub(crate) mod semantic;
 
 // Canonical path classification types
 pub use classify::{ChangeKind, ConfigKind, FileProfile, TestKind, classify_file, classify_path};

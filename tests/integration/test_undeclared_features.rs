@@ -432,9 +432,19 @@ serde = { version = "1.0", features = ["derive"] }
       decision["dep_name"] == "serde"
         && decision["subject"] == "undeclared_feature_fix"
         && decision["member"] == "crate-b"
-        && decision["reasons"]
-          .as_array()
-          .is_some_and(|reasons| reasons.iter().any(|reason| reason["code"] == "undeclared_feature_fix"))
+        && decision["reasons"].as_array().is_some_and(|reasons| {
+          reasons.iter().any(|reason| {
+            reason["code"] == "undeclared_feature_fix"
+              && reason["feature_paths"].as_array().is_some_and(|paths| {
+                paths.iter().any(|path| {
+                  path["member"] == "crate-a"
+                    && path["alias"] == "serde"
+                    && path["dependency_kind"] == "normal"
+                    && path["features"] == serde_json::json!(["derive"])
+                })
+              })
+          })
+        })
     }),
     "undeclared feature fixes should be exposed as dependency decisions.\nJSON:\n{}",
     serde_json::to_string_pretty(&json)?

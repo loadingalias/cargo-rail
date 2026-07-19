@@ -1,13 +1,13 @@
 //! `cargo rail run` - planner-contract executor.
 
 use super::plan::{
-  ExecutionScope, ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain,
+  ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain, resolve_action_packages,
 };
 use crate::action::{
-  ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason, ActionSpec,
-  ArgvTemplate, ExpandedAction, PackageArguments,
+  ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason,
+  ActionResolutionBinding, ActionSpec, ArgvTemplate, ExpandedAction, PackageArguments,
 };
-use crate::cargo::resolution::TargetSpecificationIdentity;
+use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
 use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
 use crate::config::MAX_ACTIONS;
 use crate::error::{RailError, RailResult};
@@ -17,7 +17,7 @@ use crate::test::runner::{TestCommandArgs, TestRunnerPreference, select_runner};
 use crate::workspace::WorkspaceContext;
 use clap::ValueEnum;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::process::Command;
@@ -96,7 +96,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   let snapshot = ctx.snapshot()?;
   let snapshot_id = snapshot.id().to_string();
   let platform = snapshot.toolchain().host_target().to_string();
-  let selected_targets = snapshot
+  let mut selected_targets = snapshot
     .targets()
     .iter()
     .filter(|target| target.is_build_target())
@@ -105,6 +105,9 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
       TargetSpecificationIdentity::Custom(target) => target.name().to_string(),
     })
     .collect::<Vec<_>>();
+  if selected_targets.is_empty() {
+    selected_targets.push(platform.clone());
+  }
   let mut plan = None;
 
   if !opts.all {
@@ -136,10 +139,9 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     }
   }
 
-  let scope = plan.as_ref().map(|output| &output.scope);
-  let test_targets = resolve_targets(ctx, &opts, scope, "test")?;
-  let build_targets = resolve_targets(ctx, &opts, scope, "build")?;
-  let bench_targets = resolve_targets(ctx, &opts, scope, "bench")?;
+  let test_targets = resolve_targets(ctx, &opts, plan.as_ref(), "test")?;
+  let build_targets = resolve_targets(ctx, &opts, plan.as_ref(), "build")?;
+  let bench_targets = resolve_targets(ctx, &opts, plan.as_ref(), "bench")?;
   let workspace_package_count = ctx.cargo().metadata().workspace_packages().len();
   let selected_features = selected_cargo_features(&effective.run_args);
   let action_base_ref =
@@ -161,7 +163,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   let mut reasons_by_action = std::collections::BTreeMap::<String, Vec<ActionReason>>::new();
   let mut reason_edges = std::collections::BTreeSet::new();
   for action in &effective.actions {
-    if !action_enabled(ctx, &opts, scope, action) {
+    if !action_enabled(ctx, &opts, plan.as_ref(), action) {
       continue;
     }
     let reasons = action_reasons(ctx, &opts, plan.as_ref(), action, ActionKind::from_name(action))?;
@@ -184,9 +186,10 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     selected_features: &selected_features,
     platform: &platform,
     base_ref,
+    plan: plan.as_ref(),
   };
   for action in &effective.actions {
-    if !action_enabled(ctx, &opts, scope, action) {
+    if !action_enabled(ctx, &opts, plan.as_ref(), action) {
       skipped_actions.push(action.clone());
       steps.push(RunStep::Skipped(action.clone()));
       continue;
@@ -200,6 +203,8 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
       &expansion,
     )?;
   }
+
+  bind_action_resolution_views(ctx, &mut expanded_actions)?;
 
   let graph = ActionGraph::new(snapshot_id, expanded_actions)?;
   let executed_actions = graph
@@ -446,7 +451,7 @@ fn dedup_actions(mut actions: Vec<String>) -> Vec<String> {
 fn resolve_targets(
   ctx: &WorkspaceContext,
   opts: &RunOptions,
-  scope: Option<&ExecutionScope>,
+  plan: Option<&PlanOutput>,
   surface: &str,
 ) -> RailResult<Vec<String>> {
   let package_scoped_surface = matches!(surface, "build" | "test" | "bench");
@@ -458,7 +463,7 @@ fn resolve_targets(
       .iter()
       .map(|p| p.name.to_string())
       .collect()
-  } else if let Some(scope) = scope {
+  } else if let Some(scope) = plan.and_then(|plan| plan.surfaces.get(surface).map(|decision| &decision.scope)) {
     if !package_scoped_surface {
       Vec::new()
     } else {
@@ -485,25 +490,26 @@ fn resolve_targets(
   Ok(targets)
 }
 
-fn action_enabled(ctx: &WorkspaceContext, opts: &RunOptions, scope: Option<&ExecutionScope>, action: &str) -> bool {
+fn action_enabled(ctx: &WorkspaceContext, opts: &RunOptions, plan: Option<&PlanOutput>, action: &str) -> bool {
   if opts.all {
     return true;
   }
   if let Some(kind) = ActionKind::from_name(action) {
-    return kind
-      .planner_surface()
-      .and_then(|surface| scope.and_then(|scope| scope.surfaces.get(surface)))
-      .copied()
-      .unwrap_or(false);
+    return kind.planner_surface().is_some_and(|surface| {
+      plan.is_some_and(|plan| {
+        plan.surfaces.get(surface).is_some_and(|decision| decision.enabled)
+          || (plan.has_semantic_seeds() && matches!(surface, "build" | "test" | "bench"))
+      })
+    });
   }
   ctx
     .config()
     .and_then(|config| config.run.actions.get(action))
     .is_some_and(|action| {
       action.when.iter().any(|surface| {
-        scope
-          .and_then(|scope| scope.surfaces.get(surface))
-          .copied()
+        plan
+          .and_then(|plan| plan.surfaces.get(surface))
+          .map(|decision| decision.enabled)
           .unwrap_or(false)
       })
     })
@@ -559,6 +565,180 @@ fn selected_cargo_targets(arguments: &[String], defaults: &[String]) -> Vec<Stri
   }
 }
 
+fn bind_action_resolution_views(ctx: &WorkspaceContext, actions: &mut [ExpandedAction]) -> RailResult<()> {
+  for action in actions {
+    if !action_uses_cargo_resolution(action) {
+      continue;
+    }
+
+    let selected_ids = selected_action_package_ids(ctx, action)?;
+    let root_package_ids = selected_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let packages = if action.selected_packages().is_empty() {
+      ResolutionPackages::Workspace
+    } else {
+      ResolutionPackages::Selected(selected_ids.clone())
+    };
+    let features = action_resolution_features(ctx, &selected_ids, action.selected_features())?;
+    let targets = if action.selected_targets().is_empty() {
+      vec![Some(ctx.snapshot()?.toolchain().host_target().to_string())]
+    } else {
+      action.selected_targets().iter().cloned().map(Some).collect()
+    };
+    let mut bindings = Vec::with_capacity(targets.len());
+    for target in targets {
+      let request = ResolutionRequest::new(packages.clone(), features.clone(), target.clone())?;
+      let view = ctx.resolution_view(request)?;
+      let resolved_node_count = view
+        .metadata()
+        .resolve
+        .as_ref()
+        .map_or(0, |resolve| resolve.nodes.len());
+      bindings.push(ActionResolutionBinding::new(
+        root_package_ids.clone(),
+        target,
+        action.selected_features().clone(),
+        resolved_node_count,
+      ));
+    }
+    action.bind_resolution_views(bindings);
+  }
+  Ok(())
+}
+
+fn action_uses_cargo_resolution(action: &ExpandedAction) -> bool {
+  match action.kind() {
+    ActionKind::Build
+    | ActionKind::Test
+    | ActionKind::Bench
+    | ActionKind::Docs
+    | ActionKind::Lint
+    | ActionKind::Msrv
+    | ActionKind::Package
+    | ActionKind::Distribution => true,
+    ActionKind::Repository | ActionKind::GeneratedArtifact => action
+      .argv()
+      .first()
+      .and_then(|program| std::path::Path::new(program).file_stem())
+      .and_then(|program| program.to_str())
+      .is_some_and(|program| program == "cargo"),
+    ActionKind::Format | ActionKind::Audit => false,
+  }
+}
+
+fn selected_action_package_ids(
+  ctx: &WorkspaceContext,
+  action: &ExpandedAction,
+) -> RailResult<BTreeSet<cargo_metadata::PackageId>> {
+  if action.selected_packages().is_empty() {
+    return Ok(ctx.cargo().metadata().workspace_members.iter().cloned().collect());
+  }
+  action
+    .selected_packages()
+    .iter()
+    .map(|name| {
+      ctx
+        .graph()
+        .workspace_package_by_name(name)
+        .map(|package| package.id.clone())
+    })
+    .collect()
+}
+
+fn action_resolution_features(
+  ctx: &WorkspaceContext,
+  package_ids: &BTreeSet<cargo_metadata::PackageId>,
+  selection: &ActionFeatureSelection,
+) -> RailResult<ResolutionFeatures> {
+  if selection.all_features() {
+    return Ok(ResolutionFeatures::AllFeatures);
+  }
+  if selection.named().is_empty() {
+    return Ok(if selection.default_features() {
+      ResolutionFeatures::Default
+    } else {
+      ResolutionFeatures::NoDefaultFeatures
+    });
+  }
+
+  let packages = ctx
+    .cargo()
+    .metadata()
+    .workspace_packages()
+    .iter()
+    .copied()
+    .filter(|package| package_ids.contains(&package.id))
+    .collect::<Vec<_>>();
+  let mut features = BTreeMap::<cargo_metadata::PackageId, BTreeSet<String>>::new();
+  if selection.default_features() {
+    for package in &packages {
+      if package.features.contains_key("default") {
+        features
+          .entry(package.id.clone())
+          .or_default()
+          .insert("default".to_string());
+      }
+    }
+  }
+
+  for requested in selection.named() {
+    if let Some((package_name, feature)) = requested.split_once('/') {
+      let mut matching_packages = packages.iter().filter(|package| package.name.as_str() == package_name);
+      let package = matching_packages.next().ok_or_else(|| {
+        RailError::message(format!(
+          "action feature '{}' selects package '{}' outside the action package roots",
+          requested, package_name
+        ))
+      })?;
+      if matching_packages.next().is_some() {
+        return Err(RailError::message(format!(
+          "action feature '{}' has an ambiguous workspace package name",
+          requested
+        )));
+      }
+      insert_action_feature(&mut features, package, feature, requested)?;
+      continue;
+    }
+
+    let mut matched = false;
+    for package in &packages {
+      if package.features.contains_key(requested) {
+        features
+          .entry(package.id.clone())
+          .or_default()
+          .insert(requested.clone());
+        matched = true;
+      }
+    }
+    if !matched {
+      return Err(RailError::message(format!(
+        "action feature '{}' is not declared by any selected package",
+        requested
+      )));
+    }
+  }
+
+  Ok(ResolutionFeatures::Selected(features))
+}
+
+fn insert_action_feature(
+  features: &mut BTreeMap<cargo_metadata::PackageId, BTreeSet<String>>,
+  package: &cargo_metadata::Package,
+  feature: &str,
+  requested: &str,
+) -> RailResult<()> {
+  if !package.features.contains_key(feature) {
+    return Err(RailError::message(format!(
+      "action feature '{}' names undeclared feature '{}' on package '{}'",
+      requested, feature, package.id
+    )));
+  }
+  features
+    .entry(package.id.clone())
+    .or_default()
+    .insert(feature.to_string());
+  Ok(())
+}
+
 fn split_feature_values(value: &str) -> impl Iterator<Item = String> + '_ {
   value
     .split(|character: char| character == ',' || character.is_ascii_whitespace())
@@ -609,7 +789,7 @@ fn render_action_plan<'a>(
 ) -> RailResult<()> {
   let output = ActionPlanOutput {
     artifact: "action_plan",
-    version: 1,
+    version: 2,
     snapshot_id: graph.snapshot_id(),
     profile_requested: opts.profile.as_deref(),
     profile_effective: effective.profile.as_deref(),
@@ -682,6 +862,7 @@ struct RunExpansionContext<'a> {
   selected_features: &'a ActionFeatureSelection,
   platform: &'a str,
   base_ref: &'a str,
+  plan: Option<&'a PlanOutput>,
 }
 
 fn merge_action_reasons(
@@ -879,13 +1060,9 @@ fn expand_builtin_action(
       | ActionKind::Package
       | ActionKind::Distribution
   );
-  if package_scoped && targets.is_empty() {
-    return Ok(RunStep::NoTargets(kind));
-  }
-
   let mut expanded_features = expansion.selected_features.clone();
   let mut expanded_targets = selected_cargo_targets(run_args, expansion.selected_targets);
-  let (argv, use_workspace, test_runner_name) = match kind {
+  let (argv, mut use_workspace, test_runner_name) = match kind {
     ActionKind::Build => (
       ArgvTemplate::new(
         "cargo",
@@ -1034,8 +1211,45 @@ fn expand_builtin_action(
   if matches!(kind, ActionKind::Lint | ActionKind::Msrv) {
     expanded_features = ActionFeatureSelection::requested(true, true, Vec::new());
   }
+  let mut targets = if !opts.all
+    && matches!(
+      kind,
+      ActionKind::Build
+        | ActionKind::Test
+        | ActionKind::Bench
+        | ActionKind::Lint
+        | ActionKind::Msrv
+        | ActionKind::Package
+        | ActionKind::Distribution
+    ) {
+    let plan = expansion
+      .plan
+      .ok_or_else(|| RailError::message(format!("action '{}' has no semantic plan", kind.as_str())))?;
+    let all_packages: BTreeSet<_> = ctx.cargo().metadata().workspace_members.iter().cloned().collect();
+    let features = action_resolution_features(ctx, &all_packages, &expanded_features)?;
+    resolve_action_packages(
+      ctx,
+      plan,
+      kind
+        .planner_surface()
+        .ok_or_else(|| RailError::message(format!("action '{}' has no planner surface", kind.as_str())))?,
+      features,
+      &expanded_targets,
+    )?
+  } else {
+    targets.to_vec()
+  };
+  if opts.ignore_bin_crates && package_scoped {
+    targets.retain(|crate_name| !ctx.cargo().is_binary_only(crate_name));
+  }
+  if package_scoped && targets.is_empty() {
+    return Ok(RunStep::NoTargets(kind));
+  }
+  if kind != ActionKind::Test && package_scoped {
+    use_workspace = !opts.ignore_bin_crates && targets.len() == workspace_package_count;
+  }
   let expanded = spec.expand(ActionExpansion {
-    selected_packages: targets.to_vec(),
+    selected_packages: targets,
     use_workspace,
     selected_targets: expanded_targets,
     selected_features: expanded_features,
@@ -1077,8 +1291,9 @@ fn action_reasons(
       .map(String::as_str)
       .collect()
   };
-  let reasons = surfaces
-    .into_iter()
+  let mut reasons = surfaces
+    .iter()
+    .copied()
     .filter_map(|surface| output.surfaces.get(surface).map(|decision| (surface, decision)))
     .filter(|(_, decision)| decision.enabled)
     .flat_map(|(surface, decision)| {
@@ -1088,6 +1303,22 @@ fn action_reasons(
       })
     })
     .collect::<Vec<_>>();
+  if reasons.is_empty() && kind.is_some() && output.has_semantic_seeds() {
+    for surface in surfaces
+      .into_iter()
+      .filter(|surface| matches!(*surface, "build" | "test" | "bench"))
+    {
+      reasons.extend(
+        output
+          .semantic_seed_reason_ids()
+          .into_iter()
+          .map(|trace_id| ActionReason::Planner {
+            surface: surface.to_string(),
+            trace_id,
+          }),
+      );
+    }
+  }
   if reasons.is_empty() {
     return Err(RailError::message(format!(
       "planner enabled '{}' action without a reason",
