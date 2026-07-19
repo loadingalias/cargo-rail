@@ -3,6 +3,43 @@
 
 
 
+
+## [0.18.0](https://github.com/loadingalias/cargo-rail/compare/v0.17.3...v0.18.0) - 2026-07-19
+
+- Capture complete, stable source state for deterministic planning from Git worktrees or declared Cargo filesystem roots; reject concurrent Git, byte, directory, or metadata drift; keep historical ranges object-only; support nested and no-Git Cargo workspaces; and exclude resolved Cargo and cargo-rail generated state.
+
+- Preserve every Cargo package as an exact `PackageId`-keyed graph node and build dependency edges from Cargo's resolved graph, retaining distinct versions, renamed dependencies, dependency kinds, and target conditions while keeping inactive declarations out of resolved topology and confining package-name lookup to ambiguity-aware workspace selection.
+
+- Add lazy exact Cargo resolution views keyed by package, feature, target, toolchain, and sanitized Cargo configuration; replace filename heuristics with deterministic PackageId ownership; and introduce opt-in immutable workspace snapshots over exact source, manifests, lockfile, configuration, toolchain, and target inputs without slowing native/default commands.
+
+- Replace hard-coded run surfaces with a bounded, snapshot-bound action graph. Built-in and repository actions now share
+  one shell-free expansion and stable topological order across local execution, JSON/GitHub CI plans, and version-2
+  decision receipts. Repository generators declare exclusive outputs plus separate check/regenerate commands; paths,
+  dependencies, tokens, environment capabilities, cycles, and portable ownership collisions fail closed before
+  execution. Ownership validation remains fast at the configured action/path limits, and command startup retains safe
+  stack headroom on Windows as the action CLI grows.
+
+- Make rail.toml sparse, add config explain and semantic migrations, and replace invalid option matrices with typed policies.
+
+### BREAKING CHANGES
+
+- **run**: [**breaking**] replace surfaces with a bounded action graph ([71a5972](https://github.com/loadingalias/cargo-rail/commit/71a5972c26388b286dc10175101a6a7100e36af3))
+- **config**: [**breaking**] make repository policy sparse ([577f55b](https://github.com/loadingalias/cargo-rail/commit/577f55b1a9b520c69927a3f08adc726c6ea2ecf0))
+
+### Features
+
+- **workspace**: bind commands to canonical snapshots ([7b70568](https://github.com/loadingalias/cargo-rail/commit/7b70568a6d450988299e5cc93ffaf7b354ca1a7b))
+- **workspace**: establish exact resolution snapshots ([fec7444](https://github.com/loadingalias/cargo-rail/commit/fec7444ae5cc10ffb393cc4e515ea942e716dbb1))
+- **workspace**: stabilize source and package identity ([5399da4](https://github.com/loadingalias/cargo-rail/commit/5399da4e5361a9cad613ade6338f732c3b6f0650))
+- **planner**: capture complete worktree source state ([9de889f](https://github.com/loadingalias/cargo-rail/commit/9de889f9f417c79d6aa5cc5e273414eb8eb50905))
+
+### Bug Fixes
+
+- **cli**: prevent Windows startup stack overflow ([2726bd9](https://github.com/loadingalias/cargo-rail/commit/2726bd9fb468938a598b1e171064350730334016))
+- **workspace**: report directory drift deterministically ([3c99742](https://github.com/loadingalias/cargo-rail/commit/3c997426cfe87037e93735be4a3ca62952eff698))
+- **workspace**: normalize snapshot paths on Windows ([dfe18d4](https://github.com/loadingalias/cargo-rail/commit/dfe18d404684ec1d582cd72de002953b96c72a0e))
+
+
 ## [0.17.3](https://github.com/loadingalias/cargo-rail/compare/v0.17.2...v0.17.3) - 2026-07-14
 
 - Fixed crates.io publication checks so local workspace packages cannot masquerade as published versions. Release publishing now targets crates.io explicitly, requires the committed lockfile, rejects dirty package contents, and excludes Finder metadata.
