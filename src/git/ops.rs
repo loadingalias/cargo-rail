@@ -1,7 +1,7 @@
 //! Additional operations for SystemGit (commit walking, remotes, etc.)
 
 use super::SystemGit;
-use super::system::CommitInfo;
+use super::system::{CommitInfo, CommitMetadata};
 use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::progress;
 use crate::utils;
@@ -16,6 +16,14 @@ pub(crate) struct GitTreeEntry {
   pub object_id: String,
   /// Repository-relative entry path.
   pub path: PathBuf,
+}
+
+/// Exact index mutation used to synthesize one commit tree.
+pub(crate) enum GitIndexChange {
+  /// Insert or replace an entry with an exact Git mode and object ID.
+  Upsert(GitTreeEntry),
+  /// Remove one repository-relative path.
+  Delete(PathBuf),
 }
 
 impl SystemGit {
@@ -62,6 +70,28 @@ impl SystemGit {
     self.get_commits_bulk(&shas)
   }
 
+  /// Get commits reachable from ordinary local, remote, and tag refs.
+  ///
+  /// Notes are intentionally excluded: origin recovery must work from normal
+  /// refs, including a local sync branch that is not currently checked out.
+  pub fn ordinary_commit_history(&self) -> RailResult<Vec<CommitInfo>> {
+    let output = self.run_git(&["rev-list", "--branches", "--remotes", "--tags"])?;
+    let mut seen = std::collections::HashSet::new();
+    let shas = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .map(str::trim)
+      .filter(|sha| !sha.is_empty())
+      .filter(|sha| seen.insert((*sha).to_string()))
+      .map(str::to_string)
+      .collect::<Vec<_>>();
+    self.get_commits_bulk(&shas)
+  }
+
+  /// Whether `ancestor` is reachable from `descendant`.
+  pub(crate) fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
+    self.run_git_check(&["merge-base", "--is-ancestor", ancestor, descendant])
+  }
+
   /// Get files changed in a specific commit
   ///
   /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted),
@@ -73,6 +103,89 @@ impl SystemGit {
   pub fn get_changed_files(&self, commit_sha: &str) -> RailResult<Vec<(PathBuf, char)>> {
     let output = self.run_git(&["diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commit_sha])?;
     parse_name_status_output_z(&output.stdout)
+  }
+
+  /// Get per-commit path changes through one bounded `diff-tree --stdin` stream.
+  pub(crate) fn get_changed_files_bulk(&self, commit_shas: &[String]) -> RailResult<Vec<Vec<(PathBuf, char)>>> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    if commit_shas.is_empty() {
+      return Ok(Vec::new());
+    }
+    crate::instrumentation::record_git_path_change_batch(commit_shas.len());
+    let mut command = self.git_cmd();
+    command
+      .args([
+        "diff-tree",
+        "--stdin",
+        "--root",
+        "--no-renames",
+        "--name-status",
+        "-r",
+        "-z",
+        "--format=cargo-rail-commit:%H",
+      ])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to start batched git diff-tree")?;
+    let mut stdin = child
+      .stdin
+      .take()
+      .ok_or_else(|| RailError::message("git diff-tree stdin was unavailable"))?;
+    for commit in commit_shas {
+      stdin
+        .write_all(commit.as_bytes())
+        .and_then(|()| stdin.write_all(b"\n"))
+        .context("Failed to write batched git diff-tree input")?;
+    }
+    drop(stdin);
+    let output = child
+      .wait_with_output()
+      .context("Failed to finish batched git diff-tree")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git diff-tree --stdin".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+
+    let records = output
+      .stdout
+      .split(|byte| *byte == 0)
+      .filter(|record| !record.is_empty())
+      .collect::<Vec<_>>();
+    let mut index = 0;
+    let mut results = Vec::with_capacity(commit_shas.len());
+    for expected in commit_shas {
+      let commit = records
+        .get(index)
+        .ok_or_else(|| RailError::message(format!("git diff-tree omitted commit '{expected}'")))?;
+      let expected_marker = format!("cargo-rail-commit:{expected}");
+      if *commit != expected_marker.as_bytes() {
+        return Err(RailError::message(format!(
+          "git diff-tree returned commit '{}' while '{}' was expected",
+          String::from_utf8_lossy(commit),
+          expected
+        )));
+      }
+      index += 1;
+      let start = index;
+      while index < records.len() && !records[index].starts_with(b"cargo-rail-commit:") {
+        if index + 1 >= records.len() {
+          return Err(RailError::message(
+            "git diff-tree returned an incomplete status/path pair",
+          ));
+        }
+        index += 2;
+      }
+      results.push(parse_name_status_records(&records[start..index])?);
+    }
+    if index != records.len() {
+      return Err(RailError::message("git diff-tree returned unexpected trailing records"));
+    }
+    Ok(results)
   }
 
   /// Get all files that changed between two refs.
@@ -147,13 +260,7 @@ impl SystemGit {
       .filter(|s| !s.is_empty())
       .collect();
 
-    // Fetch commit info sequentially to preserve order
-    let mut commits = Vec::with_capacity(shas.len());
-    for sha in shas {
-      commits.push(self.get_commit(&sha)?);
-    }
-
-    Ok(commits)
+    self.get_commits_bulk(&shas)
   }
 
   /// Get commits touching any of the given paths (batched for performance)
@@ -201,13 +308,7 @@ impl SystemGit {
       .filter(|s| !s.is_empty())
       .collect();
 
-    // Fetch commit info sequentially to preserve order (already deduplicated by git)
-    let mut commits = Vec::with_capacity(shas.len());
-    for sha in shas {
-      commits.push(self.get_commit(&sha)?);
-    }
-
-    Ok(commits)
+    self.get_commits_bulk(&shas)
   }
 
   /// One-pass commit log with per-commit changed files
@@ -244,7 +345,7 @@ impl SystemGit {
     // Format: %H (hash) %an (author name) %ae (author email) %at (author time)
     //         %cn (committer name) %ce (committer email) %ct (committer time)
     //         %P (parent hashes) %B (body)
-    let format = "%H%n%an%n%ae%n%at%n%cn%n%ce%n%ct%n%P%n%B";
+    let format = "%H%n%an%n%ae%n%at%n%ai%n%cn%n%ce%n%ct%n%ci%n%P%n%B";
     let format_arg = format!("--format={}", format);
 
     let output = self
@@ -308,9 +409,32 @@ impl SystemGit {
 
   /// Read exact tree entries under `path` without materializing the worktree.
   pub(crate) fn collect_tree_entries(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<GitTreeEntry>> {
-    let normalized = self.normalize_path(path)?;
-    let path_arg = utils::path_to_git_format(&normalized);
-    let output = self.run_git(&["ls-tree", "-r", "-z", "--full-tree", commit_sha, "--", &path_arg])?;
+    self.collect_tree_entries_for_paths(commit_sha, &[path.to_path_buf()])
+  }
+
+  /// Collect exact entries for many paths in one `ls-tree` subprocess.
+  pub(crate) fn collect_tree_entries_for_paths(
+    &self,
+    commit_sha: &str,
+    paths: &[PathBuf],
+  ) -> RailResult<Vec<GitTreeEntry>> {
+    if paths.is_empty() {
+      return Ok(Vec::new());
+    }
+    let normalized = paths
+      .iter()
+      .map(|path| self.normalize_path(path).map(|path| utils::path_to_git_format(&path)))
+      .collect::<RailResult<Vec<_>>>()?;
+    let mut command = self.git_cmd();
+    command.args(["ls-tree", "-r", "-z", "--full-tree", commit_sha, "--"]);
+    command.args(&normalized);
+    let output = command.output().context("Failed to collect exact Git tree entries")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git ls-tree".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
     let mut entries = Vec::new();
     for record in output
       .stdout
@@ -344,6 +468,43 @@ impl SystemGit {
       });
     }
     Ok(entries)
+  }
+
+  /// Import one commit's object closure from another local repository.
+  pub(crate) fn import_objects(&self, source_repo: &Path, commit: &str) -> RailResult<()> {
+    let source = source_repo
+      .to_str()
+      .ok_or_else(|| RailError::message("Git source repository path is not valid UTF-8"))?;
+    self.run_git(&["fetch", "--quiet", "--no-tags", source, commit])?;
+    Ok(())
+  }
+
+  /// Write one blob into this repository's object database.
+  pub(crate) fn write_blob(&self, content: &[u8]) -> RailResult<String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut command = self.git_cmd();
+    command
+      .args(["hash-object", "-w", "--stdin"])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to start git hash-object")?;
+    child
+      .stdin
+      .take()
+      .ok_or_else(|| RailError::message("git hash-object stdin was unavailable"))?
+      .write_all(content)
+      .context("Failed to write Git blob")?;
+    let output = child.wait_with_output().context("Failed to finish git hash-object")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git hash-object -w --stdin".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
   }
 
   /// Add a remote repository
@@ -450,9 +611,7 @@ impl SystemGit {
   pub fn create_commit_with_metadata(
     &self,
     message: &str,
-    author_name: &str,
-    author_email: &str,
-    timestamp: i64,
+    metadata: &CommitMetadata,
     parent_shas: &[String],
     changed_paths: &[PathBuf],
   ) -> RailResult<String> {
@@ -464,15 +623,16 @@ impl SystemGit {
     let tree_sha = String::from_utf8_lossy(&tree_output.stdout).trim().to_string();
 
     // Build commit-tree command (needs custom env vars, so we use git_cmd directly)
-    let author_date = format!("{} +0000", timestamp);
+    let author_date = format!("{} {}", metadata.author_timestamp, metadata.author_timezone);
+    let committer_date = format!("{} {}", metadata.committer_timestamp, metadata.committer_timezone);
     let mut cmd = self.git_cmd();
     cmd
-      .env("GIT_AUTHOR_NAME", author_name)
-      .env("GIT_AUTHOR_EMAIL", author_email)
+      .env("GIT_AUTHOR_NAME", &metadata.author)
+      .env("GIT_AUTHOR_EMAIL", &metadata.author_email)
       .env("GIT_AUTHOR_DATE", &author_date)
-      .env("GIT_COMMITTER_NAME", author_name)
-      .env("GIT_COMMITTER_EMAIL", author_email)
-      .env("GIT_COMMITTER_DATE", &author_date)
+      .env("GIT_COMMITTER_NAME", &metadata.committer)
+      .env("GIT_COMMITTER_EMAIL", &metadata.committer_email)
+      .env("GIT_COMMITTER_DATE", &committer_date)
       .arg("commit-tree")
       .arg(&tree_sha)
       .arg("-m")
@@ -500,6 +660,171 @@ impl SystemGit {
     Ok(commit_sha)
   }
 
+  /// Create a commit from exact Git index changes without staging ambient work.
+  pub(crate) fn create_commit_with_index_changes(
+    &self,
+    message: &str,
+    metadata: &CommitMetadata,
+    parent_shas: &[String],
+    changes: &[GitIndexChange],
+  ) -> RailResult<String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let expected_head = self.head_commit()?;
+    if !parent_shas.contains(&expected_head) {
+      return Err(RailError::message(
+        "exact Git commit parent does not match the current repository head",
+      ));
+    }
+    let temporary = tempfile::Builder::new()
+      .prefix("cargo-rail-index-")
+      .tempfile()
+      .context("Failed to allocate temporary Git index")?
+      .into_temp_path();
+    std::fs::remove_file(&temporary).context("Failed to initialize temporary Git index path")?;
+
+    let mut read_tree = self.git_cmd();
+    let output = read_tree
+      .env("GIT_INDEX_FILE", &temporary)
+      .args(["read-tree", &expected_head])
+      .output()
+      .context("Failed to seed exact Git index")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git read-tree".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+
+    let mut command = self.git_cmd();
+    command
+      .env("GIT_INDEX_FILE", &temporary)
+      .args(["update-index", "-z", "--index-info"])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to start exact Git index update")?;
+    let mut stdin = child
+      .stdin
+      .take()
+      .ok_or_else(|| RailError::message("git update-index stdin was unavailable"))?;
+    let zero_id = "0".repeat(expected_head.len());
+    let mut changed_paths = Vec::with_capacity(changes.len());
+    for change in changes {
+      let (mode, object_id, path) = match change {
+        GitIndexChange::Upsert(entry) => (&*entry.mode, &*entry.object_id, &entry.path),
+        GitIndexChange::Delete(path) => ("0", &*zero_id, path),
+      };
+      let path = self.normalize_path(path)?;
+      let path = path
+        .to_str()
+        .ok_or_else(|| RailError::message(format!("Git index path '{}' is not UTF-8", path.display())))?;
+      write!(stdin, "{} {}\t{}\0", mode, object_id, path).context("Failed to write exact Git index entry")?;
+      changed_paths.push(PathBuf::from(path));
+    }
+    drop(stdin);
+    let output = child
+      .wait_with_output()
+      .context("Failed to finish exact Git index update")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git update-index --index-info".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+
+    let output = self
+      .git_cmd()
+      .env("GIT_INDEX_FILE", &temporary)
+      .arg("write-tree")
+      .output()
+      .context("Failed to write exact Git tree")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git write-tree".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+    let tree = String::from_utf8(output.stdout)?.trim().to_string();
+    let author_date = format!("{} {}", metadata.author_timestamp, metadata.author_timezone);
+    let committer_date = format!("{} {}", metadata.committer_timestamp, metadata.committer_timezone);
+    let mut command = self.git_cmd();
+    command
+      .env("GIT_AUTHOR_NAME", &metadata.author)
+      .env("GIT_AUTHOR_EMAIL", &metadata.author_email)
+      .env("GIT_AUTHOR_DATE", &author_date)
+      .env("GIT_COMMITTER_NAME", &metadata.committer)
+      .env("GIT_COMMITTER_EMAIL", &metadata.committer_email)
+      .env("GIT_COMMITTER_DATE", &committer_date)
+      .arg("commit-tree")
+      .arg(&tree)
+      .arg("-m")
+      .arg(message);
+    for parent in parent_shas {
+      command.arg("-p").arg(parent);
+    }
+    let output = command.output().context("Failed to create exact Git commit")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git commit-tree".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+    let commit = String::from_utf8(output.stdout)?.trim().to_string();
+    self.run_git(&["update-ref", "HEAD", &commit, &expected_head])?;
+
+    if !changed_paths.is_empty() {
+      let mut reset = self.git_cmd();
+      reset.args(["reset", "-q", &commit, "--"]);
+      reset.args(&changed_paths);
+      let output = reset.output().context("Failed to align exact Git index paths")?;
+      if !output.status.success() {
+        return Err(RailError::Git(GitError::CommandFailed {
+          command: "git reset -- <exact-paths>".to_string(),
+          stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+        }));
+      }
+      let upserts = changes
+        .iter()
+        .filter_map(|change| match change {
+          GitIndexChange::Upsert(entry) => Some(entry.path.as_path()),
+          GitIndexChange::Delete(_) => None,
+        })
+        .collect::<Vec<_>>();
+      if !upserts.is_empty() {
+        let mut checkout = self.git_cmd();
+        checkout.args(["checkout-index", "-f", "--"]);
+        checkout.args(upserts);
+        let output = checkout.output().context("Failed to materialize exact Git paths")?;
+        if !output.status.success() {
+          return Err(RailError::Git(GitError::CommandFailed {
+            command: "git checkout-index -- <exact-paths>".to_string(),
+            stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+          }));
+        }
+      }
+      for path in changes.iter().filter_map(|change| match change {
+        GitIndexChange::Delete(path) => Some(path),
+        GitIndexChange::Upsert(_) => None,
+      }) {
+        let path = self.worktree_root.join(self.normalize_path(path)?);
+        match std::fs::symlink_metadata(&path) {
+          Ok(metadata) if metadata.file_type().is_dir() => {
+            return Err(RailError::message(format!(
+              "refusing to remove directory '{}' for an exact file deletion",
+              path.display()
+            )));
+          }
+          Ok(_) => std::fs::remove_file(&path)?,
+          Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+          Err(error) => return Err(error.into()),
+        }
+      }
+    }
+    Ok(commit)
+  }
+
   /// Read multiple files in bulk using git cat-file --batch
   ///
   /// This is 100x+ faster than calling read_file_at_commit in a loop.
@@ -524,22 +849,28 @@ impl SystemGit {
       let git_path = utils::path_to_git_format(&relative_path);
       requests.push(format!("{}:{}", commit_sha, git_path));
     }
-    self.read_batch_objects(&requests, true)
+    self.read_batch_objects(&requests, true, b"blob")
   }
 
   /// Read exact blob object IDs in one `git cat-file --batch` subprocess.
   pub(crate) fn read_blobs_bulk(&self, object_ids: &[&str]) -> RailResult<Vec<Vec<u8>>> {
     let requests: Vec<String> = object_ids.iter().map(|object_id| (*object_id).to_string()).collect();
-    self.read_batch_objects(&requests, false)
+    self.read_batch_objects(&requests, false, b"blob")
   }
 
-  fn read_batch_objects(&self, requests: &[String], missing_as_empty: bool) -> RailResult<Vec<Vec<u8>>> {
+  fn read_batch_objects(
+    &self,
+    requests: &[String],
+    missing_as_empty: bool,
+    expected_type: &[u8],
+  ) -> RailResult<Vec<Vec<u8>>> {
     use std::io::Write as _;
     use std::process::Stdio;
 
     if requests.is_empty() {
       return Ok(Vec::new());
     }
+    crate::instrumentation::record_git_object_read_batch(requests.len());
 
     let mut command = self.git_cmd();
     command
@@ -593,7 +924,7 @@ impl SystemGit {
       let _object_id = parts.next();
       let object_type = parts.next();
       let size = parts.next();
-      if parts.next().is_some() || object_type != Some(b"blob".as_slice()) {
+      if parts.next().is_some() || object_type != Some(expected_type) {
         return Err(RailError::message(format!(
           "Invalid cat-file header: {}",
           String::from_utf8_lossy(header)
@@ -621,22 +952,21 @@ impl SystemGit {
     Ok(results)
   }
 
-  /// Get multiple commits in bulk (parallel processing)
+  /// Get multiple commits through one bounded `cat-file --batch` stream.
   ///
-  /// Uses rayon to fetch commits in parallel chunks.
-  /// Used by `commit_history` for optimal performance.
+  /// Used by history and path-filtered walks so commit count does not become
+  /// subprocess count. Output order matches input SHA order.
   ///
   /// # Performance
-  /// - Processes commits in parallel using rayon
-  /// - Can fetch 1000+ commits in <2s
-  ///
-  /// Output order matches input SHA order.
+  /// - One subprocess for any number of commits
+  /// - Memory bounded by returned metadata plus Git's stream output
   pub fn get_commits_bulk(&self, shas: &[String]) -> RailResult<Vec<CommitInfo>> {
-    use rayon::prelude::*;
-
-    let commits: Result<Vec<_>, _> = shas.par_iter().map(|sha| self.get_commit(sha)).collect();
-
-    commits
+    let objects = self.read_batch_objects(shas, false, b"commit")?;
+    shas
+      .iter()
+      .zip(objects)
+      .map(|(sha, object)| parse_raw_commit(sha, &object))
+      .collect()
   }
 
   /// Resolve a git reference (tag, branch) to a commit SHA
@@ -784,9 +1114,36 @@ fn parse_name_status_output_z(output: &[u8]) -> RailResult<Vec<(PathBuf, char)>>
   Ok(files)
 }
 
+fn parse_name_status_records(records: &[&[u8]]) -> RailResult<Vec<(PathBuf, char)>> {
+  if !records.len().is_multiple_of(2) {
+    return Err(RailError::message(
+      "git diff-tree returned an incomplete status/path pair",
+    ));
+  }
+  records
+    .chunks_exact(2)
+    .map(|pair| {
+      let status_record = pair[0].strip_prefix(b"\n").unwrap_or(pair[0]);
+      let status = status_record
+        .first()
+        .copied()
+        .map(char::from)
+        .ok_or_else(|| RailError::message("git diff-tree returned an empty change status"))?;
+      let change_type = match status {
+        'A' | 'D' | 'M' | 'T' | 'U' => status,
+        _ => 'M',
+      };
+      Ok((
+        PathBuf::from(String::from_utf8_lossy(pair[1]).into_owned()),
+        change_type,
+      ))
+    })
+    .collect()
+}
+
 /// Parse git log output into CommitInfo
 ///
-/// Format is %H%n%an%n%ae%n%at%n%cn%n%ce%n%ct%n%P%n%B
+/// Format is %H%n%an%n%ae%n%at%n%ai%n%cn%n%ce%n%ct%n%ci%n%P%n%B
 /// Which gives us: hash, author name, author email, author time,
 ///                 committer name, committer email, committer time,
 ///                 parent hashes, body
@@ -810,6 +1167,8 @@ fn parse_commit_output(data: &[u8]) -> RailResult<CommitInfo> {
     .next()
     .and_then(|s| s.parse::<i64>().ok())
     .ok_or_else(|| RailError::message("Missing/invalid author timestamp"))?;
+  let author_timezone =
+    parse_formatted_timezone(lines.next().ok_or_else(|| RailError::message("Missing author date"))?)?;
   let committer = lines
     .next()
     .ok_or_else(|| RailError::message("Missing committer name"))?
@@ -818,7 +1177,15 @@ fn parse_commit_output(data: &[u8]) -> RailResult<CommitInfo> {
     .next()
     .ok_or_else(|| RailError::message("Missing committer email"))?
     .to_string();
-  let _committer_timestamp = lines.next(); // We don't use this
+  let committer_timestamp = lines
+    .next()
+    .and_then(|s| s.parse::<i64>().ok())
+    .ok_or_else(|| RailError::message("Missing/invalid committer timestamp"))?;
+  let committer_timezone = parse_formatted_timezone(
+    lines
+      .next()
+      .ok_or_else(|| RailError::message("Missing committer date"))?,
+  )?;
   let parents_line = lines.next().unwrap_or("");
   let parent_shas = if parents_line.is_empty() {
     vec![]
@@ -838,8 +1205,108 @@ fn parse_commit_output(data: &[u8]) -> RailResult<CommitInfo> {
     committer_email,
     message,
     timestamp,
+    author_timezone,
+    committer_timestamp,
+    committer_timezone,
     parent_shas,
   })
+}
+
+fn parse_raw_commit(sha: &str, data: &[u8]) -> RailResult<CommitInfo> {
+  let separator = data
+    .windows(2)
+    .position(|window| window == b"\n\n")
+    .ok_or_else(|| RailError::message(format!("Git commit '{}' has no message separator", sha)))?;
+  let headers = std::str::from_utf8(&data[..separator])
+    .map_err(|_| RailError::message(format!("Git commit '{}' has non-UTF-8 headers", sha)))?;
+  let mut author = None;
+  let mut committer = None;
+  let mut parent_shas = Vec::new();
+  for line in headers.lines() {
+    if let Some(parent) = line.strip_prefix("parent ") {
+      validate_batch_object_id(parent)?;
+      parent_shas.push(parent.to_string());
+    } else if let Some(signature) = line.strip_prefix("author ") {
+      author = Some(parse_raw_signature(signature, "author")?);
+    } else if let Some(signature) = line.strip_prefix("committer ") {
+      committer = Some(parse_raw_signature(signature, "committer")?);
+    }
+  }
+  let (author, author_email, timestamp, author_timezone) =
+    author.ok_or_else(|| RailError::message(format!("Git commit '{}' has no author", sha)))?;
+  let (committer, committer_email, committer_timestamp, committer_timezone) =
+    committer.ok_or_else(|| RailError::message(format!("Git commit '{}' has no committer", sha)))?;
+  let raw_message = String::from_utf8_lossy(&data[separator + 2..]);
+  let message = raw_message.strip_suffix('\n').unwrap_or(&raw_message).to_string();
+
+  Ok(CommitInfo {
+    sha: sha.to_string(),
+    author,
+    author_email,
+    committer,
+    committer_email,
+    message,
+    timestamp,
+    author_timezone,
+    committer_timestamp,
+    committer_timezone,
+    parent_shas,
+  })
+}
+
+fn parse_raw_signature(signature: &str, field: &str) -> RailResult<(String, String, i64, String)> {
+  let mut suffix = signature.rsplitn(3, ' ');
+  let timezone = suffix
+    .next()
+    .ok_or_else(|| RailError::message(format!("Git {} has no time-zone offset", field)))?;
+  validate_timezone(timezone)?;
+  let timestamp = suffix
+    .next()
+    .and_then(|value| value.parse::<i64>().ok())
+    .ok_or_else(|| RailError::message(format!("Git {} has an invalid timestamp", field)))?;
+  let identity = suffix
+    .next()
+    .ok_or_else(|| RailError::message(format!("Git {} has no identity", field)))?;
+  let email_end = identity
+    .strip_suffix('>')
+    .ok_or_else(|| RailError::message(format!("Git {} email is malformed", field)))?;
+  let (name, email) = email_end
+    .rsplit_once(" <")
+    .ok_or_else(|| RailError::message(format!("Git {} identity is malformed", field)))?;
+  Ok((name.to_string(), email.to_string(), timestamp, timezone.to_string()))
+}
+
+fn validate_batch_object_id(value: &str) -> RailResult<()> {
+  if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    Ok(())
+  } else {
+    Err(RailError::message(format!(
+      "Git commit has invalid parent object ID '{}'",
+      value
+    )))
+  }
+}
+
+fn parse_formatted_timezone(date: &str) -> RailResult<String> {
+  let timezone = date
+    .split_whitespace()
+    .next_back()
+    .ok_or_else(|| RailError::message("Git date has no time-zone offset"))?;
+  validate_timezone(timezone)?;
+  Ok(timezone.to_string())
+}
+
+fn validate_timezone(timezone: &str) -> RailResult<()> {
+  if timezone.len() == 5
+    && matches!(timezone.as_bytes().first(), Some(b'+' | b'-'))
+    && timezone.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+  {
+    return Ok(());
+  }
+  Err(RailError::message(format!(
+    "Git date has invalid time-zone offset '{}'",
+    timezone
+  )))
 }
 
 #[cfg(test)]

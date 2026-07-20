@@ -3,10 +3,9 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crate::commands::common::{SplitSyncConfigBuilder, TextJsonOutputFormat, enforce_safety_gate};
+use crate::commands::common::{SplitSyncConfigBuilder, TextJsonOutputFormat, enforce_safety_gate, split_mapping_count};
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
-use crate::git::mappings::MappingStore;
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::sync::{ConflictStrategy, SyncDirection, SyncEngine, SyncResult};
@@ -102,7 +101,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
   };
 
   let configs = builder.build_sync_configs()?;
-  let snapshots = collect_sync_snapshots(ctx, &configs, &direction, args.strategy);
+  let snapshots = collect_sync_snapshots(ctx, &configs, &direction, args.strategy)?;
   let expected_mutation_plan = build_sync_mutation_plan(ctx, &configs, &direction, args.strategy, args.allow_dirty)?;
   let pre_heads = collect_sync_heads(ctx.workspace_root(), &configs);
 
@@ -519,8 +518,8 @@ fn build_sync_mutation_plan(
       let target_head = SystemGit::open(&config.target_repo_path)
         .and_then(|git| git.head_commit())
         .unwrap_or_else(|_| "none".to_string());
-      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
-      MutationAction::new(
+      let mapping_count = split_mapping_count(ctx.workspace_root(), &config.crate_name, &config.target_repo_path)?;
+      Ok(MutationAction::new(
         "SYNC_CRATE",
         config.crate_name.clone(),
         Some(format!(
@@ -532,9 +531,9 @@ fn build_sync_mutation_plan(
           target_head,
           mapping_count
         )),
-      )
+      ))
     })
-    .collect();
+    .collect::<RailResult<Vec<_>>>()?;
 
   let mut risks = Vec::new();
   if allow_dirty {
@@ -565,7 +564,7 @@ fn collect_sync_snapshots(
   configs: &[(crate::sync::SyncConfig, bool)],
   direction: &SyncDirection,
   strategy: ConflictStrategy,
-) -> Vec<serde_json::Value> {
+) -> RailResult<Vec<serde_json::Value>> {
   let source_head = ctx
     .git()
     .and_then(|git| git.git().head_commit())
@@ -583,18 +582,27 @@ fn collect_sync_snapshots(
       let target_head = SystemGit::open(&config.target_repo_path)
         .and_then(|git| git.head_commit())
         .ok();
-      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
-      serde_json::json!({
+      let mapping_count = split_mapping_count(ctx.workspace_root(), &config.crate_name, &config.target_repo_path)?;
+      Ok(serde_json::json!({
         "crate_name": config.crate_name,
         "direction": direction_name,
         "strategy": format!("{:?}", strategy).to_lowercase(),
         "source_head": source_head,
         "target_head": target_head,
         "target_exists": target_exists,
+        "ownership": {
+          "snapshot_id": config.ownership.snapshot_id,
+          "members": config.ownership.members,
+          "dependency_closure": config.ownership.dependency_closure,
+          "release_boundaries": config.ownership.release_boundaries.iter().map(|boundary| serde_json::json!({
+            "name": boundary.name,
+            "members": boundary.members,
+          })).collect::<Vec<_>>(),
+        },
         "mapping_snapshot": {
           "mapping_count": mapping_count,
         },
-      })
+      }))
     })
     .collect()
 }
@@ -603,20 +611,20 @@ fn compute_conflict_candidates(configs: &[(crate::sync::SyncConfig, bool)]) -> V
   configs
     .iter()
     .map(|(config, _)| {
-      let paths: Vec<String> = config.crate_paths.iter().map(|p| p.display().to_string()).collect();
+      let mut paths = config
+        .crate_paths
+        .iter()
+        .chain(&config.asset_paths)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+      paths.sort();
+      paths.dedup();
       serde_json::json!({
         "crate_name": config.crate_name,
         "candidate_paths": paths,
       })
     })
     .collect()
-}
-
-fn mapping_count_for(workspace_root: &Path, crate_name: &str, target_repo_path: &Path) -> usize {
-  let mut store = MappingStore::new(crate_name.to_string());
-  let _ = store.load(workspace_root);
-  let _ = store.load(target_repo_path);
-  store.count()
 }
 
 fn collect_sync_heads(

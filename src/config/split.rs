@@ -18,10 +18,16 @@ pub struct CrateSplitConfig {
   /// For combined mode: how to structure the split repo
   #[serde(default)]
   pub workspace_mode: WorkspaceMode,
-  /// Crate paths to include in the split
+  /// Cargo workspace members included in this repository.
+  ///
+  /// A single split defaults to the owning `[crates.NAME]` key. Combined
+  /// splits name every member explicitly.
   #[serde(default)]
-  pub paths: Vec<CratePath>,
-  /// Additional files/directories to include
+  pub members: Vec<String>,
+  /// Legacy path-based member selection accepted only by `config migrate`.
+  #[serde(default, rename = "paths", skip_serializing_if = "Vec::is_empty")]
+  pub legacy_paths: Vec<CratePath>,
+  /// Additional non-Cargo files/directories to include.
   #[serde(default)]
   pub include: Vec<String>,
   /// Files/directories to exclude
@@ -43,10 +49,11 @@ pub struct SplitConfig {
   /// For combined mode: how to structure the split repo
   #[serde(default)]
   pub workspace_mode: WorkspaceMode,
-  /// Crate paths to include in the split
-  #[serde(default)]
-  pub paths: Vec<CratePath>,
-  /// Additional files/directories to include
+  /// Cargo workspace member names included in the split.
+  pub members: Vec<String>,
+  /// Legacy path-based member selection awaiting explicit migration.
+  pub legacy_paths: Vec<CratePath>,
+  /// Additional non-Cargo files/directories to include.
   #[serde(default)]
   pub include: Vec<String>,
   /// Files/directories to exclude
@@ -63,11 +70,6 @@ pub struct SplitConfig {
 }
 
 impl SplitConfig {
-  /// Get the path(s) for this split configuration
-  pub fn get_paths(&self) -> Vec<&PathBuf> {
-    self.paths.iter().map(|cp| &cp.path).collect()
-  }
-
   /// Determine the target repository path for this split configuration
   ///
   /// For local paths (testing), returns the path as-is.
@@ -93,11 +95,34 @@ impl SplitConfig {
 
   /// Validate the split configuration
   pub fn validate(&self) -> RailResult<()> {
-    // Check paths exist
-    if self.paths.is_empty() {
+    if !self.legacy_paths.is_empty() {
       return Err(RailError::with_help(
-        format!("Split '{}' must have at least one crate path", self.name),
-        format!("Add paths in rail.toml under [crates.{}.split]", self.name),
+        format!("Split '{}' still selects Cargo members by path", self.name),
+        "run 'cargo rail config migrate' to replace split.paths with member names",
+      ));
+    }
+
+    if self.members.is_empty() {
+      return Err(RailError::with_help(
+        format!("Split '{}' must own at least one Cargo member", self.name),
+        format!("Add members under [crates.{}.split]", self.name),
+      ));
+    }
+    let mut unique_members = std::collections::HashSet::with_capacity(self.members.len());
+    if let Some(member) = self
+      .members
+      .iter()
+      .find(|member| !unique_members.insert(member.as_str()))
+    {
+      return Err(RailError::with_help(
+        format!("Split '{}' selects Cargo member '{}' more than once", self.name, member),
+        "list each split member exactly once",
+      ));
+    }
+    if !self.exclude.is_empty() && self.include.is_empty() {
+      return Err(RailError::with_help(
+        format!("Split '{}' excludes assets without including any", self.name),
+        "split.exclude only narrows explicit non-Cargo assets selected by split.include",
       ));
     }
 
@@ -111,26 +136,26 @@ impl SplitConfig {
     // Validate mode-specific requirements
     match self.mode {
       SplitMode::Single => {
-        if self.paths.len() != 1 {
+        if self.members.len() != 1 {
           return Err(RailError::with_help(
             format!(
-              "Single mode split '{}' must have exactly one path (found {})",
+              "Single mode split '{}' must have exactly one member (found {})",
               self.name,
-              self.paths.len()
+              self.members.len()
             ),
-            "Change mode to 'combined' or remove extra paths",
+            "change mode to 'combined' or remove extra members",
           ));
         }
       }
       SplitMode::Combined => {
-        if self.paths.len() < 2 {
+        if self.members.len() < 2 {
           return Err(RailError::with_help(
             format!(
-              "Combined mode split '{}' should have multiple paths (found {})",
+              "Combined mode split '{}' should have multiple members (found {})",
               self.name,
-              self.paths.len()
+              self.members.len()
             ),
-            "Change mode to 'single' or add more crate paths",
+            "change mode to 'single' or add more Cargo members",
           ));
         }
       }
@@ -176,13 +201,19 @@ pub fn build_split_config(
   release_publish: Option<bool>,
   changelog: Option<&ChangelogConfig>,
 ) -> SplitConfig {
+  let members = if split.members.is_empty() {
+    vec![name.clone()]
+  } else {
+    split.members.clone()
+  };
   SplitConfig {
     name,
     remote: split.remote.clone(),
     branch: split.branch.clone(),
     mode: split.mode.clone(),
     workspace_mode: split.workspace_mode.clone(),
-    paths: split.paths.clone(),
+    members,
+    legacy_paths: split.legacy_paths.clone(),
     include: split.include.clone(),
     exclude: split.exclude.clone(),
     publish: release_publish.unwrap_or(true),
@@ -197,14 +228,15 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_split_config_validate_empty_paths() {
+  fn test_split_config_validate_empty_members() {
     let config = SplitConfig {
       name: "test-crate".to_string(),
       remote: "git@github.com:user/test.git".to_string(),
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![],
+      members: vec![],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish: true,
@@ -214,7 +246,7 @@ mod tests {
     let result = config.validate();
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("at least one crate path"));
+    assert!(err_msg.contains("at least one Cargo member"));
   }
 
   #[test]
@@ -225,9 +257,8 @@ mod tests {
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![CratePath {
-        path: PathBuf::from("crates/test"),
-      }],
+      members: vec!["test-crate".to_string()],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish: true,
@@ -241,21 +272,15 @@ mod tests {
   }
 
   #[test]
-  fn test_split_config_validate_single_mode_multiple_paths() {
+  fn test_split_config_validate_single_mode_multiple_members() {
     let config = SplitConfig {
       name: "test-crate".to_string(),
       remote: "git@github.com:user/test.git".to_string(),
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![
-        CratePath {
-          path: PathBuf::from("crates/a"),
-        },
-        CratePath {
-          path: PathBuf::from("crates/b"),
-        },
-      ],
+      members: vec!["a".to_string(), "b".to_string()],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish: true,
@@ -266,20 +291,19 @@ mod tests {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("Single mode"));
-    assert!(err_msg.contains("exactly one path"));
+    assert!(err_msg.contains("exactly one member"));
   }
 
   #[test]
-  fn test_split_config_validate_combined_mode_single_path() {
+  fn test_split_config_validate_combined_mode_single_member() {
     let config = SplitConfig {
       name: "test-crate".to_string(),
       remote: "git@github.com:user/test.git".to_string(),
       branch: "main".to_string(),
       mode: SplitMode::Combined,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![CratePath {
-        path: PathBuf::from("crates/a"),
-      }],
+      members: vec!["a".to_string()],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish: true,
@@ -290,7 +314,7 @@ mod tests {
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("Combined mode"));
-    assert!(err_msg.contains("multiple paths"));
+    assert!(err_msg.contains("multiple members"));
   }
 
   #[test]
@@ -301,9 +325,8 @@ mod tests {
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![CratePath {
-        path: PathBuf::from("crates/test"),
-      }],
+      members: vec!["test-crate".to_string()],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish: true,

@@ -277,20 +277,23 @@ topological order as GitHub key/value outputs. Structured formats require `--dry
 |---|---:|---|
 | `remote` | required | Git URL or local test path. |
 | `branch` | required | Destination branch. |
-| `mode` | required | `"single"` for one path or `"combined"` for multiple paths. |
+| `mode` | required | `"single"` for one member or `"combined"` for multiple members. |
 | `workspace_mode` | `"standalone"` | Combined layout: `"standalone"` or `"workspace"`. |
-| `paths` | required | Array of `{ crate = "path" }` ownership mappings. |
-| `include` | `[]` | Additional explicit repository paths. |
-| `exclude` | `[]` | Paths removed from the owned split tree. |
+| `members` | split name | Cargo package names owned by the split. Single mode requires one; combined mode requires at least two. |
+| `include` | `[]` | Glob patterns selecting explicit non-Cargo files from the workspace snapshot. |
+| `exclude` | `[]` | Glob patterns narrowing `include`; Cargo-owned member files cannot be excluded. |
 
 ```toml
 [crates.my-crate.split]
 remote = "git@github.com:org/my-crate.git"
 branch = "main"
 mode = "single"
-paths = [{ crate = "crates/my-crate" }]
 include = ["LICENSE"]
 ```
+
+Cargo roots, dependency closure, and intersecting release version groups are resolved by package identity from one
+`WorkspaceSnapshot`. A single split whose key differs from its package name must set `members = ["package-name"]`.
+Included assets retain their workspace-relative paths; ambiguous single-split mappings are rejected before mutation.
 
 ### Release and changelog overrides
 
@@ -312,6 +315,7 @@ Deprecated fields remain parseable for a bounded compatibility window, emit acti
 | Deprecated input | Migration |
 |---|---|
 | `[workspace]`, `[toolchain]`, `[crates.NAME.sync]` | Remove the empty reserved table. |
+| `crates.NAME.split.paths` | Resolve each legacy Cargo path to its package name and write `split.members`. |
 | `unify.compiler_diag_cache` | Remove; correct caching is automatic. |
 | `unify.sort_dependencies` | Remove; edits are always deterministic. |
 | `unify.prune_dead_features` | Remove; diagnostics are unconditional and deletion uses `consumer_scope`. |

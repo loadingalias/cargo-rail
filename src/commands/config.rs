@@ -812,6 +812,7 @@ pub fn run_config_migrate(
   migrate_release_remote_effects(&mut editor, &mut changes)?;
   migrate_run_profile_actions(&mut editor, &mut changes)?;
   migrate_run_profile_baselines(&mut editor, &mut changes)?;
+  migrate_split_member_paths(workspace_root, &mut editor, &mut changes)?;
   migrate_removed_field(
     &mut editor,
     &mut changes,
@@ -892,6 +893,113 @@ fn migrate_removed_field(
       message,
     });
   }
+}
+
+fn migrate_split_member_paths(
+  workspace_root: &Path,
+  editor: &mut TomlEditor,
+  changes: &mut Vec<MigrationChange>,
+) -> RailResult<()> {
+  let crate_names = editor
+    .doc()
+    .get("crates")
+    .and_then(toml_edit::Item::as_table)
+    .map(|crates| crates.iter().map(|(name, _)| name.to_string()).collect::<Vec<_>>())
+    .unwrap_or_default();
+
+  let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+  for crate_name in crate_names {
+    let old = format!("crates.{crate_name}.split.paths");
+    let Some(paths) = editor.get(&old).and_then(toml_edit::Item::as_array) else {
+      continue;
+    };
+    let mut members = Vec::with_capacity(paths.len());
+    for entry in paths {
+      let relative = entry
+        .as_inline_table()
+        .and_then(|table| table.get("crate"))
+        .and_then(toml_edit::Value::as_str)
+        .ok_or_else(|| RailError::message(format!("{old} entries must contain one string `crate` path")))?;
+      let candidate = Path::new(relative);
+      if candidate.is_absolute()
+        || candidate
+          .components()
+          .any(|component| matches!(component, std::path::Component::ParentDir))
+      {
+        return Err(RailError::message(format!(
+          "cannot migrate split member path '{}': path must stay inside the workspace",
+          relative
+        )));
+      }
+      let package_root = crate::utils::canonicalize_existing(&workspace_root.join(candidate))?;
+      if !package_root.starts_with(&workspace_root) {
+        return Err(RailError::message(format!(
+          "cannot migrate split member path '{}': path escapes the workspace",
+          relative
+        )));
+      }
+      let manifest_path = package_root.join("Cargo.toml");
+      let manifest = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        RailError::message(format!(
+          "cannot migrate split member path '{}': failed to read {}: {}",
+          relative,
+          manifest_path.display(),
+          error
+        ))
+      })?;
+      let manifest: toml_edit::DocumentMut = manifest.parse().map_err(|error: toml_edit::TomlError| {
+        RailError::message(format!("cannot migrate split member path '{}': {}", relative, error))
+      })?;
+      let package_name = manifest
+        .get("package")
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|package| package.get("name"))
+        .and_then(toml_edit::Item::as_str)
+        .ok_or_else(|| {
+          RailError::message(format!(
+            "cannot migrate split member path '{}': Cargo.toml has no package.name",
+            relative
+          ))
+        })?;
+      members.push(package_name.to_string());
+    }
+    members.sort();
+    members.dedup();
+
+    let new = format!("crates.{crate_name}.split.members");
+    if let Some(existing) = editor.get(&new).and_then(toml_edit::Item::as_array) {
+      let mut configured = existing
+        .iter()
+        .map(|value| {
+          value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RailError::message(format!("{new} must contain only Cargo member names")))
+        })
+        .collect::<RailResult<Vec<_>>>()?;
+      configured.sort();
+      configured.dedup();
+      if configured != members {
+        return Err(RailError::message(format!(
+          "cannot migrate {old}: existing {new} selects different Cargo members"
+        )));
+      }
+    } else {
+      let mut array = toml_edit::Array::new();
+      for member in &members {
+        array.push(member.as_str());
+      }
+      editor.set(&new, array)?;
+    }
+    editor.remove(&old);
+    changes.push(MigrationChange {
+      kind: "replace",
+      path: old,
+      replacement: Some(new),
+      message: "Split ownership is now resolved from Cargo member names and the workspace snapshot.",
+    });
+  }
+  Ok(())
 }
 
 fn migrate_unknown_file_policy(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {

@@ -2,6 +2,7 @@
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
+use cargo_rail::git::mappings::{HistorySide, MappingStore, repository_identity};
 use tempfile::TempDir;
 
 #[test]
@@ -24,7 +25,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/mylib" }}]
 "#,
     split_path.display().to_string().replace('\\', "\\\\")
   );
@@ -74,7 +74,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/mylib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -90,6 +89,68 @@ paths = [{{ crate = "crates/mylib" }}]
   assert!(log.contains("Update mylib v1"), "Should contain v1 commit");
   assert!(log.contains("Update mylib v2"), "Should contain v2 commit");
 
+  Ok(())
+}
+
+#[test]
+fn test_split_migrates_legacy_notes_losslessly_into_history() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("legacy-lib", "0.1.0", &[])?;
+  ws.commit("Add legacy-lib")?;
+  let source_commit = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?
+    .trim()
+    .to_string();
+  let source_identity = repository_identity(&ws.path)?;
+
+  let target = TempDir::new()?;
+  git(target.path(), &["init", "-b", "main"])?;
+  git(target.path(), &["config", "user.name", "Test User"])?;
+  git(target.path(), &["config", "user.email", "test@example.com"])?;
+  git(target.path(), &["commit", "--allow-empty", "-m", "Legacy split head"])?;
+  let legacy_target = String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?
+    .trim()
+    .to_string();
+  git(target.path(), &["fetch", "--quiet", ws.path.to_str().unwrap(), "HEAD"])?;
+  git(
+    target.path(),
+    &[
+      "notes",
+      "--ref",
+      "refs/notes/rail/legacy-lib",
+      "add",
+      "-m",
+      &legacy_target,
+      &source_commit,
+    ],
+  )?;
+  std::fs::write(
+    ws.path.join("rail.toml"),
+    format!(
+      "[crates.legacy-lib.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
+      target.path().display().to_string().replace('\\', "\\\\")
+    ),
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "legacy-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(output.status.success());
+  let message = git(target.path(), &["log", "-1", "--format=%B"])?;
+  let message = String::from_utf8_lossy(&message.stdout);
+  assert!(message.contains("Rail-Origin: v1"));
+  assert!(message.contains(&format!("target={legacy_target}")));
+
+  git(target.path(), &["update-ref", "-d", "refs/notes/rail/legacy-lib"])?;
+  let clone_parent = TempDir::new()?;
+  let clone = clone_parent.path().join("clone");
+  git(
+    clone_parent.path(),
+    &["clone", target.path().to_str().unwrap(), "clone"],
+  )?;
+  let mut mappings = MappingStore::new("legacy-lib".to_string());
+  mappings.load_history(&clone, HistorySide::Target, &source_identity)?;
+  assert_eq!(mappings.get_mapping(&source_commit), Some(legacy_target));
   Ok(())
 }
 
@@ -117,7 +178,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/lib-a" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -156,7 +216,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/lib-core" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -203,10 +262,7 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "combined"
-paths = [
-  {{ crate = "crates/lib-core" }},
-  {{ crate = "crates/service-api" }}
-]
+members = ["lib-core", "service-api"]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -278,7 +334,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/lib-release" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -384,7 +439,6 @@ root = "."
 remote = "/tmp/default-remote"
 branch = "main"
 mode = "single"
-paths = [{ crate = "crates/override-lib" }]
 "#,
   )?;
 
@@ -441,7 +495,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/json-lib" }}]
 "#,
       target_dir.path().display().to_string().replace('\\', "\\\\")
     ),
@@ -466,6 +519,69 @@ paths = [{{ crate = "crates/json-lib" }}]
   assert_eq!(json["result"], serde_json::json!("pending_changes"));
   assert_eq!(json["exit_code"], serde_json::json!(1));
 
+  Ok(())
+}
+
+#[test]
+fn test_split_ownership_uses_the_planner_snapshot_and_cargo_graph() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-shared-snapshot")?;
+  ws.add_crate("owned-dependency", "0.1.0", &[])?;
+  ws.add_crate(
+    "owned-root",
+    "0.1.0",
+    &[("owned-dependency", "{ path = \"../owned-dependency\" }")],
+  )?;
+  ws.commit("Add owned Cargo graph")?;
+  let target = TempDir::new()?;
+  std::fs::write(
+    ws.path.join("rail.toml"),
+    format!(
+      r#"[workspace]
+root = "."
+
+[release.version_groups]
+owned = ["owned-root", "owned-dependency"]
+
+[crates.owned-root.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+"#,
+      target.path().display().to_string().replace('\\', "\\\\")
+    ),
+  )?;
+
+  let plan = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(plan.status.success());
+  let plan: serde_json::Value = serde_json::from_slice(&plan.stdout)?;
+  let split = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "split",
+      "run",
+      "owned-root",
+      "--check",
+      "--format",
+      "json",
+      "--allow-dirty",
+    ],
+  )?;
+  assert_eq!(split.status.code(), Some(1));
+  let split: serde_json::Value = serde_json::from_slice(&split.stdout)?;
+  let ownership = &split["planning"]["targets"][0]["ownership"];
+  assert_eq!(ownership["snapshot_id"], plan["inputs"]["snapshot_id"]);
+  assert_eq!(
+    split["mutation_plan"]["pre_apply"]["metadata_fingerprint"],
+    format!("snapshot:{}", ownership["snapshot_id"].as_str().unwrap())
+  );
+  assert_eq!(ownership["members"], serde_json::json!(["owned-root"]));
+  assert_eq!(ownership["dependency_closure"], serde_json::json!(["owned-dependency"]));
+  assert_eq!(ownership["release_boundaries"][0]["name"], "owned");
+  assert_eq!(
+    ownership["release_boundaries"][0]["members"],
+    serde_json::json!(["owned-dependency", "owned-root"])
+  );
   Ok(())
 }
 
@@ -532,7 +648,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/prefetch-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -554,7 +669,7 @@ paths = [{{ crate = "crates/prefetch-lib" }}]
   // Check stderr mentions parallel prefetch (progress output goes to stderr)
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stderr.contains("Prefetching file contents in parallel"),
+    stderr.contains("Prefetching exact trees and transform inputs in parallel"),
     "Should use parallel prefetch for 9 commits. stderr: {}",
     stderr
   );
@@ -619,7 +734,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/dirty-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -724,7 +838,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/exact-tree" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -784,6 +897,58 @@ paths = [{{ crate = "crates/exact-tree" }}]
   Ok(())
 }
 
+#[test]
+fn test_split_preserves_merge_parents_and_commit_identities() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-merge-history")?;
+  ws.add_crate("merge-tree", "0.1.0", &[])?;
+  ws.commit("Add merge-tree")?;
+  git(&ws.path, &["checkout", "-b", "feature"])?;
+  ws.modify_file("merge-tree", "src/feature.rs", "pub const FEATURE: bool = true;\n")?;
+  ws.commit("Add feature side")?;
+  git(&ws.path, &["checkout", "main"])?;
+  ws.modify_file("merge-tree", "src/main_side.rs", "pub const MAIN: bool = true;\n")?;
+  ws.commit("Add main side")?;
+  git(&ws.path, &["merge", "--no-ff", "feature", "-m", "Merge split feature"])?;
+
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.merge-tree.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "merge-tree", "--yes", "--allow-dirty"],
+  )?;
+
+  let target_merge = git(
+    split_dir.path(),
+    &["log", "--format=%H", "--fixed-strings", "--grep=Merge split feature"],
+  )?;
+  let target_merge = String::from_utf8_lossy(&target_merge.stdout).trim().to_string();
+  let parents = git(split_dir.path(), &["rev-list", "--parents", "-n", "1", &target_merge])?;
+  assert_eq!(String::from_utf8_lossy(&parents.stdout).split_whitespace().count(), 3);
+
+  let metadata_format = "%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI";
+  let source_metadata = git(
+    &ws.path,
+    &["show", "-s", &format!("--format={metadata_format}"), "HEAD"],
+  )?;
+  let target_metadata = git(
+    split_dir.path(),
+    &["show", "-s", &format!("--format={metadata_format}"), &target_merge],
+  )?;
+  assert_eq!(source_metadata.stdout, target_metadata.stdout);
+  Ok(())
+}
+
 // Safety Rails Tests
 
 /// Test that split apply requires explicit confirmation in non-interactive mode
@@ -802,7 +967,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/confirm-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -840,7 +1004,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/safety-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -881,7 +1044,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/boundary-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -933,7 +1095,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/allow-dirty-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -977,7 +1138,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/boundary-lib" }}]
 "#,
     target.display().to_string().replace('\\', "\\\\")
   );
@@ -1002,17 +1162,10 @@ paths = [{{ crate = "crates/boundary-lib" }}]
 }
 
 #[test]
-fn test_split_rejects_crate_path_outside_workspace() -> Result<()> {
+fn test_split_rejects_unknown_member_before_target_mutation() -> Result<()> {
   let ws = TestWorkspace::new_named("split-crate-boundary")?;
   ws.add_crate("boundary-lib", "0.1.0", &[])?;
   ws.commit("Add boundary-lib")?;
-  let outside_root = TempDir::new()?;
-  let outside = outside_root.path().join("outside-crate");
-  std::fs::create_dir(&outside)?;
-  std::fs::write(
-    outside.join("Cargo.toml"),
-    "[package]\nname='outside'\nversion='0.1.0'\n",
-  )?;
   let target_dir = TempDir::new()?;
   let config = format!(
     r#"[workspace]
@@ -1022,10 +1175,9 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "{}" }}]
+members = ["outside"]
 "#,
-    target_dir.path().display().to_string().replace('\\', "\\\\"),
-    outside.display().to_string().replace('\\', "\\\\")
+    target_dir.path().display().to_string().replace('\\', "\\\\")
   );
   std::fs::write(ws.path.join("rail.toml"), config)?;
 
@@ -1036,8 +1188,8 @@ paths = [{{ crate = "{}" }}]
   assert!(!output.status.success());
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stderr.contains("split crate path") && stderr.contains("escapes the source workspace"),
-    "crate boundary error should explain the escape\nstderr:\n{}",
+    stderr.contains("Crate 'outside' not found") && !target_dir.path().join(".git").exists(),
+    "member resolution should fail before target mutation\nstderr:\n{}",
     stderr
   );
 
@@ -1067,7 +1219,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/idempotent-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -1145,7 +1296,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/incremental-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -1225,10 +1375,7 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "combined"
-paths = [
-  {{ crate = "crates/lib-core" }},
-  {{ crate = "crates/service-api" }}
-]
+members = ["lib-core", "service-api"]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -1307,7 +1454,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/partial-lib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -1396,7 +1542,7 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/aux-lib" }}]
+include = ["rustfmt.toml", ".editorconfig"]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );

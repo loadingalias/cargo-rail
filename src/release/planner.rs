@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 pub struct ReleasePlan {
   /// Contract version for release plan schema.
   pub plan_contract_version: u32,
+  /// Workspace snapshot shared with planner, split, and sync ownership.
+  #[serde(default, skip_serializing_if = "String::is_empty")]
+  pub snapshot_id: String,
   /// Authoritative input used for bump selection and changelog prose.
   #[serde(default = "legacy_release_source")]
   pub source: ReleaseSource,
@@ -320,7 +323,8 @@ impl<'a> ReleasePlanner<'a> {
       .collect();
 
     Ok(ReleasePlan {
-      plan_contract_version: 3,
+      plan_contract_version: 4,
+      snapshot_id: self.ctx.snapshot()?.id().to_string(),
       source: self.release_config.source,
       canonical_crate_order,
       crates: crate_plans,
@@ -551,7 +555,8 @@ impl<'a> ReleasePlanner<'a> {
 
     let crates_to_publish = crate_plans.iter().filter(|plan| plan.publish).count();
     Ok(ReleasePlan {
-      plan_contract_version: 3,
+      plan_contract_version: 4,
+      snapshot_id: self.ctx.snapshot()?.id().to_string(),
       source: self.release_config.source,
       canonical_crate_order: crate_plans.iter().map(|plan| plan.name.clone()).collect(),
       summary: ReleaseSummary {

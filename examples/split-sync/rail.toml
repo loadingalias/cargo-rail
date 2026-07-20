@@ -8,8 +8,6 @@ remote = "git@github.com:your-org/my-crate.git"
 branch = "main"
 mode = "single"             # single | combined
 workspace_mode = "standalone" # standalone | workspace
-paths = [
-  { crate = "crates/my-crate" },
-]
+# members defaults to ["my-crate"]; combined splits list package names here.
 include = []
 exclude = []

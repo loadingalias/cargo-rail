@@ -61,7 +61,7 @@ pub fn run_hash(ctx: &WorkspaceContext, opts: HashOptions) -> RailResult<()> {
       "plan_contract_version": plan.plan_contract_version,
       "portable": true,
       "cache_key": false,
-      "excluded_local_fields": ["inputs.workspace_root", "reproducibility"],
+      "excluded_local_fields": ["inputs.workspace_root", "inputs.snapshot_id", "reproducibility"],
       "refs": plan.inputs.refs,
     });
     let out = crate::output::machine_json_envelope("hash", "inspect", "success", 0, payload);

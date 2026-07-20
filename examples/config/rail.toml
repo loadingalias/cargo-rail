@@ -41,7 +41,7 @@ baseline = { kind = "merge-base" }
 remote = "git@github.com:your-org/my-crate.git"
 branch = "main"
 mode = "single"
-paths = [{ crate = "crates/my-crate" }]
+members = ["my-crate"]
 
 [crates.my-crate.release]
 publish = true

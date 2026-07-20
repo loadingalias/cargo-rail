@@ -763,6 +763,34 @@ fn test_config_migrate_check_is_read_only_and_exits_one() -> Result<()> {
 }
 
 #[test]
+fn test_config_migrate_replaces_split_paths_with_cargo_member_names() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-split-members")?;
+  ws.add_crate("member-a", "0.1.0", &[])?;
+  ws.add_crate("member-b", "0.1.0", &[])?;
+  ws.commit("Add split members")?;
+  let config_path = ws.path.join(".config/rail.toml");
+  fs::write(
+    &config_path,
+    r#"[crates.bundle.split]
+remote = "../bundle"
+branch = "main"
+mode = "combined"
+paths = [{ crate = "crates/member-b" }, { crate = "crates/member-a" }]
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+  assert!(output.status.success());
+  let migrated = fs::read_to_string(config_path)?;
+  assert!(!migrated.contains("paths ="));
+  assert!(
+    migrated.contains("members = [\"member-a\", \"member-b\"]"),
+    "{migrated}"
+  );
+  Ok(())
+}
+
+#[test]
 fn test_config_migrate_applies_explicit_renames_and_removals() -> Result<()> {
   let ws = TestWorkspace::new_named("config-migrate-apply")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;

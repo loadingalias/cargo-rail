@@ -131,7 +131,6 @@ root = "."
 remote = "/tmp/fake-remote"
 branch = "main"
 mode = "single"
-paths = [{ crate = "crates/real-crate" }]
 "#,
   )?;
 

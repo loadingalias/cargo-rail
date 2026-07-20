@@ -143,6 +143,7 @@ impl PlanOutput {
 #[derive(Debug, Serialize)]
 pub(crate) struct PlanInputs {
   pub(crate) refs: PlanRefs,
+  pub(crate) snapshot_id: Option<String>,
   pub(crate) workspace_root: String,
   pub(crate) config_fingerprint: String,
   pub(crate) toolchain_fingerprint: String,
@@ -273,9 +274,9 @@ const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIV
 const RC_SEMANTIC_INPUT_UNCHANGED: &str = "SEMANTIC_INPUT_UNCHANGED";
 const RC_SEMANTIC_INPUT_PACKAGES: &str = "SEMANTIC_INPUT_PACKAGES";
 const RC_SEMANTIC_INPUT_FALLBACK: &str = "SEMANTIC_INPUT_FALLBACK";
-const PLAN_CONTRACT_VERSION: u32 = 4;
+const PLAN_CONTRACT_VERSION: u32 = 5;
 const SCOPE_CONTRACT_VERSION: u32 = 3;
-const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v4.schema.json");
+const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v5.schema.json");
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
@@ -668,7 +669,8 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
 
   // Compute reproducibility metadata
   let git_merge_base = refs.git_merge_base();
-  let (configuration_identity, toolchain_identity) = if let Some(snapshot) = snapshot {
+  let snapshot_id = snapshot.as_ref().map(|snapshot| snapshot.id().to_string());
+  let (configuration_identity, toolchain_identity) = if let Some(snapshot) = &snapshot {
     (
       snapshot.configuration_fingerprint().to_string(),
       snapshot.toolchain_fingerprint().to_string(),
@@ -696,6 +698,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     plan_contract_version: PLAN_CONTRACT_VERSION,
     inputs: PlanInputs {
       refs: refs.into_plan_refs(),
+      snapshot_id,
       workspace_root: ctx.workspace_root().display().to_string(),
       config_fingerprint: configuration_identity.clone(),
       toolchain_fingerprint: toolchain_identity,

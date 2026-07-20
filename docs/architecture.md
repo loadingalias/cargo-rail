@@ -76,7 +76,14 @@ The compiler wrapper passes dependency linting only to workspace compilation uni
 
 Mutation contract v2 binds `HEAD`, the dirty-path snapshot, declared read-only inputs, structured actions, and every authorized file mutation. Apply rechecks that state immediately before the first write. Release commits stage only changed authorized paths. Sync commits stage only paths owned by the source commit.
 
-Split and sync canonicalize the source workspace, worktree, crate, target, and temporary roots. They reject overlapping repositories and symlink escapes before mutation and revalidate each destination before writing.
+Split and sync resolve Cargo member names, dependency closure, release boundaries, and explicit non-Cargo assets from
+the same `WorkspaceSnapshot` used by planning and release. Versioned `Rail-Origin` trailers bind synthesized commits
+to the source repository, source commit, ownership snapshot, and transform version. Ordinary heads, remote refs, and
+tags are the mapping database; Git notes are read only during lossless migration.
+
+Source, target, and temporary roots are canonicalized before mutation. Overlapping repositories and symlink escapes
+are rejected, and each destination is revalidated before writing. Exact Git trees preserve deletions, modes, symlinks,
+parents, and separate author/committer identities without staging unrelated worktree state.
 
 ## Dependency choices
 

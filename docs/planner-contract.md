@@ -7,7 +7,11 @@ cargo rail plan --schema > plan.schema.json
 cargo rail plan --merge-base -f json > plan.json
 ```
 
-The current output contains planner contract v4 and scope contract v3 inside machine envelope v1. [`schemas/plan-v4.schema.json`](../schemas/plan-v4.schema.json) defines the contract. `plan --schema` does not load workspace metadata, so consumers can validate compatibility before opening a repository.
+The current output contains planner contract v5 and scope contract v3 inside machine envelope v1. [`schemas/plan-v5.schema.json`](../schemas/plan-v5.schema.json) defines the contract. `plan --schema` does not load workspace metadata, so consumers can validate compatibility before opening a repository.
+
+Contract v5 adds `inputs.snapshot_id` for worktree plans, binding planner ownership to the same portable workspace
+snapshot used by split, sync, and release. Historical object-range plans emit `null` because they intentionally do not
+claim the current worktree snapshot.
 
 Contract v4 separates build-transitive impact from development-only impact and gives every surface its own package
 scope. `build` follows active normal, build, proc-macro, and host edges. `test` additionally includes active development

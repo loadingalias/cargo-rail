@@ -63,7 +63,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 2);
+  assert_eq!(counters["schema_version"], 3);
   assert!(
     counters["snapshot_id"]
       .as_str()
@@ -84,6 +84,70 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(counters["graph_traversals"], 1);
   assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 2));
   assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 1));
+  Ok(())
+}
+
+#[test]
+fn split_diagnostics_prove_bounded_git_object_streams() -> Result<()> {
+  let ws = TestWorkspace::new_named("diagnostic-split-streams")?;
+  ws.add_crate("streamed", "0.1.0", &[])?;
+  ws.commit("Add streamed crate")?;
+  for revision in 1..=8 {
+    ws.modify_file(
+      "streamed",
+      "src/lib.rs",
+      &format!("pub const REVISION: u8 = {revision};\n"),
+    )?;
+    ws.commit(&format!("Streamed revision {revision}"))?;
+  }
+  let target = TempDir::new()?;
+  std::fs::write(
+    ws.path.join("rail.toml"),
+    format!(
+      "[workspace]\nroot = \".\"\n\n[crates.streamed.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
+      target.path().display().to_string().replace('\\', "\\\\")
+    ),
+  )?;
+  let output = TempDir::new()?;
+  let diagnostics = output.path().join("split.json");
+  let measured = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "--diagnostics-file",
+      diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+      "split",
+      "run",
+      "streamed",
+      "--yes",
+      "--allow-dirty",
+    ],
+  )?;
+  ensure!(
+    measured.status.success(),
+    "measured split failed: {}",
+    String::from_utf8_lossy(&measured.stderr)
+  );
+  let counters = read_counters(&diagnostics)?;
+  let objects = counters["git_object_reads"].as_u64().context("missing object count")?;
+  let batches = counters["git_object_read_batches"]
+    .as_u64()
+    .context("missing object batch count")?;
+  let subprocesses = counters["git_subprocesses"]
+    .as_u64()
+    .context("missing Git subprocess count")?;
+  ensure!(objects > 0 && batches > 0);
+  assert!(
+    batches < objects,
+    "{objects} object reads used {batches} batches; per-object subprocess behavior regressed"
+  );
+  assert!(objects <= 24, "bounded split object-read baseline regressed: {objects}");
+  assert!(batches <= 4, "bounded split stream baseline regressed: {batches}");
+  assert!(
+    subprocesses <= 170,
+    "bounded split Git subprocess baseline regressed: {subprocesses}"
+  );
+  eprintln!("P5 split measurement: git_subprocesses={subprocesses}, object_reads={objects}, object_batches={batches}");
   Ok(())
 }
 

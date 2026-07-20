@@ -9,7 +9,7 @@ use std::process::Command;
 const GOLDEN_PLAN_JSON: &str = include_str!("../fixtures/plan/plan_json.golden");
 const GOLDEN_PLAN_GITHUB: &str = include_str!("../fixtures/plan/plan_github.golden");
 const GOLDEN_PLAN_GITHUB_DEBUG: &str = include_str!("../fixtures/plan/plan_github_debug.golden");
-const PLAN_V4_SCHEMA: &str = include_str!("../../schemas/plan-v4.schema.json");
+const PLAN_V5_SCHEMA: &str = include_str!("../../schemas/plan-v5.schema.json");
 
 #[test]
 fn test_plan_schema_command_matches_published_schema() -> Result<()> {
@@ -20,7 +20,7 @@ fn test_plan_schema_command_matches_published_schema() -> Result<()> {
     output.status.success(),
     "plan --schema should not require workspace metadata"
   );
-  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V4_SCHEMA);
+  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V5_SCHEMA);
   assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
 
   Ok(())
@@ -35,7 +35,7 @@ fn test_plan_json_validates_against_published_schema() -> Result<()> {
   )?;
   assert!(output.status.success(), "plan json should succeed");
 
-  let schema: Value = serde_json::from_str(PLAN_V4_SCHEMA)?;
+  let schema: Value = serde_json::from_str(PLAN_V5_SCHEMA)?;
   let instance: Value = serde_json::from_slice(&output.stdout)?;
   let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid planner schema: {error}"))?;
   let errors: Vec<_> = validator
@@ -86,7 +86,7 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert_eq!(json["mode"], serde_json::Value::String("inspect".to_string()));
   assert_eq!(json["result"], serde_json::Value::String("success".to_string()));
   assert_eq!(json["exit_code"], serde_json::Value::Number(0.into()));
-  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(4.into()));
+  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(5.into()));
   assert!(json.get("inputs").is_some(), "missing inputs");
   assert!(json.get("files").is_some(), "missing files");
   assert!(json.get("impact").is_some(), "missing impact");
@@ -1188,7 +1188,7 @@ fn test_plan_output_file_overwrites_existing_content() -> Result<()> {
 
   let content = std::fs::read_to_string(&output_path)?;
   let parsed: Value = serde_json::from_str(&content)?;
-  assert_eq!(parsed["plan_contract_version"], Value::Number(4.into()));
+  assert_eq!(parsed["plan_contract_version"], Value::Number(5.into()));
   assert_eq!(
     content.matches("\"plan_contract_version\"").count(),
     1,
@@ -2166,6 +2166,7 @@ fn normalize_plan_json_value(value: &mut Value) -> Result<()> {
     object.remove("exit_code");
   }
   value["inputs"]["workspace_root"] = Value::String("<WORKSPACE_ROOT>".to_string());
+  value["inputs"]["snapshot_id"] = Value::String("<SNAPSHOT_ID>".to_string());
   value["inputs"]["config_fingerprint"] = Value::String("<CONFIG_FP>".to_string());
   value["inputs"]["toolchain_fingerprint"] = Value::String("<TOOLCHAIN_FP>".to_string());
   value["scope"]["resolved_base"] = Value::String("origin/main".to_string());

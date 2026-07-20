@@ -1454,6 +1454,12 @@ core = ["lib-a", "lib-b", "lib-c"]
   )?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let json: serde_json::Value = serde_json::from_str(&stdout)?;
+  assert_eq!(json["release_plan"]["plan_contract_version"], 4);
+  assert!(
+    json["release_plan"]["snapshot_id"]
+      .as_str()
+      .is_some_and(|snapshot| snapshot.starts_with("v1-sha256-"))
+  );
   let crates = json["release_plan"]["crates"].as_array().expect("crates array");
   for crate_name in ["lib-a", "lib-b", "lib-c"] {
     let crate_plan = crates

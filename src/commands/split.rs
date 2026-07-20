@@ -2,11 +2,10 @@
 
 use std::io::IsTerminal;
 
-use crate::commands::common::{SplitOutputFormat, SplitSyncConfigBuilder, enforce_safety_gate};
+use crate::commands::common::{SplitOutputFormat, SplitSyncConfigBuilder, enforce_safety_gate, split_mapping_count};
 use crate::config::RailConfig;
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
-use crate::git::mappings::MappingStore;
 use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::split::SplitEngine;
@@ -63,7 +62,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 
   let config_count = builder.count();
   let configs = builder.build_split_configs()?;
-  let snapshots = collect_split_snapshots(ctx, &configs);
+  let snapshots = collect_split_snapshots(ctx, &configs)?;
   let expected_mutation_plan = build_split_mutation_plan(ctx, &configs, args.allow_dirty)?;
 
   // Check mode: show plan
@@ -118,9 +117,9 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         for config in &configs {
           println!("  {}", config.crate_name);
           println!("    mode: {:?}", config.mode);
-          println!("    paths:");
-          for path in &config.crate_paths {
-            println!("      {}", path.display());
+          println!("    members:");
+          for member in &config.ownership.members {
+            println!("      {}", member);
           }
           println!("    target: {}", config.target_repo_path.display());
           if let Some(ref remote) = config.remote_url {
@@ -314,7 +313,8 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_r
         branch: split.branch,
         mode: split.mode,
         workspace_mode: split.workspace_mode,
-        paths: split.paths,
+        members: split.members,
+        legacy_paths: split.legacy_paths,
         include: split.include,
         exclude: split.exclude,
       }),
@@ -348,7 +348,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_r
     println!("      - edit 'remote' URLs to match your repositories");
     println!("      - for combined splits (multiple crates in one repo):");
     println!("        1. set mode = \"combined\" on one crate");
-    println!("        2. add other crate paths to its 'paths' array");
+    println!("        2. add Cargo package names to its 'members' array");
     println!("        3. remove the other crate entries");
   }
 
@@ -363,9 +363,8 @@ fn detect_workspace_splits(
   ctx: &WorkspaceContext,
   requested_crates: Option<&[String]>,
 ) -> RailResult<Vec<crate::config::SplitConfig>> {
-  use crate::config::{CratePath, SplitConfig, SplitMode, WorkspaceMode};
+  use crate::config::{SplitConfig, SplitMode, WorkspaceMode};
 
-  let workspace_root = ctx.workspace_root();
   let members = ctx.cargo().workspace_members();
 
   let mut splits = Vec::new();
@@ -385,11 +384,6 @@ fn detect_workspace_splits(
     };
     // Detect per-crate CHANGELOG file
     let changelog_path = crate::utils::detect_crate_changelog(crate_dir);
-    let rel_path = match crate_dir.strip_prefix(workspace_root) {
-      Ok(p) => p.to_path_buf(),
-      Err(_) => continue, // Skip if not under workspace root
-    };
-
     // Generate a reasonable remote URL placeholder (GitHub org/repo pattern)
     let remote = format!("git@github.com:org/{}.git", pkg.name);
 
@@ -402,7 +396,8 @@ fn detect_workspace_splits(
       branch: "main".to_string(),
       mode: SplitMode::Single,
       workspace_mode: WorkspaceMode::default(),
-      paths: vec![CratePath { path: rel_path.into() }],
+      members: vec![pkg.name.to_string()],
+      legacy_paths: vec![],
       include: vec![],
       exclude: vec![],
       publish,
@@ -434,8 +429,8 @@ fn build_split_mutation_plan(
       let target_head = SystemGit::open(&config.target_repo_path)
         .and_then(|git| git.head_commit())
         .unwrap_or_else(|_| "none".to_string());
-      let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
-      MutationAction::new(
+      let mapping_count = split_mapping_count(ctx.workspace_root(), &config.crate_name, &config.target_repo_path)?;
+      Ok(MutationAction::new(
         "SPLIT_CRATE",
         config.crate_name.clone(),
         Some(format!(
@@ -445,9 +440,9 @@ fn build_split_mutation_plan(
           target_head,
           mapping_count
         )),
-      )
+      ))
     })
-    .collect();
+    .collect::<RailResult<Vec<_>>>()?;
 
   let mut risks = Vec::new();
   if allow_dirty {
@@ -466,7 +461,10 @@ fn build_split_mutation_plan(
   mutation::build_plan(ctx, "split", actions, risks, trace)
 }
 
-fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::SplitParams]) -> Vec<serde_json::Value> {
+fn collect_split_snapshots(
+  ctx: &WorkspaceContext,
+  configs: &[crate::split::SplitParams],
+) -> RailResult<Vec<serde_json::Value>> {
   let source_head = ctx
     .git()
     .and_then(|git| git.git().head_commit())
@@ -477,22 +475,24 @@ fn collect_split_snapshots(ctx: &WorkspaceContext, configs: &[crate::split::Spli
     let target_head = SystemGit::open(&config.target_repo_path)
       .and_then(|git| git.head_commit())
       .ok();
-    let mapping_count = mapping_count_for(ctx.workspace_root(), &config.crate_name, &config.target_repo_path);
+    let mapping_count = split_mapping_count(ctx.workspace_root(), &config.crate_name, &config.target_repo_path)?;
     out.push(serde_json::json!({
       "crate_name": config.crate_name,
       "source_head": source_head,
       "target_head": target_head,
+      "ownership": {
+        "snapshot_id": config.ownership.snapshot_id,
+        "members": config.ownership.members,
+        "dependency_closure": config.ownership.dependency_closure,
+        "release_boundaries": config.ownership.release_boundaries.iter().map(|boundary| serde_json::json!({
+          "name": boundary.name,
+          "members": boundary.members,
+        })).collect::<Vec<_>>(),
+      },
       "mapping_snapshot": {
         "mapping_count": mapping_count,
       },
     }));
   }
-  out
-}
-
-fn mapping_count_for(workspace_root: &std::path::Path, crate_name: &str, target_repo_path: &std::path::Path) -> usize {
-  let mut store = MappingStore::new(crate_name.to_string());
-  let _ = store.load(workspace_root);
-  let _ = store.load(target_repo_path);
-  store.count()
+  Ok(out)
 }

@@ -491,8 +491,13 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "Selects combined split repository layout.",
   ),
   policy(
+    "crates.<name>.split.members",
+    "Names Cargo workspace members whose snapshot-derived roots are owned by a split.",
+  ),
+  compatibility(
     "crates.<name>.split.paths",
-    "Declares Cargo member roots owned by a split.",
+    "Preserves legacy path-selected split members until explicit migration.",
+    "Deprecated: split ownership is derived from Cargo member names. Run `cargo rail config migrate` to replace `paths` with `members`.",
   ),
   policy(
     "crates.<name>.split.include",

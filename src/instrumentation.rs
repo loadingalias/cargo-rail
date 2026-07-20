@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
@@ -23,6 +23,10 @@ struct Counters {
   hash_input_bytes: AtomicU64,
   hashed_file_bytes_read: AtomicU64,
   git_subprocesses: AtomicU64,
+  git_object_reads: AtomicU64,
+  git_object_read_batches: AtomicU64,
+  git_path_change_reads: AtomicU64,
+  git_path_change_batches: AtomicU64,
   graph_traversals: AtomicU64,
   graph_node_visits: AtomicU64,
   graph_edge_visits: AtomicU64,
@@ -39,6 +43,10 @@ impl Counters {
       hash_input_bytes: AtomicU64::new(0),
       hashed_file_bytes_read: AtomicU64::new(0),
       git_subprocesses: AtomicU64::new(0),
+      git_object_reads: AtomicU64::new(0),
+      git_object_read_batches: AtomicU64::new(0),
+      git_path_change_reads: AtomicU64::new(0),
+      git_path_change_batches: AtomicU64::new(0),
       graph_traversals: AtomicU64::new(0),
       graph_node_visits: AtomicU64::new(0),
       graph_edge_visits: AtomicU64::new(0),
@@ -56,6 +64,10 @@ impl Counters {
       hash_input_bytes: self.hash_input_bytes.load(Ordering::Relaxed),
       hashed_file_bytes_read: self.hashed_file_bytes_read.load(Ordering::Relaxed),
       git_subprocesses: self.git_subprocesses.load(Ordering::Relaxed),
+      git_object_reads: self.git_object_reads.load(Ordering::Relaxed),
+      git_object_read_batches: self.git_object_read_batches.load(Ordering::Relaxed),
+      git_path_change_reads: self.git_path_change_reads.load(Ordering::Relaxed),
+      git_path_change_batches: self.git_path_change_batches.load(Ordering::Relaxed),
       graph_traversals: self.graph_traversals.load(Ordering::Relaxed),
       graph_node_visits: self.graph_node_visits.load(Ordering::Relaxed),
       graph_edge_visits: self.graph_edge_visits.load(Ordering::Relaxed),
@@ -74,6 +86,10 @@ struct CounterSnapshot {
   hash_input_bytes: u64,
   hashed_file_bytes_read: u64,
   git_subprocesses: u64,
+  git_object_reads: u64,
+  git_object_read_batches: u64,
+  git_path_change_reads: u64,
+  git_path_change_batches: u64,
   graph_traversals: u64,
   graph_node_visits: u64,
   graph_edge_visits: u64,
@@ -185,6 +201,16 @@ pub(crate) fn record_hashed_file_bytes_read(bytes: usize) {
 
 pub(crate) fn record_git_subprocess() {
   add(|counters| &counters.git_subprocesses, 1);
+}
+
+pub(crate) fn record_git_object_read_batch(objects: usize) {
+  add(|counters| &counters.git_object_reads, amount(objects));
+  add(|counters| &counters.git_object_read_batches, 1);
+}
+
+pub(crate) fn record_git_path_change_batch(commits: usize) {
+  add(|counters| &counters.git_path_change_reads, amount(commits));
+  add(|counters| &counters.git_path_change_batches, 1);
 }
 
 pub(crate) fn record_graph_traversal(node_visits: usize, edge_visits: usize) {

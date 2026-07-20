@@ -31,10 +31,11 @@
       "since": "origin/main",
       "to": null
     },
+    "snapshot_id": "<SNAPSHOT_ID>",
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 4,
+  "plan_contract_version": 5,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",

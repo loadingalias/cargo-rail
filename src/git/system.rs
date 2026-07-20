@@ -63,8 +63,51 @@ pub struct CommitInfo {
   pub message: String,
   /// Commit timestamp (seconds since Unix epoch)
   pub timestamp: i64,
+  /// Author time-zone offset as Git renders it (`+HHMM` or `-HHMM`).
+  pub author_timezone: String,
+  /// Committer timestamp (seconds since Unix epoch).
+  pub committer_timestamp: i64,
+  /// Committer time-zone offset as Git renders it (`+HHMM` or `-HHMM`).
+  pub committer_timezone: String,
   /// Parent commit SHAs
   pub parent_shas: Vec<String>,
+}
+
+/// Complete author and committer identity for a synthesized commit.
+#[derive(Debug, Clone)]
+pub struct CommitMetadata {
+  /// Author name.
+  pub author: String,
+  /// Author email address.
+  pub author_email: String,
+  /// Author timestamp.
+  pub author_timestamp: i64,
+  /// Author time-zone offset.
+  pub author_timezone: String,
+  /// Committer name.
+  pub committer: String,
+  /// Committer email address.
+  pub committer_email: String,
+  /// Committer timestamp.
+  pub committer_timestamp: i64,
+  /// Committer time-zone offset.
+  pub committer_timezone: String,
+}
+
+impl CommitInfo {
+  /// Copy the complete commit identity for deterministic synthesis.
+  pub fn metadata(&self) -> CommitMetadata {
+    CommitMetadata {
+      author: self.author.clone(),
+      author_email: self.author_email.clone(),
+      author_timestamp: self.timestamp,
+      author_timezone: self.author_timezone.clone(),
+      committer: self.committer.clone(),
+      committer_email: self.committer_email.clone(),
+      committer_timestamp: self.committer_timestamp,
+      committer_timezone: self.committer_timezone.clone(),
+    }
+  }
 }
 
 /// Git backend using system git (zero crate dependencies)

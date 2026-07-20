@@ -573,6 +573,40 @@ impl WorkspaceGraph {
     Ok(self.transitive_dependents_from(start_node))
   }
 
+  /// Return workspace-member dependencies reachable from the named members.
+  ///
+  /// The selected members themselves are excluded. Output is sorted so callers
+  /// can bind the closure directly into deterministic ownership evidence.
+  pub fn workspace_dependency_closure(&self, crate_names: &[String]) -> RailResult<Vec<String>> {
+    let starts = crate_names
+      .iter()
+      .map(|name| self.find_node(name))
+      .collect::<RailResult<Vec<_>>>()?;
+    let selected = starts.iter().copied().collect::<HashSet<_>>();
+    let mut visited = selected.clone();
+    let mut stack = starts;
+    let mut dependencies = Vec::new();
+    let mut edge_visits = 0;
+
+    while let Some(node) = stack.pop() {
+      for dependency in self.graph.neighbors_directed(node, Direction::Outgoing) {
+        edge_visits += 1;
+        if !visited.insert(dependency) {
+          continue;
+        }
+        let package = &self.graph[dependency];
+        if package.is_workspace_member && !selected.contains(&dependency) {
+          dependencies.push(package.name.clone());
+        }
+        stack.push(dependency);
+      }
+    }
+    crate::instrumentation::record_graph_traversal(visited.len(), edge_visits);
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(dependencies)
+  }
+
   /// Get transitive workspace dependents of one exact package.
   pub fn transitive_dependents_by_id(&self, package_id: &PackageId) -> RailResult<Vec<String>> {
     let start_node = self.find_node_by_id(package_id)?;

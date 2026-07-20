@@ -1,20 +1,191 @@
-//! Git-notes based commit mapping storage.
+//! Git-native split/sync origin mapping.
 //!
-//! Maps commits between monorepo and split repos using git-notes.
-//! Notes are stored at `refs/notes/rail/{crate_name}`.
+//! Synthesized commits carry a versioned `Rail-Origin` trailer. Ordinary clone
+//! history is therefore sufficient to recover source/target mappings. Legacy
+//! `refs/notes/rail/*` values are read only as migration evidence and are never
+//! fetched, pushed, or written by normal operation.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
-use crate::git::git_cmd_for_path;
-use crate::git::system::observable_output;
-use crate::{progress, warn};
-use rustc_hash::FxHashMap;
-use std::io::Write;
-use std::path::Path;
-use std::process::Stdio;
-use std::thread;
-use std::time::Duration;
+use crate::git::{SystemGit, git_cmd_for_path};
+use crate::source::ContentDigest;
+use crate::utils;
 
-const MAPPING_SCHEMA: &str = "cargo-rail-mapping-v1";
+const NOTE_SCHEMA: &str = "cargo-rail-mapping-v1";
+const TRAILER_PREFIX: &str = "Rail-Origin: ";
+const TRAILER_SCHEMA: &str = "v1";
+
+/// Split/sync transform schema recorded in every synthesized commit.
+pub const TRANSFORM_VERSION: u32 = 1;
+
+/// Which side of a source-to-target mapping owns the scanned history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySide {
+  /// The monorepo history. Current commits map to source commits in the target.
+  Source,
+  /// The split-repository history. Origin commits map to current target commits.
+  Target,
+}
+
+/// Stable context required to synthesize a versioned origin trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginContext {
+  source_repository: String,
+  owner: String,
+  ownership_snapshot: String,
+}
+
+impl OriginContext {
+  /// Bind a source repository, split owner, and workspace snapshot.
+  pub fn new(
+    source_repository: impl Into<String>,
+    owner: impl Into<String>,
+    ownership_snapshot: impl Into<String>,
+  ) -> RailResult<Self> {
+    let context = Self {
+      source_repository: source_repository.into(),
+      owner: owner.into(),
+      ownership_snapshot: ownership_snapshot.into(),
+    };
+    validate_repository_identity(&context.source_repository)?;
+    if context.owner.is_empty() {
+      return Err(RailError::message("Rail-Origin owner must not be empty"));
+    }
+    validate_token("ownership snapshot", &context.ownership_snapshot)?;
+    Ok(context)
+  }
+
+  /// Discover the source repository identity without serializing credentials or paths.
+  pub fn discover(
+    repo_path: &Path,
+    owner: impl Into<String>,
+    ownership_snapshot: impl Into<String>,
+  ) -> RailResult<Self> {
+    Self::new(repository_identity(repo_path)?, owner, ownership_snapshot)
+  }
+
+  /// Opaque stable source-repository identity.
+  pub fn source_repository(&self) -> &str {
+    &self.source_repository
+  }
+
+  /// Format a normal mapping trailer whose target is the containing commit.
+  pub fn trailer(&self, source_commit: &str) -> RailResult<String> {
+    self.format_trailer(source_commit, None, true)
+  }
+
+  /// Format provenance for a synthesized commit that does not define a new mapping.
+  pub fn evidence_trailer(&self, source_commit: &str) -> RailResult<String> {
+    self.format_trailer(source_commit, None, false)
+  }
+
+  fn migration_trailer(&self, source_commit: &str, target_commit: &str) -> RailResult<String> {
+    self.format_trailer(source_commit, Some(target_commit), true)
+  }
+
+  fn format_trailer(&self, source_commit: &str, target_commit: Option<&str>, mapping: bool) -> RailResult<String> {
+    validate_object_id("source", source_commit)?;
+    if let Some(target) = target_commit {
+      validate_object_id("target", target)?;
+    }
+    let mut trailer = format!(
+      "{TRAILER_PREFIX}{TRAILER_SCHEMA} source={} commit={} owner={} snapshot={} transform={TRANSFORM_VERSION}",
+      self.source_repository,
+      source_commit,
+      encode_hex(self.owner.as_bytes()),
+      self.ownership_snapshot,
+    );
+    if let Some(target) = target_commit {
+      trailer.push_str(" target=");
+      trailer.push_str(target);
+    } else if !mapping {
+      trailer.push_str(" mapping=evidence");
+    }
+    Ok(trailer)
+  }
+}
+
+/// Append one or more trailers without rewriting the original message body.
+pub fn append_origin_trailers(message: &str, trailers: &[String]) -> String {
+  if trailers.is_empty() {
+    return message.to_string();
+  }
+  let mut output = message.to_string();
+  if !output.is_empty() {
+    if !output.ends_with('\n') {
+      output.push('\n');
+    }
+    if !output.ends_with("\n\n") {
+      output.push('\n');
+    }
+  }
+  output.push_str(&trailers.join("\n"));
+  output
+}
+
+/// Derive a path-independent, credential-free repository identity.
+///
+/// A non-local `remote.origin.url` is normalized and hashed. Repositories
+/// without such a remote use their sorted root commit IDs, which remain stable
+/// across ordinary clones.
+pub fn repository_identity(repo_path: &Path) -> RailResult<String> {
+  let git = SystemGit::open(repo_path)?;
+  let identity_input = match git.get_config("remote.origin.url")? {
+    Some(url) if !utils::is_local_path(&url) => format!("remote\0{}", normalize_remote_url(&url)?),
+    _ => {
+      let output = git_cmd_for_path(repo_path)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .output()
+        .context("Failed to discover Git root commits")?;
+      if !output.status.success() {
+        return Err(RailError::message(format!(
+          "failed to discover repository identity: {}",
+          String::from_utf8_lossy(&output.stderr).trim()
+        )));
+      }
+      let roots_output = String::from_utf8_lossy(&output.stdout);
+      let mut roots = roots_output
+        .lines()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .collect::<Vec<_>>();
+      roots.sort_unstable();
+      if roots.is_empty() {
+        return Err(RailError::message(
+          "cannot identify a repository without a remote or root commit",
+        ));
+      }
+      for root in &roots {
+        validate_object_id("root", root)?;
+      }
+      format!("roots\0{}", roots.join("\n"))
+    }
+  };
+  Ok(format!("sha256-{}", ContentDigest::sha256(identity_input.as_bytes())))
+}
+
+fn normalize_remote_url(url: &str) -> RailResult<String> {
+  validate_token("Git remote URL", url)?;
+  let without_query = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
+  let normalized = if let Some((scheme, remainder)) = without_query.split_once("://") {
+    let slash = remainder.find('/').unwrap_or(remainder.len());
+    let (authority, path) = remainder.split_at(slash);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    format!(
+      "{}://{}{}",
+      scheme.to_ascii_lowercase(),
+      authority.to_ascii_lowercase(),
+      path
+    )
+  } else {
+    without_query.to_string()
+  };
+  Ok(normalized.trim_end_matches(".git").to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommitMapping {
@@ -32,13 +203,9 @@ impl CommitMapping {
     })
   }
 
-  fn encode(&self) -> String {
-    format!("{}\nsource={}\ntarget={}\n", MAPPING_SCHEMA, self.source, self.target)
-  }
-
-  fn decode(note_target: &str, content: &str) -> RailResult<Self> {
+  fn decode_note(note_target: &str, content: &str) -> RailResult<Self> {
     let lines = content.lines().collect::<Vec<_>>();
-    if lines.first().copied() != Some(MAPPING_SCHEMA) {
+    if lines.first().copied() != Some(NOTE_SCHEMA) {
       if lines.len() != 1 {
         return Err(mapping_resolution_error(
           note_target,
@@ -47,7 +214,6 @@ impl CommitMapping {
       }
       return Self::new(note_target, lines[0].trim());
     }
-
     if lines.len() != 3 {
       return Err(mapping_resolution_error(
         note_target,
@@ -70,6 +236,394 @@ impl CommitMapping {
   }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedTrailer {
+  Versioned {
+    source_repository: String,
+    source_commit: String,
+    owner: String,
+    ownership_snapshot: String,
+    transform_version: u32,
+    target_commit: Option<String>,
+    mapping: bool,
+  },
+  Legacy {
+    side: HistorySide,
+    source_commit: String,
+  },
+}
+
+impl ParsedTrailer {
+  fn parse(value: &str) -> RailResult<Self> {
+    if let Some(source_commit) = value.strip_prefix("mono@") {
+      validate_object_id("legacy mono origin", source_commit)?;
+      return Ok(Self::Legacy {
+        side: HistorySide::Target,
+        source_commit: source_commit.to_string(),
+      });
+    }
+    if let Some(source_commit) = value.strip_prefix("remote@") {
+      validate_object_id("legacy remote origin", source_commit)?;
+      return Ok(Self::Legacy {
+        side: HistorySide::Source,
+        source_commit: source_commit.to_string(),
+      });
+    }
+
+    let mut fields = value.split_whitespace();
+    if fields.next() != Some(TRAILER_SCHEMA) {
+      return Err(RailError::message(format!(
+        "unsupported Rail-Origin trailer '{}'",
+        value
+      )));
+    }
+    let source_repository = parse_field(fields.next(), "source")?.to_string();
+    validate_repository_identity(&source_repository)?;
+    let source_commit = parse_field(fields.next(), "commit")?.to_string();
+    validate_object_id("source", &source_commit)?;
+    let owner = decode_hex(parse_field(fields.next(), "owner")?)?;
+    let ownership_snapshot = parse_field(fields.next(), "snapshot")?.to_string();
+    validate_token("ownership snapshot", &ownership_snapshot)?;
+    let transform_version = parse_field(fields.next(), "transform")?
+      .parse::<u32>()
+      .map_err(|_| RailError::message("Rail-Origin transform must be an unsigned integer"))?;
+    let optional = fields.next();
+    let mapping = optional != Some("mapping=evidence");
+    let target_commit = match optional {
+      Some("mapping=evidence") | None => None,
+      Some(field) => Some(parse_field(Some(field), "target")?.to_string()),
+    };
+    if let Some(target) = &target_commit {
+      validate_object_id("target", target)?;
+    }
+    if fields.next().is_some() {
+      return Err(RailError::message("Rail-Origin trailer has unknown fields"));
+    }
+    Ok(Self::Versioned {
+      source_repository,
+      source_commit,
+      owner,
+      ownership_snapshot,
+      transform_version,
+      target_commit,
+      mapping,
+    })
+  }
+}
+
+fn parse_field<'a>(field: Option<&'a str>, name: &str) -> RailResult<&'a str> {
+  field
+    .and_then(|field| field.strip_prefix(name).and_then(|value| value.strip_prefix('=')))
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| RailError::message(format!("Rail-Origin trailer is missing {name}")))
+}
+
+/// One-to-one source/target mapping recovered from history and legacy notes.
+pub struct MappingStore {
+  owner: String,
+  mappings: FxHashMap<String, String>,
+  reverse_mappings: FxHashMap<String, String>,
+  history_mappings: FxHashSet<(String, String)>,
+  note_mappings: BTreeSet<(String, String)>,
+  source_evidence: FxHashSet<String>,
+  target_evidence: FxHashSet<String>,
+}
+
+impl MappingStore {
+  /// Create an empty store scoped to one split owner.
+  pub fn new(owner: String) -> Self {
+    Self {
+      owner,
+      mappings: FxHashMap::default(),
+      reverse_mappings: FxHashMap::default(),
+      history_mappings: FxHashSet::default(),
+      note_mappings: BTreeSet::new(),
+      source_evidence: FxHashSet::default(),
+      target_evidence: FxHashSet::default(),
+    }
+  }
+
+  /// Load mappings from ordinary history in one Git log stream.
+  pub fn load_history(
+    &mut self,
+    repo_path: &Path,
+    side: HistorySide,
+    expected_source_repository: &str,
+  ) -> RailResult<()> {
+    validate_repository_identity(expected_source_repository)?;
+    let git = SystemGit::open(repo_path)?;
+    let commits = git.ordinary_commit_history()?;
+
+    for commit in &commits {
+      for value in origin_trailer_values(&commit.message) {
+        match ParsedTrailer::parse(value)? {
+          ParsedTrailer::Legacy {
+            side: trailer_side,
+            source_commit,
+          } if side == trailer_side => {
+            let mapping = match side {
+              HistorySide::Source => CommitMapping::new(&commit.sha, &source_commit)?,
+              HistorySide::Target => CommitMapping::new(&source_commit, &commit.sha)?,
+            };
+            self.record_history(mapping)?;
+          }
+          ParsedTrailer::Legacy { .. } => {}
+          ParsedTrailer::Versioned {
+            source_repository,
+            source_commit,
+            owner,
+            ownership_snapshot,
+            transform_version,
+            target_commit,
+            mapping,
+          } => {
+            if owner != self.owner || source_repository != expected_source_repository {
+              continue;
+            }
+            if transform_version != TRANSFORM_VERSION {
+              return Err(RailError::message(format!(
+                "unsupported Rail-Origin transform version {} for '{}'",
+                transform_version, self.owner
+              )));
+            }
+            validate_token("ownership snapshot", &ownership_snapshot)?;
+            if !mapping {
+              match side {
+                HistorySide::Source => self.source_evidence.insert(commit.sha.clone()),
+                HistorySide::Target => self.target_evidence.insert(commit.sha.clone()),
+              };
+              continue;
+            }
+            let mapping = match side {
+              HistorySide::Source => {
+                if target_commit.is_some() {
+                  return Err(mapping_resolution_error(
+                    &commit.sha,
+                    "a source-history trailer cannot override its target commit",
+                  ));
+                }
+                CommitMapping::new(&commit.sha, &source_commit)?
+              }
+              HistorySide::Target => {
+                let target = target_commit.as_deref().unwrap_or(&commit.sha);
+                if !git.is_ancestor(target, &commit.sha) {
+                  return Err(mapping_resolution_error(
+                    &source_commit,
+                    &format!("migration target '{}' is not an ancestor of its trailer commit", target),
+                  ));
+                }
+                CommitMapping::new(&source_commit, target)?
+              }
+            };
+            self.record_history(mapping)?;
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Load the legacy notes ref without fetching or mutating it.
+  pub fn load_legacy_notes(&mut self, repo_path: &Path) -> RailResult<()> {
+    let notes_ref = format!("refs/notes/rail/{}", self.owner);
+    let output = git_cmd_for_path(repo_path)
+      .args(["notes", "--ref", &notes_ref, "list"])
+      .output()
+      .context("Failed to list legacy mapping notes")?;
+    if !output.status.success() {
+      return Ok(());
+    }
+    let entries = String::from_utf8_lossy(&output.stdout)
+      .lines()
+      .map(|line| {
+        let mut fields = line.split_whitespace();
+        let blob = fields
+          .next()
+          .ok_or_else(|| RailError::message("mapping note has no blob ID"))?;
+        let source = fields
+          .next()
+          .ok_or_else(|| RailError::message("mapping note has no source commit"))?;
+        if fields.next().is_some() {
+          return Err(RailError::message(format!("invalid mapping note entry '{}'", line)));
+        }
+        validate_object_id("note blob", blob)?;
+        validate_object_id("note source", source)?;
+        Ok((blob.to_string(), source.to_string()))
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+    let git = SystemGit::open(repo_path)?;
+    let blob_ids = entries.iter().map(|(blob, _)| blob.as_str()).collect::<Vec<_>>();
+    let contents = git.read_blobs_bulk(&blob_ids)?;
+    for ((_, source), content) in entries.into_iter().zip(contents) {
+      let content = std::str::from_utf8(&content)
+        .map_err(|_| RailError::message(format!("mapping note for '{}' is not UTF-8", source)))?;
+      let mapping = CommitMapping::decode_note(&source, content.trim())?;
+      self.record_mapping(&mapping.source, &mapping.target)?;
+      self.note_mappings.insert((mapping.source, mapping.target));
+    }
+    Ok(())
+  }
+
+  fn record_history(&mut self, mapping: CommitMapping) -> RailResult<()> {
+    self.record_mapping(&mapping.source, &mapping.target)?;
+    self.history_mappings.insert((mapping.source, mapping.target));
+    Ok(())
+  }
+
+  /// Record one proven source-to-target mapping.
+  pub fn record_mapping(&mut self, from_sha: &str, to_sha: &str) -> RailResult<()> {
+    let mapping = CommitMapping::new(from_sha, to_sha)?;
+    if let Some(existing) = self.mappings.get(&mapping.source)
+      && existing != &mapping.target
+    {
+      return Err(mapping_resolution_error(
+        &mapping.source,
+        &format!("it maps to both '{}' and '{}'", existing, mapping.target),
+      ));
+    }
+    if let Some(existing) = self.reverse_mappings.get(&mapping.target)
+      && existing != &mapping.source
+    {
+      return Err(mapping_resolution_error(
+        &mapping.source,
+        &format!(
+          "target '{}' is already mapped from source '{}'",
+          mapping.target, existing
+        ),
+      ));
+    }
+    self
+      .reverse_mappings
+      .insert(mapping.target.clone(), mapping.source.clone());
+    self.mappings.insert(mapping.source, mapping.target);
+    Ok(())
+  }
+
+  /// Return the mapped target commit, when known.
+  pub fn get_mapping(&self, sha: &str) -> Option<String> {
+    self.mappings.get(sha).cloned()
+  }
+
+  /// Return the source commit mapped to a target commit, when known.
+  pub fn get_reverse_mapping(&self, sha: &str) -> Option<String> {
+    self.reverse_mappings.get(sha).cloned()
+  }
+
+  /// Whether a source commit has a target mapping.
+  pub fn has_mapping(&self, sha: &str) -> bool {
+    self.mappings.contains_key(sha) || self.source_evidence.contains(sha)
+  }
+
+  /// Whether a target commit has a source mapping.
+  pub fn has_reverse_mapping(&self, sha: &str) -> bool {
+    self.reverse_mappings.contains_key(sha) || self.target_evidence.contains(sha)
+  }
+
+  /// Number of mappings recovered from all accepted evidence.
+  pub fn count(&self) -> usize {
+    self.mappings.len()
+  }
+
+  /// Legacy mappings that ordinary history does not yet carry.
+  pub fn legacy_mappings(&self) -> Vec<(String, String)> {
+    self
+      .note_mappings
+      .iter()
+      .filter(|mapping| !self.history_mappings.contains(*mapping))
+      .cloned()
+      .collect()
+  }
+
+  /// Format deterministic migration trailers for every notes-only mapping.
+  pub fn legacy_migration_trailers(&self, context: &OriginContext) -> RailResult<Vec<String>> {
+    self
+      .legacy_mappings()
+      .into_iter()
+      .map(|(source, target)| context.migration_trailer(&source, &target))
+      .collect()
+  }
+
+  /// Persist every notes-only mapping in one deterministic empty history commit.
+  ///
+  /// The commit reuses the exact `HEAD` tree and identity metadata. `update-ref`
+  /// is compare-and-swap guarded, and the worktree/index are not rewritten.
+  pub fn migrate_legacy_mappings(&mut self, repo_path: &Path, context: &OriginContext) -> RailResult<Option<String>> {
+    let legacy = self.legacy_mappings();
+    if legacy.is_empty() {
+      return Ok(None);
+    }
+    let git = SystemGit::open(repo_path)?;
+    let head = git.head_commit()?;
+    let parent = git.get_commit(&head)?;
+    let tree = git_cmd_for_path(repo_path)
+      .args(["rev-parse", "HEAD^{tree}"])
+      .output()
+      .context("Failed to resolve migration tree")?;
+    if !tree.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git rev-parse HEAD^{tree}".to_string(),
+        stderr: git_command_diagnostics(&tree.stdout, &tree.stderr),
+      }));
+    }
+    let tree = String::from_utf8(tree.stdout)?.trim().to_string();
+    validate_object_id("tree", &tree)?;
+    let trailers = legacy
+      .iter()
+      .map(|(source, target)| context.migration_trailer(source, target))
+      .collect::<RailResult<Vec<_>>>()?;
+    let message = append_origin_trailers("chore: migrate cargo-rail origin mappings", &trailers);
+    let metadata = parent.metadata();
+    let author_date = format!("{} {}", metadata.author_timestamp, metadata.author_timezone);
+    let committer_date = format!("{} {}", metadata.committer_timestamp, metadata.committer_timezone);
+    let output = git_cmd_for_path(repo_path)
+      .env("GIT_AUTHOR_NAME", &metadata.author)
+      .env("GIT_AUTHOR_EMAIL", &metadata.author_email)
+      .env("GIT_AUTHOR_DATE", &author_date)
+      .env("GIT_COMMITTER_NAME", &metadata.committer)
+      .env("GIT_COMMITTER_EMAIL", &metadata.committer_email)
+      .env("GIT_COMMITTER_DATE", &committer_date)
+      .args(["commit-tree", &tree, "-p", &head, "-m", &message])
+      .output()
+      .context("Failed to create legacy mapping migration commit")?;
+    if !output.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git commit-tree".to_string(),
+        stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+      }));
+    }
+    let commit = String::from_utf8(output.stdout)?.trim().to_string();
+    validate_object_id("migration", &commit)?;
+    let update = git_cmd_for_path(repo_path)
+      .args(["update-ref", "HEAD", &commit, &head])
+      .output()
+      .context("Failed to publish legacy mapping migration commit")?;
+    if !update.status.success() {
+      return Err(RailError::Git(GitError::CommandFailed {
+        command: "git update-ref HEAD".to_string(),
+        stderr: git_command_diagnostics(&update.stdout, &update.stderr),
+      }));
+    }
+    self.history_mappings.extend(legacy);
+    Ok(Some(commit))
+  }
+}
+
+fn origin_trailer_values(message: &str) -> Vec<&str> {
+  let lines = message.lines().collect::<Vec<_>>();
+  let end = lines
+    .iter()
+    .rposition(|line| !line.trim().is_empty())
+    .map_or(0, |index| index + 1);
+  let start = lines[..end]
+    .iter()
+    .rposition(|line| line.trim().is_empty())
+    .map_or(0, |index| index + 1);
+  lines[start..end]
+    .iter()
+    .filter_map(|line| line.strip_prefix(TRAILER_PREFIX))
+    .collect()
+}
+
 fn validate_object_id(field: &str, value: &str) -> RailResult<()> {
   if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
     return Ok(());
@@ -80,711 +634,156 @@ fn validate_object_id(field: &str, value: &str) -> RailResult<()> {
   )))
 }
 
+fn validate_repository_identity(identity: &str) -> RailResult<()> {
+  let digest = identity
+    .strip_prefix("sha256-")
+    .ok_or_else(|| RailError::message("repository identity must use sha256"))?;
+  if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    Ok(())
+  } else {
+    Err(RailError::message("repository identity has an invalid SHA-256 digest"))
+  }
+}
+
+fn validate_token(field: &str, value: &str) -> RailResult<()> {
+  if !value.is_empty() && !value.chars().any(char::is_whitespace) && !value.contains(['\0', '\n', '\r']) {
+    Ok(())
+  } else {
+    Err(RailError::message(format!("{} must be one non-empty token", field)))
+  }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+  let mut output = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    use std::fmt::Write as _;
+    let _ = write!(output, "{byte:02x}");
+  }
+  output
+}
+
+fn decode_hex(value: &str) -> RailResult<String> {
+  if value.is_empty() || !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    return Err(RailError::message("Rail-Origin owner has invalid hexadecimal encoding"));
+  }
+  let bytes = value
+    .as_bytes()
+    .chunks_exact(2)
+    .map(|pair| {
+      let pair = std::str::from_utf8(pair).map_err(|_| RailError::message("Rail-Origin owner is not UTF-8"))?;
+      u8::from_str_radix(pair, 16).map_err(|_| RailError::message("Rail-Origin owner has invalid hex"))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  String::from_utf8(bytes).map_err(|_| RailError::message("Rail-Origin owner is not UTF-8"))
+}
+
 fn mapping_resolution_error(source: &str, reason: &str) -> RailError {
   RailError::with_help(
     format!(
       "invalid or divergent mapping for source commit '{}': {}",
       source, reason
     ),
-    "inspect the local and remote mapping notes, choose exactly one target commit, and replace the note; ambiguous mappings are never merged automatically",
+    "inspect ordinary Rail-Origin trailers and any legacy refs/notes/rail mapping, then choose one target commit; cargo-rail never merges divergent mappings automatically",
   )
-}
-
-/// Commit mapping store using git-notes.
-///
-/// Maps commits between monorepo and split repos. Format in git-notes:
-/// `refs/notes/rail/{crate_name}` where each note contains the target SHA.
-pub struct MappingStore {
-  crate_name: String,
-  /// In-memory cache of mappings (from_sha -> to_sha)
-  mappings: FxHashMap<String, String>,
-  /// Reverse index for O(1) reverse lookups (to_sha -> from_sha)
-  reverse_mappings: FxHashMap<String, String>,
-}
-
-impl MappingStore {
-  /// Create a new mapping store for a specific crate.
-  pub fn new(crate_name: String) -> Self {
-    Self {
-      crate_name,
-      mappings: FxHashMap::default(),
-      reverse_mappings: FxHashMap::default(),
-    }
-  }
-
-  /// Load mappings from git-notes in a repository.
-  ///
-  /// Uses batch `cat-file` for efficient bulk reading of note contents.
-  pub fn load(&mut self, repo_path: &Path) -> RailResult<()> {
-    let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
-
-    // List all notes: git notes --ref=refs/notes/rail/{crate} list
-    // Output format: "<blob_sha> <commit_sha>" per line
-    let output = git_cmd_for_path(repo_path)
-      .args(["notes", "--ref", &notes_ref, "list"])
-      .output();
-
-    // If command fails, notes ref doesn't exist yet - that's ok
-    let output = match output {
-      Ok(o) if o.status.success() => o,
-      _ => return Ok(()), // No notes yet
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse notes list into (blob_sha, commit_sha) pairs
-    let note_entries: Vec<(&str, &str)> = stdout
-      .lines()
-      .filter_map(|line| {
-        let mut parts = line.split_whitespace();
-        match (parts.next(), parts.next()) {
-          (Some(blob_sha), Some(commit_sha)) => Some((blob_sha, commit_sha)),
-          _ => None,
-        }
-      })
-      .collect();
-
-    if note_entries.is_empty() {
-      return Ok(());
-    }
-
-    // Batch read all note blobs using cat-file --batch
-    let blob_contents = read_blobs_batch(repo_path, &note_entries)?;
-
-    // Build mappings from results. Loading multiple repositories intentionally
-    // flows through record_mapping so cross-repository divergence is rejected.
-    for ((_, commit_sha), note_content) in note_entries.iter().zip(blob_contents.iter()) {
-      if let Some(content) = note_content {
-        let mapping = CommitMapping::decode(commit_sha, content)?;
-        self.record_mapping(&mapping.source, &mapping.target)?;
-      }
-    }
-
-    Ok(())
-  }
-
-  /// Save mappings to git-notes in a repository.
-  pub fn save(&self, repo_path: &Path) -> RailResult<()> {
-    let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
-
-    // For each mapping, add a note
-    for (source_sha, target_sha) in &self.mappings {
-      let note = CommitMapping::new(source_sha, target_sha)?.encode();
-      let output = git_cmd_for_path(repo_path)
-        .args(["notes", "--ref", &notes_ref, "add", "-f", "-m", &note, source_sha])
-        .output()
-        .context("Failed to add git note")?;
-
-      if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Ignore "already has a note" errors
-        if !stderr.contains("already has a note") {
-          return Err(RailError::Git(GitError::CommandFailed {
-            command: String::from("git notes add"),
-            stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-          }));
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  /// Record a mapping between two commits.
-  pub fn record_mapping(&mut self, from_sha: &str, to_sha: &str) -> RailResult<()> {
-    let mapping = CommitMapping::new(from_sha, to_sha)?;
-    let from = mapping.source;
-    let to = mapping.target;
-    if let Some(existing) = self.mappings.get(&from)
-      && existing != &to
-    {
-      return Err(mapping_resolution_error(
-        &from,
-        &format!("it maps to both '{}' and '{}'", existing, to),
-      ));
-    }
-    if let Some(existing) = self.reverse_mappings.get(&to)
-      && existing != &from
-    {
-      return Err(mapping_resolution_error(
-        &from,
-        &format!("target '{}' is already mapped from source '{}'", to, existing),
-      ));
-    }
-    self.reverse_mappings.insert(to.clone(), from.clone());
-    self.mappings.insert(from, to);
-    Ok(())
-  }
-
-  /// Get the mapped commit SHA if it exists.
-  pub fn get_mapping(&self, sha: &str) -> RailResult<Option<String>> {
-    Ok(self.mappings.get(sha).cloned())
-  }
-
-  /// Check if a commit has been mapped (forward direction).
-  pub fn has_mapping(&self, sha: &str) -> bool {
-    self.mappings.contains_key(sha)
-  }
-
-  /// Check if a commit exists as a mapping target (reverse direction).
-  ///
-  /// O(1) lookup using reverse index.
-  pub fn has_reverse_mapping(&self, sha: &str) -> bool {
-    self.reverse_mappings.contains_key(sha)
-  }
-
-  /// Clear all mappings (only used in tests).
-  #[cfg(test)]
-  pub fn clear(&mut self) {
-    self.mappings.clear();
-    self.reverse_mappings.clear();
-  }
-
-  /// Get the number of mappings currently loaded.
-  pub fn count(&self) -> usize {
-    self.mappings.len()
-  }
-
-  /// Push git-notes to a remote repository.
-  pub fn push_notes(&self, repo_path: &Path, remote: &str) -> RailResult<()> {
-    // Skip if no mappings exist
-    if self.mappings.is_empty() {
-      progress!("   No git-notes to push (no mappings recorded)");
-      return Ok(());
-    }
-
-    let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
-
-    progress!("   Pushing git-notes to remote '{}'...", remote);
-
-    retry_operation(|| {
-      let mut command = git_cmd_for_path(repo_path);
-      command.args(["push", remote, &notes_ref]);
-      let output = observable_output(&mut command).context("Failed to push git-notes")?;
-
-      if !output.status.success() {
-        return Err(RailError::Git(GitError::CommandFailed {
-          command: String::from("git push notes"),
-          stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-        }));
-      }
-      Ok(())
-    })?;
-
-    progress!("   ✅ Pushed git-notes");
-    Ok(())
-  }
-
-  /// Fetch git-notes from a remote repository.
-  pub fn fetch_notes(&self, repo_path: &Path, remote: &str) -> RailResult<()> {
-    let notes_ref = format!("refs/notes/rail/{}", self.crate_name);
-    let refspec = format!("{}:{}", notes_ref, notes_ref);
-
-    progress!("   Fetching git-notes from remote '{}'...", remote);
-
-    // Retry the fetch operation
-    let result = retry_operation(|| {
-      let output = git_cmd_for_path(repo_path)
-        .args(["fetch", remote, &refspec])
-        .output()
-        .context("Failed to fetch git-notes")?;
-
-      if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Ignore "couldn't find remote ref" - notes may not exist yet
-        if stderr.contains("couldn't find remote ref") {
-          return Ok(()); // Treat as success (no notes yet)
-        }
-
-        return Err(RailError::Git(GitError::CommandFailed {
-          command: String::from("git fetch notes"),
-          stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-        }));
-      }
-      Ok(())
-    });
-
-    match result {
-      Ok(()) => {
-        progress!("   ✅ Fetched git-notes");
-        Ok(())
-      }
-      Err(e) => {
-        // Check if it's a conflict (non-fast-forward)
-        let is_conflict = if let RailError::Git(GitError::CommandFailed { stderr, .. }) = &e {
-          stderr.contains("non-fast-forward") || stderr.contains("rejected")
-        } else {
-          false
-        };
-
-        if is_conflict {
-          self.handle_notes_conflict(repo_path, remote, &notes_ref)
-        } else {
-          Err(e)
-        }
-      }
-    }
-  }
-
-  /// Handle divergent note refs after proving their mappings are compatible.
-  fn handle_notes_conflict(&self, repo_path: &Path, remote: &str, notes_ref: &str) -> RailResult<()> {
-    progress!("   ⚠️  Git-notes conflict detected (local and remote notes diverged)");
-    progress!("   🔎 Validating mapping cardinality before merge...");
-
-    let temporary_ref = format!("refs/notes/rail-fetch/{}-{}", self.crate_name, std::process::id());
-    let refspec = format!("+{}:{}", notes_ref, temporary_ref);
-
-    let fetch_output = git_cmd_for_path(repo_path)
-      .args(["fetch", remote, &refspec])
-      .output()
-      .context("Failed to fetch divergent notes for validation")?;
-
-    if !fetch_output.status.success() {
-      let fetch_stderr = String::from_utf8_lossy(&fetch_output.stderr);
-      if !fetch_stderr.contains("couldn't find remote ref") {
-        return Err(RailError::Git(GitError::CommandFailed {
-          command: String::from("git fetch notes for validation"),
-          stderr: git_command_diagnostics(&fetch_output.stdout, &fetch_output.stderr),
-        }));
-      }
-      return Ok(()); // No remote notes
-    }
-
-    let validation = (|| {
-      let local = load_mappings_from_ref(repo_path, notes_ref)?;
-      let remote = load_mappings_from_ref(repo_path, &temporary_ref)?;
-      let mut combined = local;
-      for mapping in remote.values() {
-        insert_mapping(&mut combined, mapping.clone())?;
-      }
-      Ok(())
-    })();
-
-    if let Err(error) = validation {
-      let _ = git_cmd_for_path(repo_path)
-        .args(["update-ref", "-d", &temporary_ref])
-        .output();
-      return Err(error);
-    }
-
-    // Union is safe only after schema and one-to-one cardinality validation.
-    let merge_output = git_cmd_for_path(repo_path)
-      .args(["notes", "--ref", notes_ref, "merge", "--strategy=union", &temporary_ref])
-      .output()
-      .context("Failed to merge validated git-notes")?;
-    let _ = git_cmd_for_path(repo_path)
-      .args(["update-ref", "-d", &temporary_ref])
-      .output();
-
-    if !merge_output.status.success() {
-      let merge_stderr = String::from_utf8_lossy(&merge_output.stderr);
-
-      warn!("   ❌ Automatic git-notes merge failed");
-      warn!("   📋 Manual resolution required:");
-      warn!("      1. cd {}", repo_path.display());
-      warn!("      2. fetch the remote notes into a temporary ref",);
-      warn!("      3. Resolve conflicts manually");
-      warn!("      4. git notes --ref={} merge --commit", notes_ref);
-      warn!("");
-      return Err(RailError::with_help(
-        format!("git notes merge failed: {}", merge_stderr),
-        format!(
-          "This usually happens when the same commit has different mappings on different machines.\n\
-           Manual resolution steps:\n  \
-           1. cd {}\n  \
-           2. fetch the remote notes into a temporary ref\n  \
-           3. choose one target commit for every source commit\n  \
-           4. replace the local note and push it",
-          repo_path.display(),
-        ),
-      ));
-    }
-
-    progress!("   ✅ Git-notes merged successfully (union strategy)");
-    Ok(())
-  }
-}
-
-fn load_mappings_from_ref(repo_path: &Path, notes_ref: &str) -> RailResult<FxHashMap<String, CommitMapping>> {
-  let output = git_cmd_for_path(repo_path)
-    .args(["notes", "--ref", notes_ref, "list"])
-    .output()
-    .context("Failed to list mapping notes")?;
-  if !output.status.success() {
-    return Ok(FxHashMap::default());
-  }
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let entries = stdout
-    .lines()
-    .map(|line| {
-      let parts = line.split_whitespace().collect::<Vec<_>>();
-      if parts.len() != 2 {
-        return Err(RailError::message(format!("invalid git notes list entry: '{}'", line)));
-      }
-      Ok((parts[0], parts[1]))
-    })
-    .collect::<RailResult<Vec<_>>>()?;
-  let contents = read_blobs_batch(repo_path, &entries)?;
-  let mut mappings = FxHashMap::default();
-  for ((_, source), content) in entries.iter().zip(contents) {
-    let content = content.ok_or_else(|| RailError::message(format!("mapping note for '{}' has no blob", source)))?;
-    insert_mapping(&mut mappings, CommitMapping::decode(source, &content)?)?;
-  }
-  Ok(mappings)
-}
-
-fn insert_mapping(mappings: &mut FxHashMap<String, CommitMapping>, mapping: CommitMapping) -> RailResult<()> {
-  if let Some(existing) = mappings.get(&mapping.source)
-    && existing.target != mapping.target
-  {
-    return Err(mapping_resolution_error(
-      &mapping.source,
-      &format!("it maps to both '{}' and '{}'", existing.target, mapping.target),
-    ));
-  }
-  if let Some(existing) = mappings
-    .values()
-    .find(|existing| existing.target == mapping.target && existing.source != mapping.source)
-  {
-    return Err(mapping_resolution_error(
-      &mapping.source,
-      &format!(
-        "target '{}' is already mapped from source '{}'",
-        mapping.target, existing.source
-      ),
-    ));
-  }
-  mappings.insert(mapping.source.clone(), mapping);
-  Ok(())
-}
-
-/// Read multiple blob objects in a single `git cat-file --batch` call.
-///
-/// Takes a list of (blob_sha, commit_sha) pairs from `git notes list` output
-/// and returns the content of each blob (the target SHA stored in the note).
-///
-/// Returns `None` for blobs that don't exist (shouldn't happen for valid notes).
-fn read_blobs_batch(repo_path: &Path, entries: &[(&str, &str)]) -> RailResult<Vec<Option<String>>> {
-  if entries.is_empty() {
-    return Ok(vec![]);
-  }
-
-  // Start cat-file --batch process
-  let mut child = git_cmd_for_path(repo_path)
-    .args(["cat-file", "--batch"])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .context("Failed to spawn git cat-file")?;
-
-  let mut stdin = child
-    .stdin
-    .take()
-    .ok_or_else(|| RailError::message("Failed to open stdin for cat-file"))?;
-
-  // Write all blob SHAs to stdin
-  for (blob_sha, _commit_sha) in entries {
-    writeln!(stdin, "{}", blob_sha).context("Failed to write to git cat-file stdin")?;
-  }
-
-  drop(stdin); // Close stdin to signal we're done
-
-  // Read output
-  let output = child.wait_with_output().context("Failed to read git cat-file output")?;
-
-  if !output.status.success() {
-    return Err(RailError::Git(GitError::CommandFailed {
-      command: String::from("git cat-file --batch"),
-      stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-    }));
-  }
-
-  // Parse batch output
-  // Format: "<sha> <type> <size>\n<content>\n"
-  // Or for missing: "<sha> missing\n"
-  let mut results = Vec::with_capacity(entries.len());
-  let stdout = &output.stdout[..];
-  let mut pos = 0;
-
-  for _ in 0..entries.len() {
-    // Read header line
-    let line_end = stdout[pos..]
-      .iter()
-      .position(|&b| b == b'\n')
-      .ok_or_else(|| RailError::message("Invalid cat-file output: missing newline"))?;
-    let header = &stdout[pos..pos + line_end];
-    pos += line_end + 1;
-
-    // Check if blob is missing
-    if header.ends_with(b" missing") {
-      results.push(None);
-      continue;
-    }
-
-    // Parse size from header: "<sha> <type> <size>"
-    let parts: Vec<&[u8]> = header.split(|&b| b == b' ').collect();
-    if parts.len() < 3 {
-      return Err(RailError::message(format!(
-        "Invalid cat-file header: {}",
-        String::from_utf8_lossy(header)
-      )));
-    }
-
-    let size_str = String::from_utf8_lossy(parts[2]);
-    let size: usize = size_str
-      .parse()
-      .map_err(|_| RailError::message(format!("Invalid size in cat-file output: {}", size_str)))?;
-
-    // Read content
-    if pos + size > stdout.len() {
-      return Err(RailError::message("Unexpected end of cat-file output"));
-    }
-
-    let content = String::from_utf8_lossy(&stdout[pos..pos + size]).trim().to_string();
-    pos += size;
-
-    // Skip trailing newline after content
-    if pos < stdout.len() && stdout[pos] == b'\n' {
-      pos += 1;
-    }
-
-    results.push(Some(content));
-  }
-
-  Ok(results)
-}
-
-/// Retry an operation with exponential backoff.
-fn retry_operation<F, T>(mut operation: F) -> RailResult<T>
-where
-  F: FnMut() -> RailResult<T>,
-{
-  const MAX_RETRIES: u32 = 3;
-  let mut attempt = 0;
-  let mut delay = Duration::from_millis(500);
-
-  loop {
-    match operation() {
-      Ok(result) => return Ok(result),
-      Err(e) => {
-        attempt += 1;
-        if attempt > MAX_RETRIES {
-          return Err(e);
-        }
-
-        // Only retry on network/lock errors
-        let should_retry = match &e {
-          RailError::Git(GitError::CommandFailed { stderr, .. }) => {
-            stderr.contains("lock")
-              || stderr.contains("temporarily unavailable")
-              || stderr.contains("Connection timed out")
-              || stderr.contains("Could not resolve host")
-              || stderr.contains("Failed to connect")
-          }
-          _ => false,
-        };
-
-        if !should_retry {
-          return Err(e);
-        }
-
-        progress!(
-          "   ⚠️  Operation failed. Retrying in {:?}... (Attempt {}/{})",
-          delay,
-          attempt,
-          MAX_RETRIES
-        );
-        thread::sleep(delay);
-        delay *= 2;
-      }
-    }
-  }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::process::Command;
-  use tempfile::TempDir;
-
-  /// Helper to run git commands in tests.
-  fn git(repo_path: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git").current_dir(repo_path).args(args).output().unwrap()
-  }
-
-  /// Initialize a git repo for testing with required config.
-  fn init_test_repo(repo_path: &Path) {
-    git(repo_path, &["init"]);
-    git(repo_path, &["config", "user.name", "Test User"]);
-    git(repo_path, &["config", "user.email", "test@example.com"]);
-    git(repo_path, &["config", "commit.gpgsign", "false"]);
-    git(repo_path, &["config", "tag.gpgsign", "false"]);
-  }
-
-  /// Create an initial commit and return its SHA.
-  fn create_initial_commit(repo_path: &Path) -> String {
-    std::fs::write(repo_path.join("test.txt"), "test").unwrap();
-    git(repo_path, &["add", "."]);
-    git(repo_path, &["commit", "-m", "Initial commit"]);
-
-    let output = git(repo_path, &["rev-parse", "HEAD"]);
-    String::from_utf8(output.stdout).unwrap().trim().to_string()
-  }
 
   fn oid(digit: char) -> String {
     std::iter::repeat_n(digit, 40).collect()
   }
 
-  #[test]
-  fn test_record_and_get_mapping() {
-    let mut store = MappingStore::new("test-crate".to_string());
-
-    let source = oid('a');
-    let target = oid('b');
-    store.record_mapping(&source, &target).unwrap();
-
-    assert_eq!(store.count(), 1);
-    assert!(store.has_mapping(&source));
-    assert_eq!(store.get_mapping(&source).unwrap(), Some(target));
-    assert_eq!(store.get_mapping("unknown").unwrap(), None);
+  fn repository_id(digit: char) -> String {
+    format!("sha256-{}", std::iter::repeat_n(digit, 64).collect::<String>())
   }
 
   #[test]
-  fn test_record_mapping_rejects_divergent_and_non_bijective_values() {
-    let mut store = MappingStore::new("test-crate".to_string());
+  fn origin_trailer_round_trips_required_identity() {
+    let context = OriginContext::new(repository_id('a'), "demo", "v1-sha256-snapshot").unwrap();
+    let source = oid('b');
+    let trailer = context.trailer(&source).unwrap();
+    let parsed = ParsedTrailer::parse(trailer.strip_prefix(TRAILER_PREFIX).unwrap()).unwrap();
+    assert_eq!(
+      parsed,
+      ParsedTrailer::Versioned {
+        source_repository: repository_id('a'),
+        source_commit: source,
+        owner: "demo".to_string(),
+        ownership_snapshot: "v1-sha256-snapshot".to_string(),
+        transform_version: TRANSFORM_VERSION,
+        target_commit: None,
+        mapping: true,
+      }
+    );
+  }
+
+  #[test]
+  fn appending_origin_preserves_the_original_message_prefix() {
+    let original = "subject\n\nbody with trailing space \n\n\n";
+    let message = append_origin_trailers(original, &["Rail-Origin: evidence".to_string()]);
+    assert!(message.starts_with(original));
+    assert!(message.ends_with("Rail-Origin: evidence"));
+  }
+
+  #[test]
+  fn origin_parser_ignores_body_lines_outside_the_trailer_block() {
+    let message = format!(
+      "subject\n\nRail-Origin: not-a-real-trailer\nbody continues\n\nSigned-off-by: Example <example.invalid>\n{}",
+      OriginContext::new(repository_id('a'), "demo", "v1-sha256-snapshot")
+        .unwrap()
+        .trailer(&oid('b'))
+        .unwrap()
+    );
+    let trailers = origin_trailer_values(&message);
+    assert_eq!(trailers.len(), 1);
+    assert!(trailers[0].starts_with("v1 "));
+  }
+
+  #[test]
+  fn mapping_store_rejects_divergence_and_non_bijective_values() {
+    let mut store = MappingStore::new("demo".to_string());
     let source = oid('a');
     let other_source = oid('b');
     let target = oid('c');
     let other_target = oid('d');
     store.record_mapping(&source, &target).unwrap();
-
-    let divergent = store.record_mapping(&source, &other_target).unwrap_err();
-    assert!(divergent.to_string().contains("maps to both"));
-    let duplicate_target = store.record_mapping(&other_source, &target).unwrap_err();
-    assert!(duplicate_target.to_string().contains("already mapped"));
-    assert!(store.record_mapping("not-an-object-id", &target).is_err());
+    assert!(
+      store
+        .record_mapping(&source, &other_target)
+        .unwrap_err()
+        .to_string()
+        .contains("maps to both")
+    );
+    assert!(
+      store
+        .record_mapping(&other_source, &target)
+        .unwrap_err()
+        .to_string()
+        .contains("already mapped")
+    );
   }
 
   #[test]
-  fn test_save_and_load() {
-    let temp = TempDir::new().unwrap();
-    let repo_path = temp.path();
-
-    init_test_repo(repo_path);
-    let mono_sha = create_initial_commit(repo_path);
-
-    // Create and save mappings
-    let mut store = MappingStore::new("test-crate".to_string());
-    let remote_sha = oid('a');
-    store.record_mapping(&mono_sha, &remote_sha).unwrap();
-    store.save(repo_path).unwrap();
-
-    // Load into new store
-    let mut loaded_store = MappingStore::new("test-crate".to_string());
-    loaded_store.load(repo_path).unwrap();
-
-    assert_eq!(loaded_store.count(), 1);
-    assert_eq!(loaded_store.get_mapping(&mono_sha).unwrap(), Some(remote_sha));
+  fn legacy_migration_trailers_preserve_exact_note_mapping() {
+    let mut store = MappingStore::new("demo".to_string());
+    let source = oid('a');
+    let target = oid('b');
+    store.note_mappings.insert((source.clone(), target.clone()));
+    store.record_mapping(&source, &target).unwrap();
+    let context = OriginContext::new(repository_id('c'), "demo", "v1-sha256-snapshot").unwrap();
+    let trailers = store.legacy_migration_trailers(&context).unwrap();
+    assert_eq!(trailers.len(), 1);
+    assert!(trailers[0].contains(&format!("commit={source}")));
+    assert!(trailers[0].contains(&format!("target={target}")));
   }
 
   #[test]
-  fn test_load_nonexistent() {
-    let temp = TempDir::new().unwrap();
-    let repo_path = temp.path();
-
-    let mut store = MappingStore::new("test-crate".to_string());
-    let result = store.load(repo_path);
-
-    assert!(result.is_ok());
-    assert_eq!(store.count(), 0);
-  }
-
-  #[test]
-  fn test_reverse_mapping() {
-    let mut store = MappingStore::new("test-crate".to_string());
-
-    // Record mapping: mono_sha -> remote_sha
-    let mono_sha = oid('a');
-    let remote_sha = oid('b');
-    store.record_mapping(&mono_sha, &remote_sha).unwrap();
-
-    // Forward lookup works
-    assert!(store.has_mapping(&mono_sha));
-    assert_eq!(store.get_mapping(&mono_sha).unwrap(), Some(remote_sha.clone()));
-
-    // Reverse lookup works (O(1) instead of O(n) scan)
-    assert!(store.has_reverse_mapping(&remote_sha));
-    assert!(!store.has_reverse_mapping(&mono_sha));
-    assert!(!store.has_reverse_mapping("nonexistent"));
-  }
-
-  #[test]
-  fn test_reverse_mapping_persistence() {
-    let temp = TempDir::new().unwrap();
-    let repo_path = temp.path();
-
-    init_test_repo(repo_path);
-    let mono_sha = create_initial_commit(repo_path);
-
-    // Create and save mappings
-    let mut store = MappingStore::new("test-crate".to_string());
-    let remote_sha = oid('a');
-    store.record_mapping(&mono_sha, &remote_sha).unwrap();
-
-    // Verify reverse mapping before save
-    assert!(store.has_reverse_mapping(&remote_sha));
-
-    store.save(repo_path).unwrap();
-
-    // Load into new store and verify reverse mapping is rebuilt
-    let mut loaded_store = MappingStore::new("test-crate".to_string());
-    loaded_store.load(repo_path).unwrap();
-
-    assert!(loaded_store.has_mapping(&mono_sha));
-    assert!(loaded_store.has_reverse_mapping(&remote_sha));
-  }
-
-  #[test]
-  fn test_batch_load_multiple_notes() {
-    let temp = TempDir::new().unwrap();
-    let repo_path = temp.path();
-
-    init_test_repo(repo_path);
-
-    // Create multiple commits
-    let sha1 = create_initial_commit(repo_path);
-
-    std::fs::write(repo_path.join("file2.txt"), "content2").unwrap();
-    git(repo_path, &["add", "."]);
-    git(repo_path, &["commit", "-m", "Second commit"]);
-    let output = git(repo_path, &["rev-parse", "HEAD"]);
-    let sha2 = String::from_utf8(output.stdout).unwrap().trim().to_string();
-
-    std::fs::write(repo_path.join("file3.txt"), "content3").unwrap();
-    git(repo_path, &["add", "."]);
-    git(repo_path, &["commit", "-m", "Third commit"]);
-    let output = git(repo_path, &["rev-parse", "HEAD"]);
-    let sha3 = String::from_utf8(output.stdout).unwrap().trim().to_string();
-
-    // Save multiple mappings
-    let mut store = MappingStore::new("test-crate".to_string());
-    let remote_1 = oid('a');
-    let remote_2 = oid('b');
-    let remote_3 = oid('c');
-    store.record_mapping(&sha1, &remote_1).unwrap();
-    store.record_mapping(&sha2, &remote_2).unwrap();
-    store.record_mapping(&sha3, &remote_3).unwrap();
-    store.save(repo_path).unwrap();
-
-    // Load and verify all mappings are retrieved via batch
-    let mut loaded_store = MappingStore::new("test-crate".to_string());
-    loaded_store.load(repo_path).unwrap();
-
-    assert_eq!(loaded_store.count(), 3);
-    assert_eq!(loaded_store.get_mapping(&sha1).unwrap(), Some(remote_1));
-    assert_eq!(loaded_store.get_mapping(&sha2).unwrap(), Some(remote_2));
-    assert_eq!(loaded_store.get_mapping(&sha3).unwrap(), Some(remote_3));
+  fn remote_normalization_removes_http_credentials_and_query() {
+    assert_eq!(
+      normalize_remote_url("https://token@example.com/Org/repo.git?secret=value").unwrap(),
+      "https://example.com/Org/repo"
+    );
   }
 }

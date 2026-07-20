@@ -6,15 +6,16 @@
 use crate::cargo::{CargoTransform, TransformContext};
 use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;
-use crate::git::SystemGit;
-use crate::git::mappings::MappingStore;
+use crate::git::mappings::{HistorySide, MappingStore, OriginContext, append_origin_trailers};
+use crate::git::ops::{GitIndexChange, GitTreeEntry};
+use crate::git::{CommitMetadata, SystemGit};
 use crate::progress;
-use crate::split::SplitPathCapabilities;
+use crate::split::{SplitOwnership, SplitPathCapabilities};
 use crate::sync::conflict::{ConflictClass, ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Configuration for sync operation
@@ -24,6 +25,10 @@ pub struct SyncConfig {
   pub crate_name: String,
   /// Paths to crate directories
   pub crate_paths: Vec<PathBuf>,
+  /// Explicit non-Cargo assets resolved from the ownership snapshot.
+  pub asset_paths: Vec<PathBuf>,
+  /// Snapshot-derived ownership and dependency/release evidence.
+  pub ownership: SplitOwnership,
   /// Split mode (single or combined)
   pub mode: SplitMode,
   /// Workspace mode (standalone or workspace)
@@ -105,10 +110,30 @@ struct SyncConflictReceipt {
   message: String,
   author: String,
   author_email: String,
-  timestamp: i64,
+  author_timestamp: i64,
+  author_timezone: String,
+  committer: String,
+  committer_email: String,
+  committer_timestamp: i64,
+  committer_timezone: String,
   commit_paths: Vec<PathBuf>,
   conflicts: Vec<ConflictInfo>,
   resulting_commit: Option<String>,
+}
+
+impl SyncConflictReceipt {
+  fn commit_metadata(&self) -> CommitMetadata {
+    CommitMetadata {
+      author: self.author.clone(),
+      author_email: self.author_email.clone(),
+      author_timestamp: self.author_timestamp,
+      author_timezone: self.author_timezone.clone(),
+      committer: self.committer.clone(),
+      committer_email: self.committer_email.clone(),
+      committer_timestamp: self.committer_timestamp,
+      committer_timezone: self.committer_timezone.clone(),
+    }
+  }
 }
 
 /// Bidirectional sync engine
@@ -119,12 +144,14 @@ pub struct SyncEngine<'a> {
   config: SyncConfig,
   /// Commit mapping store
   mapping_store: MappingStore,
+  /// Origin evidence for monorepo commits synthesized into the target.
+  source_origin: OriginContext,
+  /// Origin evidence for target commits synthesized into the monorepo.
+  target_origin: OriginContext,
   /// Cargo.toml transformer
   transform: CargoTransform,
   /// Conflict resolver
   conflict_resolver: ConflictResolver,
-  /// Track which repos we've loaded mappings from (to avoid redundant loads)
-  loaded_repos: std::collections::HashSet<PathBuf>,
 }
 
 impl<'a> SyncEngine<'a> {
@@ -137,8 +164,28 @@ impl<'a> SyncEngine<'a> {
       ));
     }
     config.path_capabilities.validate_crate_paths(&config.crate_paths)?;
+    for asset in &config.asset_paths {
+      config.path_capabilities.authorize_source(asset)?;
+      if config
+        .crate_paths
+        .iter()
+        .any(|crate_root| asset.starts_with(crate_root))
+      {
+        return Err(crate::error::RailError::message(format!(
+          "explicit asset '{}' overlaps a Cargo-owned member root",
+          asset.display()
+        )));
+      }
+    }
     config.path_capabilities.validate_target_repository()?;
     let mapping_store = MappingStore::new(config.crate_name.clone());
+    let source_origin =
+      OriginContext::discover(ctx.workspace_root(), &config.crate_name, &config.ownership.snapshot_id)?;
+    let target_origin = OriginContext::discover(
+      &config.target_repo_path,
+      &config.crate_name,
+      &config.ownership.snapshot_id,
+    )?;
     let transformer = CargoTransform::new(ctx.cargo().metadata().clone());
 
     // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
@@ -158,18 +205,34 @@ impl<'a> SyncEngine<'a> {
       ctx,
       config,
       mapping_store,
+      source_origin,
+      target_origin,
       transform: transformer,
 
       conflict_resolver,
-      loaded_repos: std::collections::HashSet::new(),
     })
   }
 
-  /// Load mappings from a repo if not already loaded (avoids redundant subprocess calls)
-  fn ensure_mappings_loaded(&mut self, repo_path: &Path) -> RailResult<()> {
-    if !self.loaded_repos.contains(repo_path) {
-      self.mapping_store.load(repo_path)?;
-      self.loaded_repos.insert(repo_path.to_path_buf());
+  fn load_mappings(&mut self) -> RailResult<()> {
+    self.mapping_store.load_history(
+      self.ctx.workspace_root(),
+      HistorySide::Source,
+      self.target_origin.source_repository(),
+    )?;
+    self.mapping_store.load_history(
+      &self.config.target_repo_path,
+      HistorySide::Target,
+      self.source_origin.source_repository(),
+    )?;
+    self.mapping_store.load_legacy_notes(self.ctx.workspace_root())?;
+    self.mapping_store.load_legacy_notes(&self.config.target_repo_path)?;
+    self.config.path_capabilities.validate_target_repository()?;
+    if self
+      .mapping_store
+      .migrate_legacy_mappings(&self.config.target_repo_path, &self.source_origin)?
+      .is_some()
+    {
+      progress!("   Migrated legacy mappings into ordinary Git history");
     }
     Ok(())
   }
@@ -181,9 +244,9 @@ impl<'a> SyncEngine<'a> {
     let bytes = std::fs::read(&receipt_path)?;
     let mut receipt: SyncConflictReceipt = serde_json::from_slice(&bytes)
       .map_err(|error| crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error)))?;
-    if receipt.schema_version != 1 || receipt.status != "conflicted" {
+    if receipt.schema_version != 2 || receipt.status != "conflicted" {
       return Err(crate::error::RailError::message(
-        "sync conflict receipt is not an active version-1 conflict",
+        "sync conflict receipt is not an active version-2 conflict",
       ));
     }
     if receipt.crate_name != self.config.crate_name {
@@ -254,16 +317,14 @@ impl<'a> SyncEngine<'a> {
       ));
     }
 
+    let metadata = receipt.commit_metadata();
     let commit = git.create_commit_with_metadata(
       &receipt.message,
-      &receipt.author,
-      &receipt.author_email,
-      receipt.timestamp,
+      &metadata,
       std::slice::from_ref(&receipt.expected_head),
       &receipt.commit_paths,
     )?;
     self.mapping_store.record_mapping(&commit, &receipt.remote_commit)?;
-    self.mapping_store.save(self.ctx.workspace_root())?;
     receipt.status = "resolved".to_string();
     receipt.resulting_commit = Some(commit);
     write_json_atomic(&receipt_path, &receipt)?;
@@ -312,6 +373,9 @@ impl<'a> SyncEngine<'a> {
   /// - `single`: only files under the single configured crate path
   /// - `combined`: files under any configured crate path
   fn mono_path_in_scope(&self, path: &Path) -> bool {
+    if self.config.asset_paths.iter().any(|asset| asset == path) {
+      return true;
+    }
     match self.config.mode {
       SplitMode::Single => self
         .config
@@ -326,13 +390,19 @@ impl<'a> SyncEngine<'a> {
     }
   }
 
+  fn owned_paths(&self) -> Vec<PathBuf> {
+    let mut paths = self.config.crate_paths.clone();
+    paths.extend(self.config.asset_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+  }
+
   /// Sync changes from monorepo to remote repository
   pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
     progress!("   Syncing monorepo → remote...");
 
-    // Load mappings (cached - only loads if not already loaded)
-
-    self.ensure_mappings_loaded(self.ctx.workspace_root())?;
+    self.load_mappings()?;
 
     // Open remote repo
     let target_repo_path = self.config.target_repo_path.clone();
@@ -341,24 +411,20 @@ impl<'a> SyncEngine<'a> {
     // Fetch latest from remote (skip for local paths)
     if !utils::is_local_path(&self.config.remote_url) {
       remote_git.fetch_from_remote("origin")?;
-      self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
       progress!("   Skipping fetch (local testing mode)");
     }
-    // Fetch updates mapping notes, so we need to reload from target repo
-    // Clear the loaded flag and reload
-    self.loaded_repos.remove(&target_repo_path);
-    self.ensure_mappings_loaded(&target_repo_path)?;
 
     // Find last synced commit in mono
     let last_synced_mono = self.find_last_synced_mono_commit()?;
 
     // Get new commits in mono that touch any of the crate paths (handles both single and combined modes)
-    let new_commits = self.ctx.git()?.git().get_commits_touching_paths(
-      &self.config.crate_paths,
-      last_synced_mono.as_deref(),
-      "HEAD",
-    )?;
+    let new_commits =
+      self
+        .ctx
+        .git()?
+        .git()
+        .get_commits_touching_paths(&self.owned_paths(), last_synced_mono.as_deref(), "HEAD")?;
 
     if new_commits.is_empty() {
       progress!("   No new commits to sync");
@@ -367,20 +433,17 @@ impl<'a> SyncEngine<'a> {
 
       let mut synced_count = 0;
       let mut current_remote_head = remote_git.head_commit()?; // Cache HEAD, update after each commit
+      let commit_shas = new_commits.iter().map(|commit| commit.sha.clone()).collect::<Vec<_>>();
+      let changed_files = self.ctx.git()?.git().get_changed_files_bulk(&commit_shas)?;
 
-      for commit in &new_commits {
+      for (commit, changed_files) in new_commits.iter().zip(&changed_files) {
         // Skip if already synced
         if self.mapping_store.has_mapping(&commit.sha) {
           continue;
         }
 
-        // Skip if this commit came from remote (check trailer)
-        if commit.message.contains("Rail-Origin: remote@") {
-          continue;
-        }
-
         // Apply commit to remote
-        let remote_sha = self.apply_mono_commit_to_remote(commit, &remote_git, &current_remote_head)?;
+        let remote_sha = self.apply_mono_commit_to_remote(commit, changed_files, &remote_git, &current_remote_head)?;
 
         // Record mapping
         self.mapping_store.record_mapping(&commit.sha, &remote_sha)?;
@@ -388,14 +451,9 @@ impl<'a> SyncEngine<'a> {
         current_remote_head = remote_sha; // Update cached HEAD (move, not clone)
       }
 
-      // Save mappings after processing commits
-      self.mapping_store.save(self.ctx.workspace_root())?;
-      self.mapping_store.save(&self.config.target_repo_path)?;
-
       // Push to remote (skip for local paths)
       if synced_count > 0 && !utils::is_local_path(&self.config.remote_url) {
         remote_git.push_to_remote("origin", &self.config.branch)?;
-        self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       }
 
       return Ok(SyncResult {
@@ -407,15 +465,10 @@ impl<'a> SyncEngine<'a> {
 
     let synced_count = 0;
 
-    // Save mappings
-    self.mapping_store.save(self.ctx.workspace_root())?;
-    self.mapping_store.save(&self.config.target_repo_path)?;
-
     // Push to remote (skip for local paths)
     if synced_count > 0 {
       if !utils::is_local_path(&self.config.remote_url) {
         remote_git.push_to_remote("origin", &self.config.branch)?;
-        self.mapping_store.push_notes(&self.config.target_repo_path, "origin")?;
       } else {
         progress!("   Skipping push (local testing mode)");
       }
@@ -435,9 +488,7 @@ impl<'a> SyncEngine<'a> {
     // Check current branch - NEVER commit directly to protected branches
     let _current_branch = self.ctx.git()?.git().current_branch()?;
 
-    // Load mappings (cached - only loads if not already loaded)
-
-    self.ensure_mappings_loaded(self.ctx.workspace_root())?;
+    self.load_mappings()?;
 
     // Open remote repo
     let target_repo_path = self.config.target_repo_path.clone();
@@ -446,14 +497,9 @@ impl<'a> SyncEngine<'a> {
     // Fetch latest from remote (skip for local paths)
     if !utils::is_local_path(&self.config.remote_url) {
       remote_git.fetch_from_remote("origin")?;
-      self.mapping_store.fetch_notes(&target_repo_path, "origin")?;
     } else {
       progress!("   Skipping fetch (local testing mode)");
     }
-    // Fetch updates mapping notes, so we need to reload from target repo
-    // Clear the loaded flag and reload
-    self.loaded_repos.remove(&target_repo_path);
-    self.ensure_mappings_loaded(&target_repo_path)?;
 
     // Find last synced commit in remote
     let last_synced_remote = self.find_last_synced_remote_commit(&remote_git)?;
@@ -470,10 +516,6 @@ impl<'a> SyncEngine<'a> {
     let commits_to_sync: Vec<_> = new_commits
       .iter()
       .filter(|c| {
-        // Skip if this commit came from mono (check trailer)
-        if c.message.contains("Rail-Origin: mono@") {
-          return false;
-        }
         // Skip if already synced (O(1) reverse mapping lookup)
         if self.mapping_store.has_reverse_mapping(&c.sha) {
           return false;
@@ -520,10 +562,15 @@ impl<'a> SyncEngine<'a> {
 
     let mut count = 0;
     let mut current_mono_head = self.ctx.git()?.git().head_commit()?; // Cache HEAD, update after each commit
+    let commit_shas = commits_to_sync
+      .iter()
+      .map(|commit| commit.sha.clone())
+      .collect::<Vec<_>>();
+    let changed_files = remote_git.get_changed_files_bulk(&commit_shas)?;
 
-    for commit in &commits_to_sync {
+    for (commit, changed_files) in commits_to_sync.iter().zip(&changed_files) {
       // Resolve conflicts using 3-way merge (returns conflicts + changed_files for caching)
-      let resolution = self.resolve_conflicts_for_commit(commit, &remote_git)?;
+      let resolution = self.resolve_conflicts_for_commit(commit, &remote_git, changed_files)?;
 
       // Collect paths of resolved files (don't overwrite these in apply_remote_commit_to_mono)
       // Using HashSet<&Path> for O(1) membership testing - borrows from resolution.conflicts, no clones
@@ -553,16 +600,21 @@ impl<'a> SyncEngine<'a> {
           .as_deref()
           .ok_or_else(|| crate::error::RailError::message("conflicted sync has no recovery branch"))?;
         let receipt = self.write_conflict_receipt(SyncConflictReceipt {
-          schema_version: 1,
+          schema_version: 2,
           status: "conflicted".to_string(),
           crate_name: self.config.crate_name.clone(),
           branch: branch.to_string(),
           expected_head: current_mono_head.clone(),
           remote_commit: commit.sha.clone(),
-          message: format!("{}\n\nRail-Origin: remote@{}", commit.message.trim(), commit.sha),
+          message: append_origin_trailers(&commit.message, &[self.target_origin.trailer(&commit.sha)?]),
           author: commit.author.clone(),
           author_email: commit.author_email.clone(),
-          timestamp: commit.timestamp,
+          author_timestamp: commit.timestamp,
+          author_timezone: commit.author_timezone.clone(),
+          committer: commit.committer.clone(),
+          committer_email: commit.committer_email.clone(),
+          committer_timestamp: commit.committer_timestamp,
+          committer_timezone: commit.committer_timezone.clone(),
           commit_paths,
           conflicts: resolution.conflicts.clone(),
           resulting_commit: None,
@@ -591,9 +643,6 @@ impl<'a> SyncEngine<'a> {
     }
 
     let synced_count = count;
-
-    // Save mappings
-    self.mapping_store.save(self.ctx.workspace_root())?;
 
     // Print PR creation instructions if we created a branch with synced commits
     if let Some(branch_name) = pr_branch
@@ -630,6 +679,7 @@ impl<'a> SyncEngine<'a> {
   /// Sync changes bidirectionally between monorepo and remote
   pub fn sync_bidirectional(&mut self) -> RailResult<SyncResult> {
     progress!("   Detecting changes...");
+    self.load_mappings()?;
 
     // Check both directions
     let mono_has_changes = self.check_mono_has_changes()?;
@@ -699,93 +749,65 @@ impl<'a> SyncEngine<'a> {
   fn apply_mono_commit_to_remote(
     &self,
     commit: &crate::git::CommitInfo,
+    changed_files: &[(PathBuf, char)],
     remote_git: &SystemGit,
     current_remote_head: &str,
   ) -> RailResult<String> {
-    // Get changed files in mono
-    let changed_files = self.ctx.git()?.git().get_changed_files(&commit.sha)?;
+    let source_git = self.ctx.git()?.git();
 
     // Filter to only files in configured crate path scope.
     let relevant_files: Vec<_> = changed_files
-      .into_iter()
-      .filter(|(path, _)| self.mono_path_in_scope(path))
-      .collect();
-
-    // Separate deletions from additions/modifications
-    let (deletions, modifications): (Vec<_>, Vec<_>) =
-      relevant_files.iter().partition(|(_, change_type)| *change_type == 'D');
-
-    // Handle deletions
-    for (mono_path, _) in &deletions {
-      let remote_path = self.map_mono_path_to_remote(mono_path)?;
-      let full_remote_path = self.config.path_capabilities.authorize_target(&remote_path)?;
-      if full_remote_path.exists() {
-        std::fs::remove_file(&full_remote_path)?;
-      }
-    }
-
-    // Bulk read all files that need to be added/modified (single git call instead of N calls)
-    // Uses references to avoid cloning SHA and paths for each file
-    let bulk_items: Vec<(&str, &Path)> = modifications
       .iter()
-      .map(|(path, _)| (commit.sha.as_str(), path.as_path()))
+      .filter(|(path, _)| self.mono_path_in_scope(path))
+      .cloned()
       .collect();
 
-    let file_contents = if !bulk_items.is_empty() {
-      self.ctx.git()?.git().read_files_bulk(&bulk_items)?
-    } else {
-      vec![]
-    };
+    let modification_paths = relevant_files
+      .iter()
+      .filter(|(_, change_type)| *change_type != 'D')
+      .map(|(path, _)| path.clone())
+      .collect::<Vec<_>>();
+    let entries = source_git
+      .collect_tree_entries_for_paths(&commit.sha, &modification_paths)?
+      .into_iter()
+      .map(|entry| (entry.path.clone(), entry))
+      .collect::<HashMap<_, _>>();
 
-    // Apply each file to remote
-    for (idx, (mono_path, _)) in modifications.iter().enumerate() {
-      let content = &file_contents[idx];
+    remote_git.import_objects(self.ctx.workspace_root(), &commit.sha)?;
+    let mut changes = Vec::with_capacity(relevant_files.len());
+    for (mono_path, change_type) in &relevant_files {
       let remote_path = self.map_mono_path_to_remote(mono_path)?;
-      let full_remote_path = self.config.path_capabilities.authorize_target(&remote_path)?;
-
-      // Create parent directories
-      if let Some(parent) = full_remote_path.parent() {
-        std::fs::create_dir_all(parent)?;
+      self.config.path_capabilities.authorize_target(&remote_path)?;
+      if *change_type == 'D' {
+        changes.push(GitIndexChange::Delete(remote_path));
+        continue;
       }
-
-      // Write file first, then transform manifest if applicable
-      std::fs::write(&full_remote_path, content)?;
-
-      // Transform Cargo.toml manifest
-      if mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        let content = std::fs::read_to_string(&full_remote_path)?;
-        // Determine if target has workspace based on split mode
-        let target_has_workspace =
-          self.config.mode == SplitMode::Combined && self.config.workspace_mode == WorkspaceMode::Workspace;
-        let context = TransformContext {
-          crate_name: self.config.crate_name.clone(),
-          workspace_root: self.ctx.workspace_root().to_path_buf(),
-          target_has_workspace,
-        };
-        let transformed = self.transform.transform_to_split(&content, &context)?;
-        std::fs::write(&full_remote_path, transformed)?;
-      }
+      let entry = entries.get(mono_path).ok_or_else(|| {
+        crate::error::RailError::message(format!(
+          "commit '{}' has no exact tree entry for '{}'",
+          commit.sha,
+          mono_path.display()
+        ))
+      })?;
+      let object_id = if mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        let content = source_git.read_blobs_bulk(&[entry.object_id.as_str()])?;
+        remote_git.write_blob(&self.transform_manifest_to_split(&content[0])?)?
+      } else {
+        entry.object_id.clone()
+      };
+      changes.push(GitIndexChange::Upsert(GitTreeEntry {
+        mode: entry.mode.clone(),
+        object_id,
+        path: remote_path,
+      }));
     }
 
     // Create commit with trailer
-    let message = format!("{}\n\nRail-Origin: mono@{}", commit.message.trim(), commit.sha);
+    let message = append_origin_trailers(&commit.message, &[self.source_origin.trailer(&commit.sha)?]);
 
-    let parent_shas = vec![current_remote_head.to_string()];
-    let mut commit_paths = relevant_files
-      .iter()
-      .map(|(mono_path, _)| self.map_mono_path_to_remote(mono_path))
-      .collect::<RailResult<Vec<_>>>()?;
-    commit_paths.sort();
-    commit_paths.dedup();
-
-    let new_commit_sha = remote_git.create_commit_with_metadata(
-      &message,
-      &commit.author,
-      &commit.author_email,
-      commit.timestamp,
-      &parent_shas,
-      &commit_paths,
-    )?;
+    let parent_shas = self.mapped_target_parents(commit, current_remote_head);
+    let new_commit_sha =
+      remote_git.create_commit_with_index_changes(&message, &commit.metadata(), &parent_shas, &changes)?;
 
     Ok(new_commit_sha)
   }
@@ -799,106 +821,183 @@ impl<'a> SyncEngine<'a> {
     changed_files: &[(PathBuf, char)], // Pre-fetched from resolve_conflicts to avoid duplicate subprocess call
     create_commit: bool,
   ) -> RailResult<Option<String>> {
-    // Use pre-fetched changed_files (already retrieved in resolve_conflicts_for_commit)
-
-    // Filter and separate files by operation type
-    let relevant_files: Vec<_> = changed_files
+    let relevant_files = changed_files
       .iter()
-      .filter_map(|(remote_path, change_type)| {
-        let mono_path = self.map_remote_path_to_mono(remote_path).ok()?;
-
-        // Skip files that were already resolved by conflict resolution (O(1) HashSet lookup)
-        if resolved_files.contains(mono_path.as_path()) {
-          progress!("      Skipping {} (already resolved)", mono_path.display());
-          return None;
-        }
-
-        Some((remote_path, mono_path, change_type))
+      .map(|(remote_path, change_type)| {
+        self
+          .map_remote_path_to_mono(remote_path)
+          .map(|mono_path| (remote_path, mono_path, change_type))
       })
-      .collect();
+      .collect::<RailResult<Vec<_>>>()?;
 
-    // Separate deletions from additions/modifications
-    let (deletions, modifications): (Vec<_>, Vec<_>) = relevant_files
-      .iter()
-      .partition(|(_, _, change_type)| **change_type == 'D');
-
-    // Handle deletions
-    for (_, mono_path, _) in &deletions {
-      let full_mono_path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
-      if full_mono_path.exists() {
-        std::fs::remove_file(&full_mono_path)?;
-      }
+    if !create_commit {
+      self.materialize_remote_changes(commit, remote_git, resolved_files, &relevant_files)?;
+      return Ok(None);
     }
 
-    // Bulk read all files that need to be added/modified (single git call instead of N calls)
-    // Uses references to avoid cloning SHA and paths for each file
-    let bulk_items: Vec<(&str, &Path)> = modifications
+    let incoming = relevant_files
       .iter()
-      .map(|(remote_path, _, _)| (commit.sha.as_str(), (*remote_path).as_path()))
-      .collect();
-
-    let file_contents = if !bulk_items.is_empty() {
-      remote_git.read_files_bulk(&bulk_items)?
-    } else {
-      vec![]
-    };
-
-    // Apply files to mono
-    for (idx, (remote_path, mono_path, _)) in modifications.iter().enumerate() {
-      let content = &file_contents[idx];
-      let full_mono_path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
-
-      // Create parent directories
-      if let Some(parent) = full_mono_path.parent() {
-        std::fs::create_dir_all(parent)?;
+      .filter(|(_, mono_path, change_type)| *change_type != &'D' && !resolved_files.contains(mono_path.as_path()))
+      .map(|(remote_path, _, _)| (*remote_path).clone())
+      .collect::<Vec<_>>();
+    let entries = remote_git
+      .collect_tree_entries_for_paths(&commit.sha, &incoming)?
+      .into_iter()
+      .map(|entry| (entry.path.clone(), entry))
+      .collect::<HashMap<_, _>>();
+    let mono_git = self.ctx.git()?.git();
+    mono_git.import_objects(&self.config.target_repo_path, &commit.sha)?;
+    let mut changes = Vec::with_capacity(relevant_files.len() + resolved_files.len());
+    for (remote_path, mono_path, change_type) in &relevant_files {
+      self.config.path_capabilities.authorize_source_mutation(mono_path)?;
+      if resolved_files.contains(mono_path.as_path()) {
+        continue;
       }
+      if **change_type == 'D' {
+        changes.push(GitIndexChange::Delete(mono_path.clone()));
+        continue;
+      }
+      let entry = entries.get(*remote_path).ok_or_else(|| {
+        crate::error::RailError::message(format!(
+          "commit '{}' has no exact tree entry for '{}'",
+          commit.sha,
+          remote_path.display()
+        ))
+      })?;
+      let object_id = if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        let content = remote_git.read_blobs_bulk(&[entry.object_id.as_str()])?;
+        mono_git.write_blob(&self.transform_manifest_to_mono(&content[0])?)?
+      } else {
+        entry.object_id.clone()
+      };
+      changes.push(GitIndexChange::Upsert(GitTreeEntry {
+        mode: entry.mode.clone(),
+        object_id,
+        path: mono_path.clone(),
+      }));
+    }
 
-      // Write file first, then transform manifest if applicable
-      std::fs::write(&full_mono_path, content)?;
-
-      // Transform Cargo.toml manifest
-      if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-        let content = std::fs::read_to_string(&full_mono_path)?;
-        // Monorepo always has a workspace
-        let context = TransformContext {
-          crate_name: self.config.crate_name.clone(),
-          workspace_root: self.ctx.workspace_root().to_path_buf(),
-          target_has_workspace: true,
-        };
-        let transformed = self.transform.transform_to_mono(&content, &context)?;
-        std::fs::write(&full_mono_path, transformed)?;
+    if !resolved_files.is_empty() {
+      let resolved = resolved_files
+        .iter()
+        .map(|path| (*path).to_path_buf())
+        .collect::<Vec<_>>();
+      let modes = mono_git
+        .collect_tree_entries_for_paths(current_mono_head, &resolved)?
+        .into_iter()
+        .map(|entry| (entry.path, entry.mode))
+        .collect::<HashMap<_, _>>();
+      for mono_path in resolved {
+        let full_path = self.config.path_capabilities.authorize_source_mutation(&mono_path)?;
+        let (mut content, mode) = read_worktree_blob(&full_path, modes.get(&mono_path).map(String::as_str))?;
+        if mode != "120000" && mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+          content = self.transform_manifest_to_mono(&content)?;
+        }
+        changes.push(GitIndexChange::Upsert(GitTreeEntry {
+          mode,
+          object_id: mono_git.write_blob(&content)?,
+          path: mono_path,
+        }));
       }
     }
 
     // Create commit with trailer
-    let message = format!("{}\n\nRail-Origin: remote@{}", commit.message.trim(), commit.sha);
+    let message = append_origin_trailers(&commit.message, &[self.target_origin.trailer(&commit.sha)?]);
 
-    let parent_shas = vec![current_mono_head.to_string()];
-    let mut commit_paths = relevant_files
-      .iter()
-      .map(|(_, mono_path, _)| mono_path.clone())
-      .chain(resolved_files.iter().map(|path| (*path).to_path_buf()))
-      .collect::<Vec<_>>();
-    commit_paths.sort();
-    commit_paths.dedup();
-
-    if !create_commit {
-      return Ok(None);
-    }
-
-    let new_commit_sha = self.ctx.git()?.git().create_commit_with_metadata(
-      &message,
-      &commit.author,
-      &commit.author_email,
-      commit.timestamp,
-      &parent_shas,
-      &commit_paths,
-    )?;
+    let parent_shas = self.mapped_source_parents(commit, current_mono_head);
+    let new_commit_sha =
+      mono_git.create_commit_with_index_changes(&message, &commit.metadata(), &parent_shas, &changes)?;
 
     Ok(Some(new_commit_sha))
   }
 
+  fn materialize_remote_changes(
+    &self,
+    commit: &crate::git::CommitInfo,
+    remote_git: &SystemGit,
+    resolved_files: &HashSet<&Path>,
+    relevant_files: &[(&PathBuf, PathBuf, &char)],
+  ) -> RailResult<()> {
+    let (deletions, modifications): (Vec<_>, Vec<_>) = relevant_files
+      .iter()
+      .filter(|(_, mono_path, _)| !resolved_files.contains(mono_path.as_path()))
+      .partition(|entry| *entry.2 == 'D');
+    for (_, mono_path, _) in deletions {
+      let path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
+      remove_worktree_file(&path)?;
+    }
+    let items = modifications
+      .iter()
+      .map(|(remote_path, _, _)| (commit.sha.as_str(), remote_path.as_path()))
+      .collect::<Vec<_>>();
+    let contents = remote_git.read_files_bulk(&items)?;
+    for ((remote_path, mono_path, _), mut content) in modifications.into_iter().zip(contents) {
+      let path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
+      if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+      }
+      if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+        content = self.transform_manifest_to_mono(&content)?;
+      }
+      write_worktree_file(&path, &content)?;
+    }
+    Ok(())
+  }
+
+  fn transform_manifest_to_split(&self, content: &[u8]) -> RailResult<Vec<u8>> {
+    let content = std::str::from_utf8(content)
+      .map_err(|error| crate::error::RailError::message(format!("Cargo.toml is not UTF-8: {error}")))?;
+    let target_has_workspace =
+      self.config.mode == SplitMode::Combined && self.config.workspace_mode == WorkspaceMode::Workspace;
+    let context = TransformContext {
+      crate_name: self.config.crate_name.clone(),
+      workspace_root: self.ctx.workspace_root().to_path_buf(),
+      target_has_workspace,
+    };
+    Ok(self.transform.transform_to_split(content, &context)?.into_bytes())
+  }
+
+  fn transform_manifest_to_mono(&self, content: &[u8]) -> RailResult<Vec<u8>> {
+    let content = std::str::from_utf8(content)
+      .map_err(|error| crate::error::RailError::message(format!("Cargo.toml is not UTF-8: {error}")))?;
+    let context = TransformContext {
+      crate_name: self.config.crate_name.clone(),
+      workspace_root: self.ctx.workspace_root().to_path_buf(),
+      target_has_workspace: true,
+    };
+    Ok(self.transform.transform_to_mono(content, &context)?.into_bytes())
+  }
+
+  fn mapped_target_parents(&self, commit: &crate::git::CommitInfo, current_head: &str) -> Vec<String> {
+    let mut parents = commit
+      .parent_shas
+      .iter()
+      .filter_map(|parent| self.mapping_store.get_mapping(parent))
+      .collect::<Vec<_>>();
+    if !parents.iter().any(|parent| parent == current_head) {
+      parents.insert(0, current_head.to_string());
+    }
+    parents.dedup();
+    parents
+  }
+
+  fn mapped_source_parents(&self, commit: &crate::git::CommitInfo, current_head: &str) -> Vec<String> {
+    let mut parents = commit
+      .parent_shas
+      .iter()
+      .filter_map(|parent| self.mapping_store.get_reverse_mapping(parent))
+      .collect::<Vec<_>>();
+    if !parents.iter().any(|parent| parent == current_head) {
+      parents.insert(0, current_head.to_string());
+    }
+    parents.dedup();
+    parents
+  }
+
   fn map_mono_path_to_remote(&self, mono_path: &Path) -> RailResult<PathBuf> {
+    if self.config.asset_paths.iter().any(|asset| asset == mono_path) {
+      return Ok(mono_path.to_path_buf());
+    }
     match self.config.mode {
       SplitMode::Single => {
         let crate_path = self
@@ -917,6 +1016,9 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn map_remote_path_to_mono(&self, remote_path: &Path) -> RailResult<PathBuf> {
+    if self.config.asset_paths.iter().any(|asset| asset == remote_path) {
+      return Ok(remote_path.to_path_buf());
+    }
     match self.config.mode {
       SplitMode::Single => {
         let crate_path = self
@@ -928,8 +1030,14 @@ impl<'a> SyncEngine<'a> {
         Ok(crate_path.join(remote_path))
       }
       SplitMode::Combined => {
-        // Keep full path
-        Ok(remote_path.to_path_buf())
+        if self.mono_path_in_scope(remote_path) {
+          Ok(remote_path.to_path_buf())
+        } else {
+          Err(crate::error::RailError::message(format!(
+            "remote path '{}' is outside combined split ownership",
+            remote_path.display()
+          )))
+        }
       }
     }
   }
@@ -940,10 +1048,8 @@ impl<'a> SyncEngine<'a> {
     &self,
     remote_commit: &crate::git::CommitInfo,
     remote_git: &SystemGit,
+    changed_files: &[(PathBuf, char)],
   ) -> RailResult<ConflictResolutionResult> {
-    // Get files changed in this remote commit
-    let changed_files = remote_git.get_changed_files(&remote_commit.sha)?;
-
     // Find the base commit (common ancestor)
     let last_synced = self.find_last_synced_mono_commit()?;
 
@@ -965,7 +1071,7 @@ impl<'a> SyncEngine<'a> {
     // Identify conflicting files (files modified on both sides)
     // Pre-allocate for worst case (all files conflict) - typically much smaller
     let mut conflicting_files = Vec::with_capacity(changed_files.len());
-    for (remote_path, _) in &changed_files {
+    for (remote_path, _) in changed_files {
       let mono_path = self.map_remote_path_to_mono(remote_path)?;
       let full_mono_path = self.config.path_capabilities.authorize_source_mutation(&mono_path)?;
 
@@ -1057,7 +1163,7 @@ impl<'a> SyncEngine<'a> {
     Ok(ConflictResolutionResult {
       conflicts,
       resolved_files,
-      changed_files,
+      changed_files: changed_files.to_vec(),
     })
   }
 
@@ -1068,12 +1174,12 @@ impl<'a> SyncEngine<'a> {
         .ctx
         .git()?
         .git()
-        .get_commits_touching_paths(&self.config.crate_paths, last_synced.as_deref(), "HEAD")?;
+        .get_commits_touching_paths(&self.owned_paths(), last_synced.as_deref(), "HEAD")?;
 
     Ok(
       new_commits
         .into_iter()
-        .any(|commit| !commit.message.contains("Rail-Origin: remote@")),
+        .any(|commit| !self.mapping_store.has_mapping(&commit.sha)),
     )
   }
 
@@ -1097,7 +1203,7 @@ impl<'a> SyncEngine<'a> {
     // Filter out commits from mono
     let relevant_commits: Vec<_> = new_commits
       .into_iter()
-      .filter(|c| !c.message.contains("Rail-Origin: mono@"))
+      .filter(|commit| !self.mapping_store.has_reverse_mapping(&commit.sha))
       .collect();
 
     Ok(!relevant_commits.is_empty())
@@ -1108,6 +1214,60 @@ fn contains_conflict_markers(content: &[u8]) -> bool {
   content
     .split(|byte| *byte == b'\n')
     .any(|line| line.starts_with(b"<<<<<<<") || line.starts_with(b"=======") || line.starts_with(b">>>>>>>"))
+}
+
+fn remove_worktree_file(path: &Path) -> RailResult<()> {
+  match std::fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_dir() => Err(crate::error::RailError::message(format!(
+      "refusing to replace directory '{}' with a synced file",
+      path.display()
+    ))),
+    Ok(_) => Ok(std::fs::remove_file(path)?),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn write_worktree_file(path: &Path, content: &[u8]) -> RailResult<()> {
+  if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    std::fs::remove_file(path)?;
+  }
+  std::fs::write(path, content)?;
+  Ok(())
+}
+
+fn read_worktree_blob(path: &Path, fallback_mode: Option<&str>) -> RailResult<(Vec<u8>, String)> {
+  let metadata = std::fs::symlink_metadata(path)?;
+  if metadata.file_type().is_symlink() {
+    let target = std::fs::read_link(path)?;
+    #[cfg(unix)]
+    let content = {
+      use std::os::unix::ffi::OsStrExt as _;
+      target.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let content = target.to_string_lossy().into_owned().into_bytes();
+    return Ok((content, "120000".to_string()));
+  }
+  if !metadata.file_type().is_file() {
+    return Err(crate::error::RailError::message(format!(
+      "resolved sync path '{}' is not a file or symlink",
+      path.display()
+    )));
+  }
+  let mut mode = if fallback_mode == Some("100755") {
+    "100755"
+  } else {
+    "100644"
+  };
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    if metadata.permissions().mode() & 0o111 != 0 {
+      mode = "100755";
+    }
+  }
+  Ok((std::fs::read(path)?, mode.to_string()))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {

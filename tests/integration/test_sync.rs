@@ -2,6 +2,12 @@
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::Command;
 use tempfile::TempDir;
 
 /// Helper to set up a split scenario
@@ -19,7 +25,6 @@ root = "."
 remote = "{1}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/{0}" }}]
 "#,
     crate_name,
     split_dir.path().display().to_string().replace('\\', "\\\\")
@@ -51,10 +56,7 @@ root = "."
 remote = "{1}"
 branch = "main"
 mode = "combined"
-paths = [
-  {{ crate = "crates/{2}" }},
-  {{ crate = "crates/{3}" }}
-]
+members = ["{2}", "{3}"]
 "#,
     group_name,
     split_dir.path().display().to_string().replace('\\', "\\\\"),
@@ -121,8 +123,115 @@ fn test_sync_to_remote_basic() -> Result<()> {
   // Verify commit message includes Rail-Origin trailer
   let log_output = git(split_dir.path(), &["log", "-1", "--format=%B"])?;
   let log = String::from_utf8_lossy(&log_output.stdout);
-  assert!(log.contains("Rail-Origin: mono@"), "Should have Rail-Origin trailer");
+  assert!(
+    log.contains("Rail-Origin: v1 source="),
+    "Should have Rail-Origin trailer"
+  );
 
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_to_remote_preserves_exact_tree_and_commit_metadata() -> Result<()> {
+  let (ws, split_dir) = setup_split_scenario("exact-sync")?;
+  let crate_root = ws.path.join("crates/exact-sync");
+  std::fs::create_dir_all(crate_root.join("bin"))?;
+  let tool = crate_root.join("bin/tool");
+  std::fs::write(&tool, "#!/bin/sh\necho exact\n")?;
+  let mut permissions = std::fs::metadata(&tool)?.permissions();
+  permissions.set_mode(0o755);
+  std::fs::set_permissions(&tool, permissions)?;
+  std::os::unix::fs::symlink("../bin/tool", crate_root.join("src/tool-link"))?;
+  std::fs::rename(crate_root.join("README.md"), crate_root.join("GUIDE.md"))?;
+  git(&ws.path, &["add", "-A"])?;
+  let status = Command::new("git")
+    .current_dir(&ws.path)
+    .env("GIT_AUTHOR_NAME", "Exact Author")
+    .env("GIT_AUTHOR_EMAIL", "author@example.com")
+    .env("GIT_AUTHOR_DATE", "1700000000 +0530")
+    .env("GIT_COMMITTER_NAME", "Exact Committer")
+    .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+    .env("GIT_COMMITTER_DATE", "1700000123 -0700")
+    .args(["commit", "-m", "Preserve exact Git state"])
+    .status()?;
+  assert!(status.success());
+
+  let metadata_format = "%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI";
+  let source_metadata = git(
+    &ws.path,
+    &["show", "-s", &format!("--format={metadata_format}"), "HEAD"],
+  )?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "exact-sync", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
+  let target_metadata = git(
+    split_dir.path(),
+    &["show", "-s", &format!("--format={metadata_format}"), "HEAD"],
+  )?;
+  assert_eq!(source_metadata.stdout, target_metadata.stdout);
+
+  let executable = git(split_dir.path(), &["ls-tree", "HEAD", "bin/tool"])?;
+  assert!(String::from_utf8_lossy(&executable.stdout).starts_with("100755 blob "));
+  let symlink = git(split_dir.path(), &["ls-tree", "HEAD", "src/tool-link"])?;
+  assert!(String::from_utf8_lossy(&symlink.stdout).starts_with("120000 blob "));
+  assert_eq!(
+    std::fs::read_link(split_dir.path().join("src/tool-link"))?,
+    PathBuf::from("../bin/tool")
+  );
+  assert!(!split_dir.path().join("README.md").exists());
+  assert!(split_dir.path().join("GUIDE.md").exists());
+
+  let source_blob = git(&ws.path, &["rev-parse", "HEAD:crates/exact-sync/bin/tool"])?;
+  let target_blob = git(split_dir.path(), &["rev-parse", "HEAD:bin/tool"])?;
+  assert_eq!(source_blob.stdout, target_blob.stdout);
+  Ok(())
+}
+
+#[test]
+fn test_explicit_non_cargo_asset_roundtrips_at_its_owned_path() -> Result<()> {
+  let ws = TestWorkspace::new()?;
+  ws.add_crate("asset-sync", "0.1.0", &[])?;
+  std::fs::write(ws.path.join("NOTICE"), "initial\n")?;
+  ws.commit("Add crate and explicit asset")?;
+  let split_dir = TempDir::new()?;
+  let config = format!(
+    r#"[workspace]
+root = "."
+
+[crates.asset-sync.split]
+remote = "{}"
+branch = "main"
+mode = "single"
+include = ["NOTICE"]
+"#,
+    split_dir.path().display().to_string().replace('\\', "\\\\")
+  );
+  std::fs::write(ws.path.join("rail.toml"), config)?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "asset-sync", "--yes", "--allow-dirty"],
+  )?;
+  assert_eq!(std::fs::read_to_string(split_dir.path().join("NOTICE"))?, "initial\n");
+
+  std::fs::write(ws.path.join("NOTICE"), "from mono\n")?;
+  ws.commit("Update explicit asset in mono")?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "asset-sync", "--to-remote", "--yes", "--allow-dirty"],
+  )?;
+  assert_eq!(std::fs::read_to_string(split_dir.path().join("NOTICE"))?, "from mono\n");
+
+  std::fs::write(split_dir.path().join("NOTICE"), "from split\n")?;
+  git(split_dir.path(), &["add", "NOTICE"])?;
+  git(split_dir.path(), &["commit", "-m", "Update explicit asset in split"])?;
+  run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "asset-sync", "--from-remote", "--yes", "--allow-dirty"],
+  )?;
+  assert_eq!(std::fs::read_to_string(ws.path.join("NOTICE"))?, "from split\n");
+  assert!(!ws.path.join("crates/asset-sync/NOTICE").exists());
   Ok(())
 }
 
@@ -179,7 +288,10 @@ fn test_sync_from_remote_basic() -> Result<()> {
   // Verify commit message includes Rail-Origin trailer
   let log_output = git(&ws.path, &["log", "-1", "--format=%B"])?;
   let log = String::from_utf8_lossy(&log_output.stdout);
-  assert!(log.contains("Rail-Origin: remote@"), "Should have Rail-Origin trailer");
+  assert!(
+    log.contains("Rail-Origin: v1 source="),
+    "Should have Rail-Origin trailer"
+  );
 
   Ok(())
 }
@@ -260,7 +372,7 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() -> R
     String::from_utf8_lossy(&resumed.stderr)
   );
   let log = git(&ws.path, &["log", "-1", "--format=%B"])?;
-  assert!(String::from_utf8_lossy(&log.stdout).contains("Rail-Origin: remote@"));
+  assert!(String::from_utf8_lossy(&log.stdout).contains("Rail-Origin: v1 source="));
   let receipt_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt)?)?;
   assert_eq!(receipt_json["status"], "resolved");
   assert!(!std::fs::read_to_string(conflicted_path)?.contains("<<<<<<<"));
@@ -313,7 +425,10 @@ fn test_sync_from_remote_creates_pr_branch() -> Result<()> {
   // Verify commit has Rail-Origin trailer
   let log_output = git(&ws.path, &["log", "-1", "--format=%B"])?;
   let log = String::from_utf8_lossy(&log_output.stdout);
-  assert!(log.contains("Rail-Origin: remote@"), "Should have Rail-Origin trailer");
+  assert!(
+    log.contains("Rail-Origin: v1 source="),
+    "Should have Rail-Origin trailer"
+  );
 
   // Switch back to original branch and verify it's unchanged
   git(&ws.path, &["checkout", &original_branch])?;
@@ -365,6 +480,8 @@ fn test_sync_multiple_commits() -> Result<()> {
 
   // Make multiple commits in mono
   ws.modify_file("mylib", "src/lib.rs", "// Version 1")?;
+  let object_id_like_path = "a".repeat(40);
+  ws.modify_file("mylib", &object_id_like_path, "valid Git filename")?;
   ws.commit("Update v1")?;
 
   ws.modify_file("mylib", "src/lib.rs", "// Version 2")?;
@@ -374,10 +491,24 @@ fn test_sync_multiple_commits() -> Result<()> {
   ws.commit("Update v3")?;
 
   // Sync all to remote
+  let diagnostics_dir = TempDir::new()?;
+  let diagnostics = diagnostics_dir.path().join("sync.json");
   run_cargo_rail(
     &ws.path,
-    &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
+    &[
+      "rail",
+      "--diagnostics-file",
+      diagnostics.to_str().unwrap(),
+      "sync",
+      "mylib",
+      "--to-remote",
+      "--yes",
+      "--allow-dirty",
+    ],
   )?;
+  let counters: serde_json::Value = serde_json::from_slice(&std::fs::read(diagnostics)?)?;
+  assert_eq!(counters["git_path_change_reads"], 3);
+  assert_eq!(counters["git_path_change_batches"], 1);
 
   // Check that all commits are in split
   let log_output = git(split_dir.path(), &["log", "--oneline"])?;
@@ -390,6 +521,10 @@ fn test_sync_multiple_commits() -> Result<()> {
   // Verify final content
   let content = std::fs::read_to_string(split_dir.path().join("src/lib.rs"))?;
   assert_eq!(content, "// Version 3", "Should have final version");
+  assert_eq!(
+    std::fs::read_to_string(split_dir.path().join(object_id_like_path))?,
+    "valid Git filename"
+  );
 
   Ok(())
 }
@@ -586,6 +721,33 @@ fn test_sync_combined_mode_syncs_all_configured_paths() -> Result<()> {
     "combined sync should include changes from second configured path"
   );
 
+  Ok(())
+}
+
+#[test]
+fn test_sync_combined_mode_rejects_remote_paths_outside_ownership() -> Result<()> {
+  let (ws, split_dir) = setup_combined_split_scenario("combined-boundary", "boundary-a", "boundary-b")?;
+  std::fs::write(split_dir.path().join("outside.txt"), "not owned\n")?;
+  git(split_dir.path(), &["add", "outside.txt"])?;
+  git(
+    split_dir.path(),
+    &["commit", "-m", "Attempt out-of-scope combined change"],
+  )?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "sync",
+      "combined-boundary",
+      "--from-remote",
+      "--yes",
+      "--allow-dirty",
+    ],
+  )?;
+  assert!(!output.status.success());
+  assert!(String::from_utf8_lossy(&output.stderr).contains("outside combined split ownership"));
+  assert!(!ws.path.join("outside.txt").exists());
   Ok(())
 }
 

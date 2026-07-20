@@ -17,6 +17,7 @@ pub struct SplitPathCapabilities {
   target_root: PathBuf,
   temporary_root: PathBuf,
   crate_roots: Vec<PathBuf>,
+  asset_paths: Vec<PathBuf>,
 }
 
 impl SplitPathCapabilities {
@@ -79,7 +80,28 @@ impl SplitPathCapabilities {
       target_root,
       temporary_root,
       crate_roots,
+      asset_paths: Vec::new(),
     })
+  }
+
+  /// Add the exact non-Cargo asset paths owned by this split.
+  pub fn with_asset_paths(mut self, asset_paths: &[PathBuf]) -> RailResult<Self> {
+    let mut resolved = Vec::with_capacity(asset_paths.len());
+    for path in asset_paths {
+      let path = self.logical_source_mutation_path(path)?;
+      if self.crate_roots.iter().any(|root| path.starts_with(root)) {
+        return Err(boundary_error(
+          "split asset path",
+          &path,
+          "overlaps a Cargo-owned crate root",
+        ));
+      }
+      resolved.push(path);
+    }
+    resolved.sort();
+    resolved.dedup();
+    self.asset_paths = resolved;
+    Ok(self)
   }
 
   /// Canonical source workspace root.
@@ -133,17 +155,36 @@ impl SplitPathCapabilities {
 
   /// Validate a possibly new source-workspace path immediately before mutation.
   pub fn authorize_source_mutation(&self, path: &Path) -> RailResult<PathBuf> {
+    let resolved = self.logical_source_mutation_path(path)?;
+    if self.crate_roots.iter().any(|root| resolved.starts_with(root)) || self.asset_paths.contains(&resolved) {
+      return Ok(resolved);
+    }
+    Err(boundary_error(
+      "sync source mutation path",
+      &resolved,
+      "is outside the Cargo roots and explicit non-Cargo assets owned by this split",
+    ))
+  }
+
+  fn logical_source_mutation_path(&self, path: &Path) -> RailResult<PathBuf> {
     let candidate = if path.is_absolute() {
       path.to_path_buf()
     } else {
       self.source_workspace.join(path)
     };
-    let resolved = resolve_allow_missing(&candidate, "sync source mutation path")?;
+    let file_name = candidate
+      .file_name()
+      .ok_or_else(|| boundary_error("sync source mutation path", &candidate, "does not identify a file"))?;
+    let parent = candidate
+      .parent()
+      .ok_or_else(|| boundary_error("sync source mutation path", &candidate, "has no parent directory"))?;
+    let mut resolved = resolve_allow_missing(parent, "sync source mutation parent")?;
+    resolved.push(file_name);
     if !resolved.starts_with(&self.source_workspace) {
       return Err(boundary_error(
         "sync source mutation path",
         &resolved,
-        "escapes the authorized source workspace (including through a symlink)",
+        "escapes the authorized source workspace (including through a parent symlink)",
       ));
     }
     Ok(resolved)
@@ -315,6 +356,32 @@ mod tests {
     let capabilities = SplitPathCapabilities::new(&source, &source, &[PathBuf::from("crates/demo")], &target).unwrap();
 
     assert!(capabilities.validate_target_repository().is_err());
+  }
+
+  #[test]
+  fn source_mutation_is_limited_to_crate_roots_and_exact_assets() {
+    let (temp, source, _crate_root) = roots();
+    let sibling = source.join("crates/sibling");
+    let asset = source.join("NOTICE");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(&asset, "notice").unwrap();
+    let target = temp.path().join("target");
+    let capabilities = SplitPathCapabilities::new(&source, &source, &[PathBuf::from("crates/demo")], &target)
+      .unwrap()
+      .with_asset_paths(&[PathBuf::from("NOTICE")])
+      .unwrap();
+
+    assert!(
+      capabilities
+        .authorize_source_mutation(Path::new("crates/demo/src/lib.rs"))
+        .is_ok()
+    );
+    assert!(capabilities.authorize_source_mutation(Path::new("NOTICE")).is_ok());
+    assert!(
+      capabilities
+        .authorize_source_mutation(Path::new("crates/sibling/src/lib.rs"))
+        .is_err()
+    );
   }
 
   #[cfg(unix)]

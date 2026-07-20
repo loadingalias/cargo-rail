@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - SystemGit backend using system git binary
-//! - Git-notes based commit mapping (rebase-safe)
+//! - Git-native commit-origin mapping with legacy note migration
 //! - Low-level git operations (rev-parse, cat-file, push, pull, etc.)
 //! - Smart defaults for git references
 
@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Smart defaults for git references
 pub mod defaults;
-/// Git-notes based commit mapping storage
+/// Git-native commit mapping storage and legacy note migration
 pub mod mappings;
 /// Git operations (commit, branch, push, pull, etc.)
 pub mod ops;
@@ -20,7 +20,7 @@ pub mod system;
 
 pub use defaults::detect_default_base_ref;
 pub use ops::LogEntry;
-pub use system::{CommitInfo, SystemGit, init_repo};
+pub use system::{CommitInfo, CommitMetadata, SystemGit, init_repo};
 
 pub(crate) fn git_command() -> Command {
   crate::instrumentation::record_git_subprocess();

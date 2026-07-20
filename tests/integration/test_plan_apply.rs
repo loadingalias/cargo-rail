@@ -46,7 +46,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/mylib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );
@@ -107,7 +106,6 @@ root = "."
 remote = "{}"
 branch = "main"
 mode = "single"
-paths = [{{ crate = "crates/mylib" }}]
 "#,
     split_dir.path().display().to_string().replace('\\', "\\\\")
   );

@@ -1958,7 +1958,8 @@ mod tests {
   #[test]
   fn release_branch_name_is_stable() {
     let plan = ReleasePlan {
-      plan_contract_version: 3,
+      plan_contract_version: 4,
+      snapshot_id: String::new(),
       source: crate::config::ReleaseSource::Changes,
       canonical_crate_order: Vec::new(),
       crates: Vec::new(),

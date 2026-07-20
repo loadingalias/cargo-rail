@@ -2,10 +2,13 @@
 
 use crate::config::{RailConfig, SplitConfig as ConfigSplitConfig};
 use crate::error::{ConfigError, RailError, RailResult};
-use crate::split::SplitParams;
+use crate::git::mappings::{HistorySide, MappingStore, repository_identity};
+use crate::split::{ReleaseBoundary, SplitOwnership, SplitParams};
 use crate::sync::SyncConfig;
 use crate::workspace::WorkspaceContext;
 use clap::ValueEnum;
+use glob::Pattern;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Render a deterministic preview for a potentially large list.
@@ -29,6 +32,24 @@ pub(crate) fn format_preview_list<T: AsRef<str>>(items: &[T], preview_limit: usi
   } else {
     format!("{preview}, ... +{} more", items.len() - preview_limit)
   }
+}
+
+pub(crate) fn split_mapping_count(
+  workspace_root: &std::path::Path,
+  crate_name: &str,
+  target_repo_path: &std::path::Path,
+) -> RailResult<usize> {
+  if !target_repo_path.join(".git").exists() {
+    return Ok(0);
+  }
+  let source_identity = repository_identity(workspace_root)?;
+  let target_identity = repository_identity(target_repo_path)?;
+  let mut store = MappingStore::new(crate_name.to_string());
+  store.load_history(workspace_root, HistorySide::Source, &target_identity)?;
+  store.load_history(target_repo_path, HistorySide::Target, &source_identity)?;
+  store.load_legacy_notes(workspace_root)?;
+  store.load_legacy_notes(target_repo_path)?;
+  Ok(store.count())
 }
 
 /// Output format for commands that support only human text and JSON.
@@ -219,6 +240,151 @@ pub fn enforce_safety_gate(
 }
 
 impl<'a> SplitSyncConfigBuilder<'a> {
+  fn resolve_ownership(&self, split_config: &ConfigSplitConfig) -> RailResult<(Vec<PathBuf>, SplitOwnership)> {
+    let snapshot = self.ctx.snapshot()?;
+    let graph = snapshot.base_resolution().graph();
+    let mut members = split_config.members.clone();
+    members.sort();
+    let original_len = members.len();
+    members.dedup();
+    if members.len() != original_len {
+      return Err(RailError::Config(ConfigError::InvalidField {
+        field: format!("crates.{}.split.members", split_config.name),
+        reason: "Cargo member names must be unique".to_string(),
+      }));
+    }
+
+    let mut crate_paths = Vec::with_capacity(members.len());
+    for member in &members {
+      let package = graph.workspace_package_by_name(member)?;
+      let snapshot_package = snapshot
+        .packages()
+        .iter()
+        .find(|candidate| candidate.id() == &package.id && candidate.is_workspace_member())
+        .ok_or_else(|| {
+          RailError::message(format!(
+            "workspace snapshot has no exact package identity for split member '{}'",
+            member
+          ))
+        })?;
+      let root = snapshot_package.package_root().ok_or_else(|| {
+        RailError::message(format!(
+          "split member '{}' has no source root in the workspace snapshot",
+          member
+        ))
+      })?;
+      crate_paths.push(root.to_path_buf());
+    }
+
+    let dependency_closure = graph.workspace_dependency_closure(&members)?;
+    let selected = members
+      .iter()
+      .map(String::as_str)
+      .collect::<std::collections::HashSet<_>>();
+    let mut release_boundaries = snapshot
+      .config()
+      .into_iter()
+      .flat_map(|config| &config.release.version_groups)
+      .filter(|(_, boundary_members)| boundary_members.iter().any(|member| selected.contains(member.as_str())))
+      .map(|(name, boundary_members)| {
+        let mut boundary_members = boundary_members.clone();
+        boundary_members.sort();
+        ReleaseBoundary {
+          name: name.clone(),
+          members: boundary_members,
+        }
+      })
+      .collect::<Vec<_>>();
+    release_boundaries.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok((
+      crate_paths,
+      SplitOwnership {
+        snapshot_id: snapshot.id().to_string(),
+        members,
+        dependency_closure,
+        release_boundaries,
+      },
+    ))
+  }
+
+  fn resolve_asset_paths(&self, split_config: &ConfigSplitConfig, crate_paths: &[PathBuf]) -> RailResult<Vec<PathBuf>> {
+    let compile = |field: &str, values: &[String]| {
+      values
+        .iter()
+        .map(|value| {
+          Pattern::new(value).map_err(|error| {
+            RailError::Config(ConfigError::InvalidField {
+              field: format!("crates.{}.split.{field}", split_config.name),
+              reason: format!("invalid glob '{value}': {error}"),
+            })
+          })
+        })
+        .collect::<RailResult<Vec<_>>>()
+    };
+    let includes = compile("include", &split_config.include)?;
+    let excludes = compile("exclude", &split_config.exclude)?;
+    let mut assets = self
+      .ctx
+      .snapshot()?
+      .source()
+      .tree()
+      .entries()
+      .iter()
+      .filter(|entry| includes.iter().any(|pattern| pattern.matches(entry.path.as_str())))
+      .filter(|entry| !excludes.iter().any(|pattern| pattern.matches(entry.path.as_str())))
+      .map(|entry| entry.path.as_path().to_path_buf())
+      .collect::<Vec<_>>();
+    assets.sort();
+    assets.dedup();
+
+    if let Some(path) = assets
+      .iter()
+      .find(|path| crate_paths.iter().any(|crate_root| path.starts_with(crate_root)))
+    {
+      return Err(RailError::Config(ConfigError::InvalidField {
+        field: format!("crates.{}.split.include", split_config.name),
+        reason: format!(
+          "'{}' is Cargo-owned; member roots are included automatically",
+          path.display()
+        ),
+      }));
+    }
+
+    if split_config.mode == crate::config::SplitMode::Single {
+      let crate_root = crate_paths
+        .first()
+        .ok_or_else(|| RailError::message("single split has no Cargo member root"))?;
+      let mut targets = BTreeMap::<PathBuf, PathBuf>::new();
+      for entry in self.ctx.snapshot()?.source().tree().entries() {
+        let source = entry.path.as_path();
+        let target = if let Ok(relative) = source.strip_prefix(crate_root) {
+          Some(relative.to_path_buf())
+        } else if assets.iter().any(|asset| asset == source) {
+          Some(source.to_path_buf())
+        } else {
+          None
+        };
+        let Some(target) = target else { continue };
+        if let Some(previous) = targets.insert(target.clone(), source.to_path_buf())
+          && previous != source
+        {
+          return Err(RailError::Config(ConfigError::InvalidField {
+            field: format!("crates.{}.split.include", split_config.name),
+            reason: format!(
+              "'{}' and '{}' both map to target path '{}'",
+              previous.display(),
+              source.display(),
+              target.display()
+            ),
+          }));
+        }
+      }
+    }
+
+    Ok(assets)
+  }
+
   /// Create a new builder from workspace context
   pub fn new(ctx: &'a WorkspaceContext) -> RailResult<Self> {
     let config = ctx.require_config()?.as_ref();
@@ -299,7 +465,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
     let mut configs = Vec::new();
 
     for split_config in &self.split_configs {
-      let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
+      let (crate_paths, ownership) = self.resolve_ownership(split_config)?;
+      let asset_paths = self.resolve_asset_paths(split_config, &crate_paths)?;
 
       // Apply remote override if provided
       let remote = self
@@ -317,19 +484,20 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         &self.ctx.git()?.git().worktree_root,
         &crate_paths,
         &target_repo_path,
-      )?;
+      )?
+      .with_asset_paths(&asset_paths)?;
       let target_repo_path = path_capabilities.target_root().to_path_buf();
 
       configs.push(SplitParams {
         crate_name: split_config.name.clone(),
         crate_paths,
+        asset_paths,
+        ownership,
         mode: split_config.mode.clone(),
         workspace_mode: split_config.workspace_mode.clone(),
         target_repo_path,
         branch: split_config.branch.clone(),
         remote_url: Some(remote),
-        include: split_config.include.clone(),
-        exclude: split_config.exclude.clone(),
         path_capabilities,
       });
     }
@@ -342,7 +510,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
     let mut configs = Vec::new();
 
     for split_config in &self.split_configs {
-      let crate_paths = split_config.get_paths().into_iter().cloned().collect::<Vec<_>>();
+      let (crate_paths, ownership) = self.resolve_ownership(split_config)?;
+      let asset_paths = self.resolve_asset_paths(split_config, &crate_paths)?;
 
       // Apply remote override if provided
       let remote = self
@@ -360,7 +529,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         &self.ctx.git()?.git().worktree_root,
         &crate_paths,
         &target_repo_path,
-      )?;
+      )?
+      .with_asset_paths(&asset_paths)?;
       let target_repo_path = path_capabilities.target_root().to_path_buf();
 
       let target_exists = target_repo_path.exists();
@@ -369,6 +539,8 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         SyncConfig {
           crate_name: split_config.name.clone(),
           crate_paths,
+          asset_paths,
+          ownership,
           mode: split_config.mode.clone(),
           workspace_mode: split_config.workspace_mode.clone(),
           target_repo_path,
