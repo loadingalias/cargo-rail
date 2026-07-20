@@ -5,6 +5,7 @@ use crate::commands::TextJsonOutputFormat;
 use crate::config::UnifyConfig;
 use crate::error::{RailError, RailResult};
 use crate::progress;
+use crate::release::state::{ReleasePhase, ReleaseState, ReleaseStatus, StepStatus, state_dir};
 use crate::workspace::WorkspaceContext;
 use std::fs;
 
@@ -13,6 +14,7 @@ struct CleanArtifacts {
   cache_files: Vec<String>,
   report_files: Vec<String>,
   backups: Vec<String>,
+  release_journals: Vec<String>,
 }
 
 impl CleanArtifacts {
@@ -21,15 +23,19 @@ impl CleanArtifacts {
       cache_files: Vec::new(),
       report_files: Vec::new(),
       backups: Vec::new(),
+      release_journals: Vec::new(),
     }
   }
 
   fn is_empty(&self) -> bool {
-    self.cache_files.is_empty() && self.report_files.is_empty() && self.backups.is_empty()
+    self.cache_files.is_empty()
+      && self.report_files.is_empty()
+      && self.backups.is_empty()
+      && self.release_journals.is_empty()
   }
 
   fn total_count(&self) -> usize {
-    self.cache_files.len() + self.report_files.len() + self.backups.len()
+    self.cache_files.len() + self.report_files.len() + self.backups.len() + self.release_journals.len()
   }
 }
 
@@ -69,6 +75,9 @@ pub fn run_clean(
   if prune_backups || delete_all_backups {
     collect_backup_artifacts(ctx, delete_all_backups, &mut artifacts)?;
   }
+  if clean_all {
+    collect_release_journal_artifacts(ctx, &mut artifacts)?;
+  }
 
   // Check mode: preview what would be cleaned
   if check {
@@ -81,6 +90,7 @@ pub fn run_clean(
           "cache": artifacts.cache_files,
           "reports": artifacts.report_files,
           "backups": artifacts.backups,
+          "release_journals": artifacts.release_journals,
         },
         "total": artifacts.total_count(),
         "has_changes": has_changes
@@ -103,6 +113,9 @@ pub fn run_clean(
       }
       for backup_id in &artifacts.backups {
         println!("  backup: {}", backup_id);
+      }
+      for path in &artifacts.release_journals {
+        println!("  release journal: {}", path);
       }
 
       if !artifacts.is_empty() {
@@ -132,6 +145,9 @@ pub fn run_clean(
   if prune_backups || delete_all_backups {
     cleaned.backups = clean_backups_handler(ctx, delete_all_backups)?;
   }
+  if clean_all {
+    cleaned.release_journals = clean_release_journals(&artifacts.release_journals)?;
+  }
 
   // Output results
   if json {
@@ -141,6 +157,7 @@ pub fn run_clean(
         "cache": cleaned.cache_files,
         "reports": cleaned.report_files,
         "backups": cleaned.backups,
+        "release_journals": cleaned.release_journals,
       },
       "total": cleaned.total_count()
     });
@@ -214,6 +231,62 @@ fn collect_backup_artifacts(
   }
 
   Ok(())
+}
+
+fn collect_release_journal_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) -> RailResult<()> {
+  let directory = state_dir(ctx.workspace_root());
+  if !directory.exists() {
+    return Ok(());
+  }
+  let mut paths = fs::read_dir(&directory)?
+    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+    .collect::<Vec<_>>();
+  paths.sort();
+  for path in paths {
+    let state = ReleaseState::load(&path).map_err(|error| {
+      RailError::with_help(
+        format!("release journal '{}' is ambiguous: {}", path.display(), error),
+        "inspect and recover it with 'cargo rail release status'; clean will not remove ambiguous state",
+      )
+    })?;
+    let superseded = state.status == ReleaseStatus::Active
+      && state.phase == ReleasePhase::Planned
+      && state
+        .crates
+        .iter()
+        .all(|crate_state| crate_state.commit.status == StepStatus::Pending)
+      && ctx.git()?.git().head_commit()? != state.initial_head;
+    if state.status == ReleaseStatus::Active && !superseded {
+      return Err(RailError::with_help(
+        format!(
+          "clean refused active release transaction '{}' in phase {}",
+          state.transaction_id,
+          state.phase.as_str()
+        ),
+        format!("resume or abort it first: cargo rail release status {}", path.display()),
+      ));
+    }
+    artifacts.release_journals.push(path.display().to_string());
+  }
+  Ok(())
+}
+
+fn clean_release_journals(paths: &[String]) -> RailResult<Vec<String>> {
+  let mut cleaned = Vec::with_capacity(paths.len());
+  for path in paths {
+    fs::remove_file(path).map_err(|error| {
+      RailError::with_help(
+        format!("failed to remove release journal '{}': {}", path, error),
+        "check file permissions and retry",
+      )
+    })?;
+    cleaned.push(path.clone());
+  }
+  if !cleaned.is_empty() {
+    progress!("removed {} terminal release journal(s)", cleaned.len());
+  }
+  Ok(cleaned)
 }
 
 fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {

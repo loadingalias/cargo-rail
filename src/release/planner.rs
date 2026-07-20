@@ -1,11 +1,12 @@
 //! Release planning and dry-run analysis
 
+use crate::change_detection::classify_path;
 use crate::config::{
-  ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, CommitPolicy, ReleaseConfig, SemverCheckPolicy,
+  ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, CommitPolicy, ReleaseConfig, ReleaseSource, SemverCheckPolicy,
 };
 use crate::error::{RailError, RailResult};
 use crate::release::attribution::{AttributedCommit, AttributedHistory, CommitAttributor};
-use crate::release::change_files::{ChangeIntent, PendingChangeSet, render_change_body};
+use crate::release::change_files::{ChangeBump, ChangeIntent, PendingChangeSet, render_change_body};
 use crate::release::changelog::{ChangelogSpec, CommitDiagnostic, CommitRef, resolve_links};
 use crate::release::process;
 use crate::release::semver_checks::{self, SemverCheck};
@@ -24,6 +25,9 @@ use std::path::{Path, PathBuf};
 pub struct ReleasePlan {
   /// Contract version for release plan schema.
   pub plan_contract_version: u32,
+  /// Authoritative input used for bump selection and changelog prose.
+  #[serde(default = "legacy_release_source")]
+  pub source: ReleaseSource,
   /// Canonical crate order (dependency order).
   pub canonical_crate_order: Vec<String>,
   /// Crates to release in dependency order
@@ -32,6 +36,9 @@ pub struct ReleasePlan {
   pub summary: ReleaseSummary,
   /// Pending change files consumed by this release plan.
   pub change_files_to_delete: Vec<PathBuf>,
+  /// Pending change files rewritten to retain unreleased no-release intent.
+  #[serde(default)]
+  pub change_files_to_update: Vec<PlannedChangeFileUpdate>,
   /// Target crates excluded from the plan, with the reason (auto mode only).
   pub skipped: Vec<SkippedCrate>,
 }
@@ -159,9 +166,18 @@ pub struct PlannedChangeEntry {
   /// Source change file path.
   pub path: PathBuf,
   /// Requested bump level.
-  pub bump: BumpLevel,
+  pub bump: ChangeBump,
   /// User-facing changelog body.
   pub body: String,
+}
+
+/// Exact retained content for a partially consumed change file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedChangeFileUpdate {
+  /// Change file rewritten by the release commit.
+  pub path: PathBuf,
+  /// Canonical content containing only retained no-release intents.
+  pub content: String,
 }
 
 /// Summary statistics for a release plan
@@ -214,7 +230,7 @@ impl<'a> ReleasePlanner<'a> {
     bump_request: &BumpRequest,
     dependent_policy: DependentPolicy,
   ) -> RailResult<ReleasePlan> {
-    if matches!(bump_request, BumpRequest::Auto) {
+    if matches!(bump_request, BumpRequest::Auto) && self.release_config.source.uses_commits() {
       ensure_not_shallow_for_auto_bump(self.ctx.workspace_root())?;
     }
 
@@ -226,11 +242,15 @@ impl<'a> ReleasePlanner<'a> {
     let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
     let mut histories: HashMap<HistoryKey, AttributedHistory> = HashMap::new();
     let workspace_members = self.ctx.graph().workspace_members();
-    let pending_changes = PendingChangeSet::load(
-      self.ctx.workspace_root(),
-      &self.release_config.change_dir,
-      workspace_members,
-    )?;
+    let pending_changes = if self.release_config.source.uses_changes() {
+      PendingChangeSet::load(
+        self.ctx.workspace_root(),
+        &self.release_config.change_dir,
+        workspace_members,
+      )?
+    } else {
+      PendingChangeSet::default()
+    };
 
     let mut skipped = Vec::new();
     for crate_name in &ordered_targets {
@@ -281,24 +301,32 @@ impl<'a> ReleasePlanner<'a> {
       crates_to_tag: crate_plans.len(),
     };
     let canonical_crate_order = crate_plans.iter().map(|plan| plan.name.clone()).collect();
-    let mut change_files_to_delete: Vec<PathBuf> = crate_plans
+    let mut selected_change_files: Vec<PathBuf> = crate_plans
       .iter()
       .flat_map(|plan| plan.change_entries.iter().map(|entry| entry.path.clone()))
       .collect();
-    change_files_to_delete.sort();
-    change_files_to_delete.dedup();
+    selected_change_files.sort();
+    selected_change_files.dedup();
 
-    // Consuming a change file deletes it in the release commit; every crate
-    // it names must be in this plan or its pending intent would be lost.
+    // Release-worthy entries are consumed atomically. No-release entries for
+    // crates outside the plan remain as reviewed coverage for their next
+    // actual release boundary.
     let planned_names: HashSet<&str> = crate_plans.iter().map(|plan| plan.name.as_str()).collect();
-    pending_changes.validate_consumable(&change_files_to_delete, &planned_names)?;
+    let consumption = pending_changes.plan_consumption(&selected_change_files, &planned_names)?;
+    let change_files_to_update = consumption
+      .update
+      .into_iter()
+      .map(|(path, content)| PlannedChangeFileUpdate { path, content })
+      .collect();
 
     Ok(ReleasePlan {
-      plan_contract_version: 2,
+      plan_contract_version: 3,
+      source: self.release_config.source,
       canonical_crate_order,
       crates: crate_plans,
       summary,
-      change_files_to_delete,
+      change_files_to_delete: consumption.delete,
+      change_files_to_update,
       skipped,
     })
   }
@@ -311,8 +339,10 @@ impl<'a> ReleasePlanner<'a> {
   /// the same effective changelog filters as bump inference, so a crate
   /// whose only changes sit in excluded paths is never gated.
   pub fn release_check_insights(&self, crate_names: &[String]) -> RailResult<ReleaseCheckInsights> {
-    let diagnose = self.release_config.unconventional_commits != CommitPolicy::Allow;
-    let gate = self.release_config.require_change_files.is_enabled();
+    let diagnose =
+      self.release_config.source.uses_commits() && self.release_config.unconventional_commits != CommitPolicy::Allow;
+    let gate =
+      self.release_config.source == ReleaseSource::Changes || self.release_config.require_change_files.is_enabled();
     let shallow_repository = is_shallow_repository(self.ctx.workspace_root())?;
     if !diagnose && !gate {
       return Ok(ReleaseCheckInsights {
@@ -331,6 +361,7 @@ impl<'a> ReleasePlanner<'a> {
       PendingChangeSet::default()
     };
     let mut histories: HashMap<HistoryKey, AttributedHistory> = HashMap::new();
+    let mut changed_code_by_base: HashMap<Option<String>, HashSet<String>> = HashMap::new();
     let attributor = CommitAttributor::new(self.ctx);
     let mut insights = ReleaseCheckInsights::default();
 
@@ -344,31 +375,65 @@ impl<'a> ReleasePlanner<'a> {
 
       let previous_tag = self.find_previous_tag(crate_name)?;
       let filters = effective_changelog_filters(&self.release_config.changelog.filters, changelog_config);
-      let history = history_for_range(&mut histories, &attributor, previous_tag, "HEAD", Some(filters))?;
 
-      if diagnose && !changelog_config.is_some_and(|config| config.skip) {
-        let commit_refs = history.commit_refs_for_crate(crate_name);
-        let spec = ChangelogSpec::resolve(&self.release_config.changelog, changelog_config)?;
-        let crate_diagnostics = spec.diagnose(&commit_refs);
-        if !crate_diagnostics.is_empty() {
-          insights
-            .commit_diagnostics
-            .push((crate_name.clone(), crate_diagnostics));
+      if diagnose || (gate && self.release_config.source != ReleaseSource::Changes) {
+        let history = history_for_range(&mut histories, &attributor, previous_tag.clone(), "HEAD", Some(filters))?;
+
+        if diagnose && !changelog_config.is_some_and(|config| config.skip) {
+          let commit_refs = history.commit_refs_for_crate(crate_name);
+          let spec = ChangelogSpec::resolve(&self.release_config.changelog, changelog_config)?;
+          let crate_diagnostics = spec.diagnose(&commit_refs);
+          if !crate_diagnostics.is_empty() {
+            insights
+              .commit_diagnostics
+              .push((crate_name.clone(), crate_diagnostics));
+          }
         }
       }
 
-      if gate
-        && self.release_config.require_change_files.applies_to(crate_name)
-        && !pending_changes.covers(crate_name)
-        && history.has_code_changes(crate_name)
-      {
-        insights.missing_change_files.push(crate_name.clone());
+      if gate && self.release_config.requires_change_file(crate_name) && !pending_changes.covers(crate_name) {
+        let has_code_changes = if self.release_config.source == ReleaseSource::Changes {
+          self
+            .changed_code_crates(previous_tag, &mut changed_code_by_base)?
+            .contains(crate_name)
+        } else {
+          let history = history_for_range(&mut histories, &attributor, previous_tag, "HEAD", Some(filters))?;
+          history.has_code_changes(crate_name)
+        };
+        if has_code_changes {
+          insights.missing_change_files.push(crate_name.clone());
+        }
       }
     }
 
     insights.missing_change_files.sort();
     insights.shallow_repository = shallow_repository;
     Ok(insights)
+  }
+
+  fn changed_code_crates<'b>(
+    &self,
+    base: Option<String>,
+    cache: &'b mut HashMap<Option<String>, HashSet<String>>,
+  ) -> RailResult<&'b HashSet<String>> {
+    if !cache.contains_key(&base) {
+      let mut crates = HashSet::new();
+      for repository_path in self.ctx.source_paths_since(base.as_deref())? {
+        let Some(workspace_path) = self.ctx.to_workspace_path(&repository_path) else {
+          continue;
+        };
+        if !classify_path(&workspace_path).seeds_build_test_transitive() {
+          continue;
+        }
+        if let Some(owner) = self.ctx.graph().file_to_crate(&workspace_path) {
+          crates.insert(owner);
+        }
+      }
+      cache.insert(base.clone(), crates);
+    }
+    cache
+      .get(&base)
+      .ok_or_else(|| RailError::message("internal error: missing cached release coverage"))
   }
 
   /// Build a finalize-only plan from current manifest versions.
@@ -380,6 +445,24 @@ impl<'a> ReleasePlanner<'a> {
     &self,
     crate_names: Option<Vec<String>>,
     dependent_policy: DependentPolicy,
+  ) -> RailResult<ReleasePlan> {
+    self.current_version_plan(crate_names, dependent_policy, true)
+  }
+
+  /// Rebuild post-commit release effects from an exact release checkout.
+  pub(crate) fn recovery_plan(
+    &self,
+    crate_names: Option<Vec<String>>,
+    dependent_policy: DependentPolicy,
+  ) -> RailResult<ReleasePlan> {
+    self.current_version_plan(crate_names, dependent_policy, false)
+  }
+
+  fn current_version_plan(
+    &self,
+    crate_names: Option<Vec<String>>,
+    dependent_policy: DependentPolicy,
+    require_changelog_entry: bool,
   ) -> RailResult<ReleasePlan> {
     let ordered_targets = self.resolve_targets(crate_names, dependent_policy)?;
     let mut crate_plans = Vec::with_capacity(ordered_targets.len());
@@ -401,7 +484,10 @@ impl<'a> ReleasePlanner<'a> {
       let changelog_config = crate_config.and_then(|config| config.changelog.as_ref());
       let changelog_path = self.resolve_changelog_path(&manifest_path, changelog_config)?;
       let generate_changelog = !changelog_config.is_some_and(|config| config.skip);
-      if generate_changelog && !changelog_contains_version_entry(&changelog_path, &current_version.to_string()) {
+      if require_changelog_entry
+        && generate_changelog
+        && !changelog_contains_version_entry(&changelog_path, &current_version.to_string())
+      {
         return Err(RailError::with_help(
           format!(
             "release finalize expected {} v{} in {}",
@@ -465,7 +551,8 @@ impl<'a> ReleasePlanner<'a> {
 
     let crates_to_publish = crate_plans.iter().filter(|plan| plan.publish).count();
     Ok(ReleasePlan {
-      plan_contract_version: 2,
+      plan_contract_version: 3,
+      source: self.release_config.source,
       canonical_crate_order: crate_plans.iter().map(|plan| plan.name.clone()).collect(),
       summary: ReleaseSummary {
         total_crates: crate_plans.len(),
@@ -474,6 +561,7 @@ impl<'a> ReleasePlanner<'a> {
       },
       crates: crate_plans,
       change_files_to_delete: Vec::new(),
+      change_files_to_update: Vec::new(),
       skipped: Vec::new(),
     })
   }
@@ -510,19 +598,27 @@ impl<'a> ReleasePlanner<'a> {
 
     let generate_changelog = !changelog_config.is_some_and(|changelog_cfg| changelog_cfg.skip);
 
-    let filters = effective_changelog_filters(&self.release_config.changelog.filters, changelog_config);
-    let attributor = CommitAttributor::new(self.ctx);
-    let history = history_for_range(histories, &attributor, previous_tag.clone(), "HEAD", Some(filters))?;
-    let attributed: Vec<&AttributedCommit> = history.for_crate(crate_name).collect();
-    let commits = planned_commits(&attributed);
-    let commit_refs: Vec<CommitRef<'_>> = attributed.iter().map(|commit| commit.as_ref()).collect();
+    let (commits, commit_refs) = if self.release_config.source.uses_commits() {
+      let filters = effective_changelog_filters(&self.release_config.changelog.filters, changelog_config);
+      let attributor = CommitAttributor::new(self.ctx);
+      let history = history_for_range(histories, &attributor, previous_tag.clone(), "HEAD", Some(filters))?;
+      let attributed: Vec<&AttributedCommit> = history.for_crate(crate_name).collect();
+      let commits = planned_commits(&attributed);
+      let commit_refs = attributed.iter().map(|commit| commit.as_ref()).collect();
+      (commits, commit_refs)
+    } else {
+      (Vec::new(), Vec::new())
+    };
     let inferred_bump = commits
       .iter()
       .filter_map(|commit| bump_level_from_str(commit.bump.as_deref()))
       .max();
     let dependency_updates = self.dependency_updates(package, version_map);
     let change_entries = planned_change_entries(pending_changes.for_crate(crate_name));
-    let change_bump = change_entries.iter().map(|entry| entry.bump).max();
+    let change_bump = change_entries
+      .iter()
+      .filter_map(|entry| entry.bump.release_level())
+      .max();
 
     // Check if should publish - per-crate config takes priority, then Cargo.toml
     let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
@@ -531,16 +627,14 @@ impl<'a> ReleasePlanner<'a> {
       .map(|r| r.publish)
       .unwrap_or(publish_from_cargo);
 
-    // Unpublished crates have no crates.io baseline to compare against, so
-    // the API check only runs for crates that actually publish.
-    let semver_breaking = if publish && matches!(bump_request, BumpRequest::Auto) {
-      self.semver_breaking_signal(crate_name)
-    } else {
-      None
-    };
-    let semver_bump = semver_breaking.as_ref().map(|_| BumpLevel::Major);
-    let explicit_signal = [change_bump, inferred_bump, semver_bump].into_iter().flatten().max();
+    let explicit_signal = [change_bump, inferred_bump].into_iter().flatten().max();
     let natural_level = explicit_signal.or_else(|| (!dependency_updates.is_empty()).then_some(BumpLevel::Patch));
+
+    // cargo-semver-checks validates reviewed intent; it never invents or
+    // escalates a release. A confirmed mismatch returns to the author.
+    if publish {
+      self.validate_semver_intent(crate_name, explicit_signal)?;
+    }
 
     let (bump_type, bump_reason, planned_auto_level) = match bump_request {
       BumpRequest::Explicit(bump_type) => (bump_type.clone(), "explicit".to_string(), None),
@@ -550,13 +644,7 @@ impl<'a> ReleasePlanner<'a> {
         } else if let Some(level) = natural_level {
           (
             level,
-            auto_bump_reason(
-              level,
-              change_bump,
-              inferred_bump,
-              semver_bump,
-              !dependency_updates.is_empty(),
-            ),
+            auto_bump_reason(level, change_bump, inferred_bump, !dependency_updates.is_empty()),
           )
         } else if change_bump.is_some() {
           unreachable!("change_bump contributes to natural_level")
@@ -568,8 +656,9 @@ impl<'a> ReleasePlanner<'a> {
           return Ok(CratePlanOutcome::Skipped(SkippedCrate {
             name: crate_name.to_string(),
             reason: format!(
-              "auto: no release-worthy changes {} (no qualifying commits, change files, or dependency updates)",
-              since
+              "auto: no release-worthy changes {} ({})",
+              since,
+              no_release_signal_reason(self.release_config.source)
             ),
           }));
         };
@@ -607,6 +696,7 @@ impl<'a> ReleasePlanner<'a> {
     });
     let mut highlights: Vec<String> = change_entries
       .iter()
+      .filter(|entry| entry.bump.release_level().is_some())
       .map(|entry| render_change_body(&entry.body))
       .collect();
     if let Some(entry) = &version_group_entry {
@@ -617,12 +707,16 @@ impl<'a> ReleasePlanner<'a> {
     } else {
       String::new()
     };
-    let changelog_entries = if generate_changelog {
+    let changelog_entries = if generate_changelog && self.release_config.source.uses_commits() {
       structured_changelog_entries(crate_name, &spec, &commit_refs, &commits)
     } else {
       Vec::new()
     };
-    let commit_diagnostics = spec.diagnose(&commit_refs);
+    let commit_diagnostics = if self.release_config.source.uses_commits() {
+      spec.diagnose(&commit_refs)
+    } else {
+      Vec::new()
+    };
 
     let bump = format!("{} -> {}", current_version, new_version);
     let publish_intent = if publish {
@@ -823,6 +917,7 @@ impl<'a> ReleasePlanner<'a> {
     let mut highlights: Vec<String> = plan
       .change_entries
       .iter()
+      .filter(|entry| entry.bump.release_level().is_some())
       .map(|entry| render_change_body(&entry.body))
       .collect();
     if let Some(entry) = &plan.version_group_entry {
@@ -877,6 +972,36 @@ impl<'a> ReleasePlanner<'a> {
       Ok(SemverCheck::Breaking { message }) => Some(message),
       Ok(SemverCheck::Pass | SemverCheck::Inconclusive { .. }) | Err(_) => None,
     }
+  }
+
+  fn validate_semver_intent(&self, crate_name: &str, declared_level: Option<BumpLevel>) -> RailResult<()> {
+    if declared_level >= Some(BumpLevel::Major) {
+      return Ok(());
+    }
+    let Some(message) = self.semver_breaking_signal(crate_name) else {
+      return Ok(());
+    };
+
+    let help = if self.release_config.source == ReleaseSource::Changes {
+      format!(
+        "revise the reviewed change entry for '{}' to use bump \"major\", then rerun the release plan",
+        crate_name
+      )
+    } else {
+      format!(
+        "record a breaking conventional commit for '{}', or select an explicit major bump",
+        crate_name
+      )
+    };
+    Err(RailError::with_help(
+      format!(
+        "cargo-semver-checks requires a major release for '{}', but the declared release intent is {}: {}",
+        crate_name,
+        declared_level.map_or("none", |level| level.as_str()),
+        message
+      ),
+      help,
+    ))
   }
 
   fn semver_available(&self) -> bool {
@@ -1278,28 +1403,29 @@ fn auto_bump_reason(
   level: BumpLevel,
   change_bump: Option<BumpLevel>,
   inferred_bump: Option<BumpLevel>,
-  semver_bump: Option<BumpLevel>,
   has_dependency_updates: bool,
 ) -> String {
-  if semver_bump == Some(BumpLevel::Major)
-    && [change_bump, inferred_bump]
-      .into_iter()
-      .flatten()
-      .max()
-      .is_some_and(|base| base < BumpLevel::Major)
-  {
-    format!("auto: cargo-semver-checks escalated to {}", level)
-  } else if change_bump.is_some() {
-    format!("auto: change files -> {}", level)
+  if change_bump.is_some() {
+    format!("auto: reviewed change files -> {}", level)
   } else if inferred_bump.is_some() {
     format!("auto: conventional commits -> {}", level)
-  } else if semver_bump.is_some() {
-    format!("auto: cargo-semver-checks -> {}", level)
   } else if has_dependency_updates {
     "auto: dependent closure -> patch".to_string()
   } else {
     format!("auto: {}", level)
   }
+}
+
+fn no_release_signal_reason(source: ReleaseSource) -> &'static str {
+  match source {
+    ReleaseSource::Changes => "no reviewed release intent or dependency updates",
+    ReleaseSource::Commits => "no qualifying conventional commits or dependency updates",
+    ReleaseSource::Both => "no qualifying reviewed intent, conventional commits, or dependency updates",
+  }
+}
+
+fn legacy_release_source() -> ReleaseSource {
+  ReleaseSource::Both
 }
 
 fn changelog_contains_version_entry(path: &Path, version: &str) -> bool {

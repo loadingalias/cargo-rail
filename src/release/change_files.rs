@@ -6,7 +6,7 @@
 use crate::error::{RailError, RailResult};
 use crate::release::version::BumpLevel;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -19,6 +19,65 @@ pub const LEGACY_CHANGE_DIR: &str = ".rail/changes";
 
 const LEGACY_CHANGE_DIR_HINT: &str = "move files to .changes/ (git mv .rail/changes .changes)";
 
+/// Reviewed release intent for one crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeBump {
+  /// The code change is intentionally not release-worthy.
+  None,
+  /// Release a patch version.
+  Patch,
+  /// Release a minor version.
+  Minor,
+  /// Release a major version.
+  Major,
+}
+
+impl ChangeBump {
+  /// Convert release-worthy intent into its semantic bump level.
+  pub const fn release_level(self) -> Option<BumpLevel> {
+    match self {
+      Self::None => None,
+      Self::Patch => Some(BumpLevel::Patch),
+      Self::Minor => Some(BumpLevel::Minor),
+      Self::Major => Some(BumpLevel::Major),
+    }
+  }
+
+  /// Canonical spelling used by change files and command output.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::None => "none",
+      Self::Patch => "patch",
+      Self::Minor => "minor",
+      Self::Major => "major",
+    }
+  }
+}
+
+impl std::str::FromStr for ChangeBump {
+  type Err = RailError;
+
+  fn from_str(value: &str) -> Result<Self, Self::Err> {
+    match value.to_ascii_lowercase().as_str() {
+      "none" | "no-release" => Ok(Self::None),
+      "patch" => Ok(Self::Patch),
+      "minor" => Ok(Self::Minor),
+      "major" => Ok(Self::Major),
+      _ => Err(RailError::with_help(
+        format!("invalid change intent: {}", value),
+        "use 'none', 'patch', 'minor', or 'major'",
+      )),
+    }
+  }
+}
+
+impl std::fmt::Display for ChangeBump {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(self.as_str())
+  }
+}
+
 /// One crate intent from a change file.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeIntent {
@@ -27,7 +86,7 @@ pub struct ChangeIntent {
   /// Crate covered by this intent.
   pub crate_name: String,
   /// Requested bump level.
-  pub bump: BumpLevel,
+  pub bump: ChangeBump,
   /// User-facing changelog body.
   pub body: String,
 }
@@ -49,7 +108,7 @@ pub struct CrateChangeSummary {
   /// Crate covered by one or more pending files.
   pub crate_name: String,
   /// Maximum pending bump for the crate.
-  pub bump: BumpLevel,
+  pub bump: ChangeBump,
   /// Number of pending files that mention this crate.
   pub file_count: usize,
 }
@@ -60,6 +119,14 @@ pub struct PendingChangeSet {
   /// Parsed files in deterministic path order.
   pub files: Vec<ChangeFile>,
   by_crate: FxHashMap<String, Vec<ChangeIntent>>,
+}
+
+/// Exact change-file mutations needed to consume one release plan.
+pub(crate) struct ChangeFileConsumption {
+  /// Files whose intents are all consumed by the release.
+  pub delete: Vec<PathBuf>,
+  /// Files rewritten to retain no-release intents for unreleased crates.
+  pub update: Vec<(PathBuf, String)>,
 }
 
 impl PendingChangeSet {
@@ -139,16 +206,19 @@ impl PendingChangeSet {
     summaries
   }
 
-  /// Reject consuming a change file whose crates are not all in the plan.
+  /// Plan lossless consumption for change files touched by a release.
   ///
-  /// Consumption deletes the file in the release commit; a partially covered
-  /// file would silently destroy the unreleased crates' pending intents.
-  pub fn validate_consumable(
+  /// Release-worthy intents are atomic: a shared file cannot be consumed
+  /// unless every release-worthy crate it names is in the plan. No-release
+  /// intents for other crates are retained by rewriting the frontmatter.
+  pub(crate) fn plan_consumption(
     &self,
-    consumed: &[std::path::PathBuf],
+    consumed: &[PathBuf],
     planned: &std::collections::HashSet<&str>,
-  ) -> RailResult<()> {
+  ) -> RailResult<ChangeFileConsumption> {
     let mut partial: Vec<String> = Vec::new();
+    let mut delete = Vec::new();
+    let mut update = Vec::new();
     for file in &self.files {
       if !consumed.contains(&file.path) {
         continue;
@@ -156,17 +226,31 @@ impl PendingChangeSet {
       let mut missing: Vec<&str> = file
         .intents
         .iter()
+        .filter(|intent| intent.bump.release_level().is_some())
         .map(|intent| intent.crate_name.as_str())
         .filter(|name| !planned.contains(name))
         .collect();
       if !missing.is_empty() {
         missing.sort_unstable();
         partial.push(format!("{} (missing: {})", file.path.display(), missing.join(", ")));
+        continue;
+      }
+
+      let retained: BTreeMap<_, _> = file
+        .intents
+        .iter()
+        .filter(|intent| !planned.contains(intent.crate_name.as_str()))
+        .map(|intent| (intent.crate_name.clone(), intent.bump))
+        .collect();
+      if retained.is_empty() {
+        delete.push(file.path.clone());
+      } else {
+        update.push((file.path.clone(), render_change_content(&retained, &file.body)));
       }
     }
 
     if partial.is_empty() {
-      return Ok(());
+      return Ok(ChangeFileConsumption { delete, update });
     }
 
     Err(RailError::with_help(
@@ -174,7 +258,7 @@ impl PendingChangeSet {
         "release would consume change file(s) naming crates outside this plan:\n  {}",
         partial.join("\n  ")
       ),
-      "release every crate the change file names together, or split it into one file per release group",
+      "release every release-worthy crate the change file names together, or split it into one file per release group",
     ))
   }
 }
@@ -197,7 +281,7 @@ pub fn write_change_file(
   workspace_root: &Path,
   change_dir: &str,
   workspace_members: &[String],
-  intents: &BTreeMap<String, BumpLevel>,
+  intents: &BTreeMap<String, ChangeBump>,
   body: &str,
   name_override: Option<&str>,
 ) -> RailResult<ChangeFile> {
@@ -242,7 +326,7 @@ pub fn write_change_file(
 }
 
 /// Render canonical change-file content from validated intents and body.
-pub fn render_change_content(intents: &BTreeMap<String, BumpLevel>, body: &str) -> String {
+pub fn render_change_content(intents: &BTreeMap<String, ChangeBump>, body: &str) -> String {
   let mut content = String::from("---\n");
   for (crate_name, bump) in intents {
     content.push_str(&format!("\"{}\" = \"{}\"\n", crate_name, bump.as_str()));
@@ -312,11 +396,11 @@ pub(crate) fn parse_change_file(
   })
 }
 
-fn validate_intents(intents: &BTreeMap<String, BumpLevel>, workspace_members: &FxHashSet<&str>) -> RailResult<()> {
+fn validate_intents(intents: &BTreeMap<String, ChangeBump>, workspace_members: &FxHashSet<&str>) -> RailResult<()> {
   if intents.is_empty() {
     return Err(RailError::with_help(
       "change add requires at least one crate",
-      "usage: cargo rail change add <CRATE...> --bump patch --message \"user-facing change\"",
+      "usage: cargo rail change add <CRATE...> --bump <none|patch|minor|major> --message \"reviewed intent\"",
     ));
   }
 
@@ -467,9 +551,24 @@ Added auto bump planning.
     let file = parse_change_file(&path, content, &member_set).unwrap();
     assert_eq!(file.intents.len(), 2);
     assert_eq!(file.intents[0].crate_name, "rail-cli");
-    assert_eq!(file.intents[0].bump, BumpLevel::Patch);
-    assert_eq!(file.intents[1].bump, BumpLevel::Minor);
+    assert_eq!(file.intents[0].bump, ChangeBump::Patch);
+    assert_eq!(file.intents[1].bump, ChangeBump::Minor);
     assert_eq!(file.body, "Added auto bump planning.");
+  }
+
+  #[test]
+  fn parses_explicit_no_release_intent() {
+    let members = members();
+    let member_set: FxHashSet<&str> = members.iter().map(String::as_str).collect();
+    let file = parse_change_file(
+      Path::new(".changes/no-release.md"),
+      "---\n\"rail-core\" = \"none\"\n---\n\nInternal refactor with no shipped behavior change.\n",
+      &member_set,
+    )
+    .unwrap();
+
+    assert_eq!(file.intents[0].bump, ChangeBump::None);
+    assert_eq!(file.intents[0].bump.release_level(), None);
   }
 
   #[test]
@@ -513,7 +612,7 @@ Added auto bump planning.
   #[test]
   fn content_hash_is_stable() {
     let mut intents = BTreeMap::new();
-    intents.insert("rail-core".to_string(), BumpLevel::Minor);
+    intents.insert("rail-core".to_string(), ChangeBump::Minor);
     let content = render_change_content(&intents, "Added reviewed release intent.");
     assert_eq!(hash4(&content), hash4(&content));
     assert_ne!(hash4(&content), hash4(&content.replace("Added", "Changed")));

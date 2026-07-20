@@ -3,6 +3,20 @@
 use super::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
+fn add_no_release_intent(ws: &TestWorkspace, crate_names: &[&str]) -> Result<()> {
+  let entries = crate_names
+    .iter()
+    .map(|crate_name| format!("\"{}\" = \"none\"", crate_name))
+    .collect::<Vec<_>>()
+    .join("\n");
+  std::fs::create_dir_all(ws.path.join(".changes"))?;
+  std::fs::write(
+    ws.path.join(".changes/check-coverage.md"),
+    format!("---\n{}\n---\n\nNo released behavior changed.\n", entries),
+  )?;
+  Ok(())
+}
+
 /// Test check command validates crate exists
 #[test]
 fn test_check_validates_crate_exists() -> Result<()> {
@@ -57,6 +71,7 @@ require_clean = false
 "#,
   )?;
 
+  add_no_release_intent(&ws, &["valid-crate"])?;
   ws.commit("Add valid-crate with release config")?;
 
   // Check should pass
@@ -97,6 +112,7 @@ require_clean = false
 "#,
   )?;
 
+  add_no_release_intent(&ws, &["crate-a", "crate-b"])?;
   ws.commit("Add crates with release config")?;
 
   // Check all should pass
@@ -117,9 +133,9 @@ require_clean = false
   Ok(())
 }
 
-/// Test check fails when require_clean is true and there are uncommitted changes
+/// Test check remains a read-only preview when the worktree is dirty.
 #[test]
-fn test_check_fails_with_uncommitted_changes() -> Result<()> {
+fn test_check_tolerates_dirty_preview_despite_legacy_require_clean() -> Result<()> {
   let ws = TestWorkspace::new_named("check-dirty")?;
 
   // Add a crate
@@ -136,6 +152,7 @@ require_clean = true
 "#,
   )?;
 
+  add_no_release_intent(&ws, &["dirty-crate"])?;
   ws.commit("Add dirty-crate with config")?;
 
   // Create uncommitted change
@@ -144,15 +161,14 @@ require_clean = true
     "pub fn hello() { /* modified */ }",
   )?;
 
-  // Check should fail
+  // Preview should succeed. Exact dirt is enforced against the bound release
+  // plan at the first write, not by this read-only command.
   let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "dirty-crate"])?;
-  assert!(!output.status.success(), "check should fail with uncommitted changes");
-
-  let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    stderr.contains("uncommitted") || stderr.contains("changes") || stderr.contains("clean"),
-    "Should mention uncommitted changes. stderr: {}",
-    stderr
+    output.status.success(),
+    "read-only release check should tolerate dirt.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
   );
 
   Ok(())
@@ -195,6 +211,7 @@ require_clean = false
 "#,
   )?;
 
+  add_no_release_intent(&ws, &["private-crate"])?;
   ws.commit("Add private-crate with config")?;
 
   // Check should succeed and report the crate as not publishable
@@ -237,6 +254,7 @@ require_clean = false
 "#,
   )?;
 
+  add_no_release_intent(&ws, &["some-crate"])?;
   ws.commit("Add some-crate with release config")?;
 
   // Check should pass with proper config

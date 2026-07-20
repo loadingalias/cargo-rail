@@ -1,12 +1,14 @@
 //! `cargo rail change` - intent-file management.
 
+use crate::change_detection::classify_path;
 use crate::commands::common::ChangeOutputFormat;
-use crate::config::{ChangelogConfig, ChangelogFilters, ReleaseConfig};
+use crate::config::{ChangelogConfig, ChangelogFilters, ReleaseConfig, ReleaseSource};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::release::attribution::{AttributedHistory, CommitAttributor};
-use crate::release::change_files::{PendingChangeSet, parse_change_file, render_change_content, write_change_file};
-use crate::release::version::BumpLevel;
+use crate::release::change_files::{
+  ChangeBump, PendingChangeSet, parse_change_file, render_change_content, write_change_file,
+};
 use crate::workspace::WorkspaceContext;
 use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
@@ -46,10 +48,10 @@ pub fn run_change_add(
   if crate_names.is_empty() {
     return Err(RailError::with_help(
       "change add requires at least one crate",
-      "usage: cargo rail change add <CRATE...> --bump patch --message \"user-facing change\"",
+      "usage: cargo rail change add <CRATE...> --bump <none|patch|minor|major> --message \"reviewed intent\"",
     ));
   }
-  let bump = bump.parse::<BumpLevel>()?;
+  let bump = bump.parse::<ChangeBump>()?;
 
   let workspace_members = ctx.graph().workspace_members();
   for crate_name in &crate_names {
@@ -202,7 +204,7 @@ pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> 
   let missing_change_files: Vec<_> = changed_code_crates
     .iter()
     .filter(|crate_name| !pending.covers(crate_name))
-    .filter(|crate_name| options.required || release_config.require_change_files.applies_to(crate_name.as_str()))
+    .filter(|crate_name| options.required || release_config.requires_change_file(crate_name))
     .cloned()
     .collect();
 
@@ -267,6 +269,24 @@ fn changed_code_crates(
   base: Option<&str>,
   workspace_members: &[String],
 ) -> RailResult<Vec<String>> {
+  if release_config.source == ReleaseSource::Changes {
+    let mut changed = FxHashSet::default();
+    for repository_path in ctx.source_paths_since(base)? {
+      let Some(workspace_path) = ctx.to_workspace_path(&repository_path) else {
+        continue;
+      };
+      if !classify_path(&workspace_path).seeds_build_test_transitive() {
+        continue;
+      }
+      if let Some(owner) = ctx.graph().file_to_crate(&workspace_path) {
+        changed.insert(owner);
+      }
+    }
+    let mut changed: Vec<_> = changed.into_iter().collect();
+    changed.sort();
+    return Ok(changed);
+  }
+
   let attributor = CommitAttributor::new(ctx);
   let mut histories: BTreeMap<HistoryKey, AttributedHistory> = BTreeMap::new();
   let mut changed = Vec::new();
@@ -400,11 +420,11 @@ fn list_or_none(items: &[String]) -> String {
 }
 
 struct EditedChange {
-  intents: BTreeMap<String, BumpLevel>,
+  intents: BTreeMap<String, ChangeBump>,
   body: String,
 }
 
-fn base_intents(crate_names: Vec<String>, bump: BumpLevel) -> BTreeMap<String, BumpLevel> {
+fn base_intents(crate_names: Vec<String>, bump: ChangeBump) -> BTreeMap<String, ChangeBump> {
   crate_names.into_iter().map(|crate_name| (crate_name, bump)).collect()
 }
 
@@ -420,7 +440,7 @@ fn edit_change_file(
   workspace_root: &Path,
   change_dir: &str,
   workspace_members: &[String],
-  intents: &BTreeMap<String, BumpLevel>,
+  intents: &BTreeMap<String, ChangeBump>,
 ) -> RailResult<EditedChange> {
   let editor = std::env::var("VISUAL")
     .ok()
@@ -439,7 +459,7 @@ fn edit_change_file_with_editor(
   workspace_root: &Path,
   change_dir: &str,
   workspace_members: &[String],
-  intents: &BTreeMap<String, BumpLevel>,
+  intents: &BTreeMap<String, ChangeBump>,
   editor: &str,
 ) -> RailResult<EditedChange> {
   let dir = workspace_root.join(change_dir);
@@ -473,7 +493,7 @@ fn edit_change_file_with_editor(
   })
 }
 
-fn editor_template(intents: &BTreeMap<String, BumpLevel>) -> String {
+fn editor_template(intents: &BTreeMap<String, ChangeBump>) -> String {
   let body = "# Write the user-facing changelog entry below.\n# Lines starting with # are ignored.\n";
   render_change_content(intents, body)
 }
@@ -566,7 +586,7 @@ printf '\nEdited body from editor.\n' >> "$1"
     fs::set_permissions(&editor, perms).unwrap();
 
     let mut intents = BTreeMap::new();
-    intents.insert("rail-core".to_string(), BumpLevel::Minor);
+    intents.insert("rail-core".to_string(), ChangeBump::Minor);
     let members = vec!["rail-core".to_string()];
     let edited = edit_change_file_with_editor(
       root.path(),
@@ -578,6 +598,6 @@ printf '\nEdited body from editor.\n' >> "$1"
     .unwrap();
 
     assert_eq!(edited.body, "Edited body from editor.");
-    assert_eq!(edited.intents.get("rail-core"), Some(&BumpLevel::Minor));
+    assert_eq!(edited.intents.get("rail-core"), Some(&ChangeBump::Minor));
   }
 }

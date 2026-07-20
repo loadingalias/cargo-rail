@@ -62,12 +62,13 @@ Use `run` directly or feed `plan -f github` into existing CI jobs. No duplicated
 
 ## Release
 
-Record release intent in the pull request that introduces the change. `release` combines reviewed change files with conventional commits, dependency cascades, changelog generation, readiness checks, publish ordering, tags, and forge releases.
+Record release intent in the pull request that introduces the change. Reviewed `.changes/` entries are the default and sole source of automatic bumps and release prose; conventional commits are available only through explicit compatibility modes. Dependency cascades remain synthesized by cargo-rail.
 
 ```bash
 cargo rail change add my-crate --bump minor --message "Added graph-aware planning."
-cargo rail change check --merge-base --required
-cargo rail release run --all --bump auto --pr --check
+cargo rail change add my-crate --bump none --message "Internal refactor; no released behavior changed."
+cargo rail change check --merge-base
+cargo rail release run --all --pr --check
 ```
 
 After the release PR merges:
@@ -76,7 +77,16 @@ After the release PR merges:
 cargo rail release finalize --all --yes
 ```
 
-Interrupted releases are resumable. Optional `cargo-semver-checks` analysis runs as an external command instead of expanding cargo-rail's installed dependency graph.
+Release execution is journaled as `planned → prepared → awaiting_checks → ready → publishing → released`. A plan-bound `Rail-Release` trailer identifies every release commit. For remote releases, cargo-rail pushes the exact commit first, waits without polling until GitHub or GitLab reports that SHA green, publishes packages in dependency order, and creates/pushes tags only after every required version is observable. Inspect interruption or convergence state without loading Cargo metadata:
+
+```bash
+cargo rail release status
+cargo rail release resume target/cargo-rail/releases/release-<id>.json
+# In another checkout with no journal:
+cargo rail release resume release-<transaction-id>
+```
+
+`cargo rail clean` refuses active or ambiguous release state and prunes terminal journals. Optional `cargo-semver-checks` analysis validates reviewed intent: a confirmed breaking change with an insufficient entry blocks and returns the plan to the author instead of silently escalating the bump.
 
 ## Split and sync
 

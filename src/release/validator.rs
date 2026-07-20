@@ -2,6 +2,7 @@
 
 use crate::config::{ChangelogRelativeTo, ReleaseConfig, SemverCheckPolicy};
 use crate::error::{RailError, RailResult};
+use crate::release::change_files::PendingChangeSet;
 use crate::release::planner::ReleasePlan;
 use crate::release::process;
 use crate::release::semver_checks;
@@ -126,7 +127,7 @@ impl<'a> ReleaseValidator<'a> {
     if !self.ctx.changed_source_paths()?.is_empty() {
       return Err(RailError::with_help(
         "Working directory has uncommitted changes",
-        "Commit or stash your changes before releasing, or set require_clean = false in [release] section of rail.toml",
+        "commit or restore every unbound path before starting release effects",
       ));
     }
 
@@ -526,13 +527,34 @@ impl<'a> ReleaseValidator<'a> {
   /// Inconclusive runs — no published baseline, network or build failures —
   /// report as skipped so a crate's first release never fails on a
   /// comparison that cannot exist.
-  fn validate_semver_checks(&self, crate_name: &str, policy: SemverCheckPolicy) -> ValidationResult {
+  fn validate_semver_checks(
+    &self,
+    crate_name: &str,
+    policy: SemverCheckPolicy,
+    reviewed_level: Option<crate::release::version::BumpLevel>,
+    reviewed_source: bool,
+  ) -> ValidationResult {
     use crate::release::semver_checks::SemverCheck;
 
     match semver_checks::check_release(self.ctx, crate_name) {
       Ok(SemverCheck::Pass) => ValidationResult::passed("semver-checks", "no semver-breaking API changes detected"),
       Ok(SemverCheck::Breaking { message }) => {
-        if policy == SemverCheckPolicy::Deny {
+        if reviewed_source && reviewed_level < Some(crate::release::version::BumpLevel::Major) {
+          ValidationResult::failed(
+            "semver-checks",
+            format!(
+              "{}; reviewed intent is {}: revise the change entry for '{}' to major",
+              message,
+              reviewed_level.map_or("none", |level| level.as_str()),
+              crate_name
+            ),
+          )
+        } else if reviewed_source {
+          ValidationResult::passed(
+            "semver-checks",
+            "breaking API change is covered by reviewed major intent",
+          )
+        } else if policy == SemverCheckPolicy::Deny {
           ValidationResult::failed("semver-checks", message)
         } else {
           ValidationResult::passed("semver-checks", format!("advisory: {}", message))
@@ -551,38 +573,62 @@ impl<'a> ReleaseValidator<'a> {
   pub fn validate_extended(
     &self,
     crate_names: &[String],
-    semver_policy: SemverCheckPolicy,
-  ) -> Vec<(String, Vec<ValidationResult>)> {
+    release_config: &ReleaseConfig,
+  ) -> RailResult<Vec<(String, Vec<ValidationResult>)>> {
+    let semver_policy = release_config.semver_check;
     let semver_available =
       semver_policy == SemverCheckPolicy::Off || semver_checks::is_available(self.ctx.workspace_root());
     let mut emitted_semver_missing = false;
+    let pending_changes = if release_config.source.uses_changes() {
+      Some(PendingChangeSet::load(
+        self.ctx.workspace_root(),
+        &release_config.change_dir,
+        self.ctx.graph().workspace_members(),
+      )?)
+    } else {
+      None
+    };
 
-    crate_names
-      .iter()
-      .map(|crate_name| {
-        let mut results = vec![
-          self.validate_publish_dry_run(crate_name),
-          self.validate_msrv(crate_name),
-        ];
+    Ok(
+      crate_names
+        .iter()
+        .map(|crate_name| {
+          let mut results = vec![
+            self.validate_publish_dry_run(crate_name),
+            self.validate_msrv(crate_name),
+          ];
 
-        if semver_policy != SemverCheckPolicy::Off {
-          if !semver_available {
-            if !emitted_semver_missing {
-              results.push(ValidationResult::passed(
-                "semver-checks",
-                "cargo-semver-checks not installed (skipped; install with: cargo install cargo-semver-checks)",
+          if semver_policy != SemverCheckPolicy::Off {
+            if !semver_available {
+              if !emitted_semver_missing {
+                results.push(ValidationResult::passed(
+                  "semver-checks",
+                  "cargo-semver-checks not installed (skipped; install with: cargo install cargo-semver-checks)",
+                ));
+                emitted_semver_missing = true;
+              }
+            } else if self.is_publishable(crate_name) && semver_checks::has_library_target(self.ctx, crate_name) {
+              // Unpublished crates have no crates.io baseline to compare against.
+              let reviewed_level = pending_changes.as_ref().and_then(|changes| {
+                changes
+                  .for_crate(crate_name)
+                  .iter()
+                  .filter_map(|intent| intent.bump.release_level())
+                  .max()
+              });
+              results.push(self.validate_semver_checks(
+                crate_name,
+                semver_policy,
+                reviewed_level,
+                release_config.source == crate::config::ReleaseSource::Changes,
               ));
-              emitted_semver_missing = true;
             }
-          } else if self.is_publishable(crate_name) && semver_checks::has_library_target(self.ctx, crate_name) {
-            // Unpublished crates have no crates.io baseline to compare against.
-            results.push(self.validate_semver_checks(crate_name, semver_policy));
           }
-        }
 
-        (crate_name.clone(), results)
-      })
-      .collect()
+          (crate_name.clone(), results)
+        })
+        .collect(),
+    )
   }
 
   /// Validate changelog paths for all crates being released

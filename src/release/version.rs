@@ -131,8 +131,7 @@ impl BumpType {
 pub enum BumpRequest {
   /// One bump applied to every target crate
   Explicit(BumpType),
-  /// Per-crate inference: change files first, then conventional commits
-  /// since each crate's previous release tag
+  /// Per-crate inference from the configured release source and dependency cascades
   Auto,
 }
 

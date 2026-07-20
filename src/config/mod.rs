@@ -21,7 +21,7 @@ mod unify;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
-  Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, RequireChangeFiles, SemverCheckPolicy,
+  Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
 };
 pub(crate) use run::{BUILTIN_ACTION_NAMES, MAX_ACTIONS, first_repository_output_overlap};
 pub use run::{

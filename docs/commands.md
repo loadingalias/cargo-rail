@@ -675,6 +675,7 @@ Commands:
   check     Validate release readiness
   finalize  Finalize a merged release PR (tag, push, publish)
   resume    Resume an interrupted release from its durable state file
+  status    Show durable release state and the safe recovery command
   abort     Abort an active release that has not reached remote side effects
   help      Print this message or the help of the given subcommand(s)
 
@@ -703,10 +704,10 @@ Examples:
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
-  cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate               # Release from reviewed change intent
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
-  cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
+  cargo rail release run my-crate --bump auto   # Infer each bump from the configured release source
   cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
   cargo rail release finalize --all             # Tag/publish after the release PR merges
   cargo rail release run my-crate --bump minor
@@ -761,7 +762,7 @@ Options:
       --bump <BUMP>
           Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
 
-          [default: patch]
+          [default: auto]
 
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
@@ -940,6 +941,48 @@ Options:
 
 ---
 
+### cargo rail release status
+
+```
+Show durable release state and the safe recovery command
+
+Usage: cargo rail release status [OPTIONS] [STATE]
+
+Arguments:
+  [STATE]
+          Inspect one state file instead of every known release transaction
+
+Options:
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
 ### cargo rail release abort
 
 ```
@@ -1024,7 +1067,7 @@ Arguments:
 
 Options:
       --bump <BUMP>
-          Bump level for the covered crate(s): patch, minor, major
+          Release intent for the covered crate(s): none, patch, minor, major
 
   -q, --quiet
           Suppress progress messages (for CI/automation)

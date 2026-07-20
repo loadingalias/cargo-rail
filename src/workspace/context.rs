@@ -817,6 +817,40 @@ impl WorkspaceContext {
     )
   }
 
+  /// Return final non-generated source paths that differ from `base`.
+  ///
+  /// With no base, every path in the final source tree is returned. This is
+  /// the release-coverage meaning of a crate with no previous release.
+  pub(crate) fn source_paths_since(&self, base: Option<&str>) -> RailResult<Vec<PathBuf>> {
+    let owned_capture;
+    let capture = if let Some(capture) = self.source_capture() {
+      capture
+    } else {
+      owned_capture = self.capture_worktree_source()?;
+      &owned_capture
+    };
+
+    match base {
+      Some(base) => Ok(
+        capture
+          .changes_from(self.git()?.git(), base)?
+          .entries()
+          .iter()
+          .map(|change| change.path.as_path().to_path_buf())
+          .collect(),
+      ),
+      None => Ok(
+        capture
+          .snapshot()
+          .tree()
+          .entries()
+          .iter()
+          .map(|entry| entry.path.as_path().to_path_buf())
+          .collect(),
+      ),
+    }
+  }
+
   pub(crate) fn exclude_generated_source_paths(&self, paths: Vec<PathBuf>) -> RailResult<Vec<PathBuf>> {
     let git = self.git()?;
     let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;

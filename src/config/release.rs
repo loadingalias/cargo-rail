@@ -9,6 +9,10 @@ use std::path::PathBuf;
 /// Release configuration (workspace-wide defaults)
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleaseConfig {
+  /// Authoritative source for release bump selection and changelog prose.
+  #[serde(default)]
+  pub source: ReleaseSource,
+
   /// Git tag prefix (default: "v")
   #[serde(default = "default_tag_prefix")]
   pub tag_prefix: String,
@@ -18,11 +22,17 @@ pub struct ReleaseConfig {
   #[serde(default = "default_tag_format")]
   pub tag_format: String,
 
-  /// Require clean working directory before release (default: true)
+  /// Deprecated compatibility input.
+  ///
+  /// Release previews allow dirt. Apply binds planned inputs and rejects every
+  /// unrelated path immediately before the first write.
   #[serde(default = "default_true")]
   pub require_clean: bool,
 
-  /// Maximum registry-convergence polling interval in seconds (default: 5)
+  /// Deprecated registry-convergence polling interval.
+  ///
+  /// Cargo-rail never sleeps for convergence; it stops and reconciles on the
+  /// next invocation.
   #[serde(default = "default_publish_delay")]
   pub publish_delay: u64,
 
@@ -66,8 +76,9 @@ pub struct ReleaseConfig {
   #[serde(default)]
   pub pre_1_breaking_bump: Pre1BreakingBump,
 
-  /// How to treat commits that do not parse as conventional commits (default: "warn").
+  /// Compatibility-mode handling for commits that do not parse as conventional (default: "warn").
   ///
+  /// Ignored when `source = "changes"`.
   /// - "allow": ignore silently
   /// - "warn": report in `release check` and plan output
   /// - "deny": fail `release check` when the release range contains them
@@ -80,14 +91,15 @@ pub struct ReleaseConfig {
   /// tool, never vendored. Missing binary downgrades to an advisory note.
   ///
   /// - "off": never run
-  /// - "warn": escalate `--bump auto` and report findings
-  /// - "deny": additionally fail `release check` when a planned bump is
-  ///   below what detected API breakage requires
+  /// - "warn": validate planned intent; extended checks remain advisory
+  /// - "deny": validate planned intent and fail extended checks on breakage
   #[serde(default)]
   pub semver_check: SemverCheckPolicy,
 
-  /// Require change files to cover released crates.
+  /// Require change files to cover released crates in compatibility modes.
   ///
+  /// Changes mode always requires repository-wide coverage. In compatibility
+  /// modes:
   /// - `false` (default): change files are optional
   /// - `true`: every released crate with code changes needs a covering change file
   /// - `["crate-a", ...]`: only the listed crates are gated
@@ -109,6 +121,7 @@ pub struct ReleaseConfig {
 impl Default for ReleaseConfig {
   fn default() -> Self {
     Self {
+      source: ReleaseSource::default(),
       tag_prefix: default_tag_prefix(),
       tag_format: default_tag_format(),
       require_clean: true,
@@ -129,7 +142,41 @@ impl Default for ReleaseConfig {
   }
 }
 
+/// Authoritative input used to select releases and render changelogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseSource {
+  /// Use reviewed change files. Commit messages are not release inputs.
+  #[default]
+  Changes,
+  /// Use conventional commits for compatibility with older repositories.
+  Commits,
+  /// Combine reviewed change files and conventional commits for compatibility.
+  Both,
+}
+
+impl ReleaseSource {
+  /// Whether conventional commits contribute to release planning.
+  pub const fn uses_commits(self) -> bool {
+    matches!(self, Self::Commits | Self::Both)
+  }
+
+  /// Whether reviewed change files contribute to release planning.
+  pub const fn uses_changes(self) -> bool {
+    matches!(self, Self::Changes | Self::Both)
+  }
+}
+
 impl ReleaseConfig {
+  /// Whether reviewed intent is required for a changed crate.
+  ///
+  /// Reviewed changes are the default release protocol, so that mode always
+  /// gates the complete workspace. The compatibility modes retain the older
+  /// configurable coverage policy.
+  pub fn requires_change_file(&self, crate_name: &str) -> bool {
+    self.source == ReleaseSource::Changes || self.require_change_files.applies_to(crate_name)
+  }
+
   /// Validate the release configuration
   pub fn validate(&self, workspace_members: &[String]) -> Result<Vec<String>, ConfigError> {
     let mut warnings = Vec::new();
@@ -249,10 +296,10 @@ pub enum CommitPolicy {
 pub enum SemverCheckPolicy {
   /// Never run cargo-semver-checks
   Off,
-  /// Escalate auto bumps and report findings (default)
+  /// Validate planned intent and report extended-check findings (default)
   #[default]
   Warn,
-  /// Fail checks when a planned bump is below detected API breakage
+  /// Fail extended checks when detected API breakage exists
   Deny,
 }
 
@@ -274,6 +321,17 @@ pub enum ReleaseRemoteEffects {
 }
 
 impl ReleaseRemoteEffects {
+  /// Stable configuration spelling used in durable release trailers.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::None => "none",
+      Self::Push => "push",
+      Self::Auto => "auto",
+      Self::Github => "github",
+      Self::Gitlab => "gitlab",
+    }
+  }
+
   /// Whether the policy authorizes pushing the release commit and tags.
   pub const fn pushes(self) -> bool {
     !matches!(self, Self::None)
@@ -288,6 +346,7 @@ impl ReleaseRemoteEffects {
 #[derive(Deserialize)]
 #[serde(default)]
 struct ReleaseConfigInput {
+  source: ReleaseSource,
   tag_prefix: String,
   tag_format: String,
   require_clean: bool,
@@ -313,6 +372,7 @@ impl Default for ReleaseConfigInput {
   fn default() -> Self {
     let config = ReleaseConfig::default();
     Self {
+      source: config.source,
       tag_prefix: config.tag_prefix,
       tag_format: config.tag_format,
       require_clean: config.require_clean,
@@ -382,6 +442,7 @@ impl<'de> Deserialize<'de> for ReleaseConfig {
     };
 
     Ok(Self {
+      source: input.source,
       tag_prefix: input.tag_prefix,
       tag_format: input.tag_format,
       require_clean: input.require_clean,
@@ -725,12 +786,14 @@ mod tests {
   #[test]
   fn release_policy_defaults() {
     let config = ReleaseConfig::default();
+    assert_eq!(config.source, ReleaseSource::Changes);
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
     assert_eq!(config.unconventional_commits, CommitPolicy::Warn);
     assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
     assert_eq!(config.remote_effects, ReleaseRemoteEffects::None);
     assert_eq!(config.change_dir, ".changes");
     assert!(!config.require_change_files.is_enabled());
+    assert!(config.requires_change_file("any-crate"));
     assert!(config.version_groups.is_empty());
     assert!(config.require_release_notes);
   }
@@ -739,6 +802,7 @@ mod tests {
   fn release_policies_parse() {
     let toml = r#"
       pre_1_breaking_bump = "major"
+      source = "commits"
       unconventional_commits = "deny"
       semver_check = "off"
       change_dir = "changes"
@@ -746,10 +810,22 @@ mod tests {
     "#;
     let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
     assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
+    assert_eq!(config.source, ReleaseSource::Commits);
     assert_eq!(config.unconventional_commits, CommitPolicy::Deny);
     assert_eq!(config.semver_check, SemverCheckPolicy::Off);
     assert_eq!(config.change_dir, "changes");
     assert_eq!(config.remote_effects, ReleaseRemoteEffects::Gitlab);
+  }
+
+  #[test]
+  fn compatibility_sources_retain_configured_change_coverage() {
+    let config: ReleaseConfig = toml_edit::de::from_str("source = \"commits\"").unwrap();
+    assert!(!config.requires_change_file("core"));
+
+    let config: ReleaseConfig =
+      toml_edit::de::from_str("source = \"both\"\nrequire_change_files = [\"core\"]").unwrap();
+    assert!(config.requires_change_file("core"));
+    assert!(!config.requires_change_file("cli"));
   }
 
   #[test]

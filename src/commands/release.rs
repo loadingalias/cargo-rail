@@ -7,12 +7,46 @@ use crate::mutation::{
   self, ExpectedMutation, MutationAction, MutationEffect, MutationInput, MutationObject, MutationRisk, MutationTrace,
 };
 use crate::release::planner::{DependentPolicy, ReleasePlanner};
-use crate::release::publisher::ReleasePublisher;
+use crate::release::publisher::{
+  CheckReadiness, ReleasePublisher, observe_github_exact_sha_readiness, observe_gitlab_exact_sha_readiness,
+};
+use crate::release::state::{ReleaseState, ReleaseStatus, StepStatus, state_dir, validate_state_path};
 use crate::release::validator::ReleaseValidator;
 use crate::release::version::BumpRequest;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(serde::Serialize)]
+struct ReleaseStatusReport {
+  transaction_id: String,
+  state: String,
+  exact_sha: Option<String>,
+  completed_effect: Option<String>,
+  next_effect: Option<String>,
+  observations: Vec<String>,
+  ambiguity: bool,
+  recoverability: String,
+  safe_operator_command: String,
+  journal: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct GitReleaseTransaction {
+  transaction_id: String,
+  exact_sha: String,
+  mode: String,
+  publish: Option<bool>,
+  tag: Option<bool>,
+  remote: Option<String>,
+  crates: BTreeMap<String, String>,
+  tags: BTreeMap<String, String>,
+  crate_publish: BTreeMap<String, bool>,
+  commit_targets: BTreeMap<String, String>,
+}
 
 /// Plan a release (check mode)
 pub fn run_release_plan(
@@ -77,9 +111,7 @@ pub fn run_release_plan(
     return Ok(());
   }
 
-  if release_config.require_clean {
-    validator.validate(&target_crates, true)?;
-  }
+  validator.validate(&target_crates, false)?;
 
   // Validate changelog paths (catches path traversal issues early)
   validator.validate_changelog_paths(&target_crates, release_config)?;
@@ -202,7 +234,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
   let target_crates = plan.canonical_crate_order.clone();
   let effective_skip_publish = args.skip_publish || args.pr;
   let effective_skip_tag = args.skip_tag || args.pr;
-  validator.validate(&target_crates, release_config.require_clean)?;
+  validator.validate(&target_crates, false)?;
 
   // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
   if let Some(warning) = validator.validate_branch(args.yes)? {
@@ -289,7 +321,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     &plan,
     effective_skip_publish,
     effective_skip_tag,
-    release_config.require_clean,
+    false,
     release_config.require_release_notes,
   )?;
   mutation::validate_pre_apply_with_allowed_paths(ctx, &mutation_plan, &plan_control_paths)?;
@@ -309,10 +341,12 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
 
   let publisher = ReleasePublisher::new(ctx, release_config);
   let planned_paths = mutation::expected_paths(&mutation_plan);
+  let transaction_id = mutation_plan.operation_id.clone();
   if args.pr {
-    publisher.execute_pr(&plan, &planned_paths, &allowed_unstaged_paths)?;
+    publisher.execute_pr(&transaction_id, &plan, &planned_paths, &allowed_unstaged_paths)?;
   } else {
     publisher.execute(
+      &transaction_id,
       &plan,
       args.skip_publish,
       args.skip_tag,
@@ -427,7 +461,7 @@ pub fn run_release_check(
     let planner = ReleasePlanner::new(ctx, release_config);
     target_crates = planner.resolve_targets(Some(target_crates), policy)?;
   }
-  validator.validate(&target_crates, release_config.require_clean)?;
+  validator.validate(&target_crates, false)?;
 
   // Validate changelog paths
   validator.validate_changelog_paths(&target_crates, release_config)?;
@@ -500,7 +534,7 @@ pub fn run_release_check(
       println!("\nrunning extended checks...");
     }
 
-    let ext_results = validator.validate_extended(&target_crates, release_config.semver_check);
+    let ext_results = validator.validate_extended(&target_crates, release_config)?;
 
     for (crate_name, checks) in ext_results {
       let mut crate_checks = Vec::with_capacity(checks.len());
@@ -624,7 +658,7 @@ pub fn run_release_check(
   Ok(())
 }
 
-/// Finalize a merged release PR by tagging, pushing, publishing, and creating forge releases.
+/// Finalize a merged release PR through exact-SHA checks, publication, tags, and forge releases.
 #[allow(clippy::too_many_arguments)]
 pub fn run_release_finalize(
   ctx: &WorkspaceContext,
@@ -670,7 +704,7 @@ pub fn run_release_finalize(
   let plan = planner.finalize_plan(targets, dependent_policy(include_dependents))?;
   let target_crates = plan.canonical_crate_order.clone();
   let validator = ReleaseValidator::new(ctx);
-  validator.validate(&target_crates, release_config.require_clean)?;
+  validator.validate(&target_crates, true)?;
   if let Some(warning) = validator.validate_branch(yes)? {
     if json {
       warnings.push(warning);
@@ -685,7 +719,10 @@ pub fn run_release_finalize(
 
   enforce_safety_gate("release finalize", yes, None, io::stdin().is_terminal() && !json)?;
   let publisher = ReleasePublisher::new(ctx, release_config);
-  publisher.execute_finalize(&plan, skip_publish, skip_tag)?;
+  let generated_transaction_id =
+    build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?.operation_id;
+  let transaction_id = prepared_release_transaction_id(ctx, &plan)?.unwrap_or(generated_transaction_id);
+  publisher.execute_finalize(&transaction_id, &plan, skip_publish, skip_tag)?;
 
   if json {
     let payload = serde_json::json!({
@@ -700,6 +737,23 @@ pub fn run_release_finalize(
   Ok(())
 }
 
+fn prepared_release_transaction_id(
+  ctx: &WorkspaceContext,
+  plan: &crate::release::planner::ReleasePlan,
+) -> RailResult<Option<String>> {
+  let expected = plan
+    .crates
+    .iter()
+    .map(|crate_plan| (crate_plan.name.clone(), crate_plan.new_version.to_string()))
+    .collect::<BTreeMap<_, _>>();
+  Ok(
+    git_release_transactions(ctx.workspace_root())?
+      .into_iter()
+      .find(|transaction| transaction.mode == "prepare" && transaction.crates == expected)
+      .map(|transaction| transaction.transaction_id),
+  )
+}
+
 fn dependent_policy(include_dependents: bool) -> DependentPolicy {
   if include_dependents {
     DependentPolicy::IncludeDependents
@@ -708,20 +762,717 @@ fn dependent_policy(include_dependents: bool) -> DependentPolicy {
   }
 }
 
+/// Show durable release transactions without loading Cargo metadata.
+pub fn run_release_status_standalone(
+  workspace_root: &Path,
+  state_path: Option<&Path>,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
+  let requested_transaction = state_path
+    .filter(|path| !path.exists())
+    .and_then(Path::to_str)
+    .filter(|value| value.starts_with("release-") && !value.contains(std::path::MAIN_SEPARATOR))
+    .map(str::to_string);
+  if let Some(path) = state_path
+    && !path.exists()
+    && requested_transaction.is_none()
+  {
+    return Err(RailError::with_help(
+      format!("release state '{}' does not exist", path.display()),
+      "pass an existing journal path or a Rail-Release transaction ID",
+    ));
+  }
+  let paths = if let Some(path) = state_path.filter(|path| path.exists()) {
+    vec![validate_state_path(workspace_root, path)?]
+  } else {
+    let directory = state_dir(workspace_root);
+    if !directory.exists() {
+      Vec::new()
+    } else {
+      let mut paths = std::fs::read_dir(&directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .collect::<Vec<_>>();
+      paths.sort();
+      paths
+    }
+  };
+  let mut reports = paths
+    .into_iter()
+    .map(|path| ReleaseState::load(&path).map(|state| release_status_report(state, path)))
+    .collect::<RailResult<Vec<_>>>()?;
+  if let Some(requested) = requested_transaction.as_ref() {
+    reports.retain(|report| &report.transaction_id == requested);
+  }
+  let journal_transactions = reports
+    .iter()
+    .map(|report| report.transaction_id.clone())
+    .collect::<HashSet<_>>();
+  if state_path.is_none() || requested_transaction.is_some() {
+    for transaction in git_release_transactions(workspace_root)? {
+      if journal_transactions.contains(&transaction.transaction_id)
+        || requested_transaction
+          .as_ref()
+          .is_some_and(|requested| requested != &transaction.transaction_id)
+      {
+        continue;
+      }
+      reports.push(reconstructed_status_report(workspace_root, transaction));
+    }
+  }
+  if let Some(requested) = requested_transaction
+    && !reports.iter().any(|report| report.transaction_id == requested)
+  {
+    return Err(RailError::with_help(
+      format!(
+        "release transaction '{}' was not found in journals or Git history",
+        requested
+      ),
+      "copy the exact transaction ID from a Rail-Release commit trailer",
+    ));
+  }
+
+  if format.is_json() {
+    crate::output::set_json_mode(true);
+    let payload = serde_json::json!({ "transactions": reports });
+    let output = crate::output::machine_json_envelope("release", "status", "success", 0, payload);
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    return Ok(());
+  }
+
+  if reports.is_empty() {
+    println!("no release transactions");
+    return Ok(());
+  }
+  for (index, report) in reports.iter().enumerate() {
+    if index > 0 {
+      println!();
+    }
+    println!("{}  {}", report.transaction_id, report.state);
+    println!("  exact SHA: {}", report.exact_sha.as_deref().unwrap_or("not prepared"));
+    println!("  completed: {}", report.completed_effect.as_deref().unwrap_or("none"));
+    println!("  next: {}", report.next_effect.as_deref().unwrap_or("none"));
+    if report.observations.is_empty() {
+      println!("  observations: none");
+    } else {
+      println!("  observations: {}", report.observations.join(", "));
+    }
+    println!("  ambiguity: {}", report.ambiguity);
+    println!("  recoverability: {}", report.recoverability);
+    println!("  safe command: {}", report.safe_operator_command);
+  }
+  Ok(())
+}
+
+fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusReport {
+  let mut completed = None;
+  let mut next = None;
+  let mut observations = Vec::new();
+  let mut ambiguity = false;
+  let mut record = |name: String, status: StepStatus, object: Option<&str>| {
+    if status == StepStatus::InProgress {
+      ambiguity = true;
+    }
+    if let Some(object) = object {
+      let status = match status {
+        StepStatus::Pending => "pending",
+        StepStatus::InProgress => "in_progress",
+        StepStatus::Complete => "complete",
+      };
+      observations.push(format!("{}:{}={}", name, status, object));
+    }
+    if status == StepStatus::Complete {
+      completed = Some(name.clone());
+    } else if next.is_none() {
+      next = Some(name);
+    }
+  };
+  for crate_state in &state.crates {
+    record(
+      format!("commit:{}", crate_state.name),
+      crate_state.commit.status,
+      crate_state.commit.object.as_deref(),
+    );
+  }
+  record(
+    "push_commit".to_string(),
+    state.commit_push.status,
+    state.commit_push.object.as_deref(),
+  );
+  record(
+    "exact_sha_checks".to_string(),
+    state.readiness.status,
+    state.readiness.object.as_deref(),
+  );
+  for crate_state in &state.crates {
+    record(
+      format!("publish:{}", crate_state.name),
+      crate_state.publication.status,
+      crate_state.publication.object.as_deref(),
+    );
+  }
+  for crate_state in &state.crates {
+    record(
+      format!("tag:{}", crate_state.name),
+      crate_state.tag.status,
+      crate_state.tag.object.as_deref(),
+    );
+  }
+  record(
+    "push_tags".to_string(),
+    state.tag_push.status,
+    state.tag_push.object.as_deref(),
+  );
+  for crate_state in &state.crates {
+    record(
+      format!("forge_create:{}", crate_state.name),
+      crate_state.forge_draft.status,
+      crate_state.forge_draft.object.as_deref(),
+    );
+    record(
+      format!("forge_release:{}", crate_state.name),
+      crate_state.forge_publication.status,
+      crate_state.forge_publication.object.as_deref(),
+    );
+  }
+  record("abort".to_string(), state.abort.status, state.abort.object.as_deref());
+
+  let abort_in_progress = state.abort.status == StepStatus::InProgress;
+  if state.status == ReleaseStatus::Aborted {
+    ambiguity = false;
+  }
+  let (recoverability, safe_operator_command) = match state.status {
+    ReleaseStatus::Active if abort_in_progress => (
+      "reconcile_abort".to_string(),
+      format!("cargo rail release abort {} --yes", path.display()),
+    ),
+    ReleaseStatus::Active => (
+      if ambiguity { "reconcile" } else { "resumable" }.to_string(),
+      format!("cargo rail release resume {}", path.display()),
+    ),
+    ReleaseStatus::Complete | ReleaseStatus::Aborted => ("terminal".to_string(), "cargo rail clean".to_string()),
+  };
+  ReleaseStatusReport {
+    transaction_id: state.transaction_id,
+    state: format!("{}:{:?}", state.phase.as_str(), state.status).to_ascii_lowercase(),
+    exact_sha: state.release_commit,
+    completed_effect: completed,
+    next_effect: if state.status == ReleaseStatus::Active {
+      next
+    } else {
+      None
+    },
+    observations,
+    ambiguity,
+    recoverability,
+    safe_operator_command,
+    journal: Some(path),
+  }
+}
+
+fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTransaction) -> ReleaseStatusReport {
+  let prepare = transaction.mode == "prepare";
+  let mut observations = transaction
+    .crates
+    .iter()
+    .map(|(name, version)| format!("git:complete={}@{}", name, version))
+    .chain(std::iter::once(format!("git:complete={}", transaction.exact_sha)))
+    .collect::<Vec<_>>();
+  let terminal = !prepare && reconstructed_release_is_terminal(workspace_root, &transaction, &mut observations);
+  let safe_operator_command = if terminal {
+    "cargo rail clean".to_string()
+  } else if prepare {
+    format!(
+      "cargo rail release finalize {} --yes",
+      transaction.crates.keys().cloned().collect::<Vec<_>>().join(" ")
+    )
+  } else {
+    format!("cargo rail release resume {}", transaction.transaction_id)
+  };
+  ReleaseStatusReport {
+    transaction_id: transaction.transaction_id,
+    state: if terminal {
+      "released:git".to_string()
+    } else if prepare {
+      "prepared:git".to_string()
+    } else {
+      "reconstructed:active".to_string()
+    },
+    exact_sha: Some(transaction.exact_sha.clone()),
+    completed_effect: Some(if terminal {
+      "release".to_string()
+    } else {
+      "release_commit".to_string()
+    }),
+    next_effect: if terminal {
+      None
+    } else {
+      Some(if prepare {
+        "finalize".to_string()
+      } else {
+        "reconcile_remote_truth".to_string()
+      })
+    },
+    observations,
+    ambiguity: !prepare && !terminal,
+    recoverability: if terminal {
+      "terminal"
+    } else if prepare {
+      "finalizable"
+    } else {
+      "reconstructable"
+    }
+    .to_string(),
+    safe_operator_command,
+    journal: None,
+  }
+}
+
+fn reconstructed_release_is_terminal(
+  workspace_root: &Path,
+  transaction: &GitReleaseTransaction,
+  observations: &mut Vec<String>,
+) -> bool {
+  let Some(remote) = transaction.remote.as_deref() else {
+    return false;
+  };
+  let tags_complete = match transaction.tag {
+    Some(true) => {
+      if transaction.tags.len() != transaction.crates.len() {
+        return false;
+      }
+      transaction.tags.iter().all(|(name, tag)| {
+        let Some(expected) = transaction.commit_targets.get(name) else {
+          return false;
+        };
+        let observed = if remote == "none" {
+          git_stdout(
+            workspace_root,
+            &["rev-parse", "--verify", &format!("refs/tags/{}^{{commit}}", tag)],
+          )
+        } else {
+          git_stdout(
+            workspace_root,
+            &["ls-remote", "origin", &format!("refs/tags/{}^{{}}", tag)],
+          )
+          .and_then(|output| output.split_whitespace().next().map(str::to_string))
+        };
+        if observed.as_deref() == Some(expected) {
+          observations.push(format!("tag:complete={}", tag));
+          true
+        } else {
+          false
+        }
+      })
+    }
+    Some(false) => true,
+    None => return false,
+  };
+  if !tags_complete {
+    return false;
+  }
+
+  let readiness_required = remote != "none" && (transaction.tag == Some(true) || transaction.publish == Some(true));
+  if readiness_required {
+    let Some(provider) = exact_sha_readiness_provider(workspace_root, remote) else {
+      observations.push("readiness:ambiguous=unsupported_provider".to_string());
+      return false;
+    };
+    let readiness = match provider {
+      "github" => observe_github_exact_sha_readiness(workspace_root, &transaction.exact_sha),
+      "gitlab" => observe_gitlab_exact_sha_readiness(workspace_root, &transaction.exact_sha),
+      _ => return false,
+    };
+    match readiness {
+      Ok(CheckReadiness::Green(detail)) => observations.push(format!("readiness:complete={}", detail)),
+      Ok(CheckReadiness::Waiting(detail)) => {
+        observations.push(format!("readiness:waiting={}", detail));
+        return false;
+      }
+      Ok(CheckReadiness::Failed(detail)) => {
+        observations.push(format!("readiness:failed={}", detail));
+        return false;
+      }
+      Err(_) => {
+        observations.push("readiness:ambiguous=provider_unavailable".to_string());
+        return false;
+      }
+    }
+  }
+
+  let publication_complete = match transaction.publish {
+    Some(false) => true,
+    Some(true) => transaction.crates.iter().all(|(name, version)| {
+      let Some(publish) = transaction.crate_publish.get(name) else {
+        return false;
+      };
+      if !publish {
+        return true;
+      }
+      let spec = format!("{}@{}", name, version);
+      let complete = command_succeeds(workspace_root, "cargo", &["info", "--registry", "crates-io", &spec]);
+      if complete {
+        observations.push(format!("registry:complete={}", spec));
+      }
+      complete
+    }),
+    None => false,
+  };
+  if !publication_complete {
+    return false;
+  }
+
+  if transaction.tag == Some(false) && remote != "none" {
+    let Some(branch) = git_stdout(workspace_root, &["branch", "--show-current"]) else {
+      return false;
+    };
+    let Some(remote_head) = git_stdout(
+      workspace_root,
+      &["ls-remote", "origin", &format!("refs/heads/{}", branch)],
+    )
+    .and_then(|output| output.split_whitespace().next().map(str::to_string)) else {
+      return false;
+    };
+    if remote_head != transaction.exact_sha {
+      return false;
+    }
+    observations.push(format!("remote_commit:complete={}", remote_head));
+  }
+  if transaction.tag == Some(false) {
+    return true;
+  }
+
+  let forge = match remote {
+    "github" | "gitlab" => Some(remote),
+    "auto" => git_stdout(workspace_root, &["config", "--get", "remote.origin.url"]).and_then(|url| {
+      let url = url.to_ascii_lowercase();
+      if url.contains("github") {
+        Some("github")
+      } else if url.contains("gitlab") {
+        Some("gitlab")
+      } else {
+        None
+      }
+    }),
+    "none" | "push" => return true,
+    _ => None,
+  };
+  let Some(forge) = forge else {
+    return false;
+  };
+  transaction.tags.values().all(|tag| {
+    let complete = match forge {
+      "github" => command_succeeds(workspace_root, "gh", &["release", "view", tag]),
+      "gitlab" => command_succeeds(workspace_root, "glab", &["release", "view", tag]),
+      _ => false,
+    };
+    if complete {
+      observations.push(format!("forge:complete={}", tag));
+    }
+    complete
+  })
+}
+
+fn exact_sha_readiness_provider(workspace_root: &Path, remote: &str) -> Option<&'static str> {
+  match remote {
+    "github" => Some("github"),
+    "gitlab" => Some("gitlab"),
+    "auto" | "push" => git_stdout(workspace_root, &["config", "--get", "remote.origin.url"]).and_then(|url| {
+      let url = url.to_ascii_lowercase();
+      if url.contains("github.com") {
+        Some("github")
+      } else if url.contains("gitlab.com") {
+        Some("gitlab")
+      } else {
+        None
+      }
+    }),
+    _ => None,
+  }
+}
+
+fn git_stdout(workspace_root: &Path, args: &[&str]) -> Option<String> {
+  let output = Command::new("git")
+    .current_dir(workspace_root)
+    .args(args)
+    .output()
+    .ok()?;
+  output
+    .status
+    .success()
+    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn command_succeeds(workspace_root: &Path, program: &str, args: &[&str]) -> bool {
+  Command::new(program)
+    .current_dir(workspace_root)
+    .args(args)
+    .output()
+    .is_ok_and(|output| output.status.success())
+}
+
+fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseTransaction>> {
+  let output = Command::new("git")
+    .current_dir(workspace_root)
+    .args([
+      "log",
+      "--fixed-strings",
+      "--grep=Rail-Release:",
+      "--format=%H%x00%B%x00",
+    ])
+    .output()
+    .map_err(|error| RailError::message(format!("failed to inspect release transaction history: {}", error)))?;
+  if !output.status.success() {
+    return Err(RailError::message(format!(
+      "failed to inspect release transaction history: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    )));
+  }
+
+  let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+  let mut transactions = Vec::<GitReleaseTransaction>::new();
+  for pair in fields.chunks(2) {
+    let [sha, message] = pair else {
+      continue;
+    };
+    let sha = String::from_utf8_lossy(sha).trim().to_string();
+    if sha.is_empty() {
+      continue;
+    }
+    let message = String::from_utf8_lossy(message);
+    let Some(transaction_id) = trailer_value(&message, "Rail-Release") else {
+      continue;
+    };
+    if !transaction_id.starts_with("release-") {
+      continue;
+    }
+    let mode = trailer_value(&message, "Rail-Release-Mode").unwrap_or_else(|| "legacy".to_string());
+    let index = transactions
+      .iter()
+      .position(|transaction| transaction.transaction_id == transaction_id);
+    let index = if let Some(index) = index {
+      index
+    } else {
+      transactions.push(GitReleaseTransaction {
+        transaction_id: transaction_id.clone(),
+        exact_sha: sha.clone(),
+        mode: mode.clone(),
+        publish: parse_bool_trailer(&message, "Rail-Release-Publish"),
+        tag: parse_bool_trailer(&message, "Rail-Release-Tag"),
+        remote: trailer_value(&message, "Rail-Release-Remote"),
+        crates: BTreeMap::new(),
+        tags: BTreeMap::new(),
+        crate_publish: BTreeMap::new(),
+        commit_targets: BTreeMap::new(),
+      });
+      transactions.len() - 1
+    };
+    let transaction = &mut transactions[index];
+    if transaction.mode == "prepare" && mode != "prepare" {
+      transaction.mode = mode;
+      transaction.exact_sha = sha.clone();
+      transaction.publish = parse_bool_trailer(&message, "Rail-Release-Publish");
+      transaction.tag = parse_bool_trailer(&message, "Rail-Release-Tag");
+      transaction.remote = trailer_value(&message, "Rail-Release-Remote");
+    }
+    for value in trailer_values(&message, "Rail-Release-Crate") {
+      let Some((name, version)) = value.rsplit_once('@') else {
+        continue;
+      };
+      transaction.crates.insert(name.to_string(), version.to_string());
+      transaction
+        .commit_targets
+        .entry(name.to_string())
+        .or_insert_with(|| sha.clone());
+    }
+    for value in trailer_values(&message, "Rail-Release-Tag-Name") {
+      let Some((name, tag)) = value.split_once('=') else {
+        continue;
+      };
+      transaction.tags.insert(name.to_string(), tag.to_string());
+    }
+    for value in trailer_values(&message, "Rail-Release-Crate-Publish") {
+      let Some((name, publish)) = value.split_once('=') else {
+        continue;
+      };
+      if let Ok(publish) = publish.parse::<bool>() {
+        transaction.crate_publish.insert(name.to_string(), publish);
+      }
+    }
+  }
+  Ok(transactions)
+}
+
+fn trailer_value(message: &str, key: &str) -> Option<String> {
+  trailer_values(message, key).into_iter().next()
+}
+
+fn trailer_values(message: &str, key: &str) -> Vec<String> {
+  let prefix = format!("{}: ", key);
+  message
+    .lines()
+    .filter_map(|line| line.trim().strip_prefix(&prefix).map(str::to_string))
+    .collect()
+}
+
+fn parse_bool_trailer(message: &str, key: &str) -> Option<bool> {
+  match trailer_value(message, key)?.as_str() {
+    "true" => Some(true),
+    "false" => Some(false),
+    _ => None,
+  }
+}
+
 /// Resume an interrupted release from durable state.
 pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> RailResult<()> {
-  ctx.snapshot()?;
   let release_config = ctx
     .config()
     .as_ref()
     .map(|config| &config.release)
     .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-  ReleasePublisher::new(ctx, release_config).resume(state)
+  let publisher = ReleasePublisher::new(ctx, release_config);
+  if state.exists() {
+    return publisher.resume(state);
+  }
+  let transaction_id = state.to_str().filter(|value| {
+    value.starts_with("release-")
+      && !value.contains(std::path::MAIN_SEPARATOR)
+      && value.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+  });
+  let Some(transaction_id) = transaction_id else {
+    return Err(RailError::with_help(
+      format!("release state '{}' does not exist", state.display()),
+      "pass an existing journal path or a Rail-Release transaction ID",
+    ));
+  };
+  let transaction = git_release_transactions(ctx.workspace_root())?
+    .into_iter()
+    .find(|transaction| transaction.transaction_id == transaction_id)
+    .ok_or_else(|| {
+      RailError::with_help(
+        format!("release transaction '{}' is not reachable from HEAD", transaction_id),
+        "fetch and check out the exact release commit before reconstructing its journal",
+      )
+    })?;
+  if transaction.mode == "prepare" {
+    return Err(RailError::with_help(
+      format!("release transaction '{}' is prepared but not finalized", transaction_id),
+      "run the safe command printed by 'cargo rail release status'",
+    ));
+  }
+  let publish = transaction.publish.ok_or_else(|| {
+    RailError::with_help(
+      format!(
+        "release transaction '{}' predates reconstructable publish intent",
+        transaction_id
+      ),
+      "recover the original local journal; legacy trailers do not authorize irreversible effects",
+    )
+  })?;
+  let tag = transaction.tag.ok_or_else(|| {
+    RailError::with_help(
+      format!(
+        "release transaction '{}' predates reconstructable tag intent",
+        transaction_id
+      ),
+      "recover the original local journal; legacy trailers do not authorize irreversible effects",
+    )
+  })?;
+  let remote = transaction.remote.as_deref().ok_or_else(|| {
+    RailError::with_help(
+      format!(
+        "release transaction '{}' predates reconstructable remote intent",
+        transaction_id
+      ),
+      "recover the original local journal; legacy trailers do not authorize remote effects",
+    )
+  })?;
+  if remote != release_config.remote_effects.as_str() {
+    return Err(RailError::with_help(
+      format!(
+        "transaction authorizes release.remote_effects = '{}', but the checkout resolves '{}'",
+        remote,
+        release_config.remote_effects.as_str()
+      ),
+      "restore the release configuration from the exact release commit",
+    ));
+  }
+  let head = ctx.git()?.git().head_commit()?;
+  if head != transaction.exact_sha {
+    return Err(RailError::with_help(
+      format!(
+        "journal reconstruction requires exact release commit {}, but HEAD is {}",
+        transaction.exact_sha, head
+      ),
+      format!(
+        "check out the release branch at {} before resuming",
+        transaction.exact_sha
+      ),
+    ));
+  }
+  let crate_names = transaction.crates.keys().cloned().collect::<Vec<_>>();
+  if crate_names.is_empty() {
+    return Err(RailError::message(format!(
+      "release transaction '{}' records no crate identities",
+      transaction_id
+    )));
+  }
+  let plan =
+    ReleasePlanner::new(ctx, release_config).recovery_plan(Some(crate_names), DependentPolicy::RejectPartialClosure)?;
+  for crate_plan in &plan.crates {
+    let expected = transaction
+      .crates
+      .get(&crate_plan.name)
+      .ok_or_else(|| RailError::message(format!("transaction has no version for crate '{}'", crate_plan.name)))?;
+    if expected != &crate_plan.new_version.to_string() {
+      return Err(RailError::with_help(
+        format!(
+          "transaction records {}@{}, but the checkout resolves version {}",
+          crate_plan.name, expected, crate_plan.new_version
+        ),
+        "check out the exact release commit and restore its release configuration",
+      ));
+    }
+    let expected_tag = transaction.tags.get(&crate_plan.name).ok_or_else(|| {
+      RailError::message(format!(
+        "transaction has no tag identity for crate '{}'",
+        crate_plan.name
+      ))
+    })?;
+    if expected_tag != &crate_plan.tag_name {
+      return Err(RailError::with_help(
+        format!(
+          "transaction records tag '{}' for {}, but the checkout resolves '{}'",
+          expected_tag, crate_plan.name, crate_plan.tag_name
+        ),
+        "restore the release tag format from the exact release commit",
+      ));
+    }
+    let authorized_publish = transaction.crate_publish.get(&crate_plan.name).ok_or_else(|| {
+      RailError::message(format!(
+        "transaction has no package publication intent for crate '{}'",
+        crate_plan.name
+      ))
+    })?;
+    if *authorized_publish != (publish && crate_plan.publish) {
+      return Err(RailError::with_help(
+        format!("package publication intent changed for '{}'", crate_plan.name),
+        "restore Cargo publish metadata and release configuration from the exact release commit",
+      ));
+    }
+  }
+  publisher.reconstruct(
+    transaction_id,
+    &plan,
+    !publish,
+    !tag,
+    transaction.exact_sha,
+    transaction.commit_targets,
+  )
 }
 
 /// Abort an active release before any external side effect has occurred.
 pub fn run_release_abort(ctx: &WorkspaceContext, state: &std::path::Path, yes: bool) -> RailResult<()> {
-  ctx.snapshot()?;
   enforce_safety_gate("release abort", yes, None, io::stdin().is_terminal())?;
   let release_config = ctx
     .config()
@@ -739,7 +1490,9 @@ fn build_release_mutation_plan(
   pr: bool,
   release_config: &crate::config::ReleaseConfig,
 ) -> RailResult<mutation::MutationPlan> {
-  let mut actions = Vec::with_capacity(plan.crates.len() * 7 + plan.change_files_to_delete.len() + 3);
+  let mut actions = Vec::with_capacity(
+    plan.crates.len() * 7 + plan.change_files_to_delete.len() + plan.change_files_to_update.len() + 3,
+  );
 
   for (index, crate_plan) in plan.crates.iter().enumerate() {
     actions.push(
@@ -819,6 +1572,13 @@ fn build_release_mutation_plan(
             .with_mutations(vec![release_mutation(ctx, path, MutationEffect::Delete)?]),
         );
       }
+      for update in &plan.change_files_to_update {
+        actions.push(
+          MutationAction::new("UPDATE_CHANGE_FILE", update.path.display().to_string(), None)
+            .with_payload(serde_json::json!({ "path": update.path, "content": update.content }))
+            .with_mutations(vec![release_mutation(ctx, &update.path, MutationEffect::Write)?]),
+        );
+      }
     }
     actions.push(
       MutationAction::new(
@@ -844,20 +1604,6 @@ fn build_release_mutation_plan(
           "message": format!("chore(release): {} v{}", crate_plan.name, crate_plan.new_version),
         })),
       );
-      if !skip_tag {
-        actions.push(
-          MutationAction::new(
-            "CREATE_TAG",
-            crate_plan.tag_name.clone(),
-            Some(format!("crate={}", crate_plan.name)),
-          )
-          .with_payload(serde_json::json!({
-            "crate": crate_plan.name,
-            "tag": crate_plan.tag_name,
-            "signed": release_config.sign_tags,
-          })),
-        );
-      }
     }
   }
 
@@ -873,22 +1619,15 @@ fn build_release_mutation_plan(
   } else {
     if release_config.remote_effects.pushes() {
       actions.push(
-        MutationAction::new("PUSH_RELEASE_REFS", "origin", None).with_payload(serde_json::json!({
+        MutationAction::new("PUSH_RELEASE_COMMIT", "origin", None).with_payload(serde_json::json!({
           "remote": "origin",
-          "tags": if skip_tag {
-            Vec::<String>::new()
-          } else {
-            plan.crates.iter().map(|crate_plan| crate_plan.tag_name.clone()).collect()
-          },
+          "branch": ctx.git()?.git().current_branch()?,
         })),
       );
-    }
-    if release_config.remote_effects.creates_forge_release() && !skip_tag {
-      for crate_plan in &plan.crates {
+      if !skip_publish || !skip_tag {
         actions.push(
-          MutationAction::new("CREATE_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-            serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
-          ),
+          MutationAction::new("AWAIT_EXACT_SHA_CHECKS", "release_commit", None)
+            .with_payload(serde_json::json!({ "remote": "origin", "poll": false })),
         );
       }
     }
@@ -900,13 +1639,44 @@ fn build_release_mutation_plan(
         );
       }
     }
-    if release_config.remote_effects.creates_forge_release() && !skip_tag {
+    if !skip_tag {
       for crate_plan in &plan.crates {
         actions.push(
-          MutationAction::new("PUBLISH_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-            serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
-          ),
+          MutationAction::new(
+            "CREATE_TAG",
+            crate_plan.tag_name.clone(),
+            Some(format!("crate={}", crate_plan.name)),
+          )
+          .with_payload(serde_json::json!({
+            "crate": crate_plan.name,
+            "tag": crate_plan.tag_name,
+            "signed": release_config.sign_tags,
+          })),
         );
+      }
+      if release_config.remote_effects.pushes() {
+        actions.push(
+          MutationAction::new("PUSH_RELEASE_TAGS", "origin", None).with_payload(serde_json::json!({
+            "remote": "origin",
+            "tags": plan.crates.iter().map(|crate_plan| crate_plan.tag_name.clone()).collect::<Vec<_>>(),
+          })),
+        );
+      }
+      if release_config.remote_effects.creates_forge_release() {
+        for crate_plan in &plan.crates {
+          actions.push(
+            MutationAction::new("CREATE_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
+              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
+            ),
+          );
+        }
+        for crate_plan in &plan.crates {
+          actions.push(
+            MutationAction::new("PUBLISH_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
+              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
+            ),
+          );
+        }
       }
     }
   }
@@ -930,7 +1700,7 @@ fn build_release_mutation_plan(
     risks.push(MutationRisk::new(
       "REMOTE_PUSH",
       "medium",
-      "release commits and tags are pushed before public publishing",
+      "the exact release commit is pushed for checks; tags are pushed only after package publication is observable",
     ));
   }
 

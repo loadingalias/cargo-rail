@@ -148,10 +148,10 @@ Examples:
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
-  cargo rail release run my-crate               # Release (patch bump)
+  cargo rail release run my-crate               # Release from reviewed change intent
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
-  cargo rail release run my-crate --bump auto   # Infer per-crate bump from commits
+  cargo rail release run my-crate --bump auto   # Infer each bump from the configured release source
   cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
   cargo rail release finalize --all             # Tag/publish after the release PR merges
   cargo rail release run my-crate --bump minor
@@ -720,7 +720,7 @@ pub enum ReleaseCommand {
     #[arg(short, long)]
     all: bool,
     /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
-    #[arg(long, default_value = "patch")]
+    #[arg(long, default_value = "auto")]
     bump: String,
     /// Check for a pending release plan (exit 1 when pending)
     #[arg(long, short = 'c')]
@@ -795,6 +795,15 @@ pub enum ReleaseCommand {
     #[arg(value_name = "STATE")]
     state: PathBuf,
   },
+  /// Show durable release state and the safe recovery command
+  Status {
+    /// Inspect one state file instead of every known release transaction
+    #[arg(value_name = "STATE")]
+    state: Option<PathBuf>,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
   /// Abort an active release that has not reached remote side effects
   Abort {
     /// State path printed by the active release
@@ -814,7 +823,7 @@ pub enum ChangeCommand {
     /// Crate name(s) covered by this change
     #[arg(value_name = "CRATE")]
     crate_names: Vec<String>,
-    /// Bump level for the covered crate(s): patch, minor, major
+    /// Release intent for the covered crate(s): none, patch, minor, major
     #[arg(long)]
     bump: String,
     /// User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
@@ -879,6 +888,7 @@ impl Commands {
       Commands::Release { command } => match command {
         ReleaseCommand::Init { .. } => false,
         ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => false,
+        ReleaseCommand::Status { format, .. } => format.is_json_like(),
         ReleaseCommand::Run { format, .. }
         | ReleaseCommand::Check { format, .. }
         | ReleaseCommand::Finalize { format, .. } => format.is_json_like(),
@@ -951,7 +961,8 @@ impl Commands {
         command:
           ReleaseCommand::Run { format, .. }
           | ReleaseCommand::Check { format, .. }
-          | ReleaseCommand::Finalize { format, .. },
+          | ReleaseCommand::Finalize { format, .. }
+          | ReleaseCommand::Status { format, .. },
       } => *format = TextJsonOutputFormat::Json,
       Commands::Release { .. } => {}
       Commands::Change {

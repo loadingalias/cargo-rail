@@ -62,7 +62,10 @@ pub use graph::run_graph;
 pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
-pub use release::{run_release_check, run_release_finalize, run_release_init, run_release_plan, run_release_publish};
+pub use release::{
+  run_release_check, run_release_finalize, run_release_init, run_release_plan, run_release_publish,
+  run_release_status_standalone,
+};
 pub use run::run_run;
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
@@ -159,6 +162,33 @@ pub fn try_dispatch_pre_context(
     Commands::Completions { shell } => {
       cli::generate_completions(shell);
       Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Release {
+      command: cli::ReleaseCommand::Status { state, format },
+    } => {
+      release::run_release_status_standalone(workspace_root, state.as_deref(), format)?;
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Release {
+      command: cli::ReleaseCommand::Resume { state },
+    } => {
+      if state.exists() {
+        crate::release::state::prepare_recovery(workspace_root, &state)?;
+      }
+      Ok(PreContextDispatch::NeedsContext(Box::new(Commands::Release {
+        command: cli::ReleaseCommand::Resume { state },
+      })))
+    }
+
+    Commands::Release {
+      command: cli::ReleaseCommand::Abort { state, yes },
+    } => {
+      crate::release::state::prepare_recovery(workspace_root, &state)?;
+      Ok(PreContextDispatch::NeedsContext(Box::new(Commands::Release {
+        command: cli::ReleaseCommand::Abort { state, yes },
+      })))
     }
 
     other => Ok(PreContextDispatch::NeedsContext(Box::new(other))),
@@ -432,6 +462,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         release::run_release_finalize(ctx, names, all, skip_publish, skip_tag, include_dependents, yes, format)
       }
       cli::ReleaseCommand::Resume { state } => release::run_release_resume(ctx, &state),
+      cli::ReleaseCommand::Status { .. } => unreachable!("release status should be handled before context loading"),
       cli::ReleaseCommand::Abort { state, yes } => release::run_release_abort(ctx, &state, yes),
     },
 

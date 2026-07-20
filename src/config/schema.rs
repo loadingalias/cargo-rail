@@ -200,18 +200,24 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "unify.sort_dependencies",
     "Deprecated: dependency edits are always deterministic. Run `cargo rail config migrate` to remove this field.",
   ),
+  policy(
+    "release.source",
+    "Selects reviewed changes or an explicit conventional-commit compatibility mode as release input.",
+  ),
   policy("release.tag_prefix", "Defines the repository's release tag prefix."),
   policy(
     "release.tag_format",
     "Defines the repository's crate/version tag namespace.",
   ),
-  policy(
+  compatibility(
     "release.require_clean",
-    "Chooses the compatibility cleanliness gate for release operations.",
+    "Preserves old configuration while release apply moves to exact planned-input cleanliness.",
+    "Deprecated: remove this field; previews permit dirt and apply always rejects paths outside the bound plan.",
   ),
-  policy(
+  compatibility(
     "release.publish_delay",
-    "Bounds compatibility registry-convergence polling.",
+    "Preserves old configuration after cargo-rail stopped polling registry convergence.",
+    "Deprecated: remove this field; release execution stops at registry wait boundaries and resumes by reconciliation.",
   ),
   policy(
     "release.remote_effects",

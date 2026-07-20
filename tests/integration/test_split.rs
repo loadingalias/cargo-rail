@@ -317,6 +317,11 @@ path = "CHANGELOG.md"
 
   // Make a change to release
   std::fs::write(split_root.join("src/lib.rs"), "// bumped")?;
+  std::fs::create_dir_all(split_root.join(".changes"))?;
+  std::fs::write(
+    split_root.join(".changes/release.md"),
+    "---\n\"lib-release\" = \"patch\"\n---\n\nPrepare the split crate release.\n",
+  )?;
   git(split_root, &["add", "."])?;
   git(split_root, &["commit", "-m", "feat: prepare release"])?;
 

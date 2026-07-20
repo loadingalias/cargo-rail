@@ -33,6 +33,8 @@ Use:
 
 ```toml
 [release]
+# Keep commit-derived bumps and prose only during this compatibility migration.
+source = "commits"
 # git-cliff's filter_unconventional silently drops unparseable commits;
 # fallback = "skip" below does the same. "deny" goes further and fails
 # `release check` — use "warn" or "allow" to match git-cliff exactly.
@@ -147,6 +149,7 @@ release-worthy changes; everything else is listed under `Skipped:` with the
 reason and the tag range it was measured against.
 
 `release check --extended` uses an installed `cargo-semver-checks` binary when
-available. It is never added as a cargo-rail dependency, and an inconclusive
-run (for example a first release with no published baseline) reports as
-skipped — it never escalates a bump or fails the release.
+available. It is never added as a cargo-rail dependency. An inconclusive run
+(for example a first release with no published baseline) reports as skipped.
+A confirmed breaking change validates the selected bump and blocks when the
+declared signal is insufficient; it never silently escalates a release.

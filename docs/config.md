@@ -115,33 +115,35 @@ preserve_features = ["unstable-*", "bench*"]
 
 | Field | Default | Behavior |
 |---|---:|---|
+| `source` | `"changes"` | `"changes"` uses reviewed intent only. `"commits"` and `"both"` are explicit compatibility modes. |
 | `tag_prefix` | `"v"` | Value rendered by `{prefix}`. |
 | `tag_format` | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`. |
-| `require_clean` | `true` | Require a clean worktree at the current release apply boundary. |
-| `publish_delay` | `5` | Compatibility registry-convergence interval in seconds. |
-| `remote_effects` | `"none"` | `"none"` stays local; `"push"` pushes commit/tags; `"auto"`, `"github"`, or `"gitlab"` also creates a forge release with `gh` or `glab`. |
+| `require_clean` | `true` | Deprecated compatibility input. Preview permits dirt; apply always rejects paths outside the bound plan. |
+| `publish_delay` | `5` | Deprecated compatibility input. Cargo-rail does not poll or sleep for registry convergence. |
+| `remote_effects` | `"none"` | `"none"` stays local. Other modes push the exact release commit, require a green GitHub/GitLab check rollup before publishing or tagging, then push tags last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
 | `sign_tags` | `false` | Sign release tags with the configured Git signing mechanism. |
 | `require_changelog_entries` | `false` | Fail when a released crate has no generated changelog entries. |
 | `require_release_notes` | `true` | Require reviewed notes before tag, publish, or forge effects. |
 | `release_notes_dir` | `"release-notes"` | Manual release-note override directory. |
 | `change_dir` | `".changes"` | Reviewed release-intent directory. |
 | `pre_1_breaking_bump` | `"minor"` | Map breaking 0.x intent to `"minor"` or `"major"`. |
-| `unconventional_commits` | `"warn"` | `"allow"`, `"warn"`, or `"deny"` non-conventional commits. |
-| `semver_check` | `"warn"` | `"off"`, `"warn"`, or `"deny"` external `cargo-semver-checks` evidence. |
-| `require_change_files` | `false` | `true`, `false`, or a list of crate names requiring reviewed intent. |
+| `unconventional_commits` | `"warn"` | Compatibility-mode policy for non-conventional commits; ignored in changes mode. |
+| `semver_check` | `"warn"` | `"off"` disables external validation. A confirmed bump mismatch blocks instead of escalating reviewed intent. |
+| `require_change_files` | `false` | Compatibility-mode coverage policy. Changes mode always gates every changed crate. |
 | `version_groups` | `{}` | Named crate lists released in lockstep at their maximum required bump. |
 
 ```toml
 [release]
+source = "changes"
 tag_format = "{prefix}{version}"
 remote_effects = "auto"
 sign_tags = true
-require_change_files = true
-unconventional_commits = "deny"
 
 [release.version_groups]
 core = ["rail-core", "rail-graph", "rail-git"]
 ```
+
+`cargo rail release run` defaults to `--bump auto`. In changes mode, only release-worthy entries (`patch`, `minor`, or `major`) select a crate; `none` records explicit reviewed no-release intent and satisfies coverage without adding changelog prose. Release-worthy entries in one shared file are consumed atomically, while `none` entries for crates outside the release plan are retained by an exact frontmatter rewrite. Dependency-only releases receive a synthesized patch entry. Use `source = "commits"` or `source = "both"` only while migrating an older commit-driven workflow.
 
 ### `[release.changelog]`
 

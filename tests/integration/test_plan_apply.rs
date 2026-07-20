@@ -169,6 +169,11 @@ tag_format = "v{version}"
 require_clean = false
 "#,
   )?;
+  std::fs::create_dir_all(ws.path.join(".changes"))?;
+  std::fs::write(
+    ws.path.join(".changes/release-plan.md"),
+    "---\n\"relplan\" = \"patch\"\n---\n\nExercise release apply from a reviewed plan.\n",
+  )?;
   ws.commit("Configure release plan test")?;
 
   let check = run_cargo_rail(

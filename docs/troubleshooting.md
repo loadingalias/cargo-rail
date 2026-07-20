@@ -34,9 +34,11 @@ Check these in order:
 
 ### Shallow CI checkout
 
-`cargo rail release run --bump auto` needs release tags to measure each crate's
-range. In a shallow clone, tags may be missing, so auto-bump planning fails
-instead of guessing from incomplete history.
+Commit compatibility modes (`[release] source = "commits"` or `"both"`) need
+release tags to measure each crate's history range. In a shallow clone, tags
+may be missing, so commit-derived auto-bump planning fails instead of guessing
+from incomplete history. The default reviewed-changes mode does not parse
+commit history for bump selection.
 
 ```bash
 git fetch --unshallow --tags
@@ -51,12 +53,28 @@ first side effect. Resume that exact plan after any local, network, registry, or
 forge failure:
 
 ```bash
+cargo rail release status
+cargo rail release status --format json
 cargo rail release resume target/cargo-rail/releases/release-<id>.json
 ```
 
-Resume reconciles commits, tags, pushed refs, forge releases, and published
-crate versions before advancing. It never replans from already-bumped manifests
-or republishes an unobserved in-progress crate version.
+Status does not load Cargo metadata, so it remains available if a crash left a
+manifest between local mutations. It reports the phase, exact SHA, last and next
+effect, persisted observations, ambiguity, recoverability, and one safe command.
+
+Resume reconciles release commits, exact remote refs, check/pipeline rollups,
+crate versions, tags, and forge releases before advancing. It never replans from
+already-bumped manifests or republishes an unobserved in-progress crate version.
+`awaiting_checks` and registry propagation are explicit external wait boundaries:
+cargo-rail exits and never sleeps or polls. Resume after the provider settles.
+
+Every release commit also records the plan-bound transaction plus release mode,
+crate versions, and publish/tag authorization in `Rail-Release-*` trailers. In a
+fresh checkout at the exact release commit, `release status` reconstructs the
+transaction from Git and `cargo rail release resume release-<transaction-id>`
+rebuilds the local journal before reconciling remote, forge, and registry truth.
+Reconstruction refuses a different HEAD or legacy trailers that do not encode
+irreversible-effect authorization.
 
 If no remote, forge, or registry side effect has started, abandon the release
 and restore its original local commit with:
@@ -67,6 +85,10 @@ cargo rail release abort target/cargo-rail/releases/release-<id>.json --yes
 
 Abort refuses once an external side effect may exist; resume is the safe path
 from that point.
+
+Plain `cargo rail clean` removes completed and aborted release journals. It
+refuses active or malformed journals before deleting anything; use `release
+status` to resolve them first.
 
 ### Manual sync conflict
 
