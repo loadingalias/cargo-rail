@@ -330,9 +330,13 @@ semver_check = "off"
   let json: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
   assert_eq!(json["release_plan"]["change_files_to_delete"], serde_json::json!([]));
   let retained = &json["release_plan"]["change_files_to_update"][0];
+  let retained_path = retained["path"]
+    .as_str()
+    .expect("retained change-file path should be a JSON string");
   assert_eq!(
-    retained["path"],
-    serde_json::json!(std::fs::canonicalize(&change_path)?)
+    std::fs::canonicalize(retained_path)?,
+    std::fs::canonicalize(&change_path)?,
+    "release plan should retain the same change file"
   );
   assert_eq!(
     retained["content"],
