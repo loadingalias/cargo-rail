@@ -2818,6 +2818,7 @@ remote_effects = "gitlab"
   Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn test_release_pushes_commit_and_tag_when_push_enabled() -> Result<()> {
   let (ws, _remote) = push_release_workspace("push-release")?;
