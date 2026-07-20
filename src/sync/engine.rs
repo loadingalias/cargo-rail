@@ -1255,18 +1255,14 @@ fn read_worktree_blob(path: &Path, fallback_mode: Option<&str>) -> RailResult<(V
       path.display()
     )));
   }
-  let mut mode = if fallback_mode == Some("100755") {
-    "100755"
-  } else {
-    "100644"
-  };
   #[cfg(unix)]
-  {
+  let executable = {
     use std::os::unix::fs::PermissionsExt as _;
-    if metadata.permissions().mode() & 0o111 != 0 {
-      mode = "100755";
-    }
-  }
+    fallback_mode == Some("100755") || metadata.permissions().mode() & 0o111 != 0
+  };
+  #[cfg(not(unix))]
+  let executable = fallback_mode == Some("100755");
+  let mode = if executable { "100755" } else { "100644" };
   Ok((std::fs::read(path)?, mode.to_string()))
 }
 

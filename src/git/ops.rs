@@ -711,6 +711,7 @@ impl SystemGit {
       .ok_or_else(|| RailError::message("git update-index stdin was unavailable"))?;
     let zero_id = "0".repeat(expected_head.len());
     let mut changed_paths = Vec::with_capacity(changes.len());
+    let mut upsert_paths = Vec::with_capacity(changes.len());
     for change in changes {
       let (mode, object_id, path) = match change {
         GitIndexChange::Upsert(entry) => (&*entry.mode, &*entry.object_id, &entry.path),
@@ -719,9 +720,13 @@ impl SystemGit {
       let path = self.normalize_path(path)?;
       let path = path
         .to_str()
-        .ok_or_else(|| RailError::message(format!("Git index path '{}' is not UTF-8", path.display())))?;
+        .ok_or_else(|| RailError::message(format!("Git index path '{}' is not UTF-8", path.display())))?
+        .replace('\\', "/");
       write!(stdin, "{} {}\t{}\0", mode, object_id, path).context("Failed to write exact Git index entry")?;
-      changed_paths.push(PathBuf::from(path));
+      if matches!(change, GitIndexChange::Upsert(_)) {
+        upsert_paths.push(path.clone());
+      }
+      changed_paths.push(path);
     }
     drop(stdin);
     let output = child
@@ -785,17 +790,10 @@ impl SystemGit {
           stderr: git_command_diagnostics(&output.stdout, &output.stderr),
         }));
       }
-      let upserts = changes
-        .iter()
-        .filter_map(|change| match change {
-          GitIndexChange::Upsert(entry) => Some(entry.path.as_path()),
-          GitIndexChange::Delete(_) => None,
-        })
-        .collect::<Vec<_>>();
-      if !upserts.is_empty() {
+      if !upsert_paths.is_empty() {
         let mut checkout = self.git_cmd();
         checkout.args(["checkout-index", "-f", "--"]);
-        checkout.args(upserts);
+        checkout.args(&upsert_paths);
         let output = checkout.output().context("Failed to materialize exact Git paths")?;
         if !output.status.success() {
           return Err(RailError::Git(GitError::CommandFailed {
@@ -1446,6 +1444,41 @@ mod tests {
     // Empty input should return empty output
     let results = git.read_files_bulk(&[]).unwrap();
     assert!(results.is_empty());
+  }
+
+  #[test]
+  fn exact_index_changes_normalize_windows_separators() {
+    let temp = tempfile::TempDir::new().unwrap();
+    crate::git::init_repo(temp.path(), "main").unwrap();
+    let git = SystemGit::open(temp.path()).unwrap();
+    git.set_config("user.name", "Test User").unwrap();
+    git.set_config("user.email", "test@example.com").unwrap();
+
+    std::fs::create_dir(temp.path().join("nested")).unwrap();
+    std::fs::write(temp.path().join("nested/file.txt"), "before\n").unwrap();
+    git.stage_all().unwrap();
+    git.commit("initial").unwrap();
+
+    let parent = git.head_commit().unwrap();
+    let metadata = git.get_commit(&parent).unwrap().metadata();
+    let object_id = git.write_blob(b"after\n").unwrap();
+    let commit = git
+      .create_commit_with_index_changes(
+        "update nested file",
+        &metadata,
+        std::slice::from_ref(&parent),
+        &[GitIndexChange::Upsert(GitTreeEntry {
+          mode: "100644".to_string(),
+          object_id,
+          path: PathBuf::from(r"nested\file.txt"),
+        })],
+      )
+      .unwrap();
+
+    let contents = git.read_files_bulk(&[(&commit, Path::new("nested/file.txt"))]).unwrap();
+    assert_eq!(contents, vec![b"after\n".to_vec()]);
+    assert!(temp.path().join("nested/file.txt").is_file());
+    git.run_git(&["diff", "--quiet", "--", "nested/file.txt"]).unwrap();
   }
 
   #[test]

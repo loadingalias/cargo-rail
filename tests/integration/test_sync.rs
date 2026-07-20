@@ -213,7 +213,8 @@ include = ["NOTICE"]
     &ws.path,
     &["rail", "split", "run", "asset-sync", "--yes", "--allow-dirty"],
   )?;
-  assert_eq!(std::fs::read_to_string(split_dir.path().join("NOTICE"))?, "initial\n");
+  assert_eq!(git(split_dir.path(), &["show", "HEAD:NOTICE"])?.stdout, b"initial\n");
+  git(split_dir.path(), &["diff", "--quiet", "--", "NOTICE"])?;
 
   std::fs::write(ws.path.join("NOTICE"), "from mono\n")?;
   ws.commit("Update explicit asset in mono")?;
@@ -221,7 +222,8 @@ include = ["NOTICE"]
     &ws.path,
     &["rail", "sync", "asset-sync", "--to-remote", "--yes", "--allow-dirty"],
   )?;
-  assert_eq!(std::fs::read_to_string(split_dir.path().join("NOTICE"))?, "from mono\n");
+  assert_eq!(git(split_dir.path(), &["show", "HEAD:NOTICE"])?.stdout, b"from mono\n");
+  git(split_dir.path(), &["diff", "--quiet", "--", "NOTICE"])?;
 
   std::fs::write(split_dir.path().join("NOTICE"), "from split\n")?;
   git(split_dir.path(), &["add", "NOTICE"])?;
@@ -230,7 +232,8 @@ include = ["NOTICE"]
     &ws.path,
     &["rail", "sync", "asset-sync", "--from-remote", "--yes", "--allow-dirty"],
   )?;
-  assert_eq!(std::fs::read_to_string(ws.path.join("NOTICE"))?, "from split\n");
+  assert_eq!(git(&ws.path, &["show", "HEAD:NOTICE"])?.stdout, b"from split\n");
+  git(&ws.path, &["diff", "--quiet", "--", "NOTICE"])?;
   assert!(!ws.path.join("crates/asset-sync/NOTICE").exists());
   Ok(())
 }
@@ -257,9 +260,10 @@ fn test_sync_preserves_committed_source_paths_named_target() -> Result<()> {
   )?;
 
   assert_eq!(
-    std::fs::read_to_string(split_dir.path().join("docs/target/example.txt"))?,
-    "intentional source\n"
+    git(split_dir.path(), &["show", "HEAD:docs/target/example.txt"])?.stdout,
+    b"intentional source\n"
   );
+  git(split_dir.path(), &["diff", "--quiet", "--", "docs/target/example.txt"])?;
   Ok(())
 }
 
