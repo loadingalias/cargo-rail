@@ -442,6 +442,7 @@ pub(crate) fn attach_execution_identities(
   manifests: &mut [CompilationObservationManifest],
   compiler: &ExecutableIdentity,
   wrappers: &[ExecutableIdentity],
+  executable_bypasses: &BTreeSet<String>,
 ) {
   for manifest in manifests {
     if manifest.execution.compiler.is_none() {
@@ -450,6 +451,7 @@ pub(crate) fn attach_execution_identities(
     if manifest.execution.wrappers.is_empty() {
       manifest.execution.wrappers = wrappers.to_vec();
     }
+    manifest.bypasses.extend(executable_bypasses.iter().cloned());
   }
 }
 

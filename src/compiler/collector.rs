@@ -71,6 +71,7 @@ pub(crate) struct CompilerCacheIdentity {
   package_observation_identities: HashMap<PackageId, String>,
   rustc_executable: ExecutableIdentity,
   wrapper_executables: Vec<ExecutableIdentity>,
+  executable_bypasses: BTreeSet<String>,
   cache_bypass_reason: Option<&'static str>,
 }
 
@@ -115,6 +116,12 @@ impl CompilerCacheIdentity {
         "remove cargo-rail from RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER; diagnostics injection is automatic",
       ));
     }
+    let mut executable_bypasses = executables.limitations().map(str::to_string).collect::<BTreeSet<_>>();
+    executable_bypasses.extend(
+      cargo_rail_executable
+        .limitations()
+        .map(|limitation| format!("compiler_wrapper_{limitation}")),
+    );
     let mut wrapper_executables = Vec::with_capacity(3);
     wrapper_executables.extend(executables.rustc_wrapper().cloned());
     wrapper_executables.push(cargo_rail_executable);
@@ -138,6 +145,7 @@ impl CompilerCacheIdentity {
       package_observation_identities,
       rustc_executable,
       wrapper_executables,
+      executable_bypasses,
       cache_bypass_reason,
     })
   }
@@ -228,13 +236,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         continue;
       }
 
-      let reason = self.identity.cache_bypass_reason.unwrap_or_else(|| {
-        if let Some(reason) = observation_miss {
-          reason
-        } else {
-          store.miss_reason(&key)
-        }
-      });
+      let reason = self
+        .identity
+        .cache_bypass_reason
+        .or(observation_miss)
+        .unwrap_or_else(|| store.miss_reason(&key));
       let summary = cache_by_member.entry(member.to_string()).or_default();
       summary.misses += 1;
       *summary.miss_reasons.entry(reason.to_string()).or_default() += 1;
@@ -343,7 +349,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           platform: PlatformTarget::from(target),
           features: features.clone(),
           compiled_units: compiled,
-          unused_crates: unused.clone(),
+          unused_crates: unused,
           unit_evidence,
           completeness,
         };
@@ -925,36 +931,24 @@ fn parse_compilation_observations(
     &mut manifests,
     &identity.rustc_executable,
     &identity.wrapper_executables,
+    &identity.executable_bypasses,
   );
   Ok(manifests)
 }
 
-fn compiler_observation_miss_reason(
-  observations: &[CompilationObservationManifest],
+fn compiler_observation_miss_reason<'a>(
+  observations: &'a [CompilationObservationManifest],
   workspace_root: &Path,
-) -> Option<&'static str> {
+) -> Option<&'a str> {
   if observations.is_empty() {
     return Some("compilation_observations_absent");
   }
-  for reason in observations
+  if let Some(reason) = observations
     .iter()
     .flat_map(|manifest| manifest.bypasses.iter().map(String::as_str))
+    .next()
   {
-    let reason = match reason {
-      "cargo_artifact_unavailable" => Some("cargo_artifact_unavailable"),
-      "rustc_invocation_unavailable" => Some("rustc_invocation_unavailable"),
-      "dep_info_unavailable" => Some("dep_info_unavailable"),
-      "dep_info_path_unavailable" => Some("dep_info_path_unavailable"),
-      "declared_input_bytes_unavailable" => Some("declared_input_bytes_unavailable"),
-      "dependency_artifact_bytes_unavailable" => Some("dependency_artifact_bytes_unavailable"),
-      "compiler_executable_identity_unavailable" => Some("compiler_executable_identity_unavailable"),
-      "non_utf8_compiler_argument" => Some("non_utf8_compiler_argument"),
-      "response_file_expansion_unavailable" => Some("response_file_expansion_unavailable"),
-      _ => None,
-    };
-    if reason.is_some() {
-      return reason;
-    }
+    return Some(reason);
   }
   for manifest in observations {
     if let Some(reason) = manifest.revalidation_reason(workspace_root) {
@@ -1066,6 +1060,9 @@ fn target_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<Strin
 }
 
 fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<&'static str> {
+  if !snapshot.cargo_config().unmodeled_settings().is_empty() {
+    return Some("cargo_configuration_unmodeled");
+  }
   for package in &snapshot.base_resolution().metadata().packages {
     if package
       .targets

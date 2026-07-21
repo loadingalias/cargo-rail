@@ -6,8 +6,9 @@
 //!
 //! This is critical - false positives would cause users to remove deps they need!
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
+use std::collections::BTreeSet;
 use std::fs;
 
 /// Helper to create a workspace for unconditional unused-dependency diagnostics.
@@ -28,6 +29,20 @@ fn add_crate_with_manifest(workspace: &TestWorkspace, name: &str, manifest: &str
     format!("//! {} crate\npub fn hello() {{}}\n", name),
   )?;
   Ok(())
+}
+
+fn compiler_key_fingerprints(cache: &serde_json::Value, package: &str, field: &str) -> BTreeSet<String> {
+  cache["entries"]
+    .as_object()
+    .into_iter()
+    .flat_map(|entries| entries.values())
+    .filter(|entry| {
+      entry["key"]["package_id"]
+        .as_str()
+        .is_some_and(|package_id| package_id.contains(package))
+    })
+    .filter_map(|entry| entry["key"][field].as_str().map(str::to_string))
+    .collect()
 }
 
 // TEST 1: Crate name normalization (hyphens vs underscores)
@@ -1433,6 +1448,10 @@ edition = "2021"
   );
   let entries = cache["entries"].as_object().expect("cache entries object");
   let entry = entries.values().next().expect("at least one cache entry");
+  assert_eq!(
+    entry["collector_version"], 10,
+    "fail-closed observation authority requires collector semantics version 10"
+  );
   assert!(
     entry["key"]["package_id"].as_str().is_some(),
     "cache key must retain Cargo package identity: {entry}"
@@ -1491,6 +1510,25 @@ edition = "2021"
       .is_some_and(|identity| identity.starts_with("v1-sha256-"))
   );
   assert_eq!(observation["unit"]["target_kind"], "library");
+  let observation_bypasses = observation["bypasses"].as_array().expect("observation bypass array");
+  assert!(
+    observation_bypasses.iter().any(|reason| reason
+      .as_str()
+      .is_some_and(|reason| reason.ends_with("dynamic_executable_inputs_unavailable"))),
+    "native tool runtime inputs must remain an explicit cache bypass: {observation}"
+  );
+  let expected_observation_miss = observation_bypasses
+    .first()
+    .and_then(serde_json::Value::as_str)
+    .expect("at least one deterministic observation bypass")
+    .to_string();
+  let expected_observation_miss = format!("{expected_observation_miss}=");
+  let baseline_source = compiler_key_fingerprints(&cache, "test-crate", "source_fingerprint");
+  let baseline_manifest = compiler_key_fingerprints(&cache, "test-crate", "manifest_fingerprint");
+  let baseline_config = compiler_key_fingerprints(&cache, "test-crate", "cargo_config_fingerprint");
+  assert!(!baseline_source.is_empty());
+  assert!(!baseline_manifest.is_empty());
+  assert!(!baseline_config.is_empty());
 
   let warm = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   let warm_json: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
@@ -1498,14 +1536,45 @@ edition = "2021"
     .as_array()
     .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
     .expect("unused dependency cache telemetry");
+  assert_eq!(
+    warm_cache["hits"], 0,
+    "an executable with unmodeled dynamic inputs must never authorize evidence reuse"
+  );
   assert!(
-    warm_cache["hits"].as_u64().is_some_and(|hits| hits > 0),
-    "warm analysis must expose exact cache reuse\n{}",
+    warm_cache["misses"].as_u64().is_some_and(|misses| misses > 0)
+      && warm_cache["miss_reasons"]
+        .as_array()
+        .is_some_and(|reasons| reasons.iter().any(|reason| reason
+          .as_str()
+          .is_some_and(|reason| reason.starts_with(&expected_observation_miss)))),
+    "warm analysis must expose the precise fail-closed executable bypass\n{}",
     serde_json::to_string_pretty(&warm_json)?
   );
-  assert_eq!(
-    warm_cache["misses"], 0,
-    "exact Cargo artifact fields and output bytes should correlate equivalent units without consulting freshness"
+
+  let profile_override = run_cargo_rail_with_env(
+    &workspace.path,
+    &["rail", "unify", "--check", "-f", "json"],
+    &[("CARGO_PROFILE_DEV_OPT_LEVEL", "1")],
+  )?;
+  assert_eq!(profile_override.status.code(), Some(1));
+  let profile_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  assert_ne!(
+    compiler_key_fingerprints(&profile_cache, "test-crate", "cargo_config_fingerprint"),
+    baseline_config,
+    "Cargo profile environment must change compiler-evidence configuration identity"
+  );
+
+  let incremental_override = run_cargo_rail_with_env(
+    &workspace.path,
+    &["rail", "unify", "--check", "-f", "json"],
+    &[("CARGO_INCREMENTAL", "0")],
+  )?;
+  assert_eq!(incremental_override.status.code(), Some(1));
+  let incremental_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  assert_ne!(
+    compiler_key_fingerprints(&incremental_cache, "test-crate", "cargo_config_fingerprint"),
+    baseline_config,
+    "CARGO_INCREMENTAL must change compiler-evidence configuration identity"
   );
 
   fs::write(
@@ -1524,13 +1593,26 @@ edition = "2021"
     .as_array()
     .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
     .expect("unrelated-input cache telemetry");
-  assert!(
-    unrelated_cache["hits"].as_u64().is_some_and(|hits| hits > 0),
-    "unrelated package source and manifest bytes must not invalidate member evidence\n{}",
-    serde_json::to_string_pretty(&unrelated_json)?
+  assert_eq!(unrelated_cache["hits"], 0);
+  let unrelated_cache_file: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  assert_eq!(
+    compiler_key_fingerprints(&unrelated_cache_file, "test-crate", "source_fingerprint"),
+    baseline_source,
+    "unrelated package source must not change selected source-closure identity"
   );
-  assert_eq!(unrelated_cache["hits"], warm_cache["hits"]);
-  assert_eq!(unrelated_cache["misses"], warm_cache["misses"]);
+  assert_eq!(
+    compiler_key_fingerprints(&unrelated_cache_file, "test-crate", "manifest_fingerprint"),
+    baseline_manifest,
+    "unrelated package manifest must not change selected manifest-closure identity"
+  );
+  assert!(
+    baseline_config.is_subset(&compiler_key_fingerprints(
+      &unrelated_cache_file,
+      "test-crate",
+      "cargo_config_fingerprint"
+    )),
+    "returning from environment overrides must recover the exact base Cargo configuration identity"
+  );
 
   let source_path = workspace.path.join("crates/test-crate/src/lib.rs");
   let original_source = fs::read_to_string(&source_path)?;
@@ -1542,19 +1624,12 @@ edition = "2021"
   );
   fs::write(&source_path, changed_source)?;
   let invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
-  let invalidated_json: serde_json::Value = serde_json::from_slice(&invalidated.stdout)?;
-  let invalidated_cache = invalidated_json["evidence_cache"]
-    .as_array()
-    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
-    .expect("invalidated dependency cache telemetry");
-  assert!(
-    invalidated_cache["miss_reasons"]
-      .as_array()
-      .is_some_and(|reasons| reasons.iter().any(|reason| reason
-        .as_str()
-        .is_some_and(|value| value.starts_with("source_changed=")))),
-    "source invalidation must be explicit\n{}",
-    serde_json::to_string_pretty(&invalidated_json)?
+  assert_eq!(invalidated.status.code(), Some(1));
+  let invalidated_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let changed_member_source = compiler_key_fingerprints(&invalidated_cache, "test-crate", "source_fingerprint");
+  assert_ne!(
+    changed_member_source, baseline_source,
+    "same-size source mutation must change the exact selected source identity"
   );
 
   let dependency_path = workspace.path.join("crates/helper/src/lib.rs");
@@ -1567,19 +1642,32 @@ edition = "2021"
   );
   fs::write(&dependency_path, changed_dependency)?;
   let dependency_invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
-  let dependency_json: serde_json::Value = serde_json::from_slice(&dependency_invalidated.stdout)?;
-  let dependency_cache = dependency_json["evidence_cache"]
+  assert_eq!(dependency_invalidated.status.code(), Some(1));
+  let dependency_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  assert_ne!(
+    compiler_key_fingerprints(&dependency_cache, "test-crate", "source_fingerprint"),
+    changed_member_source,
+    "same-size optional local dependency mutation must change the selected source-closure identity"
+  );
+
+  fs::create_dir_all(workspace.path.join(".cargo"))?;
+  fs::write(
+    workspace.path.join(".cargo/config.toml"),
+    "[build]\nfuture-compiler-mode = true\n",
+  )?;
+  let unmodeled = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let unmodeled_json: serde_json::Value = serde_json::from_slice(&unmodeled.stdout)?;
+  let unmodeled_cache = unmodeled_json["evidence_cache"]
     .as_array()
     .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
-    .unwrap_or_else(|| panic!("dependency-invalidated cache telemetry missing: {dependency_json}"));
+    .expect("unmodeled Cargo configuration telemetry");
   assert!(
-    dependency_cache["miss_reasons"]
+    unmodeled_cache["miss_reasons"]
       .as_array()
       .is_some_and(|reasons| reasons.iter().any(|reason| reason
         .as_str()
-        .is_some_and(|value| value.starts_with("source_changed=")))),
-    "optional local dependency mutation must invalidate every feature-domain evidence key\n{}",
-    serde_json::to_string_pretty(&dependency_json)?
+        .is_some_and(|reason| reason.starts_with("cargo_configuration_unmodeled=")))),
+    "unknown build-affecting Cargo configuration must bypass evidence reuse: {unmodeled_json}"
   );
 
   Ok(())

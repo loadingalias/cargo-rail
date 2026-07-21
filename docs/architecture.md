@@ -91,8 +91,10 @@ evidence can be reused. Cargo's `fresh` flag is retained only as execution metad
 Selected and underlying Cargo, rustc, and rustdoc implementations, wrappers, configured linkers and runners, and
 repository executables are content-addressed when relevant. Scripts also bind direct interpreters. Response-file
 expansion, dynamic libraries, SDK inputs, default linkers, incomplete platform images, and missing stable rustdoc
-invocation evidence produce explicit bypasses. Observation manifests never become pre-execution `ActionKey` inputs,
-and cargo-rail neither stores result artifacts nor writes or restores Cargo fingerprint state.
+invocation evidence produce explicit bypasses. Any observation bypass prevents diagnostic-evidence reuse; collector
+semantics are versioned so older evidence cannot silently gain authority. Observation manifests never become
+pre-execution `ActionKey` inputs, and cargo-rail neither stores result artifacts nor writes or restores Cargo
+fingerprint state.
 
 ## Mutation authority
 

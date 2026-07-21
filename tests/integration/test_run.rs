@@ -1563,6 +1563,84 @@ fn test_action_key_analysis_selects_exact_dependency_closure_inputs() -> Result<
 }
 
 #[test]
+fn test_action_key_cargo_cli_config_bypass_respects_argument_domains() -> Result<()> {
+  let ws = TestWorkspace::new_named("action-key-cargo-cli-config")?;
+  ws.add_crate("config-probe", "0.1.0", &[])?;
+  ws.commit("Add Cargo CLI config fixture")?;
+
+  let build = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--config",
+      "build.rustflags=[]",
+    ],
+  )?;
+  assert!(
+    build.status.success(),
+    "build plan failed: {}",
+    String::from_utf8_lossy(&build.stderr)
+  );
+  let build: serde_json::Value = serde_json::from_slice(&build.stdout)?;
+  let build_reasons = build["actions"][0]["action_key"]["reasons"]
+    .as_array()
+    .expect("build action-key reasons");
+  assert!(
+    build_reasons
+      .iter()
+      .any(|reason| reason["code"] == "cargo_cli_configuration_unmodeled"),
+    "Cargo --config must remain an explicit bypass: {build}"
+  );
+
+  let test = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "test",
+      "--skip-nextest",
+      "--dry-run",
+      "--format",
+      "json",
+      "--",
+      "--config=ordinary-harness-value",
+    ],
+  )?;
+  assert!(
+    test.status.success(),
+    "test plan failed: {}",
+    String::from_utf8_lossy(&test.stderr)
+  );
+  let test: serde_json::Value = serde_json::from_slice(&test.stdout)?;
+  assert!(
+    test["actions"][0]["argv"].as_array().is_some_and(|argv| argv
+      .iter()
+      .any(|argument| argument == "--config=ordinary-harness-value")),
+    "fixture must pass --config after Cargo's harness separator: {test}"
+  );
+  assert!(
+    test["actions"][0]["action_key"]["reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons
+        .iter()
+        .all(|reason| reason["code"] != "cargo_cli_configuration_unmodeled")),
+    "a test-harness argument must not be interpreted as Cargo configuration: {test}"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receipt() -> Result<()> {
   let ws = TestWorkspace::new_named("doctor-hermeticity")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;

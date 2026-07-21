@@ -176,3 +176,67 @@ fn configuration_id(key: &CompilerDiagKey) -> String {
     key.features.label()
   )
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::compiler::model::{DiagnosticsCompleteness, FeatureSelection, PlatformTarget, TargetEvidence};
+  use cargo_metadata::PackageId;
+  use std::collections::BTreeSet;
+
+  fn key() -> CompilerDiagKey {
+    CompilerDiagKey {
+      package_id: PackageId {
+        repr: "path+file:///workspace#member@0.1.0".to_string(),
+      },
+      target: PlatformTarget::from("default"),
+      features: FeatureSelection::Default,
+      rustc_version: "rustc test".to_string(),
+      cargo_version: "cargo test".to_string(),
+      host_triple: "test-host".to_string(),
+      toolchain_fingerprint: "sha256:toolchain".to_string(),
+      target_fingerprint: "sha256:target".to_string(),
+      lock_fingerprint: "sha256:lock".to_string(),
+      manifest_fingerprint: "sha256:manifest".to_string(),
+      source_fingerprint: "sha256:source".to_string(),
+      compiler_env_fingerprint: "sha256:environment".to_string(),
+      cargo_config_fingerprint: "sha256:configuration".to_string(),
+    }
+  }
+
+  #[test]
+  fn prior_collector_semantics_never_authorize_reuse() {
+    let root = tempfile::tempdir().expect("temporary workspace should be created");
+    let path = root.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
+    std::fs::create_dir_all(path.parent().expect("cache path should have a parent"))
+      .expect("cache directory should be created");
+    let key = key();
+    let mut cache = CompilerDiagCacheFile::default();
+    cache.entries.insert(
+      key.stable_id(),
+      CompilerDiagEntry {
+        key: key.clone(),
+        evidence: TargetEvidence {
+          platform: PlatformTarget::from("default"),
+          features: FeatureSelection::Default,
+          compiled_units: BTreeSet::new(),
+          unused_crates: BTreeSet::new(),
+          unit_evidence: Vec::new(),
+          completeness: DiagnosticsCompleteness::Complete,
+        },
+        generated_at_unix_ms: 1,
+        collector_version: COLLECTOR_VERSION - 1,
+        observations: Vec::new(),
+      },
+    );
+    std::fs::write(&path, serde_json::to_vec(&cache).expect("cache should serialize"))
+      .expect("cache should be written");
+
+    let store = CompilerDiagnosticsStore::load(root.path());
+    assert!(
+      store.get(&key).is_none(),
+      "prior collector evidence must not be returned"
+    );
+    assert_eq!(store.miss_reason(&key), "collector_changed");
+  }
+}

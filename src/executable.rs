@@ -2,10 +2,12 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -112,6 +114,24 @@ impl ToolchainExecutableIdentities {
     let rustdoc_implementation = matches!(scope, ToolchainExecutableScope::Documentation)
       .then(|| implementation("rustdoc"))
       .flatten();
+    for (role, executable) in [
+      ("cargo", Some(&cargo)),
+      ("rustc", Some(&rustc)),
+      ("rustdoc", rustdoc.as_ref()),
+      ("rustc_wrapper", rustc_wrapper.as_ref()),
+      ("rustc_workspace_wrapper", rustc_workspace_wrapper.as_ref()),
+      ("cargo_implementation", cargo_implementation.as_ref()),
+      ("rustc_implementation", rustc_implementation.as_ref()),
+      ("rustdoc_implementation", rustdoc_implementation.as_ref()),
+    ] {
+      if let Some(executable) = executable {
+        limitations.extend(
+          executable
+            .limitations()
+            .map(|limitation| format!("{role}_{limitation}")),
+        );
+      }
+    }
     Ok(Self {
       cargo,
       rustc,
@@ -207,12 +227,12 @@ fn capture_at_depth(
       canonical.display()
     )));
   }
-  let bytes = read_exact_bytes(&canonical, "executable")?;
+  let (content_digest, shebang) = digest_executable(&canonical)?;
   let executable = is_executable(&metadata);
   let mut limitations = BTreeSet::new();
-  let interpreter = if let Some(shebang) = bytes.strip_prefix(b"#!") {
+  let interpreter = if let Some(shebang) = shebang {
     limitations.insert("script_runtime_inputs_unavailable".to_string());
-    match shebang_interpreter(shebang)? {
+    match shebang_interpreter(&shebang)? {
       Some(interpreter) if is_env_interpreter(&interpreter) => {
         limitations.insert("env_shebang_resolution_unavailable".to_string());
         None
@@ -240,16 +260,65 @@ fn capture_at_depth(
     version: EXECUTABLE_IDENTITY_VERSION,
     selection: portable_selection(selection_text, current_dir, source_root),
     resolved_path: portable_path(&canonical, source_root),
-    content_digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
+    content_digest: format!("sha256:{content_digest}"),
     executable,
     interpreter,
     limitations,
   })
 }
 
-fn read_exact_bytes(path: &Path, description: &str) -> RailResult<Vec<u8>> {
-  fs::read(path)
-    .map_err(|error| RailError::message(format!("failed to read {description} '{}': {error}", path.display())))
+fn digest_executable(path: &Path) -> RailResult<(ContentDigest, Option<Vec<u8>>)> {
+  let mut file = File::open(path)
+    .map_err(|error| RailError::message(format!("failed to read executable '{}': {error}", path.display())))?;
+  let mut hasher = Sha256::new();
+  let mut prefix = [0_u8; 2];
+  let mut prefix_len = 0;
+  while prefix_len < prefix.len() {
+    let read = read_executable_chunk(&mut file, &mut prefix[prefix_len..], path)?;
+    if read == 0 {
+      break;
+    }
+    prefix_len += read;
+  }
+  hasher.update(&prefix[..prefix_len]);
+  let mut bytes_read = prefix_len;
+  let mut shebang = (prefix_len == prefix.len() && prefix == *b"#!").then(Vec::new);
+  let mut buffer = [0_u8; 64 * 1024];
+  loop {
+    let read = read_executable_chunk(&mut file, &mut buffer, path)?;
+    if read == 0 {
+      break;
+    }
+    hasher.update(&buffer[..read]);
+    bytes_read = bytes_read.saturating_add(read);
+    if let Some(line) = &mut shebang
+      && !line.ends_with(b"\n")
+    {
+      let end = buffer[..read]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(read, |newline| newline + 1);
+      line.extend_from_slice(&buffer[..end]);
+    }
+  }
+  crate::instrumentation::record_hash(bytes_read);
+  crate::instrumentation::record_hashed_file_bytes_read(bytes_read);
+  Ok((ContentDigest::from_sha256_bytes(hasher.finalize().into()), shebang))
+}
+
+fn read_executable_chunk(file: &mut File, buffer: &mut [u8], path: &Path) -> RailResult<usize> {
+  loop {
+    match file.read(buffer) {
+      Ok(read) => return Ok(read),
+      Err(error) if error.kind() == ErrorKind::Interrupted => {}
+      Err(error) => {
+        return Err(RailError::message(format!(
+          "failed to read executable '{}': {error}",
+          path.display()
+        )));
+      }
+    }
+  }
 }
 
 fn resolve_program(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
@@ -375,5 +444,21 @@ mod tests {
       ExecutableIdentity::capture(program.as_os_str(), directory.path(), directory.path()).expect("second identity");
 
     assert_ne!(first, second);
+  }
+
+  #[test]
+  fn executable_digest_streams_exact_bytes_and_retains_only_the_shebang() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let program = directory.path().join("tool");
+    for (bytes, expected_shebang) in [
+      (b"#".to_vec(), None),
+      (b"#!/bin/sh\npayload\xff".to_vec(), Some(b"/bin/sh\n".to_vec())),
+      (vec![0x5a; 256 * 1024], None),
+    ] {
+      fs::write(&program, &bytes).expect("write tool");
+      let (digest, shebang) = digest_executable(&program).expect("digest executable");
+      assert_eq!(digest, ContentDigest::sha256(&bytes));
+      assert_eq!(shebang, expected_shebang);
+    }
   }
 }

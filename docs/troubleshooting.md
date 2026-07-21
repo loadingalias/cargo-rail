@@ -39,8 +39,10 @@ same exact semantic key and successful revalidation of every recorded compiler i
 output, executable identity, and non-Cargo environment read. Missing files are misses, not fatal errors. Same-size
 edits still miss because timestamps and sizes are not authority.
 
-Build scripts, proc macros, unverified external sources, unavailable dep-info, response files, secrets, and incomplete
-compiler observations bypass reuse. Cargo freshness does not override those checks. Delete
+Build scripts, proc macros, unverified external sources, unavailable dep-info, response files, secrets, unmodeled Cargo
+configuration, dynamic executable inputs, default linker/SDK state, and incomplete platform identity bypass reuse. Any
+bypass recorded by an observation prevents a hit, and a collector-semantics change invalidates prior evidence. Cargo
+freshness does not override those checks. Delete
 `target/cargo-rail/cache/compiler-diags-v1.json` only to discard diagnostic evidence; it contains no restorable build
 artifacts or Cargo fingerprint state.
 

@@ -2952,10 +2952,12 @@ fn json_value_kind(value: &JsonValue) -> &'static str {
 fn is_relevant_environment(name: &str) -> bool {
   name == "CARGO"
     || name == "CARGO_HOME"
+    || name == "CARGO_INCREMENTAL"
     || name == "CARGO_ENCODED_RUSTFLAGS"
     || name == "CARGO_ENCODED_RUSTDOCFLAGS"
     || name.starts_with("CARGO_BUILD_")
     || name.starts_with("CARGO_NET_")
+    || name.starts_with("CARGO_PROFILE_")
     || name.starts_with("CARGO_REGISTRIES_")
     || name.starts_with("CARGO_REGISTRY_")
     || name.starts_with("CARGO_RESOLVER_")
@@ -3029,27 +3031,105 @@ fn append_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 mod tests {
   use super::*;
 
-  #[cfg(unix)]
-  fn rustc_host() -> String {
-    let output = Command::new("rustc").arg("-vV").output().expect("rustc -vV should run");
-    assert!(output.status.success(), "rustc -vV should succeed");
-    String::from_utf8(output.stdout)
-      .expect("rustc identity should be UTF-8")
-      .lines()
-      .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
-      .expect("rustc identity should contain a host")
+  const CARGO_TOOL_ENVIRONMENT: &[&str] = &[
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTDOC",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+  ];
+
+  fn rustc_host() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST
+      .get_or_init(|| {
+        let output = Command::new("rustc").arg("-vV").output().expect("rustc -vV should run");
+        assert!(output.status.success(), "rustc -vV should succeed");
+        String::from_utf8(output.stdout)
+          .expect("rustc identity should be UTF-8")
+          .lines()
+          .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
+          .expect("rustc identity should contain a host")
+      })
+      .as_str()
   }
 
   fn target_test_inputs(root: &Path) -> ResolutionInputs {
     let mut cargo_config = CargoConfigSnapshot::capture(root).expect("Cargo config should capture");
     cargo_config.environment.retain(|name, _| {
-      !name.ends_with("RUSTFLAGS") && !name.ends_with("RUSTDOCFLAGS") && name != "CARGO_BUILD_TARGET"
+      !name.ends_with("RUSTFLAGS")
+        && !name.ends_with("RUSTDOCFLAGS")
+        && name != "CARGO_BUILD_TARGET"
+        && !CARGO_TOOL_ENVIRONMENT.contains(&name.as_str())
     });
     let toolchain = ToolchainIdentity::capture(root, &cargo_config).expect("tool identity should resolve");
     ResolutionInputs {
       cargo_config: Arc::new(cargo_config),
       toolchain,
     }
+  }
+
+  fn cargo_probe_command(root: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.current_dir(root);
+    for name in CARGO_TOOL_ENVIRONMENT {
+      command.env_remove(name);
+    }
+    command
+  }
+
+  fn write_cargo_config_probe(root: &Path) {
+    fs::create_dir_all(root.join("src")).expect("probe source directory should be created");
+    fs::write(
+      root.join("Cargo.toml"),
+      "[package]\nname = \"cargo-rail-config-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("probe manifest should be written");
+    fs::write(root.join("src/lib.rs"), "pub fn probe() {}\n").expect("probe library should be written");
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("probe binary should be written");
+  }
+
+  fn run_cargo_rustc_cfg(root: &Path, leading_arguments: &[&str], environment: &[(&str, &str)]) -> BTreeSet<String> {
+    let mut command = cargo_probe_command(root);
+    command
+      .args(leading_arguments)
+      .args(["rustc", "--offline", "--quiet", "--lib", "--", "--print=cfg"]);
+    for name in ["CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"] {
+      command.env_remove(name);
+    }
+    command.env_remove(target_environment_name(rustc_host(), "rustflags"));
+    for (name, value) in environment {
+      command.env(name, value);
+    }
+    let output = command.output().expect("Cargo rustc cfg probe should run");
+    assert!(
+      output.status.success(),
+      "Cargo rustc cfg probe failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+      .expect("Cargo rustc cfg output should be UTF-8")
+      .lines()
+      .map(str::to_string)
+      .collect()
+  }
+
+  fn probe_flags(flags: &[String]) -> Vec<&str> {
+    flags
+      .iter()
+      .filter_map(|flag| flag.strip_prefix("cargo_rail_config_"))
+      .collect()
+  }
+
+  #[cfg(unix)]
+  fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::write(path, contents).expect("probe executable should be written");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("probe executable should be executable");
   }
 
   #[test]
@@ -3273,6 +3353,339 @@ mod tests {
   }
 
   #[test]
+  fn cargo_config_hierarchy_and_includes_match_cargo_rustc() {
+    let root = tempfile::tempdir().expect("temporary Cargo hierarchy should be created");
+    let ancestor = root.path().join("ancestor");
+    let workspace = ancestor.join("workspace");
+    let ancestor_cargo = ancestor.join(".cargo");
+    let workspace_cargo = workspace.join(".cargo");
+    fs::create_dir_all(&ancestor_cargo).expect("ancestor Cargo directory should be created");
+    fs::create_dir_all(&workspace_cargo).expect("workspace Cargo directory should be created");
+    write_cargo_config_probe(&workspace);
+    fs::write(
+      ancestor_cargo.join("base.toml"),
+      "[build]\nrustflags = [\"--cfg\", \"cargo_rail_config_ancestor_include\"]\n",
+    )
+    .expect("ancestor include should be written");
+    fs::write(
+      ancestor_cargo.join("config.toml"),
+      "include = [\"base.toml\"]\n[build]\nrustflags = [\"--cfg\", \"cargo_rail_config_ancestor\"]\n",
+    )
+    .expect("ancestor config should be written");
+    fs::write(
+      workspace_cargo.join("base.toml"),
+      "[build]\nrustflags = [\"--cfg\", \"cargo_rail_config_workspace_include\"]\n",
+    )
+    .expect("workspace include should be written");
+    fs::write(
+      workspace_cargo.join("config.toml"),
+      "include = [\"base.toml\"]\n[build]\nrustflags = [\"--cfg\", \"cargo_rail_config_workspace\"]\n",
+    )
+    .expect("workspace config should be written");
+
+    let inputs = target_test_inputs(&workspace);
+    let targets = capture_target_identities(&workspace, &[], &inputs).expect("target identity should resolve");
+    let target = targets.first().expect("host target identity");
+    assert_eq!(
+      probe_flags(target.rustflags()),
+      ["ancestor_include", "ancestor", "workspace_include", "workspace"],
+      "cargo-rail must preserve Cargo's low-to-high array merge order"
+    );
+
+    let cargo_cfg = run_cargo_rustc_cfg(&workspace, &[], &[]);
+    for marker in [
+      "cargo_rail_config_ancestor_include",
+      "cargo_rail_config_ancestor",
+      "cargo_rail_config_workspace_include",
+      "cargo_rail_config_workspace",
+    ] {
+      assert!(cargo_cfg.contains(marker), "Cargo did not apply modeled cfg '{marker}'");
+    }
+  }
+
+  #[test]
+  fn cargo_flag_environment_and_cli_precedence_match_cargo_rustc() {
+    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
+    write_cargo_config_probe(workspace.path());
+    fs::create_dir_all(workspace.path().join(".cargo")).expect("Cargo config directory should be created");
+    fs::write(
+      workspace.path().join(".cargo/config.toml"),
+      "[build]\nrustflags = [\"--cfg\", \"cargo_rail_config_file\"]\n",
+    )
+    .expect("Cargo config should be written");
+
+    let cargo_cfg = run_cargo_rustc_cfg(
+      workspace.path(),
+      &["--config", "build.rustflags=['--cfg','cargo_rail_config_cli']"],
+      &[],
+    );
+    assert!(cargo_cfg.contains("cargo_rail_config_cli"));
+    assert!(cargo_cfg.contains("cargo_rail_config_file"));
+
+    let mut config = CargoConfigSnapshot::capture(workspace.path()).expect("Cargo config should capture");
+    config.environment.retain(|name, _| !name.ends_with("RUSTFLAGS"));
+    config.environment.insert(
+      "RUSTFLAGS".to_string(),
+      "--cfg cargo_rail_config_environment".to_string(),
+    );
+    let modeled =
+      effective_flags(&config, rustc_host(), None, CompilerFlags::Rust).expect("RUSTFLAGS precedence should resolve");
+    assert_eq!(probe_flags(&modeled), ["environment"]);
+    let cargo_cfg = run_cargo_rustc_cfg(
+      workspace.path(),
+      &["--config", "build.rustflags=['--cfg','cargo_rail_config_cli']"],
+      &[("RUSTFLAGS", "--cfg cargo_rail_config_environment")],
+    );
+    assert!(cargo_cfg.contains("cargo_rail_config_environment"));
+    assert!(!cargo_cfg.contains("cargo_rail_config_cli"));
+    assert!(!cargo_cfg.contains("cargo_rail_config_file"));
+
+    config.environment.insert(
+      "CARGO_ENCODED_RUSTFLAGS".to_string(),
+      "--cfg\u{1f}cargo_rail_config_encoded".to_string(),
+    );
+    let modeled = effective_flags(&config, rustc_host(), None, CompilerFlags::Rust)
+      .expect("encoded rustflags precedence should resolve");
+    assert_eq!(probe_flags(&modeled), ["encoded"]);
+    let cargo_cfg = run_cargo_rustc_cfg(
+      workspace.path(),
+      &[],
+      &[
+        ("RUSTFLAGS", "--cfg cargo_rail_config_environment"),
+        ("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}cargo_rail_config_encoded"),
+      ],
+    );
+    assert!(cargo_cfg.contains("cargo_rail_config_encoded"));
+    assert!(!cargo_cfg.contains("cargo_rail_config_environment"));
+    assert!(!cargo_cfg.contains("cargo_rail_config_file"));
+  }
+
+  #[test]
+  fn cargo_profile_and_incremental_environment_are_authoritative_inputs() {
+    assert!(is_relevant_environment("CARGO_PROFILE_DEV_OPT_LEVEL"));
+    assert!(is_relevant_environment("CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG"));
+    assert!(is_relevant_environment("CARGO_INCREMENTAL"));
+    assert!(!is_relevant_environment("CARGO_RAIL_UNRELATED"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cargo_target_flags_linker_and_wrapper_chain_match_cargo_rustc() {
+    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
+    write_cargo_config_probe(workspace.path());
+    let cargo_dir = workspace.path().join(".cargo");
+    let tools_dir = workspace.path().join("tools");
+    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
+    fs::create_dir_all(&tools_dir).expect("probe tool directory should be created");
+    let host = rustc_host();
+    fs::write(
+      cargo_dir.join("config.toml"),
+      format!(
+        r#"[build]
+target = "host-tuple"
+rustc-wrapper = "tools/global-wrapper"
+rustc-workspace-wrapper = "tools/workspace-wrapper"
+
+[target.{host}]
+linker = "tools/linker"
+rustflags = ["--cfg", "cargo_rail_config_triple"]
+
+[target.'cfg(unix)']
+rustflags = ["--cfg", "cargo_rail_config_cfg"]
+
+[env]
+CARGO_RAIL_CONFIG_WRAPPER_LOG = {{ value = "wrapper.log", relative = true, force = true }}
+CARGO_RAIL_CONFIG_ARGV_LOG = {{ value = "argv.log", relative = true, force = true }}
+"#
+      ),
+    )
+    .expect("Cargo config should be written");
+    write_executable(
+      &tools_dir.join("global-wrapper"),
+      r#"#!/bin/sh
+case " $* " in
+  *" cargo_rail_config_probe "*) printf 'global\n' >> "$CARGO_RAIL_CONFIG_WRAPPER_LOG" ;;
+esac
+exec "$@"
+"#,
+    );
+    write_executable(
+      &tools_dir.join("workspace-wrapper"),
+      r#"#!/bin/sh
+case " $* " in
+  *" cargo_rail_config_probe "*)
+    printf 'workspace\n' >> "$CARGO_RAIL_CONFIG_WRAPPER_LOG"
+    printf '%s\n' "$@" > "$CARGO_RAIL_CONFIG_ARGV_LOG"
+    ;;
+esac
+exec "$@"
+"#,
+    );
+    write_executable(&tools_dir.join("linker"), "#!/bin/sh\nexec cc \"$@\"\n");
+
+    let inputs = target_test_inputs(workspace.path());
+    let targets = capture_target_identities(workspace.path(), &[], &inputs).expect("target identity should resolve");
+    let target = targets.first().expect("configured target identity");
+    assert_eq!(probe_flags(target.rustflags()), ["triple", "cfg"]);
+    let canonical_workspace = canonicalize_existing(workspace.path()).expect("workspace should canonicalize");
+    let linker = canonical_workspace.join("tools/linker");
+    assert_eq!(target.linker(), Some(linker.as_os_str()));
+    assert_eq!(
+      inputs.toolchain.rustc_wrapper_program(),
+      Some(canonical_workspace.join("tools/global-wrapper").as_os_str())
+    );
+    assert_eq!(
+      inputs.toolchain.rustc_workspace_wrapper_program(),
+      Some(canonical_workspace.join("tools/workspace-wrapper").as_os_str())
+    );
+
+    let cargo_cfg = run_cargo_rustc_cfg(workspace.path(), &[], &[]);
+    assert!(cargo_cfg.contains("cargo_rail_config_triple"));
+    assert!(cargo_cfg.contains("cargo_rail_config_cfg"));
+    let wrappers = fs::read_to_string(workspace.path().join("wrapper.log")).expect("wrapper log should be readable");
+    assert_eq!(wrappers.lines().collect::<Vec<_>>(), ["global", "workspace"]);
+    let rustc_argv = fs::read_to_string(workspace.path().join("argv.log")).expect("rustc argv should be readable");
+    assert!(
+      rustc_argv
+        .lines()
+        .any(|argument| argument == format!("linker={}", linker.display())),
+      "Cargo rustc argv did not contain the modeled linker: {rustc_argv}"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cargo_target_runner_matches_cargo_execution() {
+    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
+    write_cargo_config_probe(workspace.path());
+    let cargo_dir = workspace.path().join(".cargo");
+    let tools_dir = workspace.path().join("tools");
+    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
+    fs::create_dir_all(&tools_dir).expect("probe tool directory should be created");
+    let host = rustc_host();
+    fs::write(
+      cargo_dir.join("config.toml"),
+      format!(
+        r#"[build]
+target = "host-tuple"
+
+[target.{host}]
+runner = ["tools/runner", "--fixed"]
+
+[env]
+CARGO_RAIL_CONFIG_RUNNER_LOG = {{ value = "runner.log", relative = true, force = true }}
+"#
+      ),
+    )
+    .expect("Cargo config should be written");
+    write_executable(
+      &tools_dir.join("runner"),
+      "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CARGO_RAIL_CONFIG_RUNNER_LOG\"\n",
+    );
+
+    let inputs = target_test_inputs(workspace.path());
+    let targets = capture_target_identities(workspace.path(), &[], &inputs).expect("target identity should resolve");
+    let target = targets.first().expect("configured target identity");
+    let canonical_workspace = canonicalize_existing(workspace.path()).expect("workspace should canonicalize");
+    assert_eq!(
+      target.runner(),
+      Some(
+        [
+          canonical_workspace.join("tools/runner").into_os_string(),
+          "--fixed".into(),
+        ]
+        .as_slice()
+      )
+    );
+
+    let output = cargo_probe_command(workspace.path())
+      .args(["run", "--offline", "--quiet"])
+      .output()
+      .expect("Cargo runner probe should run");
+    assert!(
+      output.status.success(),
+      "Cargo runner probe failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let runner_argv = fs::read_to_string(workspace.path().join("runner.log")).expect("runner log should be readable");
+    let runner_argv = runner_argv.lines().collect::<Vec<_>>();
+    assert_eq!(runner_argv.first().copied(), Some("--fixed"));
+    assert!(
+      runner_argv
+        .get(1)
+        .is_some_and(|executable| executable.contains("cargo-rail-config-probe")),
+      "Cargo did not append the built executable after fixed runner arguments: {runner_argv:?}"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cargo_rustdoc_flags_match_the_selected_rustdoc_boundary() {
+    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
+    write_cargo_config_probe(workspace.path());
+    let cargo_dir = workspace.path().join(".cargo");
+    let tools_dir = workspace.path().join("tools");
+    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
+    fs::create_dir_all(&tools_dir).expect("probe tool directory should be created");
+    let host = rustc_host();
+    fs::write(
+      cargo_dir.join("config.toml"),
+      format!(
+        r#"[build]
+target = "host-tuple"
+rustdoc = "tools/rustdoc-proxy"
+
+[target.{host}]
+rustdocflags = ["--cfg", "cargo_rail_config_rustdoc_triple"]
+
+[target.'cfg(unix)']
+rustdocflags = ["--cfg", "cargo_rail_config_rustdoc_cfg"]
+
+[env]
+CARGO_RAIL_CONFIG_RUSTDOC_LOG = {{ value = "rustdoc.log", relative = true, force = true }}
+"#
+      ),
+    )
+    .expect("Cargo config should be written");
+    write_executable(
+      &tools_dir.join("rustdoc-proxy"),
+      r#"#!/bin/sh
+case " $* " in
+  *" cargo_rail_config_probe "*) printf '%s\n' "$@" > "$CARGO_RAIL_CONFIG_RUSTDOC_LOG" ;;
+esac
+exec rustdoc "$@"
+"#,
+    );
+
+    let inputs = target_test_inputs(workspace.path());
+    let targets = capture_target_identities(workspace.path(), &[], &inputs).expect("target identity should resolve");
+    let target = targets.first().expect("configured target identity");
+    assert_eq!(probe_flags(target.rustdocflags()), ["rustdoc_triple", "rustdoc_cfg"]);
+
+    let output = cargo_probe_command(workspace.path())
+      .args(["doc", "--offline", "--quiet", "--no-deps"])
+      .output()
+      .expect("Cargo rustdoc probe should run");
+    assert!(
+      output.status.success(),
+      "Cargo rustdoc probe failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let rustdoc_argv =
+      fs::read_to_string(workspace.path().join("rustdoc.log")).expect("rustdoc log should be readable");
+    assert!(
+      rustdoc_argv
+        .lines()
+        .any(|argument| argument == "cargo_rail_config_rustdoc_triple")
+    );
+    assert!(
+      rustdoc_argv
+        .lines()
+        .any(|argument| argument == "cargo_rail_config_rustdoc_cfg")
+    );
+  }
+
+  #[test]
   fn cargo_config_provenance_uses_snapshot_canonical_path_representation() {
     let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
     let cargo_dir = workspace.path().join(".cargo");
@@ -3333,7 +3746,7 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
     let target = &targets[0];
     assert!(matches!(
       target.specification(),
-      TargetSpecificationIdentity::BuiltIn(triple) if triple == &host
+      TargetSpecificationIdentity::BuiltIn(triple) if triple == host
     ));
     assert!(target.is_host());
     assert!(target.is_build_target());
@@ -3424,6 +3837,7 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
   #[test]
   fn selected_custom_target_must_be_accepted_by_the_selected_rustc() {
     let workspace = tempfile::tempdir().expect("temporary target directory should be created");
+    write_cargo_config_probe(workspace.path());
     let cargo_dir = workspace.path().join(".cargo");
     fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
     fs::write(cargo_dir.join("config.toml"), "[build]\ntarget = \"custom-target\"\n")
@@ -3438,6 +3852,17 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
     let error = capture_target_identities(workspace.path(), &[], &inputs)
       .expect_err("incomplete custom target must fail rustc validation");
     assert!(error.to_string().contains("target cfg query failed"), "{error}");
+
+    let cargo = cargo_probe_command(workspace.path())
+      .args(["check", "--offline", "--quiet"])
+      .output()
+      .expect("Cargo custom-target probe should run");
+    assert!(!cargo.status.success(), "Cargo must also reject the incomplete target");
+    assert!(
+      String::from_utf8_lossy(&cargo.stderr).contains("target specification"),
+      "Cargo failed for an unrelated reason: {}",
+      String::from_utf8_lossy(&cargo.stderr)
+    );
   }
 
   #[test]

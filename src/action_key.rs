@@ -120,18 +120,18 @@ pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> 
   identity.frame(b"kind", action.kind().as_str().as_bytes());
   for argument in action.argv() {
     identity.frame(b"argv", argument.as_bytes());
-    if argument == "--config" || argument.starts_with("--config=") {
-      reasons.add(
-        "cargo_cli_configuration_unmodeled",
-        "Cargo --config overrides are present in argv but have not been parsed into the sanitized configuration contract",
-      );
-    }
     if Path::new(argument).is_absolute() && Path::new(argument).starts_with(snapshot.source_root()) {
       reasons.add(
         "absolute_workspace_argument",
         "an argv value exposes the physical workspace root without verified path remapping",
       );
     }
+  }
+  if has_cargo_cli_config_override(action.argv()) {
+    reasons.add(
+      "cargo_cli_configuration_unmodeled",
+      "Cargo --config overrides are present in argv but have not been parsed into the sanitized configuration contract",
+    );
   }
   match action.working_directory() {
     ActionWorkingDirectory::Workspace => identity.frame(b"working-directory", b"repository:"),
@@ -219,6 +219,22 @@ pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> 
     },
     reasons: reasons.finish(),
   })
+}
+
+fn has_cargo_cli_config_override(argv: &[String]) -> bool {
+  argv.first().is_some_and(|program| is_cargo_program(program))
+    && argv
+      .iter()
+      .skip(1)
+      .take_while(|argument| argument.as_str() != "--")
+      .any(|argument| argument == "--config" || argument.starts_with("--config="))
+}
+
+fn is_cargo_program(program: &str) -> bool {
+  Path::new(program)
+    .file_name()
+    .and_then(OsStr::to_str)
+    .is_some_and(|name| name.eq_ignore_ascii_case("cargo") || name.eq_ignore_ascii_case("cargo.exe"))
 }
 
 fn bind_environment(
@@ -337,7 +353,7 @@ fn bind_resolution_and_tools(
     reasons.add("program_identity_unavailable", "the expanded argv has no program");
     return Ok(());
   };
-  if program == "cargo" {
+  if is_cargo_program(program) {
     identity.frame(
       b"toolchain",
       &snapshot
@@ -937,4 +953,45 @@ fn append_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
   output.extend_from_slice(tag);
   output.extend_from_slice(&(value.len() as u64).to_le_bytes());
   output.extend_from_slice(value);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::has_cargo_cli_config_override;
+
+  fn argv(arguments: &[&str]) -> Vec<String> {
+    arguments.iter().map(|argument| (*argument).to_string()).collect()
+  }
+
+  #[test]
+  fn cargo_cli_config_detection_stops_at_the_compiler_or_harness_boundary() {
+    assert!(has_cargo_cli_config_override(&argv(&[
+      "cargo",
+      "check",
+      "--config",
+      "build.rustflags=[]"
+    ])));
+    assert!(has_cargo_cli_config_override(&argv(&[
+      "cargo",
+      "--config=build.rustflags=[]",
+      "check"
+    ])));
+    assert!(has_cargo_cli_config_override(&argv(&[
+      "/toolchain/bin/cargo",
+      "--config=build.rustflags=[]",
+      "check"
+    ])));
+    assert!(!has_cargo_cli_config_override(&argv(&[
+      "cargo",
+      "test",
+      "--",
+      "--config",
+      "harness-value"
+    ])));
+    assert!(!has_cargo_cli_config_override(&argv(&[
+      "repository-tool",
+      "--config",
+      "tool.toml"
+    ])));
+  }
 }
