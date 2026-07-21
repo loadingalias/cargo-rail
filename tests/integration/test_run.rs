@@ -1394,7 +1394,7 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
     "identical action plans must be byte stable"
   );
   let json: serde_json::Value = serde_json::from_slice(&first_json.stdout)?;
-  assert_eq!(json["version"], 2);
+  assert_eq!(json["version"], 3);
   let ids = json["actions"]
     .as_array()
     .unwrap()
@@ -1443,6 +1443,163 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
       || String::from_utf8_lossy(&executing_json.stdout).contains("dry-run")
   );
 
+  Ok(())
+}
+
+#[test]
+fn test_action_key_analysis_selects_exact_dependency_closure_inputs() -> Result<()> {
+  fn populate_fixture(workspace: &TestWorkspace) -> Result<()> {
+    workspace.add_crate("lib-dep", "0.1.0", &[])?;
+    workspace.add_crate("lib-a", "0.1.0", &[("lib-dep", "{ path = \"../lib-dep\" }")])?;
+    let ignored_bin = workspace.add_crate("ignored-bin", "0.1.0", &[])?;
+    std::fs::remove_file(ignored_bin.join("src/lib.rs"))?;
+    std::fs::write(ignored_bin.join("src/main.rs"), "fn main() {}\n")?;
+    std::fs::write(workspace.path.join("README.md"), "workspace documentation\n")?;
+    workspace.commit("Add action-key fixture")?;
+    workspace.modify_file(
+      "lib-a",
+      "src/lib.rs",
+      "pub fn selected_action_input() { lib_dep::hello(); }\n",
+    )?;
+    Ok(())
+  }
+
+  let ws = TestWorkspace::new_named("action-key-selected-inputs")?;
+  populate_fixture(&ws)?;
+
+  let command = [
+    "rail",
+    "run",
+    "--since",
+    "HEAD",
+    "--action",
+    "build",
+    "--ignore-bin-crates",
+    "--dry-run",
+    "--format",
+    "json",
+  ];
+  let baseline = run_cargo_rail(&ws.path, &command)?;
+  assert!(
+    baseline.status.success(),
+    "baseline action-key analysis failed (status {}): stdout={} stderr={}",
+    baseline.status,
+    String::from_utf8_lossy(&baseline.stdout),
+    String::from_utf8_lossy(&baseline.stderr),
+  );
+  let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout)?;
+  let action = &baseline["actions"][0];
+  assert_eq!(action["selected_packages"], serde_json::json!(["lib-a"]));
+  let baseline_input_root = action["action_key"]["declared_inputs"]["root_digest"]
+    .as_str()
+    .expect("declared input root");
+  let baseline_resolution = action["resolution_views"][0]["resolution_digest"]
+    .as_str()
+    .expect("resolution digest");
+  assert_eq!(action["action_key"]["status"], "uncacheable");
+  assert!(
+    action["action_key"].get("key").is_none(),
+    "incomplete evidence must not issue a key"
+  );
+  let reason_codes = action["action_key"]["reasons"]
+    .as_array()
+    .expect("action-key reasons")
+    .iter()
+    .filter_map(|reason| reason["code"].as_str())
+    .collect::<Vec<_>>();
+  assert!(reason_codes.contains(&"ambient_environment"));
+  assert!(reason_codes.contains(&"cargo_units_unmodeled"));
+
+  std::fs::write(ws.path.join("README.md"), "unrelated documentation changed\n")?;
+  let unrelated = run_cargo_rail_with_env(&ws.path, &command, &[("CARGO_RAIL_UNRELATED", "changed")])?;
+  assert!(unrelated.status.success(), "unrelated-input analysis failed");
+  let unrelated: serde_json::Value = serde_json::from_slice(&unrelated.stdout)?;
+  assert_eq!(
+    unrelated["actions"][0]["action_key"]["declared_inputs"]["root_digest"], baseline_input_root,
+    "a root-level file outside selected package roots must not invalidate the action input tree"
+  );
+  assert_eq!(
+    unrelated["actions"][0]["resolution_views"][0]["resolution_digest"], baseline_resolution,
+    "an unrelated environment variable and source file must not change resolution identity"
+  );
+
+  ws.modify_file("ignored-bin", "src/main.rs", "fn main() { println!(\"unrelated\"); }\n")?;
+  let unrelated_package = run_cargo_rail(&ws.path, &command)?;
+  assert!(unrelated_package.status.success(), "unrelated-package analysis failed");
+  let unrelated_package: serde_json::Value = serde_json::from_slice(&unrelated_package.stdout)?;
+  assert_eq!(
+    unrelated_package["actions"][0]["action_key"]["declared_inputs"]["root_digest"], baseline_input_root,
+    "a package excluded from action selection must not invalidate the declared input tree"
+  );
+  assert_eq!(
+    unrelated_package["actions"][0]["resolution_views"][0]["resolution_digest"], baseline_resolution,
+    "a package excluded from action selection must not invalidate resolution identity"
+  );
+
+  ws.modify_file("lib-dep", "src/lib.rs", "pub fn changed_dependency_input() {}\n")?;
+  let changed = run_cargo_rail(&ws.path, &command)?;
+  assert!(changed.status.success(), "changed-input analysis failed");
+  let changed: serde_json::Value = serde_json::from_slice(&changed.stdout)?;
+  assert_ne!(
+    changed["actions"][0]["action_key"]["declared_inputs"]["root_digest"], baseline_input_root,
+    "exact selected source bytes must invalidate the declared input root"
+  );
+
+  let mirror = TestWorkspace::new_named("action-key-selected-inputs-mirror")?;
+  populate_fixture(&mirror)?;
+  let mirrored = run_cargo_rail(&mirror.path, &command)?;
+  assert!(mirrored.status.success(), "mirrored action-key analysis failed");
+  let mirrored: serde_json::Value = serde_json::from_slice(&mirrored.stdout)?;
+  assert_eq!(
+    mirrored["actions"][0]["action_key"]["declared_inputs"]["root_digest"], baseline_input_root,
+    "declared source identity must not depend on the physical workspace root"
+  );
+  assert_eq!(
+    mirrored["actions"][0]["resolution_views"][0]["resolution_digest"], baseline_resolution,
+    "resolved graph identity must not depend on the physical workspace root"
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receipt() -> Result<()> {
+  let ws = TestWorkspace::new_named("doctor-hermeticity")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add hermeticity fixture")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "doctor", "hermeticity", "--action", "build", "--format", "json"],
+  )?;
+  assert!(
+    output.status.success(),
+    "hermeticity doctor failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(report["artifact"], "hermeticity_report");
+  assert_eq!(report["version"], 1);
+  assert_eq!(report["actions"][0]["action_key"]["version"], 2);
+  assert_eq!(report["actions"][0]["action_key"]["status"], "uncacheable");
+  assert!(report["actions"][0]["action_key"].get("key").is_none());
+  assert!(
+    report["actions"][0]["action_key"]["reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons.iter().any(|reason| reason["code"] == "ambient_environment"))
+  );
+  assert!(
+    report["actions"][0]["action_key"]["reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons
+        .iter()
+        .any(|reason| reason["code"] == "executable_runtime_inputs_unavailable")),
+    "content-addressed executables must still report unobserved dynamic runtime inputs"
+  );
+  assert!(
+    !ws.path.join("target/cargo-rail/receipts").exists(),
+    "read-only hermeticity diagnosis must not write a run receipt"
+  );
   Ok(())
 }
 

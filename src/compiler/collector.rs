@@ -8,14 +8,23 @@ use crate::compiler::model::{
   CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
-use crate::compiler::wrapper::{INNER_WRAPPER_ENV, WRAPPER_MARKER};
+use crate::compiler::observation::{
+  CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest, CompilationProfile,
+  FileObservation, ObservationPath, attach_execution_identities, build_manifests, load_raw,
+};
+use crate::compiler::wrapper::{
+  INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
+};
 use crate::error::{RailError, RailResult, ResultExt};
+use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
 use crate::progress;
-use crate::utils::{file_fingerprint, fnv1a64};
-use cargo_metadata::PackageId;
+use crate::source::{ContentDigest, SourceEntryKind};
+use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
+use cargo_metadata::{Message, PackageId, TargetKind};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::BufReader;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -40,34 +49,125 @@ pub struct CompilerDiagnosticsCollector<'a> {
   workspace_root: &'a Path,
   manifests: &'a ManifestAnalyzer,
   targets: Vec<&'a str>,
+  identity: CompilerCacheIdentity,
+}
+
+/// Exact snapshot-derived inputs shared by every compiler-evidence key.
+#[derive(Clone)]
+pub(crate) struct CompilerCacheIdentity {
   rustc_version: String,
   cargo_version: String,
   host_triple: String,
+  toolchain_fingerprint: String,
+  target_fingerprints: HashMap<String, String>,
   lock_fingerprint: String,
   compiler_env_fingerprint: String,
   cargo_config_fingerprint: String,
+  cargo_program: OsString,
+  rustc_workspace_wrapper: Option<OsString>,
+  manifest_fingerprints: HashMap<PackageId, String>,
+  source_fingerprints: HashMap<PackageId, String>,
+  observation_context: CompilationObservationContext,
+  package_observation_identities: HashMap<PackageId, String>,
+  rustc_executable: ExecutableIdentity,
+  wrapper_executables: Vec<ExecutableIdentity>,
+  cache_bypass_reason: Option<&'static str>,
+}
+
+impl CompilerCacheIdentity {
+  /// Capture exact compiler-cache identity from one immutable workspace snapshot.
+  pub fn capture(snapshot: &WorkspaceSnapshot) -> RailResult<Self> {
+    let rustc_version = snapshot.toolchain().rustc_verbose_version().to_string();
+    let cargo_version = snapshot.toolchain().cargo_verbose_version().to_string();
+    let host_triple = snapshot.toolchain().host_target().to_string();
+    let current_executable =
+      std::env::current_exe().with_context(|| "locating cargo-rail compiler-observation wrapper".to_string())?;
+    let cargo_rail_executable = ExecutableIdentity::capture(
+      current_executable.as_os_str(),
+      snapshot.source_root(),
+      snapshot.source_root(),
+    )?;
+    let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
+    let toolchain_fingerprint = executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable)?;
+    let target_fingerprints = target_fingerprints(snapshot)?;
+    let lock_fingerprint = snapshot.lockfile_fingerprint();
+    let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
+    let cargo_config_fingerprint = cargo_config_fingerprint(snapshot)?;
+    let cargo_program = snapshot.toolchain().cargo_program().to_owned();
+    let rustc_workspace_wrapper = snapshot
+      .toolchain()
+      .rustc_workspace_wrapper_program()
+      .map(OsString::from);
+    let local_dependencies = declared_local_dependency_graph(snapshot)?;
+    let manifest_fingerprints = manifest_closure_fingerprints(snapshot, &local_dependencies)?;
+    let source_fingerprints = source_closure_fingerprints(snapshot, &local_dependencies)?;
+    let observation_context = CompilationObservationContext::capture(snapshot)?;
+    let package_observation_identities = package_observation_identities(snapshot)?;
+    let rustc_executable = executables.rustc().clone();
+    let configured_wrappers = [executables.rustc_wrapper(), executables.rustc_workspace_wrapper()];
+    if configured_wrappers
+      .iter()
+      .flatten()
+      .any(|wrapper| wrapper.same_resolved_file(&cargo_rail_executable))
+    {
+      return Err(RailError::with_help(
+        "recursive cargo-rail rustc wrapper configuration",
+        "remove cargo-rail from RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER; diagnostics injection is automatic",
+      ));
+    }
+    let mut wrapper_executables = Vec::with_capacity(3);
+    wrapper_executables.extend(executables.rustc_wrapper().cloned());
+    wrapper_executables.push(cargo_rail_executable);
+    wrapper_executables.extend(executables.rustc_workspace_wrapper().cloned());
+    let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
+
+    Ok(Self {
+      rustc_version,
+      cargo_version,
+      host_triple,
+      toolchain_fingerprint,
+      target_fingerprints,
+      lock_fingerprint,
+      compiler_env_fingerprint,
+      cargo_config_fingerprint,
+      cargo_program,
+      rustc_workspace_wrapper,
+      manifest_fingerprints,
+      source_fingerprints,
+      observation_context,
+      package_observation_identities,
+      rustc_executable,
+      wrapper_executables,
+      cache_bypass_reason,
+    })
+  }
 }
 
 impl<'a> CompilerDiagnosticsCollector<'a> {
   /// Create a new collector for a workspace-level analysis pass.
   pub fn new(workspace_root: &'a Path, manifests: &'a ManifestAnalyzer, targets: Vec<&'a str>) -> RailResult<Self> {
-    let (rustc_version, host_triple) = rustc_identity(workspace_root)?;
-    let cargo_version = cargo_identity(workspace_root)?;
-    let lock_fingerprint = file_fingerprint(&workspace_root.join("Cargo.lock"));
-    let compiler_env_fingerprint = compiler_env_fingerprint();
-    let cargo_config_fingerprint = cargo_config_fingerprint(workspace_root);
-
+    let context = WorkspaceContext::build_with_snapshot(workspace_root)?;
+    let identity = CompilerCacheIdentity::capture(context.snapshot()?)?;
     Ok(Self {
       workspace_root,
       manifests,
       targets,
-      rustc_version,
-      cargo_version,
-      host_triple,
-      lock_fingerprint,
-      compiler_env_fingerprint,
-      cargo_config_fingerprint,
+      identity,
     })
+  }
+
+  pub(crate) fn with_identity(
+    workspace_root: &'a Path,
+    manifests: &'a ManifestAnalyzer,
+    targets: Vec<&'a str>,
+    identity: &CompilerCacheIdentity,
+  ) -> Self {
+    Self {
+      workspace_root,
+      manifests,
+      targets,
+      identity: identity.clone(),
+    }
   }
 
   /// Collect diagnostics for selected workspace members.
@@ -81,7 +181,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     }
 
     let mut store = CompilerDiagnosticsStore::load(self.workspace_root);
-    let key_inputs = self.build_key_inputs(&members);
+    let key_inputs = self.build_key_inputs(&members)?;
     let manifest_to_member = build_manifest_member_index(&self.manifests.members);
     let member_ids: HashMap<&str, &PackageId> = self
       .manifests
@@ -94,14 +194,25 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     let mut result: HashMap<PackageId, MemberEvidence> = HashMap::with_capacity(members.len());
     let mut cache_by_member: HashMap<String, EvidenceCacheSummary> = HashMap::with_capacity(members.len());
     let mut stale_by_configuration: BTreeMap<AnalysisConfiguration, Vec<&str>> = BTreeMap::new();
-    let mut prior_source_evidence: HashMap<(String, AnalysisConfiguration), TargetEvidence> = HashMap::new();
+    let mut retained_observations = HashMap::<String, CompilationObservationManifest>::new();
     let mut surviving_unused: HashMap<String, BTreeSet<CandidateId>> = candidate_targets
       .iter()
       .map(|(member, candidates)| (member.clone(), candidates.keys().cloned().collect()))
       .collect();
 
     for (member, target, features, key) in key_inputs {
-      if let Some(entry) = store.get(&key) {
+      let cached = self
+        .identity
+        .cache_bypass_reason
+        .is_none()
+        .then(|| store.get(&key))
+        .flatten();
+      let observation_miss =
+        cached.and_then(|entry| compiler_observation_miss_reason(&entry.observations, self.workspace_root));
+      if self.identity.cache_bypass_reason.is_none()
+        && observation_miss.is_none()
+        && let Some(entry) = cached
+      {
         cache_by_member.entry(member.to_string()).or_default().hits += 1;
         update_candidate_survivors(
           &mut surviving_unused,
@@ -117,19 +228,13 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         continue;
       }
 
-      let reason = store.miss_reason(&key);
-      if let Some(prior) = store.prior_for_source_change(&key) {
-        prior_source_evidence.insert(
-          (
-            member.to_string(),
-            AnalysisConfiguration {
-              platform: PlatformTarget::from(target),
-              features: features.clone(),
-            },
-          ),
-          prior.evidence.clone(),
-        );
-      }
+      let reason = self.identity.cache_bypass_reason.unwrap_or_else(|| {
+        if let Some(reason) = observation_miss {
+          reason
+        } else {
+          store.miss_reason(&key)
+        }
+      });
       let summary = cache_by_member.entry(member.to_string()).or_default();
       summary.misses += 1;
       *summary.miss_reasons.entry(reason.to_string()).or_default() += 1;
@@ -169,7 +274,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         if active_members.len() == 1 { "" } else { "s" }
       );
       let started = Instant::now();
-      let run = run_workspace_check(self.workspace_root, target, &features, &active_members)?;
+      let mut run = run_workspace_check(self.workspace_root, &self.identity, target, &features, &active_members)?;
       progress!(
         "    Finished target {} in {:.1}s",
         format_args!("{} / {}", target, features.label()),
@@ -182,6 +287,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         &stale_set,
         candidates,
       );
+      let invocations = std::mem::take(&mut run.invocations);
+      let mut compilation_observations =
+        parse_compilation_observations(&run.stdout, invocations, &self.identity, target)?;
+      reconcile_exact_artifact_observations(&mut compilation_observations, &mut retained_observations);
       let completeness = if run.success {
         DiagnosticsCompleteness::Complete
       } else {
@@ -196,27 +305,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           .find(|m| m.package_name == member)
           .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
 
-        let manifest_fp = file_fingerprint(&manifests_member.path);
-        let source_fp = source_tree_fingerprint(
-          manifests_member
-            .path
-            .parent()
-            .unwrap_or(manifests_member.path.as_path()),
-        );
-
-        let key = CompilerDiagKey {
-          package_id: manifests_member.package_id.clone(),
-          target: PlatformTarget::from(target),
-          features: features.clone(),
-          rustc_version: self.rustc_version.clone(),
-          cargo_version: self.cargo_version.clone(),
-          host_triple: self.host_triple.clone(),
-          lock_fingerprint: self.lock_fingerprint.clone(),
-          manifest_fingerprint: manifest_fp,
-          source_fingerprint: source_fp,
-          compiler_env_fingerprint: self.compiler_env_fingerprint.clone(),
-          cargo_config_fingerprint: self.cargo_config_fingerprint.clone(),
-        };
+        let key = self.key_for(manifests_member, target, features.clone())?;
 
         let mut unused = BTreeSet::new();
         let mut compiled = BTreeSet::new();
@@ -227,20 +316,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           compiled = parsed_member.compiled_targets.clone();
         }
 
-        let mut unit_evidence = parsed
+        let unit_evidence = parsed
           .get(member)
           .map(ParsedMemberTarget::unit_evidence)
           .unwrap_or_default();
-        let configuration = AnalysisConfiguration {
-          platform: PlatformTarget::from(target),
-          features: features.clone(),
-        };
-        if let (Some(parsed_member), Some(prior)) = (
-          parsed.get(member),
-          prior_source_evidence.get(&(member.to_string(), configuration)),
-        ) {
-          merge_fresh_unit_evidence(&mut unit_evidence, prior, &parsed_member.fresh_targets);
-        }
         let normal_units: Vec<_> = compiled
           .iter()
           .filter(|unit| !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild)
@@ -273,6 +352,18 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           evidence: evidence.clone(),
           generated_at_unix_ms: now_unix_ms(),
           collector_version: COLLECTOR_VERSION,
+          observations: self
+            .identity
+            .package_observation_identities
+            .get(&manifests_member.package_id)
+            .map(|package| {
+              compilation_observations
+                .iter()
+                .filter(|manifest| manifest.unit.package == *package)
+                .cloned()
+                .collect()
+            })
+            .unwrap_or_default(),
         };
 
         update_candidate_survivors(
@@ -305,16 +396,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     Ok(result)
   }
 
-  fn build_key_inputs(&self, members: &HashSet<&str>) -> Vec<(&str, &str, FeatureSelection, CompilerDiagKey)> {
+  fn build_key_inputs(
+    &self,
+    members: &HashSet<&str>,
+  ) -> RailResult<Vec<(&str, &str, FeatureSelection, CompilerDiagKey)>> {
     let mut keys = Vec::with_capacity(members.len() * self.targets.len() * FeatureSelection::BASELINES.len());
 
     for member in &self.manifests.members {
       if !members.contains(member.package_name.as_str()) {
         continue;
       }
-
-      let manifest_fp = file_fingerprint(&member.path);
-      let source_fp = source_tree_fingerprint(member.path.parent().unwrap_or(member.path.as_path()));
 
       let selections = planned_feature_selections(member);
       for target in &self.targets {
@@ -323,25 +414,49 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             member.package_name.as_str(),
             *target,
             features.clone(),
-            CompilerDiagKey {
-              package_id: member.package_id.clone(),
-              target: PlatformTarget::from(*target),
-              features: features.clone(),
-              rustc_version: self.rustc_version.clone(),
-              cargo_version: self.cargo_version.clone(),
-              host_triple: self.host_triple.clone(),
-              lock_fingerprint: self.lock_fingerprint.clone(),
-              manifest_fingerprint: manifest_fp.clone(),
-              source_fingerprint: source_fp.clone(),
-              compiler_env_fingerprint: self.compiler_env_fingerprint.clone(),
-              cargo_config_fingerprint: self.cargo_config_fingerprint.clone(),
-            },
+            self.key_for(member, target, features.clone())?,
           ));
         }
       }
     }
 
-    keys
+    Ok(keys)
+  }
+
+  fn key_for(
+    &self,
+    member: &crate::cargo::manifest_analyzer::ParsedManifest,
+    target: &str,
+    features: FeatureSelection,
+  ) -> RailResult<CompilerDiagKey> {
+    let identity = &self.identity;
+    Ok(CompilerDiagKey {
+      package_id: member.package_id.clone(),
+      target: PlatformTarget::from(target),
+      features,
+      rustc_version: identity.rustc_version.clone(),
+      cargo_version: identity.cargo_version.clone(),
+      host_triple: identity.host_triple.clone(),
+      toolchain_fingerprint: identity.toolchain_fingerprint.clone(),
+      target_fingerprint: identity
+        .target_fingerprints
+        .get(target)
+        .cloned()
+        .ok_or_else(|| RailError::message(format!("missing compiler target identity for '{target}'")))?,
+      lock_fingerprint: identity.lock_fingerprint.clone(),
+      manifest_fingerprint: identity
+        .manifest_fingerprints
+        .get(&member.package_id)
+        .cloned()
+        .ok_or_else(|| RailError::message(format!("missing manifest identity for member '{}'", member.package_id)))?,
+      source_fingerprint: identity
+        .source_fingerprints
+        .get(&member.package_id)
+        .cloned()
+        .ok_or_else(|| RailError::message(format!("missing source identity for member '{}'", member.package_id)))?,
+      compiler_env_fingerprint: identity.compiler_env_fingerprint.clone(),
+      cargo_config_fingerprint: identity.cargo_config_fingerprint.clone(),
+    })
   }
 }
 
@@ -533,19 +648,30 @@ fn update_candidate_survivors(
 struct WorkspaceCheckOutput {
   stdout: String,
   success: bool,
+  invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
 }
 
 fn run_workspace_check(
   workspace_root: &Path,
+  identity: &CompilerCacheIdentity,
   target: &str,
   features: &FeatureSelection,
   members: &[&str],
 ) -> RailResult<WorkspaceCheckOutput> {
   let wrapper =
     std::env::current_exe().with_context(|| "locating cargo-rail executable for rustc wrapper".to_string())?;
-  let existing_workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+  let existing_workspace_wrapper = identity.rustc_workspace_wrapper.as_deref();
+  let observation_directory = tempfile::Builder::new()
+    .prefix("cargo-rail-compiler-observations-")
+    .tempdir()
+    .with_context(|| "creating compiler observation directory".to_string())?;
 
-  let mut args: Vec<OsString> = vec!["check".into(), "--all-targets".into(), "--message-format=json".into()];
+  let mut args: Vec<OsString> = vec![
+    "check".into(),
+    "--locked".into(),
+    "--all-targets".into(),
+    "--message-format=json".into(),
+  ];
   match features {
     FeatureSelection::Default => {}
     FeatureSelection::NoDefaultFeatures => args.push("--no-default-features".into()),
@@ -569,11 +695,13 @@ fn run_workspace_check(
     args.push(target.into());
   }
 
-  let mut command = Command::new("cargo");
+  let mut command = Command::new(&identity.cargo_program);
   command
     .current_dir(workspace_root)
     .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
     .env(WRAPPER_MARKER, "1")
+    .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
+    .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
     .args(&args);
   if let Some(inner_wrapper) = existing_workspace_wrapper
     && inner_wrapper != wrapper.as_os_str()
@@ -591,33 +719,14 @@ fn run_workspace_check(
   Ok(WorkspaceCheckOutput {
     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
     success: output.status.success(),
+    invocations: load_raw(observation_directory.path())?,
   })
 }
 
 #[derive(Debug, Default)]
 struct ParsedMemberTarget {
   compiled_targets: BTreeSet<CompilationUnitId>,
-  fresh_targets: BTreeSet<CompilationUnitId>,
   warned_targets_by_dep: HashMap<String, BTreeSet<CompilationUnitId>>,
-}
-
-fn merge_fresh_unit_evidence(
-  current: &mut Vec<CompilationUnitEvidence>,
-  prior: &TargetEvidence,
-  fresh_units: &BTreeSet<CompilationUnitId>,
-) {
-  let prior_by_unit: BTreeMap<_, _> = prior
-    .unit_evidence
-    .iter()
-    .map(|evidence| (&evidence.unit, evidence))
-    .collect();
-  for evidence in current {
-    if fresh_units.contains(&evidence.unit)
-      && let Some(prior) = prior_by_unit.get(&evidence.unit)
-    {
-      evidence.unused_crates.clone_from(&prior.unused_crates);
-    }
-  }
 }
 
 impl ParsedMemberTarget {
@@ -699,9 +808,6 @@ fn parse_target_run(
     );
     let parsed_member = parsed.entry(member_name.clone()).or_default();
     parsed_member.compiled_targets.insert(target_id.clone());
-    if message.fresh == Some(true) {
-      parsed_member.fresh_targets.insert(target_id);
-    }
   }
 
   // Cargo does not guarantee whether a diagnostic is emitted before or after
@@ -750,138 +856,522 @@ fn parse_target_run(
   parsed
 }
 
-fn rustc_identity(workspace_root: &Path) -> RailResult<(String, String)> {
-  let output = Command::new("rustc")
-    .current_dir(workspace_root)
-    .arg("-vV")
-    .output()
-    .with_context(|| "running rustc -vV".to_string())?;
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let mut version = String::new();
-  let mut host = String::new();
-
-  for line in stdout.lines() {
-    if let Some(value) = line.strip_prefix("release: ") {
-      version = value.trim().to_string();
+fn parse_compilation_observations(
+  stdout: &str,
+  invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
+  identity: &CompilerCacheIdentity,
+  requested_target: &str,
+) -> RailResult<Vec<CompilationObservationManifest>> {
+  let source_root = &identity.observation_context.source_root;
+  let mut artifacts = Vec::new();
+  for message in Message::parse_stream(BufReader::new(stdout.as_bytes())) {
+    let Message::CompilerArtifact(artifact) = message
+      .map_err(|error| RailError::message(format!("failed to parse stable Cargo compiler-artifact JSON: {error}")))?
+    else {
+      continue;
+    };
+    let mut bypasses = BTreeSet::new();
+    let package = identity
+      .package_observation_identities
+      .get(&artifact.package_id)
+      .cloned()
+      .unwrap_or_else(|| {
+        bypasses.insert("cargo_package_identity_unavailable".to_string());
+        format!("unknown:{}", artifact.package_id)
+      });
+    if !package.starts_with("local:") {
       continue;
     }
-    if let Some(value) = line.strip_prefix("host: ") {
-      host = value.trim().to_string();
+    let mut outputs = Vec::new();
+    for filename in &artifact.filenames {
+      match FileObservation::capture(filename.as_std_path(), source_root, source_root) {
+        Ok(file) => outputs.push(file),
+        Err(_) => {
+          bypasses.insert("cargo_artifact_output_bytes_unavailable".to_string());
+        }
+      }
     }
+    if let Some(executable) = &artifact.executable {
+      match FileObservation::capture(executable.as_std_path(), source_root, source_root) {
+        Ok(file) => outputs.push(file),
+        Err(_) => {
+          bypasses.insert("cargo_executable_output_bytes_unavailable".to_string());
+        }
+      }
+    }
+    outputs.sort();
+    outputs.dedup();
+    artifacts.push(CargoArtifactObservation {
+      package,
+      target_kinds: artifact.target.kind.iter().map(ToString::to_string).collect(),
+      target_name: artifact.target.name,
+      crate_types: artifact.target.crate_types.iter().map(ToString::to_string).collect(),
+      source: ObservationPath::capture(artifact.target.src_path.as_std_path(), source_root, source_root),
+      profile: CompilationProfile {
+        opt_level: artifact.profile.opt_level,
+        debuginfo: artifact.profile.debuginfo.to_string(),
+        debug_assertions: artifact.profile.debug_assertions,
+        overflow_checks: artifact.profile.overflow_checks,
+        test: artifact.profile.test,
+      },
+      features: artifact.features.into_iter().collect(),
+      outputs,
+      fresh: artifact.fresh,
+      bypasses,
+    });
   }
-
-  if version.is_empty() {
-    version = "unknown".to_string();
-  }
-  if host.is_empty() {
-    host = "unknown".to_string();
-  }
-
-  Ok((version, host))
+  let mut manifests = build_manifests(invocations, artifacts, &identity.observation_context, requested_target)?;
+  attach_execution_identities(
+    &mut manifests,
+    &identity.rustc_executable,
+    &identity.wrapper_executables,
+  );
+  Ok(manifests)
 }
 
-fn cargo_identity(workspace_root: &Path) -> RailResult<String> {
-  let output = Command::new("cargo")
-    .current_dir(workspace_root)
-    .arg("-V")
-    .output()
-    .with_context(|| "running cargo -V".to_string())?;
-  if !output.status.success() {
-    return Err(RailError::message(format!(
-      "cargo -V failed with status {}",
-      output.status
-    )));
+fn compiler_observation_miss_reason(
+  observations: &[CompilationObservationManifest],
+  workspace_root: &Path,
+) -> Option<&'static str> {
+  if observations.is_empty() {
+    return Some("compilation_observations_absent");
   }
-  Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn source_tree_fingerprint(member_dir: &Path) -> String {
-  let mut hash: u64 = 0xcbf29ce484222325;
-  crate::instrumentation::record_hash_operation();
-  let mut roots = vec![
-    member_dir.join("src"),
-    member_dir.join("tests"),
-    member_dir.join("examples"),
-    member_dir.join("benches"),
-    member_dir.join("build.rs"),
-  ];
-  roots.sort_unstable();
-
-  for path in roots {
-    hash_path_metadata(member_dir, &path, &mut hash);
-  }
-
-  format!("fnv1a64:{hash:016x}")
-}
-
-fn hash_path_metadata(base: &Path, path: &Path, hash: &mut u64) {
-  if !path.exists() {
-    hash_bytes(hash, b"missing");
-    hash_bytes(
-      hash,
-      path.strip_prefix(base).unwrap_or(path).to_string_lossy().as_bytes(),
-    );
-    return;
-  }
-
-  let Ok(metadata) = std::fs::metadata(path) else {
-    hash_bytes(hash, b"metadata-error");
-    hash_bytes(
-      hash,
-      path.strip_prefix(base).unwrap_or(path).to_string_lossy().as_bytes(),
-    );
-    return;
-  };
-
-  if metadata.is_file() {
-    hash_bytes(hash, b"file");
-    hash_bytes(
-      hash,
-      path.strip_prefix(base).unwrap_or(path).to_string_lossy().as_bytes(),
-    );
-    hash_bytes(hash, &metadata.len().to_le_bytes());
-    let modified = metadata
-      .modified()
-      .ok()
-      .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-      .map(|d| d.as_nanos() as u64)
-      .unwrap_or(0);
-    hash_bytes(hash, &modified.to_le_bytes());
-    return;
-  }
-
-  if metadata.is_dir() {
-    hash_bytes(hash, b"dir");
-    hash_bytes(
-      hash,
-      path.strip_prefix(base).unwrap_or(path).to_string_lossy().as_bytes(),
-    );
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-      hash_bytes(hash, b"read-dir-error");
-      return;
+  for reason in observations
+    .iter()
+    .flat_map(|manifest| manifest.bypasses.iter().map(String::as_str))
+  {
+    let reason = match reason {
+      "cargo_artifact_unavailable" => Some("cargo_artifact_unavailable"),
+      "rustc_invocation_unavailable" => Some("rustc_invocation_unavailable"),
+      "dep_info_unavailable" => Some("dep_info_unavailable"),
+      "dep_info_path_unavailable" => Some("dep_info_path_unavailable"),
+      "declared_input_bytes_unavailable" => Some("declared_input_bytes_unavailable"),
+      "dependency_artifact_bytes_unavailable" => Some("dependency_artifact_bytes_unavailable"),
+      "compiler_executable_identity_unavailable" => Some("compiler_executable_identity_unavailable"),
+      "non_utf8_compiler_argument" => Some("non_utf8_compiler_argument"),
+      "response_file_expansion_unavailable" => Some("response_file_expansion_unavailable"),
+      _ => None,
     };
-
-    let mut child_paths = Vec::new();
-    for entry in entries.flatten() {
-      child_paths.push(entry.path());
+    if reason.is_some() {
+      return reason;
     }
-    child_paths.sort_unstable();
+  }
+  for manifest in observations {
+    if let Some(reason) = manifest.revalidation_reason(workspace_root) {
+      return Some(reason);
+    }
+  }
+  None
+}
 
-    for child in child_paths {
-      hash_path_metadata(base, &child, hash);
+fn reconcile_exact_artifact_observations(
+  observations: &mut [CompilationObservationManifest],
+  retained: &mut HashMap<String, CompilationObservationManifest>,
+) {
+  for observation in observations {
+    let Some(identity) = observation.cargo_artifact_identity.clone() else {
+      continue;
+    };
+    if observation.has_bypass("rustc_invocation_unavailable") {
+      if let Some(exact) = retained.get(&identity) {
+        observation.clone_from(exact);
+      }
+    } else if !observation.has_bypass("cargo_artifact_unavailable")
+      && !observation.has_bypass("dep_info_unavailable")
+      && !observation.has_bypass("dep_info_path_unavailable")
+    {
+      retained.insert(identity, observation.clone());
     }
   }
 }
 
-fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
-  const FNV_PRIME: u64 = 0x100000001b3;
-  crate::instrumentation::record_hash_input_bytes(bytes.len());
-  for byte in bytes {
-    *hash ^= u64::from(*byte);
-    *hash = hash.wrapping_mul(FNV_PRIME);
+fn executable_toolchain_fingerprint(
+  snapshot: &WorkspaceSnapshot,
+  executables: &ToolchainExecutableIdentities,
+  cargo_rail_executable: &ExecutableIdentity,
+) -> RailResult<String> {
+  let toolchain = snapshot.toolchain();
+  let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v1\0"[..]);
+  append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
+  append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
+  append_identity_frame(&mut framed, b"platform-family", std::env::consts::FAMILY.as_bytes());
+  append_identity_frame(&mut framed, b"platform-os", std::env::consts::OS.as_bytes());
+  append_identity_frame(&mut framed, b"platform-arch", std::env::consts::ARCH.as_bytes());
+  append_identity_frame(
+    &mut framed,
+    b"cargo-rail-wrapper",
+    &cargo_rail_executable.identity_bytes()?,
+  );
+  Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+}
+
+fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
+  snapshot
+    .base_resolution()
+    .metadata()
+    .packages
+    .iter()
+    .map(|package| {
+      let identity = if let Some(source) = &package.source {
+        let checksum = snapshot.lockfile().and_then(|lockfile| {
+          lockfile.packages().iter().find_map(|locked| {
+            (locked.name() == package.name.as_str()
+              && locked.version() == package.version.to_string()
+              && locked.source() == Some(source.repr.as_str()))
+            .then(|| locked.checksum())
+            .flatten()
+          })
+        });
+        format!(
+          "external:{}#{}@{}#{}",
+          source.repr,
+          package.name,
+          package.version,
+          checksum.unwrap_or("unverified")
+        )
+      } else {
+        let snapshot_package = snapshot
+          .packages()
+          .iter()
+          .find(|candidate| candidate.id() == &package.id)
+          .ok_or_else(|| RailError::message(format!("snapshot is missing local package '{}'", package.id)))?;
+        let manifest = snapshot_package
+          .manifest_path()
+          .ok_or_else(|| RailError::message(format!("local package '{}' has no manifest identity", package.id)))?;
+        format!("local:{}#{}@{}", manifest.as_str(), package.name, package.version)
+      };
+      Ok((package.id.clone(), identity))
+    })
+    .collect()
+}
+
+fn target_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<String, String>> {
+  let mut fingerprints = HashMap::new();
+  for target in snapshot.targets() {
+    let identity = format!(
+      "sha256:{}",
+      ContentDigest::sha256(&target.portable_snapshot_identity(snapshot.source_root())?)
+    );
+    fingerprints.insert(target_name(target).to_string(), identity.clone());
+    if target.is_build_target() || (target.is_host() && !fingerprints.contains_key("default")) {
+      fingerprints.insert("default".to_string(), identity);
+    }
   }
+  if !fingerprints.contains_key("default") {
+    return Err(RailError::message(
+      "compiler evidence snapshot contains no default build or host target identity",
+    ));
+  }
+  Ok(fingerprints)
+}
+
+fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<&'static str> {
+  for package in &snapshot.base_resolution().metadata().packages {
+    if package
+      .targets
+      .iter()
+      .flat_map(|target| target.kind.iter())
+      .any(|kind| *kind == TargetKind::CustomBuild)
+    {
+      return Some("build_script_observations_unavailable");
+    }
+    if package
+      .targets
+      .iter()
+      .flat_map(|target| target.kind.iter())
+      .any(|kind| *kind == TargetKind::ProcMacro)
+    {
+      return Some("proc_macro_observations_unavailable");
+    }
+  }
+  snapshot
+    .packages()
+    .iter()
+    .any(|package| package.source().is_some() && package.checksum().is_none())
+    .then_some("external_source_digest_unavailable")
+}
+
+fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {
+  match target.specification() {
+    crate::cargo::resolution::TargetSpecificationIdentity::BuiltIn(name) => name,
+    crate::cargo::resolution::TargetSpecificationIdentity::Custom(specification) => specification.name(),
+  }
+}
+
+fn package_source_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
+  let manifest_paths = snapshot
+    .manifests()
+    .iter()
+    .map(|manifest| manifest.path())
+    .collect::<BTreeSet<_>>();
+  let mut package_roots = HashMap::new();
+  let mut roots_by_package = HashMap::new();
+  let mut identities = HashMap::new();
+  for package in snapshot
+    .packages()
+    .iter()
+    .filter(|package| package.package_root().is_some())
+  {
+    let root = package.package_root().ok_or_else(|| {
+      RailError::message(format!(
+        "compiler evidence package '{}' is not backed by local snapshot source",
+        package.id()
+      ))
+    })?;
+    package_roots.insert(root, package.id());
+    roots_by_package.insert(package.id(), root);
+    identities.insert(package.id(), Vec::from(&b"cargo-rail-compiler-source-v1\0"[..]));
+  }
+
+  for entry in snapshot.source().tree().entries() {
+    if manifest_paths.contains(&entry.path) {
+      continue;
+    }
+    let Some(package_id) = entry
+      .path
+      .as_path()
+      .ancestors()
+      .find_map(|ancestor| package_roots.get(ancestor).copied())
+    else {
+      continue;
+    };
+    let package_root = roots_by_package[package_id];
+    let relative = entry.path.as_path().strip_prefix(package_root).map_err(|_| {
+      RailError::message(format!(
+        "source entry '{}' is outside package '{}' root",
+        entry.path, package_id
+      ))
+    })?;
+    let identity = identities.get_mut(package_id).ok_or_else(|| {
+      RailError::message(format!(
+        "compiler source identity is missing local package '{package_id}'"
+      ))
+    })?;
+    append_identity_frame(identity, b"path", crate::utils::path_to_git_format(relative).as_bytes());
+    match &entry.kind {
+      SourceEntryKind::RegularFile { digest, executable } => {
+        append_identity_frame(identity, b"kind", b"regular-file");
+        append_identity_frame(identity, b"content", digest.as_bytes());
+        append_identity_frame(identity, b"executable", &[u8::from(*executable)]);
+      }
+      SourceEntryKind::Symlink { target } => {
+        append_identity_frame(identity, b"kind", b"symlink");
+        append_identity_frame(identity, b"target", target.as_bytes());
+      }
+      SourceEntryKind::Deleted => {
+        return Err(RailError::message(format!(
+          "compiler source identity contains deleted entry '{}'",
+          entry.path
+        )));
+      }
+    }
+  }
+  Ok(
+    identities
+      .into_iter()
+      .map(|(package_id, identity)| {
+        (
+          package_id.clone(),
+          format!("sha256:{}", ContentDigest::sha256(&identity)),
+        )
+      })
+      .collect(),
+  )
+}
+
+fn declared_local_dependency_graph(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, Vec<PackageId>>> {
+  let local_packages = snapshot
+    .packages()
+    .iter()
+    .filter(|package| package.source().is_none())
+    .map(|package| package.id())
+    .collect::<HashSet<_>>();
+  let mut roots = HashMap::new();
+  for package in &snapshot.base_resolution().metadata().packages {
+    if !local_packages.contains(&package.id) {
+      continue;
+    }
+    let root = package
+      .manifest_path
+      .as_std_path()
+      .parent()
+      .ok_or_else(|| RailError::message(format!("local package '{}' manifest has no parent", package.id)))?;
+    let root = std::fs::canonicalize(root)
+      .with_context(|| format!("resolving local package '{}' root for compiler evidence", package.id))?;
+    if let Some(previous) = roots.insert(root.clone(), package.id.clone())
+      && previous != package.id
+    {
+      return Err(RailError::message(format!(
+        "local packages '{previous}' and '{}' share compiler input root '{}'",
+        package.id,
+        root.display()
+      )));
+    }
+  }
+
+  let mut graph = HashMap::new();
+  for package in &snapshot.base_resolution().metadata().packages {
+    if !local_packages.contains(&package.id) {
+      continue;
+    }
+    let mut dependencies = BTreeSet::new();
+    for dependency in &package.dependencies {
+      let Some(path) = dependency.path.as_ref() else {
+        for candidate in &snapshot.base_resolution().metadata().packages {
+          if local_packages.contains(&candidate.id)
+            && candidate.name == dependency.name
+            && dependency.req.matches(&candidate.version)
+          {
+            dependencies.insert(candidate.id.clone());
+          }
+        }
+        continue;
+      };
+      let root = std::fs::canonicalize(path.as_std_path()).with_context(|| {
+        format!(
+          "resolving local dependency '{}' declared by '{}' for compiler evidence",
+          dependency.name, package.id
+        )
+      })?;
+      let dependency_id = roots.get(&root).ok_or_else(|| {
+        RailError::message(format!(
+          "local dependency '{}' declared by '{}' is absent from the captured package graph",
+          dependency.name, package.id
+        ))
+      })?;
+      dependencies.insert(dependency_id.clone());
+    }
+    graph.insert(package.id.clone(), dependencies.into_iter().collect());
+  }
+  Ok(graph)
+}
+
+fn manifest_closure_fingerprints(
+  snapshot: &WorkspaceSnapshot,
+  dependencies: &HashMap<PackageId, Vec<PackageId>>,
+) -> RailResult<HashMap<PackageId, String>> {
+  let manifests = snapshot
+    .manifests()
+    .iter()
+    .map(|manifest| (manifest.path(), manifest))
+    .collect::<HashMap<_, _>>();
+  let packages = snapshot
+    .packages()
+    .iter()
+    .map(|package| (package.id(), package))
+    .collect::<HashMap<_, _>>();
+  let root_manifest = snapshot
+    .manifests()
+    .iter()
+    .find(|manifest| manifest.path().as_path() == Path::new("Cargo.toml"));
+  let mut fingerprints = HashMap::new();
+
+  for member in snapshot
+    .packages()
+    .iter()
+    .filter(|package| package.is_workspace_member())
+  {
+    let mut closure = BTreeMap::new();
+    if let Some(manifest) = root_manifest {
+      closure.insert(manifest.path(), manifest.digest());
+    }
+    for package_id in local_dependency_closure(member.id(), dependencies) {
+      let package = packages.get(&package_id).ok_or_else(|| {
+        RailError::message(format!(
+          "compiler manifest identity is missing local package '{package_id}'"
+        ))
+      })?;
+      let manifest_path = package.manifest_path().ok_or_else(|| {
+        RailError::message(format!(
+          "local dependency '{package_id}' has no logical manifest identity"
+        ))
+      })?;
+      let manifest = manifests.get(manifest_path).ok_or_else(|| {
+        RailError::message(format!(
+          "local dependency '{package_id}' manifest '{manifest_path}' is absent from the snapshot"
+        ))
+      })?;
+      closure.insert(manifest.path(), manifest.digest());
+    }
+
+    let mut identity = Vec::from(&b"cargo-rail-compiler-manifest-closure-v1\0"[..]);
+    for (path, digest) in closure {
+      append_identity_frame(&mut identity, b"path", path.as_str().as_bytes());
+      append_identity_frame(&mut identity, b"content", digest.as_bytes());
+    }
+    fingerprints.insert(
+      member.id().clone(),
+      format!("sha256:{}", ContentDigest::sha256(&identity)),
+    );
+  }
+  Ok(fingerprints)
+}
+
+fn source_closure_fingerprints(
+  snapshot: &WorkspaceSnapshot,
+  dependencies: &HashMap<PackageId, Vec<PackageId>>,
+) -> RailResult<HashMap<PackageId, String>> {
+  let package_sources = package_source_fingerprints(snapshot)?;
+  let packages = snapshot
+    .packages()
+    .iter()
+    .map(|package| (package.id(), package))
+    .collect::<HashMap<_, _>>();
+  let mut fingerprints = HashMap::new();
+
+  for member in snapshot
+    .packages()
+    .iter()
+    .filter(|package| package.is_workspace_member())
+  {
+    let mut closure = BTreeMap::new();
+    for package_id in local_dependency_closure(member.id(), dependencies) {
+      let package = packages.get(&package_id).ok_or_else(|| {
+        RailError::message(format!(
+          "compiler source identity is missing local package '{package_id}'"
+        ))
+      })?;
+      let source_fingerprint = package_sources.get(&package_id).ok_or_else(|| {
+        RailError::message(format!(
+          "local dependency '{package_id}' source is absent from the authoritative snapshot"
+        ))
+      })?;
+      let manifest = package.manifest_path().ok_or_else(|| {
+        RailError::message(format!(
+          "local dependency '{package_id}' has no logical manifest identity"
+        ))
+      })?;
+      closure.insert(manifest, source_fingerprint);
+    }
+
+    let mut identity = Vec::from(&b"cargo-rail-compiler-source-closure-v1\0"[..]);
+    for (manifest, source_fingerprint) in closure {
+      append_identity_frame(&mut identity, b"manifest", manifest.as_str().as_bytes());
+      append_identity_frame(&mut identity, b"source", source_fingerprint.as_bytes());
+    }
+    fingerprints.insert(
+      member.id().clone(),
+      format!("sha256:{}", ContentDigest::sha256(&identity)),
+    );
+  }
+  Ok(fingerprints)
+}
+
+fn local_dependency_closure(
+  root: &PackageId,
+  dependencies: &HashMap<PackageId, Vec<PackageId>>,
+) -> BTreeSet<PackageId> {
+  let mut pending = vec![root.clone()];
+  let mut visited = BTreeSet::new();
+  while let Some(package_id) = pending.pop() {
+    if !visited.insert(package_id.clone()) {
+      continue;
+    }
+    if let Some(package_dependencies) = dependencies.get(&package_id) {
+      pending.extend(package_dependencies.iter().cloned());
+    }
+  }
+  visited
 }
 
 fn now_unix_ms() -> u64 {
@@ -891,18 +1381,35 @@ fn now_unix_ms() -> u64 {
     .unwrap_or(0)
 }
 
-fn compiler_env_fingerprint() -> String {
-  let rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-  let encoded_rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
-  let combined = format!("RUSTFLAGS={rustflags}\nCARGO_ENCODED_RUSTFLAGS={encoded_rustflags}");
-  format!("fnv1a64:{:016x}", fnv1a64(combined.as_bytes()))
+fn compiler_env_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
+  let environment = snapshot
+    .cargo_config()
+    .environment()
+    .iter()
+    .filter(|(name, _)| name.contains("RUSTFLAGS") || name.contains("RUSTDOCFLAGS"))
+    .collect::<BTreeMap<_, _>>();
+  Ok(format!(
+    "sha256:{}",
+    ContentDigest::sha256(&serde_json::to_vec(&environment)?)
+  ))
 }
 
-fn cargo_config_fingerprint(workspace_root: &Path) -> String {
-  let cfg_toml = file_fingerprint(&workspace_root.join(".cargo").join("config.toml"));
-  let cfg_legacy = file_fingerprint(&workspace_root.join(".cargo").join("config"));
-  let combined = format!("{cfg_toml}\n{cfg_legacy}");
-  format!("fnv1a64:{:016x}", fnv1a64(combined.as_bytes()))
+fn cargo_config_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
+  Ok(format!(
+    "sha256:{}",
+    ContentDigest::sha256(
+      &snapshot
+        .cargo_config()
+        .portable_snapshot_identity(snapshot.source_root())?
+    )
+  ))
+}
+
+fn append_identity_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
+  output.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+  output.extend_from_slice(tag);
+  output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+  output.extend_from_slice(value);
 }
 
 fn build_manifest_member_index(members: &[crate::cargo::manifest_analyzer::ParsedManifest]) -> HashMap<String, String> {
@@ -931,7 +1438,6 @@ struct CargoEvent {
   target: Option<CargoTarget>,
   message: Option<CargoDiagnostic>,
   profile: Option<CargoProfile>,
-  fresh: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1144,67 +1650,5 @@ mod tests {
       unit_evidence: Vec::new(),
       completeness: DiagnosticsCompleteness::Complete,
     }
-  }
-
-  #[test]
-  fn test_source_tree_fingerprint_changes_with_mtime_or_size() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let member = temp.path();
-    std::fs::create_dir_all(member.join("src")).expect("mkdir");
-    std::fs::write(member.join("src/lib.rs"), "pub fn a() {}\n").expect("write1");
-
-    let before = source_tree_fingerprint(member);
-    std::fs::write(member.join("src/lib.rs"), "pub fn a() { let _ = 1; }\n").expect("write2");
-    let after = source_tree_fingerprint(member);
-
-    assert_ne!(before, after);
-  }
-
-  #[test]
-  fn test_merge_fresh_unit_evidence_reuses_only_cargo_fresh_targets() {
-    let fresh = CompilationUnitId {
-      kind: CargoTargetKind::Example,
-      name: "fresh-example".to_string(),
-      source: Some("examples/fresh.rs".to_string()),
-      test_mode: false,
-    };
-    let dirty = CompilationUnitId {
-      kind: CargoTargetKind::Test,
-      name: "dirty-test".to_string(),
-      source: Some("tests/dirty.rs".to_string()),
-      test_mode: true,
-    };
-    let prior = TargetEvidence {
-      platform: PlatformTarget::from("default"),
-      features: FeatureSelection::Default,
-      compiled_units: BTreeSet::from([fresh.clone(), dirty.clone()]),
-      unused_crates: BTreeSet::new(),
-      unit_evidence: vec![
-        CompilationUnitEvidence {
-          unit: fresh.clone(),
-          unused_crates: BTreeSet::from(["alpha".to_string()]),
-        },
-        CompilationUnitEvidence {
-          unit: dirty.clone(),
-          unused_crates: BTreeSet::from(["stale".to_string()]),
-        },
-      ],
-      completeness: DiagnosticsCompleteness::Complete,
-    };
-    let mut current = vec![
-      CompilationUnitEvidence {
-        unit: fresh.clone(),
-        unused_crates: BTreeSet::new(),
-      },
-      CompilationUnitEvidence {
-        unit: dirty.clone(),
-        unused_crates: BTreeSet::from(["beta".to_string()]),
-      },
-    ];
-
-    merge_fresh_unit_evidence(&mut current, &prior, &BTreeSet::from([fresh]));
-
-    assert_eq!(current[0].unused_crates, BTreeSet::from(["alpha".to_string()]));
-    assert_eq!(current[1].unused_crates, BTreeSet::from(["beta".to_string()]));
   }
 }

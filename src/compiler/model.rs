@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Cache format version for compiler diagnostics.
-pub const COMPILER_DIAG_CACHE_VERSION: u32 = 6;
+pub const COMPILER_DIAG_CACHE_VERSION: u32 = 8;
 
 /// Collector version used to invalidate stale semantic behavior.
-pub const COLLECTOR_VERSION: u32 = 7;
+pub const COLLECTOR_VERSION: u32 = 9;
 
 /// A rustc platform target or `default` for the workspace's native target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -457,11 +457,15 @@ pub struct CompilerDiagKey {
   pub cargo_version: String,
   /// rustc host triple.
   pub host_triple: String,
+  /// Complete Cargo, rustc, rustdoc, and compiler-wrapper identity.
+  pub toolchain_fingerprint: String,
+  /// Exact target specification, cfg, tool, and compiler-flag identity.
+  pub target_fingerprint: String,
   /// Workspace lockfile fingerprint.
   pub lock_fingerprint: String,
   /// Member manifest fingerprint.
   pub manifest_fingerprint: String,
-  /// Member source-tree fingerprint.
+  /// Member and local dependency-closure source fingerprint.
   pub source_fingerprint: String,
   /// Build-affecting environment fingerprint (RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS).
   pub compiler_env_fingerprint: String,
@@ -474,13 +478,15 @@ impl CompilerDiagKey {
   #[must_use]
   pub fn stable_id(&self) -> String {
     format!(
-      "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+      "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
       self.package_id,
       self.target.as_str(),
       self.features.label(),
       self.rustc_version,
       self.cargo_version,
       self.host_triple,
+      self.toolchain_fingerprint,
+      self.target_fingerprint,
       self.lock_fingerprint,
       self.manifest_fingerprint,
       self.source_fingerprint,
@@ -510,6 +516,8 @@ pub struct CompilerDiagEntry {
   pub generated_at_unix_ms: u64,
   /// Collector semantic version.
   pub collector_version: u32,
+  /// Immutable exact-byte compilation observations supporting this evidence.
+  pub(crate) observations: Vec<crate::compiler::observation::CompilationObservationManifest>,
 }
 
 /// On-disk cache envelope.

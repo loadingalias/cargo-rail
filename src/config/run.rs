@@ -537,12 +537,31 @@ impl RepositoryAction {
           format!("duplicates environment name '{}'", entry.name()),
         ));
       }
+      if !matches!(entry, RepositoryEnvironmentEntry::Secret { .. }) && secret_environment_name(entry.name()) {
+        return Err(invalid(
+          format!("{field}.kind"),
+          format!(
+            "secret-shaped environment name '{}' must use kind = \"secret\"",
+            entry.name()
+          ),
+        ));
+      }
       if let RepositoryEnvironmentEntry::Fixed { value, .. } = entry {
         validate_bounded_string(value, &format!("{field}.value"))?;
       }
     }
     Ok(())
   }
+}
+
+fn secret_environment_name(name: &str) -> bool {
+  let normalized = name.to_ascii_lowercase().replace('_', "-");
+  normalized == "token"
+    || normalized.ends_with("-token")
+    || normalized.contains("password")
+    || normalized.contains("secret")
+    || normalized.contains("credential")
+    || normalized.contains("private-key")
 }
 
 fn validate_action_argv(argv: &[String], field: &str) -> Result<(), ConfigError> {
@@ -1205,6 +1224,21 @@ actions = ["codegen"]
       .validate()
       .expect_err("portable environment collisions must fail closed");
     assert!(error.to_string().contains("duplicates environment name 'PATH'"));
+  }
+
+  #[test]
+  fn repository_action_requires_secret_capability_for_secret_shaped_names() {
+    let mut config = RunConfig::default();
+    let mut action = valid_action(&["tool"]);
+    action.environment.entries = vec![RepositoryEnvironmentEntry::Pass {
+      name: "PUBLISH_TOKEN".to_string(),
+    }];
+    config.actions.insert("release".to_string(), action);
+
+    let error = config
+      .validate()
+      .expect_err("secret-shaped pass-through must fail closed");
+    assert!(error.to_string().contains("must use kind = \"secret\""), "{error}");
   }
 
   #[test]

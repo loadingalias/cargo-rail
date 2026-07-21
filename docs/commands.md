@@ -23,6 +23,7 @@ Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
   run          Execute planner-selected actions
+  doctor       Diagnose whether actions have complete hermetic inputs
   plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
@@ -179,6 +180,87 @@ Examples:
   cargo rail run --cargo-test-arg=--all-features --test-runner cargo
   cargo rail run --nextest-arg=-P --nextest-arg=commit
   cargo rail run -- --nocapture               # Pass harness args after --
+```
+
+---
+
+## cargo rail doctor
+
+```
+Diagnose whether actions have complete hermetic inputs
+
+Usage: cargo rail doctor [OPTIONS] <COMMAND>
+
+Commands:
+  hermeticity  Explain action-key eligibility and every incomplete input boundary
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -q, --quiet                  Suppress progress messages (for CI/automation)
+      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --config <PATH>          Path to rail.toml config file (bypass search order)
+      --workspace-root <PATH>  Workspace root directory (default: current directory)
+  -h, --help                   Print help
+  -V, --version                Print version
+```
+
+---
+
+### cargo rail doctor hermeticity
+
+```
+Explain action-key eligibility and every incomplete input boundary
+
+Usage: cargo rail doctor hermeticity [OPTIONS]
+
+Options:
+      --action <ACTION>
+          Action(s) to inspect (repeatable)
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --profile <PROFILE>
+          Named profile to inspect
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workflow <WORKFLOW>
+          Named workflow mapped to a profile via `[run.workflow]`
+
+      --generated <GENERATED>
+          Generated-output behavior to inspect
+
+          Possible values:
+          - check:      Run each generator's read-only staleness check
+          - regenerate: Update each generator's declared outputs
+
+          [default: regenerate]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --ignore-bin-crates
+          Ignore binary-only crates
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---

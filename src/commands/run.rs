@@ -7,6 +7,7 @@ use crate::action::{
   ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason,
   ActionResolutionBinding, ActionSpec, ArgvTemplate, ExpandedAction, PackageArguments,
 };
+use crate::action_key::{analyze as analyze_action_key, resolution_identity};
 use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
 use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
 use crate::config::MAX_ACTIONS;
@@ -81,6 +82,9 @@ pub struct RunOptions {
   pub test_filter: Option<String>,
   /// Pass additional arguments to the surface runner.
   pub run_args: Vec<String>,
+  /// Render a read-only hermeticity report instead of a run plan.
+  #[doc(hidden)]
+  pub hermeticity_doctor: bool,
 }
 
 /// Execute `run` with planner-driven action selection.
@@ -205,6 +209,9 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   }
 
   bind_action_resolution_views(ctx, &mut expanded_actions)?;
+  for action in &mut expanded_actions {
+    action.bind_action_key(analyze_action_key(action, snapshot)?);
+  }
 
   let graph = ActionGraph::new(snapshot_id, expanded_actions)?;
   let executed_actions = graph
@@ -240,17 +247,19 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     }
   }
 
-  let receipt_path = write_run_decision_receipt(DecisionReceiptInput {
-    ctx,
-    opts: &opts,
-    effective: &effective,
-    plan: plan.as_ref(),
-    executed_actions: &executed_actions,
-    skipped_actions: &skipped_actions,
-    graph: &graph,
-  })?;
-  if std::env::var_os("CI").is_some() {
-    progress!("decision receipt: {}", receipt_path.display());
+  if !opts.hermeticity_doctor {
+    let receipt_path = write_run_decision_receipt(DecisionReceiptInput {
+      ctx,
+      opts: &opts,
+      effective: &effective,
+      plan: plan.as_ref(),
+      executed_actions: &executed_actions,
+      skipped_actions: &skipped_actions,
+      graph: &graph,
+    })?;
+    if std::env::var_os("CI").is_some() {
+      progress!("decision receipt: {}", receipt_path.display());
+    }
   }
 
   Ok(())
@@ -588,16 +597,12 @@ fn bind_action_resolution_views(ctx: &WorkspaceContext, actions: &mut [ExpandedA
     for target in targets {
       let request = ResolutionRequest::new(packages.clone(), features.clone(), target.clone())?;
       let view = ctx.resolution_view(request)?;
-      let resolved_node_count = view
-        .metadata()
-        .resolve
-        .as_ref()
-        .map_or(0, |resolve| resolve.nodes.len());
+      let resolution = resolution_identity(ctx.snapshot()?, &view)?;
       bindings.push(ActionResolutionBinding::new(
         root_package_ids.clone(),
         target,
         action.selected_features().clone(),
-        resolved_node_count,
+        resolution,
       ));
     }
     action.bind_resolution_views(bindings);
@@ -788,8 +793,12 @@ fn render_action_plan<'a>(
   plan: Option<&'a PlanOutput>,
 ) -> RailResult<()> {
   let output = ActionPlanOutput {
-    artifact: "action_plan",
-    version: 2,
+    artifact: if opts.hermeticity_doctor {
+      "hermeticity_report"
+    } else {
+      "action_plan"
+    },
+    version: if opts.hermeticity_doctor { 1 } else { 3 },
     snapshot_id: graph.snapshot_id(),
     profile_requested: opts.profile.as_deref(),
     profile_effective: effective.profile.as_deref(),
@@ -827,7 +836,13 @@ fn render_action_plan<'a>(
     ActionOutputFormat::Json => {
       let payload = serde_json::to_value(&output)
         .map_err(|error| RailError::message(format!("failed to serialize action plan: {error}")))?;
-      let envelope = crate::output::machine_json_envelope("run", "plan", "success", 0, payload);
+      let envelope = crate::output::machine_json_envelope(
+        if opts.hermeticity_doctor { "doctor" } else { "run" },
+        if opts.hermeticity_doctor { "hermeticity" } else { "plan" },
+        "success",
+        0,
+        payload,
+      );
       let rendered = serde_json::to_string_pretty(&envelope)
         .map_err(|error| RailError::message(format!("failed to render action plan: {error}")))?;
       println!("{rendered}");
@@ -1367,6 +1382,18 @@ fn execute_run_step(
   }
 
   if opts.explain {
+    if let Some(action_key) = expanded.action_key() {
+      println!(
+        "action `{}` key: {} ({})",
+        expanded.id(),
+        if action_key.reason_codes().next().is_some() {
+          "uncacheable"
+        } else {
+          "eligible"
+        },
+        action_key.reason_codes().collect::<Vec<_>>().join(", ")
+      );
+    }
     match expanded.kind() {
       ActionKind::Build
       | ActionKind::Bench
@@ -1469,7 +1496,7 @@ fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std
   let path = dir.join(format!("run-decision-{}.json", nonce));
   let receipt = serde_json::json!({
     "artifact": "decision_receipt",
-    "version": 2,
+    "version": 3,
     "command": "run",
     "generated_at_utc": chrono::Utc::now().to_rfc3339(),
     "snapshot_id": input.graph.snapshot_id(),

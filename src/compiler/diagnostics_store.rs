@@ -5,7 +5,6 @@ use crate::compiler::model::{
 };
 use crate::error::RailResult;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,11 +74,14 @@ impl CompilerDiagnosticsStore {
     };
     if *collector_version != COLLECTOR_VERSION {
       "collector_changed"
-    } else if prior.rustc_version != key.rustc_version
+    } else if prior.toolchain_fingerprint != key.toolchain_fingerprint
+      || prior.rustc_version != key.rustc_version
       || prior.cargo_version != key.cargo_version
       || prior.host_triple != key.host_triple
     {
       "toolchain_changed"
+    } else if prior.target_fingerprint != key.target_fingerprint {
+      "target_identity_changed"
     } else if prior.lock_fingerprint != key.lock_fingerprint {
       "lockfile_changed"
     } else if prior.manifest_fingerprint != key.manifest_fingerprint {
@@ -93,28 +95,6 @@ impl CompilerDiagnosticsStore {
     } else {
       "semantic_key_changed"
     }
-  }
-
-  /// Return prior evidence when the source tree is the only changed semantic
-  /// input. Cargo's fresh-unit markers can then authorize exact unit reuse.
-  pub fn prior_for_source_change(&self, key: &CompilerDiagKey) -> Option<&CompilerDiagEntry> {
-    let (_, prior, collector_version) = self.prior_by_configuration.get(&configuration_id(key))?;
-    if *collector_version != COLLECTOR_VERSION
-      || prior.package_id != key.package_id
-      || prior.target != key.target
-      || prior.features != key.features
-      || prior.rustc_version != key.rustc_version
-      || prior.cargo_version != key.cargo_version
-      || prior.host_triple != key.host_triple
-      || prior.lock_fingerprint != key.lock_fingerprint
-      || prior.manifest_fingerprint != key.manifest_fingerprint
-      || prior.compiler_env_fingerprint != key.compiler_env_fingerprint
-      || prior.cargo_config_fingerprint != key.cargo_config_fingerprint
-      || prior.source_fingerprint == key.source_fingerprint
-    {
-      return None;
-    }
-    self.cache.entries.get(&prior.stable_id())
   }
 
   /// Upsert one entry.
@@ -140,25 +120,8 @@ impl CompilerDiagnosticsStore {
     }
 
     self.prune();
-    let temporary_path = self.path.with_extension(format!("tmp-{}", std::process::id()));
-    let temporary = std::fs::OpenOptions::new()
-      .write(true)
-      .create(true)
-      .truncate(true)
-      .open(&temporary_path)?;
-    let mut writer = BufWriter::new(temporary);
-    serde_json::to_writer(&mut writer, &self.cache)?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-    if let Err(error) = std::fs::rename(&temporary_path, &self.path) {
-      if error.kind() != std::io::ErrorKind::AlreadyExists {
-        let _ = std::fs::remove_file(&temporary_path);
-        return Err(error.into());
-      }
-      std::fs::remove_file(&self.path)?;
-      std::fs::rename(&temporary_path, &self.path)?;
-    }
+    let bytes = serde_json::to_vec(&self.cache)?;
+    crate::utils::write_file_atomic(&self.path, &bytes)?;
     self.dirty = false;
     Ok(())
   }

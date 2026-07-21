@@ -302,6 +302,13 @@ pub enum Commands {
     run_args: Vec<String>,
   },
 
+  /// Diagnose whether actions have complete hermetic inputs
+  Doctor {
+    /// Diagnostic to run
+    #[command(subcommand)]
+    command: DoctorCommand,
+  },
+
   /// Build a deterministic file-first change plan
   #[command(after_long_help = PLAN_HELP)]
   Plan {
@@ -557,6 +564,7 @@ impl Commands {
   pub fn requires_workspace_snapshot(&self) -> bool {
     match self {
       Self::Run { .. }
+      | Self::Doctor { .. }
       | Self::Unify { .. }
       | Self::Split { .. }
       | Self::Sync { .. }
@@ -573,11 +581,38 @@ impl Commands {
   pub fn requires_worktree_source_capture(&self) -> bool {
     match self {
       Self::Run { all, .. } => !all,
+      Self::Doctor { .. } => false,
       Self::Plan { from, to, schema, .. } => !schema && !(from.is_some() && to.is_some()),
       Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
       _ => false,
     }
   }
+}
+
+/// Subcommands for `cargo rail doctor`.
+#[derive(Subcommand)]
+pub enum DoctorCommand {
+  /// Explain action-key eligibility and every incomplete input boundary
+  Hermeticity {
+    /// Action(s) to inspect (repeatable)
+    #[arg(long = "action", value_name = "ACTION")]
+    actions: Vec<String>,
+    /// Named profile to inspect
+    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["actions", "workflow"])]
+    profile: Option<String>,
+    /// Named workflow mapped to a profile via `[run.workflow]`
+    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["actions", "profile"])]
+    workflow: Option<String>,
+    /// Generated-output behavior to inspect
+    #[arg(long, default_value_t, value_enum)]
+    generated: GeneratedMode,
+    /// Ignore binary-only crates
+    #[arg(long)]
+    ignore_bin_crates: bool,
+    /// Report format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
 }
 
 /// Subcommands for `cargo rail config`
@@ -874,6 +909,9 @@ impl Commands {
   pub fn is_json_format(&self) -> bool {
     match self {
       Commands::Run { format, .. } => format.is_json_like(),
+      Commands::Doctor {
+        command: DoctorCommand::Hermeticity { format, .. },
+      } => format.is_json_like(),
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
       Commands::Unify {
@@ -946,6 +984,9 @@ impl Commands {
 
     match self {
       Commands::Run { format, .. } => *format = ActionOutputFormat::Json,
+      Commands::Doctor {
+        command: DoctorCommand::Hermeticity { format, .. },
+      } => *format = TextJsonOutputFormat::Json,
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
       Commands::Unify {

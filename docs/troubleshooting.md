@@ -20,6 +20,30 @@ Check:
 
 Use `scope` for execution decisions. Use `impact` for diagnostic context.
 
+## Why is this action uncacheable?
+
+```bash
+cargo rail doctor hermeticity --action build
+cargo rail doctor hermeticity --profile ci --format json
+```
+
+The report binds declared inputs to exact SHA-256 content and lists every reason cargo-rail withheld an `ActionKey`.
+Ambient environment or output access, unobserved build scripts or proc macros, an unverified external program or
+source, and missing dependency-result digests fail closed. A reported input-root digest is diagnostic evidence; it is
+not itself a cache key.
+
+## Why did compiler evidence miss?
+
+`cargo rail unify -f json` reports `evidence_cache` hits, misses, and stable miss reasons per member. A hit requires the
+same exact semantic key and successful revalidation of every recorded compiler input, dependency artifact, emitted
+output, executable identity, and non-Cargo environment read. Missing files are misses, not fatal errors. Same-size
+edits still miss because timestamps and sizes are not authority.
+
+Build scripts, proc macros, unverified external sources, unavailable dep-info, response files, secrets, and incomplete
+compiler observations bypass reuse. Cargo freshness does not override those checks. Delete
+`target/cargo-rail/cache/compiler-diags-v1.json` only to discard diagnostic evidence; it contains no restorable build
+artifacts or Cargo fingerprint state.
+
 ## Why did this not run?
 
 Check these in order:

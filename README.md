@@ -56,9 +56,15 @@ Turn git changes into an executable Cargo scope. `plan` maps files to owning cra
 ```bash
 cargo rail plan --merge-base --explain
 cargo rail run --merge-base --profile ci
+cargo rail doctor hermeticity --profile ci
 ```
 
 Use `run` directly or feed `plan -f github` into existing CI jobs. No duplicated package-selection logic and no path-filter graph to keep synchronized with Cargo.
+
+Hermeticity diagnosis hashes only the selected source and dependency closure, resolved features and targets, effective
+Cargo settings, toolchain/wrapper chain, argv, and typed environment. It reports every incomplete ambient,
+build-script, proc-macro, external-tool, or dependency-result boundary and withholds an `ActionKey` until none remain.
+This is an eligibility diagnostic, not an output cache; current built-in actions still fail closed as uncacheable.
 
 ## Release
 
@@ -116,7 +122,7 @@ The result is one install graph, one configuration surface, and one set of decis
 | `plan` / `run` | Select and execute work affected by a change |
 | `change` / `release` | Review release intent and run graph-ordered releases |
 | `split` / `sync` | Maintain standalone repositories from monorepo crates |
-| `config`, `graph`, `hash` | Validate configuration and explain planner state |
+| `doctor`, `config`, `graph`, `hash` | Diagnose action hermeticity, validate configuration, and explain planner state |
 
 ## Documentation
 

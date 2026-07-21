@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::action_key::{ActionKeyAnalysis, ResolutionIdentity};
 use crate::config::{
   BUILTIN_ACTION_NAMES, CargoEnvironmentValue, MAX_ACTIONS, RepositoryAction, RepositoryActionKind,
   RepositoryEnvironmentEntry, RepositoryPackageSelection, first_repository_output_overlap,
@@ -99,7 +100,7 @@ impl ActionPath {
     self.0.as_path()
   }
 
-  fn as_str(&self) -> &str {
+  pub(crate) fn as_str(&self) -> &str {
     self.0.as_str()
   }
 }
@@ -205,7 +206,16 @@ pub(crate) struct ActionResolutionBinding {
   root_package_ids: Vec<String>,
   target: Option<String>,
   features: ActionFeatureSelection,
+  resolution_digest: String,
   resolved_node_count: usize,
+  #[serde(skip)]
+  resolved_local_roots: Vec<PathBuf>,
+  #[serde(skip)]
+  has_build_scripts: bool,
+  #[serde(skip)]
+  has_proc_macros: bool,
+  #[serde(skip)]
+  has_unverified_external_sources: bool,
 }
 
 impl ActionResolutionBinding {
@@ -213,14 +223,43 @@ impl ActionResolutionBinding {
     root_package_ids: Vec<String>,
     target: Option<String>,
     features: ActionFeatureSelection,
-    resolved_node_count: usize,
+    resolution: ResolutionIdentity,
   ) -> Self {
     Self {
       root_package_ids,
       target,
       features,
-      resolved_node_count,
+      resolution_digest: resolution.digest,
+      resolved_node_count: resolution.resolved_node_count,
+      resolved_local_roots: resolution.local_package_roots,
+      has_build_scripts: resolution.has_build_scripts,
+      has_proc_macros: resolution.has_proc_macros,
+      has_unverified_external_sources: resolution.has_unverified_external_sources,
     }
+  }
+
+  pub(crate) fn resolution_digest(&self) -> &str {
+    &self.resolution_digest
+  }
+
+  pub(crate) fn target(&self) -> Option<&str> {
+    self.target.as_deref()
+  }
+
+  pub(crate) fn resolved_local_roots(&self) -> &[PathBuf] {
+    &self.resolved_local_roots
+  }
+
+  pub(crate) fn has_build_scripts(&self) -> bool {
+    self.has_build_scripts
+  }
+
+  pub(crate) fn has_proc_macros(&self) -> bool {
+    self.has_proc_macros
+  }
+
+  pub(crate) fn has_unverified_external_sources(&self) -> bool {
+    self.has_unverified_external_sources
   }
 }
 
@@ -301,6 +340,15 @@ enum ActionCommandTemplate {
 enum ExpandedGeneratedMode {
   Check,
   Regenerate,
+}
+
+impl ExpandedGeneratedMode {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Check => "check",
+      Self::Regenerate => "regenerate",
+    }
+  }
 }
 
 /// Request-specific values used to expand one action declaration.
@@ -597,7 +645,7 @@ impl ActionSpec {
       inputs: self.inputs.clone(),
       outputs: self.outputs.clone(),
       environment: self.environment.clone(),
-      reusable: false,
+      action_key: None,
     })
   }
 }
@@ -718,7 +766,8 @@ pub(crate) struct ExpandedAction {
   inputs: Vec<ActionInput>,
   outputs: Vec<ActionOutput>,
   environment: ActionEnvironment,
-  reusable: bool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  action_key: Option<ActionKeyAnalysis>,
 }
 
 impl ExpandedAction {
@@ -746,12 +795,48 @@ impl ExpandedAction {
     self.resolution_views = bindings;
   }
 
+  pub(crate) fn bind_action_key(&mut self, action_key: ActionKeyAnalysis) {
+    self.action_key = Some(action_key);
+  }
+
   pub(crate) fn id(&self) -> &str {
     &self.id
   }
 
   fn dependencies(&self) -> &[String] {
     &self.dependencies
+  }
+
+  pub(crate) fn key_dependencies(&self) -> &[String] {
+    &self.dependencies
+  }
+
+  pub(crate) fn working_directory(&self) -> &ActionWorkingDirectory {
+    &self.working_directory
+  }
+
+  pub(crate) fn resolution_views(&self) -> &[ActionResolutionBinding] {
+    &self.resolution_views
+  }
+
+  pub(crate) fn platform(&self) -> &str {
+    &self.platform
+  }
+
+  pub(crate) fn generated_mode(&self) -> Option<&'static str> {
+    self.generated_mode.map(ExpandedGeneratedMode::as_str)
+  }
+
+  pub(crate) fn inputs(&self) -> &[ActionInput] {
+    &self.inputs
+  }
+
+  pub(crate) fn key_outputs(&self) -> &[ActionOutput] {
+    &self.outputs
+  }
+
+  pub(crate) fn action_key(&self) -> Option<&ActionKeyAnalysis> {
+    self.action_key.as_ref()
   }
 
   fn outputs(&self) -> &[ActionOutput] {

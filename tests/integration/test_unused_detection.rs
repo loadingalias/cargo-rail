@@ -1181,6 +1181,22 @@ glob = "0.3"
   let evidence_cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
   assert!(evidence_cache.contains("CustomBuild"), "{evidence_cache}");
   assert!(evidence_cache.contains("unit_evidence"), "{evidence_cache}");
+  let repeated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let repeated_json: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+  let cache = repeated_json["evidence_cache"]
+    .as_array()
+    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
+    .expect("build-script compiler evidence telemetry");
+  assert_eq!(cache["hits"], 0, "unobserved build-script state must never be reused");
+  assert!(
+    cache["miss_reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons.iter().any(|reason| reason
+        .as_str()
+        .is_some_and(|value| value.starts_with("build_script_observations_unavailable=")))),
+    "build-script cache bypass must be explicit\n{}",
+    serde_json::to_string_pretty(&repeated_json)?
+  );
   let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
   assert!(
     output.status.success(),
@@ -1354,14 +1370,40 @@ fn test_unused_detection_compiler_diag_cache_writes_cache_file() -> Result<()> {
 
   add_crate_with_manifest(
     &workspace,
+    "helper",
+    r#"[package]
+name = "helper"
+version = "0.1.0"
+edition = "2021"
+"#,
+  )?;
+  add_crate_with_manifest(
+    &workspace,
     "test-crate",
     r#"[package]
 name = "test-crate"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+with-helper = ["dep:helper"]
+
 [dependencies]
+helper = { path = "../helper", optional = true }
 log = "0.4"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("crates/test-crate/src/lib.rs"),
+    "//! test-crate crate\n#[cfg(feature = \"with-helper\")] pub fn hello() { helper::hello(); }\n",
+  )?;
+  add_crate_with_manifest(
+    &workspace,
+    "unrelated",
+    r#"[package]
+name = "unrelated"
+version = "0.1.0"
+edition = "2021"
 "#,
   )?;
 
@@ -1386,8 +1428,8 @@ log = "0.4"
   );
   let cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
   assert_eq!(
-    cache["version"], 6,
-    "per-compilation-unit evidence cache must use schema version 6"
+    cache["version"], 8,
+    "exact compilation observations require evidence-cache schema version 8"
   );
   let entries = cache["entries"].as_object().expect("cache entries object");
   let entry = entries.values().next().expect("at least one cache entry");
@@ -1401,10 +1443,54 @@ log = "0.4"
     "cache key must retain Cargo feature selection: {entry}"
   );
   assert!(entry["key"]["cargo_version"].is_string(), "{entry}");
+  for field in [
+    "toolchain_fingerprint",
+    "target_fingerprint",
+    "lock_fingerprint",
+    "manifest_fingerprint",
+    "source_fingerprint",
+    "compiler_env_fingerprint",
+    "cargo_config_fingerprint",
+  ] {
+    assert!(
+      entry["key"][field]
+        .as_str()
+        .is_some_and(|fingerprint| fingerprint == "absent" || fingerprint.starts_with("sha256:")),
+      "compiler evidence field '{field}' must use exact SHA-256 snapshot identity: {entry}"
+    );
+  }
   assert!(
     entry["evidence"]["compiled_units"].is_array(),
     "cache must persist typed compilation-unit evidence: {entry}"
   );
+  let observation = entries
+    .values()
+    .filter_map(|entry| entry["observations"].as_array())
+    .flatten()
+    .find(|observation| {
+      observation["unit"]["package"]
+        .as_str()
+        .is_some_and(|package| package.starts_with("local:"))
+    })
+    .expect("workspace compilation observation");
+  for field in [
+    "declared_inputs",
+    "observed_reads",
+    "dependency_artifacts",
+    "emitted_outputs",
+    "execution",
+  ] {
+    assert!(
+      observation.get(field).is_some(),
+      "observation must separate {field}: {observation}"
+    );
+  }
+  assert!(
+    observation["unit_identity"]
+      .as_str()
+      .is_some_and(|identity| identity.starts_with("v1-sha256-"))
+  );
+  assert_eq!(observation["unit"]["target_kind"], "library");
 
   let warm = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   let warm_json: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
@@ -1417,12 +1503,44 @@ log = "0.4"
     "warm analysis must expose exact cache reuse\n{}",
     serde_json::to_string_pretty(&warm_json)?
   );
-  assert_eq!(warm_cache["misses"], 0);
+  assert_eq!(
+    warm_cache["misses"], 0,
+    "exact Cargo artifact fields and output bytes should correlate equivalent units without consulting freshness"
+  );
 
   fs::write(
-    workspace.path.join("crates/test-crate/src/lib.rs"),
-    "pub fn changed_source_without_dependency_use() {}\n",
+    workspace.path.join("crates/unrelated/src/lib.rs"),
+    "//! unrelated crate\npub fn untouched() { let _ = 1; }\n",
   )?;
+  let unrelated_manifest = workspace.path.join("crates/unrelated/Cargo.toml");
+  fs::write(
+    &unrelated_manifest,
+    fs::read_to_string(&unrelated_manifest)?
+      .replace("edition = \"2021\"", "edition = \"2021\"\ndescription = \"unrelated\""),
+  )?;
+  let unrelated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let unrelated_json: serde_json::Value = serde_json::from_slice(&unrelated.stdout)?;
+  let unrelated_cache = unrelated_json["evidence_cache"]
+    .as_array()
+    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
+    .expect("unrelated-input cache telemetry");
+  assert!(
+    unrelated_cache["hits"].as_u64().is_some_and(|hits| hits > 0),
+    "unrelated package source and manifest bytes must not invalidate member evidence\n{}",
+    serde_json::to_string_pretty(&unrelated_json)?
+  );
+  assert_eq!(unrelated_cache["hits"], warm_cache["hits"]);
+  assert_eq!(unrelated_cache["misses"], warm_cache["misses"]);
+
+  let source_path = workspace.path.join("crates/test-crate/src/lib.rs");
+  let original_source = fs::read_to_string(&source_path)?;
+  let changed_source = original_source.replacen("hello", "hullo", 1);
+  assert_eq!(
+    changed_source.len(),
+    original_source.len(),
+    "fixture must retain file size"
+  );
+  fs::write(&source_path, changed_source)?;
   let invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   let invalidated_json: serde_json::Value = serde_json::from_slice(&invalidated.stdout)?;
   let invalidated_cache = invalidated_json["evidence_cache"]
@@ -1439,6 +1557,72 @@ log = "0.4"
     serde_json::to_string_pretty(&invalidated_json)?
   );
 
+  let dependency_path = workspace.path.join("crates/helper/src/lib.rs");
+  let original_dependency = fs::read_to_string(&dependency_path)?;
+  let changed_dependency = original_dependency.replace("hello() {}", "hello(){ }");
+  assert_eq!(
+    changed_dependency.len(),
+    original_dependency.len(),
+    "dependency fixture must retain file size"
+  );
+  fs::write(&dependency_path, changed_dependency)?;
+  let dependency_invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+  let dependency_json: serde_json::Value = serde_json::from_slice(&dependency_invalidated.stdout)?;
+  let dependency_cache = dependency_json["evidence_cache"]
+    .as_array()
+    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
+    .unwrap_or_else(|| panic!("dependency-invalidated cache telemetry missing: {dependency_json}"));
+  assert!(
+    dependency_cache["miss_reasons"]
+      .as_array()
+      .is_some_and(|reasons| reasons.iter().any(|reason| reason
+        .as_str()
+        .is_some_and(|value| value.starts_with("source_changed=")))),
+    "optional local dependency mutation must invalidate every feature-domain evidence key\n{}",
+    serde_json::to_string_pretty(&dependency_json)?
+  );
+
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_compiler_diag_cache_write_replaces_symlink_without_following_it() -> Result<()> {
+  use std::os::unix::fs::symlink;
+
+  let workspace = create_workspace_with_unused_detection()?;
+  add_crate_with_manifest(
+    &workspace,
+    "test-crate",
+    r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+  )?;
+  workspace.commit("Add cache symlink fixture")?;
+
+  let cache_dir = workspace.path.join("target/cargo-rail/cache");
+  fs::create_dir_all(&cache_dir)?;
+  let sentinel = workspace.path.join("cache-write-sentinel");
+  fs::write(&sentinel, "must remain unchanged")?;
+  let cache_file = cache_dir.join("compiler-diags-v1.json");
+  symlink(&sentinel, &cache_file)?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(output.status.code(), Some(1), "fixture should produce a unify plan");
+  assert_eq!(
+    fs::read_to_string(&sentinel)?,
+    "must remain unchanged",
+    "cache persistence must not follow a pre-positioned symlink"
+  );
+  assert!(
+    fs::symlink_metadata(&cache_file)?.file_type().is_file(),
+    "atomic cache persistence must replace the symlink with a regular file"
+  );
   Ok(())
 }
 

@@ -177,6 +177,7 @@ pub struct ToolchainIdentity {
   rustc_wrapper_program: Option<OsString>,
   rustc_workspace_wrapper_program: Option<OsString>,
   host_target: String,
+  rustc_sysroot: PathBuf,
 }
 
 impl ToolchainIdentity {
@@ -223,6 +224,11 @@ impl ToolchainIdentity {
   /// Return the host tuple reported by the selected rustc.
   pub fn host_target(&self) -> &str {
     &self.host_target
+  }
+
+  /// Return the stable sysroot selected by the effective rustc wrapper chain.
+  pub(crate) fn rustc_sysroot(&self) -> &Path {
+    &self.rustc_sysroot
   }
 }
 
@@ -380,6 +386,7 @@ pub struct CargoConfigSnapshot {
   provenance: Vec<CargoConfigSource>,
   credential_capabilities: JsonValue,
   credential_provenance: Option<PathBuf>,
+  unmodeled_settings: BTreeSet<String>,
 }
 
 impl CargoConfigSnapshot {
@@ -414,6 +421,11 @@ impl CargoConfigSnapshot {
   /// Return typed capabilities discovered in Cargo's credentials file.
   pub fn credential_capabilities(&self) -> &JsonValue {
     &self.credential_capabilities
+  }
+
+  /// Return Cargo settings outside the explicit hermetic build contract.
+  pub(crate) fn unmodeled_settings(&self) -> &BTreeSet<String> {
+    &self.unmodeled_settings
   }
 
   pub(crate) fn has_credential_capability(&self) -> bool {
@@ -616,6 +628,11 @@ impl CargoConfigSnapshot {
       &mut identity,
       b"credential-capabilities",
       &serde_json::to_vec(&self.credential_capabilities)?,
+    );
+    append_frame(
+      &mut identity,
+      b"unmodeled-settings",
+      &serde_json::to_vec(&self.unmodeled_settings)?,
     );
     for source in &self.provenance {
       let mut provenance = Vec::new();
@@ -1269,6 +1286,16 @@ impl ToolchainIdentity {
       cargo_current_dir,
       cargo_config,
     )?;
+    let rustc_sysroot = PathBuf::from(wrapped_rustc_query(
+      &cargo_program,
+      &rustc_program,
+      rustc_wrapper_program.as_deref(),
+      rustc_workspace_wrapper_program.as_deref(),
+      cargo_current_dir,
+      cargo_config,
+      "--print=sysroot",
+      "wrapped 'rustc --print=sysroot'",
+    )?);
     let host_target = parse_rustc_host(&rustc_verbose_version)?;
     Ok(Self {
       cargo_verbose_version: command_identity(&cargo_program, "-Vv", cargo_current_dir, None)?,
@@ -1280,6 +1307,7 @@ impl ToolchainIdentity {
       rustc_wrapper_program,
       rustc_workspace_wrapper_program,
       host_target,
+      rustc_sysroot,
     })
   }
 }
@@ -1822,24 +1850,7 @@ fn configured_rustc_command(
   rustc_wrapper_program: Option<&OsStr>,
   rustc_workspace_wrapper_program: Option<&OsStr>,
 ) -> Command {
-  match (rustc_wrapper_program, rustc_workspace_wrapper_program) {
-    (Some(wrapper), Some(workspace_wrapper)) => {
-      let mut command = Command::new(wrapper);
-      command.arg(workspace_wrapper).arg(rustc_program);
-      command
-    }
-    (Some(wrapper), None) => {
-      let mut command = Command::new(wrapper);
-      command.arg(rustc_program);
-      command
-    }
-    (None, Some(workspace_wrapper)) => {
-      let mut command = Command::new(workspace_wrapper);
-      command.arg(rustc_program);
-      command
-    }
-    (None, None) => Command::new(rustc_program),
-  }
+  crate::compiler::wrapper::rustc_command(rustc_program, rustc_wrapper_program, rustc_workspace_wrapper_program)
 }
 
 fn apply_cargo_environment(command: &mut Command, cargo_config: &CargoConfigSnapshot) -> RailResult<()> {
@@ -2241,14 +2252,37 @@ fn wrapped_rustc_identity(
   workspace_root: &Path,
   cargo_config: &CargoConfigSnapshot,
 ) -> RailResult<String> {
+  wrapped_rustc_query(
+    cargo_program,
+    rustc_program,
+    rustc_wrapper_program,
+    rustc_workspace_wrapper_program,
+    workspace_root,
+    cargo_config,
+    "-vV",
+    "wrapped 'rustc -vV'",
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wrapped_rustc_query(
+  cargo_program: &OsStr,
+  rustc_program: &OsStr,
+  rustc_wrapper_program: Option<&OsStr>,
+  rustc_workspace_wrapper_program: Option<&OsStr>,
+  workspace_root: &Path,
+  cargo_config: &CargoConfigSnapshot,
+  argument: &str,
+  description: &str,
+) -> RailResult<String> {
   let mut command = configured_rustc_command(rustc_program, rustc_wrapper_program, rustc_workspace_wrapper_program);
   apply_cargo_environment(&mut command, cargo_config)?;
   command.env("CARGO", cargo_program);
   run_identity_command(
     command,
-    "-vV",
+    argument,
     workspace_root,
-    "wrapped 'rustc -vV'",
+    description,
     "ensure the selected rustc and compiler wrappers are available and executable",
   )
 }
@@ -2264,13 +2298,22 @@ impl CargoConfigSnapshot {
     let mut framed = Vec::from(&b"cargo-rail-resolution-config-v1\0"[..]);
     let mut stack = HashSet::new();
     let mut provenance = Vec::new();
+    let mut unmodeled_settings = BTreeSet::new();
     let cargo_home = cargo_home(&cargo_current_dir)?;
 
     for config_path in discovered_cargo_configs(&cargo_current_dir, &cargo_home)?
       .into_iter()
       .rev()
     {
-      capture_config_file(&config_path, false, 0, &mut stack, &mut framed, &mut provenance)?;
+      capture_config_file(
+        &config_path,
+        false,
+        0,
+        &mut stack,
+        &mut framed,
+        &mut provenance,
+        &mut unmodeled_settings,
+      )?;
     }
     let mut effective_file_settings = JsonValue::Object(JsonMap::new());
     for source in &provenance {
@@ -2286,6 +2329,7 @@ impl CargoConfigSnapshot {
       provenance,
       credential_capabilities,
       credential_provenance,
+      unmodeled_settings,
     })
   }
 }
@@ -2449,6 +2493,7 @@ fn capture_config_file(
   stack: &mut HashSet<PathBuf>,
   framed: &mut Vec<u8>,
   provenance: &mut Vec<CargoConfigSource>,
+  unmodeled_settings: &mut BTreeSet<String>,
 ) -> RailResult<()> {
   if depth > MAX_CARGO_CONFIG_INCLUDE_DEPTH {
     return Err(RailError::message(format!(
@@ -2495,10 +2540,18 @@ fn capture_config_file(
     })?;
     let includes = take_includes(&mut document, path)?;
     for include in includes {
-      capture_config_file(&include.path, include.optional, depth + 1, stack, framed, provenance)?;
+      capture_config_file(
+        &include.path,
+        include.optional,
+        depth + 1,
+        stack,
+        framed,
+        provenance,
+        unmodeled_settings,
+      )?;
     }
 
-    let relevant = relevant_config(document, path)?;
+    let relevant = relevant_config(document, path, unmodeled_settings)?;
     append_frame(framed, b"config-path", path_bytes(&canonical)?);
     append_frame(framed, b"config-value", &serde_json::to_vec(&relevant)?);
     provenance.push(CargoConfigSource {
@@ -2576,7 +2629,11 @@ fn take_includes(document: &mut JsonValue, config_path: &Path) -> RailResult<Vec
     .collect()
 }
 
-fn relevant_config(document: JsonValue, config_path: &Path) -> RailResult<JsonValue> {
+fn relevant_config(
+  document: JsonValue,
+  config_path: &Path,
+  unmodeled_settings: &mut BTreeSet<String>,
+) -> RailResult<JsonValue> {
   const RELEVANT_TOP_LEVEL: &[&str] = &[
     "build",
     "credential-alias",
@@ -2606,7 +2663,53 @@ fn relevant_config(document: JsonValue, config_path: &Path) -> RailResult<JsonVa
       relevant.insert((*key).to_string(), sanitize_config_value(value, key)?);
     }
   }
+  const KNOWN_NON_BUILD_TOP_LEVEL: &[&str] = &["alias", "doc", "future-incompat-report", "term"];
+  for key in object.keys() {
+    if !RELEVANT_TOP_LEVEL.contains(&key.as_str()) && !KNOWN_NON_BUILD_TOP_LEVEL.contains(&key.as_str()) {
+      unmodeled_settings.insert(key.clone());
+    }
+  }
+  collect_unmodeled_build_settings(&relevant, unmodeled_settings);
   Ok(JsonValue::Object(relevant))
+}
+
+fn collect_unmodeled_build_settings(settings: &JsonMap<String, JsonValue>, unmodeled: &mut BTreeSet<String>) {
+  const BUILD_FIELDS: &[&str] = &[
+    "build-dir",
+    "dep-info-basedir",
+    "incremental",
+    "jobs",
+    "pipelining",
+    "rustc",
+    "rustc-wrapper",
+    "rustc-workspace-wrapper",
+    "rustdoc",
+    "rustdocflags",
+    "rustflags",
+    "target",
+    "target-dir",
+  ];
+  if let Some(build) = settings.get("build").and_then(JsonValue::as_object) {
+    for field in build.keys().filter(|field| !BUILD_FIELDS.contains(&field.as_str())) {
+      unmodeled.insert(format!("build.{field}"));
+    }
+  }
+  const TARGET_FIELDS: &[&str] = &["linker", "runner", "rustdocflags", "rustflags"];
+  if let Some(targets) = settings.get("target").and_then(JsonValue::as_object) {
+    for (target, table) in targets {
+      if let Some(table) = table.as_object() {
+        for field in table.keys().filter(|field| !TARGET_FIELDS.contains(&field.as_str())) {
+          unmodeled.insert(format!("target.{target}.{field}"));
+        }
+      }
+    }
+  }
+  if settings.contains_key("host") {
+    unmodeled.insert("host".to_string());
+  }
+  if settings.contains_key("unstable") {
+    unmodeled.insert("unstable".to_string());
+  }
 }
 
 fn sanitize_config_value(value: &JsonValue, path: &str) -> RailResult<JsonValue> {
@@ -3104,7 +3207,8 @@ mod tests {
       "env": {"CC": "clang"},
       "term": {"color": "never"}
     });
-    let relevant = relevant_config(document, Path::new(".cargo/config.toml"))
+    let mut unmodeled = BTreeSet::new();
+    let relevant = relevant_config(document, Path::new(".cargo/config.toml"), &mut unmodeled)
       .expect("build-affecting Cargo settings should be retained");
 
     assert_eq!(relevant["build"]["rustc-wrapper"], "wrapper");
@@ -3112,6 +3216,30 @@ mod tests {
     assert_eq!(relevant["profile"]["release"]["lto"], "thin");
     assert_eq!(relevant["env"]["CC"], "clang");
     assert!(relevant.get("term").is_none());
+    assert!(unmodeled.is_empty());
+  }
+
+  #[test]
+  fn cargo_config_contract_marks_unknown_build_influence_uncacheable() {
+    let document = serde_json::json!({
+      "build": {"rustflags": ["--cfg", "known"], "future-compiler-mode": true},
+      "target": {"x86_64-unknown-linux-gnu": {"future-link-mode": "new"}},
+      "future-build-system": {"enabled": true},
+      "term": {"color": "never"}
+    });
+    let mut unmodeled = BTreeSet::new();
+    let relevant = relevant_config(document, Path::new(".cargo/config.toml"), &mut unmodeled)
+      .expect("unknown settings should be captured fail-closed");
+
+    assert_eq!(relevant["build"]["rustflags"], serde_json::json!(["--cfg", "known"]));
+    assert_eq!(
+      unmodeled,
+      BTreeSet::from([
+        "build.future-compiler-mode".to_string(),
+        "future-build-system".to_string(),
+        "target.x86_64-unknown-linux-gnu.future-link-mode".to_string(),
+      ])
+    );
   }
 
   #[test]
@@ -3358,6 +3486,7 @@ linker = "linker-b"
       provenance: Vec::new(),
       credential_capabilities: JsonValue::Object(JsonMap::new()),
       credential_provenance: None,
+      unmodeled_settings: BTreeSet::new(),
     };
     let cfg = TargetCfgSet::from_rustc_output("unix\n");
     assert_eq!(
@@ -3450,7 +3579,10 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
 
     assert!(toolchain.rustc_verbose_version().starts_with("rustc "));
     let log = fs::read_to_string(workspace.path().join("wrapper.log")).expect("wrapper log should be readable");
-    assert_eq!(log.lines().collect::<Vec<_>>(), ["global", "workspace"]);
+    assert_eq!(
+      log.lines().collect::<Vec<_>>(),
+      ["global", "workspace", "global", "workspace"]
+    );
   }
 
   #[test]
@@ -3505,6 +3637,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
       provenance: Vec::new(),
       credential_capabilities: JsonValue::Object(JsonMap::new()),
       credential_provenance: None,
+      unmodeled_settings: BTreeSet::new(),
     };
 
     for (_, direct, precedence, config_path, default, description) in selections {
@@ -3651,16 +3784,35 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
       rustc_verbose_version: "rustc 1.95.0\nhost: x86_64-unknown-linux-gnu".to_string(),
       rustdoc_program: "rustdoc".into(),
       rustdoc_verbose_version: "rustdoc 1.95.0".to_string(),
-      rustc_wrapper_program: Some("outer-wrapper".into()),
+      rustc_wrapper_program: Some("sccache".into()),
       rustc_workspace_wrapper_program: Some("workspace-wrapper".into()),
       host_target: "x86_64-unknown-linux-gnu".to_string(),
+      rustc_sysroot: PathBuf::from("/toolchain"),
     };
     let command = rustc_command(&toolchain);
-    assert_eq!(command.get_program(), OsStr::new("outer-wrapper"));
+    assert_eq!(command.get_program(), OsStr::new("sccache"));
     assert_eq!(
       command.get_args().collect::<Vec<_>>(),
       [OsStr::new("workspace-wrapper"), OsStr::new("selected-rustc")]
     );
+
+    let diagnostics = crate::compiler::wrapper::rustc_command(
+      OsStr::new("selected-rustc"),
+      Some(OsStr::new("sccache")),
+      Some(OsStr::new("cargo-rail")),
+    );
+    assert_eq!(diagnostics.get_program(), OsStr::new("sccache"));
+    assert_eq!(
+      diagnostics.get_args().collect::<Vec<_>>(),
+      [OsStr::new("cargo-rail"), OsStr::new("selected-rustc")]
+    );
+    let inner = crate::compiler::wrapper::rustc_command(
+      OsStr::new("selected-rustc"),
+      None,
+      Some(OsStr::new("workspace-wrapper")),
+    );
+    assert_eq!(inner.get_program(), OsStr::new("workspace-wrapper"));
+    assert_eq!(inner.get_args().collect::<Vec<_>>(), [OsStr::new("selected-rustc")]);
   }
 
   #[test]
@@ -3685,6 +3837,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
         rustc_wrapper_program: None,
         rustc_workspace_wrapper_program: None,
         host_target: "x86_64-unknown-linux-gnu".to_string(),
+        rustc_sysroot: PathBuf::from("/toolchain"),
       },
       cargo_config: ContentDigest::sha256(b"config-a"),
       credential_sensitive: false,

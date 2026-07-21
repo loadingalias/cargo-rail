@@ -787,7 +787,9 @@ pub fn run_unify_analyze(
   let analyzer = UnifyAnalyzer::new(ctx)?;
 
   // Run analysis
+  ctx.validate_snapshot_unchanged()?;
   let plan = analyzer.analyze()?;
+  ctx.validate_snapshot_unchanged()?;
   let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
     workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
   } else {
@@ -1476,7 +1478,9 @@ pub fn run_unify_apply(
   // Create analyzer (config comes from rail.toml via ctx)
   let analyzer = UnifyAnalyzer::new(ctx)?;
 
+  ctx.validate_snapshot_unchanged()?;
   let plan = analyzer.analyze()?;
+  ctx.validate_snapshot_unchanged()?;
   let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
     workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
   } else {

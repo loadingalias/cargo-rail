@@ -352,7 +352,7 @@ fn test_run_emits_decision_receipt() -> Result<()> {
   let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
 
   assert_eq!(receipt["artifact"], "decision_receipt");
-  assert_eq!(receipt["version"], 2);
+  assert_eq!(receipt["version"], 3);
   assert!(
     receipt["snapshot_id"]
       .as_str()
@@ -365,6 +365,11 @@ fn test_run_emits_decision_receipt() -> Result<()> {
   let package_id = receipt["actions"][0]["resolution_views"][0]["root_package_ids"][0]
     .as_str()
     .ok_or_else(|| anyhow::anyhow!("expanded action must bind its exact root PackageId"))?;
+  let resolution_digest = receipt["actions"][0]["resolution_views"][0]["resolution_digest"]
+    .as_str()
+    .ok_or_else(|| anyhow::anyhow!("expanded action must bind its portable resolution digest"))?;
+  let build_action_key = receipt["actions"][0]["action_key"].clone();
+  let docs_action_key = receipt["actions"][1]["action_key"].clone();
   assert_eq!(
     receipt["actions"],
     serde_json::json!([
@@ -384,13 +389,14 @@ fn test_run_emits_decision_receipt() -> Result<()> {
           "root_package_ids": [package_id],
           "target": platform,
           "features": { "all_features": false, "default_features": true, "named": [] },
+          "resolution_digest": resolution_digest,
           "resolved_node_count": 1
         }],
         "platform": platform,
         "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
         "outputs": [{ "kind": "ambient_process" }],
         "environment": { "inherit": true, "entries": [] },
-        "reusable": false
+        "action_key": build_action_key
       },
       {
         "id": "docs",
@@ -408,13 +414,14 @@ fn test_run_emits_decision_receipt() -> Result<()> {
           "root_package_ids": [package_id],
           "target": platform,
           "features": { "all_features": false, "default_features": true, "named": [] },
+          "resolution_digest": resolution_digest,
           "resolved_node_count": 1
         }],
         "platform": platform,
         "inputs": [{ "kind": "workspace_snapshot" }, { "kind": "ambient_host" }],
         "outputs": [{ "kind": "ambient_process" }],
         "environment": { "inherit": true, "entries": [] },
-        "reusable": false
+        "action_key": docs_action_key
       }
     ]),
     "receipt must contain the exact ordered action expansion"

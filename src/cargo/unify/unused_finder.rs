@@ -9,8 +9,8 @@ use crate::cargo::unify_types::{
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
 use crate::compiler::{
-  CompilerCandidate, CompilerDiagnosticsCollector, DependencyEvidenceState, DependencyIdentity, FeatureSelection,
-  MemberEvidence,
+  CompilerCacheIdentity, CompilerCandidate, CompilerDiagnosticsCollector, DependencyEvidenceState, DependencyIdentity,
+  FeatureSelection, MemberEvidence,
 };
 use crate::progress;
 use cargo_metadata::PackageId;
@@ -26,6 +26,7 @@ pub struct UnusedDepFinder<'a> {
   target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
   unreachable_features: HashMap<String, BTreeSet<String>>,
   workspace_is_consumer_scope: bool,
+  compiler_cache_identity: Option<&'a CompilerCacheIdentity>,
 }
 
 struct DependencyDeclaration<'a> {
@@ -43,6 +44,7 @@ impl<'a> UnusedDepFinder<'a> {
     target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
     pruned_features: &[crate::cargo::unify_types::PrunedFeature],
     workspace_is_consumer_scope: bool,
+    compiler_cache_identity: Option<&'a CompilerCacheIdentity>,
   ) -> Self {
     let mut unreachable_features: HashMap<String, BTreeSet<String>> = HashMap::new();
     for feature in pruned_features {
@@ -58,6 +60,7 @@ impl<'a> UnusedDepFinder<'a> {
       target_cfg_sets,
       unreachable_features,
       workspace_is_consumer_scope,
+      compiler_cache_identity,
     }
   }
 
@@ -364,16 +367,15 @@ impl<'a> UnusedDepFinder<'a> {
     }
 
     let targets = self.metadata.targets();
-    let collector = match CompilerDiagnosticsCollector::new(self.workspace_root, self.manifests, targets) {
-      Ok(collector) => collector,
-      Err(error) => {
-        crate::warn!(
-          "source-level unused dependency collector initialization failed; falling back to graph-only detection: {}",
-          error
-        );
-        return HashMap::new();
-      }
+    let Some(compiler_cache_identity) = self.compiler_cache_identity else {
+      return HashMap::new();
     };
+    let collector = CompilerDiagnosticsCollector::with_identity(
+      self.workspace_root,
+      self.manifests,
+      targets,
+      compiler_cache_identity,
+    );
 
     match collector.collect_for_candidates(&candidates) {
       Ok(map) => map,

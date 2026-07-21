@@ -18,6 +18,7 @@ use crate::cargo::resolution::{
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
+use crate::executable::{ToolchainExecutableIdentities, ToolchainExecutableScope};
 use crate::source::{ContentDigest, RepositoryPath, SourceEntryKind, SourceSnapshot};
 use crate::workspace::context::CargoState;
 
@@ -202,6 +203,8 @@ pub struct WorkspaceSnapshot {
   cargo_config: Arc<CargoConfigSnapshot>,
   packages: Vec<SnapshotPackage>,
   toolchain: ToolchainIdentity,
+  compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
+  documentation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
   targets: Vec<TargetIdentity>,
   base_resolution: Arc<ResolutionView>,
   derived: Arc<DerivedViews>,
@@ -448,6 +451,8 @@ impl WorkspaceSnapshot {
       cargo_config: resolution_inputs.cargo_config,
       packages,
       toolchain: resolution_inputs.toolchain,
+      compilation_executable_identities: OnceLock::new(),
+      documentation_executable_identities: OnceLock::new(),
       targets,
       base_resolution,
       derived,
@@ -457,6 +462,10 @@ impl WorkspaceSnapshot {
   /// Return the portable identity of this exact authoritative capture.
   pub fn id(&self) -> SnapshotId {
     self.id
+  }
+
+  pub(crate) fn source_root(&self) -> &Path {
+    &self.source_root
   }
 
   pub(crate) fn configuration_fingerprint(&self) -> &str {
@@ -538,6 +547,23 @@ impl WorkspaceSnapshot {
   /// Return the resolved Cargo, rustc, rustdoc, and wrapper identity.
   pub fn toolchain(&self) -> &ToolchainIdentity {
     &self.toolchain
+  }
+
+  pub(crate) fn executable_identities(
+    &self,
+    scope: ToolchainExecutableScope,
+  ) -> RailResult<&ToolchainExecutableIdentities> {
+    let cell = match scope {
+      ToolchainExecutableScope::Compilation => &self.compilation_executable_identities,
+      ToolchainExecutableScope::Documentation => &self.documentation_executable_identities,
+    };
+    match cell.get_or_init(|| {
+      ToolchainExecutableIdentities::capture(&self.toolchain, &self.source_root, &self.source_root, scope)
+        .map_err(|error| error.to_string())
+    }) {
+      Ok(identities) => Ok(identities),
+      Err(error) => Err(RailError::message(error.clone())),
+    }
   }
 
   /// Return host and selected target identities in deterministic order.

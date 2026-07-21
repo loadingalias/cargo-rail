@@ -76,6 +76,10 @@ expect_used = "allow"
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 
+# Exact observation paths hash compiler artifacts and tool executables even in tests.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"

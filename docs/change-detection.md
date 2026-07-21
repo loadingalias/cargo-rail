@@ -31,7 +31,8 @@ planner trace reasons. Cargo actions also record the exact root PackageIds and r
 target/feature `ResolutionView`; default, all-feature, named-feature, host, and cross-target actions therefore do not
 silently share one maximal graph. `--dry-run` previews that same expansion without starting an action process. `--dry-run -f json`
 and `-f github` expose the same deterministic topological order to CI. Current built-ins inherit the host environment
-and are not sandboxed, so receipts mark their inputs and outputs as ambient and the actions as non-reusable.
+and are not sandboxed, so action-key analysis explains the ambient input and output boundaries and withholds a reusable
+key.
 
 Generated repository actions declare one output owner plus separate direct argv for read-only checking and
 regeneration. Select `--generated check` to expose staleness, use the default `regenerate` mode to update files, and add

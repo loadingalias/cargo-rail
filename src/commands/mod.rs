@@ -52,7 +52,9 @@ pub mod unify;
 pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_change_status};
 pub use clean::run_clean;
 #[doc(hidden)]
-pub use cli::{CargoCli, ChangeCommand, Commands, RailCli, ReleaseCommand, SplitCommand, generate_completions};
+pub use cli::{
+  CargoCli, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand, generate_completions,
+};
 pub use common::{ChangeOutputFormat, SplitOutputFormat, TextJsonOutputFormat};
 pub use config::{
   StrictnessMode, run_config_explain, run_config_locate, run_config_migrate, run_config_print,
@@ -241,6 +243,37 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         nextest_args,
         test_filter,
         run_args,
+        hermeticity_doctor: false,
+      },
+    ),
+
+    Commands::Doctor {
+      command:
+        cli::DoctorCommand::Hermeticity {
+          actions,
+          profile,
+          workflow,
+          generated,
+          ignore_bin_crates,
+          format,
+        },
+    } => run_run(
+      ctx,
+      run::RunOptions {
+        all: true,
+        actions,
+        profile,
+        workflow,
+        dry_run: true,
+        format: match format {
+          TextJsonOutputFormat::Text => common::ActionOutputFormat::Text,
+          TextJsonOutputFormat::Json => common::ActionOutputFormat::Json,
+        },
+        generated,
+        explain: true,
+        ignore_bin_crates,
+        hermeticity_doctor: true,
+        ..run::RunOptions::default()
       },
     ),
 

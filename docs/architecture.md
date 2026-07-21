@@ -56,8 +56,10 @@ process. Preview, local execution, CI JSON/GitHub plans, and the versioned decis
 topological expansion. Only the process boundary resolves and revalidates repository paths and applies typed
 environment capabilities. The graph rejects missing snapshot identity, duplicate action IDs, unknown or repeated
 dependencies, cycles, output overlap, and path escape before execution. Generated actions have one declared owner and
-separate check/regenerate argv. Current actions remain explicitly ambient and non-reusable; they are not presented as
-hermetic or cache-safe before the later action-key phase.
+separate check/regenerate argv. Each expansion carries a versioned action-key analysis over exact declared source,
+resolution, target, toolchain, configuration, argv, and environment identity. Incomplete ambient, process, build-script,
+proc-macro, external-source, or dependency-result evidence is reported as `uncacheable`; cargo-rail does not issue an
+authorizing key for it.
 
 ## Unify pipeline
 
@@ -71,6 +73,26 @@ hermetic or cache-safe before the later action-key phase.
 6. Revalidate exact declaration scopes and the resulting Cargo graph before applying lossless TOML edits.
 
 The compiler wrapper passes dependency linting only to workspace compilation units. Registry, git, build-script, and proc-macro units keep Cargo's normal arguments, avoiding failures in third-party code. Open-world packages preserve public feature and optional-dependency surfaces; `consumer_scope = "workspace"` explicitly authorizes closed-world cleanup for non-published packages.
+
+## Compilation observations
+
+Compiler evidence uses a versioned compilation-unit identity, not a package identity. A unit binds its Cargo package,
+typed target kind and name, crate types, host/target role, target specification, profile, features, `cfg`, emit modes,
+link responsibility, normalized compiler argv, and exact dependency-artifact edges. Libraries, binaries, tests,
+examples, benches, documentation, proc macros, build scripts, and native-link responsibility remain distinct even when
+the class is not reusable.
+
+During workspace-only `rustc` diagnostics, cargo-rail records argv-declared inputs before execution and correlates the
+completed invocation with Cargo's stable JSON artifact messages. Rustc dep-info supplies observed file and environment
+reads. The immutable result manifest keeps declared inputs, observed reads, dependency artifacts, emitted outputs, and
+execution metadata in separate fields. Every file is SHA-256 digested from its bytes and re-digested before diagnostic
+evidence can be reused. Cargo's `fresh` flag is retained only as execution metadata; it never authorizes a hit.
+
+Selected and underlying Cargo, rustc, and rustdoc implementations, wrappers, configured linkers and runners, and
+repository executables are content-addressed when relevant. Scripts also bind direct interpreters. Response-file
+expansion, dynamic libraries, SDK inputs, default linkers, incomplete platform images, and missing stable rustdoc
+invocation evidence produce explicit bypasses. Observation manifests never become pre-execution `ActionKey` inputs,
+and cargo-rail neither stores result artifacts nor writes or restores Cargo fingerprint state.
 
 ## Mutation authority
 

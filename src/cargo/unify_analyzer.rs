@@ -16,6 +16,7 @@ use crate::cargo::{
     UnifyIssue, UnifyIssueKind, UnusedDep, ValidationResult, VersionMismatch,
   },
 };
+use crate::compiler::CompilerCacheIdentity;
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
 use crate::config::{ConsumerScope, ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::{RailResult, ResultExt};
@@ -46,6 +47,7 @@ pub struct UnifyAnalyzer {
   canonical_workspace_root: PathBuf,
   /// Exact rustc cfg sets shared across target-aware unify analyses.
   target_cfg_sets: Arc<std::collections::HashMap<String, TargetCfgSet>>,
+  compiler_cache_identity: Option<CompilerCacheIdentity>,
 }
 
 type FeatureDomain = (String, String, DepKind);
@@ -92,6 +94,16 @@ impl UnifyAnalyzer {
       Self::apply_workspace_member_cohort_policy(base_config, &manifests, &workspace_member_names);
     let workspace_root = ctx.workspace_root().to_path_buf();
     let canonical_workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
+    let compiler_cache_identity = match CompilerCacheIdentity::capture(ctx.snapshot()?) {
+      Ok(identity) => Some(identity),
+      Err(error) => {
+        crate::warn!(
+          "compiler evidence identity capture failed; falling back to graph-only detection: {}",
+          error
+        );
+        None
+      }
+    };
 
     Ok(Self {
       metadata,
@@ -103,6 +115,7 @@ impl UnifyAnalyzer {
       workspace_root,
       canonical_workspace_root,
       target_cfg_sets,
+      compiler_cache_identity,
     })
   }
 
@@ -956,6 +969,7 @@ impl UnifyAnalyzer {
       &self.target_cfg_sets,
       &pruned_features,
       self.config.consumer_scope == ConsumerScope::Workspace,
+      self.compiler_cache_identity.as_ref(),
     );
     progress!("Detecting unused dependencies...");
     let mut unused_deps = unused_finder.find();

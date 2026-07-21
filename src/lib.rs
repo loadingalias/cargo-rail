@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
 pub(crate) mod action;
+pub(crate) mod action_key;
 /// Backup and restore for undo operations.
 pub mod backup;
 /// Cargo workspace metadata and manifest operations.
@@ -20,6 +21,7 @@ pub mod compiler;
 pub mod config;
 /// Error types and result aliases.
 pub mod error;
+pub(crate) mod executable;
 /// Git operations via system git.
 pub mod git;
 /// Dependency graph analysis.
