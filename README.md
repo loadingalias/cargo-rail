@@ -64,7 +64,9 @@ Use `run` directly or feed `plan -f github` into existing CI jobs. No duplicated
 Hermeticity diagnosis hashes only the selected source and dependency closure, resolved features and targets, effective
 Cargo settings, toolchain/wrapper chain, argv, and typed environment. It reports every incomplete ambient,
 build-script, proc-macro, external-tool, or dependency-result boundary and withholds an `ActionKey` until none remain.
-This is an eligibility diagnostic, not an output cache; current built-in actions still fail closed as uncacheable.
+That identity also authorizes verified local reuse for the classes that have earned it. Current support is deliberately
+narrow: pure current-host macOS hermetic `cargo check` actions and one aarch64 macOS Cargo/rustc 1.97.1 workspace-library
+metadata class. Every other action or compiler class executes cold with an explicit reason.
 
 ## Release
 

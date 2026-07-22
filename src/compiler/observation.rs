@@ -1175,6 +1175,7 @@ fn begin_compiler_invocation(
 }
 
 impl InvocationRecorder {
+  #[cfg(target_os = "macos")]
   pub(crate) fn observation(&self) -> &RawCompilerInvocation {
     &self.raw
   }

@@ -85,6 +85,7 @@ pub(super) struct CacheCandidate {
 
 /// A verified local result binding found through a non-authorizing compiler candidate key.
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheCandidate {
   pub(crate) action_key: String,
   pub(crate) validation: NativeCompilerValidation,
@@ -93,6 +94,7 @@ pub(crate) struct NativeCacheCandidate {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheHit {
   pub(crate) action_result: String,
   pub(crate) result_digest: String,
@@ -102,6 +104,7 @@ pub(crate) struct NativeCacheHit {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheMiss {
   pub(crate) reason: String,
   pub(crate) objects_verified: u64,
@@ -109,6 +112,7 @@ pub(crate) struct NativeCacheMiss {
 }
 
 #[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum NativeCacheLookup {
   Hit(NativeCacheHit),
   Miss(NativeCacheMiss),
@@ -1565,7 +1569,7 @@ impl LocalCas {
       object,
       #[cfg(any(target_os = "macos", test))]
       manifest,
-      #[cfg(target_os = "macos")]
+      #[cfg(any(target_os = "macos", test))]
       validation,
       #[cfg(any(target_os = "macos", test))]
       trees,

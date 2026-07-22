@@ -18,7 +18,9 @@ use crate::compiler::observation::{
   NativeOutputPaths, ObservationPath, RawCompilerInvocation,
 };
 use crate::error::{RailError, RailResult};
-use crate::hermetic::cas::{LocalCas, NativeCacheLookup, NativeStoreRequest};
+#[cfg(target_os = "macos")]
+use crate::hermetic::cas::NativeCacheLookup;
+use crate::hermetic::cas::{LocalCas, NativeStoreRequest};
 use crate::source::ContentDigest;
 
 pub(crate) const CANDIDATE_KEY_PREFIX: &str = "compiler-candidate-v1-sha256-";
@@ -27,7 +29,9 @@ pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const STORE_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
 const SESSION_FILE: &str = "native-compiler-cache-session-v1.json";
+#[cfg(any(target_os = "macos", test))]
 const GRADUATED_RUSTC_RELEASE: &str = "1.97.1";
+#[cfg(any(target_os = "macos", test))]
 const GRADUATED_CARGO_RELEASE: &str = "1.97.1";
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
@@ -73,6 +77,7 @@ impl NativeCompilerClass {
     }
   }
 
+  #[cfg(any(target_os = "macos", test))]
   fn eligibility_reason(&self) -> Option<&'static str> {
     if self.platform != "unix-macos-aarch64" {
       Some("native_cache_platform_not_graduated")
@@ -971,6 +976,7 @@ fn configure_cold(
   );
 }
 
+#[cfg(target_os = "macos")]
 fn is_diagnostic_workspace_wrapper(program: &OsStr) -> bool {
   if std::env::var_os(crate::compiler::wrapper::WRAPPER_MARKER).is_none() {
     return false;
@@ -1037,6 +1043,7 @@ fn macro_invocation_present(bytes: &[u8], name: &[u8]) -> bool {
   })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn revalidate_candidate(
   validation: &NativeCompilerValidation,
   session: &NativeCompilerSession,
@@ -1105,6 +1112,7 @@ fn revalidate_candidate(
   Ok((action, bytes_hashed))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn same_pre_execution_inputs(current: &RawCompilerInvocation, stored: &RawCompilerInvocation) -> bool {
   current.mode == stored.mode
     && current.crate_name == stored.crate_name
@@ -1118,6 +1126,7 @@ fn same_pre_execution_inputs(current: &RawCompilerInvocation, stored: &RawCompil
     && current.dependency_artifacts == stored.dependency_artifacts
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn revalidate_files(
   files: &[FileObservation],
   source_root: &Path,
@@ -1130,6 +1139,7 @@ fn revalidate_files(
     .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn revalidate_file(
   expected: &FileObservation,
   source_root: &Path,
@@ -1257,6 +1267,7 @@ fn validated_output_parent(outputs: &NativeOutputPaths, source_root: &Path) -> R
   Ok(canonical_parent)
 }
 
+#[cfg(target_os = "macos")]
 fn validate_current_output_binding(
   validation: &NativeCompilerValidation,
   outputs: &NativeOutputPaths,
@@ -1282,6 +1293,7 @@ fn validate_current_output_binding(
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn validate_restored_tree(root: &Path, validation: &NativeCompilerValidation) -> RailResult<()> {
   let mut files = Vec::new();
   let mut pending = vec![root.to_path_buf()];
@@ -1326,6 +1338,7 @@ fn validate_restored_tree(root: &Path, validation: &NativeCompilerValidation) ->
   Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn publish_output(source: &Path, destination: &Path, expected: &NativeCompilerOutput) -> RailResult<()> {
   if let Ok(metadata) = fs::symlink_metadata(destination) {
     if !metadata.is_file() || metadata.file_type().is_symlink() || !single_link(&metadata) {
@@ -1413,13 +1426,13 @@ fn single_link(_metadata: &fs::Metadata) -> bool {
   true
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "macos", test)))]
 fn sync_directory(path: &Path) -> RailResult<()> {
   File::open(path)?.sync_all()?;
   Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), test))]
 fn sync_directory(_path: &Path) -> RailResult<()> {
   Ok(())
 }
