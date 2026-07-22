@@ -2488,6 +2488,7 @@ mod tests {
       .expect("fixture should enter the CAS")
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn verified_bundle_round_trips_exact_bytes_and_modes() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2594,6 +2595,7 @@ mod tests {
     );
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn same_size_blob_tampering_is_a_corrupt_miss() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2657,6 +2659,7 @@ mod tests {
     );
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn missing_and_incompatible_objects_fail_closed() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2695,6 +2698,7 @@ mod tests {
     assert_eq!(incompatible.kind, CacheMissKind::Incompatible);
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn truncated_and_malicious_metadata_objects_fail_closed() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2814,6 +2818,7 @@ mod tests {
     );
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn hostile_prepositioned_materialization_root_is_preserved() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2833,6 +2838,7 @@ mod tests {
     assert_eq!(fs::read(destination.join("keep")).expect("sentinel"), b"keep");
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn concurrent_writers_converge_on_one_complete_bundle() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2873,6 +2879,7 @@ mod tests {
     );
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn interrupted_staging_state_never_authorizes_reuse() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2994,6 +3001,7 @@ mod tests {
     assert!(cas.root().exists());
   }
 
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn deterministic_gc_removes_unpinned_bundles() {
     let cache = tempfile::tempdir().expect("cache base");

@@ -1209,6 +1209,8 @@ fn capture_fetch_manifest(
   credential_capabilities: BTreeSet<String>,
 ) -> RailResult<FetchManifest> {
   let metadata = isolated_metadata(inputs, cargo_home)?;
+  let cargo_home = crate::utils::canonicalize_existing(cargo_home)?;
+  let source_root = crate::utils::canonicalize_existing(&inputs.source_root)?;
   let mut packages = Vec::new();
   for package in &metadata.packages {
     let root = package
@@ -1216,10 +1218,10 @@ fn capture_fetch_manifest(
       .parent()
       .ok_or_else(|| RailError::message(format!("external package '{}' has no source root", package.id)))?
       .as_std_path();
-    let canonical = fs::canonicalize(root)
+    let canonical = crate::utils::canonicalize_existing(root)
       .map_err(|error| RailError::message(format!("failed to resolve external package '{}': {error}", package.id)))?;
-    if !canonical.starts_with(cargo_home) {
-      if canonical.starts_with(&inputs.source_root) {
+    if !canonical.starts_with(&cargo_home) {
+      if canonical.starts_with(&source_root) {
         continue;
       }
       return Err(RailError::with_help(
@@ -1250,8 +1252,8 @@ fn capture_fetch_manifest(
   }
   packages.sort();
   packages.dedup();
-  let ignored = cargo_mutable_cache_paths(cargo_home);
-  let cargo_home_snapshot = capture_exact_tree(cargo_home, &ignored)?;
+  let ignored = cargo_mutable_cache_paths(&cargo_home);
+  let cargo_home_snapshot = capture_exact_tree(&cargo_home, &ignored)?;
   let cargo_home_digest = cargo_home_snapshot.digest;
   let cargo_home_entries = cargo_home_snapshot.entries;
   let result_digest = fetch_result_digest(&packages)?;

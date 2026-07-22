@@ -181,7 +181,15 @@ impl SparseRegistry {
                 break;
               }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error)
+              if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                  | std::io::ErrorKind::Interrupted
+                  | std::io::ErrorKind::ConnectionAborted
+                  | std::io::ErrorKind::ConnectionReset
+              ) =>
+            {
               std::thread::sleep(Duration::from_millis(2));
             }
             Err(error) => {
