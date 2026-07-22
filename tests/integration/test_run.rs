@@ -120,6 +120,7 @@ struct RegistryState {
 
 struct SparseRegistry {
   index: String,
+  wake_address: std::net::SocketAddr,
   state: Arc<Mutex<RegistryState>>,
   stop: Arc<AtomicBool>,
   threads: Vec<JoinHandle<()>>,
@@ -129,7 +130,6 @@ struct SparseRegistry {
 impl SparseRegistry {
   fn start(crate_archive: Vec<u8>, checksum: &str) -> Result<Self> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let index = format!("sparse+http://{address}/");
     let download = format!("http://{address}/api/v1/crates/{{crate}}/{{version}}/download");
@@ -150,60 +150,49 @@ impl SparseRegistry {
     let state = Arc::new(Mutex::new(RegistryState::default()));
     let stop = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(Mutex::new(Vec::new()));
-    let mut threads = Vec::with_capacity(4);
-    for _ in 0..4 {
-      let listener = listener.try_clone()?;
-      let config = Arc::clone(&config);
-      let index_entry = Arc::clone(&index_entry);
-      let crate_archive = Arc::clone(&crate_archive);
-      let thread_state = Arc::clone(&state);
-      let thread_stop = Arc::clone(&stop);
-      let thread_connections = Arc::clone(&connections);
-      threads.push(std::thread::spawn(move || {
-        while !thread_stop.load(Ordering::Acquire) {
-          match listener.accept() {
-            Ok((stream, _)) => {
-              let config = Arc::clone(&config);
-              let index_entry = Arc::clone(&index_entry);
-              let crate_archive = Arc::clone(&crate_archive);
-              let connection_state = Arc::clone(&thread_state);
-              let connection = std::thread::spawn(move || {
-                if let Err(error) =
-                  serve_sparse_registry_request(stream, &config, &index_entry, &crate_archive, &connection_state)
-                  && let Ok(mut state) = connection_state.lock()
-                {
-                  state.failure = Some(error.to_string());
-                }
-              });
-              if let Ok(mut connections) = thread_connections.lock() {
-                connections.push(connection);
-              } else {
-                break;
-              }
+    let config = Arc::clone(&config);
+    let index_entry = Arc::clone(&index_entry);
+    let crate_archive = Arc::clone(&crate_archive);
+    let thread_state = Arc::clone(&state);
+    let thread_stop = Arc::clone(&stop);
+    let thread_connections = Arc::clone(&connections);
+    let threads = vec![std::thread::spawn(move || {
+      loop {
+        match listener.accept() {
+          Ok((stream, _)) => {
+            if thread_stop.load(Ordering::Acquire) {
+              break;
             }
-            Err(error)
-              if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock
-                  | std::io::ErrorKind::Interrupted
-                  | std::io::ErrorKind::ConnectionAborted
-                  | std::io::ErrorKind::ConnectionReset
-              ) =>
-            {
-              std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(error) => {
-              if let Ok(mut state) = thread_state.lock() {
+            let config = Arc::clone(&config);
+            let index_entry = Arc::clone(&index_entry);
+            let crate_archive = Arc::clone(&crate_archive);
+            let connection_state = Arc::clone(&thread_state);
+            let connection = std::thread::spawn(move || {
+              if let Err(error) =
+                serve_sparse_registry_request(stream, &config, &index_entry, &crate_archive, &connection_state)
+                && let Ok(mut state) = connection_state.lock()
+              {
                 state.failure = Some(error.to_string());
               }
+            });
+            if let Ok(mut connections) = thread_connections.lock() {
+              connections.push(connection);
+            } else {
               break;
             }
           }
+          Err(error) => {
+            if let Ok(mut state) = thread_state.lock() {
+              state.failure = Some(error.to_string());
+            }
+            break;
+          }
         }
-      }));
-    }
+      }
+    })];
     Ok(Self {
       index,
+      wake_address: address,
       state,
       stop,
       threads,
@@ -237,6 +226,7 @@ impl SparseRegistry {
 impl Drop for SparseRegistry {
   fn drop(&mut self) {
     self.stop.store(true, Ordering::Release);
+    let _ = TcpStream::connect(self.wake_address);
     for thread in self.threads.drain(..) {
       let _ = thread.join();
     }
@@ -255,9 +245,8 @@ fn serve_sparse_registry_request(
   crate_archive: &[u8],
   state: &Mutex<RegistryState>,
 ) -> std::io::Result<()> {
-  // The listener is nonblocking so the accept loops can observe shutdown.
-  // Do not let that transport policy leak into request parsing: Cargo may
-  // connect before its request bytes are runnable on a loaded test host.
+  // Cargo may connect before its request bytes are runnable on a loaded test
+  // host. Keep each connection blocking and bounded independently.
   stream.set_nonblocking(false)?;
   // Cargo may open a registry connection before a heavily parallel test host
   // schedules its request headers. Keep the timeout bounded, but do not turn
@@ -2585,7 +2574,13 @@ fn test_hermetic_fetch_inventory_converges_for_locked_git_dependency() -> Result
   let revision = String::from_utf8(git(dependency.path(), &["rev-parse", "HEAD"])?.stdout)?;
   let revision = revision.trim();
   #[cfg(windows)]
-  let url = format!("file:///{}", dependency.path().display().to_string().replace('\\', "/"));
+  let url = format!(
+    "file:///{}",
+    cargo_rail::utils::canonicalize_existing(dependency.path())?
+      .display()
+      .to_string()
+      .replace('\\', "/")
+  );
   #[cfg(not(windows))]
   let url = format!("file://{}", dependency.path().display());
   let dependency_spec = format!("{{ git = {url:?}, rev = {revision:?} }}");
