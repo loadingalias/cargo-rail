@@ -994,6 +994,8 @@ fn prepare_fetch_inventory_with_inputs(inputs: &FetchInputs) -> RailResult<Fetch
       code: status.code().unwrap_or(1),
     });
   }
+  #[cfg(windows)]
+  hydrate_windows_git_inventory(inputs, &cargo_home, &home)?;
   ensure_package_cache_file(&cargo_home)?;
   let manifest = capture_fetch_manifest(inputs, &cargo_home, &key, credential_capabilities.clone())?;
   crate::utils::write_file_atomic(&payload.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
@@ -1037,6 +1039,41 @@ fn fetch_key(inputs: &FetchInputs, credential_capabilities: &BTreeSet<String>) -
     identity.frame(b"credential-capability", capability.as_bytes());
   }
   Ok(format!("fetch-v{FETCH_ACTION_VERSION}-sha256-{}", identity.finish()))
+}
+
+#[cfg(windows)]
+fn hydrate_windows_git_inventory(inputs: &FetchInputs, cargo_home: &Path, home: &Path) -> RailResult<()> {
+  if !inputs.locked_packages.iter().any(|package| {
+    package
+      .source
+      .as_deref()
+      .is_some_and(|source| source.starts_with("git+"))
+  }) {
+    return Ok(());
+  }
+
+  crate::instrumentation::record_cargo_metadata_load(false);
+  let mut command = Command::new(toolchain_program(inputs.toolchain.rustc_sysroot(), "cargo"));
+  command
+    .current_dir(&inputs.cargo_current_dir)
+    .args(["metadata", "--format-version", "1", "--locked", "--manifest-path"])
+    .arg(inputs.workspace_root.join("Cargo.toml"));
+  configure_fetch_environment(&mut command, inputs.toolchain.rustc_sysroot(), cargo_home, home, false);
+  apply_acquisition_environment(&mut command, &inputs.cargo_config);
+  let output = command
+    .stdout(std::process::Stdio::null())
+    .output()
+    .map_err(|error| RailError::message(format!("failed to hydrate the Windows Git source inventory: {error}")))?;
+  if !output.status.success() {
+    return Err(RailError::with_help(
+      format!(
+        "locked Git sources could not be hydrated inside the explicit fetch action: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+      ),
+      "verify that every locked Git revision is reachable, then retry the hermetic run",
+    ));
+  }
+  Ok(())
 }
 
 fn fetch_credential_capabilities(cargo_config: &CargoConfigSnapshot) -> BTreeSet<String> {

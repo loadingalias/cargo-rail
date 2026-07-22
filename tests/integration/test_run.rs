@@ -181,12 +181,10 @@ impl SparseRegistry {
               break;
             }
           }
-          Err(error) => {
-            if let Ok(mut state) = thread_state.lock() {
-              state.failure = Some(error.to_string());
-            }
-            break;
+          Err(_) if !thread_stop.load(Ordering::Acquire) => {
+            std::thread::sleep(Duration::from_millis(2));
           }
+          Err(_) => break,
         }
       }
     })];
