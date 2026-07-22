@@ -39,10 +39,25 @@ fn rustdoc_proxy_preserves_cargo_docs_and_records_dep_info() -> Result<()> {
     "rustdoc proxy must preserve HTML output at {}",
     index.display()
   );
+  let canonical_index = fs::canonicalize(&index)?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let cargo_retained_index = stdout.lines().any(|line| {
+    serde_json::from_str::<serde_json::Value>(line)
+      .ok()
+      .and_then(|message| message["filenames"].as_array().cloned())
+      .is_some_and(|filenames| {
+        filenames.iter().any(|filename| {
+          filename
+            .as_str()
+            .and_then(|filename| fs::canonicalize(filename).ok())
+            .is_some_and(|filename| filename == canonical_index)
+        })
+      })
+  });
   assert!(
-    String::from_utf8_lossy(&output.stdout).contains(index.to_string_lossy().as_ref()),
+    cargo_retained_index,
     "Cargo's stable artifact message must retain the documentation index\n{}",
-    String::from_utf8_lossy(&output.stdout)
+    stdout
   );
 
   let records = fs::read_dir(&observation_directory)?

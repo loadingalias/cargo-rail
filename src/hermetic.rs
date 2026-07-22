@@ -73,7 +73,7 @@ fn create_state_directory(workspace_root: &Path, suffix: &[&str]) -> RailResult<
     }
     validate_real_state_directory(&directory)?;
   }
-  let canonical = fs::canonicalize(&directory)?;
+  let canonical = crate::utils::canonicalize_existing(&directory)?;
   if !canonical.starts_with(&workspace_root) {
     return Err(RailError::message(format!(
       "hermetic state directory '{}' escapes workspace '{}'",
@@ -98,7 +98,7 @@ fn existing_state_directory(workspace_root: &Path, suffix: &[&str]) -> RailResul
       Err(error) => return Err(error.into()),
     }
   }
-  let canonical = fs::canonicalize(&directory)?;
+  let canonical = crate::utils::canonicalize_existing(&directory)?;
   if !canonical.starts_with(&workspace_root) {
     return Err(RailError::message(format!(
       "hermetic state directory '{}' escapes workspace '{}'",
@@ -491,7 +491,10 @@ impl FastCacheValidation {
       cargo_config_identity: format!("sha256:{}", "0".repeat(64)),
       cargo_environment_identity: format!("sha256:{}", "0".repeat(64)),
       toolchain_selector_identity: format!("sha256:{}", "0".repeat(64)),
-      rustc_sysroot: "/toolchain".to_string(),
+      rustc_sysroot: Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-toolchain")
+        .to_string_lossy()
+        .into_owned(),
       host_target: "test-target".to_string(),
       platform_identity: format!("platform-v1-{digest}"),
       inventory_result_digest: inventory_result_digest.clone(),

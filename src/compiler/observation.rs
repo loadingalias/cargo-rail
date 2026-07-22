@@ -140,10 +140,13 @@ impl ObservationPath {
     } else {
       current_dir.join(path)
     };
-    absolute
-      .strip_prefix(source_root)
-      .map(|relative| Self::Repository(crate::utils::path_to_git_format(relative)))
-      .unwrap_or_else(|_| Self::Host(crate::utils::path_to_git_format(&absolute)))
+    if let Ok(relative) = absolute.strip_prefix(source_root) {
+      return Self::Repository(crate::utils::path_to_git_format(relative));
+    }
+    if let Some(relative) = canonical_repository_relative(&absolute, source_root) {
+      return Self::Repository(crate::utils::path_to_git_format(&relative));
+    }
+    Self::Host(crate::utils::path_to_git_format(&absolute))
   }
 
   pub(crate) fn resolve(&self, source_root: &Path) -> PathBuf {
@@ -152,6 +155,18 @@ impl ObservationPath {
       Self::Host(path) => PathBuf::from(path),
     }
   }
+}
+
+fn canonical_repository_relative(path: &Path, source_root: &Path) -> Option<PathBuf> {
+  let root = crate::utils::canonicalize_existing(source_root).ok()?;
+  let metadata = fs::symlink_metadata(path).ok()?;
+  let canonical = if metadata.file_type().is_symlink() {
+    let parent = crate::utils::canonicalize_existing(path.parent()?).ok()?;
+    parent.join(path.file_name()?)
+  } else {
+    crate::utils::canonicalize_existing(path).ok()?
+  };
+  canonical.strip_prefix(root).ok().map(Path::to_path_buf)
 }
 
 /// Exact regular-file or symlink observation.
@@ -938,7 +953,7 @@ fn begin_compiler_invocation(
   arguments: &[OsString],
   mode: CompilerMode,
 ) -> RailResult<InvocationRecorder> {
-  let canonical_source_root = fs::canonicalize(source_root).map_err(|error| {
+  let canonical_source_root = crate::utils::canonicalize_existing(source_root).map_err(|error| {
     RailError::message(format!(
       "failed to resolve compiler observation source root '{}': {error}",
       source_root.display()
@@ -946,10 +961,16 @@ fn begin_compiler_invocation(
   })?;
   let physical_current_dir = std::env::current_dir()
     .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
-  let current_dir = physical_current_dir
+  let canonical_current_dir = crate::utils::canonicalize_existing(&physical_current_dir).map_err(|error| {
+    RailError::message(format!(
+      "failed to resolve compiler working directory '{}': {error}",
+      physical_current_dir.display()
+    ))
+  })?;
+  let current_dir = canonical_current_dir
     .strip_prefix(&canonical_source_root)
     .map(|relative| source_root.join(relative))
-    .unwrap_or(physical_current_dir);
+    .unwrap_or(canonical_current_dir);
   let mut bypasses = BTreeSet::new();
   let argument_text = arguments
     .iter()
@@ -1398,7 +1419,7 @@ fn parse_dep_info(
 ) -> RailResult<(Vec<FileObservation>, BTreeSet<EnvironmentObservation>)> {
   let text = fs::read_to_string(path)
     .map_err(|error| RailError::message(format!("failed to read dep-info '{}': {error}", path.display())))?;
-  let logical = text.replace("\\\n", "");
+  let logical = text.replace("\\\r\n", "").replace("\\\n", "");
   let dependency_line = logical
     .lines()
     .find(|line| !line.starts_with('#') && line.contains(": "))
@@ -1442,23 +1463,24 @@ fn parse_dep_info(
 fn makefile_words(input: &str) -> RailResult<Vec<String>> {
   let mut words = Vec::new();
   let mut word = String::new();
-  let mut escaped = false;
-  for character in input.chars() {
-    if escaped {
-      word.push(character);
-      escaped = false;
-    } else if character == '\\' {
-      escaped = true;
-    } else if character.is_ascii_whitespace() {
-      if !word.is_empty() {
-        words.push(std::mem::take(&mut word));
+  let mut characters = input.chars().peekable();
+  while let Some(character) = characters.next() {
+    match character {
+      '\\' => match characters.peek().copied() {
+        Some(next) if next.is_ascii_whitespace() || matches!(next, '\\' | '#' | ':') => {
+          word.push(next);
+          characters.next();
+        }
+        Some(_) => word.push('\\'),
+        None => return Err(RailError::message("dep-info ends with an incomplete escape")),
+      },
+      whitespace if whitespace.is_ascii_whitespace() => {
+        if !word.is_empty() {
+          words.push(std::mem::take(&mut word));
+        }
       }
-    } else {
-      word.push(character);
+      _ => word.push(character),
     }
-  }
-  if escaped {
-    return Err(RailError::message("dep-info ends with an incomplete escape"));
   }
   if !word.is_empty() {
     words.push(word);
@@ -1908,6 +1930,14 @@ mod tests {
     let encoded = serde_json::to_string(&environment).expect("serialize environment");
     assert!(!encoded.contains("never-store-this"));
     assert!(!encoded.contains("also-never-store-this"));
+  }
+
+  #[test]
+  fn dep_info_words_preserve_windows_separators_and_decode_make_escapes() {
+    assert_eq!(
+      makefile_words(r"C:\work\crate\src\lib.rs C:\work\source\ file.rs").expect("parse dep-info words"),
+      [r"C:\work\crate\src\lib.rs", r"C:\work\source file.rs"]
+    );
   }
 
   #[test]
