@@ -1,6 +1,6 @@
 //! Explicit isolated execution and reproducibility proof for Rust actions.
 
-mod cas;
+pub(crate) mod cas;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -23,7 +23,7 @@ use crate::cargo::resolution::ResolutionInputs;
 use crate::cargo::{CargoConfigSnapshot, ToolchainIdentity};
 use crate::compiler::observation::{FileObservation, ObservationPath, RawCompilerInvocation, load_raw};
 use crate::compiler::wrapper::{
-  OBSERVATION_DIRECTORY_ENV, OBSERVATION_ONLY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
+  CACHE_WRAPPER_MARKER, OBSERVATION_DIRECTORY_ENV, OBSERVATION_ONLY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
 };
 use crate::error::{RailError, RailResult};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableScope};
@@ -136,7 +136,7 @@ struct LocalCacheReference {
   root: String,
 }
 
-fn register_local_cache(workspace_root: &Path, root: &Path) -> RailResult<()> {
+pub(crate) fn register_local_cache(workspace_root: &Path, root: &Path) -> RailResult<()> {
   let directory = create_state_directory(workspace_root, &[])?;
   let root = root
     .to_str()
@@ -1876,6 +1876,7 @@ fn run_cargo_check(
     .env("OPENSSL_CONF", layout.home.join("openssl.cnf"))
     .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
     .env("RUSTC_WRAPPER", &current_executable)
+    .env_remove(CACHE_WRAPPER_MARKER)
     .env_remove(crate::compiler::wrapper::INNER_WRAPPER_ENV)
     .env(WRAPPER_MARKER, "1")
     .env(OBSERVATION_ONLY_ENV, "1")
@@ -2313,6 +2314,28 @@ fn capture_compiler_outputs(
     symlinks: symlink_count,
     bytes,
   })
+}
+
+/// Capture a bounded compiler-cache staging tree with the same output-manifest
+/// validation used by the hermetic action CAS.
+pub(crate) fn capture_native_compiler_outputs(root: &Path, paths: &[PathBuf]) -> RailResult<OutputManifest> {
+  let mut outputs = paths
+    .iter()
+    .map(|path| FileObservation::capture(path, root, root))
+    .collect::<RailResult<Vec<_>>>()?;
+  outputs.sort();
+  outputs.dedup();
+  if outputs.len() != paths.len() {
+    return Err(RailError::message("native compiler cache staging paths are not unique"));
+  }
+  let mut reasons = BTreeSet::new();
+  let manifest = capture_compiler_outputs(root, &[], &outputs, &[], &mut reasons)?;
+  if let Some(reason) = reasons.into_iter().next() {
+    return Err(RailError::message(format!(
+      "native compiler cache staging output is not reusable: {reason}"
+    )));
+  }
+  Ok(manifest)
 }
 
 fn add_output_parent_directories(
@@ -3675,9 +3698,13 @@ fn hermetic_environment_name_is_controlled(name: &str) -> bool {
     "CARGO_HOME"
       | "CARGO_INCREMENTAL"
       | "CARGO_NET_OFFLINE"
+      | "CARGO_RAIL_COMPILER_CACHE_WRAPPER"
       | "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY"
       | "CARGO_RAIL_COMPILER_OBSERVATION_ONLY"
       | "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT"
+      | "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION"
+      | "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION"
+      | "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE"
       | "CARGO_RAIL_INNER_RUSTDOC"
       | "CARGO_RAIL_INNER_WORKSPACE_WRAPPER"
       | "CARGO_RAIL_RUSTC_WRAPPER"
@@ -4611,9 +4638,13 @@ mod tests {
   #[test]
   fn private_observation_environment_cannot_override_the_hermetic_wrapper() {
     for name in [
+      "CARGO_RAIL_COMPILER_CACHE_WRAPPER",
       "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY",
       "CARGO_RAIL_COMPILER_OBSERVATION_ONLY",
       "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT",
+      "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION",
+      "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION",
+      "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE",
       "CARGO_RAIL_INNER_RUSTDOC",
       "CARGO_RAIL_INNER_WORKSPACE_WRAPPER",
       "CARGO_RAIL_RUSTC_WRAPPER",

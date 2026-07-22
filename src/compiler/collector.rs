@@ -12,13 +12,16 @@ use crate::compiler::model::{
   CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
+use crate::compiler::native_cache::{NativeCompilerSession, SESSION_ENV};
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
-  CompilationProfile, CompilerMode, FileObservation, ObservationPath, attach_build_script_result_dependencies,
+  CompilationProfile, CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, CompilerWrapperIdentity,
+  CompilerWrapperRole, FileObservation, ObservationPath, attach_build_script_result_dependencies,
   attach_execution_identities, build_manifests, load_raw,
 };
 use crate::compiler::wrapper::{
-  INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
+  CACHE_WRAPPER_MARKER, CacheWrapperPlan, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
+  WRAPPER_MARKER,
 };
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
@@ -77,7 +80,9 @@ pub(crate) struct CompilerCacheIdentity {
   package_dependencies: HashMap<String, BTreeSet<String>>,
   build_script_packages: HashMap<String, BuildScriptPackageContext>,
   rustc_executable: ExecutableIdentity,
-  wrapper_executables: Vec<ExecutableIdentity>,
+  wrapper_chain: Vec<CompilerWrapperIdentity>,
+  cache_wrapper: CompilerCacheWrapperMetadata,
+  cache_wrapper_plan: CacheWrapperPlan,
   executable_bypasses: BTreeSet<String>,
   cache_bypass_reason: Option<&'static str>,
 }
@@ -108,7 +113,12 @@ impl CompilerCacheIdentity {
       snapshot.source_root(),
     )?;
     let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-    let toolchain_fingerprint = executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable)?;
+    let cache_wrapper_plan = CacheWrapperPlan::for_chain(
+      snapshot.toolchain().rustc_wrapper_program(),
+      snapshot.toolchain().rustc_workspace_wrapper_program(),
+    );
+    let toolchain_fingerprint =
+      executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable, cache_wrapper_plan)?;
     let target_fingerprints = target_fingerprints(snapshot)?;
     let lock_fingerprint = snapshot.lockfile_fingerprint();
     let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
@@ -143,10 +153,31 @@ impl CompilerCacheIdentity {
         .limitations()
         .map(|limitation| format!("compiler_wrapper_{limitation}")),
     );
-    let mut wrapper_executables = Vec::with_capacity(3);
-    wrapper_executables.extend(executables.rustc_wrapper().cloned());
-    wrapper_executables.push(cargo_rail_executable);
-    wrapper_executables.extend(executables.rustc_workspace_wrapper().cloned());
+    let mut wrapper_chain = Vec::with_capacity(4);
+    if cache_wrapper_plan.installs_cargo_rail() {
+      wrapper_chain.push(CompilerWrapperIdentity::new(
+        CompilerWrapperRole::Cache,
+        cargo_rail_executable.clone(),
+      ));
+    }
+    wrapper_chain.extend(
+      executables
+        .rustc_wrapper()
+        .cloned()
+        .map(|executable| CompilerWrapperIdentity::new(CompilerWrapperRole::Global, executable)),
+    );
+    wrapper_chain.push(CompilerWrapperIdentity::new(
+      CompilerWrapperRole::Diagnostic,
+      cargo_rail_executable,
+    ));
+    wrapper_chain.extend(
+      executables
+        .rustc_workspace_wrapper()
+        .cloned()
+        .map(|executable| CompilerWrapperIdentity::new(CompilerWrapperRole::Workspace, executable)),
+    );
+    let cache_wrapper =
+      CompilerCacheWrapperMetadata::new(CompilerCacheWrapperStatus::Bypassed, cache_wrapper_plan.reason());
     let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
 
     Ok(Self {
@@ -167,7 +198,9 @@ impl CompilerCacheIdentity {
       package_dependencies,
       build_script_packages,
       rustc_executable,
-      wrapper_executables,
+      wrapper_chain,
+      cache_wrapper,
+      cache_wrapper_plan,
       executable_bypasses,
       cache_bypass_reason,
     })
@@ -694,6 +727,18 @@ fn run_workspace_check(
     .prefix("cargo-rail-compiler-observations-")
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
+  let native_cache_session = identity.cache_wrapper_plan.installs_cargo_rail().then(|| {
+    NativeCompilerSession::write(
+      observation_directory.path(),
+      workspace_root,
+      &identity.rustc_version,
+      &identity.cargo_version,
+      &identity.toolchain_fingerprint,
+      &identity.compiler_env_fingerprint,
+      &identity.cargo_config_fingerprint,
+    )
+    .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable"))
+  });
 
   let mut args: Vec<OsString> = vec![
     "check".into(),
@@ -731,7 +776,14 @@ fn run_workspace_check(
     .env(WRAPPER_MARKER, "1")
     .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
     .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
+    .env_remove(CACHE_WRAPPER_MARKER)
     .args(&args);
+  if identity.cache_wrapper_plan.installs_cargo_rail() {
+    command.env("RUSTC_WRAPPER", &wrapper).env(CACHE_WRAPPER_MARKER, "1");
+    if let Some(session) = &native_cache_session {
+      command.env(SESSION_ENV, session);
+    }
+  }
   if let Some(inner_wrapper) = existing_workspace_wrapper
     && inner_wrapper != wrapper.as_os_str()
   {
@@ -995,7 +1047,8 @@ fn parse_compilation_observations(
   attach_execution_identities(
     &mut manifests,
     &identity.rustc_executable,
-    &identity.wrapper_executables,
+    &identity.wrapper_chain,
+    &identity.cache_wrapper,
     &identity.executable_bypasses,
   );
   attach_build_script_action_keys(&mut manifests, identity, requested_target)?;
@@ -1187,9 +1240,10 @@ fn executable_toolchain_fingerprint(
   snapshot: &WorkspaceSnapshot,
   executables: &ToolchainExecutableIdentities,
   cargo_rail_executable: &ExecutableIdentity,
+  cache_wrapper_plan: CacheWrapperPlan,
 ) -> RailResult<String> {
   let toolchain = snapshot.toolchain();
-  let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v1\0"[..]);
+  let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
   append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
   append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
   append_identity_frame(&mut framed, b"platform-family", std::env::consts::FAMILY.as_bytes());
@@ -1197,9 +1251,21 @@ fn executable_toolchain_fingerprint(
   append_identity_frame(&mut framed, b"platform-arch", std::env::consts::ARCH.as_bytes());
   append_identity_frame(
     &mut framed,
-    b"cargo-rail-wrapper",
+    b"cargo-rail-diagnostic-wrapper",
     &cargo_rail_executable.identity_bytes()?,
   );
+  append_identity_frame(
+    &mut framed,
+    b"compiler-cache-disposition",
+    cache_wrapper_plan.reason().as_bytes(),
+  );
+  if cache_wrapper_plan.installs_cargo_rail() {
+    append_identity_frame(
+      &mut framed,
+      b"cargo-rail-cache-wrapper",
+      &cargo_rail_executable.identity_bytes()?,
+    );
+  }
   Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
 }
 
@@ -1665,15 +1731,9 @@ fn now_unix_ms() -> u64 {
 }
 
 fn compiler_env_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
-  let environment = snapshot
-    .cargo_config()
-    .environment()
-    .iter()
-    .filter(|(name, _)| name.contains("RUSTFLAGS") || name.contains("RUSTDOCFLAGS"))
-    .collect::<BTreeMap<_, _>>();
   Ok(format!(
     "sha256:{}",
-    ContentDigest::sha256(&serde_json::to_vec(&environment)?)
+    ContentDigest::sha256(&serde_json::to_vec(snapshot.cargo_config().environment())?)
   ))
 }
 

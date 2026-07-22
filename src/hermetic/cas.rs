@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{FastCacheValidation, OutputEntry, OutputEntryKind, OutputManifest};
+use crate::compiler::native_cache::NativeCompilerValidation;
 use crate::error::{RailError, RailResult};
 
 const CAS_VERSION: u32 = 1;
@@ -25,7 +26,7 @@ const MAX_TREE_DEPTH: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_ENTRIES: usize = 1_000_000;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
@@ -82,11 +83,42 @@ pub(super) struct CacheCandidate {
   pub(super) validation: FastCacheValidation,
 }
 
+/// A verified local result binding found through a non-authorizing compiler candidate key.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct NativeCacheCandidate {
+  pub(crate) action_key: String,
+  pub(crate) validation: NativeCompilerValidation,
+  pub(crate) objects_verified: u64,
+  pub(crate) bytes_read: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct NativeCacheHit {
+  pub(crate) action_result: String,
+  pub(crate) result_digest: String,
+  pub(crate) objects_verified: u64,
+  pub(crate) bytes_read: u64,
+  pub(crate) bytes_restored: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct NativeCacheMiss {
+  pub(crate) reason: String,
+  pub(crate) objects_verified: u64,
+  pub(crate) bytes_read: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) enum NativeCacheLookup {
+  Hit(NativeCacheHit),
+  Miss(NativeCacheMiss),
+}
+
 #[derive(Debug, Default)]
-pub(super) struct StoreStats {
-  pub(super) action_result: Option<String>,
-  pub(super) objects_written: u64,
-  pub(super) bytes_written: u64,
+pub(crate) struct StoreStats {
+  pub(crate) action_result: Option<String>,
+  pub(crate) objects_written: u64,
+  pub(crate) bytes_written: u64,
 }
 
 pub(super) struct StoreRequest<'a> {
@@ -99,9 +131,28 @@ pub(super) struct StoreRequest<'a> {
   pub(super) source_root: &'a Path,
 }
 
+pub(crate) struct NativeStoreRequest<'a> {
+  pub(crate) action_key: &'a str,
+  pub(crate) candidate_key: &'a str,
+  pub(crate) result_digest: &'a str,
+  pub(crate) manifest: &'a OutputManifest,
+  pub(crate) validation: &'a NativeCompilerValidation,
+  pub(crate) source_root: &'a Path,
+}
+
+struct ValidatedStoreRequest<'a> {
+  action_key: &'a str,
+  lookup_key: &'a str,
+  result_digest: &'a str,
+  manifest: &'a OutputManifest,
+  validation: StoredValidationRef<'a>,
+  compiler_units: usize,
+  source_root: &'a Path,
+}
+
 /// One validated local CAS rooted outside any physical checkout.
 #[derive(Debug)]
-pub(super) struct LocalCas {
+pub(crate) struct LocalCas {
   root: PathBuf,
   max_bytes: u64,
 }
@@ -246,9 +297,53 @@ struct BundlePublication<'a> {
   object_bytes: &'a [u8],
   manifest: &'a OutputManifest,
   manifest_bytes: &'a [u8],
-  validation: &'a FastCacheValidation,
+  validation: StoredValidationRef<'a>,
   validation_bytes: &'a [u8],
   prepared: &'a PreparedTree,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(untagged)]
+enum StoredValidationRef<'a> {
+  Hermetic(&'a FastCacheValidation),
+  NativeCompiler(&'a NativeCompilerValidation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredValidation {
+  Hermetic(Box<FastCacheValidation>),
+  NativeCompiler(Box<NativeCompilerValidation>),
+}
+
+impl StoredValidation {
+  fn action_key(&self) -> &str {
+    match self {
+      Self::Hermetic(validation) => &validation.action_key,
+      Self::NativeCompiler(validation) => validation.action_key(),
+    }
+  }
+
+  fn lookup_key(&self) -> &str {
+    match self {
+      Self::Hermetic(validation) => &validation.lookup_key,
+      Self::NativeCompiler(validation) => validation.candidate_key(),
+    }
+  }
+
+  fn validate_object(&self) -> RailResult<()> {
+    match self {
+      Self::Hermetic(validation) => validation.validate_object(),
+      Self::NativeCompiler(validation) => validation.validate_object(),
+    }
+  }
+
+  fn result_digest(&self, output_manifest: &str) -> String {
+    match self {
+      Self::Hermetic(validation) => super::hermetic_result_digest(&validation.action_key, output_manifest),
+      Self::NativeCompiler(validation) => validation.result_digest(output_manifest),
+    }
+  }
 }
 
 #[derive(Default)]
@@ -274,11 +369,11 @@ enum BuildNode {
 }
 
 impl LocalCas {
-  pub(super) fn root(&self) -> &Path {
+  pub(crate) fn root(&self) -> &Path {
     &self.root
   }
 
-  pub(super) fn open() -> RailResult<Self> {
+  pub(crate) fn open() -> RailResult<Self> {
     let base = cache_base()?;
     fs::create_dir_all(&base).map_err(|error| {
       RailError::message(format!(
@@ -347,6 +442,32 @@ impl LocalCas {
     }
   }
 
+  #[cfg(any(target_os = "macos", test))]
+  pub(crate) fn restore_native(&self, action_key: &str, destination: &Path) -> NativeCacheLookup {
+    let mut stats = ReadStats::default();
+    match self.restore_inner(action_key, destination, &mut stats) {
+      Ok(hit) => match hit.validation {
+        StoredValidation::NativeCompiler(_) => NativeCacheLookup::Hit(NativeCacheHit {
+          action_result: hit.action_result,
+          result_digest: hit.object.result_digest,
+          objects_verified: stats.objects,
+          bytes_read: stats.bytes,
+          bytes_restored: stats.restored,
+        }),
+        StoredValidation::Hermetic(_) => NativeCacheLookup::Miss(NativeCacheMiss {
+          reason: "compiler_result_validation_domain_mismatch".to_string(),
+          objects_verified: stats.objects,
+          bytes_read: stats.bytes,
+        }),
+      },
+      Err(fault) => NativeCacheLookup::Miss(NativeCacheMiss {
+        reason: fault.reason,
+        objects_verified: stats.objects,
+        bytes_read: stats.bytes,
+      }),
+    }
+  }
+
   #[cfg(target_os = "macos")]
   pub(super) fn candidates(&self, lookup_key: &str) -> RailResult<Vec<CacheCandidate>> {
     validate_lookup_key(lookup_key)?;
@@ -380,12 +501,12 @@ impl LocalCas {
       if pin.version != CAS_VERSION {
         return Err(RailError::message("local CAS candidate pin has an incompatible schema"));
       }
-      if validated_id_hex(&pin.action_key, ACTION_KEY_PREFIX)? != key_hex {
+      if validated_action_key_hex(&pin.action_key)? != key_hex {
         return Err(RailError::message(
           "local CAS candidate pin filename does not match its action key",
         ));
       }
-      validate_lookup_key(&pin.lookup_key)?;
+      validate_any_lookup_key(&pin.lookup_key)?;
       validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
       if pin.lookup_key != lookup_key {
         continue;
@@ -398,10 +519,83 @@ impl LocalCas {
           "local CAS candidate pin does not match its verified action result",
         ));
       }
-      verified.validation.validate_object()?;
+      let StoredValidation::Hermetic(validation) = verified.validation else {
+        return Err(RailError::message(
+          "local CAS candidate has the wrong validation domain",
+        ));
+      };
+      validation.validate_object()?;
       candidates.push(CacheCandidate {
         action_key: pin.action_key,
-        validation: verified.validation,
+        validation: *validation,
+      });
+    }
+    Ok(candidates)
+  }
+
+  #[cfg(any(target_os = "macos", test))]
+  pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<Vec<NativeCacheCandidate>> {
+    crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
+    let pins_directory = self.root.join("pins");
+    let mut entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.len() > MAX_CANDIDATE_PINS {
+      return Err(RailError::message(format!(
+        "local CAS has more than {MAX_CANDIDATE_PINS} action pins; refusing an unbounded compiler-candidate scan"
+      )));
+    }
+    let mut candidates = Vec::new();
+    for entry in entries {
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)?;
+      if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+        return Err(RailError::message(format!(
+          "local CAS pin '{}' is not a bounded regular file",
+          path.display()
+        )));
+      }
+      let file_name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| RailError::message("local CAS pin has a non-UTF-8 name"))?;
+      let key_hex = file_name
+        .strip_suffix(".json")
+        .ok_or_else(|| RailError::message(format!("local CAS pin '{file_name}' has an invalid name")))?;
+      let mut stats = ReadStats::default();
+      let pin: ActionPin = read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      if pin.version != CAS_VERSION {
+        return Err(RailError::message("local CAS candidate pin has an incompatible schema"));
+      }
+      if validated_action_key_hex(&pin.action_key)? != key_hex {
+        return Err(RailError::message(
+          "local CAS candidate pin filename does not match its action key",
+        ));
+      }
+      validate_any_lookup_key(&pin.lookup_key)?;
+      validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
+      if pin.lookup_key != candidate_key {
+        continue;
+      }
+      crate::compiler::native_cache::validate_action_key(&pin.action_key)?;
+      let verified = self
+        .load_verified_result(&pin.action_key, &pin.action_result, &mut stats)
+        .map_err(fault_to_error)?;
+      if verified.object.lookup_key != pin.lookup_key {
+        return Err(RailError::message(
+          "local CAS candidate pin does not match its verified action result",
+        ));
+      }
+      let StoredValidation::NativeCompiler(validation) = verified.validation else {
+        return Err(RailError::message(
+          "local CAS compiler candidate has the wrong validation domain",
+        ));
+      };
+      validation.validate_object()?;
+      candidates.push(NativeCacheCandidate {
+        action_key: pin.action_key,
+        validation: *validation,
+        objects_verified: stats.objects,
+        bytes_read: stats.bytes,
       });
     }
     Ok(candidates)
@@ -425,12 +619,61 @@ impl LocalCas {
         "local cache validation manifest does not match the stored action",
       ));
     }
+    self.store_validated(ValidatedStoreRequest {
+      action_key,
+      lookup_key,
+      result_digest,
+      manifest,
+      validation: StoredValidationRef::Hermetic(validation),
+      compiler_units,
+      source_root,
+    })
+  }
+
+  pub(crate) fn store_native(&self, request: NativeStoreRequest<'_>) -> RailResult<StoreStats> {
+    let NativeStoreRequest {
+      action_key,
+      candidate_key,
+      result_digest,
+      manifest,
+      validation,
+      source_root,
+    } = request;
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
+    validation.validate_object()?;
+    if validation.action_key() != action_key || validation.candidate_key() != candidate_key {
+      return Err(RailError::message(
+        "local cache compiler observation does not match the stored action",
+      ));
+    }
+    self.store_validated(ValidatedStoreRequest {
+      action_key,
+      lookup_key: candidate_key,
+      result_digest,
+      manifest,
+      validation: StoredValidationRef::NativeCompiler(validation),
+      compiler_units: 1,
+      source_root,
+    })
+  }
+
+  fn store_validated(&self, request: ValidatedStoreRequest<'_>) -> RailResult<StoreStats> {
+    let ValidatedStoreRequest {
+      action_key,
+      lookup_key,
+      result_digest,
+      manifest,
+      validation,
+      compiler_units,
+      source_root,
+    } = request;
     validate_manifest(manifest).map_err(fault_to_error)?;
     manifest.validate_unchanged(source_root)?;
     let prepared = prepare_tree(manifest, source_root).map_err(fault_to_error)?;
     let manifest_bytes = canonical_json(manifest)?;
     let manifest_id = manifest.digest.clone();
-    let validation_bytes = canonical_json(validation)?;
+    let validation_bytes = canonical_json(&validation)?;
     let validation_id = validation_id(&validation_bytes);
     let object = ActionResultObject {
       version: CAS_VERSION,
@@ -500,7 +743,7 @@ impl LocalCas {
     destination: &Path,
     stats: &mut ReadStats,
   ) -> Result<VerifiedResult, Fault> {
-    let key_hex = validated_id_hex(action_key, ACTION_KEY_PREFIX).map_err(|error| Fault::corrupt(error.to_string()))?;
+    let key_hex = validated_action_key_hex(action_key).map_err(|error| Fault::corrupt(error.to_string()))?;
     let pin_path = self.root.join("pins").join(format!("{key_hex}.json"));
     let pin_metadata = match fs::symlink_metadata(&pin_path) {
       Ok(metadata) => metadata,
@@ -519,7 +762,7 @@ impl LocalCas {
     if pin.action_key != action_key {
       return Err(Fault::corrupt("pin_action_key_mismatch"));
     }
-    validate_lookup_key(&pin.lookup_key).map_err(|_| Fault::corrupt("pin_lookup_identity"))?;
+    validate_any_lookup_key(&pin.lookup_key).map_err(|_| Fault::corrupt("pin_lookup_identity"))?;
     validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)
       .map_err(|_| Fault::corrupt("pin_action_result_identity"))?;
     let _lease = self
@@ -541,8 +784,8 @@ struct VerifiedResult {
   object: ActionResultObject,
   #[cfg(any(target_os = "macos", test))]
   manifest: OutputManifest,
-  #[cfg(target_os = "macos")]
-  validation: FastCacheValidation,
+  #[cfg(any(target_os = "macos", test))]
+  validation: StoredValidation,
   #[cfg(any(target_os = "macos", test))]
   trees: BTreeMap<String, TreeObject>,
   #[cfg(any(target_os = "macos", test))]
@@ -696,6 +939,22 @@ fn validate_action_key(action_key: &str) -> RailResult<()> {
 
 fn validate_lookup_key(lookup_key: &str) -> RailResult<()> {
   validated_id_hex(lookup_key, LOOKUP_PREFIX).map(|_| ())
+}
+
+fn validated_action_key_hex(action_key: &str) -> RailResult<&str> {
+  if action_key.starts_with(ACTION_KEY_PREFIX) {
+    validated_id_hex(action_key, ACTION_KEY_PREFIX)
+  } else {
+    validated_id_hex(action_key, crate::compiler::native_cache::ACTION_KEY_PREFIX)
+  }
+}
+
+fn validate_any_lookup_key(lookup_key: &str) -> RailResult<()> {
+  if lookup_key.starts_with(LOOKUP_PREFIX) {
+    validate_lookup_key(lookup_key)
+  } else {
+    crate::compiler::native_cache::validate_candidate_key(lookup_key)
+  }
 }
 
 pub(super) fn validate_fast_identity(action_key: &str, lookup_key: &str) -> RailResult<()> {
@@ -1203,7 +1462,7 @@ impl LocalCas {
     if object.action_key != action_key {
       return Err(Fault::corrupt("action_result_action_key_mismatch"));
     }
-    validate_lookup_key(&object.lookup_key).map_err(|_| Fault::corrupt("action_result_lookup_identity"))?;
+    validate_any_lookup_key(&object.lookup_key).map_err(|_| Fault::corrupt("action_result_lookup_identity"))?;
     if action_result_id(&object).map_err(|error| Fault::corrupt(format!("action_result_identity: {error}")))?
       != action_result
     {
@@ -1226,24 +1485,23 @@ impl LocalCas {
     if manifest.digest != object.output_manifest {
       return Err(Fault::corrupt("action_result_manifest_mismatch"));
     }
-    if super::hermetic_result_digest(action_key, manifest.digest()) != object.result_digest {
-      return Err(Fault::corrupt("action_result_result_digest_mismatch"));
-    }
-
     let validation_path = bundle.join("validations").join(format!("{validation_hex}.json"));
-    let validation: FastCacheValidation = read_canonical_json(&validation_path, MAX_OBJECT_METADATA_BYTES, stats)?;
+    let validation: StoredValidation = read_canonical_json(&validation_path, MAX_OBJECT_METADATA_BYTES, stats)?;
     stats.objects = stats.objects.saturating_add(1);
     let validation_bytes =
       canonical_json(&validation).map_err(|error| Fault::corrupt(format!("validation_encoding: {error}")))?;
     if validation_id(&validation_bytes) != object.validation {
       return Err(Fault::corrupt("validation_digest_mismatch"));
     }
-    if validation.action_key != object.action_key || validation.lookup_key != object.lookup_key {
+    if validation.action_key() != object.action_key || validation.lookup_key() != object.lookup_key {
       return Err(Fault::corrupt("validation_action_binding_mismatch"));
     }
     validation
       .validate_object()
       .map_err(|error| Fault::corrupt(format!("validation_object: {error}")))?;
+    if validation.result_digest(manifest.digest()) != object.result_digest {
+      return Err(Fault::corrupt("action_result_result_digest_mismatch"));
+    }
 
     let mut trees = BTreeMap::new();
     let mut loading = BTreeSet::new();
@@ -1859,7 +2117,7 @@ impl LocalCas {
     stats.bytes_written = stats.bytes_written.saturating_add(manifest_bytes.len() as u64);
 
     let validation_identity = validation_id(validation_bytes);
-    if validation_identity != object.validation || canonical_json(validation)? != validation_bytes {
+    if validation_identity != object.validation || canonical_json(&validation)? != validation_bytes {
       return Err(RailError::message(
         "local CAS validation object changed before publication",
       ));
@@ -1922,7 +2180,7 @@ impl LocalCas {
       created_unix_nanos: unix_nanos(),
     };
     let bytes = canonical_json(&pin)?;
-    let key_hex = validated_id_hex(action_key, ACTION_KEY_PREFIX)?;
+    let key_hex = validated_action_key_hex(action_key)?;
     let destination = self.root.join("pins").join(format!("{key_hex}.json"));
     let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
     temporary.write_all(&bytes)?;
@@ -2160,13 +2418,13 @@ impl LocalCas {
       if pin.version != CAS_VERSION {
         return Err(RailError::message("local CAS pin has an incompatible schema"));
       }
-      if validated_id_hex(&pin.action_key, ACTION_KEY_PREFIX)? != key_hex {
+      if validated_action_key_hex(&pin.action_key)? != key_hex {
         return Err(RailError::message(
           "local CAS pin filename does not match its action key",
         ));
       }
       validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
-      validate_lookup_key(&pin.lookup_key)?;
+      validate_any_lookup_key(&pin.lookup_key)?;
       pins.push(GcPin {
         path,
         key: pin.action_key,
@@ -2486,6 +2744,109 @@ mod tests {
         source_root: output,
       })
       .expect("fixture should enter the CAS")
+  }
+
+  fn native_fixture(root: &Path) -> (OutputManifest, NativeCompilerValidation) {
+    let files = [
+      ("target/outputs/dep-info", b"dep-info".as_slice()),
+      ("target/outputs/metadata", b"metadata".as_slice()),
+      ("target/streams/stdout", b"".as_slice()),
+      ("target/streams/stderr", b"".as_slice()),
+    ];
+    let mut paths = Vec::new();
+    for (relative, bytes) in files {
+      let path = root.join(relative);
+      fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+      fs::write(&path, bytes).expect("fixture output");
+      paths.push(path);
+    }
+    let manifest = super::super::capture_native_compiler_outputs(root, &paths).expect("native output manifest");
+    let validation = crate::compiler::native_cache::tests::cas_validation();
+    (manifest, validation)
+  }
+
+  fn store_native_fixture(
+    cas: &LocalCas,
+    output: &Path,
+    manifest: &OutputManifest,
+    validation: &NativeCompilerValidation,
+  ) -> StoreStats {
+    let result = validation.result_digest(manifest.digest());
+    cas
+      .store_native(NativeStoreRequest {
+        action_key: validation.action_key(),
+        candidate_key: validation.candidate_key(),
+        result_digest: &result,
+        manifest,
+        validation,
+        source_root: output,
+      })
+      .expect("native fixture should enter the CAS")
+  }
+
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[test]
+  fn native_candidate_lookup_does_not_materialize_and_action_restore_reverifies() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let restore_parent = tempfile::tempdir().expect("restore parent");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+
+    let destination = restore_parent.path().join("native-output");
+    let candidates = cas
+      .native_candidates(validation.candidate_key())
+      .expect("candidate index should load");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].action_key, validation.action_key());
+    assert!(!destination.exists(), "candidate lookup must not materialize output");
+
+    let NativeCacheLookup::Hit(hit) = cas.restore_native(validation.action_key(), &destination) else {
+      panic!("verified native action should restore");
+    };
+    assert_eq!(hit.bytes_restored, manifest.bytes);
+    assert_eq!(
+      fs::read(destination.join("target/outputs/dep-info")).expect("dep-info"),
+      b"dep-info"
+    );
+    assert_eq!(
+      fs::read(destination.join("target/outputs/metadata")).expect("metadata"),
+      b"metadata"
+    );
+  }
+
+  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[test]
+  fn concurrent_native_publications_converge_on_one_binding() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let manifest = Arc::new(manifest);
+    let validation = Arc::new(validation);
+    LocalCas::open_at(cache.path(), 1024 * 1024).expect("initialize CAS");
+    let barrier = Arc::new(Barrier::new(2));
+    let cache_path = cache.path();
+    let output_path = output.path();
+    std::thread::scope(|scope| {
+      let mut handles = Vec::new();
+      for _ in 0..2 {
+        let manifest = Arc::clone(&manifest);
+        let validation = Arc::clone(&validation);
+        let barrier = Arc::clone(&barrier);
+        handles.push(scope.spawn(move || {
+          let cas = LocalCas::open_at(cache_path, 1024 * 1024).expect("writer CAS");
+          barrier.wait();
+          store_native_fixture(&cas, output_path, &manifest, &validation);
+        }));
+      }
+      for handle in handles {
+        handle.join().expect("writer should converge");
+      }
+    });
+    let root = cache.path().join("cargo-rail/local-cas-v1");
+    assert_eq!(fs::read_dir(root.join("pins")).expect("pins").count(), 1);
+    assert_eq!(fs::read_dir(root.join("results")).expect("results").count(), 1);
   }
 
   #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]

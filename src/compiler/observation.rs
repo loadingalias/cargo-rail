@@ -12,9 +12,9 @@ use crate::executable::ExecutableIdentity;
 use crate::source::ContentDigest;
 use crate::workspace::WorkspaceSnapshot;
 
-pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 4;
+pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 6;
 const COMPILATION_UNIT_VERSION: u32 = 2;
-const RAW_INVOCATION_VERSION: u32 = 2;
+const RAW_INVOCATION_VERSION: u32 = 4;
 
 /// Typed Cargo target domain for one compiler or rustdoc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -180,6 +180,10 @@ pub(crate) struct FileObservation {
 
 impl FileObservation {
   pub(crate) fn capture(path: &Path, current_dir: &Path, source_root: &Path) -> RailResult<Self> {
+    Self::capture_counted(path, current_dir, source_root).map(|(observation, _)| observation)
+  }
+
+  pub(crate) fn capture_counted(path: &Path, current_dir: &Path, source_root: &Path) -> RailResult<(Self, u64)> {
     let absolute = if path.is_absolute() {
       path.to_path_buf()
     } else {
@@ -221,12 +225,16 @@ impl FileObservation {
         absolute.display()
       ))
     })?;
-    Ok(Self {
-      path: ObservationPath::capture(&absolute, current_dir, source_root),
-      content_digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
-      executable: is_executable(&metadata),
-      symlink_target,
-    })
+    let bytes_read = bytes.len() as u64;
+    Ok((
+      Self {
+        path: ObservationPath::capture(&absolute, current_dir, source_root),
+        content_digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
+        executable: is_executable(&metadata),
+        symlink_target,
+      },
+      bytes_read,
+    ))
   }
 
   pub(crate) fn revalidate(&self, source_root: &Path) -> bool {
@@ -247,11 +255,114 @@ pub(crate) struct EnvironmentObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompilationExecutionMetadata {
   pub(crate) compiler: Option<ExecutableIdentity>,
-  pub(crate) wrappers: Vec<ExecutableIdentity>,
+  pub(crate) wrappers: Vec<CompilerWrapperIdentity>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) cache_wrapper: Option<CompilerCacheWrapperMetadata>,
   pub(crate) platform_identity: String,
   pub(crate) environment_reads: BTreeSet<EnvironmentObservation>,
   pub(crate) success: bool,
   pub(crate) cargo_fresh: bool,
+}
+
+/// Stable position of one executable in Cargo's effective compiler-wrapper chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CompilerWrapperRole {
+  #[serde(rename = "cargo_rail_cache")]
+  Cache,
+  #[serde(rename = "cargo_global")]
+  Global,
+  #[serde(rename = "cargo_rail_diagnostic")]
+  Diagnostic,
+  #[serde(rename = "cargo_workspace")]
+  Workspace,
+}
+
+/// Exact executable identity bound to one stable wrapper-chain position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompilerWrapperIdentity {
+  role: CompilerWrapperRole,
+  executable: ExecutableIdentity,
+}
+
+impl CompilerWrapperIdentity {
+  pub(crate) fn new(role: CompilerWrapperRole, executable: ExecutableIdentity) -> Self {
+    Self { role, executable }
+  }
+}
+
+/// Whether the cargo-rail native compiler cache ran for this observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompilerCacheWrapperStatus {
+  Hit,
+  Miss,
+  Disabled,
+  Bypassed,
+}
+
+/// Redaction-safe compiler-cache disposition attached to the exact wrapper chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompilerCacheWrapperMetadata {
+  version: u32,
+  status: CompilerCacheWrapperStatus,
+  reason: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  candidate_key: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  action_key: Option<String>,
+  #[serde(default, skip_serializing_if = "is_zero")]
+  bytes_hashed: u64,
+  #[serde(default, skip_serializing_if = "is_zero")]
+  bytes_restored: u64,
+}
+
+impl CompilerCacheWrapperMetadata {
+  pub(crate) fn new(status: CompilerCacheWrapperStatus, reason: &str) -> Self {
+    Self {
+      version: 1,
+      status,
+      reason: reason.to_string(),
+      candidate_key: None,
+      action_key: None,
+      bytes_hashed: 0,
+      bytes_restored: 0,
+    }
+  }
+
+  pub(crate) fn native(
+    status: CompilerCacheWrapperStatus,
+    reason: impl Into<String>,
+    candidate_key: Option<String>,
+    action_key: Option<String>,
+    bytes_hashed: u64,
+    bytes_restored: u64,
+  ) -> Self {
+    Self {
+      version: 1,
+      status,
+      reason: reason.into(),
+      candidate_key,
+      action_key,
+      bytes_hashed,
+      bytes_restored,
+    }
+  }
+
+  pub(crate) fn reason(&self) -> &str {
+    &self.reason
+  }
+
+  pub(crate) fn candidate_key(&self) -> Option<&str> {
+    self.candidate_key.as_deref()
+  }
+
+  pub(crate) fn bytes_hashed(&self) -> u64 {
+    self.bytes_hashed
+  }
+}
+
+const fn is_zero(value: &u64) -> bool {
+  *value == 0
 }
 
 /// Immutable post-execution evidence for one compilation unit.
@@ -281,7 +392,13 @@ impl CompilationObservationManifest {
   /// Executables are re-digested once by the enclosing compiler-cache identity;
   /// repeating that work for every unit would hash the same toolchain many times.
   pub(crate) fn revalidation_reason(&self, source_root: &Path) -> Option<&'static str> {
-    if self.version != COMPILATION_OBSERVATION_VERSION {
+    if self.version != COMPILATION_OBSERVATION_VERSION
+      || self
+        .execution
+        .cache_wrapper
+        .as_ref()
+        .is_none_or(|metadata| metadata.version != 1)
+    {
       return Some("compilation_observation_schema_changed");
     }
     for (files, reason) in [
@@ -328,13 +445,19 @@ pub(crate) struct InvocationRecorder {
   current_dir: PathBuf,
   raw: RawCompilerInvocation,
   dep_info_paths: Vec<PathBuf>,
+  metadata_paths: Vec<PathBuf>,
   output_paths: Vec<PathBuf>,
 }
 
+pub(crate) struct NativeOutputPaths {
+  pub(crate) dep_info: PathBuf,
+  pub(crate) metadata: PathBuf,
+}
+
 /// Wrapper evidence before Cargo compiler-artifact correlation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RawCompilerInvocation {
-  version: u32,
+  pub(crate) version: u32,
   pub(crate) mode: CompilerMode,
   pub(crate) crate_name: Option<String>,
   pub(crate) crate_types: BTreeSet<String>,
@@ -349,7 +472,9 @@ pub(crate) struct RawCompilerInvocation {
   pub(crate) emitted_outputs: Vec<FileObservation>,
   pub(crate) environment_reads: BTreeSet<EnvironmentObservation>,
   pub(crate) compiler: Option<ExecutableIdentity>,
-  pub(crate) wrappers: Vec<ExecutableIdentity>,
+  pub(crate) wrappers: Vec<CompilerWrapperIdentity>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) cache_wrapper: Option<CompilerCacheWrapperMetadata>,
   pub(crate) success: bool,
   pub(crate) bypasses: BTreeSet<String>,
 }
@@ -487,7 +612,8 @@ pub(crate) fn build_manifests(
 pub(crate) fn attach_execution_identities(
   manifests: &mut [CompilationObservationManifest],
   compiler: &ExecutableIdentity,
-  wrappers: &[ExecutableIdentity],
+  wrappers: &[CompilerWrapperIdentity],
+  cache_wrapper: &CompilerCacheWrapperMetadata,
   executable_bypasses: &BTreeSet<String>,
 ) {
   for manifest in manifests {
@@ -496,6 +622,9 @@ pub(crate) fn attach_execution_identities(
     }
     if manifest.execution.wrappers.is_empty() {
       manifest.execution.wrappers = wrappers.to_vec();
+    }
+    if manifest.execution.cache_wrapper.is_none() {
+      manifest.execution.cache_wrapper = Some(cache_wrapper.clone());
     }
     manifest.bypasses.extend(executable_bypasses.iter().cloned());
   }
@@ -675,6 +804,7 @@ fn manifest_for_artifact(
   let execution = CompilationExecutionMetadata {
     compiler: raw.as_ref().and_then(|raw| raw.compiler.clone()),
     wrappers: raw.as_ref().map_or_else(Vec::new, |raw| raw.wrappers.clone()),
+    cache_wrapper: raw.as_ref().and_then(|raw| raw.cache_wrapper.clone()),
     platform_identity: platform_identity(),
     environment_reads: raw
       .as_ref()
@@ -796,6 +926,7 @@ fn manifest_without_artifact(
     execution: CompilationExecutionMetadata {
       compiler: raw.compiler,
       wrappers: raw.wrappers,
+      cache_wrapper: raw.cache_wrapper,
       platform_identity: platform_identity(),
       environment_reads: raw.environment_reads,
       success: raw.success,
@@ -1014,6 +1145,7 @@ fn begin_compiler_invocation(
     source_root: source_root.to_path_buf(),
     current_dir,
     dep_info_paths: parsed.dep_info_paths,
+    metadata_paths: parsed.metadata_paths,
     output_paths: parsed.output_paths,
     raw: RawCompilerInvocation {
       version: RAW_INVOCATION_VERSION,
@@ -1035,6 +1167,7 @@ fn begin_compiler_invocation(
       environment_reads: BTreeSet::new(),
       compiler: None,
       wrappers: Vec::new(),
+      cache_wrapper: crate::compiler::native_cache::metadata_from_environment(),
       success: false,
       bypasses,
     },
@@ -1042,8 +1175,31 @@ fn begin_compiler_invocation(
 }
 
 impl InvocationRecorder {
+  pub(crate) fn observation(&self) -> &RawCompilerInvocation {
+    &self.raw
+  }
+
+  pub(crate) fn native_output_paths(&self) -> Option<NativeOutputPaths> {
+    let [dep_info] = self.dep_info_paths.as_slice() else {
+      return None;
+    };
+    let [metadata] = self.metadata_paths.as_slice() else {
+      return None;
+    };
+    Some(NativeOutputPaths {
+      dep_info: dep_info.clone(),
+      metadata: metadata.clone(),
+    })
+  }
+
   /// Capture dep-info and emitted bytes after the compiler exits, then atomically publish raw evidence.
-  pub(crate) fn finish(mut self, success: bool) -> RailResult<()> {
+  pub(crate) fn finish(self, success: bool) -> RailResult<()> {
+    let directory = self.directory.clone();
+    let raw = self.complete(success)?;
+    publish_raw(&directory, &raw)
+  }
+
+  pub(crate) fn complete(mut self, success: bool) -> RailResult<RawCompilerInvocation> {
     self.raw.success = success;
     for dep_info in &self.dep_info_paths {
       match parse_dep_info(dep_info, &self.current_dir, &self.source_root) {
@@ -1076,15 +1232,24 @@ impl InvocationRecorder {
     }
     sort_and_deduplicate_files(&mut self.raw.observed_reads);
     sort_and_deduplicate_files(&mut self.raw.emitted_outputs);
-    fs::create_dir_all(&self.directory)?;
-    let compiler = match self.raw.mode {
-      CompilerMode::Rustc => "rustc",
-      CompilerMode::Rustdoc => "rustdoc",
-      CompilerMode::Unknown => "compiler",
-    };
-    let path = self.directory.join(format!("{compiler}-{}.json", std::process::id()));
-    crate::utils::write_file_atomic(&path, &serde_json::to_vec(&self.raw)?)
+    Ok(self.raw)
   }
+}
+
+pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> RailResult<()> {
+  if raw.version != RAW_INVOCATION_VERSION {
+    return Err(RailError::message(
+      "refusing to publish a compiler observation with an incompatible schema",
+    ));
+  }
+  fs::create_dir_all(directory)?;
+  let compiler = match raw.mode {
+    CompilerMode::Rustc => "rustc",
+    CompilerMode::Rustdoc => "rustdoc",
+    CompilerMode::Unknown => "compiler",
+  };
+  let path = directory.join(format!("{compiler}-{}.json", std::process::id()));
+  crate::utils::write_file_atomic(&path, &serde_json::to_vec(raw)?)
 }
 
 /// Load all complete wrapper records from one private invocation directory.
@@ -1124,6 +1289,7 @@ struct ParsedArguments {
   declared_input_paths: Vec<PathBuf>,
   dependency_paths: Vec<(String, PathBuf)>,
   dep_info_paths: Vec<PathBuf>,
+  metadata_paths: Vec<PathBuf>,
   output_paths: Vec<PathBuf>,
   out_dir: Option<PathBuf>,
   extra_filename: String,
@@ -1282,6 +1448,15 @@ impl ParsedArguments {
         bypasses.insert("dep_info_path_unavailable".to_string());
       }
     }
+    if parsed.emit_modes.contains("metadata")
+      && parsed.metadata_paths.is_empty()
+      && parsed.crate_types == BTreeSet::from(["lib".to_string()])
+      && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
+    {
+      let path = out_dir.join(format!("lib{crate_name}{}.rmeta", parsed.extra_filename));
+      parsed.metadata_paths.push(path.clone());
+      parsed.output_paths.push(path);
+    }
     parsed
   }
 
@@ -1301,6 +1476,8 @@ impl ParsedArguments {
         let path = resolve_argument_path(path, current_dir);
         if mode == "dep-info" {
           self.dep_info_paths.push(path.clone());
+        } else if mode == "metadata" {
+          self.metadata_paths.push(path.clone());
         }
         self.output_paths.push(path);
       } else if compiler_mode != CompilerMode::Rustdoc && !matches!(mode, "dep-info" | "link" | "metadata") {
@@ -1609,6 +1786,7 @@ mod tests {
       execution: CompilationExecutionMetadata {
         compiler: None,
         wrappers: Vec::new(),
+        cache_wrapper: None,
         platform_identity: "test-platform".to_string(),
         environment_reads: BTreeSet::new(),
         success: true,
@@ -1810,6 +1988,26 @@ mod tests {
       })
       .collect::<BTreeSet<_>>();
     assert_eq!(identities.len(), 8);
+  }
+
+  #[test]
+  fn native_metadata_path_inference_does_not_reject_other_observation_classes() {
+    let mut bypasses = BTreeSet::new();
+    let arguments = [
+      "--crate-name".to_string(),
+      "example".to_string(),
+      "--crate-type".to_string(),
+      "bin".to_string(),
+      "--emit".to_string(),
+      "metadata".to_string(),
+      "--out-dir".to_string(),
+      "/tmp/target".to_string(),
+    ];
+
+    let parsed = ParsedArguments::parse(&arguments, Path::new("/workspace"), CompilerMode::Rustc, &mut bypasses);
+
+    assert!(parsed.metadata_paths.is_empty());
+    assert!(bypasses.is_empty());
   }
 
   #[test]
@@ -2030,9 +2228,13 @@ mod tests {
         cfg: BTreeSet::new(),
       }],
     };
-    let manifests = build_manifests(raw, vec![artifact], &context, "default", CompilerMode::Rustdoc)
+    let mut manifests = build_manifests(raw, vec![artifact], &context, "default", CompilerMode::Rustdoc)
       .expect("correlate rustdoc observation");
     assert_eq!(manifests.len(), 1);
+    manifests[0].execution.cache_wrapper = Some(CompilerCacheWrapperMetadata::new(
+      CompilerCacheWrapperStatus::Bypassed,
+      "rustdoc_not_graduated",
+    ));
     let manifest = &manifests[0];
     assert_eq!(manifest.unit.mode, CompilerMode::Rustdoc);
     assert_eq!(manifest.unit.target_kind, CompilationTargetKind::Documentation);
@@ -2069,6 +2271,7 @@ mod tests {
       environment_reads: BTreeSet::new(),
       compiler: None,
       wrappers: Vec::new(),
+      cache_wrapper: None,
       success: true,
       bypasses: BTreeSet::new(),
     }

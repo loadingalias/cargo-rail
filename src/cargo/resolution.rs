@@ -19,6 +19,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::compiler::cfg_eval::{TargetCfgSet, cargo_target_constraint_matches};
 use crate::error::{RailError, RailResult};
+use crate::executable::resolve_program as resolve_executable_program;
 use crate::graph::WorkspaceGraph;
 use crate::source::ContentDigest;
 use crate::utils::canonicalize_existing;
@@ -1556,6 +1557,11 @@ impl ToolchainIdentity {
       None,
       "workspace rustc wrapper",
     )?;
+    reject_recursive_cargo_rail_wrappers(
+      cargo_current_dir,
+      rustc_wrapper_program.as_deref(),
+      rustc_workspace_wrapper_program.as_deref(),
+    )?;
     let rustc_verbose_version = wrapped_rustc_identity(
       &cargo_program,
       &rustc_program,
@@ -1588,6 +1594,34 @@ impl ToolchainIdentity {
       rustc_sysroot,
     })
   }
+}
+
+fn reject_recursive_cargo_rail_wrappers(
+  current_dir: &Path,
+  rustc_wrapper: Option<&OsStr>,
+  workspace_wrapper: Option<&OsStr>,
+) -> RailResult<()> {
+  let current_executable = std::env::current_exe()
+    .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
+  let current_executable = fs::canonicalize(&current_executable).map_err(|error| {
+    RailError::message(format!(
+      "failed to resolve cargo-rail executable '{}': {error}",
+      current_executable.display()
+    ))
+  })?;
+  let recursive = [rustc_wrapper, workspace_wrapper]
+    .into_iter()
+    .flatten()
+    .filter_map(|wrapper| resolve_executable_program(wrapper, current_dir).ok())
+    .filter_map(|wrapper| fs::canonicalize(wrapper).ok())
+    .any(|wrapper| wrapper == current_executable);
+  if recursive {
+    return Err(RailError::with_help(
+      "recursive cargo-rail rustc wrapper configuration",
+      "remove cargo-rail from RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER; wrapper injection is automatic",
+    ));
+  }
+  Ok(())
 }
 
 fn parse_rustc_host(verbose_version: &str) -> RailResult<String> {

@@ -6,8 +6,11 @@
 //! executable because Cargo has no rustdoc-wrapper setting.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Marker set when this executable is the cache-disabled outer compiler wrapper.
+pub const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
 
 /// Marker set by the diagnostics collector when this executable is acting as a
 /// rustc workspace wrapper.
@@ -30,6 +33,55 @@ pub const OBSERVATION_SOURCE_ROOT_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_S
 
 /// Record invocations without enabling cargo-rail's workspace diagnostic lint.
 pub const OBSERVATION_ONLY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_ONLY";
+
+/// Whether cargo-rail may install its cache-disabled compiler wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheWrapperPlan {
+  /// No external wrapper exists, so the transparent boundary can be exercised.
+  DisabledPassThrough,
+  /// An existing sccache wrapper keeps Cargo's original position in the chain.
+  PreserveSccache,
+  /// An existing wrapper of unknown cache behavior is preserved fail-closed.
+  PreserveExisting,
+}
+
+impl CacheWrapperPlan {
+  pub(crate) fn for_chain(
+    rustc_wrapper: Option<&std::ffi::OsStr>,
+    workspace_wrapper: Option<&std::ffi::OsStr>,
+  ) -> Self {
+    if [rustc_wrapper, workspace_wrapper]
+      .into_iter()
+      .flatten()
+      .any(is_sccache_selection)
+    {
+      Self::PreserveSccache
+    } else if rustc_wrapper.is_some() || workspace_wrapper.is_some() {
+      Self::PreserveExisting
+    } else {
+      Self::DisabledPassThrough
+    }
+  }
+
+  pub(crate) fn installs_cargo_rail(self) -> bool {
+    self == Self::DisabledPassThrough
+  }
+
+  pub(crate) fn reason(self) -> &'static str {
+    match self {
+      Self::DisabledPassThrough => "native_compiler_cache_per_invocation",
+      Self::PreserveSccache => "sccache_wrapper_preserved",
+      Self::PreserveExisting => "existing_compiler_wrapper_preserved",
+    }
+  }
+}
+
+fn is_sccache_selection(program: &std::ffi::OsStr) -> bool {
+  Path::new(program)
+    .file_stem()
+    .and_then(std::ffi::OsStr::to_str)
+    .is_some_and(|name| name.eq_ignore_ascii_case("sccache"))
+}
 
 /// Compose Cargo's stable wrapper order: global wrapper, workspace wrapper, rustc.
 pub(crate) fn rustc_command(
@@ -62,11 +114,65 @@ pub(crate) fn rustc_command(
 /// Returns `None` during normal cargo-rail CLI execution.
 #[must_use]
 pub fn run_if_requested() -> Option<i32> {
+  if std::env::var_os(CACHE_WRAPPER_MARKER).is_some() {
+    return Some(run_cache_disabled());
+  }
   if std::env::var_os(WRAPPER_MARKER).is_some() {
     return Some(run_rustc());
   }
-  std::env::var_os(RUSTDOC_WRAPPER_MARKER)?;
-  Some(run_rustdoc())
+  if std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some() {
+    return Some(run_rustdoc());
+  }
+  if is_unmarked_recursive_wrapper_invocation() {
+    eprintln!("cargo-rail rustc wrapper: recursive cargo-rail rustc wrapper configuration");
+    return Some(2);
+  }
+  None
+}
+
+fn run_cache_disabled() -> i32 {
+  let mut args = std::env::args_os().skip(1);
+  let Some(program) = args.next() else {
+    eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");
+    return 1;
+  };
+  let arguments = args.collect::<Vec<_>>();
+  let mut command = Command::new(&program);
+  command.args(&arguments).env_remove(CACHE_WRAPPER_MARKER);
+  if let Some(exit_code) = crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command) {
+    return exit_code;
+  }
+  run_transparently(command, "cargo-rail compiler cache wrapper")
+}
+
+#[cfg(unix)]
+fn run_transparently(mut command: Command, context: &str) -> i32 {
+  use std::os::unix::process::CommandExt as _;
+
+  let error = command.exec();
+  eprintln!("{context}: failed to execute compiler: {error}");
+  1
+}
+
+#[cfg(not(unix))]
+fn run_transparently(mut command: Command, context: &str) -> i32 {
+  match command.status() {
+    Ok(status) => status.code().unwrap_or(1),
+    Err(error) => {
+      eprintln!("{context}: failed to execute compiler: {error}");
+      1
+    }
+  }
+}
+
+fn is_unmarked_recursive_wrapper_invocation() -> bool {
+  std::env::var_os("CARGO").is_some()
+    && std::env::args_os().nth(1).is_some_and(|program| {
+      Path::new(&program)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("rustc"))
+    })
 }
 
 fn run_rustc() -> i32 {
@@ -98,13 +204,21 @@ fn run_rustc() -> i32 {
   if std::env::var_os(OBSERVATION_ONLY_ENV).is_none() {
     command.arg("--warn=unused-crate-dependencies");
   }
-  let status = command
+  command
     .env_remove(WRAPPER_MARKER)
     .env_remove(INNER_WRAPPER_ENV)
     .env_remove(OBSERVATION_DIRECTORY_ENV)
     .env_remove(OBSERVATION_SOURCE_ROOT_ENV)
-    .env_remove(OBSERVATION_ONLY_ENV)
-    .status();
+    .env_remove(OBSERVATION_ONLY_ENV);
+  crate::compiler::native_cache::remove_private_environment(&mut command);
+
+  if crate::compiler::native_cache::store_requested()
+    && let Some(recorder) = recorder
+  {
+    return crate::compiler::native_cache::run_and_store(command, recorder, "cargo-rail rustc wrapper");
+  }
+
+  let status = command.status();
 
   if let Some(recorder) = recorder {
     let _ = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
@@ -345,6 +459,28 @@ mod tests {
       OsString::from("unit"),
       OsString::from("src/lib.rs"),
     ]));
+  }
+
+  #[test]
+  fn cache_wrapper_plan_never_layers_over_existing_or_sccache_wrappers() {
+    assert_eq!(
+      CacheWrapperPlan::for_chain(None, None),
+      CacheWrapperPlan::DisabledPassThrough
+    );
+    assert_eq!(
+      CacheWrapperPlan::for_chain(Some(OsStr::new("sccache")), None),
+      CacheWrapperPlan::PreserveSccache
+    );
+    assert_eq!(
+      CacheWrapperPlan::for_chain(None, Some(OsStr::new("/tools/SCCACHE.exe"))),
+      CacheWrapperPlan::PreserveSccache
+    );
+    assert_eq!(
+      CacheWrapperPlan::for_chain(Some(OsStr::new("custom-wrapper")), None),
+      CacheWrapperPlan::PreserveExisting
+    );
+    assert!(!CacheWrapperPlan::PreserveSccache.installs_cargo_rail());
+    assert!(!CacheWrapperPlan::PreserveExisting.installs_cargo_rail());
   }
 
   #[test]

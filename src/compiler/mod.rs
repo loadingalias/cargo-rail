@@ -4,6 +4,7 @@ pub mod cfg_eval;
 pub mod collector;
 pub mod diagnostics_store;
 pub mod model;
+pub(crate) mod native_cache;
 pub(crate) mod observation;
 /// Workspace-only rustc wrapper used by compiler diagnostics collection.
 pub mod wrapper;

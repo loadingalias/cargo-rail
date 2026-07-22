@@ -333,7 +333,7 @@ fn read_executable_chunk(file: &mut File, buffer: &mut [u8], path: &Path) -> Rai
   }
 }
 
-fn resolve_program(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
+pub(crate) fn resolve_program(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
   let selected = Path::new(selection);
   if selected.is_absolute() || selected.components().count() > 1 {
     return Ok(if selected.is_absolute() {

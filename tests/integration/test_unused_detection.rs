@@ -1234,7 +1234,7 @@ glob = "0.3"
   let build_script_result = build_script_observation["build_script_result"]
     .as_object()
     .expect("build-script post-execution result analysis");
-  assert_eq!(build_script_observation["version"], 4);
+  assert_eq!(build_script_observation["version"], 6);
   assert_eq!(build_script_result["version"], 1);
   assert!(
     !build_script_result.contains_key("digest"),
@@ -1530,14 +1530,14 @@ edition = "2021"
   );
   let cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
   assert_eq!(
-    cache["version"], 8,
-    "exact compilation observations require evidence-cache schema version 8"
+    cache["version"], 10,
+    "native compiler result observations require evidence-cache schema version 10"
   );
   let entries = cache["entries"].as_object().expect("cache entries object");
   let entry = entries.values().next().expect("at least one cache entry");
   assert_eq!(
-    entry["collector_version"], 13,
-    "downstream build-script result propagation requires collector semantics version 13"
+    entry["collector_version"], 15,
+    "native compiler result reuse requires collector semantics version 15"
   );
   assert!(
     entry["key"]["package_id"].as_str().is_some(),

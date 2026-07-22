@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Cache format version for compiler diagnostics.
-pub const COMPILER_DIAG_CACHE_VERSION: u32 = 8;
+pub const COMPILER_DIAG_CACHE_VERSION: u32 = 10;
 
 /// Collector version used to invalidate stale semantic behavior.
-pub const COLLECTOR_VERSION: u32 = 13;
+pub const COLLECTOR_VERSION: u32 = 15;
 
 /// A rustc platform target or `default` for the workspace's native target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

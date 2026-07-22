@@ -97,6 +97,52 @@ evidence can be reused. Cargo's `fresh` flag is retained only as execution metad
 documentation artifact message names an index file rather than the complete HTML tree, so documentation output remains
 explicitly uncacheable until the isolated output boundary can enumerate and verify that tree.
 
+### Native compiler-result cache
+
+Execution metadata binds the effective compiler-wrapper chain as ordered roles with exact executable identities:
+cargo-rail cache boundary, Cargo global wrapper, cargo-rail diagnostic wrapper, and Cargo workspace wrapper. With no
+configured wrapper, the cache boundary remains outside the diagnostic workspace wrapper. If Cargo selected either
+wrapper slot through configuration or environment, cargo-rail omits its cache boundary, preserves the selected order,
+and records `sccache_wrapper_preserved` or `existing_compiler_wrapper_preserved`. This fail-closed rule prevents an
+unknown or renamed cache from being double-wrapped. An original workspace wrapper stays inside the diagnostic wrapper,
+and recursive cargo-rail selections are rejected before compiler probing. No sccache cache-format parsing is involved.
+
+Native reuse is graduated for one class only: an aarch64 macOS host running Cargo and rustc 1.97.1, no configured
+compiler wrapper, `CARGO_INCREMENTAL=0`, and one workspace `lib` compilation with exactly one complete observed Rust
+source. The invocation must emit only dep-info and metadata, may consume only repository `.rmeta` dependency artifacts,
+and may not link. Its exact selected and sysroot Cargo/rustc executables, cargo-rail wrapper, Cargo configuration,
+captured compiler environment, physical source root, argv, declared source, and dependency bytes are session or
+candidate inputs. Binding the physical root is intentional because rustc dep-info and metadata bytes can contain that
+root.
+
+`CandidateKey` is only a local index over pre-execution evidence. A candidate match reloads the canonical validation
+object from a locally verified CAS result, re-digests every stored declared input, observed read, and dependency
+artifact, re-digests every recorded environment read, and derives `ActionKey` again. Only an exact action/result binding
+may restore. The restore path re-verifies the pin, action result, validation, output manifest, tree, and every blob, then
+stages the exact `.d`, `.rmeta`, stdout, and stderr bytes. The active wrapper publishes only the two output paths rustc
+would have written, replays the streams, and returns through Cargo's normal wrapper boundary. Cargo creates its own
+fingerprints around that invocation; cargo-rail never restores a target/build directory, synthesizes fingerprint state,
+or authorizes from timestamps, sizes, Cargo freshness, or `CandidateKey` alone.
+
+Incremental, test, binary, dylib, cdylib, staticlib, proc-macro, build-script, native-linking, stdin, response-file,
+unsupported-flag/emit, filesystem-reading macro, multi-source, dependency-crate, non-`.rmeta` dependency, cross-target,
+secret/incomplete-input, other platform, and other toolchain cases execute normally with an explicit bypass. Existing
+sccache and custom wrappers also execute normally in their original positions. Corrupt or incompatible native objects
+fail the hit closed and fall back to the exact cold compiler invocation; successful cold output is published only if a
+complete validation and CAS result can be stored. Native use registers the same owner-marked P7.1 cache root, so
+`cargo rail clean --cache` retains its validated cleanup boundary.
+
+The 2026-07-22 graduation fixture used two local crates, clean `cargo check`, 20 wrapper runs, and 30 runs per
+native-cache condition on an aarch64 macOS host with 16 GiB RAM. These are gate evidence, not a performance promise:
+
+| Measurement | Result |
+|---|---|
+| Final native-cache command | cold `1.049 +/- 0.009 s`; warm `0.985 +/- 0.026 s` (6.2% lower mean and 7.3% lower median wall time) |
+| CPU and peak memory | cold `0.428 s` user / `0.358 s` system / `69,222,400 B`; warm `0.419 s` / `0.344 s` / `69,238,784 B` |
+| Warm disposition | 3/3 eligible library units hit; 3 test units bypassed; `13,368 B` hashed and `12,249 B` restored |
+| Clean wrapper overhead | diagnostic `+30.9 ms`; cache boundary `+23.2 ms`; complete unsupported chain `+53.7 ms` over native |
+| sccache 0.15 comparison | cold `260.2 ms`; warm `218.2 ms`; `.rmeta` matched direct Cargo, but restored `.d` bytes retained the prior target root instead of the requested one |
+
 Custom-build compilation retains Cargo's exact executable output separately from the other compiler artifacts. A
 versioned `BuildScriptActionKey` can be issued only at the next process boundary, after the executable and source bytes
 are revalidated and the relevant manifest/lock closure, toolchain, host and target identities, profile, features,
@@ -135,7 +181,8 @@ expansion, dynamic libraries, SDK inputs, default linkers, incomplete platform i
 trees produce explicit bypasses. Any observation bypass prevents diagnostic-evidence reuse; collector
 semantics are versioned so older evidence cannot silently gain authority. An observation manifest never identifies its
 own producing action; exact verified artifacts and result digests may become inputs only to later dependent actions.
-Cargo-rail neither stores result artifacts nor writes or restores Cargo fingerprint state.
+The diagnostic evidence store contains no restorable artifacts. The native class above stores only its exact compiler
+outputs and streams; no cargo-rail cache writes or restores Cargo fingerprint state.
 
 ## Hermetic execution profile
 
@@ -156,6 +203,8 @@ boundary, cargo-rail captures and classifies Cargo configuration, rejects config
 ambient `RUSTC`/`RUSTDOC`, and performs only locked/offline local-package metadata preflight. Toolchain discovery
 disables rustup auto-install/update behavior, ignores ambient compiler wrappers, and pins the exact sysroot Cargo,
 rustc, and rustdoc; wrappers, rustup staging homes, and a newly downloaded toolchain cannot enter the fetch identity.
+Ordinary diagnostic-wrapper coexistence and P7.3 native reuse do not relax this P7.1 boundary: the hermetic command removes the
+cache-wrapper marker and continues to use its observation-only global wrapper with the same platform limits.
 The fetch binds the lockfile, acquisition configuration, credential capability names, and exact Cargo implementation,
 captures locked registry or Git packages as an immutable source inventory, and runs full metadata locked/offline
 against that inventory. A warm run exactly revalidates and reuses this dependency inventory without contacting the
@@ -224,7 +273,8 @@ cache only through a canonical workspace reference and an exact ownership marker
 | Locked crates.io, remote registry-mirror, or Git dependencies | input supported | input supported | Network only during fetch; full metadata/build are locked and offline, and a warm inventory performs zero registry requests. Local directory/source replacement remains ungraduated. |
 | Build scripts, proc macros, native/generated code | `uncacheable` | `uncacheable` | Dynamic runtime/tool inputs are not yet sandboxed as complete action classes; normal execution remains available. |
 | Documentation, actual test execution, linked build/package artifacts | `uncacheable` | `uncacheable` | Output/runtime boundaries are incomplete or not implemented by the profile. |
-| Cross/custom targets, configured linker/runner, repository wrappers, sccache | `uncacheable` | `uncacheable` | Tool/SDK/wrapper coexistence has not passed the per-class proof gate. |
+| Cross/custom targets, configured linker/runner | `uncacheable` | `uncacheable` | Tool and SDK boundaries have not passed the per-class proof gate. |
+| Repository wrappers and sccache | `uncacheable` | `uncacheable` | Ordinary diagnostics preserve and explain the exact wrapper chain; the P7.1 hermetic profile rejects wrappers, and P7.3 native reuse bypasses them rather than double-caching. |
 
 Physical checkout roots, unrelated files/packages/environment, and Cargo's mutable cache representation do not affect
 the graduated key. Exact source, resolution, profile, feature, target, flags, environment, toolchain, platform, and

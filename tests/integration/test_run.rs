@@ -2909,7 +2909,10 @@ fn test_hermetic_all_target_check_proves_pure_rust_unit_classes_in_two_roots() -
     second_report["output_manifest"]["digest"]
   );
   #[cfg(target_os = "macos")]
-  assert_eq!(first_report["support"], "eligible");
+  assert_eq!(
+    first_report["support"], "eligible",
+    "unexpected hermetic report: {first_report:#}"
+  );
   #[cfg(not(target_os = "macos"))]
   assert_eq!(first_report["support"], "platform_limited");
   Ok(())

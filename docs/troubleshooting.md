@@ -115,6 +115,41 @@ invalidates prior evidence. Cargo freshness does not override those checks. Dele
 `target/cargo-rail/cache/compiler-diags-v1.json` only to discard diagnostic evidence; it contains no restorable build
 artifacts or Cargo fingerprint state.
 
+Each observation's `execution.wrappers` is the effective outer-to-inner wrapper chain with stable roles and exact
+executable identities. `execution.cache_wrapper` explains the separate native compiler-cache boundary:
+
+- `hit` with `verified_local_result` means the stored observation and every current input were re-digested, the final
+  action/result binding and CAS objects verified, and the invocation's exact `.d`, `.rmeta`, stdout, and stderr bytes
+  were restored;
+- `miss` means no candidate survived complete revalidation. A successful cold compile appends
+  `stored_verified_result`; a failed publication appends `local_cache_store_failed` and remains non-authorizing;
+- `bypassed` with `sccache_wrapper_preserved` means Cargo selected sccache and cargo-rail kept it in place without
+  adding a second compiler cache;
+- `bypassed` with `existing_compiler_wrapper_preserved` means Cargo selected another global or workspace wrapper. It
+  is preserved in order and conservatively treated as potentially cache-owning;
+- any other `bypassed` reason names the rejected class or missing proof. Common class reasons include
+  `incremental_compilation_not_graduated`, `test_compilation_not_graduated`, `binary_not_graduated`,
+  `linker_producing_crate_type_not_graduated`, `proc_macro_not_graduated`, `build_script_not_graduated`,
+  `native_linking_not_graduated`, `compiler_stdin_not_graduated`, `compiler_emit_mode_not_graduated`,
+  `compiler_flag_not_graduated`, `filesystem_reading_macro_not_graduated`, `multi_source_library_not_graduated`,
+  `dependency_crate_not_graduated`, `dependency_artifact_class_not_graduated`, and `cross_target_not_graduated`;
+- proof-boundary reasons include `native_cache_platform_not_graduated`, `native_cache_toolchain_not_graduated`,
+  `native_cache_session_unavailable`, `compiler_inputs_incomplete`, `secret_compiler_environment`,
+  `complete_compiler_observation_unavailable`, `compiler_output_root_not_graduated`,
+  `local_cache_candidate_corrupt`, and `verified_result_materialization_failed`.
+
+The cargo-rail diagnostic wrapper remains in Cargo's workspace-wrapper position; an existing workspace wrapper runs
+inside it. A custom or renamed cache receives the generic existing-wrapper reason, but still cannot be double-wrapped.
+Remove cargo-rail itself from `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, or the corresponding Cargo configuration if
+the recursive-wrapper error appears; cargo-rail inserts its own roles.
+
+There is no global “compiler caching supported” state. Native reuse currently requires aarch64 macOS, Cargo/rustc
+1.97.1, `CARGO_INCREMENTAL=0`, no existing wrapper, and the exact single-source workspace-library metadata class.
+`candidate_key` is only an index. `action_key` appears only after the stored observation's source, dependency, and
+environment inputs are re-digested. `bytes_hashed` and `bytes_restored` make the per-invocation cost visible. Delete
+neither CAS files nor Cargo fingerprints manually: `cargo rail clean --cache` follows the validated workspace reference
+and owner marker. The P7.1 hermetic profile remains separate and still rejects configured wrappers.
+
 For a local custom-build unit, the cached observation also contains `build_script_action_key`. A missing `key` is
 intentional when Cargo inherited ambient environment or process state, a dependency result is not yet verified, or an
 isolated logical launch layout is unavailable. The listed reasons are the missing proof; the captured-input counts are
