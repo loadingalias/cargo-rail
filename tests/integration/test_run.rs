@@ -181,10 +181,12 @@ impl SparseRegistry {
               break;
             }
           }
-          Err(_) if !thread_stop.load(Ordering::Acquire) => {
-            std::thread::sleep(Duration::from_millis(2));
+          Err(error) => {
+            if let Ok(mut state) = thread_state.lock() {
+              state.failure = Some(error.to_string());
+            }
+            break;
           }
-          Err(_) => break,
         }
       }
     })];
@@ -2553,6 +2555,10 @@ fn test_local_action_cache_concurrent_cold_writers_converge() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(
+  windows,
+  ignore = "isolated dependency-backed hermetic execution is not graduated on Windows"
+)]
 fn test_hermetic_fetch_inventory_converges_for_locked_git_dependency() -> Result<()> {
   let dependency = tempfile::tempdir()?;
   git(dependency.path(), &["init", "--initial-branch=main"])?;
@@ -2682,6 +2688,10 @@ fn test_hermetic_fetch_inventory_converges_for_locked_git_dependency() -> Result
 }
 
 #[test]
+#[cfg_attr(
+  windows,
+  ignore = "isolated dependency-backed hermetic execution is not graduated on Windows"
+)]
 fn test_hermetic_sparse_registry_fetch_is_the_only_network_boundary_and_reuses_warm_inventory() -> Result<()> {
   let dependency = tempfile::tempdir()?;
   fs::create_dir_all(dependency.path().join("src"))?;
