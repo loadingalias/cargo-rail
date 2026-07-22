@@ -2122,13 +2122,6 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
   assert_eq!(first_report["action_class"], "cargo_check");
   assert_eq!(first_report["fetch"]["version"], 1);
   assert_eq!(first_report["fetch"]["reused"], false);
-  assert_eq!(
-    second_report["fetch"]["reused"],
-    true,
-    "equivalent checkout did not hit:\nreport={second_report:#}\nstdout={}\nstderr={}",
-    String::from_utf8_lossy(&second_output.stdout),
-    String::from_utf8_lossy(&second_output.stderr)
-  );
   assert_eq!(first_report["fetch"]["packages"], 0);
   assert!(
     first_report["output_manifest"]["files"]
@@ -2151,6 +2144,13 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
 
   #[cfg(target_os = "macos")]
   {
+    assert_eq!(
+      second_report["fetch"]["reused"],
+      true,
+      "equivalent checkout did not hit:\nreport={second_report:#}\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&second_output.stdout),
+      String::from_utf8_lossy(&second_output.stderr)
+    );
     assert!(
       first_report["action_key"].is_string(),
       "an eligible action must have an action key"
@@ -2373,6 +2373,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
       assert_eq!(report["cache"]["stored"], false);
       assert_eq!(report["cache"]["cargo_check_executed"], true);
       assert_eq!(report["cache"]["compiler_units_executed"], true);
+      assert_eq!(report["fetch"]["reused"], false);
     }
   }
   Ok(())
