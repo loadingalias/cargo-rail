@@ -272,6 +272,7 @@ pub(crate) fn record_cas_read(bytes: u64) {
   add(|counters| &counters.cas_bytes_read, bytes);
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn record_cas_restore(bytes: u64) {
   add(|counters| &counters.cas_bytes_restored, bytes);
 }
@@ -301,6 +302,7 @@ pub(crate) fn record_hermetic_toolchain_probe(program: &std::ffi::OsStr) {
   }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn record_hermetic_platform_probe() {
   add(|counters| &counters.hermetic_platform_probes, 1);
 }

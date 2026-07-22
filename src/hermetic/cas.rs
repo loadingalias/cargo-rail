@@ -25,6 +25,7 @@ const MAX_TREE_DEPTH: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_ENTRIES: usize = 1_000_000;
+#[cfg(target_os = "macos")]
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
@@ -38,6 +39,8 @@ const VALIDATION_PREFIX: &str = "validation-v1-sha256-";
 const LOOKUP_PREFIX: &str = "local-lookup-v1-sha256-";
 
 /// A verified cache lookup restored into an isolated output root.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct CacheHit {
   pub(super) action_result: String,
   pub(super) result_digest: String,
@@ -49,6 +52,8 @@ pub(super) struct CacheHit {
 }
 
 /// A fail-closed lookup outcome that permits ordinary cold execution.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct CacheMiss {
   pub(super) kind: CacheMissKind,
   pub(super) reason: String,
@@ -56,6 +61,7 @@ pub(super) struct CacheMiss {
   pub(super) bytes_read: u64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CacheMissKind {
   Miss,
@@ -63,12 +69,14 @@ pub(super) enum CacheMissKind {
   Incompatible,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(super) enum CacheLookup {
   Hit(CacheHit),
   Miss(CacheMiss),
 }
 
 /// A fully verified action-result bundle that may be checked against current raw inputs.
+#[cfg(target_os = "macos")]
 pub(super) struct CacheCandidate {
   pub(super) action_key: String,
   pub(super) validation: FastCacheValidation,
@@ -166,11 +174,13 @@ struct LeaseRecord {
 struct ReadStats {
   objects: u64,
   bytes: u64,
+  #[cfg(any(target_os = "macos", test))]
   restored: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FaultKind {
+  #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
   Miss,
   Corrupt,
   Incompatible,
@@ -190,6 +200,7 @@ impl Fault {
     }
   }
 
+  #[cfg(any(target_os = "macos", test))]
   fn miss(reason: impl Into<String>) -> Self {
     Self {
       kind: FaultKind::Miss,
@@ -310,6 +321,7 @@ impl LocalCas {
     Ok(Self { root, max_bytes })
   }
 
+  #[cfg(any(target_os = "macos", test))]
   pub(super) fn restore(&self, action_key: &str, destination: &Path) -> CacheLookup {
     let mut stats = ReadStats::default();
     match self.restore_inner(action_key, destination, &mut stats) {
@@ -335,6 +347,7 @@ impl LocalCas {
     }
   }
 
+  #[cfg(target_os = "macos")]
   pub(super) fn candidates(&self, lookup_key: &str) -> RailResult<Vec<CacheCandidate>> {
     validate_lookup_key(lookup_key)?;
     let pins_directory = self.root.join("pins");
@@ -480,6 +493,7 @@ impl LocalCas {
     Ok(stats)
   }
 
+  #[cfg(any(target_os = "macos", test))]
   fn restore_inner(
     &self,
     action_key: &str,
@@ -521,11 +535,17 @@ impl LocalCas {
 }
 
 struct VerifiedResult {
+  #[cfg(any(target_os = "macos", test))]
   action_result: String,
+  #[cfg(any(target_os = "macos", test))]
   object: ActionResultObject,
+  #[cfg(any(target_os = "macos", test))]
   manifest: OutputManifest,
+  #[cfg(target_os = "macos")]
   validation: FastCacheValidation,
+  #[cfg(any(target_os = "macos", test))]
   trees: BTreeMap<String, TreeObject>,
+  #[cfg(any(target_os = "macos", test))]
   bundle: PathBuf,
 }
 
@@ -1281,15 +1301,22 @@ impl LocalCas {
       }
     }
     Ok(VerifiedResult {
+      #[cfg(any(target_os = "macos", test))]
       action_result: action_result.to_string(),
+      #[cfg(any(target_os = "macos", test))]
       object,
+      #[cfg(any(target_os = "macos", test))]
       manifest,
+      #[cfg(target_os = "macos")]
       validation,
+      #[cfg(any(target_os = "macos", test))]
       trees,
+      #[cfg(any(target_os = "macos", test))]
       bundle,
     })
   }
 
+  #[cfg(any(target_os = "macos", test))]
   fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
     let parent = destination
       .parent()
@@ -1585,6 +1612,7 @@ fn validate_object_directory(
   Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn materialize_tree(
   bundle: &Path,
   identity: &str,
@@ -1625,6 +1653,7 @@ fn materialize_tree(
   Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn materialize_blob(
   bundle: &Path,
   identity: &str,
@@ -1702,7 +1731,7 @@ fn materialize_blob(
   set_exact_mode(destination, mode)
 }
 
-#[cfg(unix)]
+#[cfg(all(any(target_os = "macos", test), unix))]
 fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   use std::os::unix::fs::PermissionsExt as _;
 
@@ -1710,7 +1739,7 @@ fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
     .map_err(|error| Fault::corrupt(format!("output_mode: {error}")))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(target_os = "macos", test), not(unix)))]
 fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   let mut permissions = fs::metadata(path)
     .map_err(|error| Fault::corrupt(format!("output_mode_metadata: {error}")))?
@@ -1719,13 +1748,13 @@ fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   fs::set_permissions(path, permissions).map_err(|error| Fault::corrupt(format!("output_mode: {error}")))
 }
 
-#[cfg(unix)]
+#[cfg(all(any(target_os = "macos", test), unix))]
 fn create_materialized_symlink(target: &Path, destination: &Path, _directory: bool) -> Result<(), Fault> {
   std::os::unix::fs::symlink(target, destination)
     .map_err(|error| Fault::corrupt(format!("symlink_materialization: {error}")))
 }
 
-#[cfg(windows)]
+#[cfg(all(any(target_os = "macos", test), windows))]
 fn create_materialized_symlink(target: &Path, destination: &Path, directory: bool) -> Result<(), Fault> {
   let result = if directory {
     std::os::windows::fs::symlink_dir(target, destination)
@@ -1735,11 +1764,12 @@ fn create_materialized_symlink(target: &Path, destination: &Path, directory: boo
   result.map_err(|error| Fault::corrupt(format!("symlink_materialization: {error}")))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(any(target_os = "macos", test), not(any(unix, windows))))]
 fn create_materialized_symlink(_target: &Path, _destination: &Path, _directory: bool) -> Result<(), Fault> {
   Err(Fault::incompatible("symlink_materialization_unsupported"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn sync_output_tree(root: &Path) -> RailResult<()> {
   let mut directories = Vec::new();
   let mut pending = vec![root.to_path_buf()];

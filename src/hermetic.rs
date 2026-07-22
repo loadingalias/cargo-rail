@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::action::{ActionKind, ActionWorkingDirectory, ExpandedAction};
-use crate::action_key::{DeclaredInputEntry, DeclaredInputKind, DeclaredInputManifest, declared_input_manifest};
+#[cfg(target_os = "macos")]
+use crate::action_key::{DeclaredInputEntry, DeclaredInputKind};
+use crate::action_key::{DeclaredInputManifest, declared_input_manifest};
 use crate::cargo::resolution::ResolutionInputs;
 use crate::cargo::{CargoConfigSnapshot, ToolchainIdentity};
 use crate::compiler::observation::{FileObservation, ObservationPath, RawCompilerInvocation, load_raw};
@@ -26,7 +28,9 @@ use crate::compiler::wrapper::{
 use crate::error::{RailError, RailResult};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableScope};
 use crate::git::SystemGit;
-use crate::source::{ContentDigest, GitWorktreeCapture, SourceEntryKind, SourceSnapshot};
+use crate::source::{ContentDigest, SourceEntryKind};
+#[cfg(target_os = "macos")]
+use crate::source::{GitWorktreeCapture, SourceSnapshot};
 use crate::workspace::snapshot::CapturedLockfile;
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
 
@@ -227,6 +231,7 @@ pub(crate) struct HermeticExecutionReport {
 
 /// A process-free local action-cache probe either restored a result or identified a safe miss.
 pub(crate) enum PreContextCacheAttempt {
+  #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
   Hit(Box<PreContextCacheHit>),
   Miss(String),
 }
@@ -272,6 +277,7 @@ impl HermeticExecutionReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum LocalCacheStatus {
+  #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
   Hit,
   Miss,
   Disabled,
@@ -2542,6 +2548,7 @@ fn cargo_environment_identity(environment: &[(String, OsString, String)]) -> Rai
   Ok(sha256_identity(&serde_json::to_vec(&portable)?))
 }
 
+#[cfg(target_os = "macos")]
 fn validation_cargo_environment(
   config: &CargoConfigSnapshot,
   source_root: &Path,
@@ -2703,6 +2710,7 @@ fn validation_metadata(metadata: &fs::Metadata) -> (u64, bool, bool) {
   )
 }
 
+#[cfg(target_os = "macos")]
 fn declared_inputs_match(
   manifest: &DeclaredInputManifest,
   snapshot: &SourceSnapshot,
@@ -2788,6 +2796,7 @@ fn declared_inputs_match(
   Ok(Err(reason))
 }
 
+#[cfg(target_os = "macos")]
 fn capture_authoritative_input(source_root: &Path, expected: &DeclaredInputEntry) -> RailResult<DeclaredInputEntry> {
   let logical = crate::source::RepositoryPath::new(Path::new(&expected.path))?;
   let path = source_root.join(logical.as_path());
@@ -2832,13 +2841,13 @@ fn capture_authoritative_input(source_root: &Path, expected: &DeclaredInputEntry
   })
 }
 
-#[cfg(unix)]
+#[cfg(all(target_os = "macos", unix))]
 fn source_executable(metadata: &fs::Metadata) -> bool {
   use std::os::unix::fs::PermissionsExt as _;
   metadata.permissions().mode() & 0o111 != 0
 }
 
-#[cfg(not(unix))]
+#[cfg(all(target_os = "macos", not(unix)))]
 fn source_executable(_metadata: &fs::Metadata) -> bool {
   false
 }
@@ -2926,6 +2935,7 @@ fn build_fast_cache_validation(request: FastCacheValidationRequest<'_>) -> RailR
   Ok(validation)
 }
 
+#[cfg(target_os = "macos")]
 fn current_cargo_directory(source_root: &Path, requested_workspace: &Path) -> RailResult<PathBuf> {
   let current = std::env::current_dir()
     .map_err(|error| RailError::message(format!("failed to determine current directory: {error}")))?;
@@ -2937,6 +2947,7 @@ fn current_cargo_directory(source_root: &Path, requested_workspace: &Path) -> Ra
   }
 }
 
+#[cfg(target_os = "macos")]
 struct FastCacheRequestGuard {
   requested_workspace: PathBuf,
   source_root: PathBuf,
@@ -2949,6 +2960,7 @@ struct FastCacheRequestGuard {
   lookup_key: String,
 }
 
+#[cfg(target_os = "macos")]
 impl FastCacheRequestGuard {
   fn capture(requested_workspace: &Path) -> RailResult<Self> {
     let requested_workspace = crate::utils::canonicalize_existing(requested_workspace)?;
@@ -3063,6 +3075,7 @@ impl FastCacheRequestGuard {
   }
 }
 
+#[cfg(target_os = "macos")]
 fn record_cache_candidate_miss(first: &mut Option<String>, reason: String) {
   fn specificity(reason: &str) -> u8 {
     if matches!(reason, "workspace_prefix_changed" | "cargo_current_directory_changed") {
@@ -3087,9 +3100,9 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
   #[cfg(not(target_os = "macos"))]
   {
     let _ = workspace_root;
-    return Ok(PreContextCacheAttempt::Miss(
+    Ok(PreContextCacheAttempt::Miss(
       "platform_process_isolation_unavailable".to_string(),
-    ));
+    ))
   }
   #[cfg(target_os = "macos")]
   {
@@ -4015,13 +4028,6 @@ fn fast_platform_identity(sysroot: &Path, host_target: &str, source_root: &Path)
   identity.frame(b"os-build", &command_stdout("/usr/bin/sw_vers", &["-buildVersion"])?);
   identity.frame(b"kernel", &command_stdout("/usr/bin/uname", &["-srv"])?);
   Ok(format!("platform-v1-sha256-{}", identity.finish()))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn fast_platform_identity(_sysroot: &Path, _host_target: &str, _source_root: &Path) -> RailResult<String> {
-  Err(RailError::message(
-    "process-free local action-cache hits are not graduated on this platform",
-  ))
 }
 
 #[cfg(target_os = "macos")]
