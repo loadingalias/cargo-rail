@@ -135,6 +135,7 @@ fn native_cache_observation(workspace: &Path) -> Result<serde_json::Value> {
   local_observation(&cache, "wrapper_app")
 }
 
+#[cfg(target_os = "macos")]
 fn assert_native_miss(workspace: &Path, output: &std::process::Output) -> Result<serde_json::Value> {
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
   let observation = native_cache_observation(workspace)?;
@@ -227,6 +228,7 @@ fn cache_disabled_wrapper_preserves_clean_cargo_outputs() -> Result<()> {
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<()> {
   let workspace = wrapper_workspace("disabled-cache-wrapper-observation")?;
@@ -324,6 +326,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let workspace = wrapper_workspace("native-cache-mutation-matrix")?;
@@ -382,6 +385,7 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> {
   fn collect_blobs(directory: &Path, blobs: &mut Vec<PathBuf>) -> Result<()> {
@@ -423,6 +427,7 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
   let workspace = wrapper_workspace("native-cache-filesystem-macro")?;
@@ -441,6 +446,37 @@ fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
     observation["execution"]["cache_wrapper"]["reason"],
     "filesystem_reading_macro_not_graduated"
   );
+  Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn unsupported_platform_bypasses_native_cache_and_preserves_cold_outputs() -> Result<()> {
+  let workspace = wrapper_workspace("native-cache-unsupported-platform")?;
+  let local_cache = tempfile::tempdir()?;
+  let target = workspace.path.join("target");
+
+  let first = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
+  assert_eq!(first.status.code(), Some(1), "first cold run: {first:?}");
+  let first_observation = native_cache_observation(&workspace.path)?;
+  assert_eq!(first_observation["execution"]["cache_wrapper"]["status"], "bypassed");
+  assert_eq!(
+    first_observation["execution"]["cache_wrapper"]["reason"],
+    "native_cache_platform_not_graduated"
+  );
+  let first_outputs = compiler_output_files(&target)?;
+  assert!(!first_outputs.is_empty(), "fixture must produce compiler outputs");
+
+  fs::remove_dir_all(&target)?;
+  let second = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
+  assert_eq!(second.status.code(), Some(1), "second cold run: {second:?}");
+  let second_observation = native_cache_observation(&workspace.path)?;
+  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "bypassed");
+  assert_eq!(
+    second_observation["execution"]["cache_wrapper"]["reason"],
+    "native_cache_platform_not_graduated"
+  );
+  assert_eq!(compiler_output_files(&target)?, first_outputs);
   Ok(())
 }
 
