@@ -461,6 +461,9 @@ pub struct WorkspaceContext {
   /// Complete authoritative snapshot when requested during context construction.
   snapshot: Option<WorkspaceSnapshot>,
 
+  /// Explicit dependency inventory prepared before hermetic snapshot metadata.
+  hermetic_fetch_inventory: Option<crate::hermetic::FetchInventory>,
+
   /// Rail configuration (rail.toml)
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
@@ -490,7 +493,7 @@ impl WorkspaceContext {
   /// - Config load: <5ms (or None if not found)
   /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::None)
+    Self::build_inner(workspace_root, ContextCapture::None, None)
   }
 
   /// Build a context and optionally capture WORKTREE source before metadata loading.
@@ -501,7 +504,7 @@ impl WorkspaceContext {
     } else {
       ContextCapture::None
     };
-    Self::build_inner(workspace_root, capture)
+    Self::build_inner(workspace_root, capture, None)
   }
 
   /// Build a context with one complete immutable workspace snapshot.
@@ -518,12 +521,45 @@ impl WorkspaceContext {
   /// configuration URL, or changes during capture. Cargo, rustc, rustdoc, and
   /// configured compiler-wrapper identity commands must also succeed.
   pub fn build_with_snapshot(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::Snapshot)
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, None)
   }
 
-  fn build_inner(workspace_root: &Path, capture: ContextCapture) -> RailResult<Self> {
-    let cargo_current_dir = std::env::current_dir()
+  pub(crate) fn build_with_hermetic_snapshot(
+    workspace_root: &Path,
+    bootstrap: crate::hermetic::HermeticBootstrap,
+  ) -> RailResult<Self> {
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, Some(bootstrap))
+  }
+
+  fn build_inner(
+    workspace_root: &Path,
+    capture: ContextCapture,
+    bootstrap: Option<crate::hermetic::HermeticBootstrap>,
+  ) -> RailResult<Self> {
+    let process_current_dir = std::env::current_dir()
       .map_err(|error| RailError::message(format!("failed to determine Cargo metadata current directory: {error}")))?;
+    let (
+      preloaded_metadata,
+      preloaded_inputs,
+      preloaded_cargo_current_dir,
+      hermetic_cargo_home,
+      preloaded_lockfile,
+      hermetic_fetch_inventory,
+    ) = bootstrap.map_or_else(
+      || (None, None, None, None, None, None),
+      |bootstrap| {
+        let cargo_home = bootstrap.inventory.cargo_home().to_path_buf();
+        (
+          Some(bootstrap.metadata),
+          Some(bootstrap.resolution_inputs),
+          Some(bootstrap.cargo_current_dir),
+          Some(cargo_home),
+          Some(bootstrap.lockfile),
+          Some(bootstrap.inventory),
+        )
+      },
+    );
+    let cargo_current_dir = preloaded_cargo_current_dir.unwrap_or(process_current_dir);
 
     // Load git state when available. Cargo-only commands such as `unify --check`
     // must work in source sandboxes that intentionally omit `.git`.
@@ -544,13 +580,18 @@ impl WorkspaceContext {
     };
 
     let resolution_inputs = if capture == ContextCapture::Snapshot {
-      Some(ResolutionViews::capture_inputs(&cargo_current_dir)?)
+      match preloaded_inputs {
+        Some(inputs) => Some(inputs),
+        None => Some(ResolutionViews::capture_inputs(&cargo_current_dir)?),
+      }
     } else {
       None
     };
 
     // Load cargo state
-    let cargo = Arc::new(if let Some(inputs) = &resolution_inputs {
+    let cargo = Arc::new(if let Some(metadata) = preloaded_metadata {
+      CargoState::from_metadata(Arc::new(metadata))
+    } else if let Some(inputs) = &resolution_inputs {
       CargoState::load_fresh(
         workspace_root,
         &cargo_current_dir,
@@ -586,7 +627,11 @@ impl WorkspaceContext {
     let generated_lockfile = if let (Some(capture), Some(git)) = (source_capture.as_mut(), git.as_ref()) {
       let generated_roots = validated_generated_source_roots(git.repo_root(), &workspace_root, &cargo)?;
       capture.exclude_generated_roots(git.git(), &generated_roots)?;
-      stabilize_cargo_generated_lockfile(capture, git, &workspace_root, &generated_roots)?
+      if preloaded_lockfile.is_some() {
+        None
+      } else {
+        stabilize_cargo_generated_lockfile(capture, git, &workspace_root, &generated_roots)?
+      }
     } else {
       None
     };
@@ -595,13 +640,23 @@ impl WorkspaceContext {
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
     let resolution_views = Arc::new(if let Some(inputs) = resolution_inputs.clone() {
-      ResolutionViews::new_with_inputs(
-        workspace_root.clone(),
-        cargo_current_dir.clone(),
-        cargo.shared_metadata(),
-        Arc::clone(&graph),
-        inputs,
-      )
+      match hermetic_cargo_home {
+        Some(cargo_home) => ResolutionViews::new_hermetic_with_inputs(
+          workspace_root.clone(),
+          cargo_current_dir.clone(),
+          cargo.shared_metadata(),
+          Arc::clone(&graph),
+          inputs,
+          cargo_home,
+        ),
+        None => ResolutionViews::new_with_inputs(
+          workspace_root.clone(),
+          cargo_current_dir.clone(),
+          cargo.shared_metadata(),
+          Arc::clone(&graph),
+          inputs,
+        ),
+      }
     } else {
       ResolutionViews::new(
         workspace_root.clone(),
@@ -658,6 +713,7 @@ impl WorkspaceContext {
       let generated_lock_marker = generated_lockfile
         .as_ref()
         .map(|lockfile| (lockfile.path().to_path_buf(), ContentDigest::sha256(lockfile.bytes())));
+      let captured_lockfile = preloaded_lockfile.or(generated_lockfile);
       let source = match (&source_capture, &git) {
         (Some(capture), Some(_)) => capture.shared_snapshot(),
         (None, None) => Arc::new(SourceSnapshot::capture_filesystem(
@@ -677,7 +733,7 @@ impl WorkspaceContext {
         source,
         Arc::clone(&cargo),
         rail_config,
-        generated_lockfile,
+        captured_lockfile,
         inputs.clone(),
         target_identities,
         Arc::clone(&derived_views),
@@ -686,7 +742,11 @@ impl WorkspaceContext {
         capture.validate_unchanged(git.git())?;
       }
       snapshot.validate_authoritative_files_unchanged()?;
-      let current_inputs = ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?;
+      let current_inputs = if hermetic_fetch_inventory.is_some() {
+        ResolutionInputs::capture_hermetic(resolution_views.cargo_current_dir())?
+      } else {
+        ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?
+      };
       validate_resolution_inputs_unchanged(&inputs, &current_inputs)?;
       snapshot.validate_external_targets_unchanged()?;
       if let Some((path, digest)) = generated_lock_marker {
@@ -706,6 +766,7 @@ impl WorkspaceContext {
       graph,
       derived_views,
       snapshot,
+      hermetic_fetch_inventory,
       config,
     })
   }
@@ -919,6 +980,10 @@ impl WorkspaceContext {
     snapshot.validate_live_authoritative_inputs()
   }
 
+  pub(crate) fn hermetic_fetch_inventory(&self) -> Option<&crate::hermetic::FetchInventory> {
+    self.hermetic_fetch_inventory.as_ref()
+  }
+
   /// Load each target's exact rustc cfg set once for the command context.
   pub fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
     if let Some(snapshot) = &self.snapshot {
@@ -971,6 +1036,11 @@ enum ContextCapture {
 }
 
 fn validate_resolution_inputs_unchanged(initial: &ResolutionInputs, current: &ResolutionInputs) -> RailResult<()> {
+  if current.hermetic != initial.hermetic {
+    return Err(RailError::message(
+      "workspace snapshot toolchain capture mode changed during construction",
+    ));
+  }
   if current.cargo_config != initial.cargo_config {
     return Err(RailError::with_help(
       "Cargo configuration changed while constructing the workspace snapshot",

@@ -1,6 +1,6 @@
 //! Versioned compilation-unit identities and exact post-execution evidence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,9 +12,9 @@ use crate::executable::ExecutableIdentity;
 use crate::source::ContentDigest;
 use crate::workspace::WorkspaceSnapshot;
 
-pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 1;
-const COMPILATION_UNIT_VERSION: u32 = 1;
-const RAW_INVOCATION_VERSION: u32 = 1;
+pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 4;
+const COMPILATION_UNIT_VERSION: u32 = 2;
+const RAW_INVOCATION_VERSION: u32 = 2;
 
 /// Typed Cargo target domain for one compiler or rustdoc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -76,6 +76,21 @@ pub(crate) struct CompilationDependencyEdge {
   pub(crate) producer_unit: Option<String>,
 }
 
+/// Verified build-script action/result pair that affects one compilation unit.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct BuildScriptResultDependency {
+  pub(crate) producer_action: String,
+  pub(crate) result_digest: String,
+}
+
+/// One observed build-script execution ready for downstream propagation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuildScriptResultBinding {
+  pub(crate) package: String,
+  pub(crate) action_key: Option<String>,
+  pub(crate) result_digest: Option<String>,
+}
+
 /// Smallest complete typed identity for one observed compilation unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompilationUnit {
@@ -96,6 +111,7 @@ pub(crate) struct CompilationUnit {
   pub(crate) linker_responsibility: LinkerResponsibility,
   pub(crate) compiler_arguments: Vec<String>,
   pub(crate) dependencies: Vec<CompilationDependencyEdge>,
+  pub(crate) build_script_results: BTreeSet<BuildScriptResultDependency>,
 }
 
 impl CompilationUnit {
@@ -234,8 +250,14 @@ pub(crate) struct CompilationObservationManifest {
   pub(crate) observed_reads: Vec<FileObservation>,
   pub(crate) dependency_artifacts: Vec<FileObservation>,
   pub(crate) emitted_outputs: Vec<FileObservation>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) executable_output: Option<FileObservation>,
   pub(crate) execution: CompilationExecutionMetadata,
   pub(crate) bypasses: BTreeSet<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) build_script_action_key: Option<crate::build_script::BuildScriptActionKeyAnalysis>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) build_script_result: Option<crate::build_script::BuildScriptResultAnalysis>,
 }
 
 impl CompilationObservationManifest {
@@ -298,6 +320,7 @@ pub(crate) struct InvocationRecorder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RawCompilerInvocation {
   version: u32,
+  pub(crate) mode: CompilerMode,
   pub(crate) crate_name: Option<String>,
   pub(crate) crate_types: BTreeSet<String>,
   pub(crate) target_argument: Option<String>,
@@ -326,6 +349,7 @@ pub(crate) struct CargoArtifactObservation {
   pub(crate) profile: CompilationProfile,
   pub(crate) features: BTreeSet<String>,
   pub(crate) outputs: Vec<FileObservation>,
+  pub(crate) executable: Option<FileObservation>,
   pub(crate) fresh: bool,
   pub(crate) bypasses: BTreeSet<String>,
 }
@@ -389,6 +413,7 @@ pub(crate) fn build_manifests(
   artifacts: Vec<CargoArtifactObservation>,
   context: &CompilationObservationContext,
   requested_target: &str,
+  expected_mode: CompilerMode,
 ) -> RailResult<Vec<CompilationObservationManifest>> {
   let mut raw_invocations = raw_invocations.into_iter().map(Some).collect::<Vec<_>>();
   let mut manifests = Vec::with_capacity(artifacts.len());
@@ -399,7 +424,13 @@ pub(crate) fn build_manifests(
         .is_some_and(|raw| invocation_matches_artifact(raw, &artifact))
     });
     let raw = raw_index.and_then(|index| raw_invocations[index].take());
-    manifests.push(manifest_for_artifact(artifact, raw, context, requested_target)?);
+    manifests.push(manifest_for_artifact(
+      artifact,
+      raw,
+      context,
+      requested_target,
+      expected_mode,
+    )?);
   }
   for raw in raw_invocations.into_iter().flatten() {
     manifests.push(manifest_without_artifact(raw, context, requested_target)?);
@@ -455,6 +486,89 @@ pub(crate) fn attach_execution_identities(
   }
 }
 
+/// Bind each verified build-script result into every transitive consumer unit.
+///
+/// `package_dependencies` is oriented from consumer package to dependency
+/// package. The producing build-script compilation unit is excluded because a
+/// post-execution result can never be an input to its own pre-execution action.
+pub(crate) fn attach_build_script_result_dependencies(
+  manifests: &mut [CompilationObservationManifest],
+  package_dependencies: &HashMap<String, BTreeSet<String>>,
+  bindings: &[BuildScriptResultBinding],
+) -> RailResult<()> {
+  if bindings.is_empty() {
+    return Ok(());
+  }
+
+  let mut dependents = BTreeMap::<&str, BTreeSet<&str>>::new();
+  for (consumer, dependencies) in package_dependencies {
+    dependents.entry(consumer).or_default();
+    for dependency in dependencies {
+      dependents.entry(dependency).or_default().insert(consumer);
+    }
+  }
+
+  for manifest in manifests.iter_mut() {
+    manifest.unit.build_script_results.clear();
+    manifest.bypasses.remove("build_script_result_unavailable");
+    manifest.bypasses.remove("build_script_action_key_unavailable");
+    manifest.bypasses.remove("build_script_dependency_graph_incomplete");
+  }
+
+  for binding in bindings {
+    let mut affected = BTreeSet::from([binding.package.as_str()]);
+    let mut pending = vec![binding.package.as_str()];
+    if !dependents.contains_key(binding.package.as_str()) {
+      for manifest in manifests.iter_mut() {
+        if manifest.unit.package != binding.package || manifest.unit.target_kind != CompilationTargetKind::BuildScript {
+          manifest
+            .bypasses
+            .insert("build_script_dependency_graph_incomplete".to_string());
+        }
+      }
+      continue;
+    }
+    while let Some(package) = pending.pop() {
+      if let Some(package_dependents) = dependents.get(package) {
+        for dependent in package_dependents {
+          if affected.insert(dependent) {
+            pending.push(dependent);
+          }
+        }
+      }
+    }
+
+    for manifest in manifests.iter_mut().filter(|manifest| {
+      affected.contains(manifest.unit.package.as_str())
+        && !(manifest.unit.package == binding.package
+          && manifest.unit.target_kind == CompilationTargetKind::BuildScript)
+    }) {
+      match (&binding.action_key, &binding.result_digest) {
+        (Some(action_key), Some(result_digest)) => {
+          manifest.unit.build_script_results.insert(BuildScriptResultDependency {
+            producer_action: action_key.clone(),
+            result_digest: result_digest.clone(),
+          });
+        }
+        (None, Some(_)) => {
+          manifest
+            .bypasses
+            .insert("build_script_action_key_unavailable".to_string());
+        }
+        (_, None) => {
+          manifest.bypasses.insert("build_script_result_unavailable".to_string());
+        }
+      }
+    }
+  }
+
+  for manifest in manifests.iter_mut() {
+    manifest.unit_identity = manifest.unit.identity()?;
+  }
+  manifests.sort_unstable_by(|left, right| left.unit_identity.cmp(&right.unit_identity));
+  Ok(())
+}
+
 fn invocation_matches_artifact(raw: &RawCompilerInvocation, artifact: &CargoArtifactObservation) -> bool {
   let crate_name_matches = raw
     .crate_name
@@ -477,14 +591,20 @@ fn manifest_for_artifact(
   raw: Option<RawCompilerInvocation>,
   context: &CompilationObservationContext,
   requested_target: &str,
+  expected_mode: CompilerMode,
 ) -> RailResult<CompilationObservationManifest> {
   let cargo_artifact_identity = cargo_artifact_identity(&artifact)?;
-  let target_kind = classify_target_kind(&artifact.target_kinds);
+  let mode = raw.as_ref().map_or(expected_mode, |raw| raw.mode);
+  let target_kind = match mode {
+    CompilerMode::Rustdoc if raw.as_ref().is_some_and(|raw| raw.test_mode) => CompilationTargetKind::Test,
+    CompilerMode::Rustdoc => CompilationTargetKind::Documentation,
+    CompilerMode::Rustc | CompilerMode::Unknown => classify_target_kind(&artifact.target_kinds),
+  };
   let domain = compilation_domain(raw.as_ref(), &target_kind, context, requested_target)?;
   let mut bypasses = raw
     .as_ref()
     .map(|raw| raw.bypasses.clone())
-    .unwrap_or_else(|| BTreeSet::from(["rustc_invocation_unavailable".to_string()]));
+    .unwrap_or_else(|| BTreeSet::from([invocation_unavailable_reason(mode).to_string()]));
   bypasses.extend(artifact.bypasses.iter().cloned());
   if let Some(reason) = domain.bypass {
     bypasses.insert(reason.to_string());
@@ -496,13 +616,17 @@ fn manifest_for_artifact(
     bypasses.insert("proc_macro_filesystem_observations_unavailable".to_string());
   }
   let emit_modes = raw.as_ref().map_or_else(BTreeSet::new, |raw| raw.emit_modes.clone());
-  let linker_responsibility = raw.as_ref().map_or(LinkerResponsibility::Unknown, |_| {
-    if emit_modes.contains("link") {
-      LinkerResponsibility::RustcDriver
-    } else {
-      LinkerResponsibility::None
-    }
-  });
+  let linker_responsibility = if mode == CompilerMode::Rustdoc {
+    LinkerResponsibility::None
+  } else {
+    raw.as_ref().map_or(LinkerResponsibility::Unknown, |_| {
+      if emit_modes.contains("link") {
+        LinkerResponsibility::RustcDriver
+      } else {
+        LinkerResponsibility::None
+      }
+    })
+  };
   if linker_responsibility == LinkerResponsibility::RustcDriver {
     bypasses.insert("native_link_sdk_inputs_unavailable".to_string());
   }
@@ -551,7 +675,7 @@ fn manifest_for_artifact(
     target_name: artifact.target_name,
     crate_types: artifact.crate_types,
     role: domain.role,
-    mode: CompilerMode::Rustc,
+    mode,
     platform: domain.platform,
     target_specification: domain.target_specification,
     profile: artifact.profile,
@@ -561,6 +685,7 @@ fn manifest_for_artifact(
     linker_responsibility,
     compiler_arguments: raw.as_ref().map_or_else(Vec::new, |raw| raw.compiler_arguments.clone()),
     dependencies,
+    build_script_results: BTreeSet::new(),
   };
   let unit_identity = unit.identity()?;
   Ok(CompilationObservationManifest {
@@ -572,8 +697,11 @@ fn manifest_for_artifact(
     observed_reads: raw.as_ref().map_or_else(Vec::new, |raw| raw.observed_reads.clone()),
     dependency_artifacts,
     emitted_outputs,
+    executable_output: artifact.executable,
     execution,
     bypasses,
+    build_script_action_key: None,
+    build_script_result: None,
   })
 }
 
@@ -582,7 +710,11 @@ fn manifest_without_artifact(
   context: &CompilationObservationContext,
   requested_target: &str,
 ) -> RailResult<CompilationObservationManifest> {
-  let target_kind = raw_target_kind(&raw.crate_types, raw.test_mode);
+  let target_kind = match raw.mode {
+    CompilerMode::Rustdoc if raw.test_mode => CompilationTargetKind::Test,
+    CompilerMode::Rustdoc => CompilationTargetKind::Documentation,
+    CompilerMode::Rustc | CompilerMode::Unknown => raw_target_kind(&raw.crate_types, raw.test_mode),
+  };
   let domain = compilation_domain(Some(&raw), &target_kind, context, requested_target)?;
   let mut bypasses = raw.bypasses.clone();
   bypasses.insert("cargo_artifact_unavailable".to_string());
@@ -609,7 +741,7 @@ fn manifest_without_artifact(
     target_name: raw.crate_name.clone().unwrap_or_else(|| "unknown".to_string()),
     crate_types: raw.crate_types.clone(),
     role: domain.role,
-    mode: CompilerMode::Rustc,
+    mode: raw.mode,
     platform: domain.platform,
     target_specification: domain.target_specification,
     profile: CompilationProfile {
@@ -633,6 +765,7 @@ fn manifest_without_artifact(
         producer_unit: None,
       })
       .collect(),
+    build_script_results: BTreeSet::new(),
   };
   let unit_identity = unit.identity()?;
   Ok(CompilationObservationManifest {
@@ -644,6 +777,7 @@ fn manifest_without_artifact(
     observed_reads: raw.observed_reads,
     dependency_artifacts,
     emitted_outputs: raw.emitted_outputs,
+    executable_output: None,
     execution: CompilationExecutionMetadata {
       compiler: raw.compiler,
       wrappers: raw.wrappers,
@@ -653,7 +787,17 @@ fn manifest_without_artifact(
       cargo_fresh: false,
     },
     bypasses,
+    build_script_action_key: None,
+    build_script_result: None,
   })
+}
+
+fn invocation_unavailable_reason(mode: CompilerMode) -> &'static str {
+  match mode {
+    CompilerMode::Rustc => "rustc_invocation_unavailable",
+    CompilerMode::Rustdoc => "rustdoc_invocation_unavailable",
+    CompilerMode::Unknown => "compiler_invocation_unavailable",
+  }
 }
 
 fn cargo_artifact_identity(artifact: &CargoArtifactObservation) -> RailResult<String> {
@@ -666,6 +810,7 @@ fn cargo_artifact_identity(artifact: &CargoArtifactObservation) -> RailResult<St
     &artifact.profile,
     &artifact.features,
     &artifact.outputs,
+    &artifact.executable,
   ))?;
   Ok(format!("sha256:{}", ContentDigest::sha256(&bytes)))
 }
@@ -775,8 +920,36 @@ pub(crate) fn begin_invocation(
   _rustc: &OsStr,
   arguments: &[OsString],
 ) -> RailResult<InvocationRecorder> {
-  let current_dir = std::env::current_dir()
+  begin_compiler_invocation(directory, source_root, arguments, CompilerMode::Rustc)
+}
+
+/// Capture one rustdoc invocation through the transparent observation proxy.
+pub(crate) fn begin_rustdoc_invocation(
+  directory: &Path,
+  source_root: &Path,
+  arguments: &[OsString],
+) -> RailResult<InvocationRecorder> {
+  begin_compiler_invocation(directory, source_root, arguments, CompilerMode::Rustdoc)
+}
+
+fn begin_compiler_invocation(
+  directory: &Path,
+  source_root: &Path,
+  arguments: &[OsString],
+  mode: CompilerMode,
+) -> RailResult<InvocationRecorder> {
+  let canonical_source_root = fs::canonicalize(source_root).map_err(|error| {
+    RailError::message(format!(
+      "failed to resolve compiler observation source root '{}': {error}",
+      source_root.display()
+    ))
+  })?;
+  let physical_current_dir = std::env::current_dir()
     .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
+  let current_dir = physical_current_dir
+    .strip_prefix(&canonical_source_root)
+    .map(|relative| source_root.join(relative))
+    .unwrap_or(physical_current_dir);
   let mut bypasses = BTreeSet::new();
   let argument_text = arguments
     .iter()
@@ -787,7 +960,15 @@ pub(crate) fn begin_invocation(
       })
     })
     .collect::<RailResult<Vec<_>>>()?;
-  let parsed = ParsedArguments::parse(&argument_text, &current_dir, source_root, &mut bypasses);
+  let parsed = ParsedArguments::parse(&argument_text, &current_dir, mode, &mut bypasses);
+  if mode == CompilerMode::Rustdoc {
+    if !parsed.emit_modes.contains("dep-info") {
+      bypasses.insert("rustdoc_dep_info_unavailable".to_string());
+    }
+    if parsed.emit_modes.iter().any(|emit| emit != "dep-info") {
+      bypasses.insert("rustdoc_output_tree_unavailable".to_string());
+    }
+  }
   let mut declared_inputs = Vec::new();
   for path in &parsed.declared_input_paths {
     capture_file(
@@ -815,6 +996,7 @@ pub(crate) fn begin_invocation(
     output_paths: parsed.output_paths,
     raw: RawCompilerInvocation {
       version: RAW_INVOCATION_VERSION,
+      mode,
       crate_name: parsed.crate_name,
       crate_types: parsed.crate_types,
       target_argument: parsed.target_argument,
@@ -823,7 +1005,7 @@ pub(crate) fn begin_invocation(
       test_mode: parsed.test_mode,
       compiler_arguments: argument_text
         .iter()
-        .map(|argument| portable_argument(argument, source_root))
+        .map(|argument| portable_argument(argument, source_root, &canonical_source_root))
         .collect(),
       declared_inputs,
       observed_reads: Vec::new(),
@@ -874,7 +1056,12 @@ impl InvocationRecorder {
     sort_and_deduplicate_files(&mut self.raw.observed_reads);
     sort_and_deduplicate_files(&mut self.raw.emitted_outputs);
     fs::create_dir_all(&self.directory)?;
-    let path = self.directory.join(format!("rustc-{}.json", std::process::id()));
+    let compiler = match self.raw.mode {
+      CompilerMode::Rustc => "rustc",
+      CompilerMode::Rustdoc => "rustdoc",
+      CompilerMode::Unknown => "compiler",
+    };
+    let path = self.directory.join(format!("{compiler}-{}.json", std::process::id()));
     crate::utils::write_file_atomic(&path, &serde_json::to_vec(&self.raw)?)
   }
 }
@@ -922,7 +1109,12 @@ struct ParsedArguments {
 }
 
 impl ParsedArguments {
-  fn parse(arguments: &[String], current_dir: &Path, _source_root: &Path, bypasses: &mut BTreeSet<String>) -> Self {
+  fn parse(
+    arguments: &[String],
+    current_dir: &Path,
+    compiler_mode: CompilerMode,
+    bypasses: &mut BTreeSet<String>,
+  ) -> Self {
     let mut parsed = Self::default();
     let mut index = 0usize;
     while index < arguments.len() {
@@ -943,7 +1135,7 @@ impl ParsedArguments {
         }
         "--emit" => {
           if let Some(value) = next() {
-            parsed.capture_emit(value, current_dir, bypasses);
+            parsed.capture_emit(value, current_dir, compiler_mode, bypasses);
           }
         }
         "--extern" => {
@@ -953,11 +1145,31 @@ impl ParsedArguments {
         }
         "-o" => {
           if let Some(value) = next() {
-            parsed.output_paths.push(resolve_argument_path(value, current_dir));
+            let path = resolve_argument_path(value, current_dir);
+            if compiler_mode == CompilerMode::Rustdoc {
+              parsed.out_dir = Some(path);
+            } else {
+              parsed.output_paths.push(path);
+            }
           }
         }
-        "--out-dir" => {
+        "--out-dir" | "--output" => {
           parsed.out_dir = next().map(|value| resolve_argument_path(value, current_dir));
+        }
+        option if compiler_mode == CompilerMode::Rustdoc && is_rustdoc_declared_input_option(option) => {
+          if let Some(value) = next() {
+            parsed
+              .declared_input_paths
+              .push(resolve_argument_path(value, current_dir));
+          }
+        }
+        option if compiler_mode == CompilerMode::Rustdoc && is_rustdoc_executable_option(option) => {
+          if let Some(value) = next() {
+            parsed
+              .declared_input_paths
+              .push(resolve_argument_path(value, current_dir));
+          }
+          bypasses.insert("rustdoc_external_tool_identity_unavailable".to_string());
         }
         "-C" => {
           if let Some(value) = next() {
@@ -983,7 +1195,12 @@ impl ParsedArguments {
           parsed.cfg.insert(argument.trim_start_matches("--cfg=").to_string());
         }
         _ if argument.starts_with("--emit=") => {
-          parsed.capture_emit(argument.trim_start_matches("--emit="), current_dir, bypasses);
+          parsed.capture_emit(
+            argument.trim_start_matches("--emit="),
+            current_dir,
+            compiler_mode,
+            bypasses,
+          );
         }
         _ if argument.starts_with("--extern=") => {
           parsed.capture_extern(argument.trim_start_matches("--extern="), current_dir, bypasses);
@@ -993,6 +1210,31 @@ impl ParsedArguments {
             argument.trim_start_matches("--out-dir="),
             current_dir,
           ));
+        }
+        _ if argument.starts_with("--output=") => {
+          parsed.out_dir = Some(resolve_argument_path(
+            argument.trim_start_matches("--output="),
+            current_dir,
+          ));
+        }
+        _ if compiler_mode == CompilerMode::Rustdoc
+          && rustdoc_option_value(argument, is_rustdoc_declared_input_option).is_some() =>
+        {
+          if let Some(value) = rustdoc_option_value(argument, is_rustdoc_declared_input_option) {
+            parsed
+              .declared_input_paths
+              .push(resolve_argument_path(value, current_dir));
+          }
+        }
+        _ if compiler_mode == CompilerMode::Rustdoc
+          && rustdoc_option_value(argument, is_rustdoc_executable_option).is_some() =>
+        {
+          if let Some(value) = rustdoc_option_value(argument, is_rustdoc_executable_option) {
+            parsed
+              .declared_input_paths
+              .push(resolve_argument_path(value, current_dir));
+          }
+          bypasses.insert("rustdoc_external_tool_identity_unavailable".to_string());
         }
         _ if argument.starts_with("-C") => parsed.capture_codegen_option(argument.trim_start_matches("-C")),
         _ if argument.starts_with('@') => {
@@ -1022,7 +1264,13 @@ impl ParsedArguments {
     parsed
   }
 
-  fn capture_emit(&mut self, value: &str, current_dir: &Path, bypasses: &mut BTreeSet<String>) {
+  fn capture_emit(
+    &mut self,
+    value: &str,
+    current_dir: &Path,
+    compiler_mode: CompilerMode,
+    bypasses: &mut BTreeSet<String>,
+  ) {
     for emit in value.split(',') {
       let (mode, path) = emit
         .split_once('=')
@@ -1034,7 +1282,7 @@ impl ParsedArguments {
           self.dep_info_paths.push(path.clone());
         }
         self.output_paths.push(path);
-      } else if !matches!(mode, "dep-info" | "link" | "metadata") {
+      } else if compiler_mode != CompilerMode::Rustdoc && !matches!(mode, "dep-info" | "link" | "metadata") {
         bypasses.insert(format!("{mode}_output_path_unavailable"));
       }
     }
@@ -1060,8 +1308,44 @@ impl ParsedArguments {
 fn option_consumes_next(argument: &str) -> bool {
   matches!(
     argument,
-    "--crate-name" | "--crate-type" | "--target" | "--cfg" | "--emit" | "--extern" | "--out-dir" | "-C" | "-o"
+    "--crate-name"
+      | "--crate-type"
+      | "--target"
+      | "--cfg"
+      | "--emit"
+      | "--extern"
+      | "--out-dir"
+      | "--output"
+      | "-C"
+      | "-o"
+  ) || is_rustdoc_declared_input_option(argument)
+    || is_rustdoc_executable_option(argument)
+}
+
+fn is_rustdoc_declared_input_option(argument: &str) -> bool {
+  matches!(
+    argument,
+    "--markdown-css"
+      | "--html-in-header"
+      | "--html-before-content"
+      | "--html-after-content"
+      | "--markdown-before-content"
+      | "--markdown-after-content"
+      | "--extend-css"
+      | "-e"
+      | "--theme"
+      | "--check-theme"
+      | "--index-page"
   )
+}
+
+fn is_rustdoc_executable_option(argument: &str) -> bool {
+  matches!(argument, "--test-builder" | "--test-builder-wrapper" | "--test-runtool")
+}
+
+fn rustdoc_option_value(argument: &str, predicate: fn(&str) -> bool) -> Option<&str> {
+  let (option, value) = argument.split_once('=')?;
+  predicate(option).then_some(value)
 }
 
 fn resolve_argument_path(path: &str, current_dir: &Path) -> PathBuf {
@@ -1187,15 +1471,32 @@ fn sort_and_deduplicate_files(files: &mut Vec<FileObservation>) {
   files.dedup();
 }
 
-fn portable_argument(argument: &str, source_root: &Path) -> String {
-  let root = crate::utils::path_to_git_format(source_root);
-  argument.replace(&root, "repository:")
+fn portable_argument(argument: &str, source_root: &Path, canonical_source_root: &Path) -> String {
+  let mut roots = [
+    source_root.to_string_lossy().into_owned(),
+    canonical_source_root.to_string_lossy().into_owned(),
+    crate::utils::path_to_git_format(source_root),
+    crate::utils::path_to_git_format(canonical_source_root),
+  ];
+  roots.sort_unstable_by_key(|root| std::cmp::Reverse(root.len()));
+  roots.iter().fold(argument.to_string(), |portable, root| {
+    if portable.contains(root) {
+      portable.replace(root, "repository:")
+    } else {
+      portable
+    }
+  })
 }
 
-fn is_secret_name(name: &str) -> bool {
+pub(crate) fn is_secret_name(name: &str) -> bool {
   let normalized = name.to_ascii_lowercase().replace('_', "-");
   normalized == "token"
     || normalized.ends_with("-token")
+    || normalized == "api-key"
+    || normalized.ends_with("-api-key")
+    || normalized == "access-key"
+    || normalized.ends_with("-access-key")
+    || normalized.contains("access-key-id")
     || normalized.contains("password")
     || normalized.contains("secret")
     || normalized.contains("credential")
@@ -1255,6 +1556,45 @@ mod tests {
         artifact_digest: "sha256:dep".to_string(),
         producer_unit: Some("v1-sha256-dep".to_string()),
       }],
+      build_script_results: BTreeSet::from([BuildScriptResultDependency {
+        producer_action: "build-script-v1-sha256-action".to_string(),
+        result_digest: "build-script-result-v1-sha256-result".to_string(),
+      }]),
+    }
+  }
+
+  fn manifest_for_build_script_propagation(
+    package: &str,
+    target_kind: CompilationTargetKind,
+  ) -> CompilationObservationManifest {
+    let mut unit = base_unit();
+    unit.package = package.to_string();
+    unit.target_kind = target_kind;
+    unit.target_name = package.to_string();
+    unit.dependencies.clear();
+    unit.build_script_results.clear();
+    let unit_identity = unit.identity().expect("unit identity");
+    CompilationObservationManifest {
+      version: COMPILATION_OBSERVATION_VERSION,
+      cargo_artifact_identity: None,
+      unit,
+      unit_identity,
+      declared_inputs: Vec::new(),
+      observed_reads: Vec::new(),
+      dependency_artifacts: Vec::new(),
+      emitted_outputs: Vec::new(),
+      executable_output: None,
+      execution: CompilationExecutionMetadata {
+        compiler: None,
+        wrappers: Vec::new(),
+        platform_identity: "test-platform".to_string(),
+        environment_reads: BTreeSet::new(),
+        success: true,
+        cargo_fresh: false,
+      },
+      bypasses: BTreeSet::new(),
+      build_script_action_key: None,
+      build_script_result: None,
     }
   }
 
@@ -1298,12 +1638,132 @@ mod tests {
       Box::new(|unit| unit.dependencies[0].extern_name.push_str("-changed")),
       Box::new(|unit| unit.dependencies[0].artifact_digest.push_str("-changed")),
       Box::new(|unit| unit.dependencies[0].producer_unit = Some("changed".to_string())),
+      Box::new(|unit| {
+        unit.build_script_results.insert(BuildScriptResultDependency {
+          producer_action: "build-script-v1-sha256-other".to_string(),
+          result_digest: "build-script-result-v1-sha256-other".to_string(),
+        });
+      }),
     ];
 
     for mutate in mutations {
       let mut changed = baseline.clone();
       mutate(&mut changed);
       assert_ne!(changed.identity().expect("changed identity"), baseline_identity);
+    }
+  }
+
+  #[test]
+  fn build_script_result_rekeys_every_transitive_consumer_without_a_result_cycle() {
+    let mut manifests = vec![
+      manifest_for_build_script_propagation("script", CompilationTargetKind::BuildScript),
+      manifest_for_build_script_propagation("script", CompilationTargetKind::Library),
+      manifest_for_build_script_propagation("direct", CompilationTargetKind::BuildScript),
+      manifest_for_build_script_propagation("direct", CompilationTargetKind::Library),
+      manifest_for_build_script_propagation("transitive", CompilationTargetKind::Binary),
+      manifest_for_build_script_propagation("unrelated", CompilationTargetKind::Library),
+    ];
+    let package_dependencies = HashMap::from([
+      ("script".to_string(), BTreeSet::new()),
+      ("direct".to_string(), BTreeSet::from(["script".to_string()])),
+      ("transitive".to_string(), BTreeSet::from(["direct".to_string()])),
+      ("unrelated".to_string(), BTreeSet::new()),
+    ]);
+    let baseline = manifests
+      .iter()
+      .map(|manifest| {
+        (
+          (manifest.unit.package.clone(), manifest.unit.target_kind.clone()),
+          manifest.unit_identity.clone(),
+        )
+      })
+      .collect::<BTreeMap<_, _>>();
+    let binding = BuildScriptResultBinding {
+      package: "script".to_string(),
+      action_key: Some("build-script-v1-sha256-action".to_string()),
+      result_digest: Some("build-script-result-v1-sha256-first".to_string()),
+    };
+    attach_build_script_result_dependencies(&mut manifests, &package_dependencies, std::slice::from_ref(&binding))
+      .expect("bind build-script result");
+
+    for manifest in &manifests {
+      let is_producer =
+        manifest.unit.package == "script" && manifest.unit.target_kind == CompilationTargetKind::BuildScript;
+      let is_unrelated = manifest.unit.package == "unrelated";
+      if is_producer || is_unrelated {
+        assert!(manifest.unit.build_script_results.is_empty());
+        assert_eq!(
+          manifest.unit_identity,
+          baseline[&(manifest.unit.package.clone(), manifest.unit.target_kind.clone())]
+        );
+      } else {
+        assert_eq!(
+          manifest.unit.build_script_results,
+          BTreeSet::from([BuildScriptResultDependency {
+            producer_action: "build-script-v1-sha256-action".to_string(),
+            result_digest: "build-script-result-v1-sha256-first".to_string(),
+          }])
+        );
+        assert_ne!(
+          manifest.unit_identity,
+          baseline[&(manifest.unit.package.clone(), manifest.unit.target_kind.clone())]
+        );
+      }
+    }
+
+    let first = manifests
+      .iter()
+      .map(|manifest| {
+        (
+          (manifest.unit.package.clone(), manifest.unit.target_kind.clone()),
+          manifest.unit_identity.clone(),
+        )
+      })
+      .collect::<BTreeMap<_, _>>();
+    let changed = BuildScriptResultBinding {
+      result_digest: Some("build-script-result-v1-sha256-second".to_string()),
+      ..binding
+    };
+    attach_build_script_result_dependencies(&mut manifests, &package_dependencies, &[changed])
+      .expect("rebind changed build-script result");
+    for manifest in &manifests {
+      let key = (manifest.unit.package.clone(), manifest.unit.target_kind.clone());
+      let affected = manifest.unit.package != "unrelated"
+        && !(manifest.unit.package == "script" && manifest.unit.target_kind == CompilationTargetKind::BuildScript);
+      if affected {
+        assert_ne!(manifest.unit_identity, first[&key]);
+      } else {
+        assert_eq!(manifest.unit_identity, first[&key]);
+      }
+    }
+  }
+
+  #[test]
+  fn incomplete_build_script_result_makes_only_semantic_consumers_non_reusable() {
+    let mut manifests = vec![
+      manifest_for_build_script_propagation("script", CompilationTargetKind::BuildScript),
+      manifest_for_build_script_propagation("script", CompilationTargetKind::Library),
+      manifest_for_build_script_propagation("consumer", CompilationTargetKind::Library),
+      manifest_for_build_script_propagation("unrelated", CompilationTargetKind::Library),
+    ];
+    let package_dependencies = HashMap::from([
+      ("script".to_string(), BTreeSet::new()),
+      ("consumer".to_string(), BTreeSet::from(["script".to_string()])),
+      ("unrelated".to_string(), BTreeSet::new()),
+    ]);
+    let binding = BuildScriptResultBinding {
+      package: "script".to_string(),
+      action_key: None,
+      result_digest: None,
+    };
+    attach_build_script_result_dependencies(&mut manifests, &package_dependencies, &[binding])
+      .expect("bind incomplete result");
+
+    for manifest in &manifests {
+      let affected = matches!(manifest.unit.package.as_str(), "script" | "consumer")
+        && !(manifest.unit.package == "script" && manifest.unit.target_kind == CompilationTargetKind::BuildScript);
+      assert_eq!(manifest.bypasses.contains("build_script_result_unavailable"), affected);
+      assert!(manifest.unit.build_script_results.is_empty());
     }
   }
 
@@ -1345,6 +1805,7 @@ mod tests {
       profile: base_unit().profile,
       features: BTreeSet::new(),
       outputs: vec![output],
+      executable: None,
       fresh: false,
       bypasses: BTreeSet::new(),
     };
@@ -1421,7 +1882,7 @@ mod tests {
     fs::write(directory.path().join("source file.rs"), "fn main() {}\n").expect("source");
     fs::write(
       directory.path().join("unit.d"),
-      "unit: source\\ file.rs\n# env-dep:VISIBLE=value\n# env-dep:API_TOKEN=never-store-this\n",
+      "unit: source\\ file.rs\n# env-dep:VISIBLE=value\n# env-dep:API_TOKEN=never-store-this\n# env-dep:API_KEY=also-never-store-this\n",
     )
     .expect("dep info");
 
@@ -1439,13 +1900,131 @@ mod tests {
         .iter()
         .any(|entry| entry.name == "API_TOKEN" && entry.secret_capability && entry.value_digest.is_none())
     );
+    assert!(
+      environment
+        .iter()
+        .any(|entry| entry.name == "API_KEY" && entry.secret_capability && entry.value_digest.is_none())
+    );
     let encoded = serde_json::to_string(&environment).expect("serialize environment");
     assert!(!encoded.contains("never-store-this"));
+    assert!(!encoded.contains("also-never-store-this"));
+  }
+
+  #[test]
+  fn portable_compiler_arguments_replace_native_and_canonical_root_aliases() {
+    let source = Path::new("/var/workspace");
+    let canonical = Path::new("/private/var/workspace");
+    assert_eq!(
+      portable_argument("--out-dir=/var/workspace/target", source, canonical),
+      "--out-dir=repository:/target"
+    );
+    assert_eq!(
+      portable_argument("--out-dir=/private/var/workspace/target", source, canonical),
+      "--out-dir=repository:/target"
+    );
+
+    let windows = Path::new(r"C:\work\workspace");
+    assert_eq!(
+      portable_argument(r"--out-dir=C:\work\workspace\target", windows, windows),
+      r"--out-dir=repository:\target"
+    );
+  }
+
+  #[test]
+  fn rustdoc_invocation_correlates_exact_dep_info_and_cargo_artifact() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let source_root = directory.path();
+    let source_dir = source_root.join("src");
+    let doc_dir = source_root.join("target/doc");
+    let dependency_dir = source_root.join("target/debug/deps");
+    fs::create_dir_all(&source_dir).expect("source directory");
+    fs::create_dir_all(doc_dir.join("docs_unit")).expect("documentation directory");
+    fs::create_dir_all(&dependency_dir).expect("dependency directory");
+    let source = source_dir.join("lib.rs");
+    let nested = source_dir.join("nested.rs");
+    let dependency = dependency_dir.join("libdep.rmeta");
+    let index = doc_dir.join("docs_unit/index.html");
+    let dep_info = doc_dir.join("docs_unit.d");
+    fs::write(&source, "mod nested;\n").expect("crate root");
+    fs::write(&nested, "pub fn value() {}\n").expect("nested source");
+    fs::write(&dependency, "dependency artifact").expect("dependency artifact");
+
+    let arguments = vec![
+      "--crate-name".into(),
+      "docs_unit".into(),
+      "--crate-type".into(),
+      "lib".into(),
+      source.as_os_str().to_owned(),
+      "-o".into(),
+      doc_dir.as_os_str().to_owned(),
+      "--extern".into(),
+      format!("dep={}", dependency.display()).into(),
+      "--emit=html-static-files,html-non-static-files,dep-info".into(),
+    ];
+    let raw_directory = source_root.join("observations");
+    let recorder =
+      begin_rustdoc_invocation(&raw_directory, source_root, &arguments).expect("begin rustdoc observation");
+    fs::write(&index, "<html>docs</html>").expect("documentation index");
+    fs::write(
+      &dep_info,
+      format!("{}: {} {}\n", dep_info.display(), source.display(), nested.display()),
+    )
+    .expect("rustdoc dep-info");
+    recorder.finish(true).expect("finish rustdoc observation");
+    let raw = load_raw(&raw_directory).expect("load rustdoc observation");
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].mode, CompilerMode::Rustdoc);
+
+    let artifact_output = FileObservation::capture(&index, source_root, source_root).expect("artifact output");
+    let artifact = CargoArtifactObservation {
+      package: "local:Cargo.toml#docs-unit@0.1.0".to_string(),
+      target_kinds: BTreeSet::from(["lib".to_string()]),
+      target_name: "docs_unit".to_string(),
+      crate_types: BTreeSet::from(["lib".to_string()]),
+      source: ObservationPath::capture(&source, source_root, source_root),
+      profile: base_unit().profile,
+      features: BTreeSet::new(),
+      outputs: vec![artifact_output],
+      executable: None,
+      fresh: false,
+      bypasses: BTreeSet::new(),
+    };
+    let target = "test-target";
+    let context = CompilationObservationContext {
+      source_root: source_root.to_path_buf(),
+      host_target: target.to_string(),
+      targets: vec![ObservedTargetIdentity {
+        selectors: BTreeSet::from([target.to_string()]),
+        platform: target.to_string(),
+        identity: "sha256:target".to_string(),
+        cfg: BTreeSet::new(),
+      }],
+    };
+    let manifests = build_manifests(raw, vec![artifact], &context, "default", CompilerMode::Rustdoc)
+      .expect("correlate rustdoc observation");
+    assert_eq!(manifests.len(), 1);
+    let manifest = &manifests[0];
+    assert_eq!(manifest.unit.mode, CompilerMode::Rustdoc);
+    assert_eq!(manifest.unit.target_kind, CompilationTargetKind::Documentation);
+    assert_eq!(manifest.declared_inputs.len(), 1);
+    assert_eq!(manifest.observed_reads.len(), 2);
+    assert_eq!(manifest.dependency_artifacts.len(), 1);
+    assert_eq!(manifest.emitted_outputs.len(), 2);
+    assert!(manifest.bypasses.contains("rustdoc_output_tree_unavailable"));
+    assert!(!manifest.bypasses.contains("rustdoc_dep_info_unavailable"));
+    assert_eq!(manifest.revalidation_reason(source_root), None);
+
+    fs::write(&nested, "pub fn other() {}\n").expect("same-size nested mutation");
+    assert_eq!(
+      manifest.revalidation_reason(source_root),
+      Some("observed_compiler_read_changed")
+    );
   }
 
   fn raw_invocation() -> RawCompilerInvocation {
     RawCompilerInvocation {
       version: RAW_INVOCATION_VERSION,
+      mode: CompilerMode::Rustc,
       crate_name: Some("unit".to_string()),
       crate_types: BTreeSet::from(["lib".to_string()]),
       target_argument: None,

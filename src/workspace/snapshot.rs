@@ -203,6 +203,7 @@ pub struct WorkspaceSnapshot {
   cargo_config: Arc<CargoConfigSnapshot>,
   packages: Vec<SnapshotPackage>,
   toolchain: ToolchainIdentity,
+  hermetic_toolchain: bool,
   compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
   documentation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
   targets: Vec<TargetIdentity>,
@@ -435,6 +436,7 @@ impl WorkspaceSnapshot {
       &targets,
       &excluded_paths,
     )?;
+    let hermetic_toolchain = resolution_inputs.hermetic;
     Ok(Self {
       id,
       source_root,
@@ -451,6 +453,7 @@ impl WorkspaceSnapshot {
       cargo_config: resolution_inputs.cargo_config,
       packages,
       toolchain: resolution_inputs.toolchain,
+      hermetic_toolchain,
       compilation_executable_identities: OnceLock::new(),
       documentation_executable_identities: OnceLock::new(),
       targets,
@@ -645,7 +648,11 @@ impl WorkspaceSnapshot {
   }
 
   pub(crate) fn validate_resolution_environment_unchanged(&self) -> RailResult<()> {
-    let current = ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?;
+    let current = if self.hermetic_toolchain {
+      ResolutionInputs::capture_hermetic(self.derived.cargo_current_dir())?
+    } else {
+      ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?
+    };
     if current.cargo_config != self.cargo_config || current.toolchain != self.toolchain {
       return Err(RailError::with_help(
         "Cargo configuration or toolchain identity changed after workspace snapshot capture",

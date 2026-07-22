@@ -36,6 +36,10 @@ impl ActionKeyAnalysis {
   pub(crate) fn reason_codes(&self) -> impl Iterator<Item = &str> {
     self.reasons.iter().map(|reason| reason.code.as_str())
   }
+
+  pub(crate) fn declared_input_root(&self) -> &str {
+    &self.declared_inputs.root_digest
+  }
 }
 
 /// Whether complete pre-execution evidence exists for an action key.
@@ -200,9 +204,12 @@ pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> 
     );
   }
 
-  let action_key = reasons.is_empty().then(|| ActionKey {
-    version: ACTION_KEY_VERSION,
-    digest: identity.finish(),
+  let action_key = reasons.is_empty().then(|| {
+    ActionKey {
+      version: ACTION_KEY_VERSION,
+      digest: identity.finish(),
+    }
+    .to_string()
   });
   let status = if action_key.is_some() {
     ActionKeyStatus::Eligible
@@ -212,7 +219,7 @@ pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> 
   Ok(ActionKeyAnalysis {
     version: ACTION_KEY_VERSION,
     status,
-    key: action_key.map(|key| key.to_string()),
+    key: action_key,
     declared_inputs: DeclaredInputSummary {
       entries: input_entries.len(),
       root_digest: format!("sha256:{input_root}"),
@@ -367,7 +374,7 @@ fn bind_resolution_and_tools(
     if action.kind() == crate::action::ActionKind::Docs {
       reasons.add(
         "rustdoc_invocation_observations_unavailable",
-        "stable Cargo exposes rustdoc artifacts after execution but has no rustdoc-wrapper boundary",
+        "normal documentation execution does not yet enable cargo-rail's rustdoc observation profile",
       );
     }
     let scope = if matches!(
@@ -437,7 +444,7 @@ fn bind_resolution_and_tools(
     if resolution.has_build_scripts() {
       reasons.add(
         "build_script_observations_unavailable",
-        "the resolved graph contains a build script without a verified result digest",
+        "the resolved graph contains a build script without a verified BuildScriptResult digest",
       );
     }
     if resolution.has_proc_macros() {
@@ -492,12 +499,12 @@ fn bind_resolution_and_tools(
         );
       } else if matches!(
         action.kind(),
-        crate::action::ActionKind::Build
-          | crate::action::ActionKind::Test
+        crate::action::ActionKind::Test
           | crate::action::ActionKind::Bench
           | crate::action::ActionKind::Package
           | crate::action::ActionKind::Distribution
-      ) {
+      ) || (action.kind() == crate::action::ActionKind::Build && cargo_action_may_link(action.argv()))
+      {
         reasons.add(
           "linker_executable_identity_unavailable",
           "rustc may select a default linker that Cargo did not expose as an executable path",
@@ -523,6 +530,13 @@ fn bind_resolution_and_tools(
     );
   }
   Ok(())
+}
+
+fn cargo_action_may_link(argv: &[String]) -> bool {
+  !argv
+    .iter()
+    .take_while(|argument| argument.as_str() != "--")
+    .any(|argument| argument == "check")
 }
 
 fn bind_executable(

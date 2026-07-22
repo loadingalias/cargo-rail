@@ -83,7 +83,130 @@ pub enum PreContextDispatch {
   /// The command ran and the process should exit.
   Handled,
   /// The command requires a WorkspaceContext to run.
-  NeedsContext(Box<Commands>),
+  NeedsContext(PreparedContext),
+}
+
+#[derive(Clone, Copy)]
+enum ContextPreparation {
+  Standard,
+  HermeticBuild,
+}
+
+/// A command paired with the context-construction contract it requires.
+#[doc(hidden)]
+pub struct PreparedContext {
+  command: Box<Commands>,
+  preparation: ContextPreparation,
+}
+
+impl PreparedContext {
+  fn new(command: Commands) -> RailResult<Self> {
+    let preparation = match &command {
+      Commands::Run {
+        actions,
+        profile,
+        workflow,
+        dry_run: false,
+        hermetic: true,
+        format,
+        run_args,
+        ..
+      } => {
+        if format.is_json_like() {
+          return Err(crate::error::RailError::with_help(
+            "structured run output is a non-executing action plan",
+            "add --dry-run when using --format json or --format github",
+          ));
+        }
+        if profile.is_some()
+          || workflow.is_some()
+          || actions.is_empty()
+          || actions.iter().any(|action| action != "build")
+        {
+          let requested = actions.first().map_or_else(
+            || profile.as_deref().or(workflow.as_deref()).unwrap_or("default"),
+            String::as_str,
+          );
+          let kind =
+            crate::action::ActionKind::from_name(requested).map_or("configured", crate::action::ActionKind::as_str);
+          return Err(crate::error::RailError::with_help(
+            format!("hermetic execution does not yet support action '{requested}' ({kind})"),
+            "use the explicit built-in build action (`--action build`); other action classes remain explicitly uncacheable",
+          ));
+        }
+        validate_hermetic_run_arguments(run_args)?;
+        ContextPreparation::HermeticBuild
+      }
+      _ => ContextPreparation::Standard,
+    };
+    Ok(Self {
+      command: Box::new(command),
+      preparation,
+    })
+  }
+
+  /// Build the exact workspace context required by this command.
+  #[doc(hidden)]
+  pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext)> {
+    let context = match self.preparation {
+      ContextPreparation::Standard if self.command.requires_workspace_snapshot() => {
+        WorkspaceContext::build_with_snapshot(workspace_root)?
+      }
+      ContextPreparation::Standard => {
+        WorkspaceContext::build_with_source_capture(workspace_root, self.command.requires_worktree_source_capture())?
+      }
+      ContextPreparation::HermeticBuild => {
+        let bootstrap = crate::hermetic::prepare_bootstrap(workspace_root)?;
+        WorkspaceContext::build_with_hermetic_snapshot(workspace_root, bootstrap)?
+      }
+    };
+    Ok((*self.command, context))
+  }
+}
+
+fn validate_hermetic_run_arguments(arguments: &[String]) -> RailResult<()> {
+  let mut blocked = std::collections::BTreeSet::new();
+  for argument in arguments {
+    let option = argument.split_once('=').map_or(argument.as_str(), |(option, _)| option);
+    if argument == "--"
+      || matches!(
+        option,
+        "--all"
+          | "--artifact-dir"
+          | "--build-dir"
+          | "--config"
+          | "--exclude"
+          | "--future-incompat-report"
+          | "--lockfile-path"
+          | "--manifest-path"
+          | "--out-dir"
+          | "--package"
+          | "--target-dir"
+          | "--timings"
+          | "--unit-graph"
+          | "--workspace"
+          | "-C"
+          | "-Z"
+          | "-m"
+          | "-p"
+      )
+      || ["-C", "-Z", "-m", "-p"]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix) && !argument.starts_with("--"))
+    {
+      blocked.insert(option);
+    }
+  }
+  if blocked.is_empty() {
+    return Ok(());
+  }
+  Err(crate::error::RailError::with_help(
+    format!(
+      "hermetic Cargo arguments override the modeled action boundary: {}",
+      blocked.into_iter().collect::<Vec<_>>().join(", ")
+    ),
+    "select packages with cargo-rail's --all/change scope; workspace, output, configuration, and raw rustc overrides remain explicitly uncacheable",
+  ))
 }
 
 /// Handle commands that don't need WorkspaceContext.
@@ -179,21 +302,25 @@ pub fn try_dispatch_pre_context(
       if state.exists() {
         crate::release::state::prepare_recovery(workspace_root, &state)?;
       }
-      Ok(PreContextDispatch::NeedsContext(Box::new(Commands::Release {
-        command: cli::ReleaseCommand::Resume { state },
-      })))
+      Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+        Commands::Release {
+          command: cli::ReleaseCommand::Resume { state },
+        },
+      )?))
     }
 
     Commands::Release {
       command: cli::ReleaseCommand::Abort { state, yes },
     } => {
       crate::release::state::prepare_recovery(workspace_root, &state)?;
-      Ok(PreContextDispatch::NeedsContext(Box::new(Commands::Release {
-        command: cli::ReleaseCommand::Abort { state, yes },
-      })))
+      Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+        Commands::Release {
+          command: cli::ReleaseCommand::Abort { state, yes },
+        },
+      )?))
     }
 
-    other => Ok(PreContextDispatch::NeedsContext(Box::new(other))),
+    other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(other)?)),
   }
 }
 
@@ -211,6 +338,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       profile,
       workflow,
       dry_run,
+      hermetic,
       format,
       generated,
       print_cmd,
@@ -232,6 +360,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         profile,
         workflow,
         dry_run,
+        hermetic,
         format,
         generated,
         print_cmd,
@@ -273,6 +402,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         explain: true,
         ignore_bin_crates,
         hermeticity_doctor: true,
+        hermetic: false,
         ..run::RunOptions::default()
       },
     ),

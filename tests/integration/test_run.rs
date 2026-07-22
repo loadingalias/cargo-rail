@@ -4,6 +4,205 @@
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
+use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use sha2::{Digest as _, Sha256};
+
+fn generate_lockfile(workspace: &Path) -> Result<()> {
+  generate_lockfile_with_env(workspace, &[])
+}
+
+fn generate_lockfile_with_env(workspace: &Path, environment: &[(&str, &str)]) -> Result<()> {
+  let mut command = std::process::Command::new("cargo");
+  command.current_dir(workspace).arg("generate-lockfile");
+  for (name, value) in environment {
+    command.env(name, value);
+  }
+  let output = command.output()?;
+  anyhow::ensure!(
+    output.status.success(),
+    "lockfile generation failed:\n{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct RegistryObservations {
+  requests: usize,
+  before_fetch_boundary: bool,
+  during_build: bool,
+}
+
+#[derive(Default)]
+struct RegistryState {
+  active_workspace: Option<std::path::PathBuf>,
+  observations: RegistryObservations,
+  failure: Option<String>,
+}
+
+struct SparseRegistry {
+  index: String,
+  state: Arc<Mutex<RegistryState>>,
+  stop: Arc<AtomicBool>,
+  threads: Vec<JoinHandle<()>>,
+}
+
+impl SparseRegistry {
+  fn start(crate_archive: Vec<u8>, checksum: &str) -> Result<Self> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let index = format!("sparse+http://{address}/");
+    let download = format!("http://{address}/api/v1/crates/{{crate}}/{{version}}/download");
+    let config: Arc<[u8]> = serde_json::to_vec(&serde_json::json!({ "dl": download }))?.into();
+    let package = serde_json::to_vec(&serde_json::json!({
+      "name": "external-dep",
+      "vers": "0.1.0",
+      "deps": [],
+      "cksum": checksum,
+      "features": {},
+      "yanked": false,
+      "links": null
+    }))?;
+    let mut index_entry = package;
+    index_entry.push(b'\n');
+    let index_entry: Arc<[u8]> = index_entry.into();
+    let crate_archive: Arc<[u8]> = crate_archive.into();
+    let state = Arc::new(Mutex::new(RegistryState::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::with_capacity(4);
+    for _ in 0..4 {
+      let listener = listener.try_clone()?;
+      let config = Arc::clone(&config);
+      let index_entry = Arc::clone(&index_entry);
+      let crate_archive = Arc::clone(&crate_archive);
+      let thread_state = Arc::clone(&state);
+      let thread_stop = Arc::clone(&stop);
+      threads.push(std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Acquire) {
+          match listener.accept() {
+            Ok((stream, _)) => {
+              if let Err(error) =
+                serve_sparse_registry_request(stream, &config, &index_entry, &crate_archive, &thread_state)
+                && let Ok(mut state) = thread_state.lock()
+              {
+                state.failure = Some(error.to_string());
+              }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+              std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => {
+              if let Ok(mut state) = thread_state.lock() {
+                state.failure = Some(error.to_string());
+              }
+              break;
+            }
+          }
+        }
+      }));
+    }
+    Ok(Self {
+      index,
+      state,
+      stop,
+      threads,
+    })
+  }
+
+  fn begin(&self, workspace: &Path) -> Result<()> {
+    let mut state = self
+      .state
+      .lock()
+      .map_err(|_| anyhow::anyhow!("sparse registry state lock poisoned"))?;
+    state.active_workspace = Some(workspace.to_path_buf());
+    state.observations = RegistryObservations::default();
+    state.failure = None;
+    Ok(())
+  }
+
+  fn observations(&self) -> Result<RegistryObservations> {
+    let state = self
+      .state
+      .lock()
+      .map_err(|_| anyhow::anyhow!("sparse registry state lock poisoned"))?;
+    if let Some(error) = &state.failure {
+      anyhow::bail!("sparse registry server failed: {error}");
+    }
+    Ok(state.observations)
+  }
+}
+
+impl Drop for SparseRegistry {
+  fn drop(&mut self) {
+    self.stop.store(true, Ordering::Release);
+    for thread in self.threads.drain(..) {
+      let _ = thread.join();
+    }
+  }
+}
+
+fn serve_sparse_registry_request(
+  mut stream: TcpStream,
+  config: &[u8],
+  index_entry: &[u8],
+  crate_archive: &[u8],
+  state: &Mutex<RegistryState>,
+) -> std::io::Result<()> {
+  stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+  let mut request = Vec::with_capacity(1024);
+  while request.len() < 16 * 1024 {
+    let mut chunk = [0u8; 1024];
+    let bytes = stream.read(&mut chunk)?;
+    if bytes == 0 {
+      break;
+    }
+    request.extend_from_slice(&chunk[..bytes]);
+    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+      break;
+    }
+  }
+  let request = String::from_utf8_lossy(&request);
+  let path = request
+    .lines()
+    .next()
+    .and_then(|line| line.split_whitespace().nth(1))
+    .and_then(|path| path.split('?').next())
+    .unwrap_or("/");
+  if let Ok(mut state) = state.lock() {
+    state.observations.requests += 1;
+    if let Some(workspace) = state.active_workspace.clone() {
+      let inventories = workspace.join("target/cargo-rail/hermetic/inventories");
+      if !inventories.is_dir() {
+        state.observations.before_fetch_boundary = true;
+      }
+      let runs = workspace.join("target/cargo-rail/hermetic/runs");
+      if fs::read_dir(runs).is_ok_and(|mut entries| entries.next().is_some()) {
+        state.observations.during_build = true;
+      }
+    }
+  }
+  let (status, content_type, body) = match path {
+    "/config.json" => ("200 OK", "application/json", config),
+    "/ex/te/external-dep" => ("200 OK", "application/json", index_entry),
+    "/api/v1/crates/external-dep/0.1.0/download" => ("200 OK", "application/octet-stream", crate_archive),
+    _ => ("404 Not Found", "text/plain", &b"not found\n"[..]),
+  };
+  write!(
+    stream,
+    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    body.len()
+  )?;
+  stream.write_all(body)
+}
 
 #[test]
 fn test_runner_basic_change_detection() -> Result<()> {
@@ -1394,7 +1593,9 @@ fn test_run_ci_plan_matches_local_graph_order_and_is_byte_deterministic() -> Res
     "identical action plans must be byte stable"
   );
   let json: serde_json::Value = serde_json::from_slice(&first_json.stdout)?;
-  assert_eq!(json["version"], 3);
+  assert_eq!(json["version"], 4);
+  assert_eq!(json["execution_profile"], "normal");
+  assert!(json["fetch_action"].is_null());
   let ids = json["actions"]
     .as_array()
     .unwrap()
@@ -1678,6 +1879,700 @@ fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receip
     !ws.path.join("target/cargo-rail/receipts").exists(),
     "read-only hermeticity diagnosis must not write a run receipt"
   );
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()> {
+  let first = TestWorkspace::new_named("hermetic-check-first")?;
+  first.add_crate("lib-a", "0.1.0", &[])?;
+  fs::create_dir_all(first.path.join(".cargo"))?;
+  fs::write(
+    first.path.join(".cargo/config.toml"),
+    "[env]\nCARGO_RAIL_HERMETIC_VALUE = { value = \"stable\", force = true }\n",
+  )?;
+  fs::write(
+    first.path.join("crates/lib-a/src/lib.rs"),
+    "pub const VALUE: &str = env!(\"CARGO_RAIL_HERMETIC_VALUE\");\npub fn hello() -> &'static str { \"Hello from lib-a\" }\n",
+  )?;
+  generate_lockfile(&first.path)?;
+  first.commit("Add hermetic check fixture")?;
+  let second = TestWorkspace::new_named("hermetic-check-second")?;
+  second.add_crate("lib-a", "0.1.0", &[])?;
+  fs::write(second.path.join(".gitignore"), "target/\nCargo.lock\n")?;
+  fs::create_dir_all(second.path.join(".cargo"))?;
+  fs::write(
+    second.path.join(".cargo/config.toml"),
+    "[env]\nCARGO_RAIL_HERMETIC_VALUE = { value = \"stable\", force = true }\n",
+  )?;
+  fs::write(
+    second.path.join("crates/lib-a/src/lib.rs"),
+    "pub const VALUE: &str = env!(\"CARGO_RAIL_HERMETIC_VALUE\");\npub fn hello() -> &'static str { \"Hello from lib-a\" }\n",
+  )?;
+  generate_lockfile(&second.path)?;
+  second.commit("Add hermetic check fixture")?;
+  let changed = TestWorkspace::new_named("hermetic-check-changed")?;
+  changed.add_crate("lib-a", "0.1.0", &[])?;
+  fs::create_dir_all(changed.path.join(".cargo"))?;
+  fs::write(
+    changed.path.join(".cargo/config.toml"),
+    "[env]\nCARGO_RAIL_HERMETIC_VALUE = { value = \"stable\", force = true }\n",
+  )?;
+  let changed_source = changed.path.join("crates/lib-a/src/lib.rs");
+  fs::write(
+    changed_source,
+    "pub const VALUE: &str = env!(\"CARGO_RAIL_HERMETIC_VALUE\");\npub fn hello() -> &'static str { \"Hallo from lib-a\" }\n",
+  )?;
+  generate_lockfile(&changed.path)?;
+  changed.commit("Change hermetic check input")?;
+
+  let plan = run_cargo_rail(
+    &first.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--hermetic",
+      "--dry-run",
+      "--format",
+      "json",
+    ],
+  )?;
+  assert!(plan.status.success(), "hermetic action plan failed");
+  let plan: serde_json::Value = serde_json::from_slice(&plan.stdout)?;
+  assert_eq!(plan["execution_profile"], "hermetic");
+  assert_eq!(plan["fetch_action"]["id"], "fetch");
+  assert_eq!(plan["fetch_action"]["network"], "allowed");
+  assert_eq!(plan["fetch_action"]["consumer_network"], "denied");
+
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
+  let first_output = run_cargo_rail(&first.path, &command)?;
+  assert!(
+    first_output.status.success(),
+    "first hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
+    first_output.status,
+    String::from_utf8_lossy(&first_output.stdout),
+    String::from_utf8_lossy(&first_output.stderr)
+  );
+  fs::write(second.path.join("UNRELATED.md"), "not selected by the build action\n")?;
+  second.commit("Add unrelated documentation")?;
+  let second_output = run_cargo_rail_with_env(&second.path, &command, &[("CARGO_RAIL_UNRELATED", "changed")])?;
+  assert!(
+    second_output.status.success(),
+    "second hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
+    second_output.status,
+    String::from_utf8_lossy(&second_output.stdout),
+    String::from_utf8_lossy(&second_output.stderr)
+  );
+  let changed_output = run_cargo_rail(&changed.path, &command)?;
+  assert!(
+    changed_output.status.success(),
+    "changed hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
+    changed_output.status,
+    String::from_utf8_lossy(&changed_output.stdout),
+    String::from_utf8_lossy(&changed_output.stderr)
+  );
+
+  let report = |workspace: &Path| -> Result<serde_json::Value> {
+    let directory = workspace.join("target/cargo-rail/hermetic/reports");
+    let paths = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(paths.len(), 1, "one hermetic report should be published");
+    Ok(serde_json::from_slice(&fs::read(paths[0].path())?)?)
+  };
+  let first_report = report(&first.path)?;
+  let second_report = report(&second.path)?;
+  let changed_report = report(&changed.path)?;
+  let inventories =
+    fs::read_dir(first.path.join("target/cargo-rail/hermetic/inventories"))?.collect::<std::io::Result<Vec<_>>>()?;
+  assert_eq!(inventories.len(), 1, "one fetch inventory should be published");
+  let mut inventory_entries = fs::read_dir(inventories[0].path())?
+    .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+    .collect::<std::io::Result<Vec<_>>>()?;
+  inventory_entries.sort();
+  assert_eq!(
+    inventory_entries,
+    ["cargo-home", "manifest.json"],
+    "fetch staging homes and Rust toolchains must never enter the immutable dependency inventory"
+  );
+  assert_eq!(first_report["version"], 1);
+  assert_eq!(first_report["profile_version"], 1);
+  assert_eq!(first_report["action_class"], "cargo_check");
+  assert_eq!(first_report["fetch"]["version"], 1);
+  assert_eq!(first_report["fetch"]["reused"], false);
+  assert_eq!(second_report["fetch"]["reused"], false);
+  assert_eq!(first_report["fetch"]["packages"], 0);
+  assert!(
+    first_report["output_manifest"]["files"]
+      .as_u64()
+      .is_some_and(|files| files > 0),
+    "rustc outputs must be declared: {first_report}"
+  );
+  assert_eq!(
+    first_report["action_key"], second_report["action_key"],
+    "equivalent source in different roots must have one action key:\nfirst={first_report:#}\nsecond={second_report:#}"
+  );
+  assert_eq!(
+    first_report["output_manifest"]["digest"], second_report["output_manifest"]["digest"],
+    "equivalent source in different roots must have one output manifest:\nfirst={first_report:#}\nsecond={second_report:#}"
+  );
+  assert_eq!(
+    first_report["result_digest"], second_report["result_digest"],
+    "equivalent source in different roots must have one result digest"
+  );
+  assert_ne!(
+    first_report["action_key"], changed_report["action_key"],
+    "a same-size source mutation must change the hermetic action key"
+  );
+  assert_ne!(
+    first_report["output_manifest"]["digest"], changed_report["output_manifest"]["digest"],
+    "a semantic source mutation must change the compiler output manifest"
+  );
+  let encoded = serde_json::to_string(&first_report)?;
+  assert!(!encoded.contains(&first.path.to_string_lossy().into_owned()));
+  assert!(!first.path.join("target/debug").exists());
+  assert!(!second.path.join("target/debug").exists());
+
+  #[cfg(target_os = "macos")]
+  {
+    assert_eq!(first_report["support"], "eligible");
+    assert_eq!(first_report["enforcement"], "filesystem_and_network");
+    assert!(first_report["reasons"].as_array().is_some_and(Vec::is_empty));
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    assert_eq!(first_report["support"], "platform_limited");
+    assert_eq!(first_report["enforcement"], "cargo_offline_only");
+  }
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_fetch_inventory_converges_for_locked_git_dependency() -> Result<()> {
+  let dependency = tempfile::tempdir()?;
+  git(dependency.path(), &["init", "--initial-branch=main"])?;
+  git(dependency.path(), &["config", "user.name", "Test User"])?;
+  git(dependency.path(), &["config", "user.email", "test@example.com"])?;
+  fs::create_dir_all(dependency.path().join("src"))?;
+  fs::write(
+    dependency.path().join("Cargo.toml"),
+    "[package]\nname = \"external-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+  )?;
+  fs::write(
+    dependency.path().join("src/lib.rs"),
+    "pub const fn value() -> u8 { 7 }\n",
+  )?;
+  git(dependency.path(), &["add", "."])?;
+  git(dependency.path(), &["commit", "-m", "Add external dependency"])?;
+  let revision = String::from_utf8(git(dependency.path(), &["rev-parse", "HEAD"])?.stdout)?;
+  let revision = revision.trim();
+  #[cfg(windows)]
+  let url = format!("file:///{}", dependency.path().display().to_string().replace('\\', "/"));
+  #[cfg(not(windows))]
+  let url = format!("file://{}", dependency.path().display());
+  let dependency_spec = format!("{{ git = {url:?}, rev = {revision:?} }}");
+
+  let first = TestWorkspace::new_named("hermetic-git-first")?;
+  first.add_crate("consumer", "0.1.0", &[("external-dep", dependency_spec.as_str())])?;
+  fs::write(
+    first.path.join("crates/consumer/src/lib.rs"),
+    "pub fn value() -> u8 { external_dep::value() }\n",
+  )?;
+  generate_lockfile(&first.path)?;
+  first.commit("Add locked Git consumer")?;
+  let second = TestWorkspace::new_named("hermetic-git-second")?;
+  second.add_crate("consumer", "0.1.0", &[("external-dep", dependency_spec.as_str())])?;
+  fs::write(
+    second.path.join("crates/consumer/src/lib.rs"),
+    "pub fn value() -> u8 { external_dep::value() }\n",
+  )?;
+  generate_lockfile(&second.path)?;
+  second.commit("Add locked Git consumer")?;
+
+  let command = ["rail", "run", "--since", "HEAD~1", "--action", "build", "--hermetic"];
+  let ambient_home = tempfile::tempdir()?;
+  let ambient_home_value = ambient_home.path().to_string_lossy().into_owned();
+  let environment = [
+    ("HOME", ambient_home_value.as_str()),
+    ("USERPROFILE", ambient_home_value.as_str()),
+  ];
+  for workspace in [&first, &second] {
+    let output = run_cargo_rail_with_env(&workspace.path, &command, &environment)?;
+    assert!(
+      output.status.success(),
+      "hermetic Git build failed\nstdout:\n{}\nstderr:\n{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+      !ambient_home.path().join(".cargo/git").exists() && !ambient_home.path().join(".cargo/registry").exists(),
+      "full metadata must not acquire the dependency in ambient Cargo state before the explicit fetch action"
+    );
+  }
+  let report = |workspace: &Path| -> Result<serde_json::Value> {
+    let directory = workspace.join("target/cargo-rail/hermetic/reports");
+    let path = fs::read_dir(directory)?
+      .next()
+      .transpose()?
+      .expect("one hermetic report")
+      .path();
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+  };
+  let first_report = report(&first.path)?;
+  let second_report = report(&second.path)?;
+  assert_eq!(first_report["fetch"]["reused"], false);
+  assert_eq!(second_report["fetch"]["reused"], false);
+  assert_eq!(
+    first_report["fetch"]["packages"], 1,
+    "locked Git package must be captured in the immutable inventory: {first_report:#}"
+  );
+  assert!(
+    first_report["fetch"]["source_entries"]
+      .as_u64()
+      .is_some_and(|entries| entries > 0)
+  );
+  assert_eq!(
+    first_report["fetch"]["result_digest"],
+    second_report["fetch"]["result_digest"]
+  );
+  assert_eq!(first_report["action_key"], second_report["action_key"]);
+  assert_eq!(
+    first_report["output_manifest"]["digest"],
+    second_report["output_manifest"]["digest"]
+  );
+
+  let warm = run_cargo_rail_with_env(&first.path, &command, &environment)?;
+  assert!(
+    warm.status.success(),
+    "warm hermetic Git build failed\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&warm.stdout),
+    String::from_utf8_lossy(&warm.stderr)
+  );
+  let reports = fs::read_dir(first.path.join("target/cargo-rail/hermetic/reports"))?
+    .map(|entry| -> Result<serde_json::Value> { Ok(serde_json::from_slice(&fs::read(entry?.path())?)?) })
+    .collect::<Result<Vec<_>>>()?;
+  assert_eq!(reports.len(), 2);
+  assert!(reports.iter().any(|report| report["fetch"]["reused"] == true));
+  assert!(
+    reports
+      .iter()
+      .all(|report| report["result_digest"] == first_report["result_digest"])
+  );
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_sparse_registry_fetch_is_the_only_network_boundary_and_reuses_warm_inventory() -> Result<()> {
+  let dependency = tempfile::tempdir()?;
+  fs::create_dir_all(dependency.path().join("src"))?;
+  fs::write(
+    dependency.path().join("Cargo.toml"),
+    "[package]\nname = \"external-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlicense = \"MIT\"\ndescription = \"hermetic registry fixture\"\n",
+  )?;
+  fs::write(
+    dependency.path().join("src/lib.rs"),
+    "pub const fn value() -> u8 { 11 }\n",
+  )?;
+  let packaged = std::process::Command::new("cargo")
+    .current_dir(dependency.path())
+    .args(["package", "--allow-dirty", "--no-verify"])
+    .output()?;
+  anyhow::ensure!(
+    packaged.status.success(),
+    "registry fixture packaging failed:\n{}",
+    String::from_utf8_lossy(&packaged.stderr)
+  );
+  let archive = fs::read(dependency.path().join("target/package/external-dep-0.1.0.crate"))?;
+  let checksum = Sha256::digest(&archive)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<Vec<_>>()
+    .join("");
+  let registry = SparseRegistry::start(archive, &checksum)?;
+
+  let create_workspace = |name: &str| -> Result<TestWorkspace> {
+    let workspace = TestWorkspace::new_named(name)?;
+    workspace.add_crate("consumer", "0.1.0", &[("external-dep", "\"=0.1.0\"")])?;
+    fs::create_dir_all(workspace.path.join(".cargo"))?;
+    fs::write(
+      workspace.path.join(".cargo/config.toml"),
+      format!(
+        "[source.crates-io]\nreplace-with = \"fixture\"\n\n[source.fixture]\nregistry = {:?}\n",
+        registry.index
+      ),
+    )?;
+    fs::write(
+      workspace.path.join("crates/consumer/src/lib.rs"),
+      "pub fn value() -> u8 { external_dep::value() }\n",
+    )?;
+    Ok(workspace)
+  };
+  let first = create_workspace("hermetic-registry-first")?;
+  let second = create_workspace("hermetic-registry-second")?;
+  let lock_home = tempfile::tempdir()?;
+  let lock_home_value = lock_home.path().to_string_lossy().into_owned();
+  let lock_environment = [("CARGO_HOME", lock_home_value.as_str())];
+  for workspace in [&first, &second] {
+    generate_lockfile_with_env(&workspace.path, &lock_environment)?;
+    workspace.commit("Add locked sparse-registry consumer")?;
+  }
+
+  let ambient_home = tempfile::tempdir()?;
+  let ambient_home_value = ambient_home.path().to_string_lossy().into_owned();
+  let environment = [
+    ("HOME", ambient_home_value.as_str()),
+    ("USERPROFILE", ambient_home_value.as_str()),
+  ];
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
+  let mut cold_reports = Vec::new();
+  for workspace in [&first, &second] {
+    registry.begin(&workspace.path)?;
+    let output = run_cargo_rail_with_env(&workspace.path, &command, &environment)?;
+    assert!(
+      output.status.success(),
+      "hermetic sparse-registry build failed\nstdout:\n{}\nstderr:\n{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let observations = registry.observations()?;
+    assert!(
+      observations.requests > 0,
+      "a cold inventory must fetch the registry package"
+    );
+    assert!(
+      !observations.before_fetch_boundary,
+      "registry access occurred before cargo-rail established the explicit fetch boundary"
+    );
+    assert!(
+      !observations.during_build,
+      "the offline build attempted registry access after fetch"
+    );
+    assert!(
+      !ambient_home.path().join(".cargo/registry").exists(),
+      "dependency acquisition escaped into ambient Cargo state"
+    );
+    let report_path = fs::read_dir(workspace.path.join("target/cargo-rail/hermetic/reports"))?
+      .next()
+      .transpose()?
+      .expect("one cold hermetic report")
+      .path();
+    cold_reports.push(serde_json::from_slice::<serde_json::Value>(&fs::read(report_path)?)?);
+  }
+  assert_eq!(cold_reports[0]["fetch"]["packages"], 1);
+  assert!(
+    cold_reports
+      .iter()
+      .all(|report| report["compiler_units"].as_u64().is_some_and(|units| units >= 2)),
+    "the external dependency and workspace consumer must both be observed"
+  );
+  assert!(cold_reports.iter().all(|report| {
+    report["output_manifest"]["entries"].as_array().is_some_and(|entries| {
+      entries
+        .iter()
+        .filter(|entry| entry["path"].as_str().is_some_and(|path| path.ends_with(".d")))
+        .count()
+        >= 2
+    })
+  }));
+  assert!(cold_reports.iter().all(|report| report["fetch"]["reused"] == false));
+  assert_eq!(
+    cold_reports[0]["fetch"]["result_digest"],
+    cold_reports[1]["fetch"]["result_digest"]
+  );
+  assert_eq!(cold_reports[0]["action_key"], cold_reports[1]["action_key"]);
+  assert_eq!(
+    cold_reports[0]["output_manifest"]["digest"],
+    cold_reports[1]["output_manifest"]["digest"]
+  );
+
+  registry.begin(&first.path)?;
+  let warm = run_cargo_rail_with_env(&first.path, &command, &environment)?;
+  assert!(
+    warm.status.success(),
+    "warm sparse-registry build failed\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&warm.stdout),
+    String::from_utf8_lossy(&warm.stderr)
+  );
+  assert_eq!(
+    registry.observations()?.requests,
+    0,
+    "a validated warm inventory must not touch the registry"
+  );
+  let reports = fs::read_dir(first.path.join("target/cargo-rail/hermetic/reports"))?
+    .map(|entry| -> Result<serde_json::Value> { Ok(serde_json::from_slice(&fs::read(entry?.path())?)?) })
+    .collect::<Result<Vec<_>>>()?;
+  assert_eq!(reports.len(), 2);
+  assert!(reports.iter().any(|report| report["fetch"]["reused"] == true));
+  assert!(
+    reports
+      .iter()
+      .all(|report| report["result_digest"] == cold_reports[0]["result_digest"])
+  );
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_all_target_check_proves_pure_rust_unit_classes_in_two_roots() -> Result<()> {
+  let create = |name: &str| -> Result<TestWorkspace> {
+    let workspace = TestWorkspace::new_named(name)?;
+    let crate_root = workspace.add_crate("all-targets", "0.1.0", &[])?;
+    fs::write(
+      crate_root.join("src/main.rs"),
+      "fn main() { let _ = all_targets::hello(); }\n",
+    )?;
+    for (directory, file, body) in [
+      (
+        "tests",
+        "smoke.rs",
+        "#[test]\nfn smoke() { assert!(!all_targets::hello().is_empty()); }\n",
+      ),
+      ("examples", "demo.rs", "fn main() { let _ = all_targets::hello(); }\n"),
+      (
+        "benches",
+        "throughput.rs",
+        "#[test]\nfn throughput() { let _ = all_targets::hello(); }\n",
+      ),
+    ] {
+      fs::create_dir_all(crate_root.join(directory))?;
+      fs::write(crate_root.join(directory).join(file), body)?;
+    }
+    generate_lockfile(&workspace.path)?;
+    workspace.commit("Add pure Rust target matrix")?;
+    Ok(workspace)
+  };
+  let first = create("hermetic-all-targets-first")?;
+  let second = create("hermetic-all-targets-second")?;
+  let command = [
+    "rail",
+    "run",
+    "--all",
+    "--action",
+    "build",
+    "--hermetic",
+    "--",
+    "--all-targets",
+  ];
+  for workspace in [&first, &second] {
+    let output = run_cargo_rail(&workspace.path, &command)?;
+    assert!(
+      output.status.success(),
+      "all-target hermetic check failed\nstdout:\n{}\nstderr:\n{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+  let report = |workspace: &Path| -> Result<serde_json::Value> {
+    let path = fs::read_dir(workspace.join("target/cargo-rail/hermetic/reports"))?
+      .next()
+      .transpose()?
+      .expect("one hermetic report")
+      .path();
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+  };
+  let first_report = report(&first.path)?;
+  let second_report = report(&second.path)?;
+  assert!(first_report["compiler_units"].as_u64().is_some_and(|units| units >= 5));
+  assert_eq!(first_report["action_key"], second_report["action_key"]);
+  assert_eq!(
+    first_report["output_manifest"]["digest"],
+    second_report["output_manifest"]["digest"]
+  );
+  #[cfg(target_os = "macos")]
+  assert_eq!(first_report["support"], "eligible");
+  #[cfg(not(target_os = "macos"))]
+  assert_eq!(first_report["support"], "platform_limited");
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_build_script_stays_executable_normally_but_fails_closed_for_reuse() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-build-script")?;
+  let crate_root = workspace.add_crate("generated", "0.1.0", &[])?;
+  fs::write(
+    crate_root.join("build.rs"),
+    "fn main() { println!(\"cargo::rustc-cfg=generated_by_build_script\"); }\n",
+  )?;
+  workspace.commit("Add build script")?;
+
+  let normal = run_cargo_rail(&workspace.path, &["rail", "run", "--all", "--action", "build"])?;
+  assert!(
+    normal.status.success(),
+    "ordinary execution must remain available\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&normal.stdout),
+    String::from_utf8_lossy(&normal.stderr)
+  );
+  let hermetic = run_cargo_rail(
+    &workspace.path,
+    &["rail", "run", "--all", "--action", "build", "--hermetic"],
+  )?;
+  assert_eq!(hermetic.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&hermetic.stderr).contains("build_scripts_not_hermetic"),
+    "the unsupported script boundary must be explicit: {}",
+    String::from_utf8_lossy(&hermetic.stderr)
+  );
+  assert!(!workspace.path.join("target/cargo-rail/hermetic").exists());
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_proc_macro_fails_before_fetch_state() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-proc-macro")?;
+  let crate_root = workspace.add_crate("derive-fixture", "0.1.0", &[])?;
+  let manifest_path = crate_root.join("Cargo.toml");
+  let mut manifest = fs::read_to_string(&manifest_path)?;
+  manifest.push_str("\n[lib]\nproc-macro = true\n");
+  fs::write(manifest_path, manifest)?;
+  fs::write(
+    crate_root.join("src/lib.rs"),
+    "use proc_macro::TokenStream;\n#[proc_macro]\npub fn passthrough(input: TokenStream) -> TokenStream { input }\n",
+  )?;
+  workspace.commit("Add proc macro")?;
+
+  let output = run_cargo_rail(
+    &workspace.path,
+    &["rail", "run", "--all", "--action", "build", "--hermetic"],
+  )?;
+  assert_eq!(output.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("proc_macros_not_hermetic"),
+    "the unsupported host executable must remain explicit: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(!workspace.path.join("target/cargo-rail/hermetic").exists());
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_rejects_unsupported_action_before_mutating_outputs() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-unsupported-docs")?;
+  workspace.add_crate("documented", "0.1.0", &[])?;
+  workspace.commit("Add documented crate")?;
+  let output = run_cargo_rail(
+    &workspace.path,
+    &["rail", "run", "--all", "--action", "docs", "--hermetic"],
+  )?;
+  assert_eq!(output.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("does not yet support action 'docs' (docs)"),
+    "unsupported class must be explicit: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(!workspace.path.join("target/doc").exists());
+  assert!(!workspace.path.join("target/cargo-rail/hermetic").exists());
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_rejects_unmodeled_cargo_boundaries_before_fetch_state() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-cargo-boundary-overrides")?;
+  workspace.add_crate("bounded", "0.1.0", &[])?;
+  workspace.commit("Add bounded crate")?;
+
+  for arguments in [
+    vec!["--manifest-path", "other/Cargo.toml"],
+    vec!["-C", "other-workspace"],
+    vec!["--workspace"],
+    vec!["--target-dir", "outside-target"],
+    vec!["--", "--cfg", "unmodeled_compiler_input"],
+  ] {
+    let mut command = vec!["rail", "run", "--all", "--action", "build", "--hermetic", "--"];
+    command.extend(arguments);
+    let output = run_cargo_rail(&workspace.path, &command)?;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+      String::from_utf8_lossy(&output.stderr).contains("override the modeled action boundary"),
+      "unmodeled Cargo boundary must be explicit: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+      !workspace.path.join("target/cargo-rail/hermetic").exists(),
+      "unmodeled Cargo arguments must fail before fetch state"
+    );
+  }
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_rejects_tool_overrides_without_invoking_wrappers_or_creating_state() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-tool-overrides")?;
+  workspace.add_crate("bounded-toolchain", "0.1.0", &[])?;
+  fs::create_dir_all(workspace.path.join(".cargo"))?;
+  fs::write(
+    workspace.path.join(".cargo/config.toml"),
+    "[build]\nrustc-wrapper = \"definitely-not-an-executable\"\n",
+  )?;
+  workspace.commit("Add rejected compiler wrapper")?;
+
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
+  let configured = run_cargo_rail(&workspace.path, &command)?;
+  assert_eq!(configured.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&configured.stderr).contains("cargo_tool_override_not_graduated"),
+    "configured wrapper must fail before invocation: {}",
+    String::from_utf8_lossy(&configured.stderr)
+  );
+  assert!(!workspace.path.join("target/cargo-rail/hermetic").exists());
+
+  fs::remove_file(workspace.path.join(".cargo/config.toml"))?;
+  let environment = [("RUSTC", "definitely-not-an-executable")];
+  let ambient = run_cargo_rail_with_env(&workspace.path, &command, &environment)?;
+  assert_eq!(ambient.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&ambient.stderr).contains("cargo_tool_override_not_graduated"),
+    "ambient compiler override must fail before invocation: {}",
+    String::from_utf8_lossy(&ambient.stderr)
+  );
+  assert!(!workspace.path.join("target/cargo-rail/hermetic").exists());
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_build_requires_an_exact_lockfile_before_fetch() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-missing-lockfile")?;
+  workspace.add_crate("unlocked", "0.1.0", &[])?;
+  workspace.commit("Add unlocked crate")?;
+
+  let output = run_cargo_rail(
+    &workspace.path,
+    &["rail", "run", "--all", "--action", "build", "--hermetic"],
+  )?;
+  assert_eq!(output.status.code(), Some(2));
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("requires exact Cargo.lock"),
+    "the dependency boundary must reject an implicit resolution: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    !workspace.path.join("target/cargo-rail/hermetic").exists(),
+    "a missing lockfile must fail before creating fetch state"
+  );
+  Ok(())
+}
+
+#[test]
+fn test_hermetic_workspace_root_runs_from_outside_the_repository() -> Result<()> {
+  let workspace = TestWorkspace::new_named("hermetic-explicit-workspace-root")?;
+  workspace.add_crate("rooted", "0.1.0", &[])?;
+  generate_lockfile(&workspace.path)?;
+  workspace.commit("Add locked crate")?;
+  let outside = tempfile::tempdir()?;
+  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(outside.path())
+    .arg("rail")
+    .arg("--workspace-root")
+    .arg(&workspace.path)
+    .args(["run", "--all", "--action", "build", "--hermetic"])
+    .output()?;
+  assert!(
+    output.status.success(),
+    "explicit hermetic workspace root failed\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(workspace.path.join("target/cargo-rail/hermetic/reports").is_dir());
+  assert!(!outside.path().join("target").exists());
   Ok(())
 }
 

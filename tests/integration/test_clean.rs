@@ -44,6 +44,12 @@ fn create_test_workspace() -> TempDir {
     "{\"version\":1,\"entries\":{}}",
   )
   .unwrap();
+  fs::create_dir_all(workspace.join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry")).unwrap();
+  fs::write(
+    workspace.join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry/source.rs"),
+    "pub fn fetched() {}\n",
+  )
+  .unwrap();
 
   // Initialize git repo
   std::process::Command::new("git")
@@ -106,6 +112,7 @@ fn test_clean_all() {
   // Verify artifacts removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
+  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   assert_eq!(manager.list_backups().unwrap().len(), 0);
 }
@@ -115,15 +122,49 @@ fn test_clean_cache_only() {
   let temp = create_test_workspace();
   let ctx = WorkspaceContext::build(temp.path()).unwrap();
 
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let inventory = temp
+      .path()
+      .join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry");
+    fs::set_permissions(inventory.join("source.rs"), fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&inventory, fs::Permissions::from_mode(0o555)).unwrap();
+  }
+
   // Run clean --cache
   run_clean(&ctx, true, false, false, false, TextJsonOutputFormat::default()).unwrap();
 
   // Verify cache removed, others remain
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
+  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_clean_refuses_to_follow_a_hermetic_state_symlink() {
+  use std::os::unix::fs::symlink;
+
+  let temp = create_test_workspace();
+  let ctx = WorkspaceContext::build(temp.path()).unwrap();
+  let outside = TempDir::new().unwrap();
+  fs::write(outside.path().join("keep"), "outside state\n").unwrap();
+  let hermetic = temp.path().join("target/cargo-rail/hermetic");
+  fs::remove_dir_all(&hermetic).unwrap();
+  symlink(outside.path(), &hermetic).unwrap();
+
+  let error = run_clean(&ctx, true, false, false, false, TextJsonOutputFormat::default())
+    .expect_err("cache cleanup must reject a hermetic-state symlink");
+  assert!(error.to_string().contains("not a real directory"), "{error}");
+  assert_eq!(
+    fs::read_to_string(outside.path().join("keep")).unwrap(),
+    "outside state\n"
+  );
 }
 
 #[test]
@@ -137,6 +178,7 @@ fn test_clean_reports_only() {
   // Verify reports removed, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(temp.path().join("target/cargo-rail/cache").exists());
+  assert!(temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -153,6 +195,7 @@ fn test_clean_backups_prune() {
   // Verify backups pruned, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(temp.path().join("target/cargo-rail/cache").exists());
+  assert!(temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 3);
@@ -169,6 +212,7 @@ fn test_clean_default() {
   // Verify everything removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
+  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 0);

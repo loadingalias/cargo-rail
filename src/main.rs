@@ -7,7 +7,6 @@
 use cargo_rail::commands::{self, CargoCli, PreContextDispatch, RailCli};
 use cargo_rail::error::{RailError, RailResult, print_error};
 use cargo_rail::instrumentation::DiagnosticSession;
-use cargo_rail::workspace;
 
 use clap::Parser;
 
@@ -76,18 +75,15 @@ fn run(cli: RailCli) -> RailResult<()> {
   // Store config override path for commands that need it
   let config_override = cli.config.as_deref();
 
-  let command = match commands::try_dispatch_pre_context(cli.command, &workspace_root, config_override, cli.json) {
+  let prepared = match commands::try_dispatch_pre_context(cli.command, &workspace_root, config_override, cli.json) {
     Ok(PreContextDispatch::Handled) => return Ok(()),
-    Ok(PreContextDispatch::NeedsContext(cmd)) => *cmd,
+    Ok(PreContextDispatch::NeedsContext(prepared)) => prepared,
     Err(error) => return Err(error),
   };
 
-  // Build workspace context (single-load pattern)
-  let ctx = if command.requires_workspace_snapshot() {
-    workspace::WorkspaceContext::build_with_snapshot(&workspace_root)?
-  } else {
-    workspace::WorkspaceContext::build_with_source_capture(&workspace_root, command.requires_worktree_source_capture())?
-  };
+  // Build workspace context (single-load pattern). Hermetic execution performs
+  // its explicit fetch boundary before any full Cargo resolution is loaded.
+  let (command, ctx) = prepared.build(&workspace_root)?;
   if let Some(snapshot_id) = ctx.snapshot_id() {
     cargo_rail::instrumentation::record_snapshot_id(snapshot_id.to_string());
   }

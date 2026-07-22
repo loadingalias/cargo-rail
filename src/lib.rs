@@ -9,6 +9,7 @@ pub(crate) mod action;
 pub(crate) mod action_key;
 /// Backup and restore for undo operations.
 pub mod backup;
+pub(crate) mod build_script;
 /// Cargo workspace metadata and manifest operations.
 pub mod cargo;
 /// Git-based change classification.
@@ -26,6 +27,7 @@ pub(crate) mod executable;
 pub mod git;
 /// Dependency graph analysis.
 pub mod graph;
+pub(crate) mod hermetic;
 /// Diagnostic-only performance instrumentation.
 #[doc(hidden)]
 pub mod instrumentation;

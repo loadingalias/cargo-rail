@@ -21,6 +21,8 @@ Commands do not reload metadata independently.
 |---|---|
 | `commands/` | CLI handlers and command dispatch |
 | `action` | shell-free action declarations and deterministic request expansion |
+| `hermetic` | isolated fetch/check execution and exact output proof |
+| `build_script` | non-circular build-script action/result identities |
 | `workspace/` | `WorkspaceContext` construction and shared state |
 | `graph/` | dependency graph queries |
 | `cargo/` | metadata, manifests, unify logic |
@@ -84,17 +86,118 @@ the class is not reusable.
 
 During workspace-only `rustc` diagnostics, cargo-rail records argv-declared inputs before execution and correlates the
 completed invocation with Cargo's stable JSON artifact messages. Rustc dep-info supplies observed file and environment
-reads. The immutable result manifest keeps declared inputs, observed reads, dependency artifacts, emitted outputs, and
+reads. Cargo has no rustdoc-wrapper setting, so the observation profile instead places a transparent proxy in Cargo's
+selected `RUSTDOC` slot and retains the selected rustdoc as the inner executable. The proxy discovers the selected
+rustdoc's supported default emit set, adds stable dep-info without dropping HTML output, and preserves response-file,
+doctest, and unsupported-tool invocations unchanged with an explicit bypass.
+
+The immutable result manifest keeps declared inputs, observed reads, dependency artifacts, emitted outputs, and
 execution metadata in separate fields. Every file is SHA-256 digested from its bytes and re-digested before diagnostic
-evidence can be reused. Cargo's `fresh` flag is retained only as execution metadata; it never authorizes a hit.
+evidence can be reused. Cargo's `fresh` flag is retained only as execution metadata; it never authorizes a hit. Cargo's
+documentation artifact message names an index file rather than the complete HTML tree, so documentation output remains
+explicitly uncacheable until the isolated output boundary can enumerate and verify that tree.
+
+Custom-build compilation retains Cargo's exact executable output separately from the other compiler artifacts. A
+versioned `BuildScriptActionKey` can be issued only at the next process boundary, after the executable and source bytes
+are revalidated and the relevant manifest/lock closure, toolchain, host and target identities, profile, features,
+configuration, complete non-secret environment, exact declared dependency-action/result set, logical working
+directory, and isolated launch layout are known. The stable action ID cannot appear in its own dependency set. The
+script's instruction stream, runtime reads, and generated output tree are deliberately absent because they are results
+of that action. Normal Cargo execution still inherits ambient state, so compiler observation records a stable
+explanation but does not issue a build-script key. Cargo leaves the optional `executable` field empty for
+custom-build artifacts, so cargo-rail accepts exactly one target-named program from `filenames`; zero or multiple
+matches fail closed.
+
+`BuildScriptResult` version 1 is the separate post-execution identity. Its digest frames the Cargo instruction lines
+in emitted order, including rerun declarations, link libraries/search paths/arguments, `rustc-cfg`,
+`rustc-check-cfg`, `rustc-env`, metadata, warnings, and errors. It also binds the sorted set of non-secret environment
+reads by value digest, a canonical logical generated-output tree with file bytes, executable modes, and symlink
+targets, plus execution success and platform identity. Modern `cargo::KEY=VALUE` and legacy `cargo:KEY=VALUE`
+instructions follow Cargo's distinct parsing rules; legacy unreserved keys are metadata. Physical checkout paths,
+escaping output symlinks, malformed observations, failed execution, secrets, or any missing domain withhold the
+digest. Serialized analysis retains only counts, capability names, and stable reasons, never raw instruction or
+environment values.
+
+Cargo's stable `build-script-executed` JSON is useful but incomplete post-execution evidence. Cargo can replay the
+message without running the script, and the message omits instruction order, rerun declarations, link arguments,
+metadata, warnings, runtime environment reads, the generated tree, and execution freshness. The normal collector
+therefore stores only redacted counts for linked libraries/paths, cfgs, `rustc-env` entries, and whether `OUT_DIR` was
+reported. It records every missing proof domain and never issues a result digest from that subset. When a complete
+result is available, its verified digest is attached to the producer package's ordinary compilation units and every
+transitive consumer unit. The build-script unit never consumes its own result. Missing action/result evidence or an
+incomplete dependency graph produces a stable bypass instead of omitting the edge. The current hermetic profile blocks
+build scripts before execution, so normal Cargo remains executable while that complete runtime boundary is still
+ungraduated.
 
 Selected and underlying Cargo, rustc, and rustdoc implementations, wrappers, configured linkers and runners, and
 repository executables are content-addressed when relevant. Scripts also bind direct interpreters. Response-file
-expansion, dynamic libraries, SDK inputs, default linkers, incomplete platform images, and missing stable rustdoc
-invocation evidence produce explicit bypasses. Any observation bypass prevents diagnostic-evidence reuse; collector
-semantics are versioned so older evidence cannot silently gain authority. Observation manifests never become
-pre-execution `ActionKey` inputs, and cargo-rail neither stores result artifacts nor writes or restores Cargo
-fingerprint state.
+expansion, dynamic libraries, SDK inputs, default linkers, incomplete platform images, and incomplete rustdoc output
+trees produce explicit bypasses. Any observation bypass prevents diagnostic-evidence reuse; collector
+semantics are versioned so older evidence cannot silently gain authority. An observation manifest never identifies its
+own producing action; exact verified artifacts and result digests may become inputs only to later dependent actions.
+Cargo-rail neither stores result artifacts nor writes or restores Cargo fingerprint state.
+
+## Hermetic execution profile
+
+`cargo rail run --all --action build --hermetic` is an explicit proof profile. It does not alter ordinary `run`
+execution and it is not yet an action-result cache.
+
+Actual hermetic execution currently requires the explicit built-in `--action build`. Default, profile, workflow, and
+other action dispatch is rejected before workspace context or hermetic state is created; dry-run remains a planning
+preview rather than an execution-boundary proof.
+
+Trailing Cargo arguments may refine modeled features, targets, target kinds, and profiles. They may not replace the
+workspace/lockfile, expand package scope outside cargo-rail's selection, redirect outputs, inject Cargo configuration,
+enable unstable Cargo semantics, or pass raw rustc arguments; those boundary overrides fail before fetch state.
+
+The profile requires an existing exact `Cargo.lock` and has one network boundary: `cargo fetch --locked`. Before that
+boundary, cargo-rail captures and classifies Cargo configuration, rejects configured compiler/rustdoc wrappers and
+ambient `RUSTC`/`RUSTDOC`, and performs only locked/offline local-package metadata preflight. Toolchain discovery
+disables rustup auto-install/update behavior, ignores ambient compiler wrappers, and pins the exact sysroot Cargo,
+rustc, and rustdoc; wrappers, rustup staging homes, and a newly downloaded toolchain cannot enter the fetch identity.
+The fetch binds the lockfile, acquisition configuration, credential capability names, and exact Cargo implementation,
+captures locked registry or Git packages as an immutable source inventory, and runs full metadata locked/offline
+against that inventory. A warm run exactly revalidates and reuses this dependency inventory without contacting the
+registry. It does not restore compiler output.
+
+Each check runs with `--locked --offline` in a fresh root containing a streamed, byte-verified, read-only source tree,
+a fresh mutable Cargo bookkeeping area, an isolated `target-dir`, stable `build.build-dir`, temporary and home
+directories, and a controlled environment. Effective supported Cargo `[env]`, remote registry source replacement,
+profile environment, target rustflags, and repository-relative values are materialized explicitly. Cargo dep-info and
+rustc output paths are remapped to logical workspace, target, build, Cargo-home, toolchain, and run roots. The source,
+dependency inventory, and exact toolchain/platform read boundary are revalidated after observation and immediately
+before the manifest is published.
+
+Cargo invokes cargo-rail as a global observation-only rustc wrapper for this profile, so registry and Git dependency
+compilations are observed with the same exactness as workspace units. Rustc version/help/print probes are excluded
+from the unit set. Before a key can be issued, the multiset of Cargo compiler artifacts must match the raw observed
+crate invocations exactly, every invocation must have observed outputs, and dep-info outputs must survive into the
+declared output manifest. Missing or extra coverage fails closed instead of producing a partial key.
+
+On macOS, `sandbox-exec` denies network and defaults filesystem access to denied. The policy admits only the isolated
+run, immutable dependency inventory, exact Cargo/rustc/driver and host sysroot inputs, the observer executable, and the
+small sealed host file set required by the selected toolchain. Other operating systems still get offline Cargo and
+isolated roots, but receive `platform_limited` and no authorizing action key until an equivalent filesystem/network
+boundary is implemented.
+
+The result is a versioned manifest of every declared compiler-output file, directory, symlink, mode, digest, and byte
+count under the isolated Cargo build directory. Cargo's internal fingerprints and incremental state are intentionally
+excluded: their layout is unstable, they are never synthesized, and P7 must not restore a whole Cargo build directory
+as if it were valid state. After source, inventory, toolchain, and platform revalidation, every declared output is
+re-read and compared with that manifest immediately before the report is published.
+
+| Action class | macOS proof | Other hosts | Current contract |
+|---|---|---|---|
+| Pure current-host `cargo check` for libraries and binaries | `eligible` | `platform_limited` | Two-root action key and output manifest converge. |
+| Pure test, example, and bench compilation via `cargo check --all-targets` | `eligible` | `platform_limited` | Compilation only; no test or benchmark process runs. |
+| Locked crates.io, remote registry-mirror, or Git dependencies | input supported | input supported | Network only during fetch; full metadata/build are locked and offline, and a warm inventory performs zero registry requests. Local directory/source replacement remains ungraduated. |
+| Build scripts, proc macros, native/generated code | `uncacheable` | `uncacheable` | Dynamic runtime/tool inputs are not yet sandboxed as complete action classes; normal execution remains available. |
+| Documentation, actual test execution, linked build/package artifacts | `uncacheable` | `uncacheable` | Output/runtime boundaries are incomplete or not implemented by the profile. |
+| Cross/custom targets, configured linker/runner, repository wrappers, sccache | `uncacheable` | `uncacheable` | Tool/SDK/wrapper coexistence has not passed the per-class proof gate. |
+
+Physical checkout roots, unrelated files/packages/environment, and Cargo's mutable cache representation do not affect
+the graduated key. Exact source, resolution, profile, feature, target, flags, environment, toolchain, platform, and
+dependency-content changes do.
 
 ## Mutation authority
 

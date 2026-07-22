@@ -63,6 +63,14 @@ impl ExecutableIdentity {
     self.limitations.iter().map(String::as_str)
   }
 
+  pub(crate) fn content_digest(&self) -> &str {
+    &self.content_digest
+  }
+
+  pub(crate) fn is_executable(&self) -> bool {
+    self.executable
+  }
+
   pub(crate) fn same_resolved_file(&self, other: &Self) -> bool {
     self.resolved_path == other.resolved_path && self.content_digest == other.content_digest
   }
@@ -163,6 +171,10 @@ impl ToolchainExecutableIdentities {
 
   pub(crate) fn rustc_workspace_wrapper(&self) -> Option<&ExecutableIdentity> {
     self.rustc_workspace_wrapper.as_ref()
+  }
+
+  pub(crate) fn cargo_implementation(&self) -> Option<&ExecutableIdentity> {
+    self.cargo_implementation.as_ref()
   }
 
   pub(crate) fn limitations(&self) -> impl Iterator<Item = &str> {

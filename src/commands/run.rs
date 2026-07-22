@@ -60,6 +60,8 @@ pub struct RunOptions {
   pub workflow: Option<String>,
   /// Preview selected executions without running subprocesses.
   pub dry_run: bool,
+  /// Execute supported actions inside the isolated hermetic profile.
+  pub hermetic: bool,
   /// Rendering contract for execution previews and CI action plans.
   pub format: ActionOutputFormat,
   /// Generated-output behavior.
@@ -232,6 +234,9 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     }
   }
   if opts.format == ActionOutputFormat::Text {
+    if opts.hermetic && opts.dry_run {
+      println!("fetch: cargo fetch --locked (network allowed; produces immutable source inventory)");
+    }
     for step in &steps {
       execute_run_step(step, graph.actions(), &opts, ctx)?;
     }
@@ -779,10 +784,31 @@ struct ActionPlanOutput<'a> {
   run_args_requested: &'a [String],
   run_args_effective: &'a [String],
   generated_mode: GeneratedMode,
+  execution_profile: &'static str,
+  fetch_action: Option<HermeticFetchPlan>,
   actions: &'a [ExpandedAction],
   skipped_actions: Vec<&'a str>,
   no_target_actions: Vec<&'static str>,
   plan: Option<&'a PlanOutput>,
+}
+
+#[derive(Serialize)]
+struct HermeticFetchPlan {
+  id: &'static str,
+  argv: &'static [&'static str],
+  network: &'static str,
+  produces: &'static str,
+  consumer_network: &'static str,
+}
+
+fn hermetic_fetch_plan(enabled: bool) -> Option<HermeticFetchPlan> {
+  enabled.then_some(HermeticFetchPlan {
+    id: "fetch",
+    argv: &["cargo", "fetch", "--locked"],
+    network: "allowed",
+    produces: "immutable_cargo_source_inventory",
+    consumer_network: "denied",
+  })
 }
 
 fn render_action_plan<'a>(
@@ -798,7 +824,7 @@ fn render_action_plan<'a>(
     } else {
       "action_plan"
     },
-    version: if opts.hermeticity_doctor { 1 } else { 3 },
+    version: if opts.hermeticity_doctor { 1 } else { 4 },
     snapshot_id: graph.snapshot_id(),
     profile_requested: opts.profile.as_deref(),
     profile_effective: effective.profile.as_deref(),
@@ -814,6 +840,8 @@ fn render_action_plan<'a>(
     run_args_requested: &opts.run_args,
     run_args_effective: &effective.run_args,
     generated_mode: opts.generated,
+    execution_profile: if opts.hermetic { "hermetic" } else { "normal" },
+    fetch_action: hermetic_fetch_plan(opts.hermetic),
     actions: graph.actions(),
     skipped_actions: steps
       .iter()
@@ -859,6 +887,11 @@ fn render_action_plan<'a>(
       let _ = writeln!(rendered, "action_count={}", action_ids.len());
       let _ = writeln!(rendered, "action_ids_json={ids_json}");
       let _ = writeln!(rendered, "generated_mode={}", opts.generated.as_str());
+      let _ = writeln!(
+        rendered,
+        "execution_profile={}",
+        if opts.hermetic { "hermetic" } else { "normal" }
+      );
       print!("{rendered}");
       Ok(())
     }
@@ -1428,6 +1461,25 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     return Ok(());
   }
 
+  if opts.hermetic {
+    let (report, path) = crate::hermetic::execute(ctx, action)?;
+    println!(
+      "{}: hermetic {}{}{}",
+      action.id(),
+      report.support().as_str(),
+      report
+        .action_key()
+        .map(|key| format!(" action_key={key}"))
+        .unwrap_or_default(),
+      report
+        .result_digest()
+        .map(|digest| format!(" result={digest}"))
+        .unwrap_or_default(),
+    );
+    println!("{}: hermetic report {}", action.id(), path.display());
+    return Ok(());
+  }
+
   let (program, arguments) = action
     .argv()
     .split_first()
@@ -1496,7 +1548,7 @@ fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std
   let path = dir.join(format!("run-decision-{}.json", nonce));
   let receipt = serde_json::json!({
     "artifact": "decision_receipt",
-    "version": 3,
+    "version": 4,
     "command": "run",
     "generated_at_utc": chrono::Utc::now().to_rfc3339(),
     "snapshot_id": input.graph.snapshot_id(),
@@ -1523,10 +1575,18 @@ fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std
       "dry_run": input.opts.dry_run,
       "format": input.opts.format,
       "generated_mode": input.opts.generated,
+      "execution_profile": if input.opts.hermetic { "hermetic" } else { "normal" },
     },
     "execution": {
       "executed_actions": input.executed_actions,
       "skipped_actions": input.skipped_actions,
+      "fetch_action": input.opts.hermetic.then(|| serde_json::json!({
+        "id": "fetch",
+        "argv": ["cargo", "fetch", "--locked"],
+        "network": "allowed",
+        "produces": "immutable_cargo_source_inventory",
+        "consumer_network": "denied",
+      })),
     },
     "scope": input.plan.map(|output| &output.scope),
     "plan": input.plan,

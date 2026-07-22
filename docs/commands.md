@@ -108,6 +108,9 @@ Options:
       --dry-run
           Preview selected execution without spawning subprocesses
 
+      --hermetic
+          Execute supported Rust actions in fresh isolated roots
+
   -f, --format <FORMAT>
           Dry-run action plan format (json/github require --dry-run)
 
@@ -172,6 +175,7 @@ Examples:
   cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
   cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
   cargo rail run --all --action test          # Force full test run
+  cargo rail run --all --action build --hermetic  # Prove a locked/offline Cargo check
   cargo rail run --dry-run --print-cmd        # Preview exact execution
   cargo rail run --dry-run -f json            # Versioned CI action plan
   cargo rail run --dry-run -f github          # GitHub Actions key=value plan

@@ -1196,6 +1196,93 @@ glob = "0.3"
   let evidence_cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
   assert!(evidence_cache.contains("CustomBuild"), "{evidence_cache}");
   assert!(evidence_cache.contains("unit_evidence"), "{evidence_cache}");
+  let evidence_json: serde_json::Value = serde_json::from_str(&evidence_cache)?;
+  let observations = evidence_json["entries"]
+    .as_object()
+    .into_iter()
+    .flat_map(|entries| entries.values())
+    .filter_map(|entry| entry["observations"].as_array())
+    .flatten()
+    .collect::<Vec<_>>();
+  let build_script_observation = observations
+    .iter()
+    .copied()
+    .find(|observation| observation["unit"]["target_kind"] == "build_script")
+    .expect("build-script compilation observation");
+  let build_script_key = build_script_observation["build_script_action_key"]
+    .as_object()
+    .expect("build-script pre-execution key analysis");
+  assert!(
+    !build_script_key.contains_key("key"),
+    "ambient Cargo execution must not issue a build-script key: {build_script_key:?}"
+  );
+  assert!(
+    build_script_key["source_inputs"]
+      .as_u64()
+      .is_some_and(|count| count > 0),
+    "build.rs must participate in the pre-execution identity: {build_script_key:?}"
+  );
+  assert_eq!(
+    build_script_key["reasons"],
+    serde_json::json!([
+      "build_script_ambient_inputs_unobserved",
+      "build_script_dependency_results_unavailable",
+      "build_script_environment_uncontrolled",
+    ]),
+    "the ordinary Cargo boundary should be the only missing pre-execution proof: {build_script_key:?}"
+  );
+  let build_script_result = build_script_observation["build_script_result"]
+    .as_object()
+    .expect("build-script post-execution result analysis");
+  assert_eq!(build_script_observation["version"], 4);
+  assert_eq!(build_script_result["version"], 1);
+  assert!(
+    !build_script_result.contains_key("digest"),
+    "Cargo's replayable subset must not authorize a result digest: {build_script_result:?}"
+  );
+  assert_eq!(
+    build_script_result["cargo_output"],
+    serde_json::json!({
+      "linked_libraries": 0,
+      "linked_paths": 0,
+      "cfgs": 0,
+      "rustc_environment": 0,
+      "output_directory_reported": true,
+    }),
+    "stable Cargo output counts should remain useful diagnostic evidence: {build_script_result:?}"
+  );
+  assert_eq!(
+    build_script_result["reasons"],
+    serde_json::json!([
+      "build_script_environment_reads_unavailable",
+      "build_script_execution_observations_unavailable",
+      "build_script_generated_output_tree_unavailable",
+      "build_script_instruction_stream_unavailable",
+      "cargo_build_script_execution_freshness_unavailable",
+    ]),
+    "ordinary Cargo execution must name every missing result proof: {build_script_result:?}"
+  );
+  let encoded_result = serde_json::to_string(build_script_result)?;
+  assert!(!encoded_result.contains(&workspace.path.to_string_lossy().into_owned()));
+  if let Ok(canonical_workspace) = workspace.path.canonicalize() {
+    assert!(!encoded_result.contains(&canonical_workspace.to_string_lossy().into_owned()));
+  }
+  let downstream_observation = observations
+    .iter()
+    .copied()
+    .find(|observation| observation["unit"]["target_kind"] != "build_script")
+    .expect("unit consuming its package build-script result");
+  assert_eq!(
+    downstream_observation["unit"]["build_script_results"],
+    serde_json::json!([]),
+    "incomplete Cargo evidence must never become a downstream result edge: {downstream_observation:?}"
+  );
+  assert!(
+    downstream_observation["bypasses"]
+      .as_array()
+      .is_some_and(|reasons| reasons.iter().any(|reason| reason == "build_script_result_unavailable")),
+    "the semantic consumer must name its missing build-script result: {downstream_observation:?}"
+  );
   let repeated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   let repeated_json: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
   let cache = repeated_json["evidence_cache"]
@@ -1449,8 +1536,8 @@ edition = "2021"
   let entries = cache["entries"].as_object().expect("cache entries object");
   let entry = entries.values().next().expect("at least one cache entry");
   assert_eq!(
-    entry["collector_version"], 10,
-    "fail-closed observation authority requires collector semantics version 10"
+    entry["collector_version"], 13,
+    "downstream build-script result propagation requires collector semantics version 13"
   );
   assert!(
     entry["key"]["package_id"].as_str().is_some(),
@@ -1507,7 +1594,8 @@ edition = "2021"
   assert!(
     observation["unit_identity"]
       .as_str()
-      .is_some_and(|identity| identity.starts_with("v1-sha256-"))
+      .is_some_and(|identity| identity.starts_with("v2-sha256-")),
+    "build-script result edges require compilation-unit identity version 2: {observation}"
   );
   assert_eq!(observation["unit"]["target_kind"], "library");
   let observation_bypasses = observation["bypasses"].as_array().expect("observation bypass array");

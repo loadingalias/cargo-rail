@@ -352,7 +352,9 @@ fn test_run_emits_decision_receipt() -> Result<()> {
   let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt_path)?)?;
 
   assert_eq!(receipt["artifact"], "decision_receipt");
-  assert_eq!(receipt["version"], 3);
+  assert_eq!(receipt["version"], 4);
+  assert_eq!(receipt["inputs"]["execution_profile"], "normal");
+  assert!(receipt["execution"]["fetch_action"].is_null());
   assert!(
     receipt["snapshot_id"]
       .as_str()

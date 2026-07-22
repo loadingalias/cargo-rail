@@ -2,6 +2,7 @@ mod helpers;
 mod test_check;
 mod test_classification;
 mod test_clean;
+mod test_compiler_observation;
 mod test_config;
 mod test_error_handling;
 mod test_frontdoor_smoke;

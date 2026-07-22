@@ -1,5 +1,9 @@
 //! Target-aware compiler diagnostics collection with persistent caching.
 
+use crate::build_script::{
+  BuildScriptActionInputs, BuildScriptCargoOutputSummary, BuildScriptResultInputs,
+  analyze_action_key as analyze_build_script_action_key, analyze_result as analyze_build_script_result,
+};
 use crate::cargo::DepKind;
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
 use crate::compiler::diagnostics_store::CompilerDiagnosticsStore;
@@ -9,8 +13,9 @@ use crate::compiler::model::{
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
 use crate::compiler::observation::{
-  CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest, CompilationProfile,
-  FileObservation, ObservationPath, attach_execution_identities, build_manifests, load_raw,
+  BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
+  CompilationProfile, CompilerMode, FileObservation, ObservationPath, attach_build_script_result_dependencies,
+  attach_execution_identities, build_manifests, load_raw,
 };
 use crate::compiler::wrapper::{
   INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
@@ -69,10 +74,24 @@ pub(crate) struct CompilerCacheIdentity {
   source_fingerprints: HashMap<PackageId, String>,
   observation_context: CompilationObservationContext,
   package_observation_identities: HashMap<PackageId, String>,
+  package_dependencies: HashMap<String, BTreeSet<String>>,
+  build_script_packages: HashMap<String, BuildScriptPackageContext>,
   rustc_executable: ExecutableIdentity,
   wrapper_executables: Vec<ExecutableIdentity>,
   executable_bypasses: BTreeSet<String>,
   cache_bypass_reason: Option<&'static str>,
+}
+
+#[derive(Clone)]
+struct BuildScriptPackageContext {
+  package_id: PackageId,
+  working_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoBuildScriptOutput {
+  One(BuildScriptCargoOutputSummary),
+  Ambiguous,
 }
 
 impl CompilerCacheIdentity {
@@ -104,6 +123,8 @@ impl CompilerCacheIdentity {
     let source_fingerprints = source_closure_fingerprints(snapshot, &local_dependencies)?;
     let observation_context = CompilationObservationContext::capture(snapshot)?;
     let package_observation_identities = package_observation_identities(snapshot)?;
+    let package_dependencies = package_dependency_graph(snapshot, &package_observation_identities)?;
+    let build_script_packages = build_script_package_contexts(snapshot, &package_observation_identities)?;
     let rustc_executable = executables.rustc().clone();
     let configured_wrappers = [executables.rustc_wrapper(), executables.rustc_workspace_wrapper()];
     if configured_wrappers
@@ -143,6 +164,8 @@ impl CompilerCacheIdentity {
       source_fingerprints,
       observation_context,
       package_observation_identities,
+      package_dependencies,
+      build_script_packages,
       rustc_executable,
       wrapper_executables,
       executable_bypasses,
@@ -870,10 +893,23 @@ fn parse_compilation_observations(
 ) -> RailResult<Vec<CompilationObservationManifest>> {
   let source_root = &identity.observation_context.source_root;
   let mut artifacts = Vec::new();
+  let mut build_script_outputs = HashMap::<String, CargoBuildScriptOutput>::new();
   for message in Message::parse_stream(BufReader::new(stdout.as_bytes())) {
-    let Message::CompilerArtifact(artifact) = message
-      .map_err(|error| RailError::message(format!("failed to parse stable Cargo compiler-artifact JSON: {error}")))?
-    else {
+    let message =
+      message.map_err(|error| RailError::message(format!("failed to parse stable Cargo JSON message: {error}")))?;
+    if let Message::BuildScriptExecuted(script) = message {
+      if let Some(package) = identity.package_observation_identities.get(&script.package_id)
+        && package.starts_with("local:")
+      {
+        let summary = build_script_output_summary(&script);
+        build_script_outputs
+          .entry(package.clone())
+          .and_modify(|output| *output = CargoBuildScriptOutput::Ambiguous)
+          .or_insert_with(|| CargoBuildScriptOutput::One(summary));
+      }
+      continue;
+    }
+    let Message::CompilerArtifact(artifact) = message else {
       continue;
     };
     let mut bypasses = BTreeSet::new();
@@ -888,6 +924,11 @@ fn parse_compilation_observations(
     if !package.starts_with("local:") {
       continue;
     }
+    let is_custom_build = artifact.target.kind.contains(&TargetKind::CustomBuild);
+    let explicit_executable_path = artifact
+      .executable
+      .as_ref()
+      .map(|path| ObservationPath::capture(path.as_std_path(), source_root, source_root));
     let mut outputs = Vec::new();
     for filename in &artifact.filenames {
       match FileObservation::capture(filename.as_std_path(), source_root, source_root) {
@@ -897,7 +938,11 @@ fn parse_compilation_observations(
         }
       }
     }
-    if let Some(executable) = &artifact.executable {
+    if let Some(executable) = &artifact.executable
+      && explicit_executable_path
+        .as_ref()
+        .is_some_and(|path| !outputs.iter().any(|output| &output.path == path))
+    {
       match FileObservation::capture(executable.as_std_path(), source_root, source_root) {
         Ok(file) => outputs.push(file),
         Err(_) => {
@@ -907,6 +952,19 @@ fn parse_compilation_observations(
     }
     outputs.sort();
     outputs.dedup();
+    let executable = explicit_executable_path
+      .as_ref()
+      .and_then(|path| outputs.iter().find(|output| &output.path == path).cloned())
+      .or_else(|| {
+        if is_custom_build {
+          build_script_executable_output(&outputs, &artifact.target.name, std::env::consts::EXE_SUFFIX)
+        } else {
+          None
+        }
+      });
+    if is_custom_build && executable.is_none() {
+      bypasses.insert("cargo_build_script_executable_output_unavailable".to_string());
+    }
     artifacts.push(CargoArtifactObservation {
       package,
       target_kinds: artifact.target.kind.iter().map(ToString::to_string).collect(),
@@ -922,18 +980,164 @@ fn parse_compilation_observations(
       },
       features: artifact.features.into_iter().collect(),
       outputs,
+      executable,
       fresh: artifact.fresh,
       bypasses,
     });
   }
-  let mut manifests = build_manifests(invocations, artifacts, &identity.observation_context, requested_target)?;
+  let mut manifests = build_manifests(
+    invocations,
+    artifacts,
+    &identity.observation_context,
+    requested_target,
+    CompilerMode::Rustc,
+  )?;
   attach_execution_identities(
     &mut manifests,
     &identity.rustc_executable,
     &identity.wrapper_executables,
     &identity.executable_bypasses,
   );
+  attach_build_script_action_keys(&mut manifests, identity, requested_target)?;
+  attach_build_script_results(&mut manifests, identity, &build_script_outputs);
+  let result_bindings = manifests
+    .iter()
+    .filter(|manifest| manifest.unit.target_kind == crate::compiler::observation::CompilationTargetKind::BuildScript)
+    .map(|manifest| BuildScriptResultBinding {
+      package: manifest.unit.package.clone(),
+      action_key: manifest
+        .build_script_action_key
+        .as_ref()
+        .and_then(crate::build_script::BuildScriptActionKeyAnalysis::key)
+        .map(str::to_string),
+      result_digest: manifest
+        .build_script_result
+        .as_ref()
+        .and_then(crate::build_script::BuildScriptResultAnalysis::digest)
+        .map(str::to_string),
+    })
+    .collect::<Vec<_>>();
+  attach_build_script_result_dependencies(&mut manifests, &identity.package_dependencies, &result_bindings)?;
   Ok(manifests)
+}
+
+fn build_script_executable_output(
+  outputs: &[FileObservation],
+  target_name: &str,
+  executable_suffix: &str,
+) -> Option<FileObservation> {
+  let expected_name = format!("{target_name}{executable_suffix}");
+  let mut matches = outputs.iter().filter(|output| {
+    let path = match &output.path {
+      ObservationPath::Repository(path) | ObservationPath::Host(path) => path,
+    };
+    path.rsplit('/').next() == Some(expected_name.as_str())
+  });
+  let executable = matches.next()?.clone();
+  matches.next().is_none().then_some(executable)
+}
+
+fn build_script_output_summary(script: &cargo_metadata::BuildScript) -> BuildScriptCargoOutputSummary {
+  BuildScriptCargoOutputSummary {
+    linked_libraries: script.linked_libs.len(),
+    linked_paths: script.linked_paths.len(),
+    cfgs: script.cfgs.len(),
+    rustc_environment: script.env.len(),
+    output_directory_reported: !script.out_dir.as_str().is_empty(),
+  }
+}
+
+fn select_build_script_output(
+  output: Option<&CargoBuildScriptOutput>,
+) -> (Option<BuildScriptCargoOutputSummary>, &'static str) {
+  match output {
+    Some(CargoBuildScriptOutput::One(output)) => (
+      Some(output.clone()),
+      "cargo_build_script_execution_freshness_unavailable",
+    ),
+    Some(CargoBuildScriptOutput::Ambiguous) => (None, "cargo_build_script_output_ambiguous"),
+    None => (None, "cargo_build_script_output_unavailable"),
+  }
+}
+
+fn attach_build_script_action_keys(
+  manifests: &mut [CompilationObservationManifest],
+  identity: &CompilerCacheIdentity,
+  requested_target: &str,
+) -> RailResult<()> {
+  for manifest in manifests {
+    if manifest.unit.target_kind != crate::compiler::observation::CompilationTargetKind::BuildScript {
+      continue;
+    }
+    let package = identity.build_script_packages.get(&manifest.unit.package);
+    let source_inputs = manifest
+      .declared_inputs
+      .iter()
+      .chain(&manifest.observed_reads)
+      .cloned()
+      .collect();
+    let target = if requested_target == "default" {
+      identity.host_triple.clone()
+    } else {
+      requested_target.to_string()
+    };
+    let inputs = BuildScriptActionInputs {
+      compiled_artifact: manifest.executable_output.clone(),
+      source_inputs,
+      manifest_closure: package.and_then(|package| identity.manifest_fingerprints.get(&package.package_id).cloned()),
+      lock_closure: Some(identity.lock_fingerprint.clone()),
+      toolchain: Some(identity.toolchain_fingerprint.clone()),
+      action_id: format!("build-script:{}", manifest.unit_identity),
+      package: manifest.unit.package.clone(),
+      arguments: Vec::new(),
+      working_directory: package.map(|package| package.working_directory.clone()),
+      host_target: identity.host_triple.clone(),
+      target,
+      target_identity: identity.target_fingerprints.get(requested_target).cloned(),
+      role: manifest.unit.role,
+      profile: manifest.unit.profile.clone(),
+      features: manifest.unit.features.clone(),
+      cfg: manifest.unit.cfg.clone(),
+      configuration: Some(identity.cargo_config_fingerprint.clone()),
+      environment: None,
+      secret_environment: BTreeSet::new(),
+      dependency_actions: BTreeSet::new(),
+      dependency_results: None,
+      executable_path: None,
+      output_root: None,
+      platform_identity: None,
+    };
+    manifest.build_script_action_key = Some(analyze_build_script_action_key(
+      &identity.observation_context.source_root,
+      inputs,
+    )?);
+  }
+  Ok(())
+}
+
+fn attach_build_script_results(
+  manifests: &mut [CompilationObservationManifest],
+  identity: &CompilerCacheIdentity,
+  cargo_outputs: &HashMap<String, CargoBuildScriptOutput>,
+) {
+  for manifest in manifests {
+    if manifest.unit.target_kind != crate::compiler::observation::CompilationTargetKind::BuildScript {
+      continue;
+    }
+    let (cargo_output, limitation) = select_build_script_output(cargo_outputs.get(&manifest.unit.package));
+    manifest.build_script_result = Some(analyze_build_script_result(
+      &identity.observation_context.source_root,
+      BuildScriptResultInputs {
+        instruction_stream: None,
+        environment_reads: None,
+        generated_outputs: None,
+        execution: None,
+        secret_capabilities: BTreeSet::new(),
+        limitations: BTreeSet::from([limitation.to_string()]),
+      },
+      cargo_output,
+    ));
+  }
 }
 
 fn compiler_observation_miss_reason<'a>(
@@ -1035,6 +1239,88 @@ fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<Ha
         format!("local:{}#{}@{}", manifest.as_str(), package.name, package.version)
       };
       Ok((package.id.clone(), identity))
+    })
+    .collect()
+}
+
+fn package_dependency_graph(
+  snapshot: &WorkspaceSnapshot,
+  identities: &HashMap<PackageId, String>,
+) -> RailResult<HashMap<String, BTreeSet<String>>> {
+  let mut graph = identities
+    .values()
+    .cloned()
+    .map(|identity| (identity, BTreeSet::new()))
+    .collect::<HashMap<_, _>>();
+  let resolve = snapshot
+    .base_resolution()
+    .metadata()
+    .resolve
+    .as_ref()
+    .ok_or_else(|| RailError::message("Cargo metadata omitted the resolved package graph"))?;
+  for node in &resolve.nodes {
+    let consumer = identities.get(&node.id).ok_or_else(|| {
+      RailError::message(format!(
+        "resolved package '{}' has no portable compiler-observation identity",
+        node.id
+      ))
+    })?;
+    let dependencies = graph
+      .get_mut(consumer)
+      .ok_or_else(|| RailError::message("portable package dependency graph lost its consumer"))?;
+    for dependency in &node.deps {
+      let identity = identities.get(&dependency.pkg).ok_or_else(|| {
+        RailError::message(format!(
+          "resolved dependency '{}' has no portable compiler-observation identity",
+          dependency.pkg
+        ))
+      })?;
+      dependencies.insert(identity.clone());
+    }
+  }
+  Ok(graph)
+}
+
+fn build_script_package_contexts(
+  snapshot: &WorkspaceSnapshot,
+  observation_identities: &HashMap<PackageId, String>,
+) -> RailResult<HashMap<String, BuildScriptPackageContext>> {
+  let package_ids = snapshot
+    .base_resolution()
+    .metadata()
+    .packages
+    .iter()
+    .filter(|package| package.source.is_none())
+    .filter(|package| {
+      package
+        .targets
+        .iter()
+        .any(|target| target.kind.contains(&TargetKind::CustomBuild))
+    })
+    .map(|package| package.id.clone())
+    .collect::<HashSet<_>>();
+  snapshot
+    .packages()
+    .iter()
+    .filter(|package| package_ids.contains(package.id()))
+    .map(|package| {
+      let observation_identity = observation_identities.get(package.id()).ok_or_else(|| {
+        RailError::message(format!(
+          "local build-script package '{}' has no portable observation identity",
+          package.id()
+        ))
+      })?;
+      let manifest = package
+        .manifest_path()
+        .ok_or_else(|| RailError::message(format!("local package '{}' has no manifest identity", package.id())))?;
+      let working_directory = manifest.as_path().parent().unwrap_or_else(|| Path::new(""));
+      Ok((
+        observation_identity.clone(),
+        BuildScriptPackageContext {
+          package_id: package.id().clone(),
+          working_directory: format!("repository:{}", crate::utils::path_to_git_format(working_directory)),
+        },
+      ))
     })
     .collect()
 }
@@ -1506,6 +1792,106 @@ fn is_relevant_target(target: &CargoTarget) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn build_script_executable_comes_from_cargo_filenames() {
+    let unix = FileObservation {
+      path: ObservationPath::Repository("target/debug/build/unit/build-script-build".to_string()),
+      content_digest: "sha256:unix".to_string(),
+      executable: true,
+      symlink_target: None,
+    };
+    assert_eq!(
+      build_script_executable_output(std::slice::from_ref(&unix), "build-script-build", ""),
+      Some(unix)
+    );
+
+    let windows = FileObservation {
+      path: ObservationPath::Repository("target/debug/build/unit/build-script-build.exe".to_string()),
+      content_digest: "sha256:windows".to_string(),
+      executable: false,
+      symlink_target: None,
+    };
+    let debug_symbols = FileObservation {
+      path: ObservationPath::Repository("target/debug/build/unit/build-script-build.pdb".to_string()),
+      content_digest: "sha256:pdb".to_string(),
+      executable: false,
+      symlink_target: None,
+    };
+    assert_eq!(
+      build_script_executable_output(&[debug_symbols, windows.clone()], "build-script-build", ".exe"),
+      Some(windows.clone())
+    );
+    let ambiguous = FileObservation {
+      path: ObservationPath::Repository("other/build-script-build.exe".to_string()),
+      ..windows.clone()
+    };
+    assert_eq!(
+      build_script_executable_output(&[windows, ambiguous], "build-script-build", ".exe"),
+      None
+    );
+  }
+
+  #[test]
+  fn cargo_build_script_summary_discards_values_and_physical_paths() {
+    let script: cargo_metadata::BuildScript = serde_json::from_value(serde_json::json!({
+      "package_id": "path+file:///workspace#unit@0.1.0",
+      "linked_libs": ["static=never-persist-this-library"],
+      "linked_paths": ["native=/physical/never-persist-this-path"],
+      "cfgs": ["never_persist_this_cfg"],
+      "env": [["REGISTRY_TOKEN", "never-persist-this-value"]],
+      "out_dir": "/physical/never-persist-this-output",
+    }))
+    .expect("Cargo build-script message");
+    let summary = build_script_output_summary(&script);
+    assert_eq!(
+      summary,
+      BuildScriptCargoOutputSummary {
+        linked_libraries: 1,
+        linked_paths: 1,
+        cfgs: 1,
+        rustc_environment: 1,
+        output_directory_reported: true,
+      }
+    );
+    let encoded = serde_json::to_string(&summary).expect("serialize redacted summary");
+    for raw in [
+      "never-persist-this-library",
+      "never-persist-this-path",
+      "never_persist_this_cfg",
+      "REGISTRY_TOKEN",
+      "never-persist-this-value",
+      "never-persist-this-output",
+    ] {
+      assert!(!encoded.contains(raw), "persisted raw Cargo output {raw:?}");
+    }
+  }
+
+  #[test]
+  fn cargo_build_script_output_selection_fails_closed() {
+    let output = BuildScriptCargoOutputSummary {
+      linked_libraries: 1,
+      linked_paths: 2,
+      cfgs: 3,
+      rustc_environment: 4,
+      output_directory_reported: true,
+    };
+    assert_eq!(
+      select_build_script_output(Some(&CargoBuildScriptOutput::One(output.clone()))),
+      (
+        Some(output.clone()),
+        "cargo_build_script_execution_freshness_unavailable"
+      )
+    );
+    assert_eq!(
+      select_build_script_output(None),
+      (None, "cargo_build_script_output_unavailable")
+    );
+    assert_eq!(
+      select_build_script_output(Some(&CargoBuildScriptOutput::Ambiguous)),
+      (None, "cargo_build_script_output_ambiguous")
+    );
+  }
 
   #[test]
   fn test_candidate_scheduler_keeps_inapplicable_declaration_for_later_target() {
