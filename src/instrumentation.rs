@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 5;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
@@ -30,6 +30,17 @@ struct Counters {
   graph_traversals: AtomicU64,
   graph_node_visits: AtomicU64,
   graph_edge_visits: AtomicU64,
+  cas_objects_written: AtomicU64,
+  cas_bytes_written: AtomicU64,
+  cas_bytes_read: AtomicU64,
+  cas_bytes_restored: AtomicU64,
+  hermetic_cargo_executions: AtomicU64,
+  hermetic_compiler_units: AtomicU64,
+  hermetic_fetch_executions: AtomicU64,
+  hermetic_cargo_probes: AtomicU64,
+  hermetic_rustc_probes: AtomicU64,
+  hermetic_rustdoc_probes: AtomicU64,
+  hermetic_platform_probes: AtomicU64,
 }
 
 impl Counters {
@@ -50,6 +61,17 @@ impl Counters {
       graph_traversals: AtomicU64::new(0),
       graph_node_visits: AtomicU64::new(0),
       graph_edge_visits: AtomicU64::new(0),
+      cas_objects_written: AtomicU64::new(0),
+      cas_bytes_written: AtomicU64::new(0),
+      cas_bytes_read: AtomicU64::new(0),
+      cas_bytes_restored: AtomicU64::new(0),
+      hermetic_cargo_executions: AtomicU64::new(0),
+      hermetic_compiler_units: AtomicU64::new(0),
+      hermetic_fetch_executions: AtomicU64::new(0),
+      hermetic_cargo_probes: AtomicU64::new(0),
+      hermetic_rustc_probes: AtomicU64::new(0),
+      hermetic_rustdoc_probes: AtomicU64::new(0),
+      hermetic_platform_probes: AtomicU64::new(0),
     }
   }
 
@@ -71,6 +93,17 @@ impl Counters {
       graph_traversals: self.graph_traversals.load(Ordering::Relaxed),
       graph_node_visits: self.graph_node_visits.load(Ordering::Relaxed),
       graph_edge_visits: self.graph_edge_visits.load(Ordering::Relaxed),
+      cas_objects_written: self.cas_objects_written.load(Ordering::Relaxed),
+      cas_bytes_written: self.cas_bytes_written.load(Ordering::Relaxed),
+      cas_bytes_read: self.cas_bytes_read.load(Ordering::Relaxed),
+      cas_bytes_restored: self.cas_bytes_restored.load(Ordering::Relaxed),
+      hermetic_cargo_executions: self.hermetic_cargo_executions.load(Ordering::Relaxed),
+      hermetic_compiler_units: self.hermetic_compiler_units.load(Ordering::Relaxed),
+      hermetic_fetch_executions: self.hermetic_fetch_executions.load(Ordering::Relaxed),
+      hermetic_cargo_probes: self.hermetic_cargo_probes.load(Ordering::Relaxed),
+      hermetic_rustc_probes: self.hermetic_rustc_probes.load(Ordering::Relaxed),
+      hermetic_rustdoc_probes: self.hermetic_rustdoc_probes.load(Ordering::Relaxed),
+      hermetic_platform_probes: self.hermetic_platform_probes.load(Ordering::Relaxed),
     }
   }
 }
@@ -93,6 +126,17 @@ struct CounterSnapshot {
   graph_traversals: u64,
   graph_node_visits: u64,
   graph_edge_visits: u64,
+  cas_objects_written: u64,
+  cas_bytes_written: u64,
+  cas_bytes_read: u64,
+  cas_bytes_restored: u64,
+  hermetic_cargo_executions: u64,
+  hermetic_compiler_units: u64,
+  hermetic_fetch_executions: u64,
+  hermetic_cargo_probes: u64,
+  hermetic_rustc_probes: u64,
+  hermetic_rustdoc_probes: u64,
+  hermetic_platform_probes: u64,
 }
 
 /// Active diagnostic session for one cargo-rail process.
@@ -217,4 +261,46 @@ pub(crate) fn record_graph_traversal(node_visits: usize, edge_visits: usize) {
   add(|counters| &counters.graph_traversals, 1);
   add(|counters| &counters.graph_node_visits, amount(node_visits));
   add(|counters| &counters.graph_edge_visits, amount(edge_visits));
+}
+
+pub(crate) fn record_cas_write(bytes: u64, objects: u64) {
+  add(|counters| &counters.cas_bytes_written, bytes);
+  add(|counters| &counters.cas_objects_written, objects);
+}
+
+pub(crate) fn record_cas_read(bytes: u64) {
+  add(|counters| &counters.cas_bytes_read, bytes);
+}
+
+pub(crate) fn record_cas_restore(bytes: u64) {
+  add(|counters| &counters.cas_bytes_restored, bytes);
+}
+
+pub(crate) fn record_hermetic_cargo_execution() {
+  add(|counters| &counters.hermetic_cargo_executions, 1);
+}
+
+pub(crate) fn record_hermetic_compiler_units(units: usize) {
+  add(|counters| &counters.hermetic_compiler_units, amount(units));
+}
+
+pub(crate) fn record_hermetic_fetch_execution() {
+  add(|counters| &counters.hermetic_fetch_executions, 1);
+}
+
+pub(crate) fn record_hermetic_toolchain_probe(program: &std::ffi::OsStr) {
+  let name = std::path::Path::new(program)
+    .file_stem()
+    .and_then(std::ffi::OsStr::to_str)
+    .unwrap_or_default();
+  match name {
+    "cargo" => add(|counters| &counters.hermetic_cargo_probes, 1),
+    "rustc" => add(|counters| &counters.hermetic_rustc_probes, 1),
+    "rustdoc" => add(|counters| &counters.hermetic_rustdoc_probes, 1),
+    _ => {}
+  }
+}
+
+pub(crate) fn record_hermetic_platform_probe() {
+  add(|counters| &counters.hermetic_platform_probes, 1);
 }

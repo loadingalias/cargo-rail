@@ -65,7 +65,7 @@ pub fn run_clean(
   let mut artifacts = CleanArtifacts::new();
 
   if clean_cache {
-    collect_cache_artifacts(ctx, &mut artifacts);
+    collect_cache_artifacts(ctx, &mut artifacts)?;
   }
 
   if clean_reports {
@@ -172,7 +172,7 @@ pub fn run_clean(
   Ok(())
 }
 
-fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) {
+fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) -> RailResult<()> {
   let state_root = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
   let cache_path = state_root.join("metadata.json");
   let compiler_cache_dir = state_root.join("cache");
@@ -189,6 +189,10 @@ fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifact
   if hermetic_cache_dir.exists() {
     artifacts.cache_files.push(hermetic_cache_dir.display().to_string());
   }
+  if let Some(local_cache) = crate::hermetic::local_cache_root(ctx.workspace_root())? {
+    artifacts.cache_files.push(local_cache.display().to_string());
+  }
+  Ok(())
 }
 
 fn collect_report_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) {
@@ -300,6 +304,7 @@ fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
   let compiler_cache_dir = state_root.join("cache");
   let hermetic_cache_dir = crate::hermetic::state_root(ctx.workspace_root());
   let mut cleaned_paths = Vec::new();
+  let removed_local_cache = crate::hermetic::remove_local_cache(ctx.workspace_root())?;
 
   if cache_path.exists() {
     progress!("removing cache...");
@@ -327,6 +332,11 @@ fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
     progress!("removing hermetic cache...");
     crate::hermetic::remove_state(ctx.workspace_root())?;
     cleaned_paths.push(hermetic_cache_dir.display().to_string());
+  }
+
+  if let Some(local_cache) = removed_local_cache {
+    progress!("removed verified local action cache");
+    cleaned_paths.push(local_cache.display().to_string());
   }
 
   Ok(cleaned_paths)

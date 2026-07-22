@@ -62,6 +62,8 @@ pub struct RunOptions {
   pub dry_run: bool,
   /// Execute supported actions inside the isolated hermetic profile.
   pub hermetic: bool,
+  /// Disable local action-result reuse.
+  pub no_cache: bool,
   /// Rendering contract for execution previews and CI action plans.
   pub format: ActionOutputFormat,
   /// Generated-output behavior.
@@ -87,6 +89,9 @@ pub struct RunOptions {
   /// Render a read-only hermeticity report instead of a run plan.
   #[doc(hidden)]
   pub hermeticity_doctor: bool,
+  /// The CLI request passed the exact process-free P7.1 lookup predicate.
+  #[doc(hidden)]
+  pub pre_context_cache_request: bool,
 }
 
 /// Execute `run` with planner-driven action selection.
@@ -1462,21 +1467,12 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
   }
 
   if opts.hermetic {
-    let (report, path) = crate::hermetic::execute(ctx, action)?;
-    println!(
-      "{}: hermetic {}{}{}",
-      action.id(),
-      report.support().as_str(),
-      report
-        .action_key()
-        .map(|key| format!(" action_key={key}"))
-        .unwrap_or_default(),
-      report
-        .result_digest()
-        .map(|digest| format!(" result={digest}"))
-        .unwrap_or_default(),
-    );
-    println!("{}: hermetic report {}", action.id(), path.display());
+    let lookup_key = opts
+      .pre_context_cache_request
+      .then(|| crate::hermetic::pre_context_lookup_key(ctx.workspace_root()))
+      .and_then(Result::ok);
+    let (report, path) = crate::hermetic::execute(ctx, action, !opts.no_cache, lookup_key.as_deref())?;
+    print_hermetic_result(action.id(), &report, &path, opts.explain);
     return Ok(());
   }
 
@@ -1531,6 +1527,114 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
   Ok(())
 }
 
+fn print_hermetic_result(
+  action_id: &str,
+  report: &crate::hermetic::HermeticExecutionReport,
+  path: &std::path::Path,
+  explain: bool,
+) {
+  println!(
+    "{action_id}: hermetic {}{}{}",
+    report.support().as_str(),
+    report
+      .action_key()
+      .map(|key| format!(" action_key={key}"))
+      .unwrap_or_default(),
+    report
+      .result_digest()
+      .map(|digest| format!(" result={digest}"))
+      .unwrap_or_default(),
+  );
+  println!("{action_id}: hermetic report {}", path.display());
+  if explain {
+    println!(
+      "action `{action_id}` local cache: {} ({}) cargo_check_executed={} compiler_units_executed={}",
+      report.cache_status(),
+      report.cache_reason(),
+      report.cargo_check_executed(),
+      report.compiler_units_executed(),
+    );
+  }
+}
+
+/// Finish the ordinary text and receipt surfaces after a process-free cache hit.
+pub(crate) fn complete_pre_context_cache_hit(
+  workspace_root: &std::path::Path,
+  hit: crate::hermetic::PreContextCacheHit,
+  print_cmd: bool,
+  explain: bool,
+) -> RailResult<()> {
+  if explain {
+    println!("action `build` key: eligible ()");
+    println!(
+      "action `build` targets ({}): {}",
+      hit.selected_packages.len(),
+      format_preview_list(&hit.selected_packages, 12)
+    );
+  }
+  if print_cmd {
+    println!("build: {}", hit.argv.join(" "));
+  }
+  print_hermetic_result("build", &hit.report, &hit.report_path, explain);
+  let cached_action = serde_json::json!({
+    "id": "build",
+    "kind": "build",
+    "argv": hit.argv,
+    "selected_packages": hit.selected_packages,
+    "action_key": hit.report.action_key(),
+    "source": "verified_local_action_result",
+  });
+  let receipt = serde_json::json!({
+    "artifact": "decision_receipt",
+    "version": 4,
+    "command": "run",
+    "generated_at_utc": chrono::Utc::now().to_rfc3339(),
+    "snapshot_id": null,
+    "cache_action_key": hit.report.action_key(),
+    "snapshot_status": "not_loaded_on_process_free_cache_hit",
+    "actions": [cached_action],
+    "inputs": {
+      "profile_requested": null,
+      "profile_effective": null,
+      "profile_source": null,
+      "workflow_requested": null,
+      "workflow_effective": null,
+      "actions_requested": ["build"],
+      "actions_effective": ["build"],
+      "since_requested": null,
+      "since_effective": null,
+      "merge_base_requested": false,
+      "merge_base_effective": false,
+      "all": true,
+      "run_args_requested": [],
+      "run_args_effective": [],
+      "test_runner": TestRunnerPreference::Auto,
+      "cargo_test_args": [],
+      "nextest_args": [],
+      "test_filter": null,
+      "dry_run": false,
+      "format": ActionOutputFormat::Text,
+      "generated_mode": GeneratedMode::Regenerate,
+      "execution_profile": "hermetic",
+    },
+    "execution": {
+      "executed_actions": ["build"],
+      "skipped_actions": [],
+      "execution_mode": "verified_local_cache_restore",
+      "cargo_check_executed": false,
+      "compiler_units_executed": false,
+      "fetch_action": null,
+    },
+    "scope": null,
+    "plan": null,
+  });
+  let receipt_path = persist_run_decision_receipt(workspace_root, &receipt)?;
+  if std::env::var_os("CI").is_some() {
+    progress!("decision receipt: {}", receipt_path.display());
+  }
+  Ok(())
+}
+
 struct DecisionReceiptInput<'a> {
   ctx: &'a WorkspaceContext,
   opts: &'a RunOptions,
@@ -1542,10 +1646,6 @@ struct DecisionReceiptInput<'a> {
 }
 
 fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std::path::PathBuf> {
-  let dir = crate::workspace::cargo_rail_state_root(input.ctx.workspace_root()).join("receipts");
-  fs::create_dir_all(&dir)?;
-  let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-  let path = dir.join(format!("run-decision-{}.json", nonce));
   let receipt = serde_json::json!({
     "artifact": "decision_receipt",
     "version": 4,
@@ -1591,6 +1691,17 @@ fn write_run_decision_receipt(input: DecisionReceiptInput<'_>) -> RailResult<std
     "scope": input.plan.map(|output| &output.scope),
     "plan": input.plan,
   });
+  persist_run_decision_receipt(input.ctx.workspace_root(), &receipt)
+}
+
+fn persist_run_decision_receipt(
+  workspace_root: &std::path::Path,
+  receipt: &serde_json::Value,
+) -> RailResult<std::path::PathBuf> {
+  let dir = crate::workspace::cargo_rail_state_root(workspace_root).join("receipts");
+  fs::create_dir_all(&dir)?;
+  let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+  let path = dir.join(format!("run-decision-{}.json", nonce));
   let bytes = serde_json::to_vec_pretty(&receipt)
     .map_err(|e| RailError::message(format!("failed to serialize decision receipt: {}", e)))?;
   let mut file = OpenOptions::new()

@@ -2530,6 +2530,7 @@ fn hermetic_command_identity(
   workspace_root: &Path,
   description: &str,
 ) -> RailResult<String> {
+  crate::instrumentation::record_hermetic_toolchain_probe(program);
   let mut command = Command::new(program);
   for name in [
     "DYLD_INSERT_LIBRARIES",

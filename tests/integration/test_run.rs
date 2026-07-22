@@ -34,6 +34,76 @@ fn generate_lockfile_with_env(workspace: &Path, environment: &[(&str, &str)]) ->
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn assert_materialized_output_matches_manifest(root: &Path, manifest: &serde_json::Value) -> Result<()> {
+  fn collect(root: &Path, directory: &Path, paths: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+      let entry = entry?;
+      let path = entry.path();
+      let relative = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+      paths.push(relative);
+      if entry.file_type()?.is_dir() {
+        collect(root, &path, paths)?;
+      }
+    }
+    Ok(())
+  }
+
+  let entries = manifest["entries"].as_array().expect("output manifest entries");
+  let mut expected_paths = entries
+    .iter()
+    .map(|entry| entry["path"].as_str().expect("manifest path").to_string())
+    .collect::<Vec<_>>();
+  let mut actual_paths = Vec::new();
+  collect(root, root, &mut actual_paths)?;
+  expected_paths.sort();
+  actual_paths.sort();
+  assert_eq!(
+    actual_paths, expected_paths,
+    "materialized tree must contain exactly the declared paths"
+  );
+
+  for entry in entries {
+    let relative = entry["path"].as_str().expect("manifest path");
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)?;
+    match entry["kind"].as_str().expect("manifest entry kind") {
+      "directory" => assert!(metadata.is_dir() && !metadata.file_type().is_symlink()),
+      "file" => {
+        assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+        let bytes = fs::read(&path)?;
+        let digest = Sha256::digest(&bytes)
+          .iter()
+          .map(|byte| format!("{byte:02x}"))
+          .collect::<String>();
+        assert_eq!(bytes.len() as u64, entry["bytes"].as_u64().expect("file byte count"));
+        assert_eq!(
+          format!("sha256:{digest}"),
+          entry["digest"].as_str().expect("file digest"),
+          "restored file bytes differ at {relative}"
+        );
+      }
+      "symlink" => {
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+          fs::read_link(&path)?.to_string_lossy(),
+          entry["target"].as_str().expect("symlink target")
+        );
+      }
+      kind => panic!("unsupported output manifest kind {kind}"),
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    if entry["kind"] != "symlink" {
+      assert_eq!(
+        metadata.permissions().mode() & 0o7777,
+        entry["mode"].as_u64().expect("output mode") as u32,
+        "restored mode differs at {relative}"
+      );
+    }
+  }
+  Ok(())
+}
+
 #[derive(Clone, Copy, Default)]
 struct RegistryObservations {
   requests: usize,
@@ -53,6 +123,7 @@ struct SparseRegistry {
   state: Arc<Mutex<RegistryState>>,
   stop: Arc<AtomicBool>,
   threads: Vec<JoinHandle<()>>,
+  connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl SparseRegistry {
@@ -78,6 +149,7 @@ impl SparseRegistry {
     let crate_archive: Arc<[u8]> = crate_archive.into();
     let state = Arc::new(Mutex::new(RegistryState::default()));
     let stop = Arc::new(AtomicBool::new(false));
+    let connections = Arc::new(Mutex::new(Vec::new()));
     let mut threads = Vec::with_capacity(4);
     for _ in 0..4 {
       let listener = listener.try_clone()?;
@@ -86,15 +158,27 @@ impl SparseRegistry {
       let crate_archive = Arc::clone(&crate_archive);
       let thread_state = Arc::clone(&state);
       let thread_stop = Arc::clone(&stop);
+      let thread_connections = Arc::clone(&connections);
       threads.push(std::thread::spawn(move || {
         while !thread_stop.load(Ordering::Acquire) {
           match listener.accept() {
             Ok((stream, _)) => {
-              if let Err(error) =
-                serve_sparse_registry_request(stream, &config, &index_entry, &crate_archive, &thread_state)
-                && let Ok(mut state) = thread_state.lock()
-              {
-                state.failure = Some(error.to_string());
+              let config = Arc::clone(&config);
+              let index_entry = Arc::clone(&index_entry);
+              let crate_archive = Arc::clone(&crate_archive);
+              let connection_state = Arc::clone(&thread_state);
+              let connection = std::thread::spawn(move || {
+                if let Err(error) =
+                  serve_sparse_registry_request(stream, &config, &index_entry, &crate_archive, &connection_state)
+                  && let Ok(mut state) = connection_state.lock()
+                {
+                  state.failure = Some(error.to_string());
+                }
+              });
+              if let Ok(mut connections) = thread_connections.lock() {
+                connections.push(connection);
+              } else {
+                break;
               }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -115,6 +199,7 @@ impl SparseRegistry {
       state,
       stop,
       threads,
+      connections,
     })
   }
 
@@ -147,6 +232,11 @@ impl Drop for SparseRegistry {
     for thread in self.threads.drain(..) {
       let _ = thread.join();
     }
+    if let Ok(mut connections) = self.connections.lock() {
+      for connection in connections.drain(..) {
+        let _ = connection.join();
+      }
+    }
   }
 }
 
@@ -157,12 +247,22 @@ fn serve_sparse_registry_request(
   crate_archive: &[u8],
   state: &Mutex<RegistryState>,
 ) -> std::io::Result<()> {
-  stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+  // The listener is nonblocking so the accept loops can observe shutdown.
+  // Do not let that transport policy leak into request parsing: Cargo may
+  // connect before its request bytes are runnable on a loaded test host.
+  stream.set_nonblocking(false)?;
+  // Cargo may open a registry connection before a heavily parallel test host
+  // schedules its request headers. Keep the timeout bounded, but do not turn
+  // ordinary scheduler pressure into an empty HTTP reply.
+  stream.set_read_timeout(Some(Duration::from_secs(10)))?;
   let mut request = Vec::with_capacity(1024);
   while request.len() < 16 * 1024 {
     let mut chunk = [0u8; 1024];
     let bytes = stream.read(&mut chunk)?;
     if bytes == 0 {
+      if request.is_empty() {
+        return Ok(());
+      }
       break;
     }
     request.extend_from_slice(&chunk[..bytes]);
@@ -1884,6 +1984,8 @@ fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receip
 
 #[test]
 fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()> {
+  let local_cache = tempfile::tempdir()?;
+  let local_cache = local_cache.path().to_string_lossy().into_owned();
   let first = TestWorkspace::new_named("hermetic-check-first")?;
   first.add_crate("lib-a", "0.1.0", &[])?;
   fs::create_dir_all(first.path.join(".cargo"))?;
@@ -1948,7 +2050,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
   assert_eq!(plan["fetch_action"]["consumer_network"], "denied");
 
   let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
-  let first_output = run_cargo_rail(&first.path, &command)?;
+  let first_output = run_cargo_rail_with_env(&first.path, &command, &[("CARGO_RAIL_CACHE_DIR", &local_cache)])?;
   assert!(
     first_output.status.success(),
     "first hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
@@ -1958,7 +2060,26 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
   );
   fs::write(second.path.join("UNRELATED.md"), "not selected by the build action\n")?;
   second.commit("Add unrelated documentation")?;
-  let second_output = run_cargo_rail_with_env(&second.path, &command, &[("CARGO_RAIL_UNRELATED", "changed")])?;
+  let diagnostics = tempfile::tempdir()?;
+  let hit_diagnostics = diagnostics.path().join("hit.json");
+  let hit_diagnostics_text = hit_diagnostics.to_string_lossy().into_owned();
+  let second_output = run_cargo_rail_with_env(
+    &second.path,
+    &[
+      "rail",
+      "--diagnostics-file",
+      hit_diagnostics_text.as_str(),
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--hermetic",
+    ],
+    &[
+      ("CARGO_RAIL_CACHE_DIR", &local_cache),
+      ("CARGO_RAIL_UNRELATED", "changed"),
+    ],
+  )?;
   assert!(
     second_output.status.success(),
     "second hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
@@ -1966,7 +2087,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     String::from_utf8_lossy(&second_output.stdout),
     String::from_utf8_lossy(&second_output.stderr)
   );
-  let changed_output = run_cargo_rail(&changed.path, &command)?;
+  let changed_output = run_cargo_rail_with_env(&changed.path, &command, &[("CARGO_RAIL_CACHE_DIR", &local_cache)])?;
   assert!(
     changed_output.status.success(),
     "changed hermetic check failed ({})\nstdout:\n{}\nstderr:\n{}",
@@ -1996,12 +2117,18 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     ["cargo-home", "manifest.json"],
     "fetch staging homes and Rust toolchains must never enter the immutable dependency inventory"
   );
-  assert_eq!(first_report["version"], 1);
+  assert_eq!(first_report["version"], 3);
   assert_eq!(first_report["profile_version"], 1);
   assert_eq!(first_report["action_class"], "cargo_check");
   assert_eq!(first_report["fetch"]["version"], 1);
   assert_eq!(first_report["fetch"]["reused"], false);
-  assert_eq!(second_report["fetch"]["reused"], false);
+  assert_eq!(
+    second_report["fetch"]["reused"],
+    true,
+    "equivalent checkout did not hit:\nreport={second_report:#}\nstdout={}\nstderr={}",
+    String::from_utf8_lossy(&second_output.stdout),
+    String::from_utf8_lossy(&second_output.stderr)
+  );
   assert_eq!(first_report["fetch"]["packages"], 0);
   assert!(
     first_report["output_manifest"]["files"]
@@ -2010,20 +2137,8 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     "rustc outputs must be declared: {first_report}"
   );
   assert_eq!(
-    first_report["action_key"], second_report["action_key"],
-    "equivalent source in different roots must have one action key:\nfirst={first_report:#}\nsecond={second_report:#}"
-  );
-  assert_eq!(
     first_report["output_manifest"]["digest"], second_report["output_manifest"]["digest"],
     "equivalent source in different roots must have one output manifest:\nfirst={first_report:#}\nsecond={second_report:#}"
-  );
-  assert_eq!(
-    first_report["result_digest"], second_report["result_digest"],
-    "equivalent source in different roots must have one result digest"
-  );
-  assert_ne!(
-    first_report["action_key"], changed_report["action_key"],
-    "a same-size source mutation must change the hermetic action key"
   );
   assert_ne!(
     first_report["output_manifest"]["digest"], changed_report["output_manifest"]["digest"],
@@ -2036,15 +2151,408 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
 
   #[cfg(target_os = "macos")]
   {
+    assert!(
+      first_report["action_key"].is_string(),
+      "an eligible action must have an action key"
+    );
+    assert!(
+      first_report["result_digest"].is_string(),
+      "an eligible action must have a result digest"
+    );
+    assert_eq!(
+      first_report["action_key"], second_report["action_key"],
+      "equivalent source in different roots must have one action key:\nfirst={first_report:#}\nsecond={second_report:#}"
+    );
+    assert_eq!(
+      first_report["result_digest"], second_report["result_digest"],
+      "equivalent source in different roots must have one result digest"
+    );
+    assert_ne!(
+      first_report["action_key"], changed_report["action_key"],
+      "a same-size source mutation must change the hermetic action key"
+    );
     assert_eq!(first_report["support"], "eligible");
     assert_eq!(first_report["enforcement"], "filesystem_and_network");
     assert!(first_report["reasons"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(first_report["cache"]["status"], "miss");
+    assert_eq!(first_report["cache"]["reason"], "validated_candidate_not_found");
+    assert_eq!(first_report["cache"]["stored"], true);
+    assert_eq!(first_report["cache"]["cargo_check_executed"], true);
+    assert_eq!(first_report["cache"]["compiler_units_executed"], true);
+    assert_eq!(second_report["cache"]["status"], "hit");
+    assert_eq!(second_report["cache"]["stored"], false);
+    assert_eq!(second_report["cache"]["cargo_check_executed"], false);
+    assert_eq!(second_report["cache"]["compiler_units_executed"], false);
+    assert_eq!(
+      second_report["cache"]["bytes_restored"], second_report["output_manifest"]["bytes"],
+      "a hit must restore every declared regular-file byte"
+    );
+    assert!(
+      !String::from_utf8_lossy(&second_output.stderr).contains("Checking lib-a"),
+      "a cache hit must not execute the Cargo check action:\n{}",
+      String::from_utf8_lossy(&second_output.stderr)
+    );
+    let materialized_root = second_report["materialized_root"]
+      .as_str()
+      .expect("a cache hit must publish its declared output root");
+    assert!(!Path::new(materialized_root).is_absolute());
+    let materialized_root = second.path.join(materialized_root);
+    assert!(
+      materialized_root.is_dir(),
+      "restored outputs must persist after cargo-rail exits"
+    );
+    assert_materialized_output_matches_manifest(&materialized_root, &second_report["output_manifest"])?;
+    let receipts =
+      fs::read_dir(second.path.join("target/cargo-rail/receipts"))?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(receipts.len(), 1, "one cache-hit decision receipt");
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(receipts[0].path())?)?;
+    assert_eq!(receipt["execution"]["execution_mode"], "verified_local_cache_restore");
+    assert_eq!(receipt["execution"]["cargo_check_executed"], false);
+    assert_eq!(receipt["execution"]["compiler_units_executed"], false);
+    assert!(
+      receipt["execution"]["fetch_action"].is_null(),
+      "a process-free hit receipt must not claim that Cargo fetch ran"
+    );
+
+    let counters: serde_json::Value = serde_json::from_slice(&fs::read(&hit_diagnostics)?)?;
+    assert_eq!(counters["schema_version"], 5);
+    assert_eq!(
+      counters["cargo_metadata_loads"], 0,
+      "a cache hit must not execute Cargo metadata"
+    );
+    assert_eq!(
+      counters["hermetic_fetch_executions"], 0,
+      "a cache hit must not execute Cargo fetch"
+    );
+    assert_eq!(
+      counters["hermetic_cargo_probes"], 0,
+      "a cache hit must not execute Cargo probes"
+    );
+    assert_eq!(
+      counters["hermetic_rustc_probes"], 0,
+      "a cache hit must not execute rustc probes"
+    );
+    assert_eq!(
+      counters["hermetic_rustdoc_probes"], 0,
+      "a cache hit must not execute rustdoc probes"
+    );
+    assert_eq!(
+      counters["hermetic_cargo_executions"], 0,
+      "a cache hit must not execute Cargo check"
+    );
+    assert_eq!(
+      counters["hermetic_compiler_units"], 0,
+      "a cache hit must not execute compiler units"
+    );
+    assert_eq!(changed_report["cache"]["status"], "miss");
+    assert_eq!(changed_report["cache"]["cargo_check_executed"], true);
+
+    let override_directory = tempfile::tempdir()?;
+    let override_path = override_directory.path().join("rail.toml");
+    fs::write(&override_path, "[run]\n")?;
+    let override_path = override_path.to_string_lossy().into_owned();
+    let config_override = run_cargo_rail_with_env(
+      &second.path,
+      &[
+        "rail",
+        "--config",
+        override_path.as_str(),
+        "run",
+        "--all",
+        "--action",
+        "build",
+        "--hermetic",
+        "--explain",
+      ],
+      &[("CARGO_RAIL_CACHE_DIR", &local_cache)],
+    )?;
+    assert!(
+      config_override.status.success()
+        && String::from_utf8_lossy(&config_override.stdout)
+          .contains("local cache: uncacheable (pre_context_request_not_graduated)")
+        && String::from_utf8_lossy(&config_override.stdout).contains("cargo_check_executed=true")
+        && String::from_utf8_lossy(&config_override.stderr).contains("Checking lib-a"),
+      "an explicit configuration override must not enter the process-free path:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&config_override.stdout),
+      String::from_utf8_lossy(&config_override.stderr)
+    );
+
+    let historical_candidates = run_cargo_rail_with_env(
+      &second.path,
+      &["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"],
+      &[("CARGO_RAIL_CACHE_DIR", &local_cache)],
+    )?;
+    assert!(
+      historical_candidates.status.success()
+        && String::from_utf8_lossy(&historical_candidates.stdout).contains("local cache: hit")
+        && !String::from_utf8_lossy(&historical_candidates.stderr).contains("Checking lib-a"),
+      "the exact candidate must hit after a same-seed source mutation is cached:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&historical_candidates.stdout),
+      String::from_utf8_lossy(&historical_candidates.stderr)
+    );
+
+    let relevant_environment = run_cargo_rail_with_env(
+      &second.path,
+      &["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"],
+      &[("CARGO_RAIL_CACHE_DIR", &local_cache), ("CARGO_PROFILE_DEV_DEBUG", "0")],
+    )?;
+    assert!(
+      relevant_environment.status.success()
+        && String::from_utf8_lossy(&relevant_environment.stdout)
+          .contains("local cache precheck: miss (cargo_configuration_changed)")
+        && String::from_utf8_lossy(&relevant_environment.stdout).contains("cargo_check_executed=true")
+        && String::from_utf8_lossy(&relevant_environment.stderr).contains("Checking lib-a"),
+      "a relevant Cargo environment mutation must execute cold:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&relevant_environment.stdout),
+      String::from_utf8_lossy(&relevant_environment.stderr)
+    );
+
+    let config_path = second.path.join(".cargo/config.toml");
+    let original_config = fs::read_to_string(&config_path)?;
+    fs::write(
+      &config_path,
+      "[env]\nCARGO_RAIL_HERMETIC_VALUE = { value = \"mutant\", force = true }\n",
+    )?;
+    let changed_config = run_cargo_rail_with_env(
+      &second.path,
+      &["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"],
+      &[("CARGO_RAIL_CACHE_DIR", &local_cache)],
+    )?;
+    assert!(
+      changed_config.status.success()
+        && !String::from_utf8_lossy(&changed_config.stdout).contains("local cache: hit")
+        && String::from_utf8_lossy(&changed_config.stdout).contains("cargo_check_executed=true")
+        && String::from_utf8_lossy(&changed_config.stderr).contains("Checking lib-a"),
+      "a same-size Cargo configuration mutation must execute cold:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&changed_config.stdout),
+      String::from_utf8_lossy(&changed_config.stderr)
+    );
+    fs::write(&config_path, original_config)?;
+
+    let lock_path = second.path.join("Cargo.lock");
+    let original_lock = fs::read_to_string(&lock_path)?;
+    fs::write(&lock_path, format!("{original_lock}\n"))?;
+    let changed_lock = run_cargo_rail_with_env(
+      &second.path,
+      &["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"],
+      &[("CARGO_RAIL_CACHE_DIR", &local_cache)],
+    )?;
+    assert!(
+      changed_lock.status.success()
+        && !String::from_utf8_lossy(&changed_lock.stdout).contains("local cache: hit")
+        && String::from_utf8_lossy(&changed_lock.stdout).contains("cargo_check_executed=true")
+        && String::from_utf8_lossy(&changed_lock.stderr).contains("Checking lib-a"),
+      "an exact lockfile mutation must execute cold:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&changed_lock.stdout),
+      String::from_utf8_lossy(&changed_lock.stderr)
+    );
+    fs::write(&lock_path, original_lock)?;
   }
   #[cfg(not(target_os = "macos"))]
   {
-    assert_eq!(first_report["support"], "platform_limited");
-    assert_eq!(first_report["enforcement"], "cargo_offline_only");
+    for report in [&first_report, &second_report, &changed_report] {
+      assert!(
+        report.get("action_key").is_none(),
+        "a platform-limited action must not publish an action key: {report}"
+      );
+      assert!(
+        report.get("result_digest").is_none(),
+        "a platform-limited action must not publish a reusable result identity: {report}"
+      );
+      assert_eq!(report["support"], "platform_limited");
+      assert_eq!(report["enforcement"], "cargo_offline_only");
+      assert_eq!(
+        report["reasons"],
+        serde_json::json!(["os_network_and_filesystem_enforcement_unavailable"])
+      );
+      assert_eq!(report["cache"]["status"], "uncacheable");
+      assert_eq!(
+        report["cache"]["reason"],
+        "os_network_and_filesystem_enforcement_unavailable"
+      );
+      assert_eq!(report["cache"]["stored"], false);
+      assert_eq!(report["cache"]["cargo_check_executed"], true);
+      assert_eq!(report["cache"]["compiler_units_executed"], true);
+    }
   }
+  Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_local_action_cache_corruption_disable_and_cleanup_fail_closed() -> Result<()> {
+  let ws = TestWorkspace::new_named("local-action-cache-fail-closed")?;
+  ws.add_crate("cached-lib", "0.1.0", &[])?;
+  generate_lockfile(&ws.path)?;
+  ws.commit("Add local cache fixture")?;
+  let cache = tempfile::tempdir()?;
+  let cache_path = cache.path().to_string_lossy().into_owned();
+  fs::write(cache.path().join("keep"), "outside owned CAS root\n")?;
+  let environment = [("CARGO_RAIL_CACHE_DIR", cache_path.as_str())];
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"];
+
+  let cold = run_cargo_rail_with_env(&ws.path, &command, &environment)?;
+  assert!(
+    cold.status.success(),
+    "cold cache population failed:\n{}",
+    String::from_utf8_lossy(&cold.stderr)
+  );
+  let cas_root = cache.path().join("cargo-rail/local-cas-v1");
+  let preview = run_cargo_rail_with_env(&ws.path, &["rail", "clean", "--cache", "--check"], &environment)?;
+  assert_eq!(preview.status.code(), Some(1), "cache preview must report work");
+  assert!(
+    String::from_utf8_lossy(&preview.stdout).contains(&cas_root.display().to_string()),
+    "clean --cache --check must explain the owned shared root"
+  );
+  assert!(cas_root.is_dir(), "check mode must not remove the local CAS");
+  let pin_path = fs::read_dir(cas_root.join("pins"))?
+    .next()
+    .expect("cold execution should publish one pin")?
+    .path();
+  let pin: serde_json::Value = serde_json::from_slice(&fs::read(pin_path)?)?;
+  let action_result = pin["action_result"].as_str().expect("action-result identity");
+  let result_hex = action_result
+    .strip_prefix("action-result-v1-sha256-")
+    .expect("versioned action-result identity");
+  let blob_path = fs::read_dir(cas_root.join("results").join(result_hex).join("blobs"))?
+    .next()
+    .expect("compiler result should contain a blob")?
+    .path();
+  fs::write(&blob_path, b"x")?;
+
+  let corrupt = run_cargo_rail_with_env(&ws.path, &command, &environment)?;
+  assert_eq!(corrupt.status.code(), Some(2), "corrupt cache must fail closed");
+  let corrupt_stderr = String::from_utf8_lossy(&corrupt.stderr);
+  assert!(
+    corrupt_stderr.contains("local action cache corrupt") && corrupt_stderr.contains("blob_"),
+    "corruption explanation must identify the rejected object:\n{corrupt_stderr}"
+  );
+  assert!(
+    !corrupt_stderr.contains("Checking cached-lib"),
+    "a corrupt object must not authorize reuse or trigger an implicit cold execution"
+  );
+
+  let disabled = run_cargo_rail_with_env(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--hermetic",
+      "--no-cache",
+      "--explain",
+    ],
+    &environment,
+  )?;
+  assert!(disabled.status.success(), "explicitly disabled cache execution failed");
+  let disabled_stdout = String::from_utf8_lossy(&disabled.stdout);
+  assert!(
+    disabled_stdout.contains("local cache: disabled (disabled_by_request)")
+      && disabled_stdout.contains("cargo_check_executed=true compiler_units_executed=true"),
+    "disabled explanation must identify the cold execution:\n{disabled_stdout}"
+  );
+
+  let cleaned = run_cargo_rail_with_env(&ws.path, &["rail", "clean", "--cache"], &environment)?;
+  assert!(
+    cleaned.status.success(),
+    "cache cleanup failed:\n{}",
+    String::from_utf8_lossy(&cleaned.stderr)
+  );
+  assert!(
+    !cas_root.exists(),
+    "clean --cache must remove the validated owned CAS root"
+  );
+  assert_eq!(
+    fs::read_to_string(cache.path().join("keep"))?,
+    "outside owned CAS root\n",
+    "cleanup must not remove the configured cache base or unrelated files"
+  );
+  Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_local_action_cache_concurrent_cold_writers_converge() -> Result<()> {
+  fn fixture(name: &str) -> Result<TestWorkspace> {
+    let ws = TestWorkspace::new_named(name)?;
+    ws.add_crate("concurrent-lib", "0.1.0", &[])?;
+    generate_lockfile(&ws.path)?;
+    ws.commit("Add concurrent cache fixture")?;
+    Ok(ws)
+  }
+
+  let first = fixture("local-cache-concurrent-first")?;
+  let second = fixture("local-cache-concurrent-second")?;
+  let cache = tempfile::tempdir()?;
+  let cache_path = cache.path().to_string_lossy().into_owned();
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
+  let barrier = Arc::new(std::sync::Barrier::new(2));
+  let first_path = &first.path;
+  let second_path = &second.path;
+  let command_ref = &command;
+  let outputs = std::thread::scope(|scope| {
+    let first_barrier = Arc::clone(&barrier);
+    let first_cache = cache_path.clone();
+    let first_handle = scope.spawn(move || {
+      first_barrier.wait();
+      run_cargo_rail_with_env(
+        first_path,
+        command_ref,
+        &[("CARGO_RAIL_CACHE_DIR", first_cache.as_str())],
+      )
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second_cache = cache_path.clone();
+    let second_handle = scope.spawn(move || {
+      second_barrier.wait();
+      run_cargo_rail_with_env(
+        second_path,
+        command_ref,
+        &[("CARGO_RAIL_CACHE_DIR", second_cache.as_str())],
+      )
+    });
+    [first_handle.join(), second_handle.join()]
+  });
+  for output in outputs {
+    let output = output.expect("concurrent cargo-rail process should not panic")?;
+    assert!(
+      output.status.success(),
+      "concurrent writer failed:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+  let cas_root = cache.path().join("cargo-rail/local-cas-v1");
+  assert_eq!(fs::read_dir(cas_root.join("pins"))?.count(), 1, "one action-key pin");
+  assert_eq!(
+    fs::read_dir(cas_root.join("results"))?.count(),
+    1,
+    "concurrent identical writers must publish one complete result bundle"
+  );
+  assert_eq!(
+    fs::read_dir(cas_root.join("staging"))?.count(),
+    0,
+    "no partial staging roots"
+  );
+  assert_eq!(
+    fs::read_dir(cas_root.join("leases"))?.count(),
+    0,
+    "no live leases after exit"
+  );
+
+  let hit = run_cargo_rail_with_env(
+    &second.path,
+    &["rail", "run", "--all", "--action", "build", "--hermetic", "--explain"],
+    &[("CARGO_RAIL_CACHE_DIR", cache_path.as_str())],
+  )?;
+  assert!(hit.status.success());
+  assert!(
+    String::from_utf8_lossy(&hit.stdout).contains("local cache: hit")
+      && !String::from_utf8_lossy(&hit.stderr).contains("Checking concurrent-lib"),
+    "published concurrent result must be reusable without compiler execution"
+  );
   Ok(())
 }
 
@@ -2090,7 +2598,16 @@ fn test_hermetic_fetch_inventory_converges_for_locked_git_dependency() -> Result
   generate_lockfile(&second.path)?;
   second.commit("Add locked Git consumer")?;
 
-  let command = ["rail", "run", "--since", "HEAD~1", "--action", "build", "--hermetic"];
+  let command = [
+    "rail",
+    "run",
+    "--since",
+    "HEAD~1",
+    "--action",
+    "build",
+    "--hermetic",
+    "--no-cache",
+  ];
   let ambient_home = tempfile::tempdir()?;
   let ambient_home_value = ambient_home.path().to_string_lossy().into_owned();
   let environment = [
@@ -2224,7 +2741,7 @@ fn test_hermetic_sparse_registry_fetch_is_the_only_network_boundary_and_reuses_w
     ("HOME", ambient_home_value.as_str()),
     ("USERPROFILE", ambient_home_value.as_str()),
   ];
-  let command = ["rail", "run", "--all", "--action", "build", "--hermetic"];
+  let command = ["rail", "run", "--all", "--action", "build", "--hermetic", "--no-cache"];
   let mut cold_reports = Vec::new();
   for workspace in [&first, &second] {
     registry.begin(&workspace.path)?;
@@ -2350,6 +2867,7 @@ fn test_hermetic_all_target_check_proves_pure_rust_unit_classes_in_two_roots() -
     "--action",
     "build",
     "--hermetic",
+    "--no-cache",
     "--",
     "--all-targets",
   ];
@@ -2563,7 +3081,7 @@ fn test_hermetic_workspace_root_runs_from_outside_the_repository() -> Result<()>
     .arg("rail")
     .arg("--workspace-root")
     .arg(&workspace.path)
-    .args(["run", "--all", "--action", "build", "--hermetic"])
+    .args(["run", "--all", "--action", "build", "--hermetic", "--no-cache"])
     .output()?;
   assert!(
     output.status.success(),

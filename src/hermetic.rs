@@ -1,5 +1,7 @@
 //! Explicit isolated execution and reproducibility proof for Rust actions.
 
+mod cas;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -14,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::action::{ActionKind, ActionWorkingDirectory, ExpandedAction};
+use crate::action_key::{DeclaredInputEntry, DeclaredInputKind, DeclaredInputManifest, declared_input_manifest};
 use crate::cargo::resolution::ResolutionInputs;
 use crate::cargo::{CargoConfigSnapshot, ToolchainIdentity};
 use crate::compiler::observation::{FileObservation, ObservationPath, RawCompilerInvocation, load_raw};
@@ -22,7 +25,8 @@ use crate::compiler::wrapper::{
 };
 use crate::error::{RailError, RailResult};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableScope};
-use crate::source::{ContentDigest, SourceEntryKind};
+use crate::git::SystemGit;
+use crate::source::{ContentDigest, GitWorktreeCapture, SourceEntryKind, SourceSnapshot};
 use crate::workspace::snapshot::CapturedLockfile;
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
 
@@ -31,7 +35,8 @@ const HERMETIC_PROFILE_VERSION: u32 = 1;
 const MACOS_SANDBOX_POLICY_VERSION: u32 = 1;
 const FETCH_ACTION_VERSION: u32 = 1;
 const OUTPUT_MANIFEST_VERSION: u32 = 1;
-const RESULT_VERSION: u32 = 1;
+const RESULT_VERSION: u32 = 3;
+const FAST_CACHE_VALIDATION_VERSION: u32 = 1;
 const MAX_OUTPUT_ENTRIES: usize = 1_000_000;
 const MAX_DEP_INFO_BYTES: u64 = 64 * 1024 * 1024;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
@@ -120,6 +125,55 @@ pub(crate) fn remove_state(workspace_root: &Path) -> RailResult<()> {
     .map_err(|error| RailError::message(format!("failed to remove hermetic cache '{}': {error}", root.display())))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCacheReference {
+  version: u32,
+  root: String,
+}
+
+fn register_local_cache(workspace_root: &Path, root: &Path) -> RailResult<()> {
+  let directory = create_state_directory(workspace_root, &[])?;
+  let root = root
+    .to_str()
+    .ok_or_else(|| RailError::message("local CAS root is not valid UTF-8"))?;
+  let reference = LocalCacheReference {
+    version: 1,
+    root: root.to_string(),
+  };
+  crate::utils::write_file_atomic(&directory.join("local-cas-v1.json"), &serde_json::to_vec(&reference)?)
+}
+
+pub(crate) fn local_cache_root(workspace_root: &Path) -> RailResult<Option<PathBuf>> {
+  let Some(directory) = existing_state_directory(workspace_root, &[])? else {
+    return Ok(None);
+  };
+  let path = directory.join("local-cas-v1.json");
+  let metadata = match fs::symlink_metadata(&path) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  };
+  if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+    return Err(RailError::message(format!(
+      "local CAS reference '{}' is not a bounded regular file",
+      path.display()
+    )));
+  }
+  let reference: LocalCacheReference = serde_json::from_slice(&fs::read(&path)?)?;
+  if reference.version != 1 {
+    return Err(RailError::message("local CAS reference has an incompatible schema"));
+  }
+  cas::existing_root_at(Path::new(&reference.root))
+}
+
+pub(crate) fn remove_local_cache(workspace_root: &Path) -> RailResult<Option<PathBuf>> {
+  let Some(root) = local_cache_root(workspace_root)? else {
+    return Ok(None);
+  };
+  cas::remove_owned_root_at(&root)
+}
+
 /// Support earned by one concrete action execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,9 +217,26 @@ pub(crate) struct HermeticExecutionReport {
   fetch: FetchSummary,
   #[serde(skip_serializing_if = "Option::is_none")]
   output_manifest: Option<OutputManifest>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  materialized_root: Option<String>,
+  cache: LocalCacheSummary,
   compiler_units: usize,
   elapsed_ms: u128,
   reasons: BTreeSet<String>,
+}
+
+/// A process-free local action-cache probe either restored a result or identified a safe miss.
+pub(crate) enum PreContextCacheAttempt {
+  Hit(Box<PreContextCacheHit>),
+  Miss(String),
+}
+
+/// Data needed to preserve the ordinary `run` output and decision receipt after an early hit.
+pub(crate) struct PreContextCacheHit {
+  pub(crate) report: HermeticExecutionReport,
+  pub(crate) report_path: PathBuf,
+  pub(crate) selected_packages: Vec<String>,
+  pub(crate) argv: Vec<String>,
 }
 
 impl HermeticExecutionReport {
@@ -179,6 +250,78 @@ impl HermeticExecutionReport {
 
   pub(crate) fn result_digest(&self) -> Option<&str> {
     self.result_digest.as_deref()
+  }
+
+  pub(crate) fn cache_status(&self) -> &'static str {
+    self.cache.status.as_str()
+  }
+
+  pub(crate) fn cache_reason(&self) -> &str {
+    &self.cache.reason
+  }
+
+  pub(crate) fn cargo_check_executed(&self) -> bool {
+    self.cache.cargo_check_executed
+  }
+
+  pub(crate) fn compiler_units_executed(&self) -> bool {
+    self.cache.compiler_units_executed
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalCacheStatus {
+  Hit,
+  Miss,
+  Disabled,
+  Uncacheable,
+}
+
+impl LocalCacheStatus {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Hit => "hit",
+      Self::Miss => "miss",
+      Self::Disabled => "disabled",
+      Self::Uncacheable => "uncacheable",
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LocalCacheSummary {
+  version: u32,
+  status: LocalCacheStatus,
+  reason: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  action_result: Option<String>,
+  objects_verified: u64,
+  bytes_read: u64,
+  bytes_restored: u64,
+  objects_written: u64,
+  bytes_written: u64,
+  stored: bool,
+  cargo_check_executed: bool,
+  compiler_units_executed: bool,
+}
+
+impl LocalCacheSummary {
+  fn new(status: LocalCacheStatus, reason: impl Into<String>) -> Self {
+    Self {
+      version: 1,
+      status,
+      reason: reason.into(),
+      action_result: None,
+      objects_verified: 0,
+      bytes_read: 0,
+      bytes_restored: 0,
+      objects_written: 0,
+      bytes_written: 0,
+      stored: false,
+      cargo_check_executed: false,
+      compiler_units_executed: false,
+    }
   }
 }
 
@@ -205,6 +348,164 @@ struct FetchManifest {
   credential_capabilities: BTreeSet<String>,
 }
 
+/// Non-authorizing exact observations used only to find a P6 action key before Cargo starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FastCacheValidation {
+  version: u32,
+  lookup_key: String,
+  action_key: String,
+  workspace_prefix: String,
+  cargo_current_directory: String,
+  declared_inputs: DeclaredInputManifest,
+  cargo_config_identity: String,
+  cargo_environment_identity: String,
+  toolchain_selector_identity: String,
+  rustc_sysroot: String,
+  host_target: String,
+  platform_identity: String,
+  inventory_result_digest: String,
+  inventory_packages: Vec<InventoryPackage>,
+  fetch: FetchSummary,
+  selected_packages: Vec<String>,
+  argv: Vec<String>,
+}
+
+impl FastCacheValidation {
+  fn validate_object(&self) -> RailResult<()> {
+    if self.version != FAST_CACHE_VALIDATION_VERSION {
+      return Err(RailError::message(
+        "local cache validation manifest has an incompatible schema",
+      ));
+    }
+    cas::validate_fast_identity(&self.action_key, &self.lookup_key)?;
+    self.declared_inputs.validate()?;
+    validate_relative_prefix(&self.workspace_prefix, true)?;
+    validate_relative_prefix(&self.cargo_current_directory, true)?;
+    let sysroot = Path::new(&self.rustc_sysroot);
+    if !sysroot.is_absolute() {
+      return Err(RailError::message(
+        "local cache validation manifest has an invalid toolchain sysroot boundary",
+      ));
+    }
+    if self.argv != ["cargo", "check", "--workspace"]
+      || self.selected_packages.is_empty()
+      || self.selected_packages.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+      return Err(RailError::message(
+        "local cache validation manifest is outside the graduated action request",
+      ));
+    }
+    for digest in [
+      &self.cargo_config_identity,
+      &self.cargo_environment_identity,
+      &self.toolchain_selector_identity,
+    ] {
+      validate_sha256_identity(digest)?;
+    }
+    if !canonical_identity(&self.platform_identity, "platform-v1-sha256-")
+      || self
+        .host_target
+        .bytes()
+        .any(|byte| byte == 0 || byte.is_ascii_whitespace())
+      || self
+        .selected_packages
+        .iter()
+        .any(|package| package.is_empty() || package.bytes().any(|byte| byte == 0 || byte.is_ascii_control()))
+    {
+      return Err(RailError::message(
+        "local cache validation manifest has a malformed platform or package identity",
+      ));
+    }
+    for package in &self.inventory_packages {
+      if package.identity.is_empty()
+        || package
+          .identity
+          .bytes()
+          .any(|byte| byte == 0 || byte.is_ascii_control())
+        || package.source_entries == 0
+        || validate_sha256_identity(&package.source_tree_digest).is_err()
+        || package.checksum.as_ref().is_some_and(|checksum| {
+          checksum.len() != 64
+            || !checksum
+              .bytes()
+              .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+      {
+        return Err(RailError::message(
+          "local cache validation manifest has malformed dependency-result evidence",
+        ));
+      }
+    }
+    if self.inventory_packages.windows(2).any(|pair| pair[0] >= pair[1]) {
+      return Err(RailError::message(
+        "local cache validation dependency results are not strictly sorted",
+      ));
+    }
+    if self.rustc_sysroot.is_empty()
+      || self.host_target.is_empty()
+      || self.platform_identity.is_empty()
+      || self.inventory_result_digest.is_empty()
+      || self.argv.is_empty()
+    {
+      return Err(RailError::message("local cache validation manifest is incomplete"));
+    }
+    if self.fetch.version != FETCH_ACTION_VERSION
+      || self.fetch.result_digest != self.inventory_result_digest
+      || self.fetch.packages != self.inventory_packages.len()
+      || self.fetch.source_entries
+        != self
+          .inventory_packages
+          .iter()
+          .map(|package| package.source_entries)
+          .sum::<usize>()
+      || !canonical_identity(&self.fetch.key, "fetch-v1-sha256-")
+      || !canonical_identity(&self.inventory_result_digest, "fetch-result-v1-sha256-")
+      || fetch_result_digest(&self.inventory_packages)? != self.inventory_result_digest
+      || self.fetch.reused
+    {
+      return Err(RailError::message(
+        "local cache validation manifest has an invalid fetch-result binding",
+      ));
+    }
+    Ok(())
+  }
+
+  #[cfg(test)]
+  fn fixture(action_key: &str, lookup_key: &str) -> Self {
+    let digest = format!("sha256-{}", "0".repeat(64));
+    let inventory_result_digest = fetch_result_digest(&[]).expect("empty dependency-result identity");
+    Self {
+      version: FAST_CACHE_VALIDATION_VERSION,
+      lookup_key: lookup_key.to_string(),
+      action_key: action_key.to_string(),
+      workspace_prefix: String::new(),
+      cargo_current_directory: String::new(),
+      declared_inputs: DeclaredInputManifest::empty_for_test(),
+      cargo_config_identity: format!("sha256:{}", "0".repeat(64)),
+      cargo_environment_identity: format!("sha256:{}", "0".repeat(64)),
+      toolchain_selector_identity: format!("sha256:{}", "0".repeat(64)),
+      rustc_sysroot: "/toolchain".to_string(),
+      host_target: "test-target".to_string(),
+      platform_identity: format!("platform-v1-{digest}"),
+      inventory_result_digest: inventory_result_digest.clone(),
+      inventory_packages: Vec::new(),
+      fetch: FetchSummary {
+        version: FETCH_ACTION_VERSION,
+        key: format!("fetch-v1-{digest}"),
+        result_digest: inventory_result_digest,
+        packages: 0,
+        source_entries: 0,
+        inventory_entries: 0,
+        credential_capabilities: BTreeSet::new(),
+        reused: false,
+      },
+      selected_packages: vec!["fixture".to_string()],
+      argv: vec!["cargo".to_string(), "check".to_string(), "--workspace".to_string()],
+    }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct InventoryPackage {
   identity: String,
@@ -218,6 +519,7 @@ pub(crate) struct FetchInventory {
   cargo_home: PathBuf,
   cargo_home_digest: String,
   cargo_home_entries: usize,
+  packages: Vec<InventoryPackage>,
   summary: FetchSummary,
 }
 
@@ -503,7 +805,8 @@ struct ExactTreeEntry {
 }
 
 /// Exact declared compiler-output tree for one action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OutputManifest {
   version: u32,
   digest: String,
@@ -560,14 +863,14 @@ impl OutputManifest {
   }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct OutputEntry {
   path: String,
   #[serde(flatten)]
   kind: OutputEntryKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum OutputEntryKind {
   Directory { mode: u32 },
@@ -673,6 +976,7 @@ fn prepare_fetch_inventory_with_inputs(inputs: &FetchInputs) -> RailResult<Fetch
     false,
   );
   apply_acquisition_environment(&mut command, &inputs.cargo_config);
+  crate::instrumentation::record_hermetic_fetch_execution();
   let status = command
     .status()
     .map_err(|error| RailError::message(format!("hermetic fetch action failed to start: {error}")))?;
@@ -870,6 +1174,7 @@ fn load_fetch_inventory(
 
 fn fetch_inventory_from_manifest(root: &Path, stored: FetchManifest, reused: bool) -> FetchInventory {
   let source_entries = stored.packages.iter().map(|package| package.source_entries).sum();
+  let packages = stored.packages;
   FetchInventory {
     cargo_home: root.join("cargo-home"),
     cargo_home_digest: stored.cargo_home_digest,
@@ -878,12 +1183,13 @@ fn fetch_inventory_from_manifest(root: &Path, stored: FetchManifest, reused: boo
       version: FETCH_ACTION_VERSION,
       key: stored.key,
       result_digest: stored.result_digest,
-      packages: stored.packages.len(),
+      packages: packages.len(),
       source_entries,
       inventory_entries: stored.cargo_home_entries,
       credential_capabilities: stored.credential_capabilities,
       reused,
     },
+    packages,
   }
 }
 
@@ -2120,10 +2426,813 @@ fn output_mode(metadata: &fs::Metadata) -> u32 {
   u32::from(metadata.permissions().readonly())
 }
 
+pub(crate) fn pre_context_lookup_key(workspace_root: &Path) -> RailResult<String> {
+  let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+  let mut identity = FramedHasher::new(b"cargo-rail-local-action-lookup\0");
+  identity.frame(b"version", &FAST_CACHE_VALIDATION_VERSION.to_le_bytes());
+  identity.frame(b"profile", &HERMETIC_PROFILE_VERSION.to_le_bytes());
+  identity.frame(b"request", b"explicit-all-build");
+  identity.frame(b"family", std::env::consts::FAMILY.as_bytes());
+  identity.frame(b"os", std::env::consts::OS.as_bytes());
+  identity.frame(b"arch", std::env::consts::ARCH.as_bytes());
+  for (relative, required) in [
+    ("Cargo.toml", true),
+    ("Cargo.lock", true),
+    (".cargo/config.toml", false),
+    (".cargo/config", false),
+    ("rust-toolchain.toml", false),
+    ("rust-toolchain", false),
+  ] {
+    frame_lookup_file(&mut identity, relative, &workspace_root.join(relative), required)?;
+  }
+  Ok(format!("local-lookup-v1-sha256-{}", identity.finish()))
+}
+
+fn frame_lookup_file(identity: &mut FramedHasher, label: &str, path: &Path, required: bool) -> RailResult<()> {
+  let before = match fs::symlink_metadata(path) {
+    Ok(metadata) => metadata,
+    Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+      identity.frame(label.as_bytes(), b"absent");
+      return Ok(());
+    }
+    Err(error) => {
+      return Err(RailError::message(format!(
+        "process-free cache lookup requires '{}': {error}",
+        path.display()
+      )));
+    }
+  };
+  if !before.is_file() || before.file_type().is_symlink() || before.len() > MAX_DEP_INFO_BYTES {
+    return Err(RailError::message(format!(
+      "process-free cache lookup input '{}' is not a bounded regular file",
+      path.display()
+    )));
+  }
+  let bytes = fs::read(path)?;
+  let after = fs::symlink_metadata(path)?;
+  if bytes.len() as u64 != before.len() || validation_metadata(&before) != validation_metadata(&after) {
+    return Err(RailError::message(format!(
+      "process-free cache lookup input '{}' changed while it was read",
+      path.display()
+    )));
+  }
+  crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+  let mut framed = Vec::with_capacity(8 + bytes.len());
+  framed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+  framed.extend_from_slice(&bytes);
+  identity.frame(label.as_bytes(), &framed);
+  Ok(())
+}
+
+#[cfg(test)]
+fn test_pre_context_lookup_key() -> String {
+  let mut identity = FramedHasher::new(b"cargo-rail-local-action-lookup\0");
+  identity.frame(b"version", &FAST_CACHE_VALIDATION_VERSION.to_le_bytes());
+  identity.frame(b"test", b"fixture");
+  format!("local-lookup-v1-sha256-{}", identity.finish())
+}
+
+fn validate_sha256_identity(identity: &str) -> RailResult<()> {
+  let hex = identity
+    .strip_prefix("sha256:")
+    .ok_or_else(|| RailError::message("validation identity has the wrong domain"))?;
+  if hex.len() != 64
+    || !hex
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(RailError::message("validation identity is not canonical SHA-256"));
+  }
+  Ok(())
+}
+
+fn canonical_identity(identity: &str, prefix: &str) -> bool {
+  identity.strip_prefix(prefix).is_some_and(|hex| {
+    hex.len() == 64
+      && hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  })
+}
+
+fn validate_relative_prefix(prefix: &str, allow_empty: bool) -> RailResult<()> {
+  if prefix.is_empty() && allow_empty {
+    return Ok(());
+  }
+  let path = crate::source::RepositoryPath::new(Path::new(prefix))?;
+  if path.as_str() != prefix {
+    return Err(RailError::message("validation path prefix is not canonical"));
+  }
+  Ok(())
+}
+
+fn sha256_identity(bytes: &[u8]) -> String {
+  format!("sha256:{}", ContentDigest::sha256(bytes))
+}
+
+fn cargo_config_identity(config: &CargoConfigSnapshot, source_root: &Path) -> RailResult<String> {
+  Ok(sha256_identity(&config.portable_snapshot_identity(source_root)?))
+}
+
+fn cargo_environment_identity(environment: &[(String, OsString, String)]) -> RailResult<String> {
+  let portable = environment
+    .iter()
+    .map(|(name, _, identity)| (name, identity))
+    .collect::<Vec<_>>();
+  Ok(sha256_identity(&serde_json::to_vec(&portable)?))
+}
+
+fn validation_cargo_environment(
+  config: &CargoConfigSnapshot,
+  source_root: &Path,
+) -> RailResult<Vec<(String, OsString, String)>> {
+  config.materialized_environment(source_root, Path::new("/workspace"))
+}
+
+fn toolchain_selector_identity(source_root: &Path, current_dir: &Path) -> RailResult<String> {
+  let mut identity = FramedHasher::new(b"cargo-rail-fast-toolchain-selector\0");
+  identity.frame(b"version", &FAST_CACHE_VALIDATION_VERSION.to_le_bytes());
+  let selected_rustc = ExecutableIdentity::capture(OsStr::new("rustc"), current_dir, source_root)?;
+  identity.frame(b"rustc-selector-executable", &selected_rustc.identity_bytes()?);
+  for name in [
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+  ] {
+    let mut binding = Vec::new();
+    binding.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    binding.extend_from_slice(name.as_bytes());
+    match std::env::var_os(name) {
+      Some(value) => {
+        binding.push(1);
+        binding.extend_from_slice(&(value.as_encoded_bytes().len() as u64).to_le_bytes());
+        binding.extend_from_slice(value.as_encoded_bytes());
+      }
+      None => binding.push(0),
+    }
+    identity.frame(b"environment", &binding);
+  }
+
+  let mut selector_files = Vec::new();
+  for directory in current_dir.ancestors() {
+    for name in ["rust-toolchain.toml", "rust-toolchain"] {
+      let path = directory.join(name);
+      if fs::symlink_metadata(&path).is_ok() {
+        selector_files.push(path);
+      }
+    }
+  }
+  selector_files.sort();
+  selector_files.dedup();
+  for path in selector_files {
+    frame_selector_file(&mut identity, source_root, &path, false)?;
+  }
+
+  let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
+    std::env::var_os("HOME")
+      .or_else(|| std::env::var_os("USERPROFILE"))
+      .map(|home| PathBuf::from(home).join(".rustup"))
+  });
+  if let Some(rustup_home) = rustup_home {
+    if !rustup_home.is_absolute() {
+      return Err(RailError::message(
+        "relative RUSTUP_HOME is not eligible for process-free cache validation",
+      ));
+    }
+    let settings = rustup_home.join("settings.toml");
+    match fs::symlink_metadata(&settings) {
+      Ok(_) => frame_selector_file(&mut identity, source_root, &settings, true)?,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => identity.frame(b"rustup-settings", b"absent"),
+      Err(error) => return Err(error.into()),
+    }
+  } else {
+    identity.frame(b"rustup-settings", b"unavailable");
+  }
+  Ok(format!("sha256:{}", identity.finish()))
+}
+
+fn frame_selector_file(
+  identity: &mut FramedHasher,
+  source_root: &Path,
+  path: &Path,
+  rustup_settings: bool,
+) -> RailResult<()> {
+  let metadata = fs::symlink_metadata(path)?;
+  if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+    return Err(RailError::message(format!(
+      "toolchain selector '{}' is not a bounded regular file",
+      path.display()
+    )));
+  }
+  let bytes = fs::read(path)?;
+  let after = fs::symlink_metadata(path)?;
+  if validation_metadata(&metadata) != validation_metadata(&after) || bytes.len() as u64 != metadata.len() {
+    return Err(RailError::message(format!(
+      "toolchain selector '{}' changed while it was read",
+      path.display()
+    )));
+  }
+  if rustup_settings {
+    let text = std::str::from_utf8(&bytes).map_err(|_| RailError::message("rustup settings are not valid UTF-8"))?;
+    let settings: serde_json::Value = toml_edit::de::from_str(text)
+      .map_err(|_| RailError::message("rustup settings could not be parsed for cache validation"))?;
+    if settings
+      .get("overrides")
+      .and_then(serde_json::Value::as_object)
+      .is_some_and(|overrides| !overrides.is_empty())
+    {
+      return Err(RailError::message(
+        "rustup directory overrides are not eligible for process-free cache validation",
+      ));
+    }
+  }
+  let label = if let Ok(relative) = path.strip_prefix(source_root) {
+    format!("repository:{}", crate::utils::path_to_git_format(relative))
+  } else {
+    path
+      .to_str()
+      .ok_or_else(|| RailError::message("toolchain selector path is not valid UTF-8"))?
+      .to_string()
+  };
+  let mut framed = Vec::new();
+  framed.extend_from_slice(&(label.len() as u64).to_le_bytes());
+  framed.extend_from_slice(label.as_bytes());
+  framed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+  framed.extend_from_slice(&bytes);
+  identity.frame(
+    if rustup_settings {
+      b"rustup-settings"
+    } else {
+      b"toolchain-file"
+    },
+    &framed,
+  );
+  Ok(())
+}
+
+#[cfg(unix)]
+fn validation_metadata(metadata: &fs::Metadata) -> (u64, u64, u32, u64, u64, i64, i64, i64, i64) {
+  use std::os::unix::fs::MetadataExt as _;
+  (
+    metadata.dev(),
+    metadata.ino(),
+    metadata.mode(),
+    metadata.nlink(),
+    metadata.size(),
+    metadata.mtime(),
+    metadata.mtime_nsec(),
+    metadata.ctime(),
+    metadata.ctime_nsec(),
+  )
+}
+
+#[cfg(not(unix))]
+fn validation_metadata(metadata: &fs::Metadata) -> (u64, bool, bool) {
+  (
+    metadata.len(),
+    metadata.permissions().readonly(),
+    metadata.file_type().is_symlink(),
+  )
+}
+
+fn declared_inputs_match(
+  manifest: &DeclaredInputManifest,
+  snapshot: &SourceSnapshot,
+  source_root: &Path,
+) -> RailResult<Result<(), String>> {
+  manifest.validate()?;
+  if manifest.entries.len() > MAX_OUTPUT_ENTRIES {
+    return Err(RailError::message(
+      "declared-input validation manifest exceeds the entry bound",
+    ));
+  }
+  let roots = manifest
+    .roots
+    .iter()
+    .map(|root| {
+      Ok(
+        crate::source::RepositoryPath::new(Path::new(root))?
+          .as_path()
+          .to_path_buf(),
+      )
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  let selected = |path: &Path| manifest.all_source || roots.iter().any(|root| path == root || path.starts_with(root));
+  let expected = manifest
+    .entries
+    .iter()
+    .map(|entry| (entry.path.as_str(), entry))
+    .collect::<BTreeMap<_, _>>();
+  let mut current = BTreeMap::<String, DeclaredInputEntry>::new();
+  for entry in snapshot.tree().entries() {
+    if !selected(entry.path.as_path()) {
+      continue;
+    }
+    let path = entry.path.as_str().to_string();
+    let kind = match &entry.kind {
+      SourceEntryKind::RegularFile { digest, executable } => DeclaredInputKind::File {
+        digest: format!("sha256:{digest}"),
+        executable: *executable,
+      },
+      SourceEntryKind::Symlink { target } => DeclaredInputKind::Symlink { target: target.clone() },
+      SourceEntryKind::Deleted => {
+        return Err(RailError::message(
+          "current source snapshot contains a deleted final entry",
+        ));
+      }
+    };
+    current.insert(
+      path.clone(),
+      DeclaredInputEntry {
+        authoritative_file: expected
+          .get(path.as_str())
+          .is_some_and(|entry| entry.authoritative_file),
+        path,
+        kind,
+      },
+    );
+  }
+  for entry in manifest.entries.iter().filter(|entry| entry.authoritative_file) {
+    if !current.contains_key(&entry.path) {
+      current.insert(entry.path.clone(), capture_authoritative_input(source_root, entry)?);
+    }
+  }
+  let current = current.into_values().collect::<Vec<_>>();
+  if current == manifest.entries {
+    return Ok(Ok(()));
+  }
+  let mut index = 0usize;
+  while index < current.len() && index < manifest.entries.len() && current[index] == manifest.entries[index] {
+    index += 1;
+  }
+  let reason = match (current.get(index), manifest.entries.get(index)) {
+    (Some(actual), Some(expected)) if actual.path == expected.path => {
+      format!("declared_input_changed:{}", expected.path)
+    }
+    (Some(actual), Some(expected)) if actual.path < expected.path => {
+      format!("declared_input_added:{}", actual.path)
+    }
+    (Some(_), Some(expected)) => format!("declared_input_removed:{}", expected.path),
+    (Some(actual), None) => format!("declared_input_added:{}", actual.path),
+    (None, Some(expected)) => format!("declared_input_removed:{}", expected.path),
+    (None, None) => "declared_input_root_changed".to_string(),
+  };
+  Ok(Err(reason))
+}
+
+fn capture_authoritative_input(source_root: &Path, expected: &DeclaredInputEntry) -> RailResult<DeclaredInputEntry> {
+  let logical = crate::source::RepositoryPath::new(Path::new(&expected.path))?;
+  let path = source_root.join(logical.as_path());
+  let before = fs::symlink_metadata(&path).map_err(|error| {
+    RailError::message(format!(
+      "declared authoritative input '{}' is unavailable: {error}",
+      expected.path
+    ))
+  })?;
+  let kind = if before.file_type().is_symlink() {
+    let target = fs::read_link(&path)?;
+    let target = target
+      .to_str()
+      .ok_or_else(|| RailError::message("declared authoritative symlink target is not valid UTF-8"))?;
+    DeclaredInputKind::Symlink {
+      target: target.to_string(),
+    }
+  } else if before.is_file() {
+    let bytes = fs::read(&path)?;
+    crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+    DeclaredInputKind::File {
+      digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
+      executable: source_executable(&before),
+    }
+  } else {
+    return Err(RailError::message(format!(
+      "declared authoritative input '{}' has an unsupported file type",
+      expected.path
+    )));
+  };
+  let after = fs::symlink_metadata(&path)?;
+  if validation_metadata(&before) != validation_metadata(&after) {
+    return Err(RailError::message(format!(
+      "declared authoritative input '{}' changed during validation",
+      expected.path
+    )));
+  }
+  Ok(DeclaredInputEntry {
+    path: expected.path.clone(),
+    authoritative_file: true,
+    kind,
+  })
+}
+
+#[cfg(unix)]
+fn source_executable(metadata: &fs::Metadata) -> bool {
+  use std::os::unix::fs::PermissionsExt as _;
+  metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn source_executable(_metadata: &fs::Metadata) -> bool {
+  false
+}
+
+fn logical_prefix(root: &Path, path: &Path, description: &str) -> RailResult<String> {
+  let relative = path.strip_prefix(root).map_err(|_| {
+    RailError::message(format!(
+      "{description} '{}' is outside source root '{}'",
+      path.display(),
+      root.display()
+    ))
+  })?;
+  if relative.as_os_str().is_empty() {
+    return Ok(String::new());
+  }
+  let relative = crate::source::RepositoryPath::new(relative)?;
+  Ok(relative.as_str().to_string())
+}
+
+struct FastCacheValidationRequest<'a> {
+  ctx: &'a WorkspaceContext,
+  action: &'a ExpandedAction,
+  snapshot: &'a WorkspaceSnapshot,
+  lookup_key: &'a str,
+  action_key: &'a str,
+  platform: &'a PlatformBoundary,
+  cargo_environment: &'a [(String, OsString, String)],
+  inventory: &'a FetchInventory,
+}
+
+fn build_fast_cache_validation(request: FastCacheValidationRequest<'_>) -> RailResult<FastCacheValidation> {
+  let FastCacheValidationRequest {
+    ctx,
+    action,
+    snapshot,
+    lookup_key,
+    action_key,
+    platform,
+    cargo_environment,
+    inventory,
+  } = request;
+  cas::validate_fast_identity(action_key, lookup_key)?;
+  let git = SystemGit::open(snapshot.source_root())?;
+  if git.worktree_root != snapshot.source_root() {
+    return Err(RailError::message(
+      "process-free cache validation requires one canonical Git source root",
+    ));
+  }
+  let workspace_prefix = logical_prefix(snapshot.source_root(), ctx.workspace_root(), "workspace root")?;
+  let cargo_current_directory = logical_prefix(
+    snapshot.source_root(),
+    snapshot.cargo_current_dir(),
+    "Cargo current directory",
+  )?;
+  let rustc_sysroot = snapshot
+    .toolchain()
+    .rustc_sysroot()
+    .to_str()
+    .filter(|path| !path.is_empty())
+    .map(str::to_string)
+    .ok_or_else(|| RailError::message("rustc sysroot is not canonical UTF-8"))?;
+  let validation = FastCacheValidation {
+    version: FAST_CACHE_VALIDATION_VERSION,
+    lookup_key: lookup_key.to_string(),
+    action_key: action_key.to_string(),
+    workspace_prefix,
+    cargo_current_directory,
+    declared_inputs: declared_input_manifest(action, snapshot)?,
+    cargo_config_identity: cargo_config_identity(snapshot.cargo_config(), snapshot.source_root())?,
+    cargo_environment_identity: cargo_environment_identity(cargo_environment)?,
+    toolchain_selector_identity: toolchain_selector_identity(snapshot.source_root(), snapshot.cargo_current_dir())?,
+    rustc_sysroot,
+    host_target: snapshot.toolchain().host_target().to_string(),
+    platform_identity: platform.identity.clone(),
+    inventory_result_digest: inventory.summary.result_digest.clone(),
+    inventory_packages: inventory.packages.clone(),
+    fetch: FetchSummary {
+      reused: false,
+      ..inventory.summary.clone()
+    },
+    selected_packages: action.selected_packages().to_vec(),
+    argv: action.argv().to_vec(),
+  };
+  validation.validate_object()?;
+  Ok(validation)
+}
+
+fn current_cargo_directory(source_root: &Path, requested_workspace: &Path) -> RailResult<PathBuf> {
+  let current = std::env::current_dir()
+    .map_err(|error| RailError::message(format!("failed to determine current directory: {error}")))?;
+  let current = crate::utils::canonicalize_existing(&current)?;
+  if current.starts_with(source_root) {
+    Ok(current)
+  } else {
+    Ok(requested_workspace.to_path_buf())
+  }
+}
+
+struct FastCacheRequestGuard {
+  requested_workspace: PathBuf,
+  source_root: PathBuf,
+  cargo_current_directory: PathBuf,
+  git: SystemGit,
+  source: GitWorktreeCapture,
+  cargo_config_identity: String,
+  cargo_environment_identity: String,
+  toolchain_selector_identity: String,
+  lookup_key: String,
+}
+
+impl FastCacheRequestGuard {
+  fn capture(requested_workspace: &Path) -> RailResult<Self> {
+    let requested_workspace = crate::utils::canonicalize_existing(requested_workspace)?;
+    let git = SystemGit::open(&requested_workspace)?;
+    let source_root = git.worktree_root.clone();
+    let cargo_current_directory = current_cargo_directory(&source_root, &requested_workspace)?;
+    let source =
+      GitWorktreeCapture::capture_excluding(&git, &[crate::workspace::cargo_rail_state_root(&requested_workspace)])?;
+    let config = CargoConfigSnapshot::capture(&cargo_current_directory)?;
+    let mut configuration_reasons = BTreeSet::new();
+    classify_cargo_configuration(&config, &mut configuration_reasons);
+    for name in ["RUSTC", "RUSTDOC"] {
+      if std::env::var_os(name).is_some() {
+        configuration_reasons.insert("cargo_tool_override_not_graduated".to_string());
+      }
+    }
+    ensure_execution_semantics_supported(&configuration_reasons)?;
+    let cargo_config_identity = cargo_config_identity(&config, &source_root)?;
+    let cargo_environment_identity = cargo_environment_identity(&validation_cargo_environment(&config, &source_root)?)?;
+    let toolchain_selector_identity = toolchain_selector_identity(&source_root, &cargo_current_directory)?;
+    let lookup_key = pre_context_lookup_key(&requested_workspace)?;
+    Ok(Self {
+      requested_workspace,
+      source_root,
+      cargo_current_directory,
+      git,
+      source,
+      cargo_config_identity,
+      cargo_environment_identity,
+      toolchain_selector_identity,
+      lookup_key,
+    })
+  }
+
+  fn candidate_matches(
+    &self,
+    candidate_action_key: &str,
+    validation: &FastCacheValidation,
+  ) -> RailResult<Result<(), String>> {
+    validation.validate_object()?;
+    if candidate_action_key != validation.action_key {
+      return Err(RailError::message(
+        "local cache candidate action key does not match its validation manifest",
+      ));
+    }
+    let expected_workspace = if validation.workspace_prefix.is_empty() {
+      self.source_root.clone()
+    } else {
+      self.source_root.join(&validation.workspace_prefix)
+    };
+    let expected_workspace = crate::utils::canonicalize_existing(&expected_workspace)?;
+    if self.requested_workspace != expected_workspace {
+      return Ok(Err("workspace_prefix_changed".to_string()));
+    }
+    if logical_prefix(
+      &self.source_root,
+      &self.cargo_current_directory,
+      "Cargo current directory",
+    )? != validation.cargo_current_directory
+    {
+      return Ok(Err("cargo_current_directory_changed".to_string()));
+    }
+    if let Err(reason) = declared_inputs_match(&validation.declared_inputs, self.source.snapshot(), &self.source_root)?
+    {
+      return Ok(Err(reason));
+    }
+    if self.cargo_config_identity != validation.cargo_config_identity {
+      return Ok(Err("cargo_configuration_changed".to_string()));
+    }
+    if self.cargo_environment_identity != validation.cargo_environment_identity {
+      return Ok(Err("cargo_environment_changed".to_string()));
+    }
+    if self.toolchain_selector_identity != validation.toolchain_selector_identity {
+      return Ok(Err("toolchain_selection_changed".to_string()));
+    }
+    if self.lookup_key != validation.lookup_key {
+      return Ok(Err("lookup_input_changed".to_string()));
+    }
+    Ok(Ok(()))
+  }
+
+  fn validate_after_restore(&self, validation: &FastCacheValidation) -> RailResult<Result<(), String>> {
+    if fast_platform_identity(
+      Path::new(&validation.rustc_sysroot),
+      &validation.host_target,
+      &self.source_root,
+    )? != validation.platform_identity
+    {
+      return Ok(Err("platform_or_toolchain_changed".to_string()));
+    }
+    let final_config = CargoConfigSnapshot::capture(&self.cargo_current_directory)?;
+    if cargo_config_identity(&final_config, &self.source_root)? != validation.cargo_config_identity
+      || cargo_environment_identity(&validation_cargo_environment(&final_config, &self.source_root)?)?
+        != validation.cargo_environment_identity
+    {
+      return Ok(Err("cargo_configuration_changed_during_validation".to_string()));
+    }
+    if toolchain_selector_identity(&self.source_root, &self.cargo_current_directory)?
+      != validation.toolchain_selector_identity
+    {
+      return Ok(Err("toolchain_selection_changed_during_validation".to_string()));
+    }
+    if pre_context_lookup_key(&self.requested_workspace)? != validation.lookup_key {
+      return Ok(Err("lookup_input_changed".to_string()));
+    }
+    if let Err(reason) = declared_inputs_match(&validation.declared_inputs, self.source.snapshot(), &self.source_root)?
+    {
+      return Ok(Err(reason));
+    }
+    self.source.validate_unchanged(&self.git)?;
+    Ok(Ok(()))
+  }
+}
+
+fn record_cache_candidate_miss(first: &mut Option<String>, reason: String) {
+  fn specificity(reason: &str) -> u8 {
+    if matches!(reason, "workspace_prefix_changed" | "cargo_current_directory_changed") {
+      0
+    } else if reason.starts_with("declared_input_") {
+      1
+    } else {
+      2
+    }
+  }
+
+  if first
+    .as_deref()
+    .is_none_or(|current| specificity(&reason) > specificity(current))
+  {
+    *first = Some(reason);
+  }
+}
+
+/// Restore a verified action result before any Cargo or rustc process is started.
+pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreContextCacheAttempt> {
+  #[cfg(not(target_os = "macos"))]
+  {
+    let _ = workspace_root;
+    return Ok(PreContextCacheAttempt::Miss(
+      "platform_process_isolation_unavailable".to_string(),
+    ));
+  }
+  #[cfg(target_os = "macos")]
+  {
+    let started = Instant::now();
+    let lookup_key = match pre_context_lookup_key(workspace_root) {
+      Ok(lookup_key) => lookup_key,
+      Err(_) => {
+        return Ok(PreContextCacheAttempt::Miss("lookup_inputs_unavailable".to_string()));
+      }
+    };
+    let local_cas = match cas::LocalCas::open() {
+      Ok(local_cas) => local_cas,
+      Err(_) => {
+        return Ok(PreContextCacheAttempt::Miss("cache_root_unavailable".to_string()));
+      }
+    };
+    let candidates = local_cas.candidates(&lookup_key).map_err(|error| {
+      RailError::with_help(
+        format!("local action cache candidate verification failed: {error}"),
+        "run with --no-cache for an explicit cold execution, or clean the validated local cache",
+      )
+    })?;
+    if candidates.is_empty() {
+      return Ok(PreContextCacheAttempt::Miss("action_not_found".to_string()));
+    }
+    let request = FastCacheRequestGuard::capture(workspace_root)?;
+    if request.lookup_key != lookup_key {
+      return Ok(PreContextCacheAttempt::Miss("lookup_input_changed".to_string()));
+    }
+    let mut first_miss = None;
+    for candidate in candidates {
+      match request.candidate_matches(&candidate.action_key, &candidate.validation)? {
+        Ok(()) => {}
+        Err(reason) => {
+          record_cache_candidate_miss(&mut first_miss, reason);
+          continue;
+        }
+      }
+      register_local_cache(workspace_root, local_cas.root())?;
+      let parent = create_state_directory(workspace_root, &["materializations"])?;
+      let temporary = tempfile::Builder::new()
+        .prefix("result-")
+        .tempdir_in(&parent)
+        .map_err(|error| RailError::message(format!("failed to create declared output root: {error}")))?;
+      let destination = temporary.path().join("output");
+      let hit = match local_cas.restore(&candidate.action_key, &destination) {
+        cas::CacheLookup::Hit(hit) => hit,
+        cas::CacheLookup::Miss(miss) if miss.kind == cas::CacheMissKind::Miss => {
+          record_cache_candidate_miss(&mut first_miss, miss.reason);
+          continue;
+        }
+        cas::CacheLookup::Miss(miss) => {
+          return Err(RailError::with_help(
+            format!(
+              "local action cache {}: {} (verified_objects={}, bytes_read={})",
+              match miss.kind {
+                cas::CacheMissKind::Miss => "miss",
+                cas::CacheMissKind::Corrupt => "corrupt",
+                cas::CacheMissKind::Incompatible => "incompatible",
+              },
+              miss.reason,
+              miss.objects_verified,
+              miss.bytes_read,
+            ),
+            "run with --no-cache for an explicit cold execution, or clean the validated local cache",
+          ));
+        }
+      };
+      match request.validate_after_restore(&candidate.validation)? {
+        Ok(()) => {}
+        Err(reason) => {
+          record_cache_candidate_miss(&mut first_miss, reason);
+          continue;
+        }
+      }
+      if !destination.starts_with(temporary.path()) {
+        return Err(RailError::message(
+          "local action output escaped its private materialization root",
+        ));
+      }
+      let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+      let materialized_root = destination
+        .strip_prefix(&workspace_root)
+        .map_err(|_| RailError::message("materialized local action output escaped the workspace"))?;
+      let mut fetch = candidate.validation.fetch.clone();
+      fetch.reused = true;
+      let cache = LocalCacheSummary {
+        version: 1,
+        status: LocalCacheStatus::Hit,
+        reason: "verified_action_result_restored_pre_context".to_string(),
+        action_result: Some(hit.action_result),
+        objects_verified: hit.objects_verified,
+        bytes_read: hit.bytes_read,
+        bytes_restored: hit.bytes_restored,
+        objects_written: 0,
+        bytes_written: 0,
+        stored: false,
+        cargo_check_executed: false,
+        compiler_units_executed: false,
+      };
+      let report = HermeticExecutionReport {
+        version: RESULT_VERSION,
+        profile_version: HERMETIC_PROFILE_VERSION,
+        action_id: "build".to_string(),
+        action_class: "cargo_check".to_string(),
+        support: HermeticSupport::Eligible,
+        enforcement: EnforcementLevel::FilesystemAndNetwork,
+        action_key: Some(candidate.action_key),
+        result_digest: Some(hit.result_digest),
+        fetch,
+        output_manifest: Some(hit.output_manifest),
+        materialized_root: Some(crate::utils::path_to_git_format(materialized_root)),
+        cache,
+        compiler_units: hit.compiler_units,
+        elapsed_ms: started.elapsed().as_millis(),
+        reasons: BTreeSet::new(),
+      };
+      let report_path = write_report(&workspace_root, &report)?;
+      let persisted_parent = temporary.keep();
+      if !destination.starts_with(&persisted_parent) {
+        return Err(RailError::message(
+          "persisted local action output escaped its declared root",
+        ));
+      }
+      return Ok(PreContextCacheAttempt::Hit(Box::new(PreContextCacheHit {
+        report,
+        report_path,
+        selected_packages: candidate.validation.selected_packages,
+        argv: candidate.validation.argv,
+      })));
+    }
+    Ok(PreContextCacheAttempt::Miss(
+      first_miss.unwrap_or_else(|| "validated_candidate_not_found".to_string()),
+    ))
+  }
+}
+
 /// Execute one supported Rust action in a fresh root and publish its proof.
 pub(crate) fn execute(
   ctx: &WorkspaceContext,
   action: &ExpandedAction,
+  cache_enabled: bool,
+  lookup_key: Option<&str>,
 ) -> RailResult<(HermeticExecutionReport, PathBuf)> {
   if action.kind() != ActionKind::Build || !cargo_check_action(action.argv()) {
     return Err(RailError::with_help(
@@ -2158,6 +3267,50 @@ pub(crate) fn execute(
     reasons.insert("os_network_and_filesystem_enforcement_unavailable".to_string());
   }
 
+  let preliminary_action_key = reasons
+    .is_empty()
+    .then(|| {
+      hermetic_action_key(
+        action,
+        snapshot,
+        &inventory.summary.result_digest,
+        &platform.identity,
+        &cargo_environment,
+      )
+    })
+    .transpose()?;
+  if let Some(lookup_key) = lookup_key
+    && !canonical_identity(lookup_key, "local-lookup-v1-sha256-")
+  {
+    return Err(RailError::message(
+      "local action lookup key has the wrong request domain",
+    ));
+  }
+  let mut local_cas = None;
+  let mut cache = if !cache_enabled {
+    LocalCacheSummary::new(LocalCacheStatus::Disabled, "disabled_by_request")
+  } else if lookup_key.is_none() {
+    LocalCacheSummary::new(LocalCacheStatus::Uncacheable, "pre_context_request_not_graduated")
+  } else if preliminary_action_key.is_some() {
+    match cas::LocalCas::open() {
+      Ok(cas) => {
+        if register_local_cache(ctx.workspace_root(), cas.root()).is_err() {
+          LocalCacheSummary::new(LocalCacheStatus::Disabled, "cache_reference_unavailable")
+        } else {
+          local_cas = Some(cas);
+          LocalCacheSummary::new(LocalCacheStatus::Miss, "validated_candidate_not_found")
+        }
+      }
+      Err(_) => LocalCacheSummary::new(LocalCacheStatus::Disabled, "cache_root_unavailable"),
+    }
+  } else {
+    LocalCacheSummary::new(
+      LocalCacheStatus::Uncacheable,
+      reasons.iter().next().map_or("action_key_unavailable", String::as_str),
+    )
+  };
+
+  crate::instrumentation::record_hermetic_cargo_execution();
   let command = run_cargo_check(action, snapshot, &layout, &inventory, &platform, &cargo_environment)?;
   if !command.status.success() {
     forward_cargo_output(&command, true);
@@ -2180,6 +3333,7 @@ pub(crate) fn execute(
   ctx.validate_snapshot_unchanged()?;
 
   let mut invocations = load_raw(&layout.observations)?;
+  crate::instrumentation::record_hermetic_compiler_units(invocations.len());
   normalize_dep_info_outputs(&mut invocations, snapshot, &layout, &inventory)?;
   let cargo_outputs = capture_cargo_artifact_outputs(&command, &layout)?;
   if cargo_outputs.files.is_empty() {
@@ -2210,13 +3364,7 @@ pub(crate) fn execute(
     HermeticSupport::Uncacheable
   };
   let action_key = if support == HermeticSupport::Eligible {
-    Some(hermetic_action_key(
-      action,
-      snapshot,
-      &inventory.summary.result_digest,
-      &platform.identity,
-      &cargo_environment,
-    )?)
+    preliminary_action_key
   } else {
     None
   };
@@ -2227,6 +3375,58 @@ pub(crate) fn execute(
   inventory.validate_unchanged()?;
   platform.validate_unchanged(snapshot)?;
   output_manifest.validate_unchanged(&layout.root)?;
+  cache.cargo_check_executed = true;
+  cache.compiler_units_executed = !invocations.is_empty();
+  if support != HermeticSupport::Eligible && cache.status == LocalCacheStatus::Miss {
+    cache.status = LocalCacheStatus::Uncacheable;
+    cache.reason = reasons
+      .iter()
+      .next()
+      .cloned()
+      .unwrap_or_else(|| "post_execution_evidence_incomplete".to_string());
+  }
+  if support == HermeticSupport::Eligible
+    && cache.status == LocalCacheStatus::Miss
+    && let (Some(cas), Some(lookup_key), Some(action_key), Some(result_digest)) = (
+      local_cas.as_ref(),
+      lookup_key,
+      action_key.as_deref(),
+      result_digest.as_deref(),
+    )
+  {
+    let stored = build_fast_cache_validation(FastCacheValidationRequest {
+      ctx,
+      action,
+      snapshot,
+      lookup_key,
+      action_key,
+      platform: &platform,
+      cargo_environment: &cargo_environment,
+      inventory: &inventory,
+    })
+    .and_then(|validation| {
+      cas.store(cas::StoreRequest {
+        action_key,
+        lookup_key,
+        result_digest,
+        manifest: &output_manifest,
+        validation: &validation,
+        compiler_units: invocations.len(),
+        source_root: &layout.root,
+      })
+    });
+    match stored {
+      Ok(stored) => {
+        cache.action_result = stored.action_result;
+        cache.objects_written = stored.objects_written;
+        cache.bytes_written = stored.bytes_written;
+        cache.stored = true;
+      }
+      Err(error) => {
+        cache.reason = format!("miss_store_failed:{error}");
+      }
+    }
+  }
   let report = HermeticExecutionReport {
     version: RESULT_VERSION,
     profile_version: HERMETIC_PROFILE_VERSION,
@@ -2238,11 +3438,13 @@ pub(crate) fn execute(
     result_digest,
     fetch: inventory.summary,
     output_manifest: Some(output_manifest),
+    materialized_root: None,
+    cache,
     compiler_units: invocations.len(),
     elapsed_ms: started.elapsed().as_millis(),
     reasons,
   };
-  let report_path = write_report(ctx, &report)?;
+  let report_path = write_report(ctx.workspace_root(), &report)?;
   Ok((report, report_path))
 }
 
@@ -2637,8 +3839,8 @@ fn hermetic_result_digest(action_key: &str, output_manifest: &str) -> String {
   format!("result-v{RESULT_VERSION}-sha256-{}", identity.finish())
 }
 
-fn write_report(ctx: &WorkspaceContext, report: &HermeticExecutionReport) -> RailResult<PathBuf> {
-  let directory = create_state_directory(ctx.workspace_root(), &["reports"])?;
+fn write_report(workspace_root: &Path, report: &HermeticExecutionReport) -> RailResult<PathBuf> {
+  let directory = create_state_directory(workspace_root, &["reports"])?;
   let nonce = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .map(|duration| duration.as_nanos())
@@ -2729,6 +3931,7 @@ impl PlatformBoundary {
 
 #[cfg(target_os = "macos")]
 fn command_stdout(program: &str, arguments: &[&str]) -> RailResult<Vec<u8>> {
+  crate::instrumentation::record_hermetic_platform_probe();
   let output = Command::new(program).args(arguments).output().map_err(|error| {
     RailError::message(format!(
       "failed to capture hermetic platform identity from '{program}': {error}"
@@ -2744,10 +3947,14 @@ fn command_stdout(program: &str, arguments: &[&str]) -> RailResult<Vec<u8>> {
 
 #[cfg(target_os = "macos")]
 fn macos_read_boundary_digest(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
-  let sysroot = snapshot.toolchain().rustc_sysroot();
+  macos_read_boundary_digest_for(snapshot.toolchain().rustc_sysroot(), snapshot.toolchain().host_target())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_read_boundary_digest_for(sysroot: &Path, host_target: &str) -> RailResult<String> {
   let mut identity = FramedHasher::new(b"cargo-rail-macos-read-boundary\0");
   identity.frame(b"version", &MACOS_SANDBOX_POLICY_VERSION.to_le_bytes());
-  for path in toolchain_read_files(snapshot)? {
+  for path in toolchain_read_files_for(sysroot)? {
     let relative = path.strip_prefix(sysroot).map_err(|_| {
       RailError::message(format!(
         "toolchain input '{}' is outside rustc sysroot '{}'",
@@ -2761,7 +3968,7 @@ fn macos_read_boundary_digest(snapshot: &WorkspaceSnapshot) -> RailResult<String
       &path,
     )?;
   }
-  for root in toolchain_read_roots(snapshot) {
+  for root in toolchain_read_roots_for(sysroot, host_target) {
     let relative = root.strip_prefix(sysroot).map_err(|_| {
       RailError::message(format!(
         "toolchain input root '{}' is outside rustc sysroot '{}'",
@@ -2780,6 +3987,41 @@ fn macos_read_boundary_digest(snapshot: &WorkspaceSnapshot) -> RailResult<String
     frame_read_boundary_file(&mut identity, path.as_bytes(), Path::new(path))?;
   }
   Ok(format!("read-boundary-v1-sha256-{}", identity.finish()))
+}
+
+#[cfg(target_os = "macos")]
+fn fast_platform_identity(sysroot: &Path, host_target: &str, source_root: &Path) -> RailResult<String> {
+  let sandbox = PathBuf::from("/usr/bin/sandbox-exec");
+  if !sandbox.is_file() {
+    return Err(RailError::message(
+      "macOS sandbox-exec is unavailable for process-free cache validation",
+    ));
+  }
+  let mut identity = FramedHasher::new(b"cargo-rail-hermetic-platform\0");
+  identity.frame(b"family", std::env::consts::FAMILY.as_bytes());
+  identity.frame(b"os", std::env::consts::OS.as_bytes());
+  identity.frame(b"arch", std::env::consts::ARCH.as_bytes());
+  let executable = ExecutableIdentity::capture(sandbox.as_os_str(), Path::new("/"), source_root)?;
+  identity.frame(b"sandbox", &executable.identity_bytes()?);
+  identity.frame(b"policy-version", &MACOS_SANDBOX_POLICY_VERSION.to_le_bytes());
+  identity.frame(
+    b"read-boundary",
+    macos_read_boundary_digest_for(sysroot, host_target)?.as_bytes(),
+  );
+  identity.frame(
+    b"policy-semantics",
+    b"deny-default;dyld-support;read=isolated-run,inventory,toolchain,executables,sealed-system;write=target,build,tmp,home,observations,package-cache;deny-network",
+  );
+  identity.frame(b"os-build", &command_stdout("/usr/bin/sw_vers", &["-buildVersion"])?);
+  identity.frame(b"kernel", &command_stdout("/usr/bin/uname", &["-srv"])?);
+  Ok(format!("platform-v1-sha256-{}", identity.finish()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fast_platform_identity(_sysroot: &Path, _host_target: &str, _source_root: &Path) -> RailResult<String> {
+  Err(RailError::message(
+    "process-free local action-cache hits are not graduated on this platform",
+  ))
 }
 
 #[cfg(target_os = "macos")]
@@ -2981,9 +4223,13 @@ fn toolchain_program(sysroot: &Path, name: &str) -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn toolchain_read_roots(snapshot: &WorkspaceSnapshot) -> Vec<PathBuf> {
-  let sysroot = snapshot.toolchain().rustc_sysroot();
+  toolchain_read_roots_for(snapshot.toolchain().rustc_sysroot(), snapshot.toolchain().host_target())
+}
+
+#[cfg(target_os = "macos")]
+fn toolchain_read_roots_for(sysroot: &Path, host_target: &str) -> Vec<PathBuf> {
   let mut roots = Vec::new();
-  let target = sysroot.join("lib/rustlib").join(snapshot.toolchain().host_target());
+  let target = sysroot.join("lib/rustlib").join(host_target);
   for relative in ["lib", "codegen-backends"] {
     let root = target.join(relative);
     if root.is_dir() {
@@ -2997,7 +4243,11 @@ fn toolchain_read_roots(snapshot: &WorkspaceSnapshot) -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn toolchain_read_files(snapshot: &WorkspaceSnapshot) -> RailResult<Vec<PathBuf>> {
-  let sysroot = snapshot.toolchain().rustc_sysroot();
+  toolchain_read_files_for(snapshot.toolchain().rustc_sysroot())
+}
+
+#[cfg(target_os = "macos")]
+fn toolchain_read_files_for(sysroot: &Path) -> RailResult<Vec<PathBuf>> {
   let mut files = vec![toolchain_program(sysroot, "cargo"), toolchain_program(sysroot, "rustc")];
   for entry in fs::read_dir(sysroot.join("lib"))? {
     let path = entry?.path();
@@ -3014,24 +4264,36 @@ fn toolchain_read_files(snapshot: &WorkspaceSnapshot) -> RailResult<Vec<PathBuf>
   Ok(files)
 }
 
-struct FramedHasher(Sha256);
+struct FramedHasher {
+  hasher: Sha256,
+  input_bytes: usize,
+}
 
 impl FramedHasher {
   fn new(domain: &[u8]) -> Self {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    Self(hasher)
+    Self {
+      hasher,
+      input_bytes: domain.len(),
+    }
   }
 
   fn frame(&mut self, tag: &[u8], value: &[u8]) {
-    self.0.update((tag.len() as u64).to_le_bytes());
-    self.0.update(tag);
-    self.0.update((value.len() as u64).to_le_bytes());
-    self.0.update(value);
+    self.hasher.update((tag.len() as u64).to_le_bytes());
+    self.hasher.update(tag);
+    self.hasher.update((value.len() as u64).to_le_bytes());
+    self.hasher.update(value);
+    self.input_bytes = self
+      .input_bytes
+      .saturating_add(16)
+      .saturating_add(tag.len())
+      .saturating_add(value.len());
   }
 
   fn finish(self) -> ContentDigest {
-    ContentDigest::from_sha256_bytes(self.0.finalize().into())
+    crate::instrumentation::record_hash(self.input_bytes);
+    ContentDigest::from_sha256_bytes(self.hasher.finalize().into())
   }
 }
 

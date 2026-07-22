@@ -63,7 +63,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 3);
+  assert_eq!(counters["schema_version"], 5);
   assert!(
     counters["snapshot_id"]
       .as_str()

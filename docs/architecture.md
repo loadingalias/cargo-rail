@@ -140,7 +140,8 @@ Cargo-rail neither stores result artifacts nor writes or restores Cargo fingerpr
 ## Hermetic execution profile
 
 `cargo rail run --all --action build --hermetic` is an explicit proof profile. It does not alter ordinary `run`
-execution and it is not yet an action-result cache.
+execution. On macOS, an eligible P6 action key now also addresses a machine-local action/output cache. This is not a
+Cargo fingerprint cache or a native per-rustc-invocation cache.
 
 Actual hermetic execution currently requires the explicit built-in `--action build`. Default, profile, workflow, and
 other action dispatch is rejected before workspace context or hermetic state is created; dry-run remains a planning
@@ -182,9 +183,39 @@ boundary is implemented.
 
 The result is a versioned manifest of every declared compiler-output file, directory, symlink, mode, digest, and byte
 count under the isolated Cargo build directory. Cargo's internal fingerprints and incremental state are intentionally
-excluded: their layout is unstable, they are never synthesized, and P7 must not restore a whole Cargo build directory
-as if it were valid state. After source, inventory, toolchain, and platform revalidation, every declared output is
-re-read and compared with that manifest immediately before the report is published.
+excluded: their layout is unstable, they are never synthesized, and cargo-rail never restores a whole Cargo build
+directory as if it were valid state. After source, inventory, toolchain, and platform revalidation, every declared
+output is re-read and compared with that manifest immediately before the report is published.
+
+Eligible action results are stored beneath `$CARGO_RAIL_CACHE_DIR/cargo-rail/local-cas-v1`, or under `CARGO_HOME` and
+then `$HOME/.cargo` when the override is absent. The default byte bound is 10 GiB and
+`CARGO_RAIL_CACHE_MAX_BYTES` may set a different positive bound. A pin maps one exact P6 action key to a versioned,
+length-framed `ActionResult`; that object binds the result digest, output-manifest identity, recursive `Tree` identity,
+and compiler-unit count. Trees bind names, kinds, modes, symlink targets, and versioned `Blob` identities. Blobs are
+streamed and SHA-256-verified from exact bytes. Result bundles are staged, synced, and atomically published before the
+action-key pin. Leases protect active results and deterministic oldest-pin garbage collection enforces the bound.
+
+A lookup verifies the pin, action result, manifest, every tree, object-directory membership, and blob metadata before
+materialization. It then streams blobs into a new private tree while hashing them, validates the complete manifest,
+syncs the tree, and atomically renames it into the clean declared output root. Absolute, parent, NUL, non-portable,
+colliding, oversized, special-file, hard-link, and escaping-symlink forms fail closed. Cargo fingerprints,
+incremental state, mtimes, and sizes never authorize reuse.
+
+The process-free lookup is deliberately narrow: exact text-mode
+`run --all --action build --hermetic`, optionally with `--explain` or `--print-cmd`, and no explicit configuration
+override. A root-independent lookup digest over the exact request and raw root manifests/configuration is only an
+index. Each candidate retains the P6 source,
+resolution, configuration, environment, toolchain, platform, dependency-inventory, package-selection, and action-key
+evidence. Those inputs are revalidated before materialization and again after restore; the lookup digest alone never
+authorizes a hit. Other requests keep their existing cold, unsupported, or platform-limited behavior.
+
+`cache.status = "hit"` means the hermetic `cargo check` action and all compilation units were skipped and the verified
+output manifest was restored. The hit path runs before `WorkspaceContext`, so it launches no Cargo metadata, Cargo,
+rustc, or rustdoc process. It still hashes the exact retained P6 inputs and performs the two current-host platform
+identity probes. `--no-cache` retains the explicit cold proof path. `run --explain` reports hit, ordinary miss,
+uncacheable, and disabled states; corrupt or incompatible selected objects produce an explained error with
+`--no-cache` and validated-cleanup guidance instead of an implicit cold fallback. `clean --cache` removes a shared
+cache only through a canonical workspace reference and an exact ownership marker.
 
 | Action class | macOS proof | Other hosts | Current contract |
 |---|---|---|---|

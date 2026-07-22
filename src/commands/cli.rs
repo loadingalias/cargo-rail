@@ -186,7 +186,7 @@ Examples:
 const CLEAN_HELP: &str = "\
 Examples:
   cargo rail clean                      # Clean all artifacts
-  cargo rail clean --cache              # Clean metadata cache only
+  cargo rail clean --cache              # Clean validated local and workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
   cargo rail clean --check              # Check for pending cleanup (exit 1)";
@@ -266,6 +266,9 @@ pub enum Commands {
     /// Execute supported Rust actions in fresh isolated roots
     #[arg(long)]
     hermetic: bool,
+    /// Disable local action-result reuse for this hermetic execution
+    #[arg(long, requires = "hermetic")]
+    no_cache: bool,
     /// Dry-run action plan format (json/github require --dry-run)
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: ActionOutputFormat,
@@ -466,7 +469,7 @@ pub enum Commands {
   /// Clean generated artifacts (cache, backups, reports)
   #[command(after_long_help = CLEAN_HELP)]
   Clean {
-    /// Clean metadata cache only
+    /// Clean validated local and workspace cache state
     #[arg(long)]
     cache: bool,
     /// Prune old backups
@@ -563,6 +566,38 @@ pub enum Commands {
 }
 
 impl Commands {
+  /// Return whether this exact request is eligible for the process-free P7.1 lookup path.
+  #[doc(hidden)]
+  pub(crate) fn is_pre_context_cache_request(&self) -> bool {
+    matches!(
+      self,
+      Self::Run {
+        since: None,
+        merge_base: false,
+        all: true,
+        actions,
+        profile: None,
+        workflow: None,
+        dry_run: false,
+        hermetic: true,
+        no_cache: false,
+        format: ActionOutputFormat::Text,
+        generated: GeneratedMode::Regenerate,
+        ignore_bin_crates: false,
+        skip_nextest: false,
+        test_runner: TestRunnerPreference::Auto,
+        cargo_test_args,
+        nextest_args,
+        test_filter: None,
+        run_args,
+        ..
+      } if actions.as_slice() == ["build"]
+        && cargo_test_args.is_empty()
+        && nextest_args.is_empty()
+        && run_args.is_empty()
+    )
+  }
+
   /// Return whether this command consumes one authoritative workspace snapshot.
   #[doc(hidden)]
   pub fn requires_workspace_snapshot(&self) -> bool {

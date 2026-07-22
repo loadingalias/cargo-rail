@@ -97,10 +97,11 @@ enum ContextPreparation {
 pub struct PreparedContext {
   command: Box<Commands>,
   preparation: ContextPreparation,
+  pre_context_cache_request: bool,
 }
 
 impl PreparedContext {
-  fn new(command: Commands) -> RailResult<Self> {
+  fn new(command: Commands, pre_context_cache_request: bool) -> RailResult<Self> {
     let preparation = match &command {
       Commands::Run {
         actions,
@@ -142,12 +143,13 @@ impl PreparedContext {
     Ok(Self {
       command: Box::new(command),
       preparation,
+      pre_context_cache_request,
     })
   }
 
   /// Build the exact workspace context required by this command.
   #[doc(hidden)]
-  pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext)> {
+  pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext, bool)> {
     let context = match self.preparation {
       ContextPreparation::Standard if self.command.requires_workspace_snapshot() => {
         WorkspaceContext::build_with_snapshot(workspace_root)?
@@ -160,7 +162,7 @@ impl PreparedContext {
         WorkspaceContext::build_with_hermetic_snapshot(workspace_root, bootstrap)?
       }
     };
-    Ok((*self.command, context))
+    Ok((*self.command, context, self.pre_context_cache_request))
   }
 }
 
@@ -219,6 +221,25 @@ pub fn try_dispatch_pre_context(
   config_override: Option<&Path>,
   json: bool,
 ) -> RailResult<PreContextDispatch> {
+  let pre_context_cache_request = config_override.is_none() && !json && cmd.is_pre_context_cache_request();
+  if pre_context_cache_request {
+    let (print_cmd, explain) = match &cmd {
+      Commands::Run { print_cmd, explain, .. } => (*print_cmd, *explain),
+      _ => unreachable!("pre-context cache predicate only accepts run commands"),
+    };
+    match crate::hermetic::try_restore_pre_context(workspace_root)? {
+      crate::hermetic::PreContextCacheAttempt::Hit(hit) => {
+        run::complete_pre_context_cache_hit(workspace_root, *hit, print_cmd, explain)?;
+        return Ok(PreContextDispatch::Handled);
+      }
+      crate::hermetic::PreContextCacheAttempt::Miss(reason) => {
+        if explain {
+          println!("action `build` local cache precheck: miss ({reason})");
+        }
+      }
+    }
+  }
+
   match cmd {
     Commands::Plan { schema: true, .. } => {
       plan::print_plan_schema();
@@ -306,6 +327,7 @@ pub fn try_dispatch_pre_context(
         Commands::Release {
           command: cli::ReleaseCommand::Resume { state },
         },
+        false,
       )?))
     }
 
@@ -317,10 +339,14 @@ pub fn try_dispatch_pre_context(
         Commands::Release {
           command: cli::ReleaseCommand::Abort { state, yes },
         },
+        false,
       )?))
     }
 
-    other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(other)?)),
+    other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+      other,
+      pre_context_cache_request,
+    )?)),
   }
 }
 
@@ -328,7 +354,7 @@ pub fn try_dispatch_pre_context(
 ///
 /// This is the main command routing logic. It takes a parsed `Commands` enum
 /// and the workspace context, then calls the appropriate handler.
-pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
+pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, pre_context_cache_request: bool) -> RailResult<()> {
   match cmd {
     Commands::Run {
       since,
@@ -339,6 +365,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
       workflow,
       dry_run,
       hermetic,
+      no_cache,
       format,
       generated,
       print_cmd,
@@ -361,6 +388,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         workflow,
         dry_run,
         hermetic,
+        no_cache,
         format,
         generated,
         print_cmd,
@@ -373,6 +401,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         test_filter,
         run_args,
         hermeticity_doctor: false,
+        pre_context_cache_request,
       },
     ),
 

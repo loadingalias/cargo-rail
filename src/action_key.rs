@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use cargo_metadata::{DependencyKind, Package, TargetKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::action::{
@@ -84,6 +84,146 @@ enum InputEntryKind {
 struct InputEntry {
   path: RepositoryPath,
   kind: InputEntryKind,
+  authoritative_file: bool,
+}
+
+/// Exact declared inputs retained only to validate a pre-context local-cache candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeclaredInputManifest {
+  pub(crate) version: u32,
+  pub(crate) all_source: bool,
+  pub(crate) roots: Vec<String>,
+  pub(crate) entries: Vec<DeclaredInputEntry>,
+  pub(crate) root_digest: String,
+}
+
+impl DeclaredInputManifest {
+  /// Reject malformed retained evidence before it participates in candidate validation.
+  pub(crate) fn validate(&self) -> RailResult<()> {
+    if self.version != 1 {
+      return Err(RailError::message(
+        "declared-input validation manifest has an incompatible schema",
+      ));
+    }
+    let mut previous_root = None::<&str>;
+    let mut parsed_roots = Vec::with_capacity(self.roots.len());
+    for root in &self.roots {
+      let path = RepositoryPath::new(Path::new(root))?;
+      if path.as_str() != root || previous_root.is_some_and(|previous| previous >= root.as_str()) {
+        return Err(RailError::message(
+          "declared-input validation roots are not canonical and strictly sorted",
+        ));
+      }
+      previous_root = Some(root);
+      parsed_roots.push(path);
+    }
+    if !self.all_source && parsed_roots.is_empty() {
+      return Err(RailError::message(
+        "declared-input validation manifest has no selected source roots",
+      ));
+    }
+    let mut previous_path = None::<&str>;
+    let mut entries = Vec::with_capacity(self.entries.len());
+    for entry in &self.entries {
+      let path = RepositoryPath::new(Path::new(&entry.path))?;
+      if path.as_str() != entry.path || previous_path.is_some_and(|previous| previous >= entry.path.as_str()) {
+        return Err(RailError::message(
+          "declared-input validation entries are not canonical and strictly sorted",
+        ));
+      }
+      previous_path = Some(&entry.path);
+      if !self.all_source
+        && !parsed_roots
+          .iter()
+          .any(|root| path.as_path() == root.as_path() || path.as_path().starts_with(root.as_path()))
+      {
+        return Err(RailError::message(
+          "declared-input validation entry is outside its selected source roots",
+        ));
+      }
+      let kind = match &entry.kind {
+        DeclaredInputKind::File { digest, executable } => {
+          let digest = parse_content_digest(digest)?;
+          InputEntryKind::RegularFile {
+            digest,
+            executable: *executable,
+          }
+        }
+        DeclaredInputKind::Symlink { target } => {
+          if target.contains('\0') {
+            return Err(RailError::message(
+              "declared-input validation symlink target contains NUL",
+            ));
+          }
+          InputEntryKind::Symlink { target: target.clone() }
+        }
+      };
+      entries.push(InputEntry {
+        path,
+        kind,
+        authoritative_file: entry.authoritative_file,
+      });
+    }
+    if format!("sha256:{}", input_root_digest(&entries)) != self.root_digest {
+      return Err(RailError::message(
+        "declared-input validation root does not match its exact entries",
+      ));
+    }
+    Ok(())
+  }
+
+  #[cfg(test)]
+  pub(crate) fn empty_for_test() -> Self {
+    Self {
+      version: 1,
+      all_source: true,
+      roots: Vec::new(),
+      entries: Vec::new(),
+      root_digest: format!("sha256:{}", input_root_digest(&[])),
+    }
+  }
+}
+
+fn parse_content_digest(value: &str) -> RailResult<ContentDigest> {
+  let hex = value
+    .strip_prefix("sha256:")
+    .ok_or_else(|| RailError::message("declared-input digest has the wrong domain"))?;
+  if hex.len() != 64
+    || !hex
+      .bytes()
+      .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+  {
+    return Err(RailError::message("declared-input digest is not canonical SHA-256"));
+  }
+  let mut bytes = [0u8; 32];
+  for (index, output) in bytes.iter_mut().enumerate() {
+    *output = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+      .map_err(|_| RailError::message("declared-input digest is not hexadecimal"))?;
+  }
+  Ok(ContentDigest::from_sha256_bytes(bytes))
+}
+
+/// One exact source entry in a [`DeclaredInputManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeclaredInputEntry {
+  pub(crate) path: String,
+  pub(crate) authoritative_file: bool,
+  pub(crate) kind: DeclaredInputKind,
+}
+
+/// File or symlink identity for one declared action input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum DeclaredInputKind {
+  File { digest: String, executable: bool },
+  Symlink { target: String },
+}
+
+struct DeclaredInputSelection {
+  all_source: bool,
+  roots: BTreeSet<PathBuf>,
 }
 
 struct ReasonSet(BTreeMap<&'static str, BTreeSet<String>>);
@@ -116,7 +256,8 @@ impl ReasonSet {
 /// Derive exact declared inputs and issue an action key only when evidence is complete.
 pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> RailResult<ActionKeyAnalysis> {
   let mut reasons = ReasonSet::new();
-  let input_entries = declared_input_entries(action, snapshot, &mut reasons)?;
+  let selection = declared_input_selection(action);
+  let input_entries = declared_input_entries(&selection, snapshot, &mut reasons)?;
   let input_root = input_root_digest(&input_entries);
   let mut identity = FramedHasher::new(b"cargo-rail-action-key\0");
   identity.frame(b"key-version", &ACTION_KEY_VERSION.to_le_bytes());
@@ -225,6 +366,47 @@ pub(crate) fn analyze(action: &ExpandedAction, snapshot: &WorkspaceSnapshot) -> 
       root_digest: format!("sha256:{input_root}"),
     },
     reasons: reasons.finish(),
+  })
+}
+
+/// Retain the exact path set that produced an eligible action's declared-input root.
+pub(crate) fn declared_input_manifest(
+  action: &ExpandedAction,
+  snapshot: &WorkspaceSnapshot,
+) -> RailResult<DeclaredInputManifest> {
+  let selection = declared_input_selection(action);
+  let mut reasons = ReasonSet::new();
+  let entries = declared_input_entries(&selection, snapshot, &mut reasons)?;
+  if !reasons.is_empty() {
+    return Err(RailError::message(
+      "eligible action cannot retain an incomplete declared-input validation manifest",
+    ));
+  }
+  let root_digest = format!("sha256:{}", input_root_digest(&entries));
+  let entries = entries
+    .into_iter()
+    .map(|entry| DeclaredInputEntry {
+      path: entry.path.as_str().to_string(),
+      authoritative_file: entry.authoritative_file,
+      kind: match entry.kind {
+        InputEntryKind::RegularFile { digest, executable } => DeclaredInputKind::File {
+          digest: format!("sha256:{digest}"),
+          executable,
+        },
+        InputEntryKind::Symlink { target } => DeclaredInputKind::Symlink { target },
+      },
+    })
+    .collect();
+  Ok(DeclaredInputManifest {
+    version: 1,
+    all_source: selection.all_source,
+    roots: selection
+      .roots
+      .iter()
+      .map(|root| crate::utils::path_to_git_format(root))
+      .collect(),
+    entries,
+    root_digest,
   })
 }
 
@@ -579,11 +761,7 @@ fn resolution_target_name(target: &crate::cargo::resolution::TargetIdentity) -> 
   }
 }
 
-fn declared_input_entries(
-  action: &ExpandedAction,
-  snapshot: &WorkspaceSnapshot,
-  reasons: &mut ReasonSet,
-) -> RailResult<Vec<InputEntry>> {
+fn declared_input_selection(action: &ExpandedAction) -> DeclaredInputSelection {
   let mut all_source = false;
   let mut roots = BTreeSet::new();
   for input in action.inputs() {
@@ -609,8 +787,21 @@ fn declared_input_entries(
       }
     }
   }
+  DeclaredInputSelection { all_source, roots }
+}
 
-  let selected = |path: &Path| all_source || roots.iter().any(|root| path == root || path.starts_with(root));
+fn declared_input_entries(
+  selection: &DeclaredInputSelection,
+  snapshot: &WorkspaceSnapshot,
+  reasons: &mut ReasonSet,
+) -> RailResult<Vec<InputEntry>> {
+  let selected = |path: &Path| {
+    selection.all_source
+      || selection
+        .roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+  };
   let mut entries = BTreeMap::new();
   for entry in snapshot.source().tree().entries() {
     if !selected(entry.path.as_path()) {
@@ -634,6 +825,7 @@ fn declared_input_entries(
       InputEntry {
         path: entry.path.clone(),
         kind,
+        authoritative_file: false,
       },
     );
   }
@@ -647,11 +839,11 @@ fn declared_input_entries(
     insert_snapshot_file(&mut entries, config, &selected);
   }
 
-  if !all_source {
-    for root in roots {
+  if !selection.all_source {
+    for root in &selection.roots {
       let found = entries
         .keys()
-        .any(|path| path.as_path() == root || path.as_path().starts_with(&root));
+        .any(|path| path.as_path() == root || path.as_path().starts_with(root));
       if !found {
         reasons.add(
           "declared_input_unavailable",
@@ -672,13 +864,17 @@ fn insert_snapshot_file(
   selected: &impl Fn(&Path) -> bool,
 ) {
   if selected(file.path().as_path()) {
-    entries.entry(file.path().clone()).or_insert_with(|| InputEntry {
-      path: file.path().clone(),
-      kind: InputEntryKind::RegularFile {
-        digest: file.digest(),
-        executable: false,
-      },
-    });
+    entries
+      .entry(file.path().clone())
+      .and_modify(|entry| entry.authoritative_file = true)
+      .or_insert_with(|| InputEntry {
+        path: file.path().clone(),
+        kind: InputEntryKind::RegularFile {
+          digest: file.digest(),
+          executable: false,
+        },
+        authoritative_file: true,
+      });
   }
 }
 

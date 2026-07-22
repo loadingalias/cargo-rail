@@ -111,6 +111,9 @@ Options:
       --hermetic
           Execute supported Rust actions in fresh isolated roots
 
+      --no-cache
+          Disable local action-result reuse for this hermetic execution
+
   -f, --format <FORMAT>
           Dry-run action plan format (json/github require --dry-run)
 
@@ -1291,7 +1294,7 @@ Usage: cargo rail clean [OPTIONS]
 
 Options:
       --cache
-          Clean metadata cache only
+          Clean validated local and workspace cache state
 
   -q, --quiet
           Suppress progress messages (for CI/automation)
@@ -1331,7 +1334,7 @@ Options:
 
 Examples:
   cargo rail clean                      # Clean all artifacts
-  cargo rail clean --cache              # Clean metadata cache only
+  cargo rail clean --cache              # Clean validated local and workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
   cargo rail clean --check              # Check for pending cleanup (exit 1)

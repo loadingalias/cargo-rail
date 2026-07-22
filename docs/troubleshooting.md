@@ -36,13 +36,17 @@ not itself a cache key.
 
 ```bash
 cargo rail run --all --action build --hermetic
+cargo rail run --all --action build --hermetic --explain
+cargo rail run --all --action build --hermetic --no-cache
 cargo rail run --all --action build --hermetic --dry-run --format json
 ```
 
-The first command requires a reviewed `Cargo.lock` and executes the explicit built-in `cargo check` action in a fresh
-source, target, build, Cargo-home, home, and temporary root. Before the fetch boundary, only local-package metadata runs
-locked/offline. The explicit fetch action may use the network; full metadata and the check then run locked/offline. The
-JSON preview names the intended boundary without executing it; preview planning is not itself a network-denial proof.
+On a cold run, the first command requires a reviewed `Cargo.lock` and executes the explicit built-in `cargo check`
+action in fresh source, target, build, Cargo-home, home, and temporary roots. Before the fetch boundary, only
+local-package metadata runs locked/offline. The explicit fetch action may use the network; full metadata and the check
+then run locked/offline. An eligible local-cache hit restores before workspace context, metadata, fetch, Cargo, or
+rustc starts. The JSON preview names the intended boundary without executing it; preview planning is not itself a
+network-denial proof.
 Actual execution currently requires `--action build`; default, profile, workflow, and other action selection is
 rejected before workspace context or hermetic state is created.
 Feature, target, target-kind, and profile arguments remain available after `--`. Workspace/package selectors,
@@ -56,7 +60,7 @@ global wrapper records workspace and external dependency compiler units. Cargo a
 emitted outputs, and dep-info must agree exactly or the action remains uncacheable.
 
 Successful executions write a redaction-safe report under `target/cargo-rail/hermetic/reports/`. Read `support`,
-`enforcement`, `action_key`, `result_digest`, `fetch`, `output_manifest`, and `reasons` together:
+`enforcement`, `action_key`, `result_digest`, `fetch`, `output_manifest`, `cache`, and `reasons` together:
 
 - `eligible` currently means a pure current-host Cargo check protected by the macOS filesystem/network sandbox.
 - `platform_limited` means isolated roots and offline Cargo ran, but the host could not enforce the complete boundary;
@@ -69,11 +73,31 @@ Successful executions write a redaction-safe report under `target/cargo-rail/her
 `cargo check --all-targets` proves compilation of library, binary, test, example, and bench units; it does not execute
 tests or benchmarks. Ordinary `cargo rail run` behavior is unchanged and remains the way to run unsupported classes.
 
-A warm `fetch.reused = true` means only that the exact immutable dependency inventory was reused. P6 does not contain
-an action-result CAS and never restores compiler outputs or Cargo fingerprints. That begins in P7. Remove reports,
-inventories, run state, and the existing diagnostic evidence with:
+A warm `fetch.reused = true` means only that the exact immutable dependency inventory was reused. It is independent of
+the local action/output cache. The process-free lookup currently accepts only exact text-mode
+`run --all --action build --hermetic`, with optional `--explain` or `--print-cmd`, no `--config` override, and no
+trailing Cargo arguments. For an eligible P6 key, the cache surfaces have these meanings:
+
+- `hit`: every CAS object and exact blob byte verified, the complete output manifest was restored into a new root, and
+  the hermetic `cargo check` action and compiler units did not execute;
+- `miss`: no action-key pin exists, so cold execution may populate it;
+- `corrupt` or `incompatible`: a selected pin or object was missing, malformed, tampered, oversized, or from another
+  schema. The command fails with an explanation; use `--no-cache` for an intentional cold run or `clean --cache` for
+  validated cleanup;
+- `disabled`: `--no-cache` was requested or the cache root/reference was unavailable;
+- `uncacheable`: P6 did not issue an eligible action key.
+
+These booleans are named `cargo_check_executed` and `compiler_units_executed` deliberately. A hit launches no Cargo,
+rustc, or rustdoc process, but it is an action/output restore rather than native per-invocation compiler caching. The
+lookup digest is non-authorizing; retained P6 inputs, all CAS objects, exact blob bytes, and final platform/input state
+must verify. Cache objects default to `$CARGO_HOME/cargo-rail/local-cas-v1` or
+`$HOME/.cargo/cargo-rail/local-cas-v1`. Set `CARGO_RAIL_CACHE_DIR` to choose the base and
+`CARGO_RAIL_CACHE_MAX_BYTES` to change the 10 GiB bound.
+
+Preview cleanup without deleting anything, then remove only the validated cargo-rail-owned root and workspace state:
 
 ```bash
+cargo rail clean --cache --check
 cargo rail clean --cache
 ```
 
