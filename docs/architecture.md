@@ -107,41 +107,59 @@ and records `sccache_wrapper_preserved` or `existing_compiler_wrapper_preserved`
 unknown or renamed cache from being double-wrapped. An original workspace wrapper stays inside the diagnostic wrapper,
 and recursive cargo-rail selections are rejected before compiler probing. No sccache cache-format parsing is involved.
 
-Native reuse is graduated for one class only: an aarch64 macOS host running Cargo and rustc 1.97.1, no configured
-compiler wrapper, `CARGO_INCREMENTAL=0`, and one workspace `lib` compilation with exactly one complete observed Rust
-source. The invocation must emit only dep-info and metadata, may consume only repository `.rmeta` dependency artifacts,
-and may not link. Its exact selected and sysroot Cargo/rustc executables, cargo-rail wrapper, Cargo configuration,
-captured compiler environment, physical source root, argv, declared source, and dependency bytes are session or
-candidate inputs. Binding the physical root is intentional because rustc dep-info and metadata bytes can contain that
-root.
+Native reuse is graduated on `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu` for Cargo and rustc 1.97.1 with
+`CARGO_INCREMENTAL=0` and no configured compiler wrapper. Ordinary `cargo rail run` build and distribution actions
+install a machine-local outer wrapper only for that boundary. Eligible dependency and workspace `lib` invocations have
+one compiler-declared crate root, complete observed Rust inputs, dep-info plus metadata and optional rlib output, only
+`.rmeta`/`.rlib` dependency artifacts, and no native linker responsibility. Exact Cargo/rustc/sysroot and cargo-rail
+executables, Cargo configuration, resolution, captured compiler environment, portable argv, declared/observed source,
+and dependency bytes enter the session or action identity. Source, output, and dependency paths are normalized to the
+logical workspace before execution; the physical checkout root never authorizes reuse or enters reusable rustc output.
 
 `CandidateKey` is only a local index over pre-execution evidence. A candidate match reloads the canonical validation
 object from a locally verified CAS result, re-digests every stored declared input, observed read, and dependency
 artifact, re-digests every recorded environment read, and derives `ActionKey` again. Only an exact action/result binding
 may restore. The restore path re-verifies the pin, action result, validation, output manifest, tree, and every blob, then
-stages the exact `.d`, `.rmeta`, stdout, and stderr bytes. The active wrapper publishes only the two output paths rustc
-would have written, replays the streams, and returns through Cargo's normal wrapper boundary. Cargo creates its own
+stages the exact `.d`, `.rmeta`, optional `.rlib`, stdout, and stderr bytes. The active wrapper publishes only the output
+paths rustc would have written, replays the streams, and returns through Cargo's normal wrapper boundary. Cargo creates its own
 fingerprints around that invocation; cargo-rail never restores a target/build directory, synthesizes fingerprint state,
 or authorizes from timestamps, sizes, Cargo freshness, or `CandidateKey` alone.
 
 Incremental, test, binary, dylib, cdylib, staticlib, proc-macro, build-script, native-linking, stdin, response-file,
-unsupported-flag/emit, filesystem-reading macro, multi-source, dependency-crate, non-`.rmeta` dependency, cross-target,
+unsupported-flag/emit, filesystem-reading macro, unsupported dependency-artifact, cross-target,
 secret/incomplete-input, other platform, and other toolchain cases execute normally with an explicit bypass. Existing
-sccache and custom wrappers also execute normally in their original positions. Corrupt or incompatible native objects
-fail the hit closed and fall back to the exact cold compiler invocation; successful cold output is published only if a
-complete validation and CAS result can be stored. Native use registers the same owner-marked P7.1 cache root, so
-`cargo rail clean --cache` retains its validated cleanup boundary.
+sccache and custom wrappers also execute normally in their original positions. On macOS, proc-macro and proc-macro
+consumer bypasses receive portable path normalization only when the default linker boundary remains intact; their
+outputs are still never cached. Corrupt or incompatible native objects fail the hit closed and fall back to the exact
+cold compiler invocation; successful cold output is published only if a complete validation and CAS result can be
+stored. Native use registers the same owner-marked local CAS root, so `cargo rail clean --cache` retains its validated
+cleanup boundary.
 
-The 2026-07-22 graduation fixture used two local crates, clean `cargo check`, 20 wrapper runs, and 30 runs per
-native-cache condition on an aarch64 macOS host with 16 GiB RAM. These are gate evidence, not a performance promise:
+The checked-in fixture combines registry and Git dependencies, build scripts, a proc macro, native code, workspace
+libraries, and a binary. Build the release binary and reproduce the benchmark with:
+
+```bash
+cargo build --release --locked
+just bench-native-cache 10
+```
+
+The final 10-run Apple Silicon gate used Cargo/rustc 1.97.1, offline clean targets, separate seed/use roots, and an M1
+host. A separate ARM64 GNU/Linux run used the same alternating clean-root method. These are release evidence, not a
+promise for unrelated repositories:
 
 | Measurement | Result |
 |---|---|
-| Final native-cache command | cold `1.049 +/- 0.009 s`; warm `0.985 +/- 0.026 s` (6.2% lower mean and 7.3% lower median wall time) |
-| CPU and peak memory | cold `0.428 s` user / `0.358 s` system / `69,222,400 B`; warm `0.419 s` / `0.344 s` / `69,238,784 B` |
-| Warm disposition | 3/3 eligible library units hit; 3 test units bypassed; `13,368 B` hashed and `12,249 B` restored |
-| Clean wrapper overhead | diagnostic `+30.9 ms`; cache boundary `+23.2 ms`; complete unsupported chain `+53.7 ms` over native |
-| sccache 0.15 comparison | cold `260.2 ms`; warm `218.2 ms`; `.rmeta` matched direct Cargo, but restored `.d` bytes retained the prior target root instead of the requested one |
+| Apple Silicon check | native p50/p95 `6.952/7.055 s`; warm cross-root `6.281/6.781 s` (p50 9.6% faster; p95 3.9% faster) |
+| Apple Silicon release build | native p50/p95 `10.300/10.862 s`; warm cross-root `9.002/12.378 s` (p50 12.6% faster; p95 14.0% slower from one outlier) |
+| ARM64 GNU/Linux check | native p50 `7.82 s`; warm cross-root `4.70 s` (40.0% faster) |
+| ARM64 GNU/Linux build | native p50 `9.89 s`; warm cross-root `5.95 s` (39.8% faster) |
+| Warm disposition per action | 27 eligible hits, 0 misses, 30 explicit bypasses; 100% eligible lookup hit rate |
+| Cold population | check/build p50 `9.079/13.944 s`; repeated reuse is required to recover the population cost |
+| Unsupported tiny binary | raw Cargo p50 `0.111 s`; cargo-rail disabled/active-bypass `0.606/0.602 s`; cache setup adds no measurable cost over cargo-rail's fixed planner cost |
+
+An earlier macOS sccache comparison completed checks faster but left 22 dep-info files bound to the seed root. That
+result is why cargo-rail requires portable output bytes and revalidates their complete action/result binding rather
+than treating compiler success as sufficient cache authority.
 
 Custom-build compilation retains Cargo's exact executable output separately from the other compiler artifacts. A
 versioned `BuildScriptActionKey` can be issued only at the next process boundary, after the executable and source bytes
@@ -203,7 +221,7 @@ boundary, cargo-rail captures and classifies Cargo configuration, rejects config
 ambient `RUSTC`/`RUSTDOC`, and performs only locked/offline local-package metadata preflight. Toolchain discovery
 disables rustup auto-install/update behavior, ignores ambient compiler wrappers, and pins the exact sysroot Cargo,
 rustc, and rustdoc; wrappers, rustup staging homes, and a newly downloaded toolchain cannot enter the fetch identity.
-Ordinary diagnostic-wrapper coexistence and P7.3 native reuse do not relax this P7.1 boundary: the hermetic command removes the
+Ordinary diagnostic-wrapper coexistence and native per-invocation reuse do not relax this hermetic boundary: the command removes the
 cache-wrapper marker and continues to use its observation-only global wrapper with the same platform limits.
 The fetch binds the lockfile, acquisition configuration, credential capability names, and exact Cargo implementation,
 captures locked registry or Git packages as an immutable source inventory, and runs full metadata locked/offline
@@ -274,7 +292,7 @@ cache only through a canonical workspace reference and an exact ownership marker
 | Build scripts, proc macros, native/generated code | `uncacheable` | `uncacheable` | Dynamic runtime/tool inputs are not yet sandboxed as complete action classes; normal execution remains available. |
 | Documentation, actual test execution, linked build/package artifacts | `uncacheable` | `uncacheable` | Output/runtime boundaries are incomplete or not implemented by the profile. |
 | Cross/custom targets, configured linker/runner | `uncacheable` | `uncacheable` | Tool and SDK boundaries have not passed the per-class proof gate. |
-| Repository wrappers and sccache | `uncacheable` | `uncacheable` | Ordinary diagnostics preserve and explain the exact wrapper chain; the P7.1 hermetic profile rejects wrappers, and P7.3 native reuse bypasses them rather than double-caching. |
+| Repository wrappers and sccache | `uncacheable` | `uncacheable` | Ordinary diagnostics preserve and explain the exact wrapper chain; the hermetic profile rejects wrappers, and native reuse bypasses them rather than double-caching. |
 
 Physical checkout roots, unrelated files/packages/environment, and Cargo's mutable cache representation do not affect
 the graduated key. Exact source, resolution, profile, feature, target, flags, environment, toolchain, platform, and

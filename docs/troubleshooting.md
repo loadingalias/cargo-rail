@@ -131,8 +131,9 @@ executable identities. `execution.cache_wrapper` explains the separate native co
   `incremental_compilation_not_graduated`, `test_compilation_not_graduated`, `binary_not_graduated`,
   `linker_producing_crate_type_not_graduated`, `proc_macro_not_graduated`, `build_script_not_graduated`,
   `native_linking_not_graduated`, `compiler_stdin_not_graduated`, `compiler_emit_mode_not_graduated`,
-  `compiler_flag_not_graduated`, `filesystem_reading_macro_not_graduated`, `multi_source_library_not_graduated`,
-  `dependency_crate_not_graduated`, `dependency_artifact_class_not_graduated`, and `cross_target_not_graduated`;
+  `compiler_flag_not_graduated`, `filesystem_reading_macro_not_graduated`,
+  `compiler_crate_type_not_graduated`, `dependency_artifact_class_not_graduated`, and
+  `cross_target_not_graduated`;
 - proof-boundary reasons include `native_cache_platform_not_graduated`, `native_cache_toolchain_not_graduated`,
   `native_cache_session_unavailable`, `compiler_inputs_incomplete`, `secret_compiler_environment`,
   `complete_compiler_observation_unavailable`, `compiler_output_root_not_graduated`,
@@ -143,12 +144,17 @@ inside it. A custom or renamed cache receives the generic existing-wrapper reaso
 Remove cargo-rail itself from `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, or the corresponding Cargo configuration if
 the recursive-wrapper error appears; cargo-rail inserts its own roles.
 
-There is no global “compiler caching supported” state. Native reuse currently requires aarch64 macOS, Cargo/rustc
-1.97.1, `CARGO_INCREMENTAL=0`, no existing wrapper, and the exact single-source workspace-library metadata class.
+There is no global “compiler caching supported” state. Native reuse is machine-local and currently requires
+`aarch64-apple-darwin` or `aarch64-unknown-linux-gnu`, Cargo/rustc 1.97.1, `CARGO_INCREMENTAL=0`, no existing wrapper,
+and an ordinary `build` or `distribution` action. Eligible dependency and workspace units are `lib` rustc invocations
+with one declared crate root, complete observed inputs, dep-info plus metadata and optional rlib output, only
+`.rmeta`/`.rlib` dependency artifacts, and no native linker responsibility. Proc macros, build scripts, binaries,
+tests, linked crate types, and every unsupported boundary still execute cold.
+
 `candidate_key` is only an index. `action_key` appears only after the stored observation's source, dependency, and
 environment inputs are re-digested. `bytes_hashed` and `bytes_restored` make the per-invocation cost visible. Delete
 neither CAS files nor Cargo fingerprints manually: `cargo rail clean --cache` follows the validated workspace reference
-and owner marker. The P7.1 hermetic profile remains separate and still rejects configured wrappers.
+and owner marker. The hermetic whole-action profile remains separate and still rejects configured wrappers.
 
 For a local custom-build unit, the cached observation also contains `build_script_action_key`. A missing `key` is
 intentional when Cargo inherited ambient environment or process state, a dependency result is not yet verified, or an

@@ -52,4 +52,7 @@ such as `inputs.workspace_root`, the machine envelope, and `reproducibility` met
 clones at different checkout paths have the same identity. Config and toolchain fingerprints normalize LF and CRLF
 line endings.
 
-This identity compares planner decisions. It is **not a cache key**. A future cache identity must additionally bind source contents, the actual compiler, target, features, command, and an explicit environment allowlist before reuse can be safe.
+This identity compares planner decisions. It is **not a cache key** and never authorizes reuse. Hermetic action keys and
+native compiler action keys are separate contracts that additionally bind exact source, resolution, compiler,
+toolchain, target, features, command, environment, observed inputs, and verified dependency results for their
+explicitly graduated classes.

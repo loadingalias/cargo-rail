@@ -8,13 +8,13 @@ Use this pattern when your repo already has `just`, `make`, `xtask`, or scripts.
 
 ```bash
 PLAN=$(cargo rail plan --merge-base -f json)
-SCOPE=$(echo "$PLAN" | jq -c '.scope')
+TEST_SCOPE=$(echo "$PLAN" | jq -c '.surfaces.test.scope')
 
 if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
-  if echo "$SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
+  if echo "$TEST_SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
     cargo xtask test --workspace
-  elif echo "$SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
-    echo "$SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
+  elif echo "$TEST_SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
+    echo "$TEST_SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
   fi
 fi
 ```
@@ -25,7 +25,7 @@ fi
 - uses: loadingalias/cargo-rail-action@v5.1.0
   id: rail
   with:
-    version: 0.18.0
+    version: 0.19.0
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'
@@ -40,4 +40,4 @@ fi
     fi
 ```
 
-Use `scope` for execution. Do not rebuild execution scope from `impact`.
+Use the selected surface's `scope` for execution. Do not rebuild execution scope from `impact`.

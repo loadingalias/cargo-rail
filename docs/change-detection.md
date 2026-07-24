@@ -23,8 +23,8 @@ cargo rail run --merge-base --action test
 Use `plan` when you want the contract. Use `run` when you want execution.
 
 `run` expands every enabled built-in or configured repository task into an ordered, shell-free argv action before
-executing the first action. A
-successful run or dry run writes a version-2 decision receipt under `target/cargo-rail/receipts/run-decision-*.json`.
+executing the first action. A successful run or dry run writes a version-4 decision receipt under
+`target/cargo-rail/receipts/run-decision-*.json`.
 The receipt binds the action list to the workspace snapshot and records each action's exact argv array, logical working
 directory, selected packages/targets/features, dependencies, typed environment names, declared side effects, and
 planner trace reasons. Cargo actions also record the exact root PackageIds and resolved-node count for every selected
@@ -82,7 +82,7 @@ benchmarks = ["benches/**", "perf/**"]
 - uses: loadingalias/cargo-rail-action@v5.1.0
   id: rail
   with:
-    version: 0.18.0
+    version: 0.19.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'

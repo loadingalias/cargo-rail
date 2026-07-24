@@ -112,7 +112,7 @@ Options:
           Execute supported Rust actions in fresh isolated roots
 
       --no-cache
-          Disable local action-result reuse for this hermetic execution
+          Disable local result reuse for this execution
 
   -f, --format <FORMAT>
           Dry-run action plan format (json/github require --dry-run)

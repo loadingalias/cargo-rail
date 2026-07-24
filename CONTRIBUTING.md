@@ -33,10 +33,13 @@ just gen-docs
 ```
 
 Changes to unify performance must include the workload and before/after numbers.
-The repository benchmark accepts package and run counts:
+Native compiler-cache changes must also run the checked-in cross-root fixture.
+The repository benchmarks accept package and run counts:
 
 ```bash
 just bench-unify 25 10
+cargo build --release --locked
+just bench-native-cache 10
 ```
 
 ## Change requirements

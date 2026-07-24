@@ -53,7 +53,6 @@ major_version_conflict = "bump"
 
 [release]
 remote_effects = "auto"
-require_change_files = true
 
 [change-detection.custom]
 verification = ["verification/**"]
