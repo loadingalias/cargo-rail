@@ -4,6 +4,47 @@
 
 
 
+
+## [0.19.0](https://github.com/loadingalias/cargo-rail/compare/v0.18.0...v0.19.0) - 2026-07-24
+
+- Make split and sync snapshot-native by replacing path ownership with Cargo member names, persisting versioned
+  `Rail-Origin` provenance in ordinary Git history, migrating legacy notes, preserving exact Git trees and commit
+  metadata, and binding planner and release output to the shared snapshot.
+
+- Add fail-closed action-key diagnostics over exact source, resolution, toolchain, executable, Cargo configuration, argv,
+  typed environment, and verified dependency-result identities. Transparent rustdoc observation preserves the selected
+  tool and HTML output while recording stable dep-info. Build-script compilation separates its non-circular
+  pre-execution action identity from the ordered instructions, environment reads, generated tree, and execution evidence
+  in its result identity. Incomplete boundaries remain explicitly non-reusable while ordinary unsupported execution stays
+  available.
+  
+  Add `cargo rail run --all --action build --hermetic` for the graduated pure-Rust Cargo-check class. It performs an
+  explicit locked fetch, captures immutable crates.io, remote registry-mirror, or Git dependency sources, then checks
+  locked/offline in fresh read-only source and isolated output roots with logical path remapping and a controlled
+  environment. macOS enforces filesystem and network denial and can issue a verified action/result manifest; other hosts
+  remain platform-limited. Build scripts, proc macros, docs, linked/native/cross-target work, custom tool boundaries, and
+  sccache fail closed. Cargo fingerprints and incremental state are never restored. Action plans and decision receipts
+  use schema version 4.
+
+- Add a bounded machine-local action/output cache for eligible macOS hermetic Cargo checks. Verified hits restore exact
+  declared outputs into a clean root without starting Cargo or rustc; changed inputs, corrupt objects, unsupported
+  classes, and other platforms remain fail-closed. Add `--no-cache` and extend `run --explain`, diagnostics, and
+  `clean --cache` with local-cache decisions.
+
+- Add portable, verified native compiler-result caching for non-incremental dependency and workspace library
+  metadata/rlib units on Apple Silicon macOS and ARM64 Linux with Cargo/rustc 1.97.1. Ordinary `cargo rail run` check
+  and build actions can reuse byte-exact outputs across clean roots without restoring or fabricating Cargo target state,
+  incremental state, or fingerprints.
+  
+  Preserve custom wrappers and sccache, keep incremental builds and unproven linker/build-script/proc-macro classes
+  explicitly bypassed, and fail closed on input, toolchain, environment, SDK/linker, cache-object, and output mutations.
+  Add a representative registry/Git/native/proc-macro fixture plus reproducible cold/warm benchmarks and cache evidence.
+
+- Make reviewed change files authoritative for release planning and add exact-SHA, resumable, tags-last release execution.
+
+- Make planner impact semantic and target-aware, bind run actions to exact Cargo resolution views, and add explainable dependency-unification diagnostics.
+
+
 ## [0.18.0](https://github.com/loadingalias/cargo-rail/compare/v0.17.3...v0.18.0) - 2026-07-19
 
 - Capture complete, stable source state for deterministic planning from Git worktrees or declared Cargo filesystem roots; reject concurrent Git, byte, directory, or metadata drift; keep historical ranges object-only; support nested and no-Git Cargo workspaces; and exclude resolved Cargo and cargo-rail generated state.
