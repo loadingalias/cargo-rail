@@ -10,6 +10,7 @@ use crate::action::{
 use crate::action_key::{analyze as analyze_action_key, resolution_identity};
 use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
 use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
+use crate::compiler::collector::prepare_direct_cargo_action;
 use crate::config::MAX_ACTIONS;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
@@ -1480,8 +1481,36 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     .argv()
     .split_first()
     .ok_or_else(|| RailError::message("expanded action argv cannot be empty"))?;
+  let native_cache = if matches!(action.kind(), ActionKind::Build | ActionKind::Distribution) {
+    Some(if opts.no_cache {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("native_cache_disabled_by_request")
+    } else if cargo_cli_configuration_override(arguments) {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("cargo_cli_configuration_not_graduated")
+    } else if action_compiler_wrapper_capability(action) {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("action_compiler_wrapper_preserved")
+    } else if !action.environment().inherit() || !action.environment().entries().is_empty() {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("action_environment_not_graduated")
+    } else if std::env::var_os("CARGO_INCREMENTAL").as_deref() != Some(std::ffi::OsStr::new("0")) {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("native_cache_incremental_policy_not_graduated")
+    } else if std::env::var_os("RUSTC_FORCE_INCREMENTAL").is_some() {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("forced_incremental_compilation_not_graduated")
+    } else {
+      match prepare_direct_cargo_action(ctx.snapshot()?) {
+        Ok(setup) => setup,
+        Err(_) => crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("native_cache_identity_unavailable"),
+      }
+    })
+  } else {
+    None
+  };
   let mut command = Command::new(program);
   let working_directory = action.validate_paths(ctx.workspace_root())?;
+  if let Some(configuration) = native_cache
+    .as_ref()
+    .and_then(crate::compiler::native_cache::DirectNativeCacheSetup::cargo_config_argument)
+  {
+    command.arg("--config").arg(configuration);
+  }
   command.args(arguments).current_dir(&working_directory);
   if !action.environment().inherit() {
     command.env_clear();
@@ -1519,12 +1548,58 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
   let status = command
     .status()
     .map_err(|error| RailError::message(format!("{} failed: {}", action.id(), error)))?;
+  if opts.explain
+    && let Some(native_cache) = &native_cache
+  {
+    if let Some(reason) = native_cache.bypass_reason() {
+      println!("action `{}` native compiler cache: bypassed ({reason})", action.id());
+    } else if let Some(report) = native_cache.report() {
+      let reasons = report
+        .reasons
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+      println!(
+        "action `{}` native compiler cache: hits={} misses={} bypasses={} setup_bytes_hashed={} bytes_hashed={} bytes_restored={} reasons={}",
+        action.id(),
+        report.hits,
+        report.misses,
+        report.bypasses,
+        report.setup_bytes_hashed,
+        report.bytes_hashed,
+        report.bytes_restored,
+        reasons,
+      );
+    }
+  }
   if !status.success() {
     return Err(RailError::ExitWithCode {
       code: status.code().unwrap_or(1),
     });
   }
   Ok(())
+}
+
+fn cargo_cli_configuration_override(arguments: &[String]) -> bool {
+  arguments
+    .iter()
+    .any(|argument| argument == "--config" || argument.starts_with("--config="))
+}
+
+fn action_compiler_wrapper_capability(action: &ExpandedAction) -> bool {
+  action.environment().entries().iter().any(|entry| {
+    let name = match entry {
+      ActionEnvironmentEntry::Fixed { name, .. }
+      | ActionEnvironmentEntry::Pass { name }
+      | ActionEnvironmentEntry::Secret { name }
+      | ActionEnvironmentEntry::Cargo { name, .. } => name,
+    };
+    matches!(
+      name.as_str(),
+      "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "CARGO_BUILD_RUSTC_WRAPPER" | "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+    )
+  })
 }
 
 fn print_hermetic_result(

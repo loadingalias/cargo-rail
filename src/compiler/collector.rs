@@ -12,7 +12,10 @@ use crate::compiler::model::{
   CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
-use crate::compiler::native_cache::{NativeCompilerSession, SESSION_ENV};
+use crate::compiler::native_cache::{
+  DIAGNOSTIC_EXECUTION_CONTRACT, DirectNativeCacheIdentity, DirectNativeCacheSetup, NativeCompilerSession, SESSION_ENV,
+  direct_cache_bypass_reason, prepare_direct_cargo_cache,
+};
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
   CompilationProfile, CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, CompilerWrapperIdentity,
@@ -30,9 +33,11 @@ use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
 use cargo_metadata::{Message, PackageId, TargetKind};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::BufReader;
+use std::fs::File;
+use std::io::{BufReader, Read as _};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -117,8 +122,14 @@ impl CompilerCacheIdentity {
       snapshot.toolchain().rustc_wrapper_program(),
       snapshot.toolchain().rustc_workspace_wrapper_program(),
     );
-    let toolchain_fingerprint =
-      executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable, cache_wrapper_plan)?;
+    let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
+    let (toolchain_fingerprint, _) = executable_toolchain_fingerprint(
+      snapshot,
+      executables,
+      &cargo_rail_executable,
+      cache_wrapper_plan,
+      cache_bypass_reason,
+    )?;
     let target_fingerprints = target_fingerprints(snapshot)?;
     let lock_fingerprint = snapshot.lockfile_fingerprint();
     let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
@@ -154,7 +165,7 @@ impl CompilerCacheIdentity {
         .map(|limitation| format!("compiler_wrapper_{limitation}")),
     );
     let mut wrapper_chain = Vec::with_capacity(4);
-    if cache_wrapper_plan.installs_cargo_rail() {
+    if cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none() {
       wrapper_chain.push(CompilerWrapperIdentity::new(
         CompilerWrapperRole::Cache,
         cargo_rail_executable.clone(),
@@ -176,9 +187,10 @@ impl CompilerCacheIdentity {
         .cloned()
         .map(|executable| CompilerWrapperIdentity::new(CompilerWrapperRole::Workspace, executable)),
     );
-    let cache_wrapper =
-      CompilerCacheWrapperMetadata::new(CompilerCacheWrapperStatus::Bypassed, cache_wrapper_plan.reason());
-    let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
+    let cache_wrapper = CompilerCacheWrapperMetadata::new(
+      CompilerCacheWrapperStatus::Bypassed,
+      cache_bypass_reason.unwrap_or_else(|| cache_wrapper_plan.reason()),
+    );
 
     Ok(Self {
       rustc_version,
@@ -205,6 +217,64 @@ impl CompilerCacheIdentity {
       cache_bypass_reason,
     })
   }
+}
+
+/// Prepare native reuse for an ordinary Cargo action without capturing
+/// diagnostic-only package graphs and source closures.
+pub(crate) fn prepare_direct_cargo_action(snapshot: &WorkspaceSnapshot) -> RailResult<DirectNativeCacheSetup> {
+  let toolchain = snapshot.toolchain();
+  let wrapper_plan = CacheWrapperPlan::for_chain(
+    toolchain.rustc_wrapper_program(),
+    toolchain.rustc_workspace_wrapper_program(),
+  );
+  if let Some(reason) = direct_cache_bypass_reason(
+    toolchain.rustc_verbose_version(),
+    toolchain.cargo_verbose_version(),
+    wrapper_plan,
+  ) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
+  if !snapshot.cargo_config().unmodeled_settings().is_empty() {
+    return Ok(DirectNativeCacheSetup::Bypassed("cargo_configuration_unmodeled"));
+  }
+  if !snapshot
+    .base_resolution()
+    .metadata()
+    .packages
+    .iter()
+    .flat_map(|package| &package.targets)
+    .any(|target| target.kind.contains(&TargetKind::Lib))
+  {
+    return Ok(DirectNativeCacheSetup::Bypassed(
+      "native_cache_no_eligible_library_units",
+    ));
+  }
+
+  let current_executable =
+    std::env::current_exe().with_context(|| "locating cargo-rail compiler-cache wrapper".to_string())?;
+  let cargo_rail_executable = ExecutableIdentity::capture(
+    current_executable.as_os_str(),
+    snapshot.source_root(),
+    snapshot.source_root(),
+  )?;
+  let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
+  let (toolchain_fingerprint, setup_bytes_hashed) =
+    executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable, wrapper_plan, None)?;
+  let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
+  let cargo_config_fingerprint = cargo_config_fingerprint(snapshot)?;
+  let lock_fingerprint = snapshot.lockfile_fingerprint();
+
+  Ok(prepare_direct_cargo_cache(DirectNativeCacheIdentity {
+    source_root: snapshot.source_root(),
+    rustc_version: toolchain.rustc_verbose_version(),
+    cargo_version: toolchain.cargo_verbose_version(),
+    toolchain_fingerprint: &toolchain_fingerprint,
+    compiler_env_fingerprint: &compiler_env_fingerprint,
+    cargo_config_fingerprint: &cargo_config_fingerprint,
+    lock_fingerprint: &lock_fingerprint,
+    wrapper_plan,
+    setup_bytes_hashed,
+  }))
 }
 
 impl<'a> CompilerDiagnosticsCollector<'a> {
@@ -727,7 +797,9 @@ fn run_workspace_check(
     .prefix("cargo-rail-compiler-observations-")
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
-  let native_cache_session = identity.cache_wrapper_plan.installs_cargo_rail().then(|| {
+  let native_cache_enabled =
+    identity.cache_wrapper_plan.installs_cargo_rail() && identity.cache_bypass_reason.is_none();
+  let native_cache_session = native_cache_enabled.then(|| {
     NativeCompilerSession::write(
       observation_directory.path(),
       workspace_root,
@@ -736,6 +808,8 @@ fn run_workspace_check(
       &identity.toolchain_fingerprint,
       &identity.compiler_env_fingerprint,
       &identity.cargo_config_fingerprint,
+      &identity.lock_fingerprint,
+      DIAGNOSTIC_EXECUTION_CONTRACT,
     )
     .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable"))
   });
@@ -778,7 +852,7 @@ fn run_workspace_check(
     .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
     .env_remove(CACHE_WRAPPER_MARKER)
     .args(&args);
-  if identity.cache_wrapper_plan.installs_cargo_rail() {
+  if native_cache_enabled {
     command.env("RUSTC_WRAPPER", &wrapper).env(CACHE_WRAPPER_MARKER, "1");
     if let Some(session) = &native_cache_session {
       command.env(SESSION_ENV, session);
@@ -1241,10 +1315,19 @@ fn executable_toolchain_fingerprint(
   executables: &ToolchainExecutableIdentities,
   cargo_rail_executable: &ExecutableIdentity,
   cache_wrapper_plan: CacheWrapperPlan,
-) -> RailResult<String> {
+  cache_bypass_reason: Option<&'static str>,
+) -> RailResult<(String, u64)> {
   let toolchain = snapshot.toolchain();
   let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
   append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
+  let native_cache_enabled = cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none();
+  let setup_bytes_hashed = if native_cache_enabled && native_sysroot_identity_required(toolchain) {
+    let (identity, bytes_hashed) = compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target())?;
+    append_identity_frame(&mut framed, b"compiler-sysroot", identity.as_bytes());
+    bytes_hashed
+  } else {
+    0
+  };
   append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
   append_identity_frame(&mut framed, b"platform-family", std::env::consts::FAMILY.as_bytes());
   append_identity_frame(&mut framed, b"platform-os", std::env::consts::OS.as_bytes());
@@ -1257,16 +1340,132 @@ fn executable_toolchain_fingerprint(
   append_identity_frame(
     &mut framed,
     b"compiler-cache-disposition",
-    cache_wrapper_plan.reason().as_bytes(),
+    cache_bypass_reason
+      .unwrap_or_else(|| cache_wrapper_plan.reason())
+      .as_bytes(),
   );
-  if cache_wrapper_plan.installs_cargo_rail() {
+  if native_cache_enabled {
     append_identity_frame(
       &mut framed,
       b"cargo-rail-cache-wrapper",
       &cargo_rail_executable.identity_bytes()?,
     );
   }
-  Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+  Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), setup_bytes_hashed))
+}
+
+fn native_sysroot_identity_required(toolchain: &crate::cargo::ToolchainIdentity) -> bool {
+  direct_cache_bypass_reason(
+    toolchain.rustc_verbose_version(),
+    toolchain.cargo_verbose_version(),
+    CacheWrapperPlan::DisabledPassThrough,
+  )
+  .is_none()
+}
+
+fn compiler_sysroot_fingerprint(sysroot: &Path, host_target: &str) -> RailResult<(String, u64)> {
+  const MAX_FILES: usize = 4096;
+  const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+  let sysroot = crate::utils::canonicalize_existing(sysroot)?;
+  let rustlib = sysroot.join("lib/rustlib").join(host_target);
+  let target_lib = rustlib.join("lib");
+  #[cfg(windows)]
+  let driver_lib = sysroot.join("bin");
+  #[cfg(not(windows))]
+  let driver_lib = sysroot.join("lib");
+  let mut files = Vec::new();
+  for entry in std::fs::read_dir(&target_lib)? {
+    let path = entry?.path();
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+      return Err(RailError::message(
+        "compiler target sysroot contains a non-regular entry",
+      ));
+    }
+    files.push(path);
+  }
+  let mut driver_files = 0usize;
+  for entry in std::fs::read_dir(&driver_lib)? {
+    let path = entry?.path();
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if rustc_driver_library(name) {
+      if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(RailError::message(
+          "compiler driver sysroot entry is not a regular file",
+        ));
+      }
+      files.push(path);
+      driver_files += 1;
+    }
+  }
+  let codegen_backends = rustlib.join("codegen-backends");
+  if codegen_backends.is_dir() {
+    for entry in std::fs::read_dir(codegen_backends)? {
+      let path = entry?.path();
+      let metadata = std::fs::symlink_metadata(&path)?;
+      if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(RailError::message("compiler codegen backend is not a regular file"));
+      }
+      files.push(path);
+    }
+  }
+  files.sort();
+  if driver_files == 0 || files.len() > MAX_FILES {
+    return Err(RailError::message(
+      "compiler sysroot has no bounded host library inventory",
+    ));
+  }
+
+  let mut total = 0u64;
+  let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-v1\0"[..]);
+  for path in files {
+    let metadata = std::fs::metadata(&path)?;
+    total = total.saturating_add(metadata.len());
+    if total > MAX_BYTES {
+      return Err(RailError::message("compiler sysroot identity exceeds its byte limit"));
+    }
+    let relative = path
+      .strip_prefix(&sysroot)
+      .map(crate::utils::path_to_git_format)
+      .map_err(|_| RailError::message("compiler sysroot entry escaped its root"))?;
+    let mut file = File::open(&path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+      let read = file.read(&mut buffer)?;
+      if read == 0 {
+        break;
+      }
+      bytes_read = bytes_read.saturating_add(read as u64);
+      if bytes_read > metadata.len() {
+        return Err(RailError::message("compiler sysroot changed during identity capture"));
+      }
+      hasher.update(&buffer[..read]);
+    }
+    if bytes_read != metadata.len() {
+      return Err(RailError::message("compiler sysroot changed during identity capture"));
+    }
+    crate::instrumentation::record_hash_operation();
+    crate::instrumentation::record_hash_input_bytes(bytes_read as usize);
+    crate::instrumentation::record_hashed_file_bytes_read(bytes_read as usize);
+    let digest = ContentDigest::from_sha256_bytes(hasher.finalize().into());
+    append_identity_frame(&mut framed, relative.as_bytes(), digest.to_string().as_bytes());
+  }
+  append_identity_frame(&mut framed, b"bytes", &total.to_le_bytes());
+  Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), total))
+}
+
+#[cfg(windows)]
+fn rustc_driver_library(name: &str) -> bool {
+  name.starts_with("rustc_driver-") && name.ends_with(".dll")
+}
+
+#[cfg(not(windows))]
+fn rustc_driver_library(name: &str) -> bool {
+  name.starts_with("librustc_driver-") && (name.ends_with(".so") || name.ends_with(".dylib"))
 }
 
 fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
@@ -1731,10 +1930,67 @@ fn now_unix_ms() -> u64 {
 }
 
 fn compiler_env_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
-  Ok(format!(
-    "sha256:{}",
-    ContentDigest::sha256(&serde_json::to_vec(snapshot.cargo_config().environment())?)
-  ))
+  let mut framed = Vec::from(&b"cargo-rail-native-compiler-environment-v2\0"[..]);
+  append_identity_frame(
+    &mut framed,
+    b"cargo",
+    &serde_json::to_vec(snapshot.cargo_config().environment())?,
+  );
+  let runtime = std::env::vars_os()
+    .filter_map(|(name, value)| {
+      let name = name.into_string().ok()?;
+      native_compiler_runtime_environment(&name).then(|| {
+        (
+          name,
+          format!("sha256:{}", ContentDigest::sha256(value.as_encoded_bytes())),
+        )
+      })
+    })
+    .collect::<BTreeMap<_, _>>();
+  append_identity_frame(&mut framed, b"runtime", &serde_json::to_vec(&runtime)?);
+  Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+}
+
+fn native_compiler_runtime_environment(name: &str) -> bool {
+  matches!(
+    name,
+    "AR"
+      | "BINDGEN_EXTRA_CLANG_ARGS"
+      | "CC"
+      | "CFLAGS"
+      | "CPPFLAGS"
+      | "CXX"
+      | "CXXFLAGS"
+      | "DEVELOPER_DIR"
+      | "DYLD_FALLBACK_LIBRARY_PATH"
+      | "DYLD_INSERT_LIBRARIES"
+      | "DYLD_LIBRARY_PATH"
+      | "LANG"
+      | "LC_ALL"
+      | "LC_CTYPE"
+      | "LD"
+      | "LDFLAGS"
+      | "LD_LIBRARY_PATH"
+      | "LD_PRELOAD"
+      | "LIBCLANG_PATH"
+      | "MACOSX_DEPLOYMENT_TARGET"
+      | "PATH"
+      | "PKG_CONFIG"
+      | "PKG_CONFIG_PATH"
+      | "PKG_CONFIG_SYSROOT_DIR"
+      | "RANLIB"
+      | "RUSTC_BOOTSTRAP"
+      | "RUSTC_FORCE_INCREMENTAL"
+      | "RUSTC_LOG"
+      | "RUST_MIN_STACK"
+      | "SDKROOT"
+      | "SOURCE_DATE_EPOCH"
+  ) || ["AR_", "CC_", "CFLAGS_", "CXX_", "CXXFLAGS_", "PKG_CONFIG_", "RANLIB_"]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    || ["_AR", "_CC", "_CFLAGS", "_CXX", "_CXXFLAGS", "_RANLIB"]
+      .iter()
+      .any(|suffix| name.ends_with(suffix))
 }
 
 fn cargo_config_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
@@ -2077,6 +2333,29 @@ mod tests {
     all_features.features = FeatureSelection::AllFeatures;
     update_candidate_survivors(&mut survivors, &targets, "member", "linux", &all_features);
     assert!(survivors["member"].is_empty());
+  }
+
+  #[test]
+  fn compiler_sysroot_identity_rehashes_target_and_driver_bytes() {
+    let sysroot = tempfile::tempdir().expect("sysroot");
+    let target_lib = sysroot.path().join("lib/rustlib/test-host/lib");
+    std::fs::create_dir_all(&target_lib).expect("target lib");
+    std::fs::write(target_lib.join("libcore-test.rlib"), b"target-one").expect("target library");
+    #[cfg(windows)]
+    let driver = sysroot.path().join("bin/rustc_driver-test.dll");
+    #[cfg(not(windows))]
+    let driver = sysroot.path().join("lib/librustc_driver-test.so");
+    std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
+    std::fs::write(&driver, b"driver-one").expect("driver library");
+
+    let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("baseline fingerprint");
+    assert_eq!(baseline.1, 20);
+    std::fs::write(target_lib.join("libcore-test.rlib"), b"target-two").expect("target mutation");
+    let target_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("target fingerprint");
+    assert_ne!(baseline.0, target_changed.0);
+    std::fs::write(&driver, b"driver-two").expect("driver mutation");
+    let driver_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("driver fingerprint");
+    assert_ne!(target_changed.0, driver_changed.0);
   }
 
   fn test_evidence(unused: &[&str]) -> TargetEvidence {

@@ -272,7 +272,7 @@ pub(crate) fn record_cas_read(bytes: u64) {
   add(|counters| &counters.cas_bytes_read, bytes);
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn record_cas_restore(bytes: u64) {
   add(|counters| &counters.cas_bytes_restored, bytes);
 }

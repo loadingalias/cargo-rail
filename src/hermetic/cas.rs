@@ -26,7 +26,7 @@ const MAX_TREE_DEPTH: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_ENTRIES: usize = 1_000_000;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
@@ -84,7 +84,7 @@ pub(super) struct CacheCandidate {
 }
 
 /// A verified local result binding found through a non-authorizing compiler candidate key.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheCandidate {
   pub(crate) action_key: String,
@@ -93,7 +93,7 @@ pub(crate) struct NativeCacheCandidate {
   pub(crate) bytes_read: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheHit {
   pub(crate) action_result: String,
@@ -103,7 +103,7 @@ pub(crate) struct NativeCacheHit {
   pub(crate) bytes_restored: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheMiss {
   pub(crate) reason: String,
@@ -111,7 +111,7 @@ pub(crate) struct NativeCacheMiss {
   pub(crate) bytes_read: u64,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum NativeCacheLookup {
   Hit(NativeCacheHit),
@@ -229,7 +229,7 @@ struct LeaseRecord {
 struct ReadStats {
   objects: u64,
   bytes: u64,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   restored: u64,
 }
 
@@ -255,7 +255,7 @@ impl Fault {
     }
   }
 
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   fn miss(reason: impl Into<String>) -> Self {
     Self {
       kind: FaultKind::Miss,
@@ -446,7 +446,7 @@ impl LocalCas {
     }
   }
 
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   pub(crate) fn restore_native(&self, action_key: &str, destination: &Path) -> NativeCacheLookup {
     let mut stats = ReadStats::default();
     match self.restore_inner(action_key, destination, &mut stats) {
@@ -537,7 +537,7 @@ impl LocalCas {
     Ok(candidates)
   }
 
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<Vec<NativeCacheCandidate>> {
     crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
     let pins_directory = self.root.join("pins");
@@ -740,7 +740,7 @@ impl LocalCas {
     Ok(stats)
   }
 
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   fn restore_inner(
     &self,
     action_key: &str,
@@ -782,17 +782,17 @@ impl LocalCas {
 }
 
 struct VerifiedResult {
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   action_result: String,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   object: ActionResultObject,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   manifest: OutputManifest,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   validation: StoredValidation,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   trees: BTreeMap<String, TreeObject>,
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   bundle: PathBuf,
 }
 
@@ -1563,22 +1563,22 @@ impl LocalCas {
       }
     }
     Ok(VerifiedResult {
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       action_result: action_result.to_string(),
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       object,
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       manifest,
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       validation,
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       trees,
-      #[cfg(any(target_os = "macos", test))]
+      #[cfg(any(unix, windows, test))]
       bundle,
     })
   }
 
-  #[cfg(any(target_os = "macos", test))]
+  #[cfg(any(unix, windows, test))]
   fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
     let parent = destination
       .parent()
@@ -1874,7 +1874,7 @@ fn validate_object_directory(
   Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 fn materialize_tree(
   bundle: &Path,
   identity: &str,
@@ -1915,7 +1915,7 @@ fn materialize_tree(
   Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 fn materialize_blob(
   bundle: &Path,
   identity: &str,
@@ -1993,7 +1993,7 @@ fn materialize_blob(
   set_exact_mode(destination, mode)
 }
 
-#[cfg(all(any(target_os = "macos", test), unix))]
+#[cfg(unix)]
 fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   use std::os::unix::fs::PermissionsExt as _;
 
@@ -2001,7 +2001,7 @@ fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
     .map_err(|error| Fault::corrupt(format!("output_mode: {error}")))
 }
 
-#[cfg(all(any(target_os = "macos", test), not(unix)))]
+#[cfg(not(unix))]
 fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   let mut permissions = fs::metadata(path)
     .map_err(|error| Fault::corrupt(format!("output_mode_metadata: {error}")))?
@@ -2010,13 +2010,13 @@ fn set_exact_mode(path: &Path, mode: u32) -> Result<(), Fault> {
   fs::set_permissions(path, permissions).map_err(|error| Fault::corrupt(format!("output_mode: {error}")))
 }
 
-#[cfg(all(any(target_os = "macos", test), unix))]
+#[cfg(unix)]
 fn create_materialized_symlink(target: &Path, destination: &Path, _directory: bool) -> Result<(), Fault> {
   std::os::unix::fs::symlink(target, destination)
     .map_err(|error| Fault::corrupt(format!("symlink_materialization: {error}")))
 }
 
-#[cfg(all(any(target_os = "macos", test), windows))]
+#[cfg(windows)]
 fn create_materialized_symlink(target: &Path, destination: &Path, directory: bool) -> Result<(), Fault> {
   let result = if directory {
     std::os::windows::fs::symlink_dir(target, destination)
@@ -2026,12 +2026,12 @@ fn create_materialized_symlink(target: &Path, destination: &Path, directory: boo
   result.map_err(|error| Fault::corrupt(format!("symlink_materialization: {error}")))
 }
 
-#[cfg(all(any(target_os = "macos", test), not(any(unix, windows))))]
+#[cfg(not(any(unix, windows)))]
 fn create_materialized_symlink(_target: &Path, _destination: &Path, _directory: bool) -> Result<(), Fault> {
   Err(Fault::incompatible("symlink_materialization_unsupported"))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(unix, windows, test))]
 fn sync_output_tree(root: &Path) -> RailResult<()> {
   let mut directories = Vec::new();
   let mut pending = vec![root.to_path_buf()];

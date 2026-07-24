@@ -266,8 +266,8 @@ pub enum Commands {
     /// Execute supported Rust actions in fresh isolated roots
     #[arg(long)]
     hermetic: bool,
-    /// Disable local action-result reuse for this hermetic execution
-    #[arg(long, requires = "hermetic")]
+    /// Disable local result reuse for this execution
+    #[arg(long)]
     no_cache: bool,
     /// Dry-run action plan format (json/github require --dry-run)
     #[arg(long, short = 'f', default_value_t, value_enum)]

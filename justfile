@@ -24,6 +24,9 @@ build-all:
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
+bench-native-cache runs="10":
+    @scripts/bench/native-cache.sh "{{ runs }}"
+
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
 

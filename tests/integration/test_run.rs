@@ -1939,6 +1939,225 @@ fn test_action_key_cargo_cli_config_bypass_respects_argument_domains() -> Result
 }
 
 #[test]
+fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Result<()> {
+  let ws = TestWorkspace::new_named("native-cache-explicit-bypasses")?;
+  ws.add_crate("cache-bypass", "0.1.0", &[])?;
+  ws.commit("Add native cache bypass fixture")?;
+
+  let disabled = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--no-cache",
+      "--explain",
+      "--",
+      "--quiet",
+    ],
+  )?;
+  assert!(
+    disabled.status.success(),
+    "explicitly disabled native-cache run failed: {}",
+    String::from_utf8_lossy(&disabled.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&disabled.stdout)
+      .contains("native compiler cache: bypassed (native_cache_disabled_by_request)"),
+    "the explicit opt-out must win: {}",
+    String::from_utf8_lossy(&disabled.stdout)
+  );
+
+  fs::remove_dir_all(ws.path.join("target"))?;
+  let configured = run_cargo_rail(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+      "--config=build.jobs=1",
+    ],
+  )?;
+  assert!(
+    configured.status.success(),
+    "Cargo CLI configuration run failed: {}",
+    String::from_utf8_lossy(&configured.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&configured.stdout)
+      .contains("native compiler cache: bypassed (cargo_cli_configuration_not_graduated)"),
+    "Cargo CLI configuration must remain authoritative: {}",
+    String::from_utf8_lossy(&configured.stdout)
+  );
+  Ok(())
+}
+
+#[test]
+fn test_native_cache_leaves_default_incremental_development_cold() -> Result<()> {
+  let ws = TestWorkspace::new_named("native-cache-incremental-bypass")?;
+  ws.add_crate("incremental-bypass", "0.1.0", &[])?;
+  ws.commit("Add incremental native cache bypass fixture")?;
+
+  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+    ])
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(
+    output.status.success(),
+    "default incremental build failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&output.stdout)
+      .contains("native compiler cache: bypassed (native_cache_incremental_policy_not_graduated)"),
+    "default Cargo development must bypass native-cache setup: {}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  fs::remove_dir_all(ws.path.join("target"))?;
+  let forced = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+    ])
+    .env("CARGO_INCREMENTAL", "0")
+    .env("RUSTC_FORCE_INCREMENTAL", "1")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(
+    forced.status.success(),
+    "forced incremental build failed: {}",
+    String::from_utf8_lossy(&forced.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&forced.stdout)
+      .contains("native compiler cache: bypassed (forced_incremental_compilation_not_graduated)"),
+    "rustc's forced incremental mode must bypass native-cache setup: {}",
+    String::from_utf8_lossy(&forced.stdout)
+  );
+  Ok(())
+}
+
+#[test]
+fn test_native_cache_bypasses_binary_only_workload_before_toolchain_hashing() -> Result<()> {
+  if !matches!(
+    (std::env::consts::OS, std::env::consts::ARCH),
+    ("macos", "aarch64") | ("linux", "aarch64")
+  ) {
+    return Ok(());
+  }
+  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
+  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
+  if !String::from_utf8_lossy(&rustc.stdout).starts_with("rustc 1.97.1 ")
+    || !String::from_utf8_lossy(&cargo.stdout).starts_with("cargo 1.97.1 ")
+  {
+    return Ok(());
+  }
+
+  let ws = TestWorkspace::new_single_crate("native-cache-binary-only", "0.1.0")?;
+  fs::remove_file(ws.path.join("src/lib.rs"))?;
+  fs::write(ws.path.join("src/main.rs"), "fn main() {}\n")?;
+  git(&ws.path, &["add", "src"])?;
+  git(&ws.path, &["commit", "-m", "Use a binary-only target"])?;
+
+  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+    ])
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env("CARGO_INCREMENTAL", "0")
+    .output()?;
+  assert!(
+    output.status.success(),
+    "binary-only build failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&output.stdout)
+      .contains("native compiler cache: bypassed (native_cache_no_eligible_library_units)"),
+    "an unsupported workload must bypass before native-cache setup: {}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+
+  fs::create_dir(ws.path.join(".cargo"))?;
+  fs::write(
+    ws.path.join(".cargo/config.toml"),
+    "[build]\nunmodeled-native-cache-test = true\n",
+  )?;
+  git(&ws.path, &["add", ".cargo/config.toml"])?;
+  git(&ws.path, &["commit", "-m", "Add unmodeled Cargo build configuration"])?;
+  fs::remove_dir_all(ws.path.join("target"))?;
+  let unmodeled = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+    ])
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env("CARGO_INCREMENTAL", "0")
+    .output()?;
+  assert!(
+    unmodeled.status.success(),
+    "unmodeled Cargo configuration build failed: {}",
+    String::from_utf8_lossy(&unmodeled.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&unmodeled.stdout)
+      .contains("native compiler cache: bypassed (cargo_configuration_unmodeled)"),
+    "unmodeled Cargo build settings must bypass native-cache setup: {}",
+    String::from_utf8_lossy(&unmodeled.stdout)
+  );
+  Ok(())
+}
+
+#[test]
 fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receipt() -> Result<()> {
   let ws = TestWorkspace::new_named("doctor-hermeticity")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;

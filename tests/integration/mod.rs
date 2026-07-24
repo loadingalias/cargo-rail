@@ -11,6 +11,8 @@ mod test_hash;
 mod test_init;
 mod test_instrumentation;
 mod test_msrv;
+#[cfg(unix)]
+mod test_native_cache_fixture;
 mod test_nested_workspace;
 mod test_output_contracts;
 mod test_ownership_index;

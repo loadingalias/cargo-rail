@@ -114,8 +114,19 @@ pub(crate) fn rustc_command(
 /// Returns `None` during normal cargo-rail CLI execution.
 #[must_use]
 pub fn run_if_requested() -> Option<i32> {
+  if let Some(context) = crate::compiler::native_cache::NativeCacheContext::from_direct_invocation() {
+    return Some(match context {
+      Ok(context) => run_cache_disabled(Some(context)),
+      Err(error) => {
+        eprintln!("cargo-rail compiler cache wrapper: {error}");
+        2
+      }
+    });
+  }
   if std::env::var_os(CACHE_WRAPPER_MARKER).is_some() {
-    return Some(run_cache_disabled());
+    return Some(run_cache_disabled(
+      crate::compiler::native_cache::NativeCacheContext::from_environment(),
+    ));
   }
   if std::env::var_os(WRAPPER_MARKER).is_some() {
     return Some(run_rustc());
@@ -130,7 +141,13 @@ pub fn run_if_requested() -> Option<i32> {
   None
 }
 
-fn run_cache_disabled() -> i32 {
+fn run_cache_disabled(context: Option<crate::compiler::native_cache::NativeCacheContext>) -> i32 {
+  if let Some(context) = context
+    && let Err(error) = context.activate()
+  {
+    eprintln!("cargo-rail compiler cache wrapper: {error}");
+    return 2;
+  }
   let mut args = std::env::args_os().skip(1);
   let Some(program) = args.next() else {
     eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");
@@ -139,10 +156,15 @@ fn run_cache_disabled() -> i32 {
   let arguments = args.collect::<Vec<_>>();
   let mut command = Command::new(&program);
   command.args(&arguments).env_remove(CACHE_WRAPPER_MARKER);
-  if let Some(exit_code) = crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command) {
-    return exit_code;
+  match crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command) {
+    crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
+    crate::compiler::native_cache::OuterCacheAction::Store(recorder) => {
+      crate::compiler::native_cache::run_and_store(command, recorder, "cargo-rail compiler cache wrapper")
+    }
+    crate::compiler::native_cache::OuterCacheAction::Execute => {
+      run_transparently(command, "cargo-rail compiler cache wrapper")
+    }
   }
-  run_transparently(command, "cargo-rail compiler cache wrapper")
 }
 
 #[cfg(unix)]
@@ -211,12 +233,6 @@ fn run_rustc() -> i32 {
     .env_remove(OBSERVATION_SOURCE_ROOT_ENV)
     .env_remove(OBSERVATION_ONLY_ENV);
   crate::compiler::native_cache::remove_private_environment(&mut command);
-
-  if crate::compiler::native_cache::store_requested()
-    && let Some(recorder) = recorder
-  {
-    return crate::compiler::native_cache::run_and_store(command, recorder, "cargo-rail rustc wrapper");
-  }
 
   let status = command.status();
 

@@ -1,0 +1,17 @@
+[package]
+name = "fixture-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+extended = ["fixture-storage/extended"]
+
+[dependencies]
+fixture-build.workspace = true
+fixture-macros.workspace = true
+fixture-storage.workspace = true
+fixture-types.workspace = true

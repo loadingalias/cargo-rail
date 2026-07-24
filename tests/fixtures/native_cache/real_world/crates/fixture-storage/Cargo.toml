@@ -1,0 +1,17 @@
+[package]
+name = "fixture-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["json"]
+json = ["dep:serde_json", "fixture-types/serde"]
+extended = ["fixture-git/extended"]
+
+[dependencies]
+fixture-git.workspace = true
+fixture-types = { workspace = true, default-features = false }
+serde_json = { workspace = true, optional = true }

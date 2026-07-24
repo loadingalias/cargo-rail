@@ -12,6 +12,11 @@ retries = 0
 cargo-subprocess = { max-threads = 2 }
 
 [[profile.default.overrides]]
+filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
+test-group = 'cargo-subprocess'
+slow-timeout = { period = "30s", terminate-after = 6 }
+
+[[profile.default.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
@@ -24,6 +29,10 @@ test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 4 }
 leak-timeout = { period = "2s", result = "fail" }
 retries = 0
+
+[[profile.commit.overrides]]
+filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
+test-group = 'cargo-subprocess'
 
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'

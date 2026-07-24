@@ -1,0 +1,11 @@
+[package]
+name = "fixture-git"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+extended = []

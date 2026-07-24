@@ -1,0 +1,10 @@
+[package]
+name = "fixture-git-prefetch"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fixture-git = { git = "__FIXTURE_GIT_URL__", rev = "__FIXTURE_GIT_REV__" }
+
+[workspace]

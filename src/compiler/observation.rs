@@ -356,6 +356,10 @@ impl CompilerCacheWrapperMetadata {
     self.candidate_key.as_deref()
   }
 
+  pub(crate) fn action_key(&self) -> Option<&str> {
+    self.action_key.as_deref()
+  }
+
   pub(crate) fn bytes_hashed(&self) -> u64 {
     self.bytes_hashed
   }
@@ -446,12 +450,14 @@ pub(crate) struct InvocationRecorder {
   raw: RawCompilerInvocation,
   dep_info_paths: Vec<PathBuf>,
   metadata_paths: Vec<PathBuf>,
+  rlib_paths: Vec<PathBuf>,
   output_paths: Vec<PathBuf>,
 }
 
 pub(crate) struct NativeOutputPaths {
   pub(crate) dep_info: PathBuf,
   pub(crate) metadata: PathBuf,
+  pub(crate) rlib: Option<PathBuf>,
 }
 
 /// Wrapper evidence before Cargo compiler-artifact correlation.
@@ -1066,7 +1072,20 @@ pub(crate) fn begin_invocation(
   _rustc: &OsStr,
   arguments: &[OsString],
 ) -> RailResult<InvocationRecorder> {
-  begin_compiler_invocation(directory, source_root, arguments, CompilerMode::Rustc)
+  let current_dir = std::env::current_dir()
+    .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
+  begin_compiler_invocation(directory, source_root, &current_dir, arguments, CompilerMode::Rustc)
+}
+
+/// Capture argv-declared inputs using the exact working directory rustc will receive.
+pub(crate) fn begin_invocation_in(
+  directory: &Path,
+  source_root: &Path,
+  current_dir: &Path,
+  _rustc: &OsStr,
+  arguments: &[OsString],
+) -> RailResult<InvocationRecorder> {
+  begin_compiler_invocation(directory, source_root, current_dir, arguments, CompilerMode::Rustc)
 }
 
 /// Capture one rustdoc invocation through the transparent observation proxy.
@@ -1075,12 +1094,15 @@ pub(crate) fn begin_rustdoc_invocation(
   source_root: &Path,
   arguments: &[OsString],
 ) -> RailResult<InvocationRecorder> {
-  begin_compiler_invocation(directory, source_root, arguments, CompilerMode::Rustdoc)
+  let current_dir = std::env::current_dir()
+    .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
+  begin_compiler_invocation(directory, source_root, &current_dir, arguments, CompilerMode::Rustdoc)
 }
 
 fn begin_compiler_invocation(
   directory: &Path,
   source_root: &Path,
+  physical_current_dir: &Path,
   arguments: &[OsString],
   mode: CompilerMode,
 ) -> RailResult<InvocationRecorder> {
@@ -1090,9 +1112,7 @@ fn begin_compiler_invocation(
       source_root.display()
     ))
   })?;
-  let physical_current_dir = std::env::current_dir()
-    .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
-  let canonical_current_dir = crate::utils::canonicalize_existing(&physical_current_dir).map_err(|error| {
+  let canonical_current_dir = crate::utils::canonicalize_existing(physical_current_dir).map_err(|error| {
     RailError::message(format!(
       "failed to resolve compiler working directory '{}': {error}",
       physical_current_dir.display()
@@ -1146,6 +1166,7 @@ fn begin_compiler_invocation(
     current_dir,
     dep_info_paths: parsed.dep_info_paths,
     metadata_paths: parsed.metadata_paths,
+    rlib_paths: parsed.rlib_paths,
     output_paths: parsed.output_paths,
     raw: RawCompilerInvocation {
       version: RAW_INVOCATION_VERSION,
@@ -1156,10 +1177,7 @@ fn begin_compiler_invocation(
       cfg: parsed.cfg,
       emit_modes: parsed.emit_modes,
       test_mode: parsed.test_mode,
-      compiler_arguments: argument_text
-        .iter()
-        .map(|argument| portable_argument(argument, source_root, &canonical_source_root))
-        .collect(),
+      compiler_arguments: portable_compiler_arguments(&argument_text, source_root, &canonical_source_root),
       declared_inputs,
       observed_reads: Vec::new(),
       dependency_artifacts,
@@ -1175,7 +1193,6 @@ fn begin_compiler_invocation(
 }
 
 impl InvocationRecorder {
-  #[cfg(target_os = "macos")]
   pub(crate) fn observation(&self) -> &RawCompilerInvocation {
     &self.raw
   }
@@ -1187,10 +1204,20 @@ impl InvocationRecorder {
     let [metadata] = self.metadata_paths.as_slice() else {
       return None;
     };
+    let rlib = match self.rlib_paths.as_slice() {
+      [] => None,
+      [rlib] => Some(rlib.clone()),
+      _ => return None,
+    };
     Some(NativeOutputPaths {
       dep_info: dep_info.clone(),
       metadata: metadata.clone(),
+      rlib,
     })
+  }
+
+  pub(crate) fn set_cache_wrapper(&mut self, metadata: CompilerCacheWrapperMetadata) {
+    self.raw.cache_wrapper = Some(metadata);
   }
 
   /// Capture dep-info and emitted bytes after the compiler exits, then atomically publish raw evidence.
@@ -1291,6 +1318,7 @@ struct ParsedArguments {
   dependency_paths: Vec<(String, PathBuf)>,
   dep_info_paths: Vec<PathBuf>,
   metadata_paths: Vec<PathBuf>,
+  rlib_paths: Vec<PathBuf>,
   output_paths: Vec<PathBuf>,
   out_dir: Option<PathBuf>,
   extra_filename: String,
@@ -1458,6 +1486,15 @@ impl ParsedArguments {
       parsed.metadata_paths.push(path.clone());
       parsed.output_paths.push(path);
     }
+    if parsed.emit_modes.contains("link")
+      && parsed.rlib_paths.is_empty()
+      && parsed.crate_types == BTreeSet::from(["lib".to_string()])
+      && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
+    {
+      let path = out_dir.join(format!("lib{crate_name}{}.rlib", parsed.extra_filename));
+      parsed.rlib_paths.push(path.clone());
+      parsed.output_paths.push(path);
+    }
     parsed
   }
 
@@ -1479,6 +1516,8 @@ impl ParsedArguments {
           self.dep_info_paths.push(path.clone());
         } else if mode == "metadata" {
           self.metadata_paths.push(path.clone());
+        } else if mode == "link" {
+          self.rlib_paths.push(path.clone());
         }
         self.output_paths.push(path);
       } else if compiler_mode != CompilerMode::Rustdoc && !matches!(mode, "dep-info" | "link" | "metadata") {
@@ -1671,7 +1710,29 @@ fn sort_and_deduplicate_files(files: &mut Vec<FileObservation>) {
   files.dedup();
 }
 
+#[cfg(test)]
 fn portable_argument(argument: &str, source_root: &Path, canonical_source_root: &Path) -> String {
+  let roots = portable_argument_roots(source_root, canonical_source_root);
+  portable_argument_with_roots(argument, &roots, false)
+}
+
+fn portable_compiler_arguments(arguments: &[String], source_root: &Path, canonical_source_root: &Path) -> Vec<String> {
+  let roots = portable_argument_roots(source_root, canonical_source_root);
+  let mut reviewed_value = false;
+  arguments
+    .iter()
+    .map(|argument| {
+      let portable = portable_argument_with_roots(argument, &roots, reviewed_value);
+      reviewed_value = matches!(
+        argument.as_str(),
+        "--emit" | "--extern" | "--out-dir" | "--remap-path-prefix" | "-L"
+      );
+      portable
+    })
+    .collect()
+}
+
+fn portable_argument_roots(source_root: &Path, canonical_source_root: &Path) -> [String; 4] {
   let mut roots = [
     source_root.to_string_lossy().into_owned(),
     canonical_source_root.to_string_lossy().into_owned(),
@@ -1679,6 +1740,29 @@ fn portable_argument(argument: &str, source_root: &Path, canonical_source_root: 
     crate::utils::path_to_git_format(canonical_source_root),
   ];
   roots.sort_unstable_by_key(|root| std::cmp::Reverse(root.len()));
+  roots
+}
+
+fn portable_argument_with_roots(argument: &str, roots: &[String], reviewed_value: bool) -> String {
+  let reviewed_path = reviewed_value && roots.iter().any(|root| argument.contains(root))
+    || roots.iter().any(|root| {
+      argument == root
+        || argument
+          .strip_prefix(root)
+          .is_some_and(|suffix| suffix.starts_with(['/', '\\']))
+        || [
+          "--emit=",
+          "--extern=",
+          "--out-dir=",
+          "--remap-path-prefix=",
+          "-Ldependency=",
+        ]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix) && argument.contains(root))
+    });
+  if !reviewed_path {
+    return argument.to_string();
+  }
   roots.iter().fold(argument.to_string(), |portable, root| {
     if portable.contains(root) {
       portable.replace(root, "repository:")
@@ -2156,6 +2240,44 @@ mod tests {
     assert_eq!(
       portable_argument(r"--out-dir=C:\work\workspace\target", windows, windows),
       r"--out-dir=repository:\target"
+    );
+    assert_eq!(
+      portable_argument("--extern=dep=/var/workspace/target/libdep.rmeta", source, canonical),
+      "--extern=dep=repository:/target/libdep.rmeta"
+    );
+    assert_eq!(
+      portable_argument("metadata=/var/workspace", source, canonical),
+      "metadata=/var/workspace"
+    );
+    assert_eq!(
+      portable_argument("cfg(path=\"/var/workspace\")", source, canonical),
+      "cfg(path=\"/var/workspace\")"
+    );
+    assert_eq!(
+      portable_compiler_arguments(
+        &[
+          "-L".to_string(),
+          "dependency=/var/workspace/target/debug/deps".to_string(),
+          "--extern".to_string(),
+          "dep=/private/var/workspace/target/debug/deps/libdep.rmeta".to_string(),
+        ],
+        source,
+        canonical,
+      ),
+      [
+        "-L",
+        "dependency=repository:/target/debug/deps",
+        "--extern",
+        "dep=repository:/target/debug/deps/libdep.rmeta",
+      ]
+    );
+    assert_eq!(
+      portable_compiler_arguments(
+        &["-C".to_string(), "metadata=/var/workspace".to_string()],
+        source,
+        canonical,
+      ),
+      ["-C", "metadata=/var/workspace"]
     );
   }
 
