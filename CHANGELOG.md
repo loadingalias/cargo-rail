@@ -5,6 +5,12 @@
 
 
 
+
+## [0.19.1](https://github.com/loadingalias/cargo-rail/compare/v0.19.0...v0.19.1) - 2026-07-25
+
+- Hardened exact-SHA release readiness to reject all-skipped GitHub rollups and run release commits through normal CI. `cargo rail config migrate` now removes the inert `release.require_clean` and `release.publish_delay` fields, and release previews no longer claim to delay between publishes. Added explicit cache capability and evaluation guidance.
+
+
 ## [0.19.0](https://github.com/loadingalias/cargo-rail/compare/v0.18.0...v0.19.0) - 2026-07-24
 
 - Make split and sync snapshot-native by replacing path ownership with Cargo member names, persisting versioned
