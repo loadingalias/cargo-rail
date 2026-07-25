@@ -43,6 +43,10 @@ else
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 fi
 
+# Generated docs must match the CLI and native-cache production gates.
+echo "Generated documentation..."
+scripts/docs/generate.sh --check
+
 # Docs always full workspace (cross-crate links require it)
 echo "Documentation..."
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked

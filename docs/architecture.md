@@ -161,6 +161,9 @@ An earlier macOS sccache comparison completed checks faster but left 22 dep-info
 result is why cargo-rail requires portable output bytes and revalidates their complete action/result binding rather
 than treating compiler success as sufficient cache authority.
 
+See [Caching](caching.md) for the operator workflow and benchmark protocol and the generated
+[cache capability matrix](cache-capabilities.md) for the exact shipped and bypassed classes.
+
 Custom-build compilation retains Cargo's exact executable output separately from the other compiler artifacts. A
 versioned `BuildScriptActionKey` can be issued only at the next process boundary, after the executable and source bytes
 are revalidated and the relevant manifest/lock closure, toolchain, host and target identities, profile, features,

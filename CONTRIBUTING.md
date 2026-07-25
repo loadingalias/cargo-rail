@@ -26,7 +26,8 @@ target-specific behavior:
 just test-all
 ```
 
-`docs/commands.md` is generated from CLI help. Regenerate it after changing commands, flags, defaults, or help text:
+`docs/commands.md` is generated from CLI help, and `docs/cache-capabilities.md` is generated from native-cache
+production gates. Regenerate them after changing commands, flags, defaults, help text, or cache eligibility:
 
 ```bash
 just gen-docs

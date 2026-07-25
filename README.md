@@ -47,7 +47,8 @@ cargo rail unify                    # apply the plan
 cargo rail unify undo               # restore the last backup
 ```
 
-The check path writes nothing and exits non-zero when manifests need changes.
+The check path does not mutate manifests and exits non-zero when changes are needed. Compiler analysis may update
+cache and report files under `target/cargo-rail/`.
 
 ## Change detection
 
@@ -71,6 +72,16 @@ metadata/rlib results across clean roots on Apple Silicon macOS and ARM64 GNU/Li
 cache is machine-local, preserves existing compiler wrappers and sccache, and executes every unproven compiler class
 cold with an explicit reason.
 
+Enable the graduated native class explicitly through Cargo's non-incremental boundary:
+
+```bash
+CARGO_INCREMENTAL=0 cargo rail run --all --action build --explain
+CARGO_INCREMENTAL=0 cargo rail run --all --action distribution --explain
+```
+
+See [Caching](docs/caching.md) for activation, telemetry, benchmark evidence, cleanup, and the generated
+[capability matrix](docs/cache-capabilities.md).
+
 ## Release
 
 Record release intent in the pull request that introduces the change. Reviewed `.changes/` entries are the default and sole source of automatic bumps and release prose; conventional commits are available only through explicit compatibility modes. Dependency cascades remain synthesized by cargo-rail.
@@ -88,7 +99,7 @@ After the release PR merges:
 cargo rail release finalize --all --yes
 ```
 
-Release execution is journaled as `planned → prepared → awaiting_checks → ready → publishing → released`. A plan-bound `Rail-Release` trailer identifies every release commit. For remote releases, cargo-rail pushes the exact commit first, waits without polling until GitHub or GitLab reports that SHA green, publishes packages in dependency order, and creates/pushes tags only after every required version is observable. Inspect interruption or convergence state without loading Cargo metadata:
+Release execution is journaled as `planned → prepared → awaiting_checks → ready → publishing → released`. A plan-bound `Rail-Release` trailer identifies every release commit. For remote releases, cargo-rail pushes the exact commit first and exits without polling. GitHub readiness requires at least one completed successful, non-skipped context, no pending or failed context, and complete context counts; GitLab requires a successful exact-SHA pipeline. After readiness is proven, cargo-rail publishes packages in dependency order and creates/pushes tags only after every required version is observable. Inspect interruption or convergence state without loading Cargo metadata:
 
 ```bash
 cargo rail release status
@@ -133,6 +144,8 @@ The result is one install graph, one configuration surface, and one set of decis
 
 - [Configuration reference](docs/config.md)
 - [Command reference](docs/commands.md)
+- [Caching and evaluation](docs/caching.md)
+- [Generated cache capability matrix](docs/cache-capabilities.md)
 - [Change detection](docs/change-detection.md)
 - [Planner machine contract](docs/planner-contract.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)
