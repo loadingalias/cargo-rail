@@ -127,13 +127,9 @@ pub fn run_release_plan(
       .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
     println!("{}", json_output);
   } else {
-    // Show publish_delay in the plan output
     println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
     // Show additional config info
-    if !skip_publish && plan.summary.crates_to_publish > 1 {
-      println!("Publish delay: {}s between crates", release_config.publish_delay);
-    }
     if release_config.remote_effects.creates_forge_release() && !skip_tag {
       println!(
         "Forge releases: enabled ({})",

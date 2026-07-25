@@ -1260,6 +1260,35 @@ fn release_plan_auto_noops_when_all_crates_are_skipped() -> Result<()> {
 }
 
 #[test]
+fn release_plan_does_not_print_removed_publish_delay() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-no-publish-delay")?;
+  write_release_config(&ws, "publish_delay = 37")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.add_crate("lib-b", "0.1.0", &[])?;
+  ws.commit("Add release crates")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "--all", "--bump", "patch", "--check"],
+  )?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "release preview should report pending changes\nstdout:\n{}\nstderr:\n{}",
+    stdout,
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    !stdout.contains("Publish delay"),
+    "inert publish_delay must not appear in release output\nstdout:\n{}",
+    stdout
+  );
+
+  Ok(())
+}
+
+#[test]
 fn release_plan_projects_exact_sha_checks_publication_and_tags_last() -> Result<()> {
   let ws = TestWorkspace::new_single_crate("release-plan-order", "0.1.0")?;
   ws.write_release_config(

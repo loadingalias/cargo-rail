@@ -1720,7 +1720,7 @@ pub(crate) fn observe_github_exact_sha_readiness(
 ) -> RailResult<CheckReadiness> {
   let (owner, repository) = detect_github_repo(workspace_root)
     .ok_or_else(|| RailError::message("could not derive the GitHub repository identity from origin"))?;
-  const QUERY: &str = "query($owner:String!,$repository:String!,$oid:GitObjectID!){repository(owner:$owner,name:$repository){object(oid:$oid){... on Commit{statusCheckRollup{state contexts{totalCount}}}}}}";
+  const QUERY: &str = "query($owner:String!,$repository:String!,$oid:GitObjectID!){repository(owner:$owner,name:$repository){object(oid:$oid){... on Commit{statusCheckRollup{state contexts{totalCount checkRunCount checkRunCountsByState{state count} statusContextCount statusContextCountsByState{state count}}}}}}}";
   let query = format!("query={}", QUERY);
   let owner = format!("owner={}", owner);
   let repository = format!("repository={}", repository);
@@ -1780,23 +1780,82 @@ pub(crate) fn observe_gitlab_exact_sha_readiness(
   Ok(gitlab_pipeline_readiness(&value, release_commit))
 }
 
+#[derive(Debug, Default)]
+struct GithubContextSummary {
+  successful: u64,
+  non_authorizing: u64,
+  waiting: u64,
+  failed: u64,
+  observed: u64,
+}
+
+impl GithubContextSummary {
+  fn add_check_run(&mut self, state: &str, count: u64) {
+    self.observed += count;
+    match state {
+      "SUCCESS" => self.successful += count,
+      "NEUTRAL" | "SKIPPED" => self.non_authorizing += count,
+      "COMPLETED" | "IN_PROGRESS" | "PENDING" | "QUEUED" | "WAITING" => self.waiting += count,
+      "ACTION_REQUIRED" | "CANCELLED" | "FAILURE" | "STALE" | "STARTUP_FAILURE" | "TIMED_OUT" => {
+        self.failed += count;
+      }
+      _ => self.waiting += count,
+    }
+  }
+
+  fn add_status_context(&mut self, state: &str, count: u64) {
+    self.observed += count;
+    match state {
+      "SUCCESS" => self.successful += count,
+      "EXPECTED" | "PENDING" => self.waiting += count,
+      "ERROR" | "FAILURE" => self.failed += count,
+      _ => self.waiting += count,
+    }
+  }
+}
+
+fn github_context_summary(contexts: &serde_json::Value) -> Option<GithubContextSummary> {
+  let total = contexts.get("totalCount")?.as_u64()?;
+  let check_runs = contexts.get("checkRunCount")?.as_u64()?;
+  let status_contexts = contexts.get("statusContextCount")?.as_u64()?;
+  if check_runs + status_contexts != total {
+    return None;
+  }
+
+  let mut summary = GithubContextSummary::default();
+  for item in contexts.get("checkRunCountsByState")?.as_array()? {
+    summary.add_check_run(item.get("state")?.as_str()?, item.get("count")?.as_u64()?);
+  }
+  for item in contexts.get("statusContextCountsByState")?.as_array()? {
+    summary.add_status_context(item.get("state")?.as_str()?, item.get("count")?.as_u64()?);
+  }
+
+  (summary.observed == total).then_some(summary)
+}
+
 fn github_check_readiness(value: &serde_json::Value, release_commit: &str) -> CheckReadiness {
   let rollup = value.pointer("/data/repository/object/statusCheckRollup");
-  let state = rollup
-    .and_then(|value| value.get("state"))
-    .and_then(serde_json::Value::as_str);
-  let check_count = rollup
-    .and_then(|value| value.pointer("/contexts/totalCount"))
-    .and_then(serde_json::Value::as_u64)
-    .unwrap_or(0);
+  let Some(rollup) = rollup else {
+    return CheckReadiness::Waiting("GitHub has not reported any checks for the release commit".to_string());
+  };
+  let Some(summary) = rollup.get("contexts").and_then(github_context_summary) else {
+    return CheckReadiness::Waiting("GitHub check context counts are incomplete or malformed".to_string());
+  };
 
-  match state {
-    Some("SUCCESS") if check_count > 0 => {
-      CheckReadiness::Green(format!("github:{}:{}_checks", release_commit, check_count))
-    }
-    Some(state @ ("FAILURE" | "ERROR")) => CheckReadiness::Failed(format!("GitHub rollup is {}", state)),
-    Some(state) => CheckReadiness::Waiting(format!("GitHub rollup is {}", state)),
-    None => CheckReadiness::Waiting("GitHub has not reported any checks for the release commit".to_string()),
+  if summary.failed > 0 {
+    CheckReadiness::Failed(format!("GitHub reports {} failed check context(s)", summary.failed))
+  } else if summary.waiting > 0 {
+    CheckReadiness::Waiting(format!("GitHub reports {} pending check context(s)", summary.waiting))
+  } else if summary.successful == 0 {
+    CheckReadiness::Waiting(format!(
+      "GitHub has no completed successful checks ({} skipped or neutral)",
+      summary.non_authorizing
+    ))
+  } else {
+    CheckReadiness::Green(format!(
+      "github:{}:{}_successful_checks",
+      release_commit, summary.successful
+    ))
   }
 }
 
@@ -1993,35 +2052,99 @@ mod tests {
   }
 
   #[test]
-  fn github_readiness_requires_a_nonempty_successful_rollup() {
+  fn github_readiness_requires_an_executed_successful_context() {
     let success = serde_json::json!({
       "data": { "repository": { "object": { "statusCheckRollup": {
-        "state": "SUCCESS", "contexts": { "totalCount": 2 }
+        "state": "SUCCESS",
+        "contexts": {
+          "totalCount": 3,
+          "checkRunCount": 2,
+          "checkRunCountsByState": [
+            { "state": "SUCCESS", "count": 1 },
+            { "state": "SKIPPED", "count": 1 }
+          ],
+          "statusContextCount": 1,
+          "statusContextCountsByState": [{ "state": "SUCCESS", "count": 1 }]
+        }
       } } } }
     });
     assert!(matches!(
       github_check_readiness(&success, "abc123"),
-      CheckReadiness::Green(detail) if detail == "github:abc123:2_checks"
+      CheckReadiness::Green(detail) if detail == "github:abc123:2_successful_checks"
     ));
 
-    let empty = serde_json::json!({
+    let skipped = serde_json::json!({
       "data": { "repository": { "object": { "statusCheckRollup": {
-        "state": "SUCCESS", "contexts": { "totalCount": 0 }
+        "state": "SUCCESS",
+        "contexts": {
+          "totalCount": 2,
+          "checkRunCount": 2,
+          "checkRunCountsByState": [
+            { "state": "SKIPPED", "count": 1 },
+            { "state": "NEUTRAL", "count": 1 }
+          ],
+          "statusContextCount": 0,
+          "statusContextCountsByState": []
+        }
       } } } }
     });
     assert!(matches!(
-      github_check_readiness(&empty, "abc123"),
-      CheckReadiness::Waiting(detail) if detail == "GitHub rollup is SUCCESS"
+      github_check_readiness(&skipped, "abc123"),
+      CheckReadiness::Waiting(detail) if detail.contains("no completed successful checks")
+    ));
+
+    let pending = serde_json::json!({
+      "data": { "repository": { "object": { "statusCheckRollup": {
+        "state": "PENDING",
+        "contexts": {
+          "totalCount": 2,
+          "checkRunCount": 2,
+          "checkRunCountsByState": [
+            { "state": "SUCCESS", "count": 1 },
+            { "state": "IN_PROGRESS", "count": 1 }
+          ],
+          "statusContextCount": 0,
+          "statusContextCountsByState": []
+        }
+      } } } }
+    });
+    assert!(matches!(
+      github_check_readiness(&pending, "abc123"),
+      CheckReadiness::Waiting(detail) if detail == "GitHub reports 1 pending check context(s)"
     ));
 
     let failure = serde_json::json!({
       "data": { "repository": { "object": { "statusCheckRollup": {
-        "state": "FAILURE", "contexts": { "totalCount": 2 }
+        "state": "FAILURE",
+        "contexts": {
+          "totalCount": 2,
+          "checkRunCount": 1,
+          "checkRunCountsByState": [{ "state": "SUCCESS", "count": 1 }],
+          "statusContextCount": 1,
+          "statusContextCountsByState": [{ "state": "ERROR", "count": 1 }]
+        }
       } } } }
     });
     assert!(matches!(
       github_check_readiness(&failure, "abc123"),
-      CheckReadiness::Failed(detail) if detail == "GitHub rollup is FAILURE"
+      CheckReadiness::Failed(detail) if detail == "GitHub reports 1 failed check context(s)"
+    ));
+
+    let malformed = serde_json::json!({
+      "data": { "repository": { "object": { "statusCheckRollup": {
+        "state": "SUCCESS",
+        "contexts": {
+          "totalCount": 2,
+          "checkRunCount": 2,
+          "checkRunCountsByState": [{ "state": "SUCCESS", "count": 1 }],
+          "statusContextCount": 0,
+          "statusContextCountsByState": []
+        }
+      } } } }
+    });
+    assert!(matches!(
+      github_check_readiness(&malformed, "abc123"),
+      CheckReadiness::Waiting(detail) if detail.contains("incomplete or malformed")
     ));
   }
 

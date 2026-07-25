@@ -73,7 +73,12 @@ The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had 
 
 ## `[unify]`
 
-`cargo rail unify --check` always performs safe diagnostics and writes nothing. It exits 1 when proven manifest edits are pending. Running without `--check` applies the plan. `cargo rail unify doctor` is a cheaper read-only resolution diagnostic: it reports the selected Cargo/channel, resolver, feature mode, source and policy overrides, target domains, ambiguous aliases, and a recommended next action. Compiler evidence caching and deterministic ordering are internal responsibilities and cannot be disabled.
+`cargo rail unify --check` always performs safe diagnostics without mutating manifests. It may update compiler-evidence
+cache and report files under `target/cargo-rail/`, and it exits 1 when proven manifest edits are pending. Running without
+`--check` applies the plan. `cargo rail unify doctor` is a cheaper read-only resolution diagnostic: it reports the
+selected Cargo/channel, resolver, feature mode, source and policy overrides, target domains, ambiguous aliases, and a
+recommended next action. Compiler evidence caching and deterministic ordering are internal responsibilities and cannot
+be disabled.
 
 `unify --check --explain` keeps feature evidence separated by exact manifest declaration. Each feature rule names the
 member, Cargo.toml alias, normal/development/build domain, target predicate, explicit features, default-feature state,
@@ -117,9 +122,9 @@ preserve_features = ["unstable-*", "bench*"]
 | `source` | `"changes"` | `"changes"` uses reviewed intent only. `"commits"` and `"both"` are explicit compatibility modes. |
 | `tag_prefix` | `"v"` | Value rendered by `{prefix}`. |
 | `tag_format` | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`. |
-| `require_clean` | `true` | Deprecated compatibility input. Preview permits dirt; apply always rejects paths outside the bound plan. |
-| `publish_delay` | `5` | Deprecated compatibility input. Cargo-rail does not poll or sleep for registry convergence. |
-| `remote_effects` | `"none"` | `"none"` stays local. Other modes push the exact release commit, require a green GitHub/GitLab check rollup before publishing or tagging, then push tags last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
+| `require_clean` | `true` | Deprecated compatibility input. Preview permits dirt and apply always rejects paths outside the bound plan. Remove it with `cargo rail config migrate`. |
+| `publish_delay` | `5` | Deprecated compatibility input with no effect. Cargo-rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`. |
+| `remote_effects` | `"none"` | `"none"` stays local. Other modes push the exact release commit, then exit until GitHub reports complete counts with at least one successful non-skipped context and no pending/failed context, or GitLab reports a successful exact-SHA pipeline. Publication follows readiness; tags are pushed last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
 | `sign_tags` | `false` | Sign release tags with the configured Git signing mechanism. |
 | `require_changelog_entries` | `false` | Fail when a released crate has no generated changelog entries. |
 | `require_release_notes` | `true` | Require reviewed notes before tag, publish, or forge effects. |
@@ -325,6 +330,7 @@ Deprecated fields remain parseable for a bounded compatibility window, emit acti
 | `change-detection.bot_pr_confidence_profile` | Remove; provider identity no longer changes policy. |
 | `change-detection.conservative_unclassified_owner_fallback` | Rename to the equivalent explicit `unknown_file_policy`. |
 | Boolean `change-detection.unknown_file_policy` | Replace `true` with `"owned_build_test"` or `false` with `"docs"`. |
+| `release.require_clean`, `release.publish_delay` | Remove; cleanliness is fixed command behavior and registry convergence is an explicit stop-and-resume boundary. |
 | `release.push`, `release.create_github_release`, `release.forge` | Merge the valid effect combination into one `release.remote_effects` value. |
 | `run.profile.NAME.surfaces` | Rename to `run.profile.NAME.actions`. |
 | `run.profile.NAME.since`, `run.profile.NAME.merge_base` | Merge one valid baseline into `run.profile.NAME.baseline`. |

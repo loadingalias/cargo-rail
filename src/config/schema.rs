@@ -212,12 +212,12 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
   compatibility(
     "release.require_clean",
     "Preserves old configuration while release apply moves to exact planned-input cleanliness.",
-    "Deprecated: remove this field; previews permit dirt and apply always rejects paths outside the bound plan.",
+    "Deprecated: previews permit dirt and apply always rejects paths outside the bound plan. Run `cargo rail config migrate` to remove this field.",
   ),
   compatibility(
     "release.publish_delay",
     "Preserves old configuration after cargo-rail stopped polling registry convergence.",
-    "Deprecated: remove this field; release execution stops at registry wait boundaries and resumes by reconciliation.",
+    "Deprecated: release execution never delays between publishes; it stops at registry wait boundaries and resumes by reconciliation. Run `cargo rail config migrate` to remove this field.",
   ),
   policy(
     "release.remote_effects",

@@ -216,6 +216,11 @@ crate versions, tags, and forge releases before advancing. It never replans from
 already-bumped manifests or republishes an unobserved in-progress crate version.
 `awaiting_checks` and registry propagation are explicit external wait boundaries:
 cargo-rail exits and never sleeps or polls. Resume after the provider settles.
+On GitHub, an all-skipped or all-neutral rollup is not release evidence. At least
+one context must complete with `SUCCESS`, every reported context count must be
+complete, and no context may remain pending or failed. Configure the repository
+workflow to run on release commits; use the manual exact-ref bootstrap workflow
+only when changing the workflow or planner protocol itself.
 
 Every release commit also records the plan-bound transaction plus release mode,
 crate versions, and publish/tag authorization in `Rail-Release-*` trailers. In a

@@ -239,14 +239,21 @@ fn test_config_validate_accepts_empty_config() -> Result<()> {
 }
 
 #[test]
-fn test_config_validate_warns_for_deprecated_implementation_toggles() -> Result<()> {
+fn test_config_validate_warns_with_migration_guidance_for_deprecated_fields() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-deprecated-toggles")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
 
   fs::write(
     ws.path.join(".config/rail.toml"),
-    "[unify]\ncompiler_diag_cache = false\nsort_dependencies = false\n",
+    r#"[unify]
+compiler_diag_cache = false
+sort_dependencies = false
+
+[release]
+require_clean = true
+publish_delay = 5
+"#,
   )?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict", "-f", "json"])?;
@@ -267,6 +274,16 @@ fn test_config_validate_warns_for_deprecated_implementation_toggles() -> Result<
       .as_str()
       .is_some_and(|message| message.contains("unify.sort_dependencies") && message.contains("config migrate"))
   }));
+  for path in ["release.require_clean", "release.publish_delay"] {
+    assert!(
+      warnings.iter().any(|warning| {
+        warning["message"]
+          .as_str()
+          .is_some_and(|message| message.contains(path) && message.contains("cargo rail config migrate"))
+      }),
+      "{path} warning must name the migration command"
+    );
+  }
 
   Ok(())
 }
@@ -742,7 +759,14 @@ fn test_config_migrate_check_is_read_only_and_exits_one() -> Result<()> {
   ws.commit("Add test crate")?;
 
   let config_path = ws.path.join(".config").join("rail.toml");
-  let original_config = "[unify]\ncompiler_diag_cache = false\nsort_dependencies = false\n";
+  let original_config = r#"[unify]
+compiler_diag_cache = false
+sort_dependencies = false
+
+[release]
+require_clean = true
+publish_delay = 5
+"#;
   fs::write(&config_path, original_config)?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
@@ -756,8 +780,21 @@ fn test_config_migrate_check_is_read_only_and_exits_one() -> Result<()> {
   assert_eq!(json["action"], "migrate");
   assert_eq!(json["has_changes"], true);
   let changes = json["changes"].as_array().expect("changes array");
-  assert_eq!(changes.len(), 2);
+  assert_eq!(changes.len(), 4);
   assert!(changes.iter().all(|change| change["kind"] == "remove"));
+  let paths = changes
+    .iter()
+    .filter_map(|change| change["path"].as_str())
+    .collect::<std::collections::BTreeSet<_>>();
+  assert_eq!(
+    paths,
+    std::collections::BTreeSet::from([
+      "release.publish_delay",
+      "release.require_clean",
+      "unify.compiler_diag_cache",
+      "unify.sort_dependencies",
+    ])
+  );
 
   Ok(())
 }
@@ -820,6 +857,8 @@ msrv_source = "workspace"
 enforce_msrv_inheritance = true
 
 [release]
+require_clean = true
+publish_delay = 5
 push = true
 create_github_release = true
 forge = "gitlab"
@@ -858,6 +897,8 @@ since = "HEAD~1"
   assert!(!migrated.contains("enforce_msrv_inheritance"));
   assert!(migrated.contains("msrv_policy = { mode = \"compute\", source = \"workspace\", inherit = true }"));
   assert!(!migrated.contains("create_github_release"));
+  assert!(!migrated.contains("require_clean"));
+  assert!(!migrated.contains("publish_delay"));
   assert!(!migrated.contains("push ="));
   assert!(!migrated.contains("forge ="));
   assert!(migrated.contains("remote_effects = \"gitlab\""));

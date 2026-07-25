@@ -808,6 +808,18 @@ pub fn run_config_migrate(
     "change-detection.bot_pr_confidence_profile",
     "Provider identity no longer changes planner policy.",
   );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "release.require_clean",
+    "Release cleanliness is enforced by fixed preview/apply semantics.",
+  );
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "release.publish_delay",
+    "Registry convergence is an explicit stop-and-resume boundary; release execution never sleeps between publishes.",
+  );
   migrate_unify_typed_policies(&mut editor, &mut changes)?;
   migrate_release_remote_effects(&mut editor, &mut changes)?;
   migrate_run_profile_actions(&mut editor, &mut changes)?;
