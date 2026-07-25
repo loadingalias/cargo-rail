@@ -79,7 +79,7 @@ benchmarks = ["benches/**", "perf/**"]
 ## GitHub Actions
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5.1.0
+- uses: loadingalias/cargo-rail-action@v6.0.0
   id: rail
   with:
     version: 0.19.0
@@ -91,7 +91,7 @@ benchmarks = ["benches/**", "perf/**"]
   run: cargo test $CARGO_ARGS
 ```
 
-Raw `cargo rail plan -f github` writes the same package selection as `cargo_args`. `@v5` selects the action contract; `version` selects the installed cargo-rail release.
+Raw `cargo rail plan -f github` writes the same package selection as `cargo_args`. `@v6` selects the action contract; `version` selects the installed cargo-rail release.
 
 ## Validate
 

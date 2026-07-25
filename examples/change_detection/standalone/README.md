@@ -13,7 +13,7 @@ cargo rail run --merge-base --dry-run --print-cmd
 ## CI Example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v5.1.0
+- uses: loadingalias/cargo-rail-action@v6.0.0
   id: rail
   with:
     version: 0.19.0
