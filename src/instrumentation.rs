@@ -5,17 +5,19 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
 struct Counters {
   snapshot_id: OnceLock<String>,
+  phases: PhaseCounters,
   cargo_metadata_loads: AtomicU64,
   cargo_metadata_cache_hits: AtomicU64,
   target_view_loads: AtomicU64,
@@ -47,6 +49,7 @@ impl Counters {
   const fn new() -> Self {
     Self {
       snapshot_id: OnceLock::new(),
+      phases: PhaseCounters::new(),
       cargo_metadata_loads: AtomicU64::new(0),
       cargo_metadata_cache_hits: AtomicU64::new(0),
       target_view_loads: AtomicU64::new(0),
@@ -79,6 +82,7 @@ impl Counters {
     CounterSnapshot {
       schema_version: SCHEMA_VERSION,
       snapshot_id: self.snapshot_id.get().cloned(),
+      phases: self.phases.snapshot(),
       cargo_metadata_loads: self.cargo_metadata_loads.load(Ordering::Relaxed),
       cargo_metadata_cache_hits: self.cargo_metadata_cache_hits.load(Ordering::Relaxed),
       target_view_loads: self.target_view_loads.load(Ordering::Relaxed),
@@ -108,10 +112,90 @@ impl Counters {
   }
 }
 
+struct PhaseCounters {
+  cli_pre_context_preparation: PhaseCounter,
+  workspace_capture_cargo_metadata: PhaseCounter,
+  action_expansion_key_construction: PhaseCounter,
+  native_cache_setup: PhaseCounter,
+  sysroot_fingerprinting: PhaseCounter,
+  cargo_child_execution: PhaseCounter,
+  cache_report_collection: PhaseCounter,
+}
+
+impl PhaseCounters {
+  const fn new() -> Self {
+    Self {
+      cli_pre_context_preparation: PhaseCounter::new(),
+      workspace_capture_cargo_metadata: PhaseCounter::new(),
+      action_expansion_key_construction: PhaseCounter::new(),
+      native_cache_setup: PhaseCounter::new(),
+      sysroot_fingerprinting: PhaseCounter::new(),
+      cargo_child_execution: PhaseCounter::new(),
+      cache_report_collection: PhaseCounter::new(),
+    }
+  }
+
+  fn snapshot(&self) -> PhaseSnapshots {
+    PhaseSnapshots {
+      cli_pre_context_preparation: self.cli_pre_context_preparation.snapshot(),
+      workspace_capture_cargo_metadata: self.workspace_capture_cargo_metadata.snapshot(),
+      action_expansion_key_construction: self.action_expansion_key_construction.snapshot(),
+      native_cache_setup: self.native_cache_setup.snapshot(),
+      sysroot_fingerprinting: self.sysroot_fingerprinting.snapshot(),
+      cargo_child_execution: self.cargo_child_execution.snapshot(),
+      cache_report_collection: self.cache_report_collection.snapshot(),
+    }
+  }
+}
+
+struct PhaseCounter {
+  invocations: AtomicU64,
+  elapsed_ns: AtomicU64,
+}
+
+impl PhaseCounter {
+  const fn new() -> Self {
+    Self {
+      invocations: AtomicU64::new(0),
+      elapsed_ns: AtomicU64::new(0),
+    }
+  }
+
+  fn record(&self, started: Instant) {
+    self.invocations.fetch_add(1, Ordering::Relaxed);
+    self.elapsed_ns.fetch_add(duration_ns(started), Ordering::Relaxed);
+  }
+
+  fn snapshot(&self) -> PhaseSnapshot {
+    PhaseSnapshot {
+      invocations: self.invocations.load(Ordering::Relaxed),
+      elapsed_ns: self.elapsed_ns.load(Ordering::Relaxed),
+    }
+  }
+}
+
+#[derive(Serialize)]
+struct PhaseSnapshots {
+  cli_pre_context_preparation: PhaseSnapshot,
+  workspace_capture_cargo_metadata: PhaseSnapshot,
+  action_expansion_key_construction: PhaseSnapshot,
+  native_cache_setup: PhaseSnapshot,
+  sysroot_fingerprinting: PhaseSnapshot,
+  cargo_child_execution: PhaseSnapshot,
+  cache_report_collection: PhaseSnapshot,
+}
+
+#[derive(Serialize)]
+struct PhaseSnapshot {
+  invocations: u64,
+  elapsed_ns: u64,
+}
+
 #[derive(Serialize)]
 struct CounterSnapshot {
   schema_version: u32,
   snapshot_id: Option<String>,
+  phases: PhaseSnapshots,
   cargo_metadata_loads: u64,
   cargo_metadata_cache_hits: u64,
   target_view_loads: u64,
@@ -137,6 +221,46 @@ struct CounterSnapshot {
   hermetic_rustc_probes: u64,
   hermetic_rustdoc_probes: u64,
   hermetic_platform_probes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticPhase {
+  ActionExpansionKeyConstruction,
+  NativeCacheSetup,
+  SysrootFingerprinting,
+  CargoChildExecution,
+  CacheReportCollection,
+}
+
+/// Active timer for one fixed diagnostic phase.
+pub(crate) struct DiagnosticPhaseGuard {
+  phase: DiagnosticPhase,
+  started: Option<Instant>,
+}
+
+impl DiagnosticPhaseGuard {
+  fn start(phase: DiagnosticPhase) -> Self {
+    Self {
+      phase,
+      started: COUNTERS.get().map(|_| Instant::now()),
+    }
+  }
+}
+
+impl Drop for DiagnosticPhaseGuard {
+  fn drop(&mut self) {
+    let (Some(counters), Some(started)) = (COUNTERS.get(), self.started) else {
+      return;
+    };
+    let counter = match self.phase {
+      DiagnosticPhase::ActionExpansionKeyConstruction => &counters.phases.action_expansion_key_construction,
+      DiagnosticPhase::NativeCacheSetup => &counters.phases.native_cache_setup,
+      DiagnosticPhase::SysrootFingerprinting => &counters.phases.sysroot_fingerprinting,
+      DiagnosticPhase::CargoChildExecution => &counters.phases.cargo_child_execution,
+      DiagnosticPhase::CacheReportCollection => &counters.phases.cache_report_collection,
+    };
+    counter.record(started);
+  }
 }
 
 /// Active diagnostic session for one cargo-rail process.
@@ -201,10 +325,50 @@ fn amount(value: usize) -> u64 {
   u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn duration_ns(started: Instant) -> u64 {
+  u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn add(counter: fn(&Counters) -> &AtomicU64, value: u64) {
   if let Some(counters) = COUNTERS.get() {
     counter(counters).fetch_add(value, Ordering::Relaxed);
   }
+}
+
+/// Finish the fixed CLI and pre-context preparation phase.
+#[doc(hidden)]
+pub fn record_cli_pre_context_preparation(started: Instant) {
+  if let Some(counters) = COUNTERS.get() {
+    counters.phases.cli_pre_context_preparation.record(started);
+  }
+}
+
+/// Finish the fixed workspace-capture and Cargo-metadata phase.
+#[doc(hidden)]
+pub fn record_workspace_capture_cargo_metadata(started: Instant) {
+  if let Some(counters) = COUNTERS.get() {
+    counters.phases.workspace_capture_cargo_metadata.record(started);
+  }
+}
+
+pub(crate) fn action_expansion_key_construction_phase() -> DiagnosticPhaseGuard {
+  DiagnosticPhaseGuard::start(DiagnosticPhase::ActionExpansionKeyConstruction)
+}
+
+pub(crate) fn native_cache_setup_phase() -> DiagnosticPhaseGuard {
+  DiagnosticPhaseGuard::start(DiagnosticPhase::NativeCacheSetup)
+}
+
+pub(crate) fn sysroot_fingerprinting_phase() -> DiagnosticPhaseGuard {
+  DiagnosticPhaseGuard::start(DiagnosticPhase::SysrootFingerprinting)
+}
+
+pub(crate) fn cargo_child_execution_phase() -> DiagnosticPhaseGuard {
+  DiagnosticPhaseGuard::start(DiagnosticPhase::CargoChildExecution)
+}
+
+pub(crate) fn cache_report_collection_phase() -> DiagnosticPhaseGuard {
+  DiagnosticPhaseGuard::start(DiagnosticPhase::CacheReportCollection)
 }
 
 pub(crate) fn record_cargo_metadata_load(target_view: bool) {

@@ -88,7 +88,9 @@ During workspace-only `rustc` diagnostics, cargo-rail records argv-declared inpu
 completed invocation with Cargo's stable JSON artifact messages. Rustc dep-info supplies observed file and environment
 reads. Cargo has no rustdoc-wrapper setting, so the observation profile instead places a transparent proxy in Cargo's
 selected `RUSTDOC` slot and retains the selected rustdoc as the inner executable. The proxy discovers the selected
-rustdoc's supported default emit set, adds stable dep-info without dropping HTML output, and preserves response-file,
+rustdoc's default emit set and probes whether stable dep-info is actually accepted before adding it without dropping
+HTML output. When rustdoc only advertises the unstable form, the proxy preserves the original invocation and records
+an explicit dep-info evidence bypass. It also preserves response-file,
 doctest, and unsupported-tool invocations unchanged with an explicit bypass.
 
 The immutable result manifest keeps declared inputs, observed reads, dependency artifacts, emitted outputs, and
@@ -107,14 +109,21 @@ and records `sccache_wrapper_preserved` or `existing_compiler_wrapper_preserved`
 unknown or renamed cache from being double-wrapped. An original workspace wrapper stays inside the diagnostic wrapper,
 and recursive cargo-rail selections are rejected before compiler probing. No sccache cache-format parsing is involved.
 
-Native reuse is graduated on `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu` for Cargo and rustc 1.97.1 with
-`CARGO_INCREMENTAL=0` and no configured compiler wrapper. Ordinary `cargo rail run` build and distribution actions
-install a machine-local outer wrapper only for that boundary. Eligible dependency and workspace `lib` invocations have
-one compiler-declared crate root, complete observed Rust inputs, dep-info plus metadata and optional rlib output, only
-`.rmeta`/`.rlib` dependency artifacts, and no native linker responsibility. Exact Cargo/rustc/sysroot and cargo-rail
-executables, Cargo configuration, resolution, captured compiler environment, portable argv, declared/observed source,
-and dependency bytes enter the session or action identity. Source, output, and dependency paths are normalized to the
-logical workspace before execution; the physical checkout root never authorizes reuse or enters reusable rustc output.
+Native reuse is graduated only for exact capability certificates in the generated
+[support matrix](cache-capabilities.md), with `CARGO_INCREMENTAL=0` and no configured compiler wrapper. A certificate
+binds the Cargo, rustc, and rustdoc implementation bytes; their complete verbose identities; the host and platform;
+the relevant target libraries, rustc driver, and codegen-backend inventory; the cache class; and the wrapper protocol.
+Release and host checks reject obvious mismatches before the bounded sysroot identity is captured. A candidate with no
+matching certificate executes cold.
+
+Ordinary `cargo rail run` build and distribution actions install a machine-local outer wrapper only for that boundary.
+Eligible dependency and workspace `lib` invocations have one compiler-declared crate root, complete observed Rust
+inputs, dep-info plus metadata and optional rlib output, only `.rmeta`/`.rlib` dependency artifacts, and no native
+linker responsibility. The action identity separately binds the selected toolchain programs and wrappers,
+cargo-rail executable, Cargo configuration, resolution, captured compiler environment, target specification and
+flags, portable argv, declared/observed source, and dependency bytes. Source, output, and dependency paths are
+normalized to the logical workspace before execution; the physical checkout root never authorizes reuse or enters
+reusable rustc output.
 
 `CandidateKey` is only a local index over pre-execution evidence. A candidate match reloads the canonical validation
 object from a locally verified CAS result, re-digests every stored declared input, observed read, and dependency
@@ -128,12 +137,28 @@ or authorizes from timestamps, sizes, Cargo freshness, or `CandidateKey` alone.
 Incremental, test, binary, dylib, cdylib, staticlib, proc-macro, build-script, native-linking, stdin, response-file,
 unsupported-flag/emit, filesystem-reading macro, unsupported dependency-artifact, cross-target,
 secret/incomplete-input, other platform, and other toolchain cases execute normally with an explicit bypass. Existing
-sccache and custom wrappers also execute normally in their original positions. On macOS, proc-macro and proc-macro
-consumer bypasses receive portable path normalization only when the default linker boundary remains intact; their
-outputs are still never cached. Corrupt or incompatible native objects fail the hit closed and fall back to the exact
-cold compiler invocation; successful cold output is published only if a complete validation and CAS result can be
-stored. Native use registers the same owner-marked local CAS root, so `cargo rail clean --cache` retains its validated
-cleanup boundary.
+sccache and custom wrappers also execute normally in their original positions. On graduated hosts, invocations that
+reach a reviewed portable argv keep that argv even if a later eligibility check bypasses reuse; bypassed outputs are
+never cached. macOS proc-macro bypasses additionally preserve the default linker boundary while normalizing their
+install names. Corrupt or incompatible native objects fail the hit closed and fall back to the exact cold compiler
+invocation; successful cold output is published only if a complete validation and CAS result can be stored. Native use
+registers the same owner-marked local CAS root, so `cargo rail clean --cache` retains its validated cleanup boundary.
+
+#### Performance model
+
+Native-cache time has four terms: fixed cargo-rail front-end work, cold observation/publication, verified warm restore,
+and cold execution for bypassed invocations. These terms have different owners and must be measured separately.
+
+Cold publication observes the completed compiler action, parses dep-info, hashes inputs and outputs, constructs the
+validation/result/tree objects, writes missing CAS objects, and publishes the candidate last. A warm hit discovers a
+candidate, reconstructs the action key from revalidated inputs, verifies every referenced object, and materializes exact
+outputs through Cargo's wrapper boundary. A bypass should pay only the minimum work needed to preserve action
+selection, argv, environment, diagnostics, and the stable bypass reason.
+
+Optimization cannot move work across the authority boundary. Shared immutable inputs may be hashed or revalidated once
+per captured action snapshot, but `CandidateKey` cannot become authorizing state, publication cannot precede complete
+object verification, and restored bytes must still pass the action/result binding. Compare implementations within one
+host; absolute results from unlike machines are not one performance score.
 
 The checked-in fixture combines registry and Git dependencies, build scripts, a proc macro, native code, workspace
 libraries, and a binary. Build the release binary and reproduce the benchmark with:
@@ -143,26 +168,14 @@ cargo build --release --locked
 just bench-native-cache 10
 ```
 
-The final 10-run Apple Silicon gate used Cargo/rustc 1.97.1, offline clean targets, separate seed/use roots, and an M1
-host. A separate ARM64 GNU/Linux run used the same alternating clean-root method. These are release evidence, not a
-promise for unrelated repositories:
+The accepted development scorecard is an interleaved 110-sample macOS ARM64 run. Warm clean-root cargo-rail reuse
+reduced p50 by 29.2% for checks and 26.4% for release builds versus native Cargo, and was 5.7% and 6.6% faster than
+sccache 0.16.0 for the same workloads. Linux x86-64, Linux ARM64, and Windows x86-64 have passed focused native
+integration suites, including clean-root output equivalence and mutation invalidation, but their post-fix performance
+matrices remain unqualified.
 
-| Measurement | Result |
-|---|---|
-| Apple Silicon check | native p50/p95 `6.952/7.055 s`; warm cross-root `6.281/6.781 s` (p50 9.6% faster; p95 3.9% faster) |
-| Apple Silicon release build | native p50/p95 `10.300/10.862 s`; warm cross-root `9.002/12.378 s` (p50 12.6% faster; p95 14.0% slower from one outlier) |
-| ARM64 GNU/Linux check | native p50 `7.82 s`; warm cross-root `4.70 s` (40.0% faster) |
-| ARM64 GNU/Linux build | native p50 `9.89 s`; warm cross-root `5.95 s` (39.8% faster) |
-| Warm disposition per action | 27 eligible hits, 0 misses, 30 explicit bypasses; 100% eligible lookup hit rate |
-| Cold population | check/build p50 `9.079/13.944 s`; repeated reuse is required to recover the population cost |
-| Unsupported tiny binary | raw Cargo p50 `0.111 s`; cargo-rail disabled/active-bypass `0.606/0.602 s`; cache setup adds no measurable cost over cargo-rail's fixed planner cost |
-
-An earlier macOS sccache comparison completed checks faster but left 22 dep-info files bound to the seed root. That
-result is why cargo-rail requires portable output bytes and revalidates their complete action/result binding rather
-than treating compiler success as sufficient cache authority.
-
-See [Caching](caching.md) for the operator workflow and benchmark protocol and the generated
-[cache capability matrix](cache-capabilities.md) for the exact shipped and bypassed classes.
+See [Caching](caching.md) for the full p50/p95 scorecard, method, limitations, and operator workflow, and the generated
+[support matrix](cache-capabilities.md) for the exact shipped and bypassed classes.
 
 Custom-build compilation retains Cargo's exact executable output separately from the other compiler artifacts. A
 versioned `BuildScriptActionKey` can be issued only at the next process boundary, after the executable and source bytes

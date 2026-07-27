@@ -379,7 +379,7 @@ impl ArgvTemplate {
     }
   }
 
-  fn expand(&self, selected_packages: &[String], use_workspace: bool) -> RailResult<Vec<String>> {
+  pub(crate) fn expand(&self, selected_packages: &[String], use_workspace: bool) -> RailResult<Vec<String>> {
     if self.program.is_empty() {
       return Err(RailError::message("action program cannot be empty"));
     }

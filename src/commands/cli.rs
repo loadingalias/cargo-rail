@@ -309,7 +309,7 @@ pub enum Commands {
     run_args: Vec<String>,
   },
 
-  /// Diagnose whether actions have complete hermetic inputs
+  /// Inspect action hermeticity and native-cache capability
   Doctor {
     /// Diagnostic to run
     #[command(subcommand)]
@@ -652,6 +652,12 @@ pub enum DoctorCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: TextJsonOutputFormat,
   },
+  /// Inspect the exact native-cache toolchain capability certificate
+  NativeCache {
+    /// Report format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
 }
 
 /// Subcommands for `cargo rail config`
@@ -949,7 +955,7 @@ impl Commands {
     match self {
       Commands::Run { format, .. } => format.is_json_like(),
       Commands::Doctor {
-        command: DoctorCommand::Hermeticity { format, .. },
+        command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => format.is_json_like(),
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
@@ -1024,7 +1030,7 @@ impl Commands {
     match self {
       Commands::Run { format, .. } => *format = ActionOutputFormat::Json,
       Commands::Doctor {
-        command: DoctorCommand::Hermeticity { format, .. },
+        command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => *format = TextJsonOutputFormat::Json,
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,

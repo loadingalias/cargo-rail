@@ -1,0 +1,16 @@
+[package]
+name = "cargo-rail-compatibility-fixture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+publish = false
+build = "build.rs"
+
+[features]
+default = ["message"]
+message = []
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[workspace]

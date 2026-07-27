@@ -1,3 +1,32 @@
+# Remote development. Provider mechanics and credentials stay in ~/dev-machines.
+
+ssh-list:
+    @"$HOME/dev-machines/dev-machine" list
+
+ssh target:
+    @"$HOME/dev-machines/dev-machine" ssh auto "{{ target }}"
+
+ssh-check target:
+    @"$HOME/dev-machines/dev-machine" ssh auto "{{ target }}" --check
+
+ssh-create target *args="":
+    @"$HOME/dev-machines/dev-machine" create auto "{{ target }}" {{ args }}
+
+ssh-start target:
+    @"$HOME/dev-machines/dev-machine" start auto "{{ target }}"
+
+ssh-deallocate target:
+    @"$HOME/dev-machines/dev-machine" deallocate auto "{{ target }}"
+
+ssh-kill target:
+    @"$HOME/dev-machines/dev-machine" kill auto "{{ target }}"
+
+ssh-status target="":
+    @if [ -n "{{ target }}" ]; then "$HOME/dev-machines/dev-machine" status auto "{{ target }}"; else "$HOME/dev-machines/dev-machine" status auto; fi
+
+ssh-bootstrap target:
+    @"$HOME/dev-machines/dev-machine" bootstrap auto "{{ target }}"
+
 check:
     @scripts/check/check.sh
 

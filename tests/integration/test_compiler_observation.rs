@@ -37,6 +37,48 @@ fn run_clean_check(workspace: &Path, target: &Path, wrapper: bool) -> Result<std
   command.output().context("run clean Cargo check")
 }
 
+fn scrub_front_door_compiler_environment(command: &mut Command) {
+  for name in [
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_TARGET",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_TARGET_DIR",
+    "RUSTC",
+    "RUSTC_BOOTSTRAP",
+    "RUSTC_FORCE_INCREMENTAL",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    CACHE_WRAPPER_MARKER,
+  ] {
+    command.env_remove(name);
+  }
+}
+
+fn generate_front_door_lockfile(workspace: &Path, cargo_home: &Path) -> Result<()> {
+  let mut command = Command::new("cargo");
+  scrub_front_door_compiler_environment(&mut command);
+  let output = command
+    .current_dir(workspace)
+    .arg("generate-lockfile")
+    .env("CARGO_HOME", cargo_home)
+    .env("CARGO_NET_OFFLINE", "true")
+    .env("CARGO_TERM_COLOR", "never")
+    .output()?;
+  assert!(output.status.success(), "fixture lockfile failed: {output:?}");
+  Ok(())
+}
+
+#[cfg(unix)]
+fn rustc_host_target() -> Result<String> {
+  let output = Command::new("rustc").arg("-vV").output()?;
+  assert!(output.status.success(), "rustc -vV failed: {output:?}");
+  String::from_utf8(output.stdout)?
+    .lines()
+    .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
+    .context("rustc host target")
+}
+
 fn compiler_output_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
   fn visit(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -65,7 +107,9 @@ fn compiler_output_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 fn portable_compiler_output_files(target: &Path, workspace: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
   let mut roots = vec![workspace.to_string_lossy().into_owned()];
@@ -95,7 +139,9 @@ fn local_observation(cache: &serde_json::Value, target_name: &str) -> Result<ser
     .values()
     .filter_map(|entry| entry["observations"].as_array())
     .flatten()
-    .find(|observation| observation["unit"]["target_name"] == target_name)
+    .find(|observation| {
+      observation["unit"]["target_name"] == target_name && observation["unit"]["profile"]["test"] == false
+    })
     .cloned()
     .with_context(|| format!("compiler observation for {target_name}"))
 }
@@ -163,7 +209,9 @@ fn native_cache_observation(workspace: &Path) -> Result<serde_json::Value> {
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 fn assert_native_miss(workspace: &Path, output: &std::process::Output) -> Result<serde_json::Value> {
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
@@ -173,6 +221,26 @@ fn assert_native_miss(workspace: &Path, output: &std::process::Output) -> Result
     "mutated input must not authorize native reuse: {observation}"
   );
   Ok(observation)
+}
+
+#[cfg(any(
+  all(target_os = "macos", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
+))]
+fn native_cache_action_boundary_bypass(observation: &serde_json::Value) -> Option<&str> {
+  if observation["execution"]["cache_wrapper"]["status"] != "bypassed" {
+    return None;
+  }
+  observation["execution"]["cache_wrapper"]["reason"]
+    .as_str()
+    .filter(|reason| {
+      matches!(
+        *reason,
+        "native_cache_toolchain_not_graduated" | "native_cache_capability_not_certified"
+      )
+    })
 }
 
 #[cfg(unix)]
@@ -257,6 +325,294 @@ fn cache_disabled_wrapper_preserves_clean_cargo_outputs() -> Result<()> {
   Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn configured_linker_is_transparent_and_bypasses_before_wrapper_setup() -> Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  fn linker_arguments(log: &Path, target: &Path) -> Result<Vec<String>> {
+    let dependency_directory = target.join("release/deps");
+    fs::read_to_string(log)?
+      .lines()
+      .map(|argument| {
+        let path = Path::new(argument);
+        let compiler_scratch_object = path.file_name() == Some(std::ffi::OsStr::new("symbols.o"))
+          && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("rustc"))
+          && path.starts_with(&dependency_directory);
+        let compiler_raw_dylibs_directory = path.file_name() == Some(std::ffi::OsStr::new("raw-dylibs"))
+          && path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("rustc"))
+          && path.starts_with(&dependency_directory);
+        if compiler_scratch_object {
+          Ok("<rustc-temporary-symbols-object>".to_string())
+        } else if compiler_raw_dylibs_directory {
+          Ok("<rustc-temporary-raw-dylibs-directory>".to_string())
+        } else {
+          Ok(argument.to_string())
+        }
+      })
+      .collect()
+  }
+
+  let workspace = TestWorkspace::new_single_crate("linker-parity", "0.1.0")?;
+  let cargo_home = tempfile::tempdir()?;
+  let cache = tempfile::tempdir()?;
+  let tools = workspace.path.join("tools with spaces");
+  let linker = tools.join("linker-proxy");
+  let linker_log = workspace.path.join("linker-arguments.log");
+  let target = workspace.path.join("target-compatibility");
+  let binary = target.join("release/linker-parity");
+  fs::create_dir_all(&tools)?;
+  write_executable(
+    &linker,
+    r#"#!/bin/sh
+{
+  printf 'BEGIN\n'
+  for argument in "$@"; do
+    printf '%s\n' "$argument"
+  done
+  printf 'END\n'
+} >> "$LINKER_LOG"
+exec cc "$@"
+"#,
+  )?;
+  fs::write(
+    workspace.path.join("src/main.rs"),
+    "fn main() { println!(\"linker parity\"); }\n",
+  )?;
+  fs::create_dir_all(workspace.path.join(".cargo"))?;
+  let linker = linker.to_str().context("UTF-8 linker path")?;
+  fs::write(
+    workspace.path.join(".cargo/config.toml"),
+    format!(
+      "[target.{}]\nlinker = {}\n",
+      rustc_host_target()?,
+      serde_json::to_string(linker)?
+    ),
+  )?;
+  fs::write(
+    workspace.path.join(".gitignore"),
+    "target/\ntarget-compatibility/\nlinker-arguments.log\n",
+  )?;
+  generate_front_door_lockfile(&workspace.path, cargo_home.path())?;
+  workspace.commit("Add configured-linker compatibility fixture")?;
+
+  let run = |rail: bool, no_cache: bool, explain: bool| -> Result<std::process::Output> {
+    let mut command = if rail {
+      let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+      command.args(["rail", "run", "--quiet", "--all", "--action", "distribution"]);
+      if no_cache {
+        command.arg("--no-cache");
+      }
+      if explain {
+        command.arg("--explain");
+      }
+      command.args(["--", "--quiet", "--target-dir"]).arg(&target);
+      command
+    } else {
+      let mut command = Command::new("cargo");
+      command
+        .args([
+          "build",
+          "--workspace",
+          "--release",
+          "--locked",
+          "--quiet",
+          "--target-dir",
+        ])
+        .arg(&target);
+      command
+    };
+    scrub_front_door_compiler_environment(&mut command);
+    command
+      .current_dir(&workspace.path)
+      .env("CARGO_BUILD_JOBS", "1")
+      .env("CARGO_HOME", cargo_home.path())
+      .env("CARGO_INCREMENTAL", "0")
+      .env("CARGO_NET_OFFLINE", "true")
+      .env("CARGO_RAIL_CACHE_DIR", cache.path())
+      .env("CARGO_TERM_COLOR", "never")
+      .env("LINKER_LOG", &linker_log)
+      .output()
+      .context("run configured-linker front door")
+  };
+  let reset = || -> Result<()> {
+    if target.exists() {
+      fs::remove_dir_all(&target)?;
+    }
+    fs::write(&linker_log, "")?;
+    Ok(())
+  };
+
+  reset()?;
+  let direct = run(false, false, false)?;
+  assert!(direct.status.success(), "direct Cargo failed: {direct:?}");
+  let direct_linker_arguments = linker_arguments(&linker_log, &target)?;
+  let direct_binary = fs::read(&binary)?;
+  let direct_mode = fs::metadata(&binary)?.permissions().mode() & 0o777;
+  assert!(
+    !direct_linker_arguments.is_empty(),
+    "the configured linker was not invoked"
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&Command::new(&binary).output()?.stdout).trim(),
+    "linker parity"
+  );
+
+  for (label, no_cache) in [("cache disabled", true), ("cache requested", false)] {
+    reset()?;
+    let rail = run(true, no_cache, false)?;
+    assert_eq!(rail.status.code(), direct.status.code(), "{label}: {rail:?}");
+    assert_eq!(rail.stdout, direct.stdout, "{label} changed stdout");
+    assert_eq!(rail.stderr, direct.stderr, "{label} changed stderr");
+    assert_eq!(
+      linker_arguments(&linker_log, &target)?,
+      direct_linker_arguments,
+      "{label} changed linker argv"
+    );
+    assert_eq!(fs::read(&binary)?, direct_binary, "{label} changed binary bytes");
+    assert_eq!(
+      fs::metadata(&binary)?.permissions().mode() & 0o777,
+      direct_mode,
+      "{label} changed binary mode"
+    );
+  }
+
+  reset()?;
+  let explained = run(true, false, true)?;
+  assert!(
+    explained.status.success(),
+    "explained cargo-rail run failed: {explained:?}"
+  );
+  assert_eq!(explained.stderr, direct.stderr);
+  assert!(
+    String::from_utf8_lossy(&explained.stdout)
+      .contains("native compiler cache: bypassed (configured_linker_not_graduated)"),
+    "configured-linker bypass was not explicit: {}",
+    String::from_utf8_lossy(&explained.stdout)
+  );
+  Ok(())
+}
+
+#[test]
+fn explicit_codegen_backend_is_transparent_and_bypasses_before_wrapper_setup() -> Result<()> {
+  let workspace = TestWorkspace::new_single_crate("codegen-backend-parity", "0.1.0")?;
+  let cargo_home = tempfile::tempdir()?;
+  let cache = tempfile::tempdir()?;
+  let target = workspace.path.join("target-compatibility");
+  fs::write(workspace.path.join(".gitignore"), "target/\ntarget-compatibility/\n")?;
+  generate_front_door_lockfile(&workspace.path, cargo_home.path())?;
+  workspace.commit("Add codegen-backend compatibility fixture")?;
+
+  let run = |rail: bool, no_cache: bool, explain: bool, backend: &str| -> Result<std::process::Output> {
+    let mut command = if rail {
+      let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+      command.args(["rail", "run", "--quiet", "--all", "--action", "build"]);
+      if no_cache {
+        command.arg("--no-cache");
+      }
+      if explain {
+        command.arg("--explain");
+      }
+      command.args(["--", "--quiet", "--target-dir"]).arg(&target);
+      command
+    } else {
+      let mut command = Command::new("cargo");
+      command
+        .args(["check", "--workspace", "--quiet", "--target-dir"])
+        .arg(&target);
+      command
+    };
+    scrub_front_door_compiler_environment(&mut command);
+    command
+      .current_dir(&workspace.path)
+      .env("CARGO_BUILD_JOBS", "1")
+      .env("CARGO_ENCODED_RUSTFLAGS", format!("-Zcodegen-backend={backend}"))
+      .env("CARGO_HOME", cargo_home.path())
+      .env("CARGO_INCREMENTAL", "0")
+      .env("CARGO_NET_OFFLINE", "true")
+      .env("CARGO_RAIL_CACHE_DIR", cache.path())
+      .env("CARGO_TERM_COLOR", "never")
+      .env("RUSTC_BOOTSTRAP", "1")
+      .output()
+      .context("run codegen-backend front door")
+  };
+  let reset = || -> Result<()> {
+    if target.exists() {
+      fs::remove_dir_all(&target)?;
+    }
+    Ok(())
+  };
+
+  reset()?;
+  let direct = run(false, false, false, "llvm")?;
+  assert!(direct.status.success(), "direct Cargo failed: {direct:?}");
+  let direct_outputs = compiler_output_files(&target)?;
+  assert!(
+    !direct_outputs.is_empty(),
+    "backend fixture produced no compiler output"
+  );
+
+  for (label, no_cache) in [("cache disabled", true), ("cache requested", false)] {
+    reset()?;
+    let rail = run(true, no_cache, false, "llvm")?;
+    assert_eq!(rail.status.code(), direct.status.code(), "{label}: {rail:?}");
+    assert_eq!(rail.stdout, direct.stdout, "{label} changed stdout");
+    assert_eq!(rail.stderr, direct.stderr, "{label} changed stderr");
+    assert_eq!(
+      compiler_output_files(&target)?,
+      direct_outputs,
+      "{label} changed compiler outputs"
+    );
+  }
+
+  reset()?;
+  let explained = run(true, false, true, "llvm")?;
+  assert!(
+    explained.status.success(),
+    "explained cargo-rail run failed: {explained:?}"
+  );
+  assert_eq!(explained.stderr, direct.stderr);
+  assert!(
+    String::from_utf8_lossy(&explained.stdout)
+      .contains("native compiler cache: bypassed (codegen_backend_not_graduated)"),
+    "codegen-backend bypass was not explicit: {}",
+    String::from_utf8_lossy(&explained.stdout)
+  );
+
+  reset()?;
+  let direct_failure = run(false, false, false, "cargo_rail_missing_backend")?;
+  assert!(
+    !direct_failure.status.success(),
+    "the missing backend unexpectedly succeeded: {direct_failure:?}"
+  );
+  for (label, no_cache) in [("cache disabled", true), ("cache requested", false)] {
+    reset()?;
+    let rail = run(true, no_cache, false, "cargo_rail_missing_backend")?;
+    assert_eq!(
+      rail.status.code(),
+      direct_failure.status.code(),
+      "{label} changed the missing-backend exit status"
+    );
+    assert_eq!(
+      rail.stdout, direct_failure.stdout,
+      "{label} changed missing-backend stdout"
+    );
+    assert_eq!(
+      rail.stderr, direct_failure.stderr,
+      "{label} changed missing-backend diagnostics"
+    );
+  }
+  Ok(())
+}
+
 #[test]
 fn ineligible_diagnostic_workspace_never_installs_the_native_cache_wrapper() -> Result<()> {
   let workspace = wrapper_workspace("native-cache-ineligible-diagnostic-workspace")?;
@@ -298,7 +654,9 @@ fn ineligible_diagnostic_workspace_never_installs_the_native_cache_wrapper() -> 
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 #[test]
 fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<()> {
@@ -306,6 +664,41 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   let local_cache = tempfile::tempdir()?;
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
+  let observation = native_cache_observation(&workspace.path)?;
+  if let Some(reason) = native_cache_action_boundary_bypass(&observation) {
+    let target = workspace.path.join("target");
+    let cold_outputs = compiler_output_files(&target)?;
+    assert!(
+      !cold_outputs.is_empty(),
+      "bypassed execution produced no compiler outputs"
+    );
+    assert!(
+      !workspace
+        .path
+        .join("target/cargo-rail/hermetic/local-cas-v1.json")
+        .exists(),
+      "an action-level bypass must not create native-cache state"
+    );
+    fs::remove_dir_all(&target)?;
+    let repeated = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
+    assert_eq!(
+      repeated.status.code(),
+      Some(1),
+      "repeated bypassed execution: {repeated:?}"
+    );
+    let repeated_observation = native_cache_observation(&workspace.path)?;
+    assert_eq!(
+      native_cache_action_boundary_bypass(&repeated_observation),
+      Some(reason),
+      "the action-level bypass must remain stable"
+    );
+    assert_eq!(
+      compiler_output_files(&target)?,
+      cold_outputs,
+      "an unavailable cache capability must preserve exact cold outputs"
+    );
+    return Ok(());
+  }
   assert!(
     workspace
       .path
@@ -318,7 +711,10 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"),
   )?)?;
   let observation = local_observation(&cache, "wrapper_app")?;
-  assert_eq!(observation["execution"]["cache_wrapper"]["status"], "miss");
+  assert_eq!(
+    observation["execution"]["cache_wrapper"]["status"], "miss",
+    "unexpected native-cache observation: {observation}"
+  );
   assert_eq!(
     observation["execution"]["cache_wrapper"]["reason"],
     "candidate_not_found;stored_verified_result"
@@ -407,7 +803,9 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 #[test]
 fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
@@ -423,7 +821,28 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let target = workspace.path.join("target");
 
   let cold = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
-  assert_native_miss(&workspace.path, &cold)?;
+  let cold_observation = assert_native_miss(&workspace.path, &cold)?;
+  if let Some(reason) = native_cache_action_boundary_bypass(&cold_observation) {
+    let cold_outputs = compiler_output_files(&target)?;
+    assert!(
+      !cold_outputs.is_empty(),
+      "bypassed execution produced no compiler outputs"
+    );
+    fs::remove_dir_all(&target)?;
+    let repeated = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
+    let repeated_observation = assert_native_miss(&workspace.path, &repeated)?;
+    assert_eq!(
+      native_cache_action_boundary_bypass(&repeated_observation),
+      Some(reason),
+      "the action-level bypass must remain stable"
+    );
+    assert_eq!(
+      compiler_output_files(&target)?,
+      cold_outputs,
+      "an unavailable cache capability must preserve exact cold outputs"
+    );
+    return Ok(());
+  }
   fs::remove_dir_all(&target)?;
   let warm = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
   assert_eq!(warm.status.code(), Some(1), "warm run: {warm:?}");
@@ -482,7 +901,9 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 #[test]
 fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> {
@@ -502,7 +923,10 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
   let workspace = wrapper_workspace("native-cache-corrupt-object")?;
   let local_cache = tempfile::tempdir()?;
   let cold = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  assert_native_miss(&workspace.path, &cold)?;
+  let cold_observation = assert_native_miss(&workspace.path, &cold)?;
+  if native_cache_action_boundary_bypass(&cold_observation).is_some() {
+    return Ok(());
+  }
   let target = workspace.path.join("target");
   let cold_outputs = compiler_output_files(&target)?;
   let mut blobs = Vec::new();
@@ -527,7 +951,9 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
 
 #[cfg(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 ))]
 #[test]
 fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
@@ -543,6 +969,9 @@ fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
   assert_eq!(output.status.code(), Some(1), "filesystem macro run: {output:?}");
   let observation = native_cache_observation(&workspace.path)?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "bypassed");
+  if native_cache_action_boundary_bypass(&observation).is_some() {
+    return Ok(());
+  }
   assert_eq!(
     observation["execution"]["cache_wrapper"]["reason"],
     "filesystem_reading_macro_not_graduated"
@@ -552,7 +981,9 @@ fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
 
 #[cfg(not(any(
   all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64")
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
 )))]
 #[test]
 fn unsupported_platform_bypasses_native_cache_and_preserves_cold_outputs() -> Result<()> {
@@ -896,33 +1327,48 @@ fn rustdoc_proxy_preserves_cargo_docs_and_records_dep_info() -> Result<()> {
     .context("rustdoc crate invocation observation")?;
   assert_eq!(record["mode"], "rustdoc");
   assert_eq!(record["success"], true);
-  assert!(
-    record["compiler_arguments"]
-      .as_array()
-      .is_some_and(|arguments| arguments.iter().any(|argument| argument
+  let records_dep_info = record["compiler_arguments"].as_array().is_some_and(|arguments| {
+    arguments.iter().any(|argument| {
+      argument
         .as_str()
-        .is_some_and(|argument| argument.starts_with("--emit=") && argument.contains("dep-info"))))
-  );
+        .is_some_and(|argument| argument.starts_with("--emit=") && argument.contains("dep-info"))
+    })
+  });
   let observed_paths = record["observed_reads"]
     .as_array()
     .context("observed rustdoc reads")?
     .iter()
     .filter_map(|read| read["path"]["path"].as_str())
     .collect::<Vec<_>>();
+  let declared_paths = record["declared_inputs"]
+    .as_array()
+    .context("declared rustdoc inputs")?
+    .iter()
+    .filter_map(|input| input["path"]["path"].as_str())
+    .collect::<Vec<_>>();
   assert!(
-    observed_paths.contains(&"src/lib.rs"),
+    declared_paths.contains(&"src/lib.rs") || observed_paths.contains(&"src/lib.rs"),
     "crate root missing from {record}"
   );
-  assert!(
-    observed_paths.contains(&"src/nested.rs"),
-    "module source missing from {record}"
-  );
-  assert!(
-    record["emitted_outputs"].as_array().is_some_and(|outputs| outputs
-      .iter()
-      .any(|output| { output["path"]["path"] == "target-observation/doc/rustdoc_observation.d" })),
-    "rustdoc dep-info output missing from {record}"
-  );
+  if records_dep_info {
+    assert!(
+      observed_paths.contains(&"src/nested.rs"),
+      "module source missing from {record}"
+    );
+    assert!(
+      record["emitted_outputs"].as_array().is_some_and(|outputs| outputs
+        .iter()
+        .any(|output| { output["path"]["path"] == "target-observation/doc/rustdoc_observation.d" })),
+      "rustdoc dep-info output missing from {record}"
+    );
+  } else {
+    assert!(
+      record["bypasses"]
+        .as_array()
+        .is_some_and(|bypasses| bypasses.iter().any(|reason| reason == "rustdoc_dep_info_unavailable")),
+      "rustdoc without stable dep-info must remain an explicit bypass: {record}"
+    );
+  }
   assert!(
     record["bypasses"].as_array().is_some_and(|bypasses| bypasses
       .iter()

@@ -5,6 +5,7 @@
 Required tools:
 
 - Rust stable
+- Python 3.11 or newer
 - `just`
 - `cargo-nextest`
 - `cargo-deny`
@@ -26,15 +27,21 @@ target-specific behavior:
 just test-all
 ```
 
-`docs/commands.md` is generated from CLI help, and `docs/cache-capabilities.md` is generated from native-cache
-production gates. Regenerate them after changing commands, flags, defaults, help text, or cache eligibility:
+`docs/commands.md` is generated from CLI help. `docs/cache-capabilities.md` joins the native CI manifest, release
+target registry, exact native-cache capability certificates, runtime gates, and performance qualifications.
+Regenerate them after changing commands, flags, defaults, support inventories, or cache eligibility:
 
 ```bash
 just gen-docs
 ```
 
-Changes to unify performance must include the workload and before/after numbers.
-Native compiler-cache changes must also run the checked-in cross-root fixture.
+Performance changes must identify the workload, host, toolchain, exact commands, sample count, and before/after p50 and
+p95. Compare cache implementations within one host. Preserve raw results and report failed correctness checks.
+
+Native compiler-cache changes must run the checked-in cross-root fixture. Measure native Cargo, cargo-rail disabled,
+cargo-rail cold, cargo-rail warm, and the pinned sccache comparator when the change can affect those lanes. Report hits,
+misses, bypasses, reasons, bytes hashed/restored, and output portability.
+
 The repository benchmarks accept package and run counts:
 
 ```bash

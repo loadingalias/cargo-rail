@@ -30,7 +30,9 @@ cargo rail init
 cargo rail config validate --strict
 ```
 
-Pre-built archives for Linux, Windows, and Apple Silicon macOS, SHA-256 checksums, and signed provenance are available from [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases). `cargo-binstall cargo-rail` is supported.
+Pre-built native archives for x86-64/ARM64 GNU/Linux, Windows MSVC, and macOS, plus cross-built musl Linux archives,
+SHA-256 checksums, and signed provenance are available from
+[GitHub Releases](https://github.com/loadingalias/cargo-rail/releases). `cargo-binstall cargo-rail` is supported.
 
 After an upgrade, run `cargo rail config migrate --check`. Exit 1 means an explicit semantic migration is available; review it, apply it with `cargo rail config migrate`, then validate. Coded defaults are never copied into `rail.toml`.
 
@@ -68,19 +70,27 @@ build-script, proc-macro, external-tool, or dependency-result boundary and withh
 That identity also authorizes verified local reuse for the classes that have earned it. The isolated whole-action cache
 remains limited to supported current-host macOS `cargo check` actions. Ordinary non-incremental `build` (`cargo check`)
 and `distribution` (`cargo build --release`) actions can additionally reuse verified dependency and workspace library
-metadata/rlib results across clean roots on Apple Silicon macOS and ARM64 GNU/Linux with Cargo/rustc 1.97.1. The native
-cache is machine-local, preserves existing compiler wrappers and sccache, and executes every unproven compiler class
-cold with an explicit reason.
+metadata/rlib results across clean roots for the exact toolchain certificates in the generated
+[capability matrix](docs/cache-capabilities.md). The native cache is machine-local, preserves existing compiler
+wrappers and sccache, and executes every unproven compiler class cold with an explicit reason.
+Linked binaries, tests, proc macros, build scripts, native linking, custom targets, and unqualified toolchains are not
+cached.
 
 Enable the graduated native class explicitly through Cargo's non-incremental boundary:
 
 ```bash
+cargo rail doctor native-cache --format json
 CARGO_INCREMENTAL=0 cargo rail run --all --action build --explain
 CARGO_INCREMENTAL=0 cargo rail run --all --action distribution --explain
 ```
 
-See [Caching](docs/caching.md) for activation, telemetry, benchmark evidence, cleanup, and the generated
-[capability matrix](docs/cache-capabilities.md).
+Interleaved 110-sample fixture measurements reduced warm clean-root p50 versus native Cargo by 29.2%/26.4% for
+checks/release builds on macOS ARM64, 41.3%/39.9% on Linux x86-64, and 37.2%/37.5% on Linux ARM64. Against sccache
+0.16.0, cargo-rail was 5.7%/6.6% faster on macOS, 8.7% slower/10.9% faster on Linux x86-64, and 0.7% slower/11.4%
+faster on Linux ARM64. These are same-host fixture results, not universal performance claims. Windows x86-64 remains
+unqualified.
+
+See [Caching](docs/caching.md) for activation, telemetry, benchmark evidence, and cleanup.
 
 ## Release
 
@@ -138,14 +148,14 @@ The result is one install graph, one configuration surface, and one set of decis
 | `plan` / `run` | Select and execute work affected by a change |
 | `change` / `release` | Review release intent and run graph-ordered releases |
 | `split` / `sync` | Maintain standalone repositories from monorepo crates |
-| `doctor`, `config`, `graph`, `hash` | Diagnose action hermeticity, validate configuration, and explain planner state |
+| `doctor`, `config`, `graph`, `hash` | Inspect action/toolchain cache proof, validate configuration, and explain planner state |
 
 ## Documentation
 
 - [Configuration reference](docs/config.md)
 - [Command reference](docs/commands.md)
 - [Caching and evaluation](docs/caching.md)
-- [Generated cache capability matrix](docs/cache-capabilities.md)
+- [Generated execution, cache, and performance support matrix](docs/cache-capabilities.md)
 - [Change detection](docs/change-detection.md)
 - [Planner machine contract](docs/planner-contract.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)

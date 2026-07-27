@@ -1137,7 +1137,7 @@ fn begin_compiler_invocation(
     if !parsed.emit_modes.contains("dep-info") {
       bypasses.insert("rustdoc_dep_info_unavailable".to_string());
     }
-    if parsed.emit_modes.iter().any(|emit| emit != "dep-info") {
+    if parsed.emit_modes.is_empty() || parsed.emit_modes.iter().any(|emit| emit != "dep-info") {
       bypasses.insert("rustdoc_output_tree_unavailable".to_string());
     }
   }
@@ -1804,7 +1804,7 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(_metadata: &fs::Metadata) -> bool {
-  true
+  false
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ cargo rail run --merge-base --dry-run --print-cmd
 - uses: loadingalias/cargo-rail-action@v6.0.0
   id: rail
   with:
-    version: 0.19.0
+    version: 0.19.1
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'

@@ -30,6 +30,8 @@ pub mod cli;
 pub mod common;
 /// Configuration management commands
 pub mod config;
+/// Read-only workspace and toolchain diagnostics
+pub mod doctor;
 /// Planner reasoning graph command
 pub mod graph;
 /// Planner hash and diff introspection commands
@@ -60,6 +62,7 @@ pub use config::{
   StrictnessMode, run_config_explain, run_config_locate, run_config_migrate, run_config_print,
   run_config_validate_standalone,
 };
+pub use doctor::run_native_cache_doctor;
 pub use graph::run_graph;
 pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
@@ -149,20 +152,29 @@ impl PreparedContext {
 
   /// Build the exact workspace context required by this command.
   #[doc(hidden)]
-  pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext, bool)> {
+  pub fn build(self, workspace_root: &Path) -> RailResult<Option<(Commands, WorkspaceContext, bool)>> {
     let context = match self.preparation {
       ContextPreparation::Standard if self.command.requires_workspace_snapshot() => {
-        WorkspaceContext::build_with_snapshot(workspace_root)?
+        WorkspaceContext::build_with_snapshot(workspace_root)
       }
       ContextPreparation::Standard => {
-        WorkspaceContext::build_with_source_capture(workspace_root, self.command.requires_worktree_source_capture())?
+        WorkspaceContext::build_with_source_capture(workspace_root, self.command.requires_worktree_source_capture())
       }
       ContextPreparation::HermeticBuild => {
         let bootstrap = crate::hermetic::prepare_bootstrap(workspace_root)?;
-        WorkspaceContext::build_with_hermetic_snapshot(workspace_root, bootstrap)?
+        WorkspaceContext::build_with_hermetic_snapshot(workspace_root, bootstrap)
       }
     };
-    Ok((*self.command, context, self.pre_context_cache_request))
+    let context = match context {
+      Ok(context) => context,
+      Err(error) => {
+        if run::try_complete_codegen_backend_probe_failure(&self.command, workspace_root, &error)? {
+          return Ok(None);
+        }
+        return Err(error);
+      }
+    };
+    Ok(Some((*self.command, context, self.pre_context_cache_request)))
   }
 }
 
@@ -435,6 +447,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, pre_context_cache_request
         ..run::RunOptions::default()
       },
     ),
+    Commands::Doctor {
+      command: cli::DoctorCommand::NativeCache { format },
+    } => run_native_cache_doctor(ctx, format),
 
     Commands::Plan {
       since,

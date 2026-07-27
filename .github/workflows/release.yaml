@@ -53,7 +53,7 @@ jobs:
           fi
 
       - name: Checkout exact tag
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -100,6 +100,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
           jq -e '
             length > 0
             and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip"))
@@ -126,33 +127,33 @@ jobs:
           exit 1
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           toolchain: ${{ steps.release.outputs.msrv }}
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           toolchain: stable
           components: clippy, rustfmt
 
       - name: Install just
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: just
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: cargo-nextest
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: cargo-deny
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: cargo-audit
 
@@ -205,7 +206,7 @@ jobs:
       matrix: ${{ fromJSON(needs.verify-release.outputs.matrix) }}
     steps:
       - name: Checkout verified commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ needs.verify-release.outputs.release_sha }}
@@ -217,7 +218,7 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # master
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           toolchain: stable
 
@@ -231,7 +232,7 @@ jobs:
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
 
       - name: Setup target toolchain
-        uses: taiki-e/setup-cross-toolchain-action@b8d1a322a6009a2b7220f53996695778eef89b41  # v1.38.0
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8  # v1.42.0
         with:
           target: ${{ matrix.target }}
 
@@ -252,7 +253,7 @@ jobs:
 
       - name: Build archive
         id: build
-        uses: taiki-e/upload-rust-binary-action@f391289bcff6a7f36b6301c0a74199657bbb4561  # v1.28.0
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6  # v1.30.2
         with:
           bin: cargo-rail
           target: ${{ matrix.target }}
@@ -299,12 +300,12 @@ jobs:
           }
 
       - name: Attest archive provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763  # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6  # v4.2.0
         with:
           subject-path: ${{ matrix.archive == 'zip' && steps.build.outputs.zip || steps.build.outputs.tar }}
 
       - name: Stage verified archive
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: release-${{ matrix.target }}
           path: ${{ matrix.archive == 'zip' && steps.build.outputs.zip || steps.build.outputs.tar }}

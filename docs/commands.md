@@ -23,7 +23,7 @@ Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
   run          Execute planner-selected actions
-  doctor       Diagnose whether actions have complete hermetic inputs
+  doctor       Inspect action hermeticity and native-cache capability
   plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
@@ -194,13 +194,14 @@ Examples:
 ## cargo rail doctor
 
 ```
-Diagnose whether actions have complete hermetic inputs
+Inspect action hermeticity and native-cache capability
 
 Usage: cargo rail doctor [OPTIONS] <COMMAND>
 
 Commands:
-  hermeticity  Explain action-key eligibility and every incomplete input boundary
-  help         Print this message or the help of the given subcommand(s)
+  hermeticity   Explain action-key eligibility and every incomplete input boundary
+  native-cache  Inspect the exact native-cache toolchain capability certificate
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
@@ -262,6 +263,44 @@ Options:
           - json: Machine-readable JSON output
 
           [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail doctor native-cache
+
+```
+Inspect the exact native-cache toolchain capability certificate
+
+Usage: cargo rail doctor native-cache [OPTIONS]
+
+Options:
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')

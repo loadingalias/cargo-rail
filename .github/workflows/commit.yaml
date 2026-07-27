@@ -41,7 +41,7 @@ jobs:
       base-ref: ${{ steps.plan.outputs.base-ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -50,62 +50,9 @@ jobs:
         id: plan
         uses: loadingalias/cargo-rail-action@b2569086d9cdad737fd62635e6d15651970521f8  # v6.0.0
         with:
-          version: 0.19.0
+          version: 0.19.1
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           args: '--explain'
-
-  # ==========================================================================
-  # Job 2: MSRV enforcement (fast fail)
-  # ==========================================================================
-  msrv:
-    name: MSRV Check
-    needs: plan
-    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Detect MSRV
-        id: msrv
-        shell: bash
-        run: |
-          msrv="$(python3 - <<'PY'
-          import pathlib, tomllib
-
-          data = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
-          msrv = (
-              data.get("workspace", {}).get("package", {}).get("rust-version")
-              or data.get("package", {}).get("rust-version")
-          )
-          if isinstance(msrv, dict):
-              msrv = None
-          if not msrv:
-              raise SystemExit("No rust-version found in Cargo.toml")
-          print(msrv)
-          PY
-          )"
-
-          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
-          echo "Using MSRV: $msrv"
-
-      - name: Install Rust MSRV Toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # master
-        with:
-          toolchain: ${{ steps.msrv.outputs.msrv }}
-
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          shared-key: "cargo-rail-msrv-v1"
-          key: msrv-${{ steps.msrv.outputs.msrv }}
-          cache-on-failure: true
-
-      - name: Compile (MSRV)
-        run: cargo check --workspace --all-targets --all-features --locked
 
   quality:
     name: Quality and Security
@@ -115,7 +62,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -127,103 +74,23 @@ jobs:
           install-nextest: "false"
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: cargo-deny
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
         with:
           tool: cargo-audit
 
       - name: Quality checks
         run: just ci-check
 
-  # ==========================================================================
-  # Job 3: CI Matrix
-  # ==========================================================================
-  ci:
-    name: CI (${{ matrix.target.name }})
-    needs: [msrv, quality, plan]
+  compatibility:
+    name: Compatibility
+    needs: [quality, plan]
     if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
-    runs-on: ${{ matrix.target.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: true
-      matrix:
-        target:
-          - name: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            cache-key: commit-linux-x64
-            test: true
-
-          - name: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            cache-key: commit-linux-arm64
-            test: false
-
-          - name: x86_64-pc-windows-msvc
-            runner: windows-latest
-            cache-key: commit-windows-x64
-            test: true
-
-          - name: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            cache-key: commit-windows-arm64
-            test: false
-
-    env:
-      RAIL_SINCE: ${{ needs.plan.outputs.base-ref }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Setup
-        uses: ./.github/actions/setup
-        with:
-          cache-key: ${{ matrix.target.cache-key }}
-          install-nextest: ${{ matrix.target.test }}
-
-      - name: Build
-        run: just build-all
-
-      - name: Tests
-        if: matrix.target.test && needs.plan.outputs.test == 'true'
-        run: just test-all
-
-      - name: Upload JUnit Test Report
-        if: always() && matrix.target.test && needs.plan.outputs.test == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
-        with:
-          name: junit-report-${{ matrix.target.name }}
-          path: target/nextest/commit/junit.xml
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Detect JUnit Test Report
-        if: always() && matrix.target.test && needs.plan.outputs.test == 'true'
-        id: junit
-        shell: bash
-        run: |
-          if [ -f target/nextest/commit/junit.xml ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish Test Report
-        if: always() && steps.junit.outputs.found == 'true'
-        uses: mikepenz/action-junit-report@74626db7353a25a20a72816467ebf035f674c5f8  # v6.2.0
-        with:
-          report_paths: 'target/nextest/commit/junit.xml'
-          check_name: 'Test Results (${{ matrix.target.name }})'
-          detailed_summary: true
-          include_passed: false
-          fail_on_failure: true
-          require_tests: true
-          annotate_only: false
-          summary: true
+    uses: ./.github/workflows/compatibility.yaml
+    with:
+      ref: ${{ github.sha }}
+      cache-prefix: commit

@@ -30,6 +30,12 @@ const MAX_ENTRIES: usize = 1_000_000;
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
+const NATIVE_CANDIDATE_INDEX_VERSION: u32 = 1;
+const NATIVE_CANDIDATE_INDEX_DIRECTORY: &str = "native-candidates";
+const NATIVE_CANDIDATE_INDEX_MARKER: &str = "READY";
+const NATIVE_CANDIDATE_INDEX_MARKER_BYTES: &[u8] = b"cargo-rail-native-candidate-index\nschema=1\n";
+#[cfg(target_os = "macos")]
+const SYSROOT_IDENTITY_MEMO_DIRECTORY: &str = "sysroot-identities";
 
 const BLOB_PREFIX: &str = "blob-v1-sha256-";
 const TREE_PREFIX: &str = "tree-v1-sha256-";
@@ -217,6 +223,15 @@ struct ActionPin {
   created_unix_nanos: u128,
 }
 
+/// Discovery-only pointer from one compiler candidate to an authoritative action pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCandidateIndexEntry {
+  version: u32,
+  action_key: String,
+  candidate_key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LeaseRecord {
@@ -377,6 +392,15 @@ impl LocalCas {
     &self.root
   }
 
+  /// Return the private candidate location for one verified sysroot identity memo.
+  #[cfg(target_os = "macos")]
+  pub(crate) fn sysroot_identity_memo_path(&self, lookup: &crate::source::ContentDigest) -> PathBuf {
+    self
+      .root
+      .join(SYSROOT_IDENTITY_MEMO_DIRECTORY)
+      .join(format!("{lookup}.json"))
+  }
+
   pub(crate) fn open() -> RailResult<Self> {
     let base = cache_base()?;
     fs::create_dir_all(&base).map_err(|error| {
@@ -396,14 +420,18 @@ impl LocalCas {
     let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
     ensure_owner_marker(&root)?;
     create_real_directory(&root, "staging")?;
-    for name in ["results", "pins", "leases"] {
+    for name in ["results", "pins", "leases", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
       create_real_directory(&root, name)?;
     }
+    #[cfg(target_os = "macos")]
+    create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
-    Ok(Self {
+    let cas = Self {
       root,
       max_bytes: cache_max_bytes()?,
-    })
+    };
+    cas.ensure_native_candidate_index()?;
+    Ok(cas)
   }
 
   #[cfg(test)]
@@ -414,10 +442,103 @@ impl LocalCas {
     let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
     ensure_owner_marker(&root)?;
     create_real_directory(&root, "staging")?;
-    for name in ["results", "pins", "leases"] {
+    for name in ["results", "pins", "leases", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
       create_real_directory(&root, name)?;
     }
-    Ok(Self { root, max_bytes })
+    #[cfg(target_os = "macos")]
+    create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
+    let cas = Self { root, max_bytes };
+    cas.ensure_native_candidate_index()?;
+    Ok(cas)
+  }
+
+  /// Build the additive discovery index once for caches written before it existed.
+  ///
+  /// The index is never cache authority: every lookup still loads the exact
+  /// action pin and verifies the complete action-result bundle.
+  fn ensure_native_candidate_index(&self) -> RailResult<()> {
+    let index_root = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY);
+    let marker = index_root.join(NATIVE_CANDIDATE_INDEX_MARKER);
+    match fs::symlink_metadata(&marker) {
+      Ok(metadata) => {
+        if !metadata.is_file()
+          || is_link_or_reparse(&metadata)
+          || !has_single_link(&metadata)
+          || metadata.len() != NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
+          || fs::read(&marker)? != NATIVE_CANDIDATE_INDEX_MARKER_BYTES
+        {
+          return Err(RailError::message("local CAS native candidate index marker is invalid"));
+        }
+        return Ok(());
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error.into()),
+    }
+
+    let pins_directory = self.root.join("pins");
+    let mut entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.len() > MAX_ENTRIES {
+      return Err(RailError::message(format!(
+        "local CAS has more than {MAX_ENTRIES} action pins; refusing an unbounded native-index migration"
+      )));
+    }
+    for entry in entries {
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)?;
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+        return Err(RailError::message(format!(
+          "local CAS pin '{}' is not a bounded regular file",
+          path.display()
+        )));
+      }
+      let file_name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| RailError::message("local CAS pin has a non-UTF-8 name"))?;
+      let key_hex = file_name
+        .strip_suffix(".json")
+        .ok_or_else(|| RailError::message(format!("local CAS pin '{file_name}' has an invalid name")))?;
+      let mut stats = ReadStats::default();
+      let pin: ActionPin = read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      if pin.version != CAS_VERSION
+        || validated_action_key_hex(&pin.action_key)? != key_hex
+        || validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX).is_err()
+        || validate_any_lookup_key(&pin.lookup_key).is_err()
+      {
+        return Err(RailError::message(
+          "local CAS pin is invalid during native-index migration",
+        ));
+      }
+      if pin
+        .lookup_key
+        .starts_with(crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)
+      {
+        self.publish_native_candidate_index(&pin.action_key, &pin.lookup_key)?;
+      }
+    }
+
+    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
+    temporary.write_all(NATIVE_CANDIDATE_INDEX_MARKER_BYTES)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&marker) {
+      Ok(_) => sync_directory(&index_root)?,
+      Err(_)
+        if fs::symlink_metadata(&marker).is_ok_and(|metadata| {
+          metadata.is_file()
+            && !is_link_or_reparse(&metadata)
+            && has_single_link(&metadata)
+            && metadata.len() == NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
+        }) && fs::read(&marker)? == NATIVE_CANDIDATE_INDEX_MARKER_BYTES => {}
+      Err(error) => {
+        return Err(RailError::message(format!(
+          "failed to publish local CAS native candidate index marker '{}': {}",
+          marker.display(),
+          error.error
+        )));
+      }
+    }
+    self.ensure_capacity(0, None)
   }
 
   #[cfg(any(target_os = "macos", test))]
@@ -487,7 +608,7 @@ impl LocalCas {
     for entry in entries {
       let path = entry.path();
       let metadata = fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
         return Err(RailError::message(format!(
           "local CAS pin '{}' is not a bounded regular file",
           path.display()
@@ -539,46 +660,84 @@ impl LocalCas {
 
   #[cfg(any(unix, windows, test))]
   pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<Vec<NativeCacheCandidate>> {
-    crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
-    let pins_directory = self.root.join("pins");
-    let mut entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
+    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
+    let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
+    let mut entries = match fs::read_dir(&directory) {
+      Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+      Err(error) => return Err(error.into()),
+    };
+    validate_real_directory(&directory, "local CAS native candidate")?;
     entries.sort_by_key(|entry| entry.file_name());
     if entries.len() > MAX_CANDIDATE_PINS {
       return Err(RailError::message(format!(
-        "local CAS has more than {MAX_CANDIDATE_PINS} action pins; refusing an unbounded compiler-candidate scan"
+        "local CAS compiler candidate has more than {MAX_CANDIDATE_PINS} actions; refusing an unbounded lookup"
       )));
     }
     let mut candidates = Vec::new();
     for entry in entries {
       let path = entry.path();
       let metadata = fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
         return Err(RailError::message(format!(
-          "local CAS pin '{}' is not a bounded regular file",
+          "local CAS native candidate entry '{}' is not a bounded regular file",
           path.display()
         )));
       }
       let file_name = entry
         .file_name()
         .into_string()
-        .map_err(|_| RailError::message("local CAS pin has a non-UTF-8 name"))?;
-      let key_hex = file_name
-        .strip_suffix(".json")
-        .ok_or_else(|| RailError::message(format!("local CAS pin '{file_name}' has an invalid name")))?;
+        .map_err(|_| RailError::message("local CAS native candidate entry has a non-UTF-8 name"))?;
+      let key_hex = file_name.strip_suffix(".json").ok_or_else(|| {
+        RailError::message(format!(
+          "local CAS native candidate entry '{file_name}' has an invalid name"
+        ))
+      })?;
       let mut stats = ReadStats::default();
-      let pin: ActionPin = read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      let indexed: NativeCandidateIndexEntry =
+        read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      if indexed.version != NATIVE_CANDIDATE_INDEX_VERSION {
+        return Err(RailError::message(
+          "local CAS native candidate index has an incompatible schema",
+        ));
+      }
+      if indexed.candidate_key != candidate_key
+        || validated_action_key_hex(&indexed.action_key)? != key_hex
+        || !indexed
+          .action_key
+          .starts_with(crate::compiler::native_cache::ACTION_KEY_PREFIX)
+      {
+        return Err(RailError::message(
+          "local CAS native candidate entry does not match its directory and action key",
+        ));
+      }
+      let pin_path = self.root.join("pins").join(&file_name);
+      let pin_metadata = match fs::symlink_metadata(&pin_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(error) => return Err(error.into()),
+      };
+      if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
+        return Err(RailError::message(format!(
+          "local CAS pin '{}' is not a bounded regular file",
+          pin_path.display()
+        )));
+      }
+      let pin: ActionPin =
+        read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
       if pin.version != CAS_VERSION {
         return Err(RailError::message("local CAS candidate pin has an incompatible schema"));
       }
-      if validated_action_key_hex(&pin.action_key)? != key_hex {
+      if pin.action_key != indexed.action_key || validated_action_key_hex(&pin.action_key)? != key_hex {
         return Err(RailError::message(
           "local CAS candidate pin filename does not match its action key",
         ));
       }
-      validate_any_lookup_key(&pin.lookup_key)?;
       validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
       if pin.lookup_key != candidate_key {
-        continue;
+        return Err(RailError::message(
+          "local CAS native candidate entry does not match its authoritative action pin",
+        ));
       }
       crate::compiler::native_cache::validate_action_key(&pin.action_key)?;
       let verified = self
@@ -646,6 +805,7 @@ impl LocalCas {
     crate::compiler::native_cache::validate_action_key(action_key)?;
     crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
     validation.validate_object()?;
+    validate_native_output_manifest(manifest, validation).map_err(fault_to_error)?;
     if validation.action_key() != action_key || validation.candidate_key() != candidate_key {
       return Err(RailError::message(
         "local cache compiler observation does not match the stored action",
@@ -693,7 +853,7 @@ impl LocalCas {
     let action_result = action_result_id(&object)?;
     let result_hex = validated_id_hex(&action_result, ACTION_RESULT_PREFIX)?;
     let incoming = match fs::symlink_metadata(self.root.join("results").join(result_hex)) {
-      Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => 0,
+      Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => 0,
       Ok(_) => {
         return Err(RailError::message(
           "local CAS action-result path is not a real directory",
@@ -730,6 +890,11 @@ impl LocalCas {
         prepared: &prepared,
       })
       .map_err(|error| RailError::message(format!("local CAS bundle publication failed: {error}")))?;
+    if let StoredValidationRef::NativeCompiler(validation) = validation {
+      self
+        .publish_native_candidate_index(action_key, validation.candidate_key())
+        .map_err(|error| RailError::message(format!("local CAS native candidate publication failed: {error}")))?;
+    }
     self
       .publish_pin(action_key, lookup_key, &action_result)
       .map_err(|error| RailError::message(format!("local CAS pin publication failed: {error}")))?;
@@ -756,7 +921,7 @@ impl LocalCas {
       }
       Err(error) => return Err(Fault::corrupt(format!("pin_unreadable: {error}"))),
     };
-    if !pin_metadata.is_file() || pin_metadata.file_type().is_symlink() || !has_single_link(&pin_metadata) {
+    if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
       return Err(Fault::corrupt("pin_not_regular_file"));
     }
     let pin: ActionPin = read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, stats)?;
@@ -863,7 +1028,7 @@ fn make_directory_private(_path: &Path) -> RailResult<()> {
 fn validate_real_directory(path: &Path, description: &str) -> RailResult<()> {
   let metadata = fs::symlink_metadata(path)
     .map_err(|error| RailError::message(format!("failed to inspect {description} '{}': {error}", path.display())))?;
-  if metadata.is_dir() && !metadata.file_type().is_symlink() {
+  if metadata.is_dir() && !is_link_or_reparse(&metadata) {
     Ok(())
   } else {
     Err(RailError::with_help(
@@ -906,8 +1071,7 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
       sync_directory(root)?;
     }
     Err(_)
-      if fs::symlink_metadata(&marker)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()) => {}
+      if fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata)) => {}
     Err(error) => {
       return Err(RailError::message(format!(
         "failed to create local CAS ownership marker '{}': {}",
@@ -920,7 +1084,20 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
 }
 
 fn validate_root_entries(root: &Path) -> RailResult<()> {
-  let allowed = BTreeSet::from(["OWNER", "leases", "pins", "results", "staging"]);
+  let allowed = BTreeSet::from([
+    "OWNER",
+    "leases",
+    NATIVE_CANDIDATE_INDEX_DIRECTORY,
+    "pins",
+    "results",
+    "staging",
+  ]);
+  #[cfg(target_os = "macos")]
+  let allowed = {
+    let mut allowed = allowed;
+    allowed.insert(SYSROOT_IDENTITY_MEMO_DIRECTORY);
+    allowed
+  };
   for entry in fs::read_dir(root)? {
     let entry = entry?;
     let name = entry
@@ -1169,6 +1346,44 @@ fn validate_manifest(manifest: &OutputManifest) -> Result<(), Fault> {
   }
   if manifest.bytes > MAX_RESULT_BYTES {
     return Err(Fault::corrupt("output_manifest_byte_limit"));
+  }
+  Ok(())
+}
+
+fn validate_native_output_manifest(
+  manifest: &OutputManifest,
+  validation: &NativeCompilerValidation,
+) -> Result<(), Fault> {
+  let mut expected_files = validation
+    .cas_output_bindings()
+    .map(|(path, digest, bytes)| (path, (digest, Some(bytes))))
+    .chain(
+      validation
+        .cas_stream_bindings()
+        .into_iter()
+        .map(|(path, digest)| (path, (digest, None))),
+    )
+    .collect::<BTreeMap<_, _>>();
+  let expected_directories = BTreeSet::from(["target", "target/outputs", "target/streams"]);
+  let mut actual_directories = BTreeSet::new();
+  for entry in &manifest.entries {
+    match &entry.kind {
+      OutputEntryKind::Directory { mode } if *mode == 0o755 => {
+        actual_directories.insert(entry.path.as_str());
+      }
+      OutputEntryKind::File { digest, mode, bytes } if *mode == 0o644 => {
+        let Some((expected_digest, expected_bytes)) = expected_files.remove(entry.path.as_str()) else {
+          return Err(Fault::corrupt("native_output_manifest_file_set"));
+        };
+        if digest != expected_digest || expected_bytes.is_some_and(|expected| expected != *bytes) {
+          return Err(Fault::corrupt("native_output_manifest_file_binding"));
+        }
+      }
+      _ => return Err(Fault::corrupt("native_output_manifest_entry_class")),
+    }
+  }
+  if !expected_files.is_empty() || actual_directories != expected_directories {
+    return Err(Fault::corrupt("native_output_manifest_membership"));
   }
   Ok(())
 }
@@ -1503,6 +1718,9 @@ impl LocalCas {
     validation
       .validate_object()
       .map_err(|error| Fault::corrupt(format!("validation_object: {error}")))?;
+    if let StoredValidation::NativeCompiler(validation) = &validation {
+      validate_native_output_manifest(&manifest, validation)?;
+    }
     if validation.result_digest(manifest.digest()) != object.result_digest {
       return Err(Fault::corrupt("action_result_result_digest_mismatch"));
     }
@@ -1555,7 +1773,7 @@ impl LocalCas {
       ));
       let metadata = fs::symlink_metadata(&path).map_err(|error| Fault::corrupt(format!("blob_missing: {error}")))?;
       if !metadata.is_file()
-        || metadata.file_type().is_symlink()
+        || is_link_or_reparse(&metadata)
         || !has_single_link(&metadata)
         || metadata.len() > MAX_RESULT_BYTES
       {
@@ -1599,6 +1817,11 @@ impl LocalCas {
       .map_err(|error| Fault::corrupt(format!("materialization_staging_unavailable: {error}")))?;
     let payload = temporary.path().join("output");
     fs::create_dir(&payload).map_err(|error| Fault::corrupt(format!("materialization_root_create: {error}")))?;
+    // A native result is a regenerable Cargo output backed by an already
+    // durable CAS bundle. Readers need atomic visibility and verified bytes,
+    // not a storage barrier for the private restored copy. Hermetic action
+    // restores retain their stronger durable-materialization behavior.
+    let durable = matches!(&verified.validation, StoredValidation::Hermetic(_));
     materialize_tree(
       &verified.bundle,
       &verified.object.output_tree,
@@ -1606,15 +1829,20 @@ impl LocalCas {
       &payload,
       stats,
       0,
+      durable,
     )?;
-    verified
-      .manifest
-      .validate_unchanged(&payload)
-      .map_err(|error| Fault::corrupt(format!("materialized_manifest_validation: {error}")))?;
-    sync_output_tree(&payload).map_err(|error| Fault::corrupt(format!("materialized_tree_sync: {error}")))?;
+    if durable {
+      verified
+        .manifest
+        .validate_unchanged(&payload)
+        .map_err(|error| Fault::corrupt(format!("materialized_manifest_validation: {error}")))?;
+      sync_output_tree(&payload).map_err(|error| Fault::corrupt(format!("materialized_tree_sync: {error}")))?;
+    }
     fs::rename(&payload, destination)
       .map_err(|error| Fault::corrupt(format!("materialization_atomic_publish: {error}")))?;
-    sync_directory(parent).map_err(|error| Fault::corrupt(format!("materialization_parent_sync: {error}")))?;
+    if durable {
+      sync_directory(parent).map_err(|error| Fault::corrupt(format!("materialization_parent_sync: {error}")))?;
+    }
     Ok(())
   }
 }
@@ -1635,7 +1863,7 @@ where
 
 fn read_bounded_file(path: &Path, limit: u64, stats: &mut ReadStats) -> Result<Vec<u8>, Fault> {
   let metadata = fs::symlink_metadata(path).map_err(|error| Fault::corrupt(format!("object_missing: {error}")))?;
-  if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+  if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
     return Err(Fault::corrupt("object_not_regular_file"));
   }
   if metadata.len() > limit {
@@ -1675,7 +1903,7 @@ fn validate_bundle_directory(path: &Path) -> Result<(), Fault> {
 fn validate_real_directory_fault(path: &Path, description: &str) -> Result<(), Fault> {
   let metadata =
     fs::symlink_metadata(path).map_err(|error| Fault::corrupt(format!("{description}_missing: {error}")))?;
-  if metadata.is_dir() && !metadata.file_type().is_symlink() {
+  if metadata.is_dir() && !is_link_or_reparse(&metadata) {
     Ok(())
   } else {
     Err(Fault::corrupt(format!("{description}_not_real_directory")))
@@ -1855,7 +2083,7 @@ fn validate_object_directory(
     let entry = entry.map_err(|error| Fault::corrupt(format!("object_directory_entry: {error}")))?;
     let metadata =
       fs::symlink_metadata(entry.path()).map_err(|error| Fault::corrupt(format!("object_metadata: {error}")))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
       return Err(Fault::corrupt("object_directory_contains_non_file"));
     }
     actual.insert(
@@ -1882,6 +2110,7 @@ fn materialize_tree(
   destination: &Path,
   stats: &mut ReadStats,
   depth: usize,
+  durable: bool,
 ) -> Result<(), Fault> {
   if depth > MAX_TREE_DEPTH {
     return Err(Fault::corrupt("tree_depth_limit"));
@@ -1899,11 +2128,11 @@ fn materialize_tree(
         bytes,
         mode,
       } => {
-        materialize_blob(bundle, blob, content_digest, *bytes, *mode, &path, stats)?;
+        materialize_blob(bundle, blob, content_digest, *bytes, *mode, &path, stats, durable)?;
       }
       TreeEntryKind::Directory { tree, mode } => {
         fs::create_dir(&path).map_err(|error| Fault::corrupt(format!("directory_materialization: {error}")))?;
-        materialize_tree(bundle, tree, trees, &path, stats, depth + 1)?;
+        materialize_tree(bundle, tree, trees, &path, stats, depth + 1, durable)?;
         set_exact_mode(&path, *mode)?;
       }
       TreeEntryKind::Symlink { target, directory } => {
@@ -1916,6 +2145,9 @@ fn materialize_tree(
 }
 
 #[cfg(any(unix, windows, test))]
+// Each argument is an independent verified blob boundary; grouping them would
+// add a construction type without removing state or knowledge.
+#[allow(clippy::too_many_arguments)]
 fn materialize_blob(
   bundle: &Path,
   identity: &str,
@@ -1924,12 +2156,13 @@ fn materialize_blob(
   mode: u32,
   destination: &Path,
   stats: &mut ReadStats,
+  durable: bool,
 ) -> Result<(), Fault> {
   let hex = validated_id_hex(identity, BLOB_PREFIX).map_err(|_| Fault::corrupt("blob_identity_encoding"))?;
   let source = bundle.join("blobs").join(format!("{hex}.blob"));
   let metadata = fs::symlink_metadata(&source).map_err(|error| Fault::corrupt(format!("blob_missing: {error}")))?;
   if !metadata.is_file()
-    || metadata.file_type().is_symlink()
+    || is_link_or_reparse(&metadata)
     || !has_single_link(&metadata)
     || metadata.len() != expected_bytes
   {
@@ -1976,9 +2209,11 @@ fn materialize_blob(
     digest.update(&buffer[..read]);
     copied = copied.saturating_add(read as u64);
   }
-  output
-    .sync_all()
-    .map_err(|error| Fault::corrupt(format!("blob_sync: {error}")))?;
+  if durable {
+    output
+      .sync_all()
+      .map_err(|error| Fault::corrupt(format!("blob_sync: {error}")))?;
+  }
   let actual_digest = format!("sha256:{}", sha256_hex(digest));
   stats.bytes = stats.bytes.saturating_add(copied);
   crate::instrumentation::record_cas_read(copied);
@@ -2037,7 +2272,7 @@ fn sync_output_tree(root: &Path) -> RailResult<()> {
   let mut pending = vec![root.to_path_buf()];
   while let Some(path) = pending.pop() {
     let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() {
+    if is_link_or_reparse(&metadata) {
       continue;
     }
     if metadata.is_dir() {
@@ -2080,7 +2315,7 @@ impl LocalCas {
     let result_hex = validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
     let destination = self.root.join("results").join(result_hex);
     match fs::symlink_metadata(&destination) {
-      Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+      Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => {
         let mut read = ReadStats::default();
         self
           .load_verified_result(&object.action_key, action_result, &mut read)
@@ -2111,6 +2346,8 @@ impl LocalCas {
     write_new_synced(&payload.join("action-result.json"), object_bytes)?;
     stats.objects_written = stats.objects_written.saturating_add(1);
     stats.bytes_written = stats.bytes_written.saturating_add(object_bytes.len() as u64);
+    #[cfg(test)]
+    pause_test_publication_after_first_object(&payload)?;
 
     let manifest_hex = validated_id_hex(manifest.digest(), MANIFEST_PREFIX)?;
     write_new_synced(
@@ -2160,7 +2397,7 @@ impl LocalCas {
       }
       Err(_)
         if fs::symlink_metadata(&destination)
-          .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink()) =>
+          .is_ok_and(|metadata| metadata.is_dir() && !is_link_or_reparse(&metadata)) =>
       {
         let mut read = ReadStats::default();
         self
@@ -2173,6 +2410,82 @@ impl LocalCas {
         destination.display()
       ))),
     }
+  }
+
+  fn publish_native_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<()> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
+    let action_hex = validated_action_key_hex(action_key)?;
+    let index_root = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY);
+    let directory = create_real_directory(&index_root, candidate_hex)?;
+    let indexed = NativeCandidateIndexEntry {
+      version: NATIVE_CANDIDATE_INDEX_VERSION,
+      action_key: action_key.to_string(),
+      candidate_key: candidate_key.to_string(),
+    };
+    let bytes = canonical_json(&indexed)?;
+    let destination = directory.join(format!("{action_hex}.json"));
+    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&destination) {
+      Ok(_) => {
+        sync_directory(&directory)?;
+        sync_directory(&index_root)
+      }
+      Err(_)
+        if fs::symlink_metadata(&destination)
+          .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata) && has_single_link(&metadata)) =>
+      {
+        let mut stats = ReadStats::default();
+        let existing: NativeCandidateIndexEntry =
+          read_canonical_json(&destination, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+        if existing != indexed {
+          return Err(RailError::message(
+            "existing local CAS native candidate entry has a different action binding",
+          ));
+        }
+        Ok(())
+      }
+      Err(error) => Err(RailError::message(format!(
+        "failed to atomically publish local CAS native candidate entry '{}': {}",
+        destination.display(),
+        error.error
+      ))),
+    }
+  }
+
+  fn remove_native_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<u64> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
+    let action_hex = validated_action_key_hex(action_key)?;
+    let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
+    let path = directory.join(format!("{action_hex}.json"));
+    let metadata = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+      Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS native candidate entry '{}' is not a regular file",
+        path.display()
+      )));
+    }
+    let mut stats = ReadStats::default();
+    let indexed: NativeCandidateIndexEntry =
+      read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+    if indexed.version != NATIVE_CANDIDATE_INDEX_VERSION
+      || indexed.action_key != action_key
+      || indexed.candidate_key != candidate_key
+    {
+      return Err(RailError::message(
+        "local CAS native candidate entry does not match its authoritative action pin",
+      ));
+    }
+    fs::remove_file(&path)?;
+    sync_directory(&directory)?;
+    Ok(metadata.len())
   }
 
   fn publish_pin(&self, action_key: &str, lookup_key: &str, action_result: &str) -> RailResult<()> {
@@ -2196,7 +2509,7 @@ impl LocalCas {
       }
       Err(_)
         if fs::symlink_metadata(&destination)
-          .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink()) =>
+          .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata)) =>
       {
         let mut stats = ReadStats::default();
         let existing: ActionPin =
@@ -2261,12 +2574,28 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> RailResult<()> {
   Ok(())
 }
 
+#[cfg(test)]
+fn pause_test_publication_after_first_object(_payload: &Path) -> RailResult<()> {
+  const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_AFTER_FIRST_OBJECT";
+  let Some(control) = std::env::var_os(PAUSE_ENV) else {
+    return Ok(());
+  };
+  let control = PathBuf::from(control);
+  fs::create_dir_all(&control)?;
+  write_new_synced(&control.join("ready"), b"ready\n")?;
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+  while !control.join("continue").is_file() {
+    if std::time::Instant::now() >= deadline {
+      return Err(RailError::message("test publication pause timed out"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+  Ok(())
+}
+
 fn copy_blob_verified(blob: &PreparedBlob, identity: &str, destination: &Path) -> RailResult<u64> {
   let metadata = fs::symlink_metadata(&blob.source)?;
-  if !metadata.is_file()
-    || metadata.file_type().is_symlink()
-    || !has_single_link(&metadata)
-    || metadata.len() != blob.bytes
+  if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) || metadata.len() != blob.bytes
   {
     return Err(RailError::message(format!(
       "declared output '{}' changed before local CAS publication",
@@ -2335,6 +2664,7 @@ fn unix_nanos() -> u128 {
 struct GcPin {
   path: PathBuf,
   key: String,
+  lookup_key: String,
   result: String,
   created: u128,
   bytes: u64,
@@ -2374,7 +2704,7 @@ impl LocalCas {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
         Err(error) => return Err(error.into()),
       };
-      if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
         return Err(RailError::message(format!(
           "local CAS lease '{}' is not a regular file",
           path.display()
@@ -2404,7 +2734,7 @@ impl LocalCas {
     for entry in pin_entries {
       let path = entry.path();
       let metadata = fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || metadata.file_type().is_symlink() || !has_single_link(&metadata) {
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
         return Err(RailError::message(format!(
           "local CAS pin '{}' is not a regular file",
           path.display()
@@ -2432,6 +2762,7 @@ impl LocalCas {
       pins.push(GcPin {
         path,
         key: pin.action_key,
+        lookup_key: pin.lookup_key,
         result: pin.action_result,
         created: pin.created_unix_nanos,
         bytes: metadata.len(),
@@ -2487,6 +2818,12 @@ impl LocalCas {
       }
       fs::remove_file(&pin.path)?;
       current = current.saturating_sub(pin.bytes);
+      if pin
+        .lookup_key
+        .starts_with(crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)
+      {
+        current = current.saturating_sub(self.remove_native_candidate_index(&pin.key, &pin.lookup_key)?);
+      }
       if let Some(count) = references.get_mut(&pin.result) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -2521,7 +2858,7 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
       Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink() {
+    if is_link_or_reparse(&metadata) {
       return Err(RailError::with_help(
         format!("local CAS contains a symlink at '{}'", path.display()),
         "run `cargo rail clean --cache`; cargo-rail will not follow cache symlinks",
@@ -2559,7 +2896,7 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
 
 fn safe_remove_tree(root: &Path) -> RailResult<()> {
   let metadata = fs::symlink_metadata(root)?;
-  if !metadata.is_dir() || metadata.file_type().is_symlink() {
+  if !metadata.is_dir() || is_link_or_reparse(&metadata) {
     return Err(RailError::message(format!(
       "refusing to recursively remove non-directory local CAS path '{}'",
       root.display()
@@ -2569,18 +2906,32 @@ fn safe_remove_tree(root: &Path) -> RailResult<()> {
   let mut pending = vec![root.to_path_buf()];
   while let Some(path) = pending.pop() {
     let metadata = fs::symlink_metadata(&path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if metadata.is_dir() && !is_link_or_reparse(&metadata) {
       directories.push(path.clone());
       let mut entries = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
       entries.sort_by_key(|entry| entry.file_name());
       pending.extend(entries.into_iter().map(|entry| entry.path()));
+    } else if metadata.is_dir() || is_directory_reparse(&metadata) {
+      fs::remove_dir(&path).map_err(|error| {
+        RailError::message(format!(
+          "failed to remove local CAS reparse directory '{}': {error}",
+          path.display()
+        ))
+      })?;
     } else {
-      fs::remove_file(path)?;
+      fs::remove_file(&path).map_err(|error| {
+        RailError::message(format!("failed to remove local CAS file '{}': {error}", path.display()))
+      })?;
     }
   }
   directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
   for directory in directories {
-    fs::remove_dir(directory)?;
+    fs::remove_dir(&directory).map_err(|error| {
+      RailError::message(format!(
+        "failed to remove local CAS directory '{}': {error}",
+        directory.display()
+      ))
+    })?;
   }
   Ok(())
 }
@@ -2609,9 +2960,11 @@ pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
   }
   ensure_owner_marker_existing(root)?;
   validate_root_entries(root)?;
-  for name in ["results", "pins", "leases", "staging"] {
+  for name in ["results", "pins", "leases", "staging", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
     validate_real_directory(&root.join(name), "local CAS domain")?;
   }
+  #[cfg(target_os = "macos")]
+  validate_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
   Ok(Some(root.to_path_buf()))
 }
 
@@ -2632,7 +2985,7 @@ fn ensure_owner_marker_existing(root: &Path) -> RailResult<()> {
     ))
   })?;
   if !metadata.is_file()
-    || metadata.file_type().is_symlink()
+    || is_link_or_reparse(&metadata)
     || !has_single_link(&metadata)
     || metadata.len() != OWNER_MARKER.len() as u64
     || fs::read(&marker)? != OWNER_MARKER
@@ -2643,6 +2996,25 @@ fn ensure_owner_marker_existing(root: &Path) -> RailResult<()> {
     ));
   }
   Ok(())
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+  crate::utils::is_symlink_or_reparse(metadata)
+}
+
+#[cfg(windows)]
+fn is_directory_reparse(metadata: &fs::Metadata) -> bool {
+  use std::os::windows::fs::MetadataExt as _;
+
+  const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+  const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+  let attributes = metadata.file_attributes();
+  attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+}
+
+#[cfg(not(windows))]
+fn is_directory_reparse(_metadata: &fs::Metadata) -> bool {
+  false
 }
 
 #[cfg(unix)]
@@ -2788,7 +3160,6 @@ mod tests {
       .expect("native fixture should enter the CAS")
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn native_candidate_lookup_does_not_materialize_and_action_restore_reverifies() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2818,9 +3189,116 @@ mod tests {
       fs::read(destination.join("target/outputs/metadata")).expect("metadata"),
       b"metadata"
     );
+
+    let action_hex = validated_action_key_hex(validation.action_key()).expect("native action key");
+    fs::remove_file(cas.root.join("pins").join(format!("{action_hex}.json"))).expect("remove authoritative pin");
+    assert!(
+      cas
+        .native_candidates(validation.candidate_key())
+        .expect("stale discovery entry should be harmless")
+        .is_empty(),
+      "the discovery index must never authorize a result without its action pin"
+    );
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[test]
+  fn native_manifest_must_match_the_validated_output_contract() {
+    let output = tempfile::tempdir().expect("output root");
+    let (mut manifest, validation) = native_fixture(output.path());
+    let metadata = manifest
+      .entries
+      .iter_mut()
+      .find(|entry| entry.path == "target/outputs/metadata")
+      .expect("metadata entry");
+    let OutputEntryKind::File { digest, .. } = &mut metadata.kind else {
+      panic!("metadata should be a file");
+    };
+    *digest = format!("sha256:{}", ContentDigest::sha256(b"forged!"));
+    manifest.digest = super::super::output_manifest_digest(&manifest.entries).expect("forged manifest digest");
+
+    assert!(
+      validate_manifest(&manifest).is_ok(),
+      "the generic manifest remains internally valid"
+    );
+    assert!(
+      validate_native_output_manifest(&manifest, &validation).is_err(),
+      "native validation must retain authority over each output slot"
+    );
+  }
+
+  #[test]
+  fn native_candidate_lookup_ignores_unrelated_primary_pins() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+
+    let lookup = super::super::test_pre_context_lookup_key();
+    for value in 0_u64..32 {
+      let action_key = format!("{ACTION_KEY_PREFIX}{value:064x}");
+      let pin = ActionPin {
+        version: CAS_VERSION,
+        action_key: action_key.clone(),
+        action_result: format!("{ACTION_RESULT_PREFIX}{value:064x}"),
+        lookup_key: lookup.clone(),
+        created_unix_nanos: u128::from(value),
+      };
+      fs::write(
+        cas.root.join("pins").join(format!(
+          "{}.json",
+          validated_action_key_hex(&action_key).expect("action key")
+        )),
+        canonical_json(&pin).expect("pin JSON"),
+      )
+      .expect("irrelevant pin");
+    }
+
+    let candidates = cas
+      .native_candidates(validation.candidate_key())
+      .expect("candidate index should load");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].action_key, validation.action_key());
+  }
+
+  #[test]
+  fn pre_index_native_pins_are_migrated_once_without_gaining_authority() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+
+    let candidate_hex = validated_id_hex(
+      validation.candidate_key(),
+      crate::compiler::native_cache::CANDIDATE_KEY_PREFIX,
+    )
+    .expect("candidate key");
+    let action_hex = validated_action_key_hex(validation.action_key()).expect("action key");
+    fs::remove_file(
+      cas
+        .root
+        .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
+        .join(candidate_hex)
+        .join(format!("{action_hex}.json")),
+    )
+    .expect("remove indexed entry");
+    fs::remove_file(
+      cas
+        .root
+        .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
+        .join(NATIVE_CANDIDATE_INDEX_MARKER),
+    )
+    .expect("remove migration marker");
+
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("legacy cache should migrate");
+    let candidates = reopened
+      .native_candidates(validation.candidate_key())
+      .expect("migrated candidate should load");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].action_key, validation.action_key());
+  }
+
   #[test]
   fn concurrent_native_publications_converge_on_one_binding() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2853,7 +3331,6 @@ mod tests {
     assert_eq!(fs::read_dir(root.join("results")).expect("results").count(), 1);
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn verified_bundle_round_trips_exact_bytes_and_modes() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -2912,17 +3389,25 @@ mod tests {
       .expect("restored manifest must revalidate");
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn verified_bundle_round_trips_bounded_symlinks() {
-    use std::os::unix::fs::symlink;
-
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let restore_parent = tempfile::tempdir().expect("restore parent");
     fs::create_dir(output.path().join("target")).expect("target directory");
     fs::write(output.path().join("target/real"), b"bytes").expect("real output");
-    symlink("real", output.path().join("target/link")).expect("bounded output symlink");
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+
+      fs::set_permissions(output.path().join("target"), fs::Permissions::from_mode(0o755)).expect("target mode");
+      fs::set_permissions(output.path().join("target/real"), fs::Permissions::from_mode(0o644)).expect("file mode");
+      std::os::unix::fs::symlink("real", output.path().join("target/link")).expect("bounded output symlink");
+    }
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file("real", output.path().join("target/link"))
+      .expect("Windows test host must permit file symlinks");
     let manifest = manifest(vec![
       OutputEntry {
         path: "target".to_string(),
@@ -2960,7 +3445,35 @@ mod tests {
     );
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[cfg(windows)]
+  #[test]
+  fn windows_junctions_never_gain_cache_authority() {
+    let root = tempfile::tempdir().expect("junction root");
+    let target = root.path().join("target");
+    let removal_root = root.path().join("removal-root");
+    let junction = removal_root.join("junction");
+    fs::create_dir(&target).expect("junction target");
+    fs::create_dir(&removal_root).expect("removal root");
+    let output = std::process::Command::new("cmd.exe")
+      .args(["/D", "/C", "mklink", "/J"])
+      .arg(&junction)
+      .arg(&target)
+      .output()
+      .expect("create junction");
+    assert!(
+      output.status.success(),
+      "mklink failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metadata = fs::symlink_metadata(&junction).expect("junction metadata");
+    assert!(is_link_or_reparse(&metadata));
+    assert!(validate_real_directory(&junction, "junction").is_err());
+    safe_remove_tree(&removal_root).expect("remove tree without traversing junction");
+    assert!(target.is_dir());
+    assert!(!removal_root.exists());
+  }
+
   #[test]
   fn same_size_blob_tampering_is_a_corrupt_miss() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3024,7 +3537,49 @@ mod tests {
     );
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[cfg(windows)]
+  #[test]
+  fn hard_links_cannot_change_cache_authority() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let outside = tempfile::tempdir().expect("outside root");
+    let restore_parent = tempfile::tempdir().expect("restore parent");
+    let manifest = write_fixture(output.path(), b"linked");
+    let source = output.path().join("target/deps/artifact.rmeta");
+    let source_alias = outside.path().join("source-alias");
+    fs::hard_link(&source, &source_alias).expect("source hard link fixture");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let key = action_key(10);
+    let stored = store_fixture(&cas, output.path(), &key, &manifest);
+
+    fs::write(&source_alias, b"mutate").expect("mutate source through hard link");
+    let first_destination = restore_parent.path().join("source-alias-restore");
+    let CacheLookup::Hit(_) = cas.restore(&key, &first_destination) else {
+      panic!("source aliases must not affect the private CAS copy");
+    };
+    assert_eq!(
+      fs::read(first_destination.join("target/deps/artifact.rmeta")).expect("restored artifact"),
+      b"linked"
+    );
+
+    let result = stored.action_result.expect("action result identity");
+    let bundle = result_path(cas.root(), &result).expect("bundle path");
+    let blob = fs::read_dir(bundle.join("blobs"))
+      .expect("blob directory")
+      .next()
+      .expect("one blob")
+      .expect("blob entry")
+      .path();
+    let blob_alias = outside.path().join("blob-alias");
+    fs::hard_link(&blob, &blob_alias).expect("CAS blob hard link fixture");
+    fs::write(&blob_alias, b"mutate").expect("mutate CAS blob through hard link");
+    let CacheLookup::Miss(miss) = cas.restore(&key, &restore_parent.path().join("blob-alias-restore")) else {
+      panic!("a hard-linked blob mutation must never authorize reuse");
+    };
+    assert_eq!(miss.kind, CacheMissKind::Corrupt);
+    assert_eq!(miss.reason, "blob_digest_mismatch");
+  }
+
   #[test]
   fn missing_and_incompatible_objects_fail_closed() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3063,7 +3618,6 @@ mod tests {
     assert_eq!(incompatible.kind, CacheMissKind::Incompatible);
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn truncated_and_malicious_metadata_objects_fail_closed() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3183,7 +3737,6 @@ mod tests {
     );
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn hostile_prepositioned_materialization_root_is_preserved() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3203,7 +3756,6 @@ mod tests {
     assert_eq!(fs::read(destination.join("keep")).expect("sentinel"), b"keep");
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn concurrent_writers_converge_on_one_complete_bundle() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3244,7 +3796,106 @@ mod tests {
     );
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
+  #[test]
+  fn concurrent_reader_sees_only_a_miss_or_one_complete_publication() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let restore_parent = tempfile::tempdir().expect("restore parent");
+    let manifest = Arc::new(write_fixture(output.path(), b"concurrent"));
+    let key = action_key(15);
+    let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
+    let barrier = Arc::new(Barrier::new(2));
+    let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| {
+      let writer_cas = Arc::clone(&cas);
+      let writer_manifest = Arc::clone(&manifest);
+      let writer_barrier = Arc::clone(&barrier);
+      let writer_published = Arc::clone(&published);
+      let writer_key = key.clone();
+      let writer = scope.spawn(move || {
+        writer_barrier.wait();
+        store_fixture(&writer_cas, output.path(), &writer_key, &writer_manifest);
+        writer_published.store(true, std::sync::atomic::Ordering::Release);
+      });
+
+      let reader_cas = Arc::clone(&cas);
+      let reader_barrier = Arc::clone(&barrier);
+      let reader_published = Arc::clone(&published);
+      let reader_key = key.clone();
+      let reader = scope.spawn(move || {
+        reader_barrier.wait();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for attempt in 0_u64.. {
+          let destination = restore_parent.path().join(format!("restore-{attempt}"));
+          match reader_cas.restore(&reader_key, &destination) {
+            CacheLookup::Miss(miss) if miss.kind == CacheMissKind::Miss && miss.reason == "action_not_found" => {
+              assert!(
+                !reader_published.load(std::sync::atomic::Ordering::Acquire),
+                "an action pin remained invisible after publication completed"
+              );
+              assert!(
+                std::time::Instant::now() < deadline,
+                "the writer did not complete in 10 seconds"
+              );
+              std::thread::yield_now();
+            }
+            CacheLookup::Miss(miss) => {
+              panic!(
+                "a concurrent reader observed a partial publication: {:?} ({})",
+                miss.kind, miss.reason
+              );
+            }
+            CacheLookup::Hit(_) => {
+              assert_eq!(
+                fs::read(destination.join("target/deps/artifact.rmeta")).expect("restored artifact"),
+                b"concurrent"
+              );
+              return;
+            }
+          }
+        }
+      });
+
+      writer.join().expect("writer should publish");
+      reader.join().expect("reader should observe the publication");
+    });
+  }
+
+  #[test]
+  fn capacity_refusal_publishes_no_authoritative_state() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let manifest = write_fixture(output.path(), b"payload");
+    let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
+    let cas = LocalCas {
+      root: initialized.root.clone(),
+      max_bytes: 1,
+    };
+    let key = action_key(16);
+    let lookup = super::super::test_pre_context_lookup_key();
+    let result = super::super::hermetic_result_digest(&key, manifest.digest());
+    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let error = cas
+      .store(StoreRequest {
+        action_key: &key,
+        lookup_key: &lookup,
+        result_digest: &result,
+        manifest: &manifest,
+        validation: &validation,
+        compiler_units: 1,
+        source_root: output.path(),
+      })
+      .expect_err("an exhausted cache must refuse publication");
+    assert!(error.to_string().contains("above the local CAS limit"), "{error}");
+    assert_eq!(fs::read_dir(cas.root.join("pins")).expect("pins").count(), 0);
+    assert_eq!(fs::read_dir(cas.root.join("results")).expect("results").count(), 0);
+    assert_eq!(fs::read_dir(cas.root.join("staging")).expect("staging").count(), 0);
+    assert_eq!(
+      fs::read(output.path().join("target/deps/artifact.rmeta")).unwrap(),
+      b"payload"
+    );
+  }
+
   #[test]
   fn interrupted_staging_state_never_authorizes_reuse() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3269,6 +3920,85 @@ mod tests {
       panic!("an unrelated complete publication must remain reusable");
     };
     assert!(orphan.exists(), "only atomic pin publication may authorize a result");
+  }
+
+  #[test]
+  fn process_death_during_publication_leaves_no_authoritative_state() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_PROCESS_DEATH_CACHE";
+    const OUTPUT_ENV: &str = "CARGO_RAIL_TEST_CAS_PROCESS_DEATH_OUTPUT";
+    const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_AFTER_FIRST_OBJECT";
+
+    let root = tempfile::tempdir().expect("process-death root");
+    let cache = root.path().join("cache");
+    let output = root.path().join("output");
+    let control = root.path().join("control");
+    fs::create_dir(&cache).expect("cache base");
+    fs::create_dir(&output).expect("output base");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+      .args([
+        "--exact",
+        "hermetic::cas::tests::process_death_publication_worker",
+        "--nocapture",
+      ])
+      .env(CACHE_ENV, &cache)
+      .env(OUTPUT_ENV, &output)
+      .env(PAUSE_ENV, &control)
+      .spawn()
+      .expect("publication worker should start");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !control.join("ready").is_file() {
+      assert!(
+        child.try_wait().expect("worker status").is_none(),
+        "publication worker exited before reaching the partial-write boundary"
+      );
+      assert!(
+        std::time::Instant::now() < deadline,
+        "publication worker did not reach the partial-write boundary"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().expect("publication worker should be terminated");
+    let status = child.wait().expect("publication worker status");
+    assert!(
+      !status.success(),
+      "a terminated publication worker must not report success"
+    );
+
+    let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should reopen after process death");
+    let restore_parent = root.path().join("restore");
+    fs::create_dir(&restore_parent).expect("restore parent");
+    let CacheLookup::Miss(miss) = cas.restore(&action_key(17), &restore_parent.join("result")) else {
+      panic!("partial staging state must not authorize reuse");
+    };
+    assert_eq!(miss.kind, CacheMissKind::Miss);
+    assert_eq!(miss.reason, "action_not_found");
+    assert_eq!(fs::read_dir(cas.root.join("pins")).expect("pins").count(), 0);
+    assert_eq!(fs::read_dir(cas.root.join("results")).expect("results").count(), 0);
+    assert!(
+      fs::read_dir(cas.root.join("staging"))
+        .expect("staging")
+        .next()
+        .is_some(),
+      "process death should leave the partial staging tree exercised by this test"
+    );
+    remove_owned_root_at(&cas.root).expect("owned cleanup should remove partial staging");
+    assert!(!cas.root.exists());
+    assert!(cache.exists(), "cleanup must preserve the configured cache base");
+  }
+
+  #[test]
+  fn process_death_publication_worker() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_PROCESS_DEATH_CACHE";
+    const OUTPUT_ENV: &str = "CARGO_RAIL_TEST_CAS_PROCESS_DEATH_OUTPUT";
+    let (Some(cache), Some(output)) = (std::env::var_os(CACHE_ENV), std::env::var_os(OUTPUT_ENV)) else {
+      return;
+    };
+    let cache = PathBuf::from(cache);
+    let output = PathBuf::from(output);
+    let manifest = write_fixture(&output, b"partial publication");
+    let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("worker CAS should open");
+    store_fixture(&cas, &output, &action_key(17), &manifest);
   }
 
   #[test]
@@ -3366,7 +4096,6 @@ mod tests {
     assert!(cas.root().exists());
   }
 
-  #[cfg_attr(not(unix), ignore = "local CAS reuse currently models Unix output modes")]
   #[test]
   fn deterministic_gc_removes_unpinned_bundles() {
     let cache = tempfile::tempdir().expect("cache base");
@@ -3378,5 +4107,32 @@ mod tests {
     cas.garbage_collect(0, None).expect("GC should be deterministic");
     assert_eq!(fs::read_dir(cas.root().join("pins")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(cas.root().join("results")).unwrap().count(), 0);
+  }
+
+  #[test]
+  fn native_gc_removes_discovery_entries_with_authoritative_pins() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    let candidate_hex = validated_id_hex(
+      validation.candidate_key(),
+      crate::compiler::native_cache::CANDIDATE_KEY_PREFIX,
+    )
+    .expect("candidate key");
+    let candidate_directory = cas.root().join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
+    assert_eq!(
+      fs::read_dir(&candidate_directory).expect("candidate directory").count(),
+      1
+    );
+
+    cas.garbage_collect(0, None).expect("GC should remove native result");
+    assert_eq!(fs::read_dir(cas.root().join("pins")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(cas.root().join("results")).unwrap().count(), 0);
+    assert_eq!(
+      fs::read_dir(candidate_directory).expect("candidate directory").count(),
+      0
+    );
   }
 }

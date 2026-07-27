@@ -134,10 +134,17 @@ executable identities. `execution.cache_wrapper` explains the separate native co
   `compiler_flag_not_graduated`, `filesystem_reading_macro_not_graduated`,
   `compiler_crate_type_not_graduated`, `dependency_artifact_class_not_graduated`, and
   `cross_target_not_graduated`;
-- proof-boundary reasons include `native_cache_platform_not_graduated`, `native_cache_toolchain_not_graduated`,
-  `native_cache_session_unavailable`, `compiler_inputs_incomplete`, `secret_compiler_environment`,
-  `complete_compiler_observation_unavailable`, `compiler_output_root_not_graduated`,
-  `local_cache_candidate_corrupt`, and `verified_result_materialization_failed`.
+- action-level proof reasons include `native_cache_platform_not_graduated`, `native_cache_toolchain_not_graduated`,
+  `native_cache_toolchain_incoherent`, `native_cache_capability_not_certified`,
+  `native_cache_capability_unavailable`, `configured_linker_not_graduated`, `codegen_backend_not_graduated`, and
+  `custom_sysroot_not_graduated`;
+- per-invocation proof reasons include `native_cache_session_unavailable`, `compiler_inputs_incomplete`,
+  `secret_compiler_environment`, `complete_compiler_observation_unavailable`,
+  `compiler_output_root_not_graduated`, `local_cache_candidate_corrupt`, and
+  `verified_result_materialization_failed`.
+
+Run `cargo rail doctor native-cache --format json` to inspect the exact candidate identity and whether the embedded
+registry certifies it. A missing certificate is a cold execution boundary, not an execution failure.
 
 The cargo-rail diagnostic wrapper remains in Cargo's workspace-wrapper position; an existing workspace wrapper runs
 inside it. A custom or renamed cache receives the generic existing-wrapper reason, but still cannot be double-wrapped.
@@ -145,11 +152,11 @@ Remove cargo-rail itself from `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, or the
 the recursive-wrapper error appears; cargo-rail inserts its own roles.
 
 There is no global “compiler caching supported” state. Native reuse is machine-local and currently requires
-`aarch64-apple-darwin` or `aarch64-unknown-linux-gnu`, Cargo/rustc 1.97.1, `CARGO_INCREMENTAL=0`, no existing wrapper,
-and an ordinary `build` or `distribution` action. Eligible dependency and workspace units are `lib` rustc invocations
-with one declared crate root, complete observed inputs, dep-info plus metadata and optional rlib output, only
-`.rmeta`/`.rlib` dependency artifacts, and no native linker responsibility. Proc macros, build scripts, binaries,
-tests, linked crate types, and every unsupported boundary still execute cold.
+a host and exact Cargo/rustc release listed in the generated [support matrix](cache-capabilities.md),
+`CARGO_INCREMENTAL=0`, no existing wrapper, and an ordinary `build` or `distribution` action. Eligible dependency and
+workspace units are `lib` rustc invocations with one declared crate root, complete observed inputs, dep-info plus
+metadata and optional rlib output, only `.rmeta`/`.rlib` dependency artifacts, and no native linker responsibility.
+Proc macros, build scripts, binaries, tests, linked crate types, and every unsupported boundary still execute cold.
 
 `candidate_key` is only an index. `action_key` appears only after the stored observation's source, dependency, and
 environment inputs are re-digested. `bytes_hashed` and `bytes_restored` make the per-invocation cost visible. Delete

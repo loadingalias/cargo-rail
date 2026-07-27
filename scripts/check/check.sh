@@ -43,7 +43,7 @@ else
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 fi
 
-# Generated docs must match the CLI and native-cache production gates.
+# Generated docs must match the CLI and executable support authorities.
 echo "Generated documentation..."
 scripts/docs/generate.sh --check
 

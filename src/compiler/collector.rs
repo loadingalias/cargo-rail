@@ -14,7 +14,8 @@ use crate::compiler::model::{
 };
 use crate::compiler::native_cache::{
   DIAGNOSTIC_EXECUTION_CONTRACT, DirectNativeCacheIdentity, DirectNativeCacheSetup, NativeCompilerSession, SESSION_ENV,
-  direct_cache_bypass_reason, prepare_direct_cargo_cache,
+  direct_cache_bypass_reason, direct_target_configuration_bypass_reason, direct_toolchain_coherence_bypass_reason,
+  prepare_direct_cargo_cache,
 };
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
@@ -28,17 +29,21 @@ use crate::compiler::wrapper::{
 };
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
+#[cfg(target_os = "macos")]
+use crate::hermetic::cas::LocalCas;
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
 use cargo_metadata::{Message, PackageId, TargetKind};
-use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,12 +95,61 @@ pub(crate) struct CompilerCacheIdentity {
   cache_wrapper_plan: CacheWrapperPlan,
   executable_bypasses: BTreeSet<String>,
   cache_bypass_reason: Option<&'static str>,
+  native_cache_bypass_reason: Option<&'static str>,
+  native_cache_capability_identity: Option<String>,
 }
 
 #[derive(Clone)]
 struct BuildScriptPackageContext {
   package_id: PackageId,
   working_directory: String,
+}
+
+/// Exact, root-independent identity considered for native-cache graduation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct NativeToolchainCapability {
+  schema_version: u32,
+  cache_class: &'static str,
+  execution_contract: &'static str,
+  platform: String,
+  host_target: String,
+  cargo_verbose_version: String,
+  rustc_verbose_version: String,
+  rustdoc_verbose_version: String,
+  cargo_content_digest: String,
+  rustc_content_digest: String,
+  rustdoc_content_digest: String,
+  sysroot_identity: String,
+  identity: String,
+  certified: bool,
+  evidence: Option<String>,
+}
+
+impl NativeToolchainCapability {
+  pub(crate) fn platform(&self) -> &str {
+    &self.platform
+  }
+
+  pub(crate) fn host_target(&self) -> &str {
+    &self.host_target
+  }
+
+  pub(crate) fn identity(&self) -> &str {
+    &self.identity
+  }
+
+  pub(crate) const fn is_certified(&self) -> bool {
+    self.certified
+  }
+
+  pub(crate) fn evidence(&self) -> Option<&str> {
+    self.evidence.as_deref()
+  }
+}
+
+struct CapturedNativeToolchainCapability {
+  report: NativeToolchainCapability,
+  bytes_hashed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,13 +177,46 @@ impl CompilerCacheIdentity {
       snapshot.toolchain().rustc_workspace_wrapper_program(),
     );
     let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
+    let mut native_cache_bypass_reason = direct_toolchain_coherence_bypass_reason(
+      snapshot.toolchain().cargo_verbose_version(),
+      snapshot.toolchain().rustc_verbose_version(),
+      snapshot.toolchain().rustdoc_verbose_version(),
+    )
+    .or_else(|| direct_target_configuration_bypass_reason(snapshot.targets()))
+    .or(cache_bypass_reason)
+    .or_else(|| {
+      direct_cache_bypass_reason(
+        snapshot.toolchain().rustc_verbose_version(),
+        snapshot.toolchain().cargo_verbose_version(),
+        cache_wrapper_plan,
+      )
+    });
+    let native_capability = if native_cache_bypass_reason.is_none() {
+      match capture_native_toolchain_capability(snapshot, executables) {
+        Ok(capability) if capability.report.is_certified() => Some(capability),
+        Ok(_) => {
+          native_cache_bypass_reason = Some("native_cache_capability_not_certified");
+          None
+        }
+        Err(_) => {
+          native_cache_bypass_reason = Some("native_cache_capability_unavailable");
+          None
+        }
+      }
+    } else {
+      None
+    };
     let (toolchain_fingerprint, _) = executable_toolchain_fingerprint(
       snapshot,
       executables,
       &cargo_rail_executable,
       cache_wrapper_plan,
-      cache_bypass_reason,
+      native_cache_bypass_reason,
+      native_capability.as_ref(),
     )?;
+    let native_cache_capability_identity = native_capability
+      .as_ref()
+      .map(|capability| capability.report.identity().to_string());
     let target_fingerprints = target_fingerprints(snapshot)?;
     let lock_fingerprint = snapshot.lockfile_fingerprint();
     let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
@@ -165,7 +252,7 @@ impl CompilerCacheIdentity {
         .map(|limitation| format!("compiler_wrapper_{limitation}")),
     );
     let mut wrapper_chain = Vec::with_capacity(4);
-    if cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none() {
+    if cache_wrapper_plan.installs_cargo_rail() && native_cache_bypass_reason.is_none() {
       wrapper_chain.push(CompilerWrapperIdentity::new(
         CompilerWrapperRole::Cache,
         cargo_rail_executable.clone(),
@@ -189,7 +276,7 @@ impl CompilerCacheIdentity {
     );
     let cache_wrapper = CompilerCacheWrapperMetadata::new(
       CompilerCacheWrapperStatus::Bypassed,
-      cache_bypass_reason.unwrap_or_else(|| cache_wrapper_plan.reason()),
+      native_cache_bypass_reason.unwrap_or_else(|| cache_wrapper_plan.reason()),
     );
 
     Ok(Self {
@@ -215,27 +302,42 @@ impl CompilerCacheIdentity {
       cache_wrapper_plan,
       executable_bypasses,
       cache_bypass_reason,
+      native_cache_bypass_reason,
+      native_cache_capability_identity,
     })
   }
 }
 
 /// Prepare native reuse for an ordinary Cargo action without capturing
 /// diagnostic-only package graphs and source closures.
-pub(crate) fn prepare_direct_cargo_action(snapshot: &WorkspaceSnapshot) -> RailResult<DirectNativeCacheSetup> {
+pub(crate) fn prepare_direct_cargo_action(
+  snapshot: &WorkspaceSnapshot,
+  retain_event_evidence: bool,
+) -> RailResult<DirectNativeCacheSetup> {
   let toolchain = snapshot.toolchain();
   let wrapper_plan = CacheWrapperPlan::for_chain(
     toolchain.rustc_wrapper_program(),
     toolchain.rustc_workspace_wrapper_program(),
   );
+  if let Some(reason) = direct_toolchain_coherence_bypass_reason(
+    toolchain.cargo_verbose_version(),
+    toolchain.rustc_verbose_version(),
+    toolchain.rustdoc_verbose_version(),
+  ) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
+  if !snapshot.cargo_config().unmodeled_settings().is_empty() {
+    return Ok(DirectNativeCacheSetup::Bypassed("cargo_configuration_unmodeled"));
+  }
+  if let Some(reason) = direct_target_configuration_bypass_reason(snapshot.targets()) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
   if let Some(reason) = direct_cache_bypass_reason(
     toolchain.rustc_verbose_version(),
     toolchain.cargo_verbose_version(),
     wrapper_plan,
   ) {
     return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if !snapshot.cargo_config().unmodeled_settings().is_empty() {
-    return Ok(DirectNativeCacheSetup::Bypassed("cargo_configuration_unmodeled"));
   }
   if !snapshot
     .base_resolution()
@@ -258,8 +360,25 @@ pub(crate) fn prepare_direct_cargo_action(snapshot: &WorkspaceSnapshot) -> RailR
     snapshot.source_root(),
   )?;
   let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-  let (toolchain_fingerprint, setup_bytes_hashed) =
-    executable_toolchain_fingerprint(snapshot, executables, &cargo_rail_executable, wrapper_plan, None)?;
+  let native_capability = match capture_native_toolchain_capability(snapshot, executables) {
+    Ok(capability) if capability.report.is_certified() => capability,
+    Ok(_) => {
+      return Ok(DirectNativeCacheSetup::Bypassed(
+        "native_cache_capability_not_certified",
+      ));
+    }
+    Err(_) => {
+      return Ok(DirectNativeCacheSetup::Bypassed("native_cache_capability_unavailable"));
+    }
+  };
+  let (toolchain_fingerprint, setup_bytes_hashed) = executable_toolchain_fingerprint(
+    snapshot,
+    executables,
+    &cargo_rail_executable,
+    wrapper_plan,
+    None,
+    Some(&native_capability),
+  )?;
   let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
   let cargo_config_fingerprint = cargo_config_fingerprint(snapshot)?;
   let lock_fingerprint = snapshot.lockfile_fingerprint();
@@ -272,8 +391,10 @@ pub(crate) fn prepare_direct_cargo_action(snapshot: &WorkspaceSnapshot) -> RailR
     compiler_env_fingerprint: &compiler_env_fingerprint,
     cargo_config_fingerprint: &cargo_config_fingerprint,
     lock_fingerprint: &lock_fingerprint,
+    capability_identity: native_capability.report.identity(),
     wrapper_plan,
     setup_bytes_hashed,
+    retain_event_evidence,
   }))
 }
 
@@ -798,21 +919,29 @@ fn run_workspace_check(
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
   let native_cache_enabled =
-    identity.cache_wrapper_plan.installs_cargo_rail() && identity.cache_bypass_reason.is_none();
-  let native_cache_session = native_cache_enabled.then(|| {
-    NativeCompilerSession::write(
-      observation_directory.path(),
-      workspace_root,
-      &identity.rustc_version,
-      &identity.cargo_version,
-      &identity.toolchain_fingerprint,
-      &identity.compiler_env_fingerprint,
-      &identity.cargo_config_fingerprint,
-      &identity.lock_fingerprint,
-      DIAGNOSTIC_EXECUTION_CONTRACT,
+    identity.cache_wrapper_plan.installs_cargo_rail() && identity.native_cache_bypass_reason.is_none();
+  let native_cache_session = if native_cache_enabled {
+    let capability_identity = identity.native_cache_capability_identity.as_deref().ok_or_else(|| {
+      RailError::message("native cache is enabled without a captured toolchain capability certificate")
+    })?;
+    Some(
+      NativeCompilerSession::write(
+        observation_directory.path(),
+        workspace_root,
+        &identity.rustc_version,
+        &identity.cargo_version,
+        capability_identity,
+        &identity.toolchain_fingerprint,
+        &identity.compiler_env_fingerprint,
+        &identity.cargo_config_fingerprint,
+        &identity.lock_fingerprint,
+        DIAGNOSTIC_EXECUTION_CONTRACT,
+      )
+      .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable")),
     )
-    .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable"))
-  });
+  } else {
+    None
+  };
 
   let mut args: Vec<OsString> = vec![
     "check".into(),
@@ -1310,24 +1439,137 @@ fn reconcile_exact_artifact_observations(
   }
 }
 
+/// Capture the exact native-cache capability candidate for operator inspection.
+pub(crate) fn native_cache_capability(snapshot: &WorkspaceSnapshot) -> RailResult<NativeToolchainCapability> {
+  let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
+  Ok(capture_native_toolchain_capability(snapshot, executables)?.report)
+}
+
+fn capture_native_toolchain_capability(
+  snapshot: &WorkspaceSnapshot,
+  executables: &ToolchainExecutableIdentities,
+) -> RailResult<CapturedNativeToolchainCapability> {
+  fn implementation_digest<'a>(executable: Option<&'a ExecutableIdentity>, name: &str) -> RailResult<&'a str> {
+    executable.map(ExecutableIdentity::content_digest).ok_or_else(|| {
+      RailError::message(format!(
+        "native-cache capability cannot resolve the sysroot {name} implementation"
+      ))
+    })
+  }
+
+  let toolchain = snapshot.toolchain();
+  let platform = format!(
+    "{}-{}-{}",
+    std::env::consts::FAMILY,
+    std::env::consts::OS,
+    std::env::consts::ARCH
+  );
+  let cargo_content_digest = implementation_digest(executables.cargo_implementation(), "Cargo")?.to_string();
+  let rustc_content_digest = implementation_digest(executables.rustc_implementation(), "rustc")?.to_string();
+  let rustdoc_content_digest = implementation_digest(executables.rustdoc_implementation(), "rustdoc")?.to_string();
+  let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target());
+  let (sysroot_identity, bytes_hashed) =
+    compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
+
+  let mut framed = Vec::from(&b"cargo-rail-native-toolchain-capability-v1\0"[..]);
+  append_identity_frame(
+    &mut framed,
+    b"cache-class",
+    crate::compiler::native_cache::native_cache_class().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"execution-contract",
+    crate::compiler::native_cache::native_cache_execution_contract().as_bytes(),
+  );
+  append_identity_frame(&mut framed, b"platform", platform.as_bytes());
+  append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
+  append_identity_frame(
+    &mut framed,
+    b"cargo-version",
+    toolchain.cargo_verbose_version().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"rustc-version",
+    toolchain.rustc_verbose_version().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"rustdoc-version",
+    toolchain.rustdoc_verbose_version().as_bytes(),
+  );
+  append_identity_frame(&mut framed, b"cargo-content", cargo_content_digest.as_bytes());
+  append_identity_frame(&mut framed, b"rustc-content", rustc_content_digest.as_bytes());
+  append_identity_frame(&mut framed, b"rustdoc-content", rustdoc_content_digest.as_bytes());
+  append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
+  let identity = format!("sha256:{}", ContentDigest::sha256(&framed));
+  let evidence =
+    crate::compiler::native_cache::native_cache_capability_evidence(&platform, toolchain.host_target(), &identity)
+      .map(str::to_string);
+
+  Ok(CapturedNativeToolchainCapability {
+    report: NativeToolchainCapability {
+      schema_version: crate::compiler::native_cache::native_cache_capability_schema_version(),
+      cache_class: crate::compiler::native_cache::native_cache_class(),
+      execution_contract: crate::compiler::native_cache::native_cache_execution_contract(),
+      platform,
+      host_target: toolchain.host_target().to_string(),
+      cargo_verbose_version: toolchain.cargo_verbose_version().to_string(),
+      rustc_verbose_version: toolchain.rustc_verbose_version().to_string(),
+      rustdoc_verbose_version: toolchain.rustdoc_verbose_version().to_string(),
+      cargo_content_digest,
+      rustc_content_digest,
+      rustdoc_content_digest,
+      sysroot_identity,
+      identity,
+      certified: evidence.is_some(),
+      evidence,
+    },
+    bytes_hashed,
+  })
+}
+
 fn executable_toolchain_fingerprint(
   snapshot: &WorkspaceSnapshot,
   executables: &ToolchainExecutableIdentities,
   cargo_rail_executable: &ExecutableIdentity,
   cache_wrapper_plan: CacheWrapperPlan,
   cache_bypass_reason: Option<&'static str>,
+  native_capability: Option<&CapturedNativeToolchainCapability>,
 ) -> RailResult<(String, u64)> {
   let toolchain = snapshot.toolchain();
   let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
   append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
   let native_cache_enabled = cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none();
-  let setup_bytes_hashed = if native_cache_enabled && native_sysroot_identity_required(toolchain) {
-    let (identity, bytes_hashed) = compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target())?;
-    append_identity_frame(&mut framed, b"compiler-sysroot", identity.as_bytes());
-    bytes_hashed
-  } else {
-    0
-  };
+  if native_cache_enabled && native_capability.is_none() {
+    return Err(RailError::message(
+      "native cache cannot activate without a toolchain capability certificate",
+    ));
+  }
+  let setup_bytes_hashed = native_capability.map_or(0, |capability| capability.bytes_hashed);
+  if let Some(capability) = native_capability {
+    append_identity_frame(
+      &mut framed,
+      b"native-toolchain-capability",
+      capability.report.identity().as_bytes(),
+    );
+  }
+  append_identity_frame(
+    &mut framed,
+    b"cargo-version",
+    toolchain.cargo_verbose_version().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"rustc-version",
+    toolchain.rustc_verbose_version().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"rustdoc-version",
+    toolchain.rustdoc_verbose_version().as_bytes(),
+  );
   append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
   append_identity_frame(&mut framed, b"platform-family", std::env::consts::FAMILY.as_bytes());
   append_identity_frame(&mut framed, b"platform-os", std::env::consts::OS.as_bytes());
@@ -1354,19 +1596,121 @@ fn executable_toolchain_fingerprint(
   Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), setup_bytes_hashed))
 }
 
-fn native_sysroot_identity_required(toolchain: &crate::cargo::ToolchainIdentity) -> bool {
-  direct_cache_bypass_reason(
-    toolchain.rustc_verbose_version(),
-    toolchain.cargo_verbose_version(),
-    CacheWrapperPlan::DisabledPassThrough,
-  )
-  .is_none()
+#[cfg(target_os = "macos")]
+const SYSROOT_MEMO_VERSION: u32 = 2;
+#[cfg(target_os = "macos")]
+const MAX_SYSROOT_MEMO_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_GENERATION_IDENTIFIER_BYTES: usize = 256;
+const MAX_SYSROOT_FILES: usize = 4096;
+const MAX_SYSROOT_BYTES: u64 = 1024 * 1024 * 1024;
+
+struct CompilerSysrootInventory {
+  #[cfg(target_os = "macos")]
+  root: PathBuf,
+  files: Vec<(String, PathBuf)>,
+  #[cfg(target_os = "macos")]
+  evidence_locations: Vec<SysrootEvidenceLocation>,
 }
 
-fn compiler_sysroot_fingerprint(sysroot: &Path, host_target: &str) -> RailResult<(String, u64)> {
-  const MAX_FILES: usize = 4096;
-  const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SysrootEvidenceKind {
+  Directory,
+  File,
+}
 
+#[cfg(target_os = "macos")]
+struct SysrootEvidenceLocation {
+  kind: SysrootEvidenceKind,
+  relative_path: String,
+  physical_path: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SysrootChangeEvidence {
+  kind: SysrootEvidenceKind,
+  relative_path: String,
+  generation_identifier: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactSysrootEvidence {
+  volume_identifier: Vec<u8>,
+  entries: Vec<SysrootChangeEvidence>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SysrootIdentityMemo {
+  version: u32,
+  sysroot: String,
+  host_target: String,
+  fingerprint: String,
+  volume_identifier: Vec<u8>,
+  entries: Vec<SysrootChangeEvidence>,
+  memo_digest: String,
+}
+
+#[cfg(target_os = "macos")]
+fn compiler_sysroot_memo_path(sysroot: &Path, host_target: &str) -> Option<PathBuf> {
+  let sysroot = crate::utils::canonicalize_existing(sysroot).ok()?;
+  let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-location-v1\0"[..]);
+  append_identity_frame(&mut framed, b"sysroot", sysroot.as_os_str().as_encoded_bytes());
+  append_identity_frame(&mut framed, b"host-target", host_target.as_bytes());
+  let lookup = ContentDigest::sha256(&framed);
+  LocalCas::open().ok().map(|cas| cas.sysroot_identity_memo_path(&lookup))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn compiler_sysroot_memo_path(_sysroot: &Path, _host_target: &str) -> Option<PathBuf> {
+  None
+}
+
+fn compiler_sysroot_fingerprint(
+  sysroot: &Path,
+  host_target: &str,
+  memo_path: Option<&Path>,
+) -> RailResult<(String, u64)> {
+  let _sysroot_fingerprinting_phase = crate::instrumentation::sysroot_fingerprinting_phase();
+  let inventory = compiler_sysroot_inventory(sysroot, host_target)?;
+
+  #[cfg(target_os = "macos")]
+  if let Some(memo_path) = memo_path
+    && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, host_target)
+    && let Some(before) = capture_exact_sysroot_evidence(&inventory)
+    && before.volume_identifier == memo.volume_identifier
+    && before.entries == memo.entries
+    && capture_exact_sysroot_evidence(&inventory).as_ref() == Some(&before)
+  {
+    return Ok((memo.fingerprint, 0));
+  }
+
+  #[cfg(target_os = "macos")]
+  let before = memo_path.and_then(|_| capture_exact_sysroot_evidence(&inventory));
+  #[cfg(not(target_os = "macos"))]
+  let _ = memo_path;
+  let fingerprint = hash_compiler_sysroot(&inventory)?;
+
+  #[cfg(target_os = "macos")]
+  if let (Some(memo_path), Some(before)) = (memo_path, before)
+    && let Ok(after_inventory) = compiler_sysroot_inventory(sysroot, host_target)
+    && inventory.files == after_inventory.files
+    && let Some(after) = capture_exact_sysroot_evidence(&after_inventory)
+    && before == after
+  {
+    publish_sysroot_identity_memo(memo_path, &after_inventory, host_target, &fingerprint.0, after);
+  }
+
+  Ok(fingerprint)
+}
+
+fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<CompilerSysrootInventory> {
   let sysroot = crate::utils::canonicalize_existing(sysroot)?;
   let rustlib = sysroot.join("lib/rustlib").join(host_target);
   let target_lib = rustlib.join("lib");
@@ -1374,6 +1718,10 @@ fn compiler_sysroot_fingerprint(sysroot: &Path, host_target: &str) -> RailResult
   let driver_lib = sysroot.join("bin");
   #[cfg(not(windows))]
   let driver_lib = sysroot.join("lib");
+  validate_sysroot_directory(&rustlib)?;
+  validate_sysroot_directory(&target_lib)?;
+  validate_sysroot_directory(&driver_lib)?;
+
   let mut files = Vec::new();
   for entry in std::fs::read_dir(&target_lib)? {
     let path = entry?.path();
@@ -1401,36 +1749,117 @@ fn compiler_sysroot_fingerprint(sysroot: &Path, host_target: &str) -> RailResult
     }
   }
   let codegen_backends = rustlib.join("codegen-backends");
-  if codegen_backends.is_dir() {
-    for entry in std::fs::read_dir(codegen_backends)? {
-      let path = entry?.path();
-      let metadata = std::fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(RailError::message("compiler codegen backend is not a regular file"));
+  match std::fs::symlink_metadata(&codegen_backends) {
+    Ok(metadata) => {
+      if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(
+          "compiler codegen backend sysroot entry is not a real directory",
+        ));
       }
-      files.push(path);
+      for entry in std::fs::read_dir(&codegen_backends)? {
+        let path = entry?.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+          return Err(RailError::message("compiler codegen backend is not a regular file"));
+        }
+        files.push(path);
+      }
     }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => return Err(error.into()),
   }
   files.sort();
-  if driver_files == 0 || files.len() > MAX_FILES {
+  if driver_files == 0 || files.len() > MAX_SYSROOT_FILES {
     return Err(RailError::message(
       "compiler sysroot has no bounded host library inventory",
     ));
   }
 
+  let files = files
+    .into_iter()
+    .map(|path| {
+      let relative = sysroot_relative_path(&sysroot, &path)?;
+      Ok((relative, path))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+
+  #[cfg(target_os = "macos")]
+  let evidence_locations = {
+    let mut locations = vec![
+      evidence_location(&sysroot, &sysroot, SysrootEvidenceKind::Directory)?,
+      evidence_location(&sysroot, &rustlib, SysrootEvidenceKind::Directory)?,
+      evidence_location(&sysroot, &target_lib, SysrootEvidenceKind::Directory)?,
+      evidence_location(&sysroot, &driver_lib, SysrootEvidenceKind::Directory)?,
+    ];
+    if codegen_backends.is_dir() {
+      locations.push(evidence_location(
+        &sysroot,
+        &codegen_backends,
+        SysrootEvidenceKind::Directory,
+      )?);
+    }
+    locations.extend(
+      files
+        .iter()
+        .map(|(relative_path, physical_path)| SysrootEvidenceLocation {
+          kind: SysrootEvidenceKind::File,
+          relative_path: relative_path.clone(),
+          physical_path: physical_path.clone(),
+        }),
+    );
+    locations.sort_by(|left, right| (&left.kind, &left.relative_path).cmp(&(&right.kind, &right.relative_path)));
+    locations.dedup_by(|left, right| left.kind == right.kind && left.relative_path == right.relative_path);
+    locations
+  };
+
+  Ok(CompilerSysrootInventory {
+    #[cfg(target_os = "macos")]
+    root: sysroot,
+    files,
+    #[cfg(target_os = "macos")]
+    evidence_locations,
+  })
+}
+
+fn validate_sysroot_directory(path: &Path) -> RailResult<()> {
+  let metadata = std::fs::symlink_metadata(path)?;
+  if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
+    return Ok(());
+  }
+  Err(RailError::message(format!(
+    "compiler sysroot path '{}' is not a real directory",
+    path.display()
+  )))
+}
+
+fn sysroot_relative_path(sysroot: &Path, path: &Path) -> RailResult<String> {
+  let relative = path
+    .strip_prefix(sysroot)
+    .map_err(|_| RailError::message("compiler sysroot entry escaped its root"))?;
+  if relative.as_os_str().is_empty() {
+    return Ok(".".to_string());
+  }
+  relative
+    .to_str()
+    .map(|path| path.replace('\\', "/"))
+    .ok_or_else(|| RailError::message("compiler sysroot entry is not valid UTF-8"))
+}
+
+fn hash_compiler_sysroot(inventory: &CompilerSysrootInventory) -> RailResult<(String, u64)> {
   let mut total = 0u64;
   let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-v1\0"[..]);
-  for path in files {
-    let metadata = std::fs::metadata(&path)?;
+  for (relative, path) in &inventory.files {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+      return Err(RailError::message(
+        "compiler sysroot entry changed type during identity capture",
+      ));
+    }
     total = total.saturating_add(metadata.len());
-    if total > MAX_BYTES {
+    if total > MAX_SYSROOT_BYTES {
       return Err(RailError::message("compiler sysroot identity exceeds its byte limit"));
     }
-    let relative = path
-      .strip_prefix(&sysroot)
-      .map(crate::utils::path_to_git_format)
-      .map_err(|_| RailError::message("compiler sysroot entry escaped its root"))?;
-    let mut file = File::open(&path)?;
+    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut bytes_read = 0u64;
@@ -1456,6 +1885,156 @@ fn compiler_sysroot_fingerprint(sysroot: &Path, host_target: &str) -> RailResult
   }
   append_identity_frame(&mut framed, b"bytes", &total.to_le_bytes());
   Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), total))
+}
+
+#[cfg(target_os = "macos")]
+fn evidence_location(sysroot: &Path, path: &Path, kind: SysrootEvidenceKind) -> RailResult<SysrootEvidenceLocation> {
+  Ok(SysrootEvidenceLocation {
+    kind,
+    relative_path: sysroot_relative_path(sysroot, path)?,
+    physical_path: path.to_path_buf(),
+  })
+}
+
+#[cfg(target_os = "macos")]
+fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Option<ExactSysrootEvidence> {
+  let volume_identifier = foundation_resource_identifier(&inventory.root, "NSURLVolumeIdentifierKey")?;
+  let mut entries = Vec::with_capacity(inventory.evidence_locations.len());
+  for location in &inventory.evidence_locations {
+    let metadata = std::fs::symlink_metadata(&location.physical_path).ok()?;
+    let valid_kind = match location.kind {
+      SysrootEvidenceKind::Directory => metadata.is_dir(),
+      SysrootEvidenceKind::File => metadata.is_file(),
+    };
+    if !valid_kind || crate::utils::is_symlink_or_reparse(&metadata) {
+      return None;
+    }
+    entries.push(SysrootChangeEvidence {
+      kind: location.kind,
+      relative_path: location.relative_path.clone(),
+      generation_identifier: foundation_resource_identifier(&location.physical_path, "NSURLGenerationIdentifierKey")?,
+    });
+  }
+  Some(ExactSysrootEvidence {
+    volume_identifier,
+    entries,
+  })
+}
+
+#[cfg(target_os = "macos")]
+fn foundation_resource_identifier(path: &Path, key: &str) -> Option<Vec<u8>> {
+  let path = path.to_str()?;
+  let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+  let key = NSString::from_str(key);
+  let keys = NSArray::from_slice(&[&*key]);
+  let values = url.resourceValuesForKeys_error(&keys).ok()?;
+  let value = values.objectForKey(&key)?;
+  let bytes = value.downcast::<NSData>().ok()?.to_vec();
+  (!bytes.is_empty() && bytes.len() <= MAX_GENERATION_IDENTIFIER_BYTES).then_some(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn load_sysroot_identity_memo(
+  path: &Path,
+  inventory: &CompilerSysrootInventory,
+  host_target: &str,
+) -> Option<SysrootIdentityMemo> {
+  use std::os::unix::fs::MetadataExt as _;
+
+  let metadata = std::fs::symlink_metadata(path).ok()?;
+  if !metadata.is_file()
+    || crate::utils::is_symlink_or_reparse(&metadata)
+    || metadata.nlink() != 1
+    || metadata.len() > MAX_SYSROOT_MEMO_BYTES
+  {
+    return None;
+  }
+  let memo = serde_json::from_slice::<SysrootIdentityMemo>(&std::fs::read(path).ok()?).ok()?;
+  let sysroot = inventory.root.to_str()?;
+  if memo.version != SYSROOT_MEMO_VERSION
+    || memo.sysroot != sysroot
+    || memo.host_target != host_target
+    || !valid_sha256_identity(&memo.fingerprint)
+    || !valid_sha256_identity(&memo.memo_digest)
+    || memo.memo_digest != sysroot_identity_memo_digest(&memo)
+    || memo.volume_identifier.is_empty()
+    || memo.volume_identifier.len() > MAX_GENERATION_IDENTIFIER_BYTES
+    || memo.entries.len() != inventory.evidence_locations.len()
+    || memo.entries.iter().any(|entry| {
+      entry.relative_path.len() > 4096
+        || entry.generation_identifier.is_empty()
+        || entry.generation_identifier.len() > MAX_GENERATION_IDENTIFIER_BYTES
+    })
+    || !memo.entries.windows(2).all(|entries| entries[0] < entries[1])
+  {
+    return None;
+  }
+  Some(memo)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_sysroot_identity_memo(
+  path: &Path,
+  inventory: &CompilerSysrootInventory,
+  host_target: &str,
+  fingerprint: &str,
+  evidence: ExactSysrootEvidence,
+) {
+  let Some(sysroot) = inventory.root.to_str() else {
+    return;
+  };
+  let memo = SysrootIdentityMemo {
+    version: SYSROOT_MEMO_VERSION,
+    sysroot: sysroot.to_string(),
+    host_target: host_target.to_string(),
+    fingerprint: fingerprint.to_string(),
+    volume_identifier: evidence.volume_identifier,
+    entries: evidence.entries,
+    memo_digest: String::new(),
+  };
+  let memo = SysrootIdentityMemo {
+    memo_digest: sysroot_identity_memo_digest(&memo),
+    ..memo
+  };
+  let Ok(bytes) = serde_json::to_vec(&memo) else {
+    return;
+  };
+  if bytes.len() as u64 <= MAX_SYSROOT_MEMO_BYTES {
+    let _ = crate::utils::write_file_atomic(path, &bytes);
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn sysroot_identity_memo_digest(memo: &SysrootIdentityMemo) -> String {
+  let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-v2\0"[..]);
+  append_identity_frame(&mut framed, b"version", &memo.version.to_le_bytes());
+  append_identity_frame(&mut framed, b"sysroot", memo.sysroot.as_bytes());
+  append_identity_frame(&mut framed, b"host-target", memo.host_target.as_bytes());
+  append_identity_frame(&mut framed, b"fingerprint", memo.fingerprint.as_bytes());
+  append_identity_frame(&mut framed, b"volume-identifier", &memo.volume_identifier);
+  for entry in &memo.entries {
+    append_identity_frame(
+      &mut framed,
+      b"entry-kind",
+      match entry.kind {
+        SysrootEvidenceKind::Directory => b"directory",
+        SysrootEvidenceKind::File => b"file",
+      },
+    );
+    append_identity_frame(&mut framed, b"entry-path", entry.relative_path.as_bytes());
+    append_identity_frame(&mut framed, b"entry-generation", &entry.generation_identifier);
+  }
+  format!("sha256:{}", ContentDigest::sha256(&framed))
+}
+
+#[cfg(target_os = "macos")]
+fn valid_sha256_identity(identity: &str) -> bool {
+  identity.strip_prefix("sha256:").is_some_and(|digest| {
+    digest.len() == 64
+      && digest
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  })
 }
 
 #[cfg(windows)]
@@ -2348,14 +2927,63 @@ mod tests {
     std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
     std::fs::write(&driver, b"driver-one").expect("driver library");
 
-    let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("baseline fingerprint");
+    let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("baseline fingerprint");
     assert_eq!(baseline.1, 20);
     std::fs::write(target_lib.join("libcore-test.rlib"), b"target-two").expect("target mutation");
-    let target_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("target fingerprint");
+    let target_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("target fingerprint");
     assert_ne!(baseline.0, target_changed.0);
     std::fs::write(&driver, b"driver-two").expect("driver mutation");
-    let driver_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host").expect("driver fingerprint");
+    let driver_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("driver fingerprint");
     assert_ne!(target_changed.0, driver_changed.0);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn compiler_sysroot_memo_requires_exact_content_generation_evidence() {
+    let sysroot = tempfile::tempdir().expect("sysroot");
+    let memo_directory = tempfile::tempdir().expect("memo directory");
+    let memo = memo_directory.path().join("sysroot.json");
+    let target_lib = sysroot.path().join("lib/rustlib/test-host/lib");
+    std::fs::create_dir_all(&target_lib).expect("target lib");
+    let target = target_lib.join("libcore-test.rlib");
+    std::fs::write(&target, b"target-one").expect("target library");
+    let driver = sysroot.path().join("lib/librustc_driver-test.dylib");
+    std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
+    std::fs::write(&driver, b"driver-one").expect("driver library");
+
+    let baseline =
+      compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("baseline fingerprint");
+    assert_eq!(baseline.1, 20);
+    let memo_hit = compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("memo hit");
+    assert_eq!(memo_hit, (baseline.0.clone(), 0));
+
+    let mut corrupted =
+      serde_json::from_slice::<serde_json::Value>(&std::fs::read(&memo).expect("memo bytes")).expect("memo JSON");
+    corrupted["fingerprint"] =
+      serde_json::Value::String("sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string());
+    std::fs::write(&memo, serde_json::to_vec(&corrupted).expect("corrupted memo JSON")).expect("corrupted memo");
+    let recovered =
+      compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("corrupted memo recovery");
+    assert_eq!(recovered, baseline, "a corrupted memo must force a full hash");
+    let recovered_hit =
+      compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("recovered memo hit");
+    assert_eq!(recovered_hit, (baseline.0.clone(), 0));
+
+    let modified = std::fs::metadata(&target)
+      .and_then(|metadata| metadata.modified())
+      .expect("target modification time");
+    std::fs::write(&target, b"target-two").expect("same-size target mutation");
+    std::fs::OpenOptions::new()
+      .write(true)
+      .open(&target)
+      .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
+      .expect("restore target modification time");
+
+    let changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("changed fingerprint");
+    assert_eq!(changed.1, 20, "same-size content changes must force a full hash");
+    assert_ne!(changed.0, baseline.0);
+    let changed_hit = compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("changed memo hit");
+    assert_eq!(changed_hit, (changed.0, 0));
   }
 
   fn test_evidence(unused: &[&str]) -> TargetEvidence {

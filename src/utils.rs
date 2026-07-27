@@ -9,6 +9,27 @@ use std::path::{Component, Path, PathBuf};
 use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
 
+/// Return whether metadata names a symlink or another Windows reparse point.
+///
+/// `FileType::is_symlink` does not classify directory junctions on Windows.
+/// Cache authority must reject every reparse point before traversing it.
+pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
+  if metadata.file_type().is_symlink() {
+    return true;
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+  }
+  #[cfg(not(windows))]
+  {
+    false
+  }
+}
+
 // ============================================================================
 // Hashing and Fingerprinting
 // ============================================================================
@@ -120,14 +141,53 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> 
         path.display()
       ))
     })?;
-  temporary.persist(path).map_err(|error| {
+  let persisted = {
+    #[cfg(windows)]
+    {
+      persist_atomic_replacement(temporary, path)
+    }
+    #[cfg(not(windows))]
+    {
+      temporary.persist(path)
+    }
+  };
+  persisted.map_err(|error| {
     RailError::message(format!(
       "failed to atomically replace {}: {}",
       path.display(),
       error.error
     ))
   })?;
+  sync_parent_directory(parent).map_err(|error| {
+    RailError::message(format!(
+      "failed to persist the atomic replacement for {}: {error}",
+      path.display()
+    ))
+  })?;
   Ok(())
+}
+
+#[cfg(windows)]
+fn persist_atomic_replacement(
+  mut temporary: tempfile::NamedTempFile,
+  path: &Path,
+) -> Result<fs::File, tempfile::PersistError> {
+  const MAX_ATTEMPTS: usize = 50;
+  let mut attempts = 0;
+  loop {
+    match temporary.persist(path) {
+      Ok(file) => return Ok(file),
+      Err(error) => {
+        attempts += 1;
+        let transient_reader_conflict = matches!(error.error.raw_os_error(), Some(5 | 32 | 33));
+        if !transient_reader_conflict || attempts >= MAX_ATTEMPTS {
+          return Err(error);
+        }
+        temporary = error.file;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+      }
+    }
+  }
 }
 
 fn destination_parent(path: &Path) -> &Path {
@@ -135,6 +195,16 @@ fn destination_parent(path: &Path) -> &Path {
     .parent()
     .filter(|parent| !parent.as_os_str().is_empty())
     .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+  fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+  Ok(())
 }
 
 /// Compute a fingerprint for the rail.toml configuration file
@@ -398,6 +468,9 @@ pub fn path_to_git_format(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
   use super::*;
   use std::path::PathBuf;
 
@@ -429,6 +502,157 @@ mod tests {
   fn atomic_writes_use_current_directory_for_bare_filenames() {
     assert_eq!(destination_parent(Path::new("rail.toml")), Path::new("."));
     assert_eq!(destination_parent(Path::new("config/rail.toml")), Path::new("config"));
+  }
+
+  #[test]
+  fn atomic_replacement_never_exposes_partial_bytes_to_concurrent_readers() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("state");
+    let first = Arc::new(vec![b'a'; 256 * 1024]);
+    let second = Arc::new(vec![b'b'; 256 * 1024]);
+    write_file_atomic(&destination, &first).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+      let reader_stop = Arc::clone(&stop);
+      let reader_reads = Arc::clone(&reads);
+      let reader_first = Arc::clone(&first);
+      let reader_second = Arc::clone(&second);
+      let destination = &destination;
+      let reader = scope.spawn(move || {
+        while !reader_stop.load(Ordering::Acquire) {
+          let observed = fs::read(destination).expect("the destination must remain visible");
+          assert!(
+            observed == *reader_first || observed == *reader_second,
+            "a reader observed a partial atomic replacement"
+          );
+          reader_reads.fetch_add(1, Ordering::Relaxed);
+          if cfg!(windows) {
+            // Leave the writer a gap between NTFS read handles so the bounded
+            // replacement retry can observe a normal sharing window.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+          }
+        }
+      });
+
+      // One concurrent NTFS rename exercises the visibility boundary without
+      // turning this oracle into an EBS flush-latency test.
+      let replacements = if cfg!(windows) { 1 } else { 64 };
+      let replacement = (|| {
+        for iteration in 0..replacements {
+          let contents = if iteration % 2 == 0 { &second } else { &first };
+          write_file_atomic(destination, contents)?;
+        }
+        Ok::<(), RailError>(())
+      })();
+      stop.store(true, Ordering::Release);
+      reader.join().unwrap();
+      replacement.unwrap();
+    });
+    assert!(reads.load(Ordering::Relaxed) > 0, "the concurrent reader did not run");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn atomic_replacement_preserves_mode_and_replaces_symlinks_without_following_them() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("state");
+    fs::write(&destination, b"old").unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+    write_file_atomic(&destination, b"new").unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"new");
+    assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
+
+    let victim = directory.path().join("victim");
+    fs::write(&victim, b"keep").unwrap();
+    fs::remove_file(&destination).unwrap();
+    symlink(&victim, &destination).unwrap();
+    write_file_atomic(&destination, b"replacement").unwrap();
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+    assert!(!fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
+  }
+
+  #[test]
+  fn atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full() {
+    const ROOT_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_ROOT";
+    const MAX_BYTES_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_MAX_BYTES";
+    let (Some(root), Some(maximum)) = (std::env::var_os(ROOT_ENV), std::env::var_os(MAX_BYTES_ENV)) else {
+      return;
+    };
+    let maximum = maximum
+      .to_str()
+      .and_then(|value| value.parse::<u64>().ok())
+      .expect("the ENOSPC byte bound must be an unsigned integer");
+    assert!(
+      (1024 * 1024..=512 * 1024 * 1024).contains(&maximum),
+      "the ENOSPC byte bound must be between 1 MiB and 512 MiB"
+    );
+
+    let directory = tempfile::Builder::new()
+      .prefix("cargo-rail-enospc-")
+      .tempdir_in(PathBuf::from(root))
+      .expect("isolated ENOSPC test directory");
+    let destination = directory.path().join("state");
+    fs::write(&destination, b"old").expect("initial state");
+    let filler_path = directory.path().join("filler");
+    let mut filler = fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&filler_path)
+      .expect("filler file");
+    let mut block = vec![0_u8; 1024 * 1024];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for chunk in block.chunks_exact_mut(8) {
+      state ^= state << 7;
+      state ^= state >> 9;
+      state ^= state << 8;
+      chunk.copy_from_slice(&state.to_le_bytes());
+    }
+
+    let mut written = 0_u64;
+    let exhausted = loop {
+      match filler.write_all(&block).and_then(|()| filler.sync_data()) {
+        Ok(()) => {
+          written = written.saturating_add(block.len() as u64);
+          if written >= maximum {
+            break None;
+          }
+        }
+        Err(error) if error.kind() == io::ErrorKind::StorageFull => break Some(error),
+        Err(error) => panic!("isolated filesystem failed before ENOSPC: {error}"),
+      }
+    };
+    if exhausted.is_none() {
+      drop(filler);
+      fs::remove_file(&filler_path).expect("remove bounded filler");
+      panic!("isolated filesystem did not report ENOSPC within {maximum} bytes");
+    }
+
+    let replacement = vec![b'n'; 1024 * 1024];
+    let error = write_file_atomic(&destination, &replacement).expect_err("replacement must fail on a full filesystem");
+    assert!(
+      error.to_string().contains("temporary file") || error.to_string().contains("atomically replace"),
+      "{error}"
+    );
+    assert_eq!(fs::read(&destination).expect("original state"), b"old");
+    assert_eq!(
+      fs::read_dir(directory.path())
+        .expect("test directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".cargo-rail-"))
+        .count(),
+      0,
+      "a failed atomic replacement must clean its private temporary file"
+    );
+
+    drop(filler);
+    fs::remove_file(&filler_path).expect("free isolated filesystem capacity");
+    write_file_atomic(&destination, b"new").expect("replacement should recover after capacity is available");
+    assert_eq!(fs::read(&destination).expect("recovered state"), b"new");
   }
 
   #[test]

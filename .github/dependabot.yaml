@@ -46,7 +46,7 @@ updates:
   # GitHub Actions (Security-Critical: SHA-Pinned)
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # Dependabot understands SHA-pinned actions when formatted as:
-  #   uses: actions/checkout@abc123...  # v4.1.7
+  #   uses: actions/checkout@abc123...  # v7.0.1
   #
   # It will:
   #   1. Monitor the semantic version in the comment

@@ -1,0 +1,500 @@
+name: Compatibility
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact ref to test
+        required: false
+        default: ''
+        type: string
+      cache-prefix:
+        description: Caller-specific cache namespace
+        required: true
+        type: string
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  CARGO_RAIL_TEST_MODE: commit
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  support:
+    name: Support matrices
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      compatibility-matrix: ${{ steps.matrices.outputs.compatibility }}
+      filesystem-matrix: ${{ steps.matrices.outputs.filesystem }}
+      forward-compatibility-matrix: ${{ steps.matrices.outputs.forward }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install current Rust stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: stable
+
+      - name: Generate compatibility matrices
+        id: matrices
+        shell: bash
+        run: |
+          current_stable="$(rustc +stable --version | awk '{print $2}')"
+          compatibility="$(python3 scripts/ci/support-matrix.py \
+            --compatibility-matrix \
+            --current-stable "$current_stable")"
+          filesystem="$(python3 scripts/ci/support-matrix.py \
+            --filesystem-matrix \
+            --current-stable "$current_stable")"
+          forward="$(python3 scripts/ci/support-matrix.py --forward-compatibility-matrix)"
+          {
+            echo "compatibility=$compatibility"
+            echo "filesystem=$filesystem"
+            echo "forward=$forward"
+          } >> "$GITHUB_OUTPUT"
+
+  stable:
+    name: Stable (${{ matrix.compatibility.name }})
+    needs: support
+    runs-on: ${{ matrix.compatibility.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.support.outputs.compatibility-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install selected Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: ${{ matrix.compatibility.toolchain }}
+          targets: ${{ matrix.compatibility.targets }}
+
+      - name: Install incoherent-selection probe toolchain
+        if: matrix.compatibility.incoherent-toolchain != ''
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: ${{ matrix.compatibility.incoherent-toolchain }}
+
+      - name: Install just for endpoint suites
+        if: matrix.compatibility.full-suite
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        with:
+          tool: just
+
+      - name: Install cargo-nextest for endpoint suites
+        if: matrix.compatibility.full-suite
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        with:
+          tool: cargo-nextest
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: "cargo-rail-compatibility-v1"
+          key: ${{ inputs.cache-prefix }}-${{ matrix.compatibility.cache-key }}
+          cache-on-failure: true
+
+      - name: Build cargo-rail with selected toolchain
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: cargo build --locked --bin cargo-rail
+
+      - name: Verify default native filesystem
+        if: matrix.compatibility.selection-probes
+        shell: bash
+        run: |
+          python_command=python3
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          "$python_command" scripts/ci/run-filesystem-compatibility.py \
+            --root "$RUNNER_TEMP" \
+            --expected-filesystem "${{ matrix.compatibility.filesystem }}" \
+            --expected-case-sensitive "${{ matrix.compatibility.case-sensitive }}"
+
+      - name: Run front-door compatibility corpus
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: |
+          cargo_rail="target/debug/cargo-rail"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo_rail="${cargo_rail}.exe"
+          fi
+          python_command=python3
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          selection_args=()
+          if [ "${{ matrix.compatibility.selection-probes }}" = "true" ]; then
+            selection_args=(--selection-probes)
+          fi
+          if [ "${{ matrix.compatibility.cross-target-mutation-probes }}" = "true" ]; then
+            selection_args+=(--cross-target-mutation-probes)
+          fi
+          if [ "${{ matrix.compatibility.linker-probes }}" = "true" ]; then
+            selection_args+=(--linker-probes)
+          fi
+          if [ "${{ matrix.compatibility.codegen-backend-probes }}" = "true" ]; then
+            selection_args+=(--codegen-backend-probes)
+          fi
+          if [ -n "${{ matrix.compatibility.incoherent-toolchain }}" ]; then
+            selection_args+=(--incoherent-toolchain "${{ matrix.compatibility.incoherent-toolchain }}")
+          fi
+          "$python_command" scripts/ci/run-compatibility.py \
+            --cargo-rail "$cargo_rail" \
+            --toolchain "${{ matrix.compatibility.toolchain }}" \
+            --expected-rust-release "${{ matrix.compatibility.release }}" \
+            --expected-host "${{ matrix.compatibility.target }}" \
+            --expected-cache-state "${{ matrix.compatibility.expected-cache-state }}" \
+            "${selection_args[@]}"
+
+      - name: Build all endpoint targets
+        if: matrix.compatibility.full-suite
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: just build-all
+
+      - name: Run full endpoint suite
+        if: matrix.compatibility.full-suite
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: just test-all
+
+      - name: Upload JUnit test report
+        if: always() && matrix.compatibility.full-suite
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: junit-${{ matrix.compatibility.target }}-rust-${{ matrix.compatibility.release }}
+          path: target/nextest/commit/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Detect JUnit test report
+        if: always() && matrix.compatibility.full-suite
+        id: junit
+        shell: bash
+        run: |
+          if [ -f target/nextest/commit/junit.xml ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish test report
+        if: always() && steps.junit.outputs.found == 'true'
+        uses: mikepenz/action-junit-report@d9f48fc87bc235f7e214acf696ca5abc0a986f16  # v6.4.2
+        with:
+          report_paths: 'target/nextest/commit/junit.xml'
+          check_name: 'Tests (${{ matrix.compatibility.target }}, Rust ${{ matrix.compatibility.release }})'
+          detailed_summary: true
+          include_passed: false
+          fail_on_failure: true
+          require_tests: true
+          annotate_only: false
+          summary: true
+
+  filesystem:
+    name: Filesystem (${{ matrix.filesystem.name }})
+    needs: support
+    runs-on: ${{ matrix.filesystem.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.support.outputs.filesystem-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install current Rust stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        with:
+          tool: cargo-nextest
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: "cargo-rail-filesystem-v1"
+          key: ${{ inputs.cache-prefix }}-${{ matrix.filesystem.name }}
+          cache-on-failure: true
+
+      - name: Build cargo-rail outside the qualified volume
+        run: cargo build --locked --bin cargo-rail
+
+      - name: Provision case-sensitive APFS volume
+        if: matrix.filesystem.setup == 'macos-apfs-case-sensitive'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/cargo-rail-case-sensitive.dmg"
+          mount="$RUNNER_TEMP/cargo-rail-case-sensitive"
+          rm -f "$image"
+          mkdir -p "$mount"
+          hdiutil create -quiet -size 256m -fs 'Case-sensitive APFS' -volname cargo-rail-case-sensitive "$image"
+          attach_output="$(hdiutil attach -nobrowse -mountpoint "$mount" "$image")"
+          device="$(awk '/^\/dev\// { print $1; exit }' <<< "$attach_output")"
+          test -n "$device"
+          mkdir "$mount/tmp"
+          {
+            echo "FILESYSTEM_IMAGE=$image"
+            echo "FILESYSTEM_DEVICE=$device"
+            echo "FILESYSTEM_ROOT=$mount"
+            echo "TMPDIR=$mount/tmp"
+            echo "TMP=$mount/tmp"
+            echo "TEMP=$mount/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Provision Linux tmpfs volume
+        if: matrix.filesystem.setup == 'linux-tmpfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/cargo-rail-tmpfs"
+          mkdir -p "$mount"
+          sudo mount -t tmpfs -o size=256m,mode=0700 cargo-rail-tmpfs "$mount"
+          sudo chown "$(id -u):$(id -g)" "$mount"
+          mkdir "$mount/tmp"
+          {
+            echo "FILESYSTEM_ROOT=$mount"
+            echo "TMPDIR=$mount/tmp"
+            echo "TMP=$mount/tmp"
+            echo "TEMP=$mount/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Provision NTFS VHD and UNC share
+        if: matrix.filesystem.setup == 'windows-ntfs-vhd'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vhd = Join-Path $env:RUNNER_TEMP 'cargo-rail-ntfs.vhd'
+          $diskpart = Join-Path $env:RUNNER_TEMP 'cargo-rail-ntfs-create.txt'
+          $used = Get-Volume | Where-Object DriveLetter | ForEach-Object { $_.DriveLetter.ToString().ToUpperInvariant() }
+          $drive = @('R', 'S', 'T', 'U', 'V', 'W') | Where-Object { $_ -notin $used } | Select-Object -First 1
+          if (-not $drive) {
+            throw 'No drive letter is available for the NTFS qualification VHD'
+          }
+          @"
+          create vdisk file="$vhd" maximum=256 type=fixed
+          select vdisk file="$vhd"
+          attach vdisk
+          create partition primary
+          format fs=ntfs quick label=CARGORAIL
+          assign letter=$drive
+          exit
+          "@ | Set-Content -Path $diskpart -Encoding ascii
+          & diskpart.exe /s $diskpart
+          if ($LASTEXITCODE -ne 0) {
+            throw "diskpart exited $LASTEXITCODE"
+          }
+          $root = "${drive}:\cargo-rail"
+          $temporary = Join-Path $root 'tmp'
+          New-Item -ItemType Directory -Path $temporary -Force | Out-Null
+          $share = "cargo-rail-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+          New-SmbShare -Name $share -Path $root -FullAccess $identity | Out-Null
+          $unc = "\\localhost\$share"
+          if (-not (Test-Path $unc)) {
+            throw "UNC qualification share is unavailable: $unc"
+          }
+          @(
+            "FILESYSTEM_IMAGE=$vhd"
+            "FILESYSTEM_DRIVE=$drive"
+            "FILESYSTEM_ROOT=$root"
+            "FILESYSTEM_SHARE=$share"
+            "FILESYSTEM_UNC_ROOT=$unc"
+            "TMPDIR=$temporary"
+            "TMP=$temporary"
+            "TEMP=$temporary"
+          ) | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+      - name: Verify qualified filesystem semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_command=python3
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          unc_args=()
+          if [ -n "${FILESYSTEM_UNC_ROOT:-}" ]; then
+            unc_args=(--unc-root "$FILESYSTEM_UNC_ROOT")
+          fi
+          "$python_command" scripts/ci/run-filesystem-compatibility.py \
+            --root "$FILESYSTEM_ROOT" \
+            --expected-filesystem "${{ matrix.filesystem.kind }}" \
+            --expected-case-sensitive "${{ matrix.filesystem.case-sensitive }}" \
+            "${unc_args[@]}"
+
+      - name: Run filesystem authority and publication tests
+        shell: bash
+        run: |
+          cargo nextest run -p cargo-rail --all-features --lib \
+            -E 'test(~hermetic::cas::tests) | test(~utils::tests)'
+
+      - name: Run front-door corpus on the qualified filesystem
+        shell: bash
+        run: |
+          cargo_rail="target/debug/cargo-rail"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo_rail="${cargo_rail}.exe"
+          fi
+          python_command=python3
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          "$python_command" scripts/ci/run-compatibility.py \
+            --cargo-rail "$cargo_rail" \
+            --toolchain "${{ matrix.filesystem.toolchain }}" \
+            --expected-rust-release "${{ matrix.filesystem.release }}" \
+            --expected-host "${{ matrix.filesystem.target }}" \
+            --expected-cache-state "${{ matrix.filesystem.expected-cache-state }}" \
+            --skip-cross-target-corpus \
+            --temporary-root "$FILESYSTEM_ROOT"
+
+      - name: Prove ENOSPC leaves the old file authoritative
+        shell: bash
+        env:
+          CARGO_RAIL_TEST_ENOSPC_ROOT: ${{ env.FILESYSTEM_ROOT }}
+          CARGO_RAIL_TEST_ENOSPC_MAX_BYTES: 536870912
+        run: |
+          cargo nextest run -p cargo-rail --all-features --lib \
+            -E 'test(=utils::tests::atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full)'
+
+      - name: Detach case-sensitive APFS volume
+        if: always() && matrix.filesystem.setup == 'macos-apfs-case-sensitive'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${FILESYSTEM_DEVICE:-}" ]; then
+            hdiutil detach -force "$FILESYSTEM_DEVICE"
+          fi
+          rm -f "${FILESYSTEM_IMAGE:-$RUNNER_TEMP/cargo-rail-case-sensitive.dmg}"
+          rmdir "$RUNNER_TEMP/cargo-rail-case-sensitive" 2>/dev/null || true
+
+      - name: Unmount Linux tmpfs volume
+        if: always() && matrix.filesystem.setup == 'linux-tmpfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/cargo-rail-tmpfs"
+          if mountpoint -q "$mount"; then
+            sudo umount "$mount"
+          fi
+          rmdir "$mount" 2>/dev/null || true
+
+      - name: Detach NTFS VHD and remove UNC share
+        if: always() && matrix.filesystem.setup == 'windows-ntfs-vhd'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $share = if ($env:FILESYSTEM_SHARE) {
+            $env:FILESYSTEM_SHARE
+          } else {
+            "cargo-rail-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          }
+          if (Get-SmbShare -Name $share -ErrorAction SilentlyContinue) {
+            Remove-SmbShare -Name $share -Force
+          }
+          $vhd = if ($env:FILESYSTEM_IMAGE) {
+            $env:FILESYSTEM_IMAGE
+          } else {
+            Join-Path $env:RUNNER_TEMP 'cargo-rail-ntfs.vhd'
+          }
+          if (Test-Path $vhd) {
+            Dismount-DiskImage -ImagePath $vhd
+            if ((Get-DiskImage -ImagePath $vhd).Attached) {
+              throw "NTFS qualification VHD remained attached: $vhd"
+            }
+            Remove-Item -Force $vhd
+          }
+
+  forward:
+    name: Forward (${{ matrix.compatibility.name }})
+    needs: support
+    runs-on: ${{ matrix.compatibility.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.support.outputs.forward-compatibility-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install selected Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: ${{ matrix.compatibility.toolchain }}
+
+      - name: Install rust-src for the pinned custom-target lane
+        if: matrix.compatibility.custom-target-json-probe
+        run: rustup component add --toolchain "${{ matrix.compatibility.toolchain }}" rust-src
+
+      - name: Install Cranelift for the pinned backend lane
+        if: matrix.compatibility.codegen-backend-probes
+        run: rustup component add --toolchain "${{ matrix.compatibility.toolchain }}" rustc-codegen-cranelift
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: "cargo-rail-forward-compatibility-v1"
+          key: ${{ inputs.cache-prefix }}-${{ matrix.compatibility.cache-key }}
+          cache-on-failure: true
+
+      - name: Build cargo-rail with selected toolchain
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: cargo build --locked --bin cargo-rail
+
+      - name: Run front-door compatibility corpus
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: |
+          probe_args=()
+          if [ "${{ matrix.compatibility.custom-target-json-probe }}" = "true" ]; then
+            probe_args+=(--custom-target-json-probe)
+          fi
+          if [ "${{ matrix.compatibility.linker-probes }}" = "true" ]; then
+            probe_args+=(--linker-probes)
+          fi
+          if [ "${{ matrix.compatibility.codegen-backend-probes }}" = "true" ]; then
+            probe_args+=(--codegen-backend-probes)
+          fi
+          python3 scripts/ci/run-compatibility.py \
+            --cargo-rail target/debug/cargo-rail \
+            --toolchain "${{ matrix.compatibility.toolchain }}" \
+            --expected-host "${{ matrix.compatibility.target }}" \
+            --expected-cache-state "${{ matrix.compatibility.expected-cache-state }}" \
+            --skip-cross-target-corpus \
+            "${probe_args[@]}"

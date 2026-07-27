@@ -63,7 +63,29 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 5);
+  assert_eq!(counters["schema_version"], 6);
+  assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
+  assert!(
+    counters["phases"]["cli_pre_context_preparation"]["elapsed_ns"]
+      .as_u64()
+      .is_some_and(|elapsed| elapsed > 0)
+  );
+  assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 1);
+  assert!(
+    counters["phases"]["workspace_capture_cargo_metadata"]["elapsed_ns"]
+      .as_u64()
+      .is_some_and(|elapsed| elapsed > 0)
+  );
+  for phase in [
+    "action_expansion_key_construction",
+    "native_cache_setup",
+    "sysroot_fingerprinting",
+    "cargo_child_execution",
+    "cache_report_collection",
+  ] {
+    assert_eq!(counters["phases"][phase]["invocations"], 0, "unexpected {phase} phase");
+    assert_eq!(counters["phases"][phase]["elapsed_ns"], 0, "unexpected {phase} time");
+  }
   assert!(
     counters["snapshot_id"]
       .as_str()
@@ -340,5 +362,33 @@ fn diagnostics_refuse_to_replace_existing_files_before_dispatch() -> Result<()> 
   assert_eq!(output.status.code(), Some(2));
   assert!(String::from_utf8_lossy(&output.stderr).contains("failed to reserve diagnostic counter file"));
   assert_eq!(std::fs::read_to_string(diagnostics)?, "keep\n");
+  Ok(())
+}
+
+#[test]
+fn pre_context_diagnostics_have_one_fixed_phase_schema() -> Result<()> {
+  let output = TempDir::new()?;
+  let diagnostics = output.path().join("schema.json");
+  let measured = run_cargo_rail(
+    output.path(),
+    &[
+      "rail",
+      "--diagnostics-file",
+      diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+      "plan",
+      "--schema",
+    ],
+  )?;
+  ensure!(measured.status.success(), "schema output failed");
+
+  let counters = read_counters(&diagnostics)?;
+  assert_eq!(counters["schema_version"], 6);
+  assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
+  assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
+  assert_eq!(
+    counters["phases"].as_object().map(serde_json::Map::len),
+    Some(7),
+    "phase keys are a versioned fixed contract"
+  );
   Ok(())
 }

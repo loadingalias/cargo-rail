@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "class": "library_metadata_rlib",
+  "fixture": "tests/fixtures/native_cache/real_world",
+  "cargo_release": "1.97.1",
+  "rustc_release": "1.97.1",
+  "qualifications": [
+    {
+      "target": "aarch64-apple-darwin",
+      "corpus": "p0-phase-interleaved-macos-v5-sysroot-memo",
+      "workloads": [
+        "check",
+        "release-build"
+      ],
+      "accepted_samples": 110,
+      "false_hits": 0
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "corpus": "p0-remote-20260726-v3/aws-linux-arm64",
+      "workloads": [
+        "check",
+        "release-build"
+      ],
+      "accepted_samples": 110,
+      "false_hits": 0
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "corpus": "p0-remote-20260726-v3/aws-linux-x64",
+      "workloads": [
+        "check",
+        "release-build"
+      ],
+      "accepted_samples": 110,
+      "false_hits": 0
+    }
+  ]
+}

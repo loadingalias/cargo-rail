@@ -2199,6 +2199,48 @@ fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receip
 }
 
 #[test]
+fn test_doctor_native_cache_reports_the_exact_capability_as_one_json_value() -> Result<()> {
+  let ws = TestWorkspace::new_named("doctor-native-cache")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add native-cache doctor fixture")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "doctor", "native-cache", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "native-cache doctor failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(output.stderr.is_empty(), "JSON diagnostics must not contaminate stderr");
+  let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(report["command"], "doctor");
+  assert_eq!(report["mode"], "native_cache");
+  assert_eq!(report["result"], "success");
+  assert_eq!(report["exit_code"], 0);
+
+  let capability = &report["capability"];
+  assert_eq!(capability["schema_version"], 1);
+  assert_eq!(capability["cache_class"], "library_metadata_rlib");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v2");
+  assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
+  assert!(
+    capability["host_target"]
+      .as_str()
+      .is_some_and(|value| !value.is_empty())
+  );
+  assert!(
+    capability["identity"]
+      .as_str()
+      .is_some_and(|value| value.len() == 71 && value.starts_with("sha256:"))
+  );
+  assert!(capability["certified"].is_boolean());
+  assert!(
+    !ws.path.join("target/cargo-rail/receipts").exists(),
+    "read-only native-cache diagnosis must not write a run receipt"
+  );
+  Ok(())
+}
+
+#[test]
 fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()> {
   let local_cache = tempfile::tempdir()?;
   let local_cache = local_cache.path().to_string_lossy().into_owned();
@@ -2431,7 +2473,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     );
 
     let counters: serde_json::Value = serde_json::from_slice(&fs::read(&hit_diagnostics)?)?;
-    assert_eq!(counters["schema_version"], 5);
+    assert_eq!(counters["schema_version"], 6);
     assert_eq!(
       counters["cargo_metadata_loads"], 0,
       "a cache hit must not execute Cargo metadata"
@@ -3476,5 +3518,56 @@ fn test_all_action_preview_does_not_require_git_without_base_ref_inputs() -> Res
   );
   assert_eq!(String::from_utf8(output.stdout)?, "build: cargo check --workspace\n");
 
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_builtin_action_executes_the_captured_cargo_program() -> Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let ws = TestWorkspace::new_single_crate("selected-cargo-program", "0.1.0")?;
+  let tools = tempfile::tempdir()?;
+  let cargo = tools.path().join("cargo proxy");
+  let log = tools.path().join("cargo.log");
+  std::fs::write(
+    &cargo,
+    "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$CARGO_SELECTION_LOG\"\nexec cargo \"$@\"\n",
+  )?;
+  std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))?;
+
+  let output = run_cargo_rail_with_env(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--quiet",
+      "--all",
+      "--action",
+      "build",
+      "--no-cache",
+      "--",
+      "--quiet",
+    ],
+    &[
+      ("CARGO", cargo.to_str().expect("UTF-8 Cargo proxy path")),
+      (
+        "CARGO_SELECTION_LOG",
+        log.to_str().expect("UTF-8 Cargo selection log path"),
+      ),
+      ("RUSTC_WRAPPER", ""),
+      ("RUSTC_WORKSPACE_WRAPPER", ""),
+    ],
+  )?;
+  assert!(
+    output.status.success(),
+    "selected Cargo execution failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let invocations = std::fs::read_to_string(log)?;
+  assert!(
+    invocations.lines().any(|argument| argument == "check"),
+    "snapshot capture used the selected Cargo program, but action execution did not:\n{invocations}"
+  );
   Ok(())
 }

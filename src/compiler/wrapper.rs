@@ -427,7 +427,10 @@ fn extend_rustdoc_emit(value: &str, supported: &str) -> Option<String> {
 
 fn rustdoc_default_emit_modes(rustdoc: &std::ffi::OsStr) -> Option<String> {
   let output = Command::new(rustdoc)
-    .arg("--help")
+    // Older stable rustdoc releases listed `--emit` in help while still
+    // rejecting it without `-Z unstable-options`. Probe the exact stable
+    // invocation cargo-rail would add instead of trusting advertised syntax.
+    .args(["--emit=dep-info", "--help"])
     .env("RUSTDOC", rustdoc)
     .env_remove(RUSTDOC_WRAPPER_MARKER)
     .env_remove(INNER_RUSTDOC_ENV)

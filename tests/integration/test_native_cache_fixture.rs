@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +8,14 @@ use sha2::{Digest as _, Sha256};
 
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
   let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/materialize-native-cache.sh");
-  let output = Command::new(script)
+  let mut command = if cfg!(windows) {
+    let mut command = Command::new("bash");
+    command.arg(script);
+    command
+  } else {
+    Command::new(script)
+  };
+  let output = command
     .arg(destination)
     .arg(git_source)
     .output()
@@ -86,23 +93,62 @@ fn cache_metric(output: &str, name: &str) -> Result<u64> {
     .with_context(|| format!("missing native-cache metric '{name}' in:\n{output}"))
 }
 
-fn graduated_host() -> bool {
-  let platform = matches!(
-    (std::env::consts::OS, std::env::consts::ARCH),
-    ("macos", "aarch64") | ("linux", "aarch64")
-  );
-  let rustc = Command::new("rustc").arg("-vV").output();
-  let cargo = Command::new("cargo").arg("-Vv").output();
-  platform
-    && rustc.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).starts_with("rustc 1.97.1 "))
-    && cargo.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).starts_with("cargo 1.97.1 "))
+fn reusable_cache_units(output: &str) -> Result<BTreeMap<String, serde_json::Value>> {
+  let mut units = BTreeMap::new();
+  for event in output.lines().filter_map(|line| {
+    line
+      .split_once(" native compiler cache event: ")
+      .map(|(_, event)| event)
+  }) {
+    let event = serde_json::from_str::<serde_json::Value>(event)?;
+    if !event["action_key"].is_string() {
+      continue;
+    }
+    ensure!(event["schema_version"] == 3, "unexpected native-cache event: {event}");
+    ensure!(
+      event["unit"].is_object(),
+      "native-cache event lacks unit evidence: {event}"
+    );
+    let identity = event["unit_identity"]
+      .as_str()
+      .context("native-cache event lacks unit identity")?
+      .to_string();
+    ensure!(
+      units.insert(identity.clone(), event).is_none(),
+      "duplicate native-cache unit identity: {identity}"
+    );
+  }
+  Ok(units)
 }
 
-fn portable_outputs(root: &Path, target: &Path) -> Result<BTreeMap<PathBuf, String>> {
-  let lexical_root = root.as_os_str().as_encoded_bytes();
+struct CompilerOutputEvidence {
+  portable: BTreeMap<PathBuf, String>,
+  root_bound: BTreeSet<PathBuf>,
+}
+
+fn compiler_output_evidence(root: &Path, target: &Path, report: &str) -> Result<CompilerOutputEvidence> {
+  let compiler_outputs = event_output_paths(report, None)?;
   let canonical = fs::canonicalize(root)?;
-  let canonical_root = canonical.as_os_str().as_encoded_bytes();
-  let mut outputs = BTreeMap::new();
+  let mut root_spellings = [root, canonical.as_path()]
+    .into_iter()
+    .flat_map(|root| {
+      let native = root.as_os_str().as_encoded_bytes().to_vec();
+      #[cfg(windows)]
+      {
+        let forward = String::from_utf8_lossy(&native).replace('\\', "/").into_bytes();
+        return vec![native, forward];
+      }
+      #[cfg(not(windows))]
+      {
+        vec![native]
+      }
+    })
+    .filter(|root| !root.is_empty())
+    .collect::<Vec<_>>();
+  root_spellings.sort();
+  root_spellings.dedup();
+  let mut portable = BTreeMap::new();
+  let mut root_bound = BTreeSet::new();
   let mut pending = vec![target.to_path_buf()];
   while let Some(directory) = pending.pop() {
     let Ok(entries) = fs::read_dir(&directory) else {
@@ -124,18 +170,62 @@ fn portable_outputs(root: &Path, target: &Path) -> Result<BTreeMap<PathBuf, Stri
       {
         continue;
       }
-      let bytes = fs::read(&path)?;
-      let contains = |needle: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle);
-      if contains(lexical_root) || contains(canonical_root) {
+      let repository_path = path.strip_prefix(root)?.to_path_buf();
+      if !compiler_outputs.contains(&repository_path) {
         continue;
       }
-      outputs.insert(
+      let bytes = fs::read(&path)?;
+      let contains = |needle: &[u8]| !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle);
+      if root_spellings.iter().any(|root| contains(root)) {
+        root_bound.insert(repository_path);
+        continue;
+      }
+      portable.insert(
         path.strip_prefix(target)?.to_path_buf(),
         Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect(),
       );
     }
   }
-  Ok(outputs)
+  Ok(CompilerOutputEvidence { portable, root_bound })
+}
+
+fn event_output_paths(output: &str, outcome: Option<&str>) -> Result<BTreeSet<PathBuf>> {
+  let mut paths = BTreeSet::new();
+  for event in output.lines().filter_map(|line| {
+    line
+      .split_once(" native compiler cache event: ")
+      .map(|(_, event)| event)
+  }) {
+    let event = serde_json::from_str::<serde_json::Value>(event)?;
+    if outcome.is_some_and(|outcome| event["outcome"] != outcome) {
+      continue;
+    }
+    for expected in event["unit"]["output_paths"].as_array().into_iter().flatten() {
+      if expected["root"] == "repository"
+        && let Some(path) = expected["path"].as_str()
+      {
+        paths.insert(PathBuf::from(path));
+      }
+    }
+    for observed in event["unit"]["observed_outputs"].as_array().into_iter().flatten() {
+      if observed["path"]["root"] == "repository"
+        && let Some(path) = observed["path"]["path"].as_str()
+      {
+        paths.insert(PathBuf::from(path));
+      }
+    }
+  }
+  Ok(paths)
+}
+
+fn verify_root_bound_outputs_are_bypassed(evidence: &CompilerOutputEvidence, report: &str, label: &str) -> Result<()> {
+  let bypassed = event_output_paths(report, Some("bypassed"))?;
+  let unaccounted = evidence.root_bound.difference(&bypassed).collect::<Vec<_>>();
+  ensure!(
+    unaccounted.is_empty(),
+    "{label} retained physical workspace roots in outputs not owned by an explicit bypass: {unaccounted:?}"
+  );
+  Ok(())
 }
 
 fn output_difference(
@@ -222,6 +312,14 @@ fn run_cargo(fixture: &Path, arguments: &[&str], target: &Path) -> Result<()> {
   Ok(())
 }
 
+fn executable(path: PathBuf) -> PathBuf {
+  if cfg!(windows) {
+    path.with_extension("exe")
+  } else {
+    path
+  }
+}
+
 #[test]
 fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Result<()> {
   let root = tempfile::tempdir()?;
@@ -290,15 +388,12 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
     &["build", "--workspace", "--all-features", "--locked", "--offline"],
     &fixture.join("target-build"),
   )?;
-  ensure!(fixture.join("target-build/debug/fixture-cli").is_file());
+  ensure!(executable(fixture.join("target-build/debug/fixture-cli")).is_file());
   Ok(())
 }
 
 #[test]
 fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Result<()> {
-  if !graduated_host() {
-    return Ok(());
-  }
   let root = tempfile::tempdir()?;
   let first = root.path().join("first");
   let second = root.path().join("second");
@@ -308,12 +403,42 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   materialize_fixture(&second, &git_source)?;
 
   let cold_check = run_cargo_rail(&first, "build", &check_cache)?;
+  if cold_check.contains("native_cache_platform_not_graduated")
+    || cold_check.contains("native_cache_toolchain_not_graduated")
+    || cold_check.contains("native_cache_capability_not_certified")
+  {
+    return Ok(());
+  }
   let warm_check = run_cargo_rail(&second, "build", &check_cache)?;
   ensure!(cache_metric(&cold_check, "hits")? == 0, "{cold_check}");
   ensure!(cache_metric(&cold_check, "misses")? >= 12, "{cold_check}");
+  let cold_units = reusable_cache_units(&cold_check)?;
+  let warm_units = reusable_cache_units(&warm_check)?;
+  let removed_units = cold_units
+    .iter()
+    .filter(|(identity, _)| !warm_units.contains_key(*identity))
+    .collect::<Vec<_>>();
+  let added_units = warm_units
+    .iter()
+    .filter(|(identity, _)| !cold_units.contains_key(*identity))
+    .collect::<Vec<_>>();
+  ensure!(
+    removed_units.is_empty() && added_units.is_empty(),
+    "native cache unit identities changed across clean roots:\nremoved={removed_units:#?}\nadded={added_units:#?}"
+  );
+  let changed_units = cold_units
+    .iter()
+    .filter_map(|(identity, cold)| {
+      let warm = warm_units.get(identity)?;
+      ((&cold["action_key"], &cold["unit"]) != (&warm["action_key"], &warm["unit"])).then_some((identity, cold, warm))
+    })
+    .collect::<Vec<_>>();
+  ensure!(
+    changed_units.is_empty(),
+    "native cache unit inputs or claimed outputs changed across clean roots:\n{changed_units:#?}"
+  );
   let check_hits = cache_metric(&warm_check, "hits")?;
   ensure!(check_hits >= 12, "{warm_check}");
-  #[cfg(target_os = "macos")]
   ensure!(cache_metric(&warm_check, "misses")? == 0, "{warm_check}");
   ensure!(cache_metric(&warm_check, "bytes_restored")? > 0, "{warm_check}");
   for reason in [
@@ -324,10 +449,12 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   ] {
     ensure!(warm_check.contains(reason), "missing bypass '{reason}':\n{warm_check}");
   }
-  let first_check = portable_outputs(&first, &first.join("target"))?;
-  let second_check = portable_outputs(&second, &second.join("target"))?;
-  ensure!(first_check.len() >= check_hits as usize * 2);
-  verify_portable_hit_outputs(&first_check, &second_check, check_hits, "cargo check")?;
+  let first_check = compiler_output_evidence(&first, &first.join("target"), &cold_check)?;
+  let second_check = compiler_output_evidence(&second, &second.join("target"), &warm_check)?;
+  verify_root_bound_outputs_are_bypassed(&first_check, &cold_check, "cold cargo check")?;
+  verify_root_bound_outputs_are_bypassed(&second_check, &warm_check, "warm cargo check")?;
+  ensure!(first_check.portable.len() >= check_hits as usize * 2);
+  verify_portable_hit_outputs(&first_check.portable, &second_check.portable, check_hits, "cargo check")?;
   #[cfg(target_os = "macos")]
   ensure!(
     unique_dependency_output(&first.join("target"), "libserde_derive-", &["dylib", "so"])?
@@ -370,14 +497,14 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   let release_default = run_cargo_rail_with_options(&first, "distribution", &check_cache, false, &[])?;
   ensure!(cache_metric(&release_default, "hits")? == 0, "{release_default}");
   ensure!(cache_metric(&release_default, "misses")? >= 8, "{release_default}");
-  let default_binary = first.join("target/release/fixture-cli");
+  let default_binary = executable(first.join("target/release/fixture-cli"));
   let default_output = Command::new(&default_binary).output()?;
   ensure!(default_output.status.success());
   ensure!(String::from_utf8_lossy(&default_output.stdout).trim() == "101");
 
   let feature_population = run_cargo_rail(&second, "distribution", &check_cache)?;
   ensure!(cache_metric(&feature_population, "misses")? > 0, "{feature_population}");
-  let feature_binary = second.join("target/release/fixture-cli");
+  let feature_binary = executable(second.join("target/release/fixture-cli"));
   let feature_output = Command::new(&feature_binary).output()?;
   ensure!(feature_output.status.success());
   ensure!(String::from_utf8_lossy(&feature_output.stdout).trim() == "119");
@@ -388,7 +515,7 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   ensure!(build_hits >= 8, "{warm_build}");
   ensure!(cache_metric(&warm_build, "bytes_restored")? > 0, "{warm_build}");
 
-  let binary = first.join("target/release/fixture-cli");
+  let binary = executable(first.join("target/release/fixture-cli"));
   ensure!(binary.is_file(), "linked fixture binary was not produced");
   let output = Command::new(binary).output()?;
   ensure!(output.status.success());
@@ -396,9 +523,16 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
 
   let warm_release = first.join("target/release");
   let populated_release = second.join("target/release");
-  let warm_outputs = portable_outputs(&first, &warm_release)?;
-  let populated_outputs = portable_outputs(&second, &populated_release)?;
-  ensure!(warm_outputs.len() >= build_hits as usize * 2);
-  verify_portable_hit_outputs(&warm_outputs, &populated_outputs, build_hits, "cargo build")?;
+  let warm_outputs = compiler_output_evidence(&first, &warm_release, &warm_build)?;
+  let populated_outputs = compiler_output_evidence(&second, &populated_release, &feature_population)?;
+  verify_root_bound_outputs_are_bypassed(&warm_outputs, &warm_build, "warm cargo build")?;
+  verify_root_bound_outputs_are_bypassed(&populated_outputs, &feature_population, "cold cargo build")?;
+  ensure!(warm_outputs.portable.len() >= build_hits as usize * 2);
+  verify_portable_hit_outputs(
+    &warm_outputs.portable,
+    &populated_outputs.portable,
+    build_hits,
+    "cargo build",
+  )?;
   Ok(())
 }

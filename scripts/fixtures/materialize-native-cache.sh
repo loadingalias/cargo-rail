@@ -11,6 +11,10 @@ destination="$1"
 [[ -n "$destination" && "$destination" != -* ]] || usage
 shared_git_source="${2:-${destination}.git-source}"
 [[ -n "$shared_git_source" && "$shared_git_source" != -* ]] || usage
+if command -v cygpath >/dev/null 2>&1; then
+  destination="$(cygpath -u "$destination")"
+  shared_git_source="$(cygpath -u "$shared_git_source")"
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 template="$repo_root/tests/fixtures/native_cache/real_world"
@@ -59,7 +63,11 @@ git_commit="$(git -C "$git_source" rev-parse --verify HEAD)"
 
 manifest="$destination/Cargo.toml"
 rendered="$destination/Cargo.toml.rendered"
-git_url="file://$git_source"
+if command -v cygpath >/dev/null 2>&1; then
+  git_url="file:///$(cygpath -m "$git_source")"
+else
+  git_url="file://$git_source"
+fi
 sed -e "s|__FIXTURE_GIT_URL__|$git_url|" -e "s|__FIXTURE_GIT_REV__|$git_commit|" "$manifest" >"$rendered"
 mv "$rendered" "$manifest"
 

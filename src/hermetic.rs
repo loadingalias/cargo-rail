@@ -2384,7 +2384,17 @@ fn normalize_output_mode(path: &Path, metadata: &fs::Metadata, directory: bool) 
   Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn normalize_output_mode(path: &Path, metadata: &fs::Metadata, _directory: bool) -> RailResult<()> {
+  if metadata.permissions().readonly() {
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)?;
+  }
+  Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn normalize_output_mode(_path: &Path, _metadata: &fs::Metadata, _directory: bool) -> RailResult<()> {
   Ok(())
 }
@@ -2450,9 +2460,7 @@ fn output_mode(metadata: &fs::Metadata) -> u32 {
 
 #[cfg(windows)]
 fn output_mode(metadata: &fs::Metadata) -> u32 {
-  use std::os::windows::fs::MetadataExt as _;
-
-  metadata.file_attributes()
+  if metadata.is_dir() { 0o755 } else { 0o644 }
 }
 
 #[cfg(not(any(unix, windows)))]

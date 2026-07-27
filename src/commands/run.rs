@@ -9,6 +9,7 @@ use crate::action::{
 };
 use crate::action_key::{analyze as analyze_action_key, resolution_identity};
 use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
+use crate::commands::cli::Commands;
 use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
 use crate::compiler::collector::prepare_direct_cargo_action;
 use crate::config::MAX_ACTIONS;
@@ -103,6 +104,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
       "add --dry-run when using --format json or --format github",
     ));
   }
+  let action_expansion_phase = crate::instrumentation::action_expansion_key_construction_phase();
   let effective = resolve_effective_inputs(ctx, &opts)?;
   validate_executable_actions(ctx, &effective.actions)?;
   let snapshot = ctx.snapshot()?;
@@ -222,6 +224,7 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
   }
 
   let graph = ActionGraph::new(snapshot_id, expanded_actions)?;
+  drop(action_expansion_phase);
   let executed_actions = graph
     .actions()
     .iter()
@@ -590,6 +593,12 @@ fn bind_action_resolution_views(ctx: &WorkspaceContext, actions: &mut [ExpandedA
     if !action_uses_cargo_resolution(action) {
       continue;
     }
+    if !cargo_resolution_cli_is_modeled(action.argv()) {
+      // Cargo CLI configuration and unstable flags can change resolution.
+      // Do not manufacture a different metadata request: the action remains
+      // uncacheable and executes with its original argv.
+      continue;
+    }
 
     let selected_ids = selected_action_package_ids(ctx, action)?;
     let root_package_ids = selected_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -639,6 +648,15 @@ fn action_uses_cargo_resolution(action: &ExpandedAction) -> bool {
       .is_some_and(|program| program == "cargo"),
     ActionKind::Format | ActionKind::Audit => false,
   }
+}
+
+fn cargo_resolution_cli_is_modeled(arguments: &[String]) -> bool {
+  arguments
+    .iter()
+    .take_while(|argument| argument.as_str() != "--")
+    .all(|argument| {
+      argument != "-Z" && !argument.starts_with("-Z") && argument != "--config" && !argument.starts_with("--config=")
+    })
 }
 
 fn selected_action_package_ids(
@@ -1118,12 +1136,7 @@ fn expand_builtin_action(
   let mut expanded_targets = selected_cargo_targets(run_args, expansion.selected_targets);
   let (argv, mut use_workspace, test_runner_name) = match kind {
     ActionKind::Build => (
-      ArgvTemplate::new(
-        "cargo",
-        vec!["check".to_string()],
-        PackageArguments::WorkspaceOrSelected,
-        run_args.to_vec(),
-      ),
+      builtin_build_template(run_args),
       !opts.ignore_bin_crates && targets.len() == workspace_package_count,
       None,
     ),
@@ -1322,6 +1335,98 @@ fn expand_builtin_action(
   })
 }
 
+fn builtin_build_template(run_args: &[String]) -> ArgvTemplate {
+  ArgvTemplate::new(
+    "cargo",
+    vec!["check".to_string()],
+    PackageArguments::WorkspaceOrSelected,
+    run_args.to_vec(),
+  )
+}
+
+/// Let Cargo own a backend-selection failure that prevented cargo-rail from
+/// acquiring its snapshot. This is deliberately a failed-probe fallback, not
+/// an eligibility fast path: valid backends retain the ordinary captured
+/// execution path and its receipt.
+pub(crate) fn try_complete_codegen_backend_probe_failure(
+  command: &Commands,
+  workspace_root: &std::path::Path,
+  error: &RailError,
+) -> RailResult<bool> {
+  if !error.is_compiler_configuration_probe_failure() || !configured_codegen_backend_present(workspace_root) {
+    return Ok(false);
+  }
+  let Commands::Run {
+    since: None,
+    merge_base: false,
+    all: true,
+    actions,
+    profile: None,
+    workflow: None,
+    dry_run: false,
+    hermetic: false,
+    format: ActionOutputFormat::Text,
+    generated: GeneratedMode::Regenerate,
+    print_cmd: false,
+    explain: false,
+    ignore_bin_crates: false,
+    skip_nextest: false,
+    test_runner: TestRunnerPreference::Auto,
+    cargo_test_args,
+    nextest_args,
+    test_filter: None,
+    run_args,
+    ..
+  } = command
+  else {
+    return Ok(false);
+  };
+  if actions.as_slice() != ["build"] || !cargo_test_args.is_empty() || !nextest_args.is_empty() {
+    return Ok(false);
+  }
+
+  let argv = builtin_build_template(run_args).expand(&[], true)?;
+  let (_, arguments) = argv
+    .split_first()
+    .ok_or_else(|| RailError::message("built-in build argv cannot be empty"))?;
+  let cargo = std::env::var_os("CARGO")
+    .filter(|program| !program.is_empty())
+    .unwrap_or_else(|| std::ffi::OsString::from("cargo"));
+  let status = {
+    let _cargo_child_execution_phase = crate::instrumentation::cargo_child_execution_phase();
+    Command::new(cargo)
+      .args(arguments)
+      .current_dir(workspace_root)
+      .status()
+      .map_err(|spawn_error| RailError::message(format!("build failed: {spawn_error}")))?
+  };
+  if !status.success() {
+    return Err(RailError::ExitWithCode {
+      code: status.code().unwrap_or(1),
+    });
+  }
+  Ok(true)
+}
+
+fn configured_codegen_backend_present(cargo_current_dir: &std::path::Path) -> bool {
+  fn contains_backend(value: &serde_json::Value) -> bool {
+    match value {
+      serde_json::Value::String(value) => value.contains("codegen-backend"),
+      serde_json::Value::Array(values) => values.iter().any(contains_backend),
+      serde_json::Value::Object(values) => values.values().any(contains_backend),
+      serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+  }
+
+  crate::cargo::CargoConfigSnapshot::capture(cargo_current_dir).is_ok_and(|config| {
+    config
+      .environment()
+      .iter()
+      .any(|(name, value)| name.ends_with("RUSTFLAGS") && value.contains("codegen-backend"))
+      || contains_backend(config.effective_file_settings())
+  })
+}
+
 fn action_reasons(
   ctx: &WorkspaceContext,
   opts: &RunOptions,
@@ -1482,6 +1587,7 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     .split_first()
     .ok_or_else(|| RailError::message("expanded action argv cannot be empty"))?;
   let native_cache = if matches!(action.kind(), ActionKind::Build | ActionKind::Distribution) {
+    let _native_cache_setup_phase = crate::instrumentation::native_cache_setup_phase();
     Some(if opts.no_cache {
       crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("native_cache_disabled_by_request")
     } else if cargo_cli_configuration_override(arguments) {
@@ -1495,7 +1601,7 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     } else if std::env::var_os("RUSTC_FORCE_INCREMENTAL").is_some() {
       crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("forced_incremental_compilation_not_graduated")
     } else {
-      match prepare_direct_cargo_action(ctx.snapshot()?) {
+      match prepare_direct_cargo_action(ctx.snapshot()?, opts.explain) {
         Ok(setup) => setup,
         Err(_) => crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed("native_cache_identity_unavailable"),
       }
@@ -1503,7 +1609,13 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
   } else {
     None
   };
-  let mut command = Command::new(program);
+  let selected_program =
+    if program == "cargo" && !matches!(action.kind(), ActionKind::GeneratedArtifact | ActionKind::Repository) {
+      ctx.snapshot()?.toolchain().cargo_program()
+    } else {
+      std::ffi::OsStr::new(program)
+    };
+  let mut command = Command::new(selected_program);
   let working_directory = action.validate_paths(ctx.workspace_root())?;
   if let Some(configuration) = native_cache
     .as_ref()
@@ -1545,15 +1657,21 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
       }
     }
   }
-  let status = command
-    .status()
-    .map_err(|error| RailError::message(format!("{} failed: {}", action.id(), error)))?;
+  let status = {
+    let _cargo_child_execution_phase = crate::instrumentation::cargo_child_execution_phase();
+    command
+      .status()
+      .map_err(|error| RailError::message(format!("{} failed: {}", action.id(), error)))?
+  };
   if opts.explain
     && let Some(native_cache) = &native_cache
   {
     if let Some(reason) = native_cache.bypass_reason() {
       println!("action `{}` native compiler cache: bypassed ({reason})", action.id());
-    } else if let Some(report) = native_cache.report() {
+    } else if let Some(report) = {
+      let _cache_report_collection_phase = crate::instrumentation::cache_report_collection_phase();
+      native_cache.report()
+    } {
       let reasons = report
         .reasons
         .iter()
@@ -1571,6 +1689,11 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
         report.bytes_restored,
         reasons,
       );
+      for event in &report.events {
+        if let Ok(encoded) = serde_json::to_string(event) {
+          println!("action `{}` native compiler cache event: {encoded}", action.id());
+        }
+      }
     }
   }
   if !status.success() {

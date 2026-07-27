@@ -2013,10 +2013,12 @@ fn capture_target_identity(
     if new_rustflags == rustflags {
       let runner = selected_target_runner(&inputs.cargo_config, &target.config_name, &cfg_set, workspace_root)?;
       let linker = selected_target_linker(&inputs.cargo_config, &target.config_name, &cfg_set, workspace_root)?;
+      let rustdoc_cfg =
+        cargo_applies_target_cfg_rustdocflags(inputs.toolchain.cargo_verbose_version()).then_some(&cfg_set);
       let rustdocflags = effective_flags(
         &inputs.cargo_config,
         &target.config_name,
-        Some(&cfg_set),
+        rustdoc_cfg,
         CompilerFlags::Rustdoc,
       )?;
       if let TargetSpecificationIdentity::Custom(specification) = &target.specification {
@@ -2301,6 +2303,20 @@ fn effective_flags(
     .map(|value| string_list(value, &format!("build.{}", kind.key())))
     .transpose()
     .map(Option::unwrap_or_default)
+}
+
+fn cargo_applies_target_cfg_rustdocflags(cargo_verbose_version: &str) -> bool {
+  let release = cargo_verbose_version
+    .lines()
+    .find_map(|line| line.strip_prefix("release: "))
+    .or_else(|| cargo_verbose_version.lines().next()?.split_whitespace().nth(1))
+    .and_then(|release| semver::Version::parse(release).ok());
+
+  // Cargo 1.95 accepts target cfg rustdocflags in configuration but does not
+  // apply them. Cargo 1.96 made them effective. For an unrecognized Cargo
+  // identity, retaining the flags over-binds cache identity and is therefore
+  // safer than omitting an input that the selected Cargo may apply.
+  release.is_none_or(|release| (release.major, release.minor) >= (1, 96))
 }
 
 fn target_field_string_list(
@@ -4012,7 +4028,13 @@ exec rustdoc "$@"
     let inputs = target_test_inputs(workspace.path());
     let targets = capture_target_identities(workspace.path(), &[], &inputs).expect("target identity should resolve");
     let target = targets.first().expect("configured target identity");
-    assert_eq!(probe_flags(target.rustdocflags()), ["rustdoc_triple", "rustdoc_cfg"]);
+    let expected_cfg_flag = cargo_applies_target_cfg_rustdocflags(inputs.toolchain.cargo_verbose_version());
+    let expected = if expected_cfg_flag {
+      vec!["rustdoc_triple", "rustdoc_cfg"]
+    } else {
+      vec!["rustdoc_triple"]
+    };
+    assert_eq!(probe_flags(target.rustdocflags()), expected);
 
     let output = cargo_probe_command(workspace.path())
       .args(["doc", "--offline", "--quiet", "--no-deps"])
@@ -4030,11 +4052,29 @@ exec rustdoc "$@"
         .lines()
         .any(|argument| argument == "cargo_rail_config_rustdoc_triple")
     );
-    assert!(
+    assert_eq!(
       rustdoc_argv
         .lines()
-        .any(|argument| argument == "cargo_rail_config_rustdoc_cfg")
+        .any(|argument| argument == "cargo_rail_config_rustdoc_cfg"),
+      expected_cfg_flag
     );
+  }
+
+  #[test]
+  fn target_cfg_rustdocflags_follow_the_selected_cargo_release_boundary() {
+    assert!(!cargo_applies_target_cfg_rustdocflags(
+      "cargo 1.95.0 (test)\nrelease: 1.95.0\n"
+    ));
+    assert!(cargo_applies_target_cfg_rustdocflags(
+      "cargo 1.96.0 (test)\nrelease: 1.96.0\n"
+    ));
+    assert!(cargo_applies_target_cfg_rustdocflags(
+      "cargo 1.96.0-beta.1 (test)\nrelease: 1.96.0-beta.1\n"
+    ));
+    assert!(cargo_applies_target_cfg_rustdocflags(
+      "cargo 1.98.0-nightly (test)\nrelease: 1.98.0-nightly\n"
+    ));
+    assert!(cargo_applies_target_cfg_rustdocflags("custom Cargo identity"));
   }
 
   #[test]
@@ -4105,10 +4145,14 @@ rustdocflags = ["--cfg", "snapshot_docs_cfg"]
     assert!(target.cfg().iter().any(|cfg| cfg == "snapshot_exact"));
     assert!(target.cfg().iter().any(|cfg| cfg == "snapshot_cfg"));
     assert_eq!(target.rustflags(), ["--cfg", "snapshot_exact", "--cfg", "snapshot_cfg"]);
-    assert_eq!(
-      target.rustdocflags(),
-      ["--cfg", "snapshot_docs_exact", "--cfg", "snapshot_docs_cfg"]
-    );
+    if cargo_applies_target_cfg_rustdocflags(inputs.toolchain.cargo_verbose_version()) {
+      assert_eq!(
+        target.rustdocflags(),
+        ["--cfg", "snapshot_docs_exact", "--cfg", "snapshot_docs_cfg"]
+      );
+    } else {
+      assert_eq!(target.rustdocflags(), ["--cfg", "snapshot_docs_exact"]);
+    }
     assert_eq!(target.host_artifact_rustflags(), Some([].as_slice()));
     assert_eq!(target.host_artifact_rustdocflags(), Some([].as_slice()));
     assert_eq!(

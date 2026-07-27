@@ -23,7 +23,7 @@
   pre-execution action identity from the ordered instructions, environment reads, generated tree, and execution evidence
   in its result identity. Incomplete boundaries remain explicitly non-reusable while ordinary unsupported execution stays
   available.
-  
+
   Add `cargo rail run --all --action build --hermetic` for the graduated pure-Rust Cargo-check class. It performs an
   explicit locked fetch, captures immutable crates.io, remote registry-mirror, or Git dependency sources, then checks
   locked/offline in fresh read-only source and isolated output roots with logical path remapping and a controlled
@@ -41,7 +41,7 @@
   metadata/rlib units on Apple Silicon macOS and ARM64 Linux with Cargo/rustc 1.97.1. Ordinary `cargo rail run` check
   and build actions can reuse byte-exact outputs across clean roots without restoring or fabricating Cargo target state,
   incremental state, or fingerprints.
-  
+
   Preserve custom wrappers and sccache, keep incremental builds and unproven linker/build-script/proc-macro classes
   explicitly bypassed, and fail closed on input, toolchain, environment, SDK/linker, cache-object, and output mutations.
   Add a representative registry/Git/native/proc-macro fixture plus reproducible cold/warm benchmarks and cache evidence.
@@ -125,7 +125,7 @@
 ## [0.17.0](https://github.com/loadingalias/cargo-rail/compare/v0.16.0...v0.17.0) - 2026-07-12
 
 - Made `cargo rail unify` faster and more exact with shared indexed Cargo metadata, workspace-only compiler evidence, source-derived feature checks, and compilation-unit cache reuse. Analysis now covers configured targets, default/no-default/all-feature builds, conditional feature selections, generated and macro-expanded source, every Cargo target kind, and target-scoped declarations.
-  
+
   Graph-removing decisions now carry deterministic proof certificates with repository-relative paths normalized across platforms. Apply verifies the exact declaration edits and resulting portable Cargo graph before writing. Closed-world cleanup of dormant private features and optional dependencies requires the explicit `consumer_scope = "workspace"` contract; published feature APIs remain preserved.
 
 - Fixed release archive verification and added recovery for an existing immutable tag.

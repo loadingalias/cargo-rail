@@ -20,6 +20,7 @@ include = [
     "/build.rs",
     "/src/**/*.rs",
     "/schemas/**",
+    "/distribution/native-cache-capabilities.json",
     "/tests/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -37,25 +38,36 @@ resolver = "3"
 rust-version = "1.95.0"
 
 [dependencies]
-clap = { version = "4.6.2", features = ["derive", "cargo"] }
+clap = { version = "4.6.4", features = ["derive", "cargo"] }
 clap_complete = "4.6.7"
 cargo_metadata = "0.23.1"
 petgraph = { version = "0.8.3", default-features = false }
 toml_edit = { version = "0.25.13", features = ["serde"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 semver = "1.0.28"
 rayon = "1.12.0"
 winnow = "1.0.4"
 chrono = "0.4.45"
-glob = "0.3.3"
+glob = "0.3.4"
 rustc-hash = "2.1.3"
 sha2 = { version = "0.11.0", default-features = false }
 tempfile = "3.27.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSURL",
+    "std",
+] }
+
 [dev-dependencies]
-anyhow = "1.0.103"
-jsonschema = { version = "0.48.0", default-features = false }
+anyhow = "1.0.104"
+jsonschema = { version = "0.49.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

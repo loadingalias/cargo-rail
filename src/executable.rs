@@ -81,7 +81,7 @@ impl ToolchainExecutableIdentities {
     toolchain: &crate::cargo::ToolchainIdentity,
     current_dir: &Path,
     source_root: &Path,
-    scope: ToolchainExecutableScope,
+    _scope: ToolchainExecutableScope,
   ) -> RailResult<Self> {
     let mut captured = std::collections::BTreeMap::<PathBuf, ExecutableIdentity>::new();
     let mut capture = |program: &OsStr| -> RailResult<ExecutableIdentity> {
@@ -100,9 +100,10 @@ impl ToolchainExecutableIdentities {
     };
     let cargo = capture(toolchain.cargo_program())?;
     let rustc = capture(toolchain.rustc_program())?;
-    let rustdoc = matches!(scope, ToolchainExecutableScope::Documentation)
-      .then(|| capture(toolchain.rustdoc_program()))
-      .transpose()?;
+    // rustdoc is part of the selected Rust distribution even when the current
+    // action compiles rather than documents. Native-cache capability
+    // certificates bind the complete Cargo/rustc/rustdoc trio.
+    let rustdoc = Some(capture(toolchain.rustdoc_program())?);
     let rustc_wrapper = toolchain.rustc_wrapper_program().map(&mut capture).transpose()?;
     let rustc_workspace_wrapper = toolchain
       .rustc_workspace_wrapper_program()
@@ -119,9 +120,7 @@ impl ToolchainExecutableIdentities {
       };
     let cargo_implementation = implementation("cargo");
     let rustc_implementation = implementation("rustc");
-    let rustdoc_implementation = matches!(scope, ToolchainExecutableScope::Documentation)
-      .then(|| implementation("rustdoc"))
-      .flatten();
+    let rustdoc_implementation = Some(implementation("rustdoc")).flatten();
     for (role, executable) in [
       ("cargo", Some(&cargo)),
       ("rustc", Some(&rustc)),
@@ -175,6 +174,14 @@ impl ToolchainExecutableIdentities {
 
   pub(crate) fn cargo_implementation(&self) -> Option<&ExecutableIdentity> {
     self.cargo_implementation.as_ref()
+  }
+
+  pub(crate) fn rustc_implementation(&self) -> Option<&ExecutableIdentity> {
+    self.rustc_implementation.as_ref()
+  }
+
+  pub(crate) fn rustdoc_implementation(&self) -> Option<&ExecutableIdentity> {
+    self.rustdoc_implementation.as_ref()
   }
 
   pub(crate) fn limitations(&self) -> impl Iterator<Item = &str> {

@@ -9,7 +9,7 @@ appropriate, but they do not share eligibility:
 | Hermetic whole action | Restore the complete declared output of an eligible isolated Cargo check | Cargo, rustc, and rustdoc for the action |
 | Native compiler result | Reuse one eligible rustc invocation through Cargo's wrapper boundary | That rustc invocation |
 
-There is no global “caching supported” state. Read the generated [capability matrix](cache-capabilities.md) before
+There is no global “caching supported” state. Read the generated [support matrix](cache-capabilities.md) before
 interpreting a hit rate or comparing another repository.
 
 ## Native compiler-result reuse
@@ -17,8 +17,8 @@ interpreting a hit rate or comparing another repository.
 Native reuse is automatic for an ordinary `build` or `distribution` action when every session boundary is supported.
 The current class requires:
 
-- `aarch64-apple-darwin` or `aarch64-unknown-linux-gnu`;
-- Cargo and rustc 1.97.1;
+- an exact Cargo, rustc, rustdoc, sysroot, backend, host, and wrapper-protocol identity with a certificate in the
+  generated [support matrix](cache-capabilities.md);
 - `CARGO_INCREMENTAL=0`;
 - no Cargo CLI `--config`, action-defined environment, forced incremental mode, existing sccache, or custom compiler
   wrapper;
@@ -36,6 +36,16 @@ CARGO_INCREMENTAL=0 cargo rail run --all --action distribution --explain
 
 `build` runs the configured check action. `distribution` runs the configured release-build action. Repository
 configuration and arguments remain authoritative; an unsupported override causes a named cold bypass.
+
+Inspect the captured toolchain without running a build:
+
+```bash
+cargo rail doctor native-cache --format json
+```
+
+The report includes the root-independent capability identity and its evidence when certified. A matching release
+without matching executable and sysroot bytes remains cold with `native_cache_capability_not_certified`; a mixed
+Cargo/rustc/rustdoc selection reports `native_cache_toolchain_incoherent`.
 
 Use `--no-cache` for an intentional cargo-rail baseline:
 
@@ -94,7 +104,7 @@ The local CAS defaults to `$CARGO_HOME/cargo-rail/local-cas-v1` or `$HOME/.cargo
 
 Do not delete individual CAS objects or Cargo fingerprint files manually.
 
-## Reproduce the shipped benchmark
+## Reproduce and interpret the benchmark
 
 The checked-in fixture includes registry and Git dependencies, build scripts, a proc macro, native code, workspace
 libraries, and a binary:
@@ -104,24 +114,86 @@ cargo build --release --locked
 just bench-native-cache 10
 ```
 
-The final v0.19.0 measurements used alternating clean roots, offline Cargo, `CARGO_INCREMENTAL=0`, and Cargo/rustc
-1.97.1. They are evidence for this fixture, not a promise for unrelated repositories:
+The accepted development measurement is an interleaved 110-sample run on a local M1 Pro: 22 complete groups, no
+rejections, no false hits, identical action censuses and output manifests, and 27 stable warm hits. It used offline
+Cargo/rustc 1.97.1, `CARGO_INCREMENTAL=0`, a clean target for every sample, distinct seed/use roots, and a fresh copy of
+the populated cache for every warm sample. sccache 0.16.0 used its local disk backend with ambient remote backends
+disabled and both physical roots in `SCCACHE_BASEDIRS`.
 
-| Measurement | Native Cargo | Warm cargo-rail | Result |
-|---|---:|---:|---:|
-| Apple Silicon check p50 | 6.952 s | 6.281 s | 9.6% faster |
-| Apple Silicon release build p50 | 10.300 s | 9.002 s | 12.6% faster |
-| ARM64 GNU/Linux check p50 | 7.82 s | 4.70 s | 40.0% faster |
-| ARM64 GNU/Linux build p50 | 9.89 s | 5.95 s | 39.8% faster |
+Times are p50/p95:
 
-The Apple Silicon release-build p95 was 14.0% slower because of one warm outlier. Cold cache population was also slower
-than native Cargo, so repeated reuse is required to recover its cost. An unsupported tiny binary measured 0.111 s in
-raw Cargo and 0.606/0.602 s through cargo-rail with caching disabled/actively bypassed; the material cost there is the
-planner, not cache setup.
+| Workload | Lane | p50 | p95 |
+|---|---|---:|---:|
+| check | native Cargo | 7.028 s | 9.002 s |
+| check | cargo-rail disabled | 7.397 s | 8.183 s |
+| check | cargo-rail cold | 9.602 s | 10.115 s |
+| check | cargo-rail warm cross-root | 4.979 s | 5.615 s |
+| check | sccache 0.16.0 | 5.278 s | 5.999 s |
+| release build | native Cargo | 10.369 s | 10.808 s |
+| release build | cargo-rail disabled | 10.947 s | 11.262 s |
+| release build | cargo-rail cold | 14.336 s | 15.173 s |
+| release build | cargo-rail warm cross-root | 7.630 s | 8.347 s |
+| release build | sccache 0.16.0 | 8.173 s | 8.902 s |
 
-An earlier sccache comparison completed the macOS check faster but retained 22 dep-info paths bound to the seed root.
-cargo-rail therefore does not claim to replace sccache. Existing sccache installations are preserved and bypass native
-reuse. Comparisons must report output portability and invalidation behavior as well as elapsed time.
+Warm cargo-rail saved 29.2% at check p50 and 26.4% at release-build p50 versus native Cargo. It saved 48.1% and 46.8%
+respectively versus cold publication; two warm reuses repaid the measured cold overhead for both workloads. Against
+sccache, warm cargo-rail was 5.7% faster for checks and 6.6% faster for release builds at p50.
+
+Dedicated AWS runs using the same 110-sample contract also qualified on Linux x86-64 and Linux ARM64:
+
+| Host | Workload | Native p50/p95 | cargo-rail warm p50/p95 | sccache p50/p95 |
+|---|---|---:|---:|---:|
+| Linux x86-64 | check | 5.841/5.891 s | 3.430/4.074 s | 3.155/3.247 s |
+| Linux x86-64 | release build | 9.224/9.351 s | 5.547/5.605 s | 6.223/6.244 s |
+| Linux ARM64 | check | 6.166/6.266 s | 3.870/4.325 s | 3.843/3.882 s |
+| Linux ARM64 | release build | 10.591/10.674 s | 6.618/6.696 s | 7.470/7.562 s |
+
+Warm cargo-rail beat native Cargo on every qualified host and workload. Against sccache, it won both macOS workloads
+and both Linux release builds; sccache led Linux checks by 8.7% on x86-64 and 0.7% on ARM64 at p50. These remain
+same-host fixture results, not universal performance claims.
+
+Windows x86-64 timing remains unqualified. Its latest partial run preserved exact rejected evidence: reusable clean-root
+hits were complete, but two deliberately bypassed consumers observed byte-unstable proc-macro DLLs, and PID reuse could
+overwrite explain-event files. Neither rejected timing nor the older pre-evidence run belongs in this scorecard.
+Existing sccache installations remain preserved and cause cargo-rail native reuse to bypass.
+
+The benchmark maps each modeled compiler output back to its versioned unit event. A modeled output may retain a
+physical root only when that exact path belongs to an explicit bypass; eligible outputs must remain portable and
+byte-identical. Cargo-owned projections outside the compiler-output model are reported but never treated as cache
+authority.
+
+## Performance and coverage priorities
+
+Treat elapsed time as the sum of distinct work:
+
+- fixed front-end work before Cargo starts;
+- cold observation, validation, hashing, and CAS publication;
+- warm candidate discovery, revalidation, CAS reads, and output materialization; and
+- cold execution for every bypassed compiler invocation.
+
+The tiny-action p50 gap of 0.203–0.721 seconds is an upper bound on removable front-end work, not a guaranteed saving.
+The first performance target is an eligibility boundary that avoids workspace planning, metadata, wrapper, report, and
+cache setup when no graduated unit can reuse a result. Cold-path work must hash immutable bytes once per captured
+snapshot and must not republish verified CAS objects. Warm-path work must reduce scans, decoding, revalidation, and
+materialization without allowing a candidate lookup to authorize restoration.
+
+Broader coverage is an accuracy problem before it is a hit-rate problem:
+
+| Compiler class | Proof required before reuse |
+|---|---|
+| Linked binaries and linked crate types | Exact linker/driver, response files, sysroot, SDK, native libraries, environment, dependency results, and complete executable/debug output |
+| Test compilation | `cfg(test)`, harness generation, dev dependencies, profile, target, linker, runner configuration, and produced test executable; test execution remains a separate action |
+| Proc macros | Macro binary and compiler bridge, input tokens, output tokens and diagnostics, plus isolated or observed filesystem, environment, subprocess, time, randomness, and network inputs |
+| Build scripts | Existing `BuildScriptActionKey` and `BuildScriptResult` authority plus the ordered Cargo instruction stream, runtime reads, subprocesses, environment, and exact `OUT_DIR` tree |
+| Native compilation and linking | External compilers, assemblers, archivers, linkers, headers, SDKs, libraries, discovery inputs, response files, dependency files, and output formats |
+| Additional Rust toolchains | Exact Cargo/rustc/rustdoc/sysroot/backend identity and a versioned probe of wrapper, argv, dep-info, emit, response-file, path-remap, and output behavior |
+
+“Arbitrary toolchain support” cannot mean accepting an unknown compiler. cargo-rail qualifies an exact toolchain
+protocol and issues `native_cache_toolchain_not_graduated` for an unqualified release,
+`native_cache_toolchain_incoherent` for a mixed toolchain, or `native_cache_capability_not_certified` when an exact
+candidate lacks proof. Every new class must pass positive reuse, negative mutation, corruption, partial-result,
+cross-root, concurrent-publication, and native-platform tests. One false hit blocks graduation regardless of
+performance.
 
 ## Evaluate another workspace
 
