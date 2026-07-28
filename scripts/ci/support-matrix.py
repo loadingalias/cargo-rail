@@ -1034,6 +1034,13 @@ def compatibility_matrix(
     releases = stable_releases(current_stable)
     msrv = workspace_msrv()
     current = RustRelease.parse(current_stable, "current stable")
+    incoherent_toolchain = msrv
+    if incoherent_toolchain == current:
+        require(
+            current.minor > 0,
+            "current stable must have a preceding stable release for the incoherent-toolchain probe",
+        )
+        incoherent_toolchain = RustRelease(current.major, current.minor - 1, 0)
     include = []
     for host in manifest.native_hosts:
         for release in releases:
@@ -1061,7 +1068,7 @@ def compatibility_matrix(
                         "filesystem": host.filesystem,
                         "case-sensitive": host.case_sensitive,
                         "incoherent-toolchain": (
-                            str(msrv)
+                            str(incoherent_toolchain)
                             if release == current
                             and host.target == "x86_64-unknown-linux-gnu"
                             else ""
