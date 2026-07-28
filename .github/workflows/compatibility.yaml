@@ -155,6 +155,9 @@ jobs:
           if [ "${{ matrix.compatibility.codegen-backend-probes }}" = "true" ]; then
             selection_args+=(--codegen-backend-probes)
           fi
+          if [ "${{ matrix.compatibility.direct-repeatability-probe }}" = "true" ]; then
+            selection_args+=(--direct-repeatability-probe)
+          fi
           if [ -n "${{ matrix.compatibility.incoherent-toolchain }}" ]; then
             selection_args+=(--incoherent-toolchain "${{ matrix.compatibility.incoherent-toolchain }}")
           fi
@@ -342,15 +345,15 @@ jobs:
           if ! command -v "$python_command" >/dev/null 2>&1; then
             python_command=python
           fi
-          unc_args=()
+          filesystem_args=(
+            --root "$FILESYSTEM_ROOT"
+            --expected-filesystem "${{ matrix.filesystem.kind }}"
+            --expected-case-sensitive "${{ matrix.filesystem.case-sensitive }}"
+          )
           if [ -n "${FILESYSTEM_UNC_ROOT:-}" ]; then
-            unc_args=(--unc-root "$FILESYSTEM_UNC_ROOT")
+            filesystem_args+=(--unc-root "$FILESYSTEM_UNC_ROOT")
           fi
-          "$python_command" scripts/ci/run-filesystem-compatibility.py \
-            --root "$FILESYSTEM_ROOT" \
-            --expected-filesystem "${{ matrix.filesystem.kind }}" \
-            --expected-case-sensitive "${{ matrix.filesystem.case-sensitive }}" \
-            "${unc_args[@]}"
+          "$python_command" scripts/ci/run-filesystem-compatibility.py "${filesystem_args[@]}"
 
       - name: Run filesystem authority and publication tests
         shell: bash

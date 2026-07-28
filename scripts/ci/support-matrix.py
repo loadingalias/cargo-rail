@@ -931,6 +931,7 @@ def validate_inventories(
         "--forward-compatibility-matrix",
         "--linker-probes",
         "--codegen-backend-probes",
+        "--direct-repeatability-probe",
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
         "just build-all",
@@ -1008,7 +1009,7 @@ def expected_action_cache_state(
         return "native_cache_toolchain_not_graduated"
     if target not in native_cache.certified_targets():
         return "native_cache_capability_not_certified"
-    return "active"
+    return "exact_certificate"
 
 
 def compatibility_matrix(
@@ -1040,6 +1041,9 @@ def compatibility_matrix(
                         "cross-target-mutation-probes": release == current,
                         "linker-probes": release == current,
                         "codegen-backend-probes": False,
+                        "direct-repeatability-probe": host.target.endswith(
+                            "-pc-windows-msvc"
+                        ),
                         "filesystem": host.filesystem,
                         "case-sensitive": host.case_sensitive,
                         "incoherent-toolchain": (

@@ -456,10 +456,26 @@ def execute_case(
     *,
     workspace: Path,
     env: dict[str, str],
+    verify_direct_repeatability: bool = False,
 ) -> tuple[ProcessResult, tuple[tuple[str, str, int, str], ...]]:
     clean_directory(target)
     direct = run(direct_argv(case, target), cwd=workspace, env=env)
     direct_outputs = output_manifest(target)
+
+    if verify_direct_repeatability:
+        clean_directory(target)
+        repeated = run(direct_argv(case, target), cwd=workspace, env=env)
+        if repeated != direct:
+            raise CompatibilityError(
+                f"{case.name} repeated direct Cargo process result differs\n"
+                f"first={direct!r}\nsecond={repeated!r}"
+            )
+        repeated_outputs = output_manifest(target)
+        if repeated_outputs != direct_outputs:
+            raise CompatibilityError(
+                f"{case.name} repeated direct Cargo output inventory or bytes differ:\n"
+                f"{manifest_difference(direct_outputs, repeated_outputs)}"
+            )
 
     for label, no_cache in (("cache-disabled", True), ("cache-requested", False)):
         clean_directory(target)
@@ -487,6 +503,78 @@ def execute_case(
                 f"{manifest_difference(direct_outputs, outputs)}"
             )
     return direct, direct_outputs
+
+
+def resolve_expected_cache_state(
+    cargo_rail: Path,
+    expected: str,
+    expected_host: str,
+    *,
+    workspace: Path,
+    env: dict[str, str],
+) -> str:
+    if expected != "exact_certificate":
+        return expected
+
+    result = run(
+        [str(cargo_rail), "rail", "doctor", "native-cache", "--format", "json"],
+        cwd=workspace,
+        env=env,
+    )
+    try:
+        report = json.loads(result.stdout)
+        capability = report["capability"]
+        registry = json.loads(
+            (
+                REPOSITORY_ROOT / "distribution/native-cache-capabilities.json"
+            ).read_bytes()
+        )
+        matches = [
+            certificate
+            for certificate in registry["certificates"]
+            if certificate["platform"] == capability["platform"]
+            and certificate["host_target"] == capability["host_target"]
+            and certificate["identity"] == capability["identity"]
+        ]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise CompatibilityError(
+            f"native-cache capability report or registry is invalid: {error}"
+        ) from error
+
+    if (
+        report.get("command") != "doctor"
+        or report.get("mode") != "native_cache"
+        or report.get("result") != "success"
+        or report.get("exit_code") != 0
+        or capability.get("host_target") != expected_host
+        or capability.get("schema_version") != registry.get("schema_version")
+        or capability.get("cache_class") != registry.get("class")
+        or capability.get("execution_contract") != registry.get(
+            "execution_contract"
+        )
+        or len(matches) > 1
+    ):
+        raise CompatibilityError(
+            "native-cache capability report disagrees with the reviewed registry"
+        )
+
+    if matches:
+        evidence = matches[0]["evidence"]
+        if capability.get("certified") is not True or capability.get(
+            "evidence"
+        ) != evidence:
+            raise CompatibilityError(
+                "native-cache capability matches the registry but is not certified"
+            )
+        return "active"
+
+    if capability.get("certified") is not False or capability.get(
+        "evidence"
+    ) is not None:
+        raise CompatibilityError(
+            "native-cache capability is absent from the registry but reports certification"
+        )
+    return "native_cache_capability_not_certified"
 
 
 def assert_cache_explanation(
@@ -1594,6 +1682,7 @@ def main() -> int:
     parser.add_argument("--custom-target-json-probe", action="store_true")
     parser.add_argument("--linker-probes", action="store_true")
     parser.add_argument("--codegen-backend-probes", action="store_true")
+    parser.add_argument("--direct-repeatability-probe", action="store_true")
     parser.add_argument("--temporary-root", type=Path)
     args = parser.parse_args()
 
@@ -1649,6 +1738,13 @@ def main() -> int:
                 env=environment,
             )
             assert_plan(cargo_rail, workspace, environment)
+            expected_cache_state = resolve_expected_cache_state(
+                cargo_rail,
+                args.expected_cache_state,
+                args.expected_host,
+                workspace=workspace,
+                env=environment,
+            )
 
             cases = (
                 ActionCase(
@@ -1688,13 +1784,16 @@ def main() -> int:
                     target,
                     workspace=workspace,
                     env=environment,
+                    verify_direct_repeatability=(
+                        args.direct_repeatability_probe and case.name == "check"
+                    ),
                 )
                 if case.action in {"build", "distribution"}:
                     assert_cache_explanation(
                         cargo_rail,
                         case,
                         target,
-                        args.expected_cache_state,
+                        expected_cache_state,
                         direct,
                         direct_outputs,
                         workspace=workspace,
@@ -1706,7 +1805,7 @@ def main() -> int:
                 assert_cross_target_corpus(
                     cargo_rail,
                     root,
-                    action_cache_state=args.expected_cache_state,
+                    action_cache_state=expected_cache_state,
                     env=environment,
                 )
             if args.cross_target_mutation_probes:
@@ -1714,7 +1813,7 @@ def main() -> int:
                     cargo_rail,
                     root,
                     args.expected_host,
-                    action_cache_state=args.expected_cache_state,
+                    action_cache_state=expected_cache_state,
                     env=environment,
                 )
             if args.custom_target_json_probe:
