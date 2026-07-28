@@ -37,11 +37,9 @@ for arg in "$@"; do
   case $arg in
     --verify-only)
       VERIFY_ONLY=true
-      shift
       ;;
     --update-lock)
       UPDATE_LOCK=true
-      shift
       ;;
     *)
       echo "Unknown option: $arg"
@@ -64,6 +62,10 @@ check_dependencies() {
 
   if ! command -v jq &> /dev/null; then
     missing+=("jq (install: brew install jq)")
+  fi
+
+  if ! command -v gh &> /dev/null && ! command -v curl &> /dev/null; then
+    missing+=("gh or curl")
   fi
 
   if [ ${#missing[@]} -gt 0 ]; then
@@ -95,7 +97,7 @@ resolve_ref_to_sha() {
 
   # Fallback to curl (unauthenticated, 60 req/hour limit)
   local sha
-  sha=$(curl -sSL "https://api.github.com/repos/$action/commits/$ref" 2>/dev/null | jq -r '.sha // empty')
+  sha=$(curl -fsSL "https://api.github.com/repos/$action/commits/$ref" 2>/dev/null | jq -r '.sha // empty')
 
   if [ -z "$sha" ]; then
     echo "ERROR: Failed to resolve $action@$ref" >&2
@@ -121,6 +123,7 @@ update_lock_file() {
   local temp_lock
   temp_lock=$(mktemp)
   cp "$LOCK_FILE" "$temp_lock"
+  local failed=false
 
   for action in $actions; do
     echo "Processing: $action"
@@ -129,26 +132,36 @@ update_lock_file() {
     ref=$(yq eval ".\"$action\".ref" "$LOCK_FILE")
 
     if [ "$ref" = "null" ] || [ -z "$ref" ]; then
-      echo "  ⚠️  Skipping: No ref defined"
+      echo "  ❌ Missing ref" >&2
+      failed=true
       continue
     fi
 
     local sha
     if ! sha=$(resolve_ref_to_sha "$action" "$ref"); then
       echo "  ❌ Failed to resolve SHA"
+      failed=true
       continue
     fi
 
-    local timestamp
-    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-    # Update YAML in-place
-    yq eval -i ".\"$action\".sha = \"$sha\"" "$temp_lock"
-    yq eval -i ".\"$action\".updated = \"$timestamp\"" "$temp_lock"
+    local current_sha
+    current_sha=$(yq eval ".\"$action\".sha" "$LOCK_FILE")
+    if [ "$current_sha" != "$sha" ]; then
+      local timestamp
+      timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      yq eval -i ".\"$action\".sha = \"$sha\"" "$temp_lock"
+      yq eval -i ".\"$action\".updated = \"$timestamp\"" "$temp_lock"
+    fi
 
     echo "  ✅ $ref → $sha"
     echo ""
   done
+
+  if [ "$failed" = true ]; then
+    rm -f "$temp_lock"
+    echo "❌ Lock update aborted; no partial resolution was written." >&2
+    return 1
+  fi
 
   mv "$temp_lock" "$LOCK_FILE"
   echo "✅ Lock file updated successfully"
@@ -167,7 +180,7 @@ rewrite_workflows() {
 
   # Find all YAML files in workflows/ and actions/
   local files
-  files=$(find "$WORKFLOWS_DIR" "$ACTIONS_DIR" -name "*.yaml" -o -name "*.yml" 2>/dev/null)
+  files=$(find "$WORKFLOWS_DIR" "$ACTIONS_DIR" \( -name "*.yaml" -o -name "*.yml" \) -type f 2>/dev/null)
 
   for file in $files; do
     echo "Processing: $(basename "$file")"
@@ -187,8 +200,9 @@ rewrite_workflows() {
       sha=$(yq eval ".\"$action\".sha" "$LOCK_FILE")
 
       if [ "$sha" = "null" ] || [ -z "$sha" ]; then
-        echo "  ⚠️  Skipping $action: No SHA in lock file"
-        continue
+        echo "ERROR: $action has no SHA in $LOCK_FILE" >&2
+        rm -f "$temp_file" "$temp_file.bak"
+        return 1
       fi
 
       # Pattern: uses: actions/checkout@v4
@@ -234,32 +248,66 @@ verify_workflows() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
 
-  local files
-  files=$(find "$WORKFLOWS_DIR" "$ACTIONS_DIR" -name "*.yaml" -o -name "*.yml" 2>/dev/null)
+  local failed=false
+  local used_actions
+  used_actions=$(mktemp)
 
-  local unpinned=()
+  while IFS= read -r file; do
+    while IFS=: read -r line_number line; do
+      local spec
+      spec=$(sed -E 's/^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*$/\1/' <<< "$line")
+      if [[ "$spec" == ./* ]]; then
+        continue
+      fi
+      if [[ "$spec" != *@* ]]; then
+        echo "❌ INVALID: $file:$line_number: $line"
+        failed=true
+        continue
+      fi
 
-  for file in $files; do
-    # Find lines with "uses:" that are NOT pinned to a SHA
-    # SHA pattern: 40 hex characters
-    # Exclude local actions: composite actions (./.github/actions/) and reusable workflows (./.github/workflows/)
-    local issues
-    issues=$(grep -n "uses:" "$file" | grep -v "@[0-9a-f]\{40\}" | grep -v "^#" | grep -v "uses: \\./\\.github/actions/" | grep -v "uses: \\./\\.github/workflows/" || true)
+      local action sha
+      action="${spec%@*}"
+      sha="${spec##*@}"
+      if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "❌ UNPINNED: $file:$line_number: $line"
+        failed=true
+        continue
+      fi
 
-    if [ -n "$issues" ]; then
-      unpinned+=("$file")
-      echo "❌ UNPINNED: $(basename "$file")"
-      printf '     %s\n' "${issues//$'\n'/$'\n     '}"
-      echo ""
+      local locked_ref locked_sha
+      locked_ref=$(yq eval ".\"$action\".ref" "$LOCK_FILE")
+      locked_sha=$(yq eval ".\"$action\".sha" "$LOCK_FILE")
+      if [ "$locked_ref" = "null" ] || [ "$locked_sha" = "null" ]; then
+        echo "❌ UNLOCKED: $file:$line_number references $action"
+        failed=true
+        continue
+      fi
+
+      local comment_ref
+      comment_ref=$(sed -nE 's/^.*#[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p' <<< "$line")
+      if [ "$sha" != "$locked_sha" ] || [ "$comment_ref" != "$locked_ref" ]; then
+        echo "❌ LOCK DRIFT: $file:$line_number"
+        echo "   workflow: $action@$sha  # ${comment_ref:-<missing>}"
+        echo "   lock:     $action@$locked_sha  # $locked_ref"
+        failed=true
+      fi
+      printf '%s\n' "$action" >> "$used_actions"
+    done < <(grep -nE '^[[:space:]]*uses:' "$file" || true)
+  done < <(find "$WORKFLOWS_DIR" "$ACTIONS_DIR" \( -name "*.yaml" -o -name "*.yml" \) -type f -print)
+
+  local action
+  while IFS= read -r action; do
+    if ! grep -Fxq "$action" "$used_actions"; then
+      echo "❌ STALE LOCK ENTRY: $action"
+      failed=true
     fi
-  done
+  done < <(yq eval 'keys | .[]' "$LOCK_FILE")
+  rm -f "$used_actions"
 
-  if [ ${#unpinned[@]} -gt 0 ]; then
+  if [ "$failed" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "❌ VERIFICATION FAILED"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    echo "Found ${#unpinned[@]} file(s) with unpinned actions."
     echo ""
     echo "To fix, run:"
     echo "  just pin-actions"
@@ -276,18 +324,19 @@ verify_workflows() {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 main() {
+  check_dependencies
+
   if [ "$VERIFY_ONLY" = true ]; then
     verify_workflows
     exit 0
   fi
-
-  check_dependencies
 
   if [ "$UPDATE_LOCK" = true ]; then
     update_lock_file
   fi
 
   rewrite_workflows
+  verify_workflows
 
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "✅ GitHub Actions pinning complete"

@@ -33,6 +33,8 @@ retries = 0
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
 test-group = 'cargo-subprocess'
+# Custom-profile overrides inherit each unset setting from matching default overrides.
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'

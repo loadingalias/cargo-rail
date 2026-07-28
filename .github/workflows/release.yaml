@@ -42,6 +42,7 @@ jobs:
       matrix: ${{ steps.targets.outputs.matrix }}
       target_count: ${{ steps.targets.outputs.count }}
       version: ${{ steps.release.outputs.version }}
+      msrv: ${{ steps.release.outputs.msrv }}
       release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
       - name: Validate release tag
@@ -130,30 +131,25 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           toolchain: ${{ steps.release.outputs.msrv }}
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
-        with:
-          toolchain: stable
           components: clippy, rustfmt
 
       - name: Install just
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2
         with:
           tool: just
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2
         with:
           tool: cargo-nextest
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2
         with:
           tool: cargo-deny
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094  # v2.85.1
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf  # v2.85.2
         with:
           tool: cargo-audit
 
@@ -170,21 +166,21 @@ jobs:
         run: cargo +${{ steps.release.outputs.msrv }} check --workspace --all-targets --all-features --locked
 
       - name: Verify formatting
-        run: cargo +stable fmt --all -- --check
+        run: cargo +${{ steps.release.outputs.msrv }} fmt --all -- --check
 
-      # Recovery rebuilds an immutable tag. Rolling Clippy lints belong to the
-      # pre-tag gate and must not make a previously published source stop shipping.
+      # A manual recovery rebuild skips lint policy while retaining the exact
+      # source compiler, tests, documentation, and dependency gates.
       - name: Verify Clippy
         if: github.event_name != 'workflow_dispatch'
-        run: cargo +stable clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo +${{ steps.release.outputs.msrv }} clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Verify tests
-        run: cargo +stable nextest run --workspace --all-features --locked
+        run: cargo +${{ steps.release.outputs.msrv }} nextest run --workspace --all-features --locked
 
       - name: Verify documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo +stable doc --workspace --no-deps --all-features --locked
+        run: cargo +${{ steps.release.outputs.msrv }} doc --workspace --no-deps --all-features --locked
 
       - name: Verify dependency policy
         run: cargo deny check all
@@ -220,7 +216,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
-          toolchain: stable
+          toolchain: ${{ needs.verify-release.outputs.msrv }}
 
       - name: Configure path remapping
         shell: bash
@@ -393,5 +389,25 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(cargo-rail-*.tar.* cargo-rail-*.zip)
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            "${files[@]}" SHA256SUMS SHA256SUMS.json --clobber
+          files+=(SHA256SUMS SHA256SUMS.json)
+          remote_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          download_dir="$(mktemp -d)"
+          trap 'rm -rf "$download_dir"' EXIT
+          missing=()
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            if grep -Fxq "$name" <<< "$remote_assets"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" --dir "$download_dir"
+              if ! cmp -s "$file" "$download_dir/$name"; then
+                echo "Release asset $name already exists with different bytes." >&2
+                exit 1
+              fi
+              echo "Verified existing immutable asset: $name"
+            else
+              missing+=("$file")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${missing[@]}"
+          fi

@@ -792,7 +792,7 @@ fn test_runner_builtin_actions_render_byte_exact_argv_in_request_order() -> Resu
   let action_crate = ws.add_crate("action-crate", "0.1.0", &[])?;
   let manifest = std::fs::read_to_string(action_crate.join("Cargo.toml"))?.replace(
     "authors.workspace = true",
-    "authors.workspace = true\nrust-version = \"1.95\"",
+    "authors.workspace = true\nrust-version = \"1.97.1\"",
   );
   std::fs::write(action_crate.join("Cargo.toml"), manifest)?;
   ws.commit("Add crate")?;
@@ -843,7 +843,7 @@ fn test_runner_builtin_actions_render_byte_exact_argv_in_request_order() -> Resu
       "docs: cargo doc --workspace --no-deps\n",
       "format: cargo fmt --all --check\n",
       "lint: cargo clippy --workspace --all-targets --all-features -- -D warnings\n",
-      "msrv: cargo +1.95.0 check --workspace --all-targets --all-features --locked\n",
+      "msrv: cargo +1.97.1 check --workspace --all-targets --all-features --locked\n",
       "package: cargo package --workspace --locked\n",
       "audit: cargo deny check all\n",
       "distribution: cargo build --workspace --release --locked\n",

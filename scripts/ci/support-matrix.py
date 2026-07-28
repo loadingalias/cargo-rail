@@ -867,7 +867,13 @@ def validate_inventories(
     )
 
     toolchain = load_toml(REPOSITORY_ROOT / "rust-toolchain.toml")
-    toolchain_targets = toolchain.get("toolchain", {}).get("targets")
+    toolchain_config = toolchain.get("toolchain", {})
+    toolchain_targets = toolchain_config.get("targets")
+    msrv = str(workspace_msrv())
+    require(
+        toolchain_config.get("channel") == msrv,
+        f"rust-toolchain.toml channel must equal workspace MSRV {msrv}",
+    )
     require(
         isinstance(toolchain_targets, list),
         "rust-toolchain.toml toolchain.targets must be an array",
@@ -880,6 +886,14 @@ def validate_inventories(
     require(
         required_release_targets <= set(toolchain_targets),
         "rust-toolchain.toml is missing advertised native or required release cross targets",
+    )
+    setup_action = (
+        REPOSITORY_ROOT / ".github/actions/setup/action.yaml"
+    ).read_text(encoding="utf-8")
+    require(
+        re.search(rf"^[ \t]+toolchain:[ \t]+{re.escape(msrv)}[ \t]*$", setup_action, re.MULTILINE)
+        is not None,
+        f"repository setup action must install workspace MSRV {msrv}",
     )
 
     rail_config = load_toml(REPOSITORY_ROOT / ".config/rail.toml")
@@ -1031,7 +1045,7 @@ def compatibility_matrix(
                         "target": host.target,
                         "runner": host.runner,
                         "cache-key": f"{host.cache_key}-rust-{release_text}",
-                        "toolchain": "stable" if release == current else release_text,
+                        "toolchain": release_text,
                         "targets": ",".join(
                             fixture.target for fixture in manifest.cross_target_fixtures
                         ),
@@ -1078,7 +1092,7 @@ def filesystem_matrix(
                 "setup": profile.setup,
                 "kind": profile.filesystem,
                 "case-sensitive": profile.case_sensitive,
-                "toolchain": "stable",
+                "toolchain": release,
                 "release": release,
                 "expected-cache-state": expected_action_cache_state(
                     profile.target,
