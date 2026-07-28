@@ -6,15 +6,35 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest as _, Sha256};
 
+#[cfg(windows)]
+fn git_bash() -> Result<PathBuf> {
+  let output = Command::new("git")
+    .arg("--exec-path")
+    .output()
+    .context("resolve Git installation for native-cache fixture")?;
+  ensure!(
+    output.status.success(),
+    "git --exec-path failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+  exec_path
+    .ancestors()
+    .map(|ancestor| ancestor.join("bin/bash.exe"))
+    .find(|candidate| candidate.is_file())
+    .with_context(|| format!("Git Bash was not found above {}", exec_path.display()))
+}
+
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
   let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/materialize-native-cache.sh");
-  let mut command = if cfg!(windows) {
-    let mut command = Command::new("bash");
+  #[cfg(windows)]
+  let mut command = {
+    let mut command = Command::new(git_bash()?);
     command.arg(script);
     command
-  } else {
-    Command::new(script)
   };
+  #[cfg(not(windows))]
+  let mut command = Command::new(script);
   let output = command
     .arg(destination)
     .arg(git_source)
@@ -324,6 +344,7 @@ fn executable(path: PathBuf) -> PathBuf {
 fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Result<()> {
   let root = tempfile::tempdir()?;
   let fixture = root.path().join("fixture");
+  let target = fixture.join("target");
   materialize_fixture(&fixture, &root.path().join("git-source"))?;
 
   let metadata = Command::new("cargo")
@@ -381,14 +402,14 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
       "--locked",
       "--offline",
     ],
-    &fixture.join("target-check"),
+    &target,
   )?;
   run_cargo(
     &fixture,
     &["build", "--workspace", "--all-features", "--locked", "--offline"],
-    &fixture.join("target-build"),
+    &target,
   )?;
-  ensure!(executable(fixture.join("target-build/debug/fixture-cli")).is_file());
+  ensure!(executable(target.join("debug/fixture-cli")).is_file());
   Ok(())
 }
 
