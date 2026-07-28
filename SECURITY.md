@@ -2,19 +2,22 @@
 
 ## Supported Versions
 
-Security fixes are released from the current release line. Older releases do not receive backports.
+Security fixes are released from the current release line. Older releases do not receive backports — please
+reproduce against the latest release before reporting.
 
 | Release line | Status |
 |---|---|
-| Latest | supported |
-| Older | unsupported |
+| Latest | Supported |
+| Older | Unsupported |
 
 ## Reporting a Vulnerability
 
-Report vulnerabilities through GitHub Security Advisories:
+Report vulnerabilities privately through GitHub Security Advisories:
 
 - <https://github.com/loadingalias/cargo-rail/security/advisories/new>
 
-Include the affected version, operating system, impact, reproduction steps, and a proof of concept when available. Do not include those details in a public issue.
+Include the affected version, operating system, impact, reproduction steps, and a proof of concept when available.
+Do not put any of those details in a public issue.
 
-If GitHub Security Advisories are unavailable, open a public issue that asks for a private contact channel and contains no vulnerability details.
+If GitHub Security Advisories are unavailable to you, open a public issue asking for a private contact channel and
+include no vulnerability details in it.

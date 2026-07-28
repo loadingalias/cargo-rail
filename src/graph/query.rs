@@ -40,10 +40,8 @@ pub struct AffectedAnalysis {
 /// 2. Single reverse traversal from all direct crates to find dependents (O(V+E))
 /// 3. Union direct crates + dependents for test targets
 ///
-/// # Performance
-/// O(n × d + V + E) where n = files, d = maximum path depth, V = vertices, E = edges.
-/// Typically <50ms for <100 crates. The single traversal approach is
-/// significantly faster than O(N × (V+E)) when many crates are directly affected.
+/// Complexity is O(n × d + V + E), where n is the file count, d is the maximum
+/// path depth, V is the vertex count, and E is the edge count.
 pub fn analyze(graph: &WorkspaceGraph, changed_files: &[impl AsRef<Path>]) -> RailResult<AffectedAnalysis> {
   if changed_files.is_empty() {
     return Ok(AffectedAnalysis {

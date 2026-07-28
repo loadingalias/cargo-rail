@@ -1,7 +1,4 @@
-//! Smart defaults for git operations
-//!
-//! Provides intelligent defaults for git references (e.g., --since)
-//! by detecting the main branch and falling back gracefully.
+//! Select a default base reference for Git change detection.
 
 use crate::error::RailResult;
 use crate::git::SystemGit;

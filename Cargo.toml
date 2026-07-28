@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = { workspace = true }
 license = "MIT"
 authors = ["loadingalias"]
-description = "Graph-aware CI, dependency unification, changesets-style releases, and crate split/sync for Rust workspaces"
+description = "Cargo-native Rust workspace engine for affected CI, verified compiler reuse, dependency coherence, exact-SHA releases, and crate split/sync"
 repository = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
@@ -14,7 +14,7 @@ categories = [
     "development-tools::testing",
     "command-line-utilities",
 ]
-keywords = ["monorepo", "workspace", "changesets", "release", "cicd"]
+keywords = ["cargo", "workspace", "build-cache", "cicd", "release"]
 readme = "README.md"
 include = [
     "/build.rs",

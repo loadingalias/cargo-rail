@@ -333,10 +333,7 @@ pub struct WorkspaceGraph {
 impl WorkspaceGraph {
   /// Load workspace graph from cargo metadata.
   ///
-  /// # Performance
-  /// - Graph construction: 10-50ms
-  /// - Ownership index: built once from workspace package roots
-  /// - **Does not reload metadata** (use existing from CargoState)
+  /// Builds the ownership index from workspace package roots without reloading metadata.
   pub fn from_metadata(metadata: &cargo_metadata::Metadata) -> RailResult<Self> {
     // Build petgraph
     let mut graph = DiGraph::new();
@@ -565,9 +562,7 @@ impl WorkspaceGraph {
   ///
   /// Returns [`RailError`] if `crate_name` is not found in the graph.
   ///
-  /// # Performance
-  ///
-  /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
+  /// Complexity is O(V + E), where V is the vertex count and E is the edge count.
   pub fn transitive_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
     let start_node = self.find_node(crate_name)?;
     Ok(self.transitive_dependents_from(start_node))
@@ -684,13 +679,7 @@ impl WorkspaceGraph {
 
   /// Get transitive reverse dependencies for multiple crates in a single traversal.
   ///
-  /// This is more efficient than calling `transitive_dependents()` multiple times
-  /// when you have many direct crates, as it does a single O(V+E) traversal instead
-  /// of O(N × (V+E)) where N is the number of crates.
-  ///
-  /// # Performance
-  /// O(V + E) regardless of input set size. Significantly faster than N separate
-  /// traversals for large input sets.
+  /// Uses one O(V + E) traversal instead of one traversal per input crate.
   pub fn transitive_dependents_of_set(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<String>> {
     let package_ids = self.resolve_package_names(crate_names)?;
     self.transitive_dependents_of_ids(&package_ids)
@@ -812,8 +801,7 @@ impl WorkspaceGraph {
   /// # Errors
   /// Returns error if circular dependencies are detected (should never happen with Cargo).
   ///
-  /// # Performance
-  /// O(V + E) where V = vertices, E = edges. Typically <10ms for <100 crates.
+  /// Complexity is O(V + E), where V is the vertex count and E is the edge count.
   pub fn publish_order(&self) -> RailResult<Vec<String>> {
     // Build a subgraph with only workspace members
     // This is critical: external dependencies can have cycles (e.g., serde/serde_derive in dev deps),

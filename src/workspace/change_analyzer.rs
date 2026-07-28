@@ -1,8 +1,8 @@
 //! Graph-aware change impact analysis
 //!
-//! This module provides intelligent change detection by combining:
+//! Combines:
 //! - Git file-level changes
-//! - Advanced file classification
+//! - File classification
 //! - Workspace dependency graph
 //! - Cargo package metadata
 

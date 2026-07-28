@@ -1,11 +1,4 @@
-//! Target triple detection for workspace validation
-//!
-//! Detects Rust target triples across configuration files in the workspace:
-//! - TOML files: rust-toolchain.toml, .cargo/config.toml, Cross.toml, dist-workspace.toml, etc.
-//! - GitHub workflow files: .github/workflows/*.yml and *.yaml
-//!
-//! Uses fuzzy matching against rustc's canonical target list to find targets
-//! regardless of where they're defined.
+//! Heuristically detect Rust target triples in workspace configuration files.
 
 use crate::error::{RailError, RailResult};
 use std::collections::HashSet;
@@ -18,11 +11,6 @@ use std::sync::OnceLock;
 ///
 /// Scans workspace TOML and GitHub workflow files, matches against rustc's
 /// canonical target list, and returns a deduplicated sorted result.
-///
-/// # Performance
-/// - Caches rustc output (one-time ~5ms cost)
-/// - Typical workspace: <5ms total
-/// - Large workspace (60+ crates): <10ms total
 ///
 pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
   detect_targets_excluding(workspace_root, &[])

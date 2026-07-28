@@ -1,5 +1,8 @@
 # Planner Machine Contract
 
+This document is for CI and tooling authors who consume plan output programmatically. To run affected work directly,
+see [change detection](change-detection.md) instead.
+
 `cargo rail plan -f json` is a versioned API for CI and other tooling. Validate it with the schema shipped in this repository:
 
 ```bash

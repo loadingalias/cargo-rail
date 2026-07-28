@@ -1,5 +1,9 @@
 # Troubleshooting
 
+Every Rail decision is explainable: `--explain` on any command shows the reasoning, and stable machine-readable
+reason codes name exactly why something ran, skipped, or bypassed the cache. This page maps the common questions to
+the command that answers them.
+
 Start with the planner trace. It records the base ref, file classification, ownership, graph expansion, surface decisions, and execution scope.
 
 ## Why did this run?
@@ -27,7 +31,7 @@ cargo rail doctor hermeticity --action build
 cargo rail doctor hermeticity --profile ci --format json
 ```
 
-The report binds declared inputs to exact SHA-256 content and lists every reason cargo-rail withheld an `ActionKey`.
+The report binds declared inputs to exact SHA-256 content and lists every reason Rail withheld an `ActionKey`.
 Ambient environment or output access, unobserved build scripts or proc macros, an unverified external program or
 source, and missing dependency-result digests fail closed. A reported input-root digest is diagnostic evidence; it is
 not itself a cache key.
@@ -94,7 +98,7 @@ must verify. Cache objects default to `$CARGO_HOME/cargo-rail/local-cas-v1` or
 `$HOME/.cargo/cargo-rail/local-cas-v1`. Set `CARGO_RAIL_CACHE_DIR` to choose the base and
 `CARGO_RAIL_CACHE_MAX_BYTES` to change the 10 GiB bound.
 
-Preview cleanup without deleting anything, then remove only the validated cargo-rail-owned root and workspace state:
+Preview cleanup without deleting anything, then remove only the validated Rail-owned root and workspace state:
 
 ```bash
 cargo rail clean --cache --check
@@ -123,7 +127,7 @@ executable identities. `execution.cache_wrapper` explains the separate native co
   were restored;
 - `miss` means no candidate survived complete revalidation. A successful cold compile appends
   `stored_verified_result`; a failed publication appends `local_cache_store_failed` and remains non-authorizing;
-- `bypassed` with `sccache_wrapper_preserved` means Cargo selected sccache and cargo-rail kept it in place without
+- `bypassed` with `sccache_wrapper_preserved` means Cargo selected sccache and Rail kept it in place without
   adding a second compiler cache;
 - `bypassed` with `existing_compiler_wrapper_preserved` means Cargo selected another global or workspace wrapper. It
   is preserved in order and conservatively treated as potentially cache-owning;
@@ -149,7 +153,7 @@ registry certifies it. A missing certificate is a cold execution boundary, not a
 The cargo-rail diagnostic wrapper remains in Cargo's workspace-wrapper position; an existing workspace wrapper runs
 inside it. A custom or renamed cache receives the generic existing-wrapper reason, but still cannot be double-wrapped.
 Remove cargo-rail itself from `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, or the corresponding Cargo configuration if
-the recursive-wrapper error appears; cargo-rail inserts its own roles.
+the recursive-wrapper error appears; Rail inserts its own roles.
 
 There is no global “compiler caching supported” state. Native reuse is machine-local and currently requires
 a host and exact Cargo/rustc release listed in the generated [support matrix](cache-capabilities.md),
@@ -222,7 +226,7 @@ Resume reconciles release commits, exact remote refs, check/pipeline rollups,
 crate versions, tags, and forge releases before advancing. It never replans from
 already-bumped manifests or republishes an unobserved in-progress crate version.
 `awaiting_checks` and registry propagation are explicit external wait boundaries:
-cargo-rail exits and never sleeps or polls. Resume after the provider settles.
+Rail exits and never sleeps or polls. Resume after the provider settles.
 On GitHub, an all-skipped or all-neutral rollup is not release evidence. At least
 one context must complete with `SUCCESS`, every reported context count must be
 complete, and no context may remain pending or failed. Configure the repository

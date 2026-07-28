@@ -2,7 +2,7 @@
 
 Use this pattern when your repo already has `just`, `make`, `xtask`, or scripts.
 
-`cargo-rail` emits crate and surface scope. The task runner maps that scope to repository-specific commands.
+Rail emits crate and surface scope. The task runner maps that scope to repository-specific commands.
 
 ## Local Example
 

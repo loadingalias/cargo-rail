@@ -1,45 +1,62 @@
-# Contributing to cargo-rail
+# Contributing to Rail
 
-## Before changing code
+## Set up
 
-Required tools:
+You need:
 
-- Rust stable
+- Rust 1.97.1 (the repository toolchain installs automatically via `rust-toolchain.toml`)
 - Python 3.11 or newer
 - `just`
 - `cargo-nextest`
 - `cargo-deny`
+- `cargo-audit`
 
-Install the repository toolchain, then run the same focused checks used during development:
+Then run the same checks used during development:
 
 ```bash
 just check
 just test
 ```
 
-`just check` is read-only. Run `just fix` when you explicitly want rustfmt and
-Clippy to rewrite the worktree.
+`just check` is read-only and always workspace-wide. When you want rustfmt and Clippy to rewrite the worktree,
+run `just fix` explicitly.
 
-`just check` is always workspace-wide. Run the full test suite after changing features, dependency resolution, or
-target-specific behavior:
+After changing features, dependency resolution, or target-specific behavior, run the full suite:
 
 ```bash
 just test-all
 ```
 
-`docs/commands.md` is generated from CLI help. `docs/cache-capabilities.md` joins the native CI manifest, release
-target registry, exact native-cache capability certificates, runtime gates, and performance qualifications.
-Regenerate them after changing commands, flags, defaults, support inventories, or cache eligibility:
+## What every change needs
+
+- Keep the patch scoped to one problem.
+- Put production behavior in the library; `main.rs` stays limited to argument handling and error reporting.
+- Add or update tests for changed behavior. Tests run through `cargo-nextest` — this repository does not use
+  `cargo test` for the normal suite.
+- Update user documentation when commands, configuration, output, side effects, or exit codes change.
+- Add a `.changes/*.md` file for any user-visible change — CLI, configuration, documentation, performance, safety,
+  or release behavior. A few sentences aimed at users is enough; these files become the changelog.
+- Run `just check && just test` before opening a pull request.
+
+## Generated documentation
+
+Two docs are generated, not hand-edited: `docs/commands.md` comes from CLI help, and `docs/cache-capabilities.md`
+is assembled from the native CI manifest, release target registry, native-cache capability certificates, runtime
+gates, and performance qualifications. Regenerate both after changing commands, flags, defaults, support
+inventories, or cache eligibility:
 
 ```bash
 just gen-docs
 ```
 
-Performance changes must identify the workload, host, toolchain, exact commands, sample count, and before/after p50 and
-p95. Compare cache implementations within one host. Preserve raw results and report failed correctness checks.
+## Performance changes
 
-Native compiler-cache changes must run the checked-in cross-root fixture. Measure native Cargo, cargo-rail disabled,
-cargo-rail cold, cargo-rail warm, and the pinned sccache comparator when the change can affect those lanes. Report hits,
+A performance claim needs evidence someone else can check. Identify the workload, host, toolchain, exact commands,
+sample count, and before/after p50 and p95. Compare cache implementations on one host. Preserve the raw results,
+and report any failed correctness checks alongside the numbers.
+
+Native compiler-cache changes must run the checked-in cross-root fixture. When the change can affect those lanes,
+measure native Cargo, Rail disabled, Rail cold, Rail warm, and the pinned sccache comparator — reporting hits,
 misses, bypasses, reasons, bytes hashed/restored, and output portability.
 
 The repository benchmarks accept package and run counts:
@@ -50,29 +67,21 @@ cargo build --release --locked
 just bench-native-cache 10
 ```
 
-## Change requirements
-
-- Keep the patch scoped to one problem.
-- Put production behavior in the library and keep `main.rs` limited to argument handling and error reporting.
-- Add or update tests for changed behavior. Use `cargo-nextest`; this repository does not use `cargo test` for the normal test suite.
-- Update user documentation when commands, configuration, output, side effects, or exit codes change.
-- Add a `.changes/*.md` file for user-visible CLI, configuration, documentation, performance, safety, or release behavior.
-- Run `just check && just test` before opening a pull request.
-
 ## Pull requests
 
 - Explain the user-visible result and the reason for the change.
-- Include the commands used to verify it.
+- Include the commands you used to verify it.
 - Call out compatibility changes to CLI output, configuration, planner contracts, or release state.
 - Link the issue when one exists.
 
 ## Release policy
 
-- Add a change file in the pull request that introduces user-visible behavior.
+- Add the change file in the pull request that introduces the user-visible behavior.
 - Accumulate reviewed change files into a coherent minor release instead of tagging each merged change.
 - Cut an immediate patch only for a regression, security issue, broken package, or broken installer.
-- Test release infrastructure with check mode or manual workflow dispatch. Do not create public tags to test the pipeline.
-- Keep published version tags and release assets immutable.
+- Test release infrastructure with check mode or manual workflow dispatch. Never create public tags to test the
+  pipeline.
+- Published version tags and release assets are immutable.
 
 Before opening a release PR:
 

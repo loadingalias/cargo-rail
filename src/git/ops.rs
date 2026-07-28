@@ -50,7 +50,7 @@ impl SystemGit {
   /// Get commit history from HEAD with optional limit
   ///
   /// Returns commits in reverse chronological order (newest first).
-  /// Uses parallel batch processing for optimal performance.
+  /// Loads commit records in one bounded batch stream.
   pub fn commit_history(&self, limit: Option<usize>) -> RailResult<Vec<CommitInfo>> {
     let mut args = vec!["log", "--format=%H"];
     let limit_str;
@@ -197,9 +197,7 @@ impl SystemGit {
   /// - Old path with 'D' (deleted from old location)
   /// - New path with 'A' (added at new location)
   ///
-  /// # Performance
-  /// Uses `git diff --name-status` which is optimized for listing changes.
-  /// Typically <100ms even for large diffs with 1000s of files.
+  /// Uses `git diff --name-status` to list changes without reading file contents.
   pub fn get_changed_files_between(&self, base_ref: &str, head_ref: Option<&str>) -> RailResult<Vec<(PathBuf, char)>> {
     let mut args = vec!["diff", "--name-status", "-z", "--end-of-options", base_ref];
     if let Some(head) = head_ref {
@@ -384,9 +382,7 @@ impl SystemGit {
     Ok(files)
   }
 
-  /// Collect all files from a tree recursively
-  ///
-  /// Uses bulk file reading for 100x+ speedup on large trees.
+  /// Collect all files from a tree recursively.
   pub fn collect_tree_files(&self, commit_sha: &str, path: &Path) -> RailResult<Vec<(PathBuf, Vec<u8>)>> {
     let files = self.list_files_at_commit(commit_sha, path)?;
 
@@ -398,7 +394,7 @@ impl SystemGit {
     let paths: Vec<PathBuf> = files.iter().map(|file| path.join(file)).collect();
     let items: Vec<(&str, &Path)> = paths.iter().map(|p| (commit_sha, p.as_path())).collect();
 
-    // Read all files in one batch (100x+ faster than loop)
+    // Read all files in one batch.
     let contents = self.read_files_bulk(&items)?;
 
     // Combine full paths (with crate prefix) with contents
@@ -823,17 +819,7 @@ impl SystemGit {
     Ok(commit)
   }
 
-  /// Read multiple files in bulk using git cat-file --batch
-  ///
-  /// This is 100x+ faster than calling read_file_at_commit in a loop.
-  /// Uses a single subprocess with `git cat-file --batch` to read all files.
-  ///
-  /// Used by `collect_tree_files` for optimal performance.
-  ///
-  /// # Performance
-  /// - Single subprocess call (vs N calls for N files)
-  /// - Can read 1000+ files in <500ms
-  /// - Processes files in parallel chunks using rayon
+  /// Read multiple files through one `git cat-file --batch` subprocess.
   ///
   /// Output order matches input order. Missing files produce empty byte vectors.
   pub fn read_files_bulk(&self, items: &[(&str, &Path)]) -> RailResult<Vec<Vec<u8>>> {

@@ -1,10 +1,11 @@
 # Configuration Reference
 
-`rail.toml` stores repository policy, not cargo-rail defaults. An empty file is valid. Omitted fields use coded defaults and upgrades do not require copying new fields into the repository.
+`rail.toml` stores repository policy, not Rail defaults. An empty file is valid. Omitted fields use coded defaults, and
+upgrades do not require copying new fields into the repository.
 
 ## File discovery
 
-Cargo-rail uses the first file found in this order:
+Rail uses the first file found in this order:
 
 1. `rail.toml`
 2. `.rail.toml`
@@ -123,7 +124,7 @@ preserve_features = ["unstable-*", "bench*"]
 | `tag_prefix` | `"v"` | Value rendered by `{prefix}`. |
 | `tag_format` | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`. |
 | `require_clean` | `true` | Deprecated compatibility input. Preview permits dirt and apply always rejects paths outside the bound plan. Remove it with `cargo rail config migrate`. |
-| `publish_delay` | `5` | Deprecated compatibility input with no effect. Cargo-rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`. |
+| `publish_delay` | `5` | Deprecated compatibility input with no effect. Rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`. |
 | `remote_effects` | `"none"` | `"none"` stays local. Other modes push the exact release commit, then exit until GitHub reports complete counts with at least one successful non-skipped context and no pending/failed context, or GitLab reports a successful exact-SHA pipeline. Publication follows readiness; tags are pushed last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
 | `sign_tags` | `false` | Sign release tags with the configured Git signing mechanism. |
 | `require_changelog_entries` | `false` | Fail when a released crate has no generated changelog entries. |

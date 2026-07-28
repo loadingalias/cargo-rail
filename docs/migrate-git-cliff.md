@@ -1,6 +1,13 @@
 # Migrate from git-cliff or release-plz
 
-cargo-rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and reviewed change files. It uses fixed changelog placeholders and groups instead of git-cliff's Tera templates.
+Rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and
+reviewed change files in one release engine. It uses fixed changelog placeholders and groups instead of git-cliff's
+Tera templates.
+
+The mappings below start in commit-driven compatibility mode (`source = "commits"`) so your existing
+conventional-commit workflow keeps working unchanged. The end state most teams migrate toward is the default
+reviewed-changes mode, where release intent lives in `.changes/*.md` files written during review rather than being
+reconstructed from commit messages.
 
 ## git-cliff mapping
 
@@ -77,10 +84,10 @@ group_order = ["breaking", "sec", "feat", "fix", "deps", "other"]
 
 ## Templates
 
-git-cliff uses Tera templates. cargo-rail intentionally does not. Use the
+git-cliff uses Tera templates. Rail intentionally does not. Use the
 fixed placeholder format instead:
 
-| git-cliff value | cargo-rail placeholder |
+| git-cliff value | Rail placeholder |
 | --- | --- |
 | commit message body/summary | `{description}` |
 | commit scope | `{scope}` |
@@ -99,7 +106,7 @@ cargo rail change add rail-core --bump minor --message "Added graph-aware releas
 ## Paths
 
 Do not migrate git-cliff monorepo path globs directly as the primary model.
-cargo-rail attributes commits through the workspace graph:
+Rail attributes commits through the workspace graph:
 
 1. changed file resolves to its owning crate,
 2. a conventional-commit scope matching a crate name narrows attribution,

@@ -3,7 +3,7 @@
 Choose the execution owner:
 
 - [`with-task-runner/`](with-task-runner/) if your repo already has `just`, `make`, `xtask`, or scripts
-- [`standalone/`](standalone/) if you want `cargo-rail` to plan and execute directly
+- [`standalone/`](standalone/) if you want Rail to plan and execute directly
 
 ## Quick Start
 

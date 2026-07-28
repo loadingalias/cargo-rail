@@ -1,8 +1,12 @@
 # Change Detection
 
-`cargo-rail` maps changed files to workspace crates, includes affected dependents, classifies CI surfaces, and emits the package scope that should run.
+Rail maps changed files to the crates that own them, adds the crates that depend on those, classifies what kind of
+work the change requires, and emits the exact package scope that should run. Path globs never enter the decision —
+ownership and impact come from Cargo's resolved workspace graph.
 
 ## Surfaces
+
+A surface is a kind of work a change can require:
 
 | Surface | Meaning |
 |---|---|
@@ -20,23 +24,27 @@ cargo rail plan --merge-base -f json
 cargo rail run --merge-base --action test
 ```
 
-Use `plan` when you want the contract. Use `run` when you want execution.
+`plan` reports the decision without executing anything. `run` executes it.
 
-`run` expands every enabled built-in or configured repository task into an ordered, shell-free argv action before
-executing the first action. A successful run or dry run writes a version-4 decision receipt under
-`target/cargo-rail/receipts/run-decision-*.json`.
-The receipt binds the action list to the workspace snapshot and records each action's exact argv array, logical working
-directory, selected packages/targets/features, dependencies, typed environment names, declared side effects, and
-planner trace reasons. Cargo actions also record the exact root PackageIds and resolved-node count for every selected
-target/feature `ResolutionView`; default, all-feature, named-feature, host, and cross-target actions therefore do not
-silently share one maximal graph. `--dry-run` previews that same expansion without starting an action process. `--dry-run -f json`
-and `-f github` expose the same deterministic topological order to CI. Current built-ins inherit the host environment
-and are not sandboxed, so action-key analysis explains the ambient input and output boundaries and withholds a reusable
-key.
+Before starting the first process, `run` expands every enabled built-in or configured repository task into an
+ordered list of direct process invocations — exact argv arrays, no shell. `--dry-run` previews that same expansion
+without starting any process; `--dry-run -f json` and `-f github` expose the same deterministic topological order
+to CI.
+
+Each Cargo action resolves its own target/feature view and records the exact root `PackageId`s and resolved-node
+count for it, so default, all-feature, named-feature, host, and cross-target actions never silently share one
+maximal dependency graph.
+
+A successful run or dry run writes a version-4 decision receipt under
+`target/cargo-rail/receipts/run-decision-*.json`. The receipt binds the action list to the workspace snapshot and
+records, for every action: the exact argv array, logical working directory, selected packages/targets/features,
+dependencies, typed environment names, declared side effects, and the planner trace reasons that selected it.
+Current built-in actions inherit the host environment and are not sandboxed, so action-key analysis explains the
+ambient input and output boundaries and withholds a reusable cache key.
 
 Generated repository actions declare one output owner plus separate direct argv for read-only checking and
-regeneration. Select `--generated check` to expose staleness, use the default `regenerate` mode to update files, and add
-`--explain` to see output ownership.
+regeneration. Select `--generated check` to expose staleness, use the default `regenerate` mode to update files,
+and add `--explain` to see output ownership.
 
 ## Execution outputs
 
@@ -47,14 +55,19 @@ regeneration. Select `--generated check` to expose staleness, use the default `r
 - `surfaces.NAME.scope` is the exact package selection for one surface
 - `scope.cargo_args` is the compatibility Cargo selection across active package-scoped surfaces
 
-If another tool executes one surface, use `surfaces.NAME.scope.cargo_args`, not `impact`. Existing integrations that
-execute all active package-scoped surfaces together may continue using `scope.cargo_args`.
+If another tool executes one surface, use `surfaces.NAME.scope.cargo_args`, not `impact` — impact is diagnostic
+context, not an execution scope. Existing integrations that execute all active package-scoped surfaces together may
+continue using `scope.cargo_args`.
 
-Worktree planning resolves Cargo's default features for every effective Cargo build target, defaulting to the host.
-Reverse impact preserves normal,
-development, build, proc-macro, optional, renamed, and target-conditioned edges. Historical object-to-object planning
-cannot ask Cargo to resolve the historical tree, so package-scoped work widens to the workspace. Current-graph edge
-evidence remains explanatory only and reports `historical_resolution_unavailable` in `trace` and `--explain`.
+## Worktree versus historical plans
+
+When planning the current worktree, Rail resolves Cargo's default features for every effective Cargo build target,
+defaulting to the host. Reverse impact preserves normal, development, build, proc-macro, optional, renamed, and
+target-conditioned edges.
+
+Historical object-to-object planning — comparing two commits with neither checked out — cannot ask Cargo to resolve
+the historical tree, so package-scoped work widens to the workspace. Current-graph edge evidence is still shown,
+but as explanation only, reported as `historical_resolution_unavailable` in `trace` and `--explain`.
 
 ## Config
 

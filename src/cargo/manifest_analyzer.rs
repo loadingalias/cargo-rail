@@ -1,6 +1,4 @@
-//! Unified manifest analysis for feature classification
-//!
-//! This module handles ALL manifest parsing and analysis
+//! Parse workspace manifests and classify dependency feature usage.
 
 use crate::error::{RailResult, ResultExt};
 use cargo_metadata::{DependencyKind as MetadataDepKind, PackageId};
@@ -217,7 +215,7 @@ impl ManifestAnalyzer {
 
   /// Parse all workspace member manifests (in parallel)
   pub fn parse_workspace(_workspace_root: &Path, members: &[&cargo_metadata::Package]) -> RailResult<Self> {
-    // Parse manifests in parallel for 50-70% speedup
+    // Parse independent manifests in parallel.
     let results: Vec<RailResult<ParsedManifest>> = members
       .par_iter()
       .map(|pkg| {
@@ -257,7 +255,7 @@ impl ManifestAnalyzer {
       }
     }
 
-    // Pre-compute usage counts for O(1) lookup (20-30% speedup)
+    // Pre-compute usage counts for O(1) lookup.
     let usage_counts: HashMap<DepKey, usize> = usage_index
       .iter()
       .map(|(key, usages)| {

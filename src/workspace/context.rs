@@ -1,27 +1,4 @@
-//! Unified workspace context - build once, pass everywhere
-//!
-//! # Design
-//!
-//! WorkspaceContext eliminates redundant metadata/config/graph loads by building
-//! all workspace-level data structures once in main.rs, then passing by reference
-//! to all commands. Snapshot-aware callers use an explicit constructor so current
-//! commands do not pay capture cost before their ordered migration.
-//!
-//! # Performance Impact
-//!
-//! Before: Each command loaded metadata/config independently (50-200ms × N commands)
-//! After: Single load in main, shared across all operations (50-200ms total)
-//!
-//! # Architecture
-//!
-//! ```text
-//! main.rs:
-//!   WorkspaceContext::build() -> &WorkspaceContext
-//!   |
-//!   v
-//! commands/split.rs, sync.rs, etc:
-//!   fn execute(ctx: &WorkspaceContext)
-//! ```
+//! Capture one authoritative workspace view and share its derived state.
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::resolution::{
@@ -488,13 +465,6 @@ impl WorkspaceContext {
   ///
   /// Returns [`RailError::Config`] if `rail.toml` exists but fails to parse.
   ///
-  /// # Performance
-  ///
-  /// - Git state: <5ms (single git rev-parse)
-  /// - Cargo metadata: 50-200ms for large workspaces
-  /// - Graph build: 10-50ms
-  /// - Config load: <5ms (or None if not found)
-  /// - **Total: ~100-300ms** (vs 100-300ms × N commands without context)
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
     Self::build_inner(workspace_root, ContextCapture::None, None)
   }
@@ -646,7 +616,7 @@ impl WorkspaceContext {
       None
     };
 
-    // Build dependency graph from already-loaded metadata (avoids 50-200ms reload)
+    // Build the dependency graph from the metadata already loaded above.
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
     let resolution_views = Arc::new(if let Some(inputs) = resolution_inputs.clone() {
@@ -710,8 +680,7 @@ impl WorkspaceContext {
       cfg.run.validate().map_err(RailError::Config)?;
     }
 
-    // Store targets for lazy multi-target metadata loading
-    // The metadata is only loaded when unify actually needs it (saves 150-600ms for other commands)
+    // Store targets for lazy multi-target metadata loading by unify.
     let targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
     let derived_views = Arc::new(DerivedViews::new(
       workspace_root.clone(),
@@ -939,8 +908,7 @@ impl WorkspaceContext {
 
   /// Get multi-target metadata, loading lazily on first access.
   ///
-  /// This is only used by `cargo rail unify`. Other commands don't need it,
-  /// so lazy loading saves 150-600ms for commands like `plan`, `run`, `split`, etc.
+  /// This is only used by `cargo rail unify`; other commands do not load it.
   ///
   /// The metadata is cached after first load - subsequent calls return the cached value.
   pub fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {

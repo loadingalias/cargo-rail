@@ -1,6 +1,9 @@
 # Migrate from cargo-hakari
 
-`cargo-rail unify` replaces the generated workspace-hack crate with explicit transitive pins in the root or a selected workspace member. The resolved graph remains inspectable through normal Cargo manifests.
+cargo-hakari stabilizes feature unification by generating a `workspace-hack` crate that every member depends on.
+`cargo rail unify` achieves the same effect with explicit transitive pins in the workspace root or a selected member:
+no generated crate to maintain, no extra dependency edge in every manifest, and the resolved graph remains
+inspectable through normal Cargo manifests.
 
 ## Migration
 
@@ -28,7 +31,7 @@ cargo rail unify
 
 ## Mapping
 
-| cargo-hakari | cargo-rail |
+| cargo-hakari | Rail |
 |---|---|
 | workspace-hack crate | no extra crate |
 | `hakari.toml` | `rail.toml` |
@@ -40,4 +43,4 @@ cargo rail unify
 cargo rail unify undo
 ```
 
-`unify undo` restores cargo-rail's latest manifest backup. Use version control to restore the removed workspace-hack files.
+`unify undo` restores Rail's latest manifest backup. Use version control to restore the removed workspace-hack files.

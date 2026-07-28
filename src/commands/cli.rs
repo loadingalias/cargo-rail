@@ -16,13 +16,16 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 const MAIN_HELP: &str = "\
-Monorepo orchestration for Rust workspaces.
+The Rust workspace engine.
+
+Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
+dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
-  cargo rail init              # Generate .config/rail.toml (default)
-  cargo rail plan              # Build deterministic change plan
-  cargo rail run               # Execute planner-selected surfaces
-  cargo rail unify --check     # Check for pending dependency changes (exit 1)
+  cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
+  cargo rail run --merge-base --dry-run --print-cmd  # Preview selected actions
+  cargo rail run --merge-base --profile ci        # Run affected CI actions
+  cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
 
 Docs: https://github.com/loadingalias/cargo-rail";
 
@@ -34,8 +37,8 @@ Docs: https://github.com/loadingalias/cargo-rail";
 #[command(bin_name = "cargo")]
 #[command(styles = get_styles())]
 pub enum CargoCli {
-  /// Monorepo orchestration for Rust workspaces
-  #[command(about = "Monorepo orchestration for Rust workspaces", long_about = MAIN_HELP)]
+  /// The Rust workspace engine
+  #[command(about = "The Rust workspace engine", long_about = MAIN_HELP)]
   Rail(RailCli),
 }
 
@@ -45,7 +48,7 @@ pub enum CargoCli {
 #[derive(Parser)]
 #[command(name = "rail")]
 #[command(version)]
-#[command(about = "Monorepo orchestration for Rust workspaces")]
+#[command(about = "The Rust workspace engine")]
 #[command(long_about = MAIN_HELP)]
 #[command(propagate_version = true)]
 #[command(styles = get_styles())]

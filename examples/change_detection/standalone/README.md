@@ -46,4 +46,4 @@ cargo rail run --merge-base --dry-run --print-cmd
 
 `infra` remains a planner surface for gating configured repository actions; it is not executable itself.
 
-Use `cargo rail run` instead when profiles, test-runner selection, or decision receipts should be owned by cargo-rail.
+Use `cargo rail run` instead when profiles, test-runner selection, or decision receipts should be owned by Rail.
