@@ -17,6 +17,8 @@ pub struct ValidationResult {
   pub check_name: String,
   /// Whether the check passed
   pub passed: bool,
+  /// Whether the check could not produce evidence and was not treated as a failure.
+  pub skipped: bool,
   /// Details about what was validated
   pub details: Option<String>,
   /// Error message if failed
@@ -28,6 +30,7 @@ impl ValidationResult {
     Self {
       check_name: name.into(),
       passed: true,
+      skipped: false,
       details: Some(details.into()),
       error: None,
     }
@@ -37,8 +40,19 @@ impl ValidationResult {
     Self {
       check_name: name.into(),
       passed: false,
+      skipped: false,
       details: None,
       error: Some(error.into()),
+    }
+  }
+
+  fn skipped(name: impl Into<String>, details: impl Into<String>) -> Self {
+    Self {
+      check_name: name.into(),
+      passed: false,
+      skipped: true,
+      details: Some(details.into()),
+      error: None,
     }
   }
 }
@@ -464,8 +478,7 @@ impl<'a> ReleaseValidator<'a> {
     let msrv_str = match msrv {
       Some(v) => v.to_string(),
       None => {
-        // No MSRV declared - check passes (nothing to verify)
-        return ValidationResult::passed("msrv", "no rust-version declared (skipped)");
+        return ValidationResult::skipped("msrv", "no rust-version declared");
       }
     };
 
@@ -480,17 +493,16 @@ impl<'a> ReleaseValidator<'a> {
 
     match check_toolchain {
       Ok(result) if !result.status.success() => {
-        // Toolchain not installed - skip with warning
-        return ValidationResult::passed(
+        return ValidationResult::skipped(
           "msrv",
           format!(
-            "rust {} not installed (skipped, install with: rustup install {})",
+            "rust {} not installed; install with: rustup install {}",
             msrv_str, msrv_str
           ),
         );
       }
       Err(_) => {
-        return ValidationResult::passed("msrv", "rustup not available (skipped)");
+        return ValidationResult::skipped("msrv", "rustup not available");
       }
       _ => {}
     }
@@ -560,10 +572,8 @@ impl<'a> ReleaseValidator<'a> {
           ValidationResult::passed("semver-checks", format!("advisory: {}", message))
         }
       }
-      Ok(SemverCheck::Inconclusive { message }) => {
-        ValidationResult::passed("semver-checks", format!("skipped ({})", message))
-      }
-      Err(e) => ValidationResult::passed("semver-checks", format!("skipped (failed to run: {})", e)),
+      Ok(SemverCheck::Inconclusive { message }) => ValidationResult::skipped("semver-checks", message),
+      Err(e) => ValidationResult::skipped("semver-checks", format!("failed to run: {}", e)),
     }
   }
 
@@ -601,9 +611,9 @@ impl<'a> ReleaseValidator<'a> {
           if semver_policy != SemverCheckPolicy::Off {
             if !semver_available {
               if !emitted_semver_missing {
-                results.push(ValidationResult::passed(
+                results.push(ValidationResult::skipped(
                   "semver-checks",
-                  "cargo-semver-checks not installed (skipped; install with: cargo install cargo-semver-checks)",
+                  "cargo-semver-checks not installed; install with: cargo install cargo-semver-checks",
                 ));
                 emitted_semver_missing = true;
               }
@@ -695,61 +705,54 @@ impl<'a> ReleaseValidator<'a> {
 
   /// Validate that a path is within the workspace bounds
   fn validate_path_within_workspace(&self, path: &std::path::Path, crate_name: &str) -> RailResult<()> {
-    let workspace_root = self.ctx.workspace_root();
+    let workspace_root = crate::utils::canonicalize_existing(self.ctx.workspace_root()).map_err(|error| {
+      RailError::message(format!(
+        "failed to resolve workspace root '{}': {}",
+        self.ctx.workspace_root().display(),
+        error
+      ))
+    })?;
+    let resolved = crate::utils::canonicalize_allow_missing(path).map_err(|error| {
+      RailError::message(format!(
+        "failed to resolve changelog path '{}': {}",
+        path.display(),
+        error
+      ))
+    })?;
+    if !resolved.starts_with(&workspace_root) || resolved == workspace_root {
+      return Err(RailError::with_help(
+        format!(
+          "changelog path for '{}' escapes workspace: {}",
+          crate_name,
+          path.display()
+        ),
+        "configure a changelog file inside the workspace",
+      ));
+    }
 
-    // Check for ".." in the path string (simple check)
-    let path_str = path.to_string_lossy();
-    if path_str.contains("..") {
-      // More thorough check: canonicalize if possible to see if it escapes
-      // If the path doesn't exist yet, we check by normalizing components
-      let normalized = normalize_path(path);
-      let workspace_canonical = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-
-      // Check if normalized path starts with workspace root
-      if !normalized.starts_with(&workspace_canonical) && !normalized.starts_with(workspace_root) {
+    match fs::symlink_metadata(path) {
+      Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
         return Err(RailError::with_help(
           format!(
-            "Changelog path for '{}' escapes workspace: {}",
+            "changelog path for '{}' is not a regular file: {}",
             crate_name,
             path.display()
           ),
-          "Ensure changelog paths stay within the workspace directory",
+          "replace the path with a regular file or choose a missing path inside the workspace",
         ));
       }
+      Ok(_) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(RailError::message(format!(
+          "failed to inspect changelog path '{}': {}",
+          path.display(),
+          error
+        )));
+      }
     }
-
     Ok(())
   }
-}
-
-/// Normalize a path by resolving `.` and `..` components without requiring the path to exist
-fn normalize_path(path: &std::path::Path) -> PathBuf {
-  use std::path::Component;
-
-  let mut components = Vec::new();
-
-  for component in path.components() {
-    match component {
-      Component::Prefix(p) => components.push(Component::Prefix(p)),
-      Component::RootDir => {
-        components.clear();
-        components.push(Component::RootDir);
-      }
-      Component::CurDir => {}
-      Component::ParentDir => {
-        if let Some(Component::Normal(_)) = components.last() {
-          components.pop();
-        } else if components.is_empty() || matches!(components.last(), Some(Component::ParentDir)) {
-          components.push(Component::ParentDir);
-        }
-      }
-      Component::Normal(c) => components.push(Component::Normal(c)),
-    }
-  }
-
-  components.iter().collect()
 }
 
 fn changelog_contains_version_entry(path: &std::path::Path, version: &str) -> bool {
@@ -758,4 +761,18 @@ fn changelog_contains_version_entry(path: &std::path::Path, version: &str) -> bo
   };
   let needle = format!("## [{}]", version);
   contents.lines().any(|line| line.trim_start().starts_with(&needle))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ValidationResult;
+
+  #[test]
+  fn skipped_validation_is_not_reported_as_passed() {
+    let result = ValidationResult::skipped("msrv", "toolchain unavailable");
+    assert!(!result.passed);
+    assert!(result.skipped);
+    assert_eq!(result.details.as_deref(), Some("toolchain unavailable"));
+    assert!(result.error.is_none());
+  }
 }

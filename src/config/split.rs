@@ -30,7 +30,7 @@ pub struct CrateSplitConfig {
   /// Additional non-Cargo files/directories to include.
   #[serde(default)]
   pub include: Vec<String>,
-  /// Files/directories to exclude
+  /// Paths to remove from the explicit non-Cargo `include` set.
   #[serde(default)]
   pub exclude: Vec<String>,
 }
@@ -56,7 +56,7 @@ pub struct SplitConfig {
   /// Additional non-Cargo files/directories to include.
   #[serde(default)]
   pub include: Vec<String>,
-  /// Files/directories to exclude
+  /// Paths to remove from the explicit non-Cargo `include` set.
   #[serde(default)]
   pub exclude: Vec<String>,
 

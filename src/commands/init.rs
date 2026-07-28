@@ -1,7 +1,4 @@
-//! `cargo rail init` - Initialize cargo-rail configuration
-//!
-//! Auto-detects workspace structure, toolchain settings, and generates
-//! a sensible .config/rail.toml with smart defaults.
+//! Generate a sparse cargo-rail configuration.
 
 use crate::error::{RailError, RailResult};
 use crate::progress;
@@ -22,9 +19,8 @@ pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, dry_run:
 /// Cross.toml, dist-workspace.toml, .github/workflows/*.yml, etc.).
 ///
 /// Returns sorted list of detected targets.
-fn detect_targets(workspace_root: &Path) -> Vec<String> {
-  // Use the new comprehensive target detection
-  crate::targets::detect_targets(workspace_root).unwrap_or_default()
+fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
+  crate::targets::detect_targets(workspace_root)
 }
 
 fn build_sparse_config(targets: &[String]) -> String {
@@ -44,9 +40,7 @@ fn check_existing_config(workspace_root: &Path) -> Option<PathBuf> {
 
 /// Ensure output directory exists
 fn ensure_output_dir(output_path: &Path) -> RailResult<()> {
-  if let Some(parent) = output_path.parent()
-    && !parent.exists()
-  {
+  if let Some(parent) = output_path.parent() {
     fs::create_dir_all(parent)
       .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
   }
@@ -102,7 +96,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
     }
   }
 
-  let detected_targets = detect_targets(workspace_root);
+  let detected_targets = detect_targets(workspace_root)?;
   let toml_content = build_sparse_config(&detected_targets);
 
   if dry_run {
@@ -115,7 +109,11 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
         "content": toml_content
       });
       let output = crate::output::machine_json_envelope("init", "dry_run", "success", 0, payload);
-      println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+      println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+          .map_err(|error| RailError::message(format!("failed to serialize init result: {error}")))?
+      );
     } else {
       println!("{}", toml_content);
     }
@@ -131,7 +129,11 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
         "targets_detected": detected_targets
       });
       let output = crate::output::machine_json_envelope("init", "apply", "created", 0, payload);
-      println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+      println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+          .map_err(|error| RailError::message(format!("failed to serialize init result: {error}")))?
+      );
     } else {
       progress!("created: {}", config_path.display());
       progress!("\nnext: cargo rail unify --check");

@@ -53,6 +53,31 @@ mode = "single"
 }
 
 #[test]
+fn test_split_initializes_the_configured_branch() -> Result<()> {
+  let ws = TestWorkspace::new_named("split-configured-branch")?;
+  ws.add_crate("mylib", "0.1.0", &[])?;
+  ws.commit("Add mylib")?;
+  let split_dir = TempDir::new()?;
+  std::fs::write(
+    ws.path.join("rail.toml"),
+    format!(
+      r#"[crates.mylib.split]
+remote = "{}"
+branch = "stable"
+mode = "single"
+"#,
+      split_dir.path().display().to_string().replace('\\', "\\\\")
+    ),
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--yes", "--allow-dirty"])?;
+  assert!(output.status.success());
+  let branch = git(split_dir.path(), &["branch", "--show-current"])?;
+  assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "stable");
+  Ok(())
+}
+
+#[test]
 fn test_split_preserves_git_history() -> Result<()> {
   let ws = TestWorkspace::new()?;
   ws.add_crate("mylib", "0.1.0", &[])?;
@@ -444,7 +469,7 @@ mode = "single"
 
   ws.commit("Add override-lib with config")?;
 
-  // Run split with --remote override in check mode (dry-run)
+  // Refuse an unrelated existing repository with no cargo-rail origin evidence.
   let output = run_cargo_rail(
     &ws.path,
     &[
@@ -457,20 +482,11 @@ mode = "single"
       custom_target.path().to_str().unwrap(),
     ],
   )?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
-
-  // Exit code 1 = check found pending changes (correct behavior)
+  assert_eq!(output.status.code(), Some(2));
+  let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(
-    output.status.code() == Some(1),
-    "split --remote --check should exit 1 when split pending. stderr: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-
-  // Verify the custom target path appears in the plan
-  assert!(
-    stdout.contains(custom_target.path().to_str().unwrap()) || stdout.contains("override-lib"),
-    "Should show the custom target path or crate name in plan. stdout: {}",
-    stdout
+    stderr.contains("existing split target has no cargo-rail origin evidence"),
+    "unexpected diagnostic: {stderr}"
   );
 
   Ok(())
@@ -518,6 +534,21 @@ mode = "single"
   assert_eq!(json["mode"], serde_json::json!("check"));
   assert_eq!(json["result"], serde_json::json!("pending_changes"));
   assert_eq!(json["exit_code"], serde_json::json!(1));
+
+  let applied = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "json-lib", "--yes", "--allow-dirty"],
+  )?;
+  assert!(applied.status.success());
+  let clean = run_cargo_rail(
+    &ws.path,
+    &["rail", "split", "run", "json-lib", "--check", "--format", "json"],
+  )?;
+  assert_eq!(clean.status.code(), Some(0));
+  let clean_json: serde_json::Value = serde_json::from_slice(&clean.stdout)?;
+  assert_eq!(clean_json["result"], "clean");
+  assert_eq!(clean_json["exit_code"], 0);
+  assert_eq!(clean_json["crates"][0]["pending"], false);
 
   Ok(())
 }

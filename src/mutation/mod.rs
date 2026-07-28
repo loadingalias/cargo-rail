@@ -596,6 +596,7 @@ pub fn declared_input_paths(plan: &MutationPlan) -> Vec<PathBuf> {
 /// Verify that an approved plan authorizes the currently requested action payloads.
 pub fn validate_requested_operation(approved: &MutationPlan, expected: &MutationPlan) -> RailResult<()> {
   if approved.contract_version == expected.contract_version
+    && approved.operation == expected.operation
     && approved.actions == expected.actions
     && approved.declared_inputs == expected.declared_inputs
     && approved.risks == expected.risks
@@ -722,5 +723,37 @@ mod tests {
   fn test_operation_id_is_stable() {
     let op = build_operation_id("unify apply", "git-object:0123456789abcdef");
     assert_eq!(op, "unify-apply-0123456789ab");
+  }
+
+  #[test]
+  fn requested_operation_rejects_a_different_operation_domain() {
+    let plan = MutationPlan {
+      contract_version: MUTATION_CONTRACT_VERSION,
+      operation: "split".to_string(),
+      operation_id: "same".to_string(),
+      inputs_fingerprint: "same".to_string(),
+      resolved_refs: MutationResolvedRefs {
+        git_head: "head".to_string(),
+        git_branch: "main".to_string(),
+      },
+      actions: vec![MutationAction::new("ACTION", "target", None)],
+      declared_inputs: Vec::new(),
+      risks: Vec::new(),
+      trace: Vec::new(),
+      pre_apply: MutationPreApplyChecks {
+        git_head: "head".to_string(),
+        config_fingerprint: "config".to_string(),
+        toolchain_fingerprint: "toolchain".to_string(),
+        lock_fingerprint: "lock".to_string(),
+        metadata_fingerprint: "metadata".to_string(),
+        worktree_fingerprint: "worktree".to_string(),
+        changed_paths: Vec::new(),
+      },
+    };
+    let mut other = plan.clone();
+    other.operation = "sync".to_string();
+
+    assert!(validate_requested_operation(&plan, &plan).is_ok());
+    assert!(validate_requested_operation(&plan, &other).is_err());
   }
 }

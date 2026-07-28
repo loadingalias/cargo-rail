@@ -154,20 +154,14 @@ impl SystemGit {
     })
   }
 
-  /// Get HEAD commit SHA
-  ///
-  /// Note: We don't cache this anymore to avoid interior mutability.
-  /// The performance difference is negligible (1-2ms per call).
+  /// Get HEAD commit SHA.
   pub fn head_commit(&self) -> RailResult<String> {
     self.run_git_stdout(&["rev-parse", "HEAD"])
   }
 
   /// Get current branch name
   pub fn current_branch(&self) -> RailResult<String> {
-    // Try to get branch name, fallback to "HEAD" if detached
-    self
-      .run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
-      .or(Ok("HEAD".to_string()))
+    self.run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
   }
 
   /// Check if HEAD is detached (not on any branch)

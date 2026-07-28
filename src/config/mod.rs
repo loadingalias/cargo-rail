@@ -1,14 +1,4 @@
-//! Configuration for cargo-rail
-//!
-//! This module provides all configuration types for cargo-rail:
-//! - `RailConfig` - Main configuration struct loaded from rail.toml
-//! - `UnifyConfig` - Dependency unification settings
-//! - `ReleaseConfig` - Release management settings
-//! - `SplitConfig` - Crate splitting/syncing settings
-//! - `ChangeDetectionConfig` - Change detection settings
-//! - `RunConfig` - `cargo rail run` profile settings
-//!
-//! Configuration is searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
+//! Typed `rail.toml` configuration and discovery.
 
 mod change_detection;
 mod release;
@@ -17,7 +7,6 @@ pub(crate) mod schema;
 mod split;
 mod unify;
 
-// Re-export all public types
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
@@ -36,7 +25,7 @@ pub use unify::{
 
 use crate::error::{ConfigError, RailError, RailResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -62,7 +51,7 @@ pub struct RailConfig {
   pub run: RunConfig,
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
-  pub crates: HashMap<String, CrateConfig>,
+  pub crates: BTreeMap<String, CrateConfig>,
 }
 
 /// Per-crate configuration
@@ -95,7 +84,6 @@ impl RailConfig {
   fn parse_path(path: &Path) -> Result<(Self, Vec<u8>), String> {
     let bytes = fs::read(path).map_err(|error| format!("failed to read file: {error}"))?;
     let content = std::str::from_utf8(&bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
-    let config = toml_edit::de::from_str(content).map_err(|error| error.to_string())?;
     let doc: toml_edit::DocumentMut = content
       .parse()
       .map_err(|error: toml_edit::TomlError| error.to_string())?;
@@ -104,6 +92,7 @@ impl RailConfig {
         crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);
       }
     }
+    let config = toml_edit::de::from_document(doc).map_err(|error| error.to_string())?;
     Ok((config, bytes))
   }
 

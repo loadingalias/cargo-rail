@@ -306,8 +306,7 @@ impl ConfigError {
       ConfigError::NotFound { .. } => Some("run 'cargo rail init' to create configuration".to_string()),
       ConfigError::ParseError { .. } => Some("check the config file syntax and fix the error".to_string()),
       ConfigError::CrateNotFound { name } => Some(format!(
-        "run 'cargo rail split --check' to list configured crates (did you mean '{}'?)",
-        name
+        "check the '[crates.{name}]' table in rail.toml or run 'cargo rail config validate'"
       )),
       ConfigError::InvalidValue { field, .. } => Some(format!("check the '{}' field in your config file", field)),
       ConfigError::InvalidField { field, .. } => Some(format!("check the '{}' field in your config file", field)),
@@ -396,7 +395,7 @@ impl GitError {
     match self {
       GitError::PushFailed { reason, .. } => {
         if reason.contains("non-fast-forward") {
-          Some("pull first, or use --force".to_string())
+          Some("fetch and reconcile the remote branch, then retry".to_string())
         } else if reason.contains("permission denied") || reason.contains("403") {
           Some("check SSH key and repository permissions".to_string())
         } else {
@@ -435,11 +434,10 @@ impl fmt::Display for GitError {
         if count <= 5 {
           write!(f, "working tree has uncommitted changes:\n{}", files.join("\n"))
         } else {
-          let shown: Vec<_> = files.iter().take(5).cloned().collect();
           write!(
             f,
             "working tree has uncommitted changes:\n{}\n  ... and {} more",
-            shown.join("\n"),
+            files[..5].join("\n"),
             count - 5
           )
         }

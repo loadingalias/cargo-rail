@@ -3591,6 +3591,76 @@ relative_to = "workspace"
   Ok(())
 }
 
+#[test]
+fn release_rejects_an_absolute_changelog_path_outside_the_workspace() -> Result<()> {
+  let ws = TestWorkspace::new_named("changelog-outside-workspace")?;
+  let outside = tempfile::TempDir::new()?;
+  let outside_path = outside.path().join("CHANGELOG.md");
+  ws.write_release_config(&format!(
+    r#"source = "commits"
+require_clean = false
+
+[release.changelog]
+path = "{}"
+relative_to = "workspace"
+"#,
+    outside_path.display().to_string().replace('\\', "\\\\")
+  ))?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--check"],
+  )?;
+  assert!(!output.status.success());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    stderr.contains("escapes workspace") || stderr.contains("outside git worktree"),
+    "outside changelog path should fail before mutation\nstderr:\n{}",
+    stderr
+  );
+  assert!(!outside_path.exists());
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn release_rejects_a_symlink_changelog_path() -> Result<()> {
+  use std::os::unix::fs::symlink;
+
+  let ws = TestWorkspace::new_named("changelog-symlink")?;
+  ws.write_release_config(
+    r#"source = "commits"
+require_clean = false
+
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "workspace"
+"#,
+  )?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+  let outside = tempfile::TempDir::new()?;
+  let victim = outside.path().join("victim");
+  std::fs::write(&victim, "outside\n")?;
+  symlink(&victim, ws.path.join("CHANGELOG.md"))?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+  ws.commit("feat: change lib-a")?;
+
+  let output = run_cargo_rail(
+    &ws.path,
+    &["rail", "release", "run", "lib-a", "--bump", "patch", "--check"],
+  )?;
+  assert!(!output.status.success());
+  assert_eq!(std::fs::read_to_string(victim)?, "outside\n");
+  Ok(())
+}
+
 /// Test that parent directories are auto-created for changelog paths
 #[test]
 fn test_changelog_parent_directories_auto_created() -> Result<()> {
@@ -3924,6 +3994,46 @@ fn test_release_resume_reconciles_tag_created_before_failure() -> Result<()> {
   assert_eq!(String::from_utf8_lossy(&tags.stdout).lines().count(), 1);
   let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
   assert_eq!(state["status"], "complete");
+  Ok(())
+}
+
+#[test]
+fn release_resume_rejects_same_branch_head_movement() -> Result<()> {
+  let ws = TestWorkspace::new_named("release-resume-head-drift")?;
+  write_release_config(&ws, "")?;
+  ws.add_crate("lib-a", "0.1.0", &[])?;
+  ws.commit("Add lib-a")?;
+  ws.tag("lib-a-v0.1.0", "Initial release")?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+  ws.commit("feat: prepare release")?;
+
+  let interrupted = run_release_with_fault(
+    &ws.path,
+    &[
+      "rail",
+      "release",
+      "run",
+      "lib-a",
+      "--bump",
+      "patch",
+      "--skip-publish",
+      "--yes",
+    ],
+    "tag",
+  )?;
+  assert!(!interrupted.status.success());
+  let state_path = only_release_state(&ws.path)?;
+  ws.modify_file("lib-a", "src/lib.rs", "pub fn moved_after_release() {}")?;
+  ws.commit("feat: move release branch")?;
+
+  let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+  assert!(!resumed.status.success());
+  let stderr = String::from_utf8_lossy(&resumed.stderr);
+  assert!(
+    stderr.contains("persisted release commit"),
+    "resume should reject same-branch HEAD drift\nstderr:\n{}",
+    stderr
+  );
   Ok(())
 }
 

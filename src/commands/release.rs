@@ -536,7 +536,16 @@ pub fn run_release_check(
       let mut crate_checks = Vec::with_capacity(checks.len());
 
       for check in checks {
-        if check.passed {
+        if check.skipped {
+          if !json {
+            println!(
+              "  {}: {} - SKIPPED: {}",
+              crate_name,
+              check.check_name,
+              check.details.as_deref().unwrap_or("no evidence")
+            );
+          }
+        } else if check.passed {
           if !json {
             println!(
               "  {}: {} - {}",
@@ -560,6 +569,7 @@ pub fn run_release_check(
         crate_checks.push(serde_json::json!({
           "check": check.check_name,
           "passed": check.passed,
+          "skipped": check.skipped,
           "details": check.details,
           "error": check.error
         }));

@@ -114,6 +114,9 @@ mode = "single"
   let split = run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--yes", "--allow-dirty"])?;
   assert!(split.status.success(), "initial split should succeed");
 
+  std::fs::write(ws.path.join("crates/mylib/src/lib.rs"), "pub fn changed() {}\n")?;
+  ws.commit("Change mylib after split")?;
+
   let check = run_cargo_rail(
     &ws.path,
     &[

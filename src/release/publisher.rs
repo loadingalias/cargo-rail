@@ -346,6 +346,9 @@ impl<'a> ReleasePublisher<'a> {
         format!("git switch {}", state.branch),
       ));
     }
+    if state.release_commit.is_some() {
+      self.validate_release_head(&state)?;
+    }
     progress!("resuming release state: {}", state_path.display());
     self.execute_state(&mut state, &state_path)
   }
@@ -439,6 +442,7 @@ impl<'a> ReleasePublisher<'a> {
 
   fn execute_state(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
     self.reconcile_local_commits(state, state_path)?;
+    self.validate_release_head(state)?;
     advance_phase(state, state_path, ReleasePhase::Prepared)?;
     self.reconcile_commit_push(state, state_path)?;
     advance_phase(state, state_path, ReleasePhase::AwaitingChecks)?;
@@ -455,6 +459,43 @@ impl<'a> ReleasePublisher<'a> {
     state.save(state_path, "released")?;
     progress!("\nrelease complete");
 
+    Ok(())
+  }
+
+  fn validate_release_head(&self, state: &ReleaseState) -> RailResult<()> {
+    let expected = state
+      .release_commit
+      .as_deref()
+      .ok_or_else(|| RailError::message("prepared release has no exact release commit"))?;
+    let git = self.ctx.git()?.git();
+    let actual = git.head_commit()?;
+    if actual != expected {
+      return Err(RailError::with_help(
+        format!(
+          "release checkout is at {}, but the persisted release commit is {}",
+          actual, expected
+        ),
+        format!(
+          "restore a clean checkout of {} on branch '{}' before resuming",
+          expected, state.branch
+        ),
+      ));
+    }
+    Ok(())
+  }
+
+  fn validate_publish_checkout(&self, state: &ReleaseState) -> RailResult<()> {
+    self.validate_release_head(state)?;
+    let git = self.ctx.git()?.git();
+    if git.is_dirty()? {
+      return Err(RailError::with_help(
+        format!(
+          "release checkout has uncommitted content: {}",
+          git.dirty_files()?.join(", ")
+        ),
+        "restore a clean checkout before publishing; cargo packages ambient worktree bytes",
+      ));
+    }
     Ok(())
   }
 
@@ -680,6 +721,7 @@ impl<'a> ReleasePublisher<'a> {
     state.commit_push.status = StepStatus::InProgress;
     state.commit_push.object = Some(release_commit.clone());
     state.save(state_path, "commit_push_intent")?;
+    self.validate_release_head(state)?;
     fault_before("push", RELEASE_REMOTE)?;
     self.push_release_commit(&state.branch)?;
     fault_after("push", RELEASE_REMOTE)?;
@@ -822,6 +864,7 @@ impl<'a> ReleasePublisher<'a> {
         state.save(state_path, &format!("publish_intent:{}", crate_plan.name))?;
       }
       progress!("  publishing {}...", crate_plan.name);
+      self.validate_publish_checkout(state)?;
       fault_before("publish", &crate_plan.name)?;
       let publish = self.publish_crate(&crate_plan);
       fault_after("publish", &crate_plan.name)?;

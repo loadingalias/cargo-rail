@@ -1,31 +1,7 @@
-//! Backup and restore functionality for cargo-rail operations
+//! Contained workspace-file backups for mutation recovery.
 //!
-//! Provides automatic backup/restore of workspace files to enable safe
-//! undo operations. Backups are stored in `target/.cargo-rail/backups/`
-//! to keep them out of version control and the main workspace tree.
-//!
-//! # Architecture
-//!
-//! - Each backup is stored in a timestamped directory
-//! - `metadata.json` tracks what was backed up and why
-//! - Original file structure is preserved for easy restoration
-//! - Automatic cleanup keeps only recent backups
-//!
-//! # Usage
-//!
-//! ```text
-//! let manager = BackupManager::new(workspace_root);
-//!
-//! // Create backup before modifications
-//! let metadata = BackupMetadata::new("cargo rail unify");
-//! let backup_id = manager.create_backup(&files_to_backup, metadata)?;
-//!
-//! // Restore if needed
-//! manager.restore_backup(&backup_id)?;
-//!
-//! // List available backups
-//! let backups = manager.list_backups()?;
-//! ```
+//! Each timestamped directory under `target/cargo-rail/backups` preserves the
+//! original relative file layout and records it in `metadata.json`.
 
 use std::path::{Path, PathBuf};
 

@@ -67,17 +67,26 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 
   // Check mode: show plan
   if args.check {
+    let pending = configs
+      .iter()
+      .map(|config| SplitEngine::has_pending_changes(ctx, config))
+      .collect::<RailResult<Vec<_>>>()?;
+    let has_pending = pending.iter().any(|pending| *pending);
+    let result = if has_pending { "pending_changes" } else { "clean" };
+    let exit_code = i32::from(has_pending);
     match args.format {
       SplitOutputFormat::Json => {
         let crates: Vec<_> = configs
           .iter()
-          .map(|config| {
+          .zip(&pending)
+          .map(|(config, pending)| {
             serde_json::json!({
               "crate_name": config.crate_name,
               "mode": format!("{:?}", config.mode),
               "target_repo": config.target_repo_path,
               "branch": config.branch,
               "remote_url": config.remote_url,
+              "pending": pending,
             })
           })
           .collect();
@@ -92,7 +101,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           },
           "mutation_plan": expected_mutation_plan,
         });
-        let output = crate::output::machine_json_envelope("split", "check", "pending_changes", 1, payload);
+        let output = crate::output::machine_json_envelope("split", "check", result, exit_code, payload);
         println!("{}", serde_json::to_string_pretty(&output)?);
       }
       SplitOutputFormat::NamesOnly => {
@@ -101,21 +110,23 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         }
       }
       SplitOutputFormat::JsonLines => {
-        for config in &configs {
+        for (config, pending) in configs.iter().zip(&pending) {
           let obj = serde_json::json!({
             "crate_name": config.crate_name,
             "mode": format!("{:?}", config.mode),
             "target_repo": config.target_repo_path.display().to_string(),
             "branch": config.branch,
             "remote_url": config.remote_url,
+            "pending": pending,
           });
           println!("{}", serde_json::to_string(&obj)?);
         }
       }
       SplitOutputFormat::Text => {
         println!("split plan:\n");
-        for config in &configs {
+        for (config, pending) in configs.iter().zip(&pending) {
           println!("  {}", config.crate_name);
+          println!("    status: {}", if *pending { "pending" } else { "clean" });
           println!("    mode: {:?}", config.mode);
           println!("    members:");
           for member in &config.ownership.members {
@@ -127,10 +138,18 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
           }
           println!("    branch: {}", config.branch);
         }
-        println!("\nChanges detected. Run without --check to apply.");
+        if has_pending {
+          println!("\nChanges detected. Run without --check to apply.");
+        } else {
+          println!("\nNo changes detected.");
+        }
       }
     }
-    return Err(crate::error::RailError::CheckHasPendingChanges);
+    return if has_pending {
+      Err(crate::error::RailError::CheckHasPendingChanges)
+    } else {
+      Ok(())
+    };
   }
 
   enforce_safety_gate(

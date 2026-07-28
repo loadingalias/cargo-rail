@@ -427,32 +427,7 @@ fn display_json_value(value: &serde_json::Value) -> String {
 
 /// Load config from explicit path or search, returning both config and path
 fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<(RailConfig, PathBuf)> {
-  if let Some(explicit_path) = config_override {
-    let path = if explicit_path.is_absolute() {
-      explicit_path.to_path_buf()
-    } else {
-      workspace_root.join(explicit_path)
-    };
-
-    if !path.exists() {
-      return Err(RailError::message(format!(
-        "specified config file not found: {}",
-        path.display()
-      )));
-    }
-
-    let (config, _) = RailConfig::load_path_with_bytes(&path)?;
-    return Ok((config, path));
-  }
-
-  // Search standard locations
-  let config_path = RailConfig::find_config_path(workspace_root).ok_or_else(|| {
-    RailError::with_help(
-      "no rail.toml found".to_string(),
-      "run 'cargo rail init' first to create a configuration file".to_string(),
-    )
-  })?;
-
+  let config_path = resolve_config_path(workspace_root, config_override)?;
   let (config, _) = RailConfig::load_path_with_bytes(&config_path)?;
   Ok((config, config_path))
 }
@@ -554,6 +529,9 @@ pub fn run_config_validate_standalone(
       if let Err(e) = config.run.validate() {
         errors.push(ValidationIssue::new("run", e.to_string()));
       }
+      if let Err(e) = config.unify.validate(workspace_root) {
+        errors.push(ValidationIssue::new("unify", e.to_string()));
+      }
       if let Err(e) = config.release.changelog.filters.validate("release.changelog.filters") {
         errors.push(ValidationIssue::new("release.changelog.filters", e.to_string()));
       }
@@ -577,9 +555,9 @@ pub fn run_config_validate_standalone(
             ));
           }
           if split_cfg.branch.is_empty() {
-            warnings.push(ValidationIssue::new(
+            errors.push(ValidationIssue::new(
               format!("crates.{}.split", crate_name),
-              "branch is empty, will use default",
+              "branch must not be empty",
             ));
           }
         }
@@ -606,7 +584,7 @@ pub fn run_config_validate_standalone(
   // In strict mode, warnings become errors
   let (final_errors, final_warnings) = if strict {
     let mut all_errors = errors;
-    all_errors.extend(warnings.iter().cloned());
+    all_errors.extend(warnings);
     (all_errors, vec![])
   } else {
     (errors, warnings)

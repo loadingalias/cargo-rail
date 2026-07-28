@@ -1,10 +1,10 @@
 //! Backup manager - handles backup creation, restoration, and listing
 
 use super::metadata::{BackupMetadata, BackupRecord};
-use super::{BackupId, create_backup_id, get_backup_dir, get_backup_root};
+use super::{BackupId, create_backup_id, get_backup_root};
 use crate::error::{RailError, RailResult};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Manages backups for a workspace
 pub struct BackupManager {
@@ -16,6 +16,13 @@ impl BackupManager {
   /// Create a new backup manager for a workspace
   pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
     let workspace_root = workspace_root.into();
+    let workspace_root = if workspace_root.is_absolute() {
+      workspace_root
+    } else {
+      std::env::current_dir()
+        .map(|current| current.join(&workspace_root))
+        .unwrap_or(workspace_root)
+    };
     let backup_root = get_backup_root(&workspace_root);
     Self {
       workspace_root,
@@ -38,28 +45,60 @@ impl BackupManager {
       return Ok("none".to_string());
     }
 
+    let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
+    let backup_root_path = get_backup_root(&workspace_root);
+    let backup_root = prepare_contained_directory(&workspace_root, &backup_root_path, "backup root")?;
+    let sources = files
+      .iter()
+      .map(|file| {
+        validate_relative_entry(file, "backup file")?;
+        let source = contained_path(&workspace_root, file, "backup source")?;
+        match fs::symlink_metadata(&source) {
+          Ok(file_type) if file_type.file_type().is_symlink() => Err(RailError::message(format!(
+            "backup source '{}' must not be a symlink",
+            file.display()
+          ))),
+          Ok(file_type) if file_type.is_file() => Ok(Some((file.clone(), source))),
+          Ok(_) => Err(RailError::message(format!(
+            "backup source '{}' is not a regular file",
+            file.display()
+          ))),
+          Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+          Err(error) => Err(RailError::message(format!(
+            "failed to inspect backup source '{}': {}",
+            file.display(),
+            error
+          ))),
+        }
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+
     let backup_id = create_backup_id();
-    let backup_dir = get_backup_dir(&self.workspace_root, &backup_id);
+    validate_backup_id(&backup_id)?;
+    let backup_dir = backup_root.join(&backup_id);
 
-    fs::create_dir_all(&backup_dir)
+    fs::create_dir(&backup_dir)
       .map_err(|e| RailError::message(format!("failed to create {}: {}", backup_dir.display(), e)))?;
+    let backup_dir = canonical_directory(&backup_dir, "backup directory")?;
 
-    for file in files {
-      let src = self.workspace_root.join(file);
-      let dest = backup_dir.join(file);
-
-      if !src.exists() {
+    for source in sources {
+      let Some((file, source)) = source else {
         continue;
+      };
+      let dest = contained_path(&backup_dir, &file, "backup destination")?;
+
+      if let Some(parent) = dest.parent()
+        && parent != backup_dir
+      {
+        prepare_contained_directory(&backup_dir, parent, "backup destination directory")?;
       }
 
-      if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-          .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
-      }
+      revalidate_regular_file(&workspace_root, &source, "backup source")?;
+      revalidate_destination(&backup_dir, &dest, "backup destination")?;
+      fs::copy(&source, &dest)
+        .map_err(|e| RailError::message(format!("failed to backup {}: {}", source.display(), e)))?;
 
-      fs::copy(&src, &dest).map_err(|e| RailError::message(format!("failed to backup {}: {}", src.display(), e)))?;
-
-      metadata.add_file(file.clone());
+      metadata.add_file(file);
     }
 
     metadata.save(&backup_dir)?;
@@ -72,11 +111,17 @@ impl BackupManager {
 
   /// Restore a backup
   pub fn restore_backup(&self, backup_id: &str) -> RailResult<()> {
-    let backup_dir = get_backup_dir(&self.workspace_root, backup_id);
-
-    if !backup_dir.exists() {
-      return Err(RailError::message(format!("backup '{}' not found", backup_id)));
+    validate_backup_id(backup_id)?;
+    let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
+    let backup_root = canonical_directory(&self.backup_root, "backup root")?;
+    if !backup_root.starts_with(&workspace_root) || backup_root == workspace_root {
+      return Err(RailError::message(format!(
+        "backup root '{}' is outside '{}'",
+        self.backup_root.display(),
+        workspace_root.display()
+      )));
     }
+    let backup_dir = validate_backup_directory(&backup_root, &backup_root.join(backup_id))?;
 
     let metadata = BackupMetadata::load(&backup_dir)?;
 
@@ -84,20 +129,20 @@ impl BackupManager {
     crate::status!("  {} files", metadata.files_modified.len());
 
     for file in &metadata.files_modified {
-      let src = backup_dir.join(file);
-      let dest = self.workspace_root.join(file);
+      validate_relative_entry(file, "backup metadata file")?;
+      let source = contained_path(&backup_dir, file, "backup source")?;
+      let destination = contained_path(&workspace_root, file, "restore destination")?;
+      revalidate_regular_file(&backup_dir, &source, "backup source")?;
 
-      if !src.exists() {
-        crate::status!("  skipped (missing): {}", file.display());
-        continue;
+      if let Some(parent) = destination.parent()
+        && parent != workspace_root
+      {
+        prepare_contained_directory(&workspace_root, parent, "restore destination directory")?;
       }
 
-      if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-          .map_err(|e| RailError::message(format!("failed to create {}: {}", parent.display(), e)))?;
-      }
-
-      fs::copy(&src, &dest).map_err(|e| RailError::message(format!("failed to restore {}: {}", file.display(), e)))?;
+      revalidate_destination(&workspace_root, &destination, "restore destination")?;
+      fs::copy(&source, &destination)
+        .map_err(|e| RailError::message(format!("failed to restore {}: {}", file.display(), e)))?;
 
       crate::status!("  restored: {}", file.display());
     }
@@ -112,17 +157,29 @@ impl BackupManager {
     if !self.backup_root.exists() {
       return Ok(Vec::new());
     }
+    let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
+    let backup_root = canonical_directory(&self.backup_root, "backup root")?;
+    if !backup_root.starts_with(&workspace_root) || backup_root == workspace_root {
+      return Err(RailError::message(format!(
+        "backup root '{}' is outside '{}'",
+        self.backup_root.display(),
+        workspace_root.display()
+      )));
+    }
 
     let mut backups = Vec::new();
 
-    let entries = fs::read_dir(&self.backup_root)
-      .map_err(|e| RailError::message(format!("failed to read {}: {}", self.backup_root.display(), e)))?;
+    let entries = fs::read_dir(&backup_root)
+      .map_err(|e| RailError::message(format!("failed to read {}: {}", backup_root.display(), e)))?;
 
     for entry in entries {
       let entry = entry.map_err(|e| RailError::message(format!("failed to read entry: {}", e)))?;
 
       let path = entry.path();
-      if !path.is_dir() {
+      let file_type = entry
+        .file_type()
+        .map_err(|e| RailError::message(format!("failed to inspect {}: {}", path.display(), e)))?;
+      if !file_type.is_dir() || file_type.is_symlink() {
         continue;
       }
 
@@ -164,8 +221,10 @@ impl BackupManager {
     let to_delete = &backups[keep_count..];
     let deleted_count = to_delete.len();
 
+    let backup_root = canonical_directory(&self.backup_root, "backup root")?;
     for backup in to_delete {
-      fs::remove_dir_all(&backup.path)
+      let backup_path = validate_backup_directory(&backup_root, &backup.path)?;
+      fs::remove_dir_all(&backup_path)
         .map_err(|e| RailError::message(format!("failed to delete {}: {}", backup.id, e)))?;
     }
 
@@ -183,9 +242,159 @@ impl BackupManager {
   }
 }
 
+fn validate_relative_entry(path: &Path, description: &str) -> RailResult<()> {
+  let mut components = path.components();
+  let Some(Component::Normal(_)) = components.next() else {
+    return Err(RailError::message(format!(
+      "{description} '{}' must be a non-empty relative path",
+      path.display()
+    )));
+  };
+  if components.any(|component| !matches!(component, Component::Normal(_))) {
+    return Err(RailError::message(format!(
+      "{description} '{}' must not contain '.', '..', a root, or a platform prefix",
+      path.display()
+    )));
+  }
+  Ok(())
+}
+
+fn validate_backup_id(backup_id: &str) -> RailResult<()> {
+  let path = Path::new(backup_id);
+  validate_relative_entry(path, "backup id")?;
+  if path.components().count() != 1 {
+    return Err(RailError::message(format!(
+      "backup id '{}' must identify one backup directory",
+      backup_id
+    )));
+  }
+  Ok(())
+}
+
+fn canonical_directory(path: &Path, description: &str) -> RailResult<PathBuf> {
+  let metadata = fs::symlink_metadata(path)
+    .map_err(|error| RailError::message(format!("failed to inspect {description} '{}': {error}", path.display())))?;
+  if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    return Err(RailError::message(format!(
+      "{description} '{}' must be a real directory",
+      path.display()
+    )));
+  }
+  crate::utils::canonicalize_existing(path)
+    .map_err(|error| RailError::message(format!("failed to resolve {description} '{}': {error}", path.display())))
+}
+
+fn contained_path(root: &Path, path: &Path, description: &str) -> RailResult<PathBuf> {
+  let candidate = if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    root.join(path)
+  };
+  let resolved = crate::utils::canonicalize_allow_missing(&candidate)
+    .map_err(|error| RailError::message(format!("failed to resolve {description} '{}': {error}", path.display())))?;
+  if !resolved.starts_with(root) || resolved == root {
+    return Err(RailError::message(format!(
+      "{description} '{}' is outside '{}'",
+      path.display(),
+      root.display()
+    )));
+  }
+  Ok(candidate)
+}
+
+fn prepare_contained_directory(root: &Path, path: &Path, description: &str) -> RailResult<PathBuf> {
+  let resolved = contained_path(root, path, description)?;
+  fs::create_dir_all(&resolved)
+    .map_err(|error| RailError::message(format!("failed to create {description} '{}': {error}", path.display())))?;
+  let canonical = canonical_directory(&resolved, description)?;
+  if !canonical.starts_with(root) || canonical == root {
+    return Err(RailError::message(format!(
+      "{description} '{}' is outside '{}'",
+      path.display(),
+      root.display()
+    )));
+  }
+  Ok(canonical)
+}
+
+fn validate_backup_directory(backup_root: &Path, path: &Path) -> RailResult<PathBuf> {
+  let canonical = canonical_directory(path, "backup directory").map_err(|error| {
+    if !path.exists() {
+      RailError::message(format!(
+        "backup '{}' not found",
+        path.file_name().unwrap_or_default().to_string_lossy()
+      ))
+    } else {
+      error
+    }
+  })?;
+  if canonical.parent() != Some(backup_root) {
+    return Err(RailError::message(format!(
+      "backup directory '{}' is outside '{}'",
+      path.display(),
+      backup_root.display()
+    )));
+  }
+  Ok(canonical)
+}
+
+fn revalidate_regular_file(root: &Path, path: &Path, description: &str) -> RailResult<()> {
+  let metadata = fs::symlink_metadata(path)
+    .map_err(|error| RailError::message(format!("failed to inspect {description} '{}': {error}", path.display())))?;
+  if metadata.file_type().is_symlink() || !metadata.is_file() {
+    return Err(RailError::message(format!(
+      "{description} '{}' must be a regular file",
+      path.display()
+    )));
+  }
+  let canonical = crate::utils::canonicalize_existing(path)
+    .map_err(|error| RailError::message(format!("failed to resolve {description} '{}': {error}", path.display())))?;
+  if !canonical.starts_with(root) || canonical == root {
+    return Err(RailError::message(format!(
+      "{description} '{}' is outside '{}'",
+      path.display(),
+      root.display()
+    )));
+  }
+  Ok(())
+}
+
+fn revalidate_destination(root: &Path, path: &Path, description: &str) -> RailResult<()> {
+  match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+      return Err(RailError::message(format!(
+        "{description} '{}' must be a regular file or absent",
+        path.display()
+      )));
+    }
+    Ok(_) => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Err(error) => {
+      return Err(RailError::message(format!(
+        "failed to inspect {description} '{}': {error}",
+        path.display()
+      )));
+    }
+  }
+  let resolved = contained_path(root, path, description)?;
+  let parent = resolved
+    .parent()
+    .ok_or_else(|| RailError::message(format!("{description} '{}' has no parent", path.display())))?;
+  let canonical_parent = canonical_directory(parent, description)?;
+  if !canonical_parent.starts_with(root) {
+    return Err(RailError::message(format!(
+      "{description} '{}' is outside '{}'",
+      path.display(),
+      root.display()
+    )));
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::backup::get_backup_dir;
   use tempfile::TempDir;
 
   fn create_test_workspace() -> TempDir {
@@ -262,8 +471,7 @@ mod tests {
     assert_eq!(backups.len(), 1);
     assert_eq!(backups[0].metadata.command, "test 1");
 
-    // Sleep to ensure different timestamp
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Create another backup
     let metadata2 = BackupMetadata::new("test 2");
@@ -281,14 +489,11 @@ mod tests {
     let workspace = create_test_workspace();
     let manager = BackupManager::new(workspace.path());
 
-    // Create 5 backups with sufficient delay for unique timestamps
-    // Use max_backups=100 so all 5 are kept initially
     let files = vec![PathBuf::from("Cargo.toml")];
     for i in 1..=5 {
       let metadata = BackupMetadata::new(format!("test {}", i));
       manager.create_backup(&files, metadata, 100)?;
-      // Sleep 1 second to ensure different timestamps (format is YYYY-MM-DD-HHMMSS)
-      std::thread::sleep(std::time::Duration::from_secs(1));
+      std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     // Verify we have 5 backups
@@ -314,10 +519,9 @@ mod tests {
     // Initially no backups
     assert!(manager.get_latest_backup()?.is_none());
 
-    // Create backups with sufficient delay (use max_backups=10 to keep them)
     let files = vec![PathBuf::from("Cargo.toml")];
     manager.create_backup(&files, BackupMetadata::new("first"), 10)?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    std::thread::sleep(std::time::Duration::from_millis(10));
     manager.create_backup(&files, BackupMetadata::new("second"), 10)?;
 
     // Latest should be "second"
@@ -343,6 +547,93 @@ mod tests {
     let backups = manager.list_backups()?;
     assert_eq!(backups.len(), 0);
 
+    Ok(())
+  }
+
+  #[test]
+  fn backup_paths_must_be_workspace_relative() {
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+
+    for path in [PathBuf::from("../Cargo.toml"), workspace.path().join("Cargo.toml")] {
+      let error = manager
+        .create_backup(&[path], BackupMetadata::new("test"), 10)
+        .unwrap_err();
+      assert!(error.to_string().contains("must be a non-empty relative path"));
+    }
+  }
+
+  #[test]
+  fn restore_rejects_uncontained_metadata_paths() -> RailResult<()> {
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+    let backup_id = manager.create_backup(&[PathBuf::from("Cargo.toml")], BackupMetadata::new("test"), 10)?;
+    let backup_dir = get_backup_dir(workspace.path(), &backup_id);
+    let mut metadata = BackupMetadata::load(&backup_dir)?;
+    metadata.files_modified = vec![PathBuf::from("../outside")];
+    metadata.save(&backup_dir)?;
+
+    let error = manager.restore_backup(&backup_id).unwrap_err();
+    assert!(error.to_string().contains("must be a non-empty relative path"));
+    Ok(())
+  }
+
+  #[test]
+  fn restore_rejects_uncontained_backup_ids() {
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+
+    for backup_id in ["../outside", "/tmp/outside"] {
+      let error = manager.restore_backup(backup_id).unwrap_err();
+      assert!(error.to_string().contains("backup id"));
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn backup_and_restore_reject_symlink_targets() -> RailResult<()> {
+    use std::os::unix::fs::symlink;
+
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+    let outside = TempDir::new().unwrap();
+    let outside_file = outside.path().join("outside");
+    fs::write(&outside_file, "outside")?;
+
+    fs::remove_file(workspace.path().join("Cargo.toml"))?;
+    symlink(&outside_file, workspace.path().join("Cargo.toml"))?;
+    let error = manager
+      .create_backup(&[PathBuf::from("Cargo.toml")], BackupMetadata::new("test"), 10)
+      .unwrap_err();
+    assert!(error.to_string().contains("outside"));
+
+    fs::remove_file(workspace.path().join("Cargo.toml"))?;
+    fs::write(workspace.path().join("Cargo.toml"), "original")?;
+    let backup_id = manager.create_backup(&[PathBuf::from("Cargo.toml")], BackupMetadata::new("test"), 10)?;
+    fs::remove_file(workspace.path().join("Cargo.toml"))?;
+    symlink(&outside_file, workspace.path().join("Cargo.toml"))?;
+
+    let error = manager.restore_backup(&backup_id).unwrap_err();
+    assert!(error.to_string().contains("outside"));
+    assert_eq!(fs::read_to_string(&outside_file)?, "outside");
+    Ok(())
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn backup_root_must_remain_in_workspace() -> RailResult<()> {
+    use std::os::unix::fs::symlink;
+
+    let workspace = create_test_workspace();
+    let manager = BackupManager::new(workspace.path());
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(workspace.path().join("target/cargo-rail"))?;
+    symlink(outside.path(), &manager.backup_root)?;
+
+    let error = manager
+      .create_backup(&[PathBuf::from("Cargo.toml")], BackupMetadata::new("test"), 10)
+      .unwrap_err();
+    assert!(error.to_string().contains("outside"));
     Ok(())
   }
 }

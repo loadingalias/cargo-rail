@@ -351,6 +351,69 @@ fn test_config_validate_json_output() -> Result<()> {
 }
 
 #[test]
+fn test_config_validate_rejects_invalid_unify_glob() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-invalid-unify-glob")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    "[unify]\npreserve_features = [\"[\"]\n",
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(!output.status.success(), "invalid unify glob should fail validation");
+
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["valid"], false);
+  assert!(
+    json["errors"]
+      .as_array()
+      .is_some_and(|errors| errors.iter().any(|error| {
+        error["message"].as_str().is_some_and(|message| {
+          message.contains("invalid glob pattern") && message.contains("unify.preserve_features")
+        })
+      }))
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_config_validate_rejects_empty_split_branch() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-empty-split-branch")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    r#"[crates.test-crate.split]
+remote = "https://example.invalid/test-crate.git"
+branch = ""
+mode = "single"
+members = ["test-crate"]
+"#,
+  )?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
+  assert!(!output.status.success(), "empty split branch should fail validation");
+
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(json["valid"], false);
+  assert!(
+    json["errors"]
+      .as_array()
+      .is_some_and(|errors| errors.iter().any(|error| {
+        error["message"]
+          .as_str()
+          .is_some_and(|message| message == "branch must not be empty")
+      }))
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_config_validate_no_config_json() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-no-config-json")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
@@ -381,11 +444,6 @@ fn test_config_validate_no_config_json() -> Result<()> {
 
   Ok(())
 }
-
-// Note: Tests for invalid targets and split config validation are skipped
-// because those validations happen during config loading, not during
-// `config validate`. The config validate command checks for semantic issues
-// that can only be detected after the config is loaded successfully.
 
 #[test]
 fn test_config_validate_global_json_flag() -> Result<()> {

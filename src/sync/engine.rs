@@ -198,7 +198,6 @@ impl<'a> SyncEngine<'a> {
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_nanos()
     )))?;
-    std::fs::create_dir_all(&temp_dir)?;
     let conflict_resolver = ConflictResolver::new(conflict_strategy, temp_dir);
 
     Ok(Self {
@@ -214,6 +213,18 @@ impl<'a> SyncEngine<'a> {
   }
 
   fn load_mappings(&mut self) -> RailResult<()> {
+    self.load_mapping_evidence()?;
+    if self
+      .mapping_store
+      .migrate_legacy_mappings(&self.config.target_repo_path, &self.source_origin)?
+      .is_some()
+    {
+      progress!("   Migrated legacy mappings into ordinary Git history");
+    }
+    Ok(())
+  }
+
+  fn load_mapping_evidence(&mut self) -> RailResult<()> {
     self.mapping_store.load_history(
       self.ctx.workspace_root(),
       HistorySide::Source,
@@ -227,14 +238,18 @@ impl<'a> SyncEngine<'a> {
     self.mapping_store.load_legacy_notes(self.ctx.workspace_root())?;
     self.mapping_store.load_legacy_notes(&self.config.target_repo_path)?;
     self.config.path_capabilities.validate_target_repository()?;
-    if self
-      .mapping_store
-      .migrate_legacy_mappings(&self.config.target_repo_path, &self.source_origin)?
-      .is_some()
-    {
-      progress!("   Migrated legacy mappings into ordinary Git history");
-    }
     Ok(())
+  }
+
+  /// Classify whether the selected direction has mapped commits pending.
+  pub fn has_pending_changes(&mut self, direction: &SyncDirection) -> RailResult<bool> {
+    self.load_mapping_evidence()?;
+    match direction {
+      SyncDirection::MonoToRemote => self.check_mono_has_changes(),
+      SyncDirection::RemoteToMono => self.check_remote_has_changes(),
+      SyncDirection::Both => Ok(self.check_mono_has_changes()? || self.check_remote_has_changes()?),
+      SyncDirection::None => Ok(false),
+    }
   }
 
   /// Commit operator-resolved work from a durable conflict receipt, then
@@ -1269,10 +1284,7 @@ fn read_worktree_blob(path: &Path, fallback_mode: Option<&str>) -> RailResult<(V
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {
   let bytes = serde_json::to_vec_pretty(value)
     .map_err(|error| crate::error::RailError::message(format!("failed to serialize sync receipt: {}", error)))?;
-  let temporary = path.with_extension("json.tmp");
-  std::fs::write(&temporary, bytes)?;
-  std::fs::rename(&temporary, path)?;
-  Ok(())
+  utils::write_file_atomic(path, &bytes)
 }
 
 /// Read the crate identity from a workspace-owned conflict receipt.

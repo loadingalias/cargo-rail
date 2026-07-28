@@ -671,18 +671,13 @@ fn test_sync_strategy_theirs() -> Result<()> {
   Ok(())
 }
 
-/// Test sync --json output
+/// Test sync --check JSON clean and pending classification.
 #[test]
 fn test_sync_json_output() -> Result<()> {
   let (ws, _split_dir) = setup_split_scenario("json-lib")?;
 
-  // Run sync with --check and --json
   let output = run_cargo_rail(&ws.path, &["rail", "sync", "json-lib", "--check", "--json"])?;
-  assert_eq!(
-    output.status.code(),
-    Some(1),
-    "sync --check --json should exit 1 when pending changes are detected"
-  );
+  assert_eq!(output.status.code(), Some(0));
   let stdout = String::from_utf8_lossy(&output.stdout);
   let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
   assert!(parsed.is_ok(), "JSON output should be valid. stdout: {}", stdout);
@@ -690,8 +685,21 @@ fn test_sync_json_output() -> Result<()> {
   assert_eq!(json["schema_version"], serde_json::json!(1));
   assert_eq!(json["command"], serde_json::json!("sync"));
   assert_eq!(json["mode"], serde_json::json!("check"));
-  assert_eq!(json["result"], serde_json::json!("pending_changes"));
-  assert_eq!(json["exit_code"], serde_json::json!(1));
+  assert_eq!(json["result"], serde_json::json!("clean"));
+  assert_eq!(json["exit_code"], serde_json::json!(0));
+  assert_eq!(json["crates"][0]["pending"], false);
+
+  ws.modify_file("json-lib", "src/lib.rs", "// pending")?;
+  ws.commit("Update json-lib")?;
+  let pending = run_cargo_rail(
+    &ws.path,
+    &["rail", "sync", "json-lib", "--to-remote", "--check", "--json"],
+  )?;
+  assert_eq!(pending.status.code(), Some(1));
+  let pending_json: serde_json::Value = serde_json::from_slice(&pending.stdout)?;
+  assert_eq!(pending_json["result"], "pending_changes");
+  assert_eq!(pending_json["exit_code"], 1);
+  assert_eq!(pending_json["crates"][0]["pending"], true);
 
   Ok(())
 }

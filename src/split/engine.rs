@@ -131,12 +131,54 @@ impl<'a> SplitEngine<'a> {
     })
   }
 
+  /// Return whether committed source history lacks target mapping evidence.
+  pub fn has_pending_changes(ctx: &WorkspaceContext, config: &SplitParams) -> RailResult<bool> {
+    if !config.target_repo_path.join(".git").exists() {
+      return Ok(true);
+    }
+    config.path_capabilities.validate_target_repository()?;
+    let target_git = SystemGit::open(&config.target_repo_path)?;
+    let target_identity = repository_identity(&config.target_repo_path)?;
+    let origin = OriginContext::discover(ctx.workspace_root(), &config.crate_name, &config.ownership.snapshot_id)?;
+    let mut mappings = MappingStore::new(config.crate_name.clone());
+    mappings.load_history(ctx.workspace_root(), HistorySide::Source, &target_identity)?;
+    mappings.load_history(
+      &config.target_repo_path,
+      HistorySide::Target,
+      origin.source_repository(),
+    )?;
+    mappings.load_legacy_notes(ctx.workspace_root())?;
+    mappings.load_legacy_notes(&config.target_repo_path)?;
+    if target_git.head_commit().is_ok() && mappings.count() == 0 {
+      return Err(RailError::with_help(
+        "existing split target has no cargo-rail origin evidence",
+        "choose an empty target or migrate the target's legacy trailers/notes before splitting",
+      ));
+    }
+
+    let mut owned_paths = config.crate_paths.clone();
+    owned_paths.extend(config.asset_paths.iter().cloned());
+    owned_paths.sort();
+    owned_paths.dedup();
+    let commits = ctx
+      .git()?
+      .git()
+      .get_commits_touching_paths(&owned_paths, None, "HEAD")?;
+    if commits.is_empty() {
+      return Err(RailError::with_help(
+        "split ownership has no committed Git history",
+        "commit the Cargo members and explicit assets before splitting",
+      ));
+    }
+    Ok(commits.iter().any(|commit| !mappings.has_mapping(&commit.sha)))
+  }
+
   /// Walk commit history and filter commits that touch the given paths
   /// Returns commits in chronological order (oldest first)
   fn walk_filtered_history(&self, paths: &[PathBuf]) -> RailResult<Vec<CommitInfo>> {
     progress!("   Walking commit history to find commits touching crate...");
 
-    // Use batched git command for all paths at once (much faster than N separate calls)
+    // Use one batched Git command for all paths.
     let filtered_commits = self.ctx.git()?.git().get_commits_touching_paths(paths, None, "HEAD")?;
 
     progress!(
@@ -147,13 +189,9 @@ impl<'a> SplitEngine<'a> {
     Ok(filtered_commits)
   }
 
-  /// Prefetch files for multiple commits in parallel
+  /// Prefetch files for multiple commits in parallel.
   ///
-  /// This significantly speeds up split operations on large repositories by
-  /// reading file contents for many commits concurrently while the sequential
-  /// commit recreation happens.
-  ///
-  /// Returns a FxHashMap from commit SHA to its prefetched files (faster String hashing).
+  /// Returns a map from commit SHA to its prefetched files.
   /// Accepts references to avoid cloning CommitInfo structs.
   fn prefetch_commit_files(&self, commits: &[&CommitInfo], crate_paths: &[PathBuf]) -> RailResult<PrefetchedWindow> {
     let git_state = self.ctx.git()?;
@@ -509,7 +547,7 @@ impl<'a> SplitEngine<'a> {
     }
 
     // Create or reuse target repo
-    self.ensure_target_repo(&config.path_capabilities)?;
+    self.ensure_target_repo(&config.path_capabilities, &config.branch)?;
     self.import_source_objects(&config.target_repo_path)?;
     let origin = OriginContext::discover(
       self.ctx.workspace_root(),
@@ -752,7 +790,7 @@ impl<'a> SplitEngine<'a> {
   }
 
   /// Ensure target repository exists and is initialized
-  fn ensure_target_repo(&self, paths: &SplitPathCapabilities) -> RailResult<()> {
+  fn ensure_target_repo(&self, paths: &SplitPathCapabilities, branch: &str) -> RailResult<()> {
     let target_path = paths.authorize_target(paths.target_root())?;
     if !target_path.exists() {
       std::fs::create_dir_all(&target_path)
@@ -764,13 +802,23 @@ impl<'a> SplitEngine<'a> {
     if !git_dir.exists() {
       progress!("   Initializing git repository at {}", target_path.display());
 
-      // Initialize using system git with main as default branch
       paths.validate_target_repository()?;
-      crate::git::init_repo(&target_path, "main")?;
+      crate::git::init_repo(&target_path, branch)?;
 
-      // Configure git identity from source repository
       paths.validate_target_repository()?;
       self.configure_git_identity(&target_path)?;
+    } else {
+      paths.validate_target_repository()?;
+      let current_branch = SystemGit::open(&target_path)?.current_branch()?;
+      if current_branch != branch {
+        return Err(RailError::with_help(
+          format!(
+            "split target is on branch '{}', but configuration requires '{}'",
+            current_branch, branch
+          ),
+          format!("switch the target repository to '{}' and retry", branch),
+        ));
+      }
     }
 
     Ok(())

@@ -86,15 +86,7 @@ impl BackupMetadata {
     let content = serde_json::to_string_pretty(self)
       .map_err(|e| RailError::message(format!("Failed to serialize backup metadata: {}", e)))?;
 
-    fs::write(&metadata_path, content).map_err(|e| {
-      RailError::message(format!(
-        "Failed to write backup metadata to {}: {}",
-        metadata_path.display(),
-        e
-      ))
-    })?;
-
-    Ok(())
+    crate::utils::write_file_atomic(&metadata_path, content.as_bytes())
   }
 }
 

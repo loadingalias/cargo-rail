@@ -83,13 +83,21 @@ impl ConflictResolver {
     base_content: &[u8],
     incoming_content: &[u8],
   ) -> RailResult<MergeResult> {
-    // Create temporary files for 3-way merge
+    std::fs::create_dir_all(&self.work_dir).context("Failed to create conflict working directory")?;
     let temp_base = self.work_dir.join("merge-base");
     let temp_current = self.work_dir.join("merge-current");
     let temp_incoming = self.work_dir.join("merge-incoming");
+    let current_metadata = std::fs::symlink_metadata(current_path)?;
+    if current_metadata.file_type().is_symlink() || !current_metadata.is_file() {
+      return Err(crate::error::RailError::message(format!(
+        "sync conflict path '{}' must be a regular file",
+        current_path.display()
+      )));
+    }
+    let current_content = std::fs::read(current_path)?;
 
     std::fs::write(&temp_base, base_content).context("Failed to write base file for merge")?;
-    std::fs::write(&temp_current, std::fs::read(current_path)?).context("Failed to write current file for merge")?;
+    std::fs::write(&temp_current, current_content).context("Failed to write current file for merge")?;
     std::fs::write(&temp_incoming, incoming_content).context("Failed to write incoming file for merge")?;
 
     // Build git merge-file command with strategy
@@ -118,32 +126,15 @@ impl ConflictResolver {
 
     let output = cmd.output().context("Failed to run git merge-file")?;
 
-    // Check result
-    // Exit codes: 0 = clean merge, 1 = conflicts, >1 = error
-    match output.status.code() {
-      Some(0) => {
-        // Clean merge - copy result back
+    let result = match output.status.code() {
+      Some(code @ (0 | 1)) => {
         let merged_content = std::fs::read(&temp_current)?;
-        std::fs::write(current_path, merged_content)?;
-
-        // Clean up temp files
-        let _ = std::fs::remove_file(&temp_base);
-        let _ = std::fs::remove_file(&temp_current);
-        let _ = std::fs::remove_file(&temp_incoming);
-
-        Ok(MergeResult::Success)
-      }
-      Some(1) => {
-        // Conflicts detected
-        let merged_content = std::fs::read(&temp_current)?;
-        std::fs::write(current_path, merged_content)?;
-
-        // Clean up temp files
-        let _ = std::fs::remove_file(&temp_base);
-        let _ = std::fs::remove_file(&temp_current);
-        let _ = std::fs::remove_file(&temp_incoming);
-
-        Ok(MergeResult::Conflicts(vec![current_path.to_path_buf()]))
+        crate::utils::write_file_atomic(current_path, &merged_content)?;
+        if code == 0 {
+          Ok(MergeResult::Success)
+        } else {
+          Ok(MergeResult::Conflicts(vec![current_path.to_path_buf()]))
+        }
       }
       Some(code) => {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -155,7 +146,11 @@ impl ConflictResolver {
       None => Ok(MergeResult::Failed(
         "git merge-file was terminated by signal".to_string(),
       )),
-    }
+    };
+    let _ = std::fs::remove_file(&temp_base);
+    let _ = std::fs::remove_file(&temp_current);
+    let _ = std::fs::remove_file(&temp_incoming);
+    result
   }
 }
 
@@ -301,5 +296,23 @@ mod tests {
       }
       _ => panic!("Expected clean merge with --union"),
     }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn conflict_resolution_does_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let resolver = ConflictResolver::new(ConflictStrategy::Manual, temp.path().to_path_buf());
+    let outside = TempDir::new().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "outside\n").unwrap();
+    let current = temp.path().join("current");
+    symlink(&victim, &current).unwrap();
+
+    let error = resolver.resolve_file(&current, b"base\n", b"incoming\n").unwrap_err();
+    assert!(error.to_string().contains("must be a regular file"));
+    assert_eq!(std::fs::read_to_string(victim).unwrap(), "outside\n");
   }
 }

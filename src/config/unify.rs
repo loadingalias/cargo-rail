@@ -177,6 +177,9 @@ impl UnifyConfig {
   /// - transitive pinning host path exists if configured as a path (not "root")
   /// - transitive pinning host path contains a Cargo.toml
   pub fn validate(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
+    validate_glob_patterns("unify.preserve_features", &self.preserve_features)?;
+    validate_glob_patterns("unify.skip_undeclared_patterns", &self.skip_undeclared_patterns)?;
+
     if let Some(TransitivePinning {
       host: TransitiveFeatureHost::Path(p),
     }) = &self.transitive_pinning
@@ -220,7 +223,15 @@ impl UnifyConfig {
   }
 }
 
-// Helper Types
+fn validate_glob_patterns(field: &str, patterns: &[String]) -> Result<(), crate::error::ConfigError> {
+  for pattern in patterns {
+    glob::Pattern::new(pattern).map_err(|error| crate::error::ConfigError::InvalidGlobPattern {
+      pattern: pattern.clone(),
+      message: format!("{field}: {error}"),
+    })?;
+  }
+  Ok(())
+}
 
 /// How to determine the final MSRV (Minimum Supported Rust Version)
 ///
@@ -276,7 +287,6 @@ pub enum MajorVersionConflict {
   /// Force unify to the highest resolved version
   ///
   /// Uses the highest version from the resolved metadata across all target triples.
-  /// This works in ~85% of cases; the remaining ~15% may break the codebase.
   /// Use when you want the leanest build graph and accept breakage risk.
   Bump,
 }
@@ -744,6 +754,38 @@ mod tests {
       assert!(message.contains(".."));
     } else {
       panic!("Expected InvalidValue error");
+    }
+  }
+
+  #[test]
+  fn invalid_feature_globs_fail_validation() {
+    for (field, config) in [
+      (
+        "unify.preserve_features",
+        UnifyConfig {
+          preserve_features: vec!["[".to_string()],
+          ..Default::default()
+        },
+      ),
+      (
+        "unify.skip_undeclared_patterns",
+        UnifyConfig {
+          skip_undeclared_patterns: vec!["[".to_string()],
+          ..Default::default()
+        },
+      ),
+    ] {
+      let error = config.validate(std::path::Path::new(".")).unwrap_err();
+      assert!(
+        matches!(
+          error,
+          crate::error::ConfigError::InvalidGlobPattern {
+            ref message,
+            ..
+          } if message.contains(field)
+        ),
+        "{field} should reject malformed glob patterns"
+      );
     }
   }
 

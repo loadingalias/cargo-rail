@@ -593,23 +593,21 @@ pub fn is_known_path(path: &str) -> bool {
 }
 
 fn path_matches(pattern: &str, path: &str) -> bool {
-  let pattern: Vec<_> = pattern.split('.').collect();
-  let path: Vec<_> = path.split('.').collect();
-  pattern.len() == path.len()
+  let pattern = pattern.split('.');
+  let path = path.split('.');
+  pattern.clone().count() == path.clone().count()
     && pattern
-      .iter()
       .zip(path)
-      .all(|(expected, actual)| expected.starts_with('<') || *expected == actual)
+      .all(|(expected, actual)| expected.starts_with('<') || expected == actual)
 }
 
 fn path_prefix_matches(pattern: &str, path: &str) -> bool {
-  let pattern: Vec<_> = pattern.split('.').collect();
-  let path: Vec<_> = path.split('.').collect();
-  path.len() < pattern.len()
+  let pattern = pattern.split('.');
+  let path = path.split('.');
+  path.clone().count() < pattern.clone().count()
     && path
-      .iter()
       .zip(pattern)
-      .all(|(actual, expected)| expected.starts_with('<') || *actual == expected)
+      .all(|(actual, expected)| expected.starts_with('<') || actual == expected)
 }
 
 /// A deprecated field found in a concrete document.
@@ -625,7 +623,7 @@ pub struct PresentDeprecation {
 pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecation> {
   let mut paths = Vec::new();
   collect_table_paths(doc.as_table(), "", &mut paths);
-  paths.sort();
+  paths.sort_unstable();
   paths.dedup();
   let mut deprecations: Vec<_> = paths
     .into_iter()
@@ -646,7 +644,7 @@ pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecat
       spec: &LEGACY_UNKNOWN_FILE_POLICY_BOOL,
     });
   }
-  deprecations.sort_by(|left, right| left.path.cmp(&right.path));
+  deprecations.sort_unstable_by(|left, right| left.path.cmp(&right.path));
   deprecations
 }
 

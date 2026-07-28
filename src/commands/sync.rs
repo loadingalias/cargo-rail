@@ -107,6 +107,19 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
   // Check mode
   if args.check {
+    let pending = configs
+      .iter()
+      .map(|(config, target_exists)| {
+        if !target_exists {
+          return Ok(true);
+        }
+        let mut engine = SyncEngine::new(ctx, config.clone(), args.strategy)?;
+        engine.has_pending_changes(&direction)
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+    let has_pending = pending.iter().any(|pending| *pending);
+    let result = if has_pending { "pending_changes" } else { "clean" };
+    let exit_code = i32::from(has_pending);
     if json {
       let dir_str = match direction {
         SyncDirection::MonoToRemote => "to_remote",
@@ -117,7 +130,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
       let crates: Vec<_> = configs
         .iter()
-        .map(|(sync_config, target_exists)| {
+        .zip(&pending)
+        .map(|((sync_config, target_exists), pending)| {
           serde_json::json!({
             "crate_name": sync_config.crate_name,
             "mode": format!("{:?}", sync_config.mode),
@@ -125,6 +139,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             "branch": sync_config.branch,
             "remote_url": sync_config.remote_url,
             "target_exists": target_exists,
+            "pending": pending,
           })
         })
         .collect();
@@ -143,9 +158,13 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         },
         "mutation_plan": expected_mutation_plan,
       });
-      let output = crate::output::machine_json_envelope("sync", "check", "pending_changes", 1, payload);
+      let output = crate::output::machine_json_envelope("sync", "check", result, exit_code, payload);
       println!("{}", serde_json::to_string_pretty(&output)?);
-      return Err(crate::error::RailError::CheckHasPendingChanges);
+      return if has_pending {
+        Err(crate::error::RailError::CheckHasPendingChanges)
+      } else {
+        Ok(())
+      };
     }
 
     let dir_display = match direction {
@@ -156,8 +175,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     };
 
     println!("sync plan:\n");
-    for (sync_config, target_exists) in &configs {
+    for ((sync_config, target_exists), pending) in configs.iter().zip(&pending) {
       println!("  {}", sync_config.crate_name);
+      println!("    status: {}", if *pending { "pending" } else { "clean" });
       println!("    direction: {}", dir_display);
       println!("    target: {}", sync_config.target_repo_path.display());
       println!("    remote: {}", sync_config.remote_url);
@@ -167,8 +187,12 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
       }
     }
 
-    println!("\nChanges detected. Run without --check to apply.");
-    return Err(crate::error::RailError::CheckHasPendingChanges);
+    if has_pending {
+      println!("\nChanges detected. Run without --check to apply.");
+      return Err(crate::error::RailError::CheckHasPendingChanges);
+    }
+    println!("\nNo changes detected.");
+    return Ok(());
   }
 
   enforce_safety_gate(
