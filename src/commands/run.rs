@@ -5,7 +5,7 @@ use super::plan::{
 };
 use crate::action::{
   ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason,
-  ActionResolutionBinding, ActionSpec, ArgvTemplate, ExpandedAction, PackageArguments,
+  ActionResolutionBinding, ActionSpec, ActionWorkingDirectory, ArgvTemplate, ExpandedAction, PackageArguments,
 };
 use crate::action_key::{analyze as analyze_action_key, resolution_identity};
 use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
@@ -1616,7 +1616,27 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
       std::ffi::OsStr::new(program)
     };
   let mut command = Command::new(selected_program);
-  let working_directory = action.validate_paths(ctx.workspace_root())?;
+  let validated_working_directory = action.validate_paths(ctx.workspace_root())?;
+  let working_directory = if action.working_directory() == &ActionWorkingDirectory::Workspace {
+    let execution_workspace_root = ctx.execution_workspace_root();
+    let current = crate::utils::canonicalize_existing(execution_workspace_root).map_err(|error| {
+      RailError::message(format!(
+        "workspace execution root '{}' cannot be resolved: {error}",
+        execution_workspace_root.display()
+      ))
+    })?;
+    if current != validated_working_directory {
+      return Err(RailError::message(format!(
+        "workspace execution root '{}' resolved to '{}', expected '{}'",
+        execution_workspace_root.display(),
+        current.display(),
+        validated_working_directory.display()
+      )));
+    }
+    execution_workspace_root.to_path_buf()
+  } else {
+    validated_working_directory
+  };
   if let Some(configuration) = native_cache
     .as_ref()
     .and_then(crate::compiler::native_cache::DirectNativeCacheSetup::cargo_config_argument)

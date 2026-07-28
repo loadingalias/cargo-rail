@@ -436,6 +436,9 @@ pub struct WorkspaceContext {
   /// worktree. Access the repository root through [`WorkspaceContext::git`].
   pub workspace_root: PathBuf,
 
+  /// Cargo workspace root using the caller's captured path spelling.
+  execution_workspace_root: PathBuf,
+
   /// Git state and operations, when the workspace is inside a Git repository.
   ///
   /// Commands that require Git must call [`WorkspaceContext::git`] so Cargo-only
@@ -538,6 +541,11 @@ impl WorkspaceContext {
   ) -> RailResult<Self> {
     let process_current_dir = std::env::current_dir()
       .map_err(|error| RailError::message(format!("failed to determine Cargo metadata current directory: {error}")))?;
+    let requested_workspace_root = if workspace_root.is_absolute() {
+      workspace_root.to_path_buf()
+    } else {
+      process_current_dir.join(workspace_root)
+    };
     let (
       preloaded_metadata,
       preloaded_inputs,
@@ -602,6 +610,8 @@ impl WorkspaceContext {
       CargoState::load(workspace_root)?
     });
     let workspace_root = cargo.workspace_root().to_path_buf();
+    let execution_workspace_root =
+      select_execution_workspace_root(&requested_workspace_root, &cargo_current_dir, &workspace_root);
 
     // Repository paths are the authority for Git-backed capture and mutation.
     // A Cargo workspace may be nested inside that boundary, but never contain it
@@ -759,6 +769,7 @@ impl WorkspaceContext {
 
     Ok(Self {
       workspace_root,
+      execution_workspace_root,
       git,
       cargo,
       workspace_prefix,
@@ -996,6 +1007,10 @@ impl WorkspaceContext {
   /// Get workspace root as Path reference (convenience)
   pub fn workspace_root(&self) -> &Path {
     &self.workspace_root
+  }
+
+  pub(crate) fn execution_workspace_root(&self) -> &Path {
+    &self.execution_workspace_root
   }
 
   /// Get the validated relative path from the Git root to the Cargo workspace.
@@ -1236,6 +1251,38 @@ fn validate_cargo_output_root(
   Ok(())
 }
 
+fn select_execution_workspace_root(requested: &Path, cargo_current_dir: &Path, authoritative: &Path) -> PathBuf {
+  let Ok(canonical_workspace) = crate::utils::canonicalize_existing(authoritative) else {
+    return authoritative.to_path_buf();
+  };
+  let same_directory =
+    |candidate: &Path| crate::utils::canonicalize_existing(candidate).is_ok_and(|path| path == canonical_workspace);
+  if same_directory(requested) {
+    return requested.to_path_buf();
+  }
+  if same_directory(cargo_current_dir) {
+    return cargo_current_dir.to_path_buf();
+  }
+
+  let Ok(canonical_current_dir) = crate::utils::canonicalize_existing(cargo_current_dir) else {
+    return authoritative.to_path_buf();
+  };
+  let Ok(relative_current_dir) = canonical_current_dir.strip_prefix(&canonical_workspace) else {
+    return authoritative.to_path_buf();
+  };
+  let mut candidate = cargo_current_dir.to_path_buf();
+  for _ in relative_current_dir.components() {
+    if !candidate.pop() {
+      return authoritative.to_path_buf();
+    }
+  }
+  if same_directory(&candidate) {
+    candidate
+  } else {
+    authoritative.to_path_buf()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1343,5 +1390,21 @@ mod tests {
         member
       );
     }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn execution_workspace_root_preserves_a_captured_alias() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let nested = workspace.join("nested");
+    let alias = temporary.path().join("workspace-alias");
+    fs::create_dir_all(&nested).unwrap();
+    std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+
+    assert_eq!(
+      select_execution_workspace_root(&alias.join("nested"), &alias.join("nested"), &workspace),
+      alias
+    );
   }
 }

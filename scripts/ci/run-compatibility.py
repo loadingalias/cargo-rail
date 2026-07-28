@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import os
@@ -383,15 +382,6 @@ def clean_directory(path: Path) -> None:
     shutil.rmtree(path, onerror=make_writable_and_retry)
 
 
-def encoded_rmeta_outputs(root: Path) -> dict[str, str]:
-    return {
-        path.relative_to(root).as_posix(): base64.b64encode(path.read_bytes()).decode(
-            "ascii"
-        )
-        for path in root.rglob("*.rmeta")
-    }
-
-
 def rail_argv(
     cargo_rail: Path,
     case: ActionCase,
@@ -471,9 +461,6 @@ def execute_case(
     clean_directory(target)
     direct = run(direct_argv(case, target), cwd=workspace, env=env)
     direct_outputs = output_manifest(target)
-    direct_rmeta = (
-        encoded_rmeta_outputs(target) if verify_direct_repeatability else {}
-    )
 
     if verify_direct_repeatability:
         clean_directory(target)
@@ -511,15 +498,9 @@ def execute_case(
             )
         outputs = output_manifest(target)
         if outputs != direct_outputs:
-            rmeta_detail = ""
-            if verify_direct_repeatability:
-                rmeta_detail = (
-                    f"\ndirect .rmeta base64={direct_rmeta!r}"
-                    f"\n{label} .rmeta base64={encoded_rmeta_outputs(target)!r}"
-                )
             raise CompatibilityError(
                 f"{case.name} {label} output inventory or bytes differ from direct Cargo:\n"
-                f"{manifest_difference(direct_outputs, outputs)}{rmeta_detail}"
+                f"{manifest_difference(direct_outputs, outputs)}"
             )
     return direct, direct_outputs
 
