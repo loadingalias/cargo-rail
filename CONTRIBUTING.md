@@ -1,4 +1,4 @@
-# Contributing to Rail
+# Contributing to Cargo-Rail
 
 ## Set up
 
@@ -18,8 +18,7 @@ just check
 just test
 ```
 
-`just check` is read-only and always workspace-wide. When you want rustfmt and Clippy to rewrite the worktree,
-run `just fix` explicitly.
+`just check` is read-only and always workspace-wide. When you want rustfmt and Clippy to rewrite the worktree, run `just fix` explicitly.
 
 After changing features, dependency resolution, or target-specific behavior, run the full suite:
 
@@ -56,7 +55,7 @@ sample count, and before/after p50 and p95. Compare cache implementations on one
 and report any failed correctness checks alongside the numbers.
 
 Native compiler-cache changes must run the checked-in cross-root fixture. When the change can affect those lanes,
-measure native Cargo, Rail disabled, Rail cold, Rail warm, and the pinned sccache comparator — reporting hits,
+measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the pinned sccache comparator — reporting hits,
 misses, bypasses, reasons, bytes hashed/restored, and output portability.
 
 The repository benchmarks accept package and run counts:

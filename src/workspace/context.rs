@@ -444,7 +444,7 @@ pub struct WorkspaceContext {
   /// Explicit dependency inventory prepared before hermetic snapshot metadata.
   hermetic_fetch_inventory: Option<crate::hermetic::FetchInventory>,
 
-  /// Rail configuration (rail.toml)
+  /// Cargo-Rail configuration (`rail.toml`).
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
   config: Option<Arc<RailConfig>>,

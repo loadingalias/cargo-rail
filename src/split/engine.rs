@@ -850,7 +850,7 @@ impl<'a> SplitEngine<'a> {
 
     // Set identity in target repository
     // Use a fallback if source doesn't have identity configured
-    let name = if user_name.is_empty() { "Cargo Rail" } else { &user_name };
+    let name = if user_name.is_empty() { "Cargo-Rail" } else { &user_name };
     let email = if user_email.is_empty() {
       "cargo-rail@localhost"
     } else {

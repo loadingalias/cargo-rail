@@ -1,11 +1,12 @@
 # Configuration Reference
 
-`rail.toml` stores repository policy, not Rail defaults. An empty file is valid. Omitted fields use coded defaults, and
-upgrades do not require copying new fields into the repository.
+`rail.toml` supplies repository policy to Cargo-Rail's captured workspace view; it does not mirror Cargo-Rail's internal defaults.
+An empty file is valid. Omitted fields use coded defaults, and upgrades do not require copying new fields into the
+repository.
 
 ## File discovery
 
-Rail uses the first file found in this order:
+Cargo-Rail uses the first file found in this order:
 
 1. `rail.toml`
 2. `.rail.toml`
@@ -118,13 +119,17 @@ preserve_features = ["unstable-*", "bench*"]
 
 ## `[release]`
 
+Reviewed `.changes/*.md` files are the default authority for bump selection and release prose. Commit-derived modes
+exist for migration. Remote release modes bind the prepared commit, wait for readiness on that exact SHA, publish in
+dependency order, observe registry state, and create tags last.
+
 | Field | Default | Behavior |
 |---|---:|---|
 | `source` | `"changes"` | `"changes"` uses reviewed intent only. `"commits"` and `"both"` are explicit compatibility modes. |
 | `tag_prefix` | `"v"` | Value rendered by `{prefix}`. |
 | `tag_format` | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`. |
 | `require_clean` | `true` | Deprecated compatibility input. Preview permits dirt and apply always rejects paths outside the bound plan. Remove it with `cargo rail config migrate`. |
-| `publish_delay` | `5` | Deprecated compatibility input with no effect. Rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`. |
+| `publish_delay` | `5` | Deprecated compatibility input with no effect. Cargo-Rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`. |
 | `remote_effects` | `"none"` | `"none"` stays local. Other modes push the exact release commit, then exit until GitHub reports complete counts with at least one successful non-skipped context and no pending/failed context, or GitLab reports a successful exact-SHA pipeline. Publication follows readiness; tags are pushed last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
 | `sign_tags` | `false` | Sign release tags with the configured Git signing mechanism. |
 | `require_changelog_entries` | `false` | Fail when a released crate has no generated changelog entries. |
@@ -184,6 +189,9 @@ exclude_paths = ["fixtures/**"]
 
 ## `[change-detection]`
 
+Cargo ownership and reverse dependency impact come from the resolved graph. The globs below classify infrastructure
+and custom repository surfaces; they do not replace crate ownership with hand-maintained path filters.
+
 | Field | Default | Behavior |
 |---|---:|---|
 | `infrastructure` | built-in tooling globs | Paths that select workspace-wide infrastructure work. |
@@ -205,9 +213,9 @@ assets = ["web/assets/**"]
 
 ## `[run]`
 
-`run` profiles select ordered action IDs. Built-ins are `build`, `test`, `bench`, `docs`, `format`, `lint`, `msrv`,
-`package`, `audit`, and `distribution`. Planner-only `infra` and `custom:*` values can enable configured actions through
-`when`, but are not executable action IDs.
+`run` consumes planner scope instead of reclassifying the workspace. Profiles select ordered action IDs. Built-ins are
+`build`, `test`, `bench`, `docs`, `format`, `lint`, `msrv`, `package`, `audit`, and `distribution`. Planner-only
+`infra` and `custom:*` values can enable configured actions through `when`, but are not executable action IDs.
 
 | Field | Default | Behavior |
 |---|---:|---|

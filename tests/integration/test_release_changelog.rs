@@ -3038,7 +3038,7 @@ remote_effects = "gitlab"
     .args(["clone", remote.path().to_str().unwrap(), clone.to_str().unwrap()])
     .output()?;
   assert!(cloned.status.success(), "{}", String::from_utf8_lossy(&cloned.stderr));
-  git(&clone, &["config", "user.name", "Cargo Rail Test"])?;
+  git(&clone, &["config", "user.name", "Cargo-Rail Test"])?;
   git(&clone, &["config", "user.email", "cargo-rail@example.com"])?;
 
   let status = run_cargo_rail(&clone, &["rail", "release", "status", "--format", "json"])?;

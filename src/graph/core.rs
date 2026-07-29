@@ -5,7 +5,7 @@
 //! We use `cargo_metadata` + `petgraph` directly instead of guppy because:
 //! - **No simulation needed**: We need workspace membership, dep edges, reverse deps,
 //!   and "what's affected" - all available in cargo_metadata already
-//! - **Your domain, your types**: Rail's concepts (WorkspaceGraph, affected analysis)
+//! - **Your domain, your types**: Cargo-Rail's concepts (WorkspaceGraph, affected analysis)
 //!   should be first-class, not wrappers around guppy
 //! - **Minimal cognitive tax**: Single engineer, opinionated tool - every abstraction
 //!   layer must earn its keep

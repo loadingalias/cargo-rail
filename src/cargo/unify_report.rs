@@ -14,7 +14,7 @@ impl UnifyReport {
   pub fn from_plan(plan: &UnificationPlan) -> String {
     let mut md = String::new();
 
-    md.push_str("# Cargo Rail Unification Report\n\n");
+    md.push_str("# Cargo-Rail Unification Report\n\n");
     md.push_str(&format!(
       "Generated: {}\n\n",
       chrono::Local::now().format("%Y-%m-%d %H:%M:%S")

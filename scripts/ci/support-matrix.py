@@ -1282,6 +1282,9 @@ def render_markdown(
 > native-cache capability registry schema: `{native_cache.schema_version}`; qualification schema:
 > `{qualifications.schema_version}`.
 
+Use this matrix to answer one question: for this exact host, target, toolchain, and compiler class, does Cargo-Rail execute
+normally, restore a verified result, or bypass reuse? **Fast when proven. Normal Cargo when not.**
+
 Execution support, cache graduation, and performance qualification are independent. A cache bypass still executes
 Cargo normally; it is not an execution-support failure.
 

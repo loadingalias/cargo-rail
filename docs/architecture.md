@@ -1,11 +1,10 @@
 # Architecture
 
-Rail is implemented as the library-backed `cargo-rail` CLI. Commands share one workspace snapshot and use explicit
-plans for filesystem, Git, and release mutations.
+Cargo-Rail is one library-backed workspace engine, not a coordinator for independent Cargo plugins. Each workspace-bound operation captures one authoritative view, derives narrower graph and source views from it, and uses explicit plans for filesystem, Git, and release mutations.
 
-The first half of this page is an orientation map for contributors. From [Compilation observations](#compilation-observations)
-onward it becomes an exact protocol specification for the caching and hermetic-execution boundaries — reference
-material for maintainers of those subsystems, not required reading for using Rail.
+That ownership makes the product layers cumulative: dependency coherence removes invalid or unnecessary graph edges; planning removes unaffected actions; verified caches remove compiler work from the actions that remain; release and split/sync preserve evidence across external boundaries.
+
+The first half of this page is an orientation map for contributors. From [Compilation observations](#compilation-observations) onward it becomes an exact protocol specification for the caching and hermetic-execution boundaries... this is reference material for maintainers of those subsystems, not required reading for using Cargo-Rail.
 
 ## Workspace snapshot
 
@@ -15,7 +14,7 @@ The context owns:
 
 - git state
 - resolved Cargo metadata
-- workspace dependency graph
+- workspace dep graph
 - loaded config
 
 Commands do not reload metadata independently.
@@ -65,7 +64,7 @@ environment capabilities. The graph rejects missing snapshot identity, duplicate
 dependencies, cycles, output overlap, and path escape before execution. Generated actions have one declared owner and
 separate check/regenerate argv. Each expansion carries a versioned action-key analysis over exact declared source,
 resolution, target, toolchain, configuration, argv, and environment identity. Incomplete ambient, process, build-script,
-proc-macro, external-source, or dependency-result evidence is reported as `uncacheable`; Rail does not issue an
+proc-macro, external-source, or dependency-result evidence is reported as `uncacheable`; Cargo-Rail does not issue an
 authorizing key for it.
 
 ## Unify pipeline
@@ -89,7 +88,7 @@ link responsibility, normalized compiler argv, and exact dependency-artifact edg
 examples, benches, documentation, proc macros, build scripts, and native-link responsibility remain distinct even when
 the class is not reusable.
 
-During workspace-only `rustc` diagnostics, Rail records argv-declared inputs before execution and correlates the
+During workspace-only `rustc` diagnostics, Cargo-Rail records argv-declared inputs before execution and correlates the
 completed invocation with Cargo's stable JSON artifact messages. Rustc dep-info supplies observed file and environment
 reads. Cargo has no rustdoc-wrapper setting, so the observation profile instead places a transparent proxy in Cargo's
 selected `RUSTDOC` slot and retains the selected rustdoc as the inner executable. The proxy discovers the selected
@@ -136,7 +135,7 @@ artifact, re-digests every recorded environment read, and derives `ActionKey` ag
 may restore. The restore path re-verifies the pin, action result, validation, output manifest, tree, and every blob, then
 stages the exact `.d`, `.rmeta`, optional `.rlib`, stdout, and stderr bytes. The active wrapper publishes only the output
 paths rustc would have written, replays the streams, and returns through Cargo's normal wrapper boundary. Cargo creates its own
-fingerprints around that invocation; Rail never restores a target/build directory, synthesizes fingerprint state,
+fingerprints around that invocation; Cargo-Rail never restores a target/build directory, synthesizes fingerprint state,
 or authorizes from timestamps, sizes, Cargo freshness, or `CandidateKey` alone.
 
 Incremental, test, binary, dylib, cdylib, staticlib, proc-macro, build-script, native-linking, stdin, response-file,
@@ -151,7 +150,7 @@ registers the same owner-marked local CAS root, so `cargo rail clean --cache` re
 
 #### Performance model
 
-Native-cache time has four terms: fixed Rail front-end work, cold observation/publication, verified warm restore,
+Native-cache time has four terms: fixed Cargo-Rail front-end work, cold observation/publication, verified warm restore,
 and cold execution for bypassed invocations. These terms have different owners and must be measured separately.
 
 Cold publication observes the completed compiler action, parses dep-info, hashes inputs and outputs, constructs the
@@ -177,7 +176,7 @@ directory, and isolated launch layout are known. The stable action ID cannot app
 script's instruction stream, runtime reads, and generated output tree are deliberately absent because they are results
 of that action. Normal Cargo execution still inherits ambient state, so compiler observation records a stable
 explanation but does not issue a build-script key. Cargo leaves the optional `executable` field empty for
-custom-build artifacts, so Rail accepts exactly one target-named program from `filenames`; zero or multiple
+custom-build artifacts, so Cargo-Rail accepts exactly one target-named program from `filenames`; zero or multiple
 matches fail closed.
 
 `BuildScriptResult` version 1 is the separate post-execution identity. Its digest frames the Cargo instruction lines
@@ -221,11 +220,11 @@ other action dispatch is rejected before workspace context or hermetic state is 
 preview rather than an execution-boundary proof.
 
 Trailing Cargo arguments may refine modeled features, targets, target kinds, and profiles. They may not replace the
-workspace/lockfile, expand package scope outside Rail's selection, redirect outputs, inject Cargo configuration,
+workspace/lockfile, expand package scope outside Cargo-Rail's selection, redirect outputs, inject Cargo configuration,
 enable unstable Cargo semantics, or pass raw rustc arguments; those boundary overrides fail before fetch state.
 
 The profile requires an existing exact `Cargo.lock` and has one network boundary: `cargo fetch --locked`. Before that
-boundary, Rail captures and classifies Cargo configuration, rejects configured compiler/rustdoc wrappers and
+boundary, Cargo-Rail captures and classifies Cargo configuration, rejects configured compiler/rustdoc wrappers and
 ambient `RUSTC`/`RUSTDOC`, and performs only locked/offline local-package metadata preflight. Toolchain discovery
 disables rustup auto-install/update behavior, ignores ambient compiler wrappers, and pins the exact sysroot Cargo,
 rustc, and rustdoc; wrappers, rustup staging homes, and a newly downloaded toolchain cannot enter the fetch identity.
@@ -258,7 +257,7 @@ boundary is implemented.
 
 The result is a versioned manifest of every declared compiler-output file, directory, symlink, mode, digest, and byte
 count under the isolated Cargo build directory. Cargo's internal fingerprints and incremental state are intentionally
-excluded: their layout is unstable, they are never synthesized, and Rail never restores a whole Cargo build
+excluded: their layout is unstable, they are never synthesized, and Cargo-Rail never restores a whole Cargo build
 directory as if it were valid state. After source, inventory, toolchain, and platform revalidation, every declared
 output is re-read and compared with that manifest immediately before the report is published.
 

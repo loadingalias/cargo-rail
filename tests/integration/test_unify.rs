@@ -2074,7 +2074,7 @@ generate_report = true
   let report_content = std::fs::read_to_string(&report_path)?;
 
   assert!(
-    report_content.contains("# Cargo Rail Unification Report"),
+    report_content.contains("# Cargo-Rail Unification Report"),
     "Report should have title"
   );
   assert!(report_content.contains("Summary"), "Report should have summary section");

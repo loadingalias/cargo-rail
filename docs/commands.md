@@ -4,6 +4,11 @@
 >
 > Regenerate with: `./scripts/docs/generate.sh`
 
+This is the exhaustive CLI surface. Start with `cargo rail plan --merge-base --explain` to inspect affected work,
+then use `cargo rail run --merge-base --dry-run --print-cmd` to preview execution. Adopt dependency, release, and
+split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo state in
+separate tools.
+
 ---
 
 ## cargo rail
@@ -11,7 +16,7 @@
 ```
 The Rust workspace engine.
 
-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
+Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
 dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 const MAIN_HELP: &str = "\
 The Rust workspace engine.
 
-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
+Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
 dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:

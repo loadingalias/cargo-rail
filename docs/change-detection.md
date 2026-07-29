@@ -1,8 +1,12 @@
 # Change Detection
 
-Rail maps changed files to the crates that own them, adds the crates that depend on those, classifies what kind of
-work the change requires, and emits the exact package scope that should run. Path globs never enter the decision —
-ownership and impact come from Cargo's resolved workspace graph.
+Cargo-Rail maps changed files to the crates that own them, adds the crates that depend on those, classifies what kind of
+work the change requires, and emits the exact package scope that should run. Crate ownership and reverse impact come
+from Cargo's resolved workspace graph. Configured globs classify infrastructure and custom surfaces only; they do not
+stand in for the package graph.
+
+`plan` is the scope authority. `run`, JSON/GitHub projections, and external integrations consume that scope instead of
+reimplementing package selection.
 
 ## Surfaces
 
@@ -61,7 +65,7 @@ continue using `scope.cargo_args`.
 
 ## Worktree versus historical plans
 
-When planning the current worktree, Rail resolves Cargo's default features for every effective Cargo build target,
+When planning the current worktree, Cargo-Rail resolves Cargo's default features for every effective Cargo build target,
 defaulting to the host. Reverse impact preserves normal, development, build, proc-macro, optional, renamed, and
 target-conditioned edges.
 
@@ -81,7 +85,7 @@ unknown_file_policy = "strict"
 benchmarks = ["benches/**", "perf/**"]
 ```
 
-## Confidence Profiles
+## Confidence profiles
 
 | Profile | Intent |
 |---|---|
@@ -92,7 +96,7 @@ benchmarks = ["benches/**", "perf/**"]
 ## GitHub Actions
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v6.0.0
+- uses: loadingalias/cargo-rail-action@v6
   id: rail
   with:
     version: 0.19.1
@@ -114,7 +118,7 @@ cargo rail plan --merge-base --explain
 cargo rail run --merge-base --dry-run --print-cmd
 ```
 
-## See Also
+## See also
 
 - [Configuration Reference](./config.md)
 - [Troubleshooting](./troubleshooting.md)

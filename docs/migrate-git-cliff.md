@@ -1,13 +1,21 @@
 # Migrate from git-cliff or release-plz
 
-Rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and
+Cargo-Rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and
 reviewed change files in one release engine. It uses fixed changelog placeholders and groups instead of git-cliff's
 Tera templates.
 
-The mappings below start in commit-driven compatibility mode (`source = "commits"`) so your existing
-conventional-commit workflow keeps working unchanged. The end state most teams migrate toward is the default
-reviewed-changes mode, where release intent lives in `.changes/*.md` files written during review rather than being
-reconstructed from commit messages.
+The mappings below start in commit-driven compatibility mode (`source = "commits"`) so the existing
+conventional-commit workflow continues to select bumps and prose. Move to the default reviewed-changes mode after the
+generated plan matches the current release. Commit mode reconstructs intent from history; changes mode records intent
+in `.changes/*.md` while the code is reviewed.
+
+## Migration path
+
+1. Configure `source = "commits"` and map the existing changelog policy.
+2. Compare `cargo rail release run --all --bump auto --check` with the current release plan.
+3. Add `.changes/*.md` files to new pull requests with `cargo rail change add`.
+4. Switch to `source = "changes"` after every pending release has reviewed change intent.
+5. Run `cargo rail change check --merge-base --required`, then remove the old release automation.
 
 ## git-cliff mapping
 
@@ -59,7 +67,7 @@ include_paths = []
 exclude_paths = []
 ```
 
-## Custom Groups
+## Custom groups
 
 git-cliff parser groups map to `[[release.changelog.groups]]` entries:
 
@@ -84,10 +92,10 @@ group_order = ["breaking", "sec", "feat", "fix", "deps", "other"]
 
 ## Templates
 
-git-cliff uses Tera templates. Rail intentionally does not. Use the
+git-cliff uses Tera templates. Cargo-Rail intentionally does not. Use the
 fixed placeholder format instead:
 
-| git-cliff value | Rail placeholder |
+| git-cliff value | Cargo-Rail placeholder |
 | --- | --- |
 | commit message body/summary | `{description}` |
 | commit scope | `{scope}` |
@@ -106,7 +114,7 @@ cargo rail change add rail-core --bump minor --message "Added graph-aware releas
 ## Paths
 
 Do not migrate git-cliff monorepo path globs directly as the primary model.
-Rail attributes commits through the workspace graph:
+Cargo-Rail attributes commits through the workspace graph:
 
 1. changed file resolves to its owning crate,
 2. a conventional-commit scope matching a crate name narrows attribution,
@@ -151,9 +159,8 @@ cargo rail release run --all --bump auto --check
 cargo rail release check --all --extended
 ```
 
-Like release-plz, `--bump auto --all` only releases crates with
-release-worthy changes; everything else is listed under `Skipped:` with the
-reason and the tag range it was measured against.
+In commit mode, `--bump auto --all` releases only crates with release-worthy changes. Everything else is listed under
+`Skipped:` with the reason and the tag range it was measured against.
 
 `release check --extended` uses an installed `cargo-semver-checks` binary when
 available. It is never added as a cargo-rail dependency. An inconclusive run
