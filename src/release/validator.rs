@@ -17,8 +17,6 @@ pub struct ValidationResult {
   pub check_name: String,
   /// Whether the check passed
   pub passed: bool,
-  /// Whether the check could not produce evidence and was not treated as a failure.
-  pub skipped: bool,
   /// Details about what was validated
   pub details: Option<String>,
   /// Error message if failed
@@ -26,11 +24,16 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
+  /// Whether the check could not produce evidence and was not treated as a failure.
+  #[must_use]
+  pub fn is_skipped(&self) -> bool {
+    !self.passed && self.error.is_none()
+  }
+
   fn passed(name: impl Into<String>, details: impl Into<String>) -> Self {
     Self {
       check_name: name.into(),
       passed: true,
-      skipped: false,
       details: Some(details.into()),
       error: None,
     }
@@ -40,7 +43,6 @@ impl ValidationResult {
     Self {
       check_name: name.into(),
       passed: false,
-      skipped: false,
       details: None,
       error: Some(error.into()),
     }
@@ -50,7 +52,6 @@ impl ValidationResult {
     Self {
       check_name: name.into(),
       passed: false,
-      skipped: true,
       details: Some(details.into()),
       error: None,
     }
@@ -771,7 +772,7 @@ mod tests {
   fn skipped_validation_is_not_reported_as_passed() {
     let result = ValidationResult::skipped("msrv", "toolchain unavailable");
     assert!(!result.passed);
-    assert!(result.skipped);
+    assert!(result.is_skipped());
     assert_eq!(result.details.as_deref(), Some("toolchain unavailable"));
     assert!(result.error.is_none());
   }
