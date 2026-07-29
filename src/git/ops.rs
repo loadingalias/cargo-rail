@@ -869,15 +869,24 @@ impl SystemGit {
       .take()
       .ok_or_else(|| RailError::message("Failed to open stdin"))?;
 
-    for request in requests {
-      stdin
-        .write_all(request.as_bytes())
-        .and_then(|()| stdin.write_all(b"\n"))
+    // `cat-file --batch` writes one response while it reads each request. Drain
+    // stdout concurrently with request submission so neither pipe can fill and
+    // deadlock on repositories whose tree exceeds the platform pipe capacity.
+    let output = std::thread::scope(|scope| -> RailResult<_> {
+      let writer = scope.spawn(move || -> std::io::Result<()> {
+        for request in requests {
+          stdin.write_all(request.as_bytes())?;
+          stdin.write_all(b"\n")?;
+        }
+        Ok(())
+      });
+      let output = child.wait_with_output().context("Failed to read git cat-file output")?;
+      writer
+        .join()
+        .map_err(|_| RailError::message("git cat-file request writer panicked"))?
         .context("Failed to write to git cat-file stdin")?;
-    }
-
-    drop(stdin);
-    let output = child.wait_with_output().context("Failed to read git cat-file output")?;
+      Ok(output)
+    })?;
     if !output.status.success() {
       return Err(RailError::Git(GitError::CommandFailed {
         command: "git cat-file --batch".to_string(),
@@ -1430,6 +1439,19 @@ mod tests {
     // Empty input should return empty output
     let results = git.read_files_bulk(&[]).unwrap();
     assert!(results.is_empty());
+  }
+
+  #[test]
+  fn read_blobs_bulk_exceeding_pipe_capacity_completes() {
+    let git = SystemGit::open(&find_git_root()).unwrap();
+    let payload = vec![b'x'; 1024];
+    let object_id = git.write_blob(&payload).unwrap();
+    let object_ids = vec![object_id.as_str(); 4096];
+
+    let results = git.read_blobs_bulk(&object_ids).unwrap();
+
+    assert_eq!(results.len(), object_ids.len());
+    assert!(results.iter().all(|result| result == &payload));
   }
 
   #[test]
