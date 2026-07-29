@@ -47,9 +47,9 @@ actions/attest:
 # cargo-rail Ecosystem
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 loadingalias/cargo-rail-action:
-  ref: v6.0.0
-  sha: "b2569086d9cdad737fd62635e6d15651970521f8"
-  updated: "2026-07-25T14:41:47Z"
+  ref: v6.1.0
+  sha: "f622a3936a231fe78a772292c6892d71e8c57f9f"
+  updated: "2026-07-29T18:14:02Z"
   notes: "Planner-first CI transport for cargo rail plan surfaces"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Testing & Reporting

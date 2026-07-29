@@ -22,10 +22,10 @@ fi
 ## CI Example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v6.0.0
+- uses: loadingalias/cargo-rail-action@v6
   id: rail
   with:
-    version: 0.19.1
+    version: 0.20.0
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'

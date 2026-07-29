@@ -99,7 +99,7 @@ benchmarks = ["benches/**", "perf/**"]
 - uses: loadingalias/cargo-rail-action@v6
   id: rail
   with:
-    version: 0.19.1
+    version: 0.20.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
