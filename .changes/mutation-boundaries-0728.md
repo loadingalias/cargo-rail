@@ -1,5 +1,5 @@
 ---
-"cargo-rail" = "patch"
+"cargo-rail" = "major"
 ---
 
 Hardened backup, release, split, and sync mutation boundaries against path escape, symlink traversal, cross-operation
