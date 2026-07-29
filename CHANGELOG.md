@@ -6,6 +6,33 @@
 
 
 
+
+## [0.20.0](https://github.com/loadingalias/cargo-rail/compare/v0.19.1...v0.20.0) - 2026-07-29
+
+- Raised the repository and package toolchain to Rust 1.97.1, updated Rust dependencies, the native-cache fixture
+  dependency graph, GitHub Actions, the CI planner's cargo-rail version, and the native-cache comparator's sccache
+  installation to their current releases. Release rebuilds now use the exact package toolchain, immutable assets are
+  verified instead of overwritten, and action verification binds every workflow pin to the action lock.
+
+- Prevented bulk Git object reads from deadlocking when request and response pipes fill.
+
+- Hardened backup, release, split, and sync mutation boundaries against path escape, symlink traversal, cross-operation
+  plan reuse, and exact-release checkout drift. Split and sync check modes now distinguish clean state from pending work,
+  configuration validation rejects malformed unify globs and empty split branches, and release checks report skipped
+  evidence separately from passed checks.
+
+- Added exact generated native-cache capability authority and `cargo rail doctor native-cache`, kept uncertified hosts on
+  stable fail-closed bypasses, hardened Windows cache boundaries against reparse points and transient reader conflicts,
+  and preserved Cargo's workspace path spelling so Windows compiler outputs remain byte-exact.
+
+- Published one generated execution, cache, and performance support matrix, added continuous full-suite CI for all six
+  advertised native host/architecture pairs, and added macOS x86-64 plus required Linux musl release inventories.
+
+- Presented the `cargo-rail` crate and CLI as Cargo-Rail, the Rust workspace engine, and aligned the README, CLI help,
+  package metadata, and public documentation around its shared Cargo and Git decision model without renaming technical
+  interfaces.
+
+
 ## [0.19.1](https://github.com/loadingalias/cargo-rail/compare/v0.19.0...v0.19.1) - 2026-07-25
 
 - Hardened exact-SHA release readiness to reject all-skipped GitHub rollups and run release commits through normal CI. `cargo rail config migrate` now removes the inert `release.require_clean` and `release.publish_delay` fields, and release previews no longer claim to delay between publishes. Added explicit cache capability and evaluation guidance.
