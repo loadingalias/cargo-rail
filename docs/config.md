@@ -366,6 +366,5 @@ cargo rail config validate --strict
 ## See also
 
 - [Command reference](commands.md)
-- [Change detection](change-detection.md)
-- [Planner contract](planner-contract.md)
+- [Planning and execution](planning.md)
 - [Split/sync example](../examples/split-sync/README.md)

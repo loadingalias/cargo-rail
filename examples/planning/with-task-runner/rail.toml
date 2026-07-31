@@ -1,7 +1,7 @@
 # cargo-rail configuration
 # For projects WITH a task runner (just, make, xtask, scripts)
 #
-# Strategy: cargo rail plan provides change detection data,
+# Strategy: cargo rail plan provides the execution scope,
 # your task runner handles execution.
 
 [change-detection]

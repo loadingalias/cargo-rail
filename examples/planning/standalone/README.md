@@ -1,8 +1,8 @@
-# Change Detection: Standalone
+# Planning and Execution: Standalone
 
 Use this pattern when CI should pass planner-selected package arguments directly to Cargo without a repository-specific task runner.
 
-## Local Example
+## Local example
 
 ```bash
 cargo rail plan --merge-base --explain
@@ -10,13 +10,11 @@ cargo rail run --merge-base --action test
 cargo rail run --merge-base --dry-run --print-cmd
 ```
 
-## CI Example
+## CI example
 
 ```yaml
 - uses: loadingalias/cargo-rail-action@v6
   id: rail
-  with:
-    version: 0.20.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
@@ -31,7 +29,7 @@ cargo rail run --merge-base --dry-run --print-cmd
   run: cargo build $CARGO_ARGS
 ```
 
-## Built-in Actions
+## Built-in actions
 
 - `build`
 - `test`

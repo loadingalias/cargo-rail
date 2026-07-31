@@ -6,7 +6,7 @@ set -euo pipefail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
 # Generates docs/commands.md from the CLI's --help output and
-# docs/cache-capabilities.md from executable support registries.
+# docs/caching.md from executable support registries and reviewed benchmark evidence.
 #
 # Usage:
 #   ./scripts/docs/generate.sh           # Generate docs
@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUTPUT_FILE="$REPO_ROOT/docs/commands.md"
-CACHE_OUTPUT_FILE="$REPO_ROOT/docs/cache-capabilities.md"
+CACHE_OUTPUT_FILE="$REPO_ROOT/docs/caching.md"
 BINARY="$REPO_ROOT/target/debug/cargo-rail"
 
 CHECK_MODE=false
@@ -132,7 +132,7 @@ $subcmd_help
   printf '%s\n' "$output" | sed 's/[[:blank:]]*$//'
 }
 
-generate_cache_capabilities() {
+generate_caching() {
   python3 "$REPO_ROOT/scripts/ci/support-matrix.py" --markdown
 }
 
@@ -146,8 +146,8 @@ main() {
 
   local generated
   generated=$(generate_docs)
-  local generated_cache_capabilities
-  generated_cache_capabilities=$(generate_cache_capabilities)
+  local generated_caching
+  generated_caching=$(generate_caching)
 
   if [ "$CHECK_MODE" = true ]; then
     if [ ! -f "$OUTPUT_FILE" ]; then
@@ -172,11 +172,11 @@ main() {
       exit 1
     fi
 
-    if ! diff -q <(echo "$generated_cache_capabilities") "$CACHE_OUTPUT_FILE" > /dev/null 2>&1; then
-      echo "ERROR: docs/cache-capabilities.md is out of date"
+    if ! diff -q <(echo "$generated_caching") "$CACHE_OUTPUT_FILE" > /dev/null 2>&1; then
+      echo "ERROR: docs/caching.md is out of date"
       echo ""
       echo "Diff:"
-      diff <(echo "$generated_cache_capabilities") "$CACHE_OUTPUT_FILE" || true
+      diff <(echo "$generated_caching") "$CACHE_OUTPUT_FILE" || true
       echo ""
       echo "Run: ./scripts/docs/generate.sh"
       exit 1
@@ -187,7 +187,7 @@ main() {
   fi
 
   echo "$generated" > "$OUTPUT_FILE"
-  echo "$generated_cache_capabilities" > "$CACHE_OUTPUT_FILE"
+  echo "$generated_caching" > "$CACHE_OUTPUT_FILE"
   echo "Generated: $OUTPUT_FILE"
   echo "Generated: $CACHE_OUTPUT_FILE"
 }

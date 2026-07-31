@@ -62,7 +62,7 @@ Pre-built archives, SHA-256 checksums, and signed provenance are available from 
 
 3. **Reuse only verified compiler results.** Cargo-Rail revalidates the toolchain, sources, dependency artifacts, environment reads, action identity, stored result, and exact output blobs before a native cache hit. Unsupported or incomplete cases run through Cargo with a named bypass. **Fast when proven. Normal Cargo when not.**
 
-   The checked-in 110-sample M1 Pro fixture (it's my personal dev machine) measured warm cross-root p50 reductions of **29.2% for checks** and **26.4% for release builds** against native Cargo. These are same-host fixture results, not universal performance claims. The default native CAS lives outside `target/`, so `cargo clean` does not erase reusable results. See the [caching method and measurements](docs/caching.md) and generated [support matrix](docs/cache-capabilities.md) for the exact graduated classes and current limits.
+   The checked-in 110-sample M1 Pro fixture measured warm cross-root p50 reductions of **29.2% for checks** and **26.4% for release builds** against native Cargo. These are same-host fixture results, not universal performance claims. The default native CAS lives outside `target/`, so `cargo clean` does not erase reusable results. See [caching](docs/caching.md) for the proof model, current support, and measurements.
 
 4. **Record release intent before history loses it.** Contributors add small `.changes/*.md` files with the code they change. That reviewed intent is the default source for version bumps and release notes; commit-derived release modes remain available for compatibility. Cargo-Rail validates the exact release commit, waits for readiness on that SHA, publishes in dependency order, observes each registry result, and creates tags after publication. Durable state makes an interrupted release resumable instead of ambiguous.
 
@@ -72,9 +72,9 @@ Pre-built archives, SHA-256 checksums, and signed provenance are available from 
 
 - [Command reference](docs/commands.md)
 - [Config reference](docs/config.md)
-- [Change detection](docs/change-detection.md)
+- [Planning and execution](docs/planning.md)
 - [Architecture](docs/architecture.md)
-- [Planner machine contract](docs/planner-contract.md)
+- [Caching](docs/caching.md)
 - [Split/sync example](examples/split-sync/README.md)
 - [Troubleshooting and recovery](docs/troubleshooting.md)
 

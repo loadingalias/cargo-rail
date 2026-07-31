@@ -1,10 +1,10 @@
-# Change Detection: With Task Runner
+# Planning and Execution: With Task Runner
 
 Use this pattern when your repo already has `just`, `make`, `xtask`, or scripts.
 
 Cargo-Rail emits crate and surface scope. The task runner maps that scope to repository-specific commands.
 
-## Local Example
+## Local example
 
 ```bash
 PLAN=$(cargo rail plan --merge-base -f json)
@@ -19,24 +19,25 @@ if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
 fi
 ```
 
-## CI Example
+## CI example
 
 ```yaml
 - uses: loadingalias/cargo-rail-action@v6
   id: rail
   with:
-    version: 0.20.0
+    mode: debug
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'
   env:
-    SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
+    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
   run: |
-    MODE=$(echo "$SCOPE_JSON" | jq -r '.mode')
+    TEST_SCOPE=$(echo "$PLAN_JSON" | jq -c '.surfaces.test.scope')
+    MODE=$(echo "$TEST_SCOPE" | jq -r '.mode')
     if [ "$MODE" = "workspace" ]; then
       cargo xtask test --workspace
     elif [ "$MODE" = "crates" ]; then
-      echo "$SCOPE_JSON" | jq -r '.crates[]' | xargs cargo xtask test
+      echo "$TEST_SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
     fi
 ```
 

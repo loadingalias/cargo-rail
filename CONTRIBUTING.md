@@ -39,7 +39,7 @@ just test-all
 
 ## Generated documentation
 
-Two docs are generated, not hand-edited: `docs/commands.md` comes from CLI help, and `docs/cache-capabilities.md`
+Two docs are generated, not hand-edited: `docs/commands.md` comes from CLI help, and `docs/caching.md`
 is assembled from the native CI manifest, release target registry, native-cache capability certificates, runtime
 gates, and performance qualifications. Regenerate both after changing commands, flags, defaults, support
 inventories, or cache eligibility:

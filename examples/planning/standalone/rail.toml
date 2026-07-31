@@ -1,7 +1,7 @@
 # cargo-rail configuration
 # For projects WITHOUT a task runner
 #
-# Strategy: cargo rail run handles both detection and execution.
+# Strategy: cargo rail run owns planning and execution.
 
 [change-detection]
 infrastructure = [
