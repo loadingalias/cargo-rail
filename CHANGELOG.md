@@ -7,6 +7,13 @@
 
 
 
+
+## [0.20.1](https://github.com/loadingalias/cargo-rail/compare/v0.20.0...v0.20.1) - 2026-07-31
+
+- Consolidate planning and caching documentation, correct the release-source example, and refresh Rust dependencies and
+  CI action pins.
+
+
 ## [0.20.0](https://github.com/loadingalias/cargo-rail/compare/v0.19.1...v0.20.0) - 2026-07-29
 
 - Raised the repository and package toolchain to Rust 1.97.1, updated Rust dependencies, the native-cache fixture
