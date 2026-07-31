@@ -38,7 +38,7 @@ resolver = "3"
 rust-version = "1.97.1"
 
 [dependencies]
-clap = { version = "4.6.4", features = ["derive", "cargo"] }
+clap = { version = "4.6.5", features = ["derive", "cargo"] }
 clap_complete = "4.6.8"
 cargo_metadata = "0.23.1"
 petgraph = { version = "0.8.3", default-features = false }

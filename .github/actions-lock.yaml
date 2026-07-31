@@ -39,9 +39,9 @@ actions/download-artifact:
   updated: "2026-07-25T14:41:46Z"
   notes: "Collect verified release archives before publication"
 actions/attest:
-  ref: v4.2.0
-  sha: "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6"
-  updated: "2026-07-25T14:41:47Z"
+  ref: v4.2.1
+  sha: "508db95dd578ae2727ebd6217d5ba78e4fbda05d"
+  updated: "2026-07-31T19:03:57Z"
   notes: "Generate signed SLSA provenance for release archives"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # cargo-rail Ecosystem
@@ -68,9 +68,9 @@ dtolnay/rust-toolchain:
   updated: "2026-07-25T14:41:49Z"
   notes: "Rust toolchain installation for stable, MSRV, and release builds"
 taiki-e/install-action:
-  ref: v2.85.2
-  sha: "41049aa56687c35e0afa74eed4f09cec4f9afabf"
-  updated: "2026-07-28T04:38:58Z"
+  ref: v2.85.5
+  sha: "6a1bd70eaac3c8bdf093356838d7ee09fda951cf"
+  updated: "2026-07-31T19:03:57Z"
   notes: "Install cargo tools (nextest, just, deny, audit)"
 Swatinem/rust-cache:
   ref: v2.9.1

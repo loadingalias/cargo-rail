@@ -12,10 +12,9 @@ cargo rail release run my-crate --bump auto --check
 cargo rail release run my-crate --bump auto --yes
 ```
 
-`--bump auto` reads change files first, then conventional commits since each
-crate's previous tag. Change files are consumed in the release commit;
-consumption is all-or-nothing, so a plan covering only some of a file's
-crates is rejected.
+`--bump auto` reads the configured release source. The default `source = "changes"` uses reviewed change files only;
+conventional commits participate only with `source = "commits"` or `source = "both"`. Change files are consumed in
+the release commit; consumption is all-or-nothing, so a plan covering only some of a file's crates is rejected.
 
 With `remote_effects = "push"`, `release run` pushes its verified release commit and tags. Use `"auto"`, `"github"`, or `"gitlab"` to push and create a forge release. Do not add a second push step.
 
