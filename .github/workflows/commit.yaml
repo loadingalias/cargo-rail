@@ -48,7 +48,7 @@ jobs:
 
       - name: Build Plan
         id: plan
-        uses: loadingalias/cargo-rail-action@1dc464f6c1e4a1606b6bd64cd9e671b68fae3a22  # v6.1.1
+        uses: loadingalias/cargo-rail-action@e4eaae7f1d90c261e14bc7b2e351ed3d0b95c130  # main
         with:
           version: 0.20.0
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
