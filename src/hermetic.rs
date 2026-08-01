@@ -1858,8 +1858,7 @@ fn set_tree_read_only(root: &Path) -> RailResult<()> {
 #[cfg(unix)]
 fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
   use rustix::fd::OwnedFd;
-  use rustix::fs::{Dir, Mode, OFlags};
-  use std::os::unix::fs::MetadataExt as _;
+  use rustix::fs::{ABS, AtFlags, Dir, FileType, Mode, OFlags};
   use std::path::Component;
 
   fn io_error(error: rustix::io::Errno) -> RailError {
@@ -1905,8 +1904,8 @@ fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
       root.display()
     )));
   }
-  let expected = fs::symlink_metadata(root)?;
-  if !expected.is_dir() || crate::utils::is_symlink_or_reparse(&expected) {
+  let expected = rustix::fs::statat(ABS, root, AtFlags::SYMLINK_NOFOLLOW).map_err(io_error)?;
+  if FileType::from_raw_mode(expected.st_mode) != FileType::Directory {
     return Err(RailError::message(format!(
       "refusing to reclaim non-directory cache path '{}'",
       root.display()
@@ -1929,7 +1928,7 @@ fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
     }
   }
   let opened = rustix::fs::fstat(&directory).map_err(io_error)?;
-  if u64::try_from(opened.st_dev).ok() != Some(expected.dev()) || opened.st_ino != expected.ino() {
+  if opened.st_dev != expected.st_dev || opened.st_ino != expected.st_ino {
     return Err(RailError::message(format!(
       "cache path '{}' changed while reclamation authority was acquired",
       root.display()
