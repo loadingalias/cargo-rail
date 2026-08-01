@@ -392,3 +392,202 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() -> Result<()> {
   );
   Ok(())
 }
+
+#[test]
+fn active_cargo_profile_delegation_skips_snapshot_work_and_retains_a_receipt() -> Result<()> {
+  let ws = TestWorkspace::new_named("diagnostic-active-cargo-delegation")?;
+  ws.add_crate("member", "0.1.0", &[])?;
+  ws.commit("Add active Cargo fixture")?;
+  let cargo_home = TempDir::new()?;
+  let cache = TempDir::new()?;
+  let seed = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["check", "--workspace", "--quiet"])
+    .env("CARGO_HOME", cargo_home.path())
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    seed.status.success(),
+    "active Cargo seed failed: {}",
+    String::from_utf8_lossy(&seed.stderr)
+  );
+
+  let output = TempDir::new()?;
+  let diagnostics = output.path().join("active.json");
+  let measured = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "--diagnostics-file",
+      diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--",
+      "--quiet",
+    ])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_RAIL_CACHE_DIR", cache.path())
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    measured.status.success(),
+    "active Cargo delegation failed: {}",
+    String::from_utf8_lossy(&measured.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&measured.stderr)
+      .contains("native compiler cache: bypassed reason=active_cargo_profile_preferred"),
+    "default text mode should emit one concise cache decision: {}",
+    String::from_utf8_lossy(&measured.stderr)
+  );
+
+  let counters = read_counters(&diagnostics)?;
+  assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
+  assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
+  assert_eq!(
+    counters["phases"]["action_expansion_key_construction"]["invocations"],
+    0
+  );
+  assert_eq!(counters["phases"]["native_cache_setup"]["invocations"], 0);
+  assert_eq!(counters["phases"]["cargo_child_execution"]["invocations"], 1);
+  assert_eq!(counters["cargo_metadata_loads"], 0);
+  assert_eq!(counters["git_subprocesses"], 0);
+  assert_eq!(
+    counters["hash_operations"], 1,
+    "only the sanitized Cargo configuration is hashed"
+  );
+
+  let receipts = std::fs::read_dir(ws.path.join("target/cargo-rail/receipts"))?.collect::<std::io::Result<Vec<_>>>()?;
+  assert_eq!(receipts.len(), 1);
+  let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipts[0].path())?)?;
+  assert!(receipt["snapshot_id"].is_null());
+  assert_eq!(
+    receipt["snapshot_status"],
+    "not_loaded_for_active_cargo_profile_delegation"
+  );
+  assert_eq!(
+    receipt["execution"]["execution_mode"],
+    "active_cargo_profile_delegation"
+  );
+  assert_eq!(
+    receipt["execution"]["native_cache_reason"],
+    "active_cargo_profile_preferred"
+  );
+  assert_eq!(
+    receipt["actions"][0]["argv"],
+    serde_json::json!(["cargo", "check", "--workspace", "--quiet"])
+  );
+
+  let release_seed = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["build", "--workspace", "--release", "--locked", "--quiet"])
+    .env("CARGO_HOME", cargo_home.path())
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    release_seed.status.success(),
+    "active release seed failed: {}",
+    String::from_utf8_lossy(&release_seed.stderr)
+  );
+  let distribution_diagnostics = output.path().join("active-distribution.json");
+  let distribution = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "--diagnostics-file",
+      distribution_diagnostics
+        .to_str()
+        .context("non-UTF-8 distribution diagnostics path")?,
+      "run",
+      "--all",
+      "--action",
+      "distribution",
+      "--",
+      "--quiet",
+    ])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_RAIL_CACHE_DIR", cache.path())
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    distribution.status.success(),
+    "active distribution delegation failed: {}",
+    String::from_utf8_lossy(&distribution.stderr)
+  );
+  let distribution_counters = read_counters(&distribution_diagnostics)?;
+  assert_eq!(
+    distribution_counters["phases"]["workspace_capture_cargo_metadata"]["invocations"],
+    0
+  );
+  assert_eq!(
+    distribution_counters["phases"]["action_expansion_key_construction"]["invocations"],
+    0
+  );
+  assert_eq!(
+    distribution_counters["phases"]["cargo_child_execution"]["invocations"],
+    1
+  );
+  let distribution_receipt = std::fs::read_dir(ws.path.join("target/cargo-rail/receipts"))?
+    .map(|entry| -> Result<Option<serde_json::Value>> {
+      let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+      Ok((receipt["actions"][0]["id"] == "distribution").then_some(receipt))
+    })
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .next()
+    .context("missing distribution decision receipt")?;
+  assert_eq!(
+    distribution_receipt["actions"][0]["argv"],
+    serde_json::json!(["cargo", "build", "--workspace", "--release", "--locked", "--quiet"])
+  );
+
+  let captured_diagnostics = output.path().join("explicit-nonincremental.json");
+  let captured = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "--diagnostics-file",
+      captured_diagnostics
+        .to_str()
+        .context("non-UTF-8 captured diagnostics path")?,
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--",
+      "--quiet",
+    ])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_RAIL_CACHE_DIR", cache.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    captured.status.success(),
+    "explicit non-incremental run failed: {}",
+    String::from_utf8_lossy(&captured.stderr)
+  );
+  let captured = read_counters(&captured_diagnostics)?;
+  assert_eq!(
+    captured["phases"]["workspace_capture_cargo_metadata"]["invocations"], 1,
+    "an explicit non-incremental request must retain the captured cache path"
+  );
+  Ok(())
+}

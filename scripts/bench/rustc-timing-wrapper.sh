@@ -13,6 +13,8 @@ source="unknown"
 test_mode="false"
 native_link="false"
 incremental="false"
+link_probe="not_requested"
+linker_producing="false"
 
 arguments=("$@")
 index=1
@@ -42,6 +44,13 @@ while ((index < ${#arguments[@]})); do
       ;;
     --emit=*) emit="${argument#--emit=}" ;;
     --test) test_mode="true" ;;
+    -L)
+      if [[ "$next" == native=* ]]; then
+        native_link="true"
+      fi
+      ((index += 2))
+      continue
+      ;;
     -l | -l* | -Lnative* | *linker=* | *link-arg=* | *link-args=*) native_link="true" ;;
     *incremental=*) incremental="true" ;;
     *.rs)
@@ -53,6 +62,10 @@ while ((index < ${#arguments[@]})); do
   ((index += 1))
 done
 
+case ",$crate_type," in
+  *,bin,* | *,proc-macro,* | *,dylib,* | *,cdylib,* | *,staticlib,*) linker_producing="true" ;;
+esac
+
 case "$source" in
   "$workspace"/*) source_class="workspace" ;;
   */registry/src/*) source_class="registry" ;;
@@ -63,12 +76,35 @@ case "$source" in
 esac
 
 printf '%s\0' "$@" >"$record.argv"
-/usr/bin/time -p -o "$record.time" "$@"
-status=$?
+if [[ "${CARGO_RAIL_LINK_PROBE:-0}" == 1 && "$OSTYPE" == darwin* && "$linker_producing" == true && \
+  "$emit" == *link* && "$test_mode" == false ]]; then
+  link_dependencies="$record.link-dependencies"
+  link_stdout="$record.link-stdout"
+  if [[ "$link_dependencies" == *,* ]]; then
+    link_probe="unsupported_path"
+    /usr/bin/time -p -o "$record.time" "$@"
+    status=$?
+  else
+    /usr/bin/time -p -o "$record.time" "$@" --print=link-args \
+      "-Clink-arg=-Wl,-dependency_info,$link_dependencies" >"$link_stdout"
+    status=$?
+    if [[ "$status" -eq 0 && -s "$link_dependencies" && "$(head -c 4 "$link_stdout")" == "env " ]]; then
+      head -n 1 "$link_stdout" >"$record.link-command"
+      tail -n +2 "$link_stdout"
+      link_probe="captured"
+    else
+      cat "$link_stdout"
+      link_probe="incomplete"
+    fi
+  fi
+else
+  /usr/bin/time -p -o "$record.time" "$@"
+  status=$?
+fi
 real="$(awk '$1 == "real" { print $2 }' "$record.time")"
 user="$(awk '$1 == "user" { print $2 }' "$record.time")"
 sys="$(awk '$1 == "sys" { print $2 }' "$record.time")"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$crate_name" "$crate_type" "$emit" "$source_class" "$test_mode" "$native_link" "$incremental" \
-  "${real:-0}" "${user:-0}" "${sys:-0}" "$status" >"$record.tsv"
+  "${real:-0}" "${user:-0}" "${sys:-0}" "$status" "$link_probe" >"$record.tsv"
 exit "$status"

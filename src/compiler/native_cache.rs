@@ -43,9 +43,6 @@ const GRADUATED_RUSTC_RELEASE: &str = "1.97.1";
 const GRADUATED_CARGO_RELEASE: &str = "1.97.1";
 const NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION: u32 = 1;
 const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 3;
-const CONFIGURED_LINKER_BYPASS_REASON: &str = "configured_linker_not_graduated";
-const CODEGEN_BACKEND_BYPASS_REASON: &str = "codegen_backend_not_graduated";
-const CUSTOM_SYSROOT_BYPASS_REASON: &str = "custom_sysroot_not_graduated";
 const GRADUATED_NATIVE_HOSTS: &[(&str, &str)] = &[
   ("unix-linux-aarch64", "aarch64-unknown-linux-gnu"),
   ("unix-linux-x86_64", "x86_64-unknown-linux-gnu"),
@@ -104,14 +101,14 @@ impl NativeCompilerClass {
     }
   }
 
-  fn eligibility_reason(&self) -> Option<&'static str> {
+  fn eligibility_reason(&self) -> Option<DirectCacheBypass> {
     if !GRADUATED_NATIVE_HOSTS
       .iter()
       .any(|&(platform, host_target)| self.platform == platform && self.host_target == host_target)
     {
-      Some("native_cache_platform_not_graduated")
+      Some(DirectCacheBypass::PlatformNotGraduated)
     } else if self.rustc_release != GRADUATED_RUSTC_RELEASE || self.cargo_release != GRADUATED_CARGO_RELEASE {
-      Some("native_cache_toolchain_not_graduated")
+      Some(DirectCacheBypass::ToolchainNotGraduated)
     } else {
       None
     }
@@ -136,7 +133,75 @@ pub(crate) struct DirectNativeCacheIdentity<'a> {
 /// Activation result for one ordinary Cargo action.
 pub(crate) enum DirectNativeCacheSetup {
   Active(DirectNativeCacheRun),
-  Bypassed(&'static str),
+  Bypassed(DirectCacheBypass),
+}
+
+/// Stable action-level reason that prevents cargo-rail from installing its compiler cache wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectCacheBypass {
+  DisabledByRequest,
+  CargoCliConfiguration,
+  ActionCompilerWrapper,
+  ActionEnvironment,
+  ForcedIncremental,
+  ExplicitIncremental,
+  CustomCargoProfile,
+  ActiveCargoProfile,
+  IdentityUnavailable,
+  PlatformNotGraduated,
+  ToolchainNotGraduated,
+  SccacheWrapper,
+  ExistingCompilerWrapper,
+  ToolchainIncoherent,
+  ConfiguredLinker,
+  CodegenBackend,
+  CustomSysroot,
+  CargoConfiguration,
+  BuildScriptObservations,
+  ProcMacroObservations,
+  ExternalSourceDigest,
+  NoEligibleLibraryUnits,
+  CapabilityNotCertified,
+  CapabilityUnavailable,
+  ObservationDirectoryUnavailable,
+  SessionUnavailable,
+  WrapperExecutableUnavailable,
+  SourceRootUnavailable,
+}
+
+impl DirectCacheBypass {
+  pub(crate) const fn as_str(self) -> &'static str {
+    match self {
+      Self::DisabledByRequest => "native_cache_disabled_by_request",
+      Self::CargoCliConfiguration => "cargo_cli_configuration_not_graduated",
+      Self::ActionCompilerWrapper => "action_compiler_wrapper_preserved",
+      Self::ActionEnvironment => "action_environment_not_graduated",
+      Self::ForcedIncremental => "forced_incremental_compilation_preserved",
+      Self::ExplicitIncremental => "explicit_incremental_compilation_preserved",
+      Self::CustomCargoProfile => "custom_cargo_profile_preserved",
+      Self::ActiveCargoProfile => "active_cargo_profile_preferred",
+      Self::IdentityUnavailable => "native_cache_identity_unavailable",
+      Self::PlatformNotGraduated => "native_cache_platform_not_graduated",
+      Self::ToolchainNotGraduated => "native_cache_toolchain_not_graduated",
+      Self::SccacheWrapper => "sccache_wrapper_preserved",
+      Self::ExistingCompilerWrapper => "existing_compiler_wrapper_preserved",
+      Self::ToolchainIncoherent => "native_cache_toolchain_incoherent",
+      Self::ConfiguredLinker => "configured_linker_not_graduated",
+      Self::CodegenBackend => "codegen_backend_not_graduated",
+      Self::CustomSysroot => "custom_sysroot_not_graduated",
+      Self::CargoConfiguration => "cargo_configuration_unmodeled",
+      Self::BuildScriptObservations => "build_script_observations_unavailable",
+      Self::ProcMacroObservations => "proc_macro_observations_unavailable",
+      Self::ExternalSourceDigest => "external_source_digest_unavailable",
+      Self::NoEligibleLibraryUnits => "native_cache_no_eligible_library_units",
+      Self::CapabilityNotCertified => "native_cache_capability_not_certified",
+      Self::CapabilityUnavailable => "native_cache_capability_unavailable",
+      Self::ObservationDirectoryUnavailable => "native_cache_observation_directory_unavailable",
+      Self::SessionUnavailable => "native_cache_session_unavailable",
+      Self::WrapperExecutableUnavailable => "compiler_wrapper_executable_unavailable",
+      Self::SourceRootUnavailable => "native_cache_source_root_unavailable",
+    }
+  }
 }
 
 /// Keeps the private session and its per-invocation evidence alive for one Cargo process.
@@ -236,7 +301,7 @@ pub(crate) struct DirectNativeCacheReport {
 pub(crate) struct NativeCacheEventIdentity {
   schema_version: u32,
   unit_identity: Option<String>,
-  outcome: String,
+  outcome: CompilerCacheWrapperStatus,
   reason: String,
   action_key: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -292,7 +357,7 @@ impl DirectNativeCacheSetup {
   pub(crate) fn bypass_reason(&self) -> Option<&'static str> {
     match self {
       Self::Active(_) => None,
-      Self::Bypassed(reason) => Some(reason),
+      Self::Bypassed(reason) => Some(reason.as_str()),
     }
   }
 
@@ -322,11 +387,12 @@ impl DirectNativeCacheRun {
       let Ok(event) = serde_json::from_slice::<OwnedNativeCacheEvent>(&bytes) else {
         continue;
       };
-      match event.status.as_str() {
-        "hit" => report.hits = report.hits.saturating_add(1),
-        "miss" => report.misses = report.misses.saturating_add(1),
-        "bypassed" | "disabled" => report.bypasses = report.bypasses.saturating_add(1),
-        _ => continue,
+      match event.status {
+        CompilerCacheWrapperStatus::Hit => report.hits = report.hits.saturating_add(1),
+        CompilerCacheWrapperStatus::Miss => report.misses = report.misses.saturating_add(1),
+        CompilerCacheWrapperStatus::Bypassed | CompilerCacheWrapperStatus::Disabled => {
+          report.bypasses = report.bypasses.saturating_add(1);
+        }
       }
       report.bytes_hashed = report.bytes_hashed.saturating_add(event.bytes_hashed);
       report.bytes_restored = report.bytes_restored.saturating_add(event.bytes_restored);
@@ -337,7 +403,10 @@ impl DirectNativeCacheRun {
         .and_then(|candidate| units.get(candidate))
         .map(|unit| {
           let mut unit = unit.clone();
-          if !matches!(event.status.as_str(), "hit" | "miss") {
+          if !matches!(
+            event.status,
+            CompilerCacheWrapperStatus::Hit | CompilerCacheWrapperStatus::Miss
+          ) {
             unit.claimed_outputs = None;
           }
           unit
@@ -499,11 +568,11 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
   }
   let class = NativeCompilerClass::capture(identity.rustc_version, identity.cargo_version);
   if native_cache_capability_evidence(&class.platform, &class.host_target, identity.capability_identity).is_none() {
-    return DirectNativeCacheSetup::Bypassed("native_cache_capability_not_certified");
+    return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::CapabilityNotCertified);
   }
   let observations = match tempfile::Builder::new().prefix("cargo-rail-native-cargo-").tempdir() {
     Ok(directory) => directory,
-    Err(_) => return DirectNativeCacheSetup::Bypassed("native_cache_observation_directory_unavailable"),
+    Err(_) => return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::ObservationDirectoryUnavailable),
   };
   if NativeCompilerSession::write(
     observations.path(),
@@ -519,22 +588,22 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
   )
   .is_err()
   {
-    return DirectNativeCacheSetup::Bypassed("native_cache_session_unavailable");
+    return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::SessionUnavailable);
   }
   let executable = match std::env::current_exe() {
     Ok(wrapper) => wrapper,
-    Err(_) => return DirectNativeCacheSetup::Bypassed("compiler_wrapper_executable_unavailable"),
+    Err(_) => return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::WrapperExecutableUnavailable),
   };
   let wrapper = observations.path().join(DIRECT_WRAPPER_NAME);
   if create_direct_wrapper(&executable, &wrapper).is_err() {
-    return DirectNativeCacheSetup::Bypassed("compiler_wrapper_executable_unavailable");
+    return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::WrapperExecutableUnavailable);
   }
   let source_root = match crate::utils::canonicalize_existing(identity.source_root)
     .ok()
     .and_then(|root| root.to_str().map(str::to_string))
   {
     Some(root) => root,
-    None => return DirectNativeCacheSetup::Bypassed("native_cache_source_root_unavailable"),
+    None => return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::SourceRootUnavailable),
   };
   let context = DirectNativeCacheContext {
     version: 2,
@@ -546,11 +615,11 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
     .and_then(|bytes| crate::utils::write_file_atomic(&observations.path().join(DIRECT_CONTEXT_FILE), &bytes).ok())
     .is_none()
   {
-    return DirectNativeCacheSetup::Bypassed("native_cache_session_unavailable");
+    return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::SessionUnavailable);
   }
   let wrapper = match wrapper.to_str().and_then(|path| serde_json::to_string(path).ok()) {
     Some(wrapper) => wrapper,
-    None => return DirectNativeCacheSetup::Bypassed("compiler_wrapper_executable_unavailable"),
+    None => return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::WrapperExecutableUnavailable),
   };
   DirectNativeCacheSetup::Active(DirectNativeCacheRun {
     observations,
@@ -563,9 +632,13 @@ pub(crate) fn direct_cache_bypass_reason(
   rustc_version: &str,
   cargo_version: &str,
   wrapper_plan: CacheWrapperPlan,
-) -> Option<&'static str> {
+) -> Option<DirectCacheBypass> {
   if !wrapper_plan.installs_cargo_rail() {
-    return Some(wrapper_plan.reason());
+    return Some(match wrapper_plan {
+      CacheWrapperPlan::PreserveSccache => DirectCacheBypass::SccacheWrapper,
+      CacheWrapperPlan::PreserveExisting => DirectCacheBypass::ExistingCompilerWrapper,
+      CacheWrapperPlan::DisabledPassThrough => return None,
+    });
   }
   NativeCompilerClass::capture(rustc_version, cargo_version).eligibility_reason()
 }
@@ -576,7 +649,7 @@ pub(crate) fn direct_toolchain_coherence_bypass_reason(
   cargo_verbose_version: &str,
   rustc_verbose_version: &str,
   rustdoc_verbose_version: &str,
-) -> Option<&'static str> {
+) -> Option<DirectCacheBypass> {
   let cargo_release = release_from_verbose(cargo_verbose_version, "cargo");
   let rustc_release = release_from_verbose(rustc_verbose_version, "rustc");
   let rustdoc_release = release_from_verbose(rustdoc_verbose_version, "rustdoc");
@@ -590,23 +663,23 @@ pub(crate) fn direct_toolchain_coherence_bypass_reason(
     || cargo_host == "unknown"
     || cargo_host != rustc_host
     || cargo_host != rustdoc_host)
-    .then_some("native_cache_toolchain_incoherent")
+    .then_some(DirectCacheBypass::ToolchainIncoherent)
 }
 
 /// Return the stable action-level bypass for compiler controls that are not
 /// part of the graduated native-cache authority.
 pub(crate) fn direct_target_configuration_bypass_reason(
   targets: &[crate::cargo::TargetIdentity],
-) -> Option<&'static str> {
+) -> Option<DirectCacheBypass> {
   for target in targets.iter().filter(|target| target.is_build_target()) {
     if target.linker().is_some() || compiler_option_selected(target.rustflags(), &LINKER_OPTIONS) {
-      return Some(CONFIGURED_LINKER_BYPASS_REASON);
+      return Some(DirectCacheBypass::ConfiguredLinker);
     }
     if compiler_option_selected(target.rustflags(), &["codegen-backend"]) {
-      return Some(CODEGEN_BACKEND_BYPASS_REASON);
+      return Some(DirectCacheBypass::CodegenBackend);
     }
     if long_option_selected(target.rustflags(), "--sysroot") {
-      return Some(CUSTOM_SYSROOT_BYPASS_REASON);
+      return Some(DirectCacheBypass::CustomSysroot);
     }
   }
   None
@@ -775,8 +848,7 @@ impl NativeCompilerSession {
     };
     session.validate_object()?;
     if session.class.eligibility_reason().is_none() {
-      let cas = LocalCas::open()?;
-      crate::hermetic::register_local_cache(&source_root, cas.root())?;
+      LocalCas::open()?;
     }
     let session_directory = directory.join("native-cache-session");
     fs::create_dir(&session_directory)?;
@@ -1483,7 +1555,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     configure_cold(
       command,
       CompilerCacheWrapperStatus::Bypassed,
-      reason,
+      reason.as_str(),
       None,
       0,
       diagnostic_wrapper,
@@ -1803,6 +1875,7 @@ fn portable_compiler_arguments(
         )?));
         index += 1;
       }
+      _ if argument.starts_with("incremental=") => return Err("incremental_compilation_not_graduated"),
       _ => {
         if remap_roots.iter().any(|root| argument.contains(root)) {
           return Err("compiler_argument_root_binding_not_graduated");
@@ -2009,14 +2082,7 @@ fn configure_cold(
     command.env(DISPOSITION_ENV, encoded);
   }
   if status != CompilerCacheWrapperStatus::Miss {
-    write_cache_event(
-      status_name(status),
-      reason,
-      candidate_key.as_deref(),
-      None,
-      bytes_hashed,
-      0,
-    );
+    write_cache_event(status, reason, candidate_key.as_deref(), None, bytes_hashed, 0);
   }
   metadata
 }
@@ -2234,7 +2300,7 @@ fn restore_and_publish(
   std::io::stdout().write_all(&stdout)?;
   std::io::stderr().write_all(&stderr)?;
   write_cache_event(
-    "hit",
+    CompilerCacheWrapperStatus::Hit,
     "verified_local_result",
     Some(&validation.candidate_key),
     Some(&validation.action_key),
@@ -2653,7 +2719,7 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
         0,
       ));
       write_cache_event(
-        "miss",
+        CompilerCacheWrapperStatus::Miss,
         "stored_verified_result",
         Some(&validation.candidate_key),
         Some(&validation.action_key),
@@ -2681,7 +2747,7 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
         0,
       ));
       write_cache_event(
-        "bypassed",
+        CompilerCacheWrapperStatus::Bypassed,
         &reason,
         initial.as_ref().and_then(CompilerCacheWrapperMetadata::candidate_key),
         None,
@@ -2719,7 +2785,7 @@ fn publish_and_record_cold_observation(
   publish_cold_observation(raw, reason, action_key, bytes_hashed, bytes_restored)?;
   let metadata = raw.cache_wrapper.as_ref();
   write_cache_event(
-    "bypassed",
+    CompilerCacheWrapperStatus::Bypassed,
     reason,
     metadata.and_then(CompilerCacheWrapperMetadata::candidate_key),
     metadata.and_then(CompilerCacheWrapperMetadata::action_key),
@@ -2947,19 +3013,10 @@ fn cold_input_bytes(observation: &RawCompilerInvocation, source_root: &Path, pos
     .saturating_add(post_execution_bytes)
 }
 
-fn status_name(status: CompilerCacheWrapperStatus) -> &'static str {
-  match status {
-    CompilerCacheWrapperStatus::Hit => "hit",
-    CompilerCacheWrapperStatus::Miss => "miss",
-    CompilerCacheWrapperStatus::Disabled => "disabled",
-    CompilerCacheWrapperStatus::Bypassed => "bypassed",
-  }
-}
-
 #[derive(Serialize)]
 struct NativeCacheEvent<'a> {
   version: u32,
-  status: &'a str,
+  status: CompilerCacheWrapperStatus,
   reason: &'a str,
   candidate_key: Option<&'a str>,
   action_key: Option<&'a str>,
@@ -2972,7 +3029,7 @@ struct NativeCacheEvent<'a> {
 struct OwnedNativeCacheEvent {
   #[serde(rename = "version")]
   _version: u32,
-  status: String,
+  status: CompilerCacheWrapperStatus,
   reason: String,
   candidate_key: Option<String>,
   action_key: Option<String>,
@@ -2981,7 +3038,7 @@ struct OwnedNativeCacheEvent {
 }
 
 fn write_cache_event(
-  status: &str,
+  status: CompilerCacheWrapperStatus,
   reason: &str,
   candidate_key: Option<&str>,
   action_key: Option<&str>,
@@ -3017,7 +3074,7 @@ fn write_cache_event(
       }
     })
     .collect::<String>();
-  let stem = format!("event-{}-{status}-{reason_slug}", std::process::id());
+  let stem = format!("event-{}-{}-{reason_slug}", std::process::id(), status.as_str());
   write_unique_cache_event(&directory, &stem, &bytes);
 }
 
@@ -3578,14 +3635,14 @@ pub(crate) mod tests {
     platform.host_target = "x86_64-unknown-freebsd".to_string();
     assert_eq!(
       platform.eligibility_reason(),
-      Some("native_cache_platform_not_graduated")
+      Some(DirectCacheBypass::PlatformNotGraduated)
     );
 
     let mut toolchain = session.class;
     toolchain.rustc_release = "1.97.2".to_string();
     assert_eq!(
       toolchain.eligibility_reason(),
-      Some("native_cache_toolchain_not_graduated")
+      Some(DirectCacheBypass::ToolchainNotGraduated)
     );
   }
 
@@ -3599,16 +3656,16 @@ pub(crate) mod tests {
     let old_cargo = cargo.replace("1.97.1", "1.96.0");
     assert_eq!(
       direct_toolchain_coherence_bypass_reason(&old_cargo, rustc, rustdoc),
-      Some("native_cache_toolchain_incoherent")
+      Some(DirectCacheBypass::ToolchainIncoherent)
     );
     let other_host = rustdoc.replace("aarch64-apple-darwin", "x86_64-apple-darwin");
     assert_eq!(
       direct_toolchain_coherence_bypass_reason(cargo, rustc, &other_host),
-      Some("native_cache_toolchain_incoherent")
+      Some(DirectCacheBypass::ToolchainIncoherent)
     );
     assert_eq!(
       direct_toolchain_coherence_bypass_reason("cargo without structured identity", rustc, rustdoc),
-      Some("native_cache_toolchain_incoherent")
+      Some(DirectCacheBypass::ToolchainIncoherent)
     );
   }
 
@@ -3772,7 +3829,7 @@ pub(crate) mod tests {
         "second.json",
         NativeCacheEvent {
           version: 1,
-          status: "hit",
+          status: CompilerCacheWrapperStatus::Hit,
           reason: "verified_local_result",
           candidate_key: Some("native-candidate-v1-sha256:bbbb"),
           action_key: Some("native-action-v1-sha256:2222"),
@@ -3784,7 +3841,7 @@ pub(crate) mod tests {
         "first.json",
         NativeCacheEvent {
           version: 1,
-          status: "miss",
+          status: CompilerCacheWrapperStatus::Miss,
           reason: "stored_verified_result",
           candidate_key: Some("native-candidate-v1-sha256:aaaa"),
           action_key: Some("native-action-v1-sha256:1111"),
@@ -3813,7 +3870,7 @@ pub(crate) mod tests {
       report.events[0].unit_identity.as_deref(),
       Some("native-candidate-v1-sha256:aaaa")
     );
-    assert_eq!(report.events[0].outcome, "miss");
+    assert_eq!(report.events[0].outcome, CompilerCacheWrapperStatus::Miss);
     let unit = report.events[0].unit.as_ref().expect("unit evidence");
     assert_eq!(unit.descriptor.crate_name.as_deref(), Some("fixture"));
     assert_eq!(
@@ -3835,7 +3892,7 @@ pub(crate) mod tests {
       report.events[1].unit_identity.as_deref(),
       Some("native-candidate-v1-sha256:bbbb")
     );
-    assert_eq!(report.events[1].outcome, "hit");
+    assert_eq!(report.events[1].outcome, CompilerCacheWrapperStatus::Hit);
   }
 
   #[test]

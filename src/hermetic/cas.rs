@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{FastCacheValidation, OutputEntry, OutputEntryKind, OutputManifest};
+use crate::compiler::diagnostics_store::{
+  CompilerEvidenceObject, CompilerEvidenceValidation, EVIDENCE_ACTION_KEY_PREFIX, EVIDENCE_CANDIDATE_KEY_PREFIX,
+  EVIDENCE_OBJECT_PREFIX, validate_evidence_action_key, validate_evidence_candidate_key, validate_evidence_object,
+};
 use crate::compiler::native_cache::NativeCompilerValidation;
 use crate::error::{RailError, RailResult};
 
@@ -34,6 +38,9 @@ const NATIVE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const NATIVE_CANDIDATE_INDEX_DIRECTORY: &str = "native-candidates";
 const NATIVE_CANDIDATE_INDEX_MARKER: &str = "READY";
 const NATIVE_CANDIDATE_INDEX_MARKER_BYTES: &[u8] = b"cargo-rail-native-candidate-index\nschema=1\n";
+const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
+const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
+const LIFECYCLE_LOCK_NAME: &str = "local-cas-v1.lock";
 #[cfg(target_os = "macos")]
 const SYSROOT_IDENTITY_MEMO_DIRECTORY: &str = "sysroot-identities";
 
@@ -124,6 +131,13 @@ pub(crate) enum NativeCacheLookup {
   Miss(NativeCacheMiss),
 }
 
+/// One verified compiler-evidence candidate loaded without granting reuse authority.
+pub(crate) struct CompilerEvidenceCandidate {
+  pub(crate) validation: CompilerEvidenceValidation,
+  pub(crate) evidence: CompilerEvidenceObject,
+  pub(crate) created_unix_nanos: u128,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StoreStats {
   pub(crate) action_result: Option<String>,
@@ -150,6 +164,11 @@ pub(crate) struct NativeStoreRequest<'a> {
   pub(crate) source_root: &'a Path,
 }
 
+pub(crate) struct CompilerEvidenceStoreRequest<'a> {
+  pub(crate) validation: &'a CompilerEvidenceValidation,
+  pub(crate) evidence: &'a CompilerEvidenceObject,
+}
+
 struct ValidatedStoreRequest<'a> {
   action_key: &'a str,
   lookup_key: &'a str,
@@ -164,7 +183,40 @@ struct ValidatedStoreRequest<'a> {
 #[derive(Debug)]
 pub(crate) struct LocalCas {
   root: PathBuf,
+  lifecycle_lock: PathBuf,
   max_bytes: u64,
+}
+
+/// Read-only measurements for one validated shared local CAS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LocalCasStatus {
+  pub(crate) root: String,
+  pub(crate) bytes: u64,
+  pub(crate) max_bytes: u64,
+  pub(crate) results: u64,
+  pub(crate) pins: u64,
+  pub(crate) objects: u64,
+  pub(crate) active_leases: u64,
+  pub(crate) stale_leases: u64,
+  pub(crate) staging_entries: u64,
+  pub(crate) staging_bytes: u64,
+  pub(crate) index_files: u64,
+  pub(crate) reclaimable_bytes: u64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) oldest_used_unix_ms: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) newest_used_unix_ms: Option<u64>,
+}
+
+/// Exclusive authority over one shared CAS lifecycle mutation or snapshot.
+struct LocalCasLifecycleLock {
+  _file: File,
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+  Shared,
+  Exclusive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,10 +259,15 @@ struct ActionResultObject {
   action_key: String,
   lookup_key: String,
   result_digest: String,
-  output_manifest: String,
-  output_tree: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  output_manifest: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  output_tree: Option<String>,
   validation: String,
-  compiler_units: usize,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  compiler_units: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  compiler_evidence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +284,15 @@ struct ActionPin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeCandidateIndexEntry {
+  version: u32,
+  action_key: String,
+  candidate_key: String,
+}
+
+/// Disposable discovery pointer for one compiler-evidence configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceCandidateIndexEntry {
   version: u32,
   action_key: String,
   candidate_key: String,
@@ -321,6 +387,16 @@ struct BundlePublication<'a> {
   prepared: &'a PreparedTree,
 }
 
+struct CompilerEvidencePublication<'a> {
+  action_result: &'a str,
+  object: &'a ActionResultObject,
+  object_bytes: &'a [u8],
+  validation: &'a CompilerEvidenceValidation,
+  validation_bytes: &'a [u8],
+  evidence: &'a CompilerEvidenceObject,
+  evidence_bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, Serialize)]
 #[serde(untagged)]
 enum StoredValidationRef<'a> {
@@ -388,8 +464,24 @@ enum BuildNode {
 }
 
 impl LocalCas {
+  #[cfg(test)]
   pub(crate) fn root(&self) -> &Path {
     &self.root
+  }
+
+  fn lock(&self) -> RailResult<LocalCasLifecycleLock> {
+    lock_local_cas(&self.lifecycle_lock, false, LockMode::Exclusive)?
+      .ok_or_else(|| RailError::message("local CAS lifecycle lock disappeared"))
+  }
+
+  fn read_lock(&self) -> RailResult<LocalCasLifecycleLock> {
+    lock_local_cas(&self.lifecycle_lock, false, LockMode::Shared)?
+      .ok_or_else(|| RailError::message("local CAS lifecycle lock disappeared"))
+  }
+
+  #[cfg(test)]
+  pub(crate) fn status(&self) -> RailResult<LocalCasStatus> {
+    status_at_with_max(&self.root, self.max_bytes)?.ok_or_else(|| RailError::message("local CAS disappeared"))
   }
 
   /// Return the private candidate location for one verified sysroot identity memo.
@@ -417,17 +509,28 @@ impl LocalCas {
     })?;
     validate_real_directory(&base, "local cache base")?;
     let cargo_rail = create_real_directory(&base, "cargo-rail")?;
+    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+      .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
     let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
     ensure_owner_marker(&root)?;
     create_real_directory(&root, "staging")?;
-    for name in ["results", "pins", "leases", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
+    for name in [
+      "results",
+      "pins",
+      "leases",
+      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
+    ] {
       create_real_directory(&root, name)?;
     }
     #[cfg(target_os = "macos")]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
+    clear_staging(&root.join("staging"))?;
     let cas = Self {
       root,
+      lifecycle_lock,
       max_bytes: cache_max_bytes()?,
     };
     cas.ensure_native_candidate_index()?;
@@ -435,19 +538,34 @@ impl LocalCas {
   }
 
   #[cfg(test)]
-  fn open_at(base: &Path, max_bytes: u64) -> RailResult<Self> {
+  pub(crate) fn open_at(base: &Path, max_bytes: u64) -> RailResult<Self> {
     fs::create_dir_all(base)?;
     let base = fs::canonicalize(base)?;
     let cargo_rail = create_real_directory(&base, "cargo-rail")?;
+    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+      .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
     let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
     ensure_owner_marker(&root)?;
     create_real_directory(&root, "staging")?;
-    for name in ["results", "pins", "leases", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
+    for name in [
+      "results",
+      "pins",
+      "leases",
+      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
+    ] {
       create_real_directory(&root, name)?;
     }
     #[cfg(target_os = "macos")]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
-    let cas = Self { root, max_bytes };
+    validate_root_entries(&root)?;
+    clear_staging(&root.join("staging"))?;
+    let cas = Self {
+      root,
+      lifecycle_lock,
+      max_bytes,
+    };
     cas.ensure_native_candidate_index()?;
     Ok(cas)
   }
@@ -549,7 +667,7 @@ impl LocalCas {
         action_result: hit.action_result,
         result_digest: hit.object.result_digest,
         output_manifest: hit.manifest,
-        compiler_units: hit.object.compiler_units,
+        compiler_units: hit.object.compiler_units.unwrap_or_default(),
         objects_verified: stats.objects,
         bytes_read: stats.bytes,
         bytes_restored: stats.restored,
@@ -595,6 +713,7 @@ impl LocalCas {
 
   #[cfg(target_os = "macos")]
   pub(super) fn candidates(&self, lookup_key: &str) -> RailResult<Vec<CacheCandidate>> {
+    let _lock = self.read_lock()?;
     validate_lookup_key(lookup_key)?;
     let pins_directory = self.root.join("pins");
     let mut entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
@@ -660,6 +779,7 @@ impl LocalCas {
 
   #[cfg(any(unix, windows, test))]
   pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<Vec<NativeCacheCandidate>> {
+    let _lock = self.read_lock()?;
     let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
     let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
     let mut entries = match fs::read_dir(&directory) {
@@ -764,6 +884,96 @@ impl LocalCas {
     Ok(candidates)
   }
 
+  /// Load fully verified compiler evidence discovered by one non-authoritative configuration key.
+  pub(crate) fn compiler_evidence_candidates(&self, candidate_key: &str) -> RailResult<Vec<CompilerEvidenceCandidate>> {
+    let _lock = self.read_lock()?;
+    let candidate_hex = validated_id_hex(candidate_key, EVIDENCE_CANDIDATE_KEY_PREFIX)?;
+    let directory = self.root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
+    let mut entries = match fs::read_dir(&directory) {
+      Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+      Err(error) => return Err(error.into()),
+    };
+    validate_real_directory(&directory, "local CAS compiler-evidence candidate")?;
+    entries.sort_by_key(|entry| entry.file_name());
+    if entries.len() > MAX_CANDIDATE_PINS {
+      return Err(RailError::message(format!(
+        "local CAS compiler-evidence candidate has more than {MAX_CANDIDATE_PINS} actions; refusing an unbounded lookup"
+      )));
+    }
+
+    let mut candidates = Vec::with_capacity(entries.len());
+    for entry in entries {
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)?;
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+        return Err(RailError::message(format!(
+          "local CAS compiler-evidence candidate entry '{}' is not a bounded regular file",
+          path.display()
+        )));
+      }
+      let file_name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| RailError::message("local CAS compiler-evidence candidate entry has a non-UTF-8 name"))?;
+      let action_hex = file_name.strip_suffix(".json").ok_or_else(|| {
+        RailError::message(format!(
+          "local CAS compiler-evidence candidate entry '{file_name}' has an invalid name"
+        ))
+      })?;
+      let mut stats = ReadStats::default();
+      let indexed: EvidenceCandidateIndexEntry =
+        read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      if indexed.version != EVIDENCE_CANDIDATE_INDEX_VERSION
+        || indexed.candidate_key != candidate_key
+        || validated_id_hex(&indexed.action_key, EVIDENCE_ACTION_KEY_PREFIX)? != action_hex
+      {
+        return Err(RailError::message(
+          "local CAS compiler-evidence candidate entry does not match its directory and action key",
+        ));
+      }
+
+      let pin_path = self.root.join("pins").join(&file_name);
+      let pin_metadata = match fs::symlink_metadata(&pin_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(error) => return Err(error.into()),
+      };
+      if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
+        return Err(RailError::message(format!(
+          "local CAS compiler-evidence pin '{}' is not a bounded regular file",
+          pin_path.display()
+        )));
+      }
+      let pin: ActionPin =
+        read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+      if pin.version != CAS_VERSION
+        || pin.action_key != indexed.action_key
+        || pin.lookup_key != candidate_key
+        || validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX).is_err()
+      {
+        return Err(RailError::message(
+          "local CAS compiler-evidence pin does not match its discovery entry",
+        ));
+      }
+      let verified = self
+        .load_verified_compiler_evidence(&pin.action_key, &pin.action_result, &mut stats)
+        .map_err(fault_to_error)?;
+      if verified.validation.candidate_key() != candidate_key {
+        return Err(RailError::message(
+          "local CAS compiler-evidence result does not match its discovery key",
+        ));
+      }
+      candidates.push(CompilerEvidenceCandidate {
+        validation: verified.validation,
+        evidence: verified.evidence,
+        created_unix_nanos: pin.created_unix_nanos,
+      });
+    }
+    candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.created_unix_nanos));
+    Ok(candidates)
+  }
+
   pub(super) fn store(&self, request: StoreRequest<'_>) -> RailResult<StoreStats> {
     let StoreRequest {
       action_key,
@@ -822,7 +1032,85 @@ impl LocalCas {
     })
   }
 
+  /// Publish one deterministic compiler-evidence object through the shared local lifecycle.
+  pub(crate) fn store_compiler_evidence(&self, request: CompilerEvidenceStoreRequest<'_>) -> RailResult<StoreStats> {
+    let _lock = self.lock()?;
+    let CompilerEvidenceStoreRequest { validation, evidence } = request;
+    validation.validate_object()?;
+    validate_evidence_action_key(validation.action_key())?;
+    validate_evidence_candidate_key(validation.candidate_key())?;
+    let evidence_id = evidence.identity()?;
+    validate_evidence_object(&evidence_id)?;
+    let result_digest = validation.result_digest(&evidence_id);
+    let validation_bytes = canonical_json(validation)?;
+    let validation_id = validation_id(&validation_bytes);
+    let evidence_bytes = canonical_json(evidence)?;
+    if evidence_bytes.len() as u64 > MAX_OBJECT_METADATA_BYTES {
+      return Err(RailError::message(
+        "compiler evidence exceeds the local CAS metadata-object bound",
+      ));
+    }
+    let object = ActionResultObject {
+      version: CAS_VERSION,
+      action_key: validation.action_key().to_string(),
+      lookup_key: validation.candidate_key().to_string(),
+      result_digest,
+      output_manifest: None,
+      output_tree: None,
+      validation: validation_id,
+      compiler_units: None,
+      compiler_evidence: Some(evidence_id),
+    };
+    let object_bytes = canonical_json(&object)?;
+    let action_result = action_result_id(&object)?;
+    let result_hex = validated_id_hex(&action_result, ACTION_RESULT_PREFIX)?;
+    let destination = self.root.join("results").join(result_hex);
+    let incoming = match fs::symlink_metadata(&destination) {
+      Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => 0,
+      Ok(_) => {
+        return Err(RailError::message(
+          "local CAS compiler-evidence result path is not a real directory",
+        ));
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => object_bytes
+        .len()
+        .checked_add(validation_bytes.len())
+        .and_then(|bytes| bytes.checked_add(evidence_bytes.len()))
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| RailError::message("local CAS compiler-evidence result size overflow"))?,
+      Err(error) => return Err(error.into()),
+    };
+    if incoming > MAX_RESULT_BYTES || incoming > self.max_bytes {
+      return Err(RailError::message(format!(
+        "verified compiler evidence is {incoming} bytes, above the local CAS limit"
+      )));
+    }
+    let reserve =
+      compiler_evidence_publication_reserve(validation.action_key(), validation.candidate_key(), &action_result)?;
+    let admitted = incoming
+      .checked_add(reserve)
+      .ok_or_else(|| RailError::message("local CAS compiler-evidence publication size overflow"))?;
+    self.ensure_capacity(admitted, Some(&action_result))?;
+    let lease = self.create_lease(&action_result)?;
+    let mut stats = self.publish_compiler_evidence_bundle(CompilerEvidencePublication {
+      action_result: &action_result,
+      object: &object,
+      object_bytes: &object_bytes,
+      validation,
+      validation_bytes: &validation_bytes,
+      evidence,
+      evidence_bytes: &evidence_bytes,
+    })?;
+    self.publish_pin(validation.action_key(), validation.candidate_key(), &action_result)?;
+    self.publish_compiler_evidence_candidate_index(validation.action_key(), validation.candidate_key())?;
+    drop(lease);
+    self.ensure_capacity(0, None)?;
+    stats.action_result = Some(action_result);
+    Ok(stats)
+  }
+
   fn store_validated(&self, request: ValidatedStoreRequest<'_>) -> RailResult<StoreStats> {
+    let _lock = self.lock()?;
     let ValidatedStoreRequest {
       action_key,
       lookup_key,
@@ -844,10 +1132,11 @@ impl LocalCas {
       action_key: action_key.to_string(),
       lookup_key: lookup_key.to_string(),
       result_digest: result_digest.to_string(),
-      output_manifest: manifest_id,
-      output_tree: prepared.root.clone(),
+      output_manifest: Some(manifest_id),
+      output_tree: Some(prepared.root.clone()),
       validation: validation_id,
-      compiler_units,
+      compiler_units: Some(compiler_units),
+      compiler_evidence: None,
     };
     let object_bytes = canonical_json(&object)?;
     let action_result = action_result_id(&object)?;
@@ -872,10 +1161,14 @@ impl LocalCas {
         "verified action result is {incoming} bytes, above the local CAS limit"
       )));
     }
+    let reserve = action_publication_reserve(action_key, lookup_key, &action_result, validation)?;
+    let admitted = incoming
+      .checked_add(reserve)
+      .ok_or_else(|| RailError::message("local CAS action publication size overflow"))?;
     self
-      .ensure_capacity(incoming, Some(&action_result))
+      .ensure_capacity(admitted, Some(&action_result))
       .map_err(|error| RailError::message(format!("local CAS pre-publication capacity check failed: {error}")))?;
-    let _lease = self
+    let lease = self
       .create_lease(&action_result)
       .map_err(|error| RailError::message(format!("local CAS lease creation failed: {error}")))?;
     let mut stats = self
@@ -890,16 +1183,17 @@ impl LocalCas {
         prepared: &prepared,
       })
       .map_err(|error| RailError::message(format!("local CAS bundle publication failed: {error}")))?;
+    self
+      .publish_pin(action_key, lookup_key, &action_result)
+      .map_err(|error| RailError::message(format!("local CAS pin publication failed: {error}")))?;
     if let StoredValidationRef::NativeCompiler(validation) = validation {
       self
         .publish_native_candidate_index(action_key, validation.candidate_key())
         .map_err(|error| RailError::message(format!("local CAS native candidate publication failed: {error}")))?;
     }
+    drop(lease);
     self
-      .publish_pin(action_key, lookup_key, &action_result)
-      .map_err(|error| RailError::message(format!("local CAS pin publication failed: {error}")))?;
-    self
-      .ensure_capacity(0, Some(&action_result))
+      .ensure_capacity(0, None)
       .map_err(|error| RailError::message(format!("local CAS post-publication capacity check failed: {error}")))?;
     stats.action_result = Some(action_result);
     Ok(stats)
@@ -912,6 +1206,9 @@ impl LocalCas {
     destination: &Path,
     stats: &mut ReadStats,
   ) -> Result<VerifiedResult, Fault> {
+    let _lock = self
+      .read_lock()
+      .map_err(|error| Fault::corrupt(format!("lifecycle_lock_unavailable: {error}")))?;
     let key_hex = validated_action_key_hex(action_key).map_err(|error| Fault::corrupt(error.to_string()))?;
     let pin_path = self.root.join("pins").join(format!("{key_hex}.json"));
     let pin_metadata = match fs::symlink_metadata(&pin_path) {
@@ -942,6 +1239,11 @@ impl LocalCas {
       return Err(Fault::corrupt("pin_lookup_binding_mismatch"));
     }
     self.materialize(&verified, destination, stats)?;
+    let _ = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&pin_path)
+      .and_then(|file| file.set_modified(SystemTime::now()));
     Ok(verified)
   }
 }
@@ -961,6 +1263,11 @@ struct VerifiedResult {
   bundle: PathBuf,
 }
 
+struct VerifiedCompilerEvidence {
+  validation: CompilerEvidenceValidation,
+  evidence: CompilerEvidenceObject,
+}
+
 fn cache_base() -> RailResult<PathBuf> {
   if let Some(base) = std::env::var_os(CACHE_BASE_ENV) {
     if base.is_empty() {
@@ -977,6 +1284,29 @@ fn cache_base() -> RailResult<PathBuf> {
     .filter(|home| !home.is_empty())
     .ok_or_else(|| RailError::message("local CAS needs CARGO_RAIL_CACHE_DIR, CARGO_HOME, or HOME"))?;
   Ok(PathBuf::from(home).join(".cargo"))
+}
+
+/// Resolve the selected user-wide CAS without creating cache state.
+pub(super) fn configured_root() -> RailResult<Option<PathBuf>> {
+  let base = cache_base()?;
+  let base = match fs::canonicalize(&base) {
+    Ok(base) => base,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  };
+  validate_real_directory(&base, "local cache base")?;
+  let owner = base.join("cargo-rail");
+  match fs::symlink_metadata(&owner) {
+    Ok(_) => validate_real_directory(&owner, "local CAS owner")?,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  }
+  let root = fs::canonicalize(owner)?.join("local-cas-v1");
+  match fs::symlink_metadata(&root) {
+    Ok(_) => Ok(Some(root)),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(error) => Err(error.into()),
+  }
 }
 
 fn cache_max_bytes() -> RailResult<u64> {
@@ -1038,6 +1368,14 @@ fn validate_real_directory(path: &Path, description: &str) -> RailResult<()> {
   }
 }
 
+fn validate_optional_real_directory(path: &Path, description: &str) -> RailResult<()> {
+  match fs::symlink_metadata(path) {
+    Ok(_) => validate_real_directory(path, description),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error.into()),
+  }
+}
+
 fn ensure_owner_marker(root: &Path) -> RailResult<()> {
   let marker = root.join("OWNER");
   match fs::symlink_metadata(&marker) {
@@ -1086,6 +1424,7 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
 fn validate_root_entries(root: &Path) -> RailResult<()> {
   let allowed = BTreeSet::from([
     "OWNER",
+    EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
     "leases",
     NATIVE_CANDIDATE_INDEX_DIRECTORY,
     "pins",
@@ -1125,6 +1464,8 @@ fn validate_lookup_key(lookup_key: &str) -> RailResult<()> {
 fn validated_action_key_hex(action_key: &str) -> RailResult<&str> {
   if action_key.starts_with(ACTION_KEY_PREFIX) {
     validated_id_hex(action_key, ACTION_KEY_PREFIX)
+  } else if action_key.starts_with(EVIDENCE_ACTION_KEY_PREFIX) {
+    validated_id_hex(action_key, EVIDENCE_ACTION_KEY_PREFIX)
   } else {
     validated_id_hex(action_key, crate::compiler::native_cache::ACTION_KEY_PREFIX)
   }
@@ -1133,6 +1474,8 @@ fn validated_action_key_hex(action_key: &str) -> RailResult<&str> {
 fn validate_any_lookup_key(lookup_key: &str) -> RailResult<()> {
   if lookup_key.starts_with(LOOKUP_PREFIX) {
     validate_lookup_key(lookup_key)
+  } else if lookup_key.starts_with(EVIDENCE_CANDIDATE_KEY_PREFIX) {
+    validate_evidence_candidate_key(lookup_key)
   } else {
     crate::compiler::native_cache::validate_candidate_key(lookup_key)
   }
@@ -1224,23 +1567,73 @@ fn tree_id(tree: &TreeObject) -> RailResult<String> {
 
 fn action_result_id(object: &ActionResultObject) -> RailResult<String> {
   let version = object.version.to_le_bytes();
-  let compiler_units = (object.compiler_units as u64).to_le_bytes();
-  Ok(format!(
-    "{ACTION_RESULT_PREFIX}{}",
-    framed_identity(
-      b"cargo-rail-cas-action-result\0",
-      &[
-        (b"version", &version),
-        (b"action-key", object.action_key.as_bytes()),
-        (b"lookup-key", object.lookup_key.as_bytes()),
-        (b"result-digest", object.result_digest.as_bytes()),
-        (b"output-manifest", object.output_manifest.as_bytes()),
-        (b"output-tree", object.output_tree.as_bytes()),
-        (b"validation", object.validation.as_bytes()),
-        (b"compiler-units", &compiler_units),
-      ],
-    )
-  ))
+  match (
+    object.output_manifest.as_deref(),
+    object.output_tree.as_deref(),
+    object.compiler_units,
+    object.compiler_evidence.as_deref(),
+  ) {
+    (Some(output_manifest), Some(output_tree), Some(compiler_units), None) => {
+      let compiler_units = (compiler_units as u64).to_le_bytes();
+      Ok(format!(
+        "{ACTION_RESULT_PREFIX}{}",
+        framed_identity(
+          b"cargo-rail-cas-action-result\0",
+          &[
+            (b"version", &version),
+            (b"action-key", object.action_key.as_bytes()),
+            (b"lookup-key", object.lookup_key.as_bytes()),
+            (b"result-digest", object.result_digest.as_bytes()),
+            (b"output-manifest", output_manifest.as_bytes()),
+            (b"output-tree", output_tree.as_bytes()),
+            (b"validation", object.validation.as_bytes()),
+            (b"compiler-units", &compiler_units),
+          ],
+        )
+      ))
+    }
+    (None, None, None, Some(evidence)) => Ok(format!(
+      "{ACTION_RESULT_PREFIX}{}",
+      framed_identity(
+        b"cargo-rail-cas-compiler-evidence-result\0",
+        &[
+          (b"version", &version),
+          (b"action-key", object.action_key.as_bytes()),
+          (b"lookup-key", object.lookup_key.as_bytes()),
+          (b"result-digest", object.result_digest.as_bytes()),
+          (b"validation", object.validation.as_bytes()),
+          (b"compiler-evidence", evidence.as_bytes()),
+        ],
+      )
+    )),
+    _ => Err(RailError::message(
+      "local CAS action result contains an invalid typed payload",
+    )),
+  }
+}
+
+fn output_result_payload(object: &ActionResultObject) -> Result<(&str, &str, usize), Fault> {
+  match (
+    object.output_manifest.as_deref(),
+    object.output_tree.as_deref(),
+    object.compiler_units,
+    object.compiler_evidence.as_deref(),
+  ) {
+    (Some(manifest), Some(tree), Some(compiler_units), None) => Ok((manifest, tree, compiler_units)),
+    _ => Err(Fault::corrupt("action_result_output_payload_shape")),
+  }
+}
+
+fn compiler_evidence_payload(object: &ActionResultObject) -> Result<&str, Fault> {
+  match (
+    object.output_manifest.as_deref(),
+    object.output_tree.as_deref(),
+    object.compiler_units,
+    object.compiler_evidence.as_deref(),
+  ) {
+    (None, None, None, Some(evidence)) => Ok(evidence),
+    _ => Err(Fault::corrupt("action_result_compiler_evidence_payload_shape")),
+  }
 }
 
 fn validation_id(bytes: &[u8]) -> String {
@@ -1659,6 +2052,64 @@ fn estimate_result_bytes(
     .ok_or_else(|| RailError::message("local CAS result size overflow"))
 }
 
+fn action_publication_reserve(
+  action_key: &str,
+  lookup_key: &str,
+  action_result: &str,
+  validation: StoredValidationRef<'_>,
+) -> RailResult<u64> {
+  let index_bytes = match validation {
+    StoredValidationRef::Hermetic(_) => 0,
+    StoredValidationRef::NativeCompiler(_) => canonical_json(&NativeCandidateIndexEntry {
+      version: NATIVE_CANDIDATE_INDEX_VERSION,
+      action_key: action_key.to_string(),
+      candidate_key: lookup_key.to_string(),
+    })?
+    .len(),
+  };
+  publication_metadata_reserve(action_key, lookup_key, action_result, index_bytes)
+}
+
+fn compiler_evidence_publication_reserve(
+  action_key: &str,
+  candidate_key: &str,
+  action_result: &str,
+) -> RailResult<u64> {
+  let index_bytes = canonical_json(&EvidenceCandidateIndexEntry {
+    version: EVIDENCE_CANDIDATE_INDEX_VERSION,
+    action_key: action_key.to_string(),
+    candidate_key: candidate_key.to_string(),
+  })?
+  .len();
+  publication_metadata_reserve(action_key, candidate_key, action_result, index_bytes)
+}
+
+fn publication_metadata_reserve(
+  action_key: &str,
+  lookup_key: &str,
+  action_result: &str,
+  index_bytes: usize,
+) -> RailResult<u64> {
+  let pin = canonical_json(&ActionPin {
+    version: CAS_VERSION,
+    action_key: action_key.to_string(),
+    action_result: action_result.to_string(),
+    lookup_key: lookup_key.to_string(),
+    created_unix_nanos: u128::MAX,
+  })?;
+  let lease = canonical_json(&LeaseRecord {
+    version: CAS_VERSION,
+    action_result: action_result.to_string(),
+    created_unix_seconds: u64::MAX,
+  })?;
+  pin
+    .len()
+    .checked_add(lease.len())
+    .and_then(|bytes| bytes.checked_add(index_bytes))
+    .map(|bytes| bytes as u64)
+    .ok_or_else(|| RailError::message("local CAS publication metadata size overflow"))
+}
+
 impl LocalCas {
   fn load_verified_result(
     &self,
@@ -1687,21 +2138,22 @@ impl LocalCas {
     {
       return Err(Fault::corrupt("action_result_digest_mismatch"));
     }
-    validated_id_hex(&object.output_manifest, MANIFEST_PREFIX)
+    let (output_manifest, output_tree, _) = output_result_payload(&object)?;
+    validated_id_hex(output_manifest, MANIFEST_PREFIX)
       .map_err(|_| Fault::corrupt("action_result_manifest_identity"))?;
-    validated_id_hex(&object.output_tree, TREE_PREFIX).map_err(|_| Fault::corrupt("action_result_tree_identity"))?;
+    validated_id_hex(output_tree, TREE_PREFIX).map_err(|_| Fault::corrupt("action_result_tree_identity"))?;
     let validation_hex = validated_id_hex(&object.validation, VALIDATION_PREFIX)
       .map_err(|_| Fault::corrupt("action_result_validation_identity"))?;
 
     let manifest_path = bundle.join("manifests").join(format!(
       "{}.json",
-      validated_id_hex(&object.output_manifest, MANIFEST_PREFIX)
+      validated_id_hex(output_manifest, MANIFEST_PREFIX)
         .map_err(|_| { Fault::corrupt("action_result_manifest_identity") })?
     ));
     let manifest: OutputManifest = read_canonical_json(&manifest_path, MAX_OBJECT_METADATA_BYTES, stats)?;
     stats.objects = stats.objects.saturating_add(1);
     validate_manifest(&manifest)?;
-    if manifest.digest != object.output_manifest {
+    if manifest.digest != output_manifest {
       return Err(Fault::corrupt("action_result_manifest_mismatch"));
     }
     let validation_path = bundle.join("validations").join(format!("{validation_hex}.json"));
@@ -1718,8 +2170,9 @@ impl LocalCas {
     validation
       .validate_object()
       .map_err(|error| Fault::corrupt(format!("validation_object: {error}")))?;
-    if let StoredValidation::NativeCompiler(validation) = &validation {
-      validate_native_output_manifest(&manifest, validation)?;
+    match &validation {
+      StoredValidation::NativeCompiler(validation) => validate_native_output_manifest(&manifest, validation)?,
+      StoredValidation::Hermetic(_) => {}
     }
     if validation.result_digest(manifest.digest()) != object.result_digest {
       return Err(Fault::corrupt("action_result_result_digest_mismatch"));
@@ -1730,7 +2183,7 @@ impl LocalCas {
     let mut tree_entries = 0usize;
     load_tree_recursive(
       &bundle,
-      &object.output_tree,
+      output_tree,
       0,
       &mut tree_entries,
       &mut loading,
@@ -1739,7 +2192,7 @@ impl LocalCas {
     )?;
     let mut flattened = BTreeMap::new();
     let mut blobs = BTreeSet::new();
-    flatten_tree(&object.output_tree, "", &trees, &mut flattened, &mut blobs, 0)?;
+    flatten_tree(output_tree, "", &trees, &mut flattened, &mut blobs, 0)?;
     let flattened = flattened
       .into_iter()
       .map(|(path, kind)| OutputEntry { path, kind })
@@ -1756,7 +2209,7 @@ impl LocalCas {
     validate_object_directory(&bundle.join("blobs"), &blobs, BLOB_PREFIX, "blob")?;
     validate_object_directory(
       &bundle.join("manifests"),
-      &BTreeSet::from([object.output_manifest.clone()]),
+      &BTreeSet::from([output_manifest.to_string()]),
       MANIFEST_PREFIX,
       "json",
     )?;
@@ -1796,8 +2249,93 @@ impl LocalCas {
     })
   }
 
+  fn load_verified_compiler_evidence(
+    &self,
+    action_key: &str,
+    action_result: &str,
+    stats: &mut ReadStats,
+  ) -> Result<VerifiedCompilerEvidence, Fault> {
+    validate_evidence_action_key(action_key).map_err(|_| Fault::corrupt("compiler_evidence_action_identity"))?;
+    let result_hex = validated_id_hex(action_result, ACTION_RESULT_PREFIX)
+      .map_err(|_| Fault::corrupt("action_result_identity_encoding"))?;
+    let bundle = self.root.join("results").join(result_hex);
+    validate_bundle_directory(&bundle)?;
+    validate_compiler_evidence_bundle_root_entries(&bundle)?;
+
+    let object: ActionResultObject =
+      read_canonical_json(&bundle.join("action-result.json"), MAX_OBJECT_METADATA_BYTES, stats)?;
+    stats.objects = stats.objects.saturating_add(1);
+    if object.version != CAS_VERSION {
+      return Err(Fault::incompatible("action_result_schema_version"));
+    }
+    if object.action_key != action_key {
+      return Err(Fault::corrupt("action_result_action_key_mismatch"));
+    }
+    if action_result_id(&object).map_err(|error| Fault::corrupt(format!("action_result_identity: {error}")))?
+      != action_result
+    {
+      return Err(Fault::corrupt("action_result_digest_mismatch"));
+    }
+    validate_evidence_candidate_key(&object.lookup_key)
+      .map_err(|_| Fault::corrupt("compiler_evidence_candidate_identity"))?;
+    let evidence_id = compiler_evidence_payload(&object)?;
+    let evidence_hex = validated_id_hex(evidence_id, EVIDENCE_OBJECT_PREFIX)
+      .map_err(|_| Fault::corrupt("compiler_evidence_object_identity"))?;
+    let validation_hex = validated_id_hex(&object.validation, VALIDATION_PREFIX)
+      .map_err(|_| Fault::corrupt("action_result_validation_identity"))?;
+
+    let validation: CompilerEvidenceValidation = read_canonical_json(
+      &bundle.join("validations").join(format!("{validation_hex}.json")),
+      MAX_OBJECT_METADATA_BYTES,
+      stats,
+    )?;
+    stats.objects = stats.objects.saturating_add(1);
+    let validation_bytes =
+      canonical_json(&validation).map_err(|error| Fault::corrupt(format!("validation_encoding: {error}")))?;
+    if validation_id(&validation_bytes) != object.validation
+      || validation.action_key() != object.action_key
+      || validation.candidate_key() != object.lookup_key
+    {
+      return Err(Fault::corrupt("compiler_evidence_validation_binding_mismatch"));
+    }
+    validation
+      .validate_object()
+      .map_err(|error| Fault::corrupt(format!("compiler_evidence_validation: {error}")))?;
+
+    let evidence: CompilerEvidenceObject = read_canonical_json(
+      &bundle.join("evidence").join(format!("{evidence_hex}.json")),
+      MAX_OBJECT_METADATA_BYTES,
+      stats,
+    )?;
+    stats.objects = stats.objects.saturating_add(1);
+    if evidence
+      .identity()
+      .map_err(|error| Fault::corrupt(format!("compiler_evidence_identity: {error}")))?
+      != evidence_id
+    {
+      return Err(Fault::corrupt("compiler_evidence_digest_mismatch"));
+    }
+    if validation.result_digest(evidence_id) != object.result_digest {
+      return Err(Fault::corrupt("compiler_evidence_result_digest_mismatch"));
+    }
+    validate_object_directory(
+      &bundle.join("validations"),
+      &BTreeSet::from([object.validation.clone()]),
+      VALIDATION_PREFIX,
+      "json",
+    )?;
+    validate_object_directory(
+      &bundle.join("evidence"),
+      &BTreeSet::from([evidence_id.to_string()]),
+      EVIDENCE_OBJECT_PREFIX,
+      "json",
+    )?;
+    Ok(VerifiedCompilerEvidence { validation, evidence })
+  }
+
   #[cfg(any(unix, windows, test))]
   fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
+    let (_, output_tree, _) = output_result_payload(&verified.object)?;
     let parent = destination
       .parent()
       .ok_or_else(|| Fault::corrupt("materialization_root_has_no_parent"))?;
@@ -1824,7 +2362,7 @@ impl LocalCas {
     let durable = matches!(&verified.validation, StoredValidation::Hermetic(_));
     materialize_tree(
       &verified.bundle,
-      &verified.object.output_tree,
+      output_tree,
       &verified.trees,
       &payload,
       stats,
@@ -1931,6 +2469,32 @@ fn validate_bundle_root_entries(bundle: &Path) -> Result<(), Fault> {
     return Err(Fault::corrupt("bundle_entries_mismatch"));
   }
   for directory in ["blobs", "manifests", "trees", "validations"] {
+    validate_real_directory_fault(&bundle.join(directory), "bundle object directory")?;
+  }
+  Ok(())
+}
+
+fn validate_compiler_evidence_bundle_root_entries(bundle: &Path) -> Result<(), Fault> {
+  let expected = ["action-result.json", "evidence", "validations"]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+  let mut actual = BTreeSet::new();
+  for entry in fs::read_dir(bundle).map_err(|error| Fault::corrupt(format!("bundle_read: {error}")))? {
+    let entry = entry.map_err(|error| Fault::corrupt(format!("bundle_entry: {error}")))?;
+    let name = entry
+      .file_name()
+      .into_string()
+      .map_err(|_| Fault::corrupt("bundle_non_utf8_entry"))?;
+    actual.insert(name);
+    if actual.len() > expected.len() {
+      return Err(Fault::corrupt("bundle_entries_mismatch"));
+    }
+  }
+  if actual != expected {
+    return Err(Fault::corrupt("bundle_entries_mismatch"));
+  }
+  for directory in ["evidence", "validations"] {
     validate_real_directory_fault(&bundle.join(directory), "bundle object directory")?;
   }
   Ok(())
@@ -2325,7 +2889,7 @@ impl LocalCas {
       Ok(_) => {
         return Err(RailError::with_help(
           format!("local CAS result '{}' is not a real directory", destination.display()),
-          "run `cargo rail clean --cache`; cargo-rail will not replace a hostile object",
+          "run `cargo rail cache clean --scope local`; cargo-rail will not replace a hostile object",
         ));
       }
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2412,6 +2976,158 @@ impl LocalCas {
     }
   }
 
+  fn publish_compiler_evidence_bundle(&self, publication: CompilerEvidencePublication<'_>) -> RailResult<StoreStats> {
+    let CompilerEvidencePublication {
+      action_result,
+      object,
+      object_bytes,
+      validation,
+      validation_bytes,
+      evidence,
+      evidence_bytes,
+    } = publication;
+    let result_hex = validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
+    let destination = self.root.join("results").join(result_hex);
+    match fs::symlink_metadata(&destination) {
+      Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => {
+        let mut read = ReadStats::default();
+        self
+          .load_verified_compiler_evidence(&object.action_key, action_result, &mut read)
+          .map_err(fault_to_error)?;
+        return Ok(StoreStats::default());
+      }
+      Ok(_) => {
+        return Err(RailError::with_help(
+          format!(
+            "local CAS compiler-evidence result '{}' is not a real directory",
+            destination.display()
+          ),
+          "run `cargo rail cache clean --scope local`; cargo-rail will not replace a hostile object",
+        ));
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error.into()),
+    }
+
+    if validation.action_key() != object.action_key
+      || validation.candidate_key() != object.lookup_key
+      || validation_id(validation_bytes) != object.validation
+      || evidence.identity()? != object.compiler_evidence.as_deref().unwrap_or_default()
+    {
+      return Err(RailError::message(
+        "compiler evidence changed before local CAS publication",
+      ));
+    }
+    let temporary = tempfile::Builder::new()
+      .prefix("compiler-evidence-")
+      .tempdir_in(self.root.join("staging"))?;
+    let payload = temporary.path().join("payload");
+    fs::create_dir(&payload)?;
+    make_directory_private(&payload)?;
+    for name in ["evidence", "validations"] {
+      let directory = payload.join(name);
+      fs::create_dir(&directory)?;
+      make_directory_private(&directory)?;
+    }
+
+    let mut stats = StoreStats::default();
+    write_new_synced(&payload.join("action-result.json"), object_bytes)?;
+    stats.objects_written = 1;
+    stats.bytes_written = object_bytes.len() as u64;
+    #[cfg(test)]
+    pause_test_publication_after_first_object(&payload)?;
+
+    let validation_hex = validated_id_hex(&object.validation, VALIDATION_PREFIX)?;
+    write_new_synced(
+      &payload.join("validations").join(format!("{validation_hex}.json")),
+      validation_bytes,
+    )?;
+    stats.objects_written = stats.objects_written.saturating_add(1);
+    stats.bytes_written = stats.bytes_written.saturating_add(validation_bytes.len() as u64);
+
+    let evidence_identity = evidence.identity()?;
+    let evidence_hex = validated_id_hex(&evidence_identity, EVIDENCE_OBJECT_PREFIX)?;
+    if canonical_json(evidence)? != evidence_bytes {
+      return Err(RailError::message(
+        "compiler evidence encoding changed before local CAS publication",
+      ));
+    }
+    write_new_synced(
+      &payload.join("evidence").join(format!("{evidence_hex}.json")),
+      evidence_bytes,
+    )?;
+    stats.objects_written = stats.objects_written.saturating_add(1);
+    stats.bytes_written = stats.bytes_written.saturating_add(evidence_bytes.len() as u64);
+    sync_directory(&payload.join("evidence"))?;
+    sync_directory(&payload.join("validations"))?;
+    sync_directory(&payload)?;
+
+    match fs::rename(&payload, &destination) {
+      Ok(()) => {
+        sync_directory(&self.root.join("results"))?;
+        crate::instrumentation::record_cas_write(stats.bytes_written, stats.objects_written);
+        Ok(stats)
+      }
+      Err(_)
+        if fs::symlink_metadata(&destination)
+          .is_ok_and(|metadata| metadata.is_dir() && !is_link_or_reparse(&metadata)) =>
+      {
+        let mut read = ReadStats::default();
+        self
+          .load_verified_compiler_evidence(&object.action_key, action_result, &mut read)
+          .map_err(fault_to_error)?;
+        Ok(StoreStats::default())
+      }
+      Err(error) => Err(RailError::message(format!(
+        "failed to atomically publish local CAS compiler evidence '{}': {error}",
+        destination.display()
+      ))),
+    }
+  }
+
+  fn publish_compiler_evidence_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<()> {
+    validate_evidence_action_key(action_key)?;
+    let candidate_hex = validated_id_hex(candidate_key, EVIDENCE_CANDIDATE_KEY_PREFIX)?;
+    let action_hex = validated_id_hex(action_key, EVIDENCE_ACTION_KEY_PREFIX)?;
+    let index_root = self.root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY);
+    let directory = create_real_directory(&index_root, candidate_hex)?;
+    let indexed = EvidenceCandidateIndexEntry {
+      version: EVIDENCE_CANDIDATE_INDEX_VERSION,
+      action_key: action_key.to_string(),
+      candidate_key: candidate_key.to_string(),
+    };
+    let bytes = canonical_json(&indexed)?;
+    let destination = directory.join(format!("{action_hex}.json"));
+    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&destination) {
+      Ok(_) => {
+        sync_directory(&directory)?;
+        sync_directory(&index_root)
+      }
+      Err(_)
+        if fs::symlink_metadata(&destination)
+          .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata) && has_single_link(&metadata)) =>
+      {
+        let mut stats = ReadStats::default();
+        let existing: EvidenceCandidateIndexEntry =
+          read_canonical_json(&destination, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+        if existing != indexed {
+          return Err(RailError::message(
+            "existing local CAS compiler-evidence candidate has a different action binding",
+          ));
+        }
+        Ok(())
+      }
+      Err(error) => Err(RailError::message(format!(
+        "failed to publish local CAS compiler-evidence candidate '{}': {}",
+        destination.display(),
+        error.error
+      ))),
+    }
+  }
+
   fn publish_native_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<()> {
     crate::compiler::native_cache::validate_action_key(action_key)?;
     let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
@@ -2488,6 +3204,39 @@ impl LocalCas {
     Ok(metadata.len())
   }
 
+  fn remove_compiler_evidence_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<u64> {
+    validate_evidence_action_key(action_key)?;
+    let candidate_hex = validated_id_hex(candidate_key, EVIDENCE_CANDIDATE_KEY_PREFIX)?;
+    let action_hex = validated_id_hex(action_key, EVIDENCE_ACTION_KEY_PREFIX)?;
+    let directory = self.root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
+    let path = directory.join(format!("{action_hex}.json"));
+    let metadata = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+      Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS compiler-evidence candidate entry '{}' is not a regular file",
+        path.display()
+      )));
+    }
+    let mut stats = ReadStats::default();
+    let indexed: EvidenceCandidateIndexEntry =
+      read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+    if indexed.version != EVIDENCE_CANDIDATE_INDEX_VERSION
+      || indexed.action_key != action_key
+      || indexed.candidate_key != candidate_key
+    {
+      return Err(RailError::message(
+        "local CAS compiler-evidence candidate entry does not match its authoritative pin",
+      ));
+    }
+    fs::remove_file(&path)?;
+    sync_directory(&directory)?;
+    Ok(metadata.len())
+  }
+
   fn publish_pin(&self, action_key: &str, lookup_key: &str, action_result: &str) -> RailResult<()> {
     let pin = ActionPin {
       version: CAS_VERSION,
@@ -2525,7 +3274,7 @@ impl LocalCas {
         {
           return Err(RailError::with_help(
             format!("action key '{action_key}' produced two different verified results"),
-            "the action is nondeterministic or the cache is corrupt; run `cargo rail clean --cache` before retrying",
+            "the action is nondeterministic or the cache is corrupt; run `cargo rail cache clean --scope local` before retrying",
           ));
         }
         Ok(())
@@ -2576,7 +3325,15 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> RailResult<()> {
 
 #[cfg(test)]
 fn pause_test_publication_after_first_object(_payload: &Path) -> RailResult<()> {
+  const FAIL_ENV: &str = "CARGO_RAIL_TEST_CAS_FAIL_AFTER_FIRST_OBJECT";
   const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_AFTER_FIRST_OBJECT";
+  if std::env::var_os(FAIL_ENV).is_some() {
+    #[cfg(windows)]
+    const OUT_OF_SPACE: i32 = 112;
+    #[cfg(not(windows))]
+    const OUT_OF_SPACE: i32 = 28;
+    return Err(std::io::Error::from_raw_os_error(OUT_OF_SPACE).into());
+  }
   let Some(control) = std::env::var_os(PAUSE_ENV) else {
     return Ok(());
   };
@@ -2666,7 +3423,7 @@ struct GcPin {
   key: String,
   lookup_key: String,
   result: String,
-  created: u128,
+  last_used: u128,
   bytes: u64,
 }
 
@@ -2685,7 +3442,7 @@ impl LocalCas {
           "local CAS needs {incoming} bytes but its {}-byte bound cannot be satisfied",
           self.max_bytes
         ),
-        format!("raise {CACHE_MAX_BYTES_ENV} or run `cargo rail clean --cache`"),
+        format!("raise {CACHE_MAX_BYTES_ENV} or run `cargo rail cache clean --scope local`"),
       ));
     }
     Ok(())
@@ -2764,11 +3521,11 @@ impl LocalCas {
         key: pin.action_key,
         lookup_key: pin.lookup_key,
         result: pin.action_result,
-        created: pin.created_unix_nanos,
+        last_used: last_used_unix_nanos(&metadata, pin.created_unix_nanos),
         bytes: metadata.len(),
       });
     }
-    pins.sort_by(|left, right| (left.created, &left.key).cmp(&(right.created, &right.key)));
+    pins.sort_by(|left, right| (left.last_used, &left.key).cmp(&(right.last_used, &right.key)));
 
     let results_directory = self.root.join("results");
     let mut result_sizes = BTreeMap::<String, u64>::new();
@@ -2823,6 +3580,8 @@ impl LocalCas {
         .starts_with(crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)
       {
         current = current.saturating_sub(self.remove_native_candidate_index(&pin.key, &pin.lookup_key)?);
+      } else if pin.lookup_key.starts_with(EVIDENCE_CANDIDATE_KEY_PREFIX) {
+        current = current.saturating_sub(self.remove_compiler_evidence_candidate_index(&pin.key, &pin.lookup_key)?);
       }
       if let Some(count) = references.get_mut(&pin.result) {
         *count = count.saturating_sub(1);
@@ -2850,9 +3609,22 @@ fn result_path(root: &Path, identity: &str) -> RailResult<PathBuf> {
 }
 
 fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
+  checked_tree_file_stats(root).map(|(_, bytes)| bytes)
+}
+
+fn checked_tree_file_stats(root: &Path) -> RailResult<(u64, u64)> {
+  let mut files = 0u64;
   let mut bytes = 0u64;
+  let mut entries = 0usize;
   let mut pending = vec![root.to_path_buf()];
   while let Some(path) = pending.pop() {
+    entries = entries.saturating_add(1);
+    if entries > MAX_ENTRIES {
+      return Err(RailError::message(format!(
+        "local CAS tree '{}' exceeds its {MAX_ENTRIES}-entry scan bound",
+        root.display()
+      )));
+    }
     let metadata = match fs::symlink_metadata(&path) {
       Ok(metadata) => metadata,
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2861,7 +3633,7 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
     if is_link_or_reparse(&metadata) {
       return Err(RailError::with_help(
         format!("local CAS contains a symlink at '{}'", path.display()),
-        "run `cargo rail clean --cache`; cargo-rail will not follow cache symlinks",
+        "run `cargo rail cache clean --scope local`; cargo-rail will not follow cache symlinks",
       ));
     }
     if metadata.is_dir() {
@@ -2881,6 +3653,7 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
       children.sort_by_key(|entry| entry.file_name());
       pending.extend(children.into_iter().map(|entry| entry.path()));
     } else if metadata.is_file() {
+      files = files.saturating_add(1);
       bytes = bytes
         .checked_add(metadata.len())
         .ok_or_else(|| RailError::message("local CAS size overflow"))?;
@@ -2891,7 +3664,118 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
       )));
     }
   }
-  Ok(bytes)
+  Ok((files, bytes))
+}
+
+fn lifecycle_lock_path(root: &Path) -> RailResult<PathBuf> {
+  let parent = root
+    .parent()
+    .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
+    .ok_or_else(|| RailError::message("local CAS root has no canonical cargo-rail owner directory"))?;
+  Ok(parent.join(LIFECYCLE_LOCK_NAME))
+}
+
+fn lock_local_cas(path: &Path, create: bool, mode: LockMode) -> RailResult<Option<LocalCasLifecycleLock>> {
+  let parent = path
+    .parent()
+    .ok_or_else(|| RailError::message("local CAS lifecycle lock has no parent"))?;
+  validate_real_directory(parent, "local CAS owner")?;
+  let file = match OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(create)
+    .truncate(false)
+    .open(path)
+  {
+    Ok(file) => file,
+    Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  };
+  let opened = file.metadata()?;
+  let named = fs::symlink_metadata(path)?;
+  if !same_lock_file(&opened, &named) {
+    return Err(RailError::with_help(
+      format!(
+        "local CAS lifecycle lock '{}' is not a private regular file",
+        path.display()
+      ),
+      "remove the hostile lock path; cargo-rail will not follow or share cache lock files",
+    ));
+  }
+  match mode {
+    LockMode::Shared => file.lock_shared()?,
+    LockMode::Exclusive => file.lock()?,
+  }
+  let named = fs::symlink_metadata(path)?;
+  if !same_lock_file(&opened, &named) {
+    return Err(RailError::message(format!(
+      "local CAS lifecycle lock '{}' changed while it was acquired",
+      path.display()
+    )));
+  }
+  Ok(Some(LocalCasLifecycleLock { _file: file }))
+}
+
+#[cfg(unix)]
+fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
+  use std::os::unix::fs::MetadataExt as _;
+
+  opened.is_file()
+    && named.is_file()
+    && !is_link_or_reparse(named)
+    && opened.dev() == named.dev()
+    && opened.ino() == named.ino()
+    && opened.nlink() == 1
+    && named.nlink() == 1
+    && opened.len() == 0
+    && named.len() == 0
+}
+
+#[cfg(windows)]
+fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
+  use std::os::windows::fs::MetadataExt as _;
+
+  opened.is_file()
+    && named.is_file()
+    && !is_link_or_reparse(named)
+    && opened.volume_serial_number() == named.volume_serial_number()
+    && opened.file_index() == named.file_index()
+    && opened.number_of_links() == 1
+    && named.number_of_links() == 1
+    && opened.len() == 0
+    && named.len() == 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
+  opened.is_file() && named.is_file() && !is_link_or_reparse(named) && opened.len() == 0 && named.len() == 0
+}
+
+fn bounded_directory_entries(directory: &Path, description: &str) -> RailResult<Vec<fs::DirEntry>> {
+  let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+  if entries.len() > MAX_ENTRIES {
+    return Err(RailError::message(format!(
+      "{description} exceeds its {MAX_ENTRIES}-entry scan bound"
+    )));
+  }
+  entries.sort_by_key(|entry| entry.file_name());
+  Ok(entries)
+}
+
+fn bounded_optional_directory_entries(directory: &Path, description: &str) -> RailResult<Vec<fs::DirEntry>> {
+  match fs::symlink_metadata(directory) {
+    Ok(_) => bounded_directory_entries(directory, description),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn optional_tree_file_stats(root: &Path) -> RailResult<(u64, u64)> {
+  match fs::symlink_metadata(root) {
+    Ok(_) => checked_tree_file_stats(root),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((0, 0)),
+    Err(error) => Err(error.into()),
+  }
 }
 
 fn safe_remove_tree(root: &Path) -> RailResult<()> {
@@ -2902,38 +3786,29 @@ fn safe_remove_tree(root: &Path) -> RailResult<()> {
       root.display()
     )));
   }
-  let mut directories = Vec::new();
-  let mut pending = vec![root.to_path_buf()];
-  while let Some(path) = pending.pop() {
+  // `remove_dir_all` uses the platform's non-following recursive removal. Keep
+  // ownership validation here and leave race-resistant traversal to `std`.
+  fs::remove_dir_all(root).map_err(|error| {
+    RailError::message(format!(
+      "failed to remove local CAS directory '{}': {error}",
+      root.display()
+    ))
+  })
+}
+
+fn clear_staging(staging: &Path) -> RailResult<()> {
+  for entry in bounded_directory_entries(staging, "local CAS staging")? {
+    let path = entry.path();
     let metadata = fs::symlink_metadata(&path)?;
     if metadata.is_dir() && !is_link_or_reparse(&metadata) {
-      directories.push(path.clone());
-      let mut entries = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
-      entries.sort_by_key(|entry| entry.file_name());
-      pending.extend(entries.into_iter().map(|entry| entry.path()));
+      safe_remove_tree(&path)?;
     } else if metadata.is_dir() || is_directory_reparse(&metadata) {
-      fs::remove_dir(&path).map_err(|error| {
-        RailError::message(format!(
-          "failed to remove local CAS reparse directory '{}': {error}",
-          path.display()
-        ))
-      })?;
+      fs::remove_dir(&path)?;
     } else {
-      fs::remove_file(&path).map_err(|error| {
-        RailError::message(format!("failed to remove local CAS file '{}': {error}", path.display()))
-      })?;
+      fs::remove_file(&path)?;
     }
   }
-  directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-  for directory in directories {
-    fs::remove_dir(&directory).map_err(|error| {
-      RailError::message(format!(
-        "failed to remove local CAS directory '{}': {error}",
-        directory.display()
-      ))
-    })?;
-  }
-  Ok(())
+  sync_directory(staging)
 }
 
 pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
@@ -2960,20 +3835,199 @@ pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
   }
   ensure_owner_marker_existing(root)?;
   validate_root_entries(root)?;
-  for name in ["results", "pins", "leases", "staging", NATIVE_CANDIDATE_INDEX_DIRECTORY] {
-    validate_real_directory(&root.join(name), "local CAS domain")?;
+  for name in [
+    "results",
+    "pins",
+    "leases",
+    "staging",
+    NATIVE_CANDIDATE_INDEX_DIRECTORY,
+    EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
+  ] {
+    validate_optional_real_directory(&root.join(name), "local CAS domain")?;
   }
   #[cfg(target_os = "macos")]
-  validate_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
+  validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
   Ok(Some(root.to_path_buf()))
 }
 
-pub(super) fn remove_owned_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
+pub(super) fn status_at(root: &Path) -> RailResult<Option<LocalCasStatus>> {
+  status_at_with_max(root, cache_max_bytes()?)
+}
+
+fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Option<LocalCasStatus>> {
+  let lifecycle_lock = lifecycle_lock_path(root)?;
+  let lock = lock_local_cas(&lifecycle_lock, false, LockMode::Exclusive)?;
+  if lock.is_none() && existing_root_at(root)?.is_some() {
+    return Err(RailError::with_help(
+      "local CAS predates coordinated lifecycle snapshots",
+      "run an ordinary cargo-rail cacheable action once to establish the lifecycle lock",
+    ));
+  }
+  let _lock = lock;
   let Some(root) = existing_root_at(root)? else {
     return Ok(None);
   };
+  let now = unix_seconds();
+  let mut referenced_results = BTreeSet::new();
+  let mut oldest_used = None::<u128>;
+  let mut newest_used = None::<u128>;
+
+  let pin_entries = bounded_optional_directory_entries(&root.join("pins"), "local CAS pins")?;
+  for entry in &pin_entries {
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS pin '{}' is not a bounded regular file",
+        path.display()
+      )));
+    }
+    let mut stats = ReadStats::default();
+    let pin: ActionPin = read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+    if pin.version != CAS_VERSION {
+      return Err(RailError::message("local CAS pin has an incompatible schema"));
+    }
+    validated_action_key_hex(&pin.action_key)?;
+    validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
+    validate_any_lookup_key(&pin.lookup_key)?;
+    referenced_results.insert(pin.action_result);
+    let last_used = last_used_unix_nanos(&metadata, pin.created_unix_nanos);
+    oldest_used = Some(oldest_used.map_or(last_used, |current| current.min(last_used)));
+    newest_used = Some(newest_used.map_or(last_used, |current| current.max(last_used)));
+  }
+
+  let mut active_leases = 0u64;
+  let mut stale_leases = 0u64;
+  let mut reclaimable_bytes = 0u64;
+  for entry in bounded_optional_directory_entries(&root.join("leases"), "local CAS leases")? {
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS lease '{}' is not a bounded regular file",
+        path.display()
+      )));
+    }
+    let mut stats = ReadStats::default();
+    let lease: LeaseRecord =
+      read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+    if lease.version != CAS_VERSION {
+      return Err(RailError::message("local CAS lease has an incompatible schema"));
+    }
+    validated_id_hex(&lease.action_result, ACTION_RESULT_PREFIX)?;
+    if now.saturating_sub(lease.created_unix_seconds) >= STALE_LEASE_SECONDS {
+      stale_leases = stale_leases.saturating_add(1);
+      reclaimable_bytes = reclaimable_bytes.saturating_add(metadata.len());
+    } else {
+      active_leases = active_leases.saturating_add(1);
+      referenced_results.insert(lease.action_result);
+    }
+  }
+
+  let mut results = 0u64;
+  let mut objects = 0u64;
+  for entry in bounded_optional_directory_entries(&root.join("results"), "local CAS results")? {
+    let name = entry
+      .file_name()
+      .into_string()
+      .map_err(|_| RailError::message("local CAS result has a non-UTF-8 name"))?;
+    validated_id_hex(&format!("{ACTION_RESULT_PREFIX}{name}"), ACTION_RESULT_PREFIX)?;
+    validate_real_directory(&entry.path(), "local CAS result")?;
+    let (files, bytes) = checked_tree_file_stats(&entry.path())?;
+    results = results.saturating_add(1);
+    objects = objects.saturating_add(files);
+    if !referenced_results.contains(&format!("{ACTION_RESULT_PREFIX}{name}")) {
+      reclaimable_bytes = reclaimable_bytes.saturating_add(bytes);
+    }
+  }
+
+  let staging = &root.join("staging");
+  let staging_entries = bounded_optional_directory_entries(staging, "local CAS staging")?.len() as u64;
+  let (_, staging_bytes) = optional_tree_file_stats(staging)?;
+  let mut index_files = optional_tree_file_stats(&root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY))?.0;
+  index_files = index_files.saturating_add(optional_tree_file_stats(&root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY))?.0);
+
+  Ok(Some(LocalCasStatus {
+    root: root.to_string_lossy().into_owned(),
+    bytes: checked_tree_bytes(&root)?,
+    max_bytes,
+    results,
+    pins: pin_entries.len() as u64,
+    objects,
+    active_leases,
+    stale_leases,
+    staging_entries,
+    staging_bytes,
+    index_files,
+    reclaimable_bytes,
+    oldest_used_unix_ms: oldest_used.map(|value| u64::try_from(value / 1_000_000).unwrap_or(u64::MAX)),
+    newest_used_unix_ms: newest_used.map(|value| u64::try_from(value / 1_000_000).unwrap_or(u64::MAX)),
+  }))
+}
+
+fn last_used_unix_nanos(metadata: &fs::Metadata, created_unix_nanos: u128) -> u128 {
+  metadata
+    .modified()
+    .ok()
+    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+    .map_or(created_unix_nanos, |duration| duration.as_nanos())
+    .max(created_unix_nanos)
+}
+
+pub(super) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+  let lifecycle_lock = lifecycle_lock_path(root)?;
+  let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+    .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
+  let Some(root) = existing_root_at(root)? else {
+    return Ok(None);
+  };
+  let bytes = removable_tree_bytes(&root)?;
   safe_remove_tree(&root)?;
-  Ok(Some(root))
+  Ok(Some((root, bytes)))
+}
+
+/// Measure an owned tree without following links so cleanup can still recover
+/// a cache containing a hostile nested link.
+fn removable_tree_bytes(root: &Path) -> RailResult<u64> {
+  let mut bytes = 0u64;
+  let mut visited = 0usize;
+  let mut pending = vec![root.to_path_buf()];
+  while let Some(path) = pending.pop() {
+    visited = visited.saturating_add(1);
+    if visited > MAX_ENTRIES {
+      return Err(RailError::message(format!(
+        "local CAS tree '{}' exceeds its {MAX_ENTRIES}-entry cleanup bound",
+        root.display()
+      )));
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+      Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !is_link_or_reparse(&metadata) {
+      let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        Err(error) => return Err(error.into()),
+      };
+      let mut children = Vec::new();
+      for entry in entries {
+        match entry {
+          Ok(entry) => children.push(entry),
+          Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+          Err(error) => return Err(error.into()),
+        }
+      }
+      children.sort_by_key(|entry| entry.file_name());
+      pending.extend(children.into_iter().map(|entry| entry.path()));
+    } else {
+      bytes = bytes
+        .checked_add(metadata.len())
+        .ok_or_else(|| RailError::message("local CAS cleanup byte count overflow"))?;
+    }
+  }
+  Ok(bytes)
 }
 
 fn ensure_owner_marker_existing(root: &Path) -> RailResult<()> {
@@ -3663,7 +4717,7 @@ mod tests {
       canonical_json(&malicious_tree).expect("canonical tree"),
     )
     .expect("malicious tree object");
-    object.output_tree = malicious_tree_id;
+    object.output_tree = Some(malicious_tree_id);
     let forged_result = action_result_id(&object).expect("forged result identity");
     fs::write(
       old_bundle.join("action-result.json"),
@@ -3869,6 +4923,7 @@ mod tests {
     let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
     let cas = LocalCas {
       root: initialized.root.clone(),
+      lifecycle_lock: initialized.lifecycle_lock.clone(),
       max_bytes: 1,
     };
     let key = action_key(16);
@@ -3975,12 +5030,10 @@ mod tests {
     assert_eq!(miss.reason, "action_not_found");
     assert_eq!(fs::read_dir(cas.root.join("pins")).expect("pins").count(), 0);
     assert_eq!(fs::read_dir(cas.root.join("results")).expect("results").count(), 0);
-    assert!(
-      fs::read_dir(cas.root.join("staging"))
-        .expect("staging")
-        .next()
-        .is_some(),
-      "process death should leave the partial staging tree exercised by this test"
+    assert_eq!(
+      fs::read_dir(cas.root.join("staging")).expect("staging").count(),
+      0,
+      "the next coordinated open must reclaim partial publication state"
     );
     remove_owned_root_at(&cas.root).expect("owned cleanup should remove partial staging");
     assert!(!cas.root.exists());
@@ -3999,6 +5052,87 @@ mod tests {
     let manifest = write_fixture(&output, b"partial publication");
     let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("worker CAS should open");
     store_fixture(&cas, &output, &action_key(17), &manifest);
+  }
+
+  #[test]
+  fn out_of_space_during_publication_preserves_prior_authority() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_ENOSPC_CACHE";
+    const OUTPUT_ENV: &str = "CARGO_RAIL_TEST_CAS_ENOSPC_OUTPUT";
+    const FAIL_ENV: &str = "CARGO_RAIL_TEST_CAS_FAIL_AFTER_FIRST_OBJECT";
+
+    let root = tempfile::tempdir().expect("out-of-space root");
+    let cache = root.path().join("cache");
+    let prior_output = root.path().join("prior-output");
+    let failed_output = root.path().join("failed-output");
+    fs::create_dir(&cache).expect("cache base");
+    fs::create_dir(&prior_output).expect("prior output");
+    fs::create_dir(&failed_output).expect("failed output");
+    let prior_manifest = write_fixture(&prior_output, b"prior valid result");
+    let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+    store_fixture(&cas, &prior_output, &action_key(18), &prior_manifest);
+
+    let child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+      .args([
+        "--exact",
+        "hermetic::cas::tests::out_of_space_publication_worker",
+        "--nocapture",
+      ])
+      .env(CACHE_ENV, &cache)
+      .env(OUTPUT_ENV, &failed_output)
+      .env(FAIL_ENV, "1")
+      .output()
+      .expect("out-of-space worker should run");
+    assert!(
+      child.status.success(),
+      "out-of-space worker failed:\nstdout={}\nstderr={}",
+      String::from_utf8_lossy(&child.stdout),
+      String::from_utf8_lossy(&child.stderr)
+    );
+
+    let reopened = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should reopen");
+    let restore = root.path().join("restore");
+    let CacheLookup::Hit(_) = reopened.restore(&action_key(18), &restore) else {
+      panic!("the prior result must survive an out-of-space publication failure");
+    };
+    assert_eq!(
+      fs::read(restore.join("target/deps/artifact.rmeta")).unwrap(),
+      b"prior valid result"
+    );
+    let CacheLookup::Miss(miss) = reopened.restore(&action_key(19), &root.path().join("failed-restore")) else {
+      panic!("the failed publication must not gain authority");
+    };
+    assert_eq!(miss.reason, "action_not_found");
+    assert_eq!(fs::read_dir(reopened.root().join("pins")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(reopened.root().join("results")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(reopened.root().join("staging")).unwrap().count(), 0);
+  }
+
+  #[test]
+  fn out_of_space_publication_worker() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_ENOSPC_CACHE";
+    const OUTPUT_ENV: &str = "CARGO_RAIL_TEST_CAS_ENOSPC_OUTPUT";
+    let (Some(cache), Some(output)) = (std::env::var_os(CACHE_ENV), std::env::var_os(OUTPUT_ENV)) else {
+      return;
+    };
+    let output = PathBuf::from(output);
+    let manifest = write_fixture(&output, b"unpublished result");
+    let cas = LocalCas::open_at(Path::new(&cache), 1024 * 1024).expect("worker CAS should open");
+    let key = action_key(19);
+    let lookup = super::super::test_pre_context_lookup_key();
+    let result = super::super::hermetic_result_digest(&key, manifest.digest());
+    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let error = cas
+      .store(StoreRequest {
+        action_key: &key,
+        lookup_key: &lookup,
+        result_digest: &result,
+        manifest: &manifest,
+        validation: &validation,
+        compiler_units: 1,
+        source_root: &output,
+      })
+      .expect_err("the publication failpoint must surface an out-of-space error");
+    assert!(error.to_string().to_ascii_lowercase().contains("space"), "{error}");
   }
 
   #[test]
@@ -4110,6 +5244,42 @@ mod tests {
   }
 
   #[test]
+  fn stale_leases_lose_authority_during_collection() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let manifest = write_fixture(output.path(), b"stale lease");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let key = action_key(33);
+    let stored = store_fixture(&cas, output.path(), &key, &manifest);
+    let result = stored.action_result.expect("action result");
+    let lease = cas.create_lease(&result).expect("lease");
+    let lease_path = lease.path.clone();
+    std::mem::forget(lease);
+    fs::write(
+      &lease_path,
+      canonical_json(&LeaseRecord {
+        version: CAS_VERSION,
+        action_result: result.clone(),
+        created_unix_seconds: 0,
+      })
+      .expect("stale lease record"),
+    )
+    .expect("age lease");
+    fs::remove_file(
+      cas
+        .root()
+        .join("pins")
+        .join(format!("{}.json", validated_action_key_hex(&key).expect("action key"))),
+    )
+    .expect("remove authoritative pin");
+
+    cas.garbage_collect(0, None).expect("collect stale lease");
+
+    assert!(!lease_path.exists());
+    assert!(!result_path(cas.root(), &result).expect("result path").exists());
+  }
+
+  #[test]
   fn native_gc_removes_discovery_entries_with_authoritative_pins() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
@@ -4134,5 +5304,208 @@ mod tests {
       fs::read_dir(candidate_directory).expect("candidate directory").count(),
       0
     );
+  }
+
+  #[test]
+  fn cleanup_waits_for_an_in_flight_cache_reader() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let root = cas.root.clone();
+    let reader = cas.read_lock().expect("shared lifecycle lock");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+      scope.spawn(move || {
+        let removed = remove_owned_root_at(&root).expect("cleanup should wait, then remove");
+        finished_tx.send(removed).expect("cleanup result");
+      });
+      assert!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+        "cleanup crossed the shared lifecycle boundary"
+      );
+      drop(reader);
+      assert!(
+        finished_rx
+          .recv_timeout(std::time::Duration::from_secs(10))
+          .expect("cleanup should finish")
+          .is_some()
+      );
+    });
+    assert!(!cas.root.exists());
+  }
+
+  #[test]
+  fn cleanup_waits_for_an_in_flight_cache_mutation() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let root = cas.root.clone();
+    let mutation = cas.lock().expect("exclusive lifecycle lock");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    std::thread::scope(|scope| {
+      scope.spawn(move || {
+        let removed = remove_owned_root_at(&root).expect("cleanup should wait, then remove");
+        finished_tx.send(removed).expect("cleanup result");
+      });
+      assert!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+        "cleanup crossed the exclusive lifecycle boundary"
+      );
+      drop(mutation);
+      assert!(
+        finished_rx
+          .recv_timeout(std::time::Duration::from_secs(10))
+          .expect("cleanup should finish")
+          .is_some()
+      );
+    });
+    assert!(!cas.root.exists());
+  }
+
+  #[test]
+  fn status_and_cleanup_accept_owned_pre_index_transition_state() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    fs::remove_dir(cas.root().join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY)).expect("remove transition directory");
+
+    let status = status_at_with_max(cas.root(), 1024 * 1024)
+      .expect("transition status")
+      .expect("present transition root");
+    assert_eq!(status.index_files, 1, "the native READY marker remains");
+
+    let removed = remove_owned_root_at(cas.root()).expect("transition cleanup");
+    assert!(removed.is_some());
+    assert!(!cas.root().exists());
+  }
+
+  #[test]
+  fn garbage_collection_evicts_the_least_recently_used_pin() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let manifest = write_fixture(output.path(), b"payload");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let newer = action_key(21);
+    let older = action_key(22);
+    store_fixture(&cas, output.path(), &newer, &manifest);
+    store_fixture(&cas, output.path(), &older, &manifest);
+
+    let pin = |key: &str| {
+      cas
+        .root
+        .join("pins")
+        .join(format!("{}.json", validated_action_key_hex(key).expect("action key")))
+    };
+    let now = SystemTime::now();
+    OpenOptions::new()
+      .write(true)
+      .open(pin(&older))
+      .expect("older pin")
+      .set_modified(now + std::time::Duration::from_secs(1))
+      .expect("older use time");
+    OpenOptions::new()
+      .write(true)
+      .open(pin(&newer))
+      .expect("newer pin")
+      .set_modified(now + std::time::Duration::from_secs(2))
+      .expect("newer use time");
+
+    let current = checked_tree_bytes(cas.root()).expect("current cache bytes");
+    cas.garbage_collect(current - 1, None).expect("bounded LRU collection");
+
+    assert!(pin(&newer).exists(), "the most recently used result must survive");
+    assert!(!pin(&older).exists(), "the least recently used result must be evicted");
+  }
+
+  #[test]
+  fn publication_metadata_is_admitted_before_any_authoritative_state() {
+    let measurement_cache = tempfile::tempdir().expect("measurement cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let manifest = write_fixture(output.path(), b"bounded payload");
+    let measurement = LocalCas::open_at(measurement_cache.path(), 1024 * 1024).expect("measurement CAS");
+    let stored = store_fixture(&measurement, output.path(), &action_key(31), &manifest);
+    let result = stored.action_result.expect("action result");
+    let result_bytes =
+      checked_tree_bytes(&result_path(measurement.root(), &result).expect("result path")).expect("result bundle bytes");
+
+    let bounded_cache = tempfile::tempdir().expect("bounded cache base");
+    let mut bounded = LocalCas::open_at(bounded_cache.path(), 1024 * 1024).expect("bounded CAS");
+    let baseline = checked_tree_bytes(bounded.root()).expect("baseline bytes");
+    bounded.max_bytes = baseline + result_bytes;
+    let key = action_key(32);
+    let result_digest = super::super::hermetic_result_digest(&key, manifest.digest());
+    let lookup = super::super::test_pre_context_lookup_key();
+    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+
+    let error = bounded
+      .store(StoreRequest {
+        action_key: &key,
+        lookup_key: &lookup,
+        result_digest: &result_digest,
+        manifest: &manifest,
+        validation: &validation,
+        compiler_units: 1,
+        source_root: output.path(),
+      })
+      .expect_err("pin and lease bytes must be admitted with the result bundle");
+
+    assert!(
+      error.to_string().contains("pre-publication capacity check failed"),
+      "{error}"
+    );
+    assert_eq!(fs::read_dir(bounded.root().join("pins")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(bounded.root().join("results")).unwrap().count(), 0);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cache_open_rejects_a_linked_lifecycle_lock() {
+    use std::os::unix::fs::symlink;
+
+    let cache = tempfile::tempdir().expect("cache base");
+    let owner = cache.path().join("cargo-rail");
+    fs::create_dir(&owner).expect("CAS owner");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    fs::write(outside.path(), b"preserve").expect("outside contents");
+    symlink(outside.path(), owner.join(LIFECYCLE_LOCK_NAME)).expect("hostile lock link");
+
+    let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("linked lock must fail");
+
+    assert!(error.to_string().contains("not a private regular file"), "{error}");
+    assert_eq!(fs::read(outside.path()).expect("outside contents"), b"preserve");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cache_open_rejects_a_hard_linked_lifecycle_lock() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let owner = cache.path().join("cargo-rail");
+    fs::create_dir(&owner).expect("CAS owner");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    fs::hard_link(outside.path(), owner.join(LIFECYCLE_LOCK_NAME)).expect("hostile hard-linked lock");
+
+    let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("hard-linked lock must fail");
+
+    assert!(error.to_string().contains("not a private regular file"), "{error}");
+    assert!(outside.path().exists(), "outside lock target must survive");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cache_open_unlinks_hostile_staging_links_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let cache = tempfile::tempdir().expect("cache base");
+    let outside = tempfile::tempdir().expect("outside root");
+    let sentinel = outside.path().join("keep");
+    fs::write(&sentinel, b"outside").expect("outside sentinel");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let hostile = cas.root().join("staging/hostile-link");
+    symlink(outside.path(), &hostile).expect("hostile staging link");
+
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reclaim staging");
+
+    assert!(!hostile.exists(), "hostile staging link must be unlinked");
+    assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
+    assert_eq!(fs::read_dir(reopened.root().join("staging")).unwrap().count(), 0);
   }
 }

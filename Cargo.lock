@@ -184,6 +184,7 @@ dependencies = [
  "petgraph",
  "rayon",
  "rustc-hash",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

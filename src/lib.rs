@@ -10,6 +10,7 @@ pub(crate) mod action_key;
 /// Backup and restore for undo operations.
 pub mod backup;
 pub(crate) mod build_script;
+pub(crate) mod cache;
 /// Cargo workspace metadata and manifest operations.
 pub mod cargo;
 /// Git-based change classification.

@@ -2,11 +2,15 @@
 
 use crate::cargo::manifest_analyzer::DepKind;
 use cargo_metadata::PackageId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 /// Cache format version for compiler diagnostics.
 pub const COMPILER_DIAG_CACHE_VERSION: u32 = 10;
+
+/// Maximum number of entries accepted from one legacy diagnostics cache file.
+pub(crate) const MAX_COMPILER_DIAG_CACHE_ENTRIES: usize = 4096;
 
 /// Collector version used to invalidate stale semantic behavior.
 pub const COLLECTOR_VERSION: u32 = 15;
@@ -447,6 +451,9 @@ fn dependency_state_in_configuration(
 pub struct CompilerDiagKey {
   /// Opaque workspace package identity.
   pub package_id: PackageId,
+  /// Workspace package name used as the root-independent discovery identity.
+  #[serde(default)]
+  pub package_name: String,
   /// Target triple or `default` when no explicit target was used.
   pub target: PlatformTarget,
   /// Cargo feature selection used by the check.
@@ -526,14 +533,53 @@ pub struct CompilerDiagCacheFile {
   /// Cache format version.
   pub version: u32,
   /// Entries keyed by [`CompilerDiagKey::stable_id`].
-  pub entries: std::collections::BTreeMap<String, CompilerDiagEntry>,
+  #[serde(deserialize_with = "deserialize_compiler_diag_entries")]
+  pub entries: BTreeMap<String, CompilerDiagEntry>,
+}
+
+fn deserialize_compiler_diag_entries<'de, D>(deserializer: D) -> Result<BTreeMap<String, CompilerDiagEntry>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  struct EntriesVisitor;
+
+  impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+    type Value = BTreeMap<String, CompilerDiagEntry>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+      formatter.write_str("a bounded map of compiler diagnostics entries")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+      A: serde::de::MapAccess<'de>,
+    {
+      let mut entries = BTreeMap::new();
+      while let Some(key) = map.next_key::<String>()? {
+        if entries.len() == MAX_COMPILER_DIAG_CACHE_ENTRIES {
+          return Err(serde::de::Error::custom(format_args!(
+            "compiler diagnostics cache exceeds its {MAX_COMPILER_DIAG_CACHE_ENTRIES}-entry bound"
+          )));
+        }
+        let entry = map.next_value()?;
+        if entries.insert(key, entry).is_some() {
+          return Err(serde::de::Error::custom(
+            "compiler diagnostics cache contains a duplicate entry ID",
+          ));
+        }
+      }
+      Ok(entries)
+    }
+  }
+
+  deserializer.deserialize_map(EntriesVisitor)
 }
 
 impl Default for CompilerDiagCacheFile {
   fn default() -> Self {
     Self {
       version: COMPILER_DIAG_CACHE_VERSION,
-      entries: std::collections::BTreeMap::new(),
+      entries: BTreeMap::new(),
     }
   }
 }

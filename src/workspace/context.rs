@@ -46,6 +46,7 @@ pub struct CargoState {
 /// Cache version - increment when MetadataCache format changes
 /// This ensures old cache files are automatically invalidated
 const CACHE_VERSION: u32 = 2;
+pub(crate) const METADATA_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Metadata cache structure
 #[derive(Serialize, Deserialize)]
@@ -65,6 +66,10 @@ impl CargoState {
   /// Uses a content-based cache (FNV-1a hash of workspace Cargo.toml/Cargo.lock + all workspace member Cargo.toml)
   /// stored in `target/cargo-rail/metadata.json` to speed up subsequent loads.
   fn load(workspace_root: &Path) -> RailResult<Self> {
+    // Metadata caching is optional. Hold the workspace cache lifecycle authority
+    // across lookup, Cargo acquisition, and publication so scoped cleanup cannot
+    // race with a stale read or recreate state after deletion.
+    let cache_lock = crate::cache::lock_workspace(workspace_root).ok();
     let cache_dir = super::cargo_rail_state_root(workspace_root);
     let cache_file = cache_dir.join("metadata.json");
 
@@ -73,9 +78,8 @@ impl CargoState {
     // 1. Version matches (cache format unchanged)
     // 2. Hash matches (workspace + member manifests unchanged)
     // 3. Workspace root path matches (repo hasn't been moved/copied)
-    if let Some(cache) = fs::read_to_string(&cache_file)
-      .ok()
-      .and_then(|s| serde_json::from_str::<MetadataCache>(&s).ok())
+    if cache_lock.is_some()
+      && let Some(cache) = read_metadata_cache(&cache_file)
       && cache.version == CACHE_VERSION
     {
       // Validate workspace root path matches current location
@@ -106,7 +110,7 @@ impl CargoState {
     let metadata = Arc::new(metadata);
 
     // Save to cache
-    if let Ok(()) = fs::create_dir_all(&cache_dir) {
+    if cache_lock.is_some() && create_metadata_cache_directory(workspace_root, &cache_dir).is_ok() {
       let current_hash = compute_workspace_hash_with_members(workspace_root, &metadata);
       #[derive(Serialize)]
       struct MetadataCacheRef<'a> {
@@ -119,11 +123,17 @@ impl CargoState {
         hash: current_hash,
         metadata: &metadata,
       };
-      match serde_json::to_string(&cache) {
-        Ok(json) => {
-          if let Err(e) = fs::write(&cache_file, json) {
+      match serde_json::to_vec(&cache) {
+        Ok(bytes) if bytes.len() as u64 <= METADATA_CACHE_MAX_BYTES => {
+          if let Err(e) = crate::utils::write_file_atomic(&cache_file, &bytes) {
             crate::warn!("failed to write metadata cache {}: {}", cache_file.display(), e);
           }
+        }
+        Ok(_) => {
+          crate::warn!(
+            "metadata cache exceeds its {}-byte bound (proceeding without cache)",
+            METADATA_CACHE_MAX_BYTES
+          );
         }
         Err(e) => {
           crate::warn!(
@@ -282,6 +292,57 @@ impl CargoState {
 
     has_bin && !has_lib_like
   }
+}
+
+fn read_metadata_cache(path: &Path) -> Option<MetadataCache> {
+  let metadata = fs::symlink_metadata(path).ok()?;
+  if !metadata.is_file()
+    || crate::utils::is_symlink_or_reparse(&metadata)
+    || !has_single_link(&metadata)
+    || metadata.len() > METADATA_CACHE_MAX_BYTES
+  {
+    return None;
+  }
+  let bytes = fs::read(path).ok()?;
+  if bytes.len() as u64 != metadata.len() {
+    return None;
+  }
+  serde_json::from_slice(&bytes).ok()
+}
+
+fn create_metadata_cache_directory(workspace_root: &Path, cache_dir: &Path) -> RailResult<()> {
+  let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+  let mut current = workspace_root.clone();
+  for component in ["target", "cargo-rail"] {
+    current.push(component);
+    match fs::create_dir(&current) {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(&current)?;
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+      return Err(RailError::message(format!(
+        "metadata cache path '{}' is not a real directory",
+        current.display()
+      )));
+    }
+  }
+  if current != cache_dir || !crate::utils::canonicalize_existing(&current)?.starts_with(workspace_root) {
+    return Err(RailError::message("metadata cache directory escaped the workspace"));
+  }
+  Ok(())
+}
+
+#[cfg(unix)]
+fn has_single_link(metadata: &fs::Metadata) -> bool {
+  use std::os::unix::fs::MetadataExt as _;
+  metadata.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn has_single_link(_metadata: &fs::Metadata) -> bool {
+  true
 }
 
 /// Compute a content-based hash of workspace manifests
@@ -444,6 +505,9 @@ pub struct WorkspaceContext {
   /// Explicit dependency inventory prepared before hermetic snapshot metadata.
   hermetic_fetch_inventory: Option<crate::hermetic::FetchInventory>,
 
+  /// Serializes cache-owned workspace state for one hermetic command.
+  _hermetic_cache_lock: Option<crate::cache::WorkspaceCacheLock>,
+
   /// Cargo-Rail configuration (`rail.toml`).
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
@@ -523,8 +587,9 @@ impl WorkspaceContext {
       hermetic_cargo_home,
       preloaded_lockfile,
       hermetic_fetch_inventory,
+      hermetic_cache_lock,
     ) = bootstrap.map_or_else(
-      || (None, None, None, None, None, None),
+      || (None, None, None, None, None, None, None),
       |bootstrap| {
         let cargo_home = bootstrap.inventory.cargo_home().to_path_buf();
         (
@@ -534,6 +599,7 @@ impl WorkspaceContext {
           Some(cargo_home),
           Some(bootstrap.lockfile),
           Some(bootstrap.inventory),
+          Some(bootstrap.workspace_cache_lock),
         )
       },
     );
@@ -747,6 +813,7 @@ impl WorkspaceContext {
       derived_views,
       snapshot,
       hermetic_fetch_inventory,
+      _hermetic_cache_lock: hermetic_cache_lock,
       config,
     })
   }
@@ -1254,6 +1321,50 @@ fn select_execution_workspace_root(requested: &Path, cargo_current_dir: &Path, a
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn metadata_cache_rejects_oversized_input_before_deserialization() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("metadata.json");
+    fs::File::create(&path)
+      .unwrap()
+      .set_len(METADATA_CACHE_MAX_BYTES + 1)
+      .unwrap();
+
+    assert!(read_metadata_cache(&path).is_none());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn metadata_cache_rejects_links_and_linked_state_roots() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("metadata.json");
+    fs::write(&outside_file, b"{}").unwrap();
+    let linked_file = root.path().join("metadata.json");
+    symlink(&outside_file, &linked_file).unwrap();
+    assert!(read_metadata_cache(&linked_file).is_none());
+
+    let linked_target = root.path().join("target");
+    symlink(outside.path(), &linked_target).unwrap();
+    let error = create_metadata_cache_directory(root.path(), &root.path().join("target/cargo-rail"))
+      .expect_err("linked workspace state root must be rejected");
+    assert!(error.to_string().contains("not a real directory"), "{error}");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn metadata_cache_rejects_hard_links() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside.json");
+    let linked = root.path().join("metadata.json");
+    fs::write(&outside, b"{}").unwrap();
+    fs::hard_link(&outside, &linked).unwrap();
+
+    assert!(read_metadata_cache(&linked).is_none());
+  }
 
   #[test]
   fn test_workspace_context_build() {

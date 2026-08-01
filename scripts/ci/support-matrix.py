@@ -1300,22 +1300,33 @@ cold with a stable reason. **Fast when proven. Normal Cargo when not.**
 Native reuse is automatic for an ordinary `build` or `distribution` action when all of these are true:
 
 - the exact Cargo, rustc, rustdoc, sysroot, backend, host, and wrapper protocol has a certificate below;
-- `CARGO_INCREMENTAL=0`;
+- the selected Cargo profile has no active fingerprints and neither the environment nor rustc forces incremental
+  compilation;
 - no Cargo CLI `--config`, action-defined environment, sccache, or custom compiler wrapper changes the boundary; and
 - the invocation is an eligible dependency or workspace library with complete Rust inputs, dep-info, metadata,
   optional rlib output, Rust-only dependency artifacts, and no linker responsibility.
 
 ```bash
-CARGO_INCREMENTAL=0 cargo rail run --all --action build --explain
-CARGO_INCREMENTAL=0 cargo rail run --all --action distribution --explain
+cargo rail run --all --action build --explain
+cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
-The doctor reports the exact capability identity and certificate evidence without running a build. A missing
-certificate is a cold execution boundary, not a command failure. Existing wrappers remain in their selected order and
-Cargo-Rail does not add a second cache.
+Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
+incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
+capability identity and certificate evidence without running a build. A missing certificate is a cold execution
+boundary, not a command failure. Existing wrappers remain in their selected order and Cargo-Rail does not add a second
+cache.
 
-The run summary reports `hits`, `misses`, `bypasses`, `setup_bytes_hashed`, `bytes_hashed`, and `bytes_restored`:
+For the exact normal all-workspace `build` and `distribution` shapes, an unambiguous active profile delegates the
+unchanged built-in Cargo action before metadata, Git, tool hashing, and action-key construction. Cargo configuration
+that makes the target location ambiguous, a non-workspace manifest, or an explicit incremental setting retains the
+captured planner/runner path. Delegation preserves ambient wrappers and records the bypass with an explicitly absent
+snapshot in the ordinary decision receipt.
+
+Default text mode emits one concise decision with `hits`, `misses`, `bypasses`, and `bytes_restored`, or the stable
+action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, the complete reason census, and
+per-unit evidence:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
 - `miss` means no candidate survived revalidation; successful cold output may populate the local CAS; and
@@ -1365,12 +1376,15 @@ The local CAS defaults to `$CARGO_HOME/cargo-rail/local-cas-v1` or
 `CARGO_RAIL_CACHE_MAX_BYTES` changes the positive 10 GiB bound.
 
 ```bash
-cargo rail clean --cache --check
-cargo rail clean --cache
+cargo rail cache status
+cargo rail cache clean --scope workspace --check
+cargo rail cache clean --scope local
 ```
 
-Cleanup follows a validated workspace reference and owner marker. Do not remove individual CAS objects or Cargo
-fingerprints by hand.
+Workspace cleanup removes reconstructible state for the current checkout. Local cleanup resolves the currently
+configured cache domain, validates its owner marker, waits for in-flight readers, and removes the cross-workspace CAS.
+Use `--scope all` only when both effects are intended. `cargo rail clean --cache` remains a combined compatibility
+alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
 
 ## Execution and reuse support
 
@@ -1417,7 +1431,7 @@ every applicable native host before Cargo-Rail advertises it.
 | Class | Reuse status | Boundary |
 |---|---|---|
 | Dependency and workspace library metadata/rlib | Graduated only for listed host/toolchain tuples | One declared crate root, complete observed Rust inputs, dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
-| Incremental compilation | Bypassed; compiler executes | Requires `CARGO_INCREMENTAL=0`; forced incremental mode also bypasses |
+| Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
 | Proc macros and their consumers | Bypassed; compiler executes | Compile-time filesystem and process reads are not completely observed |
@@ -1434,38 +1448,48 @@ The fixture contains registry and Git dependencies, build scripts, a proc macro,
 a binary:
 
 ```bash
-cargo build --release --locked
 just bench-native-cache 10
 ```
 
-The accepted local M1 Pro measurement interleaved 110 samples in 22 complete groups with no rejections or false hits,
-identical action censuses and output manifests, and 27 stable warm hits. Every sample used offline Cargo/rustc
-`1.97.1`, `CARGO_INCREMENTAL=0`, a clean target, distinct seed/use roots, and a fresh copy of the populated cache.
-sccache `0.16.0` used its local disk backend with remote backends disabled.
+The accepted local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
+`0.16.0` was unavailable, so all 88 available samples were accepted with no rejections or false hits, identical action
+censuses and output manifests, and 27 stable eligible units per workload. Every sample used offline Cargo/rustc
+`1.97.1`, a clean target, distinct seed/use roots, and a fresh copy of the populated cache. Native Cargo used
+`CARGO_INCREMENTAL=0`; Cargo-Rail received no incremental environment setup and selected its clean-profile policy.
 
 Times are p50/p95:
 
 | Host and workload | Native Cargo | Cargo-Rail disabled | Cargo-Rail cold | Cargo-Rail warm | sccache |
 |---|---:|---:|---:|---:|---:|
-| M1 Pro check | 7.028/9.002 s | 7.397/8.183 s | 9.602/10.115 s | 4.979/5.615 s | 5.278/5.999 s |
-| M1 Pro release build | 10.369/10.808 s | 10.947/11.262 s | 14.336/15.173 s | 7.630/8.347 s | 8.173/8.902 s |
+| M1 Pro check | 7.574/8.265 s | 8.012/10.072 s | 10.834/12.427 s | 5.506/6.932 s | — |
+| M1 Pro release build | 11.591/12.536 s | 11.822/13.284 s | 14.866/17.018 s | 8.293/13.532 s | — |
 | Linux x86-64 check | 5.841/5.891 s | — | — | 3.430/4.074 s | 3.155/3.247 s |
 | Linux x86-64 release build | 9.224/9.351 s | — | — | 5.547/5.605 s | 6.223/6.244 s |
 | Linux ARM64 check | 6.166/6.266 s | — | — | 3.870/4.325 s | 3.843/3.882 s |
 | Linux ARM64 release build | 10.591/10.674 s | — | — | 6.618/6.696 s | 7.470/7.562 s |
 
-On the M1 Pro, warm Cargo-Rail reduced p50 by 29.2% for checks and 26.4% for release builds versus native Cargo; two
-warm reuses repaid the measured cold publication overhead. Warm Cargo-Rail beat native Cargo for every qualified host
-and workload. sccache led the two Linux check workloads; Cargo-Rail led the other four comparisons. These are same-host
-fixture results, not universal performance claims.
+On the M1 Pro, warm Cargo-Rail reduced p50 by 27.3% for checks and 28.5% for release builds versus native Cargo. The
+fresh CAS grew by 24,424,339 bytes for check and 65,631,693 bytes for release build; warm results restored 24,107,066
+and 65,362,456 bytes per sample. Two check reuses or one release-build reuse repaid the p50 cold-publication premium.
+Warm Cargo-Rail beat native Cargo at p50 for every qualified host and workload; the M1 Pro release-build p95 remained
+slower in this corpus. sccache led the two Linux check workloads and Cargo-Rail led the two Linux release-build
+comparisons. These are same-host fixture results, not universal performance claims.
+
+The final 30-sample M1 Pro active-profile follow-up measured unchanged Cargo at 60.2/60.8 ms p50/p95 and the narrow
+build delegation at 66.3/70.7 ms. The lean path removed workspace capture, metadata, Git, native-cache setup,
+action-key construction, and a false synchronous flush on the observational receipt, reducing the earlier 479.6 ms
+cargo-rail median by 86.2%. The corresponding active distribution profile measured Cargo at 59.3/60.3 ms and
+cargo-rail at 65.3/66.0 ms. The remaining 6.0–6.1 ms p50 premiums had non-overlapping observed ranges, so
+the active-profile policy accepts a 7 ms p50 supervisory budget for exact child exit behavior and a post-success
+receipt. The evidence does not justify process replacement, weaker receipt semantics, or broader static bypasses.
 
 Windows x86-64 timing remains unqualified. Its latest partial run found reusable clean-root hits but rejected timing
 because two bypassed proc-macro consumers produced byte-unstable DLLs and PID reuse could overwrite evidence files.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
 wrappers, flags, exact action argv, clean-root method, p50/p95 for native/disabled/cold/warm lanes, hit and byte counts,
-all bypass reasons, and output portability findings. Use at least five measured runs after warmup, alternate lane order,
-preserve raw output, and never combine different commits, toolchains, targets, or policies.
+all bypass reasons, and output portability findings. Retain at least ten accepted runs after warmup for each available
+lane, alternate lane order, preserve raw output, and never combine different commits, toolchains, targets, or policies.
 """
 
 

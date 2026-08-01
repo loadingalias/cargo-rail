@@ -291,13 +291,24 @@ impl CompilerWrapperIdentity {
 }
 
 /// Whether the cargo-rail native compiler cache ran for this observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CompilerCacheWrapperStatus {
   Hit,
   Miss,
   Disabled,
   Bypassed,
+}
+
+impl CompilerCacheWrapperStatus {
+  pub(crate) const fn as_str(self) -> &'static str {
+    match self {
+      Self::Hit => "hit",
+      Self::Miss => "miss",
+      Self::Disabled => "disabled",
+      Self::Bypassed => "bypassed",
+    }
+  }
 }
 
 /// Redaction-safe compiler-cache disposition attached to the exact wrapper chain.

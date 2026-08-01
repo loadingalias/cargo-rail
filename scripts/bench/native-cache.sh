@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 runs="${1:-10}"
+binary_overridden="${CARGO_RAIL_BIN+x}"
 binary="${CARGO_RAIL_BIN:-$repo_root/target/release/cargo-rail}"
 results="${CARGO_RAIL_BENCH_RESULTS:-$repo_root/target/benchmarks/native-cache/$(date -u +%Y%m%dT%H%M%SZ)}"
 
@@ -17,13 +18,18 @@ for tool in cargo git hyperfine jq; do
     exit 2
   }
 done
+if [[ -z "$binary_overridden" ]]; then
+  cargo build --manifest-path "$repo_root/Cargo.toml" --package cargo-rail --bin cargo-rail \
+    --all-features --release --locked
+fi
 [[ -f "$binary" && -x "$binary" ]] || {
   echo "build the release binary first: cargo build --release --locked" >&2
   exit 2
 }
 
 unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS
-unset CARGO_TARGET_DIR RUSTC RUSTC_BOOTSTRAP RUSTC_FORCE_INCREMENTAL RUSTC_WORKSPACE_WRAPPER RUSTC_WRAPPER RUSTFLAGS
+unset CARGO_INCREMENTAL CARGO_TARGET_DIR RUSTC RUSTC_BOOTSTRAP RUSTC_FORCE_INCREMENTAL RUSTC_WORKSPACE_WRAPPER
+unset RUSTC_WRAPPER RUSTFLAGS
 unset SCCACHE_AZURE_BLOB_CONTAINER SCCACHE_AZURE_CONNECTION_STRING SCCACHE_AZURE_KEY_PREFIX
 unset SCCACHE_BUCKET SCCACHE_COS_BUCKET SCCACHE_ENDPOINT SCCACHE_GCS_BUCKET SCCACHE_GHA_ENABLED SCCACHE_GHA_VERSION
 unset SCCACHE_MEMCACHED SCCACHE_MEMCACHED_ENDPOINT SCCACHE_MULTILEVEL_CHAIN SCCACHE_OSS_BUCKET
@@ -88,7 +94,7 @@ jq -n \
     instance_type: $instance_type,
     filesystem: (if $filesystem == "" then null else $filesystem end),
     environment: {
-      cargo_incremental: "0",
+      cargo_incremental: "native/sccache=0; cargo-rail cache=automatic clean-profile policy; disabled=Cargo default",
       network: "offline",
       cargo_target_dir: "fixture-local",
       compiler_overrides: "removed",
@@ -204,6 +210,7 @@ seed_cargo_rail_cache() {
   local workload="$1"
   local root="$fixture_root/$workload-cargo-rail-seed"
   local cache="$fixture_root/$workload-cargo-rail-seed-cache"
+  local status="$results/seed-$workload-cache-status.json"
   local action
   action="$(workload_action "$workload")"
   safe_remove "$root/target" "$cache"
@@ -213,10 +220,14 @@ seed_cargo_rail_cache() {
   fi
   (
     cd "$root"
-    env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
-      CARGO_INCREMENTAL=0 CARGO_RAIL_CACHE_DIR="$cache" \
+    env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+      CARGO_RAIL_CACHE_DIR="$cache" \
       "$binary" rail run --all --action "$action" -- "${args[@]}" >/dev/null 2>&1
+    env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+      CARGO_RAIL_CACHE_DIR="$cache" \
+      "$binary" rail cache status --scope local -f json >"$status"
   )
+  jq -e '.status.local.present and .status.local.cache.bytes > 0' "$status" >/dev/null
 }
 
 seed_sccache() {
@@ -301,27 +312,27 @@ command_for() {
       argv="$(shell_join cargo "$subcommand" "${cargo_args[@]}")"
       measured_argv_json="$(argv_to_json cargo "$subcommand" "${cargo_args[@]}")"
       measured_cache_state="native-empty-target"
-      environment_prefix="$(shell_join env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL=0)"
+      environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL=0)"
       ;;
     cargo-rail-disabled)
       argv="$(shell_join "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --no-cache --explain -- "${rail_args[@]}")"
       measured_argv_json="$(argv_to_json "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --no-cache --explain -- "${rail_args[@]}")"
       measured_cache_state="disabled-empty-target"
-      environment_prefix="$(shell_join env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL=0)"
+      environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER)"
       ;;
     cargo-rail-cold)
       local cold_cache="$fixture_root/$workload-cargo-rail-cold-cache"
       argv="$(shell_join "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --explain -- "${rail_args[@]}")"
       measured_argv_json="$(argv_to_json "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --explain -- "${rail_args[@]}")"
       measured_cache_state="empty-cache-empty-target"
-      environment_prefix="$(shell_join env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL=0 CARGO_RAIL_CACHE_DIR="$cold_cache")"
+      environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_RAIL_CACHE_DIR="$cold_cache")"
       ;;
     cargo-rail-warm)
       local warm_cache="$fixture_root/$workload-cargo-rail-warm-cache"
       argv="$(shell_join "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --explain -- "${rail_args[@]}")"
       measured_argv_json="$(argv_to_json "$binary" rail --diagnostics-file "$diagnostics" run --all --action "$action" --explain -- "${rail_args[@]}")"
       measured_cache_state="verified-cross-root-seed-empty-target"
-      environment_prefix="$(shell_join env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_INCREMENTAL=0 CARGO_RAIL_CACHE_DIR="$warm_cache")"
+      environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_RAIL_CACHE_DIR="$warm_cache")"
       ;;
     sccache)
       local sccache_cache="$fixture_root/$workload-sccache-live-cache"
@@ -720,7 +731,11 @@ measure_lane() {
 finalize_group() {
   local group_dir="$1"
   local group_file="$group_dir/group.json"
-  jq -s '
+  local required_available=4
+  if [[ "$sccache_available" == true ]]; then
+    required_available=5
+  fi
+  jq -s --argjson required_available "$required_available" '
     def normalized_reusable_cache_events:
       [
         (.events // [])[]
@@ -777,9 +792,9 @@ finalize_group() {
         schema_version: 4,
         round: $samples[0].round,
         workload: $samples[0].workload,
-        complete: (($samples | length) == 5 and ($available | length) == 5),
+        complete: (($samples | length) == 5 and ($available | length) == $required_available),
         output_manifests_identical: (
-          ($available | length) == 5
+          ($available | length) == $required_available
           and ($available | all(.outputs.available))
           and ($by_lane["cargo-rail-cold"].outputs.digest == $by_lane["cargo-rail-warm"].outputs.digest)
         ),
@@ -788,7 +803,7 @@ finalize_group() {
           and ($by_lane["cargo-rail-warm"] | modeled_root_bound_outputs_safely_bypassed)
         ),
         action_census_identical: (
-          ($available | length) == 5
+          ($available | length) == $required_available
           and ($available | all(.action_census.available))
           and ($census_digests | length) == 1
         ),
@@ -820,7 +835,7 @@ finalize_group() {
         and .action_census_identical
         and .cache_event_streams_complete
         and .cache_equivalent
-        and (.samples | all(.execution.exit_code == 0 and .execution.diagnostics_valid))
+        and (.samples | map(select(.available)) | all(.execution.exit_code == 0 and .execution.diagnostics_valid))
       )
     | .rejection_reasons = [
         if .complete then empty else "incomplete_interleaved_lanes" end,
@@ -831,8 +846,10 @@ finalize_group() {
         if .action_census_identical then empty else "action_census_not_identical" end,
         if .cache_event_streams_complete then empty else "cache_event_stream_incomplete" end,
         if .cache_equivalent then empty else "cache_identities_or_claimed_outputs_not_equivalent" end,
-        if (.samples | all(.execution.exit_code == 0)) then empty else "command_failed" end,
-        if (.samples | all(.execution.diagnostics_valid)) then empty else "diagnostics_invalid" end
+        if (.samples | map(select(.available)) | all(.execution.exit_code == 0)) then empty else "command_failed" end,
+        if (.samples | map(select(.available)) | all(.execution.diagnostics_valid))
+          then empty else "diagnostics_invalid"
+        end
       ]
   ' "$group_dir"/*/sample.json >"$group_file"
   jq -c --slurpfile group "$group_file" '.samples[] + {
@@ -1028,17 +1045,19 @@ jq -s \
   --arg sccache_unavailable_reason "$sccache_unavailable_reason" \
   --slurpfile environment "$results/environment.json" \
   --slurpfile check_units "$results/unit-check.json" \
-  --slurpfile build_units "$results/unit-build.json" '
+  --slurpfile build_units "$results/unit-build.json" \
+  --slurpfile check_seed "$results/seed-check-cache-status.json" \
+  --slurpfile build_seed "$results/seed-build-cache-status.json" '
   def percentile($values; $fraction):
     ($values | sort) as $sorted
     | if ($sorted | length) == 0 then null
       else $sorted[(((($sorted | length) * $fraction) | ceil) - 1)]
       end;
   def lane_stats($workload; $lane):
-    [.[] | select(.accepted and .workload == $workload and .lane == $lane)] as $samples
+    [.[] | select(.accepted and .available and .workload == $workload and .lane == $lane)] as $samples
     | {
         accepted_samples: ($samples | length),
-        rejected_samples: ([.[] | select((.accepted | not) and .workload == $workload and .lane == $lane)] | length),
+        rejected_samples: ([.[] | select(.available and (.accepted | not) and .workload == $workload and .lane == $lane)] | length),
         p50_seconds: percentile([$samples[].resources.wall_seconds]; 0.50),
         p95_seconds: percentile([$samples[].resources.wall_seconds]; 0.95),
         user_mean_seconds: (
@@ -1052,13 +1071,13 @@ jq -s \
         )
       };
   {
-    schema_version: 4,
+    schema_version: 5,
     runs: $runs,
     attempts: $attempts,
     warmup_runs: 1,
     environment: $environment[0],
-    accepted_samples: ([.[] | select(.accepted)] | length),
-    rejected_samples: ([.[] | select(.accepted | not)] | length),
+    accepted_samples: ([.[] | select(.accepted and .available)] | length),
+    rejected_samples: ([.[] | select((.accepted | not) and .available)] | length),
     workloads: {
       check: {
         native_cargo: lane_stats("check"; "native-cargo"),
@@ -1080,13 +1099,17 @@ jq -s \
       rejected_groups: ([group_by([.workload, .round])[] | select(any(.accepted | not))] | length),
       minimum_accepted_samples_per_lane: (
         group_by([.workload, .lane])
-        | map([.[] | select(.accepted)] | length)
+        | map(select(any(.available)) | [.[] | select(.accepted and .available)] | length)
         | min
       ),
       false_hits: 0
     },
     check_units: $check_units[0],
     build_units: $build_units[0],
+    publication: {
+      check: $check_seed[0].status.local.cache,
+      build: $build_seed[0].status.local.cache
+    },
     sccache_0_16: {
       available: $sccache_available,
       path: (if $sccache_path == "" then null else $sccache_path end),

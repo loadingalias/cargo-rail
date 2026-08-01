@@ -26,7 +26,7 @@ pub(crate) struct BuildScriptResultAnalysis {
   generated_outputs: Option<usize>,
   #[serde(skip_serializing_if = "Option::is_none")]
   cargo_output: Option<BuildScriptCargoOutputSummary>,
-  #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+  #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
   secret_capabilities: BTreeSet<String>,
   reasons: BTreeSet<String>,
 }

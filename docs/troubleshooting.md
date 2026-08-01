@@ -64,11 +64,16 @@ isolated check ran without an authorizing cache key.
 For `unify`, `evidence_cache` reports diagnostic-observation reuse. That cache never restores Cargo build artifacts.
 
 The full eligibility matrix, result meanings, storage paths, and current measurements are in [Caching](caching.md).
-Preview validated cleanup before removing cache state:
+Inspect the affected scope, then preview validated cleanup before removing cache state:
 
 ```bash
-cargo rail clean --cache --check
-cargo rail clean --cache
+cargo rail cache status --scope workspace
+cargo rail cache clean --scope workspace --check
+cargo rail cache clean --scope workspace
+
+cargo rail cache status --scope local
+cargo rail cache clean --scope local --check
+cargo rail cache clean --scope local
 ```
 
 ## Release stopped

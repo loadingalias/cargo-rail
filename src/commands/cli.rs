@@ -194,6 +194,13 @@ Examples:
   cargo rail clean --reports            # Clean generated reports
   cargo rail clean --check              # Check for pending cleanup (exit 1)";
 
+const CACHE_HELP: &str = "\
+Examples:
+  cargo rail cache status                         # Inspect workspace and shared local cache state
+  cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
+  cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS";
+
 const CONFIG_HELP: &str = "\
 Examples:
   cargo rail config locate              # Show which config file is active
@@ -317,6 +324,14 @@ pub enum Commands {
     /// Diagnostic to run
     #[command(subcommand)]
     command: DoctorCommand,
+  },
+
+  /// Inspect or reclaim explicitly scoped cache state
+  #[command(after_long_help = CACHE_HELP)]
+  Cache {
+    /// Cache operation
+    #[command(subcommand)]
+    command: CacheCommand,
   },
 
   /// Build a deterministic file-first change plan
@@ -663,6 +678,61 @@ pub enum DoctorCommand {
   },
 }
 
+/// Cache ownership scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheScope {
+  /// Reconstructible cache state inside the selected workspace.
+  Workspace,
+  /// The validated user-wide CAS shared by local workspaces.
+  Local,
+  /// Both workspace state and the shared local CAS.
+  All,
+}
+
+impl CacheScope {
+  pub(crate) const fn includes_workspace(self) -> bool {
+    matches!(self, Self::Workspace | Self::All)
+  }
+
+  pub(crate) const fn includes_local(self) -> bool {
+    matches!(self, Self::Local | Self::All)
+  }
+
+  pub(crate) const fn as_str(self) -> &'static str {
+    match self {
+      Self::Workspace => "workspace",
+      Self::Local => "local",
+      Self::All => "all",
+    }
+  }
+}
+
+/// Subcommands for `cargo rail cache`.
+#[derive(Subcommand)]
+pub enum CacheCommand {
+  /// Report exact bytes, counts, bounds, leases, and ownership scope.
+  Status {
+    /// Cache scope to inspect.
+    #[arg(long, value_enum, default_value = "all")]
+    scope: CacheScope,
+    /// Report format.
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
+  /// Reclaim one explicitly selected cache scope.
+  Clean {
+    /// Cache scope to reclaim; required to prevent accidental cross-workspace deletion.
+    #[arg(long, value_enum)]
+    scope: CacheScope,
+    /// Preview exact bytes and paths without deleting them.
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Report format.
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
+}
+
 /// Subcommands for `cargo rail config`
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -960,6 +1030,9 @@ impl Commands {
       Commands::Doctor {
         command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => format.is_json_like(),
+      Commands::Cache { command } => match command {
+        CacheCommand::Status { format, .. } | CacheCommand::Clean { format, .. } => format.is_json_like(),
+      },
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
       Commands::Unify {
@@ -1035,6 +1108,11 @@ impl Commands {
       Commands::Doctor {
         command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => *format = TextJsonOutputFormat::Json,
+      Commands::Cache { command } => match command {
+        CacheCommand::Status { format, .. } | CacheCommand::Clean { format, .. } => {
+          *format = TextJsonOutputFormat::Json;
+        }
+      },
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
       Commands::Unify {

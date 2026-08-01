@@ -6,7 +6,7 @@
 //!
 //! This is critical - false positives would cause users to remove deps they need!
 
-use crate::helpers::{TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
+use crate::helpers::{TestWorkspace, compiler_evidence_cache, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fs;
@@ -895,10 +895,11 @@ required-features = ["example-gate"]
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
   );
-  let cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
+  let cache = compiler_evidence_cache(&workspace.path)?;
+  let encoded_cache = serde_json::to_string(&cache)?;
   assert!(
-    cache.contains("example-gate"),
-    "the evidence cache should retain the required feature configuration\n{cache}"
+    encoded_cache.contains("example-gate"),
+    "the evidence cache should retain the required feature configuration\n{encoded_cache}"
   );
 
   Ok(())
@@ -1193,10 +1194,10 @@ glob = "0.3"
     check_stdout.contains("glob"),
     "unused build evidence missing\n{check_stdout}"
   );
-  let evidence_cache = fs::read_to_string(workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"))?;
+  let evidence_json = compiler_evidence_cache(&workspace.path)?;
+  let evidence_cache = serde_json::to_string(&evidence_json)?;
   assert!(evidence_cache.contains("CustomBuild"), "{evidence_cache}");
   assert!(evidence_cache.contains("unit_evidence"), "{evidence_cache}");
-  let evidence_json: serde_json::Value = serde_json::from_str(&evidence_cache)?;
   let observations = evidence_json["entries"]
     .as_object()
     .into_iter()
@@ -1317,7 +1318,9 @@ glob = "0.3"
   );
   assert!(
     !manifest.contains("tempfile ="),
-    "unused dev dependency should be removed\n{manifest}\ncheck:\n{check_stdout}"
+    "unused dev dependency should be removed\n{manifest}\ncheck:\n{check_stdout}\napply stdout:\n{}\napply stderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
   );
   assert!(
     !manifest.contains("glob ="),
@@ -1467,7 +1470,7 @@ mod tests {
 }
 
 #[test]
-fn test_unused_detection_compiler_diag_cache_writes_cache_file() -> Result<()> {
+fn test_unused_detection_compiler_evidence_uses_shared_local_cas() -> Result<()> {
   let workspace = create_workspace_with_unused_detection()?;
 
   add_crate_with_manifest(
@@ -1522,16 +1525,16 @@ edition = "2021"
 
   let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
   assert!(
-    cache_file.exists(),
-    "compiler diagnostics cache should exist at {}\nstdout:\n{}\nstderr:\n{}",
+    !cache_file.exists(),
+    "compiler evidence must not recreate the legacy monolith at {}\nstdout:\n{}\nstderr:\n{}",
     cache_file.display(),
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
   );
-  let cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
-  assert_eq!(
-    cache["version"], 10,
-    "native compiler result observations require evidence-cache schema version 10"
+  let cache = compiler_evidence_cache(&workspace.path)?;
+  assert!(
+    cache["entries"].as_object().is_some_and(|entries| !entries.is_empty()),
+    "shared local CAS should contain typed compiler evidence: {cache}"
   );
   let entries = cache["entries"].as_object().expect("cache entries object");
   let entry = entries.values().next().expect("at least one cache entry");
@@ -1645,7 +1648,7 @@ edition = "2021"
     &[("CARGO_PROFILE_DEV_OPT_LEVEL", "1")],
   )?;
   assert_eq!(profile_override.status.code(), Some(1));
-  let profile_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let profile_cache = compiler_evidence_cache(&workspace.path)?;
   assert_ne!(
     compiler_key_fingerprints(&profile_cache, "test-crate", "cargo_config_fingerprint"),
     baseline_config,
@@ -1658,7 +1661,7 @@ edition = "2021"
     &[("CARGO_INCREMENTAL", "0")],
   )?;
   assert_eq!(incremental_override.status.code(), Some(1));
-  let incremental_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let incremental_cache = compiler_evidence_cache(&workspace.path)?;
   assert_ne!(
     compiler_key_fingerprints(&incremental_cache, "test-crate", "cargo_config_fingerprint"),
     baseline_config,
@@ -1682,7 +1685,7 @@ edition = "2021"
     .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
     .expect("unrelated-input cache telemetry");
   assert_eq!(unrelated_cache["hits"], 0);
-  let unrelated_cache_file: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let unrelated_cache_file = compiler_evidence_cache(&workspace.path)?;
   assert_eq!(
     compiler_key_fingerprints(&unrelated_cache_file, "test-crate", "source_fingerprint"),
     baseline_source,
@@ -1713,7 +1716,7 @@ edition = "2021"
   fs::write(&source_path, changed_source)?;
   let invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   assert_eq!(invalidated.status.code(), Some(1));
-  let invalidated_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let invalidated_cache = compiler_evidence_cache(&workspace.path)?;
   let changed_member_source = compiler_key_fingerprints(&invalidated_cache, "test-crate", "source_fingerprint");
   assert_ne!(
     changed_member_source, baseline_source,
@@ -1731,7 +1734,7 @@ edition = "2021"
   fs::write(&dependency_path, changed_dependency)?;
   let dependency_invalidated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
   assert_eq!(dependency_invalidated.status.code(), Some(1));
-  let dependency_cache: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache_file)?)?;
+  let dependency_cache = compiler_evidence_cache(&workspace.path)?;
   assert_ne!(
     compiler_key_fingerprints(&dependency_cache, "test-crate", "source_fingerprint"),
     changed_member_source,
@@ -1763,7 +1766,7 @@ edition = "2021"
 
 #[cfg(unix)]
 #[test]
-fn test_compiler_diag_cache_write_replaces_symlink_without_following_it() -> Result<()> {
+fn test_compiler_evidence_migration_does_not_follow_or_replace_a_legacy_symlink() -> Result<()> {
   use std::os::unix::fs::symlink;
 
   let workspace = create_workspace_with_unused_detection()?;
@@ -1796,8 +1799,14 @@ log = "0.4"
     "cache persistence must not follow a pre-positioned symlink"
   );
   assert!(
-    fs::symlink_metadata(&cache_file)?.file_type().is_file(),
-    "atomic cache persistence must replace the symlink with a regular file"
+    fs::symlink_metadata(&cache_file)?.file_type().is_symlink(),
+    "CAS persistence must leave an unowned legacy symlink untouched"
+  );
+  assert!(
+    compiler_evidence_cache(&workspace.path)?["entries"]
+      .as_object()
+      .is_some_and(|entries| !entries.is_empty()),
+    "new evidence should still publish through the safe local CAS"
   );
   Ok(())
 }
@@ -1888,11 +1897,17 @@ log = "0.4"
 
   let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
   assert!(
-    cache_file.exists(),
-    "deprecated implementation input must not disable correct caching at {}\nstdout:\n{}\nstderr:\n{}",
+    !cache_file.exists(),
+    "deprecated implementation input must not recreate the legacy cache at {}\nstdout:\n{}\nstderr:\n{}",
     cache_file.display(),
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    compiler_evidence_cache(&workspace.path)?["entries"]
+      .as_object()
+      .is_some_and(|entries| !entries.is_empty()),
+    "deprecated configuration must not disable shared local evidence caching"
   );
   assert!(
     String::from_utf8_lossy(&output.stderr).contains("config migrate"),

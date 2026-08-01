@@ -4,6 +4,7 @@
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -2000,10 +2001,20 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
 }
 
 #[test]
-fn test_native_cache_leaves_default_incremental_development_cold() -> Result<()> {
+fn test_native_cache_preserves_active_incremental_development_automatically() -> Result<()> {
   let ws = TestWorkspace::new_named("native-cache-incremental-bypass")?;
   ws.add_crate("incremental-bypass", "0.1.0", &[])?;
   ws.commit("Add incremental native cache bypass fixture")?;
+
+  let direct = std::process::Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["check", "--workspace", "--quiet"])
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(direct.status.success(), "initial Cargo check failed: {direct:?}");
 
   let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
     .current_dir(&ws.path)
@@ -2030,8 +2041,8 @@ fn test_native_cache_leaves_default_incremental_development_cold() -> Result<()>
   );
   assert!(
     String::from_utf8_lossy(&output.stdout)
-      .contains("native compiler cache: bypassed (native_cache_incremental_policy_not_graduated)"),
-    "default Cargo development must bypass native-cache setup: {}",
+      .contains("native compiler cache: bypassed (active_cargo_profile_preferred)"),
+    "an active Cargo profile must retain its incremental loop: {}",
     String::from_utf8_lossy(&output.stdout)
   );
 
@@ -2062,9 +2073,106 @@ fn test_native_cache_leaves_default_incremental_development_cold() -> Result<()>
   );
   assert!(
     String::from_utf8_lossy(&forced.stdout)
-      .contains("native compiler cache: bypassed (forced_incremental_compilation_not_graduated)"),
+      .contains("native compiler cache: bypassed (forced_incremental_compilation_preserved)"),
     "rustc's forced incremental mode must bypass native-cache setup: {}",
     String::from_utf8_lossy(&forced.stdout)
+  );
+  Ok(())
+}
+
+#[test]
+fn test_native_cache_uses_clean_root_dependencies_without_global_incremental_configuration() -> Result<()> {
+  if !matches!(
+    (std::env::consts::OS, std::env::consts::ARCH),
+    ("macos", "aarch64") | ("linux", "aarch64") | ("linux", "x86_64") | ("windows", "x86_64")
+  ) {
+    return Ok(());
+  }
+  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
+  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
+  if !String::from_utf8_lossy(&rustc.stdout).starts_with("rustc 1.97.1 ")
+    || !String::from_utf8_lossy(&cargo.stdout).starts_with("cargo 1.97.1 ")
+  {
+    return Ok(());
+  }
+
+  let ws = TestWorkspace::new_named("native-cache-automatic-clean-root")?;
+  let root_manifest = fs::read_to_string(ws.path.join("Cargo.toml"))?
+    .replace("resolver = \"2\"", "exclude = [\"vendor/cache-dep\"]\nresolver = \"2\"");
+  fs::write(ws.path.join("Cargo.toml"), root_manifest)?;
+  fs::create_dir_all(ws.path.join("vendor/cache-dep/src"))?;
+  fs::write(
+    ws.path.join("vendor/cache-dep/Cargo.toml"),
+    "[package]\nname = \"cache-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+  )?;
+  let mut dependency_source = String::with_capacity(900_000);
+  dependency_source.push_str("pub fn value() -> u8 { 7 }\n");
+  for index in 0..20_000 {
+    writeln!(
+      dependency_source,
+      "pub fn generated_{index}(value: u64) -> u64 {{ value.wrapping_mul({index}) }}"
+    )?;
+  }
+  fs::write(ws.path.join("vendor/cache-dep/src/lib.rs"), dependency_source)?;
+  ws.add_crate(
+    "cache-app",
+    "0.1.0",
+    &[("cache-dep", "{ path = \"../../vendor/cache-dep\" }")],
+  )?;
+  fs::write(
+    ws.path.join("crates/cache-app/src/lib.rs"),
+    "pub fn value() -> u8 { cache_dep::value() }\n",
+  )?;
+  ws.commit("Add automatic native cache fixture")?;
+  let local_cache = tempfile::tempdir()?;
+
+  let run = |incremental: Option<&str>| -> Result<std::process::Output> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+    command
+      .current_dir(&ws.path)
+      .args([
+        "rail",
+        "run",
+        "--quiet",
+        "--all",
+        "--action",
+        "build",
+        "--explain",
+        "--",
+        "--quiet",
+      ])
+      .env("CARGO_BUILD_JOBS", "1")
+      .env("CARGO_RAIL_CACHE_DIR", local_cache.path())
+      .env_remove("RUSTC_FORCE_INCREMENTAL")
+      .env_remove("RUSTC_WRAPPER")
+      .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if let Some(incremental) = incremental {
+      command.env("CARGO_INCREMENTAL", incremental);
+    } else {
+      command.env_remove("CARGO_INCREMENTAL");
+    }
+    Ok(command.output()?)
+  };
+
+  let seed = run(None)?;
+  assert!(seed.status.success(), "cache seed failed: {seed:?}");
+  let clean = std::process::Command::new("cargo")
+    .current_dir(&ws.path)
+    .arg("clean")
+    .output()?;
+  assert!(clean.status.success(), "cargo clean failed: {clean:?}");
+
+  let automatic = run(None)?;
+  assert!(automatic.status.success(), "automatic cache run failed: {automatic:?}");
+  let stdout = String::from_utf8_lossy(&automatic.stdout);
+  let summary = stdout
+    .lines()
+    .find(|line| line.contains("native compiler cache: hits="))
+    .unwrap_or_default();
+  assert!(
+    !summary.is_empty() && !summary.contains("hits=0 "),
+    "a clean profile must reuse verified results without caller-supplied CARGO_INCREMENTAL=0: {stdout}\nstderr: {}",
+    String::from_utf8_lossy(&automatic.stderr)
   );
   Ok(())
 }

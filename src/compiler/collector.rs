@@ -13,9 +13,9 @@ use crate::compiler::model::{
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
 use crate::compiler::native_cache::{
-  DIAGNOSTIC_EXECUTION_CONTRACT, DirectNativeCacheIdentity, DirectNativeCacheSetup, NativeCompilerSession, SESSION_ENV,
-  direct_cache_bypass_reason, direct_target_configuration_bypass_reason, direct_toolchain_coherence_bypass_reason,
-  prepare_direct_cargo_cache,
+  DIAGNOSTIC_EXECUTION_CONTRACT, DirectCacheBypass, DirectNativeCacheIdentity, DirectNativeCacheSetup,
+  NativeCompilerSession, SESSION_ENV, direct_cache_bypass_reason, direct_target_configuration_bypass_reason,
+  direct_toolchain_coherence_bypass_reason, prepare_direct_cargo_cache,
 };
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
@@ -94,8 +94,8 @@ pub(crate) struct CompilerCacheIdentity {
   cache_wrapper: CompilerCacheWrapperMetadata,
   cache_wrapper_plan: CacheWrapperPlan,
   executable_bypasses: BTreeSet<String>,
-  cache_bypass_reason: Option<&'static str>,
-  native_cache_bypass_reason: Option<&'static str>,
+  cache_bypass_reason: Option<CompilerCacheBypass>,
+  native_cache_bypass_reason: Option<DirectCacheBypass>,
   native_cache_capability_identity: Option<String>,
 }
 
@@ -158,6 +158,34 @@ enum CargoBuildScriptOutput {
   Ambiguous,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompilerCacheBypass {
+  CargoConfiguration,
+  BuildScriptObservations,
+  ProcMacroObservations,
+  ExternalSourceDigest,
+}
+
+impl CompilerCacheBypass {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::CargoConfiguration => "cargo_configuration_unmodeled",
+      Self::BuildScriptObservations => "build_script_observations_unavailable",
+      Self::ProcMacroObservations => "proc_macro_observations_unavailable",
+      Self::ExternalSourceDigest => "external_source_digest_unavailable",
+    }
+  }
+
+  const fn direct(self) -> DirectCacheBypass {
+    match self {
+      Self::CargoConfiguration => DirectCacheBypass::CargoConfiguration,
+      Self::BuildScriptObservations => DirectCacheBypass::BuildScriptObservations,
+      Self::ProcMacroObservations => DirectCacheBypass::ProcMacroObservations,
+      Self::ExternalSourceDigest => DirectCacheBypass::ExternalSourceDigest,
+    }
+  }
+}
+
 impl CompilerCacheIdentity {
   /// Capture exact compiler-cache identity from one immutable workspace snapshot.
   pub fn capture(snapshot: &WorkspaceSnapshot) -> RailResult<Self> {
@@ -183,7 +211,7 @@ impl CompilerCacheIdentity {
       snapshot.toolchain().rustdoc_verbose_version(),
     )
     .or_else(|| direct_target_configuration_bypass_reason(snapshot.targets()))
-    .or(cache_bypass_reason)
+    .or_else(|| cache_bypass_reason.map(CompilerCacheBypass::direct))
     .or_else(|| {
       direct_cache_bypass_reason(
         snapshot.toolchain().rustc_verbose_version(),
@@ -195,11 +223,11 @@ impl CompilerCacheIdentity {
       match capture_native_toolchain_capability(snapshot, executables) {
         Ok(capability) if capability.report.is_certified() => Some(capability),
         Ok(_) => {
-          native_cache_bypass_reason = Some("native_cache_capability_not_certified");
+          native_cache_bypass_reason = Some(DirectCacheBypass::CapabilityNotCertified);
           None
         }
         Err(_) => {
-          native_cache_bypass_reason = Some("native_cache_capability_unavailable");
+          native_cache_bypass_reason = Some(DirectCacheBypass::CapabilityUnavailable);
           None
         }
       }
@@ -211,7 +239,7 @@ impl CompilerCacheIdentity {
       executables,
       &cargo_rail_executable,
       cache_wrapper_plan,
-      native_cache_bypass_reason,
+      native_cache_bypass_reason.map(DirectCacheBypass::as_str),
       native_capability.as_ref(),
     )?;
     let native_cache_capability_identity = native_capability
@@ -276,7 +304,7 @@ impl CompilerCacheIdentity {
     );
     let cache_wrapper = CompilerCacheWrapperMetadata::new(
       CompilerCacheWrapperStatus::Bypassed,
-      native_cache_bypass_reason.unwrap_or_else(|| cache_wrapper_plan.reason()),
+      native_cache_bypass_reason.map_or_else(|| cache_wrapper_plan.reason(), DirectCacheBypass::as_str),
     );
 
     Ok(Self {
@@ -327,7 +355,7 @@ pub(crate) fn prepare_direct_cargo_action(
     return Ok(DirectNativeCacheSetup::Bypassed(reason));
   }
   if !snapshot.cargo_config().unmodeled_settings().is_empty() {
-    return Ok(DirectNativeCacheSetup::Bypassed("cargo_configuration_unmodeled"));
+    return Ok(DirectNativeCacheSetup::Bypassed(DirectCacheBypass::CargoConfiguration));
   }
   if let Some(reason) = direct_target_configuration_bypass_reason(snapshot.targets()) {
     return Ok(DirectNativeCacheSetup::Bypassed(reason));
@@ -348,7 +376,7 @@ pub(crate) fn prepare_direct_cargo_action(
     .any(|target| target.kind.contains(&TargetKind::Lib))
   {
     return Ok(DirectNativeCacheSetup::Bypassed(
-      "native_cache_no_eligible_library_units",
+      DirectCacheBypass::NoEligibleLibraryUnits,
     ));
   }
 
@@ -364,11 +392,13 @@ pub(crate) fn prepare_direct_cargo_action(
     Ok(capability) if capability.report.is_certified() => capability,
     Ok(_) => {
       return Ok(DirectNativeCacheSetup::Bypassed(
-        "native_cache_capability_not_certified",
+        DirectCacheBypass::CapabilityNotCertified,
       ));
     }
     Err(_) => {
-      return Ok(DirectNativeCacheSetup::Bypassed("native_cache_capability_unavailable"));
+      return Ok(DirectNativeCacheSetup::Bypassed(
+        DirectCacheBypass::CapabilityUnavailable,
+      ));
     }
   };
   let (toolchain_fingerprint, setup_bytes_hashed) = executable_toolchain_fingerprint(
@@ -456,41 +486,43 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       .collect();
 
     for (member, target, features, key) in key_inputs {
-      let cached = self
-        .identity
-        .cache_bypass_reason
-        .is_none()
-        .then(|| store.get(&key))
-        .flatten();
-      let observation_miss =
-        cached.and_then(|entry| compiler_observation_miss_reason(&entry.observations, self.workspace_root));
-      if self.identity.cache_bypass_reason.is_none()
-        && observation_miss.is_none()
-        && let Some(entry) = cached
-      {
-        cache_by_member.entry(member.to_string()).or_default().hits += 1;
-        update_candidate_survivors(
-          &mut surviving_unused,
-          &candidate_targets,
-          member,
-          target,
-          &entry.evidence,
-        );
-        let package_id = member_ids
-          .get(member)
-          .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
-        record_target_evidence(&mut result, package_id, &entry.evidence);
+      let package_id = member_ids
+        .get(member)
+        .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
+      let mut cache_hit = false;
+      let observation_miss = if self.identity.cache_bypass_reason.is_none() {
+        store.get(&key).and_then(|entry| {
+          let miss = compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
+          if miss.is_none() {
+            cache_hit = true;
+            cache_by_member.entry(member.to_string()).or_default().hits += 1;
+            update_candidate_survivors(
+              &mut surviving_unused,
+              &candidate_targets,
+              member,
+              target,
+              &entry.evidence,
+            );
+            record_target_evidence(&mut result, package_id, &entry.evidence);
+          }
+          miss
+        })
+      } else {
+        None
+      };
+      if cache_hit {
         continue;
       }
 
       let reason = self
         .identity
         .cache_bypass_reason
+        .map(|reason| reason.as_str().to_string())
         .or(observation_miss)
-        .unwrap_or_else(|| store.miss_reason(&key));
+        .unwrap_or_else(|| store.miss_reason(&key).to_string());
       let summary = cache_by_member.entry(member.to_string()).or_default();
       summary.misses += 1;
-      *summary.miss_reasons.entry(reason.to_string()).or_default() += 1;
+      *summary.miss_reasons.entry(reason).or_default() += 1;
 
       stale_by_configuration
         .entry(AnalysisConfiguration {
@@ -685,6 +717,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     let identity = &self.identity;
     Ok(CompilerDiagKey {
       package_id: member.package_id.clone(),
+      package_name: member.package_name.clone(),
       target: PlatformTarget::from(target),
       features,
       rustc_version: identity.rustc_version.clone(),
@@ -2189,9 +2222,9 @@ fn target_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<Strin
   Ok(fingerprints)
 }
 
-fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<&'static str> {
+fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<CompilerCacheBypass> {
   if !snapshot.cargo_config().unmodeled_settings().is_empty() {
-    return Some("cargo_configuration_unmodeled");
+    return Some(CompilerCacheBypass::CargoConfiguration);
   }
   for package in &snapshot.base_resolution().metadata().packages {
     if package
@@ -2200,7 +2233,7 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<&'static
       .flat_map(|target| target.kind.iter())
       .any(|kind| *kind == TargetKind::CustomBuild)
     {
-      return Some("build_script_observations_unavailable");
+      return Some(CompilerCacheBypass::BuildScriptObservations);
     }
     if package
       .targets
@@ -2208,14 +2241,14 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<&'static
       .flat_map(|target| target.kind.iter())
       .any(|kind| *kind == TargetKind::ProcMacro)
     {
-      return Some("proc_macro_observations_unavailable");
+      return Some(CompilerCacheBypass::ProcMacroObservations);
     }
   }
   snapshot
     .packages()
     .iter()
     .any(|package| package.source().is_some() && package.checksum().is_none())
-    .then_some("external_source_digest_unavailable")
+    .then_some(CompilerCacheBypass::ExternalSourceDigest)
 }
 
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {

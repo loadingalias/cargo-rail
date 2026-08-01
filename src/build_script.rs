@@ -28,7 +28,7 @@ pub(crate) struct BuildScriptActionKeyAnalysis {
   source_inputs: usize,
   environment_entries: usize,
   dependency_results: usize,
-  #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+  #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
   secret_capabilities: BTreeSet<String>,
   reasons: BTreeSet<String>,
 }

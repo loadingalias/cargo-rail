@@ -61,11 +61,15 @@ pub fn run_clean(
   let prune_backups = backups && !clean_all;
   let delete_all_backups = clean_all;
 
+  let cache_status = (check && clean_cache)
+    .then(|| crate::cache::status(ctx.workspace_root(), true, true))
+    .transpose()?;
+
   // Collect artifacts to clean
   let mut artifacts = CleanArtifacts::new();
 
-  if clean_cache {
-    collect_cache_artifacts(ctx, &mut artifacts)?;
+  if let Some(status) = &cache_status {
+    collect_cache_artifacts(status, &mut artifacts);
   }
 
   if clean_reports {
@@ -77,6 +81,12 @@ pub fn run_clean(
   }
   if clean_all {
     collect_release_journal_artifacts(ctx, &mut artifacts)?;
+  }
+  // Combined apply preserves the historical local+workspace behavior. Validate
+  // the entire workspace scope before deleting the shared CAS so a hostile
+  // workspace path cannot produce an avoidable partial cleanup.
+  if !check && clean_cache {
+    crate::cache::status(ctx.workspace_root(), true, false)?;
   }
 
   // Check mode: preview what would be cleaned
@@ -93,7 +103,8 @@ pub fn run_clean(
           "release_journals": artifacts.release_journals,
         },
         "total": artifacts.total_count(),
-        "has_changes": has_changes
+        "has_changes": has_changes,
+        "cache_status": cache_status,
       });
       let output = crate::output::machine_json_envelope(
         "clean",
@@ -107,6 +118,16 @@ pub fn run_clean(
       println!("would clean:\n");
       for path in &artifacts.cache_files {
         println!("  {}", path);
+      }
+      if let Some(status) = &cache_status {
+        let workspace_bytes = status.workspace.as_ref().map_or(0, |workspace| workspace.bytes);
+        let local_bytes = status
+          .local
+          .as_ref()
+          .and_then(|local| local.cache.as_ref())
+          .map_or(0, |local| local.bytes);
+        println!("\n  workspace cache bytes: {workspace_bytes}");
+        println!("  shared local CAS bytes: {local_bytes} (affects other workspaces)");
       }
       for path in &artifacts.report_files {
         println!("  {}", path);
@@ -172,27 +193,19 @@ pub fn run_clean(
   Ok(())
 }
 
-fn collect_cache_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) -> RailResult<()> {
-  let state_root = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
-  let cache_path = state_root.join("metadata.json");
-  let compiler_cache_dir = state_root.join("cache");
-  let hermetic_cache_dir = crate::hermetic::state_root(ctx.workspace_root());
-
-  if cache_path.exists() {
-    artifacts.cache_files.push(cache_path.display().to_string());
+fn collect_cache_artifacts(status: &crate::cache::CacheStatus, artifacts: &mut CleanArtifacts) {
+  if let Some(workspace) = &status.workspace {
+    artifacts.cache_files.extend(
+      workspace
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind != "workspace_cache_lock")
+        .map(|artifact| artifact.path.clone()),
+    );
   }
-
-  if compiler_cache_dir.exists() {
-    artifacts.cache_files.push(compiler_cache_dir.display().to_string());
+  if let Some(local) = status.local.as_ref().and_then(|local| local.cache.as_ref()) {
+    artifacts.cache_files.push(local.root.clone());
   }
-
-  if hermetic_cache_dir.exists() {
-    artifacts.cache_files.push(hermetic_cache_dir.display().to_string());
-  }
-  if let Some(local_cache) = crate::hermetic::local_cache_root(ctx.workspace_root())? {
-    artifacts.cache_files.push(local_cache.display().to_string());
-  }
-  Ok(())
 }
 
 fn collect_report_artifacts(ctx: &WorkspaceContext, artifacts: &mut CleanArtifacts) {
@@ -299,47 +312,10 @@ fn clean_release_journals(paths: &[String]) -> RailResult<Vec<String>> {
 }
 
 fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
-  let state_root = crate::workspace::cargo_rail_state_root(ctx.workspace_root());
-  let cache_path = state_root.join("metadata.json");
-  let compiler_cache_dir = state_root.join("cache");
-  let hermetic_cache_dir = crate::hermetic::state_root(ctx.workspace_root());
-  let mut cleaned_paths = Vec::new();
-  let removed_local_cache = crate::hermetic::remove_local_cache(ctx.workspace_root())?;
-
-  if cache_path.exists() {
-    progress!("removing cache...");
-    fs::remove_file(&cache_path).map_err(|e| {
-      RailError::with_help(
-        format!("failed to remove {}: {}", cache_path.display(), e),
-        "check file permissions or if the file is in use",
-      )
-    })?;
-    cleaned_paths.push(cache_path.display().to_string());
-  }
-
-  if compiler_cache_dir.exists() {
-    progress!("removing cache...");
-    fs::remove_dir_all(&compiler_cache_dir).map_err(|e| {
-      RailError::with_help(
-        format!("failed to remove {}: {}", compiler_cache_dir.display(), e),
-        "check directory permissions or if files are in use",
-      )
-    })?;
-    cleaned_paths.push(compiler_cache_dir.display().to_string());
-  }
-
-  if hermetic_cache_dir.exists() {
-    progress!("removing hermetic cache...");
-    crate::hermetic::remove_state(ctx.workspace_root())?;
-    cleaned_paths.push(hermetic_cache_dir.display().to_string());
-  }
-
-  if let Some(local_cache) = removed_local_cache {
-    progress!("removed verified local action cache");
-    cleaned_paths.push(local_cache.display().to_string());
-  }
-
-  Ok(cleaned_paths)
+  progress!("removing validated cache state...");
+  let mut removal = crate::cache::remove_local()?;
+  removal.extend(crate::cache::remove_workspace(ctx.workspace_root())?)?;
+  Ok(removal.paths)
 }
 
 fn clean_generated_reports(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {

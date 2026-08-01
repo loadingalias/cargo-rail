@@ -45,13 +45,17 @@ const MAX_OUTPUT_ENTRIES: usize = 1_000_000;
 const MAX_DEP_INFO_BYTES: u64 = 64 * 1024 * 1024;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const CARGO_MUTABLE_CACHE_FILES: &[&str] = &[".global-cache", ".package-cache", ".package-cache-mutate"];
+const FETCH_INVENTORY_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MATERIALIZATIONS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const REPORTS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REPORTS: usize = 128;
+
+/// Maximum retained bytes under `target/cargo-rail/hermetic` after an operation.
+pub(crate) const HERMETIC_WORKSPACE_MAX_BYTES: u64 =
+  FETCH_INVENTORY_MAX_BYTES + MATERIALIZATIONS_MAX_BYTES + REPORTS_MAX_BYTES;
 
 #[cfg(target_os = "macos")]
 const MACOS_REQUIRED_HOST_FILES: &[&str] = &["/private/etc/ssl/openssl.cnf"];
-
-pub(crate) fn state_root(workspace_root: &Path) -> PathBuf {
-  crate::workspace::cargo_rail_state_root(workspace_root).join("hermetic")
-}
 
 fn create_state_directory(workspace_root: &Path, suffix: &[&str]) -> RailResult<PathBuf> {
   let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
@@ -120,6 +124,114 @@ fn validate_real_state_directory(path: &Path) -> RailResult<()> {
   ))
 }
 
+fn reclaim_workspace_state(workspace_root: &Path) -> RailResult<()> {
+  if let Some(root) = existing_state_directory(workspace_root, &[])? {
+    let obsolete_reference = root.join("local-cas-v1.json");
+    match fs::symlink_metadata(&obsolete_reference) {
+      Ok(_) => remove_owned_path(&obsolete_reference)?,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error.into()),
+    }
+  }
+  if let Some(runs) = existing_state_directory(workspace_root, &["runs"])? {
+    remove_children(&runs, None)?;
+  }
+  if let Some(materializations) = existing_state_directory(workspace_root, &["materializations"])? {
+    prune_children(&materializations, None, MATERIALIZATIONS_MAX_BYTES, usize::MAX)?;
+  }
+  if let Some(reports) = existing_state_directory(workspace_root, &["reports"])? {
+    prune_children(&reports, None, REPORTS_MAX_BYTES, MAX_REPORTS)?;
+  }
+  Ok(())
+}
+
+fn retain_fetch_inventory(root: &Path, retained: &Path) -> RailResult<()> {
+  remove_children(root, Some(retained))?;
+  if retained.exists() {
+    ensure_tree_bytes(retained, FETCH_INVENTORY_MAX_BYTES, "hermetic fetch inventory")?;
+  }
+  Ok(())
+}
+
+fn prune_children(root: &Path, retained: Option<&Path>, max_bytes: u64, max_entries: usize) -> RailResult<()> {
+  let mut entries = fs::read_dir(root)?
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .map(|entry| {
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)?;
+      let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+      let bytes = if crate::utils::is_symlink_or_reparse(&metadata) {
+        metadata.len()
+      } else {
+        crate::cache::path_status(&path)?.map_or(0, |status| status.0)
+      };
+      Ok((modified, entry.file_name(), path, bytes))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+  let mut bytes = entries.iter().try_fold(0u64, |total, entry| {
+    total
+      .checked_add(entry.3)
+      .ok_or_else(|| RailError::message("workspace hermetic state size overflow"))
+  })?;
+  let mut count = entries.len();
+  for (_, _, path, entry_bytes) in entries {
+    if bytes <= max_bytes && count <= max_entries {
+      break;
+    }
+    if retained.is_some_and(|retained| path == retained) {
+      continue;
+    }
+    remove_owned_path(&path)?;
+    bytes = bytes.saturating_sub(entry_bytes);
+    count = count.saturating_sub(1);
+  }
+  if bytes > max_bytes || count > max_entries {
+    return Err(RailError::message(format!(
+      "retained workspace hermetic state exceeds its {max_bytes}-byte/{max_entries}-entry bound"
+    )));
+  }
+  Ok(())
+}
+
+fn remove_children(root: &Path, retained: Option<&Path>) -> RailResult<()> {
+  let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+  entries.sort_by_key(|entry| entry.file_name());
+  for entry in entries {
+    let path = entry.path();
+    if retained.is_some_and(|retained| path == retained) {
+      continue;
+    }
+    remove_owned_path(&path)?;
+  }
+  Ok(())
+}
+
+fn remove_owned_path(path: &Path) -> RailResult<()> {
+  let metadata = fs::symlink_metadata(path)?;
+  if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
+    set_tree_owner_writable(path)?;
+    fs::remove_dir_all(path)?;
+  } else if metadata.is_dir() {
+    fs::remove_dir(path)?;
+  } else {
+    fs::remove_file(path)?;
+  }
+  Ok(())
+}
+
+fn ensure_tree_bytes(root: &Path, max_bytes: u64, description: &str) -> RailResult<u64> {
+  let bytes = crate::cache::path_status(root)?.map_or(0, |status| status.0);
+  if bytes > max_bytes {
+    return Err(RailError::with_help(
+      format!("{description} '{}' exceeds its {max_bytes}-byte bound", root.display()),
+      "reduce the retained inputs or outputs; cargo-rail will not keep unbounded workspace cache state",
+    ));
+  }
+  Ok(bytes)
+}
+
 pub(crate) fn remove_state(workspace_root: &Path) -> RailResult<()> {
   let Some(root) = existing_state_directory(workspace_root, &[])? else {
     return Ok(());
@@ -129,53 +241,18 @@ pub(crate) fn remove_state(workspace_root: &Path) -> RailResult<()> {
     .map_err(|error| RailError::message(format!("failed to remove hermetic cache '{}': {error}", root.display())))
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LocalCacheReference {
-  version: u32,
-  root: String,
-}
-
-pub(crate) fn register_local_cache(workspace_root: &Path, root: &Path) -> RailResult<()> {
-  let directory = create_state_directory(workspace_root, &[])?;
-  let root = root
-    .to_str()
-    .ok_or_else(|| RailError::message("local CAS root is not valid UTF-8"))?;
-  let reference = LocalCacheReference {
-    version: 1,
-    root: root.to_string(),
-  };
-  crate::utils::write_file_atomic(&directory.join("local-cas-v1.json"), &serde_json::to_vec(&reference)?)
-}
-
-pub(crate) fn local_cache_root(workspace_root: &Path) -> RailResult<Option<PathBuf>> {
-  let Some(directory) = existing_state_directory(workspace_root, &[])? else {
-    return Ok(None);
-  };
-  let path = directory.join("local-cas-v1.json");
-  let metadata = match fs::symlink_metadata(&path) {
-    Ok(metadata) => metadata,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-    Err(error) => return Err(error.into()),
-  };
-  if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
-    return Err(RailError::message(format!(
-      "local CAS reference '{}' is not a bounded regular file",
-      path.display()
-    )));
-  }
-  let reference: LocalCacheReference = serde_json::from_slice(&fs::read(&path)?)?;
-  if reference.version != 1 {
-    return Err(RailError::message("local CAS reference has an incompatible schema"));
-  }
-  cas::existing_root_at(Path::new(&reference.root))
-}
-
-pub(crate) fn remove_local_cache(workspace_root: &Path) -> RailResult<Option<PathBuf>> {
-  let Some(root) = local_cache_root(workspace_root)? else {
+pub(crate) fn remove_local_cache() -> RailResult<Option<(PathBuf, u64)>> {
+  let Some(root) = cas::configured_root()? else {
     return Ok(None);
   };
   cas::remove_owned_root_at(&root)
+}
+
+pub(crate) fn local_cache_status() -> RailResult<Option<cas::LocalCasStatus>> {
+  let Some(root) = cas::configured_root()? else {
+    return Ok(None);
+  };
+  cas::status_at(&root)
 }
 
 /// Support earned by one concrete action execution.
@@ -557,6 +634,7 @@ pub(crate) struct HermeticBootstrap {
   pub(crate) cargo_current_dir: PathBuf,
   pub(crate) inventory: FetchInventory,
   pub(crate) lockfile: CapturedLockfile,
+  pub(crate) workspace_cache_lock: crate::cache::WorkspaceCacheLock,
 }
 
 pub(crate) fn prepare_bootstrap(workspace_root: &Path) -> RailResult<HermeticBootstrap> {
@@ -597,6 +675,8 @@ pub(crate) fn prepare_bootstrap(workspace_root: &Path) -> RailResult<HermeticBoo
       "select a Cargo workspace contained by the repository or declared source boundary",
     ));
   }
+  let workspace_cache_lock = crate::cache::lock_workspace(&workspace_root)?;
+  reclaim_workspace_state(&workspace_root)?;
   let lock_path = workspace_root.join("Cargo.lock");
   let (lock_fingerprint, locked_packages, lockfile_bytes) = capture_fetch_lockfile(&lock_path)?;
   let executables = crate::executable::ToolchainExecutableIdentities::capture(
@@ -628,6 +708,7 @@ pub(crate) fn prepare_bootstrap(workspace_root: &Path) -> RailResult<HermeticBoo
     cargo_current_dir: inputs.cargo_current_dir,
     inventory,
     lockfile: CapturedLockfile::new(lock_path, lockfile_bytes),
+    workspace_cache_lock,
   })
 }
 
@@ -788,7 +869,7 @@ impl FetchInventory {
     if captured.digest != self.cargo_home_digest || captured.entries != self.cargo_home_entries {
       return Err(RailError::with_help(
         "immutable Cargo fetch inventory changed during hermetic execution",
-        "remove cargo-rail's hermetic cache with `cargo rail clean --cache` and retry",
+        "remove this workspace's hermetic cache with `cargo rail cache clean --scope workspace` and retry",
       ));
     }
     Ok(())
@@ -902,6 +983,7 @@ struct RunLayout {
 impl RunLayout {
   fn create(ctx: &WorkspaceContext) -> RailResult<Self> {
     let parent = create_state_directory(ctx.workspace_root(), &["runs"])?;
+    remove_children(&parent, None)?;
     let directory = tempfile::Builder::new()
       .prefix("run-")
       .tempdir_in(&parent)
@@ -946,6 +1028,7 @@ fn prepare_fetch_inventory_with_inputs(inputs: &FetchInputs) -> RailResult<Fetch
   let key = fetch_key(inputs, &credential_capabilities)?;
   let inventory_root = create_state_directory(workspace_root, &["inventories"])?;
   let destination = inventory_root.join(key.trim_start_matches("fetch-v1-sha256-"));
+  retain_fetch_inventory(&inventory_root, &destination)?;
   match fs::symlink_metadata(&destination) {
     Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
       return load_fetch_inventory(&destination, &key, &credential_capabilities, true);
@@ -956,7 +1039,7 @@ fn prepare_fetch_inventory_with_inputs(inputs: &FetchInputs) -> RailResult<Fetch
           "hermetic fetch inventory '{}' is not a real directory",
           destination.display()
         ),
-        "remove the hostile or corrupt path and retry, or run `cargo rail clean --cache`",
+        "remove the hostile or corrupt path and retry, or run `cargo rail cache clean --scope workspace`",
       ));
     }
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -997,6 +1080,7 @@ fn prepare_fetch_inventory_with_inputs(inputs: &FetchInputs) -> RailResult<Fetch
   ensure_package_cache_file(&cargo_home)?;
   let manifest = capture_fetch_manifest(inputs, &cargo_home, &key, credential_capabilities.clone())?;
   crate::utils::write_file_atomic(&payload.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
+  ensure_tree_bytes(&payload, FETCH_INVENTORY_MAX_BYTES, "hermetic fetch inventory")?;
   seal_fetch_inventory(&cargo_home)?;
   let published = match fs::rename(&payload, &destination) {
     Ok(()) => true,
@@ -1144,7 +1228,7 @@ fn load_fetch_inventory(
         "hermetic fetch inventory manifest '{}' is not a regular file",
         manifest_path.display()
       ),
-      "remove cargo-rail's hermetic cache with `cargo rail clean --cache` and retry",
+      "remove this workspace's hermetic cache with `cargo rail cache clean --scope workspace` and retry",
     ));
   }
   let bytes = fs::read(&manifest_path).map_err(|error| {
@@ -1166,7 +1250,7 @@ fn load_fetch_inventory(
   {
     return Err(RailError::with_help(
       "hermetic fetch inventory is incompatible with the current action",
-      "remove cargo-rail's hermetic cache with `cargo rail clean --cache` and retry",
+      "remove this workspace's hermetic cache with `cargo rail cache clean --scope workspace` and retry",
     ));
   }
   let cargo_home = root.join("cargo-home");
@@ -1175,7 +1259,7 @@ fn load_fetch_inventory(
   if current.digest != stored.cargo_home_digest || current.entries != stored.cargo_home_entries {
     return Err(RailError::with_help(
       "hermetic fetch inventory failed exact source revalidation",
-      "remove cargo-rail's hermetic cache with `cargo rail clean --cache` and fetch again",
+      "remove this workspace's hermetic cache with `cargo rail cache clean --scope workspace` and fetch again",
     ));
   }
   Ok(fetch_inventory_from_manifest(root, stored, reused))
@@ -1484,7 +1568,7 @@ fn seal_fetch_inventory(cargo_home: &Path) -> RailResult<()> {
   set_tree_read_only(cargo_home)?;
   for path in cargo_mutable_cache_paths(cargo_home) {
     if path.is_file() {
-      make_path_owner_writable(&path)?;
+      make_private_path_owner_writable(&path)?;
     }
   }
   Ok(())
@@ -1771,6 +1855,90 @@ fn set_tree_read_only(root: &Path) -> RailResult<()> {
   Ok(())
 }
 
+#[cfg(unix)]
+fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
+  use rustix::fd::OwnedFd;
+  use rustix::fs::{Dir, Mode, OFlags};
+  use std::os::unix::fs::MetadataExt as _;
+  use std::path::Component;
+
+  fn io_error(error: rustix::io::Errno) -> RailError {
+    std::io::Error::from_raw_os_error(error.raw_os_error()).into()
+  }
+
+  fn open_directory<Fd: std::os::fd::AsFd>(parent: Fd, name: &std::ffi::OsStr) -> Result<OwnedFd, rustix::io::Errno> {
+    rustix::fs::openat(
+      parent,
+      name,
+      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+  }
+
+  fn make_directories_writable(directory: OwnedFd) -> RailResult<()> {
+    let stat = rustix::fs::fstat(&directory).map_err(io_error)?;
+    rustix::fs::fchmod(&directory, Mode::from_raw_mode(stat.st_mode) | Mode::RWXU).map_err(io_error)?;
+    let mut entries = Dir::read_from(&directory).map_err(io_error)?;
+    for entry in &mut entries {
+      let entry = entry.map_err(io_error)?;
+      let name = entry.file_name();
+      if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        continue;
+      }
+      match rustix::fs::openat(
+        &directory,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+      ) {
+        Ok(child) => make_directories_writable(child)?,
+        Err(rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP | rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(io_error(error)),
+      }
+    }
+    Ok(())
+  }
+
+  if !root.is_absolute() {
+    return Err(RailError::message(format!(
+      "refusing to reclaim non-absolute cache path '{}'",
+      root.display()
+    )));
+  }
+  let expected = fs::symlink_metadata(root)?;
+  if !expected.is_dir() || crate::utils::is_symlink_or_reparse(&expected) {
+    return Err(RailError::message(format!(
+      "refusing to reclaim non-directory cache path '{}'",
+      root.display()
+    )));
+  }
+  let canonical = fs::canonicalize(root)?;
+  let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+  let mut directory = rustix::fs::open("/", flags, Mode::empty()).map_err(io_error)?;
+  for component in canonical.components() {
+    match component {
+      Component::RootDir => {}
+      Component::Normal(name) => directory = open_directory(&directory, name).map_err(io_error)?,
+      Component::CurDir => {}
+      Component::ParentDir | Component::Prefix(_) => {
+        return Err(RailError::message(format!(
+          "refusing to reclaim non-normalized cache path '{}'",
+          root.display()
+        )));
+      }
+    }
+  }
+  let opened = rustix::fs::fstat(&directory).map_err(io_error)?;
+  if u64::try_from(opened.st_dev).ok() != Some(expected.dev()) || opened.st_ino != expected.ino() {
+    return Err(RailError::message(format!(
+      "cache path '{}' changed while reclamation authority was acquired",
+      root.display()
+    )));
+  }
+  make_directories_writable(directory)
+}
+
+#[cfg(not(unix))]
 fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
   if !root.exists() {
     return Ok(());
@@ -1778,7 +1946,7 @@ fn set_tree_owner_writable(root: &Path) -> RailResult<()> {
   let mut paths = vec![root.to_path_buf()];
   while let Some(path) = paths.pop() {
     let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() {
+    if crate::utils::is_symlink_or_reparse(&metadata) {
       continue;
     }
     if metadata.is_dir() {
@@ -1810,8 +1978,20 @@ fn make_path_read_only(path: &Path, mut permissions: fs::Permissions) -> RailRes
   Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(not(unix))]
 fn make_path_owner_writable(path: &Path) -> RailResult<()> {
+  let mut permissions = fs::metadata(path)?.permissions();
+  permissions.set_readonly(false);
+  fs::set_permissions(path, permissions)?;
+  Ok(())
+}
+
+// These Cargo bookkeeping files are still inside an unpublished private
+// TempDir, so no external actor can replace a parent during this path-based
+// permission change. Published-tree reclamation uses descriptor-relative
+// traversal above.
+#[cfg(unix)]
+fn make_private_path_owner_writable(path: &Path) -> RailResult<()> {
   use std::os::unix::fs::PermissionsExt as _;
 
   let mut permissions = fs::metadata(path)?.permissions();
@@ -1821,11 +2001,8 @@ fn make_path_owner_writable(path: &Path) -> RailResult<()> {
 }
 
 #[cfg(not(unix))]
-fn make_path_owner_writable(path: &Path) -> RailResult<()> {
-  let mut permissions = fs::metadata(path)?.permissions();
-  permissions.set_readonly(false);
-  fs::set_permissions(path, permissions)?;
-  Ok(())
+fn make_private_path_owner_writable(path: &Path) -> RailResult<()> {
+  make_path_owner_writable(path)
 }
 
 fn run_cargo_check(
@@ -3143,6 +3320,8 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
   #[cfg(target_os = "macos")]
   {
     let started = Instant::now();
+    let _workspace_cache_lock = crate::cache::lock_workspace(workspace_root)?;
+    reclaim_workspace_state(workspace_root)?;
     let lookup_key = match pre_context_lookup_key(workspace_root) {
       Ok(lookup_key) => lookup_key,
       Err(_) => {
@@ -3177,8 +3356,8 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
           continue;
         }
       }
-      register_local_cache(workspace_root, local_cas.root())?;
       let parent = create_state_directory(workspace_root, &["materializations"])?;
+      prune_children(&parent, None, MATERIALIZATIONS_MAX_BYTES, usize::MAX)?;
       let temporary = tempfile::Builder::new()
         .prefix("result-")
         .tempdir_in(&parent)
@@ -3219,6 +3398,11 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
           "local action output escaped its private materialization root",
         ));
       }
+      ensure_tree_bytes(
+        &destination,
+        MATERIALIZATIONS_MAX_BYTES,
+        "restored hermetic materialization",
+      )?;
       let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
       let materialized_root = destination
         .strip_prefix(&workspace_root)
@@ -3263,6 +3447,7 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
           "persisted local action output escaped its declared root",
         ));
       }
+      prune_children(&parent, Some(&persisted_parent), MATERIALIZATIONS_MAX_BYTES, usize::MAX)?;
       return Ok(PreContextCacheAttempt::Hit(Box::new(PreContextCacheHit {
         report,
         report_path,
@@ -3343,12 +3528,8 @@ pub(crate) fn execute(
   } else if preliminary_action_key.is_some() {
     match cas::LocalCas::open() {
       Ok(cas) => {
-        if register_local_cache(ctx.workspace_root(), cas.root()).is_err() {
-          LocalCacheSummary::new(LocalCacheStatus::Disabled, "cache_reference_unavailable")
-        } else {
-          local_cas = Some(cas);
-          LocalCacheSummary::new(LocalCacheStatus::Miss, "validated_candidate_not_found")
-        }
+        local_cas = Some(cas);
+        LocalCacheSummary::new(LocalCacheStatus::Miss, "validated_candidate_not_found")
       }
       Err(_) => LocalCacheSummary::new(LocalCacheStatus::Disabled, "cache_root_unavailable"),
     }
@@ -3894,12 +4075,20 @@ fn hermetic_result_digest(action_key: &str, output_manifest: &str) -> String {
 
 fn write_report(workspace_root: &Path, report: &HermeticExecutionReport) -> RailResult<PathBuf> {
   let directory = create_state_directory(workspace_root, &["reports"])?;
+  prune_children(&directory, None, REPORTS_MAX_BYTES, MAX_REPORTS)?;
   let nonce = SystemTime::now()
     .duration_since(UNIX_EPOCH)
     .map(|duration| duration.as_nanos())
     .unwrap_or_default();
   let path = directory.join(format!("{}-{nonce}.json", report.action_id));
-  crate::utils::write_file_atomic(&path, &serde_json::to_vec_pretty(report)?)?;
+  let bytes = serde_json::to_vec_pretty(report)?;
+  if bytes.len() as u64 > REPORTS_MAX_BYTES {
+    return Err(RailError::message(format!(
+      "hermetic execution report exceeds its {REPORTS_MAX_BYTES}-byte bound"
+    )));
+  }
+  crate::utils::write_file_atomic(&path, &bytes)?;
+  prune_children(&directory, Some(&path), REPORTS_MAX_BYTES, MAX_REPORTS)?;
   Ok(path)
 }
 
@@ -4660,5 +4849,36 @@ mod tests {
     ] {
       assert!(hermetic_environment_name_is_controlled(name));
     }
+  }
+
+  #[test]
+  fn workspace_pruning_keeps_only_bounded_protected_state() {
+    let root = tempfile::tempdir().expect("workspace state root");
+    let older = root.path().join("a");
+    let retained = root.path().join("b");
+    fs::create_dir(&older).expect("older state");
+    fs::create_dir(&retained).expect("retained state");
+    fs::write(older.join("payload"), [1; 8]).expect("older payload");
+    fs::write(retained.join("payload"), [2; 8]).expect("retained payload");
+
+    prune_children(root.path(), Some(&retained), 8, 1).expect("bounded pruning");
+
+    assert!(!older.exists());
+    assert!(retained.is_dir());
+  }
+
+  #[test]
+  fn fetch_inventory_retention_removes_superseded_and_crash_state() {
+    let root = tempfile::tempdir().expect("inventory root");
+    let retained = root.path().join("current");
+    fs::create_dir(&retained).expect("current inventory");
+    fs::write(retained.join("manifest.json"), b"{}").expect("current manifest");
+    fs::create_dir(root.path().join("superseded")).expect("superseded inventory");
+    fs::create_dir(root.path().join("fetch-crash")).expect("crash staging");
+
+    retain_fetch_inventory(root.path(), &retained).expect("inventory retention");
+
+    assert_eq!(fs::read_dir(root.path()).expect("retained inventory root").count(), 1);
+    assert!(retained.is_dir());
   }
 }

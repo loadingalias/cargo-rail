@@ -32,6 +32,7 @@ Usage: cargo rail [OPTIONS] <COMMAND>
 Commands:
   run          Execute planner-selected actions
   doctor       Inspect action hermeticity and native-cache capability
+  cache        Inspect or reclaim explicitly scoped cache state
   plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
@@ -306,6 +307,143 @@ Options:
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+## cargo rail cache
+
+```
+Inspect or reclaim explicitly scoped cache state
+
+Usage: cargo rail cache [OPTIONS] <COMMAND>
+
+Commands:
+  status  Report exact bytes, counts, bounds, leases, and ownership scope
+  clean   Reclaim one explicitly selected cache scope
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail cache status                         # Inspect workspace and shared local cache state
+  cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
+  cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
+```
+
+---
+
+### cargo rail cache status
+
+```
+Report exact bytes, counts, bounds, leases, and ownership scope
+
+Usage: cargo rail cache status [OPTIONS]
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --scope <SCOPE>
+          Cache scope to inspect
+
+          Possible values:
+          - workspace: Reconstructible cache state inside the selected workspace
+          - local:     The validated user-wide CAS shared by local workspaces
+          - all:       Both workspace state and the shared local CAS
+
+          [default: all]
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail cache clean
+
+```
+Reclaim one explicitly selected cache scope
+
+Usage: cargo rail cache clean [OPTIONS] --scope <SCOPE>
+
+Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --scope <SCOPE>
+          Cache scope to reclaim; required to prevent accidental cross-workspace deletion
+
+          Possible values:
+          - workspace: Reconstructible cache state inside the selected workspace
+          - local:     The validated user-wide CAS shared by local workspaces
+          - all:       Both workspace state and the shared local CAS
+
+  -c, --check
+          Preview exact bytes and paths without deleting them
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)

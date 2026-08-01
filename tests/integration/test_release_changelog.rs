@@ -717,6 +717,7 @@ fn run_with_path_prefix(ws: &TestWorkspace, prefix: &Path, args: &[&str]) -> Res
   Command::new(cargo_rail_bin)
     .current_dir(&ws.path)
     .env("PATH", path)
+    .env("CARGO_RAIL_CACHE_DIR", ws.path.join("target/cargo-rail-test-cache"))
     .env("GIT_CONFIG_COUNT", "2")
     .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
     .env("GIT_CONFIG_VALUE_0", "false")

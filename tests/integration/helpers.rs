@@ -417,6 +417,7 @@ pub fn run_cargo_rail_with_env(cwd: &Path, args: &[&str], environment: &[(&str, 
     .env("GIT_CONFIG_VALUE_0", "false")
     .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
     .env("GIT_CONFIG_VALUE_1", "false")
+    .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))
     .args(args);
   for (name, value) in environment {
     command.env(name, value);
@@ -424,6 +425,68 @@ pub fn run_cargo_rail_with_env(cwd: &Path, args: &[&str], environment: &[(&str, 
   let output = command.output().context("Failed to run cargo-rail")?;
 
   Ok(output)
+}
+
+/// Reconstruct compiler-evidence entries from the configured local CAS.
+pub fn compiler_evidence_cache(workspace_root: &Path) -> Result<serde_json::Value> {
+  compiler_evidence_cache_at(&workspace_root.join("target/cargo-rail-test-cache"))
+}
+
+/// Reconstruct compiler-evidence entries from an explicitly configured cache base.
+pub fn compiler_evidence_cache_at(cache_base: &Path) -> Result<serde_json::Value> {
+  let root = cache_base.join("cargo-rail/local-cas-v1");
+  let mut pin_created = std::collections::HashMap::new();
+  for pin in std::fs::read_dir(root.join("pins"))? {
+    let pin: serde_json::Value = serde_json::from_slice(&std::fs::read(pin?.path())?)?;
+    if let (Some(action_key), Ok(created)) = (
+      pin["action_key"].as_str(),
+      pin["created_unix_nanos"].to_string().parse::<u128>(),
+    ) {
+      pin_created.insert(action_key.to_string(), created);
+    }
+  }
+  let mut result_directories = std::fs::read_dir(root.join("results"))?.collect::<Result<Vec<_>, _>>()?;
+  result_directories.sort_by_key(|entry| entry.file_name());
+  let mut latest = std::collections::BTreeMap::<String, (u128, serde_json::Value)>::new();
+  for result in result_directories {
+    let validation_directory = result.path().join("validations");
+    let evidence_directory = result.path().join("evidence");
+    if !validation_directory.is_dir() || !evidence_directory.is_dir() {
+      continue;
+    }
+    let validation_path = std::fs::read_dir(&validation_directory)?
+      .next()
+      .transpose()?
+      .context("compiler-evidence validation object")?
+      .path();
+    let evidence_path = std::fs::read_dir(&evidence_directory)?
+      .next()
+      .transpose()?
+      .context("compiler-evidence payload object")?
+      .path();
+    let validation: serde_json::Value = serde_json::from_slice(&std::fs::read(validation_path)?)?;
+    let evidence: serde_json::Value = serde_json::from_slice(&std::fs::read(evidence_path)?)?;
+    let Some(action_key) = validation["action_key"].as_str() else {
+      continue;
+    };
+    let key = serde_json::to_string(&validation["key"])?;
+    let created = pin_created.get(action_key).copied().unwrap_or_default();
+    let value = serde_json::json!({
+      "key": validation["key"],
+      "evidence": evidence["evidence"],
+      "collector_version": validation["collector_version"],
+      "observations": validation["observations"],
+      "created_unix_nanos": created,
+    });
+    if latest.get(&key).is_none_or(|(current, _)| *current < created) {
+      latest.insert(key, (created, value));
+    }
+  }
+  let entries = latest
+    .into_iter()
+    .map(|(key, (_, value))| (key, value))
+    .collect::<serde_json::Map<_, _>>();
+  Ok(serde_json::json!({ "entries": entries }))
 }
 
 /// Load RailConfig from a workspace

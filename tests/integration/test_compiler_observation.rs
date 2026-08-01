@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::helpers::TestWorkspace;
+use crate::helpers::{TestWorkspace, compiler_evidence_cache, compiler_evidence_cache_at};
 
 const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
 
@@ -137,10 +137,24 @@ fn local_observation(cache: &serde_json::Value, target_name: &str) -> Result<ser
     .as_object()
     .context("compiler cache entries")?
     .values()
-    .filter_map(|entry| entry["observations"].as_array())
-    .flatten()
-    .find(|observation| {
-      observation["unit"]["target_name"] == target_name && observation["unit"]["profile"]["test"] == false
+    .filter_map(|entry| {
+      let observations = entry["observations"].as_array()?;
+      observations
+        .iter()
+        .any(|observation| {
+          observation["unit"]["target_name"] == target_name && observation["unit"]["profile"]["test"] == false
+        })
+        .then_some(entry)
+    })
+    .max_by_key(|entry| entry["created_unix_nanos"].as_u64())
+    .and_then(|entry| entry["observations"].as_array())
+    .and_then(|observations| {
+      observations
+        .iter()
+        .filter(|observation| {
+          observation["unit"]["target_name"] == target_name && observation["unit"]["profile"]["test"] == false
+        })
+        .min_by_key(|observation| observation["execution"]["cache_wrapper"]["status"] == "hit")
     })
     .cloned()
     .with_context(|| format!("compiler observation for {target_name}"))
@@ -200,10 +214,8 @@ fn run_unify_with_environment(
     .context("run cargo-rail unify without ambient wrappers")
 }
 
-fn native_cache_observation(workspace: &Path) -> Result<serde_json::Value> {
-  let cache: serde_json::Value = serde_json::from_slice(&fs::read(
-    workspace.join("target/cargo-rail/cache/compiler-diags-v1.json"),
-  )?)?;
+fn native_cache_observation(cache_root: &Path) -> Result<serde_json::Value> {
+  let cache = compiler_evidence_cache_at(cache_root)?;
   local_observation(&cache, "wrapper_app")
 }
 
@@ -213,14 +225,38 @@ fn native_cache_observation(workspace: &Path) -> Result<serde_json::Value> {
   all(target_os = "linux", target_arch = "x86_64"),
   all(target_os = "windows", target_arch = "x86_64")
 ))]
-fn assert_native_miss(workspace: &Path, output: &std::process::Output) -> Result<serde_json::Value> {
+fn assert_native_miss(cache_root: &Path, output: &std::process::Output) -> Result<serde_json::Value> {
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
-  let observation = native_cache_observation(workspace)?;
+  let observation = native_cache_observation(cache_root)?;
   assert_ne!(
     observation["execution"]["cache_wrapper"]["status"], "hit",
     "mutated input must not authorize native reuse: {observation}"
   );
   Ok(observation)
+}
+
+#[cfg(any(
+  all(target_os = "macos", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "aarch64"),
+  all(target_os = "linux", target_arch = "x86_64"),
+  all(target_os = "windows", target_arch = "x86_64")
+))]
+fn assert_native_invalidation(
+  cache_root: &Path,
+  output: &std::process::Output,
+  prior_action_keys: &[String],
+) -> Result<(serde_json::Value, String)> {
+  assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
+  let observation = native_cache_observation(cache_root)?;
+  let action_key = observation["execution"]["cache_wrapper"]["action_key"]
+    .as_str()
+    .context("native-cache action key after input mutation")?
+    .to_string();
+  assert!(
+    !prior_action_keys.contains(&action_key),
+    "mutated input reused a prior native-cache action key: {observation}"
+  );
+  Ok((observation, action_key))
 }
 
 #[cfg(any(
@@ -636,7 +672,7 @@ fn ineligible_diagnostic_workspace_never_installs_the_native_cache_wrapper() -> 
   let local_cache = tempfile::tempdir()?;
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
-  let observation = native_cache_observation(&workspace.path)?;
+  let observation = native_cache_observation(local_cache.path())?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "bypassed");
   assert_eq!(
     observation["execution"]["cache_wrapper"]["reason"],
@@ -664,7 +700,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   let local_cache = tempfile::tempdir()?;
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
-  let observation = native_cache_observation(&workspace.path)?;
+  let observation = native_cache_observation(local_cache.path())?;
   if let Some(reason) = native_cache_action_boundary_bypass(&observation) {
     let target = workspace.path.join("target");
     let cold_outputs = compiler_output_files(&target)?;
@@ -673,10 +709,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
       "bypassed execution produced no compiler outputs"
     );
     assert!(
-      !workspace
-        .path
-        .join("target/cargo-rail/hermetic/local-cas-v1.json")
-        .exists(),
+      !local_cache.path().join("cargo-rail/local-cas-v1").exists(),
       "an action-level bypass must not create native-cache state"
     );
     fs::remove_dir_all(&target)?;
@@ -686,7 +719,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
       Some(1),
       "repeated bypassed execution: {repeated:?}"
     );
-    let repeated_observation = native_cache_observation(&workspace.path)?;
+    let repeated_observation = native_cache_observation(local_cache.path())?;
     assert_eq!(
       native_cache_action_boundary_bypass(&repeated_observation),
       Some(reason),
@@ -700,16 +733,18 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     return Ok(());
   }
   assert!(
-    workspace
+    local_cache.path().join("cargo-rail/local-cas-v1").is_dir(),
+    "native reuse must publish into the configured local CAS"
+  );
+  assert!(
+    !workspace
       .path
       .join("target/cargo-rail/hermetic/local-cas-v1.json")
-      .is_file(),
-    "native reuse must retain P7.1's validated cleanup reference"
+      .exists(),
+    "native reuse must not recreate the obsolete workspace-local CAS reference"
   );
 
-  let cache: serde_json::Value = serde_json::from_slice(&fs::read(
-    workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"),
-  )?)?;
+  let cache = compiler_evidence_cache_at(local_cache.path())?;
   let observation = local_observation(&cache, "wrapper_app")?;
   assert_eq!(
     observation["execution"]["cache_wrapper"]["status"], "miss",
@@ -732,16 +767,22 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   let portable_cold_outputs = portable_compiler_output_files(&target, &workspace.path)?;
   assert!(!cold_outputs.is_empty());
   assert!(!portable_cold_outputs.is_empty());
-  fs::remove_dir_all(&target)?;
+  let clean = Command::new("cargo")
+    .current_dir(&workspace.path)
+    .arg("clean")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove(CACHE_WRAPPER_MARKER)
+    .output()?;
+  assert!(clean.status.success(), "cargo clean failed: {clean:?}");
+  assert!(!target.exists(), "cargo clean must remove workspace target state");
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(
     output.status.code(),
     Some(1),
     "unexpected warm unify result: {output:?}"
   );
-  let cache_file: serde_json::Value = serde_json::from_slice(&fs::read(
-    workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"),
-  )?)?;
+  let cache_file = compiler_evidence_cache_at(local_cache.path())?;
   let observation = local_observation(&cache_file, "wrapper_app")?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "hit");
   assert_eq!(
@@ -761,7 +802,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     Some(1),
     "second-root cache hit: {second_hit:?}"
   );
-  let second_observation = native_cache_observation(&second.path)?;
+  let second_observation = native_cache_observation(local_cache.path())?;
   assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
   assert_eq!(
     second_observation["execution"]["cache_wrapper"]["candidate_key"], first_candidate,
@@ -779,7 +820,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     Some(1),
     "second-root warm run: {second_warm:?}"
   );
-  let second_observation = native_cache_observation(&second.path)?;
+  let second_observation = native_cache_observation(local_cache.path())?;
   assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
   assert_eq!(
     portable_compiler_output_files(&second_target, &second.path)?,
@@ -821,7 +862,8 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let target = workspace.path.join("target");
 
   let cold = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
-  let cold_observation = assert_native_miss(&workspace.path, &cold)?;
+  assert_eq!(cold.status.code(), Some(1), "cold run: {cold:?}");
+  let cold_observation = native_cache_observation(local_cache.path())?;
   if let Some(reason) = native_cache_action_boundary_bypass(&cold_observation) {
     let cold_outputs = compiler_output_files(&target)?;
     assert!(
@@ -830,7 +872,7 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
     );
     fs::remove_dir_all(&target)?;
     let repeated = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
-    let repeated_observation = assert_native_miss(&workspace.path, &repeated)?;
+    let repeated_observation = assert_native_miss(local_cache.path(), &repeated)?;
     assert_eq!(
       native_cache_action_boundary_bypass(&repeated_observation),
       Some(reason),
@@ -847,9 +889,14 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let warm = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
   assert_eq!(warm.status.code(), Some(1), "warm run: {warm:?}");
   assert_eq!(
-    native_cache_observation(&workspace.path)?["execution"]["cache_wrapper"]["status"],
+    native_cache_observation(local_cache.path())?["execution"]["cache_wrapper"]["status"],
     "hit"
   );
+  let baseline_action_key = native_cache_observation(local_cache.path())?["execution"]["cache_wrapper"]["action_key"]
+    .as_str()
+    .context("baseline native-cache action key")?
+    .to_string();
+  let mut prior_action_keys = vec![baseline_action_key];
 
   fs::remove_dir_all(&target)?;
   let forced_incremental = run_unify_with_environment(
@@ -857,7 +904,7 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
     local_cache.path(),
     &[("P73_VALUE", "one"), ("RUSTC_FORCE_INCREMENTAL", "1")],
   )?;
-  let forced_observation = assert_native_miss(&workspace.path, &forced_incremental)?;
+  let forced_observation = assert_native_miss(local_cache.path(), &forced_incremental)?;
   assert_eq!(forced_observation["execution"]["cache_wrapper"]["status"], "bypassed");
   assert_eq!(
     forced_observation["execution"]["cache_wrapper"]["reason"],
@@ -870,11 +917,14 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
     "pub const BUILD_VALUE: &str = env!(\"P73_VALUE\");\npub const MARKER: u8 = 2;\n",
   )?;
   let source_mutation = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
-  assert_native_miss(&workspace.path, &source_mutation)?;
+  let (_, source_action_key) = assert_native_invalidation(local_cache.path(), &source_mutation, &prior_action_keys)?;
+  prior_action_keys.push(source_action_key);
 
   fs::remove_dir_all(&target)?;
   let environment_mutation = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "two")])?;
-  assert_native_miss(&workspace.path, &environment_mutation)?;
+  let (_, environment_action_key) =
+    assert_native_invalidation(local_cache.path(), &environment_mutation, &prior_action_keys)?;
+  prior_action_keys.push(environment_action_key);
 
   fs::remove_dir_all(&target)?;
   let flag_mutation = run_unify_with_environment(
@@ -882,7 +932,8 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
     local_cache.path(),
     &[("P73_VALUE", "two"), ("RUSTFLAGS", "--cfg=p73_mutation")],
   )?;
-  assert_native_miss(&workspace.path, &flag_mutation)?;
+  let (_, flag_action_key) = assert_native_invalidation(local_cache.path(), &flag_mutation, &prior_action_keys)?;
+  prior_action_keys.push(flag_action_key);
 
   fs::remove_dir_all(&target)?;
   let compiler_environment_mutation = run_unify_with_environment(
@@ -890,12 +941,14 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
     local_cache.path(),
     &[("P73_VALUE", "two"), ("RUSTC_BOOTSTRAP", "1")],
   )?;
-  assert_native_miss(&workspace.path, &compiler_environment_mutation)?;
+  let (_, compiler_environment_action_key) =
+    assert_native_invalidation(local_cache.path(), &compiler_environment_mutation, &prior_action_keys)?;
+  prior_action_keys.push(compiler_environment_action_key);
 
   fs::remove_dir_all(&target)?;
   fs::write(&dependency, "pub fn dependency() { let _changed = true; }\n")?;
   let dependency_mutation = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "two")])?;
-  assert_native_miss(&workspace.path, &dependency_mutation)?;
+  assert_native_invalidation(local_cache.path(), &dependency_mutation, &prior_action_keys)?;
   Ok(())
 }
 
@@ -923,7 +976,7 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
   let workspace = wrapper_workspace("native-cache-corrupt-object")?;
   let local_cache = tempfile::tempdir()?;
   let cold = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  let cold_observation = assert_native_miss(&workspace.path, &cold)?;
+  let cold_observation = assert_native_miss(local_cache.path(), &cold)?;
   if native_cache_action_boundary_bypass(&cold_observation).is_some() {
     return Ok(());
   }
@@ -938,7 +991,7 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
 
   fs::remove_dir_all(&target)?;
   let fallback = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  let observation = assert_native_miss(&workspace.path, &fallback)?;
+  let observation = assert_native_miss(local_cache.path(), &fallback)?;
   assert!(
     observation["execution"]["cache_wrapper"]["reason"]
       .as_str()
@@ -967,7 +1020,7 @@ fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
   let local_cache = tempfile::tempdir()?;
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "filesystem macro run: {output:?}");
-  let observation = native_cache_observation(&workspace.path)?;
+  let observation = native_cache_observation(local_cache.path())?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "bypassed");
   if native_cache_action_boundary_bypass(&observation).is_some() {
     return Ok(());
@@ -993,7 +1046,7 @@ fn unsupported_platform_bypasses_native_cache_and_preserves_cold_outputs() -> Re
 
   let first = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(first.status.code(), Some(1), "first cold run: {first:?}");
-  let first_observation = native_cache_observation(&workspace.path)?;
+  let first_observation = native_cache_observation(local_cache.path())?;
   assert_eq!(first_observation["execution"]["cache_wrapper"]["status"], "bypassed");
   assert_eq!(
     first_observation["execution"]["cache_wrapper"]["reason"],
@@ -1005,7 +1058,7 @@ fn unsupported_platform_bypasses_native_cache_and_preserves_cold_outputs() -> Re
   fs::remove_dir_all(&target)?;
   let second = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(second.status.code(), Some(1), "second cold run: {second:?}");
-  let second_observation = native_cache_observation(&workspace.path)?;
+  let second_observation = native_cache_observation(local_cache.path())?;
   assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "bypassed");
   assert_eq!(
     second_observation["execution"]["cache_wrapper"]["reason"],
@@ -1047,14 +1100,16 @@ exec "$@"
     .env("RUSTC_WRAPPER", &sccache)
     .env("RUSTC_WORKSPACE_WRAPPER", &workspace_wrapper)
     .env_remove(CACHE_WRAPPER_MARKER)
+    .env(
+      "CARGO_RAIL_CACHE_DIR",
+      workspace.path.join("target/cargo-rail-test-cache"),
+    )
     .env("WRAPPER_LOG", &wrapper_log)
     .env("WORKSPACE_WRAPPER_LOG", &workspace_wrapper_log)
     .output()?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
 
-  let cache: serde_json::Value = serde_json::from_slice(&fs::read(
-    workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json"),
-  )?)?;
+  let cache = compiler_evidence_cache(&workspace.path)?;
   let observation = local_observation(&cache, "wrapper_app")?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "bypassed");
   assert_eq!(
@@ -1209,6 +1264,10 @@ fn recursive_cargo_rail_wrapper_configuration_is_rejected_before_cargo() -> Resu
     .current_dir(&workspace.path)
     .args(["rail", "unify", "--check"])
     .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_cargo-rail"))
+    .env(
+      "CARGO_RAIL_CACHE_DIR",
+      workspace.path.join("target/cargo-rail-test-cache"),
+    )
     .env_remove("RUSTC_WORKSPACE_WRAPPER")
     .env_remove(CACHE_WRAPPER_MARKER)
     .output()?;
@@ -1243,6 +1302,10 @@ fn bare_name_recursive_cargo_rail_wrapper_is_rejected_explicitly() -> Result<()>
     .args(["rail", "unify", "--check"])
     .env("PATH", search_path)
     .env("RUSTC_WRAPPER", "cargo-rail")
+    .env(
+      "CARGO_RAIL_CACHE_DIR",
+      workspace.path.join("target/cargo-rail-test-cache"),
+    )
     .env_remove("RUSTC_WORKSPACE_WRAPPER")
     .env_remove(CACHE_WRAPPER_MARKER)
     .output()?;

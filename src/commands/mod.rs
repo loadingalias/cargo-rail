@@ -19,6 +19,7 @@
 //!
 //! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
 
+pub(crate) mod cache;
 /// Intent-file management.
 pub mod change;
 /// Clean up workspace artifacts
@@ -55,7 +56,8 @@ pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_chang
 pub use clean::run_clean;
 #[doc(hidden)]
 pub use cli::{
-  CargoCli, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand, generate_completions,
+  CacheCommand, CacheScope, CargoCli, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand,
+  generate_completions,
 };
 pub use common::{ChangeOutputFormat, SplitOutputFormat, TextJsonOutputFormat};
 pub use config::{
@@ -233,6 +235,9 @@ pub fn try_dispatch_pre_context(
   config_override: Option<&Path>,
   json: bool,
 ) -> RailResult<PreContextDispatch> {
+  if config_override.is_none() && !json && run::try_complete_active_cargo_profile(&cmd, workspace_root)? {
+    return Ok(PreContextDispatch::Handled);
+  }
   let pre_context_cache_request = config_override.is_none() && !json && cmd.is_pre_context_cache_request();
   if pre_context_cache_request {
     let (print_cmd, explain) = match &cmd {
@@ -319,6 +324,16 @@ pub fn try_dispatch_pre_context(
 
     Commands::Completions { shell } => {
       cli::generate_completions(shell);
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Cache { command } => {
+      match command {
+        cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
+        cli::CacheCommand::Clean { scope, check, format } => {
+          cache::run_clean(workspace_root, scope, check, format)?;
+        }
+      }
       Ok(PreContextDispatch::Handled)
     }
 
@@ -681,6 +696,8 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, pre_context_cache_request
       check,
       format,
     } => run_clean(ctx, cache, backups, reports, check, format),
+
+    Commands::Cache { .. } => unreachable!("cache commands should be handled before context loading"),
 
     // Config commands are handled before WorkspaceContext is built
     Commands::Config { command } => match command {

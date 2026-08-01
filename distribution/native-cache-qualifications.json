@@ -7,12 +7,12 @@
   "qualifications": [
     {
       "target": "aarch64-apple-darwin",
-      "corpus": "p0-phase-interleaved-macos-v5-sysroot-memo",
+      "corpus": "p0-local-automatic-policy-20260801",
       "workloads": [
         "check",
         "release-build"
       ],
-      "accepted_samples": 110,
+      "accepted_samples": 88,
       "false_hits": 0
     },
     {
