@@ -1,31 +1,34 @@
+[windows]
+set shell := ["bash", "-lc"]
+
 # Remote development. Provider mechanics and credentials stay in ~/dev-machines.
 
 ssh-list:
     @"$HOME/dev-machines/dev-machine" list
 
 ssh target:
-    @"$HOME/dev-machines/dev-machine" ssh auto "{{ target }}"
+    @"$HOME/dev-machines/dev-machine" ssh cargo-rail "{{ target }}"
 
 ssh-check target:
-    @"$HOME/dev-machines/dev-machine" ssh auto "{{ target }}" --check
+    @"$HOME/dev-machines/dev-machine" ssh cargo-rail "{{ target }}" --check
 
 ssh-create target *args="":
-    @"$HOME/dev-machines/dev-machine" create auto "{{ target }}" {{ args }}
-
-ssh-start target:
-    @"$HOME/dev-machines/dev-machine" start auto "{{ target }}"
-
-ssh-deallocate target:
-    @"$HOME/dev-machines/dev-machine" deallocate auto "{{ target }}"
+    @"$HOME/dev-machines/dev-machine" create cargo-rail "{{ target }}" {{ args }}
 
 ssh-kill target:
-    @"$HOME/dev-machines/dev-machine" kill auto "{{ target }}"
+    @"$HOME/dev-machines/dev-machine" kill cargo-rail "{{ target }}"
 
-ssh-status target="":
-    @if [ -n "{{ target }}" ]; then "$HOME/dev-machines/dev-machine" status auto "{{ target }}"; else "$HOME/dev-machines/dev-machine" status auto; fi
+ssh-status target:
+    @"$HOME/dev-machines/dev-machine" status cargo-rail "{{ target }}"
 
 ssh-bootstrap target:
-    @"$HOME/dev-machines/dev-machine" bootstrap auto "{{ target }}"
+    @"$HOME/dev-machines/dev-machine" bootstrap cargo-rail "{{ target }}"
+
+ssh-just target recipe *args="":
+    @"$HOME/dev-machines/dev-machine" just cargo-rail "{{ target }}" "{{ recipe }}" {{ args }}
+
+ssh-collect-bench target run_id destination:
+    @"$HOME/dev-machines/dev-machine" collect-bench cargo-rail "{{ target }}" "{{ run_id }}" "{{ destination }}"
 
 check:
     @scripts/check/check.sh
@@ -53,8 +56,43 @@ build-all:
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
-bench-native-cache runs="10":
-    @scripts/bench/native-cache.sh "{{ runs }}"
+bench-native-cache runs="1":
+    @scripts/bench/native-cache.sh run "{{ runs }}"
+
+bench-native-cache-smoke:
+    @scripts/bench/native-cache.sh smoke
+
+bench-native-cache-resume results:
+    @scripts/bench/native-cache.sh resume "{{ results }}"
+
+bench-native-cache-summarize results:
+    @scripts/bench/native-cache-report.sh summarize "{{ results }}"
+
+bench-native-cache-validate results:
+    @scripts/bench/native-cache-report.sh validate "{{ results }}"
+
+bench-native-cache-aws-plan target:
+    @scripts/bench/remote-native-cache.sh plan "{{ target }}"
+
+bench-native-cache-aws-smoke target *args="":
+    @scripts/bench/remote-native-cache.sh smoke "{{ target }}" {{ args }}
+
+bench-native-cache-aws target runs="1" *args="":
+    @scripts/bench/remote-native-cache.sh run "{{ target }}" "{{ runs }}" {{ args }}
+
+bench-native-cache-remote mode runs run_id:
+    @if [ "{{ mode }}" = smoke ]; then \
+      CARGO_RAIL_BENCH_INSTANCE_TYPE="${DEV_MACHINE_INSTANCE_TYPE:-unknown}" \
+      CARGO_RAIL_BENCH_RESULTS="$PWD/benchmark_results/native-cache/{{ run_id }}" \
+      scripts/bench/native-cache.sh smoke; \
+    else \
+      CARGO_RAIL_BENCH_INSTANCE_TYPE="${DEV_MACHINE_INSTANCE_TYPE:-unknown}" \
+      CARGO_RAIL_BENCH_RESULTS="$PWD/benchmark_results/native-cache/{{ run_id }}" \
+      scripts/bench/native-cache.sh run "{{ runs }}"; \
+    fi
+
+bench-native-cache-archive run_id:
+    @scripts/bench/native-cache-archive.sh "{{ run_id }}"
 
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"

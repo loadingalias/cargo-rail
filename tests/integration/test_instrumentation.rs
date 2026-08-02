@@ -63,7 +63,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
   assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 6);
+  assert_eq!(counters["schema_version"], 7);
   assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
   assert!(
     counters["phases"]["cli_pre_context_preparation"]["elapsed_ns"]
@@ -382,7 +382,7 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() -> Result<()> {
   ensure!(measured.status.success(), "schema output failed");
 
   let counters = read_counters(&diagnostics)?;
-  assert_eq!(counters["schema_version"], 6);
+  assert_eq!(counters["schema_version"], 7);
   assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
   assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
   assert_eq!(
@@ -588,6 +588,184 @@ fn active_cargo_profile_delegation_skips_snapshot_work_and_retains_a_receipt() -
   assert_eq!(
     captured["phases"]["workspace_capture_cargo_metadata"]["invocations"], 1,
     "an explicit non-incremental request must retain the captured cache path"
+  );
+  Ok(())
+}
+
+#[test]
+fn clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt() -> Result<()> {
+  let ws = TestWorkspace::new_named("diagnostic-clean-native-cache")?;
+  ws.add_crate("dependency", "0.1.0", &[])?;
+  ws.add_crate("consumer", "0.1.0", &[("dependency", "{ path = \"../dependency\" }")])?;
+  let lockfile = Command::new("cargo")
+    .current_dir(&ws.path)
+    .args(["generate-lockfile", "--offline"])
+    .output()?;
+  ensure!(
+    lockfile.status.success(),
+    "offline lockfile generation failed: {}",
+    String::from_utf8_lossy(&lockfile.stderr)
+  );
+  ws.commit("Add clean native-cache fixture")?;
+  let cargo_home = TempDir::new()?;
+  let cache = TempDir::new()?;
+
+  let run = |diagnostics: &Path| -> Result<std::process::Output> {
+    Ok(
+      Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        .current_dir(&ws.path)
+        .args([
+          "rail",
+          "--diagnostics-file",
+          diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+          "run",
+          "--all",
+          "--action",
+          "build",
+          "--",
+          "--quiet",
+        ])
+        .env("CARGO_HOME", cargo_home.path())
+        .env("CARGO_RAIL_CACHE_DIR", cache.path())
+        .env_remove("CARGO_INCREMENTAL")
+        .env_remove("RUSTC_FORCE_INCREMENTAL")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()?,
+    )
+  };
+
+  let output = TempDir::new()?;
+  let cold_diagnostics = output.path().join("cold.json");
+  let cold = run(&cold_diagnostics)?;
+  ensure!(
+    cold.status.success(),
+    "clean native-cache seed failed: {}",
+    String::from_utf8_lossy(&cold.stderr)
+  );
+  let clean = Command::new("cargo").current_dir(&ws.path).arg("clean").output()?;
+  ensure!(clean.status.success(), "cargo clean failed: {clean:?}");
+
+  let warm_diagnostics = output.path().join("warm.json");
+  let warm = run(&warm_diagnostics)?;
+  ensure!(
+    warm.status.success(),
+    "clean native-cache reuse failed: {}",
+    String::from_utf8_lossy(&warm.stderr)
+  );
+  let stderr = String::from_utf8_lossy(&warm.stderr);
+  assert!(
+    stderr.contains("native compiler cache: hits=") && !stderr.contains("hits=0 "),
+    "the clean fast path must reuse a verified compiler result: {stderr}"
+  );
+
+  let counters = read_counters(&warm_diagnostics)?;
+  assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
+  assert_eq!(
+    counters["phases"]["action_expansion_key_construction"]["invocations"],
+    0
+  );
+  assert_eq!(counters["phases"]["native_cache_setup"]["invocations"], 1);
+  assert_eq!(counters["phases"]["cargo_child_execution"]["invocations"], 1);
+  assert_eq!(counters["phases"]["cache_report_collection"]["invocations"], 1);
+  assert_eq!(counters["cargo_metadata_loads"], 1);
+  assert_eq!(counters["git_subprocesses"], 0);
+  let wrapper = &counters["native_cache_wrapper"];
+  assert_eq!(wrapper["phases"].as_object().map(serde_json::Map::len), Some(10));
+  assert!(
+    wrapper["process"]["invocations"]
+      .as_u64()
+      .is_some_and(|count| count > 0)
+  );
+  assert!(
+    wrapper["phases"]["context_load"]["invocations"]
+      .as_u64()
+      .is_some_and(|count| count > 0)
+  );
+  let hit = wrapper["events"]
+    .as_array()
+    .and_then(|events| events.iter().find(|event| event["outcome"] == "hit"))
+    .context("warm diagnostics did not retain a native-cache hit event")?;
+  let hit_phases = hit["trace"]["phases"]
+    .as_array()
+    .context("native-cache hit event has no phase trace")?;
+  for phase in [
+    "session_load",
+    "argument_normalization_input_capture",
+    "candidate_lookup",
+    "input_revalidation_action_key",
+    "result_restore_materialization",
+    "cargo_output_publication",
+  ] {
+    assert!(
+      hit_phases.iter().any(|trace| trace["phase"] == phase),
+      "native-cache hit trace omitted {phase}: {hit}"
+    );
+  }
+
+  let receipts = std::fs::read_dir(ws.path.join("target/cargo-rail/receipts"))?
+    .map(|entry| -> Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(entry?.path())?)?) })
+    .collect::<Result<Vec<_>>>()?;
+  assert_eq!(receipts.len(), 1);
+  let receipt = &receipts[0];
+  assert!(receipt["snapshot_id"].is_null());
+  assert_eq!(
+    receipt["snapshot_status"],
+    "not_loaded_for_exact_native_compiler_cache_execution"
+  );
+  assert_eq!(
+    receipt["execution"]["execution_mode"],
+    "exact_native_compiler_cache_execution"
+  );
+  assert_eq!(receipt["execution"]["native_cache"], "active");
+  assert!(receipt["execution"]["native_cache_reason"].is_null());
+  assert_eq!(
+    receipt["actions"][0]["argv"],
+    serde_json::json!(["cargo", "check", "--workspace", "--quiet"])
+  );
+
+  let fallback_diagnostics = output.path().join("explicit-nonincremental-print.json");
+  let fallback = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "--diagnostics-file",
+      fallback_diagnostics
+        .to_str()
+        .context("non-UTF-8 fallback diagnostics path")?,
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--print-cmd",
+      "--",
+      "--quiet",
+    ])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_RAIL_CACHE_DIR", cache.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .env_remove("RUSTC_FORCE_INCREMENTAL")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  ensure!(
+    fallback.status.success(),
+    "explicit non-incremental fallback failed: {}",
+    String::from_utf8_lossy(&fallback.stderr)
+  );
+  let printed_commands = String::from_utf8_lossy(&fallback.stdout)
+    .lines()
+    .filter(|line| line.starts_with("build: cargo "))
+    .count();
+  assert_eq!(
+    printed_commands,
+    1,
+    "a speculative pre-context path must not print before falling back: {}",
+    String::from_utf8_lossy(&fallback.stdout)
   );
   Ok(())
 }

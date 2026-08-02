@@ -101,8 +101,8 @@ impl ToolchainExecutableIdentities {
     let cargo = capture(toolchain.cargo_program())?;
     let rustc = capture(toolchain.rustc_program())?;
     // rustdoc is part of the selected Rust distribution even when the current
-    // action compiles rather than documents. Native-cache capability
-    // certificates bind the complete Cargo/rustc/rustdoc trio.
+    // action compiles rather than documents. Native-cache keys bind the
+    // complete Cargo/rustc/rustdoc trio.
     let rustdoc = Some(capture(toolchain.rustdoc_program())?);
     let rustc_wrapper = toolchain.rustc_wrapper_program().map(&mut capture).transpose()?;
     let rustc_workspace_wrapper = toolchain

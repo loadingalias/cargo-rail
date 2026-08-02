@@ -48,6 +48,160 @@ install_cargo_tool() {
   }
 }
 
+install_release_binary() {
+  local package="$1"
+  local version="$2"
+  local repository="$3"
+  local tag="$4"
+  local asset="$5"
+  local digest="$6"
+  local member="$7"
+  local binary="${8:-$package}"
+  local destination="$cargo_bin/$binary"
+  local expected_version="$package $version"
+  if [[ -x "$destination" ]] && [[ "$("$destination" --version 2>&1)" == "$expected_version" ]]; then
+    echo "$package $version is already installed"
+    return
+  fi
+
+  local temporary archive staged
+  temporary="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-tool.XXXXXX")"
+  staged="$(mktemp "$cargo_bin/.${binary}.XXXXXX")"
+  trap 'rm -rf -- "$temporary"; rm -f -- "$staged"' RETURN
+  archive="$temporary/$asset"
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://github.com/$repository/releases/download/$tag/$asset" \
+    -o "$archive"
+  printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
+  case "$asset" in
+    *.tar.gz) tar -xOzf "$archive" "$member" >"$staged" ;;
+    *.zip)
+      python.exe - "$archive" "$member" "$staged" <<'PY'
+import shutil
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    with archive.open(sys.argv[2]) as source, open(sys.argv[3], "wb") as destination:
+        shutil.copyfileobj(source, destination)
+PY
+      ;;
+    *)
+      echo "$package archive has unsupported format: $asset" >&2
+      exit 1
+      ;;
+  esac
+  chmod +x "$staged"
+  mv -f "$staged" "$destination"
+  [[ "$("$destination" --version 2>&1)" == "$expected_version" ]] || {
+    echo "$package archive did not install exact version $expected_version" >&2
+    exit 1
+  }
+  rm -rf -- "$temporary"
+  trap - RETURN
+}
+
+install_just() {
+  local asset digest binary
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      asset="just-$JUST_VERSION-x86_64-unknown-linux-musl.tar.gz"
+      digest="45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155"
+      binary=just
+      ;;
+    aarch64-unknown-linux-gnu)
+      asset="just-$JUST_VERSION-aarch64-unknown-linux-musl.tar.gz"
+      digest="f225044a81adea6e0b3a8b9370aaf374e6af76c8735ae263ac993df55fd137ec"
+      binary=just
+      ;;
+    x86_64-pc-windows-msvc)
+      asset="just-$JUST_VERSION-x86_64-pc-windows-msvc.zip"
+      digest="4c7391d17cb1d17b758b52004ee6411372b8a13ff37c3c9b9031625cb6026e09"
+      binary=just.exe
+      ;;
+    aarch64-pc-windows-msvc)
+      asset="just-$JUST_VERSION-aarch64-pc-windows-msvc.zip"
+      digest="14ff33bbac8d2f07deda30cd3bafe7be083213cdb1c4dae7a55567d375cc17f1"
+      binary=just.exe
+      ;;
+    *)
+      echo "just $JUST_VERSION has no configured asset for Rust host $rust_host" >&2
+      exit 1
+      ;;
+  esac
+  install_release_binary just "$JUST_VERSION" casey/just "$JUST_VERSION" "$asset" "$digest" "$binary" "$binary"
+}
+
+install_hyperfine() {
+  local asset digest archive_target binary
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      archive_target="x86_64-unknown-linux-gnu"
+      asset="hyperfine-v$HYPERFINE_VERSION-$archive_target.tar.gz"
+      digest="63ad53934062118f5b0be11785e0bb1603d4b91667d1921f2fd8df9a8712040a"
+      binary=hyperfine
+      ;;
+    aarch64-unknown-linux-gnu)
+      archive_target="aarch64-unknown-linux-gnu"
+      asset="hyperfine-v$HYPERFINE_VERSION-$archive_target.tar.gz"
+      digest="90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c"
+      binary=hyperfine
+      ;;
+    x86_64-pc-windows-msvc)
+      archive_target="x86_64-pc-windows-msvc"
+      asset="hyperfine-v$HYPERFINE_VERSION-$archive_target.zip"
+      digest="2508c549b049b1d4342d08edc1cb42bfac169082b6e3069431b5bab9822dbb32"
+      binary=hyperfine.exe
+      ;;
+    aarch64-pc-windows-msvc)
+      install_cargo_tool hyperfine "$HYPERFINE_VERSION"
+      return
+      ;;
+    *)
+      echo "hyperfine $HYPERFINE_VERSION has no configured asset for Rust host $rust_host" >&2
+      exit 1
+      ;;
+  esac
+  install_release_binary hyperfine "$HYPERFINE_VERSION" sharkdp/hyperfine "v$HYPERFINE_VERSION" \
+    "$asset" "$digest" "hyperfine-v$HYPERFINE_VERSION-$archive_target/$binary" "$binary"
+}
+
+install_sccache() {
+  local asset digest archive_target binary
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      archive_target="x86_64-unknown-linux-musl"
+      asset="sccache-v$SCCACHE_VERSION-$archive_target.tar.gz"
+      digest="aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
+      binary=sccache
+      ;;
+    aarch64-unknown-linux-gnu)
+      archive_target="aarch64-unknown-linux-musl"
+      asset="sccache-v$SCCACHE_VERSION-$archive_target.tar.gz"
+      digest="f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
+      binary=sccache
+      ;;
+    x86_64-pc-windows-msvc)
+      archive_target="x86_64-pc-windows-msvc"
+      asset="sccache-v$SCCACHE_VERSION-$archive_target.zip"
+      digest="b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0edf1b"
+      binary=sccache.exe
+      ;;
+    aarch64-pc-windows-msvc)
+      archive_target="aarch64-pc-windows-msvc"
+      asset="sccache-v$SCCACHE_VERSION-$archive_target.zip"
+      digest="6a715fe44d9b7a2cac15c256411ef232d3b6276e2421bd3be16ab32af71fbf88"
+      binary=sccache.exe
+      ;;
+    *)
+      echo "sccache $SCCACHE_VERSION has no configured asset for Rust host $rust_host" >&2
+      exit 1
+      ;;
+  esac
+  install_release_binary sccache "$SCCACHE_VERSION" mozilla/sccache "v$SCCACHE_VERSION" \
+    "$asset" "$digest" "sccache-v$SCCACHE_VERSION-$archive_target/$binary" "$binary"
+}
+
 install_cargo_nextest() {
   local path="$cargo_bin/cargo-nextest.exe"
   if [[ -x "$path" ]] && "$path" --version 2>&1 | grep -Fq "$CARGO_NEXTEST_VERSION"; then
@@ -127,23 +281,32 @@ install_jq() {
   trap - RETURN
 }
 
-install_cargo_tool just "$JUST_VERSION"
-install_cargo_nextest
+install_just
 install_jq
 
 just --version
-cargo nextest --version
 jq --version
 
 case "$profile" in
-  *-ci) ;;
+  *-ci)
+    install_cargo_nextest
+    cargo nextest --version
+    ;;
+  *-bench)
+    install_hyperfine
+    install_sccache
+    hyperfine --version
+    sccache --version
+    ;;
   *)
+    install_cargo_nextest
     install_cargo_tool cargo-deny "$CARGO_DENY_VERSION" cargo-deny
     install_cargo_tool cargo-audit "$CARGO_AUDIT_VERSION" cargo-audit
-    install_cargo_tool hyperfine "$HYPERFINE_VERSION"
-    install_cargo_tool sccache "$SCCACHE_VERSION"
+    install_hyperfine
+    install_sccache
     cargo deny --version
     cargo audit --version
+    cargo nextest --version
     hyperfine --version
     sccache --version
     ;;

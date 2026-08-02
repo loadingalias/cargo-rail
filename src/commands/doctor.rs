@@ -4,7 +4,7 @@ use crate::commands::common::TextJsonOutputFormat;
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceContext;
 
-/// Report the exact native-cache capability represented by the captured toolchain.
+/// Report the exact native-cache identity represented by the captured toolchain.
 pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFormat) -> RailResult<()> {
   if format.is_json() {
     crate::output::set_json_mode(true);
@@ -22,20 +22,9 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
     return Ok(());
   }
 
-  println!("native-cache capability");
+  println!("native-cache toolchain identity");
   println!("  platform: {}", capability.platform());
   println!("  host target: {}", capability.host_target());
   println!("  identity: {}", capability.identity());
-  println!(
-    "  certificate: {}",
-    if capability.is_certified() {
-      "certified"
-    } else {
-      "not certified"
-    }
-  );
-  if let Some(evidence) = capability.evidence() {
-    println!("  evidence: {evidence}");
-  }
   Ok(())
 }

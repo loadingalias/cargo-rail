@@ -124,7 +124,7 @@ fn reusable_cache_units(output: &str) -> Result<BTreeMap<String, serde_json::Val
     if !event["action_key"].is_string() {
       continue;
     }
-    ensure!(event["schema_version"] == 3, "unexpected native-cache event: {event}");
+    ensure!(event["schema_version"] == 4, "unexpected native-cache event: {event}");
     ensure!(
       event["unit"].is_object(),
       "native-cache event lacks unit evidence: {event}"
@@ -424,15 +424,10 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   materialize_fixture(&second, &git_source)?;
 
   let cold_check = run_cargo_rail(&first, "build", &check_cache)?;
-  if cold_check.contains("native_cache_platform_not_graduated")
-    || cold_check.contains("native_cache_toolchain_not_graduated")
-    || cold_check.contains("native_cache_capability_not_certified")
-  {
-    return Ok(());
-  }
   let warm_check = run_cargo_rail(&second, "build", &check_cache)?;
   ensure!(cache_metric(&cold_check, "hits")? == 0, "{cold_check}");
   ensure!(cache_metric(&cold_check, "misses")? >= 12, "{cold_check}");
+  ensure!(cache_metric(&cold_check, "cache_bytes_written")? > 0, "{cold_check}");
   let cold_units = reusable_cache_units(&cold_check)?;
   let warm_units = reusable_cache_units(&warm_check)?;
   let removed_units = cold_units
@@ -461,7 +456,13 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   let check_hits = cache_metric(&warm_check, "hits")?;
   ensure!(check_hits >= 12, "{warm_check}");
   ensure!(cache_metric(&warm_check, "misses")? == 0, "{warm_check}");
-  ensure!(cache_metric(&warm_check, "bytes_restored")? > 0, "{warm_check}");
+  let check_bytes_restored = cache_metric(&warm_check, "bytes_restored")?;
+  ensure!(check_bytes_restored > 0, "{warm_check}");
+  ensure!(
+    cache_metric(&warm_check, "cache_bytes_read")? >= check_bytes_restored,
+    "{warm_check}"
+  );
+  ensure!(cache_metric(&warm_check, "cache_bytes_written")? == 0, "{warm_check}");
   for reason in [
     "build_script_not_graduated",
     "proc_macro_not_graduated",
@@ -516,8 +517,11 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   fs::remove_dir_all(first.join("target"))?;
   fs::remove_dir_all(second.join("target"))?;
   let release_default = run_cargo_rail_with_options(&first, "distribution", &check_cache, false, &[])?;
-  ensure!(cache_metric(&release_default, "hits")? == 0, "{release_default}");
   ensure!(cache_metric(&release_default, "misses")? >= 8, "{release_default}");
+  ensure!(
+    cache_metric(&release_default, "cache_bytes_written")? > 0,
+    "{release_default}"
+  );
   let default_binary = executable(first.join("target/release/fixture-cli"));
   let default_output = Command::new(&default_binary).output()?;
   ensure!(default_output.status.success());
@@ -534,7 +538,13 @@ fn real_cargo_check_and_build_reuse_verified_outputs_across_clean_roots() -> Res
   let warm_build = run_cargo_rail(&first, "distribution", &check_cache)?;
   let build_hits = cache_metric(&warm_build, "hits")?;
   ensure!(build_hits >= 8, "{warm_build}");
-  ensure!(cache_metric(&warm_build, "bytes_restored")? > 0, "{warm_build}");
+  let build_bytes_restored = cache_metric(&warm_build, "bytes_restored")?;
+  ensure!(build_bytes_restored > 0, "{warm_build}");
+  ensure!(
+    cache_metric(&warm_build, "cache_bytes_read")? >= build_bytes_restored,
+    "{warm_build}"
+  );
+  ensure!(cache_metric(&warm_build, "cache_bytes_written")? == 0, "{warm_build}");
 
   let binary = executable(first.join("target/release/fixture-cli"));
   ensure!(binary.is_file(), "linked fixture binary was not produced");

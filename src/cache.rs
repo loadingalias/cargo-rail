@@ -2,7 +2,7 @@
 
 use crate::error::{RailError, RailResult};
 use serde::Serialize;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
@@ -39,15 +39,8 @@ pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCache
   }
 
   let path = directory.join("cache.lock");
-  let file = OpenOptions::new()
-    .read(true)
-    .write(true)
-    .create(true)
-    .truncate(false)
-    .open(&path)?;
-  let opened = file.metadata()?;
-  let named = fs::symlink_metadata(&path)?;
-  if !same_lock_file(&opened, &named) {
+  let file = crate::utils::open_cache_lock_file(&path, true)?;
+  if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
     return Err(RailError::with_help(
       format!(
         "workspace cache lock '{}' is not a private regular file",
@@ -57,8 +50,7 @@ pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCache
     ));
   }
   file.lock()?;
-  let named = fs::symlink_metadata(&path)?;
-  if !same_lock_file(&opened, &named) {
+  if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
     return Err(RailError::message(format!(
       "workspace cache lock '{}' changed while it was acquired",
       path.display()
@@ -305,45 +297,6 @@ pub(crate) fn path_status(root: &Path) -> RailResult<Option<(u64, u64, u64)>> {
   Ok(Some((bytes, files, directories)))
 }
 
-#[cfg(unix)]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  use std::os::unix::fs::MetadataExt as _;
-
-  opened.is_file()
-    && named.is_file()
-    && !crate::utils::is_symlink_or_reparse(named)
-    && opened.dev() == named.dev()
-    && opened.ino() == named.ino()
-    && opened.nlink() == 1
-    && named.nlink() == 1
-    && opened.len() == WORKSPACE_LOCK_BYTES
-    && named.len() == WORKSPACE_LOCK_BYTES
-}
-
-#[cfg(windows)]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  use std::os::windows::fs::MetadataExt as _;
-
-  opened.is_file()
-    && named.is_file()
-    && !crate::utils::is_symlink_or_reparse(named)
-    && opened.volume_serial_number() == named.volume_serial_number()
-    && opened.file_index() == named.file_index()
-    && opened.number_of_links() == 1
-    && named.number_of_links() == 1
-    && opened.len() == WORKSPACE_LOCK_BYTES
-    && named.len() == WORKSPACE_LOCK_BYTES
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  opened.is_file()
-    && named.is_file()
-    && !crate::utils::is_symlink_or_reparse(named)
-    && opened.len() == WORKSPACE_LOCK_BYTES
-    && named.len() == WORKSPACE_LOCK_BYTES
-}
-
 fn remove_owned_file(path: &Path) -> RailResult<bool> {
   let metadata = match fs::symlink_metadata(path) {
     Ok(metadata) => metadata,
@@ -398,6 +351,23 @@ mod tests {
 
     assert!(error.to_string().contains("not a private regular file"), "{error}");
     assert_eq!(fs::metadata(outside.path()).expect("outside metadata").len(), 0);
+  }
+
+  #[cfg(any(unix, windows))]
+  #[test]
+  fn workspace_lock_rejects_hard_links_without_touching_the_target() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::NamedTempFile::new().expect("outside lock target");
+    fs::create_dir_all(workspace.path().join("target/cargo-rail")).expect("cache state root");
+    let lock = workspace.path().join("target/cargo-rail/cache.lock");
+    fs::hard_link(outside.path(), &lock).expect("hostile hard-linked lock");
+
+    let error = lock_workspace(workspace.path())
+      .err()
+      .expect("hard-linked lock must fail");
+
+    assert!(error.to_string().contains("not a private regular file"), "{error}");
+    assert!(outside.path().exists(), "outside lock target must survive");
   }
 
   #[cfg(unix)]

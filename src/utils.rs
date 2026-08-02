@@ -30,6 +30,72 @@ pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
   }
 }
 
+/// Open a cache lock without permitting pathname replacement on Windows.
+pub(crate) fn open_cache_lock_file(path: &Path, create: bool) -> io::Result<fs::File> {
+  let mut options = fs::OpenOptions::new();
+  options.read(true).write(true).create(create).truncate(false);
+  #[cfg(windows)]
+  {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+  }
+  options.open(path)
+}
+
+/// Verify that a path still names one private opened regular file.
+pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected_len: u64) -> io::Result<bool> {
+  let opened_metadata = opened.metadata()?;
+  let named_metadata = fs::symlink_metadata(path)?;
+  if !opened_metadata.is_file()
+    || !named_metadata.is_file()
+    || is_symlink_or_reparse(&named_metadata)
+    || opened_metadata.len() != expected_len
+    || named_metadata.len() != expected_len
+  {
+    return Ok(false);
+  }
+
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(
+      opened_metadata.dev() == named_metadata.dev()
+        && opened_metadata.ino() == named_metadata.ino()
+        && opened_metadata.nlink() == 1
+        && named_metadata.nlink() == 1,
+    )
+  }
+  #[cfg(windows)]
+  {
+    let named = fs::File::open(path)?;
+    let named_handle_metadata = named.metadata()?;
+    if !named_handle_metadata.is_file()
+      || is_symlink_or_reparse(&named_handle_metadata)
+      || named_handle_metadata.len() != expected_len
+    {
+      return Ok(false);
+    }
+    let opened_information = winapi_util::file::information(opened)?;
+    let named_information = winapi_util::file::information(&named)?;
+    Ok(
+      opened_information.volume_serial_number() == named_information.volume_serial_number()
+        && opened_information.file_index() == named_information.file_index()
+        && opened_information.number_of_links() == 1
+        && named_information.number_of_links() == 1
+        && opened_information.file_size() == expected_len
+        && named_information.file_size() == expected_len,
+    )
+  }
+  #[cfg(not(any(unix, windows)))]
+  {
+    Ok(true)
+  }
+}
+
 // ============================================================================
 // Hashing and Fingerprinting
 // ============================================================================

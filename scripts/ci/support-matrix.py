@@ -531,25 +531,10 @@ def load_compatibility_manifest() -> CompatibilityManifest:
 
 
 @dataclass(frozen=True)
-class NativeCacheCertificate:
-    platform: str
-    host_target: str
-    identity: str
-    evidence: str
-
-
-@dataclass(frozen=True)
-class NativeCacheRegistry:
+class NativeCacheContract:
     schema_version: int
     cache_class: str
     execution_contract: str
-    cargo_release: str
-    rustc_release: str
-    candidate_hosts: dict[str, str]
-    certificates: tuple[NativeCacheCertificate, ...]
-
-    def certified_targets(self) -> set[str]:
-        return {certificate.host_target for certificate in self.certificates}
 
 
 def required_source_value(source: str, pattern: str, name: str) -> str:
@@ -558,35 +543,17 @@ def required_source_value(source: str, pattern: str, name: str) -> str:
     return matches[0]
 
 
-def load_native_cache_registry() -> NativeCacheRegistry:
+def load_native_cache_contract() -> NativeCacheContract:
     source_path = REPOSITORY_ROOT / "src/compiler/native_cache.rs"
     source = source_path.read_text(encoding="utf-8")
-    registry_path = "distribution/native-cache-capabilities.json"
     require(
-        f'include_str!("../../{registry_path}")' in source,
-        "native-cache runtime does not embed the reviewed capability registry",
-    )
-    package_include = (
-        load_toml(REPOSITORY_ROOT / "Cargo.toml").get("package", {}).get("include")
-    )
-    require(
-        isinstance(package_include, list) and f"/{registry_path}" in package_include,
-        "Cargo package include list is missing the native-cache capability registry",
+        "native-cache-capabilities.json" not in source,
+        "native-cache runtime must not depend on a static toolchain registry",
     )
     cache_class = required_source_value(
         source,
         r'^const GRADUATED_NATIVE_CACHE_CLASS: &str = "([^"]+)";$',
         "GRADUATED_NATIVE_CACHE_CLASS",
-    )
-    rustc_release = required_source_value(
-        source,
-        r'^const GRADUATED_RUSTC_RELEASE: &str = "([^"]+)";$',
-        "GRADUATED_RUSTC_RELEASE",
-    )
-    cargo_release = required_source_value(
-        source,
-        r'^const GRADUATED_CARGO_RELEASE: &str = "([^"]+)";$',
-        "GRADUATED_CARGO_RELEASE",
     )
     execution_contract = required_source_value(
         source,
@@ -596,103 +563,10 @@ def load_native_cache_registry() -> NativeCacheRegistry:
     schema_version = int(
         required_source_value(
             source,
-            r"^const NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION: u32 = ([0-9]+);$",
-            "NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION",
+            r"^const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = ([0-9]+);$",
+            "NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION",
         )
     )
-    block_match = re.search(
-        r"^const GRADUATED_NATIVE_HOSTS: &\[\(&str, &str\)\] = &\[\n(?P<body>.*?)^\];$",
-        source,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    require(
-        block_match is not None,
-        "native-cache source must define GRADUATED_NATIVE_HOSTS in the reviewed form",
-    )
-    candidate_hosts: dict[str, str] = {}
-    platforms: set[str] = set()
-    body = block_match.group("body")
-    entries = re.findall(r'^  \("([^"]+)", "([^"]+)"\),$', body, flags=re.MULTILINE)
-    recognized = (
-        "\n".join(f'  ("{platform}", "{target}"),' for platform, target in entries)
-        + "\n"
-    )
-    require(body == recognized, "GRADUATED_NATIVE_HOSTS contains an unrecognized entry")
-    require(entries, "GRADUATED_NATIVE_HOSTS must not be empty")
-    for platform, target in entries:
-        require(platform not in platforms, f"duplicate graduated platform {platform}")
-        require(
-            target not in candidate_hosts, f"duplicate graduated host target {target}"
-        )
-        platforms.add(platform)
-        candidate_hosts[target] = platform
-
-    raw = require_object(
-        load_json(REPOSITORY_ROOT / registry_path),
-        "native-cache capability registry",
-        {"schema_version", "class", "execution_contract", "certificates"},
-    )
-    require(
-        raw["schema_version"] == schema_version,
-        "native-cache capability registry schema does not match the runtime schema",
-    )
-    require(
-        raw["class"] == cache_class,
-        "native-cache capability registry class does not match the runtime class",
-    )
-    require(
-        raw["execution_contract"] == execution_contract,
-        "native-cache capability registry execution contract does not match the runtime contract",
-    )
-    require(
-        isinstance(raw["certificates"], list),
-        "native-cache capability certificates must be an array",
-    )
-    certificates: list[NativeCacheCertificate] = []
-    certificate_keys: list[tuple[str, str]] = []
-    for index, value in enumerate(raw["certificates"]):
-        certificate = require_object(
-            value,
-            f"native-cache capability certificates[{index}]",
-            {"platform", "host_target", "identity", "evidence"},
-        )
-        platform = require_string(
-            certificate["platform"],
-            f"native-cache capability certificates[{index}].platform",
-        )
-        host_target = require_string(
-            certificate["host_target"],
-            f"native-cache capability certificates[{index}].host_target",
-        )
-        identity = require_string(
-            certificate["identity"],
-            f"native-cache capability certificates[{index}].identity",
-        )
-        evidence = require_string(
-            certificate["evidence"],
-            f"native-cache capability certificates[{index}].evidence",
-        )
-        require(
-            candidate_hosts.get(host_target) == platform,
-            f"native-cache capability certificate {host_target} is outside the candidate host boundary",
-        )
-        require(
-            re.fullmatch(r"sha256:[0-9a-f]{64}", identity) is not None,
-            f"native-cache capability certificate {host_target} has an invalid identity",
-        )
-        certificate_keys.append((host_target, identity))
-        certificates.append(
-            NativeCacheCertificate(platform, host_target, identity, evidence)
-        )
-    require(
-        certificate_keys == sorted(certificate_keys),
-        "native-cache capability certificates must be sorted by host target and identity",
-    )
-    require(
-        len(certificate_keys) == len(set(certificate_keys)),
-        "native-cache capability certificates contain duplicate host/identity tuples",
-    )
-
     run_source = (REPOSITORY_ROOT / "src/commands/run.rs").read_text(encoding="utf-8")
     require(
         "ActionKind::Build | ActionKind::Distribution" in run_source,
@@ -706,28 +580,21 @@ def load_native_cache_registry() -> NativeCacheRegistry:
         encoding="utf-8"
     )
     for reason in (
-        "codegen_backend_not_graduated",
+        "compiler_flag_not_graduated",
         "configured_linker_not_graduated",
         "cross_target_not_graduated",
         "custom_sysroot_not_graduated",
-        "native_cache_capability_not_certified",
         "native_cache_capability_unavailable",
-        "native_cache_platform_not_graduated",
-        "native_cache_toolchain_incoherent",
     ):
         require(
             f'"{reason}"' in bypass_source,
             f"native-cache source is missing stable bypass reason {reason}",
         )
 
-    return NativeCacheRegistry(
+    return NativeCacheContract(
         schema_version=schema_version,
         cache_class=cache_class,
         execution_contract=execution_contract,
-        cargo_release=cargo_release,
-        rustc_release=rustc_release,
-        candidate_hosts=candidate_hosts,
-        certificates=tuple(certificates),
     )
 
 
@@ -836,7 +703,7 @@ def load_qualifications() -> QualificationRegistry:
 
 def validate_inventories(
     manifest: CompatibilityManifest,
-    native_cache: NativeCacheRegistry,
+    native_cache: NativeCacheContract,
     qualifications: QualificationRegistry,
 ) -> None:
     native_targets = {host.target for host in manifest.native_hosts}
@@ -912,21 +779,12 @@ def validate_inventories(
     )
 
     require(
-        set(native_cache.candidate_hosts) <= native_targets,
-        "runtime native-cache candidate set includes a target outside the advertised native host set",
-    )
-    require(
-        qualifications.cargo_release == native_cache.cargo_release
-        and qualifications.rustc_release == native_cache.rustc_release,
-        "performance qualification toolchain does not match the runtime graduation registry",
-    )
-    require(
         qualifications.cache_class == native_cache.cache_class,
-        "performance qualification class does not match the runtime graduation registry",
+        "performance qualification class does not match the runtime cache contract",
     )
     require(
-        set(qualifications.qualifications) <= set(native_cache.candidate_hosts),
-        "performance qualification includes a target outside the runtime cache candidate set",
+        set(qualifications.qualifications) <= native_targets,
+        "performance qualification includes a target outside the advertised native host set",
     )
 
     corpus_runner = (REPOSITORY_ROOT / manifest.corpus_runner).read_text(
@@ -1009,26 +867,8 @@ def stable_releases(current_stable: str) -> tuple[RustRelease, ...]:
     return tuple(releases)
 
 
-def expected_action_cache_state(
-    target: str,
-    rustc_release: str,
-    native_cache: NativeCacheRegistry,
-) -> str:
-    if target not in native_cache.candidate_hosts:
-        return "native_cache_platform_not_graduated"
-    if (
-        rustc_release != native_cache.rustc_release
-        or rustc_release != native_cache.cargo_release
-    ):
-        return "native_cache_toolchain_not_graduated"
-    if target not in native_cache.certified_targets():
-        return "native_cache_capability_not_certified"
-    return "exact_certificate"
-
-
 def compatibility_matrix(
     manifest: CompatibilityManifest,
-    native_cache: NativeCacheRegistry,
     current_stable: str,
 ) -> str:
     releases = stable_releases(current_stable)
@@ -1073,11 +913,7 @@ def compatibility_matrix(
                             and host.target == "x86_64-unknown-linux-gnu"
                             else ""
                         ),
-                        "expected-cache-state": expected_action_cache_state(
-                            host.target,
-                            release_text,
-                            native_cache,
-                        ),
+                        "expected-cache-state": "active",
                     }
                 }
             )
@@ -1086,7 +922,6 @@ def compatibility_matrix(
 
 def filesystem_matrix(
     manifest: CompatibilityManifest,
-    native_cache: NativeCacheRegistry,
     current_stable: str,
 ) -> str:
     release = str(RustRelease.parse(current_stable, "current stable"))
@@ -1101,11 +936,7 @@ def filesystem_matrix(
                 "case-sensitive": profile.case_sensitive,
                 "toolchain": release,
                 "release": release,
-                "expected-cache-state": expected_action_cache_state(
-                    profile.target,
-                    release,
-                    native_cache,
-                ),
+                "expected-cache-state": "active",
             }
         }
         for profile in manifest.filesystem_profiles
@@ -1115,7 +946,6 @@ def filesystem_matrix(
 
 def forward_compatibility_matrix(
     manifest: CompatibilityManifest,
-    native_cache: NativeCacheRegistry,
 ) -> str:
     target = "x86_64-unknown-linux-gnu"
     host = next(
@@ -1138,9 +968,7 @@ def forward_compatibility_matrix(
                 "custom-target-json-probe": False,
                 "linker-probes": False,
                 "codegen-backend-probes": False,
-                "expected-cache-state": expected_action_cache_state(
-                    target, channel, native_cache
-                ),
+                "expected-cache-state": "active",
             }
         }
         for channel in ("beta", "nightly")
@@ -1157,11 +985,7 @@ def forward_compatibility_matrix(
                 "custom-target-json-probe": True,
                 "linker-probes": False,
                 "codegen-backend-probes": True,
-                "expected-cache-state": expected_action_cache_state(
-                    custom.target,
-                    custom.toolchain,
-                    native_cache,
-                ),
+                "expected-cache-state": "active",
             }
         }
     )
@@ -1174,7 +998,7 @@ def formatted_list(values: tuple[str, ...]) -> str:
 
 def render_markdown(
     manifest: CompatibilityManifest,
-    native_cache: NativeCacheRegistry,
+    native_cache: NativeCacheContract,
     qualifications: QualificationRegistry,
 ) -> str:
     native_hosts = {host.target: host for host in manifest.native_hosts}
@@ -1200,21 +1024,10 @@ def render_markdown(
             execution = f"Advertised; full-suite CI required (`{host.runner}`)"
             cross = "—"
             release = "Native artifact required"
-            if target in native_cache.certified_targets():
-                certificate_count = sum(
-                    certificate.host_target == target
-                    for certificate in native_cache.certificates
-                )
-                cache = (
-                    f"Graduated `{native_cache.cache_class}` "
-                    f"(Cargo `{native_cache.cargo_release}`, rustc `{native_cache.rustc_release}`; "
-                    f"{certificate_count} exact certificate"
-                    f"{'' if certificate_count == 1 else 's'})"
-                )
-            elif target in native_cache.candidate_hosts:
-                cache = "Bypass: `native_cache_capability_not_certified`"
-            else:
-                cache = "Bypass: `native_cache_platform_not_graduated`"
+            cache = (
+                f"Active for structurally eligible `{native_cache.cache_class}` units; "
+                "exact toolchain identity is part of every key"
+            )
         qualification = qualifications.qualifications.get(target)
         if qualification is None:
             performance = "Not qualified"
@@ -1230,8 +1043,8 @@ def render_markdown(
 
     deferred_rows = [
         (
-            f"| {host.name} | `{host.target}` | Pass-through target execution remains unqualified | "
-            "`native_cache_platform_not_graduated` | Not qualified |"
+            f"| {host.name} | `{host.target}` | Native execution evidence is not retained yet | "
+            "Structurally active when the exact toolchain identity is captured | Not qualified |"
         )
         for host in manifest.deferred_hosts
     ]
@@ -1276,10 +1089,10 @@ def render_markdown(
     return f"""# Caching
 
 > Auto-generated from executable CI/release registries, native-cache production gates, reviewed qualification
-> manifests, and retained benchmark evidence. Do not edit manually.
+> manifests, and reviewed benchmark evidence. Do not edit manually.
 >
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `{manifest.schema_version}`;
-> native-cache capability registry schema: `{native_cache.schema_version}`; qualification schema:
+> native-cache toolchain-identity schema: `{native_cache.schema_version}`; qualification schema:
 > `{qualifications.schema_version}`.
 
 Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
@@ -1299,12 +1112,14 @@ cold with a stable reason. **Fast when proven. Normal Cargo when not.**
 
 Native reuse is automatic for an ordinary `build` or `distribution` action when all of these are true:
 
-- the exact Cargo, rustc, rustdoc, sysroot, backend, host, and wrapper protocol has a certificate below;
+- Cargo-Rail can content-identify the exact Cargo, rustc, rustdoc, complete sysroot, host, and wrapper protocol;
 - the selected Cargo profile has no active fingerprints and neither the environment nor rustc forces incremental
   compilation;
-- no Cargo CLI `--config`, action-defined environment, sccache, or custom compiler wrapper changes the boundary; and
-- the invocation is an eligible dependency or workspace library with complete Rust inputs, dep-info, metadata,
-  optional rlib output, Rust-only dependency artifacts, and no linker responsibility.
+- no Cargo CLI `--config`, action-defined environment, unknown Cargo setting, `build.dep-info-basedir`, sccache, or
+  custom compiler wrapper changes the boundary; and
+- the invocation is an eligible dependency or workspace library with complete rustc-reported filesystem and
+  environment inputs, root-independent dep-info, metadata, optional rlib output, Rust-only dependency artifacts, and
+  no linker responsibility.
 
 ```bash
 cargo rail run --all --action build --explain
@@ -1312,21 +1127,37 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
+The reusable session binds toolchain, compiler class, wrapper protocol, capabilities, and compiler-process environment.
+It does not bind the complete Cargo configuration or `Cargo.lock`. Each compiler unit instead binds its exact rustc
+arguments and cfg, source inputs, dependency artifact contents, and rustc-reported filesystem and environment reads.
+Changes to `build.warnings`, jobs, build or target directories, network policy, registry settings, and unrelated
+lockfile entries can therefore reuse a result when those exact unit inputs remain unchanged. Rust flags, features,
+dependency contents, target, linker, sysroot, and observed inputs still change or reject reuse at their owning
+boundary.
+
+Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. A dep-info file that
+retains the physical workspace root as an input bypasses reuse because that input cannot be restored unchanged in
+another root. The CAS stores canonical internal tokens for verified dep-info and compiler-stream output paths, then
+binds them to Cargo's current output directory after verification. Output names and materialized bytes remain exact;
+any other cached reference to a previous output directory fails closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
-capability identity and certificate evidence without running a build. A missing certificate is a cold execution
-boundary, not a command failure. Existing wrappers remain in their selected order and Cargo-Rail does not add a second
-cache.
+toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
+`native_cache_capability_unavailable`. Existing wrappers remain in their selected order and Cargo-Rail does not add a
+second cache.
 
 For the exact normal all-workspace `build` and `distribution` shapes, an unambiguous active profile delegates the
 unchanged built-in Cargo action before metadata, Git, tool hashing, and action-key construction. Cargo configuration
 that makes the target location ambiguous, a non-workspace manifest, or an explicit incremental setting retains the
-captured planner/runner path. Delegation preserves ambient wrappers and records the bypass with an explicitly absent
-snapshot in the ordinary decision receipt.
+captured planner/runner path. An eligible clean profile uses one locked, no-dependencies Cargo metadata query to prove
+the workspace-library boundary, then enters the same verified compiler-result cache without capturing Git state or
+expanding the full action plan. Any ambiguity or acquisition failure falls back to the captured path. Both shortcuts
+preserve ambient wrappers and record their deliberately absent snapshot in the ordinary decision receipt.
 
 Default text mode emits one concise decision with `hits`, `misses`, `bypasses`, and `bytes_restored`, or the stable
-action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, the complete reason census, and
-per-unit evidence:
+action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, accounted verified-result
+`cache_bytes_read` and `cache_bytes_written` totals, the complete reason census, and per-unit evidence. Low-level I/O
+that fails without returning byte statistics is not inferred:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
 - `miss` means no candidate survived revalidation; successful cold output may populate the local CAS; and
@@ -1389,7 +1220,8 @@ alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
 ## Execution and reuse support
 
 Execution support, cache graduation, and performance qualification are independent. A cache bypass still executes
-Cargo normally. Native graduation is certificate-specific, not target-wide.
+Cargo normally. Native reuse is structural and exact-toolchain-keyed; benchmark qualification reports measured
+performance and is not an allowlist.
 
 ### Hosts and targets
 
@@ -1413,15 +1245,15 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 |---|---|---|---|---|
 {chr(10).join(deferred_rows)}
 
-IBM Power and IBM Z need native runners before Cargo-Rail can advertise compatibility, cache graduation, or performance
-qualification.
+IBM Power and IBM Z need native runners before Cargo-Rail can claim tested execution or performance. They are not
+excluded by a runtime platform allowlist.
 
 ### Linkers and codegen backends
 
 | Capability | Advertised non-default implementations | Current contract |
 |---|---|---|
-| Linker | {linkers} | Default, explicit-driver, and bundled host LLD pass-through are tested. Other selected linkers use `configured_linker_not_graduated`. |
-| Codegen backend | {backends} | Stable LLVM and pinned-nightly Cranelift pass-through are tested. Other selected backends use `codegen_backend_not_graduated`. |
+| Linker | {linkers} | Default and bundled host linkers are tested. An explicitly configured linker keeps the complete action on Cargo's path until Cargo-Rail can preserve its exact argv and effects. |
+| Codegen backend | {backends} | Bundled named backends are bound by the complete sysroot identity and compiler arguments. An external backend path bypasses until its executable bytes are content-identified. |
 
 Pass-through execution is not cache graduation. A non-default implementation needs a named compatibility fixture on
 every applicable native host before Cargo-Rail advertises it.
@@ -1430,7 +1262,7 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Graduated only for listed host/toolchain tuples | One declared crate root, complete observed Rust inputs, dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One declared crate root, complete dep-info-observed inputs, root-independent dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
 | Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
@@ -1448,10 +1280,31 @@ The fixture contains registry and Git dependencies, build scripts, a proc macro,
 a binary:
 
 ```bash
-just bench-native-cache 10
+just bench-native-cache
 ```
 
-The accepted local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
+The latest optimized Linux x86-64 screen used one complete interleaved group on an AWS `c8i.xlarge` with local
+sccache `0.16.0`, offline Cargo/rustc `1.97.1`, distinct seed/use roots, and clean target directories. All 20 available
+lane samples were accepted with no rejections or false hits. Warm Cargo-Rail restored 28 verified results per workload.
+
+| Final-candidate sample | Cargo-Rail warm | sccache 0.16.0 | Cargo-Rail difference |
+|---|---:|---:|---:|
+| Check wall time | 4.003 s | 4.777 s | 16.2% lower |
+| Check complete CPU | 12.855 s | 15.511 s | 17.1% lower |
+| Check peak RSS | 374,759,424 B | 1,076,908,032 B | 65.2% lower |
+| Release-build wall time | 6.302 s | 8.081 s | 22.0% lower |
+| Release-build complete CPU | 20.131 s | 23.464 s | 14.2% lower |
+| Release-build peak RSS | 406,233,088 B | 1,041,481,728 B | 61.0% lower |
+
+This is a one-sample same-machine comparison, not a p50/p95 distribution. The retained qualification corpus below
+records the broader historical host coverage and remains the authority for qualified targets.
+
+One local M1 Pro before/after group measured the narrower unit identity and removed redundant warm rehashing. Warm
+release-build input hashing fell from 105,219,083 to 68,903,107 bytes (34.5%); warm check input hashing fell from
+75,037,802 to 49,793,592 bytes (33.6%). Both groups completed with zero false hits. The single wall-time samples moved
+by +4.6% and +8.0%, so this evidence supports the hashing reduction and wider reuse boundary, not a latency claim.
+
+The retained local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
 `0.16.0` was unavailable, so all 88 available samples were accepted with no rejections or false hits, identical action
 censuses and output manifests, and 27 stable eligible units per workload. Every sample used offline Cargo/rustc
 `1.97.1`, a clean target, distinct seed/use roots, and a fresh copy of the populated cache. Native Cargo used
@@ -1487,9 +1340,10 @@ Windows x86-64 timing remains unqualified. Its latest partial run found reusable
 because two bypassed proc-macro consumers produced byte-unstable DLLs and PID reuse could overwrite evidence files.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
-wrappers, flags, exact action argv, clean-root method, p50/p95 for native/disabled/cold/warm lanes, hit and byte counts,
-all bypass reasons, and output portability findings. Retain at least ten accepted runs after warmup for each available
-lane, alternate lane order, preserve raw output, and never combine different commits, toolchains, targets, or policies.
+wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
+reasons, and output portability findings. Use one accepted interleaved group for a bounded engineering decision.
+Increase the sample count only for distribution or tail claims. Preserve raw output and never combine different
+commits, toolchains, targets, or policies.
 """
 
 
@@ -1506,7 +1360,7 @@ def main() -> int:
 
     try:
         manifest = load_compatibility_manifest()
-        native_cache = load_native_cache_registry()
+        native_cache = load_native_cache_contract()
         qualifications = load_qualifications()
         validate_inventories(manifest, native_cache, qualifications)
         if args.github_matrix:
@@ -1516,19 +1370,19 @@ def main() -> int:
                 args.current_stable is not None,
                 "--compatibility-matrix requires --current-stable",
             )
-            print(compatibility_matrix(manifest, native_cache, args.current_stable))
+            print(compatibility_matrix(manifest, args.current_stable))
         elif args.filesystem_matrix:
             require(
                 args.current_stable is not None,
                 "--filesystem-matrix requires --current-stable",
             )
-            print(filesystem_matrix(manifest, native_cache, args.current_stable))
+            print(filesystem_matrix(manifest, args.current_stable))
         elif args.forward_compatibility_matrix:
             require(
                 args.current_stable is None,
                 "--current-stable only applies to --compatibility-matrix",
             )
-            print(forward_compatibility_matrix(manifest, native_cache))
+            print(forward_compatibility_matrix(manifest))
         else:
             require(
                 args.current_stable is None,

@@ -235,7 +235,7 @@ pub fn try_dispatch_pre_context(
   config_override: Option<&Path>,
   json: bool,
 ) -> RailResult<PreContextDispatch> {
-  if config_override.is_none() && !json && run::try_complete_active_cargo_profile(&cmd, workspace_root)? {
+  if config_override.is_none() && !json && run::try_complete_exact_builtin_cargo_action(&cmd, workspace_root)? {
     return Ok(PreContextDispatch::Handled);
   }
   let pre_context_cache_request = config_override.is_none() && !json && cmd.is_pre_context_cache_request();

@@ -41,7 +41,7 @@ const NATIVE_CANDIDATE_INDEX_MARKER_BYTES: &[u8] = b"cargo-rail-native-candidate
 const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
 const LIFECYCLE_LOCK_NAME: &str = "local-cas-v1.lock";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SYSROOT_IDENTITY_MEMO_DIRECTORY: &str = "sysroot-identities";
 
 const BLOB_PREFIX: &str = "blob-v1-sha256-";
@@ -104,6 +104,7 @@ pub(crate) struct NativeCacheCandidate {
   pub(crate) validation: NativeCompilerValidation,
   pub(crate) objects_verified: u64,
   pub(crate) bytes_read: u64,
+  verified: VerifiedResult,
 }
 
 #[cfg(any(unix, windows, test))]
@@ -211,6 +212,60 @@ pub(crate) struct LocalCasStatus {
 /// Exclusive authority over one shared CAS lifecycle mutation or snapshot.
 struct LocalCasLifecycleLock {
   _file: File,
+}
+
+/// Fully verified native candidates held under one shared lifecycle view.
+#[cfg(any(unix, windows, test))]
+pub(crate) struct NativeCacheCandidates<'a> {
+  cas: &'a LocalCas,
+  _lock: LocalCasLifecycleLock,
+  candidates: Vec<NativeCacheCandidate>,
+}
+
+#[cfg(any(unix, windows, test))]
+impl std::ops::Deref for NativeCacheCandidates<'_> {
+  type Target = [NativeCacheCandidate];
+
+  fn deref(&self) -> &Self::Target {
+    &self.candidates
+  }
+}
+
+#[cfg(any(unix, windows, test))]
+impl NativeCacheCandidates<'_> {
+  /// Materialize one candidate already verified inside this retained shared view.
+  pub(crate) fn restore(&self, index: usize, destination: &Path) -> NativeCacheLookup {
+    let Some(candidate) = self.candidates.get(index) else {
+      return NativeCacheLookup::Miss(NativeCacheMiss {
+        reason: "compiler_candidate_index_unavailable".to_string(),
+        objects_verified: 0,
+        bytes_read: 0,
+      });
+    };
+    let mut stats = ReadStats::default();
+    if let Err(fault) = self.cas.materialize(&candidate.verified, destination, &mut stats) {
+      return NativeCacheLookup::Miss(NativeCacheMiss {
+        reason: fault.reason,
+        objects_verified: stats.objects,
+        bytes_read: stats.bytes,
+      });
+    }
+    if let Ok(key_hex) = validated_action_key_hex(&candidate.action_key) {
+      let pin_path = self.cas.root.join("pins").join(format!("{key_hex}.json"));
+      let _ = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pin_path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    }
+    NativeCacheLookup::Hit(NativeCacheHit {
+      action_result: candidate.verified.action_result.clone(),
+      result_digest: candidate.verified.object.result_digest.clone(),
+      objects_verified: stats.objects,
+      bytes_read: stats.bytes,
+      bytes_restored: stats.restored,
+    })
+  }
 }
 
 #[derive(Clone, Copy)]
@@ -336,7 +391,7 @@ impl Fault {
     }
   }
 
-  #[cfg(any(unix, windows, test))]
+  #[cfg(any(target_os = "macos", test))]
   fn miss(reason: impl Into<String>) -> Self {
     Self {
       kind: FaultKind::Miss,
@@ -485,7 +540,7 @@ impl LocalCas {
   }
 
   /// Return the private candidate location for one verified sysroot identity memo.
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   pub(crate) fn sysroot_identity_memo_path(&self, lookup: &crate::source::ContentDigest) -> PathBuf {
     self
       .root
@@ -524,7 +579,7 @@ impl LocalCas {
     ] {
       create_real_directory(&root, name)?;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
     clear_staging(&root.join("staging"))?;
@@ -534,6 +589,58 @@ impl LocalCas {
       max_bytes: cache_max_bytes()?,
     };
     cas.ensure_native_candidate_index()?;
+    Ok(cas)
+  }
+
+  /// Open the CAS prepared by this Cargo session without repeating lifecycle mutation.
+  ///
+  /// Native compiler wrappers call this only after the parent wrote the session
+  /// through `LocalCas::open`. Every lookup and restore still takes the shared
+  /// lifecycle lock and verifies its exact objects at the final operation.
+  pub(crate) fn open_initialized() -> RailResult<Self> {
+    let base = cache_base()?;
+    let base = fs::canonicalize(&base).map_err(|error| {
+      RailError::message(format!(
+        "failed to resolve initialized local cache base '{}': {error}",
+        base.display()
+      ))
+    })?;
+    let max_bytes = cache_max_bytes()?;
+    Self::open_initialized_at(&base, max_bytes)
+  }
+
+  fn open_initialized_at(base: &Path, max_bytes: u64) -> RailResult<Self> {
+    validate_real_directory(base, "local cache base")?;
+    let cargo_rail = base.join("cargo-rail");
+    validate_real_directory(&cargo_rail, "local CAS owner")?;
+    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let _lock = lock_local_cas(&lifecycle_lock, false, LockMode::Shared)?
+      .ok_or_else(|| RailError::message("initialized local CAS lifecycle lock disappeared"))?;
+    let root = cargo_rail.join("local-cas-v1");
+    validate_real_directory(&root, "local CAS root")?;
+    ensure_owner_marker_existing(&root)?;
+    for name in [
+      "staging",
+      "results",
+      "pins",
+      "leases",
+      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
+    ] {
+      validate_real_directory(&root.join(name), "local CAS required directory")?;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    validate_real_directory(
+      &root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY),
+      "local CAS sysroot memo directory",
+    )?;
+    validate_root_entries(&root)?;
+    let cas = Self {
+      root,
+      lifecycle_lock,
+      max_bytes,
+    };
+    cas.validate_native_candidate_index()?;
     Ok(cas)
   }
 
@@ -557,7 +664,7 @@ impl LocalCas {
     ] {
       create_real_directory(&root, name)?;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
     clear_staging(&root.join("staging"))?;
@@ -578,17 +685,7 @@ impl LocalCas {
     let index_root = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY);
     let marker = index_root.join(NATIVE_CANDIDATE_INDEX_MARKER);
     match fs::symlink_metadata(&marker) {
-      Ok(metadata) => {
-        if !metadata.is_file()
-          || is_link_or_reparse(&metadata)
-          || !has_single_link(&metadata)
-          || metadata.len() != NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
-          || fs::read(&marker)? != NATIVE_CANDIDATE_INDEX_MARKER_BYTES
-        {
-          return Err(RailError::message("local CAS native candidate index marker is invalid"));
-        }
-        return Ok(());
-      }
+      Ok(_) => return self.validate_native_candidate_index(),
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
       Err(error) => return Err(error.into()),
     }
@@ -659,6 +756,23 @@ impl LocalCas {
     self.ensure_capacity(0, None)
   }
 
+  fn validate_native_candidate_index(&self) -> RailResult<()> {
+    let marker = self
+      .root
+      .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
+      .join(NATIVE_CANDIDATE_INDEX_MARKER);
+    let metadata = fs::symlink_metadata(&marker)?;
+    if !metadata.is_file()
+      || is_link_or_reparse(&metadata)
+      || !has_single_link(&metadata)
+      || metadata.len() != NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
+      || fs::read(&marker)? != NATIVE_CANDIDATE_INDEX_MARKER_BYTES
+    {
+      return Err(RailError::message("local CAS native candidate index marker is invalid"));
+    }
+    Ok(())
+  }
+
   #[cfg(any(target_os = "macos", test))]
   pub(super) fn restore(&self, action_key: &str, destination: &Path) -> CacheLookup {
     let mut stats = ReadStats::default();
@@ -678,32 +792,6 @@ impl LocalCas {
           FaultKind::Corrupt => CacheMissKind::Corrupt,
           FaultKind::Incompatible => CacheMissKind::Incompatible,
         },
-        reason: fault.reason,
-        objects_verified: stats.objects,
-        bytes_read: stats.bytes,
-      }),
-    }
-  }
-
-  #[cfg(any(unix, windows, test))]
-  pub(crate) fn restore_native(&self, action_key: &str, destination: &Path) -> NativeCacheLookup {
-    let mut stats = ReadStats::default();
-    match self.restore_inner(action_key, destination, &mut stats) {
-      Ok(hit) => match hit.validation {
-        StoredValidation::NativeCompiler(_) => NativeCacheLookup::Hit(NativeCacheHit {
-          action_result: hit.action_result,
-          result_digest: hit.object.result_digest,
-          objects_verified: stats.objects,
-          bytes_read: stats.bytes,
-          bytes_restored: stats.restored,
-        }),
-        StoredValidation::Hermetic(_) => NativeCacheLookup::Miss(NativeCacheMiss {
-          reason: "compiler_result_validation_domain_mismatch".to_string(),
-          objects_verified: stats.objects,
-          bytes_read: stats.bytes,
-        }),
-      },
-      Err(fault) => NativeCacheLookup::Miss(NativeCacheMiss {
         reason: fault.reason,
         objects_verified: stats.objects,
         bytes_read: stats.bytes,
@@ -778,13 +866,19 @@ impl LocalCas {
   }
 
   #[cfg(any(unix, windows, test))]
-  pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<Vec<NativeCacheCandidate>> {
-    let _lock = self.read_lock()?;
+  pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<NativeCacheCandidates<'_>> {
+    let lock = self.read_lock()?;
     let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
     let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
     let mut entries = match fs::read_dir(&directory) {
       Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(NativeCacheCandidates {
+          cas: self,
+          _lock: lock,
+          candidates: Vec::new(),
+        });
+      }
       Err(error) => return Err(error.into()),
     };
     validate_real_directory(&directory, "local CAS native candidate")?;
@@ -868,20 +962,28 @@ impl LocalCas {
           "local CAS candidate pin does not match its verified action result",
         ));
       }
-      let StoredValidation::NativeCompiler(validation) = verified.validation else {
-        return Err(RailError::message(
-          "local CAS compiler candidate has the wrong validation domain",
-        ));
+      let validation = match &verified.validation {
+        StoredValidation::NativeCompiler(validation) => validation.as_ref().clone(),
+        StoredValidation::Hermetic(_) => {
+          return Err(RailError::message(
+            "local CAS compiler candidate has the wrong validation domain",
+          ));
+        }
       };
       validation.validate_object()?;
       candidates.push(NativeCacheCandidate {
         action_key: pin.action_key,
-        validation: *validation,
+        validation,
         objects_verified: stats.objects,
         bytes_read: stats.bytes,
+        verified,
       });
     }
-    Ok(candidates)
+    Ok(NativeCacheCandidates {
+      cas: self,
+      _lock: lock,
+      candidates,
+    })
   }
 
   /// Load fully verified compiler evidence discovered by one non-authoritative configuration key.
@@ -1199,7 +1301,7 @@ impl LocalCas {
     Ok(stats)
   }
 
-  #[cfg(any(unix, windows, test))]
+  #[cfg(any(target_os = "macos", test))]
   fn restore_inner(
     &self,
     action_key: &str,
@@ -1431,7 +1533,7 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
     "results",
     "staging",
   ]);
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   let allowed = {
     let mut allowed = allowed;
     allowed.insert(SYSROOT_IDENTITY_MEMO_DIRECTORY);
@@ -3680,20 +3782,12 @@ fn lock_local_cas(path: &Path, create: bool, mode: LockMode) -> RailResult<Optio
     .parent()
     .ok_or_else(|| RailError::message("local CAS lifecycle lock has no parent"))?;
   validate_real_directory(parent, "local CAS owner")?;
-  let file = match OpenOptions::new()
-    .read(true)
-    .write(true)
-    .create(create)
-    .truncate(false)
-    .open(path)
-  {
+  let file = match crate::utils::open_cache_lock_file(path, create) {
     Ok(file) => file,
     Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
     Err(error) => return Err(error.into()),
   };
-  let opened = file.metadata()?;
-  let named = fs::symlink_metadata(path)?;
-  if !same_lock_file(&opened, &named) {
+  if !crate::utils::private_file_matches_path(&file, path, 0)? {
     return Err(RailError::with_help(
       format!(
         "local CAS lifecycle lock '{}' is not a private regular file",
@@ -3706,49 +3800,13 @@ fn lock_local_cas(path: &Path, create: bool, mode: LockMode) -> RailResult<Optio
     LockMode::Shared => file.lock_shared()?,
     LockMode::Exclusive => file.lock()?,
   }
-  let named = fs::symlink_metadata(path)?;
-  if !same_lock_file(&opened, &named) {
+  if !crate::utils::private_file_matches_path(&file, path, 0)? {
     return Err(RailError::message(format!(
       "local CAS lifecycle lock '{}' changed while it was acquired",
       path.display()
     )));
   }
   Ok(Some(LocalCasLifecycleLock { _file: file }))
-}
-
-#[cfg(unix)]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  use std::os::unix::fs::MetadataExt as _;
-
-  opened.is_file()
-    && named.is_file()
-    && !is_link_or_reparse(named)
-    && opened.dev() == named.dev()
-    && opened.ino() == named.ino()
-    && opened.nlink() == 1
-    && named.nlink() == 1
-    && opened.len() == 0
-    && named.len() == 0
-}
-
-#[cfg(windows)]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  use std::os::windows::fs::MetadataExt as _;
-
-  opened.is_file()
-    && named.is_file()
-    && !is_link_or_reparse(named)
-    && opened.volume_serial_number() == named.volume_serial_number()
-    && opened.file_index() == named.file_index()
-    && opened.number_of_links() == 1
-    && named.number_of_links() == 1
-    && opened.len() == 0
-    && named.len() == 0
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_lock_file(opened: &fs::Metadata, named: &fs::Metadata) -> bool {
-  opened.is_file() && named.is_file() && !is_link_or_reparse(named) && opened.len() == 0 && named.len() == 0
 }
 
 fn bounded_directory_entries(directory: &Path, description: &str) -> RailResult<Vec<fs::DirEntry>> {
@@ -3845,7 +3903,7 @@ pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
   ] {
     validate_optional_real_directory(&root.join(name), "local CAS domain")?;
   }
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
   Ok(Some(root.to_path_buf()))
 }
@@ -4215,7 +4273,7 @@ mod tests {
   }
 
   #[test]
-  fn native_candidate_lookup_does_not_materialize_and_action_restore_reverifies() {
+  fn native_candidate_lookup_does_not_materialize_and_retained_view_restores() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let restore_parent = tempfile::tempdir().expect("restore parent");
@@ -4231,7 +4289,7 @@ mod tests {
     assert_eq!(candidates[0].action_key, validation.action_key());
     assert!(!destination.exists(), "candidate lookup must not materialize output");
 
-    let NativeCacheLookup::Hit(hit) = cas.restore_native(validation.action_key(), &destination) else {
+    let NativeCacheLookup::Hit(hit) = candidates.restore(0, &destination) else {
       panic!("verified native action should restore");
     };
     assert_eq!(hit.bytes_restored, manifest.bytes);
@@ -4243,6 +4301,7 @@ mod tests {
       fs::read(destination.join("target/outputs/metadata")).expect("metadata"),
       b"metadata"
     );
+    drop(candidates);
 
     let action_hex = validated_action_key_hex(validation.action_key()).expect("native action key");
     fs::remove_file(cas.root.join("pins").join(format!("{action_hex}.json"))).expect("remove authoritative pin");
@@ -5456,6 +5515,23 @@ mod tests {
     assert_eq!(fs::read_dir(bounded.root().join("results")).unwrap().count(), 0);
   }
 
+  #[test]
+  fn initialized_cache_open_validates_without_reclaiming_shared_staging() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let in_flight = cas.root().join("staging/in-flight");
+    fs::write(&in_flight, b"owned by another compiler process").expect("staging sentinel");
+
+    let base = fs::canonicalize(cache.path()).expect("canonical cache base");
+    let reopened = LocalCas::open_initialized_at(&base, 1024 * 1024).expect("initialized CAS should open");
+
+    assert_eq!(reopened.root(), cas.root());
+    assert_eq!(
+      fs::read(in_flight).expect("initialized open must preserve staging"),
+      b"owned by another compiler process"
+    );
+  }
+
   #[cfg(unix)]
   #[test]
   fn cache_open_rejects_a_linked_lifecycle_lock() {
@@ -5474,7 +5550,7 @@ mod tests {
     assert_eq!(fs::read(outside.path()).expect("outside contents"), b"preserve");
   }
 
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[test]
   fn cache_open_rejects_a_hard_linked_lifecycle_lock() {
     let cache = tempfile::tempdir().expect("cache base");

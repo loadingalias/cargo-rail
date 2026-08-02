@@ -4,7 +4,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::helpers::{TestWorkspace, compiler_evidence_cache, compiler_evidence_cache_at};
+#[cfg(unix)]
+use crate::helpers::compiler_evidence_cache;
+use crate::helpers::{TestWorkspace, compiler_evidence_cache_at};
 
 const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
 
@@ -184,6 +186,59 @@ fn wrapper_workspace(name: &str) -> Result<TestWorkspace> {
   Ok(workspace)
 }
 
+fn run_direct_native_build(workspace: &Path, cache: &Path) -> Result<std::process::Output> {
+  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(workspace)
+    .args([
+      "rail",
+      "run",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--offline",
+      "--quiet",
+    ])
+    .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_RAIL_CACHE_DIR", cache)
+    .env_remove("CARGO_BUILD_BUILD_DIR")
+    .env_remove("CARGO_BUILD_JOBS")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_TARGET_DIR")
+    .env_remove("CARGO_BUILD_WARNINGS")
+    .env_remove("CARGO_TARGET_DIR")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(output.status.success(), "direct native-cache run failed: {output:?}");
+  Ok(output)
+}
+
+fn native_unit_event(output: &std::process::Output, crate_name: &str) -> Result<serde_json::Value> {
+  [&output.stdout, &output.stderr]
+    .into_iter()
+    .flat_map(|stream| {
+      String::from_utf8_lossy(stream)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    })
+    .filter_map(|line| {
+      line
+        .split_once(" native compiler cache event: ")
+        .map(|(_, event)| event.to_string())
+    })
+    .map(|event| serde_json::from_str::<serde_json::Value>(&event).map_err(Into::into))
+    .find_map(|event| match event {
+      Ok(event) if event["unit"]["descriptor"]["crate_name"] == crate_name => Some(Ok(event)),
+      Ok(_) => None,
+      Err(error) => Some(Err(error)),
+    })
+    .with_context(|| format!("native-cache event for {crate_name}"))?
+}
+
 fn run_unify_without_ambient_wrappers(workspace: &Path, cache: &Path) -> Result<std::process::Output> {
   run_unify_with_environment(workspace, cache, &[])
 }
@@ -257,26 +312,6 @@ fn assert_native_invalidation(
     "mutated input reused a prior native-cache action key: {observation}"
   );
   Ok((observation, action_key))
-}
-
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
-fn native_cache_action_boundary_bypass(observation: &serde_json::Value) -> Option<&str> {
-  if observation["execution"]["cache_wrapper"]["status"] != "bypassed" {
-    return None;
-  }
-  observation["execution"]["cache_wrapper"]["reason"]
-    .as_str()
-    .filter(|reason| {
-      matches!(
-        *reason,
-        "native_cache_toolchain_not_graduated" | "native_cache_capability_not_certified"
-      )
-    })
 }
 
 #[cfg(unix)]
@@ -538,7 +573,7 @@ exec cc "$@"
 }
 
 #[test]
-fn explicit_codegen_backend_is_transparent_and_bypasses_before_wrapper_setup() -> Result<()> {
+fn bundled_codegen_backend_is_content_identified_and_transparent() -> Result<()> {
   let workspace = TestWorkspace::new_single_crate("codegen-backend-parity", "0.1.0")?;
   let cargo_home = tempfile::tempdir()?;
   let cache = tempfile::tempdir()?;
@@ -596,18 +631,28 @@ fn explicit_codegen_backend_is_transparent_and_bypasses_before_wrapper_setup() -
     "backend fixture produced no compiler output"
   );
 
-  for (label, no_cache) in [("cache disabled", true), ("cache requested", false)] {
-    reset()?;
-    let rail = run(true, no_cache, false, "llvm")?;
-    assert_eq!(rail.status.code(), direct.status.code(), "{label}: {rail:?}");
-    assert_eq!(rail.stdout, direct.stdout, "{label} changed stdout");
-    assert_eq!(rail.stderr, direct.stderr, "{label} changed stderr");
-    assert_eq!(
-      compiler_output_files(&target)?,
-      direct_outputs,
-      "{label} changed compiler outputs"
-    );
-  }
+  reset()?;
+  let disabled = run(true, true, false, "llvm")?;
+  assert_eq!(
+    disabled.status.code(),
+    direct.status.code(),
+    "cache disabled: {disabled:?}"
+  );
+  assert_eq!(disabled.stdout, direct.stdout, "cache disabled changed stdout");
+  assert_eq!(disabled.stderr, direct.stderr, "cache disabled changed stderr");
+  assert_eq!(
+    compiler_output_files(&target)?,
+    direct_outputs,
+    "cache disabled changed compiler outputs"
+  );
+
+  reset()?;
+  let cold = run(true, false, false, "llvm")?;
+  assert_eq!(cold.status.code(), direct.status.code(), "cache cold: {cold:?}");
+  assert_eq!(cold.stdout, direct.stdout, "cache cold changed stdout");
+  assert_eq!(cold.stderr, direct.stderr, "cache cold changed stderr");
+  let portable_outputs = compiler_output_files(&target)?;
+  assert!(!portable_outputs.is_empty(), "cache cold produced no compiler outputs");
 
   reset()?;
   let explained = run(true, false, true, "llvm")?;
@@ -616,10 +661,19 @@ fn explicit_codegen_backend_is_transparent_and_bypasses_before_wrapper_setup() -
     "explained cargo-rail run failed: {explained:?}"
   );
   assert_eq!(explained.stderr, direct.stderr);
+  assert_eq!(
+    compiler_output_files(&target)?,
+    portable_outputs,
+    "bundled-backend warm reuse changed cold cache output bytes"
+  );
   assert!(
+    String::from_utf8_lossy(&explained.stdout).contains("native compiler cache: hits=1"),
+    "bundled backend did not restore a verified result: {}",
     String::from_utf8_lossy(&explained.stdout)
-      .contains("native compiler cache: bypassed (codegen_backend_not_graduated)"),
-    "codegen-backend bypass was not explicit: {}",
+  );
+  assert!(
+    !String::from_utf8_lossy(&explained.stdout).contains("native compiler cache: bypassed"),
+    "bundled backend disabled the whole native cache action: {}",
     String::from_utf8_lossy(&explained.stdout)
   );
 
@@ -688,12 +742,6 @@ fn ineligible_diagnostic_workspace_never_installs_the_native_cache_wrapper() -> 
   Ok(())
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 #[test]
 fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<()> {
   let workspace = wrapper_workspace("disabled-cache-wrapper-observation")?;
@@ -701,37 +749,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
   let observation = native_cache_observation(local_cache.path())?;
-  if let Some(reason) = native_cache_action_boundary_bypass(&observation) {
-    let target = workspace.path.join("target");
-    let cold_outputs = compiler_output_files(&target)?;
-    assert!(
-      !cold_outputs.is_empty(),
-      "bypassed execution produced no compiler outputs"
-    );
-    assert!(
-      !local_cache.path().join("cargo-rail/local-cas-v1").exists(),
-      "an action-level bypass must not create native-cache state"
-    );
-    fs::remove_dir_all(&target)?;
-    let repeated = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-    assert_eq!(
-      repeated.status.code(),
-      Some(1),
-      "repeated bypassed execution: {repeated:?}"
-    );
-    let repeated_observation = native_cache_observation(local_cache.path())?;
-    assert_eq!(
-      native_cache_action_boundary_bypass(&repeated_observation),
-      Some(reason),
-      "the action-level bypass must remain stable"
-    );
-    assert_eq!(
-      compiler_output_files(&target)?,
-      cold_outputs,
-      "an unavailable cache capability must preserve exact cold outputs"
-    );
-    return Ok(());
-  }
+  assert_eq!(observation["execution"]["cache_wrapper"]["status"], "miss");
   assert!(
     local_cache.path().join("cargo-rail/local-cas-v1").is_dir(),
     "native reuse must publish into the configured local CAS"
@@ -842,12 +860,6 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   Ok(())
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 #[test]
 fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let workspace = wrapper_workspace("native-cache-mutation-matrix")?;
@@ -864,27 +876,7 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   let cold = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
   assert_eq!(cold.status.code(), Some(1), "cold run: {cold:?}");
   let cold_observation = native_cache_observation(local_cache.path())?;
-  if let Some(reason) = native_cache_action_boundary_bypass(&cold_observation) {
-    let cold_outputs = compiler_output_files(&target)?;
-    assert!(
-      !cold_outputs.is_empty(),
-      "bypassed execution produced no compiler outputs"
-    );
-    fs::remove_dir_all(&target)?;
-    let repeated = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
-    let repeated_observation = assert_native_miss(local_cache.path(), &repeated)?;
-    assert_eq!(
-      native_cache_action_boundary_bypass(&repeated_observation),
-      Some(reason),
-      "the action-level bypass must remain stable"
-    );
-    assert_eq!(
-      compiler_output_files(&target)?,
-      cold_outputs,
-      "an unavailable cache capability must preserve exact cold outputs"
-    );
-    return Ok(());
-  }
+  assert_eq!(cold_observation["execution"]["cache_wrapper"]["status"], "miss");
   fs::remove_dir_all(&target)?;
   let warm = run_unify_with_environment(&workspace.path, local_cache.path(), &[("P73_VALUE", "one")])?;
   assert_eq!(warm.status.code(), Some(1), "warm run: {warm:?}");
@@ -952,12 +944,6 @@ fn native_cache_mutations_produce_no_false_hits() -> Result<()> {
   Ok(())
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 #[test]
 fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> {
   fn collect_blobs(directory: &Path, blobs: &mut Vec<PathBuf>) -> Result<()> {
@@ -976,10 +962,7 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
   let workspace = wrapper_workspace("native-cache-corrupt-object")?;
   let local_cache = tempfile::tempdir()?;
   let cold = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  let cold_observation = assert_native_miss(local_cache.path(), &cold)?;
-  if native_cache_action_boundary_bypass(&cold_observation).is_some() {
-    return Ok(());
-  }
+  assert_native_miss(local_cache.path(), &cold)?;
   let target = workspace.path.join("target");
   let cold_outputs = compiler_output_files(&target)?;
   let mut blobs = Vec::new();
@@ -1002,69 +985,171 @@ fn corrupt_native_cache_object_falls_back_to_exact_cold_outputs() -> Result<()> 
   Ok(())
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 #[test]
-fn filesystem_reading_macro_has_an_explicit_native_bypass() -> Result<()> {
+fn filesystem_macro_inputs_are_reused_and_invalidated_from_dep_info() -> Result<()> {
   let workspace = wrapper_workspace("native-cache-filesystem-macro")?;
-  fs::write(workspace.path.join("crates/wrapper-app/src/value.txt"), "observed\n")?;
+  let included = workspace.path.join("crates/wrapper-app/src/value.txt");
+  fs::write(&included, "observed\n")?;
   fs::write(
     workspace.path.join("crates/wrapper-app/src/lib.rs"),
     "pub const VALUE: &str = include_str!(\"value.txt\");\n",
   )?;
   workspace.commit("Add filesystem macro fixture")?;
   let local_cache = tempfile::tempdir()?;
-  let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  assert_eq!(output.status.code(), Some(1), "filesystem macro run: {output:?}");
-  let observation = native_cache_observation(local_cache.path())?;
-  assert_eq!(observation["execution"]["cache_wrapper"]["status"], "bypassed");
-  if native_cache_action_boundary_bypass(&observation).is_some() {
-    return Ok(());
-  }
-  assert_eq!(
-    observation["execution"]["cache_wrapper"]["reason"],
-    "filesystem_reading_macro_not_graduated"
+  let target = workspace.path.join("target");
+
+  let cold = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let cold_event = native_unit_event(&cold, "wrapper_app")?;
+  assert_eq!(cold_event["outcome"], "miss", "unexpected cold event: {cold_event}");
+  assert_eq!(cold_event["reason"], "stored_verified_result");
+  assert!(
+    compiler_output_files(&target)?.iter().any(|(path, bytes)| path
+      .extension()
+      .is_some_and(|extension| extension == "d")
+      && bytes.windows(b"value.txt".len()).any(|window| window == b"value.txt")),
+    "rustc dep-info did not report the included file"
   );
+  let original_action_key = cold_event["action_key"]
+    .as_str()
+    .context("filesystem macro cold action key")?
+    .to_string();
+
+  fs::remove_dir_all(&target)?;
+  let warm = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let warm_event = native_unit_event(&warm, "wrapper_app")?;
+  assert_eq!(
+    warm_event["outcome"],
+    "hit",
+    "unexpected warm event: {warm_event}\nstderr:\n{}",
+    String::from_utf8_lossy(&warm.stderr)
+  );
+  assert_eq!(warm_event["action_key"], original_action_key);
+
+  fs::remove_dir_all(&target)?;
+  fs::write(&included, "changed!\n")?;
+  let changed = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let changed_event = native_unit_event(&changed, "wrapper_app")?;
+  assert_eq!(
+    changed_event["outcome"], "miss",
+    "unexpected changed event: {changed_event}"
+  );
+  let changed_action_key = changed_event["action_key"]
+    .as_str()
+    .context("filesystem macro changed action key")?;
+  assert_ne!(changed_action_key, original_action_key);
+
+  fs::remove_dir_all(&target)?;
+  fs::write(&included, "observed\n")?;
+  let restored = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let restored_event = native_unit_event(&restored, "wrapper_app")?;
+  assert_eq!(
+    restored_event["outcome"], "hit",
+    "unexpected restored event: {restored_event}"
+  );
+  assert_eq!(restored_event["action_key"], original_action_key);
+  assert_ne!(restored_event["action_key"], changed_action_key);
   Ok(())
 }
 
-#[cfg(not(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-)))]
 #[test]
-fn unsupported_platform_bypasses_native_cache_and_preserves_cold_outputs() -> Result<()> {
-  let workspace = wrapper_workspace("native-cache-unsupported-platform")?;
+fn output_neutral_cargo_configuration_reuses_native_results_across_build_directories() -> Result<()> {
+  let workspace = wrapper_workspace("native-cache-output-neutral-configuration")?;
+  let configuration_directory = workspace.path.join(".cargo");
+  fs::create_dir_all(&configuration_directory)?;
+  let configuration = configuration_directory.join("config.toml");
+  fs::write(
+    &configuration,
+    "[build]\nbuild-dir = \"build-one\"\njobs = 1\ntarget-dir = \"target-one\"\nwarnings = \"warn\"\n\n[net]\noffline = true\nretry = 1\n",
+  )?;
   let local_cache = tempfile::tempdir()?;
-  let target = workspace.path.join("target");
 
-  let first = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  assert_eq!(first.status.code(), Some(1), "first cold run: {first:?}");
-  let first_observation = native_cache_observation(local_cache.path())?;
-  assert_eq!(first_observation["execution"]["cache_wrapper"]["status"], "bypassed");
-  assert_eq!(
-    first_observation["execution"]["cache_wrapper"]["reason"],
-    "native_cache_platform_not_graduated"
-  );
-  let first_outputs = compiler_output_files(&target)?;
-  assert!(!first_outputs.is_empty(), "fixture must produce compiler outputs");
+  let cold = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let cold_event = native_unit_event(&cold, "wrapper_app")?;
+  assert_eq!(cold_event["outcome"], "miss", "unexpected cold event: {cold_event}");
+  let cold_action = cold_event["action_key"]
+    .as_str()
+    .context("output-neutral cold action key")?
+    .to_string();
+  for directory in ["build-one", "target-one"] {
+    let path = workspace.path.join(directory);
+    if path.exists() {
+      fs::remove_dir_all(path)?;
+    }
+  }
 
-  fs::remove_dir_all(&target)?;
-  let second = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
-  assert_eq!(second.status.code(), Some(1), "second cold run: {second:?}");
-  let second_observation = native_cache_observation(local_cache.path())?;
-  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "bypassed");
+  fs::write(
+    &configuration,
+    "[build]\nbuild-dir = \"build-two\"\njobs = 2\ntarget-dir = \"target-two\"\nwarnings = \"deny\"\n\n[net]\noffline = true\nretry = 2\n\n[registries.crates-io]\nprotocol = \"sparse\"\n",
+  )?;
+  let warm = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let warm_event = native_unit_event(&warm, "wrapper_app")?;
   assert_eq!(
-    second_observation["execution"]["cache_wrapper"]["reason"],
-    "native_cache_platform_not_graduated"
+    warm_event["outcome"],
+    "hit",
+    "unexpected warm event: {warm_event}\nstderr:\n{}",
+    String::from_utf8_lossy(&warm.stderr)
   );
-  assert_eq!(compiler_output_files(&target)?, first_outputs);
+  assert_eq!(warm_event["action_key"], cold_action);
+  let outputs = warm_event["unit"]["observed_outputs"]
+    .as_array()
+    .context("warm output observations")?;
+  assert!(
+    outputs.iter().all(|output| output["path"]["path"]
+      .as_str()
+      .is_some_and(|path| path.starts_with("build-two/"))),
+    "cache hit published stale output paths: {warm_event}"
+  );
+  for (_, bytes) in compiler_output_files(&workspace.path.join("build-two"))?
+    .into_iter()
+    .filter(|(path, _)| path.extension().is_some_and(|extension| extension == "d"))
+  {
+    assert!(
+      !bytes.windows("build-one".len()).any(|window| window == b"build-one")
+        && !bytes.windows("target-one".len()).any(|window| window == b"target-one"),
+      "materialized dep-info retained the previous Cargo output directory"
+    );
+  }
+  Ok(())
+}
+
+#[test]
+fn unrelated_lockfile_resolution_churn_reuses_native_results() -> Result<()> {
+  let workspace = wrapper_workspace("native-cache-unrelated-lockfile-churn")?;
+  let unused = workspace.path.join("vendor/unused-dep");
+  fs::create_dir_all(unused.join("src"))?;
+  fs::write(
+    unused.join("Cargo.toml"),
+    "[package]\nname = \"unused-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+  )?;
+  fs::write(unused.join("src/lib.rs"), "pub fn unused() {}\n")?;
+  let manifest = workspace.path.join("crates/wrapper-app/Cargo.toml");
+  let mut contents = fs::read_to_string(&manifest)?;
+  contents.push_str("unused-dep = { path = \"../../vendor/unused-dep\", optional = true }\n");
+  fs::write(&manifest, contents)?;
+  let cargo_home = tempfile::tempdir()?;
+  generate_front_door_lockfile(&workspace.path, cargo_home.path())?;
+  let local_cache = tempfile::tempdir()?;
+
+  let cold = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let cold_event = native_unit_event(&cold, "wrapper_app")?;
+  assert_eq!(cold_event["outcome"], "miss", "unexpected cold event: {cold_event}");
+  let cold_action = cold_event["action_key"]
+    .as_str()
+    .context("lockfile cold action key")?
+    .to_string();
+  let original_lockfile = fs::read(workspace.path.join("Cargo.lock"))?;
+  fs::remove_dir_all(workspace.path.join("target"))?;
+
+  fs::write(
+    unused.join("Cargo.toml"),
+    "[package]\nname = \"unused-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+  )?;
+  generate_front_door_lockfile(&workspace.path, cargo_home.path())?;
+  assert_ne!(fs::read(workspace.path.join("Cargo.lock"))?, original_lockfile);
+  let warm = run_direct_native_build(&workspace.path, local_cache.path())?;
+  let warm_event = native_unit_event(&warm, "wrapper_app")?;
+  assert_eq!(warm_event["outcome"], "hit", "unexpected warm event: {warm_event}");
+  assert_eq!(warm_event["action_key"], cold_action);
   Ok(())
 }
 

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -457,6 +458,7 @@ def execute_case(
     workspace: Path,
     env: dict[str, str],
     verify_direct_repeatability: bool = False,
+    portable_cache_outputs: bool = False,
 ) -> tuple[ProcessResult, tuple[tuple[str, str, int, str], ...]]:
     clean_directory(target)
     direct = run(direct_argv(case, target), cwd=workspace, env=env)
@@ -477,6 +479,7 @@ def execute_case(
                 f"{manifest_difference(direct_outputs, repeated_outputs)}"
             )
 
+    cache_outputs = direct_outputs
     for label, no_cache in (("cache-disabled", True), ("cache-requested", False)):
         clean_directory(target)
         result = run(
@@ -497,25 +500,30 @@ def execute_case(
                 f"direct={direct!r}\nrail={result!r}"
             )
         outputs = output_manifest(target)
-        if outputs != direct_outputs:
+        if outputs != direct_outputs and (no_cache or not portable_cache_outputs):
             raise CompatibilityError(
                 f"{case.name} {label} output inventory or bytes differ from direct Cargo:\n"
                 f"{manifest_difference(direct_outputs, outputs)}"
             )
-    return direct, direct_outputs
+        if not no_cache and portable_cache_outputs:
+            direct_inventory = tuple(entry[:3] for entry in direct_outputs)
+            cache_inventory = tuple(entry[:3] for entry in outputs)
+            if cache_inventory != direct_inventory:
+                raise CompatibilityError(
+                    f"{case.name} cache output paths, kinds, or modes differ from direct Cargo:\n"
+                    f"{manifest_difference(direct_outputs, outputs)}"
+                )
+            cache_outputs = outputs
+    return direct, cache_outputs
 
 
-def resolve_expected_cache_state(
+def assert_native_cache_identity(
     cargo_rail: Path,
-    expected: str,
     expected_host: str,
     *,
     workspace: Path,
     env: dict[str, str],
-) -> str:
-    if expected != "exact_certificate":
-        return expected
-
+) -> None:
     result = run(
         [str(cargo_rail), "rail", "doctor", "native-cache", "--format", "json"],
         cwd=workspace,
@@ -524,21 +532,9 @@ def resolve_expected_cache_state(
     try:
         report = json.loads(result.stdout)
         capability = report["capability"]
-        registry = json.loads(
-            (
-                REPOSITORY_ROOT / "distribution/native-cache-capabilities.json"
-            ).read_bytes()
-        )
-        matches = [
-            certificate
-            for certificate in registry["certificates"]
-            if certificate["platform"] == capability["platform"]
-            and certificate["host_target"] == capability["host_target"]
-            and certificate["identity"] == capability["identity"]
-        ]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise CompatibilityError(
-            f"native-cache capability report or registry is invalid: {error}"
+            f"native-cache toolchain identity report is invalid: {error}"
         ) from error
 
     if (
@@ -547,34 +543,19 @@ def resolve_expected_cache_state(
         or report.get("result") != "success"
         or report.get("exit_code") != 0
         or capability.get("host_target") != expected_host
-        or capability.get("schema_version") != registry.get("schema_version")
-        or capability.get("cache_class") != registry.get("class")
-        or capability.get("execution_contract") != registry.get(
-            "execution_contract"
-        )
-        or len(matches) > 1
+        or capability.get("schema_version") != 2
+        or capability.get("cache_class") != "library_metadata_rlib"
+        or capability.get("execution_contract") != "direct-global-wrapper-v3"
+        or not isinstance(capability.get("platform"), str)
+        or not capability["platform"]
+        or not isinstance(capability.get("identity"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", capability["identity"]) is None
+        or "certified" in capability
+        or "evidence" in capability
     ):
         raise CompatibilityError(
-            "native-cache capability report disagrees with the reviewed registry"
+            "native-cache doctor did not report the exact structural toolchain identity"
         )
-
-    if matches:
-        evidence = matches[0]["evidence"]
-        if capability.get("certified") is not True or capability.get(
-            "evidence"
-        ) != evidence:
-            raise CompatibilityError(
-                "native-cache capability matches the registry but is not certified"
-            )
-        return "active"
-
-    if capability.get("certified") is not False or capability.get(
-        "evidence"
-    ) is not None:
-        raise CompatibilityError(
-            "native-cache capability is absent from the registry but reports certification"
-        )
-    return "native_cache_capability_not_certified"
 
 
 def assert_cache_explanation(
@@ -587,7 +568,7 @@ def assert_cache_explanation(
     *,
     workspace: Path,
     env: dict[str, str],
-) -> None:
+) -> str:
     clean_directory(target)
     explained = run(
         rail_argv(
@@ -607,9 +588,13 @@ def assert_cache_explanation(
     stdout = explained.stdout.decode("utf-8")
     marker = "native compiler cache:"
     if expected_cache_state == "active":
-        if marker not in stdout or f"{marker} bypassed" in stdout:
+        if (
+            marker not in stdout
+            or f"{marker} bypassed" in stdout
+            or re.search(r"native compiler cache: hits=[1-9][0-9]*", stdout) is None
+        ):
             raise CompatibilityError(
-                f"{case.name} did not report an active native cache:\n{stdout}"
+                f"{case.name} did not restore a verified native-cache result:\n{stdout}"
             )
     else:
         expected = f"{marker} bypassed ({expected_cache_state})"
@@ -617,6 +602,7 @@ def assert_cache_explanation(
             raise CompatibilityError(
                 f"{case.name} did not report {expected_cache_state}:\n{stdout}"
             )
+    return stdout
 
 
 def assert_explicit_bypass_explanation(
@@ -793,7 +779,7 @@ def assert_cross_target_mutations(
             "wasm32v1-none",
             (),
             env,
-            ("cross_target_not_graduated",),
+            ("configured_linker_not_graduated", "cross_target_not_graduated"),
             ("src/lib.rs", "const REPEAT: usize = 2;"),
         ),
         (
@@ -841,7 +827,7 @@ def assert_cross_target_mutations(
             "wasm32-unknown-unknown",
             (),
             {**env, "CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_LINKER": str(linker)},
-            ("configured_linker_not_graduated", "cross_target_not_graduated"),
+            ("cross_target_not_graduated",),
             None,
         ),
     )
@@ -996,7 +982,6 @@ def assert_custom_target_json(
         case,
         target,
         (
-            "native_cache_toolchain_not_graduated",
             "custom_target_not_graduated",
             "compiler_flag_not_graduated",
         ),
@@ -1248,7 +1233,7 @@ def assert_codegen_backend_probes(
     shutil.copytree(FIXTURE_ROOT, workspace)
     initialize_git_repository(workspace, env)
 
-    success_target = root / "codegen-backend-target"
+    success_target = workspace / "target/codegen-backend"
     success_env = {
         **env,
         "CARGO_ENCODED_RUSTFLAGS": "-Zcodegen-backend=cranelift",
@@ -1279,20 +1264,26 @@ def assert_codegen_backend_probes(
         success_target,
         workspace=workspace,
         env=success_env,
+        portable_cache_outputs=True,
     )
     assert_release_binary(success_target, workspace, success_env)
-    assert_explicit_bypass_explanation(
+    explanation = assert_cache_explanation(
         cargo_rail,
         success_case,
         success_target,
-        ("codegen_backend_not_graduated",),
+        "active",
         direct,
         direct_outputs,
         workspace=workspace,
         env=success_env,
     )
+    if re.search(r"native compiler cache: hits=[1-9][0-9]*", explanation) is None:
+        raise CompatibilityError(
+            "Cranelift completed but did not restore any verified compiler result:\n"
+            f"{explanation}"
+        )
 
-    failure_target = root / "unknown-codegen-backend-target"
+    failure_target = success_target
     failure_env = {
         **env,
         "CARGO_ENCODED_RUSTFLAGS": "-Zcodegen-backend=cargo_rail_missing_backend",
@@ -1613,59 +1604,31 @@ def assert_incoherent_toolchain_selection(
             "RUSTDOC": rustup_program(primary_toolchain, "rustdoc", workspace, env),
         }
     )
-    direct_argv = [
-        alternate_cargo,
-        "check",
-        "--workspace",
-        "--locked",
-        "--quiet",
-        "--target-dir",
-        str(target),
-    ]
-    rail_base = [
-        str(cargo_rail),
-        "rail",
-        "run",
-        "--quiet",
-        "--all",
-        "--action",
+    case = ActionCase(
+        "mixed Cargo/rustc/rustdoc selection",
         "build",
-    ]
-    rail_arguments = ["--", "--locked", "--quiet", "--target-dir", str(target)]
-    direct, direct_outputs = assert_command_parity(
-        "incoherent Cargo/rustc/rustdoc selection",
-        direct_argv,
-        (
-            ("cache-disabled", [*rail_base, "--no-cache", *rail_arguments]),
-            ("cache-requested", [*rail_base, *rail_arguments]),
-        ),
+        (alternate_cargo, "check", "--workspace", "--locked", "--quiet"),
+        rail_run_args=("--locked", "--quiet"),
+    )
+    direct, direct_outputs = execute_case(
+        cargo_rail,
+        case,
         target,
         workspace=workspace,
         env=mixed_environment,
+        portable_cache_outputs=True,
     )
 
-    clean_directory(target)
-    explained = run(
-        [*rail_base, "--explain", *rail_arguments],
-        cwd=workspace,
+    assert_cache_explanation(
+        cargo_rail,
+        case,
+        target,
+        "active",
+        direct,
+        direct_outputs,
+        workspace=workspace,
         env=mixed_environment,
     )
-    if explained.returncode != direct.returncode or explained.stderr != direct.stderr:
-        raise CompatibilityError(
-            "incoherent toolchain explain changed exit status or stderr"
-        )
-    explained_outputs = output_manifest(target)
-    if explained_outputs != direct_outputs:
-        raise CompatibilityError(
-            "incoherent toolchain explain changed outputs:\n"
-            f"{manifest_difference(direct_outputs, explained_outputs)}"
-        )
-    expected = "native compiler cache: bypassed (native_cache_toolchain_incoherent)"
-    if expected not in explained.stdout.decode("utf-8"):
-        raise CompatibilityError(
-            f"incoherent toolchain did not report {expected}:\n"
-            f"{explained.stdout.decode(errors='replace')}"
-        )
 
 
 def main() -> int:
@@ -1719,7 +1682,7 @@ def main() -> int:
         ) as temporary:
             root = Path(temporary)
             workspace = root / "workspace"
-            target = root / "target"
+            target = workspace / "target/compatibility"
             environment = selected_environment(
                 args.toolchain, root / "cargo-home", root / "cache"
             )
@@ -1738,13 +1701,13 @@ def main() -> int:
                 env=environment,
             )
             assert_plan(cargo_rail, workspace, environment)
-            expected_cache_state = resolve_expected_cache_state(
+            assert_native_cache_identity(
                 cargo_rail,
-                args.expected_cache_state,
                 args.expected_host,
                 workspace=workspace,
                 env=environment,
             )
+            expected_cache_state = args.expected_cache_state
 
             cases = (
                 ActionCase(
@@ -1787,6 +1750,7 @@ def main() -> int:
                     verify_direct_repeatability=(
                         args.direct_repeatability_probe and case.name == "check"
                     ),
+                    portable_cache_outputs=(expected_cache_state == "active"),
                 )
                 if case.action in {"build", "distribution"}:
                     assert_cache_explanation(

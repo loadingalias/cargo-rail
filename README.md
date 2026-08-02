@@ -162,16 +162,28 @@ Cargo-Rail does not restore an old target directory or manufacture Cargo freshne
 - action and result identity; and
 - exact stored output bytes.
 
+The cache does not partition every compiler unit by the complete Cargo configuration or `Cargo.lock`. Output-neutral
+changes such as warning policy, job count, build or target directory, network policy, registry settings, and unrelated
+lockfile entries can reuse a verified result. Rust flags, features, dependency contents, target, linker, sysroot, and
+observed compiler inputs still change or reject reuse at their owning boundary.
+
 A matching lookup is not enough. Incomplete or unsupported evidence produces a named bypass and runs normal Cargo.
 
 **Fast when proven. Normal Cargo when not.**
 
-In the checked-in qualified fixtures:
+In the latest same-host Linux x86-64 comparison, one accepted sample per lane measured warm Cargo-Rail against local
+`sccache` 0.16.0:
 
-- warm Cargo-Rail beat native Cargo on every measured host and workload;
-- M1 Pro p50 fell by **27.3% for checks** and **28.5% for release builds**;
-- Cargo-Rail led local `sccache` in the two Linux release-build comparisons; and
-- `sccache` led the two Linux check comparisons.
+- **16.2% faster checks**: 4.003 s instead of 4.777 s;
+- **22.0% faster release builds**: 6.302 s instead of 8.081 s; and
+- **61–65% lower peak RSS**: 375–406 MB instead of 1.04–1.08 GB.
+
+The sample covered one complete interleaved group with zero rejected samples or false hits. It is a bounded
+same-machine result, not a claim about every workspace or a timing distribution.
+
+A separate one-group before/after check measured 33.6–34.5% fewer warm input bytes hashed after moving identity from
+whole-workspace state to the compiler unit that consumed it. Its wall-time samples were mixed, so this is a resource
+and reuse-boundary result, not an additional latency claim.
 
 See [Caching](docs/caching.md) for the proof model, support matrix, raw methodology, and current qualification boundaries.
 
@@ -341,6 +353,7 @@ The current MSRV is published in
 - [Command reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
 - [Caching](docs/caching.md)
+- [Benchmarking](docs/benchmarking.md)
 - [Troubleshooting and recovery](docs/troubleshooting.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)
 - [Migrate from git-cliff or release-plz](docs/migrate-git-cliff.md)

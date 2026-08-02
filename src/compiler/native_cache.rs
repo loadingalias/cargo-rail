@@ -22,16 +22,20 @@ use crate::compiler::observation::{
 use crate::compiler::wrapper::CacheWrapperPlan;
 use crate::error::{RailError, RailResult};
 use crate::hermetic::cas::NativeCacheLookup;
-use crate::hermetic::cas::{LocalCas, NativeStoreRequest};
+use crate::hermetic::cas::{LocalCas, NativeCacheCandidates, NativeStoreRequest};
+use crate::instrumentation::{
+  NativeCacheWrapperDiagnostics, NativeCacheWrapperEventDiagnostics, NativeCacheWrapperPhase, NativeCacheWrapperTrace,
+  NativeCacheWrapperTraceSnapshot, NativeCacheWrapperWork,
+};
 use crate::source::ContentDigest;
 
-pub(crate) const CANDIDATE_KEY_PREFIX: &str = "compiler-candidate-v2-sha256-";
-pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v2-sha256-";
+pub(crate) const CANDIDATE_KEY_PREFIX: &str = "compiler-candidate-v3-sha256-";
+pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v3-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v2";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v2";
-const SESSION_FILE: &str = "native-compiler-cache-session-v2.json";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v3";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v3";
+const SESSION_FILE: &str = "native-compiler-cache-session-v3.json";
 const DIRECT_CONTEXT_FILE: &str = "native-compiler-cache-context-v2.json";
 const UNIT_EVIDENCE_DIRECTORY: &str = "native-cache-unit-evidence";
 #[cfg(not(windows))]
@@ -39,17 +43,10 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
-const GRADUATED_RUSTC_RELEASE: &str = "1.97.1";
-const GRADUATED_CARGO_RELEASE: &str = "1.97.1";
-const NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION: u32 = 1;
-const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 3;
-const GRADUATED_NATIVE_HOSTS: &[(&str, &str)] = &[
-  ("unix-linux-aarch64", "aarch64-unknown-linux-gnu"),
-  ("unix-linux-x86_64", "x86_64-unknown-linux-gnu"),
-  ("unix-macos-aarch64", "aarch64-apple-darwin"),
-  ("windows-windows-x86_64", "x86_64-pc-windows-msvc"),
-];
-const NATIVE_CACHE_CAPABILITY_REGISTRY: &str = include_str!("../../distribution/native-cache-capabilities.json");
+const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 2;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 3;
+const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 4;
+const NATIVE_CACHE_RUN_EVENT_VERSION: u32 = 3;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const DEP_INFO_SLOT: &str = "target/outputs/dep-info";
@@ -68,13 +65,11 @@ pub(crate) struct NativeCompilerSession {
   class: NativeCompilerClass,
   capability_identity: String,
   toolchain_identity: String,
-  compiler_environment_identity: String,
-  cargo_configuration_identity: String,
-  resolution_identity: String,
+  compiler_process_environment_identity: String,
   execution_contract: String,
 }
 
-/// Exact class, platform, and toolchain boundary that earned native reuse.
+/// Exact result class and toolchain boundary for one native reuse session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeCompilerClass {
@@ -101,17 +96,12 @@ impl NativeCompilerClass {
     }
   }
 
-  fn eligibility_reason(&self) -> Option<DirectCacheBypass> {
-    if !GRADUATED_NATIVE_HOSTS
-      .iter()
-      .any(|&(platform, host_target)| self.platform == platform && self.host_target == host_target)
-    {
-      Some(DirectCacheBypass::PlatformNotGraduated)
-    } else if self.rustc_release != GRADUATED_RUSTC_RELEASE || self.cargo_release != GRADUATED_CARGO_RELEASE {
-      Some(DirectCacheBypass::ToolchainNotGraduated)
-    } else {
-      None
-    }
+  fn is_valid(&self) -> bool {
+    self.name == GRADUATED_NATIVE_CACHE_CLASS
+      && !self.platform.is_empty()
+      && self.host_target != "unknown"
+      && self.rustc_release != "unknown"
+      && self.cargo_release != "unknown"
   }
 }
 
@@ -122,9 +112,7 @@ pub(crate) struct DirectNativeCacheIdentity<'a> {
   pub(crate) cargo_version: &'a str,
   pub(crate) toolchain_fingerprint: &'a str,
   pub(crate) capability_identity: &'a str,
-  pub(crate) compiler_env_fingerprint: &'a str,
-  pub(crate) cargo_config_fingerprint: &'a str,
-  pub(crate) lock_fingerprint: &'a str,
+  pub(crate) compiler_process_env_fingerprint: &'a str,
   pub(crate) wrapper_plan: CacheWrapperPlan,
   pub(crate) setup_bytes_hashed: u64,
   pub(crate) retain_event_evidence: bool,
@@ -148,20 +136,15 @@ pub(crate) enum DirectCacheBypass {
   CustomCargoProfile,
   ActiveCargoProfile,
   IdentityUnavailable,
-  PlatformNotGraduated,
-  ToolchainNotGraduated,
   SccacheWrapper,
   ExistingCompilerWrapper,
-  ToolchainIncoherent,
-  ConfiguredLinker,
-  CodegenBackend,
   CustomSysroot,
+  ConfiguredLinker,
   CargoConfiguration,
   BuildScriptObservations,
   ProcMacroObservations,
   ExternalSourceDigest,
   NoEligibleLibraryUnits,
-  CapabilityNotCertified,
   CapabilityUnavailable,
   ObservationDirectoryUnavailable,
   SessionUnavailable,
@@ -181,20 +164,15 @@ impl DirectCacheBypass {
       Self::CustomCargoProfile => "custom_cargo_profile_preserved",
       Self::ActiveCargoProfile => "active_cargo_profile_preferred",
       Self::IdentityUnavailable => "native_cache_identity_unavailable",
-      Self::PlatformNotGraduated => "native_cache_platform_not_graduated",
-      Self::ToolchainNotGraduated => "native_cache_toolchain_not_graduated",
       Self::SccacheWrapper => "sccache_wrapper_preserved",
       Self::ExistingCompilerWrapper => "existing_compiler_wrapper_preserved",
-      Self::ToolchainIncoherent => "native_cache_toolchain_incoherent",
-      Self::ConfiguredLinker => "configured_linker_not_graduated",
-      Self::CodegenBackend => "codegen_backend_not_graduated",
       Self::CustomSysroot => "custom_sysroot_not_graduated",
+      Self::ConfiguredLinker => "configured_linker_not_graduated",
       Self::CargoConfiguration => "cargo_configuration_unmodeled",
       Self::BuildScriptObservations => "build_script_observations_unavailable",
       Self::ProcMacroObservations => "proc_macro_observations_unavailable",
       Self::ExternalSourceDigest => "external_source_digest_unavailable",
       Self::NoEligibleLibraryUnits => "native_cache_no_eligible_library_units",
-      Self::CapabilityNotCertified => "native_cache_capability_not_certified",
       Self::CapabilityUnavailable => "native_cache_capability_unavailable",
       Self::ObservationDirectoryUnavailable => "native_cache_observation_directory_unavailable",
       Self::SessionUnavailable => "native_cache_session_unavailable",
@@ -217,6 +195,7 @@ pub(crate) struct NativeCacheContext {
   source_root: PathBuf,
   observation_directory: PathBuf,
   retain_event_evidence: bool,
+  capture_wrapper_diagnostics: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,28 +204,10 @@ struct DirectNativeCacheContext {
   version: u32,
   source_root: String,
   retain_event_evidence: bool,
+  capture_wrapper_diagnostics: bool,
 }
 
 static ACTIVE_CONTEXT: OnceLock<NativeCacheContext> = OnceLock::new();
-static CAPABILITY_REGISTRY: OnceLock<Option<NativeCacheCapabilityRegistry>> = OnceLock::new();
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeCacheCapabilityRegistry {
-  schema_version: u32,
-  class: String,
-  execution_contract: String,
-  certificates: Vec<NativeCacheCapabilityCertificate>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeCacheCapabilityCertificate {
-  platform: String,
-  host_target: String,
-  identity: String,
-  evidence: String,
-}
 
 pub(crate) const fn native_cache_class() -> &'static str {
   GRADUATED_NATIVE_CACHE_CLASS
@@ -257,30 +218,7 @@ pub(crate) const fn native_cache_execution_contract() -> &'static str {
 }
 
 pub(crate) const fn native_cache_capability_schema_version() -> u32 {
-  NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION
-}
-
-pub(crate) fn native_cache_capability_evidence(
-  platform: &str,
-  host_target: &str,
-  identity: &str,
-) -> Option<&'static str> {
-  let registry = CAPABILITY_REGISTRY
-    .get_or_init(|| serde_json::from_str::<NativeCacheCapabilityRegistry>(NATIVE_CACHE_CAPABILITY_REGISTRY).ok())
-    .as_ref()?;
-  if registry.schema_version != NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION
-    || registry.class != GRADUATED_NATIVE_CACHE_CLASS
-    || registry.execution_contract != DIRECT_EXECUTION_CONTRACT
-  {
-    return None;
-  }
-  registry
-    .certificates
-    .iter()
-    .find(|certificate| {
-      certificate.platform == platform && certificate.host_target == host_target && certificate.identity == identity
-    })
-    .map(|certificate| certificate.evidence.as_str())
+  NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION
 }
 
 /// Aggregate evidence emitted by one direct Cargo run.
@@ -291,9 +229,20 @@ pub(crate) struct DirectNativeCacheReport {
   pub(crate) bypasses: u64,
   pub(crate) setup_bytes_hashed: u64,
   pub(crate) bytes_hashed: u64,
+  pub(crate) cache_bytes_read: u64,
+  pub(crate) cache_bytes_written: u64,
   pub(crate) bytes_restored: u64,
   pub(crate) reasons: std::collections::BTreeMap<String, u64>,
   pub(crate) events: Vec<NativeCacheEventIdentity>,
+  pub(crate) wrapper_diagnostics: Option<NativeCacheWrapperDiagnostics>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeCacheMetrics {
+  bytes_hashed: u64,
+  cache_bytes_read: u64,
+  cache_bytes_written: u64,
+  bytes_restored: u64,
 }
 
 /// Stable per-unit evidence retained from one native-cache compiler event.
@@ -335,7 +284,33 @@ struct NativeCacheIdentityInputs {
   cfg: BTreeSet<String>,
   compiler_arguments: Vec<String>,
   declared_inputs: Vec<FileObservation>,
-  dependency_artifacts: Vec<(String, FileObservation)>,
+  dependency_artifacts: Vec<NativeDependencyArtifactIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NativeDependencyArtifactIdentity {
+  extern_name: String,
+  artifact_name: String,
+  content_digest: String,
+  executable: bool,
+  symlink_target: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NativeCacheKeyInputs<'a> {
+  cfg: &'a BTreeSet<String>,
+  compiler_arguments: Vec<String>,
+  declared_inputs: &'a [FileObservation],
+  dependency_artifacts: Vec<NativeDependencyArtifactKey<'a>>,
+}
+
+#[derive(Serialize)]
+struct NativeDependencyArtifactKey<'a> {
+  extern_name: &'a str,
+  artifact_name: &'a str,
+  content_digest: &'a str,
+  executable: bool,
+  symlink_target: &'a Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -376,6 +351,7 @@ impl DirectNativeCacheRun {
       ..DirectNativeCacheReport::default()
     };
     let units = native_cache_unit_evidence(self.observations.path());
+    let mut wrapper_events = Vec::new();
     let directory = self.observations.path().join("native-cache-events");
     let Ok(entries) = fs::read_dir(directory) else {
       return report;
@@ -387,6 +363,9 @@ impl DirectNativeCacheRun {
       let Ok(event) = serde_json::from_slice::<OwnedNativeCacheEvent>(&bytes) else {
         continue;
       };
+      if event.version != NATIVE_CACHE_RUN_EVENT_VERSION {
+        continue;
+      }
       match event.status {
         CompilerCacheWrapperStatus::Hit => report.hits = report.hits.saturating_add(1),
         CompilerCacheWrapperStatus::Miss => report.misses = report.misses.saturating_add(1),
@@ -395,8 +374,18 @@ impl DirectNativeCacheRun {
         }
       }
       report.bytes_hashed = report.bytes_hashed.saturating_add(event.bytes_hashed);
+      report.cache_bytes_read = report.cache_bytes_read.saturating_add(event.cache_bytes_read);
+      report.cache_bytes_written = report.cache_bytes_written.saturating_add(event.cache_bytes_written);
       report.bytes_restored = report.bytes_restored.saturating_add(event.bytes_restored);
       *report.reasons.entry(event.reason.clone()).or_default() += 1;
+      if let Some(trace) = event.wrapper_trace.clone() {
+        wrapper_events.push(NativeCacheWrapperEventDiagnostics::new(
+          event.candidate_key.clone(),
+          event.status.as_str(),
+          event.reason.clone(),
+          trace,
+        ));
+      }
       let unit = event
         .candidate_key
         .as_ref()
@@ -428,6 +417,7 @@ impl DirectNativeCacheRun {
         &right.reason,
       ))
     });
+    report.wrapper_diagnostics = NativeCacheWrapperDiagnostics::from_events(wrapper_events);
     report
   }
 }
@@ -463,6 +453,9 @@ fn native_cache_unit_evidence(directory: &Path) -> BTreeMap<String, NativeCacheU
     if ambiguous.contains(&candidate) {
       continue;
     }
+    let Ok(identity_inputs) = native_cache_identity_inputs(&raw) else {
+      continue;
+    };
     let evidence = NativeCacheUnitEvidence {
       descriptor: NativeCacheUnitDescriptor {
         mode: raw.mode,
@@ -473,12 +466,7 @@ fn native_cache_unit_evidence(directory: &Path) -> BTreeMap<String, NativeCacheU
         test_mode: raw.test_mode,
         crate_root: raw.declared_inputs.first().map(|input| input.path.clone()),
       },
-      identity_inputs: NativeCacheIdentityInputs {
-        cfg: raw.cfg,
-        compiler_arguments: raw.compiler_arguments,
-        declared_inputs: raw.declared_inputs,
-        dependency_artifacts: raw.dependency_artifacts,
-      },
+      identity_inputs,
       output_paths: raw.emitted_outputs.iter().map(|output| output.path.clone()).collect(),
       observed_outputs: raw.emitted_outputs.clone(),
       claimed_outputs: Some(raw.emitted_outputs),
@@ -519,6 +507,9 @@ fn retain_pre_execution_unit_evidence(
   outputs: Option<&NativeOutputPaths>,
   source_root: &Path,
 ) {
+  let Ok(identity_inputs) = native_cache_identity_inputs(observation) else {
+    return;
+  };
   let output_paths = outputs
     .into_iter()
     .flat_map(native_output_bindings)
@@ -537,12 +528,7 @@ fn retain_pre_execution_unit_evidence(
         test_mode: observation.test_mode,
         crate_root: observation.declared_inputs.first().map(|input| input.path.clone()),
       },
-      identity_inputs: NativeCacheIdentityInputs {
-        cfg: observation.cfg.clone(),
-        compiler_arguments: observation.compiler_arguments.clone(),
-        declared_inputs: observation.declared_inputs.clone(),
-        dependency_artifacts: observation.dependency_artifacts.clone(),
-      },
+      identity_inputs,
       output_paths,
       observed_outputs: Vec::new(),
       claimed_outputs: None,
@@ -561,14 +547,8 @@ fn retain_pre_execution_unit_evidence(
 
 /// Prepare an argument-scoped global wrapper for one ordinary Cargo check/build action.
 pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>) -> DirectNativeCacheSetup {
-  if let Some(reason) =
-    direct_cache_bypass_reason(identity.rustc_version, identity.cargo_version, identity.wrapper_plan)
-  {
+  if let Some(reason) = direct_cache_bypass_reason(identity.wrapper_plan) {
     return DirectNativeCacheSetup::Bypassed(reason);
-  }
-  let class = NativeCompilerClass::capture(identity.rustc_version, identity.cargo_version);
-  if native_cache_capability_evidence(&class.platform, &class.host_target, identity.capability_identity).is_none() {
-    return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::CapabilityNotCertified);
   }
   let observations = match tempfile::Builder::new().prefix("cargo-rail-native-cargo-").tempdir() {
     Ok(directory) => directory,
@@ -581,9 +561,7 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
     identity.cargo_version,
     identity.capability_identity,
     identity.toolchain_fingerprint,
-    identity.compiler_env_fingerprint,
-    identity.cargo_config_fingerprint,
-    identity.lock_fingerprint,
+    identity.compiler_process_env_fingerprint,
     DIRECT_EXECUTION_CONTRACT,
   )
   .is_err()
@@ -606,9 +584,10 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
     None => return DirectNativeCacheSetup::Bypassed(DirectCacheBypass::SourceRootUnavailable),
   };
   let context = DirectNativeCacheContext {
-    version: 2,
+    version: 3,
     source_root,
     retain_event_evidence: identity.retain_event_evidence,
+    capture_wrapper_diagnostics: crate::instrumentation::enabled(),
   };
   if serde_json::to_vec(&context)
     .ok()
@@ -628,11 +607,7 @@ pub(crate) fn prepare_direct_cargo_cache(identity: DirectNativeCacheIdentity<'_>
   })
 }
 
-pub(crate) fn direct_cache_bypass_reason(
-  rustc_version: &str,
-  cargo_version: &str,
-  wrapper_plan: CacheWrapperPlan,
-) -> Option<DirectCacheBypass> {
+pub(crate) fn direct_cache_bypass_reason(wrapper_plan: CacheWrapperPlan) -> Option<DirectCacheBypass> {
   if !wrapper_plan.installs_cargo_rail() {
     return Some(match wrapper_plan {
       CacheWrapperPlan::PreserveSccache => DirectCacheBypass::SccacheWrapper,
@@ -640,82 +615,23 @@ pub(crate) fn direct_cache_bypass_reason(
       CacheWrapperPlan::DisabledPassThrough => return None,
     });
   }
-  NativeCompilerClass::capture(rustc_version, cargo_version).eligibility_reason()
+  None
 }
 
-/// Reject a mixed Cargo/rustc/rustdoc selection before considering a
-/// toolchain capability certificate.
-pub(crate) fn direct_toolchain_coherence_bypass_reason(
-  cargo_verbose_version: &str,
-  rustc_verbose_version: &str,
-  rustdoc_verbose_version: &str,
-) -> Option<DirectCacheBypass> {
-  let cargo_release = release_from_verbose(cargo_verbose_version, "cargo");
-  let rustc_release = release_from_verbose(rustc_verbose_version, "rustc");
-  let rustdoc_release = release_from_verbose(rustdoc_verbose_version, "rustdoc");
-  let cargo_host = host_from_verbose(cargo_verbose_version);
-  let rustc_host = host_from_verbose(rustc_verbose_version);
-  let rustdoc_host = host_from_verbose(rustdoc_verbose_version);
-
-  (cargo_release == "unknown"
-    || cargo_release != rustc_release
-    || cargo_release != rustdoc_release
-    || cargo_host == "unknown"
-    || cargo_host != rustc_host
-    || cargo_host != rustdoc_host)
-    .then_some(DirectCacheBypass::ToolchainIncoherent)
-}
-
-/// Return the stable action-level bypass for compiler controls that are not
-/// part of the graduated native-cache authority.
+/// Return the stable action-level bypass for toolchain roots that are not part
+/// of the captured compiler identity.
 pub(crate) fn direct_target_configuration_bypass_reason(
   targets: &[crate::cargo::TargetIdentity],
 ) -> Option<DirectCacheBypass> {
   for target in targets.iter().filter(|target| target.is_build_target()) {
-    if target.linker().is_some() || compiler_option_selected(target.rustflags(), &LINKER_OPTIONS) {
+    if target.linker().is_some() {
       return Some(DirectCacheBypass::ConfiguredLinker);
-    }
-    if compiler_option_selected(target.rustflags(), &["codegen-backend"]) {
-      return Some(DirectCacheBypass::CodegenBackend);
     }
     if long_option_selected(target.rustflags(), "--sysroot") {
       return Some(DirectCacheBypass::CustomSysroot);
     }
   }
   None
-}
-
-const LINKER_OPTIONS: [&str; 9] = [
-  "default-linker-libraries",
-  "link-arg",
-  "link-args",
-  "link-self-contained",
-  "linker",
-  "linker-features",
-  "linker-flavor",
-  "linker-plugin-lto",
-  "link-native-libraries",
-];
-
-fn compiler_option_selected(flags: &[String], names: &[&str]) -> bool {
-  let mut index = 0usize;
-  while index < flags.len() {
-    let flag = flags[index].as_str();
-    let option = if matches!(flag, "-C" | "-Z") {
-      index += 1;
-      flags.get(index).map(String::as_str)
-    } else {
-      flag.strip_prefix("-C").or_else(|| flag.strip_prefix("-Z"))
-    };
-    if option
-      .map(|option| option.split_once('=').map_or(option, |(name, _)| name))
-      .is_some_and(|name| names.contains(&name))
-    {
-      return true;
-    }
-    index += 1;
-  }
-  false
 }
 
 fn long_option_selected(flags: &[String], name: &str) -> bool {
@@ -753,15 +669,18 @@ impl NativeCacheContext {
       observation_directory: std::env::var_os(crate::compiler::wrapper::OBSERVATION_DIRECTORY_ENV)
         .map(PathBuf::from)?,
       retain_event_evidence: false,
+      capture_wrapper_diagnostics: false,
     })
   }
 
-  pub(crate) fn from_direct_invocation() -> Option<RailResult<Self>> {
+  pub(crate) fn from_direct_invocation()
+  -> Option<(RailResult<Self>, crate::instrumentation::NativeCacheWrapperProcessStart)> {
     let invoked = PathBuf::from(std::env::args_os().next()?);
     if invoked.file_name() != Some(OsStr::new(DIRECT_WRAPPER_NAME)) {
       return None;
     }
-    Some(Self::load_direct(&invoked))
+    let started = crate::instrumentation::NativeCacheWrapperProcessStart::capture();
+    Some((Self::load_direct(&invoked), started))
   }
 
   fn load_direct(invoked: &Path) -> RailResult<Self> {
@@ -782,7 +701,7 @@ impl NativeCacheContext {
       ));
     }
     let context: DirectNativeCacheContext = serde_json::from_slice(&fs::read(context_path)?)?;
-    if context.version != 2 {
+    if context.version != 3 {
       return Err(RailError::message(
         "native compiler cache context has an incompatible schema",
       ));
@@ -798,7 +717,12 @@ impl NativeCacheContext {
       source_root,
       observation_directory: directory,
       retain_event_evidence: context.retain_event_evidence,
+      capture_wrapper_diagnostics: context.capture_wrapper_diagnostics,
     })
+  }
+
+  pub(crate) fn captures_wrapper_diagnostics(&self) -> bool {
+    self.capture_wrapper_diagnostics
   }
 }
 
@@ -817,9 +741,7 @@ impl NativeCompilerSession {
     cargo_verbose_version: &str,
     capability_identity: &str,
     toolchain_identity: &str,
-    compiler_environment_identity: &str,
-    cargo_configuration_identity: &str,
-    resolution_identity: &str,
+    compiler_process_environment_identity: &str,
     execution_contract: &str,
   ) -> RailResult<PathBuf> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
@@ -829,25 +751,21 @@ impl NativeCompilerSession {
       &class,
       capability_identity,
       toolchain_identity,
-      compiler_environment_identity,
-      cargo_configuration_identity,
-      resolution_identity,
+      compiler_process_environment_identity,
       execution_contract,
     )?;
     let session = Self {
-      version: 3,
+      version: 4,
       identity,
       source_root_identity,
       class,
       capability_identity: capability_identity.to_string(),
       toolchain_identity: toolchain_identity.to_string(),
-      compiler_environment_identity: compiler_environment_identity.to_string(),
-      cargo_configuration_identity: cargo_configuration_identity.to_string(),
-      resolution_identity: resolution_identity.to_string(),
+      compiler_process_environment_identity: compiler_process_environment_identity.to_string(),
       execution_contract: execution_contract.to_string(),
     };
     session.validate_object()?;
-    if session.class.eligibility_reason().is_none() {
+    if session.class.is_valid() {
       LocalCas::open()?;
     }
     let session_directory = directory.join("native-cache-session");
@@ -873,7 +791,7 @@ impl NativeCompilerSession {
   }
 
   fn validate_object(&self) -> RailResult<()> {
-    if self.version != 3 {
+    if self.version != 4 {
       return Err(RailError::message(
         "native compiler cache session has an incompatible schema",
       ));
@@ -883,9 +801,7 @@ impl NativeCompilerSession {
       &self.source_root_identity,
       &self.capability_identity,
       &self.toolchain_identity,
-      &self.compiler_environment_identity,
-      &self.cargo_configuration_identity,
-      &self.resolution_identity,
+      &self.compiler_process_environment_identity,
     ] {
       validate_sha256(digest)?;
     }
@@ -901,9 +817,7 @@ impl NativeCompilerSession {
       &self.class,
       &self.capability_identity,
       &self.toolchain_identity,
-      &self.compiler_environment_identity,
-      &self.cargo_configuration_identity,
-      &self.resolution_identity,
+      &self.compiler_process_environment_identity,
       &self.execution_contract,
     )?;
     if self.identity != expected {
@@ -911,12 +825,9 @@ impl NativeCompilerSession {
         "native compiler cache session identity does not match its inputs",
       ));
     }
-    if self.class.eligibility_reason().is_none()
-      && native_cache_capability_evidence(&self.class.platform, &self.class.host_target, &self.capability_identity)
-        .is_none()
-    {
+    if !self.class.is_valid() {
       return Err(RailError::message(
-        "native compiler cache session has no matching capability certificate",
+        "native compiler cache session has an invalid compiler class",
       ));
     }
     Ok(())
@@ -959,7 +870,7 @@ impl NativeCompilerValidation {
     let candidate_key = candidate_key(&session.identity, &session.class, &observation)?;
     let action_key = action_key(&session.identity, &session.class, &observation)?;
     let validation = Self {
-      version: 2,
+      version: 3,
       candidate_key,
       action_key,
       session_identity: session.identity.clone(),
@@ -1000,7 +911,7 @@ impl NativeCompilerValidation {
   }
 
   pub(crate) fn validate_object(&self) -> RailResult<()> {
-    if self.version != 2 {
+    if self.version != 3 {
       return Err(RailError::message(
         "native compiler observation has an incompatible schema",
       ));
@@ -1010,8 +921,7 @@ impl NativeCompilerValidation {
     for digest in [&self.session_identity, &self.stdout_digest, &self.stderr_digest] {
       validate_sha256(digest)?;
     }
-    if self.class.name != GRADUATED_NATIVE_CACHE_CLASS
-      || self.class.eligibility_reason().is_some()
+    if !self.class.is_valid()
       || self.observation.version != 4
       || !self.observation.success
       || self.observation.mode != CompilerMode::Rustc
@@ -1084,9 +994,7 @@ fn session_identity(
   class: &NativeCompilerClass,
   capability_identity: &str,
   toolchain_identity: &str,
-  compiler_environment_identity: &str,
-  cargo_configuration_identity: &str,
-  resolution_identity: &str,
+  compiler_process_environment_identity: &str,
   execution_contract: &str,
 ) -> RailResult<String> {
   let class = serde_json::to_vec(class)?;
@@ -1094,17 +1002,18 @@ fn session_identity(
     "sha256:",
     b"cargo-rail-native-compiler-session\0",
     &[
-      (b"version", &3_u32.to_le_bytes()),
+      (b"version", &4_u32.to_le_bytes()),
       (
-        b"host-capability-registry",
-        &NATIVE_CACHE_CAPABILITY_REGISTRY_VERSION.to_le_bytes(),
+        b"toolchain-capability-contract",
+        &NATIVE_CACHE_IDENTITY_CONTRACT_VERSION.to_le_bytes(),
       ),
       (b"class", &class),
       (b"capability", capability_identity.as_bytes()),
       (b"toolchain", toolchain_identity.as_bytes()),
-      (b"compiler-environment", compiler_environment_identity.as_bytes()),
-      (b"cargo-configuration", cargo_configuration_identity.as_bytes()),
-      (b"resolution", resolution_identity.as_bytes()),
+      (
+        b"compiler-process-environment",
+        compiler_process_environment_identity.as_bytes(),
+      ),
       (b"execution-contract", execution_contract.as_bytes()),
     ],
   ))
@@ -1116,23 +1025,21 @@ fn candidate_key(
   observation: &RawCompilerInvocation,
 ) -> RailResult<String> {
   let class = serde_json::to_vec(class)?;
+  let identity_inputs = native_cache_key_inputs(observation)?;
   let pre_execution = serde_json::to_vec(&(
     &observation.mode,
     &observation.crate_name,
     &observation.crate_types,
     &observation.target_argument,
-    &observation.cfg,
     &observation.emit_modes,
     observation.test_mode,
-    &observation.compiler_arguments,
-    &observation.declared_inputs,
-    &observation.dependency_artifacts,
+    &identity_inputs,
   ))?;
   Ok(sha256_identity(
     CANDIDATE_KEY_PREFIX,
     b"cargo-rail-native-compiler-candidate\0",
     &[
-      (b"version", &2_u32.to_le_bytes()),
+      (b"version", &3_u32.to_le_bytes()),
       (b"session", session_identity.as_bytes()),
       (b"class", &class),
       (b"pre-execution", &pre_execution),
@@ -1151,11 +1058,215 @@ fn action_key(
     ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-action\0",
     &[
-      (b"version", &2_u32.to_le_bytes()),
+      (b"version", &3_u32.to_le_bytes()),
       (b"candidate", candidate.as_bytes()),
       (b"discovered-inputs", &discovered),
     ],
   ))
+}
+
+fn native_cache_identity_inputs(observation: &RawCompilerInvocation) -> RailResult<NativeCacheIdentityInputs> {
+  let identity = native_cache_key_inputs(observation)?;
+  Ok(NativeCacheIdentityInputs {
+    cfg: identity.cfg.clone(),
+    compiler_arguments: identity.compiler_arguments,
+    declared_inputs: identity.declared_inputs.to_vec(),
+    dependency_artifacts: identity
+      .dependency_artifacts
+      .into_iter()
+      .map(|artifact| NativeDependencyArtifactIdentity {
+        extern_name: artifact.extern_name.to_string(),
+        artifact_name: artifact.artifact_name.to_string(),
+        content_digest: artifact.content_digest.to_string(),
+        executable: artifact.executable,
+        symlink_target: artifact.symlink_target.clone(),
+      })
+      .collect(),
+  })
+}
+
+fn native_cache_key_inputs(observation: &RawCompilerInvocation) -> RailResult<NativeCacheKeyInputs<'_>> {
+  let dependency_artifacts = observation
+    .dependency_artifacts
+    .iter()
+    .map(|(extern_name, artifact)| {
+      Ok(NativeDependencyArtifactKey {
+        extern_name,
+        artifact_name: observation_path_basename(&artifact.path)
+          .ok_or_else(|| RailError::message("native dependency artifact has no file name"))?,
+        content_digest: &artifact.content_digest,
+        executable: artifact.executable,
+        symlink_target: &artifact.symlink_target,
+      })
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  let compiler_arguments = cache_key_compiler_arguments(&observation.compiler_arguments, &dependency_artifacts)?;
+  Ok(NativeCacheKeyInputs {
+    cfg: &observation.cfg,
+    compiler_arguments,
+    declared_inputs: &observation.declared_inputs,
+    dependency_artifacts,
+  })
+}
+
+fn cache_key_compiler_arguments(
+  arguments: &[String],
+  dependencies: &[NativeDependencyArtifactKey<'_>],
+) -> RailResult<Vec<String>> {
+  let mut dependency_names = BTreeMap::new();
+  for dependency in dependencies {
+    if dependency_names
+      .insert(dependency.extern_name, dependency.artifact_name)
+      .is_some()
+    {
+      return Err(RailError::message("native compiler invocation repeats an extern name"));
+    }
+  }
+  let relocatable_directories = cache_key_relocatable_directories(arguments);
+
+  let mut identity = Vec::with_capacity(arguments.len());
+  let mut index = 0usize;
+  while index < arguments.len() {
+    let argument = &arguments[index];
+    let next = arguments.get(index + 1);
+    match argument.as_str() {
+      "--out-dir" | "--output" => {
+        next.ok_or_else(|| RailError::message("native compiler output directory is missing"))?;
+        identity.push(argument.clone());
+        identity.push("\0cargo-rail-native-output-directory".to_string());
+        index += 2;
+      }
+      "--emit" => {
+        let value = next.ok_or_else(|| RailError::message("native compiler emit value is missing"))?;
+        identity.push(argument.clone());
+        identity.push(cache_key_emit_argument(value)?);
+        index += 2;
+      }
+      "--extern" => {
+        let value = next.ok_or_else(|| RailError::message("native compiler extern value is missing"))?;
+        identity.push(argument.clone());
+        identity.push(cache_key_extern_argument(value, &dependency_names)?);
+        index += 2;
+      }
+      "-L" => {
+        let value = next.ok_or_else(|| RailError::message("native compiler library search value is missing"))?;
+        identity.push(argument.clone());
+        identity.push(cache_key_library_search_argument(value, &relocatable_directories));
+        index += 2;
+      }
+      _ if argument.starts_with("--out-dir=") || argument.starts_with("--output=") => {
+        let (option, _) = argument
+          .split_once('=')
+          .ok_or_else(|| RailError::message("native compiler output directory is invalid"))?;
+        identity.push(format!("{option}=\0cargo-rail-native-output-directory"));
+        index += 1;
+      }
+      _ if argument.starts_with("--emit=") => {
+        identity.push(format!(
+          "--emit={}",
+          cache_key_emit_argument(argument.trim_start_matches("--emit="))?
+        ));
+        index += 1;
+      }
+      _ if argument.starts_with("--extern=") => {
+        identity.push(format!(
+          "--extern={}",
+          cache_key_extern_argument(argument.trim_start_matches("--extern="), &dependency_names)?
+        ));
+        index += 1;
+      }
+      _ if argument.starts_with("-Ldependency=") => {
+        identity.push(format!(
+          "-L{}",
+          cache_key_library_search_argument(argument.trim_start_matches("-L"), &relocatable_directories)
+        ));
+        index += 1;
+      }
+      _ => {
+        identity.push(argument.clone());
+        index += 1;
+      }
+    }
+  }
+  Ok(identity)
+}
+
+fn cache_key_relocatable_directories(arguments: &[String]) -> BTreeSet<String> {
+  let mut directories = BTreeSet::new();
+  let mut index = 0usize;
+  while index < arguments.len() {
+    match arguments[index].as_str() {
+      "--out-dir" | "--output" => {
+        if let Some(path) = arguments.get(index + 1) {
+          directories.insert(portable_directory_identity(path));
+        }
+        index += 2;
+      }
+      argument if argument.starts_with("--out-dir=") || argument.starts_with("--output=") => {
+        if let Some((_, path)) = argument.split_once('=') {
+          directories.insert(portable_directory_identity(path));
+        }
+        index += 1;
+      }
+      _ => index += 1,
+    }
+  }
+  directories
+}
+
+fn cache_key_emit_argument(value: &str) -> RailResult<String> {
+  value
+    .split(',')
+    .map(|emit| {
+      let Some((mode, path)) = emit.split_once('=') else {
+        return Ok(emit.to_string());
+      };
+      let file_name =
+        portable_path_basename(path).ok_or_else(|| RailError::message("native compiler output has no file name"))?;
+      Ok(format!("{mode}=\0cargo-rail-native-output:{file_name}"))
+    })
+    .collect::<RailResult<Vec<_>>>()
+    .map(|emits| emits.join(","))
+}
+
+fn cache_key_extern_argument(value: &str, dependencies: &BTreeMap<&str, &str>) -> RailResult<String> {
+  let Some((name, path)) = value.split_once('=') else {
+    return Ok(value.to_string());
+  };
+  let artifact_name = dependencies
+    .get(name)
+    .ok_or_else(|| RailError::message("native compiler extern is missing exact artifact evidence"))?;
+  if portable_path_basename(path) != Some(*artifact_name) {
+    return Err(RailError::message(
+      "native compiler extern path disagrees with its exact artifact evidence",
+    ));
+  }
+  Ok(format!("{name}=\0cargo-rail-native-dependency:{artifact_name}"))
+}
+
+fn cache_key_library_search_argument(value: &str, relocatable_directories: &BTreeSet<String>) -> String {
+  if value
+    .strip_prefix("dependency=")
+    .is_some_and(|path| relocatable_directories.contains(&portable_directory_identity(path)))
+  {
+    "dependency=\0cargo-rail-native-dependency-search".to_string()
+  } else {
+    value.to_string()
+  }
+}
+
+fn portable_directory_identity(path: &str) -> String {
+  path.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn observation_path_basename(path: &ObservationPath) -> Option<&str> {
+  match path {
+    ObservationPath::Repository(path) | ObservationPath::Host(path) => portable_path_basename(path),
+  }
+}
+
+fn portable_path_basename(path: &str) -> Option<&str> {
+  path.rsplit(['/', '\\']).find(|component| !component.is_empty())
 }
 
 fn sha256_identity(prefix: &str, domain: &[u8], frames: &[(&[u8], &[u8])]) -> String {
@@ -1405,6 +1516,7 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
       "--extern" => next.is_some_and(|value| value.contains('=')),
       "-L" => next.is_some_and(|value| value.starts_with("dependency=")),
       "-C" => next.is_some_and(supported_codegen_option),
+      "-Z" => next.is_some_and(supported_unstable_option),
       "-A" | "-W" | "-D" | "-F" => next.is_some(),
       _ if argument.starts_with("--crate-name=")
         || argument == "--crate-type=lib"
@@ -1439,6 +1551,12 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
         }
         false
       }
+      _ if argument.starts_with("-Z") && argument.len() > 2 => {
+        if !supported_unstable_option(argument.trim_start_matches("-Z")) {
+          return true;
+        }
+        false
+      }
       _ if !argument.starts_with('-') && argument.ends_with(".rs") => {
         source_inputs += 1;
         false
@@ -1451,6 +1569,20 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
     index += usize::from(consumes_next) + 1;
   }
   source_inputs != 1
+}
+
+fn supported_unstable_option(option: &str) -> bool {
+  let Some(("codegen-backend", backend)) = option.split_once('=') else {
+    return false;
+  };
+  !backend.is_empty()
+    && !backend.contains('/')
+    && !backend.contains('\\')
+    && !backend.contains(':')
+    && backend
+      .as_bytes()
+      .iter()
+      .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
 }
 
 fn supported_codegen_option(option: &str) -> bool {
@@ -1488,7 +1620,10 @@ pub(crate) enum OuterCacheAction {
   /// Verified compiler outputs and streams were restored without running rustc.
   Hit(i32),
   /// Run the compiler once and store only its verified exact outputs.
-  Store(InvocationRecorder),
+  Store {
+    recorder: InvocationRecorder,
+    cache_bytes_read: u64,
+  },
   /// Execute the original invocation unchanged.
   Execute,
 }
@@ -1498,7 +1633,12 @@ pub(crate) enum OuterCacheAction {
 /// `arguments` starts with the rustc executable because `program` is Cargo's
 /// workspace-wrapper slot. A returned code means verified outputs and streams
 /// were already restored; `Execute` preserves the ordinary child execution.
-pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: &mut Command) -> OuterCacheAction {
+pub(crate) fn configure_outer(
+  program: &OsStr,
+  arguments: &[OsString],
+  command: &mut Command,
+  trace: &mut NativeCacheWrapperTrace,
+) -> OuterCacheAction {
   command.env_remove(DISPOSITION_ENV);
   let Some(context) = active_context() else {
     return OuterCacheAction::Execute;
@@ -1513,6 +1653,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       None,
       0,
       diagnostic_wrapper,
+      trace,
     );
     return OuterCacheAction::Execute;
   }
@@ -1531,12 +1672,15 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       None,
       0,
       diagnostic_wrapper,
+      trace,
     );
     return OuterCacheAction::Execute;
   };
   let source_root = &context.source_root;
   let observation_directory = &context.observation_directory;
+  let session_phase = trace.start(NativeCacheWrapperPhase::SessionLoad);
   let session = NativeCompilerSession::load(&context.session, source_root);
+  trace.finish(session_phase, NativeCacheWrapperWork::default());
   let session = match session {
     Ok(session) => session,
     Err(_) => {
@@ -1547,21 +1691,12 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         None,
         0,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
-  if let Some(reason) = session.class.eligibility_reason() {
-    configure_cold(
-      command,
-      CompilerCacheWrapperStatus::Bypassed,
-      reason.as_str(),
-      None,
-      0,
-      diagnostic_wrapper,
-    );
-    return OuterCacheAction::Execute;
-  }
+  let input_capture_phase = trace.start(NativeCacheWrapperPhase::ArgumentNormalizationInputCapture);
   let original_current_dir = match std::env::current_dir() {
     Ok(directory) => directory,
     Err(_) => {
@@ -1572,6 +1707,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         None,
         0,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -1586,6 +1722,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         None,
         0,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -1606,13 +1743,27 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         None,
         0,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
   let observation = recorder.observation();
-  if let Some(reason) = invocation_bypass_reason(observation, false, &session.class.host_target) {
+  let initial_input_bytes = estimated_input_bytes(observation, source_root);
+  trace.finish(
+    input_capture_phase,
+    NativeCacheWrapperWork {
+      bytes_hashed: initial_input_bytes,
+      ..NativeCacheWrapperWork::default()
+    },
+  );
+  let classification_phase = trace.start(NativeCacheWrapperPhase::BypassClassification);
+  let bypass_reason = invocation_bypass_reason(observation, false, &session.class.host_target);
+  trace.finish(classification_phase, NativeCacheWrapperWork::default());
+  if let Some(reason) = bypass_reason {
+    let candidate_phase = trace.start(NativeCacheWrapperPhase::CandidateKeyConstruction);
     let unit_identity = candidate_key(&session.identity, &session.class, observation).ok();
+    trace.finish(candidate_phase, NativeCacheWrapperWork::default());
     if context.retain_event_evidence
       && let Some(unit_identity) = &unit_identity
     {
@@ -1630,8 +1781,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       CompilerCacheWrapperStatus::Bypassed,
       reason,
       unit_identity,
-      estimated_input_bytes(observation, source_root),
+      initial_input_bytes,
       diagnostic_wrapper,
+      trace,
     );
     #[cfg(target_os = "macos")]
     let portable_bypass_arguments =
@@ -1656,6 +1808,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       None,
       estimated_input_bytes(observation, source_root),
       diagnostic_wrapper,
+      trace,
     );
     return OuterCacheAction::Execute;
   };
@@ -1667,10 +1820,14 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       None,
       estimated_input_bytes(observation, source_root),
       diagnostic_wrapper,
+      trace,
     );
     return OuterCacheAction::Execute;
   }
-  let candidate = match candidate_key(&session.identity, &session.class, observation) {
+  let candidate_phase = trace.start(NativeCacheWrapperPhase::CandidateKeyConstruction);
+  let candidate = candidate_key(&session.identity, &session.class, observation);
+  trace.finish(candidate_phase, NativeCacheWrapperWork::default());
+  let candidate = match candidate {
     Ok(candidate) => candidate,
     Err(_) => {
       configure_cold(
@@ -1680,12 +1837,19 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         None,
         estimated_input_bytes(observation, source_root),
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
-  let mut bytes_hashed = estimated_input_bytes(observation, source_root);
-  let cas = match LocalCas::open() {
+  let mut metrics = NativeCacheMetrics {
+    bytes_hashed: initial_input_bytes,
+    ..NativeCacheMetrics::default()
+  };
+  let cas_open_phase = trace.start(NativeCacheWrapperPhase::CasOpen);
+  let cas = LocalCas::open_initialized();
+  trace.finish(cas_open_phase, NativeCacheWrapperWork::default());
+  let cas = match cas {
     Ok(cas) => cas,
     Err(_) => {
       configure_cold(
@@ -1693,13 +1857,31 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         CompilerCacheWrapperStatus::Bypassed,
         "local_cache_unavailable",
         Some(candidate),
-        bytes_hashed,
+        metrics.bytes_hashed,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
-  let candidates = match cas.native_candidates(&candidate) {
+  let candidate_lookup_phase = trace.start(NativeCacheWrapperPhase::CandidateLookup);
+  let candidates = cas.native_candidates(&candidate);
+  let lookup_bytes = candidates
+    .as_ref()
+    .map(|candidates| {
+      candidates
+        .iter()
+        .fold(0u64, |bytes, candidate| bytes.saturating_add(candidate.bytes_read))
+    })
+    .unwrap_or_default();
+  trace.finish(
+    candidate_lookup_phase,
+    NativeCacheWrapperWork {
+      cache_bytes_read: lookup_bytes,
+      ..NativeCacheWrapperWork::default()
+    },
+  );
+  let candidates = match candidates {
     Ok(candidates) => candidates,
     Err(_) => {
       configure_cold(
@@ -1707,40 +1889,54 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         CompilerCacheWrapperStatus::Bypassed,
         "local_cache_candidate_corrupt",
         Some(candidate),
-        bytes_hashed,
+        metrics.bytes_hashed,
         diagnostic_wrapper,
+        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
   let mut miss_reason = "candidate_not_found";
-  for cached in candidates {
-    let _ = (cached.objects_verified, cached.bytes_read);
+  for (candidate_index, cached) in candidates.iter().enumerate() {
+    let _ = cached.objects_verified;
+    metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
+    let revalidation_phase = trace.start(NativeCacheWrapperPhase::InputRevalidationActionKey);
     let revalidated = revalidate_candidate(&cached.validation, &session, observation, source_root);
-    let action_key = match revalidated {
-      Ok((revalidated, hashed)) if revalidated == cached.action_key => {
-        bytes_hashed = bytes_hashed.saturating_add(hashed);
+    let revalidated_bytes = match &revalidated {
+      Ok(revalidated) => revalidated.bytes_hashed,
+      Err((_, bytes)) => *bytes,
+    };
+    trace.finish(
+      revalidation_phase,
+      NativeCacheWrapperWork {
+        bytes_hashed: revalidated_bytes,
+        ..NativeCacheWrapperWork::default()
+      },
+    );
+    let revalidated = match revalidated {
+      Ok(revalidated) if revalidated.action_key == cached.action_key => {
+        metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(revalidated.bytes_hashed);
         revalidated
       }
-      Ok((_, hashed)) => {
-        bytes_hashed = bytes_hashed.saturating_add(hashed);
+      Ok(revalidated) => {
+        metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(revalidated.bytes_hashed);
         miss_reason = "candidate_action_binding_mismatch";
         continue;
       }
       Err((reason, hashed)) => {
-        bytes_hashed = bytes_hashed.saturating_add(hashed);
+        metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(hashed);
         miss_reason = reason;
         continue;
       }
     };
     match restore_and_publish(
-      &cas,
-      &action_key,
+      &candidates,
+      candidate_index,
       &cached.validation,
+      &revalidated.observation,
       &output_paths,
-      source_root,
-      observation_directory,
-      bytes_hashed,
+      &mut metrics,
+      trace,
     ) {
       Ok(()) => return OuterCacheAction::Hit(0),
       Err(_) => {
@@ -1753,8 +1949,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     CompilerCacheWrapperStatus::Miss,
     miss_reason,
     Some(candidate),
-    bytes_hashed,
+    metrics.bytes_hashed,
     diagnostic_wrapper,
+    trace,
   );
   configure_portable_child(
     command,
@@ -1766,7 +1963,10 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
   );
   let mut recorder = recorder;
   recorder.set_cache_wrapper(metadata);
-  OuterCacheAction::Store(recorder)
+  OuterCacheAction::Store {
+    recorder,
+    cache_bytes_read: metrics.cache_bytes_read,
+  }
 }
 
 fn portable_compiler_arguments(
@@ -2076,13 +2276,24 @@ fn configure_cold(
   candidate_key: Option<String>,
   bytes_hashed: u64,
   propagate_metadata: bool,
+  trace: &NativeCacheWrapperTrace,
 ) -> CompilerCacheWrapperMetadata {
   let metadata = CompilerCacheWrapperMetadata::native(status, reason, candidate_key.clone(), None, bytes_hashed, 0);
   if propagate_metadata && let Ok(encoded) = serde_json::to_string(&metadata) {
     command.env(DISPOSITION_ENV, encoded);
   }
   if status != CompilerCacheWrapperStatus::Miss {
-    write_cache_event(status, reason, candidate_key.as_deref(), None, bytes_hashed, 0);
+    write_cache_event(
+      status,
+      reason,
+      candidate_key.as_deref(),
+      None,
+      NativeCacheMetrics {
+        bytes_hashed,
+        ..NativeCacheMetrics::default()
+      },
+      trace,
+    );
   }
   metadata
 }
@@ -2115,50 +2326,12 @@ fn estimated_input_bytes(observation: &RawCompilerInvocation, source_root: &Path
     .fold(0u64, |total, metadata| total.saturating_add(metadata.len()))
 }
 
-fn filesystem_macro_present(observation: &RawCompilerInvocation, source_root: &Path) -> bool {
-  observation
-    .declared_inputs
-    .iter()
-    .chain(&observation.observed_reads)
-    .filter_map(|file| fs::read(file.path.resolve(source_root)).ok())
-    .any(|bytes| {
-      [
-        b"include".as_slice(),
-        b"include_str".as_slice(),
-        b"include_bytes".as_slice(),
-      ]
-      .iter()
-      .any(|name| macro_invocation_present(&bytes, name))
-    })
-}
-
-fn macro_invocation_present(bytes: &[u8], name: &[u8]) -> bool {
-  if name.len() > bytes.len() {
-    return false;
-  }
-  bytes.windows(name.len()).enumerate().any(|(offset, window)| {
-    if window != name
-      || offset
-        .checked_sub(1)
-        .and_then(|index| bytes.get(index))
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    {
-      return false;
-    }
-    bytes[offset + name.len()..]
-      .iter()
-      .copied()
-      .find(|byte| !byte.is_ascii_whitespace())
-      == Some(b'!')
-  })
-}
-
 fn revalidate_candidate(
   validation: &NativeCompilerValidation,
   session: &NativeCompilerSession,
   current: &RawCompilerInvocation,
   source_root: &Path,
-) -> Result<(String, u64), (&'static str, u64)> {
+) -> Result<RevalidatedNativeCandidate, (&'static str, u64)> {
   if validation.validate_object().is_err()
     || validation.session_identity != session.identity
     || validation.class != session.class
@@ -2167,31 +2340,22 @@ fn revalidate_candidate(
   }
   let current_candidate =
     candidate_key(&session.identity, &session.class, current).map_err(|_| ("candidate_key_unavailable", 0))?;
-  if current_candidate != validation.candidate_key || !same_pre_execution_inputs(current, &validation.observation) {
+  if current_candidate != validation.candidate_key {
     return Err(("candidate_pre_execution_inputs_changed", 0));
   }
 
   let mut bytes_hashed = 0u64;
   let mut revalidated = validation.observation.clone();
-  revalidated.declared_inputs = revalidate_files(
-    &validation.observation.declared_inputs,
-    source_root,
-    &mut bytes_hashed,
-    "declared_compiler_input_changed",
-  )?;
-  revalidated.observed_reads = revalidate_files(
+  revalidated.compiler_arguments = current.compiler_arguments.clone();
+  revalidated.declared_inputs = current.declared_inputs.clone();
+  revalidated.dependency_artifacts = current.dependency_artifacts.clone();
+  revalidated.observed_reads = revalidate_observed_files(
     &validation.observation.observed_reads,
+    &validation.observation.declared_inputs,
+    &current.declared_inputs,
     source_root,
     &mut bytes_hashed,
-    "observed_compiler_read_changed",
   )?;
-  let mut dependencies = Vec::with_capacity(validation.observation.dependency_artifacts.len());
-  for (name, file) in &validation.observation.dependency_artifacts {
-    let current = revalidate_file(file, source_root, &mut bytes_hashed)
-      .map_err(|_| ("dependency_artifact_changed", bytes_hashed))?;
-    dependencies.push((name.clone(), current));
-  }
-  revalidated.dependency_artifacts = dependencies;
   for environment in &validation.observation.environment_reads {
     if environment.secret_capability {
       return Err(("secret_compiler_environment", bytes_hashed));
@@ -2207,31 +2371,38 @@ fn revalidate_candidate(
   }
   let action = action_key(&session.identity, &session.class, &revalidated)
     .map_err(|_| ("compiler_action_key_unavailable", bytes_hashed))?;
-  Ok((action, bytes_hashed))
+  Ok(RevalidatedNativeCandidate {
+    action_key: action,
+    observation: revalidated,
+    bytes_hashed,
+  })
 }
 
-fn same_pre_execution_inputs(current: &RawCompilerInvocation, stored: &RawCompilerInvocation) -> bool {
-  current.mode == stored.mode
-    && current.crate_name == stored.crate_name
-    && current.crate_types == stored.crate_types
-    && current.target_argument == stored.target_argument
-    && current.cfg == stored.cfg
-    && current.emit_modes == stored.emit_modes
-    && current.test_mode == stored.test_mode
-    && current.compiler_arguments == stored.compiler_arguments
-    && current.declared_inputs == stored.declared_inputs
-    && current.dependency_artifacts == stored.dependency_artifacts
+#[derive(Debug)]
+struct RevalidatedNativeCandidate {
+  action_key: String,
+  observation: RawCompilerInvocation,
+  bytes_hashed: u64,
 }
 
-fn revalidate_files(
-  files: &[FileObservation],
+fn revalidate_observed_files(
+  observed: &[FileObservation],
+  stored_declared: &[FileObservation],
+  current_declared: &[FileObservation],
   source_root: &Path,
   bytes_hashed: &mut u64,
-  reason: &'static str,
 ) -> Result<Vec<FileObservation>, (&'static str, u64)> {
-  files
+  observed
     .iter()
-    .map(|file| revalidate_file(file, source_root, bytes_hashed).map_err(|_| (reason, *bytes_hashed)))
+    .map(|file| {
+      if let Some(index) = stored_declared.iter().position(|declared| declared == file) {
+        return current_declared
+          .get(index)
+          .cloned()
+          .ok_or(("declared_compiler_input_changed", *bytes_hashed));
+      }
+      revalidate_file(file, source_root, bytes_hashed).map_err(|_| ("observed_compiler_read_changed", *bytes_hashed))
+    })
     .collect()
 }
 
@@ -2250,24 +2421,33 @@ fn revalidate_file(
 }
 
 fn restore_and_publish(
-  cas: &LocalCas,
-  action_key: &str,
+  candidates: &NativeCacheCandidates<'_>,
+  candidate_index: usize,
   validation: &NativeCompilerValidation,
+  revalidated_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
-  source_root: &Path,
-  observation_directory: &Path,
-  bytes_hashed: u64,
+  metrics: &mut NativeCacheMetrics,
+  trace: &mut NativeCacheWrapperTrace,
 ) -> RailResult<()> {
+  let context = active_context().ok_or_else(|| RailError::message("native compiler cache context disappeared"))?;
+  let source_root = &context.source_root;
+  let observation_directory = &context.observation_directory;
+  let restore_phase = trace.start(NativeCacheWrapperPhase::ResultRestoreMaterialization);
+  let cache_bytes_before = metrics.cache_bytes_read;
   validate_current_output_binding(validation, output_paths, source_root)?;
   let output_parent = validated_output_parent(output_paths, source_root)?;
   let temporary = tempfile::Builder::new()
     .prefix(".cargo-rail-native-cache-")
     .tempdir_in(&output_parent)?;
   let restored = temporary.path().join("verified");
-  let hit = match cas.restore_native(action_key, &restored) {
-    NativeCacheLookup::Hit(hit) => hit,
+  let hit = match candidates.restore(candidate_index, &restored) {
+    NativeCacheLookup::Hit(hit) => {
+      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(hit.bytes_read);
+      hit
+    }
     NativeCacheLookup::Miss(miss) => {
-      let _ = (miss.objects_verified, miss.bytes_read);
+      let _ = miss.objects_verified;
+      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
       return Err(RailError::message(format!(
         "native compiler cache restore rejected the result: {}",
         miss.reason
@@ -2282,37 +2462,81 @@ fn restore_and_publish(
       "native compiler cache stream binding changed after restore",
     ));
   }
+  let stdout = translate_output_binding_bytes(&stdout, validation, output_paths, source_root, false)?;
+  let stderr = translate_output_binding_bytes(&stderr, validation, output_paths, source_root, false)?;
+  trace.finish(
+    restore_phase,
+    NativeCacheWrapperWork {
+      bytes_hashed: hit.bytes_restored,
+      cache_bytes_read: metrics.cache_bytes_read.saturating_sub(cache_bytes_before),
+      bytes_restored: hit.bytes_restored,
+      ..NativeCacheWrapperWork::default()
+    },
+  );
+  let publication_phase = trace.start(NativeCacheWrapperPhase::CargoOutputPublication);
   let bindings = native_output_bindings(output_paths);
-  for ((_, slot, destination), expected) in bindings.iter().zip(&validation.outputs) {
-    publish_output(&restored.join(slot), destination, expected)?;
+  let mut emitted_outputs = Vec::with_capacity(bindings.len());
+  let mut published_bytes = 0u64;
+  for ((role, slot, destination), expected) in bindings.iter().zip(&validation.outputs) {
+    if *role == "dep_info" {
+      let source = restored.join(slot);
+      let bytes = read_bounded(&source, usize::try_from(expected.bytes).unwrap_or(usize::MAX))?;
+      if bytes.len() as u64 != expected.bytes || digest(&bytes) != expected.content_digest {
+        return Err(RailError::message(
+          "native compiler dep-info binding changed after restore",
+        ));
+      }
+      let materialized = translate_dep_info_output_bindings(&bytes, validation, output_paths, source_root)?;
+      let staged = temporary.path().join("materialized-dep-info");
+      write_new_file(&staged, &materialized)?;
+      let materialized_output = NativeCompilerOutput {
+        role: expected.role.clone(),
+        slot: expected.slot.clone(),
+        content_digest: digest(&materialized),
+        bytes: materialized.len() as u64,
+      };
+      publish_output(&staged, destination, &materialized_output)?;
+      published_bytes = published_bytes.saturating_add(materialized_output.bytes);
+    } else {
+      publish_output(&restored.join(slot), destination, expected)?;
+      published_bytes = published_bytes.saturating_add(expected.bytes);
+    }
+    emitted_outputs.push(FileObservation::capture(destination, source_root, source_root)?);
   }
-  let mut raw = validation.observation.clone();
+  let mut raw = revalidated_observation.clone();
+  raw.emitted_outputs = emitted_outputs;
   raw.emitted_outputs.sort();
+  raw.success = true;
   raw.cache_wrapper = Some(CompilerCacheWrapperMetadata::native(
     CompilerCacheWrapperStatus::Hit,
     "verified_local_result",
     Some(validation.candidate_key.clone()),
     Some(validation.action_key.clone()),
-    bytes_hashed,
+    metrics.bytes_hashed,
     hit.bytes_restored,
   ));
   crate::compiler::observation::publish_raw(observation_directory, &raw)?;
   std::io::stdout().write_all(&stdout)?;
   std::io::stderr().write_all(&stderr)?;
+  trace.finish(
+    publication_phase,
+    NativeCacheWrapperWork {
+      bytes_hashed: published_bytes,
+      ..NativeCacheWrapperWork::default()
+    },
+  );
   write_cache_event(
     CompilerCacheWrapperStatus::Hit,
     "verified_local_result",
     Some(&validation.candidate_key),
     Some(&validation.action_key),
-    bytes_hashed,
-    hit.bytes_restored,
+    NativeCacheMetrics {
+      bytes_restored: hit.bytes_restored,
+      ..*metrics
+    },
+    trace,
   );
-  let _ = (
-    hit.action_result,
-    hit.result_digest,
-    hit.objects_verified,
-    hit.bytes_read,
-  );
+  let _ = (hit.action_result, hit.result_digest, hit.objects_verified);
   Ok(())
 }
 
@@ -2378,22 +2602,291 @@ fn validate_current_output_binding(
   outputs: &NativeOutputPaths,
   source_root: &Path,
 ) -> RailResult<()> {
-  let current = native_output_bindings(outputs)
-    .into_iter()
-    .map(|(_, _, output)| ObservationPath::capture(output, source_root, source_root))
-    .collect::<BTreeSet<_>>();
   let stored = validation
     .observation
     .emitted_outputs
     .iter()
-    .map(|output| output.path.clone())
-    .collect::<BTreeSet<_>>();
-  if current != stored {
+    .filter_map(|output| output_binding_role(&output.path).map(|role| (role, observation_path_basename(&output.path))))
+    .collect::<BTreeMap<_, _>>();
+  let current = native_output_bindings(outputs)
+    .into_iter()
+    .map(|(role, _, output)| (role, output.file_name().and_then(OsStr::to_str)))
+    .collect::<BTreeMap<_, _>>();
+  if stored != current || stored.len() != validation.outputs.len() {
     return Err(RailError::message(
-      "native compiler output destinations do not match the verified invocation",
+      "native compiler output file names do not match the verified invocation",
     ));
   }
+  validated_output_parent(outputs, source_root)?;
   Ok(())
+}
+
+fn output_binding_role(path: &ObservationPath) -> Option<&'static str> {
+  match portable_path_basename(match path {
+    ObservationPath::Repository(path) | ObservationPath::Host(path) => path,
+  })?
+  .rsplit_once('.')?
+  .1
+  {
+    "d" => Some("dep_info"),
+    "rmeta" => Some("metadata"),
+    "rlib" => Some("rlib"),
+    _ => None,
+  }
+}
+
+fn translate_dep_info_output_bindings(
+  bytes: &[u8],
+  validation: &NativeCompilerValidation,
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+) -> RailResult<Vec<u8>> {
+  translate_output_binding_bytes(bytes, validation, outputs, source_root, true)
+}
+
+fn portable_stream_output_bindings(
+  bytes: &[u8],
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+) -> RailResult<Vec<u8>> {
+  portable_output_binding_bytes(bytes, outputs, source_root, false)
+}
+
+fn portable_dep_info_output_bindings(
+  bytes: &[u8],
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+) -> RailResult<Vec<u8>> {
+  portable_output_binding_bytes(bytes, outputs, source_root, true)
+}
+
+fn portable_output_binding_bytes(
+  bytes: &[u8],
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  require_replacement: bool,
+) -> RailResult<Vec<u8>> {
+  let mut replacements = native_output_bindings(outputs)
+    .into_iter()
+    .map(|(_, _, output)| {
+      let relative = output
+        .strip_prefix(source_root)
+        .map_err(|_| RailError::message("native compiler output is outside the source root"))?;
+      let relative = crate::utils::path_to_git_format(relative);
+      let absolute = crate::utils::path_to_git_format(output);
+      let portable = portable_output_binding(&relative)?;
+      Ok(
+        [
+          canonical_output_path_replacements(&absolute, &portable),
+          canonical_output_path_replacements(&relative, &portable),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+      )
+    })
+    .collect::<RailResult<Vec<_>>>()?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+  replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
+  replacements.dedup();
+
+  let mut portable = bytes.to_vec();
+  let mut replacement_count = 0usize;
+  for (current, canonical) in replacements {
+    let (next, count) = replace_bytes(&portable, &current, &canonical);
+    portable = next;
+    replacement_count = replacement_count.saturating_add(count);
+  }
+
+  let output = native_output_bindings(outputs)[0].2;
+  let output_parent = output
+    .parent()
+    .ok_or_else(|| RailError::message("native compiler output has no parent"))?;
+  let relative_parent = output_parent
+    .strip_prefix(source_root)
+    .map_err(|_| RailError::message("native compiler output parent is outside the source root"))?;
+  if require_replacement && replacement_count == 0
+    || [
+      crate::utils::path_to_git_format(output_parent),
+      crate::utils::path_to_git_format(relative_parent),
+    ]
+    .iter()
+    .flat_map(|path| output_path_spellings(path))
+    .any(|path| contains_path_prefix(&portable, &path))
+  {
+    return Err(RailError::message(
+      "native compiler output contains an unmodeled output-directory binding",
+    ));
+  }
+  Ok(portable)
+}
+
+fn portable_output_binding(path: &str) -> RailResult<String> {
+  let file_name = portable_path_basename(path)
+    .ok_or_else(|| RailError::message("native compiler output has no portable file name"))?;
+  Ok(format!("/cargo-rail/native-output/{file_name}"))
+}
+
+fn translate_output_binding_bytes(
+  bytes: &[u8],
+  validation: &NativeCompilerValidation,
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  require_replacement: bool,
+) -> RailResult<Vec<u8>> {
+  let current = native_output_bindings(outputs)
+    .into_iter()
+    .map(|(role, _, path)| {
+      let relative = path
+        .strip_prefix(source_root)
+        .map_err(|_| RailError::message("native compiler dep-info destination is outside the source root"))?;
+      Ok((role, crate::utils::path_to_git_format(relative)))
+    })
+    .collect::<RailResult<BTreeMap<_, _>>>()?;
+  let stored = validation
+    .observation
+    .emitted_outputs
+    .iter()
+    .map(|output| {
+      let role = output_binding_role(&output.path)
+        .ok_or_else(|| RailError::message("native compiler dep-info source has an unknown output role"))?;
+      let ObservationPath::Repository(path) = &output.path else {
+        return Err(RailError::message(
+          "native compiler dep-info source is not repository-relative",
+        ));
+      };
+      Ok((role, portable_output_binding(path)?))
+    })
+    .collect::<RailResult<BTreeMap<_, _>>>()?;
+  if stored.keys().ne(current.keys()) {
+    return Err(RailError::message(
+      "native compiler dep-info output roles changed during materialization",
+    ));
+  }
+
+  let stored_parent = common_output_parent(stored.values().map(String::as_str))?;
+
+  let mut replacements = stored
+    .iter()
+    .map(|(role, stored)| (stored.as_bytes().to_vec(), current[role].as_bytes().to_vec()))
+    .collect::<Vec<_>>();
+  replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
+  replacements.dedup();
+  let mut translated = bytes.to_vec();
+  let mut replacement_count = 0usize;
+  for (stored, current) in replacements {
+    let (next, count) = replace_bytes(&translated, &stored, &current);
+    translated = next;
+    replacement_count = replacement_count.saturating_add(count);
+  }
+  if require_replacement && replacement_count == 0
+    || output_path_spellings(&stored_parent)
+      .iter()
+      .any(|path| contains_path_prefix(&translated, path))
+  {
+    return Err(RailError::message(
+      "native compiler cached data contains an unmodeled output-directory binding",
+    ));
+  }
+  Ok(translated)
+}
+
+fn common_output_parent<'a>(paths: impl IntoIterator<Item = &'a str>) -> RailResult<String> {
+  let mut parents = paths
+    .into_iter()
+    .map(|path| {
+      path
+        .rsplit_once(['/', '\\'])
+        .map(|(parent, _)| parent.to_string())
+        .ok_or_else(|| RailError::message("native compiler output has no portable parent"))
+    })
+    .collect::<RailResult<BTreeSet<_>>>()?;
+  if parents.len() != 1 {
+    return Err(RailError::message(
+      "native compiler outputs do not share one portable parent",
+    ));
+  }
+  parents
+    .pop_first()
+    .ok_or_else(|| RailError::message("native compiler output set is empty"))
+}
+
+fn canonical_output_path_replacements(current: &str, portable: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+  let portable = portable.as_bytes().to_vec();
+  output_path_spellings(current)
+    .into_iter()
+    .map(|current| (current, portable.clone()))
+    .collect()
+}
+
+fn output_path_spellings(path: &str) -> Vec<Vec<u8>> {
+  let git = path.replace('\\', "/");
+  let native = git.replace('/', "\\");
+  let mut plain = vec![git.clone(), native.clone()];
+  if let Some((parent, name)) = git.rsplit_once('/') {
+    plain.push(format!("{parent}\\{name}"));
+    plain.push(format!("{}/{name}", parent.replace('/', "\\")));
+  }
+  let mut spellings = Vec::new();
+  for plain in plain.into_iter().map(String::into_bytes) {
+    let escaped = escape_dep_info_path(&plain);
+    let json = json_string_contents(&plain);
+    spellings.extend([plain, escaped, json]);
+  }
+  spellings
+}
+
+fn json_string_contents(value: &[u8]) -> Vec<u8> {
+  let Ok(value) = std::str::from_utf8(value) else {
+    return value.to_vec();
+  };
+  match serde_json::to_vec(value) {
+    Ok(encoded) if encoded.len() >= 2 => encoded[1..encoded.len() - 1].to_vec(),
+    _ => value.as_bytes().to_vec(),
+  }
+}
+
+fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
+  let mut escaped = Vec::with_capacity(path.len());
+  for byte in path {
+    if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
+      escaped.push(b'\\');
+    }
+    escaped.push(*byte);
+  }
+  escaped
+}
+
+fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> (Vec<u8>, usize) {
+  if from.is_empty() {
+    return (bytes.to_vec(), 0);
+  }
+  let mut output = Vec::with_capacity(bytes.len());
+  let mut remaining = bytes;
+  let mut count = 0usize;
+  while let Some(index) = remaining.windows(from.len()).position(|window| window == from) {
+    output.extend_from_slice(&remaining[..index]);
+    output.extend_from_slice(to);
+    remaining = &remaining[index + from.len()..];
+    count += 1;
+  }
+  output.extend_from_slice(remaining);
+  (output, count)
+}
+
+fn contains_path_prefix(bytes: &[u8], path: &[u8]) -> bool {
+  !path.is_empty()
+    && bytes.windows(path.len()).enumerate().any(|(index, window)| {
+      if window != path {
+        return false;
+      }
+      let before = index.checked_sub(1).and_then(|index| bytes.get(index));
+      let after = bytes.get(index + path.len());
+      before.is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b':' | b'=' | b'\'' | b'"'))
+        && after.is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b':' | b'\'' | b'"'))
+    })
 }
 
 fn publish_output(source: &Path, destination: &Path, expected: &NativeCompilerOutput) -> RailResult<()> {
@@ -2613,23 +3106,65 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
 
 /// Execute one eligible cold invocation, replay its exact streams, and publish
 /// only a complete successful observation.
-pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, context: &str) -> i32 {
+pub(crate) fn run_and_store(
+  mut command: Command,
+  recorder: InvocationRecorder,
+  cache_bytes_read: u64,
+  trace: &mut NativeCacheWrapperTrace,
+  context: &str,
+) -> i32 {
   let output_paths = recorder.native_output_paths();
   let stdout_file = match tempfile::NamedTempFile::new() {
     Ok(file) => file,
-    Err(_) => return run_without_store(command, recorder, context, "native_cache_stream_capture_unavailable"),
+    Err(_) => {
+      return run_without_store(
+        command,
+        recorder,
+        cache_bytes_read,
+        trace,
+        context,
+        "native_cache_stream_capture_unavailable",
+      );
+    }
   };
   let stderr_file = match tempfile::NamedTempFile::new() {
     Ok(file) => file,
-    Err(_) => return run_without_store(command, recorder, context, "native_cache_stream_capture_unavailable"),
+    Err(_) => {
+      return run_without_store(
+        command,
+        recorder,
+        cache_bytes_read,
+        trace,
+        context,
+        "native_cache_stream_capture_unavailable",
+      );
+    }
   };
   let stdout_writer = match stdout_file.reopen() {
     Ok(file) => file,
-    Err(_) => return run_without_store(command, recorder, context, "native_cache_stream_capture_unavailable"),
+    Err(_) => {
+      return run_without_store(
+        command,
+        recorder,
+        cache_bytes_read,
+        trace,
+        context,
+        "native_cache_stream_capture_unavailable",
+      );
+    }
   };
   let stderr_writer = match stderr_file.reopen() {
     Ok(file) => file,
-    Err(_) => return run_without_store(command, recorder, context, "native_cache_stream_capture_unavailable"),
+    Err(_) => {
+      return run_without_store(
+        command,
+        recorder,
+        cache_bytes_read,
+        trace,
+        context,
+        "native_cache_stream_capture_unavailable",
+      );
+    }
   };
   let status = command.stdout(stdout_writer).stderr(stderr_writer).status();
   let status = match status {
@@ -2653,21 +3188,53 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
     Err(_) => return status.code().unwrap_or(1),
   };
   if !status.success() {
-    let _ = publish_and_record_cold_observation(&mut raw, "compiler_execution_failed", None, 0, 0);
+    let _ = publish_and_record_cold_observation(
+      &mut raw,
+      "compiler_execution_failed",
+      None,
+      0,
+      cache_bytes_read,
+      0,
+      trace,
+    );
     return status.code().unwrap_or(1);
   }
   let Some(output_paths) = output_paths else {
-    let _ = publish_and_record_cold_observation(&mut raw, "compiler_output_paths_unavailable", None, 0, 0);
+    let _ = publish_and_record_cold_observation(
+      &mut raw,
+      "compiler_output_paths_unavailable",
+      None,
+      0,
+      cache_bytes_read,
+      0,
+      trace,
+    );
     return status.code().unwrap_or(1);
   };
   if stdout_len.is_none_or(|bytes| bytes > MAX_STREAM_BYTES as u64)
     || stderr_len.is_none_or(|bytes| bytes > MAX_STREAM_BYTES as u64)
   {
-    let _ = publish_and_record_cold_observation(&mut raw, "compiler_stream_limit_exceeded", None, 0, 0);
+    let _ = publish_and_record_cold_observation(
+      &mut raw,
+      "compiler_stream_limit_exceeded",
+      None,
+      0,
+      cache_bytes_read,
+      0,
+      trace,
+    );
     return status.code().unwrap_or(1);
   }
   let Some(cache_context) = active_context() else {
-    let _ = publish_and_record_cold_observation(&mut raw, "native_cache_context_unavailable", None, 0, 0);
+    let _ = publish_and_record_cold_observation(
+      &mut raw,
+      "native_cache_context_unavailable",
+      None,
+      0,
+      cache_bytes_read,
+      0,
+      trace,
+    );
     return status.code().unwrap_or(1);
   };
   let source_root = &cache_context.source_root;
@@ -2675,7 +3242,15 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
   let session = match session {
     Ok(session) => session,
     Err(_) => {
-      let _ = publish_and_record_cold_observation(&mut raw, "native_cache_session_unavailable", None, 0, 0);
+      let _ = publish_and_record_cold_observation(
+        &mut raw,
+        "native_cache_session_unavailable",
+        None,
+        0,
+        cache_bytes_read,
+        0,
+        trace,
+      );
       return status.code().unwrap_or(1);
     }
   };
@@ -2683,21 +3258,37 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
     Ok(bytes_hashed) => bytes_hashed,
     Err((reason, bytes_hashed)) => {
       let bytes_hashed = cold_input_bytes(&raw, source_root, bytes_hashed);
-      let _ = publish_and_record_cold_observation(&mut raw, reason, None, bytes_hashed, 0);
+      let _ = publish_and_record_cold_observation(&mut raw, reason, None, bytes_hashed, cache_bytes_read, 0, trace);
       return status.code().unwrap_or(1);
     }
   };
   let stdout = match read_bounded(stdout_file.path(), MAX_STREAM_BYTES) {
     Ok(bytes) => bytes,
     Err(_) => {
-      let _ = publish_and_record_cold_observation(&mut raw, "compiler_stdout_unavailable", None, 0, 0);
+      let _ = publish_and_record_cold_observation(
+        &mut raw,
+        "compiler_stdout_unavailable",
+        None,
+        0,
+        cache_bytes_read,
+        0,
+        trace,
+      );
       return status.code().unwrap_or(1);
     }
   };
   let stderr = match read_bounded(stderr_file.path(), MAX_STREAM_BYTES) {
     Ok(bytes) => bytes,
     Err(_) => {
-      let _ = publish_and_record_cold_observation(&mut raw, "compiler_stderr_unavailable", None, 0, 0);
+      let _ = publish_and_record_cold_observation(
+        &mut raw,
+        "compiler_stderr_unavailable",
+        None,
+        0,
+        cache_bytes_read,
+        0,
+        trace,
+      );
       return status.code().unwrap_or(1);
     }
   };
@@ -2723,10 +3314,14 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
         "stored_verified_result",
         Some(&validation.candidate_key),
         Some(&validation.action_key),
-        bytes_hashed,
-        0,
+        NativeCacheMetrics {
+          bytes_hashed,
+          cache_bytes_read,
+          cache_bytes_written: written,
+          bytes_restored: 0,
+        },
+        trace,
       );
-      let _ = written;
     }
     Err(_) => {
       let initial = raw.cache_wrapper.clone().or_else(metadata_from_environment);
@@ -2751,8 +3346,12 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
         &reason,
         initial.as_ref().and_then(CompilerCacheWrapperMetadata::candidate_key),
         None,
-        bytes_hashed,
-        0,
+        NativeCacheMetrics {
+          bytes_hashed,
+          cache_bytes_read,
+          ..NativeCacheMetrics::default()
+        },
+        trace,
       );
     }
   }
@@ -2760,11 +3359,18 @@ pub(crate) fn run_and_store(mut command: Command, recorder: InvocationRecorder, 
   status.code().unwrap_or(1)
 }
 
-fn run_without_store(mut command: Command, recorder: InvocationRecorder, context: &str, reason: &'static str) -> i32 {
+fn run_without_store(
+  mut command: Command,
+  recorder: InvocationRecorder,
+  cache_bytes_read: u64,
+  trace: &mut NativeCacheWrapperTrace,
+  context: &str,
+  reason: &'static str,
+) -> i32 {
   match command.status() {
     Ok(status) => {
       if let Ok(mut raw) = recorder.complete(status.success()) {
-        let _ = publish_and_record_cold_observation(&mut raw, reason, None, 0, 0);
+        let _ = publish_and_record_cold_observation(&mut raw, reason, None, 0, cache_bytes_read, 0, trace);
       }
       status.code().unwrap_or(1)
     }
@@ -2780,7 +3386,9 @@ fn publish_and_record_cold_observation(
   reason: &'static str,
   action_key: Option<String>,
   bytes_hashed: u64,
+  cache_bytes_read: u64,
   bytes_restored: u64,
+  trace: &NativeCacheWrapperTrace,
 ) -> RailResult<()> {
   publish_cold_observation(raw, reason, action_key, bytes_hashed, bytes_restored)?;
   let metadata = raw.cache_wrapper.as_ref();
@@ -2789,8 +3397,13 @@ fn publish_and_record_cold_observation(
     reason,
     metadata.and_then(CompilerCacheWrapperMetadata::candidate_key),
     metadata.and_then(CompilerCacheWrapperMetadata::action_key),
-    bytes_hashed,
-    bytes_restored,
+    NativeCacheMetrics {
+      bytes_hashed,
+      cache_bytes_read,
+      cache_bytes_written: 0,
+      bytes_restored,
+    },
+    trace,
   );
   Ok(())
 }
@@ -2828,27 +3441,10 @@ fn validate_post_execution_inputs(
   if let Some(reason) = invocation_bypass_reason(observation, true, host_target) {
     return Err((reason, 0));
   }
-  if filesystem_macro_present(observation, source_root) {
-    return Err(("filesystem_reading_macro_not_graduated", 0));
-  }
-  let declared = observation
-    .declared_inputs
-    .iter()
-    .map(|file| &file.path)
-    .collect::<BTreeSet<_>>();
-  let additional = observation
-    .observed_reads
-    .iter()
-    .filter(|file| !declared.contains(&file.path))
-    .collect::<Vec<_>>();
-  if additional.iter().any(|file| {
-    file
-      .path
-      .resolve(source_root)
-      .extension()
-      .is_none_or(|extension| extension != "rs")
-  }) {
-    return Err(("filesystem_reading_macro_not_graduated", 0));
+  match dep_info_contains_source_root(observation, source_root) {
+    Ok(true) => return Err(("root_bound_dep_info_not_graduated", 0)),
+    Ok(false) => {}
+    Err(_) => return Err(("dep_info_portability_unavailable", 0)),
   }
   let mut bytes_hashed = 0u64;
   for file in observation
@@ -2864,6 +3460,36 @@ fn validate_post_execution_inputs(
   Ok(bytes_hashed)
 }
 
+fn dep_info_contains_source_root(observation: &RawCompilerInvocation, source_root: &Path) -> RailResult<bool> {
+  let canonical_root = crate::utils::canonicalize_existing(source_root)?;
+  let roots = remap_source_root_spellings(source_root, &canonical_root)
+    .map_err(|reason| RailError::message(format!("compiler source root is not portable: {reason}")))?;
+  let spellings = roots
+    .iter()
+    .flat_map(|root| {
+      let mut escaped = Vec::with_capacity(root.len());
+      for byte in root.bytes() {
+        if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
+          escaped.push(b'\\');
+        }
+        escaped.push(byte);
+      }
+      [root.as_bytes().to_vec(), escaped]
+    })
+    .collect::<BTreeSet<_>>();
+  let dep_info = observation
+    .emitted_outputs
+    .iter()
+    .find(|output| output.path.resolve(source_root).extension() == Some(OsStr::new("d")))
+    .ok_or_else(|| RailError::message("compiler dep-info output is unavailable"))?;
+  let bytes = fs::read(dep_info.path.resolve(source_root))?;
+  Ok(
+    spellings
+      .iter()
+      .any(|root| bytes.windows(root.len()).any(|window| window == root)),
+  )
+}
+
 fn publish_cold_result(
   session: &NativeCompilerSession,
   observation: &RawCompilerInvocation,
@@ -2874,20 +3500,48 @@ fn publish_cold_result(
 ) -> RailResult<(NativeCompilerValidation, u64)> {
   validated_output_parent(output_paths, source_root)?;
   let bindings = native_output_bindings(output_paths);
+  // Rustc reports artifact paths with platform-specific spelling. Store one
+  // canonical path token so a verified result can be late-bound to a different
+  // Cargo output directory (and workspace root) on restore.
+  let stdout = portable_stream_output_bindings(stdout, output_paths, source_root)?;
+  let stderr = portable_stream_output_bindings(stderr, output_paths, source_root)?;
+  let dep_info_observation = observed_output(observation, &output_paths.dep_info, source_root)?;
+  let dep_info_bytes = read_bounded(
+    &output_paths.dep_info,
+    usize::try_from(fs::metadata(&output_paths.dep_info)?.len()).unwrap_or(usize::MAX),
+  )?;
+  if digest(&dep_info_bytes) != dep_info_observation.content_digest {
+    return Err(RailError::message(
+      "native compiler dep-info changed before canonical cache staging",
+    ));
+  }
+  let portable_dep_info = portable_dep_info_output_bindings(&dep_info_bytes, output_paths, source_root)?;
+  let mut cache_observation = observation.clone();
+  let cached_dep_info = cache_observation
+    .emitted_outputs
+    .iter_mut()
+    .find(|output| output.path == dep_info_observation.path)
+    .ok_or_else(|| RailError::message("native compiler dep-info observation disappeared"))?;
+  cached_dep_info.content_digest = digest(&portable_dep_info);
   let outputs = bindings
     .iter()
     .map(|(role, slot, path)| {
-      let observed = observed_output(observation, path, source_root)?;
+      let observed = observed_output(&cache_observation, path, source_root)?;
+      let bytes = if *role == "dep_info" {
+        portable_dep_info.len() as u64
+      } else {
+        fs::metadata(path)?.len()
+      };
       Ok(NativeCompilerOutput {
         role: (*role).to_string(),
         slot: (*slot).to_string(),
         content_digest: observed.content_digest.clone(),
-        bytes: fs::metadata(path)?.len(),
+        bytes,
       })
     })
     .collect::<RailResult<Vec<_>>>()?;
   let validation =
-    NativeCompilerValidation::new(session, observation.clone(), outputs, digest(stdout), digest(stderr))?;
+    NativeCompilerValidation::new(session, cache_observation, outputs, digest(&stdout), digest(&stderr))?;
   if observation
     .cache_wrapper
     .as_ref()
@@ -2913,13 +3567,17 @@ fn publish_cold_result(
   {
     fs::create_dir_all(directory)?;
   }
-  for (((_, _, source), staged), expected) in bindings.iter().zip(&staged_outputs).zip(&validation.outputs) {
-    let observed = observed_output(observation, source, source_root)?;
-    copy_regular_file(source, staged, expected.bytes)?;
+  for (((role, _, source), staged), expected) in bindings.iter().zip(&staged_outputs).zip(&validation.outputs) {
+    let observed = observed_output(&validation.observation, source, source_root)?;
+    if *role == "dep_info" {
+      write_new_file(staged, &portable_dep_info)?;
+    } else {
+      copy_regular_file(source, staged, expected.bytes)?;
+    }
     validate_staged_output(staged, observed, expected.bytes)?;
   }
-  write_new_file(&stdout_slot, stdout)?;
-  write_new_file(&stderr_slot, stderr)?;
+  write_new_file(&stdout_slot, &stdout)?;
+  write_new_file(&stderr_slot, &stderr)?;
   let mut manifest_paths = staged_outputs;
   manifest_paths.extend([stdout_slot, stderr_slot]);
   let manifest = crate::hermetic::capture_native_compiler_outputs(staging.path(), &manifest_paths)?;
@@ -3021,20 +3679,26 @@ struct NativeCacheEvent<'a> {
   candidate_key: Option<&'a str>,
   action_key: Option<&'a str>,
   bytes_hashed: u64,
+  cache_bytes_read: u64,
+  cache_bytes_written: u64,
   bytes_restored: u64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  wrapper_trace: Option<NativeCacheWrapperTraceSnapshot>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnedNativeCacheEvent {
-  #[serde(rename = "version")]
-  _version: u32,
+  version: u32,
   status: CompilerCacheWrapperStatus,
   reason: String,
   candidate_key: Option<String>,
   action_key: Option<String>,
   bytes_hashed: u64,
+  cache_bytes_read: u64,
+  cache_bytes_written: u64,
   bytes_restored: u64,
+  wrapper_trace: Option<NativeCacheWrapperTraceSnapshot>,
 }
 
 fn write_cache_event(
@@ -3042,8 +3706,8 @@ fn write_cache_event(
   reason: &str,
   candidate_key: Option<&str>,
   action_key: Option<&str>,
-  bytes_hashed: u64,
-  bytes_restored: u64,
+  metrics: NativeCacheMetrics,
+  trace: &NativeCacheWrapperTrace,
 ) {
   let Some(directory) = active_context().map(|context| context.observation_directory.join("native-cache-events"))
   else {
@@ -3053,13 +3717,16 @@ fn write_cache_event(
     return;
   }
   let event = NativeCacheEvent {
-    version: 1,
+    version: NATIVE_CACHE_RUN_EVENT_VERSION,
     status,
     reason,
     candidate_key,
     action_key,
-    bytes_hashed,
-    bytes_restored,
+    bytes_hashed: metrics.bytes_hashed,
+    cache_bytes_read: metrics.cache_bytes_read,
+    cache_bytes_written: metrics.cache_bytes_written,
+    bytes_restored: metrics.bytes_restored,
+    wrapper_trace: trace.snapshot(),
   };
   let Ok(bytes) = serde_json::to_vec(&event) else {
     return;
@@ -3136,25 +3803,23 @@ pub(crate) mod tests {
   use crate::compiler::observation::EnvironmentObservation;
 
   #[test]
-  fn compiler_option_detection_accepts_joined_and_split_rustc_forms() {
-    for flags in [
-      ["-Clinker=/opt/toolchain/bin/clang"].as_slice(),
-      ["-C", "linker=/opt/toolchain/bin/clang"].as_slice(),
-      ["-Zcodegen-backend=cranelift"].as_slice(),
-      ["-Z", "codegen-backend=cranelift"].as_slice(),
+  fn bundled_codegen_backends_are_supported_but_external_paths_are_not() {
+    for option in [
+      "codegen-backend=llvm",
+      "codegen-backend=cranelift",
+      "codegen-backend=my_backend-2",
     ] {
-      let flags = flags.iter().map(ToString::to_string).collect::<Vec<_>>();
-      assert!(
-        compiler_option_selected(&flags, &["linker", "codegen-backend"]),
-        "did not detect {flags:?}"
-      );
+      assert!(supported_unstable_option(option), "rejected {option}");
+    }
+    for option in [
+      "codegen-backend=",
+      "codegen-backend=/opt/backend.so",
+      "codegen-backend=C:\\backend.dll",
+      "mir-opt-level=4",
+    ] {
+      assert!(!supported_unstable_option(option), "accepted {option}");
     }
 
-    let unrelated = ["-C", "opt-level=3", "-Zmir-opt-level=4"]
-      .into_iter()
-      .map(ToString::to_string)
-      .collect::<Vec<_>>();
-    assert!(!compiler_option_selected(&unrelated, &["linker", "codegen-backend"]));
     assert!(long_option_selected(
       &["--sysroot=/opt/toolchain".to_string()],
       "--sysroot"
@@ -3224,42 +3889,33 @@ pub(crate) mod tests {
   }
 
   fn graduated_session(source_root_identity: String) -> NativeCompilerSession {
-    let registry: NativeCacheCapabilityRegistry =
-      serde_json::from_str(NATIVE_CACHE_CAPABILITY_REGISTRY).expect("capability registry");
-    let certificate = registry.certificates.first().expect("graduated capability certificate");
     let class = NativeCompilerClass {
       name: "library_metadata_rlib".to_string(),
-      platform: certificate.platform.clone(),
-      host_target: certificate.host_target.clone(),
-      rustc_release: GRADUATED_RUSTC_RELEASE.to_string(),
-      cargo_release: GRADUATED_CARGO_RELEASE.to_string(),
+      platform: "unix-test-x86_64".to_string(),
+      host_target: "x86_64-unknown-test".to_string(),
+      rustc_release: "1.97.1".to_string(),
+      cargo_release: "1.97.1".to_string(),
     };
-    let capability_identity = certificate.identity.clone();
+    let capability_identity = digest(b"toolchain-capability");
     let toolchain_identity = digest(b"toolchain");
-    let compiler_environment_identity = digest(b"compiler-environment");
-    let cargo_configuration_identity = digest(b"cargo-configuration");
-    let resolution_identity = digest(b"resolution");
+    let compiler_process_environment_identity = digest(b"compiler-process-environment");
     let execution_contract = DIAGNOSTIC_EXECUTION_CONTRACT.to_string();
     let identity = session_identity(
       &class,
       &capability_identity,
       &toolchain_identity,
-      &compiler_environment_identity,
-      &cargo_configuration_identity,
-      &resolution_identity,
+      &compiler_process_environment_identity,
       &execution_contract,
     )
     .expect("session identity");
     NativeCompilerSession {
-      version: 3,
+      version: 4,
       identity,
       source_root_identity,
       class,
       capability_identity,
       toolchain_identity,
-      compiler_environment_identity,
-      cargo_configuration_identity,
-      resolution_identity,
+      compiler_process_environment_identity,
       execution_contract,
     }
   }
@@ -3321,7 +3977,7 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn revalidation_hashes_bytes_instead_of_trusting_size() {
+  fn current_candidate_capture_hashes_bytes_instead_of_trusting_size() {
     let root = tempfile::tempdir().expect("source root");
     fs::create_dir(root.path().join("src")).expect("source directory");
     let source = root.path().join("src/lib.rs");
@@ -3339,15 +3995,18 @@ pub(crate) mod tests {
       digest(b""),
     )
     .expect("validation");
-    let (action, bytes_hashed) =
+    let revalidated =
       revalidate_candidate(&validation, &session, &observation, root.path()).expect("unchanged candidate");
-    assert_eq!(action, validation.action_key);
-    assert_eq!(bytes_hashed, fs::metadata(&source).expect("source metadata").len() * 2);
+    assert_eq!(revalidated.action_key, validation.action_key);
+    assert_eq!(revalidated.bytes_hashed, 0, "declared inputs were already captured");
 
     fs::write(&source, b"pub const VALUE: u8 = 2;\n").expect("same-size mutation");
-    let error = revalidate_candidate(&validation, &session, &observation, root.path())
+    let changed = FileObservation::capture(&source, root.path(), root.path()).expect("changed source observation");
+    let mut current = observation;
+    current.declared_inputs = vec![changed];
+    let error = revalidate_candidate(&validation, &session, &current, root.path())
       .expect_err("same-size content mutation must miss");
-    assert_eq!(error.0, "declared_compiler_input_changed");
+    assert_eq!(error.0, "candidate_pre_execution_inputs_changed");
   }
 
   #[test]
@@ -3368,6 +4027,13 @@ pub(crate) mod tests {
     observation.declared_inputs = vec![source.clone()];
     observation.observed_reads = vec![source];
     observation.dependency_artifacts = vec![("dependency".to_string(), dependency_observation)];
+    let dep_info = observation.emitted_outputs[0].path.resolve(root.path());
+    fs::create_dir_all(dep_info.parent().expect("dep-info parent")).expect("dep-info directory");
+    fs::write(
+      dep_info,
+      b"target/debug/deps/libfixture.rmeta: src/lib.rs target/libdependency.rmeta\n",
+    )
+    .expect("portable dep-info");
 
     let bytes =
       validate_post_execution_inputs(&observation, root.path(), "aarch64-apple-darwin").expect("stable inputs");
@@ -3406,6 +4072,14 @@ pub(crate) mod tests {
       invocation_bypass_reason(&explicit_host, true, &session.class.host_target),
       None
     );
+    let mut bundled_backend = baseline.clone();
+    bundled_backend
+      .compiler_arguments
+      .push("-Zcodegen-backend=cranelift".to_string());
+    assert_eq!(
+      invocation_bypass_reason(&bundled_backend, true, &session.class.host_target),
+      None
+    );
     assert_bypass("rustdoc_not_graduated", |value| value.mode = CompilerMode::Rustdoc);
     assert_bypass("cross_target_not_graduated", |value| {
       value.target_argument = Some("x86_64-unknown-linux-gnu".to_string());
@@ -3442,6 +4116,11 @@ pub(crate) mod tests {
     });
     assert_bypass("compiler_flag_not_graduated", |value| {
       value.compiler_arguments.push("-Zunproven".to_string());
+    });
+    assert_bypass("compiler_flag_not_graduated", |value| {
+      value
+        .compiler_arguments
+        .push("-Zcodegen-backend=/opt/backend.so".to_string());
     });
     assert_bypass("dependency_artifact_class_not_graduated", |value| {
       value.dependency_artifacts.push((
@@ -3579,6 +4258,28 @@ pub(crate) mod tests {
     assert!(!destination.exists());
   }
 
+  #[test]
+  fn physical_source_roots_in_dep_info_are_not_portable() {
+    let directory = tempfile::tempdir().expect("source root parent");
+    let source_root = directory.path().join("workspace root");
+    let output = source_root.join("target/debug/deps/fixture.d");
+    fs::create_dir_all(output.parent().expect("dep-info parent")).expect("dep-info directory");
+    let escaped_root = source_root.to_string_lossy().replace(' ', "\\ ");
+    fs::write(
+      &output,
+      format!("target/debug/deps/fixture.rmeta: {escaped_root}/target/generated.rs\n"),
+    )
+    .expect("root-bound dep-info");
+    let mut observation = graduated_observation();
+    observation.emitted_outputs[0] =
+      FileObservation::capture(&output, &source_root, &source_root).expect("dep-info observation");
+
+    assert!(dep_info_contains_source_root(&observation, &source_root).expect("root-bound check"));
+
+    fs::write(&output, "target/debug/deps/fixture.rmeta: target/generated.rs\n").expect("portable dep-info");
+    assert!(!dep_info_contains_source_root(&observation, &source_root).expect("portable check"));
+  }
+
   #[cfg(any(unix, windows))]
   #[test]
   fn publication_moves_the_verified_staging_file_without_copying_it() {
@@ -3603,95 +4304,40 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn filesystem_reading_macros_are_detected_conservatively() {
-    assert!(macro_invocation_present(
-      b"const X: &str = include_str!(\"x\");",
-      b"include_str"
-    ));
-    assert!(macro_invocation_present(b"include_bytes ! (\"x\")", b"include_bytes"));
-    assert!(macro_invocation_present(b"include!(\"x.rs\")", b"include"));
-    assert!(!macro_invocation_present(b"fn include_str_value() {}", b"include_str"));
-    assert!(!macro_invocation_present(b"// included text", b"include"));
-  }
-
-  #[test]
-  fn eligibility_is_scoped_to_one_platform_and_toolchain() {
+  fn compiler_class_accepts_any_identified_host_and_release() {
     let session = graduated_session(digest(b"source-root"));
-    assert_eq!(session.class.eligibility_reason(), None);
+    assert!(session.class.is_valid());
 
-    for &(platform, host_target) in GRADUATED_NATIVE_HOSTS {
+    for (platform, host_target, release) in [
+      ("unix-linux-aarch64", "aarch64-unknown-linux-gnu", "1.91.0"),
+      ("unix-macos-x86_64", "x86_64-apple-darwin", "1.97.1"),
+      ("windows-windows-x86_64", "x86_64-pc-windows-msvc", "1.98.0-nightly"),
+      ("unix-freebsd-x86_64", "x86_64-unknown-freebsd", "custom"),
+    ] {
       let mut class = session.class.clone();
       class.platform = platform.to_string();
       class.host_target = host_target.to_string();
-      assert_eq!(class.eligibility_reason(), None, "{platform}/{host_target}");
+      class.rustc_release = release.to_string();
+      class.cargo_release = release.to_string();
+      assert!(class.is_valid(), "{platform}/{host_target}/{release}");
     }
-    assert!(
-      GRADUATED_NATIVE_HOSTS.windows(2).all(|pair| pair[0] < pair[1]),
-      "the generated capability registry must stay deterministic"
-    );
 
-    let mut platform = session.class.clone();
-    platform.platform = "unix-freebsd-x86_64".to_string();
-    platform.host_target = "x86_64-unknown-freebsd".to_string();
-    assert_eq!(
-      platform.eligibility_reason(),
-      Some(DirectCacheBypass::PlatformNotGraduated)
-    );
-
-    let mut toolchain = session.class;
-    toolchain.rustc_release = "1.97.2".to_string();
-    assert_eq!(
-      toolchain.eligibility_reason(),
-      Some(DirectCacheBypass::ToolchainNotGraduated)
-    );
-  }
-
-  #[test]
-  fn mixed_cargo_rustc_or_rustdoc_selections_bypass_before_certification() {
-    let cargo = "cargo 1.97.1 (cargo-commit 2026-06-30)\nrelease: 1.97.1\nhost: aarch64-apple-darwin\n";
-    let rustc = "rustc 1.97.1 (rust-commit 2026-07-14)\nrelease: 1.97.1\nhost: aarch64-apple-darwin\n";
-    let rustdoc = "rustdoc 1.97.1 (rust-commit 2026-07-14)\nrelease: 1.97.1\nhost: aarch64-apple-darwin\n";
-    assert_eq!(direct_toolchain_coherence_bypass_reason(cargo, rustc, rustdoc), None);
-
-    let old_cargo = cargo.replace("1.97.1", "1.96.0");
-    assert_eq!(
-      direct_toolchain_coherence_bypass_reason(&old_cargo, rustc, rustdoc),
-      Some(DirectCacheBypass::ToolchainIncoherent)
-    );
-    let other_host = rustdoc.replace("aarch64-apple-darwin", "x86_64-apple-darwin");
-    assert_eq!(
-      direct_toolchain_coherence_bypass_reason(cargo, rustc, &other_host),
-      Some(DirectCacheBypass::ToolchainIncoherent)
-    );
-    assert_eq!(
-      direct_toolchain_coherence_bypass_reason("cargo without structured identity", rustc, rustdoc),
-      Some(DirectCacheBypass::ToolchainIncoherent)
-    );
+    let mut invalid = session.class;
+    invalid.host_target = "unknown".to_string();
+    assert!(!invalid.is_valid());
   }
 
   #[test]
   fn session_identity_changes_with_exact_toolchain_identity() {
     let session = graduated_session(digest(b"source-root"));
-    let identity =
-      |capability: &str, toolchain: &str, environment: &str, configuration: &str, resolution: &str, contract: &str| {
-        session_identity(
-          &session.class,
-          capability,
-          toolchain,
-          environment,
-          configuration,
-          resolution,
-          contract,
-        )
-        .expect("session identity")
-      };
+    let identity = |capability: &str, toolchain: &str, environment: &str, contract: &str| {
+      session_identity(&session.class, capability, toolchain, environment, contract).expect("session identity")
+    };
     assert_ne!(
       identity(
         &digest(b"changed-capability"),
         &session.toolchain_identity,
-        &session.compiler_environment_identity,
-        &session.cargo_configuration_identity,
-        &session.resolution_identity,
+        &session.compiler_process_environment_identity,
         &session.execution_contract,
       ),
       session.identity
@@ -3700,9 +4346,7 @@ pub(crate) mod tests {
       identity(
         &session.capability_identity,
         &digest(b"changed-toolchain"),
-        &session.compiler_environment_identity,
-        &session.cargo_configuration_identity,
-        &session.resolution_identity,
+        &session.compiler_process_environment_identity,
         &session.execution_contract,
       ),
       session.identity
@@ -3712,8 +4356,6 @@ pub(crate) mod tests {
         &session.capability_identity,
         &session.toolchain_identity,
         &digest(b"changed-environment"),
-        &session.cargo_configuration_identity,
-        &session.resolution_identity,
         &session.execution_contract,
       ),
       session.identity
@@ -3722,31 +4364,7 @@ pub(crate) mod tests {
       identity(
         &session.capability_identity,
         &session.toolchain_identity,
-        &session.compiler_environment_identity,
-        &digest(b"changed-configuration"),
-        &session.resolution_identity,
-        &session.execution_contract,
-      ),
-      session.identity
-    );
-    assert_ne!(
-      identity(
-        &session.capability_identity,
-        &session.toolchain_identity,
-        &session.compiler_environment_identity,
-        &session.cargo_configuration_identity,
-        &digest(b"changed-resolution"),
-        &session.execution_contract,
-      ),
-      session.identity
-    );
-    assert_ne!(
-      identity(
-        &session.capability_identity,
-        &session.toolchain_identity,
-        &session.compiler_environment_identity,
-        &session.cargo_configuration_identity,
-        &session.resolution_identity,
+        &session.compiler_process_environment_identity,
         DIRECT_EXECUTION_CONTRACT,
       ),
       session.identity
@@ -3754,27 +4372,21 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn session_validation_rejects_an_uncertified_capability_even_with_a_consistent_identity() {
+  fn session_validation_accepts_any_exact_capability_identity() {
     let mut session = graduated_session(digest(b"source-root"));
-    session.capability_identity = digest(b"uncertified-capability");
+    let original_identity = session.identity.clone();
+    session.capability_identity = digest(b"different-exact-toolchain");
     session.identity = session_identity(
       &session.class,
       &session.capability_identity,
       &session.toolchain_identity,
-      &session.compiler_environment_identity,
-      &session.cargo_configuration_identity,
-      &session.resolution_identity,
+      &session.compiler_process_environment_identity,
       &session.execution_contract,
     )
     .expect("session identity");
 
-    let error = session
-      .validate_object()
-      .expect_err("uncertified capability must fail closed");
-    assert!(
-      error.to_string().contains("no matching capability certificate"),
-      "{error}"
-    );
+    assert_ne!(session.identity, original_identity);
+    session.validate_object().expect("exact toolchain identity");
   }
 
   #[test]
@@ -3793,9 +4405,7 @@ pub(crate) mod tests {
         cargo_version: "cargo 1.97.1 (test)\n",
         toolchain_fingerprint: &digest(b"toolchain"),
         capability_identity: &digest(b"capability"),
-        compiler_env_fingerprint: &digest(b"environment"),
-        cargo_config_fingerprint: &digest(b"configuration"),
-        lock_fingerprint: &digest(b"lock"),
+        compiler_process_env_fingerprint: &digest(b"environment"),
         wrapper_plan: plan,
         setup_bytes_hashed: 0,
         retain_event_evidence: false,
@@ -3828,25 +4438,46 @@ pub(crate) mod tests {
       (
         "second.json",
         NativeCacheEvent {
-          version: 1,
+          version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Hit,
           reason: "verified_local_result",
           candidate_key: Some("native-candidate-v1-sha256:bbbb"),
           action_key: Some("native-action-v1-sha256:2222"),
           bytes_hashed: 20,
+          cache_bytes_read: 40,
+          cache_bytes_written: 0,
           bytes_restored: 30,
+          wrapper_trace: None,
         },
       ),
       (
         "first.json",
         NativeCacheEvent {
-          version: 1,
+          version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Miss,
           reason: "stored_verified_result",
           candidate_key: Some("native-candidate-v1-sha256:aaaa"),
           action_key: Some("native-action-v1-sha256:1111"),
           bytes_hashed: 10,
+          cache_bytes_read: 0,
+          cache_bytes_written: 50,
           bytes_restored: 0,
+          wrapper_trace: None,
+        },
+      ),
+      (
+        "old.json",
+        NativeCacheEvent {
+          version: NATIVE_CACHE_RUN_EVENT_VERSION - 1,
+          status: CompilerCacheWrapperStatus::Hit,
+          reason: "obsolete_run_event",
+          candidate_key: None,
+          action_key: None,
+          bytes_hashed: u64::MAX,
+          cache_bytes_read: u64::MAX,
+          cache_bytes_written: u64::MAX,
+          bytes_restored: u64::MAX,
+          wrapper_trace: None,
         },
       ),
     ] {
@@ -3863,6 +4494,8 @@ pub(crate) mod tests {
     assert_eq!(report.misses, 1);
     assert_eq!(report.setup_bytes_hashed, 40);
     assert_eq!(report.bytes_hashed, 30);
+    assert_eq!(report.cache_bytes_read, 40);
+    assert_eq!(report.cache_bytes_written, 50);
     assert_eq!(report.bytes_restored, 30);
     assert_eq!(report.events.len(), 2);
     assert_eq!(report.events[0].schema_version, NATIVE_CACHE_EVENT_EVIDENCE_VERSION);
@@ -3877,7 +4510,10 @@ pub(crate) mod tests {
       unit.descriptor.crate_root,
       Some(ObservationPath::Repository("src/lib.rs".to_string()))
     );
-    assert_eq!(unit.identity_inputs.compiler_arguments, observation.compiler_arguments);
+    assert_eq!(
+      unit.identity_inputs,
+      native_cache_identity_inputs(&observation).expect("event identity inputs")
+    );
     assert_eq!(
       unit.output_paths,
       observation
@@ -4010,6 +4646,134 @@ pub(crate) mod tests {
       .compiler_arguments
       .extend(["--cap-lints".to_string(), "allow".to_string()]);
     assert_changed(flags, "flags");
+  }
+
+  #[test]
+  fn output_and_dependency_directories_do_not_partition_candidate_identity() {
+    let session = graduated_session(digest(b"source-root"));
+    let mut first = graduated_observation();
+    first.compiler_arguments.extend([
+      "--extern".to_string(),
+      "dep=target-one/debug/deps/libdep-0123456789abcdef.rmeta".to_string(),
+      "-Ldependency=target-one/debug/deps".to_string(),
+    ]);
+    for argument in &mut first.compiler_arguments {
+      if argument == "target/debug/deps" {
+        *argument = "target-one/debug/deps".to_string();
+      }
+    }
+    first.dependency_artifacts.push((
+      "dep".to_string(),
+      observed_file("target-one/debug/deps/libdep-0123456789abcdef.rmeta", b"dependency"),
+    ));
+    let mut second = first.clone();
+    second.compiler_arguments = second
+      .compiler_arguments
+      .into_iter()
+      .map(|argument| argument.replace("target-one", "target-two"))
+      .collect();
+    second.dependency_artifacts[0].1.path =
+      ObservationPath::Repository("target-two/debug/deps/libdep-0123456789abcdef.rmeta".to_string());
+
+    let first_key = candidate_key(&session.identity, &session.class, &first).expect("first candidate");
+    assert_eq!(
+      candidate_key(&session.identity, &session.class, &second).expect("second candidate"),
+      first_key
+    );
+
+    let mut external_search = first.clone();
+    external_search
+      .compiler_arguments
+      .push("-Ldependency=/outside/native-cache-search-one".to_string());
+    let mut changed_external_search = external_search.clone();
+    *changed_external_search
+      .compiler_arguments
+      .last_mut()
+      .expect("external search") = "-Ldependency=/outside/native-cache-search-two".to_string();
+    assert_ne!(
+      candidate_key(&session.identity, &session.class, &external_search).expect("first external search candidate"),
+      candidate_key(&session.identity, &session.class, &changed_external_search)
+        .expect("changed external search candidate"),
+      "only Cargo's exact output directory may be erased from dependency search identity"
+    );
+
+    second.dependency_artifacts[0].1.content_digest = digest(b"changed dependency");
+    assert_ne!(
+      candidate_key(&session.identity, &session.class, &second).expect("changed dependency candidate"),
+      first_key
+    );
+  }
+
+  #[test]
+  fn dep_info_materialization_rebinds_only_verified_output_paths() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let validation = graduated_validation(graduated_observation());
+    let output_directory = source_root.path().join("build-two/debug/deps");
+    let outputs = NativeOutputPaths {
+      dep_info: output_directory.join("fixture-0123456789abcdef.d"),
+      metadata: output_directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
+    let portable = b"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta: src/lib.rs\n";
+    let translated = translate_dep_info_output_bindings(portable, &validation, &outputs, source_root.path())
+      .expect("portable dep-info");
+    assert_eq!(
+      translated,
+      b"build-two/debug/deps/libfixture-0123456789abcdef.rmeta: src/lib.rs\n"
+    );
+
+    let windows_stream =
+      br#"{"artifact":"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta","emit":"metadata"}"#;
+    let translated_stream =
+      translate_output_binding_bytes(windows_stream, &validation, &outputs, source_root.path(), false)
+        .expect("Windows mixed-separator stream");
+    assert_eq!(
+      translated_stream,
+      br#"{"artifact":"build-two/debug/deps/libfixture-0123456789abcdef.rmeta","emit":"metadata"}"#
+    );
+
+    let generated =
+      b"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta: /cargo-rail/native-output/out/generated.rs\n";
+    translate_dep_info_output_bindings(generated, &validation, &outputs, source_root.path())
+      .expect_err("unmodeled output-directory inputs must not be rebound");
+  }
+
+  #[test]
+  fn stream_output_paths_use_canonical_tokens_on_windows() {
+    let absolute = r"C:\Users\builder\workspace\build-one\debug\deps\libfixture.rmeta";
+    let portable = "/cargo-rail/native-output/libfixture.rmeta";
+    let mut stream =
+      br#"{"artifact":"C:\\Users\\builder\\workspace\\build-one\\debug\\deps\\libfixture.rmeta"}"#.to_vec();
+    for (stored, portable) in canonical_output_path_replacements(absolute, portable) {
+      stream = replace_bytes(&stream, &stored, &portable).0;
+    }
+    assert_eq!(stream, br#"{"artifact":"/cargo-rail/native-output/libfixture.rmeta"}"#);
+  }
+
+  #[test]
+  fn dep_info_cas_bytes_do_not_depend_on_cargo_output_directory() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let output_paths = |directory: &str| {
+      let directory = source_root.path().join(directory);
+      NativeOutputPaths {
+        dep_info: directory.join("fixture-0123456789abcdef.d"),
+        metadata: directory.join("libfixture-0123456789abcdef.rmeta"),
+        rlib: None,
+      }
+    };
+    let first = portable_dep_info_output_bindings(
+      b"build-one/debug/deps/libfixture-0123456789abcdef.rmeta: src/lib.rs\n",
+      &output_paths("build-one/debug/deps"),
+      source_root.path(),
+    )
+    .expect("first portable dep-info");
+    let second = portable_dep_info_output_bindings(
+      b"build-two/debug/deps/libfixture-0123456789abcdef.rmeta: src/lib.rs\n",
+      &output_paths("build-two/debug/deps"),
+      source_root.path(),
+    )
+    .expect("second portable dep-info");
+    assert_eq!(first, second);
   }
 
   #[test]

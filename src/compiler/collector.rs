@@ -4,8 +4,9 @@ use crate::build_script::{
   BuildScriptActionInputs, BuildScriptCargoOutputSummary, BuildScriptResultInputs,
   analyze_action_key as analyze_build_script_action_key, analyze_result as analyze_build_script_result,
 };
-use crate::cargo::DepKind;
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
+use crate::cargo::resolution::{ResolutionInputs, capture_target_identities};
+use crate::cargo::{CargoConfigSnapshot, DepKind, ToolchainIdentity};
 use crate::compiler::diagnostics_store::CompilerDiagnosticsStore;
 use crate::compiler::model::{
   AnalysisConfiguration, COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId,
@@ -15,7 +16,7 @@ use crate::compiler::model::{
 use crate::compiler::native_cache::{
   DIAGNOSTIC_EXECUTION_CONTRACT, DirectCacheBypass, DirectNativeCacheIdentity, DirectNativeCacheSetup,
   NativeCompilerSession, SESSION_ENV, direct_cache_bypass_reason, direct_target_configuration_bypass_reason,
-  direct_toolchain_coherence_bypass_reason, prepare_direct_cargo_cache,
+  prepare_direct_cargo_cache,
 };
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
@@ -29,7 +30,7 @@ use crate::compiler::wrapper::{
 };
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::hermetic::cas::LocalCas;
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
@@ -40,7 +41,7 @@ use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,7 @@ pub(crate) struct CompilerCacheIdentity {
   lock_fingerprint: String,
   compiler_env_fingerprint: String,
   cargo_config_fingerprint: String,
+  native_compiler_process_env_fingerprint: String,
   cargo_program: OsString,
   rustc_workspace_wrapper: Option<OsString>,
   manifest_fingerprints: HashMap<PackageId, String>,
@@ -105,7 +107,7 @@ struct BuildScriptPackageContext {
   working_directory: String,
 }
 
-/// Exact, root-independent identity considered for native-cache graduation.
+/// Exact, root-independent toolchain identity used by native-cache keys.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeToolchainCapability {
   schema_version: u32,
@@ -121,8 +123,6 @@ pub(crate) struct NativeToolchainCapability {
   rustdoc_content_digest: String,
   sysroot_identity: String,
   identity: String,
-  certified: bool,
-  evidence: Option<String>,
 }
 
 impl NativeToolchainCapability {
@@ -136,14 +136,6 @@ impl NativeToolchainCapability {
 
   pub(crate) fn identity(&self) -> &str {
     &self.identity
-  }
-
-  pub(crate) const fn is_certified(&self) -> bool {
-    self.certified
-  }
-
-  pub(crate) fn evidence(&self) -> Option<&str> {
-    self.evidence.as_deref()
   }
 }
 
@@ -205,27 +197,17 @@ impl CompilerCacheIdentity {
       snapshot.toolchain().rustc_workspace_wrapper_program(),
     );
     let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
-    let mut native_cache_bypass_reason = direct_toolchain_coherence_bypass_reason(
-      snapshot.toolchain().cargo_verbose_version(),
-      snapshot.toolchain().rustc_verbose_version(),
-      snapshot.toolchain().rustdoc_verbose_version(),
-    )
-    .or_else(|| direct_target_configuration_bypass_reason(snapshot.targets()))
-    .or_else(|| cache_bypass_reason.map(CompilerCacheBypass::direct))
-    .or_else(|| {
-      direct_cache_bypass_reason(
-        snapshot.toolchain().rustc_verbose_version(),
-        snapshot.toolchain().cargo_verbose_version(),
-        cache_wrapper_plan,
-      )
-    });
+    let mut native_cache_bypass_reason = direct_target_configuration_bypass_reason(snapshot.targets())
+      .or_else(|| native_cargo_configuration_bypass_reason(snapshot.cargo_config()))
+      .or_else(|| {
+        cache_bypass_reason
+          .filter(|reason| *reason != CompilerCacheBypass::CargoConfiguration)
+          .map(CompilerCacheBypass::direct)
+      })
+      .or_else(|| direct_cache_bypass_reason(cache_wrapper_plan));
     let native_capability = if native_cache_bypass_reason.is_none() {
-      match capture_native_toolchain_capability(snapshot, executables) {
-        Ok(capability) if capability.report.is_certified() => Some(capability),
-        Ok(_) => {
-          native_cache_bypass_reason = Some(DirectCacheBypass::CapabilityNotCertified);
-          None
-        }
+      match capture_native_toolchain_capability(snapshot.toolchain(), executables) {
+        Ok(capability) => Some(capability),
         Err(_) => {
           native_cache_bypass_reason = Some(DirectCacheBypass::CapabilityUnavailable);
           None
@@ -235,7 +217,7 @@ impl CompilerCacheIdentity {
       None
     };
     let (toolchain_fingerprint, _) = executable_toolchain_fingerprint(
-      snapshot,
+      snapshot.toolchain(),
       executables,
       &cargo_rail_executable,
       cache_wrapper_plan,
@@ -247,8 +229,9 @@ impl CompilerCacheIdentity {
       .map(|capability| capability.report.identity().to_string());
     let target_fingerprints = target_fingerprints(snapshot)?;
     let lock_fingerprint = snapshot.lockfile_fingerprint();
-    let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
-    let cargo_config_fingerprint = cargo_config_fingerprint(snapshot)?;
+    let compiler_env_fingerprint = compiler_env_fingerprint(snapshot.cargo_config())?;
+    let cargo_config_fingerprint = cargo_config_fingerprint(snapshot.cargo_config(), snapshot.source_root())?;
+    let native_compiler_process_env_fingerprint = native_compiler_process_env_fingerprint(snapshot.cargo_config())?;
     let cargo_program = snapshot.toolchain().cargo_program().to_owned();
     let rustc_workspace_wrapper = snapshot
       .toolchain()
@@ -316,6 +299,7 @@ impl CompilerCacheIdentity {
       lock_fingerprint,
       compiler_env_fingerprint,
       cargo_config_fingerprint,
+      native_compiler_process_env_fingerprint,
       cargo_program,
       rustc_workspace_wrapper,
       manifest_fingerprints,
@@ -342,39 +326,65 @@ pub(crate) fn prepare_direct_cargo_action(
   snapshot: &WorkspaceSnapshot,
   retain_event_evidence: bool,
 ) -> RailResult<DirectNativeCacheSetup> {
-  let toolchain = snapshot.toolchain();
-  let wrapper_plan = CacheWrapperPlan::for_chain(
-    toolchain.rustc_wrapper_program(),
-    toolchain.rustc_workspace_wrapper_program(),
-  );
-  if let Some(reason) = direct_toolchain_coherence_bypass_reason(
-    toolchain.cargo_verbose_version(),
-    toolchain.rustc_verbose_version(),
-    toolchain.rustdoc_verbose_version(),
-  ) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if !snapshot.cargo_config().unmodeled_settings().is_empty() {
-    return Ok(DirectNativeCacheSetup::Bypassed(DirectCacheBypass::CargoConfiguration));
-  }
-  if let Some(reason) = direct_target_configuration_bypass_reason(snapshot.targets()) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if let Some(reason) = direct_cache_bypass_reason(
-    toolchain.rustc_verbose_version(),
-    toolchain.cargo_verbose_version(),
-    wrapper_plan,
-  ) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if !snapshot
+  let has_eligible_library_units = snapshot
     .base_resolution()
     .metadata()
     .packages
     .iter()
     .flat_map(|package| &package.targets)
-    .any(|target| target.kind.contains(&TargetKind::Lib))
-  {
+    .any(|target| target.kind.contains(&TargetKind::Lib));
+  prepare_direct_cargo_action_from_inputs(
+    snapshot.source_root(),
+    snapshot.cargo_config(),
+    snapshot.toolchain(),
+    snapshot.targets(),
+    has_eligible_library_units,
+    retain_event_evidence,
+  )
+}
+
+/// Prepare native reuse from the narrow authority required by one exact
+/// all-workspace Cargo action.
+pub(crate) fn prepare_pre_context_direct_cargo_action(
+  source_root: &Path,
+  inputs: &ResolutionInputs,
+  has_eligible_library_units: bool,
+  retain_event_evidence: bool,
+) -> RailResult<DirectNativeCacheSetup> {
+  let targets = capture_target_identities(source_root, &[], inputs)?;
+  prepare_direct_cargo_action_from_inputs(
+    source_root,
+    &inputs.cargo_config,
+    &inputs.toolchain,
+    &targets,
+    has_eligible_library_units,
+    retain_event_evidence,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_direct_cargo_action_from_inputs(
+  source_root: &Path,
+  cargo_config: &CargoConfigSnapshot,
+  toolchain: &ToolchainIdentity,
+  targets: &[crate::cargo::TargetIdentity],
+  has_eligible_library_units: bool,
+  retain_event_evidence: bool,
+) -> RailResult<DirectNativeCacheSetup> {
+  let wrapper_plan = CacheWrapperPlan::for_chain(
+    toolchain.rustc_wrapper_program(),
+    toolchain.rustc_workspace_wrapper_program(),
+  );
+  if let Some(reason) = native_cargo_configuration_bypass_reason(cargo_config) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
+  if let Some(reason) = direct_target_configuration_bypass_reason(targets) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
+  if let Some(reason) = direct_cache_bypass_reason(wrapper_plan) {
+    return Ok(DirectNativeCacheSetup::Bypassed(reason));
+  }
+  if !has_eligible_library_units {
     return Ok(DirectNativeCacheSetup::Bypassed(
       DirectCacheBypass::NoEligibleLibraryUnits,
     ));
@@ -382,19 +392,15 @@ pub(crate) fn prepare_direct_cargo_action(
 
   let current_executable =
     std::env::current_exe().with_context(|| "locating cargo-rail compiler-cache wrapper".to_string())?;
-  let cargo_rail_executable = ExecutableIdentity::capture(
-    current_executable.as_os_str(),
-    snapshot.source_root(),
-    snapshot.source_root(),
+  let cargo_rail_executable = ExecutableIdentity::capture(current_executable.as_os_str(), source_root, source_root)?;
+  let executables = ToolchainExecutableIdentities::capture(
+    toolchain,
+    source_root,
+    source_root,
+    ToolchainExecutableScope::Compilation,
   )?;
-  let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-  let native_capability = match capture_native_toolchain_capability(snapshot, executables) {
-    Ok(capability) if capability.report.is_certified() => capability,
-    Ok(_) => {
-      return Ok(DirectNativeCacheSetup::Bypassed(
-        DirectCacheBypass::CapabilityNotCertified,
-      ));
-    }
+  let native_capability = match capture_native_toolchain_capability(toolchain, &executables) {
+    Ok(capability) => capability,
     Err(_) => {
       return Ok(DirectNativeCacheSetup::Bypassed(
         DirectCacheBypass::CapabilityUnavailable,
@@ -402,25 +408,21 @@ pub(crate) fn prepare_direct_cargo_action(
     }
   };
   let (toolchain_fingerprint, setup_bytes_hashed) = executable_toolchain_fingerprint(
-    snapshot,
-    executables,
+    toolchain,
+    &executables,
     &cargo_rail_executable,
     wrapper_plan,
     None,
     Some(&native_capability),
   )?;
-  let compiler_env_fingerprint = compiler_env_fingerprint(snapshot)?;
-  let cargo_config_fingerprint = cargo_config_fingerprint(snapshot)?;
-  let lock_fingerprint = snapshot.lockfile_fingerprint();
+  let compiler_process_env_fingerprint = native_compiler_process_env_fingerprint(cargo_config)?;
 
   Ok(prepare_direct_cargo_cache(DirectNativeCacheIdentity {
-    source_root: snapshot.source_root(),
+    source_root,
     rustc_version: toolchain.rustc_verbose_version(),
     cargo_version: toolchain.cargo_verbose_version(),
     toolchain_fingerprint: &toolchain_fingerprint,
-    compiler_env_fingerprint: &compiler_env_fingerprint,
-    cargo_config_fingerprint: &cargo_config_fingerprint,
-    lock_fingerprint: &lock_fingerprint,
+    compiler_process_env_fingerprint: &compiler_process_env_fingerprint,
     capability_identity: native_capability.report.identity(),
     wrapper_plan,
     setup_bytes_hashed,
@@ -954,9 +956,10 @@ fn run_workspace_check(
   let native_cache_enabled =
     identity.cache_wrapper_plan.installs_cargo_rail() && identity.native_cache_bypass_reason.is_none();
   let native_cache_session = if native_cache_enabled {
-    let capability_identity = identity.native_cache_capability_identity.as_deref().ok_or_else(|| {
-      RailError::message("native cache is enabled without a captured toolchain capability certificate")
-    })?;
+    let capability_identity = identity
+      .native_cache_capability_identity
+      .as_deref()
+      .ok_or_else(|| RailError::message("native cache is enabled without a captured exact toolchain identity"))?;
     Some(
       NativeCompilerSession::write(
         observation_directory.path(),
@@ -965,9 +968,7 @@ fn run_workspace_check(
         &identity.cargo_version,
         capability_identity,
         &identity.toolchain_fingerprint,
-        &identity.compiler_env_fingerprint,
-        &identity.cargo_config_fingerprint,
-        &identity.lock_fingerprint,
+        &identity.native_compiler_process_env_fingerprint,
         DIAGNOSTIC_EXECUTION_CONTRACT,
       )
       .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable")),
@@ -1472,14 +1473,14 @@ fn reconcile_exact_artifact_observations(
   }
 }
 
-/// Capture the exact native-cache capability candidate for operator inspection.
+/// Capture the exact native-cache toolchain identity for operator inspection.
 pub(crate) fn native_cache_capability(snapshot: &WorkspaceSnapshot) -> RailResult<NativeToolchainCapability> {
   let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-  Ok(capture_native_toolchain_capability(snapshot, executables)?.report)
+  Ok(capture_native_toolchain_capability(snapshot.toolchain(), executables)?.report)
 }
 
 fn capture_native_toolchain_capability(
-  snapshot: &WorkspaceSnapshot,
+  toolchain: &ToolchainIdentity,
   executables: &ToolchainExecutableIdentities,
 ) -> RailResult<CapturedNativeToolchainCapability> {
   fn implementation_digest<'a>(executable: Option<&'a ExecutableIdentity>, name: &str) -> RailResult<&'a str> {
@@ -1490,7 +1491,6 @@ fn capture_native_toolchain_capability(
     })
   }
 
-  let toolchain = snapshot.toolchain();
   let platform = format!(
     "{}-{}-{}",
     std::env::consts::FAMILY,
@@ -1537,10 +1537,6 @@ fn capture_native_toolchain_capability(
   append_identity_frame(&mut framed, b"rustdoc-content", rustdoc_content_digest.as_bytes());
   append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
   let identity = format!("sha256:{}", ContentDigest::sha256(&framed));
-  let evidence =
-    crate::compiler::native_cache::native_cache_capability_evidence(&platform, toolchain.host_target(), &identity)
-      .map(str::to_string);
-
   Ok(CapturedNativeToolchainCapability {
     report: NativeToolchainCapability {
       schema_version: crate::compiler::native_cache::native_cache_capability_schema_version(),
@@ -1556,28 +1552,25 @@ fn capture_native_toolchain_capability(
       rustdoc_content_digest,
       sysroot_identity,
       identity,
-      certified: evidence.is_some(),
-      evidence,
     },
     bytes_hashed,
   })
 }
 
 fn executable_toolchain_fingerprint(
-  snapshot: &WorkspaceSnapshot,
+  toolchain: &ToolchainIdentity,
   executables: &ToolchainExecutableIdentities,
   cargo_rail_executable: &ExecutableIdentity,
   cache_wrapper_plan: CacheWrapperPlan,
   cache_bypass_reason: Option<&'static str>,
   native_capability: Option<&CapturedNativeToolchainCapability>,
 ) -> RailResult<(String, u64)> {
-  let toolchain = snapshot.toolchain();
   let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
   append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
   let native_cache_enabled = cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none();
   if native_cache_enabled && native_capability.is_none() {
     return Err(RailError::message(
-      "native cache cannot activate without a toolchain capability certificate",
+      "native cache cannot activate without an exact toolchain identity",
     ));
   }
   let setup_bytes_hashed = native_capability.map_or(0, |capability| capability.bytes_hashed);
@@ -1629,24 +1622,24 @@ fn executable_toolchain_fingerprint(
   Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), setup_bytes_hashed))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const SYSROOT_MEMO_VERSION: u32 = 2;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_SYSROOT_MEMO_BYTES: u64 = 4 * 1024 * 1024;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_GENERATION_IDENTIFIER_BYTES: usize = 256;
 const MAX_SYSROOT_FILES: usize = 4096;
 const MAX_SYSROOT_BYTES: u64 = 1024 * 1024 * 1024;
 
 struct CompilerSysrootInventory {
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   root: PathBuf,
   files: Vec<(String, PathBuf)>,
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   evidence_locations: Vec<SysrootEvidenceLocation>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SysrootEvidenceKind {
@@ -1654,14 +1647,14 @@ enum SysrootEvidenceKind {
   File,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct SysrootEvidenceLocation {
   kind: SysrootEvidenceKind,
   relative_path: String,
   physical_path: PathBuf,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SysrootChangeEvidence {
@@ -1670,14 +1663,14 @@ struct SysrootChangeEvidence {
   generation_identifier: Vec<u8>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExactSysrootEvidence {
   volume_identifier: Vec<u8>,
   entries: Vec<SysrootChangeEvidence>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SysrootIdentityMemo {
@@ -1690,7 +1683,7 @@ struct SysrootIdentityMemo {
   memo_digest: String,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn compiler_sysroot_memo_path(sysroot: &Path, host_target: &str) -> Option<PathBuf> {
   let sysroot = crate::utils::canonicalize_existing(sysroot).ok()?;
   let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-location-v1\0"[..]);
@@ -1700,7 +1693,7 @@ fn compiler_sysroot_memo_path(sysroot: &Path, host_target: &str) -> Option<PathB
   LocalCas::open().ok().map(|cas| cas.sysroot_identity_memo_path(&lookup))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn compiler_sysroot_memo_path(_sysroot: &Path, _host_target: &str) -> Option<PathBuf> {
   None
 }
@@ -1713,7 +1706,7 @@ fn compiler_sysroot_fingerprint(
   let _sysroot_fingerprinting_phase = crate::instrumentation::sysroot_fingerprinting_phase();
   let inventory = compiler_sysroot_inventory(sysroot, host_target)?;
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   if let Some(memo_path) = memo_path
     && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, host_target)
     && let Some(before) = capture_exact_sysroot_evidence(&inventory)
@@ -1724,13 +1717,13 @@ fn compiler_sysroot_fingerprint(
     return Ok((memo.fingerprint, 0));
   }
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   let before = memo_path.and_then(|_| capture_exact_sysroot_evidence(&inventory));
-  #[cfg(not(target_os = "macos"))]
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
   let _ = memo_path;
   let fingerprint = hash_compiler_sysroot(&inventory)?;
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   if let (Some(memo_path), Some(before)) = (memo_path, before)
     && let Ok(after_inventory) = compiler_sysroot_inventory(sysroot, host_target)
     && inventory.files == after_inventory.files
@@ -1816,7 +1809,7 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
     })
     .collect::<RailResult<Vec<_>>>()?;
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   let evidence_locations = {
     let mut locations = vec![
       evidence_location(&sysroot, &sysroot, SysrootEvidenceKind::Directory)?,
@@ -1846,10 +1839,10 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
   };
 
   Ok(CompilerSysrootInventory {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     root: sysroot,
     files,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     evidence_locations,
   })
 }
@@ -1920,7 +1913,7 @@ fn hash_compiler_sysroot(inventory: &CompilerSysrootInventory) -> RailResult<(St
   Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), total))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn evidence_location(sysroot: &Path, path: &Path, kind: SysrootEvidenceKind) -> RailResult<SysrootEvidenceLocation> {
   Ok(SysrootEvidenceLocation {
     kind,
@@ -1954,6 +1947,51 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
   })
 }
 
+#[cfg(target_os = "linux")]
+fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Option<ExactSysrootEvidence> {
+  use std::os::unix::fs::MetadataExt as _;
+
+  let root = std::fs::symlink_metadata(&inventory.root).ok()?;
+  if !root.is_dir() || crate::utils::is_symlink_or_reparse(&root) {
+    return None;
+  }
+  let volume_identifier = root.dev().to_le_bytes().to_vec();
+  let mut entries = Vec::with_capacity(inventory.evidence_locations.len());
+  for location in &inventory.evidence_locations {
+    let metadata = std::fs::symlink_metadata(&location.physical_path).ok()?;
+    let valid_kind = match location.kind {
+      SysrootEvidenceKind::Directory => metadata.is_dir(),
+      SysrootEvidenceKind::File => metadata.is_file(),
+    };
+    if !valid_kind || crate::utils::is_symlink_or_reparse(&metadata) {
+      return None;
+    }
+    let mut generation_identifier = Vec::from(&b"linux-stat-v1\0"[..]);
+    for value in [
+      metadata.dev(),
+      metadata.ino(),
+      metadata.mode() as u64,
+      metadata.nlink(),
+      metadata.size(),
+      metadata.mtime() as u64,
+      metadata.mtime_nsec() as u64,
+      metadata.ctime() as u64,
+      metadata.ctime_nsec() as u64,
+    ] {
+      generation_identifier.extend_from_slice(&value.to_le_bytes());
+    }
+    entries.push(SysrootChangeEvidence {
+      kind: location.kind,
+      relative_path: location.relative_path.clone(),
+      generation_identifier,
+    });
+  }
+  Some(ExactSysrootEvidence {
+    volume_identifier,
+    entries,
+  })
+}
+
 #[cfg(target_os = "macos")]
 fn foundation_resource_identifier(path: &Path, key: &str) -> Option<Vec<u8>> {
   let path = path.to_str()?;
@@ -1966,7 +2004,7 @@ fn foundation_resource_identifier(path: &Path, key: &str) -> Option<Vec<u8>> {
   (!bytes.is_empty() && bytes.len() <= MAX_GENERATION_IDENTIFIER_BYTES).then_some(bytes)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load_sysroot_identity_memo(
   path: &Path,
   inventory: &CompilerSysrootInventory,
@@ -2005,7 +2043,7 @@ fn load_sysroot_identity_memo(
   Some(memo)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_sysroot_identity_memo(
   path: &Path,
   inventory: &CompilerSysrootInventory,
@@ -2037,7 +2075,7 @@ fn publish_sysroot_identity_memo(
   }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sysroot_identity_memo_digest(memo: &SysrootIdentityMemo) -> String {
   let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-v2\0"[..]);
   append_identity_frame(&mut framed, b"version", &memo.version.to_le_bytes());
@@ -2060,7 +2098,7 @@ fn sysroot_identity_memo_digest(memo: &SysrootIdentityMemo) -> String {
   format!("sha256:{}", ContentDigest::sha256(&framed))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn valid_sha256_identity(identity: &str) -> bool {
   identity.strip_prefix("sha256:").is_some_and(|digest| {
     digest.len() == 64
@@ -2249,6 +2287,17 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
     .iter()
     .any(|package| package.source().is_some() && package.checksum().is_none())
     .then_some(CompilerCacheBypass::ExternalSourceDigest)
+}
+
+fn native_cargo_configuration_bypass_reason(cargo_config: &CargoConfigSnapshot) -> Option<DirectCacheBypass> {
+  let build = cargo_config
+    .effective_file_settings()
+    .get("build")
+    .and_then(serde_json::Value::as_object);
+  (!cargo_config.unmodeled_settings().is_empty()
+    || build.is_some_and(|build| build.contains_key("dep-info-basedir"))
+    || cargo_config.environment().contains_key("CARGO_BUILD_DEP_INFO_BASEDIR"))
+  .then_some(DirectCacheBypass::CargoConfiguration)
 }
 
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {
@@ -2541,17 +2590,13 @@ fn now_unix_ms() -> u64 {
     .unwrap_or(0)
 }
 
-fn compiler_env_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
+fn compiler_env_fingerprint(cargo_config: &CargoConfigSnapshot) -> RailResult<String> {
   let mut framed = Vec::from(&b"cargo-rail-native-compiler-environment-v2\0"[..]);
-  append_identity_frame(
-    &mut framed,
-    b"cargo",
-    &serde_json::to_vec(snapshot.cargo_config().environment())?,
-  );
+  append_identity_frame(&mut framed, b"cargo", &serde_json::to_vec(cargo_config.environment())?);
   let runtime = std::env::vars_os()
     .filter_map(|(name, value)| {
       let name = name.into_string().ok()?;
-      native_compiler_runtime_environment(&name).then(|| {
+      compiler_diagnostics_runtime_environment(&name).then(|| {
         (
           name,
           format!("sha256:{}", ContentDigest::sha256(value.as_encoded_bytes())),
@@ -2563,7 +2608,41 @@ fn compiler_env_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> 
   Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
 }
 
-fn native_compiler_runtime_environment(name: &str) -> bool {
+fn native_compiler_process_env_fingerprint(cargo_config: &CargoConfigSnapshot) -> RailResult<String> {
+  let configured = cargo_config
+    .effective_file_settings()
+    .get("env")
+    .and_then(serde_json::Value::as_object);
+  let names = std::env::vars_os()
+    .filter_map(|(name, _)| name.into_string().ok())
+    .chain(cargo_config.environment().keys().cloned())
+    .chain(
+      configured
+        .into_iter()
+        .flat_map(|environment| environment.keys().cloned()),
+    )
+    .filter(|name| native_compiler_process_environment(name))
+    .collect::<BTreeSet<_>>();
+  let mut runtime = BTreeMap::new();
+  for name in names {
+    let value = cargo_config
+      .effective_environment_value(&name)?
+      .or_else(|| std::env::var_os(&name));
+    runtime.insert(
+      name,
+      value
+        .as_deref()
+        .map(OsStr::as_encoded_bytes)
+        .map(ContentDigest::sha256)
+        .map(|digest| format!("sha256:{digest}")),
+    );
+  }
+  let mut framed = Vec::from(&b"cargo-rail-native-compiler-process-environment-v1\0"[..]);
+  append_identity_frame(&mut framed, b"runtime", &serde_json::to_vec(&runtime)?);
+  Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+}
+
+fn compiler_diagnostics_runtime_environment(name: &str) -> bool {
   matches!(
     name,
     "AR"
@@ -2605,14 +2684,47 @@ fn native_compiler_runtime_environment(name: &str) -> bool {
       .any(|suffix| name.ends_with(suffix))
 }
 
-fn cargo_config_fingerprint(snapshot: &WorkspaceSnapshot) -> RailResult<String> {
+fn native_compiler_process_environment(name: &str) -> bool {
+  matches!(
+    name,
+    "AR"
+      | "DEVELOPER_DIR"
+      | "DYLD_FALLBACK_LIBRARY_PATH"
+      | "DYLD_INSERT_LIBRARIES"
+      | "DYLD_LIBRARY_PATH"
+      | "IPHONEOS_DEPLOYMENT_TARGET"
+      | "LANG"
+      | "LC_ALL"
+      | "LC_CTYPE"
+      | "LD"
+      | "LDFLAGS"
+      | "LD_LIBRARY_PATH"
+      | "LD_PRELOAD"
+      | "MACOSX_DEPLOYMENT_TARGET"
+      | "PATH"
+      | "RANLIB"
+      | "RUSTC_BOOTSTRAP"
+      | "RUSTC_FORCE_INCREMENTAL"
+      | "RUSTC_LOG"
+      | "RUST_MIN_STACK"
+      | "SDKROOT"
+      | "SOURCE_DATE_EPOCH"
+      | "TVOS_DEPLOYMENT_TARGET"
+      | "VISIONOS_DEPLOYMENT_TARGET"
+      | "WATCHOS_DEPLOYMENT_TARGET"
+      | "ZERO_AR_DATE"
+  ) || ["AR_", "LC_", "RANLIB_", "RUSTC_"]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    || ["_AR", "_DEPLOYMENT_TARGET", "_RANLIB"]
+      .iter()
+      .any(|suffix| name.ends_with(suffix))
+}
+
+fn cargo_config_fingerprint(cargo_config: &CargoConfigSnapshot, source_root: &Path) -> RailResult<String> {
   Ok(format!(
     "sha256:{}",
-    ContentDigest::sha256(
-      &snapshot
-        .cargo_config()
-        .portable_snapshot_identity(snapshot.source_root())?
-    )
+    ContentDigest::sha256(&cargo_config.portable_snapshot_identity(source_root)?)
   ))
 }
 
@@ -2720,6 +2832,32 @@ fn is_relevant_target(target: &CargoTarget) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn native_session_environment_excludes_build_script_only_state() {
+    for name in [
+      "LD",
+      "PATH",
+      "RUSTC_BOOTSTRAP",
+      "SDKROOT",
+      "X86_64_UNKNOWN_LINUX_GNU_AR",
+    ] {
+      assert!(
+        native_compiler_process_environment(name),
+        "missing compiler state: {name}"
+      );
+    }
+    for name in ["BINDGEN_EXTRA_CLANG_ARGS", "CC", "CFLAGS", "CXX", "PKG_CONFIG_PATH"] {
+      assert!(
+        !native_compiler_process_environment(name),
+        "build-script-only state partitioned every native compiler unit: {name}"
+      );
+      assert!(
+        compiler_diagnostics_runtime_environment(name),
+        "diagnostic evidence still needs the broader environment: {name}"
+      );
+    }
+  }
 
   #[test]
   fn build_script_executable_comes_from_cargo_filenames() {
@@ -2970,7 +3108,7 @@ mod tests {
     assert_ne!(target_changed.0, driver_changed.0);
   }
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   #[test]
   fn compiler_sysroot_memo_requires_exact_content_generation_evidence() {
     let sysroot = tempfile::tempdir().expect("sysroot");
@@ -2980,7 +3118,10 @@ mod tests {
     std::fs::create_dir_all(&target_lib).expect("target lib");
     let target = target_lib.join("libcore-test.rlib");
     std::fs::write(&target, b"target-one").expect("target library");
+    #[cfg(target_os = "macos")]
     let driver = sysroot.path().join("lib/librustc_driver-test.dylib");
+    #[cfg(target_os = "linux")]
+    let driver = sysroot.path().join("lib/librustc_driver-test.so");
     std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
     std::fs::write(&driver, b"driver-one").expect("driver library");
 

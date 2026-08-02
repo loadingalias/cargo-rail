@@ -652,7 +652,7 @@ impl CargoConfigSnapshot {
     Ok(selected)
   }
 
-  fn effective_environment_value(&self, name: &str) -> RailResult<Option<OsString>> {
+  pub(crate) fn effective_environment_value(&self, name: &str) -> RailResult<Option<OsString>> {
     let configured = self
       .effective_file_settings
       .get("env")
@@ -1082,6 +1082,18 @@ pub(crate) struct ResolutionInputs {
 }
 
 impl ResolutionInputs {
+  pub(crate) fn capture_with_config(
+    cargo_current_dir: &Path,
+    cargo_config: Arc<CargoConfigSnapshot>,
+  ) -> RailResult<Self> {
+    let toolchain = ToolchainIdentity::capture(cargo_current_dir, &cargo_config)?;
+    Ok(Self {
+      cargo_config,
+      toolchain,
+      hermetic: false,
+    })
+  }
+
   pub(crate) fn capture_hermetic(cargo_current_dir: &Path) -> RailResult<Self> {
     Self::from_hermetic_config(
       cargo_current_dir,
@@ -1206,12 +1218,7 @@ impl ResolutionViews {
 
   pub(crate) fn capture_inputs(cargo_current_dir: &Path) -> RailResult<ResolutionInputs> {
     let cargo_config = Arc::new(CargoConfigSnapshot::capture(cargo_current_dir)?);
-    let toolchain = ToolchainIdentity::capture(cargo_current_dir, &cargo_config)?;
-    Ok(ResolutionInputs {
-      cargo_config,
-      toolchain,
-      hermetic: false,
-    })
+    ResolutionInputs::capture_with_config(cargo_current_dir, cargo_config)
   }
 
   pub(crate) fn inputs(&self) -> RailResult<ResolutionInputs> {
@@ -3055,6 +3062,7 @@ fn collect_unmodeled_build_settings(settings: &JsonMap<String, JsonValue>, unmod
     "rustflags",
     "target",
     "target-dir",
+    "warnings",
   ];
   if let Some(build) = settings.get("build").and_then(JsonValue::as_object) {
     for field in build.keys().filter(|field| !BUILD_FIELDS.contains(&field.as_str())) {

@@ -2307,7 +2307,7 @@ fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receip
 }
 
 #[test]
-fn test_doctor_native_cache_reports_the_exact_capability_as_one_json_value() -> Result<()> {
+fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_value() -> Result<()> {
   let ws = TestWorkspace::new_named("doctor-native-cache")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add native-cache doctor fixture")?;
@@ -2326,9 +2326,9 @@ fn test_doctor_native_cache_reports_the_exact_capability_as_one_json_value() -> 
   assert_eq!(report["exit_code"], 0);
 
   let capability = &report["capability"];
-  assert_eq!(capability["schema_version"], 1);
+  assert_eq!(capability["schema_version"], 2);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v2");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v3");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]
@@ -2340,7 +2340,8 @@ fn test_doctor_native_cache_reports_the_exact_capability_as_one_json_value() -> 
       .as_str()
       .is_some_and(|value| value.len() == 71 && value.starts_with("sha256:"))
   );
-  assert!(capability["certified"].is_boolean());
+  assert!(capability.get("certified").is_none());
+  assert!(capability.get("evidence").is_none());
   assert!(
     !ws.path.join("target/cargo-rail/receipts").exists(),
     "read-only native-cache diagnosis must not write a run receipt"
@@ -2581,7 +2582,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     );
 
     let counters: serde_json::Value = serde_json::from_slice(&fs::read(&hit_diagnostics)?)?;
-    assert_eq!(counters["schema_version"], 6);
+    assert_eq!(counters["schema_version"], 7);
     assert_eq!(
       counters["cargo_metadata_loads"], 0,
       "a cache hit must not execute Cargo metadata"

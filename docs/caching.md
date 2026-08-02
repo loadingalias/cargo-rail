@@ -1,10 +1,10 @@
 # Caching
 
 > Auto-generated from executable CI/release registries, native-cache production gates, reviewed qualification
-> manifests, and retained benchmark evidence. Do not edit manually.
+> manifests, and reviewed benchmark evidence. Do not edit manually.
 >
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `4`;
-> native-cache capability registry schema: `1`; qualification schema:
+> native-cache toolchain-identity schema: `2`; qualification schema:
 > `1`.
 
 Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
@@ -24,12 +24,14 @@ cold with a stable reason. **Fast when proven. Normal Cargo when not.**
 
 Native reuse is automatic for an ordinary `build` or `distribution` action when all of these are true:
 
-- the exact Cargo, rustc, rustdoc, sysroot, backend, host, and wrapper protocol has a certificate below;
+- Cargo-Rail can content-identify the exact Cargo, rustc, rustdoc, complete sysroot, host, and wrapper protocol;
 - the selected Cargo profile has no active fingerprints and neither the environment nor rustc forces incremental
   compilation;
-- no Cargo CLI `--config`, action-defined environment, sccache, or custom compiler wrapper changes the boundary; and
-- the invocation is an eligible dependency or workspace library with complete Rust inputs, dep-info, metadata,
-  optional rlib output, Rust-only dependency artifacts, and no linker responsibility.
+- no Cargo CLI `--config`, action-defined environment, unknown Cargo setting, `build.dep-info-basedir`, sccache, or
+  custom compiler wrapper changes the boundary; and
+- the invocation is an eligible dependency or workspace library with complete rustc-reported filesystem and
+  environment inputs, root-independent dep-info, metadata, optional rlib output, Rust-only dependency artifacts, and
+  no linker responsibility.
 
 ```bash
 cargo rail run --all --action build --explain
@@ -37,21 +39,37 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
+The reusable session binds toolchain, compiler class, wrapper protocol, capabilities, and compiler-process environment.
+It does not bind the complete Cargo configuration or `Cargo.lock`. Each compiler unit instead binds its exact rustc
+arguments and cfg, source inputs, dependency artifact contents, and rustc-reported filesystem and environment reads.
+Changes to `build.warnings`, jobs, build or target directories, network policy, registry settings, and unrelated
+lockfile entries can therefore reuse a result when those exact unit inputs remain unchanged. Rust flags, features,
+dependency contents, target, linker, sysroot, and observed inputs still change or reject reuse at their owning
+boundary.
+
+Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. A dep-info file that
+retains the physical workspace root as an input bypasses reuse because that input cannot be restored unchanged in
+another root. The CAS stores canonical internal tokens for verified dep-info and compiler-stream output paths, then
+binds them to Cargo's current output directory after verification. Output names and materialized bytes remain exact;
+any other cached reference to a previous output directory fails closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
-capability identity and certificate evidence without running a build. A missing certificate is a cold execution
-boundary, not a command failure. Existing wrappers remain in their selected order and Cargo-Rail does not add a second
-cache.
+toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
+`native_cache_capability_unavailable`. Existing wrappers remain in their selected order and Cargo-Rail does not add a
+second cache.
 
 For the exact normal all-workspace `build` and `distribution` shapes, an unambiguous active profile delegates the
 unchanged built-in Cargo action before metadata, Git, tool hashing, and action-key construction. Cargo configuration
 that makes the target location ambiguous, a non-workspace manifest, or an explicit incremental setting retains the
-captured planner/runner path. Delegation preserves ambient wrappers and records the bypass with an explicitly absent
-snapshot in the ordinary decision receipt.
+captured planner/runner path. An eligible clean profile uses one locked, no-dependencies Cargo metadata query to prove
+the workspace-library boundary, then enters the same verified compiler-result cache without capturing Git state or
+expanding the full action plan. Any ambiguity or acquisition failure falls back to the captured path. Both shortcuts
+preserve ambient wrappers and record their deliberately absent snapshot in the ordinary decision receipt.
 
 Default text mode emits one concise decision with `hits`, `misses`, `bypasses`, and `bytes_restored`, or the stable
-action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, the complete reason census, and
-per-unit evidence:
+action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, accounted verified-result
+`cache_bytes_read` and `cache_bytes_written` totals, the complete reason census, and per-unit evidence. Low-level I/O
+that fails without returning byte statistics is not inferred:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
 - `miss` means no candidate survived revalidation; successful cold output may populate the local CAS; and
@@ -114,23 +132,24 @@ alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
 ## Execution and reuse support
 
 Execution support, cache graduation, and performance qualification are independent. A cache bypass still executes
-Cargo normally. Native graduation is certificate-specific, not target-wide.
+Cargo normally. Native reuse is structural and exact-toolchain-keyed; benchmark qualification reports measured
+performance and is not an allowlist.
 
 ### Hosts and targets
 
 | Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache | Performance qualification |
 |---|---|---|---|---|---|
-| `aarch64-apple-darwin` | Advertised; full-suite CI required (`macos-15`) | — | Native artifact required | Graduated `library_metadata_rlib` (Cargo `1.97.1`, rustc `1.97.1`; 1 exact certificate) | Qualified: check + release-build; 88 accepted, 0 false hits |
-| `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Bypass: `native_cache_platform_not_graduated` | Not qualified |
-| `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Bypass: `native_cache_capability_not_certified` | Qualified: check + release-build; 110 accepted, 0 false hits |
+| `aarch64-apple-darwin` | Advertised; full-suite CI required (`macos-15`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Qualified: check + release-build; 88 accepted, 0 false hits |
+| `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Not qualified |
+| `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Qualified: check + release-build; 110 accepted, 0 false hits |
 | `aarch64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
 | `thumbv7em-none-eabihf` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
 | `wasm32-unknown-unknown` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
 | `wasm32-wasip1` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
 | `wasm32v1-none` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
-| `x86_64-apple-darwin` | Advertised; full-suite CI required (`macos-15-intel`) | — | Native artifact required | Bypass: `native_cache_platform_not_graduated` | Not qualified |
-| `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Bypass: `native_cache_capability_not_certified` | Not qualified |
-| `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Bypass: `native_cache_capability_not_certified` | Qualified: check + release-build; 110 accepted, 0 false hits |
+| `x86_64-apple-darwin` | Advertised; full-suite CI required (`macos-15-intel`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Not qualified |
+| `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Not qualified |
+| `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key | Qualified: check + release-build; 110 accepted, 0 false hits |
 | `x86_64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_not_graduated` | Not qualified |
 
 Linux musl rows are release cross-builds, not native Linux host evidence.
@@ -155,18 +174,18 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 
 | Platform | Target | Execution status | Cache status | Performance status |
 |---|---|---|---|---|
-| IBM Power | `powerpc64le-unknown-linux-gnu` | Pass-through target execution remains unqualified | `native_cache_platform_not_graduated` | Not qualified |
-| IBM Z | `s390x-unknown-linux-gnu` | Pass-through target execution remains unqualified | `native_cache_platform_not_graduated` | Not qualified |
+| IBM Power | `powerpc64le-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact toolchain identity is captured | Not qualified |
+| IBM Z | `s390x-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact toolchain identity is captured | Not qualified |
 
-IBM Power and IBM Z need native runners before Cargo-Rail can advertise compatibility, cache graduation, or performance
-qualification.
+IBM Power and IBM Z need native runners before Cargo-Rail can claim tested execution or performance. They are not
+excluded by a runtime platform allowlist.
 
 ### Linkers and codegen backends
 
 | Capability | Advertised non-default implementations | Current contract |
 |---|---|---|
-| Linker | None | Default, explicit-driver, and bundled host LLD pass-through are tested. Other selected linkers use `configured_linker_not_graduated`. |
-| Codegen backend | None | Stable LLVM and pinned-nightly Cranelift pass-through are tested. Other selected backends use `codegen_backend_not_graduated`. |
+| Linker | None | Default and bundled host linkers are tested. An explicitly configured linker keeps the complete action on Cargo's path until Cargo-Rail can preserve its exact argv and effects. |
+| Codegen backend | None | Bundled named backends are bound by the complete sysroot identity and compiler arguments. An external backend path bypasses until its executable bytes are content-identified. |
 
 Pass-through execution is not cache graduation. A non-default implementation needs a named compatibility fixture on
 every applicable native host before Cargo-Rail advertises it.
@@ -175,7 +194,7 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Graduated only for listed host/toolchain tuples | One declared crate root, complete observed Rust inputs, dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One declared crate root, complete dep-info-observed inputs, root-independent dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
 | Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
@@ -193,10 +212,31 @@ The fixture contains registry and Git dependencies, build scripts, a proc macro,
 a binary:
 
 ```bash
-just bench-native-cache 10
+just bench-native-cache
 ```
 
-The accepted local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
+The latest optimized Linux x86-64 screen used one complete interleaved group on an AWS `c8i.xlarge` with local
+sccache `0.16.0`, offline Cargo/rustc `1.97.1`, distinct seed/use roots, and clean target directories. All 20 available
+lane samples were accepted with no rejections or false hits. Warm Cargo-Rail restored 28 verified results per workload.
+
+| Final-candidate sample | Cargo-Rail warm | sccache 0.16.0 | Cargo-Rail difference |
+|---|---:|---:|---:|
+| Check wall time | 4.003 s | 4.777 s | 16.2% lower |
+| Check complete CPU | 12.855 s | 15.511 s | 17.1% lower |
+| Check peak RSS | 374,759,424 B | 1,076,908,032 B | 65.2% lower |
+| Release-build wall time | 6.302 s | 8.081 s | 22.0% lower |
+| Release-build complete CPU | 20.131 s | 23.464 s | 14.2% lower |
+| Release-build peak RSS | 406,233,088 B | 1,041,481,728 B | 61.0% lower |
+
+This is a one-sample same-machine comparison, not a p50/p95 distribution. The retained qualification corpus below
+records the broader historical host coverage and remains the authority for qualified targets.
+
+One local M1 Pro before/after group measured the narrower unit identity and removed redundant warm rehashing. Warm
+release-build input hashing fell from 105,219,083 to 68,903,107 bytes (34.5%); warm check input hashing fell from
+75,037,802 to 49,793,592 bytes (33.6%). Both groups completed with zero false hits. The single wall-time samples moved
+by +4.6% and +8.0%, so this evidence supports the hashing reduction and wider reuse boundary, not a latency claim.
+
+The retained local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
 `0.16.0` was unavailable, so all 88 available samples were accepted with no rejections or false hits, identical action
 censuses and output manifests, and 27 stable eligible units per workload. Every sample used offline Cargo/rustc
 `1.97.1`, a clean target, distinct seed/use roots, and a fresh copy of the populated cache. Native Cargo used
@@ -232,6 +272,7 @@ Windows x86-64 timing remains unqualified. Its latest partial run found reusable
 because two bypassed proc-macro consumers produced byte-unstable DLLs and PID reuse could overwrite evidence files.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
-wrappers, flags, exact action argv, clean-root method, p50/p95 for native/disabled/cold/warm lanes, hit and byte counts,
-all bypass reasons, and output portability findings. Retain at least ten accepted runs after warmup for each available
-lane, alternate lane order, preserve raw output, and never combine different commits, toolchains, targets, or policies.
+wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
+reasons, and output portability findings. Use one accepted interleaved group for a bounded engineering decision.
+Increase the sample count only for distribution or tail claims. Preserve raw output and never combine different
+commits, toolchains, targets, or policies.

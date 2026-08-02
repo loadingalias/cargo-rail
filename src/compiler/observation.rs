@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1288,7 +1289,23 @@ pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> Rail
     CompilerMode::Unknown => "compiler",
   };
   let path = directory.join(format!("{compiler}-{}.json", std::process::id()));
-  crate::utils::write_file_atomic(&path, &serde_json::to_vec(raw)?)
+  let encoded = serde_json::to_vec(raw)?;
+  // The parent owns this private temporary directory and reads it only after
+  // Cargo has joined every wrapper. Preserve atomic visibility, but do not pay
+  // durable mutation fsyncs for regenerable per-invocation evidence.
+  let mut temporary = tempfile::Builder::new()
+    .prefix(".cargo-rail-observation-")
+    .suffix(".tmp")
+    .tempfile_in(directory)?;
+  temporary.write_all(&encoded)?;
+  temporary.persist(&path).map_err(|error| {
+    RailError::message(format!(
+      "failed to publish compiler observation '{}': {}",
+      path.display(),
+      error.error
+    ))
+  })?;
+  Ok(())
 }
 
 /// Load all complete wrapper records from one private invocation directory.

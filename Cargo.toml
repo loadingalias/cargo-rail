@@ -20,7 +20,6 @@ include = [
     "/build.rs",
     "/src/**/*.rs",
     "/schemas/**",
-    "/distribution/native-cache-capabilities.json",
     "/tests/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -67,6 +66,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSURL",
     "std",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
 
 [dev-dependencies]
 anyhow = "1.0.104"

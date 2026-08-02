@@ -114,9 +114,12 @@ pub(crate) fn rustc_command(
 /// Returns `None` during normal cargo-rail CLI execution.
 #[must_use]
 pub fn run_if_requested() -> Option<i32> {
-  if let Some(context) = crate::compiler::native_cache::NativeCacheContext::from_direct_invocation() {
+  if let Some((context, started)) = crate::compiler::native_cache::NativeCacheContext::from_direct_invocation() {
     return Some(match context {
-      Ok(context) => run_cache_disabled(Some(context)),
+      Ok(context) => {
+        let trace = started.finish_context_load(context.captures_wrapper_diagnostics());
+        run_cache_disabled(Some(context), trace)
+      }
       Err(error) => {
         eprintln!("cargo-rail compiler cache wrapper: {error}");
         2
@@ -126,6 +129,7 @@ pub fn run_if_requested() -> Option<i32> {
   if std::env::var_os(CACHE_WRAPPER_MARKER).is_some() {
     return Some(run_cache_disabled(
       crate::compiler::native_cache::NativeCacheContext::from_environment(),
+      crate::instrumentation::NativeCacheWrapperTrace::disabled(),
     ));
   }
   if std::env::var_os(WRAPPER_MARKER).is_some() {
@@ -141,7 +145,10 @@ pub fn run_if_requested() -> Option<i32> {
   None
 }
 
-fn run_cache_disabled(context: Option<crate::compiler::native_cache::NativeCacheContext>) -> i32 {
+fn run_cache_disabled(
+  context: Option<crate::compiler::native_cache::NativeCacheContext>,
+  mut trace: crate::instrumentation::NativeCacheWrapperTrace,
+) -> i32 {
   if let Some(context) = context
     && let Err(error) = context.activate()
   {
@@ -156,11 +163,18 @@ fn run_cache_disabled(context: Option<crate::compiler::native_cache::NativeCache
   let arguments = args.collect::<Vec<_>>();
   let mut command = Command::new(&program);
   command.args(&arguments).env_remove(CACHE_WRAPPER_MARKER);
-  match crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command) {
+  match crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command, &mut trace) {
     crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
-    crate::compiler::native_cache::OuterCacheAction::Store(recorder) => {
-      crate::compiler::native_cache::run_and_store(command, recorder, "cargo-rail compiler cache wrapper")
-    }
+    crate::compiler::native_cache::OuterCacheAction::Store {
+      recorder,
+      cache_bytes_read,
+    } => crate::compiler::native_cache::run_and_store(
+      command,
+      recorder,
+      cache_bytes_read,
+      &mut trace,
+      "cargo-rail compiler cache wrapper",
+    ),
     crate::compiler::native_cache::OuterCacheAction::Execute => {
       run_transparently(command, "cargo-rail compiler cache wrapper")
     }

@@ -46,16 +46,18 @@ Use the doctor for the cache boundary you are testing:
 # Expanded action-key eligibility
 cargo rail doctor hermeticity --action build --format json
 
-# Exact native compiler-cache capability certificate
+# Exact native compiler-cache toolchain identity
 cargo rail doctor native-cache --format json
 
 # Compiler evidence used by unify
 cargo rail unify --check -f json
 ```
 
-For native reuse, inspect the run summary's hits, misses, bypasses, hashed/restored bytes, and stable reasons. A missing
-certificate, incremental compilation, an existing wrapper, an unsupported compiler class, or incomplete observed input
-executes cold; it is not a failed build.
+For native reuse, inspect the run summary's hits, misses, bypasses, hashed/restored bytes, and stable reasons. Failure
+to capture the exact toolchain identity, incremental compilation, an existing wrapper, an unsupported compiler class,
+or incomplete observed input executes normally; it is not a false cache hit. `root_bound_dep_info_not_graduated`
+means rustc's dep-info retained the physical checkout path, commonly through an `OUT_DIR` include, so the result cannot
+be restored byte-for-byte in another root.
 
 For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
 describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the
