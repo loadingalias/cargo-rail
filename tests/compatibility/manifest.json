@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "front_door_corpus": {
     "fixture": "tests/compatibility/fixtures/front-door",
     "runner": "scripts/ci/run-compatibility.py"
@@ -26,13 +26,6 @@
       "artifact": "rlib"
     }
   ],
-  "custom_target_json": {
-    "toolchain": "nightly-2026-07-17",
-    "target": "x86_64-unknown-linux-gnu",
-    "runner": "ubuntu-24.04",
-    "base_target": "wasm32-unknown-unknown",
-    "fixture": "tests/compatibility/fixtures/wasm32-unknown-unknown"
-  },
   "native_hosts": [
     {
       "target": "aarch64-apple-darwin",

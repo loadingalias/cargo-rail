@@ -47,9 +47,10 @@ tokens for verified dep-info and JSON compiler streams, then late-bind the curre
 verification while preserving Windows separators and escaping exactly. Remove the redundant pre-context lockfile hash,
 warm rehashing of already captured inputs, and the cold-path dep-info root scan. Strengthen compatibility and benchmark
 oracles to compare direct, disabled, cold, and warm output bytes without root-bound exclusions, and invalidate
-qualification evidence when the cache execution contract changes. Restore a real MSRV-to-stable compatibility matrix
-instead of testing the repository toolchain repeatedly. Also make the benchmark identity manifest valid when the
-repository has no untracked files.
+qualification evidence when the cache execution contract changes. Use the public MSRV as the repository and CI
+toolchain, preserving MSRV-native host, filesystem, cross-target, linker, and cache-correctness coverage without
+separate live stable, intermediate stable, beta, or nightly release gates. Also make the benchmark identity manifest
+valid when the repository has no untracked files.
 
 Decode rustc's Makefile-escaped dep-info environment values before hashing them, so Windows `OUT_DIR` and Cargo path
 dependencies compare against the exact compiler process environment instead of producing false warm misses. Require

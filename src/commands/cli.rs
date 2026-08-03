@@ -627,7 +627,7 @@ impl Commands {
       | Self::Sync { .. }
       | Self::Release { .. }
       | Self::Change { .. } => true,
-      Self::Plan { from, to, schema, .. } => !schema && !(from.is_some() && to.is_some()),
+      Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
       Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
       _ => false,
     }
@@ -639,7 +639,7 @@ impl Commands {
     match self {
       Self::Run { all, .. } => !all,
       Self::Doctor { .. } => false,
-      Self::Plan { from, to, schema, .. } => !schema && !(from.is_some() && to.is_some()),
+      Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
       Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
       _ => false,
     }

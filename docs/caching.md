@@ -3,7 +3,7 @@
 > Auto-generated from executable CI/release registries, native-cache production gates, reviewed qualification
 > manifests, and reviewed benchmark evidence. Do not edit manually.
 >
-> Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `4`;
+> Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `5`;
 > native-cache toolchain-identity schema: `3`; qualification schema:
 > `2`.
 

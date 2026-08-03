@@ -30,7 +30,7 @@ runs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
       with:
-        toolchain: 1.97.1
+        toolchain: 1.95.0
         components: clippy, rustfmt
 
     - name: Setup Rust Cache

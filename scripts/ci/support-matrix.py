@@ -93,15 +93,6 @@ class CrossTargetFixture:
 
 
 @dataclass(frozen=True)
-class CustomTargetJson:
-    toolchain: str
-    target: str
-    runner: str
-    base_target: str
-    fixture: str
-
-
-@dataclass(frozen=True)
 class DeferredHost:
     name: str
     target: str
@@ -113,33 +104,12 @@ class CompatibilityManifest:
     corpus_fixture: str
     corpus_runner: str
     cross_target_fixtures: tuple[CrossTargetFixture, ...]
-    custom_target_json: CustomTargetJson
     native_hosts: tuple[NativeHost, ...]
     filesystem_profiles: tuple[FilesystemProfile, ...]
     release_cross_targets: tuple[str, ...]
     deferred_hosts: tuple[DeferredHost, ...]
     alternate_linkers: tuple[dict[str, Any], ...]
     alternate_codegen_backends: tuple[dict[str, Any], ...]
-
-
-@dataclass(frozen=True, order=True)
-class RustRelease:
-    major: int
-    minor: int
-    patch: int
-
-    @classmethod
-    def parse(cls, value: str, path: str) -> RustRelease:
-        match = re.fullmatch(
-            r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value
-        )
-        require(
-            match is not None, f"{path} must be an exact major.minor.patch Rust release"
-        )
-        return cls(*(int(component) for component in match.groups()))
-
-    def __str__(self) -> str:
-        return f"{self.major}.{self.minor}.{self.patch}"
 
 
 def load_compatibility_manifest() -> CompatibilityManifest:
@@ -151,7 +121,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
             "schema_version",
             "front_door_corpus",
             "cross_target_corpus",
-            "custom_target_json",
             "native_hosts",
             "filesystem_profiles",
             "required_release_cross_targets",
@@ -161,7 +130,7 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         },
     )
     require(
-        raw["schema_version"] == 4, "compatibility manifest schema_version must be 4"
+        raw["schema_version"] == 5, "compatibility manifest schema_version must be 5"
     )
     corpus = require_object(
         raw["front_door_corpus"], "front_door_corpus", {"fixture", "runner"}
@@ -216,40 +185,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         "cross_target_corpus targets",
     )
 
-    custom_raw = require_object(
-        raw["custom_target_json"],
-        "custom_target_json",
-        {"toolchain", "target", "runner", "base_target", "fixture"},
-    )
-    custom_toolchain = require_string(
-        custom_raw["toolchain"], "custom_target_json.toolchain"
-    )
-    require(
-        re.fullmatch(r"nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}", custom_toolchain)
-        is not None,
-        "custom_target_json.toolchain must be a dated nightly",
-    )
-    custom_base_target = require_string(
-        custom_raw["base_target"], "custom_target_json.base_target"
-    )
-    custom_fixture = require_string(custom_raw["fixture"], "custom_target_json.fixture")
-    base_fixture = next(
-        (
-            fixture
-            for fixture in cross_target_fixtures
-            if fixture.target == custom_base_target
-        ),
-        None,
-    )
-    require(
-        base_fixture is not None,
-        "custom_target_json.base_target is not in cross_target_corpus",
-    )
-    require(
-        base_fixture.fixture == custom_fixture,
-        "custom_target_json.fixture disagrees with cross_target_corpus",
-    )
-
     native_hosts: list[NativeHost] = []
     require(
         isinstance(raw["native_hosts"], list) and raw["native_hosts"],
@@ -300,27 +235,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         len({host.cache_key for host in native_hosts}) == len(native_hosts),
         "native_hosts cache keys must be unique",
     )
-    custom_target = require_string(custom_raw["target"], "custom_target_json.target")
-    custom_runner = require_string(custom_raw["runner"], "custom_target_json.runner")
-    custom_host = next(
-        (host for host in native_hosts if host.target == custom_target), None
-    )
-    require(
-        custom_host is not None,
-        "custom_target_json.target is not an advertised native host",
-    )
-    require(
-        custom_host.runner == custom_runner,
-        "custom_target_json.runner disagrees with its native host",
-    )
-    custom_target_json = CustomTargetJson(
-        toolchain=custom_toolchain,
-        target=custom_target,
-        runner=custom_runner,
-        base_target=custom_base_target,
-        fixture=custom_fixture,
-    )
-
     filesystem_profiles: list[FilesystemProfile] = []
     require(
         isinstance(raw["filesystem_profiles"], list) and raw["filesystem_profiles"],
@@ -520,7 +434,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         corpus_fixture=corpus_fixture,
         corpus_runner=corpus_runner,
         cross_target_fixtures=tuple(cross_target_fixtures),
-        custom_target_json=custom_target_json,
         native_hosts=tuple(native_hosts),
         filesystem_profiles=tuple(filesystem_profiles),
         release_cross_targets=tuple(release_cross_targets),
@@ -744,15 +657,19 @@ def validate_inventories(
     toolchain_config = toolchain.get("toolchain", {})
     toolchain_targets = toolchain_config.get("targets")
     msrv = workspace_msrv()
-    repository_toolchain = RustRelease.parse(
-        require_string(
-            toolchain_config.get("channel"), "rust-toolchain.toml toolchain.channel"
-        ),
-        "rust-toolchain.toml toolchain.channel",
+    repository_toolchain = require_string(
+        toolchain_config.get("channel"), "rust-toolchain.toml toolchain.channel"
     )
     require(
-        repository_toolchain >= msrv,
-        f"repository toolchain {repository_toolchain} predates workspace MSRV {msrv}",
+        re.fullmatch(
+            r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", repository_toolchain
+        )
+        is not None,
+        "rust-toolchain.toml toolchain.channel must be an exact major.minor.patch Rust release",
+    )
+    require(
+        repository_toolchain == msrv,
+        f"repository toolchain {repository_toolchain} must equal workspace MSRV {msrv}",
     )
     require(
         isinstance(toolchain_targets, list),
@@ -767,12 +684,12 @@ def validate_inventories(
         required_release_targets <= set(toolchain_targets),
         "rust-toolchain.toml is missing advertised native or required release cross targets",
     )
-    setup_action = (
-        REPOSITORY_ROOT / ".github/actions/setup/action.yaml"
-    ).read_text(encoding="utf-8")
+    setup_action = (REPOSITORY_ROOT / ".github/actions/setup/action.yaml").read_text(
+        encoding="utf-8"
+    )
     require(
         re.search(
-            rf"^[ \t]+toolchain:[ \t]+{re.escape(str(repository_toolchain))}[ \t]*$",
+            rf"^[ \t]+toolchain:[ \t]+{re.escape(repository_toolchain)}[ \t]*$",
             setup_action,
             re.MULTILINE,
         )
@@ -821,9 +738,9 @@ def validate_inventories(
     for fragment in (
         "--compatibility-matrix",
         "--filesystem-matrix",
-        "--forward-compatibility-matrix",
+        "--selection-probes",
+        "--cross-target-mutation-probes",
         "--linker-probes",
-        "--codegen-backend-probes",
         "--direct-repeatability-probe",
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
@@ -857,95 +774,49 @@ def github_matrix(manifest: CompatibilityManifest) -> str:
     return json.dumps({"include": include}, separators=(",", ":"))
 
 
-def workspace_msrv() -> RustRelease:
+def workspace_msrv() -> str:
     manifest = load_toml(REPOSITORY_ROOT / "Cargo.toml")
     value = manifest.get("workspace", {}).get("package", {}).get("rust-version")
     require(
-        isinstance(value, str),
-        "Cargo.toml workspace.package.rust-version must be an exact string",
+        isinstance(value, str)
+        and re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value)
+        is not None,
+        "Cargo.toml workspace.package.rust-version must be an exact major.minor.patch Rust release",
     )
-    return RustRelease.parse(value, "Cargo.toml workspace.package.rust-version")
+    return value
 
 
-def stable_releases(current_stable: str) -> tuple[RustRelease, ...]:
+def compatibility_matrix(manifest: CompatibilityManifest) -> str:
     msrv = workspace_msrv()
-    current = RustRelease.parse(current_stable, "current stable")
-    require(
-        msrv.major == current.major,
-        "MSRV and current stable must have the same Rust major release",
-    )
-    require(
-        current >= msrv, f"current stable {current} predates repository MSRV {msrv}"
-    )
-
-    releases = [msrv]
-    releases.extend(
-        RustRelease(msrv.major, minor, 0)
-        for minor in range(msrv.minor + 1, current.minor)
-    )
-    if current != msrv:
-        releases.append(current)
-    return tuple(releases)
-
-
-def compatibility_matrix(
-    manifest: CompatibilityManifest,
-    current_stable: str,
-) -> str:
-    releases = stable_releases(current_stable)
-    msrv = workspace_msrv()
-    current = RustRelease.parse(current_stable, "current stable")
-    incoherent_toolchain = msrv
-    if incoherent_toolchain == current:
-        require(
-            current.minor > 0,
-            "current stable must have a preceding stable release for the incoherent-toolchain probe",
-        )
-        incoherent_toolchain = RustRelease(current.major, current.minor - 1, 0)
-    include = []
-    for host in manifest.native_hosts:
-        for release in releases:
-            release_text = str(release)
-            include.append(
-                {
-                    "compatibility": {
-                        "name": f"{host.target} / Rust {release_text}",
-                        "target": host.target,
-                        "runner": host.runner,
-                        "cache-key": f"{host.cache_key}-rust-{release_text}",
-                        "toolchain": release_text,
-                        "targets": ",".join(
-                            fixture.target for fixture in manifest.cross_target_fixtures
-                        ),
-                        "release": release_text,
-                        "full-suite": release in {msrv, current},
-                        "selection-probes": release == current,
-                        "cross-target-mutation-probes": release == current,
-                        "linker-probes": release == current,
-                        "codegen-backend-probes": False,
-                        "direct-repeatability-probe": host.target.endswith(
-                            "-pc-windows-msvc"
-                        ),
-                        "filesystem": host.filesystem,
-                        "case-sensitive": host.case_sensitive,
-                        "incoherent-toolchain": (
-                            str(incoherent_toolchain)
-                            if release == current
-                            and host.target == "x86_64-unknown-linux-gnu"
-                            else ""
-                        ),
-                        "expected-cache-state": "active",
-                    }
-                }
-            )
+    include = [
+        {
+            "compatibility": {
+                "name": f"{host.target} / Rust {msrv}",
+                "target": host.target,
+                "runner": host.runner,
+                "cache-key": f"{host.cache_key}-rust-{msrv}",
+                "toolchain": msrv,
+                "targets": ",".join(
+                    fixture.target for fixture in manifest.cross_target_fixtures
+                ),
+                "release": msrv,
+                "full-suite": host.full_suite,
+                "selection-probes": True,
+                "cross-target-mutation-probes": True,
+                "linker-probes": True,
+                "direct-repeatability-probe": host.target.endswith("-pc-windows-msvc"),
+                "filesystem": host.filesystem,
+                "case-sensitive": host.case_sensitive,
+                "expected-cache-state": "active",
+            }
+        }
+        for host in manifest.native_hosts
+    ]
     return json.dumps({"include": include}, separators=(",", ":"))
 
 
-def filesystem_matrix(
-    manifest: CompatibilityManifest,
-    current_stable: str,
-) -> str:
-    release = str(RustRelease.parse(current_stable, "current stable"))
+def filesystem_matrix(manifest: CompatibilityManifest) -> str:
+    msrv = workspace_msrv()
     include = [
         {
             "filesystem": {
@@ -955,61 +826,13 @@ def filesystem_matrix(
                 "setup": profile.setup,
                 "kind": profile.filesystem,
                 "case-sensitive": profile.case_sensitive,
-                "toolchain": release,
-                "release": release,
+                "toolchain": msrv,
+                "release": msrv,
                 "expected-cache-state": "active",
             }
         }
         for profile in manifest.filesystem_profiles
     ]
-    return json.dumps({"include": include}, separators=(",", ":"))
-
-
-def forward_compatibility_matrix(
-    manifest: CompatibilityManifest,
-) -> str:
-    target = "x86_64-unknown-linux-gnu"
-    host = next(
-        (
-            candidate
-            for candidate in manifest.native_hosts
-            if candidate.target == target
-        ),
-        None,
-    )
-    require(host is not None, f"forward-compatibility host {target} is not advertised")
-    include = [
-        {
-            "compatibility": {
-                "name": f"{target} / Rust {channel}",
-                "target": target,
-                "runner": host.runner,
-                "cache-key": f"{host.cache_key}-rust-{channel}",
-                "toolchain": channel,
-                "custom-target-json-probe": False,
-                "linker-probes": False,
-                "codegen-backend-probes": False,
-                "expected-cache-state": "active",
-            }
-        }
-        for channel in ("beta", "nightly")
-    ]
-    custom = manifest.custom_target_json
-    include.append(
-        {
-            "compatibility": {
-                "name": f"{custom.target} / Rust {custom.toolchain} custom target JSON",
-                "target": custom.target,
-                "runner": custom.runner,
-                "cache-key": f"{host.cache_key}-rust-{custom.toolchain}-custom-target",
-                "toolchain": custom.toolchain,
-                "custom-target-json-probe": True,
-                "linker-probes": False,
-                "codegen-backend-probes": True,
-                "expected-cache-state": "active",
-            }
-        }
-    )
     return json.dumps({"include": include}, separators=(",", ":"))
 
 
@@ -1340,9 +1163,7 @@ def main() -> int:
     output.add_argument("--github-matrix", action="store_true")
     output.add_argument("--compatibility-matrix", action="store_true")
     output.add_argument("--filesystem-matrix", action="store_true")
-    output.add_argument("--forward-compatibility-matrix", action="store_true")
     output.add_argument("--markdown", action="store_true")
-    parser.add_argument("--current-stable")
     args = parser.parse_args()
 
     try:
@@ -1353,28 +1174,10 @@ def main() -> int:
         if args.github_matrix:
             print(github_matrix(manifest))
         elif args.compatibility_matrix:
-            require(
-                args.current_stable is not None,
-                "--compatibility-matrix requires --current-stable",
-            )
-            print(compatibility_matrix(manifest, args.current_stable))
+            print(compatibility_matrix(manifest))
         elif args.filesystem_matrix:
-            require(
-                args.current_stable is not None,
-                "--filesystem-matrix requires --current-stable",
-            )
-            print(filesystem_matrix(manifest, args.current_stable))
-        elif args.forward_compatibility_matrix:
-            require(
-                args.current_stable is None,
-                "--current-stable only applies to --compatibility-matrix",
-            )
-            print(forward_compatibility_matrix(manifest))
+            print(filesystem_matrix(manifest))
         else:
-            require(
-                args.current_stable is None,
-                "--current-stable only applies to --compatibility-matrix",
-            )
             print(render_markdown(manifest, native_cache, qualifications), end="")
         return 0
     except (ContractError, OSError) as error:

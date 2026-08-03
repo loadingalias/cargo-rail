@@ -32,7 +32,6 @@ jobs:
     outputs:
       compatibility-matrix: ${{ steps.matrices.outputs.compatibility }}
       filesystem-matrix: ${{ steps.matrices.outputs.filesystem }}
-      forward-compatibility-matrix: ${{ steps.matrices.outputs.forward }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -40,31 +39,19 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
-      - name: Install current Rust stable
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
-        with:
-          toolchain: stable
-
       - name: Generate compatibility matrices
         id: matrices
         shell: bash
         run: |
-          current_stable="$(rustc +stable --version | awk '{print $2}')"
-          compatibility="$(python3 scripts/ci/support-matrix.py \
-            --compatibility-matrix \
-            --current-stable "$current_stable")"
-          filesystem="$(python3 scripts/ci/support-matrix.py \
-            --filesystem-matrix \
-            --current-stable "$current_stable")"
-          forward="$(python3 scripts/ci/support-matrix.py --forward-compatibility-matrix)"
+          compatibility="$(python3 scripts/ci/support-matrix.py --compatibility-matrix)"
+          filesystem="$(python3 scripts/ci/support-matrix.py --filesystem-matrix)"
           {
             echo "compatibility=$compatibility"
             echo "filesystem=$filesystem"
-            echo "forward=$forward"
           } >> "$GITHUB_OUTPUT"
 
-  stable:
-    name: Stable (${{ matrix.compatibility.name }})
+  msrv:
+    name: MSRV (${{ matrix.compatibility.name }})
     needs: support
     runs-on: ${{ matrix.compatibility.runner }}
     timeout-minutes: 60
@@ -85,12 +72,6 @@ jobs:
         with:
           toolchain: ${{ matrix.compatibility.toolchain }}
           targets: ${{ matrix.compatibility.targets }}
-
-      - name: Install incoherent-selection probe toolchain
-        if: matrix.compatibility.incoherent-toolchain != ''
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
-        with:
-          toolchain: ${{ matrix.compatibility.incoherent-toolchain }}
 
       - name: Install just for endpoint suites
         if: matrix.compatibility.full-suite
@@ -152,14 +133,8 @@ jobs:
           if [ "${{ matrix.compatibility.linker-probes }}" = "true" ]; then
             selection_args+=(--linker-probes)
           fi
-          if [ "${{ matrix.compatibility.codegen-backend-probes }}" = "true" ]; then
-            selection_args+=(--codegen-backend-probes)
-          fi
           if [ "${{ matrix.compatibility.direct-repeatability-probe }}" = "true" ]; then
             selection_args+=(--direct-repeatability-probe)
-          fi
-          if [ -n "${{ matrix.compatibility.incoherent-toolchain }}" ]; then
-            selection_args+=(--incoherent-toolchain "${{ matrix.compatibility.incoherent-toolchain }}")
           fi
           "$python_command" scripts/ci/run-compatibility.py \
             --cargo-rail "$cargo_rail" \
@@ -231,10 +206,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install current Rust stable
+      - name: Install selected Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.filesystem.toolchain }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf  # v2.85.5
@@ -437,67 +412,3 @@ jobs:
             }
             Remove-Item -Force $vhd
           }
-
-  forward:
-    name: Forward (${{ matrix.compatibility.name }})
-    needs: support
-    runs-on: ${{ matrix.compatibility.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.support.outputs.forward-compatibility-matrix) }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install selected Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
-        with:
-          toolchain: ${{ matrix.compatibility.toolchain }}
-
-      - name: Install rust-src for the pinned custom-target lane
-        if: matrix.compatibility.custom-target-json-probe
-        run: rustup component add --toolchain "${{ matrix.compatibility.toolchain }}" rust-src
-
-      - name: Install Cranelift for the pinned backend lane
-        if: matrix.compatibility.codegen-backend-probes
-        run: rustup component add --toolchain "${{ matrix.compatibility.toolchain }}" rustc-codegen-cranelift
-
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          shared-key: "cargo-rail-forward-compatibility-v1"
-          key: ${{ inputs.cache-prefix }}-${{ matrix.compatibility.cache-key }}
-          cache-on-failure: true
-
-      - name: Build cargo-rail with selected toolchain
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
-        run: cargo build --locked --bin cargo-rail
-
-      - name: Run front-door compatibility corpus
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
-        run: |
-          probe_args=()
-          if [ "${{ matrix.compatibility.custom-target-json-probe }}" = "true" ]; then
-            probe_args+=(--custom-target-json-probe)
-          fi
-          if [ "${{ matrix.compatibility.linker-probes }}" = "true" ]; then
-            probe_args+=(--linker-probes)
-          fi
-          if [ "${{ matrix.compatibility.codegen-backend-probes }}" = "true" ]; then
-            probe_args+=(--codegen-backend-probes)
-          fi
-          python3 scripts/ci/run-compatibility.py \
-            --cargo-rail target/debug/cargo-rail \
-            --toolchain "${{ matrix.compatibility.toolchain }}" \
-            --expected-host "${{ matrix.compatibility.target }}" \
-            --expected-cache-state "${{ matrix.compatibility.expected-cache-state }}" \
-            --skip-cross-target-corpus \
-            "${probe_args[@]}"

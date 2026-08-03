@@ -4,7 +4,7 @@
 
 You need:
 
-- Rust 1.97.1 (the repository toolchain installs automatically via `rust-toolchain.toml`)
+- Rust at the [public MSRV](Cargo.toml) (the repository toolchain installs automatically via `rust-toolchain.toml`)
 - Python 3.11 or newer
 - `just`
 - `cargo-nextest`

@@ -247,12 +247,6 @@ fn native_cache_observation(cache_root: &Path) -> Result<serde_json::Value> {
   local_observation(&cache, "wrapper_app")
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 fn assert_native_miss(cache_root: &Path, output: &std::process::Output) -> Result<serde_json::Value> {
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
   let observation = native_cache_observation(cache_root)?;
@@ -263,12 +257,6 @@ fn assert_native_miss(cache_root: &Path, output: &std::process::Output) -> Resul
   Ok(observation)
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
 fn assert_native_invalidation(
   cache_root: &Path,
   output: &std::process::Output,
