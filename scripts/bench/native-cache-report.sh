@@ -50,7 +50,6 @@ while IFS= read -r -d '' group; do
           output_manifests_identical: $group.output_manifests_identical,
           cross_root_artifacts: $group.cross_root_artifacts,
           runtime_outputs_identical: $group.runtime_outputs_identical,
-          modeled_root_bound_outputs_safely_bypassed: $group.modeled_root_bound_outputs_safely_bypassed,
           action_census_identical: $group.action_census_identical,
           bypass_cache_io_zero: $group.bypass_cache_io_zero,
           cache_event_streams_complete: $group.cache_event_streams_complete,

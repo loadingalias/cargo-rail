@@ -1,38 +1,29 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "class": "library_metadata_rlib",
+  "execution_contract": "direct-global-wrapper-v4",
   "fixture": "tests/fixtures/native_cache/real_world",
   "cargo_release": "1.97.1",
   "rustc_release": "1.97.1",
   "qualifications": [
     {
-      "target": "aarch64-apple-darwin",
-      "corpus": "p0-local-automatic-policy-20260801",
+      "target": "x86_64-pc-windows-msvc",
+      "corpus": "20260803T142934Z-aws-windows-x64-bench-v4-final-one",
       "workloads": [
         "check",
         "release-build"
       ],
-      "accepted_samples": 88,
-      "false_hits": 0
-    },
-    {
-      "target": "aarch64-unknown-linux-gnu",
-      "corpus": "p0-remote-20260726-v3/aws-linux-arm64",
-      "workloads": [
-        "check",
-        "release-build"
-      ],
-      "accepted_samples": 110,
+      "accepted_samples": 20,
       "false_hits": 0
     },
     {
       "target": "x86_64-unknown-linux-gnu",
-      "corpus": "p0-remote-20260726-v3/aws-linux-x64",
+      "corpus": "20260803T045358Z-aws-linux-x64-bench-v4-final-one",
       "workloads": [
         "check",
         "release-build"
       ],
-      "accepted_samples": 110,
+      "accepted_samples": 20,
       "false_hits": 0
     }
   ]

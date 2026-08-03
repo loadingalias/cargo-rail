@@ -24,6 +24,9 @@ ssh-status target:
 ssh-bootstrap target:
     @"$HOME/dev-machines/dev-machine" bootstrap cargo-rail "{{ target }}"
 
+ssh-qualification-tools target:
+    @"$HOME/dev-machines/dev-machine" just cargo-rail "{{ target }}" "install-qualification-tools"
+
 ssh-just target recipe *args="":
     @"$HOME/dev-machines/dev-machine" just cargo-rail "{{ target }}" "{{ recipe }}" {{ args }}
 
@@ -90,6 +93,15 @@ bench-native-cache-remote mode runs run_id:
       CARGO_RAIL_BENCH_RESULTS="$PWD/benchmark_results/native-cache/{{ run_id }}" \
       scripts/bench/native-cache.sh run "{{ runs }}"; \
     fi
+
+install-qualification-tools:
+    @host="$(rustc -vV | sed -n 's/^host: //p')"; \
+      case "$host" in \
+        *-unknown-linux-*) profile=linux-qualification ;; \
+        *-pc-windows-*) profile=windows-qualification ;; \
+        *) echo "remote qualification requires a supported Linux or Windows host, got: $host" >&2; exit 2 ;; \
+      esac; \
+      scripts/ci/install-tools.sh "$profile"
 
 bench-native-cache-archive run_id:
     @scripts/bench/native-cache-archive.sh "{{ run_id }}"

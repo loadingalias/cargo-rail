@@ -107,33 +107,6 @@ fn compiler_output_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
   Ok(files)
 }
 
-#[cfg(any(
-  all(target_os = "macos", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "aarch64"),
-  all(target_os = "linux", target_arch = "x86_64"),
-  all(target_os = "windows", target_arch = "x86_64")
-))]
-fn portable_compiler_output_files(target: &Path, workspace: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-  let mut roots = vec![workspace.to_string_lossy().into_owned()];
-  if let Ok(canonical) = workspace.canonicalize() {
-    roots.push(canonical.to_string_lossy().into_owned());
-  }
-  roots.sort();
-  roots.dedup();
-  Ok(
-    compiler_output_files(target)?
-      .into_iter()
-      .filter(|(_, bytes)| {
-        !bytes.is_empty()
-          && roots.iter().all(|root| {
-            let root = root.as_bytes();
-            !bytes.windows(root.len()).any(|window| window == root)
-          })
-      })
-      .collect(),
-  )
-}
-
 fn local_observation(cache: &serde_json::Value, target_name: &str) -> Result<serde_json::Value> {
   cache["entries"]
     .as_object()
@@ -651,8 +624,12 @@ fn bundled_codegen_backend_is_content_identified_and_transparent() -> Result<()>
   assert_eq!(cold.status.code(), direct.status.code(), "cache cold: {cold:?}");
   assert_eq!(cold.stdout, direct.stdout, "cache cold changed stdout");
   assert_eq!(cold.stderr, direct.stderr, "cache cold changed stderr");
-  let portable_outputs = compiler_output_files(&target)?;
-  assert!(!portable_outputs.is_empty(), "cache cold produced no compiler outputs");
+  let cold_outputs = compiler_output_files(&target)?;
+  assert!(!cold_outputs.is_empty(), "cache cold produced no compiler outputs");
+  assert_eq!(
+    cold_outputs, direct_outputs,
+    "cache cold changed direct Cargo compiler outputs"
+  );
 
   reset()?;
   let explained = run(true, false, true, "llvm")?;
@@ -663,7 +640,7 @@ fn bundled_codegen_backend_is_content_identified_and_transparent() -> Result<()>
   assert_eq!(explained.stderr, direct.stderr);
   assert_eq!(
     compiler_output_files(&target)?,
-    portable_outputs,
+    cold_outputs,
     "bundled-backend warm reuse changed cold cache output bytes"
   );
   assert!(
@@ -782,9 +759,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
 
   let target = workspace.path.join("target");
   let cold_outputs = compiler_output_files(&target)?;
-  let portable_cold_outputs = portable_compiler_output_files(&target, &workspace.path)?;
   assert!(!cold_outputs.is_empty());
-  assert!(!portable_cold_outputs.is_empty());
   let clean = Command::new("cargo")
     .current_dir(&workspace.path)
     .arg("clean")
@@ -814,22 +789,24 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     .context("first-root candidate key")?
     .to_string();
   let second = wrapper_workspace("native-cache-second-independent-root")?;
-  let second_hit = run_unify_without_ambient_wrappers(&second.path, local_cache.path())?;
+  let second_miss = run_unify_without_ambient_wrappers(&second.path, local_cache.path())?;
   assert_eq!(
-    second_hit.status.code(),
+    second_miss.status.code(),
     Some(1),
-    "second-root cache hit: {second_hit:?}"
+    "second-root cache miss: {second_miss:?}"
   );
   let second_observation = native_cache_observation(local_cache.path())?;
-  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
-  assert_eq!(
+  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "miss");
+  assert_ne!(
     second_observation["execution"]["cache_wrapper"]["candidate_key"], first_candidate,
-    "physical roots must not enter the reusable candidate identity"
+    "opaque compiler outputs require a source-root-bound candidate identity"
   );
   let second_target = second.path.join("target");
-  assert_eq!(
-    portable_compiler_output_files(&second_target, &second.path)?,
-    portable_cold_outputs
+  let second_cold_outputs = compiler_output_files(&second_target)?;
+  assert!(!second_cold_outputs.is_empty());
+  assert_ne!(
+    second_cold_outputs, cold_outputs,
+    "the fixture must expose rustc's physical source-root binding"
   );
   fs::remove_dir_all(&second_target)?;
   let second_warm = run_unify_without_ambient_wrappers(&second.path, local_cache.path())?;
@@ -840,10 +817,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   );
   let second_observation = native_cache_observation(local_cache.path())?;
   assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
-  assert_eq!(
-    portable_compiler_output_files(&second_target, &second.path)?,
-    portable_cold_outputs
-  );
+  assert_eq!(compiler_output_files(&second_target)?, second_cold_outputs);
 
   let cleanup = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
     .current_dir(&second.path)
@@ -1528,7 +1502,7 @@ fn rustdoc_proxy_preserves_cargo_docs_and_records_dep_info() -> Result<()> {
   for root in [&workspace.path, &canonical_workspace] {
     assert!(
       !encoded.contains(root.to_string_lossy().as_ref()),
-      "portable compiler argv must not retain checkout root '{}': {record}",
+      "captured compiler observation must not retain checkout root '{}': {record}",
       root.display()
     );
   }

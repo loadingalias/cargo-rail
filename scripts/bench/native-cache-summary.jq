@@ -135,7 +135,7 @@ def lane_minimum:
 group_by([.workload, .round]) as $groups
 | lane_minimum as $minimum
 | {
-    schema_version: 11,
+    schema_version: 12,
     evidence_kind: $evidence_kind,
     publishable: (
       $evidence_kind == "retained"
@@ -245,9 +245,9 @@ group_by([.workload, .round]) as $groups
     native_check_cold: lane_stats("check"; "native-cargo"),
     cargo_rail_check_disabled: lane_stats("check"; "cargo-rail-disabled"),
     cargo_rail_check_cold: lane_stats("check"; "cargo-rail-cold"),
-    cargo_rail_check_warm_cross_root: lane_stats("check"; "cargo-rail-warm"),
+    cargo_rail_check_warm_same_root: lane_stats("check"; "cargo-rail-warm"),
     native_build_cold: lane_stats("build"; "native-cargo"),
     cargo_rail_build_disabled: lane_stats("build"; "cargo-rail-disabled"),
     cargo_rail_build_cold: lane_stats("build"; "cargo-rail-cold"),
-    cargo_rail_build_warm_cross_root: lane_stats("build"; "cargo-rail-warm")
+    cargo_rail_build_warm_same_root: lane_stats("build"; "cargo-rail-warm")
   }

@@ -66,6 +66,46 @@ budget, and false hits remain zero. Cargo-Rail cold/warm lanes run for every too
 rustdoc, sysroot, and host identity can be captured. Identity-capture failure is a benchmark failure, not an
 unsupported performance lane or a request to add the toolchain to an allowlist.
 
+## Retained v4 evidence
+
+The retained corpora used Rust 1.97.1 and one AWS `c8i.xlarge` per host:
+
+- Linux: `20260803T045358Z-aws-linux-x64-bench-v4-final-one`, Intel Xeon 6975P-C, Ubuntu 24.04.
+- Windows: `20260803T142934Z-aws-windows-x64-bench-v4-final-one`, Windows Server 2025.
+
+Each row is one accepted point measurement, not a percentile. Each host accepted all 20 planned lane samples in two
+complete groups with no rejected samples or false hits. Do not pool the hosts into one population.
+
+| Host | Workload | Native Cargo cold | Cargo-Rail cold | Cargo-Rail warm | `sccache` 0.16.0 | Warm vs Cargo | Warm vs `sccache` |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Linux | Check | 9.866 s | 10.994 s | 3.848 s | 4.735 s | 61.0% faster | 18.7% faster |
+| Linux | Release build | 12.445 s | 15.119 s | 6.055 s | 7.918 s | 51.3% faster | 23.5% faster |
+| Windows | Check | 19.500 s | 22.694 s | 9.744 s | 12.847 s | 50.0% faster | 24.2% faster |
+| Windows | Release build | 23.150 s | 28.000 s | 13.579 s | 17.202 s | 41.3% faster | 21.1% faster |
+
+On Linux, the warm check hashed 62,723,112 bytes, read 31,243,330 cache bytes, and restored 30,914,896 output bytes.
+The warm release build hashed 82,519,866 bytes, read 82,883,850 cache bytes, and restored 82,538,597 output bytes.
+Complete process-tree accounting measured 11.423 CPU-seconds and 374,693,888 bytes peak RSS for the warm check,
+compared with 15.287 CPU-seconds and 1,105,412,096 bytes for `sccache`. Release build measured 18.482 CPU-seconds and
+386,019,328 bytes for Cargo-Rail, compared with 23.230 CPU-seconds and 1,045,946,368 bytes for `sccache`.
+
+On Windows, both workloads changed 28 cold publications into 28 warm hits while preserving the same 29 explicit
+bypasses and exact output manifests. Warm check hashed 54,640,890 unit bytes, read 34,194,373 cache bytes, and restored
+33,858,458 output bytes. Warm release build hashed 72,159,810 unit bytes, read 86,337,345 cache bytes, and restored
+85,984,609 output bytes. Each Windows Cargo-Rail cold or warm lane also hashed 313,772,556 setup bytes; removing that
+repeated identity work is open optimization work. Windows retains wall-time comparisons but not specialist CPU or RSS
+claims because the detached `sccache` server is outside the complete accounting boundary.
+
+One observed warm reuse repaid the cold-publication premium in every host/workload pair. The measured repayment was
+0.187 check reuses and 0.418 release-build reuses on Linux, and 0.327 and 0.507 on Windows.
+
+The same corpora keep the remaining costs visible. Linux no-op supervision measured -0.045 ms for check and +1.085 ms
+for release build; Windows measured -3.579 ms and +4.597 ms. All were within the 7 ms point budget. The explicit
+incremental bypass added 346.840/202.603 ms on Linux and 792.636/779.374 ms on Windows. Preserving `sccache` added
+6.523/8.245 s on Linux and 11.685/14.875 s on Windows. Those bypass paths exceeded their 50 ms point budgets and remain
+optimization work; they do not weaken output-equivalence or false-hit acceptance. A negative point delta means that
+the delegated lane happened to finish first in that sample, not that Cargo-Rail made Cargo faster.
+
 ## Maintainer AWS runners
 
 The maintainer workflow delegates provider mechanics and credentials to `~/dev-machines`. Cargo-Rail adds no AWS SDK,
@@ -109,6 +149,19 @@ one local rename. Unrelated remote results are never collected, and an interrupt
 result. A sibling `<UTC run id>.orchestration.log` retains the complete create-through-teardown transcript even when
 compilation fails before the benchmark can create raw results. The wrapper attempts collection after any benchmark
 exit.
+
+The benchmark bootstrap stays lean. Before using a live benchmark host as a release qualification runner, install the
+pinned check/test tools and run the repository gates explicitly:
+
+```bash
+just ssh-qualification-tools aws-linux-x64-bench
+just ssh-just aws-linux-x64-bench check
+just ssh-just aws-linux-x64-bench build-all
+just ssh-just aws-linux-x64-bench test-all
+```
+
+Use the matching Windows target for Windows qualification. This profile installs `cargo-nextest`, `cargo-deny`, and
+`cargo-audit`; it does not add those tools to ordinary benchmark-only images.
 
 The exit trap then invokes `dev-machine kill`. AWS instances use IMDSv2-only metadata, encrypted gp3 root volumes,
 guest-shutdown termination, and `DeleteOnTermination=true`. Teardown waits for instance termination, finds every EBS

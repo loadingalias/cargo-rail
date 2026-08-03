@@ -1288,24 +1288,35 @@ pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> Rail
     CompilerMode::Rustdoc => "rustdoc",
     CompilerMode::Unknown => "compiler",
   };
-  let path = directory.join(format!("{compiler}-{}.json", std::process::id()));
   let encoded = serde_json::to_vec(raw)?;
+  let path = directory.join(format!("{compiler}-sha256-{}.json", ContentDigest::sha256(&encoded)));
   // The parent owns this private temporary directory and reads it only after
-  // Cargo has joined every wrapper. Preserve atomic visibility, but do not pay
-  // durable mutation fsyncs for regenerable per-invocation evidence.
+  // Cargo has joined every wrapper. Publish immutable content-addressed bytes,
+  // but do not pay durable mutation fsyncs for regenerable evidence.
   let mut temporary = tempfile::Builder::new()
     .prefix(".cargo-rail-observation-")
     .suffix(".tmp")
     .tempfile_in(directory)?;
   temporary.write_all(&encoded)?;
-  temporary.persist(&path).map_err(|error| {
-    RailError::message(format!(
+  match temporary.persist_noclobber(&path) {
+    Ok(_) => Ok(()),
+    Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+      let existing = fs::read(&path)?;
+      if existing == encoded {
+        Ok(())
+      } else {
+        Err(RailError::message(format!(
+          "compiler observation content identity collided at '{}'",
+          path.display()
+        )))
+      }
+    }
+    Err(error) => Err(RailError::message(format!(
       "failed to publish compiler observation '{}': {}",
       path.display(),
       error.error
-    ))
-  })?;
-  Ok(())
+    ))),
+  }
 }
 
 /// Load all complete wrapper records from one private invocation directory.
@@ -1694,15 +1705,37 @@ fn parse_dep_info(
       return Err(RailError::message("dep-info contains an empty environment dependency"));
     }
     let secret = is_secret_name(name);
+    let value_digest = if secret {
+      None
+    } else {
+      value
+        .map(decode_makefile_value)
+        .transpose()?
+        .map(|value| format!("sha256:{}", ContentDigest::sha256(value.as_bytes())))
+    };
     environment.insert(EnvironmentObservation {
       name: name.to_string(),
-      value_digest: value
-        .filter(|_| !secret)
-        .map(|value| format!("sha256:{}", ContentDigest::sha256(value.as_bytes()))),
+      value_digest,
       secret_capability: secret,
     });
   }
   Ok((reads, environment))
+}
+
+fn decode_makefile_value(input: &str) -> RailResult<String> {
+  if input.is_empty() {
+    return Ok(String::new());
+  }
+  let mut words = makefile_words(input)?.into_iter();
+  let Some(value) = words.next() else {
+    return Err(RailError::message("dep-info environment value is missing"));
+  };
+  if words.next().is_some() {
+    return Err(RailError::message(
+      "dep-info environment value contains an unescaped separator",
+    ));
+  }
+  Ok(value)
 }
 
 fn makefile_words(input: &str) -> RailResult<Vec<String>> {
@@ -2215,7 +2248,7 @@ mod tests {
     fs::write(directory.path().join("source file.rs"), "fn main() {}\n").expect("source");
     fs::write(
       directory.path().join("unit.d"),
-      "unit: source\\ file.rs\n# env-dep:VISIBLE=value\n# env-dep:API_TOKEN=never-store-this\n# env-dep:API_KEY=also-never-store-this\n",
+      "unit: source\\ file.rs\n# env-dep:VISIBLE=value\n# env-dep:WINDOWS_PATH=C:\\\\work\\\\fixture\\ root\n# env-dep:API_TOKEN=never-store-this\n# env-dep:API_KEY=also-never-store-this\n",
     )
     .expect("dep info");
 
@@ -2228,6 +2261,11 @@ mod tests {
         .iter()
         .any(|entry| entry.name == "VISIBLE" && entry.value_digest.is_some())
     );
+    assert!(environment.iter().any(|entry| {
+      entry.name == "WINDOWS_PATH"
+        && entry.value_digest.as_deref()
+          == Some(format!("sha256:{}", ContentDigest::sha256(br"C:\work\fixture root")).as_str())
+    }));
     assert!(
       environment
         .iter()
@@ -2249,6 +2287,11 @@ mod tests {
       makefile_words(r"C:\work\crate\src\lib.rs C:\work\source\ file.rs").expect("parse dep-info words"),
       [r"C:\work\crate\src\lib.rs", r"C:\work\source file.rs"]
     );
+    assert_eq!(
+      decode_makefile_value(r"C:\\work\\fixture\ root").expect("decode dep-info environment value"),
+      r"C:\work\fixture root"
+    );
+    assert_eq!(decode_makefile_value("").expect("decode empty value"), "");
   }
 
   #[test]
@@ -2426,5 +2469,22 @@ mod tests {
       success: true,
       bypasses: BTreeSet::new(),
     }
+  }
+
+  #[test]
+  fn raw_publication_survives_process_identifier_reuse() {
+    let directory = tempfile::tempdir().expect("observation directory");
+    let first = raw_invocation();
+    publish_raw(directory.path(), &first).expect("first observation");
+
+    let mut second = first.clone();
+    second.crate_name = Some("other_unit".to_string());
+    publish_raw(directory.path(), &second).expect("second observation");
+    publish_raw(directory.path(), &first).expect("idempotent first observation");
+
+    let loaded = load_raw(directory.path()).expect("complete observations");
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.contains(&first));
+    assert!(loaded.contains(&second));
   }
 }

@@ -34,7 +34,7 @@ members = ["."]
 resolver = "3"
 
 [workspace.package]
-rust-version = "1.97.1"
+rust-version = "1.95.0"
 
 [dependencies]
 clap = { version = "4.6.5", features = ["derive", "cargo"] }

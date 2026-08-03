@@ -51,20 +51,24 @@ just gen-docs
 ## Performance changes
 
 A performance claim needs evidence someone else can check. Identify the workload, host, toolchain, exact commands,
-sample count, and before/after p50 and p95. Compare cache implementations on one host. Preserve the raw results,
-and report any failed correctness checks alongside the numbers.
+sample count, and before/after values. Report point measurements for one sample; report p50 or p95 only when the run
+contains enough samples to support a distribution claim. Compare cache implementations on one host. Preserve the raw
+results, and report failed correctness checks or performance budgets alongside the numbers.
 
-Native compiler-cache changes must run the checked-in cross-root fixture. When the change can affect those lanes,
-measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the pinned sccache comparator — reporting hits,
-misses, bypasses, reasons, bytes hashed/restored, and output portability.
+Native compiler-cache changes must run the checked-in same-root output-directory and independent-root fixture. When a
+change can affect those lanes, measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the
+pinned sccache comparator. Report hits, misses, bypasses, reasons, bytes hashed and restored, and exact output-byte
+equivalence.
 
 The repository benchmarks accept package and run counts:
 
 ```bash
 just bench-unify 25 10
 cargo build --release --locked
-just bench-native-cache 10
+just bench-native-cache
 ```
+
+Use `just bench-native-cache 10` only when the decision requires distribution or tail evidence.
 
 ## Pull requests
 

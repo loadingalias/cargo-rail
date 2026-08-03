@@ -458,7 +458,6 @@ def execute_case(
     workspace: Path,
     env: dict[str, str],
     verify_direct_repeatability: bool = False,
-    portable_cache_outputs: bool = False,
 ) -> tuple[ProcessResult, tuple[tuple[str, str, int, str], ...]]:
     clean_directory(target)
     direct = run(direct_argv(case, target), cwd=workspace, env=env)
@@ -479,7 +478,6 @@ def execute_case(
                 f"{manifest_difference(direct_outputs, repeated_outputs)}"
             )
 
-    cache_outputs = direct_outputs
     for label, no_cache in (("cache-disabled", True), ("cache-requested", False)):
         clean_directory(target)
         result = run(
@@ -500,21 +498,12 @@ def execute_case(
                 f"direct={direct!r}\nrail={result!r}"
             )
         outputs = output_manifest(target)
-        if outputs != direct_outputs and (no_cache or not portable_cache_outputs):
+        if outputs != direct_outputs:
             raise CompatibilityError(
                 f"{case.name} {label} output inventory or bytes differ from direct Cargo:\n"
                 f"{manifest_difference(direct_outputs, outputs)}"
             )
-        if not no_cache and portable_cache_outputs:
-            direct_inventory = tuple(entry[:3] for entry in direct_outputs)
-            cache_inventory = tuple(entry[:3] for entry in outputs)
-            if cache_inventory != direct_inventory:
-                raise CompatibilityError(
-                    f"{case.name} cache output paths, kinds, or modes differ from direct Cargo:\n"
-                    f"{manifest_difference(direct_outputs, outputs)}"
-                )
-            cache_outputs = outputs
-    return direct, cache_outputs
+    return direct, direct_outputs
 
 
 def assert_native_cache_identity(
@@ -543,9 +532,9 @@ def assert_native_cache_identity(
         or report.get("result") != "success"
         or report.get("exit_code") != 0
         or capability.get("host_target") != expected_host
-        or capability.get("schema_version") != 2
+        or capability.get("schema_version") != 3
         or capability.get("cache_class") != "library_metadata_rlib"
-        or capability.get("execution_contract") != "direct-global-wrapper-v3"
+        or capability.get("execution_contract") != "direct-global-wrapper-v4"
         or not isinstance(capability.get("platform"), str)
         or not capability["platform"]
         or not isinstance(capability.get("identity"), str)
@@ -983,7 +972,7 @@ def assert_custom_target_json(
         target,
         (
             "custom_target_not_graduated",
-            "compiler_flag_not_graduated",
+            "cross_target_not_graduated",
         ),
         direct,
         direct_outputs,
@@ -1152,6 +1141,11 @@ def assert_native_linker_probes(
         }
         lld_probe_response_argument = driver_response_argument
 
+    lld_bypass_reason = (
+        "configured_linker_not_graduated"
+        if target_linker_environment in lld_overrides
+        else "native_linking_not_graduated"
+    )
     configurations = (
         (
             "explicit default driver",
@@ -1160,20 +1154,26 @@ def assert_native_linker_probes(
                 target_linker_environment: str(driver),
             },
             driver_response_argument,
+            "configured_linker_not_graduated",
         ),
         (
             lld_label,
             (f'[build]\nrustflags = ["-C", {json.dumps(f"linker={poison_linker}")}]\n'),
             lld_overrides,
             lld_probe_response_argument,
+            lld_bypass_reason,
         ),
     )
 
-    for index, (label, cargo_config, overrides, response_argument) in enumerate(
-        configurations
-    ):
+    for index, (
+        label,
+        cargo_config,
+        overrides,
+        response_argument,
+        bypass_reason,
+    ) in enumerate(configurations):
         workspace = root / f"native-linker-workspace-{index}"
-        target = root / f"native-linker-target-{index}"
+        target = workspace / "target-native-linker"
         response = root / f"native linker response {index}.rsp"
         shutil.copytree(FIXTURE_ROOT, workspace)
         (workspace / ".cargo").mkdir()
@@ -1215,7 +1215,7 @@ def assert_native_linker_probes(
             cargo_rail,
             case,
             target,
-            ("configured_linker_not_graduated",),
+            (bypass_reason,),
             direct,
             direct_outputs,
             workspace=workspace,
@@ -1264,7 +1264,6 @@ def assert_codegen_backend_probes(
         success_target,
         workspace=workspace,
         env=success_env,
-        portable_cache_outputs=True,
     )
     assert_release_binary(success_target, workspace, success_env)
     explanation = assert_cache_explanation(
@@ -1616,7 +1615,6 @@ def assert_incoherent_toolchain_selection(
         target,
         workspace=workspace,
         env=mixed_environment,
-        portable_cache_outputs=True,
     )
 
     assert_cache_explanation(
@@ -1750,7 +1748,6 @@ def main() -> int:
                     verify_direct_repeatability=(
                         args.direct_repeatability_probe and case.name == "check"
                     ),
-                    portable_cache_outputs=(expected_cache_state == "active"),
                 )
                 if case.action in {"build", "distribution"}:
                     assert_cache_explanation(

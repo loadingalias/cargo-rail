@@ -133,7 +133,15 @@ $subcmd_help
 }
 
 generate_caching() {
-  python3 "$REPO_ROOT/scripts/ci/support-matrix.py" --markdown
+  local python_command=python3
+  if ! command -v "$python_command" >/dev/null 2>&1; then
+    python_command=python
+  fi
+  if ! command -v "$python_command" >/dev/null 2>&1; then
+    echo "ERROR: generated documentation requires Python" >&2
+    return 127
+  fi
+  PYTHONIOENCODING=utf-8 "$python_command" "$REPO_ROOT/scripts/ci/support-matrix.py" --markdown | sed 's/\r$//'
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

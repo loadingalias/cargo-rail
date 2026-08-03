@@ -793,7 +793,7 @@ fn test_runner_builtin_actions_render_byte_exact_argv_in_request_order() -> Resu
   let action_crate = ws.add_crate("action-crate", "0.1.0", &[])?;
   let manifest = std::fs::read_to_string(action_crate.join("Cargo.toml"))?.replace(
     "authors.workspace = true",
-    "authors.workspace = true\nrust-version = \"1.97.1\"",
+    "authors.workspace = true\nrust-version = \"1.95.0\"",
   );
   std::fs::write(action_crate.join("Cargo.toml"), manifest)?;
   ws.commit("Add crate")?;
@@ -844,7 +844,7 @@ fn test_runner_builtin_actions_render_byte_exact_argv_in_request_order() -> Resu
       "docs: cargo doc --workspace --no-deps\n",
       "format: cargo fmt --all --check\n",
       "lint: cargo clippy --workspace --all-targets --all-features -- -D warnings\n",
-      "msrv: cargo +1.97.1 check --workspace --all-targets --all-features --locked\n",
+      "msrv: cargo +1.95.0 check --workspace --all-targets --all-features --locked\n",
       "package: cargo package --workspace --locked\n",
       "audit: cargo deny check all\n",
       "distribution: cargo build --workspace --release --locked\n",
@@ -2326,9 +2326,9 @@ fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_val
   assert_eq!(report["exit_code"], 0);
 
   let capability = &report["capability"];
-  assert_eq!(capability["schema_version"], 2);
+  assert_eq!(capability["schema_version"], 3);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v3");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v4");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]

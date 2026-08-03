@@ -580,6 +580,7 @@ def load_native_cache_contract() -> NativeCacheContract:
         encoding="utf-8"
     )
     for reason in (
+        "compiler_diagnostic_format_not_graduated",
         "compiler_flag_not_graduated",
         "configured_linker_not_graduated",
         "cross_target_not_graduated",
@@ -610,6 +611,7 @@ class Qualification:
 class QualificationRegistry:
     schema_version: int
     cache_class: str
+    execution_contract: str
     cargo_release: str
     rustc_release: str
     qualifications: dict[str, Qualification]
@@ -622,6 +624,7 @@ def load_qualifications() -> QualificationRegistry:
         {
             "schema_version",
             "class",
+            "execution_contract",
             "fixture",
             "cargo_release",
             "rustc_release",
@@ -629,8 +632,8 @@ def load_qualifications() -> QualificationRegistry:
         },
     )
     require(
-        raw["schema_version"] == 1,
-        "native-cache qualification schema_version must be 1",
+        raw["schema_version"] == 2,
+        "native-cache qualification schema_version must be 2",
     )
     fixture = require_string(raw["fixture"], "native-cache qualifications.fixture")
     require(
@@ -691,6 +694,10 @@ def load_qualifications() -> QualificationRegistry:
     return QualificationRegistry(
         schema_version=raw["schema_version"],
         cache_class=require_string(raw["class"], "native-cache qualifications.class"),
+        execution_contract=require_string(
+            raw["execution_contract"],
+            "native-cache qualifications.execution_contract",
+        ),
         cargo_release=require_string(
             raw["cargo_release"], "native-cache qualifications.cargo_release"
         ),
@@ -736,10 +743,16 @@ def validate_inventories(
     toolchain = load_toml(REPOSITORY_ROOT / "rust-toolchain.toml")
     toolchain_config = toolchain.get("toolchain", {})
     toolchain_targets = toolchain_config.get("targets")
-    msrv = str(workspace_msrv())
+    msrv = workspace_msrv()
+    repository_toolchain = RustRelease.parse(
+        require_string(
+            toolchain_config.get("channel"), "rust-toolchain.toml toolchain.channel"
+        ),
+        "rust-toolchain.toml toolchain.channel",
+    )
     require(
-        toolchain_config.get("channel") == msrv,
-        f"rust-toolchain.toml channel must equal workspace MSRV {msrv}",
+        repository_toolchain >= msrv,
+        f"repository toolchain {repository_toolchain} predates workspace MSRV {msrv}",
     )
     require(
         isinstance(toolchain_targets, list),
@@ -758,9 +771,13 @@ def validate_inventories(
         REPOSITORY_ROOT / ".github/actions/setup/action.yaml"
     ).read_text(encoding="utf-8")
     require(
-        re.search(rf"^[ \t]+toolchain:[ \t]+{re.escape(msrv)}[ \t]*$", setup_action, re.MULTILINE)
+        re.search(
+            rf"^[ \t]+toolchain:[ \t]+{re.escape(str(repository_toolchain))}[ \t]*$",
+            setup_action,
+            re.MULTILINE,
+        )
         is not None,
-        f"repository setup action must install workspace MSRV {msrv}",
+        f"repository setup action must install repository toolchain {repository_toolchain}",
     )
 
     rail_config = load_toml(REPOSITORY_ROOT / ".config/rail.toml")
@@ -781,6 +798,10 @@ def validate_inventories(
     require(
         qualifications.cache_class == native_cache.cache_class,
         "performance qualification class does not match the runtime cache contract",
+    )
+    require(
+        qualifications.execution_contract == native_cache.execution_contract,
+        "performance qualification execution contract does not match the runtime cache contract",
     )
     require(
         set(qualifications.qualifications) <= native_targets,
@@ -1118,7 +1139,7 @@ Native reuse is automatic for an ordinary `build` or `distribution` action when 
 - no Cargo CLI `--config`, action-defined environment, unknown Cargo setting, `build.dep-info-basedir`, sccache, or
   custom compiler wrapper changes the boundary; and
 - the invocation is an eligible dependency or workspace library with complete rustc-reported filesystem and
-  environment inputs, root-independent dep-info, metadata, optional rlib output, Rust-only dependency artifacts, and
+  environment inputs, source-root-bound dep-info, metadata, optional rlib output, Rust-only dependency artifacts, and
   no linker responsibility.
 
 ```bash
@@ -1127,19 +1148,22 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
-The reusable session binds toolchain, compiler class, wrapper protocol, capabilities, and compiler-process environment.
-It does not bind the complete Cargo configuration or `Cargo.lock`. Each compiler unit instead binds its exact rustc
-arguments and cfg, source inputs, dependency artifact contents, and rustc-reported filesystem and environment reads.
+The reusable session binds the physical source root, toolchain, compiler class, wrapper protocol, capabilities, and
+compiler-process environment. It does not bind the complete Cargo configuration or `Cargo.lock`. Each compiler unit
+instead binds its exact rustc arguments and cfg, source inputs, dependency artifact contents, and rustc-reported
+filesystem and environment reads.
 Changes to `build.warnings`, jobs, build or target directories, network policy, registry settings, and unrelated
 lockfile entries can therefore reuse a result when those exact unit inputs remain unchanged. Rust flags, features,
 dependency contents, target, linker, sysroot, and observed inputs still change or reject reuse at their owning
 boundary.
 
-Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. A dep-info file that
-retains the physical workspace root as an input bypasses reuse because that input cannot be restored unchanged in
-another root. The CAS stores canonical internal tokens for verified dep-info and compiler-stream output paths, then
-binds them to Cargo's current output directory after verification. Output names and materialized bytes remain exact;
-any other cached reference to a previous output directory fails closed.
+Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. Rust metadata contains
+opaque source-root-sensitive bytes, so Cargo-Rail does not claim cross-checkout reuse for this class. It executes
+Cargo's rustc argv and current directory unchanged, binds the session to the source root, and reuses results only
+inside that authority. The CAS stores reversible internal tokens for verified dep-info and JSON compiler-stream output
+paths, including their Windows separator and escaping form, then binds them to Cargo's current output directory after
+verification. Output names and materialized bytes remain exact; ambiguous spellings or any other cached reference to a
+previous output directory fail closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
 toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
@@ -1262,7 +1286,7 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One declared crate root, complete dep-info-observed inputs, root-independent dep-info, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One source-root-bound session, one declared crate root, complete dep-info-observed inputs, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
 | Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
@@ -1283,50 +1307,16 @@ a binary:
 just bench-native-cache
 ```
 
-The latest optimized Linux x86-64 screen used one complete interleaved group on an AWS `c8i.xlarge` with local
-sccache `0.16.0`, offline Cargo/rustc `1.97.1`, distinct seed/use roots, and clean target directories. All 20 available
-lane samples were accepted with no rejections or false hits. Warm Cargo-Rail restored 28 verified results per workload.
+The v4 execution contract intentionally invalidates the retained v3 native-cache qualifications. Those measurements
+used a compiler-invocation rewrite and distinct source roots, so they cannot prove the corrected contract. Only hosts
+backed by a retained v4 corpus in the executable qualification registry are performance-qualified; structural cache
+availability is independent of that performance label.
 
-| Final-candidate sample | Cargo-Rail warm | sccache 0.16.0 | Cargo-Rail difference |
-|---|---:|---:|---:|
-| Check wall time | 4.003 s | 4.777 s | 16.2% lower |
-| Check complete CPU | 12.855 s | 15.511 s | 17.1% lower |
-| Check peak RSS | 374,759,424 B | 1,076,908,032 B | 65.2% lower |
-| Release-build wall time | 6.302 s | 8.081 s | 22.0% lower |
-| Release-build complete CPU | 20.131 s | 23.464 s | 14.2% lower |
-| Release-build peak RSS | 406,233,088 B | 1,041,481,728 B | 61.0% lower |
-
-This is a one-sample same-machine comparison, not a p50/p95 distribution. The retained qualification corpus below
-records the broader historical host coverage and remains the authority for qualified targets.
-
-One local M1 Pro before/after group measured the narrower unit identity and removed redundant warm rehashing. Warm
-release-build input hashing fell from 105,219,083 to 68,903,107 bytes (34.5%); warm check input hashing fell from
-75,037,802 to 49,793,592 bytes (33.6%). Both groups completed with zero false hits. The single wall-time samples moved
-by +4.6% and +8.0%, so this evidence supports the hashing reduction and wider reuse boundary, not a latency claim.
-
-The retained local M1 Pro automatic-policy measurement interleaved 110 lane attempts in 22 complete groups. sccache
-`0.16.0` was unavailable, so all 88 available samples were accepted with no rejections or false hits, identical action
-censuses and output manifests, and 27 stable eligible units per workload. Every sample used offline Cargo/rustc
-`1.97.1`, a clean target, distinct seed/use roots, and a fresh copy of the populated cache. Native Cargo used
-`CARGO_INCREMENTAL=0`; Cargo-Rail received no incremental environment setup and selected its clean-profile policy.
-
-Times are p50/p95:
-
-| Host and workload | Native Cargo | Cargo-Rail disabled | Cargo-Rail cold | Cargo-Rail warm | sccache |
-|---|---:|---:|---:|---:|---:|
-| M1 Pro check | 7.574/8.265 s | 8.012/10.072 s | 10.834/12.427 s | 5.506/6.932 s | — |
-| M1 Pro release build | 11.591/12.536 s | 11.822/13.284 s | 14.866/17.018 s | 8.293/13.532 s | — |
-| Linux x86-64 check | 5.841/5.891 s | — | — | 3.430/4.074 s | 3.155/3.247 s |
-| Linux x86-64 release build | 9.224/9.351 s | — | — | 5.547/5.605 s | 6.223/6.244 s |
-| Linux ARM64 check | 6.166/6.266 s | — | — | 3.870/4.325 s | 3.843/3.882 s |
-| Linux ARM64 release build | 10.591/10.674 s | — | — | 6.618/6.696 s | 7.470/7.562 s |
-
-On the M1 Pro, warm Cargo-Rail reduced p50 by 27.3% for checks and 28.5% for release builds versus native Cargo. The
-fresh CAS grew by 24,424,339 bytes for check and 65,631,693 bytes for release build; warm results restored 24,107,066
-and 65,362,456 bytes per sample. Two check reuses or one release-build reuse repaid the p50 cold-publication premium.
-Warm Cargo-Rail beat native Cargo at p50 for every qualified host and workload; the M1 Pro release-build p95 remained
-slower in this corpus. sccache led the two Linux check workloads and Cargo-Rail led the two Linux release-build
-comparisons. These are same-host fixture results, not universal performance claims.
+The benchmark now seeds and measures Cargo-Rail in one authoritative source root with a clean target directory and a
+fresh copy of the populated CAS. Acceptance hashes every `.d`, `.rmeta`, and `.rlib` byte without a root-bound
+exclusion, and requires identical action censuses, runtime behavior, compiler-event identities, cache accounting, and
+measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they cannot qualify
+Cargo-Rail's source-root-bound class.
 
 The final 30-sample M1 Pro active-profile follow-up measured unchanged Cargo at 60.2/60.8 ms p50/p95 and the narrow
 build delegation at 66.3/70.7 ms. The lean path removed workspace capture, metadata, Git, native-cache setup,
@@ -1336,12 +1326,9 @@ cargo-rail at 65.3/66.0 ms. The remaining 6.0–6.1 ms p50 premiums had non-over
 the active-profile policy accepts a 7 ms p50 supervisory budget for exact child exit behavior and a post-success
 receipt. The evidence does not justify process replacement, weaker receipt semantics, or broader static bypasses.
 
-Windows x86-64 timing remains unqualified. Its latest partial run found reusable clean-root hits but rejected timing
-because two bypassed proc-macro consumers produced byte-unstable DLLs and PID reuse could overwrite evidence files.
-
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
 wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
-reasons, and output portability findings. Use one accepted interleaved group for a bounded engineering decision.
+reasons, and byte-identity findings. Use one accepted interleaved group for a bounded engineering decision.
 Increase the sample count only for distribution or tail claims. Preserve raw output and never combine different
 commits, toolchains, targets, or policies.
 """

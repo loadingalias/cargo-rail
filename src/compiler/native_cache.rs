@@ -29,13 +29,13 @@ use crate::instrumentation::{
 };
 use crate::source::ContentDigest;
 
-pub(crate) const CANDIDATE_KEY_PREFIX: &str = "compiler-candidate-v3-sha256-";
-pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v3-sha256-";
+pub(crate) const CANDIDATE_KEY_PREFIX: &str = "compiler-candidate-v4-sha256-";
+pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v4-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v3";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v3";
-const SESSION_FILE: &str = "native-compiler-cache-session-v3.json";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v4";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v4";
+const SESSION_FILE: &str = "native-compiler-cache-session-v4.json";
 const DIRECT_CONTEXT_FILE: &str = "native-compiler-cache-context-v2.json";
 const UNIT_EVIDENCE_DIRECTORY: &str = "native-cache-unit-evidence";
 #[cfg(not(windows))]
@@ -43,8 +43,8 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
-const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 2;
-const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 3;
+const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 3;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 4;
 const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 4;
 const NATIVE_CACHE_RUN_EVENT_VERSION: u32 = 3;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
@@ -749,13 +749,14 @@ impl NativeCompilerSession {
     let class = NativeCompilerClass::capture(rustc_verbose_version, cargo_verbose_version);
     let identity = session_identity(
       &class,
+      &source_root_identity,
       capability_identity,
       toolchain_identity,
       compiler_process_environment_identity,
       execution_contract,
     )?;
     let session = Self {
-      version: 4,
+      version: 5,
       identity,
       source_root_identity,
       class,
@@ -791,7 +792,7 @@ impl NativeCompilerSession {
   }
 
   fn validate_object(&self) -> RailResult<()> {
-    if self.version != 4 {
+    if self.version != 5 {
       return Err(RailError::message(
         "native compiler cache session has an incompatible schema",
       ));
@@ -815,6 +816,7 @@ impl NativeCompilerSession {
     }
     let expected = session_identity(
       &self.class,
+      &self.source_root_identity,
       &self.capability_identity,
       &self.toolchain_identity,
       &self.compiler_process_environment_identity,
@@ -870,7 +872,7 @@ impl NativeCompilerValidation {
     let candidate_key = candidate_key(&session.identity, &session.class, &observation)?;
     let action_key = action_key(&session.identity, &session.class, &observation)?;
     let validation = Self {
-      version: 3,
+      version: 4,
       candidate_key,
       action_key,
       session_identity: session.identity.clone(),
@@ -911,7 +913,7 @@ impl NativeCompilerValidation {
   }
 
   pub(crate) fn validate_object(&self) -> RailResult<()> {
-    if self.version != 3 {
+    if self.version != 4 {
       return Err(RailError::message(
         "native compiler observation has an incompatible schema",
       ));
@@ -992,6 +994,7 @@ pub(crate) fn result_digest(action_key: &str, output_manifest: &str) -> String {
 
 fn session_identity(
   class: &NativeCompilerClass,
+  source_root_identity: &str,
   capability_identity: &str,
   toolchain_identity: &str,
   compiler_process_environment_identity: &str,
@@ -1002,7 +1005,8 @@ fn session_identity(
     "sha256:",
     b"cargo-rail-native-compiler-session\0",
     &[
-      (b"version", &4_u32.to_le_bytes()),
+      (b"version", &5_u32.to_le_bytes()),
+      (b"source-root", source_root_identity.as_bytes()),
       (
         b"toolchain-capability-contract",
         &NATIVE_CACHE_IDENTITY_CONTRACT_VERSION.to_le_bytes(),
@@ -1039,7 +1043,7 @@ fn candidate_key(
     CANDIDATE_KEY_PREFIX,
     b"cargo-rail-native-compiler-candidate\0",
     &[
-      (b"version", &3_u32.to_le_bytes()),
+      (b"version", &4_u32.to_le_bytes()),
       (b"session", session_identity.as_bytes()),
       (b"class", &class),
       (b"pre-execution", &pre_execution),
@@ -1058,7 +1062,7 @@ fn action_key(
     ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-action\0",
     &[
-      (b"version", &3_u32.to_le_bytes()),
+      (b"version", &4_u32.to_le_bytes()),
       (b"candidate", candidate.as_bytes()),
       (b"discovered-inputs", &discovered),
     ],
@@ -1431,6 +1435,9 @@ fn invocation_bypass_reason(
   if observation.emit_modes != metadata && observation.emit_modes != metadata_and_rlib {
     return Some("compiler_emit_mode_not_graduated");
   }
+  if compiler_long_option_value(&observation.compiler_arguments, "--error-format") != Some("json") {
+    return Some("compiler_diagnostic_format_not_graduated");
+  }
   if observation.compiler_arguments.iter().any(|argument| argument == "-") {
     return Some("compiler_stdin_not_graduated");
   }
@@ -1458,15 +1465,6 @@ fn invocation_bypass_reason(
     .any(|argument| argument.contains("incremental="))
   {
     return Some("incremental_compilation_not_graduated");
-  }
-  let remap_count = observation
-    .compiler_arguments
-    .iter()
-    .filter(|argument| argument.as_str() == "--remap-path-prefix=repository:=/cargo-rail/workspace")
-    .count();
-  let maximum_remap_count = if cfg!(windows) { 4 } else { 2 };
-  if !(1..=maximum_remap_count).contains(&remap_count) {
-    return Some("compiler_path_remap_contract_not_graduated");
   }
   if unsupported_compiler_argument(&observation.compiler_arguments) {
     return Some("compiler_flag_not_graduated");
@@ -1503,6 +1501,24 @@ fn invocation_bypass_reason(
   None
 }
 
+fn compiler_long_option_value<'a>(arguments: &'a [String], option: &str) -> Option<&'a str> {
+  let inline = format!("{option}=");
+  let mut selected = None;
+  let mut index = 0usize;
+  while index < arguments.len() {
+    if arguments[index] == option {
+      selected = arguments.get(index + 1).map(String::as_str);
+      index = index.saturating_add(2);
+    } else {
+      if let Some(value) = arguments[index].strip_prefix(&inline) {
+        selected = Some(value);
+      }
+      index = index.saturating_add(1);
+    }
+  }
+  selected
+}
+
 fn unsupported_compiler_argument(arguments: &[String]) -> bool {
   let mut index = 0usize;
   let mut source_inputs = 0usize;
@@ -1513,6 +1529,7 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
       "--crate-name" | "--crate-type" | "--emit" | "--out-dir" | "--target" | "--edition" | "--error-format"
       | "--json" | "--cfg" | "--check-cfg" | "--cap-lints" | "--color" | "--diagnostic-width" | "--allow"
       | "--warn" | "--deny" | "--forbid" => next.is_some(),
+      "--remap-path-prefix" => next.is_some_and(supported_path_remap),
       "--extern" => next.is_some_and(|value| value.contains('=')),
       "-L" => next.is_some_and(|value| value.starts_with("dependency=")),
       "-C" => next.is_some_and(supported_codegen_option),
@@ -1535,7 +1552,9 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
         || argument.starts_with("--warn=")
         || argument.starts_with("--deny=")
         || argument.starts_with("--forbid=")
-        || argument == "--remap-path-prefix=repository:=/cargo-rail/workspace"
+        || argument
+          .strip_prefix("--remap-path-prefix=")
+          .is_some_and(supported_path_remap)
         || argument.starts_with("--extern=") && argument.contains('=')
         || argument.starts_with("-Ldependency=")
         || argument.starts_with("-A") && argument.len() > 2
@@ -1569,6 +1588,12 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
     index += usize::from(consumes_next) + 1;
   }
   source_inputs != 1
+}
+
+fn supported_path_remap(value: &str) -> bool {
+  value
+    .split_once('=')
+    .is_some_and(|(source, destination)| !source.is_empty() && !destination.is_empty())
 }
 
 fn supported_unstable_option(option: &str) -> bool {
@@ -1645,6 +1670,7 @@ pub(crate) fn configure_outer(
   };
 
   let diagnostic_wrapper = is_diagnostic_workspace_wrapper(program);
+  prepare_original_child(command, diagnostic_wrapper);
   if std::env::var_os("RUSTC_FORCE_INCREMENTAL").is_some() {
     configure_cold(
       command,
@@ -1712,27 +1738,12 @@ pub(crate) fn configure_outer(
       return OuterCacheAction::Execute;
     }
   };
-  let portable_arguments = match portable_compiler_arguments(compiler_arguments, &original_current_dir, source_root) {
-    Ok(arguments) => arguments,
-    Err(reason) => {
-      configure_cold(
-        command,
-        CompilerCacheWrapperStatus::Bypassed,
-        reason,
-        None,
-        0,
-        diagnostic_wrapper,
-        trace,
-      );
-      return OuterCacheAction::Execute;
-    }
-  };
   let recorder = match crate::compiler::observation::begin_invocation_in(
     observation_directory,
     source_root,
-    source_root,
+    &original_current_dir,
     rustc,
-    &portable_arguments,
+    compiler_arguments,
   ) {
     Ok(recorder) => recorder,
     Err(_) => {
@@ -1784,19 +1795,6 @@ pub(crate) fn configure_outer(
       initial_input_bytes,
       diagnostic_wrapper,
       trace,
-    );
-    #[cfg(target_os = "macos")]
-    let portable_bypass_arguments =
-      portable_macos_bypass_arguments(reason, &portable_arguments, observation).unwrap_or(portable_arguments);
-    #[cfg(not(target_os = "macos"))]
-    let portable_bypass_arguments = portable_arguments;
-    configure_portable_child(
-      command,
-      program,
-      rustc,
-      &portable_bypass_arguments,
-      diagnostic_wrapper,
-      source_root,
     );
     return OuterCacheAction::Execute;
   }
@@ -1953,320 +1951,27 @@ pub(crate) fn configure_outer(
     diagnostic_wrapper,
     trace,
   );
-  configure_portable_child(
-    command,
-    program,
-    rustc,
-    &portable_arguments,
-    diagnostic_wrapper,
-    source_root,
-  );
   let mut recorder = recorder;
   recorder.set_cache_wrapper(metadata);
+  suppress_nested_observation(command);
   OuterCacheAction::Store {
     recorder,
     cache_bytes_read: metrics.cache_bytes_read,
   }
 }
 
-fn portable_compiler_arguments(
-  arguments: &[OsString],
-  original_current_dir: &Path,
-  source_root: &Path,
-) -> Result<Vec<OsString>, &'static str> {
-  let canonical_root =
-    crate::utils::canonicalize_existing(source_root).map_err(|_| "native_cache_source_root_unavailable")?;
-  let remap_roots = remap_source_root_spellings(source_root, &canonical_root)?;
-  let text = arguments
-    .iter()
-    .map(|argument| argument.to_str().ok_or("non_utf8_compiler_argument"))
-    .collect::<Result<Vec<_>, _>>()?;
-  let mut rewritten = Vec::with_capacity(arguments.len() + 2);
-  let mut index = 0usize;
-  while index < text.len() {
-    let argument = text[index];
-    let next = text.get(index + 1).copied();
-    match argument {
-      "--out-dir" => {
-        let value = next.ok_or("compiler_output_paths_unavailable")?;
-        rewritten.push(OsString::from(argument));
-        rewritten.push(OsString::from(rewrite_compiler_path(
-          value,
-          original_current_dir,
-          &canonical_root,
-          true,
-        )?));
-        index += 2;
-      }
-      "--extern" => {
-        let value = next.ok_or("dependency_artifact_path_unavailable")?;
-        rewritten.push(OsString::from(argument));
-        rewritten.push(if value == "proc_macro" {
-          OsString::from(value)
-        } else {
-          OsString::from(rewrite_prefixed_path(
-            value,
-            '=',
-            original_current_dir,
-            &canonical_root,
-            false,
-          )?)
-        });
-        index += 2;
-      }
-      "-L" => {
-        let value = next.ok_or("dependency_artifact_path_unavailable")?;
-        rewritten.push(OsString::from(argument));
-        rewritten.push(OsString::from(rewrite_prefixed_path(
-          value,
-          '=',
-          original_current_dir,
-          &canonical_root,
-          false,
-        )?));
-        index += 2;
-      }
-      "--emit" => {
-        let value = next.ok_or("compiler_output_paths_unavailable")?;
-        rewritten.push(OsString::from(argument));
-        rewritten.push(OsString::from(rewrite_emit_paths(
-          value,
-          original_current_dir,
-          &canonical_root,
-        )?));
-        index += 2;
-      }
-      _ if argument.starts_with("--out-dir=") => {
-        let value = argument.trim_start_matches("--out-dir=");
-        let path = rewrite_compiler_path(value, original_current_dir, &canonical_root, true)?;
-        rewritten.push(OsString::from(format!("--out-dir={path}")));
-        index += 1;
-      }
-      _ if argument.starts_with("--extern=") => {
-        let value = argument.trim_start_matches("--extern=");
-        rewritten.push(if value == "proc_macro" {
-          OsString::from(argument)
-        } else {
-          let value = rewrite_prefixed_path(value, '=', original_current_dir, &canonical_root, false)?;
-          OsString::from(format!("--extern={value}"))
-        });
-        index += 1;
-      }
-      _ if argument.starts_with("-Ldependency=") => {
-        let value = argument.trim_start_matches("-L");
-        let value = rewrite_prefixed_path(value, '=', original_current_dir, &canonical_root, false)?;
-        rewritten.push(OsString::from(format!("-L{value}")));
-        index += 1;
-      }
-      _ if argument.starts_with("--emit=") => {
-        let value = argument.trim_start_matches("--emit=");
-        rewritten.push(OsString::from(format!(
-          "--emit={}",
-          rewrite_emit_paths(value, original_current_dir, &canonical_root)?
-        )));
-        index += 1;
-      }
-      _ if !argument.starts_with('-') && argument.ends_with(".rs") => {
-        rewritten.push(OsString::from(rewrite_compiler_path(
-          argument,
-          original_current_dir,
-          &canonical_root,
-          false,
-        )?));
-        index += 1;
-      }
-      _ if argument.starts_with("incremental=") => return Err("incremental_compilation_not_graduated"),
-      _ => {
-        if remap_roots.iter().any(|root| argument.contains(root)) {
-          return Err("compiler_argument_root_binding_not_graduated");
-        }
-        rewritten.push(OsString::from(argument));
-        index += 1;
-      }
-    }
-  }
-  for root in remap_roots {
-    rewritten.push(OsString::from(format!(
-      "--remap-path-prefix={root}=/cargo-rail/workspace"
-    )));
-  }
-  Ok(rewritten)
-}
-
-fn remap_source_root_spellings(source_root: &Path, canonical_root: &Path) -> Result<Vec<String>, &'static str> {
-  let mut roots = BTreeSet::new();
-  for root in [source_root, canonical_root] {
-    let root = root
-      .to_str()
-      .filter(|root| !root.is_empty() && !root.contains('='))
-      .ok_or("source_root_not_remappable")?;
-    roots.insert(root.to_string());
-    #[cfg(windows)]
-    roots.insert(root.replace('\\', "/"));
-  }
-  Ok(roots.into_iter().collect())
-}
-
-#[cfg(target_os = "macos")]
-fn portable_macos_bypass_arguments(
-  reason: &str,
-  arguments: &[OsString],
-  observation: &RawCompilerInvocation,
-) -> Option<Vec<OsString>> {
-  match reason {
-    "proc_macro_not_graduated" => portable_macos_proc_macro_arguments(arguments, observation),
-    "dependency_artifact_class_not_graduated" if only_proc_macro_dylib_is_ungraduated(observation) => {
-      Some(arguments.to_vec())
-    }
-    _ => None,
+fn prepare_original_child(command: &mut Command, diagnostic_wrapper: bool) {
+  if !diagnostic_wrapper {
+    suppress_nested_observation(command);
   }
 }
 
-#[cfg(target_os = "macos")]
-fn only_proc_macro_dylib_is_ungraduated(observation: &RawCompilerInvocation) -> bool {
-  let mut dylib = false;
-  for (_, artifact) in &observation.dependency_artifacts {
-    match artifact
-      .path
-      .resolve(Path::new("/"))
-      .extension()
-      .and_then(OsStr::to_str)
-    {
-      Some("rmeta" | "rlib") => {}
-      Some("dylib") => dylib = true,
-      _ => return false,
-    }
-  }
-  dylib
-}
-
-#[cfg(target_os = "macos")]
-fn portable_macos_proc_macro_arguments(
-  arguments: &[OsString],
-  observation: &RawCompilerInvocation,
-) -> Option<Vec<OsString>> {
-  let crate_name = observation.crate_name.as_deref()?;
-  let mut extra_filename = None;
-  let mut index = 0usize;
-  while index < arguments.len() {
-    let argument = arguments[index].to_str()?;
-    let codegen = if argument == "-C" {
-      index += 1;
-      arguments.get(index)?.to_str()?
-    } else {
-      argument.strip_prefix("-C").unwrap_or_default()
-    };
-    let name = codegen.split_once('=').map_or(codegen, |(name, _)| name);
-    if matches!(
-      name,
-      "linker" | "link-arg" | "link-args" | "linker-flavor" | "link-self-contained" | "default-linker-libraries"
-    ) || argument == "-l"
-      || argument.starts_with("-l")
-      || argument.starts_with("-Lnative")
-      || argument == "-L"
-        && arguments
-          .get(index + 1)
-          .and_then(|value| value.to_str())
-          .is_some_and(|value| value.starts_with("native="))
-    {
-      return None;
-    }
-    if let Some(value) = codegen.strip_prefix("extra-filename=") {
-      extra_filename = Some(value);
-    }
-    index += 1;
-  }
-  let extra_filename = extra_filename?;
-  if !crate_name
-    .bytes()
-    .chain(extra_filename.bytes())
-    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-  {
-    return None;
-  }
-  let install_name = format!("link-arg=-Wl,-install_name,@rpath/lib{crate_name}{extra_filename}.dylib");
-  let mut portable = arguments.to_vec();
-  portable.push(OsString::from("-C"));
-  portable.push(OsString::from(install_name));
-  Some(portable)
-}
-
-fn rewrite_emit_paths(value: &str, original_current_dir: &Path, source_root: &Path) -> Result<String, &'static str> {
-  value
-    .split(',')
-    .map(|emit| {
-      let Some((mode, path)) = emit.split_once('=') else {
-        return Ok(emit.to_string());
-      };
-      rewrite_compiler_path(path, original_current_dir, source_root, true).map(|path| format!("{mode}={path}"))
-    })
-    .collect::<Result<Vec<_>, _>>()
-    .map(|parts| parts.join(","))
-}
-
-fn rewrite_prefixed_path(
-  value: &str,
-  separator: char,
-  original_current_dir: &Path,
-  source_root: &Path,
-  require_repository: bool,
-) -> Result<String, &'static str> {
-  let (prefix, path) = value
-    .split_once(separator)
-    .ok_or("dependency_artifact_path_unavailable")?;
-  rewrite_compiler_path(path, original_current_dir, source_root, require_repository)
-    .map(|path| format!("{prefix}{separator}{path}"))
-}
-
-fn rewrite_compiler_path(
-  value: &str,
-  original_current_dir: &Path,
-  source_root: &Path,
-  require_repository: bool,
-) -> Result<String, &'static str> {
-  let selected = Path::new(value);
-  let absolute = if selected.is_absolute() {
-    selected.to_path_buf()
-  } else {
-    original_current_dir.join(selected)
-  };
-  let resolved = if absolute.exists() {
-    crate::utils::canonicalize_existing(&absolute).map_err(|_| "compiler_path_unavailable")?
-  } else {
-    let parent = absolute.parent().ok_or("compiler_path_unavailable")?;
-    let parent = crate::utils::canonicalize_existing(parent).map_err(|_| "compiler_path_unavailable")?;
-    parent.join(absolute.file_name().ok_or("compiler_path_unavailable")?)
-  };
-  if let Ok(relative) = resolved.strip_prefix(source_root) {
-    return Ok(crate::utils::path_to_git_format(relative));
-  }
-  if require_repository {
-    return Err("compiler_output_root_not_graduated");
-  }
-  resolved.to_str().map(str::to_string).ok_or("non_utf8_compiler_path")
-}
-
-fn configure_portable_child(
-  command: &mut Command,
-  program: &OsStr,
-  rustc: &OsStr,
-  compiler_arguments: &[OsString],
-  diagnostic_wrapper: bool,
-  source_root: &Path,
-) {
-  let mut portable = Command::new(program);
-  if diagnostic_wrapper {
-    portable.arg(rustc);
-  }
-  portable
-    .args(compiler_arguments)
-    .current_dir(source_root)
-    .env_remove(crate::compiler::wrapper::CACHE_WRAPPER_MARKER)
+fn suppress_nested_observation(command: &mut Command) {
+  command
     .env_remove(crate::compiler::wrapper::OBSERVATION_DIRECTORY_ENV)
     .env_remove(crate::compiler::wrapper::OBSERVATION_SOURCE_ROOT_ENV)
     .env_remove(SESSION_ENV)
     .env_remove(DISPOSITION_ENV);
-  *command = portable;
 }
 
 fn configure_cold(
@@ -2666,67 +2371,32 @@ fn portable_output_binding_bytes(
   source_root: &Path,
   require_replacement: bool,
 ) -> RailResult<Vec<u8>> {
-  let mut replacements = native_output_bindings(outputs)
-    .into_iter()
-    .map(|(_, _, output)| {
-      let relative = output
-        .strip_prefix(source_root)
-        .map_err(|_| RailError::message("native compiler output is outside the source root"))?;
-      let relative = crate::utils::path_to_git_format(relative);
-      let absolute = crate::utils::path_to_git_format(output);
-      let portable = portable_output_binding(&relative)?;
-      Ok(
-        [
-          canonical_output_path_replacements(&absolute, &portable),
-          canonical_output_path_replacements(&relative, &portable),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>(),
-      )
-    })
-    .collect::<RailResult<Vec<_>>>()?
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-  replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
-  replacements.dedup();
-
-  let mut portable = bytes.to_vec();
-  let mut replacement_count = 0usize;
-  for (current, canonical) in replacements {
-    let (next, count) = replace_bytes(&portable, &current, &canonical);
-    portable = next;
-    replacement_count = replacement_count.saturating_add(count);
+  if bytes
+    .windows(PORTABLE_OUTPUT_BINDING_PREFIX.len())
+    .any(|window| window == PORTABLE_OUTPUT_BINDING_PREFIX)
+  {
+    return Err(RailError::message(
+      "native compiler output collides with a reserved output-binding token",
+    ));
   }
+  let encoding = if require_replacement {
+    OutputBindingEncoding::DepInfo
+  } else {
+    OutputBindingEncoding::Json
+  };
+  let replacements = output_binding_replacements(outputs, source_root, encoding, true)?;
+  let (portable, replacement_count) = replace_output_bindings(bytes, &replacements, encoding);
 
-  let output = native_output_bindings(outputs)[0].2;
-  let output_parent = output
-    .parent()
-    .ok_or_else(|| RailError::message("native compiler output has no parent"))?;
-  let relative_parent = output_parent
-    .strip_prefix(source_root)
-    .map_err(|_| RailError::message("native compiler output parent is outside the source root"))?;
   if require_replacement && replacement_count == 0
-    || [
-      crate::utils::path_to_git_format(output_parent),
-      crate::utils::path_to_git_format(relative_parent),
-    ]
-    .iter()
-    .flat_map(|path| output_path_spellings(path))
-    .any(|path| contains_path_prefix(&portable, &path))
+    || output_parent_spellings(outputs, source_root, encoding)?
+      .iter()
+      .any(|path| contains_path_prefix(&portable, path))
   {
     return Err(RailError::message(
       "native compiler output contains an unmodeled output-directory binding",
     ));
   }
   Ok(portable)
-}
-
-fn portable_output_binding(path: &str) -> RailResult<String> {
-  let file_name = portable_path_basename(path)
-    .ok_or_else(|| RailError::message("native compiler output has no portable file name"))?;
-  Ok(format!("/cargo-rail/native-output/{file_name}"))
 }
 
 fn translate_output_binding_bytes(
@@ -2736,55 +2406,32 @@ fn translate_output_binding_bytes(
   source_root: &Path,
   require_replacement: bool,
 ) -> RailResult<Vec<u8>> {
-  let current = native_output_bindings(outputs)
-    .into_iter()
-    .map(|(role, _, path)| {
-      let relative = path
-        .strip_prefix(source_root)
-        .map_err(|_| RailError::message("native compiler dep-info destination is outside the source root"))?;
-      Ok((role, crate::utils::path_to_git_format(relative)))
-    })
-    .collect::<RailResult<BTreeMap<_, _>>>()?;
-  let stored = validation
-    .observation
-    .emitted_outputs
+  let stored_roles = validation
+    .outputs
     .iter()
-    .map(|output| {
-      let role = output_binding_role(&output.path)
-        .ok_or_else(|| RailError::message("native compiler dep-info source has an unknown output role"))?;
-      let ObservationPath::Repository(path) = &output.path else {
-        return Err(RailError::message(
-          "native compiler dep-info source is not repository-relative",
-        ));
-      };
-      Ok((role, portable_output_binding(path)?))
-    })
-    .collect::<RailResult<BTreeMap<_, _>>>()?;
-  if stored.keys().ne(current.keys()) {
+    .map(|output| output.role.as_str())
+    .collect::<BTreeSet<_>>();
+  let current_roles = native_output_bindings(outputs)
+    .into_iter()
+    .map(|(role, _, _)| role)
+    .collect::<BTreeSet<_>>();
+  if stored_roles != current_roles {
     return Err(RailError::message(
       "native compiler dep-info output roles changed during materialization",
     ));
   }
 
-  let stored_parent = common_output_parent(stored.values().map(String::as_str))?;
-
-  let mut replacements = stored
-    .iter()
-    .map(|(role, stored)| (stored.as_bytes().to_vec(), current[role].as_bytes().to_vec()))
-    .collect::<Vec<_>>();
-  replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
-  replacements.dedup();
-  let mut translated = bytes.to_vec();
-  let mut replacement_count = 0usize;
-  for (stored, current) in replacements {
-    let (next, count) = replace_bytes(&translated, &stored, &current);
-    translated = next;
-    replacement_count = replacement_count.saturating_add(count);
-  }
+  let encoding = if require_replacement {
+    OutputBindingEncoding::DepInfo
+  } else {
+    OutputBindingEncoding::Json
+  };
+  let replacements = output_binding_replacements(outputs, source_root, encoding, false)?;
+  let (translated, replacement_count) = replace_output_bindings(bytes, &replacements, encoding);
   if require_replacement && replacement_count == 0
-    || output_path_spellings(&stored_parent)
-      .iter()
-      .any(|path| contains_path_prefix(&translated, path))
+    || translated
+      .windows(PORTABLE_OUTPUT_BINDING_PREFIX.len())
+      .any(|window| window == PORTABLE_OUTPUT_BINDING_PREFIX)
   {
     return Err(RailError::message(
       "native compiler cached data contains an unmodeled output-directory binding",
@@ -2793,49 +2440,128 @@ fn translate_output_binding_bytes(
   Ok(translated)
 }
 
-fn common_output_parent<'a>(paths: impl IntoIterator<Item = &'a str>) -> RailResult<String> {
-  let mut parents = paths
-    .into_iter()
-    .map(|path| {
-      path
-        .rsplit_once(['/', '\\'])
-        .map(|(parent, _)| parent.to_string())
-        .ok_or_else(|| RailError::message("native compiler output has no portable parent"))
-    })
-    .collect::<RailResult<BTreeSet<_>>>()?;
-  if parents.len() != 1 {
-    return Err(RailError::message(
-      "native compiler outputs do not share one portable parent",
-    ));
-  }
-  parents
-    .pop_first()
-    .ok_or_else(|| RailError::message("native compiler output set is empty"))
+const PORTABLE_OUTPUT_BINDING_PREFIX: &[u8] = b"/cargo-rail/native-output/v3/";
+
+#[derive(Clone, Copy)]
+enum OutputBindingEncoding {
+  Json,
+  DepInfo,
 }
 
-fn canonical_output_path_replacements(current: &str, portable: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-  let portable = portable.as_bytes().to_vec();
-  output_path_spellings(current)
-    .into_iter()
-    .map(|current| (current, portable.clone()))
-    .collect()
+fn output_binding_replacements(
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  encoding: OutputBindingEncoding,
+  to_portable: bool,
+) -> RailResult<Vec<(Vec<u8>, Vec<u8>)>> {
+  let mut replacements = Vec::new();
+  for (role, _, output) in native_output_bindings(outputs) {
+    for (scope, path) in output_binding_paths(output, source_root)? {
+      for (form, path) in output_path_forms(&path) {
+        for (representation, rendered) in encoded_output_path_forms(&path, encoding) {
+          let portable = format!("/cargo-rail/native-output/v3/{role}/{scope}/{form}/{representation}").into_bytes();
+          replacements.push(if to_portable {
+            (rendered, portable)
+          } else {
+            (portable, rendered)
+          });
+        }
+      }
+    }
+  }
+  replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
+  if replacements
+    .windows(2)
+    .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+  {
+    return Err(RailError::message("native compiler output path spelling is ambiguous"));
+  }
+  replacements.dedup();
+  Ok(replacements)
 }
 
-fn output_path_spellings(path: &str) -> Vec<Vec<u8>> {
-  let git = path.replace('\\', "/");
-  let native = git.replace('/', "\\");
-  let mut plain = vec![git.clone(), native.clone()];
-  if let Some((parent, name)) = git.rsplit_once('/') {
-    plain.push(format!("{parent}\\{name}"));
-    plain.push(format!("{}/{name}", parent.replace('/', "\\")));
-  }
+fn output_binding_paths(output: &Path, source_root: &Path) -> RailResult<Vec<(&'static str, String)>> {
+  let output_parent = output
+    .parent()
+    .ok_or_else(|| RailError::message("native compiler output has no parent"))?;
+  let file_name = output
+    .file_name()
+    .ok_or_else(|| RailError::message("native compiler output has no file name"))?;
+  let canonical_root = crate::utils::canonicalize_existing(source_root)?;
+  let canonical_output = crate::utils::canonicalize_existing(output_parent)?.join(file_name);
+  let relative = canonical_output
+    .strip_prefix(&canonical_root)
+    .map_err(|_| RailError::message("native compiler output is outside the source root"))?;
+  let mut paths = vec![
+    ("selected", crate::utils::path_to_git_format(output)),
+    ("canonical", crate::utils::path_to_git_format(&canonical_output)),
+    ("relative", crate::utils::path_to_git_format(relative)),
+  ];
+  let mut seen = BTreeSet::new();
+  paths.retain(|(_, path)| seen.insert(path.clone()));
+  Ok(paths)
+}
+
+fn output_parent_spellings(
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  encoding: OutputBindingEncoding,
+) -> RailResult<Vec<Vec<u8>>> {
+  let output_parent = native_output_bindings(outputs)[0]
+    .2
+    .parent()
+    .ok_or_else(|| RailError::message("native compiler output has no parent"))?;
+  let canonical_root = crate::utils::canonicalize_existing(source_root)?;
+  let canonical_parent = crate::utils::canonicalize_existing(output_parent)?;
+  let relative_parent = canonical_parent
+    .strip_prefix(&canonical_root)
+    .map_err(|_| RailError::message("native compiler output parent is outside the source root"))?;
+  let paths = [
+    crate::utils::path_to_git_format(output_parent),
+    crate::utils::path_to_git_format(&canonical_parent),
+    crate::utils::path_to_git_format(relative_parent),
+  ]
+  .into_iter()
+  .collect::<BTreeSet<_>>();
   let mut spellings = Vec::new();
-  for plain in plain.into_iter().map(String::into_bytes) {
-    let escaped = escape_dep_info_path(&plain);
-    let json = json_string_contents(&plain);
-    spellings.extend([plain, escaped, json]);
+  for path in paths {
+    for (_, path) in output_path_forms(&path) {
+      spellings.extend(
+        encoded_output_path_forms(&path, encoding)
+          .into_iter()
+          .map(|(_, encoded)| encoded),
+      );
+    }
   }
-  spellings
+  spellings.sort();
+  spellings.dedup();
+  Ok(spellings)
+}
+
+fn output_path_forms(path: &str) -> Vec<(&'static str, String)> {
+  let forward = path.replace('\\', "/");
+  let backward = forward.replace('/', "\\");
+  let mut forms = vec![("forward", forward.clone()), ("backward", backward)];
+  if let Some((parent, name)) = forward.rsplit_once('/') {
+    forms.push(("forward-parent", format!("{parent}\\{name}")));
+    forms.push(("backward-parent", format!("{}/{name}", parent.replace('/', "\\"))));
+  }
+  forms
+}
+
+fn encoded_output_path_forms(path: &str, encoding: OutputBindingEncoding) -> Vec<(&'static str, Vec<u8>)> {
+  match encoding {
+    OutputBindingEncoding::Json => vec![("json", json_string_contents(path.as_bytes()))],
+    OutputBindingEncoding::DepInfo => {
+      let literal = path.as_bytes().to_vec();
+      let escaped = escape_dep_info_path(path.as_bytes());
+      if literal == escaped {
+        vec![("literal", literal)]
+      } else {
+        vec![("literal", literal), ("escaped", escaped)]
+      }
+    }
+  }
 }
 
 fn json_string_contents(value: &[u8]) -> Vec<u8> {
@@ -2857,6 +2583,51 @@ fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
     escaped.push(*byte);
   }
   escaped
+}
+
+fn replace_output_bindings(
+  bytes: &[u8],
+  replacements: &[(Vec<u8>, Vec<u8>)],
+  encoding: OutputBindingEncoding,
+) -> (Vec<u8>, usize) {
+  match encoding {
+    OutputBindingEncoding::Json => replace_json_artifact_values(bytes, replacements),
+    OutputBindingEncoding::DepInfo => {
+      replacements
+        .iter()
+        .fold((bytes.to_vec(), 0usize), |(current, total), (from, to)| {
+          let (next, count) = replace_bytes(&current, from, to);
+          (next, total.saturating_add(count))
+        })
+    }
+  }
+}
+
+fn replace_json_artifact_values(bytes: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -> (Vec<u8>, usize) {
+  const PREFIX: &[u8] = b"\"artifact\":\"";
+
+  let mut output = Vec::with_capacity(bytes.len());
+  let mut cursor = 0usize;
+  let mut count = 0usize;
+  while let Some(relative) = bytes[cursor..]
+    .windows(PREFIX.len())
+    .position(|window| window == PREFIX)
+  {
+    let value = cursor + relative + PREFIX.len();
+    output.extend_from_slice(&bytes[cursor..value]);
+    if let Some((from, to)) = replacements
+      .iter()
+      .find(|(from, _)| bytes[value..].starts_with(from) && bytes.get(value + from.len()) == Some(&b'"'))
+    {
+      output.extend_from_slice(to);
+      cursor = value + from.len();
+      count = count.saturating_add(1);
+    } else {
+      cursor = value;
+    }
+  }
+  output.extend_from_slice(&bytes[cursor..]);
+  (output, count)
 }
 
 fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> (Vec<u8>, usize) {
@@ -3441,11 +3212,6 @@ fn validate_post_execution_inputs(
   if let Some(reason) = invocation_bypass_reason(observation, true, host_target) {
     return Err((reason, 0));
   }
-  match dep_info_contains_source_root(observation, source_root) {
-    Ok(true) => return Err(("root_bound_dep_info_not_graduated", 0)),
-    Ok(false) => {}
-    Err(_) => return Err(("dep_info_portability_unavailable", 0)),
-  }
   let mut bytes_hashed = 0u64;
   for file in observation
     .declared_inputs
@@ -3460,36 +3226,6 @@ fn validate_post_execution_inputs(
   Ok(bytes_hashed)
 }
 
-fn dep_info_contains_source_root(observation: &RawCompilerInvocation, source_root: &Path) -> RailResult<bool> {
-  let canonical_root = crate::utils::canonicalize_existing(source_root)?;
-  let roots = remap_source_root_spellings(source_root, &canonical_root)
-    .map_err(|reason| RailError::message(format!("compiler source root is not portable: {reason}")))?;
-  let spellings = roots
-    .iter()
-    .flat_map(|root| {
-      let mut escaped = Vec::with_capacity(root.len());
-      for byte in root.bytes() {
-        if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
-          escaped.push(b'\\');
-        }
-        escaped.push(byte);
-      }
-      [root.as_bytes().to_vec(), escaped]
-    })
-    .collect::<BTreeSet<_>>();
-  let dep_info = observation
-    .emitted_outputs
-    .iter()
-    .find(|output| output.path.resolve(source_root).extension() == Some(OsStr::new("d")))
-    .ok_or_else(|| RailError::message("compiler dep-info output is unavailable"))?;
-  let bytes = fs::read(dep_info.path.resolve(source_root))?;
-  Ok(
-    spellings
-      .iter()
-      .any(|root| bytes.windows(root.len()).any(|window| window == root)),
-  )
-}
-
 fn publish_cold_result(
   session: &NativeCompilerSession,
   observation: &RawCompilerInvocation,
@@ -3502,7 +3238,7 @@ fn publish_cold_result(
   let bindings = native_output_bindings(output_paths);
   // Rustc reports artifact paths with platform-specific spelling. Store one
   // canonical path token so a verified result can be late-bound to a different
-  // Cargo output directory (and workspace root) on restore.
+  // Cargo output directory within this physical source root on restore.
   let stdout = portable_stream_output_bindings(stdout, output_paths, source_root)?;
   let stderr = portable_stream_output_bindings(stderr, output_paths, source_root)?;
   let dep_info_observation = observed_output(observation, &output_paths.dep_info, source_root)?;
@@ -3858,6 +3594,7 @@ pub(crate) mod tests {
         "--crate-name",
         "fixture",
         "--edition=2024",
+        "--error-format=json",
         "src/lib.rs",
         "--crate-type",
         "lib",
@@ -3867,7 +3604,6 @@ pub(crate) mod tests {
         "-Cextra-filename=-0123456789abcdef",
         "--out-dir",
         "target/debug/deps",
-        "--remap-path-prefix=repository:=/cargo-rail/workspace",
       ]
       .into_iter()
       .map(str::to_string)
@@ -3902,6 +3638,7 @@ pub(crate) mod tests {
     let execution_contract = DIAGNOSTIC_EXECUTION_CONTRACT.to_string();
     let identity = session_identity(
       &class,
+      &source_root_identity,
       &capability_identity,
       &toolchain_identity,
       &compiler_process_environment_identity,
@@ -3909,7 +3646,7 @@ pub(crate) mod tests {
     )
     .expect("session identity");
     NativeCompilerSession {
-      version: 4,
+      version: 5,
       identity,
       source_root_identity,
       class,
@@ -4104,6 +3841,13 @@ pub(crate) mod tests {
     assert_bypass("compiler_stdin_not_graduated", |value| {
       value.compiler_arguments.push("-".to_string());
     });
+    assert_bypass("compiler_diagnostic_format_not_graduated", |value| {
+      *value
+        .compiler_arguments
+        .iter_mut()
+        .find(|argument| argument.starts_with("--error-format="))
+        .expect("diagnostic format") = "--error-format=human".to_string();
+    });
     assert_bypass("native_linking_not_graduated", |value| {
       value
         .compiler_arguments
@@ -4144,61 +3888,6 @@ pub(crate) mod tests {
     assert_bypass("complete_compiler_observation_unavailable", |value| {
       value.observed_reads.clear();
     });
-  }
-
-  #[cfg(target_os = "macos")]
-  #[test]
-  fn portable_proc_macro_execution_uses_a_unique_non_rooted_install_name() {
-    let mut observation = graduated_observation();
-    observation.crate_name = Some("fixture_macros".to_string());
-    observation.crate_types = BTreeSet::from(["proc-macro".to_string()]);
-    observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
-    let arguments = observation
-      .compiler_arguments
-      .iter()
-      .map(OsString::from)
-      .collect::<Vec<_>>();
-
-    let portable = portable_macos_bypass_arguments("proc_macro_not_graduated", &arguments, &observation)
-      .expect("portable proc-macro arguments");
-    assert_eq!(
-      portable[portable.len() - 2..],
-      [
-        OsString::from("-C"),
-        OsString::from("link-arg=-Wl,-install_name,@rpath/libfixture_macros-0123456789abcdef.dylib")
-      ]
-    );
-    assert_eq!(
-      invocation_bypass_reason(&observation, false, "aarch64-apple-darwin"),
-      Some("proc_macro_not_graduated")
-    );
-
-    let mut explicit_linker = arguments.clone();
-    explicit_linker.push(OsString::from("-Clinker=/usr/bin/cc"));
-    assert!(
-      portable_macos_proc_macro_arguments(&explicit_linker, &observation).is_none(),
-      "explicit linker control must retain Cargo's exact compiler argv"
-    );
-
-    let mut consumer = graduated_observation();
-    consumer.dependency_artifacts.push((
-      "fixture_macros".to_string(),
-      observed_file(
-        "target/debug/deps/libfixture_macros-0123456789abcdef.dylib",
-        b"proc-macro",
-      ),
-    ));
-    assert_eq!(
-      portable_macos_bypass_arguments("dependency_artifact_class_not_graduated", &arguments, &consumer,),
-      Some(arguments.clone())
-    );
-
-    consumer.dependency_artifacts[0].1 =
-      observed_file("target/debug/deps/libfixture_macros-0123456789abcdef.so", b"plugin");
-    assert!(
-      portable_macos_bypass_arguments("dependency_artifact_class_not_graduated", &arguments, &consumer,).is_none(),
-      "unreviewed dynamic dependency classes must retain Cargo's exact compiler argv"
-    );
   }
 
   #[test]
@@ -4258,28 +3947,6 @@ pub(crate) mod tests {
     assert!(!destination.exists());
   }
 
-  #[test]
-  fn physical_source_roots_in_dep_info_are_not_portable() {
-    let directory = tempfile::tempdir().expect("source root parent");
-    let source_root = directory.path().join("workspace root");
-    let output = source_root.join("target/debug/deps/fixture.d");
-    fs::create_dir_all(output.parent().expect("dep-info parent")).expect("dep-info directory");
-    let escaped_root = source_root.to_string_lossy().replace(' ', "\\ ");
-    fs::write(
-      &output,
-      format!("target/debug/deps/fixture.rmeta: {escaped_root}/target/generated.rs\n"),
-    )
-    .expect("root-bound dep-info");
-    let mut observation = graduated_observation();
-    observation.emitted_outputs[0] =
-      FileObservation::capture(&output, &source_root, &source_root).expect("dep-info observation");
-
-    assert!(dep_info_contains_source_root(&observation, &source_root).expect("root-bound check"));
-
-    fs::write(&output, "target/debug/deps/fixture.rmeta: target/generated.rs\n").expect("portable dep-info");
-    assert!(!dep_info_contains_source_root(&observation, &source_root).expect("portable check"));
-  }
-
   #[cfg(any(unix, windows))]
   #[test]
   fn publication_moves_the_verified_staging_file_without_copying_it() {
@@ -4331,7 +3998,15 @@ pub(crate) mod tests {
   fn session_identity_changes_with_exact_toolchain_identity() {
     let session = graduated_session(digest(b"source-root"));
     let identity = |capability: &str, toolchain: &str, environment: &str, contract: &str| {
-      session_identity(&session.class, capability, toolchain, environment, contract).expect("session identity")
+      session_identity(
+        &session.class,
+        &session.source_root_identity,
+        capability,
+        toolchain,
+        environment,
+        contract,
+      )
+      .expect("session identity")
     };
     assert_ne!(
       identity(
@@ -4378,6 +4053,7 @@ pub(crate) mod tests {
     session.capability_identity = digest(b"different-exact-toolchain");
     session.identity = session_identity(
       &session.class,
+      &session.source_root_identity,
       &session.capability_identity,
       &session.toolchain_identity,
       &session.compiler_process_environment_identity,
@@ -4546,12 +4222,12 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn session_identity_is_portable_but_each_session_file_is_root_bound() {
+  fn session_identity_is_root_bound_with_opaque_compiler_outputs() {
     let first = tempfile::tempdir().expect("first source root");
     let second = tempfile::tempdir().expect("second source root");
     let first_session = graduated_session(path_identity(first.path()).expect("first root identity"));
     let second_session = graduated_session(path_identity(second.path()).expect("second root identity"));
-    assert_eq!(first_session.identity, second_session.identity);
+    assert_ne!(first_session.identity, second_session.identity);
 
     let session_file = first.path().join("session.json");
     fs::write(&session_file, serde_json::to_vec(&first_session).expect("session JSON")).expect("session file");
@@ -4708,46 +4384,159 @@ pub(crate) mod tests {
   fn dep_info_materialization_rebinds_only_verified_output_paths() {
     let source_root = tempfile::tempdir().expect("source root");
     let validation = graduated_validation(graduated_observation());
+    let original_directory = source_root.path().join("build-one/debug/deps");
+    fs::create_dir_all(&original_directory).expect("original output directory");
+    let original_outputs = NativeOutputPaths {
+      dep_info: original_directory.join("fixture-0123456789abcdef.d"),
+      metadata: original_directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
     let output_directory = source_root.path().join("build-two/debug/deps");
+    fs::create_dir_all(&output_directory).expect("current output directory");
     let outputs = NativeOutputPaths {
       dep_info: output_directory.join("fixture-0123456789abcdef.d"),
       metadata: output_directory.join("libfixture-0123456789abcdef.rmeta"),
       rlib: None,
     };
-    let portable = b"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta: src/lib.rs\n";
-    let translated = translate_dep_info_output_bindings(portable, &validation, &outputs, source_root.path())
+    let portable = portable_dep_info_output_bindings(
+      b"build-one/debug/deps/libfixture-0123456789abcdef.rmeta: src/lib.rs\n",
+      &original_outputs,
+      source_root.path(),
+    )
+    .expect("canonical dep-info");
+    let translated = translate_dep_info_output_bindings(&portable, &validation, &outputs, source_root.path())
       .expect("portable dep-info");
     assert_eq!(
       translated,
       b"build-two/debug/deps/libfixture-0123456789abcdef.rmeta: src/lib.rs\n"
     );
 
-    let windows_stream =
-      br#"{"artifact":"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta","emit":"metadata"}"#;
+    let windows_stream = portable_stream_output_bindings(
+      br#"{"artifact":"build-one/debug/deps/libfixture-0123456789abcdef.rmeta","emit":"metadata"}"#,
+      &original_outputs,
+      source_root.path(),
+    )
+    .expect("canonical stream");
     let translated_stream =
-      translate_output_binding_bytes(windows_stream, &validation, &outputs, source_root.path(), false)
+      translate_output_binding_bytes(&windows_stream, &validation, &outputs, source_root.path(), false)
         .expect("Windows mixed-separator stream");
     assert_eq!(
       translated_stream,
       br#"{"artifact":"build-two/debug/deps/libfixture-0123456789abcdef.rmeta","emit":"metadata"}"#
     );
 
-    let generated =
-      b"/cargo-rail/native-output/libfixture-0123456789abcdef.rmeta: /cargo-rail/native-output/out/generated.rs\n";
-    translate_dep_info_output_bindings(generated, &validation, &outputs, source_root.path())
+    let generated = b"build-one/debug/deps/libfixture-0123456789abcdef.rmeta: build-one/debug/deps/out/generated.rs\n";
+    portable_dep_info_output_bindings(generated, &original_outputs, source_root.path())
       .expect_err("unmodeled output-directory inputs must not be rebound");
   }
 
   #[test]
   fn stream_output_paths_use_canonical_tokens_on_windows() {
-    let absolute = r"C:\Users\builder\workspace\build-one\debug\deps\libfixture.rmeta";
-    let portable = "/cargo-rail/native-output/libfixture.rmeta";
-    let mut stream =
-      br#"{"artifact":"C:\\Users\\builder\\workspace\\build-one\\debug\\deps\\libfixture.rmeta"}"#.to_vec();
-    for (stored, portable) in canonical_output_path_replacements(absolute, portable) {
-      stream = replace_bytes(&stream, &stored, &portable).0;
-    }
-    assert_eq!(stream, br#"{"artifact":"/cargo-rail/native-output/libfixture.rmeta"}"#);
+    let source_root = tempfile::tempdir().expect("source root");
+    let output_paths = |directory: &str| {
+      let directory = source_root.path().join(directory);
+      fs::create_dir_all(&directory).expect("output directory");
+      NativeOutputPaths {
+        dep_info: directory.join("fixture-0123456789abcdef.d"),
+        metadata: directory.join("libfixture-0123456789abcdef.rmeta"),
+        rlib: None,
+      }
+    };
+    let cold = br#"{"artifact":"build-one\\debug\\deps\\libfixture-0123456789abcdef.rmeta"}"#;
+    let portable = portable_stream_output_bindings(cold, &output_paths("build-one/debug/deps"), source_root.path())
+      .expect("portable stream");
+    assert!(
+      portable
+        .windows(PORTABLE_OUTPUT_BINDING_PREFIX.len())
+        .any(|window| { window == PORTABLE_OUTPUT_BINDING_PREFIX })
+    );
+
+    let restored = translate_output_binding_bytes(
+      &portable,
+      &graduated_validation(graduated_observation()),
+      &output_paths("build-two/debug/deps"),
+      source_root.path(),
+      false,
+    )
+    .expect("restored stream");
+    assert_eq!(
+      restored,
+      br#"{"artifact":"build-two\\debug\\deps\\libfixture-0123456789abcdef.rmeta"}"#
+    );
+  }
+
+  #[test]
+  fn compiler_stream_rejects_reserved_output_binding_tokens() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let directory = source_root.path().join("build-one/debug/deps");
+    let outputs = NativeOutputPaths {
+      dep_info: directory.join("fixture-0123456789abcdef.d"),
+      metadata: directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
+    let stream = br#"{"artifact":"build-one/debug/deps/libfixture-0123456789abcdef.rmeta","message":"/cargo-rail/native-output/v3/metadata/relative/forward/literal"}"#;
+
+    let error = portable_stream_output_bindings(stream, &outputs, source_root.path())
+      .expect_err("compiler output must not collide with reserved CAS tokens");
+    assert!(error.to_string().contains("reserved output-binding token"));
+  }
+
+  #[test]
+  fn compiler_stream_rejects_output_paths_outside_artifact_fields() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let directory = source_root.path().join("build-one/debug/deps");
+    fs::create_dir_all(&directory).expect("output directory");
+    let outputs = NativeOutputPaths {
+      dep_info: directory.join("fixture-0123456789abcdef.d"),
+      metadata: directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
+    let stream = br#"{"artifact":"build-one/debug/deps/libfixture-0123456789abcdef.rmeta","message":"build-one/debug/deps/libfixture-0123456789abcdef.rmeta"}"#;
+
+    let error = portable_stream_output_bindings(stream, &outputs, source_root.path())
+      .expect_err("an output path in diagnostic text must not be rewritten");
+    assert!(error.to_string().contains("unmodeled output-directory binding"));
+  }
+
+  #[test]
+  fn dep_info_output_rebinding_preserves_windows_path_spelling() {
+    let source_root = tempfile::tempdir().expect("source root");
+    let first_directory = source_root.path().join("build one/debug/deps");
+    fs::create_dir_all(&first_directory).expect("first output directory");
+    let first_outputs = NativeOutputPaths {
+      dep_info: first_directory.join("fixture-0123456789abcdef.d"),
+      metadata: first_directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
+    let cold = br"build\ one\\debug\\deps\\libfixture-0123456789abcdef.rmeta: src\\lib.rs\n";
+    let portable =
+      portable_dep_info_output_bindings(cold, &first_outputs, source_root.path()).expect("portable Windows dep-info");
+
+    let validation = graduated_validation(graduated_observation());
+    let second_directory = source_root.path().join("build two/debug/deps");
+    fs::create_dir_all(&second_directory).expect("second output directory");
+    let second_outputs = NativeOutputPaths {
+      dep_info: second_directory.join("fixture-0123456789abcdef.d"),
+      metadata: second_directory.join("libfixture-0123456789abcdef.rmeta"),
+      rlib: None,
+    };
+    let restored = translate_dep_info_output_bindings(&portable, &validation, &second_outputs, source_root.path())
+      .expect("restored Windows dep-info");
+
+    assert_eq!(
+      restored,
+      br"build\ two\\debug\\deps\\libfixture-0123456789abcdef.rmeta: src\\lib.rs\n"
+    );
+
+    let literal = br"build one\debug\deps\libfixture-0123456789abcdef.rmeta: src\lib.rs\n";
+    let portable = portable_dep_info_output_bindings(literal, &first_outputs, source_root.path())
+      .expect("portable literal Windows dep-info");
+    let restored = translate_dep_info_output_bindings(&portable, &validation, &second_outputs, source_root.path())
+      .expect("restored literal Windows dep-info");
+    assert_eq!(
+      restored,
+      br"build two\debug\deps\libfixture-0123456789abcdef.rmeta: src\lib.rs\n"
+    );
   }
 
   #[test]
@@ -4755,6 +4544,7 @@ pub(crate) mod tests {
     let source_root = tempfile::tempdir().expect("source root");
     let output_paths = |directory: &str| {
       let directory = source_root.path().join(directory);
+      fs::create_dir_all(&directory).expect("output directory");
       NativeOutputPaths {
         dep_info: directory.join("fixture-0123456789abcdef.d"),
         metadata: directory.join("libfixture-0123456789abcdef.rmeta"),
@@ -4774,92 +4564,5 @@ pub(crate) mod tests {
     )
     .expect("second portable dep-info");
     assert_eq!(first, second);
-  }
-
-  #[test]
-  fn portable_arguments_rebase_only_reviewed_repository_paths() {
-    let source_root = tempfile::tempdir().expect("source root");
-    let crate_root = source_root.path().join("crates/app");
-    let output = source_root.path().join("target/debug/deps");
-    fs::create_dir_all(crate_root.join("src")).expect("source directory");
-    fs::create_dir_all(&output).expect("output directory");
-    fs::write(crate_root.join("src/lib.rs"), "pub fn value() {}\n").expect("source");
-    fs::write(output.join("libdep.rmeta"), b"dependency").expect("dependency");
-    let arguments = vec![
-      "--crate-name".into(),
-      "fixture".into(),
-      "--crate-type=lib".into(),
-      "--emit=dep-info,metadata,link".into(),
-      "-Cmetadata=0123456789abcdef".into(),
-      "-Cextra-filename=-0123456789abcdef".into(),
-      "--target=aarch64-apple-darwin".into(),
-      "--out-dir".into(),
-      output.as_os_str().into(),
-      "--extern".into(),
-      format!("dep={}", output.join("libdep.rmeta").display()).into(),
-      "--extern".into(),
-      "proc_macro".into(),
-      "-L".into(),
-      format!("dependency={}", output.display()).into(),
-      "src/lib.rs".into(),
-    ];
-    let portable = portable_compiler_arguments(&arguments, &crate_root, source_root.path()).expect("portable argv");
-    let portable = portable
-      .iter()
-      .map(|argument| argument.to_str().expect("UTF-8 argv"))
-      .collect::<Vec<_>>();
-    assert!(portable.contains(&"target/debug/deps"));
-    assert!(portable.contains(&"dep=target/debug/deps/libdep.rmeta"));
-    assert!(portable.contains(&"proc_macro"));
-    assert!(portable.contains(&"dependency=target/debug/deps"));
-    assert!(portable.contains(&"crates/app/src/lib.rs"));
-    assert!(
-      portable
-        .iter()
-        .any(|argument| argument.ends_with("=/cargo-rail/workspace"))
-    );
-    #[cfg(windows)]
-    {
-      let native = format!(
-        "--remap-path-prefix={}=/cargo-rail/workspace",
-        source_root.path().display()
-      );
-      let forward = native.replace('\\', "/");
-      assert!(portable.contains(&native.as_str()));
-      assert!(portable.contains(&forward.as_str()));
-    }
-
-    let semantic_root = vec![
-      "--crate-name=fixture".into(),
-      "--crate-type=lib".into(),
-      "--emit=dep-info,metadata".into(),
-      format!("-Cmetadata={}", source_root.path().display()).into(),
-      format!("--out-dir={}", output.display()).into(),
-      "src/lib.rs".into(),
-    ];
-    assert_eq!(
-      portable_compiler_arguments(&semantic_root, &crate_root, source_root.path()),
-      Err("compiler_argument_root_binding_not_graduated")
-    );
-
-    let external = tempfile::tempdir().expect("external output");
-    let escaped = vec![
-      "--crate-name=fixture".into(),
-      "--crate-type=lib".into(),
-      "--emit=dep-info,metadata".into(),
-      format!("--out-dir={}", external.path().display()).into(),
-      "src/lib.rs".into(),
-    ];
-    assert_eq!(
-      portable_compiler_arguments(&escaped, &crate_root, source_root.path()),
-      Err("compiler_output_root_not_graduated")
-    );
-
-    let equals_root = source_root.path().join("root=not-remappable");
-    fs::create_dir(&equals_root).expect("equals root");
-    assert_eq!(
-      portable_compiler_arguments(&escaped, &crate_root, &equals_root),
-      Err("source_root_not_remappable")
-    );
   }
 }

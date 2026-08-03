@@ -1980,9 +1980,18 @@ fn make_path_read_only(path: &Path, mut permissions: fs::Permissions) -> RailRes
 #[cfg(not(unix))]
 fn make_path_owner_writable(path: &Path) -> RailResult<()> {
   let mut permissions = fs::metadata(path)?.permissions();
-  permissions.set_readonly(false);
+  make_permissions_writable(&mut permissions);
   fs::set_permissions(path, permissions)?;
   Ok(())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_permissions_writable(permissions: &mut fs::Permissions) {
+  // This code is excluded from Unix, where clearing `readonly` would widen
+  // permissions beyond the owner-write bit. Windows is the supported non-Unix
+  // host, where this clears the exact filesystem attribute these paths own.
+  permissions.set_readonly(false);
 }
 
 // These Cargo bookkeeping files are still inside an unpublished private
@@ -2564,7 +2573,7 @@ fn normalize_output_mode(path: &Path, metadata: &fs::Metadata, directory: bool) 
 fn normalize_output_mode(path: &Path, metadata: &fs::Metadata, _directory: bool) -> RailResult<()> {
   if metadata.permissions().readonly() {
     let mut permissions = metadata.permissions();
-    permissions.set_readonly(false);
+    make_permissions_writable(&mut permissions);
     fs::set_permissions(path, permissions)?;
   }
   Ok(())

@@ -534,8 +534,8 @@ pub fn path_to_git_format(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Arc;
   use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+  use std::sync::{Arc, Barrier};
 
   use super::*;
   use std::path::PathBuf;
@@ -580,13 +580,22 @@ mod tests {
 
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(Barrier::new(2));
     std::thread::scope(|scope| {
       let reader_stop = Arc::clone(&stop);
       let reader_reads = Arc::clone(&reads);
+      let reader_ready = Arc::clone(&ready);
       let reader_first = Arc::clone(&first);
       let reader_second = Arc::clone(&second);
       let destination = &destination;
       let reader = scope.spawn(move || {
+        let observed = fs::read(destination).expect("the destination must remain visible");
+        assert!(
+          observed == *reader_first || observed == *reader_second,
+          "a reader observed a partial atomic replacement"
+        );
+        reader_reads.fetch_add(1, Ordering::Relaxed);
+        reader_ready.wait();
         while !reader_stop.load(Ordering::Acquire) {
           let observed = fs::read(destination).expect("the destination must remain visible");
           assert!(
@@ -601,6 +610,8 @@ mod tests {
           }
         }
       });
+
+      ready.wait();
 
       // One concurrent NTFS rename exercises the visibility boundary without
       // turning this oracle into an EBS flush-latency test.

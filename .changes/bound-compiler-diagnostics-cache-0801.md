@@ -30,10 +30,10 @@ run receipts and parent-owned compiler observations because they are not recover
 
 Memoize the complete Linux sysroot identity only while two exact filesystem inventories agree, and bypass to a full
 hash when generation evidence changes. Reuse non-Rust files reported by rustc dep-info, including `include!`,
-`include_str!`, and `include_bytes!` inputs, while rejecting dep-info that retains the physical workspace root. Keep
-timed benchmark commands free of opt-in diagnostics and validate their outcomes through a separate unmeasured replay.
-The benchmark workflow now defaults to one accepted interleaved group and treats that complete group as publishable
-bounded evidence; larger sample counts are explicit for distribution or tail claims.
+`include_str!`, and `include_bytes!` inputs. Keep timed benchmark commands free of opt-in diagnostics and validate their
+outcomes through a separate unmeasured replay. The benchmark workflow now defaults to one accepted interleaved group
+and treats that complete group as publishable bounded evidence; larger sample counts are explicit for distribution or
+tail claims.
 
 Move native compiler identity from whole-workspace session state to the exact compiler unit that consumed it. The
 session no longer includes the complete Cargo configuration or `Cargo.lock`; exact rustc arguments, cfg, sources,
@@ -41,10 +41,21 @@ dependency contents, observed filesystem reads, observed environment reads, and 
 remain authoritative. Output-neutral warning, job, build-directory, target-directory, network, registry, and
 unrelated lockfile changes can now reuse verified results, while unknown or unobservable behavior continues to bypass.
 
-Store canonical internal path tokens for verified dep-info and compiler streams, then late-bind the current output
-directory after CAS verification, including Windows path spelling, without weakening exact output names or
-materialized bytes. Remove the redundant pre-context lockfile hash and warm rehashing of already captured declared
-inputs and dependency artifacts. One local group measured 34.5% fewer warm
-release-build input bytes hashed and 33.6% fewer warm check input bytes hashed with zero false hits; its mixed
-wall-time samples do not support a latency claim. Also make the benchmark identity manifest valid when the repository
-has no untracked files.
+Preserve Cargo's exact rustc argv and current directory. Bind opaque Rust metadata to the physical source root instead
+of rewriting the compiler invocation and claiming unsafe cross-checkout portability. Store reversible internal path
+tokens for verified dep-info and JSON compiler streams, then late-bind the current output directory after CAS
+verification while preserving Windows separators and escaping exactly. Remove the redundant pre-context lockfile hash,
+warm rehashing of already captured inputs, and the cold-path dep-info root scan. Strengthen compatibility and benchmark
+oracles to compare direct, disabled, cold, and warm output bytes without root-bound exclusions, and invalidate
+qualification evidence when the cache execution contract changes. Restore a real MSRV-to-stable compatibility matrix
+instead of testing the repository toolchain repeatedly. Also make the benchmark identity manifest valid when the
+repository has no untracked files.
+
+Decode rustc's Makefile-escaped dep-info environment values before hashing them, so Windows `OUT_DIR` and Cargo path
+dependencies compare against the exact compiler process environment instead of producing false warm misses. Require
+every cold cache publication to become a warm hit in the real-world fixture while preserving the exact bypass count.
+Run that long fixture first and exclusively under nextest so Windows load cannot consume its bounded timeout.
+
+Retain reviewed Rust 1.97.1 Linux and Windows v4 qualification corpora with 20 accepted lane samples, two complete
+groups, no rejections, and no false hits on each host. Keep large benchmark diagnostics file-backed through `jq`
+instead of passing megabyte JSON values through the process argument limit.

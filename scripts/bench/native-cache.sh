@@ -302,11 +302,24 @@ lanes=(
   cargo-rail-sccache-preserved
 )
 workloads=(check build)
+
+lane_root() {
+  local workload="$1"
+  local lane="$2"
+  case "$lane" in
+    cargo-rail-cold | cargo-rail-warm) printf '%s\n' "$fixture_root/$workload-cargo-rail-cache" ;;
+    *) printf '%s\n' "$fixture_root/$workload-$lane" ;;
+  esac
+}
+
 for workload in "${workloads[@]}"; do
   for lane in "${lanes[@]}"; do
-    materialize "$workload-$lane"
+    case "$lane" in
+      cargo-rail-cold | cargo-rail-warm) ;;
+      *) materialize "$workload-$lane" ;;
+    esac
   done
-  materialize "$workload-cargo-rail-seed"
+  materialize "$workload-cargo-rail-cache"
   materialize "$workload-sccache-seed"
 done
 fixture_git_commit="$(git -C "$shared_git" rev-parse --verify HEAD)"
@@ -314,11 +327,12 @@ materialized_fixture_commit="$(git -C "$fixture_root/check-native-cargo" rev-par
 materialized_fixture_tree="$(git -C "$fixture_root/check-native-cargo" rev-parse 'HEAD^{tree}')"
 for workload in "${workloads[@]}"; do
   for lane in "${lanes[@]}"; do
-    [[ "$(git -C "$fixture_root/$workload-$lane" rev-parse --verify HEAD)" == "$materialized_fixture_commit" ]] || {
+    root="$(lane_root "$workload" "$lane")"
+    [[ "$(git -C "$root" rev-parse --verify HEAD)" == "$materialized_fixture_commit" ]] || {
       echo "materialized fixture commit differs for $workload/$lane" >&2
       exit 1
     }
-    [[ "$(git -C "$fixture_root/$workload-$lane" rev-parse 'HEAD^{tree}')" == "$materialized_fixture_tree" ]] || {
+    [[ "$(git -C "$root" rev-parse 'HEAD^{tree}')" == "$materialized_fixture_tree" ]] || {
       echo "materialized fixture tree differs for $workload/$lane" >&2
       exit 1
     }
@@ -388,9 +402,9 @@ if ! jq -e '
   and .command == "doctor"
   and .mode == "native_cache"
   and .result == "success"
-  and .capability.schema_version == 2
+  and .capability.schema_version == 3
   and .capability.cache_class == "library_metadata_rlib"
-  and .capability.execution_contract == "direct-global-wrapper-v3"
+  and .capability.execution_contract == "direct-global-wrapper-v4"
   and (.capability.platform | type) == "string"
   and (.capability.host_target | type) == "string"
   and (.capability.identity | type) == "string"
@@ -430,7 +444,7 @@ jq -n \
   --argjson sccache_resource_accounting_available "$sccache_resource_accounting_available" \
   --arg sccache_resource_accounting_reason "$sccache_resource_accounting_reason" \
   '{
-    schema_version: 6,
+    schema_version: 7,
     evidence_kind: $evidence_kind,
     required_accepted_samples: $required_accepted_samples,
     attempts: $attempts,
@@ -448,6 +462,7 @@ jq -n \
       platform: $cargo_rail_cache_platform,
       host_target: $cargo_rail_cache_host_target,
       identity: $cargo_rail_cache_identity,
+      reuse_scope: "physical-source-root",
       unavailable_reason: null
     },
     sccache: {
@@ -664,7 +679,8 @@ finish_accounted_sccache_server() {
 
 seed_cargo_rail_cache() {
   local workload="$1"
-  local root="$fixture_root/$workload-cargo-rail-seed"
+  local root
+  root="$(lane_root "$workload" cargo-rail-warm)"
   local cache="$fixture_root/$workload-cargo-rail-seed-cache"
   local status="$results/seed-$workload-cache-status.json"
   local stdout="$results/seed-$workload-cargo-rail.stdout"
@@ -758,7 +774,8 @@ done
 prepare_lane() {
   local workload="$1"
   local lane="$2"
-  local root="$fixture_root/$workload-$lane"
+  local root
+  root="$(lane_root "$workload" "$lane")"
   case "$lane" in
     native-cargo-warm | native-cargo-incremental-warm | cargo-rail-delegated | cargo-rail-incremental-bypass) ;;
     *) safe_remove "$root/target" ;;
@@ -791,7 +808,8 @@ command_for() {
   local stdout="$4"
   local stderr="$5"
   local evidence_mode="${6:-measured}"
-  local root="$fixture_root/$workload-$lane"
+  local root
+  root="$(lane_root "$workload" "$lane")"
   local action subcommand
   action="$(workload_action "$workload")"
   subcommand="$(workload_cargo_subcommand "$workload")"
@@ -859,7 +877,7 @@ command_for() {
       local warm_cache="$fixture_root/$workload-cargo-rail-warm-cache"
       argv="$(shell_join "$binary" rail "${rail_diagnostics_args[@]}" run --all --action "$action" "${rail_evidence_args[@]}" -- "${rail_args[@]}")"
       measured_argv_json="$(argv_to_json "$binary" rail "${rail_diagnostics_args[@]}" run --all --action "$action" "${rail_evidence_args[@]}" -- "${rail_args[@]}")"
-      measured_cache_state="verified-cross-root-seed-empty-target"
+      measured_cache_state="verified-same-root-seed-empty-target"
       environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_RAIL_CACHE_DIR="$warm_cache")"
       ;;
     sccache)
@@ -900,40 +918,11 @@ output_manifest() {
   local output="$2"
   local target="$root/target"
   local entries="${output}.entries"
-  local excluded="${output}.excluded"
-  local root_spellings="${output}.roots"
   : >"$entries"
-  : >"$excluded"
-  : >"$root_spellings"
   if [[ -d "$target" ]]; then
-    local canonical_root
-    canonical_root="$(cd "$root" && pwd -P)"
-    printf '%s\n' "$root" "$canonical_root" >>"$root_spellings"
-    case "$(uname -s)" in
-      MINGW* | MSYS* | CYGWIN*)
-        printf '%s\n' \
-          "$(cygpath -m "$root")" \
-          "$(cygpath -w "$root")" \
-          "$(cygpath -m "$canonical_root")" \
-          "$(cygpath -w "$canonical_root")" \
-          >>"$root_spellings"
-        ;;
-    esac
-    LC_ALL=C sort -u "$root_spellings" -o "$root_spellings"
     while IFS= read -r path; do
       [[ -n "$path" ]] || continue
       local relative="${path#"$target"/}"
-      local root_bound=false spelling
-      while IFS= read -r spelling; do
-        if [[ -n "$spelling" ]] && LC_ALL=C grep -a -F -q "$spelling" "$path" 2>/dev/null; then
-          root_bound=true
-          break
-        fi
-      done <"$root_spellings"
-      if [[ "$root_bound" == true ]]; then
-        jq -nc --arg path "$relative" --arg reason root_bound '{path: $path, reason: $reason}' >>"$excluded"
-        continue
-      fi
       local bytes digest
       bytes="$(wc -c <"$path" | tr -d ' ')"
       digest="$(sha256_file "$path")"
@@ -944,25 +933,20 @@ output_manifest() {
     )
   fi
   local entries_json="${output}.entries.json"
-  local excluded_json="${output}.excluded.json"
   jq -sc 'sort_by(.path)' "$entries" >"$entries_json"
-  jq -sc 'sort_by(.path)' "$excluded" >"$excluded_json"
   local digest
   digest="$(sha256_file "$entries_json")"
   jq -n \
     --arg digest "sha256:$digest" \
     --slurpfile entries "$entries_json" \
-    --slurpfile excluded "$excluded_json" \
     '{
-      schema_version: 1,
+      schema_version: 2,
       digest: $digest,
-      byte_identical_entries: $entries[0],
-      excluded_root_bound_entries: $excluded[0],
+      entries: $entries[0],
       entry_count: ($entries[0] | length),
-      excluded_count: ($excluded[0] | length),
       available: (($entries[0] | length) > 0)
     }' >"$output"
-  rm -f -- "$entries" "$excluded" "$root_spellings" "$entries_json" "$excluded_json"
+  rm -f -- "$entries" "$entries_json"
 }
 
 action_census() {
@@ -1315,9 +1299,11 @@ measure_lane() {
     fi
   fi
 
-  output_manifest "$fixture_root/$workload-$lane" "$manifest"
+  local root
+  root="$(lane_root "$workload" "$lane")"
+  output_manifest "$root" "$manifest"
   action_census "$stdout" "$census"
-  runtime_report "$workload" "$fixture_root/$workload-$lane" "$runtime"
+  runtime_report "$workload" "$root" "$runtime"
   local diagnostics_evidence="$diagnostics"
   local diagnostics_source="not_applicable"
   local diagnostics_replay_exit_code=null
@@ -1339,7 +1325,7 @@ measure_lane() {
         bash -c "$measured_command"
         local proof_exit_code=$?
         set -e
-        output_manifest "$fixture_root/$workload-$lane" "$proof_manifest"
+        output_manifest "$root" "$proof_manifest"
         action_census "$proof_stdout" "$proof_census"
         native_cache_report "$proof_stdout" "$proof_stderr" "$cache_report"
         local proof_diagnostics_valid=false
@@ -1438,12 +1424,13 @@ measure_lane() {
   fi
 
   local diagnostics_valid=false
-  local diagnostics_json=null
+  local diagnostics_input="$lane_dir/diagnostics-unavailable.json"
+  printf '%s\n' 'null' >"$diagnostics_input"
   if [[ "$lane" == cargo-rail-cold || "$lane" == cargo-rail-warm ]]; then
     if [[ -s "$diagnostics_evidence" ]] \
       && jq -e '.schema_version == 7 and (.phases | length == 7)' "$diagnostics_evidence" >/dev/null; then
       diagnostics_valid=true
-      diagnostics_json="$(jq -c . "$diagnostics_evidence")"
+      diagnostics_input="$diagnostics_evidence"
     fi
   else
     diagnostics_valid=true
@@ -1469,10 +1456,10 @@ measure_lane() {
     --argjson argv "$sample_argv_json" \
     --argjson available "$available" \
     --argjson diagnostics_valid "$diagnostics_valid" \
-    --argjson diagnostics "$diagnostics_json" \
     --arg diagnostics_source "$diagnostics_source" \
     --argjson diagnostics_replay_exit_code "$diagnostics_replay_exit_code" \
     --argjson exit_code "$exit_code" \
+    --slurpfile diagnostics "$diagnostics_input" \
     --slurpfile timing "$timing" \
     --slurpfile manifest "$manifest" \
     --slurpfile census "$census" \
@@ -1480,7 +1467,7 @@ measure_lane() {
     --slurpfile runtime "$runtime" \
     --slurpfile specialist_resources "$specialist_resources" \
     '{
-      schema_version: 11,
+      schema_version: 12,
       sample_id: $sample_id,
       round: $round,
       workload: $workload,
@@ -1595,7 +1582,7 @@ measure_lane() {
         diagnostics_valid: $diagnostics_valid,
         diagnostics_source: (if $diagnostics_source == "not_applicable" then null else $diagnostics_source end),
         diagnostics_replay_exit_code: $diagnostics_replay_exit_code,
-        diagnostics: $diagnostics
+        diagnostics: $diagnostics[0]
       },
       action_census: $census[0],
       cache: $cache[0],
@@ -1645,23 +1632,6 @@ finalize_group() {
       | sort_by(tojson);
     def event_stream_complete:
       ((.events // []) | length) == ((.hits // 0) + (.misses // 0) + (.bypasses // 0));
-    def event_output_paths($outcome):
-      [
-        (.cache.events // [])[]
-        | select($outcome == null or .outcome == $outcome)
-        | .unit
-        | (.output_paths[]?, .observed_outputs[]?.path)
-        | select(.root == "repository")
-        | .path
-        | sub("^target/"; "")
-      ]
-      | unique;
-    def modeled_root_bound_outputs_safely_bypassed:
-      (. | event_output_paths(null)) as $modeled
-      | (. | event_output_paths("bypassed")) as $bypassed
-      | ([.outputs.excluded_root_bound_entries[].path] | map(select(. as $path | $modeled | contains([$path]))))
-        as $modeled_root_bound
-      | ($modeled_root_bound - $bypassed | length) == 0;
     def pair_outputs_identical($by_lane; $left; $right):
       ($by_lane[$left].available == $by_lane[$right].available)
       and if $by_lane[$left].available
@@ -1694,7 +1664,7 @@ finalize_group() {
         | map(select(.lane == "native-cargo-incremental-warm" or .lane == "cargo-rail-incremental-bypass"))
       ) as $incremental_profile
     | {
-        schema_version: 8,
+        schema_version: 9,
         round: $samples[0].round,
         workload: $samples[0].workload,
         complete: (($samples | length) == $total_lanes and ($available | length) == $required_available),
@@ -1705,7 +1675,7 @@ finalize_group() {
         ),
         cross_root_artifacts: {
           supported: false,
-          reason: "native and specialist artifacts retain opaque root-bound bytes outside cargo-rail restore authority",
+          reason: "opaque compiler artifacts are source-root-bound by cache identity",
           observed_pairs_identical: (
             pair_outputs_identical($by_lane; "native-cargo-warm"; "cargo-rail-delegated")
             and pair_outputs_identical($by_lane; "native-cargo-incremental-warm"; "cargo-rail-incremental-bypass")
@@ -1718,10 +1688,6 @@ finalize_group() {
             ($available | all(.runtime.available and .runtime.exit_code == 0))
             and ($available | map(.runtime.identity) | unique | length) == 1
           )
-        ),
-        modeled_root_bound_outputs_safely_bypassed: (
-          ($by_lane["cargo-rail-cold"] | modeled_root_bound_outputs_safely_bypassed)
-          and ($by_lane["cargo-rail-warm"] | modeled_root_bound_outputs_safely_bypassed)
         ),
         action_census_identical: (
           ($available | length) == $required_available
@@ -1794,7 +1760,6 @@ finalize_group() {
         .complete
         and .output_manifests_identical
         and .runtime_outputs_identical
-        and .modeled_root_bound_outputs_safely_bypassed
         and .action_census_identical
         and .bypass_cache_io_zero
         and .cache_event_streams_complete
@@ -1807,9 +1772,6 @@ finalize_group() {
         if .complete then empty else "incomplete_interleaved_lanes" end,
         if .output_manifests_identical then empty else "output_manifests_not_identical" end,
         if .runtime_outputs_identical then empty else "runtime_outputs_not_identical" end,
-        if .modeled_root_bound_outputs_safely_bypassed
-          then empty else "root_bound_output_not_owned_by_explicit_bypass"
-        end,
         if .action_census_identical then empty else "action_census_not_identical" end,
         if .bypass_cache_io_zero then empty else "action_bypass_cache_io_or_reason_incorrect" end,
         if .cache_event_streams_complete then empty else "cache_event_stream_incomplete" end,
