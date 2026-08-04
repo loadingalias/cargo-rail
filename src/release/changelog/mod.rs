@@ -430,7 +430,8 @@ pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
 
 /// Parse a GitHub remote URL into (org, repo)
 fn parse_github_remote(url: &str) -> Option<(String, String)> {
-  let trimmed = url.trim().trim_end_matches(".git").trim_end_matches('/');
+  let trimmed = url.trim().trim_end_matches('/');
+  let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
 
   let repo_part = if let Some(ssh) = trimmed.strip_prefix("git@github.com:") {
     ssh
@@ -440,9 +441,10 @@ fn parse_github_remote(url: &str) -> Option<(String, String)> {
     trimmed.strip_prefix("https://github.com/")?
   };
 
-  let mut parts = repo_part.split('/');
-  let org = parts.next()?;
-  let repo = parts.next()?;
+  let (org, repo) = repo_part.split_once('/')?;
+  if org.is_empty() || repo.is_empty() || repo.contains('/') || org.contains(['?', '#']) || repo.contains(['?', '#']) {
+    return None;
+  }
 
   Some((org.to_string(), repo.to_string()))
 }
@@ -708,7 +710,20 @@ mod tests {
       parse_github_remote("ssh://git@github.com/org/repo"),
       Some(("org".to_string(), "repo".to_string()))
     );
+    assert_eq!(
+      parse_github_remote("https://github.com/org/repo.git/"),
+      Some(("org".to_string(), "repo".to_string()))
+    );
     assert_eq!(parse_github_remote("git@gitlab.com:org/repo.git"), None);
+  }
+
+  #[test]
+  fn parse_github_remote_rejects_non_repository_paths() {
+    assert_eq!(parse_github_remote("https://github.com/org/repo/issues"), None);
+    assert_eq!(parse_github_remote("https://github.com//repo.git"), None);
+    assert_eq!(parse_github_remote("https://github.com/org/.git"), None);
+    assert_eq!(parse_github_remote("https://github.com/org/repo?tab=readme"), None);
+    assert_eq!(parse_github_remote("https://github.com/org/repo#readme"), None);
   }
 
   #[test]
