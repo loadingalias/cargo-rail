@@ -33,7 +33,6 @@ jobs:
       CARGO_RAIL_CACHE_EXPECTED_OWNER: ${{ vars.CACHE_QUALIFICATION_AWS_OWNER }}
       CARGO_RAIL_CACHE_BUCKET: ${{ vars.CACHE_QUALIFICATION_AWS_BUCKET }}
       CARGO_RAIL_CACHE_PREFIX: ${{ vars.CACHE_QUALIFICATION_AWS_PREFIX }}
-      CARGO_RAIL_CACHE_TARGETS_FILE: ${{ runner.temp }}/cargo-rail-cache-targets.json
 
     steps:
       - name: Checkout
@@ -56,6 +55,8 @@ jobs:
           install-nextest: "false"
 
       - name: Qualify native S3 cache
+        env:
+          CARGO_RAIL_CACHE_TARGETS_FILE: ${{ runner.temp }}/cargo-rail-cache-targets.json
         run: just qualify-native-cache-s3 "${{ inputs.mode }}" "gha-${{ github.run_id }}-${{ inputs.mode }}"
 
       - name: Retain qualification evidence
