@@ -1,5 +1,6 @@
 //! Typed `rail.toml` configuration and discovery.
 
+mod cache;
 mod change_detection;
 mod release;
 mod run;
@@ -7,6 +8,7 @@ pub(crate) mod schema;
 mod split;
 mod unify;
 
+pub use cache::CacheConfig;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
@@ -29,6 +31,52 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// One discovered repository configuration retained across a pre-context cache shortcut.
+///
+/// Absence is captured as deliberately as file bytes so a configuration change
+/// cannot authorize cache work from a different filesystem moment.
+pub(crate) struct CapturedDiscoveredConfig {
+  workspace_root: PathBuf,
+  file: Option<(PathBuf, Vec<u8>)>,
+  config: Option<Box<RailConfig>>,
+}
+
+impl CapturedDiscoveredConfig {
+  pub(crate) fn capture(workspace_root: &Path) -> RailResult<Self> {
+    let Some(path) = RailConfig::find_config_path(workspace_root) else {
+      return Ok(Self {
+        workspace_root: workspace_root.to_path_buf(),
+        file: None,
+        config: None,
+      });
+    };
+    let (config, bytes) = RailConfig::load_path_with_bytes(&path)?;
+    Ok(Self {
+      workspace_root: workspace_root.to_path_buf(),
+      file: Some((path, bytes)),
+      config: Some(Box::new(config)),
+    })
+  }
+
+  pub(crate) fn config(&self) -> Option<&RailConfig> {
+    self.config.as_deref()
+  }
+
+  pub(crate) fn cache_enabled(&self) -> bool {
+    self.config().is_none_or(|config| config.cache.enabled)
+  }
+
+  pub(crate) fn validate_unchanged(&self) -> bool {
+    match &self.file {
+      None => RailConfig::find_config_path(&self.workspace_root).is_none(),
+      Some((path, bytes)) => {
+        RailConfig::find_config_path(&self.workspace_root).as_ref() == Some(path)
+          && fs::read(path).is_ok_and(|current| current.as_slice() == bytes.as_slice())
+      }
+    }
+  }
+}
+
 /// Configuration for cargo-rail
 /// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,6 +85,9 @@ pub struct RailConfig {
   /// Detected via `cargo rail init`, used by multiple commands
   #[serde(default)]
   pub targets: Vec<String>,
+  /// Build-result cache policy.
+  #[serde(default)]
+  pub cache: CacheConfig,
   /// Dependency unification settings
   #[serde(default)]
   pub unify: UnifyConfig,

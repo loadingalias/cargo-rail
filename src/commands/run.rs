@@ -13,19 +13,18 @@ use crate::commands::cli::Commands;
 use crate::commands::common::{ActionOutputFormat, PlanOutputFormat, format_preview_list};
 use crate::compiler::collector::{prepare_direct_cargo_action, prepare_pre_context_direct_cargo_action};
 use crate::compiler::native_cache::DirectCacheBypass;
-use crate::config::MAX_ACTIONS;
+use crate::config::{CapturedDiscoveredConfig, MAX_ACTIONS};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
 use crate::progress;
 use crate::test::runner::{TestCommandArgs, TestRunnerPreference, select_runner};
 use crate::workspace::WorkspaceContext;
-use cargo_metadata::{MetadataCommand, TargetKind};
 use clap::ValueEnum;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -68,7 +67,7 @@ pub struct RunOptions {
   pub dry_run: bool,
   /// Execute supported actions inside the isolated hermetic profile.
   pub hermetic: bool,
-  /// Disable local action-result reuse.
+  /// Disable all Cargo-Rail build-result cache reads and writes.
   pub no_cache: bool,
   /// Rendering contract for execution previews and CI action plans.
   pub format: ActionOutputFormat,
@@ -250,8 +249,9 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     if opts.hermetic && opts.dry_run {
       println!("fetch: cargo fetch --locked (network allowed; produces immutable source inventory)");
     }
+    let mut completed_generated_outputs = Vec::new();
     for step in &steps {
-      execute_run_step(step, graph.actions(), &opts, ctx)?;
+      execute_run_step(step, graph.actions(), &opts, ctx, &mut completed_generated_outputs)?;
     }
   } else {
     render_action_plan(&graph, &steps, &opts, &effective, plan.as_ref())?;
@@ -1350,8 +1350,8 @@ fn builtin_build_template(run_args: &[String]) -> ArgvTemplate {
 
 /// Execute one exact all-workspace built-in Cargo action before captured planning.
 ///
-/// Active profiles delegate unchanged to Cargo. Clean profiles install the
-/// existing compiler-unit cache only after a narrow Cargo/toolchain/target
+/// Exact cache bypasses delegate unchanged to Cargo. Clean profiles install
+/// the existing compiler-unit cache only after a narrow Cargo/toolchain/target
 /// capture proves the same direct-action contract. Every ambiguous or
 /// unsupported request retains the full captured planner/runner path.
 pub(crate) fn try_complete_exact_builtin_cargo_action(
@@ -1387,9 +1387,18 @@ pub(crate) fn try_complete_exact_builtin_cargo_action(
     return Ok(false);
   }
   let workspace_root = crate::utils::canonicalize_existing(requested_workspace_root)?;
-  if !manifest_declares_workspace(&workspace_root) || !rail_configuration_allows_builtin_delegation(&workspace_root) {
+  if !manifest_declares_workspace(&workspace_root) {
     return Ok(false);
   }
+  let captured_config = match CapturedDiscoveredConfig::capture(&workspace_root) {
+    Ok(config) => config,
+    Err(_) => return Ok(false),
+  };
+  if !rail_configuration_allows_builtin_delegation(&captured_config, &workspace_root) {
+    return Ok(false);
+  }
+  let cache_enabled = captured_config.cache_enabled();
+  let l2_alias = captured_config.config().and_then(|config| config.cache.l2.as_deref());
   let (action_id, action_kind, mut arguments) = match actions.as_slice() {
     [action] if action == "build" => (
       "build",
@@ -1413,29 +1422,42 @@ pub(crate) fn try_complete_exact_builtin_cargo_action(
     return Ok(false);
   }
   let cargo_config = Arc::new(crate::cargo::CargoConfigSnapshot::capture(&workspace_root)?);
-  let Some(target_directory) = static_cargo_target_directory(&workspace_root, &arguments, &cargo_config)? else {
-    return Ok(false);
-  };
+  let target_directory = static_cargo_target_directory(&workspace_root, &arguments, &cargo_config)?;
   let cargo_incremental = std::env::var_os("CARGO_INCREMENTAL");
-  let cache_policy = native_cache_policy_bypass_reason(
-    action_kind,
-    &arguments,
-    &target_directory,
-    &workspace_root,
-    cargo_incremental.as_deref(),
-    std::env::var_os("RUSTC_FORCE_INCREMENTAL").is_some(),
-  );
+  let cache_policy = target_directory.as_ref().and_then(|target_directory| {
+    native_cache_policy_bypass_reason(
+      action_kind,
+      &arguments,
+      target_directory,
+      &workspace_root,
+      cargo_incremental.as_deref(),
+      std::env::var_os("RUSTC_FORCE_INCREMENTAL").is_some(),
+    )
+  });
+  let pass_through = if !cache_enabled {
+    Some(DirectCacheBypass::DisabledByConfiguration)
+  } else if cache_policy.is_some() {
+    cache_policy
+  } else {
+    crate::compiler::native_cache::direct_cache_bypass_reason(cargo_config.cache_wrapper_plan(&workspace_root)?)
+  };
 
   let mut argv = Vec::with_capacity(arguments.len() + 1);
   argv.push("cargo".to_string());
   argv.extend(arguments);
-  if cache_policy == Some(DirectCacheBypass::ActiveCargoProfile) {
+  if let Some(reason) = pass_through {
+    if !captured_config.validate_unchanged() {
+      return Ok(false);
+    }
     if *print_cmd {
       println!("{action_id}: {}", argv.join(" "));
     }
+    let cargo_program = cargo_config.selected_cargo_program(&workspace_root)?;
+    let mut child = Command::new(cargo_program);
+    crate::compiler::native_cache::remove_private_environment(&mut child);
     let status = {
       let _cargo_child_execution_phase = crate::instrumentation::cargo_child_execution_phase();
-      Command::new(&argv[0])
+      child
         .args(&argv[1..])
         .current_dir(&workspace_root)
         .status()
@@ -1448,7 +1470,7 @@ pub(crate) fn try_complete_exact_builtin_cargo_action(
     }
     progress!(
       "action `{action_id}` native compiler cache: bypassed reason={}",
-      DirectCacheBypass::ActiveCargoProfile.as_str()
+      reason.as_str()
     );
     write_pre_context_cargo_receipt(
       &workspace_root,
@@ -1456,27 +1478,42 @@ pub(crate) fn try_complete_exact_builtin_cargo_action(
       action_kind,
       &argv,
       run_args,
-      PreContextExecution::ActiveCargoProfile,
+      PreContextExecution::CargoPassThrough(reason),
     )?;
     return Ok(true);
   }
-  if cache_policy.is_some() || cargo_incremental.is_some() || !workspace_root.join("Cargo.lock").is_file() {
+  if target_directory.is_none() {
+    return Ok(false);
+  }
+  if cargo_incremental.is_some() || !workspace_root.join("Cargo.lock").is_file() {
+    return Ok(false);
+  }
+  if !captured_config.validate_unchanged() {
     return Ok(false);
   }
 
-  let inputs = crate::cargo::resolution::ResolutionInputs::capture_with_config(&workspace_root, cargo_config)?;
-  let Some(has_eligible_library_units) = pre_context_workspace_has_eligible_library(&workspace_root, &inputs) else {
-    return Ok(false);
-  };
-  let native_cache = {
+  let (native_cache, cargo_program) = {
     let _native_cache_setup_phase = crate::instrumentation::native_cache_setup_phase();
-    match prepare_pre_context_direct_cargo_action(&workspace_root, &inputs, has_eligible_library_units, false) {
-      Ok(setup @ crate::compiler::native_cache::DirectNativeCacheSetup::Active(_)) => setup,
-      Ok(crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(_)) | Err(_) => return Ok(false),
+    match prepare_pre_context_direct_cargo_action(&workspace_root, cargo_config, cache_enabled, l2_alias, false) {
+      Ok((setup @ crate::compiler::native_cache::DirectNativeCacheSetup::Active(_), cargo_program)) => {
+        (setup, cargo_program)
+      }
+      Ok((crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(_), _)) => return Ok(false),
+      Ok((crate::compiler::native_cache::DirectNativeCacheSetup::OperationalFailure(message), _)) => {
+        return Err(RailError::message(message));
+      }
+      Err(_) => return Ok(false),
     }
   };
 
-  let mut child = Command::new(inputs.toolchain.cargo_program());
+  if !captured_config.validate_unchanged() {
+    return Ok(false);
+  }
+
+  let mut child = Command::new(cargo_program);
+  if native_cache.remote_active() {
+    crate::remote_cache::scrub_child_environment(&mut child);
+  }
   if let Some(configuration) = native_cache.cargo_config_argument() {
     child.arg("--config").arg(configuration);
     if std::env::var_os("CARGO_INCREMENTAL").is_none() {
@@ -1494,12 +1531,13 @@ pub(crate) fn try_complete_exact_builtin_cargo_action(
       .status()
       .map_err(|error| RailError::message(format!("{action_id} failed: {error}")))?
   };
-  report_native_cache_decision(action_id, &native_cache, false);
+  let native_cache_report = report_native_cache_decision(action_id, &native_cache, false);
   if !status.success() {
     return Err(RailError::ExitWithCode {
       code: status.code().unwrap_or(1),
     });
   }
+  native_cache_report?;
   write_pre_context_cargo_receipt(
     &workspace_root,
     action_id,
@@ -1537,16 +1575,16 @@ fn manifest_declares_workspace(workspace_root: &std::path::Path) -> bool {
     .is_ok_and(|document| document.get("workspace").is_some())
 }
 
-fn rail_configuration_allows_builtin_delegation(workspace_root: &std::path::Path) -> bool {
-  match crate::config::RailConfig::try_load(workspace_root) {
-    crate::config::ConfigLoadResult::NotFound => true,
-    crate::config::ConfigLoadResult::ParseError { .. } => false,
-    crate::config::ConfigLoadResult::Loaded(config) => {
-      config.change_detection.validate().is_ok()
-        && config.unify.validate(workspace_root).is_ok()
-        && config.run.validate().is_ok()
-    }
-  }
+fn rail_configuration_allows_builtin_delegation(
+  captured: &CapturedDiscoveredConfig,
+  workspace_root: &std::path::Path,
+) -> bool {
+  captured.config().is_none_or(|config| {
+    config.cache.validate().is_ok()
+      && config.change_detection.validate().is_ok()
+      && config.unify.validate(workspace_root).is_ok()
+      && config.run.validate().is_ok()
+  })
 }
 
 fn static_cargo_target_directory(
@@ -1583,38 +1621,9 @@ fn static_cargo_target_directory(
   }))
 }
 
-fn pre_context_workspace_has_eligible_library(
-  workspace_root: &Path,
-  inputs: &crate::cargo::resolution::ResolutionInputs,
-) -> Option<bool> {
-  let mut command = MetadataCommand::new();
-  command
-    .cargo_path(PathBuf::from(inputs.toolchain.cargo_program()))
-    .current_dir(workspace_root)
-    .manifest_path(workspace_root.join("Cargo.toml"))
-    .no_deps()
-    .other_options(vec!["--locked".to_string()]);
-  crate::instrumentation::record_cargo_metadata_load(false);
-  let metadata = command.exec().ok()?;
-  let workspace_root = crate::utils::canonicalize_existing(workspace_root).ok()?;
-  let metadata_root = crate::utils::canonicalize_existing(metadata.workspace_root.as_std_path()).ok()?;
-  if metadata_root != workspace_root {
-    return None;
-  }
-  let workspace_members = metadata.workspace_members.iter().collect::<BTreeSet<_>>();
-  Some(
-    metadata
-      .packages
-      .iter()
-      .filter(|package| workspace_members.contains(&package.id))
-      .flat_map(|package| &package.targets)
-      .any(|target| target.kind.contains(&TargetKind::Lib)),
-  )
-}
-
 #[derive(Clone, Copy)]
 enum PreContextExecution {
-  ActiveCargoProfile,
+  CargoPassThrough(DirectCacheBypass),
   NativeCompilerCache,
 }
 
@@ -1627,12 +1636,19 @@ fn write_pre_context_cargo_receipt(
   execution: PreContextExecution,
 ) -> RailResult<()> {
   let (snapshot_status, action_source, execution_mode, native_cache, native_cache_reason) = match execution {
-    PreContextExecution::ActiveCargoProfile => (
+    PreContextExecution::CargoPassThrough(DirectCacheBypass::ActiveCargoProfile) => (
       "not_loaded_for_active_cargo_profile_delegation",
       "builtin_active_cargo_profile_delegation",
       "active_cargo_profile_delegation",
       "bypassed",
       Some(DirectCacheBypass::ActiveCargoProfile.as_str()),
+    ),
+    PreContextExecution::CargoPassThrough(reason) => (
+      "not_loaded_for_exact_cargo_pass_through",
+      "builtin_exact_cargo_pass_through",
+      "exact_cargo_pass_through",
+      "bypassed",
+      Some(reason.as_str()),
     ),
     PreContextExecution::NativeCompilerCache => (
       "not_loaded_for_exact_native_compiler_cache_execution",
@@ -1848,6 +1864,7 @@ fn execute_run_step(
   ordered_actions: &[ExpandedAction],
   opts: &RunOptions,
   ctx: &WorkspaceContext,
+  completed_generated_outputs: &mut Vec<PathBuf>,
 ) -> RailResult<()> {
   let test_runner_name = match step {
     RunStep::Skipped(action) if opts.explain || opts.dry_run => {
@@ -1917,10 +1934,23 @@ fn execute_run_step(
     }
   }
 
-  run_or_print_action(opts, ctx, expanded)
+  run_or_print_action(opts, ctx, expanded, completed_generated_outputs)?;
+  if !opts.dry_run && opts.generated == GeneratedMode::Regenerate && expanded.is_generated() {
+    completed_generated_outputs.extend(
+      expanded
+        .repository_outputs()
+        .map(|output| ctx.workspace_root().join(output)),
+    );
+  }
+  Ok(())
 }
 
-fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &ExpandedAction) -> RailResult<()> {
+fn run_or_print_action(
+  opts: &RunOptions,
+  ctx: &WorkspaceContext,
+  action: &ExpandedAction,
+  completed_generated_outputs: &[PathBuf],
+) -> RailResult<()> {
   if opts.print_cmd || opts.dry_run {
     println!("{}: {}", action.id(), action.argv().join(" "));
   }
@@ -1933,7 +1963,14 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
       .pre_context_cache_request
       .then(|| crate::hermetic::pre_context_lookup_key(ctx.workspace_root()))
       .and_then(Result::ok);
-    let (report, path) = crate::hermetic::execute(ctx, action, !opts.no_cache, lookup_key.as_deref())?;
+    let cache_disabled_reason = if opts.no_cache {
+      Some("disabled_by_request")
+    } else if !ctx.cache_enabled() {
+      Some("disabled_by_configuration")
+    } else {
+      None
+    };
+    let (report, path) = crate::hermetic::execute(ctx, action, cache_disabled_reason, lookup_key.as_deref())?;
     print_hermetic_result(action.id(), &report, &path, opts.explain);
     return Ok(());
   }
@@ -1942,10 +1979,13 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     .argv()
     .split_first()
     .ok_or_else(|| RailError::message("expanded action argv cannot be empty"))?;
+  ctx.validate_snapshot_unchanged_excluding(completed_generated_outputs)?;
   let native_cache = if matches!(action.kind(), ActionKind::Build | ActionKind::Distribution) {
     let _native_cache_setup_phase = crate::instrumentation::native_cache_setup_phase();
     Some(if opts.no_cache {
       crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(DirectCacheBypass::DisabledByRequest)
+    } else if !ctx.cache_enabled() {
+      crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(DirectCacheBypass::DisabledByConfiguration)
     } else if cargo_cli_configuration_override(arguments) {
       crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(DirectCacheBypass::CargoCliConfiguration)
     } else if action_compiler_wrapper_capability(action) {
@@ -1962,7 +2002,7 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
     ) {
       crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(reason)
     } else {
-      match prepare_direct_cargo_action(ctx.snapshot()?, opts.explain) {
+      match prepare_direct_cargo_action(ctx.snapshot()?, ctx.execution_workspace_root(), opts.explain) {
         Ok(setup) => setup,
         Err(_) => {
           crate::compiler::native_cache::DirectNativeCacheSetup::Bypassed(DirectCacheBypass::IdentityUnavailable)
@@ -1972,6 +2012,12 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
   } else {
     None
   };
+  if let Some(message) = native_cache
+    .as_ref()
+    .and_then(crate::compiler::native_cache::DirectNativeCacheSetup::operational_failure)
+  {
+    return Err(RailError::message(message.to_string()));
+  }
   let selected_program =
     if program == "cargo" && !matches!(action.kind(), ActionKind::GeneratedArtifact | ActionKind::Repository) {
       ctx.snapshot()?.toolchain().cargo_program()
@@ -1979,6 +2025,12 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
       std::ffi::OsStr::new(program)
     };
   let mut command = Command::new(selected_program);
+  if native_cache
+    .as_ref()
+    .is_some_and(crate::compiler::native_cache::DirectNativeCacheSetup::remote_active)
+  {
+    crate::remote_cache::scrub_child_environment(&mut command);
+  }
   let validated_working_directory = action.validate_paths(ctx.workspace_root())?;
   let working_directory = if action.working_directory() == &ActionWorkingDirectory::Workspace {
     let execution_workspace_root = ctx.execution_workspace_root();
@@ -2046,20 +2098,28 @@ fn run_or_print_action(opts: &RunOptions, ctx: &WorkspaceContext, action: &Expan
       }
     }
   }
+  if native_cache
+    .as_ref()
+    .is_some_and(|native_cache| native_cache.bypass_reason().is_some())
+  {
+    crate::compiler::native_cache::remove_private_environment(&mut command);
+  }
+  ctx.validate_snapshot_unchanged_excluding(completed_generated_outputs)?;
   let status = {
     let _cargo_child_execution_phase = crate::instrumentation::cargo_child_execution_phase();
     command
       .status()
       .map_err(|error| RailError::message(format!("{} failed: {}", action.id(), error)))?
   };
-  if let Some(native_cache) = &native_cache {
-    report_native_cache_decision(action.id(), native_cache, opts.explain);
-  }
+  let native_cache_report = native_cache.as_ref().map_or(Ok(()), |native_cache| {
+    report_native_cache_decision(action.id(), native_cache, opts.explain)
+  });
   if !status.success() {
     return Err(RailError::ExitWithCode {
       code: status.code().unwrap_or(1),
     });
   }
+  native_cache_report?;
   Ok(())
 }
 
@@ -2067,7 +2127,7 @@ fn report_native_cache_decision(
   action_id: &str,
   native_cache: &crate::compiler::native_cache::DirectNativeCacheSetup,
   explain: bool,
-) {
+) -> RailResult<()> {
   if let Some(reason) = native_cache.bypass_reason() {
     if explain {
       println!("action `{action_id}` native compiler cache: bypassed ({reason})");
@@ -2078,6 +2138,7 @@ fn report_native_cache_decision(
     let _cache_report_collection_phase = crate::instrumentation::cache_report_collection_phase();
     native_cache.report()
   } {
+    let operational_result = validate_native_cache_report(&report);
     if let Some(diagnostics) = report.wrapper_diagnostics.clone() {
       crate::instrumentation::record_native_cache_wrapper_diagnostics(diagnostics);
     }
@@ -2100,6 +2161,18 @@ fn report_native_cache_decision(
         report.bytes_restored,
         reasons,
       );
+      if let Some(remote) = report.remote {
+        println!(
+          "action `{action_id}` remote compiler cache: requests={} bytes={} hits={} misses={} conflicts={} failures={} publications={}",
+          remote.requests,
+          remote.bytes,
+          remote.hits,
+          remote.misses,
+          remote.conflicts,
+          remote.failures,
+          remote.publications,
+        );
+      }
       for event in &report.events {
         if let Ok(encoded) = serde_json::to_string(event) {
           println!("action `{action_id}` native compiler cache event: {encoded}");
@@ -2113,8 +2186,28 @@ fn report_native_cache_decision(
         report.bypasses,
         report.bytes_restored,
       );
+      if let Some(remote) = report.remote {
+        progress!(
+          "action `{action_id}` remote compiler cache: requests={} hits={} misses={} conflicts={} failures={} publications={}",
+          remote.requests,
+          remote.hits,
+          remote.misses,
+          remote.conflicts,
+          remote.failures,
+          remote.publications,
+        );
+      }
     }
+    operational_result?;
   }
+  Ok(())
+}
+
+fn validate_native_cache_report(report: &crate::compiler::native_cache::DirectNativeCacheReport) -> RailResult<()> {
+  if report.environment_selector_diverged {
+    return Err(RailError::message("native compiler environment selector diverged"));
+  }
+  Ok(())
 }
 
 fn cargo_cli_configuration_override(arguments: &[String]) -> bool {
@@ -2440,10 +2533,11 @@ mod tests {
     fs::create_dir(root.path().join(".config")).expect("configuration directory");
     let configuration = root.path().join(".config/rail.toml");
     fs::write(&configuration, "[run\n").expect("invalid configuration");
-    assert!(!rail_configuration_allows_builtin_delegation(root.path()));
+    assert!(CapturedDiscoveredConfig::capture(root.path()).is_err());
 
     fs::write(&configuration, "# Empty configuration.\n").expect("valid configuration");
-    assert!(rail_configuration_allows_builtin_delegation(root.path()));
+    let captured = CapturedDiscoveredConfig::capture(root.path()).expect("captured configuration");
+    assert!(rail_configuration_allows_builtin_delegation(&captured, root.path()));
   }
 
   #[test]
@@ -2612,6 +2706,21 @@ mod tests {
         false,
       ),
       Some(DirectCacheBypass::ActiveCargoProfile)
+    );
+  }
+
+  #[test]
+  fn native_cache_report_rejects_only_selector_divergence() {
+    let mut report = crate::compiler::native_cache::DirectNativeCacheReport::default();
+    report.reasons.insert("local_cache_store_failed".to_string(), 1);
+    assert!(validate_native_cache_report(&report).is_ok());
+
+    report.environment_selector_diverged = true;
+    assert_eq!(
+      validate_native_cache_report(&report)
+        .expect_err("selector divergence must fail the command")
+        .to_string(),
+      "native compiler environment selector diverged"
     );
   }
 }

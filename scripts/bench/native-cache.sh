@@ -2,13 +2,23 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-operation="${1:-run}"
+reporter="$repo_root/scripts/bench/native-cache-report.sh"
+command -v jq >/dev/null || {
+  echo "missing required benchmark tool: jq" >&2
+  exit 2
+}
+
+usage() {
+  echo "usage: $0 <runs>|run <runs>|smoke|resume <result-directory>" >&2
+  exit 2
+}
+
+operation="${1:-}"
 case "$operation" in
-  '' | run)
-    if [[ "$#" -gt 0 ]]; then
-      shift
-    fi
-    runs="${1:-1}"
+  run)
+    shift
+    [[ "$#" -eq 1 ]] || usage
+    runs="$1"
     evidence_kind=retained
     results="${CARGO_RAIL_BENCH_RESULTS:-$repo_root/target/benchmarks/native-cache/$(date -u +%Y%m%dT%H%M%SZ)}"
     ;;
@@ -40,11 +50,9 @@ case "$operation" in
     runs="$(jq -er '.required_accepted_samples' "$results/run.json")"
     evidence_kind="$(jq -er '.evidence_kind' "$results/run.json")"
     ;;
-  *[!0-9]*)
-    echo "usage: $0 [<runs>|run [<runs>]|smoke|resume <result-directory>]" >&2
-    exit 2
-    ;;
-  *)
+  '' | *[!0-9]*) usage ;;
+  [0-9]*)
+    [[ "$#" -eq 1 ]] || usage
     runs="$operation"
     operation=run
     evidence_kind=retained
@@ -54,7 +62,11 @@ esac
 
 binary_overridden="${CARGO_RAIL_BIN+x}"
 binary="${CARGO_RAIL_BIN:-$repo_root/target/release/cargo-rail}"
-reporter="$repo_root/scripts/bench/native-cache-report.sh"
+sccache_expected_version="$(sed -n 's/^readonly SCCACHE_VERSION=//p' "$repo_root/scripts/ci/install-tools.sh")"
+[[ "$sccache_expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "cannot read the pinned sccache version from scripts/ci/install-tools.sh" >&2
+  exit 2
+}
 
 [[ "$runs" =~ ^[0-9]+$ ]] || {
   echo "native-cache benchmark runs must be an integer" >&2
@@ -64,19 +76,17 @@ if [[ "$runs" -lt 1 ]]; then
   echo "native-cache benchmark runs must be positive" >&2
   exit 2
 fi
-if [[ "$evidence_kind" == smoke || "$runs" -eq 1 ]]; then
+if [[ "$operation" == resume ]]; then
+  attempts="$(jq -er '.attempts' "$results/run.json")"
+  warmup_runs="$(jq -er '.warmup_runs' "$results/run.json")"
+elif [[ "$evidence_kind" == smoke ]]; then
   attempts=1
   warmup_runs=0
 else
-  attempts=$((runs + 1))
+  attempts="$runs"
   warmup_runs=1
 fi
-if [[ "$operation" == resume ]]; then
-  [[ "$(jq -er '.attempts' "$results/run.json")" -eq "$attempts" ]] || {
-    echo "native-cache run metadata has inconsistent attempt counts: $results/run.json" >&2
-    exit 2
-  }
-else
+if [[ "$operation" != resume ]]; then
   mkdir -p "$results"
   results="$(cd "$results" && pwd -P)"
   [[ -z "$(find "$results" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
@@ -84,15 +94,16 @@ else
     exit 2
   }
 fi
+run_id="$(basename "$results")"
 
-for tool in cargo git hyperfine jq; do
+for tool in cargo git hyperfine; do
   command -v "$tool" >/dev/null || {
     echo "missing required benchmark tool: $tool" >&2
     exit 2
   }
 done
 if [[ -z "$binary_overridden" ]]; then
-  cargo build --manifest-path "$repo_root/Cargo.toml" --package cargo-rail --bin cargo-rail \
+  cargo build --manifest-path "$repo_root/Cargo.toml" --package cargo-rail --bins \
     --all-features --release --locked
 fi
 [[ -f "$binary" && -x "$binary" ]] || {
@@ -100,15 +111,24 @@ fi
   exit 2
 }
 binary="$(cd "$(dirname "$binary")" && pwd -P)/$(basename "$binary")"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) wrapper_binary="$(dirname "$binary")/cargo-rail-native-rustc-wrapper.exe" ;;
+  *) wrapper_binary="$(dirname "$binary")/cargo-rail-native-rustc-wrapper" ;;
+esac
+[[ -f "$wrapper_binary" && -x "$wrapper_binary" ]] || {
+  echo "build the release compiler wrapper beside cargo-rail: cargo build --release --bins --locked" >&2
+  exit 2
+}
 
 unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS
 unset CARGO_INCREMENTAL CARGO_TARGET_DIR RUSTC RUSTC_BOOTSTRAP RUSTC_FORCE_INCREMENTAL RUSTC_WORKSPACE_WRAPPER
+unset HYPERFINE_ITERATION HYPERFINE_RANDOMIZED_ENVIRONMENT_OFFSET SHLVL __CF_USER_TEXT_ENCODING
 unset RUSTC_WRAPPER RUSTFLAGS
 unset SCCACHE_AZURE_BLOB_CONTAINER SCCACHE_AZURE_CONNECTION_STRING SCCACHE_AZURE_KEY_PREFIX
 unset SCCACHE_BUCKET SCCACHE_COS_BUCKET SCCACHE_ENDPOINT SCCACHE_GCS_BUCKET SCCACHE_GHA_ENABLED SCCACHE_GHA_VERSION
 unset SCCACHE_MEMCACHED SCCACHE_MEMCACHED_ENDPOINT SCCACHE_MULTILEVEL_CHAIN SCCACHE_OSS_BUCKET
 unset SCCACHE_REDIS SCCACHE_REDIS_CLUSTER_ENDPOINTS SCCACHE_REDIS_ENDPOINT SCCACHE_REGION SCCACHE_S3_KEY_PREFIX
-unset SCCACHE_WEBDAV_ENDPOINT
+unset SCCACHE_WEBDAV_ENDPOINT SCCACHE_CLIENT_SIDE
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -136,6 +156,7 @@ tree_content_sha256() {
 }
 
 binary_sha256="$(sha256_file "$binary")"
+wrapper_binary_sha256="$(sha256_file "$wrapper_binary")"
 worktree_dirty=false
 [[ -z "$(git -C "$repo_root" status --porcelain=v1)" ]] || worktree_dirty=true
 identity_root="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-native-identity.XXXXXX")"
@@ -193,6 +214,8 @@ jq -n \
   --arg fixture "tests/fixtures/native_cache/real_world" \
   --arg binary "$binary" \
   --arg binary_sha256 "$binary_sha256" \
+  --arg wrapper_binary "$wrapper_binary" \
+  --arg wrapper_binary_sha256 "$wrapper_binary_sha256" \
   --arg commit "$(git -C "$repo_root" rev-parse HEAD)" \
   --argjson worktree_dirty "$worktree_dirty" \
   --arg worktree_status_sha256 "$worktree_status_sha256" \
@@ -206,11 +229,13 @@ jq -n \
   --arg instance_type "${CARGO_RAIL_BENCH_INSTANCE_TYPE:-local}" \
   --arg filesystem "$filesystem" \
   '{
-    schema_version: 6,
+    schema_version: 7,
     generated_at: $generated_at,
     fixture: $fixture,
     release_binary: $binary,
     release_binary_sha256: $binary_sha256,
+    compiler_wrapper_binary: $wrapper_binary,
+    compiler_wrapper_binary_sha256: $wrapper_binary_sha256,
     repository_commit: $commit,
     worktree_dirty: $worktree_dirty,
     worktree_status_sha256: $worktree_status_sha256,
@@ -228,6 +253,7 @@ jq -n \
       network: "offline",
       cargo_target_dir: "fixture-local; empty per clean lane; retained per warm/delegated/bypass lane",
       compiler_overrides: "removed",
+      benchmark_control_environment: "Hyperfine and nested-shell control variables removed before compiler environment capture",
       rustflags: "removed",
       rustc_wrapper: "removed_except_sccache_lane",
       rustc_workspace_wrapper: "removed",
@@ -299,6 +325,7 @@ lanes=(
   cargo-rail-cold
   cargo-rail-warm
   sccache
+  sccache-client-side
   cargo-rail-sccache-preserved
 )
 workloads=(check build)
@@ -345,7 +372,7 @@ sed -E 's#git\+file://[^?"]+#git+file://<FIXTURE_GIT>#g' \
 fixture_lock_sha256="$(sha256_file "$normalized_fixture_lock")"
 
 sccache_available=false
-sccache_bin="${SCCACHE_016_BIN:-$(command -v sccache || true)}"
+sccache_bin="${SCCACHE_BIN:-$(command -v sccache || true)}"
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
     if [[ "$sccache_bin" != *.exe && -f "$sccache_bin.exe" ]]; then
@@ -362,17 +389,17 @@ case "$(uname -s)" in
     ;;
 esac
 sccache_version=""
-sccache_unavailable_reason="sccache 0.16.0 was not found"
+sccache_unavailable_reason="sccache $sccache_expected_version was not found"
 if [[ -n "$sccache_bin" && -x "$sccache_bin" ]]; then
   sccache_version="$("$sccache_bin" --version)"
-  if [[ "$sccache_version" == "sccache 0.16.0" ]]; then
+  if [[ "$sccache_version" == "sccache $sccache_expected_version" ]]; then
     sccache_available=true
     sccache_unavailable_reason=""
-  elif [[ -n "${SCCACHE_016_BIN:-}" ]]; then
-    echo "SCCACHE_016_BIN must name sccache 0.16.0: $sccache_bin reports $sccache_version" >&2
+  elif [[ -n "${SCCACHE_BIN:-}" ]]; then
+    echo "SCCACHE_BIN must name sccache $sccache_expected_version: $sccache_bin reports $sccache_version" >&2
     exit 2
   else
-    sccache_unavailable_reason="$sccache_bin reports $sccache_version, not sccache 0.16.0"
+    sccache_unavailable_reason="$sccache_bin reports $sccache_version, not sccache $sccache_expected_version"
     sccache_bin=""
   fi
 fi
@@ -402,9 +429,9 @@ if ! jq -e '
   and .command == "doctor"
   and .mode == "native_cache"
   and .result == "success"
-  and .capability.schema_version == 3
+  and .capability.schema_version == 5
   and .capability.cache_class == "library_metadata_rlib"
-  and .capability.execution_contract == "direct-global-wrapper-v4"
+  and .capability.execution_contract == "direct-global-wrapper-v8"
   and (.capability.platform | type) == "string"
   and (.capability.host_target | type) == "string"
   and (.capability.identity | type) == "string"
@@ -418,11 +445,13 @@ fi
 cargo_rail_cache_platform="$(jq -r '.capability.platform' "$native_cache_capability_candidate")"
 cargo_rail_cache_host_target="$(jq -r '.capability.host_target' "$native_cache_capability_candidate")"
 cargo_rail_cache_identity="$(jq -r '.capability.identity' "$native_cache_capability_candidate")"
+cargo_rail_cache_execution_contract="$(jq -r '.capability.execution_contract' "$native_cache_capability_candidate")"
 
 run_candidate="$fixture_root/run.json"
 lanes_json="$(printf '%s\n' "${lanes[@]}" | jq -Rsc 'split("\n")[:-1]')"
 workloads_json="$(printf '%s\n' "${workloads[@]}" | jq -Rsc 'split("\n")[:-1]')"
 jq -n \
+  --arg run_id "$run_id" \
   --arg evidence_kind "$evidence_kind" \
   --argjson required_accepted_samples "$runs" \
   --argjson attempts "$attempts" \
@@ -437,6 +466,7 @@ jq -n \
   --arg cargo_rail_cache_platform "$cargo_rail_cache_platform" \
   --arg cargo_rail_cache_host_target "$cargo_rail_cache_host_target" \
   --arg cargo_rail_cache_identity "$cargo_rail_cache_identity" \
+  --arg cargo_rail_cache_execution_contract "$cargo_rail_cache_execution_contract" \
   --argjson sccache_available "$sccache_available" \
   --arg sccache_path "$sccache_bin" \
   --arg sccache_version "$sccache_version" \
@@ -444,7 +474,8 @@ jq -n \
   --argjson sccache_resource_accounting_available "$sccache_resource_accounting_available" \
   --arg sccache_resource_accounting_reason "$sccache_resource_accounting_reason" \
   '{
-    schema_version: 7,
+    schema_version: 9,
+    run_id: $run_id,
     evidence_kind: $evidence_kind,
     required_accepted_samples: $required_accepted_samples,
     attempts: $attempts,
@@ -461,6 +492,7 @@ jq -n \
       available: true,
       platform: $cargo_rail_cache_platform,
       host_target: $cargo_rail_cache_host_target,
+      execution_contract: $cargo_rail_cache_execution_contract,
       identity: $cargo_rail_cache_identity,
       reuse_scope: "physical-source-root",
       unavailable_reason: null
@@ -470,6 +502,7 @@ jq -n \
       path: (if $sccache_path == "" then null else $sccache_path end),
       version: (if $sccache_version == "" then null else $sccache_version end),
       unavailable_reason: (if $sccache_unavailable_reason == "" then null else $sccache_unavailable_reason end),
+      measured_modes: ["server_local_disk", "client_side_local_disk"],
       resource_accounting: {
         available: $sccache_resource_accounting_available,
         reason: (if $sccache_resource_accounting_reason == "" then null else $sccache_resource_accounting_reason end),
@@ -531,6 +564,16 @@ stop_sccache() {
   local cache="$1"
   if [[ "$sccache_available" == true ]]; then
     env SCCACHE_DIR="$cache" "$sccache_bin" --stop-server >/dev/null 2>&1 || true
+  fi
+}
+
+sccache_cache_for_lane() {
+  local workload="$1"
+  local lane="$2"
+  if [[ "$lane" == sccache-client-side ]]; then
+    printf '%s\n' "$fixture_root/$workload-sccache-client-side-live-cache"
+  else
+    printf '%s\n' "$fixture_root/$workload-sccache-live-cache"
   fi
 }
 
@@ -728,7 +771,7 @@ seed_sccache() {
   fi
   (
     cd "$root"
-    env -u RUSTC_WORKSPACE_WRAPPER \
+    env -u RUSTC_WORKSPACE_WRAPPER -u SCCACHE_CLIENT_SIDE \
       SCCACHE_BASEDIRS="$roots" SCCACHE_DIR="$cache" RUSTC_WRAPPER="$sccache_bin" CARGO_INCREMENTAL=0 \
       cargo "$subcommand" "${args[@]}" >"$stdout" 2>"$stderr"
   )
@@ -788,11 +831,13 @@ prepare_lane() {
       safe_remove "$fixture_root/$workload-cargo-rail-warm-cache"
       cp -R "$fixture_root/$workload-cargo-rail-seed-cache" "$fixture_root/$workload-cargo-rail-warm-cache"
       ;;
-    sccache | cargo-rail-sccache-preserved)
+    sccache | sccache-client-side | cargo-rail-sccache-preserved)
       if [[ "$sccache_available" == true ]]; then
-        stop_sccache "$fixture_root/$workload-sccache-live-cache"
-        safe_remove "$fixture_root/$workload-sccache-live-cache"
-        cp -R "$fixture_root/$workload-sccache-seed-cache" "$fixture_root/$workload-sccache-live-cache"
+        local live_cache
+        live_cache="$(sccache_cache_for_lane "$workload" "$lane")"
+        stop_sccache "$live_cache"
+        safe_remove "$live_cache"
+        cp -R "$fixture_root/$workload-sccache-seed-cache" "$live_cache"
       fi
       ;;
   esac
@@ -880,8 +925,9 @@ command_for() {
       measured_cache_state="verified-same-root-seed-empty-target"
       environment_prefix="$(shell_join env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CARGO_RAIL_CACHE_DIR="$warm_cache")"
       ;;
-    sccache)
-      local sccache_cache="$fixture_root/$workload-sccache-live-cache"
+    sccache | sccache-client-side)
+      local sccache_cache
+      sccache_cache="$(sccache_cache_for_lane "$workload" "$lane")"
       local basedirs
       case "$(uname -s)" in
         MINGW* | MSYS* | CYGWIN*)
@@ -891,8 +937,14 @@ command_for() {
       esac
       argv="$(shell_join cargo "$subcommand" "${cargo_args[@]}")"
       measured_argv_json="$(argv_to_json cargo "$subcommand" "${cargo_args[@]}")"
-      measured_cache_state="sccache-0.16.0-cross-root-seed-empty-target"
-      environment_prefix="$(shell_join env -u RUSTC_WORKSPACE_WRAPPER SCCACHE_BASEDIRS="$basedirs" SCCACHE_DIR="$sccache_cache" RUSTC_WRAPPER="$sccache_bin" CARGO_INCREMENTAL=0)"
+      local sccache_mode="server"
+      local sccache_mode_environment=(-u SCCACHE_CLIENT_SIDE)
+      if [[ "$lane" == sccache-client-side ]]; then
+        sccache_mode="client-side"
+        sccache_mode_environment+=(SCCACHE_CLIENT_SIDE=1)
+      fi
+      measured_cache_state="sccache-$sccache_expected_version-$sccache_mode-cross-root-seed-empty-target"
+      environment_prefix="$(shell_join env -u RUSTC_WORKSPACE_WRAPPER "${sccache_mode_environment[@]}" SCCACHE_BASEDIRS="$basedirs" SCCACHE_DIR="$sccache_cache" RUSTC_WRAPPER="$sccache_bin" CARGO_INCREMENTAL=0)"
       ;;
     cargo-rail-sccache-preserved)
       local preserved_sccache_cache="$fixture_root/$workload-sccache-live-cache"
@@ -906,11 +958,14 @@ command_for() {
       esac
       argv="$(shell_join "$binary" rail "${rail_diagnostics_args[@]}" run --all --action "$action" "${rail_evidence_args[@]}" -- "${rail_args[@]}")"
       measured_argv_json="$(argv_to_json "$binary" rail "${rail_diagnostics_args[@]}" run --all --action "$action" "${rail_evidence_args[@]}" -- "${rail_args[@]}")"
-      measured_cache_state="sccache-0.16.0-preserved-cross-root-seed-empty-target-empty-cargo-rail-cache"
-      environment_prefix="$(shell_join env -u RUSTC_WORKSPACE_WRAPPER SCCACHE_BASEDIRS="$preserved_basedirs" SCCACHE_DIR="$preserved_sccache_cache" RUSTC_WRAPPER="$sccache_bin" CARGO_INCREMENTAL=0 CARGO_RAIL_CACHE_DIR="$preserved_rail_cache")"
+      measured_cache_state="sccache-$sccache_expected_version-preserved-cross-root-seed-empty-target-empty-cargo-rail-cache"
+      environment_prefix="$(shell_join env -u RUSTC_WORKSPACE_WRAPPER -u SCCACHE_CLIENT_SIDE SCCACHE_BASEDIRS="$preserved_basedirs" SCCACHE_DIR="$preserved_sccache_cache" RUSTC_WRAPPER="$sccache_bin" CARGO_INCREMENTAL=0 CARGO_RAIL_CACHE_DIR="$preserved_rail_cache")"
       ;;
   esac
-  measured_command="cd $(shell_join "$root") && $environment_prefix $argv >$(shell_join "$stdout") 2>$(shell_join "$stderr")"
+  # Hyperfine and its nested Bash inject process controls into each command.
+  # They are benchmark machinery, not compiler inputs, so remove them before
+  # exact environment capture just as we remove wrapper controls above.
+  measured_command="cd $(shell_join "$root") && env -u HYPERFINE_ITERATION -u HYPERFINE_RANDOMIZED_ENVIRONMENT_OFFSET -u SHLVL -u __CF_USER_TEXT_ENCODING $environment_prefix $argv >$(shell_join "$stdout") 2>$(shell_join "$stderr")"
 }
 
 output_manifest() {
@@ -1001,9 +1056,10 @@ native_cache_report() {
   local events="${output}.events"
   grep 'native compiler cache event:' "$stdout" "$stderr" \
     | sed 's/^.* native compiler cache event: //' \
-    | jq -s 'sort_by([.unit_identity, .action_key, .outcome, .reason])' >"$events" || printf '%s\n' '[]' >"$events"
+    | jq -s 'sort_by([.unit_identity, .result_key, .outcome, .reason])' >"$events" || printf '%s\n' '[]' >"$events"
   local eligible="${output}.eligible"
-  jq '[.[] | select(.unit_identity != null and .action_key != null) | .unit_identity] | sort' "$events" >"$eligible"
+  jq '[.[] | select((.outcome == "hit" or .outcome == "miss") and .unit_identity != null) | .unit_identity] | sort' \
+    "$events" >"$eligible"
   local event_digest eligible_digest
   event_digest="$(sha256_file "$events")"
   eligible_digest="$(sha256_file "$eligible")"
@@ -1150,18 +1206,19 @@ sccache_report() {
   local cache="$1"
   local output="$2"
   if [[ "$sccache_available" != true ]]; then
-    jq -n --arg reason "$sccache_unavailable_reason" \
-      '{available: false, kind: "sccache-0.16.0", status: "unavailable", reason: $reason}' >"$output"
+    jq -n --arg reason "$sccache_unavailable_reason" --arg version "$sccache_expected_version" \
+      '{available: false, kind: ("sccache-" + $version), status: "unavailable", reason: $reason}' >"$output"
     return
   fi
   env SCCACHE_DIR="$cache" "$sccache_bin" --show-stats --stats-format json >"${output}.raw" 2>/dev/null || true
   if ! jq -e . "${output}.raw" >/dev/null 2>&1; then
-    printf '%s\n' '{"available":false,"kind":"sccache-0.16.0","status":"stats-unavailable"}' >"$output"
+    jq -n --arg version "$sccache_expected_version" \
+      '{available: false, kind: ("sccache-" + $version), status: "stats-unavailable"}' >"$output"
     return
   fi
-  jq '{
+  jq --arg version "$sccache_expected_version" '{
     available: true,
-    kind: "sccache-0.16.0",
+    kind: ("sccache-" + $version),
     status: "reported",
     compile_requests: .stats.compile_requests,
     hits: ([.stats.cache_hits.counts[]] | add // 0),
@@ -1253,7 +1310,8 @@ measure_lane() {
   jq -n \
     --arg reason "lane does not use an accounted detached specialist server" \
     '{schema_version: 1, available: false, reason: $reason}' >"$specialist_resources"
-  if [[ ("$lane" == sccache || "$lane" == cargo-rail-sccache-preserved) && "$sccache_available" != true ]]; then
+  if [[ ("$lane" == sccache || "$lane" == sccache-client-side || "$lane" == cargo-rail-sccache-preserved) \
+    && "$sccache_available" != true ]]; then
     available=false
     unavailable_reason="$sccache_unavailable_reason"
   fi
@@ -1274,9 +1332,9 @@ measure_lane() {
     sample_cache_state="$measured_cache_state"
     sample_command="$measured_command"
     local accounted_sccache=false
-    if [[ "$lane" == sccache || "$lane" == cargo-rail-sccache-preserved ]]; then
+    if [[ "$lane" == sccache || "$lane" == sccache-client-side || "$lane" == cargo-rail-sccache-preserved ]]; then
       if [[ "$sccache_resource_accounting_available" == true ]]; then
-        start_accounted_sccache_server "$fixture_root/$workload-sccache-live-cache" "$lane_dir"
+        start_accounted_sccache_server "$(sccache_cache_for_lane "$workload" "$lane")" "$lane_dir"
         accounted_sccache=true
       else
         jq -n --arg reason "$sccache_resource_accounting_reason" \
@@ -1330,7 +1388,7 @@ measure_lane() {
         native_cache_report "$proof_stdout" "$proof_stderr" "$cache_report"
         local proof_diagnostics_valid=false
         if [[ "$proof_exit_code" -eq 0 && -s "$proof_diagnostics" ]] \
-          && jq -e '.schema_version == 7 and (.phases | length == 7)' "$proof_diagnostics" >/dev/null; then
+          && jq -e '.schema_version == 10 and (.phases | length == 7)' "$proof_diagnostics" >/dev/null; then
           proof_diagnostics_valid=true
         fi
         local proof_outputs_identical=false
@@ -1399,13 +1457,14 @@ measure_lane() {
     cargo-rail-*)
       native_cache_report "$stdout" "$stderr" "$cache_report"
       ;;
-    sccache)
-      sccache_report "$fixture_root/$workload-sccache-live-cache" "$cache_report"
+    sccache | sccache-client-side)
+      local specialist_cache
+      specialist_cache="$(sccache_cache_for_lane "$workload" "$lane")"
+      sccache_report "$specialist_cache" "$cache_report"
       if [[ -n "$sccache_server_supervisor_pid" ]]; then
-        finish_accounted_sccache_server \
-          "$fixture_root/$workload-sccache-live-cache" "$timing" "$specialist_resources"
+        finish_accounted_sccache_server "$specialist_cache" "$timing" "$specialist_resources"
       else
-        stop_sccache "$fixture_root/$workload-sccache-live-cache"
+        stop_sccache "$specialist_cache"
       fi
       ;;
     *)
@@ -1417,7 +1476,7 @@ measure_lane() {
   if [[ "$lane" == cargo-rail-* ]]; then
     local rail_cache="$fixture_root/$workload-$lane-cache"
     local cache_directory_present=false
-    [[ -d "$rail_cache/cargo-rail/local-cas-v1" ]] && cache_directory_present=true
+    [[ -d "$rail_cache/cargo-rail/local-cas-v2" ]] && cache_directory_present=true
     jq --argjson cache_directory_present "$cache_directory_present" \
       '. + {cache_directory_present: $cache_directory_present}' "$cache_report" >"${cache_report}.updated"
     mv "${cache_report}.updated" "$cache_report"
@@ -1428,7 +1487,7 @@ measure_lane() {
   printf '%s\n' 'null' >"$diagnostics_input"
   if [[ "$lane" == cargo-rail-cold || "$lane" == cargo-rail-warm ]]; then
     if [[ -s "$diagnostics_evidence" ]] \
-      && jq -e '.schema_version == 7 and (.phases | length == 7)' "$diagnostics_evidence" >/dev/null; then
+      && jq -e '.schema_version == 10 and (.phases | length == 7)' "$diagnostics_evidence" >/dev/null; then
       diagnostics_valid=true
       diagnostics_input="$diagnostics_evidence"
     fi
@@ -1530,7 +1589,7 @@ measure_lane() {
         },
         specialist_server: $specialist_resources[0],
         accounting: (
-          if $lane == "sccache" or $lane == "cargo-rail-sccache-preserved" then {
+          if $lane == "sccache" or $lane == "sccache-client-side" or $lane == "cargo-rail-sccache-preserved" then {
             wall_time: {
               complete: true,
               scope: (
@@ -1598,14 +1657,20 @@ finalize_group() {
   local total_lanes="${#lanes[@]}"
   local required_available="$total_lanes"
   if [[ "$sccache_available" != true ]]; then
-    required_available=$((required_available - 2))
+    required_available=$((required_available - 3))
   fi
   jq -s --argjson total_lanes "$total_lanes" --argjson required_available "$required_available" '
     def normalized_reusable_cache_events:
       [
         (.events // [])[]
-        | select(.action_key != null)
-        | if (.outcome == "miss" and .reason == "stored_verified_result")
+        | select((.outcome == "hit" or .outcome == "miss") and .unit_identity != null)
+        | if (
+            .outcome == "miss"
+            and (
+              .reason == "stored_verified_result"
+              or (.reason | endswith(";stored_verified_result"))
+            )
+          )
             or (.outcome == "hit" and .reason == "verified_local_result")
           then .outcome = "reusable" | .reason = "verified_result"
           else .
@@ -1615,7 +1680,7 @@ finalize_group() {
     def normalized_bypass_events:
       [
         (.events // [])[]
-        | select(.action_key == null)
+        | select(.outcome == "bypassed" or .outcome == "disabled")
         | {
             outcome,
             reason,
@@ -1664,7 +1729,7 @@ finalize_group() {
         | map(select(.lane == "native-cargo-incremental-warm" or .lane == "cargo-rail-incremental-bypass"))
       ) as $incremental_profile
     | {
-        schema_version: 9,
+        schema_version: 10,
         round: $samples[0].round,
         workload: $samples[0].workload,
         complete: (($samples | length) == $total_lanes and ($available | length) == $required_available),
@@ -1791,7 +1856,8 @@ warmup_lane() {
   local workload="$1"
   local lane="$2"
   prepare_lane "$workload" "$lane"
-  if [[ ("$lane" == sccache || "$lane" == cargo-rail-sccache-preserved) && "$sccache_available" != true ]]; then
+  if [[ ("$lane" == sccache || "$lane" == sccache-client-side || "$lane" == cargo-rail-sccache-preserved) \
+    && "$sccache_available" != true ]]; then
     return
   fi
   local warmup_root="$fixture_root/warmup"
@@ -1802,8 +1868,8 @@ warmup_lane() {
   rm -f -- "$diagnostics" "$stdout" "$stderr"
   command_for "$workload" "$lane" "$diagnostics" "$stdout" "$stderr"
   bash -c "$measured_command"
-  if [[ "$lane" == sccache || "$lane" == cargo-rail-sccache-preserved ]]; then
-    stop_sccache "$fixture_root/$workload-sccache-live-cache"
+  if [[ "$lane" == sccache || "$lane" == sccache-client-side || "$lane" == cargo-rail-sccache-preserved ]]; then
+    stop_sccache "$(sccache_cache_for_lane "$workload" "$lane")"
   fi
 }
 

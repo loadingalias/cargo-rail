@@ -38,6 +38,7 @@ pub mod mutation;
 pub mod output;
 /// Release planning and publishing.
 pub mod release;
+pub(crate) mod remote_cache;
 /// Canonical Git-backed or filesystem-backed source state.
 pub mod source;
 /// Crate extraction to standalone repos.

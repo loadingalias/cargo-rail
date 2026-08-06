@@ -434,7 +434,7 @@ pub fn compiler_evidence_cache(workspace_root: &Path) -> Result<serde_json::Valu
 
 /// Reconstruct compiler-evidence entries from an explicitly configured cache base.
 pub fn compiler_evidence_cache_at(cache_base: &Path) -> Result<serde_json::Value> {
-  let root = cache_base.join("cargo-rail/local-cas-v1");
+  let root = cache_base.join("cargo-rail/local-cas-v2");
   let mut pin_created = std::collections::HashMap::new();
   for pin in std::fs::read_dir(root.join("pins"))? {
     let pin: serde_json::Value = serde_json::from_slice(&std::fs::read(pin?.path())?)?;

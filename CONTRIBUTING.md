@@ -18,7 +18,7 @@ just check
 just test
 ```
 
-`just check` is read-only and always workspace-wide. When you want rustfmt and Clippy to rewrite the worktree, run `just fix` explicitly.
+`just check` is workspace-wide and mutates: it formats and applies Clippy's automatic fixes. CI runs `just check-ci`, the read-only equivalent that never touches the worktree.
 
 After changing features, dependency resolution, or target-specific behavior, run the full suite:
 
@@ -40,9 +40,8 @@ just test-all
 ## Generated documentation
 
 Two docs are generated, not hand-edited: `docs/commands.md` comes from CLI help, and `docs/caching.md`
-is assembled from the native CI manifest, release target registry, native-cache capability certificates, runtime
-gates, and performance qualifications. Regenerate both after changing commands, flags, defaults, support
-inventories, or cache eligibility:
+is assembled from the native CI manifest, release target registry, and runtime cache contract. Regenerate both after
+changing commands, flags, defaults, support inventories, or cache eligibility:
 
 ```bash
 just gen-docs
@@ -53,7 +52,7 @@ just gen-docs
 A performance claim needs evidence someone else can check. Identify the workload, host, toolchain, exact commands,
 sample count, and before/after values. Report point measurements for one sample; report p50 or p95 only when the run
 contains enough samples to support a distribution claim. Compare cache implementations on one host. Preserve the raw
-results, and report failed correctness checks or performance budgets alongside the numbers.
+results, and report failed correctness checks alongside the numbers.
 
 Native compiler-cache changes must run the checked-in same-root output-directory and independent-root fixture. When a
 change can affect those lanes, measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the

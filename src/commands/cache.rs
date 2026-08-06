@@ -116,7 +116,7 @@ fn has_state(status: &CacheStatus) -> bool {
 }
 
 fn total_bytes(status: &CacheStatus) -> u64 {
-  status
+  let bytes = status
     .workspace
     .as_ref()
     .map_or(0, |workspace| workspace.bytes)
@@ -126,7 +126,14 @@ fn total_bytes(status: &CacheStatus) -> u64 {
         .as_ref()
         .and_then(|local| local.cache.as_ref())
         .map_or(0, |local| local.bytes),
-    )
+    );
+  bytes.saturating_add(
+    status
+      .local
+      .as_ref()
+      .and_then(|local| local.legacy.as_ref())
+      .map_or(0, |legacy| legacy.bytes),
+  )
 }
 
 fn render_status(status: &CacheStatus) {
@@ -152,10 +159,24 @@ fn render_status(status: &CacheStatus) {
     println!("  local (shared across workspaces)");
     if let Some(cache) = &local.cache {
       println!("    root: {}", cache.root);
+      println!("    trust domain: {}", cache.trust_domain);
       println!("    bytes: {} / {}", cache.bytes, cache.max_bytes);
+      println!("    committed result bytes: {}", cache.committed_result_bytes);
       println!("    results: {}", cache.results);
       println!("    objects: {}", cache.objects);
       println!("    pins: {}", cache.pins);
+      println!(
+        "    native actions: {} ({} unique, {} conflicted, {} quarantined)",
+        cache.native_actions, cache.native_unique, cache.native_conflicted, cache.native_quarantined
+      );
+      println!(
+        "    native origins: {} local / {} remote",
+        cache.native_local_origins, cache.native_remote_origins
+      );
+      println!(
+        "    native terminal ledger: {} / {} bytes (disabled: {})",
+        cache.native_ledger_bytes, cache.native_ledger_max_bytes, cache.native_ledger_disabled
+      );
       println!("    active leases: {}", cache.active_leases);
       println!("    stale leases: {}", cache.stale_leases);
       println!(
@@ -170,7 +191,21 @@ fn render_status(status: &CacheStatus) {
         println!("    newest use (unix ms): {newest}");
       }
     } else {
-      println!("    absent");
+      println!("    current authority root: absent");
     }
+    if let Some(legacy) = &local.legacy {
+      println!("    legacy reclaim-only root: {} bytes ({})", legacy.bytes, legacy.root);
+    }
+  }
+  if let Some(remote) = &status.remote {
+    println!("  remote (machine-owned)");
+    println!("    alias: {}", remote.alias);
+    println!("    transport: {}", remote.transport);
+    println!("    authority: {}", remote.authority);
+    println!("    role: {}", remote.role);
+    println!(
+      "    shared compiler environment names: {}",
+      remote.shared_environment_names
+    );
   }
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 10;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
@@ -240,24 +240,30 @@ pub(crate) enum NativeCacheWrapperPhase {
   SessionLoad,
   ArgumentNormalizationInputCapture,
   BypassClassification,
-  CandidateKeyConstruction,
+  ActionCapture,
   CasOpen,
-  CandidateLookup,
-  InputRevalidationActionKey,
+  ActionLookup,
+  ColdResultPreparation,
+  ColdResultHandoff,
+  ColdResultAdmission,
+  FinalActionRevalidation,
   ResultRestoreMaterialization,
   CargoOutputPublication,
 }
 
 impl NativeCacheWrapperPhase {
-  const ALL: [Self; 10] = [
+  const ALL: [Self; 13] = [
     Self::ContextLoad,
     Self::SessionLoad,
     Self::ArgumentNormalizationInputCapture,
     Self::BypassClassification,
-    Self::CandidateKeyConstruction,
+    Self::ActionCapture,
     Self::CasOpen,
-    Self::CandidateLookup,
-    Self::InputRevalidationActionKey,
+    Self::ActionLookup,
+    Self::ColdResultPreparation,
+    Self::ColdResultHandoff,
+    Self::ColdResultAdmission,
+    Self::FinalActionRevalidation,
     Self::ResultRestoreMaterialization,
     Self::CargoOutputPublication,
   ];
@@ -268,10 +274,13 @@ impl NativeCacheWrapperPhase {
       Self::SessionLoad => "session_load",
       Self::ArgumentNormalizationInputCapture => "argument_normalization_input_capture",
       Self::BypassClassification => "bypass_classification",
-      Self::CandidateKeyConstruction => "candidate_key_construction",
+      Self::ActionCapture => "action_capture",
       Self::CasOpen => "cas_open",
-      Self::CandidateLookup => "candidate_lookup",
-      Self::InputRevalidationActionKey => "input_revalidation_action_key",
+      Self::ActionLookup => "action_lookup",
+      Self::ColdResultPreparation => "cold_result_preparation",
+      Self::ColdResultHandoff => "cold_result_handoff",
+      Self::ColdResultAdmission => "cold_result_admission",
+      Self::FinalActionRevalidation => "final_action_revalidation",
       Self::ResultRestoreMaterialization => "result_restore_materialization",
       Self::CargoOutputPublication => "cargo_output_publication",
     }
@@ -847,7 +856,7 @@ mod tests {
     assert_eq!(encoded["process"]["invocations"], 3);
     assert_eq!(encoded["process"]["aggregate_elapsed_ns"], 300);
     assert_eq!(encoded["process"]["wall_occupied_ns"], 250);
-    assert_eq!(encoded["phases"].as_object().map(serde_json::Map::len), Some(10));
+    assert_eq!(encoded["phases"].as_object().map(serde_json::Map::len), Some(13));
     assert_eq!(encoded["phases"]["cas_open"]["invocations"], 3);
     assert_eq!(encoded["phases"]["cas_open"]["aggregate_elapsed_ns"], 120);
     assert_eq!(encoded["phases"]["cas_open"]["wall_occupied_ns"], 100);

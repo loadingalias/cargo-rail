@@ -251,7 +251,8 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6  # v1.30.2
         with:
-          bin: cargo-rail
+          bin: cargo-rail,cargo-rail-native-rustc-wrapper
+          archive: cargo-rail-${{ matrix.target }}
           target: ${{ matrix.target }}
           locked: true
           tar: unix
@@ -271,8 +272,12 @@ jobs:
           mkdir smoke
           tar -xzf "$ARCHIVE" -C smoke
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
+          wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
           test -n "$binary"
+          test -n "$wrapper"
+          test "$(dirname "$binary")" = "$(dirname "$wrapper")"
           chmod +x "$binary"
+          chmod +x "$wrapper"
           test "$("$binary" rail --version)" = "cargo-rail $VERSION"
 
       - name: Smoke-test zip archive
@@ -287,8 +292,15 @@ jobs:
           }
           Expand-Archive -Path $env:ARCHIVE -DestinationPath smoke
           $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
+          $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $wrapper) {
+            throw "cargo-rail-native-rustc-wrapper.exe is missing from $env:ARCHIVE"
+          }
+          if ($binary.DirectoryName -ne $wrapper.DirectoryName) {
+            throw "cargo-rail compiler wrapper is not adjacent to cargo-rail.exe"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

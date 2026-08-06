@@ -1003,7 +1003,7 @@ mod tests {
     writer.put(original.clone());
     writer.flush().expect("compiler evidence should publish");
 
-    let results = cache_root.path().join("cargo-rail/local-cas-v1/results");
+    let results = cache_root.path().join("cargo-rail/local-cas-v2/results");
     let bundle = fs::read_dir(results)
       .expect("results should be readable")
       .next()
@@ -1052,7 +1052,7 @@ mod tests {
       }
     });
 
-    let root = cache_root.path().join("cargo-rail/local-cas-v1");
+    let root = cache_root.path().join("cargo-rail/local-cas-v2");
     assert_eq!(fs::read_dir(root.join("results")).expect("results").count(), 1);
     assert_eq!(fs::read_dir(root.join("pins")).expect("pins").count(), 1);
     let candidate_directories = fs::read_dir(root.join("compiler-evidence-candidates"))

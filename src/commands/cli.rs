@@ -276,7 +276,7 @@ pub enum Commands {
     /// Execute supported Rust actions in fresh isolated roots
     #[arg(long)]
     hermetic: bool,
-    /// Disable local result reuse for this execution
+    /// Disable all Cargo-Rail build-result cache reads and writes for this execution
     #[arg(long)]
     no_cache: bool,
     /// Dry-run action plan format (json/github require --dry-run)

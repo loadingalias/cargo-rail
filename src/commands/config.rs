@@ -522,6 +522,9 @@ pub fn run_config_validate_standalone(
     .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())));
   match parsed_config {
     Ok(config) => {
+      if let Err(e) = config.cache.validate() {
+        errors.push(ValidationIssue::new("cache", e.to_string()));
+      }
       // Validate change detection config
       if let Err(e) = config.change_detection.validate() {
         errors.push(ValidationIssue::new("change_detection", e.to_string()));

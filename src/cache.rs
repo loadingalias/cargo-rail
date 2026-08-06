@@ -89,6 +89,15 @@ pub(crate) struct SharedCacheStatus {
   pub(crate) cross_workspace: bool,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) cache: Option<crate::hermetic::cas::LocalCasStatus>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) legacy: Option<LegacyLocalCacheStatus>,
+}
+
+/// Legacy authority root retained only for explicit scoped reclamation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LegacyLocalCacheStatus {
+  pub(crate) root: String,
+  pub(crate) bytes: u64,
 }
 
 /// Versioned read-only cache status projection.
@@ -99,6 +108,8 @@ pub(crate) struct CacheStatus {
   pub(crate) workspace: Option<WorkspaceCacheStatus>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) local: Option<SharedCacheStatus>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) remote: Option<crate::remote_cache::RemoteCacheConfigurationStatus>,
 }
 
 /// Cache state removed by one explicitly authorized cleanup.
@@ -121,20 +132,49 @@ impl CacheRemoval {
 
 /// Inspect selected cache scopes without creating or modifying cache state.
 pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> RailResult<CacheStatus> {
+  let remote = if local {
+    let alias = configured_l2_alias(workspace_root)?;
+    crate::remote_cache::configuration_status(workspace_root, alias.as_deref())
+      .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
+  } else {
+    None
+  };
   Ok(CacheStatus {
-    schema_version: 1,
+    schema_version: 5,
     workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
     local: local
       .then(|| {
         let cache = crate::hermetic::local_cache_status()?;
+        let legacy = crate::hermetic::legacy_local_cache_status()?.map(|(root, bytes)| LegacyLocalCacheStatus {
+          root: root.to_string_lossy().into_owned(),
+          bytes,
+        });
         Ok::<_, RailError>(SharedCacheStatus {
-          present: cache.is_some(),
+          present: cache.is_some() || legacy.is_some(),
           cross_workspace: true,
           cache,
+          legacy,
         })
       })
       .transpose()?,
+    remote,
   })
+}
+
+fn configured_l2_alias(workspace_root: &Path) -> RailResult<Option<String>> {
+  match crate::config::RailConfig::try_load(workspace_root) {
+    crate::config::ConfigLoadResult::Loaded(config) => {
+      config.cache.validate().map_err(RailError::Config)?;
+      Ok(config.cache.l2.clone())
+    }
+    crate::config::ConfigLoadResult::ParseError { path, message } => {
+      Err(RailError::Config(crate::error::ConfigError::ParseError {
+        path,
+        message,
+      }))
+    }
+    crate::config::ConfigLoadResult::NotFound => Ok(None),
+  }
 }
 
 /// Remove reconstructible cache state inside one workspace.
@@ -174,13 +214,16 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
 
 /// Remove the validated shared local CAS in the selected local cache domain.
 pub(crate) fn remove_local() -> RailResult<CacheRemoval> {
-  let Some((path, bytes)) = crate::hermetic::remove_local_cache()? else {
-    return Ok(CacheRemoval::default());
-  };
-  Ok(CacheRemoval {
-    paths: vec![path.to_string_lossy().into_owned()],
-    bytes,
-  })
+  crate::hermetic::remove_local_cache()?
+    .into_iter()
+    .try_fold(CacheRemoval::default(), |mut removal, (path, bytes)| {
+      removal.bytes = removal
+        .bytes
+        .checked_add(bytes)
+        .ok_or_else(|| RailError::message("cache cleanup byte count overflow"))?;
+      removal.paths.push(path.to_string_lossy().into_owned());
+      Ok(removal)
+    })
 }
 
 fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {

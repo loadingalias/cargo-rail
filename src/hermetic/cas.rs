@@ -15,13 +15,18 @@ use crate::compiler::diagnostics_store::{
   CompilerEvidenceObject, CompilerEvidenceValidation, EVIDENCE_ACTION_KEY_PREFIX, EVIDENCE_CANDIDATE_KEY_PREFIX,
   EVIDENCE_OBJECT_PREFIX, validate_evidence_action_key, validate_evidence_candidate_key, validate_evidence_object,
 };
-use crate::compiler::native_cache::NativeCompilerValidation;
+use crate::compiler::native_cache::{NativeCompilerValidation, PreparedNativeOrigin, PreparedNativeResult};
 use crate::error::{RailError, RailResult};
 
-const CAS_VERSION: u32 = 1;
-const OWNER_MARKER: &[u8] = b"cargo-rail-local-cas\nschema=1\n";
-const CACHE_BASE_ENV: &str = "CARGO_RAIL_CACHE_DIR";
-const CACHE_MAX_BYTES_ENV: &str = "CARGO_RAIL_CACHE_MAX_BYTES";
+const CAS_VERSION: u32 = 2;
+const CAS_ROOT_NAME: &str = "local-cas-v2";
+const LEGACY_CAS_ROOT_NAME: &str = "local-cas-v1";
+const LEGACY_OWNER_MARKER: &[u8] = b"cargo-rail-local-cas\nschema=1\n";
+const OWNER_MARKER_PREFIX: &str = "cargo-rail-local-cas\nschema=2\ntrust-domain=";
+const DEFAULT_TRUST_DOMAIN_FILE: &str = "LOCAL_TRUST_DOMAIN";
+pub(crate) const CACHE_BASE_ENV: &str = "CARGO_RAIL_CACHE_DIR";
+pub(crate) const CACHE_MAX_BYTES_ENV: &str = "CARGO_RAIL_CACHE_MAX_BYTES";
+pub(crate) const CACHE_TRUST_DOMAIN_ENV: &str = "CARGO_RAIL_CACHE_TRUST_DOMAIN";
 const DEFAULT_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_RESULT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_OBJECT_METADATA_BYTES: u64 = 64 * 1024 * 1024;
@@ -34,14 +39,20 @@ const MAX_ENTRIES: usize = 1_000_000;
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
-const NATIVE_CANDIDATE_INDEX_VERSION: u32 = 1;
-const NATIVE_CANDIDATE_INDEX_DIRECTORY: &str = "native-candidates";
-const NATIVE_CANDIDATE_INDEX_MARKER: &str = "READY";
-const NATIVE_CANDIDATE_INDEX_MARKER_BYTES: &[u8] = b"cargo-rail-native-candidate-index\nschema=1\n";
 const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
-const LIFECYCLE_LOCK_NAME: &str = "local-cas-v1.lock";
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+const NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
+const MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES: u64 = 1024 * 1024;
+const NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES: &[u8] =
+  b"cargo-rail-native-environment-selector-conflict\nschema=1\n";
+const NATIVE_ACTION_STATE_VERSION: u32 = 2;
+const NATIVE_ACTION_STATE_DIRECTORY: &str = "native-actions-v2";
+const LEGACY_NATIVE_ACTION_STATE_DIRECTORY: &str = "native-actions";
+const CAPACITY_STATE_FILE: &str = "CAPACITY.json";
+const NATIVE_LEDGER_STATE_FILE: &str = "NATIVE_LEDGER.json";
+const MAX_NATIVE_TERMINAL_STATES: u64 = 32 * 1024;
+const MAX_NATIVE_TERMINAL_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SYSROOT_IDENTITY_MEMO_DIRECTORY: &str = "sysroot-identities";
 
 const BLOB_PREFIX: &str = "blob-v1-sha256-";
@@ -96,23 +107,9 @@ pub(super) struct CacheCandidate {
   pub(super) validation: FastCacheValidation,
 }
 
-/// A verified local result binding found through a non-authorizing compiler candidate key.
-#[cfg(any(unix, windows, test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) struct NativeCacheCandidate {
-  pub(crate) action_key: String,
-  pub(crate) validation: NativeCompilerValidation,
-  pub(crate) objects_verified: u64,
-  pub(crate) bytes_read: u64,
-  verified: VerifiedResult,
-}
-
 #[cfg(any(unix, windows, test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheHit {
-  pub(crate) action_result: String,
-  pub(crate) result_digest: String,
-  pub(crate) objects_verified: u64,
   pub(crate) bytes_read: u64,
   pub(crate) bytes_restored: u64,
 }
@@ -121,7 +118,6 @@ pub(crate) struct NativeCacheHit {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheMiss {
   pub(crate) reason: String,
-  pub(crate) objects_verified: u64,
   pub(crate) bytes_read: u64,
 }
 
@@ -130,6 +126,29 @@ pub(crate) struct NativeCacheMiss {
 pub(crate) enum NativeCacheLookup {
   Hit(NativeCacheHit),
   Miss(NativeCacheMiss),
+}
+
+/// Outcome of immutably publishing one native compiler environment selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeEnvironmentSelectorPublication {
+  Created,
+  Converged,
+  Diverged,
+}
+
+/// Exact lookup outcome for one complete pre-executable native action.
+pub(crate) enum NativeActionLookup<'a> {
+  Hit(Box<NativeActionHit<'a>>),
+  Miss(NativeCacheMiss),
+}
+
+/// One uniquely authoritative native result held under a stable local CAS view.
+pub(crate) struct NativeActionHit<'a> {
+  pub(crate) validation: NativeCompilerValidation,
+  pub(crate) bytes_read: u64,
+  cas: &'a LocalCas,
+  _lock: LocalCasLifecycleLock,
+  verified: VerifiedResult,
 }
 
 /// One verified compiler-evidence candidate loaded without granting reuse authority.
@@ -156,15 +175,6 @@ pub(super) struct StoreRequest<'a> {
   pub(super) source_root: &'a Path,
 }
 
-pub(crate) struct NativeStoreRequest<'a> {
-  pub(crate) action_key: &'a str,
-  pub(crate) candidate_key: &'a str,
-  pub(crate) result_digest: &'a str,
-  pub(crate) manifest: &'a OutputManifest,
-  pub(crate) validation: &'a NativeCompilerValidation,
-  pub(crate) source_root: &'a Path,
-}
-
 pub(crate) struct CompilerEvidenceStoreRequest<'a> {
   pub(crate) validation: &'a CompilerEvidenceValidation,
   pub(crate) evidence: &'a CompilerEvidenceObject,
@@ -178,6 +188,9 @@ struct ValidatedStoreRequest<'a> {
   validation: StoredValidationRef<'a>,
   compiler_units: usize,
   source_root: &'a Path,
+  native_origins: Option<NativeResultOrigins>,
+  move_preverified_blobs: bool,
+  before_authority: Option<&'a mut dyn FnMut() -> RailResult<()>>,
 }
 
 /// One validated local CAS rooted outside any physical checkout.
@@ -188,14 +201,30 @@ pub(crate) struct LocalCas {
   max_bytes: u64,
 }
 
+struct SelectedCacheAuthority {
+  root_name: String,
+  trust_domain: String,
+}
+
 /// Read-only measurements for one validated shared local CAS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct LocalCasStatus {
   pub(crate) root: String,
+  pub(crate) trust_domain: String,
   pub(crate) bytes: u64,
   pub(crate) max_bytes: u64,
+  pub(crate) committed_result_bytes: u64,
   pub(crate) results: u64,
   pub(crate) pins: u64,
+  pub(crate) native_actions: u64,
+  pub(crate) native_unique: u64,
+  pub(crate) native_conflicted: u64,
+  pub(crate) native_quarantined: u64,
+  pub(crate) native_local_origins: u64,
+  pub(crate) native_remote_origins: u64,
+  pub(crate) native_ledger_bytes: u64,
+  pub(crate) native_ledger_max_bytes: u64,
+  pub(crate) native_ledger_disabled: bool,
   pub(crate) objects: u64,
   pub(crate) active_leases: u64,
   pub(crate) stale_leases: u64,
@@ -214,54 +243,127 @@ struct LocalCasLifecycleLock {
   _file: File,
 }
 
-/// Fully verified native candidates held under one shared lifecycle view.
-#[cfg(any(unix, windows, test))]
-pub(crate) struct NativeCacheCandidates<'a> {
-  cas: &'a LocalCas,
-  _lock: LocalCasLifecycleLock,
-  candidates: Vec<NativeCacheCandidate>,
-}
-
-#[cfg(any(unix, windows, test))]
-impl std::ops::Deref for NativeCacheCandidates<'_> {
-  type Target = [NativeCacheCandidate];
-
-  fn deref(&self) -> &Self::Target {
-    &self.candidates
-  }
-}
-
-#[cfg(any(unix, windows, test))]
-impl NativeCacheCandidates<'_> {
-  /// Materialize one candidate already verified inside this retained shared view.
-  pub(crate) fn restore(&self, index: usize, destination: &Path) -> NativeCacheLookup {
-    let Some(candidate) = self.candidates.get(index) else {
-      return NativeCacheLookup::Miss(NativeCacheMiss {
-        reason: "compiler_candidate_index_unavailable".to_string(),
-        objects_verified: 0,
-        bytes_read: 0,
-      });
+impl NativeActionHit<'_> {
+  /// Revalidate the selector that authorized this action without reacquiring the lifecycle lock.
+  ///
+  /// This hit retains the shared lifecycle lock, so an exclusive selector publisher cannot
+  /// create a conflict between this check and the caller's restore.
+  pub(crate) fn validate_environment_selector<'a>(
+    &self,
+    base_action_key: &str,
+    expected_names: impl IntoIterator<Item = &'a str>,
+  ) -> RailResult<()> {
+    if self.cas.native_environment_selector_conflicted(base_action_key)? {
+      return Err(RailError::message(
+        "local CAS native environment selector is durably conflicted",
+      ));
+    }
+    let Some(actual_names) = self.cas.load_native_environment_selector(base_action_key)? else {
+      return Err(RailError::message(
+        "local CAS native environment selector is absent for an authoritative action",
+      ));
     };
+    if !actual_names.iter().map(String::as_str).eq(expected_names) {
+      return Err(RailError::message(
+        "local CAS native environment selector does not match the authoritative action",
+      ));
+    }
+    if self.cas.native_environment_selector_conflicted(base_action_key)? {
+      return Err(RailError::message(
+        "local CAS native environment selector is durably conflicted",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Verify the action-to-base binding and its terminal selector immediately
+  /// before exposing this result to a remote authority.
+  pub(crate) fn validate_remote_publication<'a>(&'a self, base_action_key: &str) -> RailResult<&'a [String]> {
+    let expected_names = self.validation.remote_publication_environment_names(base_action_key)?;
+    self.validate_environment_selector(base_action_key, expected_names.iter().map(String::as_str))?;
+    Ok(expected_names)
+  }
+
+  pub(crate) fn association(&self) -> RailResult<crate::compiler::native_cache::pack::NativeAssociation> {
+    crate::compiler::native_cache::pack::association(&self.validation)
+  }
+
+  /// Stream the fixed canonical result pack directly from immutable CAS blobs
+  /// while this verified action view holds the lifecycle read authority.
+  pub(crate) fn export_pack<W: std::io::Write>(
+    &self,
+    writer: W,
+  ) -> RailResult<crate::compiler::native_cache::pack::NativePackExport> {
+    crate::compiler::native_cache::pack::export(&self.validation, writer, |slot| {
+      let identity = blob_id(slot.digest, slot.bytes).map_err(fault_to_error)?;
+      let hex = validated_id_hex(&identity, BLOB_PREFIX)?;
+      let path = self.verified.bundle.join("blobs").join(format!("{hex}.blob"));
+      let file = File::open(&path)?;
+      if !crate::utils::private_file_matches_path(&file, &path, slot.bytes)? {
+        return Err(RailError::message(
+          "native result pack source is not the expected private immutable blob",
+        ));
+      }
+      Ok(file)
+    })
+  }
+
+  /// Materialize the already verified unique result into private staging.
+  #[cfg(test)]
+  pub(crate) fn restore(&self, destination: &Path) -> NativeCacheLookup {
     let mut stats = ReadStats::default();
-    if let Err(fault) = self.cas.materialize(&candidate.verified, destination, &mut stats) {
+    if let Err(fault) = self.cas.materialize(&self.verified, destination, &mut stats) {
       return NativeCacheLookup::Miss(NativeCacheMiss {
         reason: fault.reason,
-        objects_verified: stats.objects,
         bytes_read: stats.bytes,
       });
     }
-    if let Ok(key_hex) = validated_action_key_hex(&candidate.action_key) {
-      let pin_path = self.cas.root.join("pins").join(format!("{key_hex}.json"));
+    if let Ok(key_hex) = validated_action_key_hex(self.validation.action_key()) {
+      let state_path = self
+        .cas
+        .root
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
+        .join(format!("{key_hex}.json"));
       let _ = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(pin_path)
+        .open(state_path)
         .and_then(|file| file.set_modified(SystemTime::now()));
     }
     NativeCacheLookup::Hit(NativeCacheHit {
-      action_result: candidate.verified.action_result.clone(),
-      result_digest: candidate.verified.object.result_digest.clone(),
-      objects_verified: stats.objects,
+      bytes_read: stats.bytes,
+      bytes_restored: stats.restored,
+    })
+  }
+
+  /// Materialize into one caller-registered exact staging directory.
+  ///
+  /// Restore transactions use this path so process-death recovery never has
+  /// to discover a random CAS temporary directory by scanning its parent.
+  pub(crate) fn restore_registered(&self, destination: &Path, staging: &Path) -> NativeCacheLookup {
+    let mut stats = ReadStats::default();
+    if let Err(fault) = self
+      .cas
+      .materialize_registered(&self.verified, destination, staging, &mut stats)
+    {
+      return NativeCacheLookup::Miss(NativeCacheMiss {
+        reason: fault.reason,
+        bytes_read: stats.bytes,
+      });
+    }
+    if let Ok(key_hex) = validated_action_key_hex(self.validation.action_key()) {
+      let state_path = self
+        .cas
+        .root
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
+        .join(format!("{key_hex}.json"));
+      let _ = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state_path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    }
+    NativeCacheLookup::Hit(NativeCacheHit {
       bytes_read: stats.bytes,
       bytes_restored: stats.restored,
     })
@@ -335,13 +437,48 @@ struct ActionPin {
   created_unix_nanos: u128,
 }
 
-/// Discovery-only pointer from one compiler candidate to an authoritative action pin.
+/// Durable native action authority. Conflict and quarantine states are terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeCandidateIndexEntry {
+struct NativeActionState {
   version: u32,
   action_key: String,
-  candidate_key: String,
+  state: NativeActionStateKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeActionStateKind {
+  UniqueResult {
+    result_key: String,
+    action_result: String,
+    origins: NativeResultOrigins,
+  },
+  ConflictedResults {
+    first_result_key: String,
+    second_result_key: String,
+  },
+  Quarantined {
+    fault: NativeStateFault,
+    evidence_digest: String,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeResultOrigins {
+  local: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  remote: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeStateFault {
+  Unreadable,
+  Malformed,
+  Incompatible,
+  AmbiguousReplacement,
 }
 
 /// Disposable discovery pointer for one compiler-evidence configuration.
@@ -359,6 +496,22 @@ struct LeaseRecord {
   version: u32,
   action_result: String,
   created_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityState {
+  version: u32,
+  result_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeLedgerState {
+  version: u32,
+  terminal_states: u64,
+  terminal_bytes: u64,
+  disabled: bool,
 }
 
 #[derive(Default)]
@@ -432,7 +585,6 @@ struct PreparedTree {
 }
 
 struct BundlePublication<'a> {
-  action_result: &'a str,
   object: &'a ActionResultObject,
   object_bytes: &'a [u8],
   manifest: &'a OutputManifest,
@@ -440,6 +592,32 @@ struct BundlePublication<'a> {
   validation: StoredValidationRef<'a>,
   validation_bytes: &'a [u8],
   prepared: &'a PreparedTree,
+  move_preverified_blobs: bool,
+}
+
+struct StagedBundle {
+  _temporary: tempfile::TempDir,
+  _active: File,
+  payload: PathBuf,
+  stats: StoreStats,
+}
+
+/// One native result whose immutable bundle is ready for a later authority
+/// commit. The command coordinator retains this value so preparation can
+/// overlap rustc while one empty-authority batch owns the durability barriers.
+pub(crate) struct StagedNativeResult {
+  validation: NativeCompilerValidation,
+  origins: NativeResultOrigins,
+  object: ActionResultObject,
+  action_result: String,
+  incoming: u64,
+  staged: StagedBundle,
+}
+
+impl StagedNativeResult {
+  pub(crate) fn validation(&self) -> &NativeCompilerValidation {
+    &self.validation
+  }
 }
 
 struct CompilerEvidencePublication<'a> {
@@ -477,7 +655,7 @@ impl StoredValidation {
   fn lookup_key(&self) -> &str {
     match self {
       Self::Hermetic(validation) => &validation.lookup_key,
-      Self::NativeCompiler(validation) => validation.candidate_key(),
+      Self::NativeCompiler(validation) => validation.action_key(),
     }
   }
 
@@ -534,13 +712,332 @@ impl LocalCas {
       .ok_or_else(|| RailError::message("local CAS lifecycle lock disappeared"))
   }
 
+  /// Load the compiler-selected environment names for one environment-neutral action.
+  pub(crate) fn native_environment_selector(&self, base_action_key: &str) -> RailResult<Option<Vec<String>>> {
+    let _lock = self.read_lock()?;
+    if self.native_environment_selector_conflicted(base_action_key)? {
+      return Err(RailError::message(
+        "local CAS native environment selector is durably conflicted",
+      ));
+    }
+    let selector = self.load_native_environment_selector(base_action_key)?;
+    if self.native_environment_selector_conflicted(base_action_key)? {
+      return Err(RailError::message(
+        "local CAS native environment selector is durably conflicted",
+      ));
+    }
+    Ok(selector)
+  }
+
+  /// Immutably publish compiler-selected environment names for one environment-neutral action.
+  pub(crate) fn publish_native_environment_selector(
+    &self,
+    base_action_key: &str,
+    names: &[String],
+  ) -> RailResult<NativeEnvironmentSelectorPublication> {
+    let _lock = self.lock()?;
+    let bytes = encode_native_environment_selector(names)?;
+    let destination = self.native_environment_selector_path(base_action_key)?;
+    let directory = destination
+      .parent()
+      .ok_or_else(|| RailError::message("native environment selector has no parent directory"))?;
+    validate_real_directory(directory, "local CAS native environment selector directory")?;
+    if self.native_environment_selector_conflicted(base_action_key)? {
+      return Ok(NativeEnvironmentSelectorPublication::Diverged);
+    }
+
+    if let Some(existing) = self.load_native_environment_selector(base_action_key)? {
+      if existing != names {
+        self.publish_native_environment_selector_conflict(base_action_key)?;
+        return Ok(NativeEnvironmentSelectorPublication::Diverged);
+      }
+      return Ok(if self.native_environment_selector_conflicted(base_action_key)? {
+        NativeEnvironmentSelectorPublication::Diverged
+      } else {
+        NativeEnvironmentSelectorPublication::Converged
+      });
+    }
+
+    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    match persist_noclobber_committed(temporary, &destination) {
+      Ok(file) => {
+        if !crate::utils::private_file_matches_path(&file, &destination, bytes.len() as u64)? {
+          return Err(RailError::message(
+            "published local CAS native environment selector is not a private regular file",
+          ));
+        }
+        sync_directory(directory)?;
+        Ok(if self.native_environment_selector_conflicted(base_action_key)? {
+          NativeEnvironmentSelectorPublication::Diverged
+        } else {
+          NativeEnvironmentSelectorPublication::Created
+        })
+      }
+      Err(error) => {
+        if self.native_environment_selector_conflicted(base_action_key)? {
+          return Ok(NativeEnvironmentSelectorPublication::Diverged);
+        }
+        match self.load_native_environment_selector(base_action_key)? {
+          Some(existing) if existing == names => Ok(if self.native_environment_selector_conflicted(base_action_key)? {
+            NativeEnvironmentSelectorPublication::Diverged
+          } else {
+            NativeEnvironmentSelectorPublication::Converged
+          }),
+          Some(_) => {
+            self.publish_native_environment_selector_conflict(base_action_key)?;
+            Ok(NativeEnvironmentSelectorPublication::Diverged)
+          }
+          None => Err(RailError::message(format!(
+            "failed to atomically publish local CAS native environment selector '{}': {}",
+            destination.display(),
+            error.error
+          ))),
+        }
+      }
+    }
+  }
+
+  fn native_environment_selector_conflicted(&self, base_action_key: &str) -> RailResult<bool> {
+    let directory = self.root.join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY);
+    validate_real_directory(&directory, "local CAS native environment selector directory")?;
+    let path = self.native_environment_selector_conflict_path(base_action_key)?;
+    let metadata = match fs::symlink_metadata(&path) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+      Err(error) => return Err(error.into()),
+      Ok(metadata) => metadata,
+    };
+    if !metadata.is_file()
+      || is_link_or_reparse(&metadata)
+      || !has_single_link(&metadata)
+      || metadata.len() != NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES.len() as u64
+    {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector conflict '{}' is not a private canonical file",
+        path.display()
+      )));
+    }
+    let mut file = File::open(&path)?;
+    if !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector conflict '{}' changed before it was read",
+        path.display()
+      )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+      .take(metadata.len().saturating_add(1))
+      .read_to_end(&mut bytes)?;
+    if bytes != NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES
+      || !crate::utils::private_file_matches_path(&file, &path, metadata.len())?
+    {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector conflict '{}' is malformed or changed while it was read",
+        path.display()
+      )));
+    }
+    crate::instrumentation::record_cas_read(bytes.len() as u64);
+    Ok(true)
+  }
+
+  fn publish_native_environment_selector_conflict(&self, base_action_key: &str) -> RailResult<()> {
+    let destination = self.native_environment_selector_conflict_path(base_action_key)?;
+    let directory = destination
+      .parent()
+      .ok_or_else(|| RailError::message("native environment selector conflict has no parent directory"))?;
+    validate_real_directory(directory, "local CAS native environment selector directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
+    temporary.write_all(NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES)?;
+    temporary.as_file().sync_all()?;
+    match persist_noclobber_committed(temporary, &destination) {
+      Ok(file) => {
+        if !crate::utils::private_file_matches_path(
+          &file,
+          &destination,
+          NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES.len() as u64,
+        )? {
+          return Err(RailError::message(
+            "published local CAS native environment selector conflict is not a private regular file",
+          ));
+        }
+        sync_directory(directory)
+      }
+      Err(error) => {
+        if self.native_environment_selector_conflicted(base_action_key)? {
+          Ok(())
+        } else {
+          Err(RailError::message(format!(
+            "failed to atomically publish local CAS native environment selector conflict '{}': {}",
+            destination.display(),
+            error.error
+          )))
+        }
+      }
+    }
+  }
+
+  fn load_native_environment_selector(&self, base_action_key: &str) -> RailResult<Option<Vec<String>>> {
+    let path = self.native_environment_selector_path(base_action_key)?;
+    let directory = self.root.join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY);
+    validate_real_directory(&directory, "local CAS native environment selector directory")?;
+    let metadata = match fs::symlink_metadata(&path) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+      Err(error) => return Err(error.into()),
+      Ok(metadata) => metadata,
+    };
+    if !metadata.is_file()
+      || is_link_or_reparse(&metadata)
+      || !has_single_link(&metadata)
+      || metadata.len() > MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES
+    {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector '{}' is not a private bounded regular file",
+        path.display()
+      )));
+    }
+    let mut file = File::open(&path).map_err(|error| {
+      RailError::message(format!(
+        "failed to open local CAS native environment selector '{}': {error}",
+        path.display()
+      ))
+    })?;
+    if !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector '{}' changed before it was read",
+        path.display()
+      )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&mut file)
+      .take(metadata.len().saturating_add(1))
+      .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector '{}' changed while it was read",
+        path.display()
+      )));
+    }
+    crate::instrumentation::record_cas_read(bytes.len() as u64);
+    let names: Vec<String> = serde_json::from_slice(&bytes).map_err(|error| {
+      RailError::message(format!(
+        "local CAS native environment selector '{}' is malformed: {error}",
+        path.display()
+      ))
+    })?;
+    if canonical_json(&names)? != bytes {
+      return Err(RailError::message(format!(
+        "local CAS native environment selector '{}' is not canonically encoded",
+        path.display()
+      )));
+    }
+    crate::compiler::native_cache::validate_environment_selector_names(names.iter().map(String::as_str))?;
+    Ok(Some(names))
+  }
+
+  fn native_environment_selector_path(&self, base_action_key: &str) -> RailResult<PathBuf> {
+    let key = validated_id_hex(base_action_key, crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)?;
+    Ok(
+      self
+        .root
+        .join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY)
+        .join(format!("{key}.json")),
+    )
+  }
+
+  fn native_environment_selector_conflict_path(&self, base_action_key: &str) -> RailResult<PathBuf> {
+    let key = validated_id_hex(base_action_key, crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)?;
+    Ok(
+      self
+        .root
+        .join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY)
+        .join(format!("{key}.conflict")),
+    )
+  }
+
+  /// Prove that this local authority currently contains no native action state.
+  /// A concurrent publisher after this linearization point may cause a
+  /// conservative cold compile, but cannot make discovery-only keys reusable.
+  pub(crate) fn native_authority_is_empty(&self) -> RailResult<bool> {
+    let _lock = self.read_lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Ok(false);
+    }
+    let directory = self.root.join(NATIVE_ACTION_STATE_DIRECTORY);
+    validate_real_directory(&directory, "local CAS native action state")?;
+    Ok(fs::read_dir(directory)?.next().is_none())
+  }
+
+  /// Create private same-filesystem native-result staging guarded from concurrent GC.
+  pub(crate) fn native_result_staging(&self) -> RailResult<crate::compiler::native_cache::pack::NativeResultStaging> {
+    let (directory, active) = self.create_guarded_staging("native-result-")?;
+    Ok(crate::compiler::native_cache::pack::NativeResultStaging::guarded(
+      directory, active,
+    ))
+  }
+
+  /// Create one result directory beneath a command-owned staging lease.
+  pub(crate) fn native_command_result_staging(
+    &self,
+    command_staging: &Path,
+  ) -> RailResult<crate::compiler::native_cache::pack::NativeResultStaging> {
+    let _lifecycle = self.read_lock()?;
+    let staging_root = self.root.join("staging");
+    validate_real_directory(&staging_root, "local CAS staging")?;
+    let parent = command_staging
+      .parent()
+      .ok_or_else(|| RailError::message("native publication staging has no parent"))?;
+    if crate::utils::canonicalize_existing(parent)? != crate::utils::canonicalize_existing(&staging_root)? {
+      return Err(RailError::message(
+        "native publication staging is outside the local CAS staging root",
+      ));
+    }
+    let name = command_staging.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    if !name.starts_with("native-command-") {
+      return Err(RailError::message("native publication staging has an invalid name"));
+    }
+    validate_real_directory(command_staging, "native publication staging")?;
+    if !staging_entry_is_active(command_staging)? {
+      return Err(RailError::message("native publication staging is not active"));
+    }
+    let incoming = command_staging.join("incoming");
+    validate_real_directory(&incoming, "native publication incoming directory")?;
+    let directory = tempfile::Builder::new().prefix("native-unit-").tempdir_in(incoming)?;
+    Ok(crate::compiler::native_cache::pack::NativeResultStaging::command_scoped(directory))
+  }
+
+  /// Create one command-owned staging lease that protects all queued native results.
+  pub(crate) fn native_publication_staging(&self) -> RailResult<(tempfile::TempDir, File)> {
+    self.create_guarded_staging("native-command-")
+  }
+
+  /// Create one staging directory without exposing an unlocked directory to
+  /// lifecycle cleanup. The shared lock covers only directory and lease
+  /// creation; the per-entry lock protects the longer parallel staging work.
+  fn create_guarded_staging(&self, prefix: &str) -> RailResult<(tempfile::TempDir, File)> {
+    let _lifecycle = self.read_lock()?;
+    let staging = self.root.join("staging");
+    validate_real_directory(&staging, "local CAS staging")?;
+    let directory = tempfile::Builder::new().prefix(prefix).tempdir_in(&staging)?;
+    #[cfg(test)]
+    pause_test_staging_before_active(directory.path())?;
+    let active_path = directory.path().join("ACTIVE");
+    let active = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create_new(true)
+      .open(active_path)?;
+    active.lock()?;
+    Ok((directory, active))
+  }
+
   #[cfg(test)]
   pub(crate) fn status(&self) -> RailResult<LocalCasStatus> {
     status_at_with_max(&self.root, self.max_bytes)?.ok_or_else(|| RailError::message("local CAS disappeared"))
   }
 
   /// Return the private candidate location for one verified sysroot identity memo.
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
   pub(crate) fn sysroot_identity_memo_path(&self, lookup: &crate::source::ContentDigest) -> PathBuf {
     self
       .root
@@ -564,32 +1061,39 @@ impl LocalCas {
     })?;
     validate_real_directory(&base, "local cache base")?;
     let cargo_rail = create_real_directory(&base, "cargo-rail")?;
-    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let authority = selected_cache_authority(&cargo_rail, true)?;
+    let lifecycle_lock = cargo_rail.join(format!("{}.lock", authority.root_name));
     let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
       .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
-    let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
-    ensure_owner_marker(&root)?;
+    let root = create_real_directory(&cargo_rail, &authority.root_name)?;
+    prove_local_cache_volume(&root)?;
+    ensure_owner_marker(&root, &authority.trust_domain)?;
     create_real_directory(&root, "staging")?;
     for name in [
       "results",
       "pins",
       "leases",
-      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      NATIVE_ACTION_STATE_DIRECTORY,
+      NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
       EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
     ] {
       create_real_directory(&root, name)?;
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    validate_optional_real_directory(
+      &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
+      "legacy local CAS native action state",
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
     clear_staging(&root.join("staging"))?;
-    let cas = Self {
+    reconcile_capacity_state(&root)?;
+    reconcile_native_ledger(&root)?;
+    Ok(Self {
       root,
       lifecycle_lock,
       max_bytes: cache_max_bytes()?,
-    };
-    cas.ensure_native_candidate_index()?;
-    Ok(cas)
+    })
   }
 
   /// Open the CAS prepared by this Cargo session without repeating lifecycle mutation.
@@ -613,35 +1117,42 @@ impl LocalCas {
     validate_real_directory(base, "local cache base")?;
     let cargo_rail = base.join("cargo-rail");
     validate_real_directory(&cargo_rail, "local CAS owner")?;
-    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let authority = selected_cache_authority(&cargo_rail, false)?;
+    let lifecycle_lock = cargo_rail.join(format!("{}.lock", authority.root_name));
     let _lock = lock_local_cas(&lifecycle_lock, false, LockMode::Shared)?
       .ok_or_else(|| RailError::message("initialized local CAS lifecycle lock disappeared"))?;
-    let root = cargo_rail.join("local-cas-v1");
+    let root = cargo_rail.join(&authority.root_name);
     validate_real_directory(&root, "local CAS root")?;
-    ensure_owner_marker_existing(&root)?;
+    prove_local_cache_volume(&root)?;
+    ensure_owner_marker_existing(&root, Some(&authority.trust_domain))?;
     for name in [
       "staging",
       "results",
       "pins",
       "leases",
-      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      NATIVE_ACTION_STATE_DIRECTORY,
+      NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
       EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
     ] {
       validate_real_directory(&root.join(name), "local CAS required directory")?;
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    validate_optional_real_directory(
+      &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
+      "legacy local CAS native action state",
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     validate_real_directory(
       &root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY),
       "local CAS sysroot memo directory",
     )?;
     validate_root_entries(&root)?;
-    let cas = Self {
+    validate_capacity_state(&root)?;
+    validate_native_ledger(&root)?;
+    Ok(Self {
       root,
       lifecycle_lock,
       max_bytes,
-    };
-    cas.validate_native_candidate_index()?;
-    Ok(cas)
+    })
   }
 
   #[cfg(test)]
@@ -649,128 +1160,42 @@ impl LocalCas {
     fs::create_dir_all(base)?;
     let base = fs::canonicalize(base)?;
     let cargo_rail = create_real_directory(&base, "cargo-rail")?;
-    let lifecycle_lock = cargo_rail.join(LIFECYCLE_LOCK_NAME);
+    let authority = SelectedCacheAuthority {
+      root_name: CAS_ROOT_NAME.to_string(),
+      trust_domain: load_default_trust_domain(&cargo_rail, true)?,
+    };
+    let lifecycle_lock = cargo_rail.join(format!("{}.lock", authority.root_name));
     let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
       .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
-    let root = create_real_directory(&cargo_rail, "local-cas-v1")?;
-    ensure_owner_marker(&root)?;
+    let root = create_real_directory(&cargo_rail, &authority.root_name)?;
+    prove_local_cache_volume(&root)?;
+    ensure_owner_marker(&root, &authority.trust_domain)?;
     create_real_directory(&root, "staging")?;
     for name in [
       "results",
       "pins",
       "leases",
-      NATIVE_CANDIDATE_INDEX_DIRECTORY,
+      NATIVE_ACTION_STATE_DIRECTORY,
+      NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
       EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
     ] {
       create_real_directory(&root, name)?;
     }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    validate_optional_real_directory(
+      &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
+      "legacy local CAS native action state",
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
     clear_staging(&root.join("staging"))?;
-    let cas = Self {
+    reconcile_capacity_state(&root)?;
+    reconcile_native_ledger(&root)?;
+    Ok(Self {
       root,
       lifecycle_lock,
       max_bytes,
-    };
-    cas.ensure_native_candidate_index()?;
-    Ok(cas)
-  }
-
-  /// Build the additive discovery index once for caches written before it existed.
-  ///
-  /// The index is never cache authority: every lookup still loads the exact
-  /// action pin and verifies the complete action-result bundle.
-  fn ensure_native_candidate_index(&self) -> RailResult<()> {
-    let index_root = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY);
-    let marker = index_root.join(NATIVE_CANDIDATE_INDEX_MARKER);
-    match fs::symlink_metadata(&marker) {
-      Ok(_) => return self.validate_native_candidate_index(),
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-      Err(error) => return Err(error.into()),
-    }
-
-    let pins_directory = self.root.join("pins");
-    let mut entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    if entries.len() > MAX_ENTRIES {
-      return Err(RailError::message(format!(
-        "local CAS has more than {MAX_ENTRIES} action pins; refusing an unbounded native-index migration"
-      )));
-    }
-    for entry in entries {
-      let path = entry.path();
-      let metadata = fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
-        return Err(RailError::message(format!(
-          "local CAS pin '{}' is not a bounded regular file",
-          path.display()
-        )));
-      }
-      let file_name = entry
-        .file_name()
-        .into_string()
-        .map_err(|_| RailError::message("local CAS pin has a non-UTF-8 name"))?;
-      let key_hex = file_name
-        .strip_suffix(".json")
-        .ok_or_else(|| RailError::message(format!("local CAS pin '{file_name}' has an invalid name")))?;
-      let mut stats = ReadStats::default();
-      let pin: ActionPin = read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-      if pin.version != CAS_VERSION
-        || validated_action_key_hex(&pin.action_key)? != key_hex
-        || validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX).is_err()
-        || validate_any_lookup_key(&pin.lookup_key).is_err()
-      {
-        return Err(RailError::message(
-          "local CAS pin is invalid during native-index migration",
-        ));
-      }
-      if pin
-        .lookup_key
-        .starts_with(crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)
-      {
-        self.publish_native_candidate_index(&pin.action_key, &pin.lookup_key)?;
-      }
-    }
-
-    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
-    temporary.write_all(NATIVE_CANDIDATE_INDEX_MARKER_BYTES)?;
-    temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&marker) {
-      Ok(_) => sync_directory(&index_root)?,
-      Err(_)
-        if fs::symlink_metadata(&marker).is_ok_and(|metadata| {
-          metadata.is_file()
-            && !is_link_or_reparse(&metadata)
-            && has_single_link(&metadata)
-            && metadata.len() == NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
-        }) && fs::read(&marker)? == NATIVE_CANDIDATE_INDEX_MARKER_BYTES => {}
-      Err(error) => {
-        return Err(RailError::message(format!(
-          "failed to publish local CAS native candidate index marker '{}': {}",
-          marker.display(),
-          error.error
-        )));
-      }
-    }
-    self.ensure_capacity(0, None)
-  }
-
-  fn validate_native_candidate_index(&self) -> RailResult<()> {
-    let marker = self
-      .root
-      .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
-      .join(NATIVE_CANDIDATE_INDEX_MARKER);
-    let metadata = fs::symlink_metadata(&marker)?;
-    if !metadata.is_file()
-      || is_link_or_reparse(&metadata)
-      || !has_single_link(&metadata)
-      || metadata.len() != NATIVE_CANDIDATE_INDEX_MARKER_BYTES.len() as u64
-      || fs::read(&marker)? != NATIVE_CANDIDATE_INDEX_MARKER_BYTES
-    {
-      return Err(RailError::message("local CAS native candidate index marker is invalid"));
-    }
-    Ok(())
+    })
   }
 
   #[cfg(any(target_os = "macos", test))]
@@ -866,124 +1291,172 @@ impl LocalCas {
   }
 
   #[cfg(any(unix, windows, test))]
-  pub(crate) fn native_candidates(&self, candidate_key: &str) -> RailResult<NativeCacheCandidates<'_>> {
+  pub(crate) fn native_action(&self, action_key: &str) -> RailResult<NativeActionLookup<'_>> {
+    self.native_action_for_authority(action_key, None)
+  }
+
+  /// Resolve an exact action while accepting remote-only authority solely from
+  /// the command's already authenticated, deployment-pinned authority.
+  pub(crate) fn native_action_for_authority(
+    &self,
+    action_key: &str,
+    accepted_remote: Option<&crate::compiler::native_cache::RemoteAuthorityId>,
+  ) -> RailResult<NativeActionLookup<'_>> {
+    self.native_action_with_retry(action_key, accepted_remote, true)
+  }
+
+  #[cfg(any(unix, windows, test))]
+  fn native_action_with_retry(
+    &self,
+    action_key: &str,
+    accepted_remote: Option<&crate::compiler::native_cache::RemoteAuthorityId>,
+    retry_after_race: bool,
+  ) -> RailResult<NativeActionLookup<'_>> {
     let lock = self.read_lock()?;
-    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
-    let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
-    let mut entries = match fs::read_dir(&directory) {
-      Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+    if validate_native_ledger(&self.root)?.disabled {
+      return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+        reason: "native_authority_ledger_full".to_string(),
+        bytes_read: 0,
+      }));
+    }
+    let action_hex = validated_id_hex(action_key, crate::compiler::native_cache::ACTION_KEY_PREFIX)?;
+    let path = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    match fs::symlink_metadata(&path) {
+      Ok(_) => {}
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-        return Ok(NativeCacheCandidates {
-          cas: self,
-          _lock: lock,
-          candidates: Vec::new(),
-        });
+        return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+          reason: "action_not_found".to_string(),
+          bytes_read: 0,
+        }));
       }
       Err(error) => return Err(error.into()),
-    };
-    validate_real_directory(&directory, "local CAS native candidate")?;
-    entries.sort_by_key(|entry| entry.file_name());
-    if entries.len() > MAX_CANDIDATE_PINS {
-      return Err(RailError::message(format!(
-        "local CAS compiler candidate has more than {MAX_CANDIDATE_PINS} actions; refusing an unbounded lookup"
-      )));
     }
-    let mut candidates = Vec::new();
-    for entry in entries {
-      let path = entry.path();
-      let metadata = fs::symlink_metadata(&path)?;
-      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
-        return Err(RailError::message(format!(
-          "local CAS native candidate entry '{}' is not a bounded regular file",
-          path.display()
-        )));
-      }
-      let file_name = entry
-        .file_name()
-        .into_string()
-        .map_err(|_| RailError::message("local CAS native candidate entry has a non-UTF-8 name"))?;
-      let key_hex = file_name.strip_suffix(".json").ok_or_else(|| {
-        RailError::message(format!(
-          "local CAS native candidate entry '{file_name}' has an invalid name"
-        ))
-      })?;
-      let mut stats = ReadStats::default();
-      let indexed: NativeCandidateIndexEntry =
-        read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-      if indexed.version != NATIVE_CANDIDATE_INDEX_VERSION {
-        return Err(RailError::message(
-          "local CAS native candidate index has an incompatible schema",
-        ));
-      }
-      if indexed.candidate_key != candidate_key
-        || validated_action_key_hex(&indexed.action_key)? != key_hex
-        || !indexed
-          .action_key
-          .starts_with(crate::compiler::native_cache::ACTION_KEY_PREFIX)
-      {
-        return Err(RailError::message(
-          "local CAS native candidate entry does not match its directory and action key",
-        ));
-      }
-      let pin_path = self.root.join("pins").join(&file_name);
-      let pin_metadata = match fs::symlink_metadata(&pin_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-        Err(error) => return Err(error.into()),
-      };
-      if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
-        return Err(RailError::message(format!(
-          "local CAS pin '{}' is not a bounded regular file",
-          pin_path.display()
-        )));
-      }
-      let pin: ActionPin =
-        read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-      if pin.version != CAS_VERSION {
-        return Err(RailError::message("local CAS candidate pin has an incompatible schema"));
-      }
-      if pin.action_key != indexed.action_key || validated_action_key_hex(&pin.action_key)? != key_hex {
-        return Err(RailError::message(
-          "local CAS candidate pin filename does not match its action key",
-        ));
-      }
-      validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
-      if pin.lookup_key != candidate_key {
-        return Err(RailError::message(
-          "local CAS native candidate entry does not match its authoritative action pin",
-        ));
-      }
-      crate::compiler::native_cache::validate_action_key(&pin.action_key)?;
-      let verified = self
-        .load_verified_result(&pin.action_key, &pin.action_result, &mut stats)
-        .map_err(fault_to_error)?;
-      if verified.object.lookup_key != pin.lookup_key {
-        return Err(RailError::message(
-          "local CAS candidate pin does not match its verified action result",
-        ));
-      }
-      let validation = match &verified.validation {
-        StoredValidation::NativeCompiler(validation) => validation.as_ref().clone(),
-        StoredValidation::Hermetic(_) => {
-          return Err(RailError::message(
-            "local CAS compiler candidate has the wrong validation domain",
-          ));
+    let mut stats = ReadStats::default();
+    let state_bytes = match read_bounded_file(&path, MAX_OBJECT_METADATA_BYTES, &mut stats) {
+      Ok(bytes) => bytes,
+      Err(fault) => {
+        let evidence = fault.reason.into_bytes();
+        drop(lock);
+        let quarantined =
+          self.quarantine_native_action_if_invalid(action_key, NativeStateFault::Unreadable, &evidence)?;
+        if !quarantined && retry_after_race {
+          return self.native_action_with_retry(action_key, accepted_remote, false);
         }
-      };
-      validation.validate_object()?;
-      candidates.push(NativeCacheCandidate {
-        action_key: pin.action_key,
-        validation,
-        objects_verified: stats.objects,
+        return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+          reason: "action_quarantined".to_string(),
+          bytes_read: stats.bytes,
+        }));
+      }
+    };
+    let state = match decode_native_action_state(&state_bytes, action_key) {
+      Ok(state) => state,
+      Err(fault) => {
+        drop(lock);
+        let quarantined = self.quarantine_native_action_if_invalid(action_key, fault, &state_bytes)?;
+        if !quarantined && retry_after_race {
+          return self.native_action_with_retry(action_key, accepted_remote, false);
+        }
+        return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+          reason: "action_quarantined".to_string(),
+          bytes_read: stats.bytes,
+        }));
+      }
+    };
+    let NativeActionStateKind::UniqueResult {
+      result_key,
+      action_result,
+      origins,
+    } = &state.state
+    else {
+      return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+        reason: if matches!(&state.state, NativeActionStateKind::ConflictedResults { .. }) {
+          "action_conflicted"
+        } else {
+          "action_quarantined"
+        }
+        .to_string(),
         bytes_read: stats.bytes,
-        verified,
-      });
+      }));
+    };
+    if !origins.local
+      && origins.remote.as_deref() != accepted_remote.map(crate::compiler::native_cache::RemoteAuthorityId::as_str)
+    {
+      return Ok(NativeActionLookup::Miss(NativeCacheMiss {
+        reason: "action_origin_unaccepted".to_string(),
+        bytes_read: stats.bytes,
+      }));
     }
-    Ok(NativeCacheCandidates {
+    let verified = self
+      .load_verified_result(action_key, action_result, &mut stats)
+      .map_err(fault_to_error)?;
+    if verified.object.lookup_key != action_key || verified.object.result_digest != *result_key {
+      return Err(RailError::message(
+        "local CAS native action state does not match its verified result",
+      ));
+    }
+    let validation = match &verified.validation {
+      StoredValidation::NativeCompiler(validation) => validation.as_ref().clone(),
+      StoredValidation::Hermetic(_) => {
+        return Err(RailError::message(
+          "local CAS native action has the wrong validation domain",
+        ));
+      }
+    };
+    validation.validate_object()?;
+    if validation.action_key() != action_key || validation.result_key() != result_key {
+      return Err(RailError::message(
+        "local CAS native descriptor does not match its action state",
+      ));
+    }
+    Ok(NativeActionLookup::Hit(Box::new(NativeActionHit {
+      validation,
+      bytes_read: stats.bytes,
       cas: self,
       _lock: lock,
-      candidates,
-    })
+      verified,
+    })))
+  }
+
+  /// Preserve evidence that an unreadable state may already have encoded a conflict.
+  /// Returns `false` only when a concurrent writer installed a valid state first.
+  #[cfg(any(unix, windows, test))]
+  fn quarantine_native_action_if_invalid(
+    &self,
+    action_key: &str,
+    observed_fault: NativeStateFault,
+    observed_evidence: &[u8],
+  ) -> RailResult<bool> {
+    let _lock = self.lock()?;
+    let action_hex = validated_id_hex(action_key, crate::compiler::native_cache::ACTION_KEY_PREFIX)?;
+    let path = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let (fault, evidence) = match fs::symlink_metadata(&path) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => (observed_fault, observed_evidence.to_vec()),
+      Err(error) => (NativeStateFault::Unreadable, error.to_string().into_bytes()),
+      Ok(metadata)
+        if metadata.is_file()
+          && !is_link_or_reparse(&metadata)
+          && has_single_link(&metadata)
+          && metadata.len() <= MAX_OBJECT_METADATA_BYTES =>
+      {
+        match fs::read(&path) {
+          Ok(bytes) => match decode_native_action_state(&bytes, action_key) {
+            Ok(_) => return Ok(false),
+            Err(fault) => (fault, bytes),
+          },
+          Err(error) => (NativeStateFault::Unreadable, error.to_string().into_bytes()),
+        }
+      }
+      Ok(_) => (NativeStateFault::Unreadable, observed_evidence.to_vec()),
+    };
+    let quarantined = quarantined_native_action_state(action_key, fault, &evidence);
+    self.publish_terminal_native_state(&path, &quarantined)?;
+    Ok(true)
   }
 
   /// Load fully verified compiler evidence discovered by one non-authoritative configuration key.
@@ -1102,36 +1575,474 @@ impl LocalCas {
       validation: StoredValidationRef::Hermetic(validation),
       compiler_units,
       source_root,
+      native_origins: None,
+      move_preverified_blobs: false,
+      before_authority: None,
     })
   }
 
-  pub(crate) fn store_native(&self, request: NativeStoreRequest<'_>) -> RailResult<StoreStats> {
-    let NativeStoreRequest {
-      action_key,
-      candidate_key,
-      result_digest,
-      manifest,
-      validation,
-      source_root,
-    } = request;
-    crate::compiler::native_cache::validate_action_key(action_key)?;
-    crate::compiler::native_cache::validate_candidate_key(candidate_key)?;
-    validation.validate_object()?;
-    validate_native_output_manifest(manifest, validation).map_err(fault_to_error)?;
-    if validation.action_key() != action_key || validation.candidate_key() != candidate_key {
-      return Err(RailError::message(
-        "local cache compiler observation does not match the stored action",
+  pub(crate) fn store_native(
+    &self,
+    prepared: PreparedNativeResult,
+  ) -> RailResult<(NativeCompilerValidation, StoreStats)> {
+    self.store_native_revalidated(prepared, |_| Ok(()))
+  }
+
+  /// Admit one verified native result only after its live action is revalidated
+  /// at the final boundary before durable authority publication.
+  pub(crate) fn store_native_revalidated<F>(
+    &self,
+    prepared: PreparedNativeResult,
+    mut revalidate: F,
+  ) -> RailResult<(NativeCompilerValidation, StoreStats)>
+  where
+    F: FnMut(&NativeCompilerValidation) -> RailResult<()>,
+  {
+    let staged = self.stage_native(prepared)?;
+    revalidate(staged.validation())?;
+    self.commit_staged_native(staged)
+  }
+
+  /// Prepare one native result completely without publishing payload or
+  /// action authority. This is intentionally safe to overlap with rustc.
+  pub(crate) fn stage_native(&self, prepared: PreparedNativeResult) -> RailResult<StagedNativeResult> {
+    let (staging, _staging_lock, manifest, validation, origin, move_preverified_blobs) = prepared.into_parts();
+    if validate_native_ledger(&self.root)?.disabled {
+      return Err(RailError::with_help(
+        "native cache authority is disabled because its terminal-state ledger is full",
+        "run `cargo rail cache clean --scope local` to explicitly reset the complete authority root",
       ));
     }
-    self.store_validated(ValidatedStoreRequest {
-      action_key,
-      lookup_key: candidate_key,
+    let source_root = staging.path();
+    let action_key = validation.action_key().to_string();
+    let result_digest = validation.result_key().to_string();
+    crate::compiler::native_cache::validate_action_key(&action_key)?;
+    crate::compiler::native_cache::validate_result_key(&result_digest)?;
+    validation.validate_object()?;
+    if !validation.is_authoritative() {
+      return Err(RailError::message(
+        "local CAS rejected a discovery-only native compiler session",
+      ));
+    }
+    validate_native_output_manifest(&manifest, &validation).map_err(fault_to_error)?;
+    let native_origins = match origin {
+      PreparedNativeOrigin::Local => NativeResultOrigins {
+        local: true,
+        remote: None,
+      },
+      PreparedNativeOrigin::Remote(authority) => NativeResultOrigins {
+        local: false,
+        remote: Some(authority.as_str().to_string()),
+      },
+    };
+    if !move_preverified_blobs {
+      manifest.validate_unchanged(source_root)?;
+    }
+    let prepared = prepare_tree(&manifest, source_root).map_err(fault_to_error)?;
+    let manifest_bytes = canonical_json(&manifest)?;
+    let validation_bytes = canonical_json(&StoredValidationRef::NativeCompiler(&validation))?;
+    let validation_id = validation_id(&validation_bytes);
+    let object = ActionResultObject {
+      version: CAS_VERSION,
+      action_key: action_key.clone(),
+      lookup_key: action_key,
       result_digest,
-      manifest,
-      validation: StoredValidationRef::NativeCompiler(validation),
-      compiler_units: 1,
-      source_root,
+      output_manifest: Some(manifest.digest.clone()),
+      output_tree: Some(prepared.root.clone()),
+      validation: validation_id,
+      compiler_units: Some(1),
+      compiler_evidence: None,
+    };
+    let object_bytes = canonical_json(&object)?;
+    let action_result = action_result_id(&object)?;
+    let estimated = estimate_result_bytes(
+      &prepared,
+      manifest_bytes.len(),
+      validation_bytes.len(),
+      object_bytes.len(),
+    )?;
+    let staged = self
+      .stage_bundle(BundlePublication {
+        object: &object,
+        object_bytes: &object_bytes,
+        manifest: &manifest,
+        manifest_bytes: &manifest_bytes,
+        validation: StoredValidationRef::NativeCompiler(&validation),
+        validation_bytes: &validation_bytes,
+        prepared: &prepared,
+        move_preverified_blobs,
+      })
+      .map_err(|error| RailError::message(format!("local CAS bundle preparation failed: {error}")))?;
+    let incoming = estimated.max(staged.stats.bytes_written);
+    if incoming > MAX_RESULT_BYTES || incoming > self.max_bytes {
+      return Err(RailError::message(format!(
+        "verified action result is {incoming} bytes, above the local CAS limit"
+      )));
+    }
+    Ok(StagedNativeResult {
+      validation,
+      origins: native_origins,
+      object,
+      action_result,
+      incoming,
+      staged,
     })
+  }
+
+  fn commit_staged_native(&self, staged: StagedNativeResult) -> RailResult<(NativeCompilerValidation, StoreStats)> {
+    let StagedNativeResult {
+      validation,
+      origins,
+      object,
+      action_result,
+      incoming,
+      staged,
+    } = staged;
+    let _lock = self.lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Err(RailError::with_help(
+        "native cache authority is disabled because its terminal-state ledger is full",
+        "run `cargo rail cache clean --scope local` to explicitly reset the complete authority root",
+      ));
+    }
+    self.reserve_result_capacity(incoming, Some(&action_result))?;
+    let mut stats = self.publish_staged_bundle(&action_result, &object, staged, true)?;
+    self.publish_native_action_state(
+      validation.action_key(),
+      validation.result_key(),
+      &action_result,
+      origins,
+    )?;
+    if stats.bytes_written != incoming {
+      self.settle_result_capacity(incoming, stats.bytes_written)?;
+    }
+    stats.action_result = Some(action_result);
+    Ok((validation, stats))
+  }
+
+  /// Commit one discovery-only cohort after every result has been staged and
+  /// revalidated. Only the addressed actions and result payloads must remain
+  /// absent under the exclusive lifecycle view, so bounded cohorts can overlap
+  /// their durability work with the remaining rustc DAG.
+  pub(crate) fn commit_new_native_batch(
+    &self,
+    staged: Vec<StagedNativeResult>,
+  ) -> RailResult<Vec<(NativeCompilerValidation, StoreStats)>> {
+    if staged.is_empty() {
+      return Ok(Vec::new());
+    }
+    let mut actions = BTreeSet::new();
+    let mut total = 0u64;
+    for result in &staged {
+      result.validation.validate_object()?;
+      if !result.validation.is_authoritative()
+        || !result.origins.local
+        || result.origins.remote.is_some()
+        || !actions.insert(result.validation.action_key().to_string())
+        || result.incoming != result.staged.stats.bytes_written
+      {
+        return Err(RailError::message(
+          "native discovery batch is not one exact local result per action",
+        ));
+      }
+      total = total
+        .checked_add(result.incoming)
+        .ok_or_else(|| RailError::message("native discovery batch size overflow"))?;
+    }
+    if total > self.max_bytes {
+      return Err(RailError::message(format!(
+        "verified native batch is {total} bytes, above the local CAS limit"
+      )));
+    }
+
+    let _lock = self.lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Err(RailError::with_help(
+        "native cache authority is disabled because its terminal-state ledger is full",
+        "run `cargo rail cache clean --scope local` to explicitly reset the complete authority root",
+      ));
+    }
+    let action_directory = self.root.join(NATIVE_ACTION_STATE_DIRECTORY);
+    validate_real_directory(&action_directory, "local CAS native action state")?;
+    for result in &staged {
+      let action_hex = validated_action_key_hex(result.validation.action_key())?;
+      let action_state = action_directory.join(format!("{action_hex}.json"));
+      match fs::symlink_metadata(action_state) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+          return Err(RailError::message(
+            "native discovery cohort encountered pre-existing action authority",
+          ));
+        }
+      }
+      let destination = result_path(&self.root, &result.action_result)?;
+      match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+          return Err(RailError::message(
+            "native discovery cohort encountered pre-existing result payload",
+          ));
+        }
+      }
+    }
+
+    self.reserve_result_capacity(total, None)?;
+    let mut published = Vec::with_capacity(staged.len());
+    for result in staged {
+      let StagedNativeResult {
+        validation,
+        origins,
+        object,
+        action_result,
+        incoming: _,
+        staged,
+      } = result;
+      let mut stats = self.publish_staged_bundle(&action_result, &object, staged, false)?;
+      if stats.bytes_written == 0 {
+        return Err(RailError::message(
+          "native discovery batch result became visible concurrently",
+        ));
+      }
+      stats.action_result = Some(action_result.clone());
+      published.push((validation, origins, action_result, stats));
+    }
+    sync_directory_before_commit(&self.root.join("results"))?;
+
+    let mut pending_states = Vec::with_capacity(published.len());
+    for (validation, origins, action_result, _) in &published {
+      let state = NativeActionState {
+        version: NATIVE_ACTION_STATE_VERSION,
+        action_key: validation.action_key().to_string(),
+        state: NativeActionStateKind::UniqueResult {
+          result_key: validation.result_key().to_string(),
+          action_result: action_result.clone(),
+          origins: origins.clone(),
+        },
+      };
+      validate_native_action_state(&state, validation.action_key())?;
+      let action_hex = validated_action_key_hex(validation.action_key())?;
+      let destination = action_directory.join(format!("{action_hex}.json"));
+      let mut temporary = tempfile::Builder::new()
+        .prefix(".cargo-rail-native-action-")
+        .suffix(".tmp")
+        .tempfile_in(&action_directory)?;
+      temporary.write_all(&canonical_json(&state)?)?;
+      sync_before_commit(temporary.as_file())?;
+      pending_states.push((temporary, destination));
+    }
+    for (temporary, destination) in pending_states {
+      persist_noclobber_committed(temporary, &destination).map_err(|error| {
+        RailError::message(format!(
+          "failed to publish native discovery action '{}': {}",
+          destination.display(),
+          error.error
+        ))
+      })?;
+    }
+    sync_directory_before_commit(&action_directory)?;
+
+    Ok(
+      published
+        .into_iter()
+        .map(|(validation, _, _, stats)| (validation, stats))
+        .collect(),
+    )
+  }
+
+  /// Attach one already authenticated remote origin to verified semantic bytes
+  /// without fetching or rewriting their immutable payload.
+  pub(crate) fn attach_remote_origin(
+    &self,
+    action_key: &str,
+    result_key: &str,
+    authority: &crate::compiler::native_cache::RemoteAuthorityId,
+  ) -> RailResult<bool> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    crate::compiler::native_cache::validate_result_key(result_key)?;
+    let _lock = self.lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Ok(false);
+    }
+    let action_hex = validated_action_key_hex(action_key)?;
+    let path = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let metadata = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+      Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+      || is_link_or_reparse(&metadata)
+      || !has_single_link(&metadata)
+      || metadata.len() > MAX_OBJECT_METADATA_BYTES
+    {
+      return Ok(false);
+    }
+    let bytes = fs::read(&path)?;
+    let state = match decode_native_action_state(&bytes, action_key) {
+      Ok(state) => state,
+      Err(_) => return Ok(false),
+    };
+    let NativeActionStateKind::UniqueResult {
+      result_key: stored_result,
+      action_result,
+      mut origins,
+    } = state.state
+    else {
+      return Ok(false);
+    };
+    if stored_result != result_key {
+      return Ok(false);
+    }
+    let mut stats = ReadStats::default();
+    let verified = match self.load_verified_result(action_key, &action_result, &mut stats) {
+      Ok(verified) => verified,
+      Err(_) => return Ok(false),
+    };
+    if verified.object.result_digest != result_key {
+      return Ok(false);
+    }
+    origins.remote = Some(authority.as_str().to_string());
+    let updated = NativeActionState {
+      version: NATIVE_ACTION_STATE_VERSION,
+      action_key: action_key.to_string(),
+      state: NativeActionStateKind::UniqueResult {
+        result_key: result_key.to_string(),
+        action_result,
+        origins,
+      },
+    };
+    write_file_atomic_committed(&path, &canonical_json(&updated)?)?;
+    Ok(true)
+  }
+
+  /// Revalidate a bounded event handle before the parent attempts remote
+  /// publication. The caller receives no path and must drop this read view
+  /// before performing any remote I/O.
+  pub(crate) fn native_result_needs_remote_publication(
+    &self,
+    action_key: &str,
+    result_key: &str,
+    authority: &crate::compiler::native_cache::RemoteAuthorityId,
+  ) -> RailResult<bool> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    crate::compiler::native_cache::validate_result_key(result_key)?;
+    let _lock = self.read_lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Ok(false);
+    }
+    let action_hex = validated_action_key_hex(action_key)?;
+    let path = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let mut stats = ReadStats::default();
+    let state: NativeActionState = match read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats) {
+      Ok(state) => state,
+      Err(_) => return Ok(false),
+    };
+    validate_native_action_state(&state, action_key)?;
+    let NativeActionStateKind::UniqueResult {
+      result_key: stored_result,
+      action_result,
+      origins,
+    } = state.state
+    else {
+      return Ok(false);
+    };
+    if stored_result != result_key || !origins.local || origins.remote.as_deref() == Some(authority.as_str()) {
+      return Ok(false);
+    }
+    let verified = match self.load_verified_result(action_key, &action_result, &mut stats) {
+      Ok(verified) => verified,
+      Err(_) => return Ok(false),
+    };
+    Ok(
+      verified.object.result_digest == result_key && matches!(verified.validation, StoredValidation::NativeCompiler(_)),
+    )
+  }
+
+  /// Persist authenticated remote nondeterminism through the same terminal
+  /// action-state transition used by local admission.
+  pub(crate) fn record_remote_conflict(
+    &self,
+    action_key: &str,
+    first_result: &str,
+    second_result: &str,
+  ) -> RailResult<()> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    crate::compiler::native_cache::validate_result_key(first_result)?;
+    crate::compiler::native_cache::validate_result_key(second_result)?;
+    if first_result == second_result {
+      return Err(RailError::message(
+        "remote conflict evidence repeats one result identity",
+      ));
+    }
+    let _lock = self.lock()?;
+    if validate_native_ledger(&self.root)?.disabled {
+      return Err(RailError::message("native cache terminal-state ledger is disabled"));
+    }
+    let action_hex = validated_action_key_hex(action_key)?;
+    let path = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let existing = match fs::symlink_metadata(&path) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+      Err(error) => return Err(error.into()),
+      Ok(metadata)
+        if metadata.is_file()
+          && !is_link_or_reparse(&metadata)
+          && has_single_link(&metadata)
+          && metadata.len() <= MAX_OBJECT_METADATA_BYTES =>
+      {
+        let bytes = fs::read(&path)?;
+        match decode_native_action_state(&bytes, action_key) {
+          Ok(state) => Some(state),
+          Err(fault) => {
+            let quarantined = quarantined_native_action_state(action_key, fault, &bytes);
+            self.publish_terminal_native_state(&path, &quarantined)?;
+            return Ok(());
+          }
+        }
+      }
+      Ok(_) => {
+        let quarantined = quarantined_native_action_state(action_key, NativeStateFault::Unreadable, &[]);
+        self.publish_terminal_native_state(&path, &quarantined)?;
+        return Ok(());
+      }
+    };
+    if existing.as_ref().is_some_and(|state| {
+      matches!(
+        state.state,
+        NativeActionStateKind::ConflictedResults { .. } | NativeActionStateKind::Quarantined { .. }
+      )
+    }) {
+      return Ok(());
+    }
+    let mut results = vec![first_result.to_string(), second_result.to_string()];
+    if let Some(NativeActionState {
+      state: NativeActionStateKind::UniqueResult { result_key, .. },
+      ..
+    }) = existing
+    {
+      results.push(result_key);
+    }
+    results.sort_unstable();
+    results.dedup();
+    let conflicted = NativeActionState {
+      version: NATIVE_ACTION_STATE_VERSION,
+      action_key: action_key.to_string(),
+      state: NativeActionStateKind::ConflictedResults {
+        first_result_key: results[0].clone(),
+        second_result_key: results[1].clone(),
+      },
+    };
+    self.publish_terminal_native_state(&path, &conflicted)
   }
 
   /// Publish one deterministic compiler-evidence object through the shared local lifecycle.
@@ -1187,12 +2098,7 @@ impl LocalCas {
         "verified compiler evidence is {incoming} bytes, above the local CAS limit"
       )));
     }
-    let reserve =
-      compiler_evidence_publication_reserve(validation.action_key(), validation.candidate_key(), &action_result)?;
-    let admitted = incoming
-      .checked_add(reserve)
-      .ok_or_else(|| RailError::message("local CAS compiler-evidence publication size overflow"))?;
-    self.ensure_capacity(admitted, Some(&action_result))?;
+    self.reserve_result_capacity(incoming, Some(&action_result))?;
     let lease = self.create_lease(&action_result)?;
     let mut stats = self.publish_compiler_evidence_bundle(CompilerEvidencePublication {
       action_result: &action_result,
@@ -1206,13 +2112,12 @@ impl LocalCas {
     self.publish_pin(validation.action_key(), validation.candidate_key(), &action_result)?;
     self.publish_compiler_evidence_candidate_index(validation.action_key(), validation.candidate_key())?;
     drop(lease);
-    self.ensure_capacity(0, None)?;
+    self.settle_result_capacity(incoming, stats.bytes_written)?;
     stats.action_result = Some(action_result);
     Ok(stats)
   }
 
   fn store_validated(&self, request: ValidatedStoreRequest<'_>) -> RailResult<StoreStats> {
-    let _lock = self.lock()?;
     let ValidatedStoreRequest {
       action_key,
       lookup_key,
@@ -1221,9 +2126,14 @@ impl LocalCas {
       validation,
       compiler_units,
       source_root,
+      native_origins,
+      move_preverified_blobs,
+      mut before_authority,
     } = request;
     validate_manifest(manifest).map_err(fault_to_error)?;
-    manifest.validate_unchanged(source_root)?;
+    if !move_preverified_blobs {
+      manifest.validate_unchanged(source_root)?;
+    }
     let prepared = prepare_tree(manifest, source_root).map_err(fault_to_error)?;
     let manifest_bytes = canonical_json(manifest)?;
     let manifest_id = manifest.digest.clone();
@@ -1242,40 +2152,14 @@ impl LocalCas {
     };
     let object_bytes = canonical_json(&object)?;
     let action_result = action_result_id(&object)?;
-    let result_hex = validated_id_hex(&action_result, ACTION_RESULT_PREFIX)?;
-    let incoming = match fs::symlink_metadata(self.root.join("results").join(result_hex)) {
-      Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => 0,
-      Ok(_) => {
-        return Err(RailError::message(
-          "local CAS action-result path is not a real directory",
-        ));
-      }
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => estimate_result_bytes(
-        &prepared,
-        manifest_bytes.len(),
-        validation_bytes.len(),
-        object_bytes.len(),
-      )?,
-      Err(error) => return Err(error.into()),
-    };
-    if incoming > MAX_RESULT_BYTES || incoming > self.max_bytes {
-      return Err(RailError::message(format!(
-        "verified action result is {incoming} bytes, above the local CAS limit"
-      )));
-    }
-    let reserve = action_publication_reserve(action_key, lookup_key, &action_result, validation)?;
-    let admitted = incoming
-      .checked_add(reserve)
-      .ok_or_else(|| RailError::message("local CAS action publication size overflow"))?;
-    self
-      .ensure_capacity(admitted, Some(&action_result))
-      .map_err(|error| RailError::message(format!("local CAS pre-publication capacity check failed: {error}")))?;
-    let lease = self
-      .create_lease(&action_result)
-      .map_err(|error| RailError::message(format!("local CAS lease creation failed: {error}")))?;
-    let mut stats = self
-      .publish_bundle(BundlePublication {
-        action_result: &action_result,
+    let estimated = estimate_result_bytes(
+      &prepared,
+      manifest_bytes.len(),
+      validation_bytes.len(),
+      object_bytes.len(),
+    )?;
+    let staged = self
+      .stage_bundle(BundlePublication {
         object: &object,
         object_bytes: &object_bytes,
         manifest,
@@ -1283,20 +2167,47 @@ impl LocalCas {
         validation,
         validation_bytes: &validation_bytes,
         prepared: &prepared,
+        move_preverified_blobs,
       })
-      .map_err(|error| RailError::message(format!("local CAS bundle publication failed: {error}")))?;
-    self
-      .publish_pin(action_key, lookup_key, &action_result)
-      .map_err(|error| RailError::message(format!("local CAS pin publication failed: {error}")))?;
-    if let StoredValidationRef::NativeCompiler(validation) = validation {
-      self
-        .publish_native_candidate_index(action_key, validation.candidate_key())
-        .map_err(|error| RailError::message(format!("local CAS native candidate publication failed: {error}")))?;
+      .map_err(|error| RailError::message(format!("local CAS bundle preparation failed: {error}")))?;
+    let incoming = estimated.max(staged.stats.bytes_written);
+    if incoming > MAX_RESULT_BYTES || incoming > self.max_bytes {
+      return Err(RailError::message(format!(
+        "verified action result is {incoming} bytes, above the local CAS limit"
+      )));
     }
-    drop(lease);
+    if let Some(revalidate) = &mut before_authority {
+      revalidate()?;
+    }
+    let _lock = self.lock()?;
     self
-      .ensure_capacity(0, None)
-      .map_err(|error| RailError::message(format!("local CAS post-publication capacity check failed: {error}")))?;
+      .reserve_result_capacity(incoming, Some(&action_result))
+      .map_err(|error| RailError::message(format!("local CAS pre-publication capacity check failed: {error}")))?;
+    // The exclusive lifecycle lock remains held through payload publication,
+    // authority commit, and capacity settlement. A result lease inside the
+    // same interval adds no protection and would force two durable writes per
+    // compiler action.
+    let mut stats = self
+      .publish_staged_bundle(&action_result, &object, staged, true)
+      .map_err(|error| RailError::message(format!("local CAS bundle publication failed: {error}")))?;
+    match validation {
+      StoredValidationRef::NativeCompiler(validation) => self
+        .publish_native_action_state(
+          action_key,
+          validation.result_key(),
+          &action_result,
+          native_origins.ok_or_else(|| RailError::message("native CAS admission omitted its result origin"))?,
+        )
+        .map_err(|error| RailError::message(format!("local CAS native action publication failed: {error}")))?,
+      StoredValidationRef::Hermetic(_) => self
+        .publish_pin(action_key, lookup_key, &action_result)
+        .map_err(|error| RailError::message(format!("local CAS pin publication failed: {error}")))?,
+    }
+    if stats.bytes_written != incoming {
+      self
+        .settle_result_capacity(incoming, stats.bytes_written)
+        .map_err(|error| RailError::message(format!("local CAS capacity settlement failed: {error}")))?;
+    }
     stats.action_result = Some(action_result);
     Ok(stats)
   }
@@ -1388,6 +2299,98 @@ fn cache_base() -> RailResult<PathBuf> {
   Ok(PathBuf::from(home).join(".cargo"))
 }
 
+fn selected_cache_authority(owner: &Path, create_default: bool) -> RailResult<SelectedCacheAuthority> {
+  if let Some(value) = std::env::var_os(CACHE_TRUST_DOMAIN_ENV) {
+    let trust_domain = value
+      .to_str()
+      .ok_or_else(|| RailError::message(format!("{CACHE_TRUST_DOMAIN_ENV} is not valid UTF-8")))?;
+    validate_trust_domain(trust_domain)?;
+    return Ok(SelectedCacheAuthority {
+      root_name: format!("{CAS_ROOT_NAME}-{trust_domain}"),
+      trust_domain: trust_domain.to_string(),
+    });
+  }
+  let trust_domain = load_default_trust_domain(owner, create_default)?;
+  Ok(SelectedCacheAuthority {
+    root_name: CAS_ROOT_NAME.to_string(),
+    trust_domain,
+  })
+}
+
+fn load_default_trust_domain(owner: &Path, create: bool) -> RailResult<String> {
+  let path = owner.join(DEFAULT_TRUST_DOMAIN_FILE);
+  match fs::symlink_metadata(&path) {
+    Ok(_) => return read_trust_domain_file(&path),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {}
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      return Err(RailError::with_help(
+        format!("local CAS trust-domain marker '{}' is missing", path.display()),
+        "run an ordinary cacheable cargo-rail action to create a new isolated authority root",
+      ));
+    }
+    Err(error) => return Err(error.into()),
+  }
+  let mut temporary = tempfile::NamedTempFile::new_in(owner)?;
+  let seed = format!(
+    "{}\0{}\0{}\0{}",
+    owner.display(),
+    temporary.path().display(),
+    std::process::id(),
+    unix_nanos()
+  );
+  let trust_domain = crate::source::ContentDigest::sha256(seed.as_bytes()).to_string();
+  temporary.write_all(format!("{trust_domain}\n").as_bytes())?;
+  sync_before_commit(temporary.as_file())?;
+  match persist_noclobber_committed(temporary, &path) {
+    Ok(_) => sync_directory_before_commit(owner)?,
+    Err(error)
+      if fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata) && has_single_link(&metadata)) =>
+    {
+      let _ = error;
+    }
+    Err(error) => {
+      return Err(RailError::message(format!(
+        "failed to create local CAS trust-domain marker '{}': {}",
+        path.display(),
+        error.error
+      )));
+    }
+  }
+  read_trust_domain_file(&path)
+}
+
+fn read_trust_domain_file(path: &Path) -> RailResult<String> {
+  let metadata = fs::symlink_metadata(path)?;
+  if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) || metadata.len() != 65 {
+    return Err(RailError::message(format!(
+      "local CAS trust-domain marker '{}' is not a private canonical file",
+      path.display()
+    )));
+  }
+  let bytes = fs::read(path)?;
+  let value = bytes
+    .strip_suffix(b"\n")
+    .and_then(|value| std::str::from_utf8(value).ok())
+    .ok_or_else(|| RailError::message("local CAS trust-domain marker is malformed"))?;
+  validate_trust_domain(value)?;
+  Ok(value.to_string())
+}
+
+fn validate_trust_domain(value: &str) -> RailResult<()> {
+  if value.len() == 64
+    && value
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    Ok(())
+  } else {
+    Err(RailError::message(format!(
+      "{CACHE_TRUST_DOMAIN_ENV} must be a 64-character lowercase hexadecimal opaque ID"
+    )))
+  }
+}
+
 /// Resolve the selected user-wide CAS without creating cache state.
 pub(super) fn configured_root() -> RailResult<Option<PathBuf>> {
   let base = cache_base()?;
@@ -1403,7 +2406,43 @@ pub(super) fn configured_root() -> RailResult<Option<PathBuf>> {
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
     Err(error) => return Err(error.into()),
   }
-  let root = fs::canonicalize(owner)?.join("local-cas-v1");
+  let owner = fs::canonicalize(owner)?;
+  let authority = match selected_cache_authority(&owner, false) {
+    Ok(authority) => authority,
+    Err(_)
+      if std::env::var_os(CACHE_TRUST_DOMAIN_ENV).is_none()
+        && fs::symlink_metadata(owner.join(CAS_ROOT_NAME))
+          .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+    {
+      return Ok(None);
+    }
+    Err(error) => return Err(error),
+  };
+  let root = owner.join(authority.root_name);
+  match fs::symlink_metadata(&root) {
+    Ok(_) => {
+      ensure_owner_marker_existing(&root, Some(&authority.trust_domain))?;
+      Ok(Some(root))
+    }
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    Err(error) => Err(error.into()),
+  }
+}
+
+pub(super) fn configured_legacy_root() -> RailResult<Option<PathBuf>> {
+  let base = match fs::canonicalize(cache_base()?) {
+    Ok(base) => base,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  };
+  validate_real_directory(&base, "local cache base")?;
+  let owner = base.join("cargo-rail");
+  match fs::symlink_metadata(&owner) {
+    Ok(_) => validate_real_directory(&owner, "local CAS owner")?,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+  }
+  let root = fs::canonicalize(owner)?.join(LEGACY_CAS_ROOT_NAME);
   match fs::symlink_metadata(&root) {
     Ok(_) => Ok(Some(root)),
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1470,6 +2509,61 @@ fn validate_real_directory(path: &Path, description: &str) -> RailResult<()> {
   }
 }
 
+#[cfg(windows)]
+fn prove_local_cache_volume(path: &Path) -> RailResult<()> {
+  use cargo_rail_windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
+
+  const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+  let opened = open_for_observation(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to open local CAS root '{}' for capability proof: {error}",
+      path.display()
+    ))
+  })?;
+  let before = observe_file(&opened).map_err(|error| {
+    RailError::message(format!(
+      "failed to observe local CAS root '{}': {error}",
+      path.display()
+    ))
+  })?;
+  if before.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+    return Err(RailError::message(format!(
+      "local CAS root '{}' changed type during capability proof",
+      path.display()
+    )));
+  }
+  prove_local_ntfs(&opened, before.volume_serial_number).map_err(|error| {
+    RailError::message(format!(
+      "local CAS root '{}' is not on a proven local NTFS volume: {error}",
+      path.display()
+    ))
+  })?;
+
+  let current = open_for_observation(path).and_then(|current| {
+    let observation = observe_file(&current)?;
+    prove_local_ntfs(&current, observation.volume_serial_number)?;
+    Ok(observation)
+  });
+  let current = current.map_err(|error| {
+    RailError::message(format!(
+      "local CAS root '{}' changed while its capability was proven: {error}",
+      path.display()
+    ))
+  })?;
+  if current != before {
+    return Err(RailError::message(format!(
+      "local CAS root '{}' changed while its capability was proven",
+      path.display()
+    )));
+  }
+  Ok(())
+}
+
+#[cfg(not(windows))]
+fn prove_local_cache_volume(_path: &Path) -> RailResult<()> {
+  Ok(())
+}
+
 fn validate_optional_real_directory(path: &Path, description: &str) -> RailResult<()> {
   match fs::symlink_metadata(path) {
     Ok(_) => validate_real_directory(path, description),
@@ -1478,10 +2572,10 @@ fn validate_optional_real_directory(path: &Path, description: &str) -> RailResul
   }
 }
 
-fn ensure_owner_marker(root: &Path) -> RailResult<()> {
+fn ensure_owner_marker(root: &Path, trust_domain: &str) -> RailResult<()> {
   let marker = root.join("OWNER");
   match fs::symlink_metadata(&marker) {
-    Ok(_) => return ensure_owner_marker_existing(root),
+    Ok(_) => return ensure_owner_marker_existing(root, Some(trust_domain)),
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
     Err(error) => return Err(error.into()),
   }
@@ -1490,7 +2584,7 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
     // check. Accept only that exact ownership transition; never adopt an
     // unrelated nonempty directory.
     if fs::symlink_metadata(&marker).is_ok() {
-      return ensure_owner_marker_existing(root);
+      return ensure_owner_marker_existing(root, Some(trust_domain));
     }
     return Err(RailError::with_help(
       format!(
@@ -1504,11 +2598,11 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
     .parent()
     .ok_or_else(|| RailError::message("local CAS root has no parent directory"))?;
   let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-  temporary.write_all(OWNER_MARKER)?;
-  temporary.as_file().sync_all()?;
-  match temporary.persist_noclobber(&marker) {
+  temporary.write_all(&owner_marker_bytes(trust_domain)?)?;
+  sync_before_commit(temporary.as_file())?;
+  match persist_noclobber_committed(temporary, &marker) {
     Ok(_) => {
-      sync_directory(root)?;
+      sync_directory_before_commit(root)?;
     }
     Err(_)
       if fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata)) => {}
@@ -1520,20 +2614,24 @@ fn ensure_owner_marker(root: &Path) -> RailResult<()> {
       )));
     }
   }
-  ensure_owner_marker_existing(root)
+  ensure_owner_marker_existing(root, Some(trust_domain))
 }
 
 fn validate_root_entries(root: &Path) -> RailResult<()> {
   let allowed = BTreeSet::from([
+    CAPACITY_STATE_FILE,
+    NATIVE_LEDGER_STATE_FILE,
     "OWNER",
     EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
     "leases",
-    NATIVE_CANDIDATE_INDEX_DIRECTORY,
+    NATIVE_ACTION_STATE_DIRECTORY,
+    NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
+    LEGACY_NATIVE_ACTION_STATE_DIRECTORY,
     "pins",
     "results",
     "staging",
   ]);
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
   let allowed = {
     let mut allowed = allowed;
     allowed.insert(SYSROOT_IDENTITY_MEMO_DIRECTORY);
@@ -1563,6 +2661,17 @@ fn validate_lookup_key(lookup_key: &str) -> RailResult<()> {
   validated_id_hex(lookup_key, LOOKUP_PREFIX).map(|_| ())
 }
 
+fn encode_native_environment_selector(names: &[String]) -> RailResult<Vec<u8>> {
+  crate::compiler::native_cache::validate_environment_selector_names(names.iter().map(String::as_str))?;
+  let bytes = canonical_json(&names)?;
+  if bytes.len() as u64 > MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES {
+    return Err(RailError::message(format!(
+      "native environment selector exceeds its {MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES}-byte bound"
+    )));
+  }
+  Ok(bytes)
+}
+
 fn validated_action_key_hex(action_key: &str) -> RailResult<&str> {
   if action_key.starts_with(ACTION_KEY_PREFIX) {
     validated_id_hex(action_key, ACTION_KEY_PREFIX)
@@ -1579,8 +2688,81 @@ fn validate_any_lookup_key(lookup_key: &str) -> RailResult<()> {
   } else if lookup_key.starts_with(EVIDENCE_CANDIDATE_KEY_PREFIX) {
     validate_evidence_candidate_key(lookup_key)
   } else {
-    crate::compiler::native_cache::validate_candidate_key(lookup_key)
+    crate::compiler::native_cache::validate_action_key(lookup_key)
   }
+}
+
+fn validate_native_action_state(state: &NativeActionState, expected_action: &str) -> RailResult<()> {
+  if state.version != NATIVE_ACTION_STATE_VERSION || state.action_key != expected_action {
+    return Err(RailError::message(
+      "local CAS native action state has an incompatible identity",
+    ));
+  }
+  crate::compiler::native_cache::validate_action_key(&state.action_key)?;
+  match &state.state {
+    NativeActionStateKind::UniqueResult {
+      result_key,
+      action_result,
+      origins,
+    } => {
+      crate::compiler::native_cache::validate_result_key(result_key)?;
+      validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
+      if !origins.local && origins.remote.is_none() {
+        return Err(RailError::message("local CAS native action has no authority origin"));
+      }
+      if origins.remote.as_deref().is_some_and(|origin| {
+        origin.strip_prefix("remote-authority-v1-sha256-").is_none_or(|digest| {
+          digest.len() != 64
+            || !digest
+              .bytes()
+              .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+      }) {
+        return Err(RailError::message(
+          "local CAS native action has an invalid remote origin",
+        ));
+      }
+    }
+    NativeActionStateKind::ConflictedResults {
+      first_result_key,
+      second_result_key,
+    } => {
+      crate::compiler::native_cache::validate_result_key(first_result_key)?;
+      crate::compiler::native_cache::validate_result_key(second_result_key)?;
+      if first_result_key >= second_result_key {
+        return Err(RailError::message(
+          "local CAS native conflict evidence is not canonical",
+        ));
+      }
+    }
+    NativeActionStateKind::Quarantined { evidence_digest, .. } => {
+      validate_content_digest(evidence_digest).map_err(fault_to_error)?;
+    }
+  }
+  Ok(())
+}
+
+fn quarantined_native_action_state(action_key: &str, fault: NativeStateFault, evidence: &[u8]) -> NativeActionState {
+  NativeActionState {
+    version: NATIVE_ACTION_STATE_VERSION,
+    action_key: action_key.to_string(),
+    state: NativeActionStateKind::Quarantined {
+      fault,
+      evidence_digest: format!("sha256:{}", crate::source::ContentDigest::sha256(evidence)),
+    },
+  }
+}
+
+fn decode_native_action_state(bytes: &[u8], expected_action: &str) -> Result<NativeActionState, NativeStateFault> {
+  let state = serde_json::from_slice::<NativeActionState>(bytes).map_err(|_| NativeStateFault::Malformed)?;
+  if state.version != NATIVE_ACTION_STATE_VERSION || state.action_key != expected_action {
+    return Err(NativeStateFault::Incompatible);
+  }
+  validate_native_action_state(&state, expected_action).map_err(|_| NativeStateFault::Malformed)?;
+  if canonical_json(&state).map_err(|_| NativeStateFault::Malformed)? != bytes {
+    return Err(NativeStateFault::Malformed);
+  }
+  Ok(state)
 }
 
 pub(super) fn validate_fast_identity(action_key: &str, lookup_key: &str) -> RailResult<()> {
@@ -1851,12 +3033,12 @@ fn validate_native_output_manifest(
 ) -> Result<(), Fault> {
   let mut expected_files = validation
     .cas_output_bindings()
-    .map(|(path, digest, bytes)| (path, (digest, Some(bytes))))
+    .map(|(path, digest, bytes, mode)| (path, (digest, Some(bytes), mode)))
     .chain(
       validation
         .cas_stream_bindings()
         .into_iter()
-        .map(|(path, digest)| (path, (digest, None))),
+        .map(|(path, digest, bytes, mode)| (path, (digest, Some(bytes), mode))),
     )
     .collect::<BTreeMap<_, _>>();
   let expected_directories = BTreeSet::from(["target", "target/outputs", "target/streams"]);
@@ -1866,11 +3048,14 @@ fn validate_native_output_manifest(
       OutputEntryKind::Directory { mode } if *mode == 0o755 => {
         actual_directories.insert(entry.path.as_str());
       }
-      OutputEntryKind::File { digest, mode, bytes } if *mode == 0o644 => {
-        let Some((expected_digest, expected_bytes)) = expected_files.remove(entry.path.as_str()) else {
+      OutputEntryKind::File { digest, mode, bytes } => {
+        let Some((expected_digest, expected_bytes, expected_mode)) = expected_files.remove(entry.path.as_str()) else {
           return Err(Fault::corrupt("native_output_manifest_file_set"));
         };
-        if digest != expected_digest || expected_bytes.is_some_and(|expected| expected != *bytes) {
+        if digest != expected_digest
+          || expected_bytes.is_some_and(|expected| expected != *bytes)
+          || *mode != expected_mode
+        {
           return Err(Fault::corrupt("native_output_manifest_file_binding"));
         }
       }
@@ -1939,13 +3124,23 @@ fn validate_mode(mode: u32, directory: bool) -> Result<(), Fault> {
   let allowed = if directory {
     mode == 0o755
   } else {
-    mode == 0o644 || mode == 0o755
+    mode == 0o755 || valid_regular_file_mode(mode)
   };
   if allowed {
     Ok(())
   } else {
     Err(Fault::incompatible("unsupported_output_mode"))
   }
+}
+
+#[cfg(unix)]
+const fn valid_regular_file_mode(mode: u32) -> bool {
+  mode & !0o666 == 0 && mode & 0o400 != 0
+}
+
+#[cfg(not(unix))]
+const fn valid_regular_file_mode(mode: u32) -> bool {
+  matches!(mode, 0o444 | 0o644)
 }
 
 fn validate_symlink(path: &str, target: &str) -> Result<(), Fault> {
@@ -2152,64 +3347,6 @@ fn estimate_result_bytes(
     .and_then(|total| total.checked_add(validation as u64))
     .and_then(|total| total.checked_add(action_result as u64))
     .ok_or_else(|| RailError::message("local CAS result size overflow"))
-}
-
-fn action_publication_reserve(
-  action_key: &str,
-  lookup_key: &str,
-  action_result: &str,
-  validation: StoredValidationRef<'_>,
-) -> RailResult<u64> {
-  let index_bytes = match validation {
-    StoredValidationRef::Hermetic(_) => 0,
-    StoredValidationRef::NativeCompiler(_) => canonical_json(&NativeCandidateIndexEntry {
-      version: NATIVE_CANDIDATE_INDEX_VERSION,
-      action_key: action_key.to_string(),
-      candidate_key: lookup_key.to_string(),
-    })?
-    .len(),
-  };
-  publication_metadata_reserve(action_key, lookup_key, action_result, index_bytes)
-}
-
-fn compiler_evidence_publication_reserve(
-  action_key: &str,
-  candidate_key: &str,
-  action_result: &str,
-) -> RailResult<u64> {
-  let index_bytes = canonical_json(&EvidenceCandidateIndexEntry {
-    version: EVIDENCE_CANDIDATE_INDEX_VERSION,
-    action_key: action_key.to_string(),
-    candidate_key: candidate_key.to_string(),
-  })?
-  .len();
-  publication_metadata_reserve(action_key, candidate_key, action_result, index_bytes)
-}
-
-fn publication_metadata_reserve(
-  action_key: &str,
-  lookup_key: &str,
-  action_result: &str,
-  index_bytes: usize,
-) -> RailResult<u64> {
-  let pin = canonical_json(&ActionPin {
-    version: CAS_VERSION,
-    action_key: action_key.to_string(),
-    action_result: action_result.to_string(),
-    lookup_key: lookup_key.to_string(),
-    created_unix_nanos: u128::MAX,
-  })?;
-  let lease = canonical_json(&LeaseRecord {
-    version: CAS_VERSION,
-    action_result: action_result.to_string(),
-    created_unix_seconds: u64::MAX,
-  })?;
-  pin
-    .len()
-    .checked_add(lease.len())
-    .and_then(|bytes| bytes.checked_add(index_bytes))
-    .map(|bytes| bytes as u64)
-    .ok_or_else(|| RailError::message("local CAS publication metadata size overflow"))
 }
 
 impl LocalCas {
@@ -2438,53 +3575,91 @@ impl LocalCas {
   #[cfg(any(unix, windows, test))]
   fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
     let (_, output_tree, _) = output_result_payload(&verified.object)?;
-    let parent = destination
-      .parent()
-      .ok_or_else(|| Fault::corrupt("materialization_root_has_no_parent"))?;
-    validate_real_directory_fault(parent, "materialization parent")?;
-    match fs::symlink_metadata(destination) {
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-      Ok(_) => return Err(Fault::corrupt("materialization_destination_prepositioned")),
-      Err(error) => {
-        return Err(Fault::corrupt(format!(
-          "materialization_destination_unreadable: {error}"
-        )));
-      }
-    }
+    let parent = validate_materialization_destination(destination)?;
     let temporary = tempfile::Builder::new()
       .prefix("restore-")
       .tempdir_in(parent)
       .map_err(|error| Fault::corrupt(format!("materialization_staging_unavailable: {error}")))?;
-    let payload = temporary.path().join("output");
-    fs::create_dir(&payload).map_err(|error| Fault::corrupt(format!("materialization_root_create: {error}")))?;
-    // A native result is a regenerable Cargo output backed by an already
-    // durable CAS bundle. Readers need atomic visibility and verified bytes,
-    // not a storage barrier for the private restored copy. Hermetic action
-    // restores retain their stronger durable-materialization behavior.
-    let durable = matches!(&verified.validation, StoredValidation::Hermetic(_));
-    materialize_tree(
-      &verified.bundle,
-      output_tree,
-      &verified.trees,
-      &payload,
-      stats,
-      0,
-      durable,
-    )?;
-    if durable {
-      verified
-        .manifest
-        .validate_unchanged(&payload)
-        .map_err(|error| Fault::corrupt(format!("materialized_manifest_validation: {error}")))?;
-      sync_output_tree(&payload).map_err(|error| Fault::corrupt(format!("materialized_tree_sync: {error}")))?;
-    }
-    fs::rename(&payload, destination)
-      .map_err(|error| Fault::corrupt(format!("materialization_atomic_publish: {error}")))?;
-    if durable {
-      sync_directory(parent).map_err(|error| Fault::corrupt(format!("materialization_parent_sync: {error}")))?;
-    }
-    Ok(())
+    materialize_from_staging(verified, output_tree, destination, temporary.path(), parent, stats)
   }
+
+  #[cfg(any(unix, windows, test))]
+  fn materialize_registered(
+    &self,
+    verified: &VerifiedResult,
+    destination: &Path,
+    staging: &Path,
+    stats: &mut ReadStats,
+  ) -> Result<(), Fault> {
+    let (_, output_tree, _) = output_result_payload(&verified.object)?;
+    let parent = validate_materialization_destination(destination)?;
+    if staging == destination || staging.parent() != Some(parent) {
+      return Err(Fault::corrupt("materialization_staging_outside_registered_parent"));
+    }
+    match fs::symlink_metadata(staging) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Ok(_) => return Err(Fault::corrupt("materialization_staging_prepositioned")),
+      Err(error) => return Err(Fault::corrupt(format!("materialization_staging_unreadable: {error}"))),
+    }
+    fs::create_dir(staging).map_err(|error| Fault::corrupt(format!("materialization_staging_create: {error}")))?;
+    materialize_from_staging(verified, output_tree, destination, staging, parent, stats)?;
+    fs::remove_dir(staging).map_err(|error| Fault::corrupt(format!("materialization_staging_cleanup: {error}")))
+  }
+}
+
+#[cfg(any(unix, windows, test))]
+fn validate_materialization_destination(destination: &Path) -> Result<&Path, Fault> {
+  let parent = destination
+    .parent()
+    .ok_or_else(|| Fault::corrupt("materialization_root_has_no_parent"))?;
+  validate_real_directory_fault(parent, "materialization parent")?;
+  match fs::symlink_metadata(destination) {
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(parent),
+    Ok(_) => Err(Fault::corrupt("materialization_destination_prepositioned")),
+    Err(error) => Err(Fault::corrupt(format!(
+      "materialization_destination_unreadable: {error}"
+    ))),
+  }
+}
+
+#[cfg(any(unix, windows, test))]
+fn materialize_from_staging(
+  verified: &VerifiedResult,
+  output_tree: &str,
+  destination: &Path,
+  staging: &Path,
+  parent: &Path,
+  stats: &mut ReadStats,
+) -> Result<(), Fault> {
+  let payload = staging.join("output");
+  fs::create_dir(&payload).map_err(|error| Fault::corrupt(format!("materialization_root_create: {error}")))?;
+  // A native result is a regenerable Cargo output backed by an already
+  // durable CAS bundle. Readers need atomic visibility and verified bytes,
+  // not a storage barrier for the private restored copy. Hermetic action
+  // restores retain their stronger durable-materialization behavior.
+  let durable = matches!(&verified.validation, StoredValidation::Hermetic(_));
+  materialize_tree(
+    &verified.bundle,
+    output_tree,
+    &verified.trees,
+    &payload,
+    stats,
+    0,
+    durable,
+  )?;
+  if durable {
+    verified
+      .manifest
+      .validate_unchanged(&payload)
+      .map_err(|error| Fault::corrupt(format!("materialized_manifest_validation: {error}")))?;
+    sync_output_tree(&payload).map_err(|error| Fault::corrupt(format!("materialized_tree_sync: {error}")))?;
+  }
+  fs::rename(&payload, destination)
+    .map_err(|error| Fault::corrupt(format!("materialization_atomic_publish: {error}")))?;
+  if durable {
+    sync_directory(parent).map_err(|error| Fault::corrupt(format!("materialization_parent_sync: {error}")))?;
+  }
+  Ok(())
 }
 
 fn read_canonical_json<T>(path: &Path, limit: u64, stats: &mut ReadStats) -> Result<T, Fault>
@@ -2967,9 +4142,8 @@ fn sync_directory(_path: &Path) -> RailResult<()> {
 }
 
 impl LocalCas {
-  fn publish_bundle(&self, publication: BundlePublication<'_>) -> RailResult<StoreStats> {
+  fn stage_bundle(&self, publication: BundlePublication<'_>) -> RailResult<StagedBundle> {
     let BundlePublication {
-      action_result,
       object,
       object_bytes,
       manifest,
@@ -2977,7 +4151,83 @@ impl LocalCas {
       validation,
       validation_bytes,
       prepared,
+      move_preverified_blobs,
     } = publication;
+    let (temporary, active) = self.create_guarded_staging("result-")?;
+    let payload = temporary.path().join("payload");
+    fs::create_dir(&payload)?;
+    make_directory_private(&payload)?;
+    for name in ["blobs", "manifests", "trees", "validations"] {
+      let directory = payload.join(name);
+      fs::create_dir(&directory)?;
+      make_directory_private(&directory)?;
+    }
+    let mut stats = StoreStats::default();
+    write_new_before_commit(&payload.join("action-result.json"), object_bytes)?;
+    stats.objects_written = stats.objects_written.saturating_add(1);
+    stats.bytes_written = stats.bytes_written.saturating_add(object_bytes.len() as u64);
+    #[cfg(test)]
+    pause_test_publication_after_first_object(&payload)?;
+
+    let manifest_hex = validated_id_hex(manifest.digest(), MANIFEST_PREFIX)?;
+    write_new_before_commit(
+      &payload.join("manifests").join(format!("{manifest_hex}.json")),
+      manifest_bytes,
+    )?;
+    stats.objects_written = stats.objects_written.saturating_add(1);
+    stats.bytes_written = stats.bytes_written.saturating_add(manifest_bytes.len() as u64);
+
+    let validation_identity = validation_id(validation_bytes);
+    if validation_identity != object.validation || canonical_json(&validation)? != validation_bytes {
+      return Err(RailError::message(
+        "local CAS validation object changed before publication",
+      ));
+    }
+    let validation_hex = validated_id_hex(&validation_identity, VALIDATION_PREFIX)?;
+    write_new_before_commit(
+      &payload.join("validations").join(format!("{validation_hex}.json")),
+      validation_bytes,
+    )?;
+    stats.objects_written = stats.objects_written.saturating_add(1);
+    stats.bytes_written = stats.bytes_written.saturating_add(validation_bytes.len() as u64);
+
+    for (identity, bytes) in &prepared.trees {
+      let hex = validated_id_hex(identity, TREE_PREFIX)?;
+      write_new_before_commit(&payload.join("trees").join(format!("{hex}.json")), bytes)?;
+      stats.objects_written = stats.objects_written.saturating_add(1);
+      stats.bytes_written = stats.bytes_written.saturating_add(bytes.len() as u64);
+    }
+    for (identity, blob) in &prepared.blobs {
+      let hex = validated_id_hex(identity, BLOB_PREFIX)?;
+      let destination = payload.join("blobs").join(format!("{hex}.blob"));
+      let written = if move_preverified_blobs {
+        move_blob_verified(blob, identity, &destination)?
+      } else {
+        copy_blob_verified(blob, identity, &destination)?
+      };
+      stats.objects_written = stats.objects_written.saturating_add(1);
+      stats.bytes_written = stats.bytes_written.saturating_add(written);
+    }
+    sync_directory_before_commit(&payload.join("blobs"))?;
+    sync_directory_before_commit(&payload.join("manifests"))?;
+    sync_directory_before_commit(&payload.join("trees"))?;
+    sync_directory_before_commit(&payload.join("validations"))?;
+    sync_directory_before_commit(&payload)?;
+    Ok(StagedBundle {
+      _temporary: temporary,
+      _active: active,
+      payload,
+      stats,
+    })
+  }
+
+  fn publish_staged_bundle(
+    &self,
+    action_result: &str,
+    object: &ActionResultObject,
+    staged: StagedBundle,
+    commit_durability: bool,
+  ) -> RailResult<StoreStats> {
     let result_hex = validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
     let destination = self.root.join("results").join(result_hex);
     match fs::symlink_metadata(&destination) {
@@ -2997,67 +4247,17 @@ impl LocalCas {
       Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
       Err(error) => return Err(error.into()),
     }
-
-    let staging = self.root.join("staging");
-    let temporary = tempfile::Builder::new().prefix("result-").tempdir_in(&staging)?;
-    let payload = temporary.path().join("payload");
-    fs::create_dir(&payload)?;
-    make_directory_private(&payload)?;
-    for name in ["blobs", "manifests", "trees", "validations"] {
-      let directory = payload.join(name);
-      fs::create_dir(&directory)?;
-      make_directory_private(&directory)?;
-    }
-    let mut stats = StoreStats::default();
-    write_new_synced(&payload.join("action-result.json"), object_bytes)?;
-    stats.objects_written = stats.objects_written.saturating_add(1);
-    stats.bytes_written = stats.bytes_written.saturating_add(object_bytes.len() as u64);
-    #[cfg(test)]
-    pause_test_publication_after_first_object(&payload)?;
-
-    let manifest_hex = validated_id_hex(manifest.digest(), MANIFEST_PREFIX)?;
-    write_new_synced(
-      &payload.join("manifests").join(format!("{manifest_hex}.json")),
-      manifest_bytes,
-    )?;
-    stats.objects_written = stats.objects_written.saturating_add(1);
-    stats.bytes_written = stats.bytes_written.saturating_add(manifest_bytes.len() as u64);
-
-    let validation_identity = validation_id(validation_bytes);
-    if validation_identity != object.validation || canonical_json(&validation)? != validation_bytes {
-      return Err(RailError::message(
-        "local CAS validation object changed before publication",
-      ));
-    }
-    let validation_hex = validated_id_hex(&validation_identity, VALIDATION_PREFIX)?;
-    write_new_synced(
-      &payload.join("validations").join(format!("{validation_hex}.json")),
-      validation_bytes,
-    )?;
-    stats.objects_written = stats.objects_written.saturating_add(1);
-    stats.bytes_written = stats.bytes_written.saturating_add(validation_bytes.len() as u64);
-
-    for (identity, bytes) in &prepared.trees {
-      let hex = validated_id_hex(identity, TREE_PREFIX)?;
-      write_new_synced(&payload.join("trees").join(format!("{hex}.json")), bytes)?;
-      stats.objects_written = stats.objects_written.saturating_add(1);
-      stats.bytes_written = stats.bytes_written.saturating_add(bytes.len() as u64);
-    }
-    for (identity, blob) in &prepared.blobs {
-      let hex = validated_id_hex(identity, BLOB_PREFIX)?;
-      let written = copy_blob_verified(blob, identity, &payload.join("blobs").join(format!("{hex}.blob")))?;
-      stats.objects_written = stats.objects_written.saturating_add(1);
-      stats.bytes_written = stats.bytes_written.saturating_add(written);
-    }
-    sync_directory(&payload.join("blobs"))?;
-    sync_directory(&payload.join("manifests"))?;
-    sync_directory(&payload.join("trees"))?;
-    sync_directory(&payload.join("validations"))?;
-    sync_directory(&payload)?;
-
-    match fs::rename(&payload, &destination) {
+    let StagedBundle {
+      _temporary,
+      _active,
+      payload,
+      stats,
+    } = staged;
+    match rename_committed(&payload, &destination, false) {
       Ok(()) => {
-        sync_directory(&self.root.join("results"))?;
+        if commit_durability {
+          sync_directory_before_commit(&self.root.join("results"))?;
+        }
         crate::instrumentation::record_cas_write(stats.bytes_written, stats.objects_written);
         Ok(stats)
       }
@@ -3164,7 +4364,7 @@ impl LocalCas {
     sync_directory(&payload.join("validations"))?;
     sync_directory(&payload)?;
 
-    match fs::rename(&payload, &destination) {
+    match rename_committed(&payload, &destination, false) {
       Ok(()) => {
         sync_directory(&self.root.join("results"))?;
         crate::instrumentation::record_cas_write(stats.bytes_written, stats.objects_written);
@@ -3203,7 +4403,7 @@ impl LocalCas {
     let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&destination) {
+    match persist_noclobber_committed(temporary, &destination) {
       Ok(_) => {
         sync_directory(&directory)?;
         sync_directory(&index_root)
@@ -3228,82 +4428,6 @@ impl LocalCas {
         error.error
       ))),
     }
-  }
-
-  fn publish_native_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<()> {
-    crate::compiler::native_cache::validate_action_key(action_key)?;
-    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
-    let action_hex = validated_action_key_hex(action_key)?;
-    let index_root = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY);
-    let directory = create_real_directory(&index_root, candidate_hex)?;
-    let indexed = NativeCandidateIndexEntry {
-      version: NATIVE_CANDIDATE_INDEX_VERSION,
-      action_key: action_key.to_string(),
-      candidate_key: candidate_key.to_string(),
-    };
-    let bytes = canonical_json(&indexed)?;
-    let destination = directory.join(format!("{action_hex}.json"));
-    let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
-    temporary.write_all(&bytes)?;
-    temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&destination) {
-      Ok(_) => {
-        sync_directory(&directory)?;
-        sync_directory(&index_root)
-      }
-      Err(_)
-        if fs::symlink_metadata(&destination)
-          .is_ok_and(|metadata| metadata.is_file() && !is_link_or_reparse(&metadata) && has_single_link(&metadata)) =>
-      {
-        let mut stats = ReadStats::default();
-        let existing: NativeCandidateIndexEntry =
-          read_canonical_json(&destination, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-        if existing != indexed {
-          return Err(RailError::message(
-            "existing local CAS native candidate entry has a different action binding",
-          ));
-        }
-        Ok(())
-      }
-      Err(error) => Err(RailError::message(format!(
-        "failed to atomically publish local CAS native candidate entry '{}': {}",
-        destination.display(),
-        error.error
-      ))),
-    }
-  }
-
-  fn remove_native_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<u64> {
-    crate::compiler::native_cache::validate_action_key(action_key)?;
-    let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)?;
-    let action_hex = validated_action_key_hex(action_key)?;
-    let directory = self.root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
-    let path = directory.join(format!("{action_hex}.json"));
-    let metadata = match fs::symlink_metadata(&path) {
-      Ok(metadata) => metadata,
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-      Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
-      return Err(RailError::message(format!(
-        "local CAS native candidate entry '{}' is not a regular file",
-        path.display()
-      )));
-    }
-    let mut stats = ReadStats::default();
-    let indexed: NativeCandidateIndexEntry =
-      read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-    if indexed.version != NATIVE_CANDIDATE_INDEX_VERSION
-      || indexed.action_key != action_key
-      || indexed.candidate_key != candidate_key
-    {
-      return Err(RailError::message(
-        "local CAS native candidate entry does not match its authoritative action pin",
-      ));
-    }
-    fs::remove_file(&path)?;
-    sync_directory(&directory)?;
-    Ok(metadata.len())
   }
 
   fn remove_compiler_evidence_candidate_index(&self, action_key: &str, candidate_key: &str) -> RailResult<u64> {
@@ -3353,7 +4477,7 @@ impl LocalCas {
     let mut temporary = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&destination) {
+    match persist_noclobber_committed(temporary, &destination) {
       Ok(_) => {
         sync_directory(&self.root.join("pins"))?;
         Ok(())
@@ -3389,6 +4513,141 @@ impl LocalCas {
     }
   }
 
+  fn publish_native_action_state(
+    &self,
+    action_key: &str,
+    result_key: &str,
+    action_result: &str,
+    admitted_origins: NativeResultOrigins,
+  ) -> RailResult<()> {
+    crate::compiler::native_cache::validate_action_key(action_key)?;
+    crate::compiler::native_cache::validate_result_key(result_key)?;
+    validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
+    let action_hex = validated_action_key_hex(action_key)?;
+    let destination = self
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let state = match fs::symlink_metadata(&destination) {
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeActionState {
+        version: NATIVE_ACTION_STATE_VERSION,
+        action_key: action_key.to_string(),
+        state: NativeActionStateKind::UniqueResult {
+          result_key: result_key.to_string(),
+          action_result: action_result.to_string(),
+          origins: admitted_origins,
+        },
+      },
+      Err(error) => return Err(error.into()),
+      Ok(metadata) => {
+        if !metadata.is_file()
+          || is_link_or_reparse(&metadata)
+          || !has_single_link(&metadata)
+          || metadata.len() > MAX_OBJECT_METADATA_BYTES
+        {
+          let quarantined = quarantined_native_action_state(action_key, NativeStateFault::Unreadable, &[]);
+          self.publish_terminal_native_state(&destination, &quarantined)?;
+          return Err(RailError::message(
+            "local CAS native action state was quarantined because it was unreadable",
+          ));
+        }
+        let bytes = fs::read(&destination)?;
+        let existing = match decode_native_action_state(&bytes, action_key) {
+          Ok(existing) => existing,
+          Err(fault) => {
+            let quarantined = quarantined_native_action_state(action_key, fault, &bytes);
+            self.publish_terminal_native_state(&destination, &quarantined)?;
+            return Err(RailError::message(
+              "local CAS native action state was quarantined because it was malformed",
+            ));
+          }
+        };
+        match existing.state {
+          NativeActionStateKind::UniqueResult {
+            result_key: existing_result,
+            origins,
+            ..
+          } if existing_result == result_key => NativeActionState {
+            version: NATIVE_ACTION_STATE_VERSION,
+            action_key: action_key.to_string(),
+            state: NativeActionStateKind::UniqueResult {
+              result_key: result_key.to_string(),
+              action_result: action_result.to_string(),
+              origins: NativeResultOrigins {
+                local: origins.local || admitted_origins.local,
+                remote: admitted_origins.remote.or(origins.remote),
+              },
+            },
+          },
+          NativeActionStateKind::UniqueResult {
+            result_key: existing_result,
+            ..
+          } => {
+            let (first_result_key, second_result_key) = if existing_result.as_str() < result_key {
+              (existing_result, result_key.to_string())
+            } else {
+              (result_key.to_string(), existing_result)
+            };
+            let conflicted = NativeActionState {
+              version: NATIVE_ACTION_STATE_VERSION,
+              action_key: action_key.to_string(),
+              state: NativeActionStateKind::ConflictedResults {
+                first_result_key,
+                second_result_key,
+              },
+            };
+            self.publish_terminal_native_state(&destination, &conflicted)?;
+            return Err(RailError::with_help(
+              format!("native action '{action_key}' produced two different verified results"),
+              "the action is nondeterministic; this cache authority root will never restore that action",
+            ));
+          }
+          NativeActionStateKind::ConflictedResults { .. } => {
+            return Err(RailError::message("local CAS native action is durably conflicted"));
+          }
+          NativeActionStateKind::Quarantined { .. } => {
+            return Err(RailError::message("local CAS native action is durably quarantined"));
+          }
+        }
+      }
+    };
+    validate_native_action_state(&state, action_key)?;
+    write_file_atomic_committed(&destination, &canonical_json(&state)?)
+  }
+
+  fn publish_terminal_native_state(&self, destination: &Path, state: &NativeActionState) -> RailResult<()> {
+    if !matches!(
+      state.state,
+      NativeActionStateKind::ConflictedResults { .. } | NativeActionStateKind::Quarantined { .. }
+    ) {
+      return Err(RailError::message(
+        "native terminal-state publication received a unique state",
+      ));
+    }
+    let bytes = canonical_json(state)?;
+    let mut ledger = validate_native_ledger(&self.root)?;
+    ledger.terminal_states = ledger
+      .terminal_states
+      .checked_add(1)
+      .ok_or_else(|| RailError::message("native terminal-state count overflow"))?;
+    ledger.terminal_bytes = ledger
+      .terminal_bytes
+      .checked_add(bytes.len() as u64)
+      .ok_or_else(|| RailError::message("native terminal-state byte count overflow"))?;
+    if ledger.terminal_states > MAX_NATIVE_TERMINAL_STATES || ledger.terminal_bytes > MAX_NATIVE_TERMINAL_BYTES {
+      ledger.disabled = true;
+      write_native_ledger(&self.root, &ledger)?;
+      return Err(RailError::with_help(
+        "native cache authority was disabled because its terminal-state ledger is full",
+        "run `cargo rail cache clean --scope local` to explicitly reset the complete authority root",
+      ));
+    }
+    // Reserve evidence before replacing action authority. A crash may
+    // conservatively overcharge, but cannot expose an uncharged terminal state.
+    write_native_ledger(&self.root, &ledger)?;
+    write_file_atomic_committed(destination, &bytes)
+  }
+
   fn create_lease(&self, action_result: &str) -> RailResult<LeaseGuard> {
     validated_id_hex(action_result, ACTION_RESULT_PREFIX)?;
     let record = LeaseRecord {
@@ -3406,7 +4665,7 @@ impl LocalCas {
       .and_then(OsStr::to_str)
       .ok_or_else(|| RailError::message("temporary lease name is not valid UTF-8"))?;
     let destination = self.root.join("leases").join(format!("{random}.json"));
-    temporary.persist_noclobber(&destination).map_err(|error| {
+    persist_noclobber_committed(temporary, &destination).map_err(|error| {
       RailError::message(format!(
         "failed to atomically publish local CAS lease '{}': {}",
         destination.display(),
@@ -3422,6 +4681,89 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> RailResult<()> {
   let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
   file.write_all(bytes)?;
   file.sync_all()?;
+  Ok(())
+}
+
+/// Write private result bytes without issuing an independent device-cache
+/// drain for every CAS object.
+///
+/// On Apple platforms `File::sync_all` maps to `F_FULLFSYNC`, which drains the
+/// whole device queue. A plain `fsync` still establishes the write-before-rename
+/// ordering this regenerable CAS needs without imposing that device-wide drain.
+fn write_new_before_commit(path: &Path, bytes: &[u8]) -> RailResult<()> {
+  let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+  file.write_all(bytes)?;
+  sync_before_commit(&file)
+}
+
+struct CommittedPersistError {
+  error: std::io::Error,
+}
+
+#[cfg(windows)]
+fn persist_noclobber_committed(
+  temporary: tempfile::NamedTempFile,
+  destination: &Path,
+) -> Result<File, CommittedPersistError> {
+  let (file, temporary_path) = temporary
+    .keep()
+    .map_err(|error| CommittedPersistError { error: error.error })?;
+  if let Err(error) = cargo_rail_windows_fs::rename_write_through(&temporary_path, destination, false) {
+    drop(file);
+    let error = match fs::remove_file(&temporary_path) {
+      Ok(()) => error,
+      Err(cleanup) => std::io::Error::new(
+        error.kind(),
+        format!(
+          "{error}; failed to remove retained temporary file '{}': {cleanup}",
+          temporary_path.display()
+        ),
+      ),
+    };
+    return Err(CommittedPersistError { error });
+  }
+  Ok(file)
+}
+
+#[cfg(not(windows))]
+fn persist_noclobber_committed(
+  temporary: tempfile::NamedTempFile,
+  destination: &Path,
+) -> Result<File, CommittedPersistError> {
+  temporary
+    .persist_noclobber(destination)
+    .map_err(|error| CommittedPersistError { error: error.error })
+}
+
+#[cfg(windows)]
+fn rename_committed(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
+  cargo_rail_windows_fs::rename_write_through(source, destination, replace)
+}
+
+#[cfg(not(windows))]
+fn rename_committed(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
+  fs::rename(source, destination)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_before_commit(file: &File) -> RailResult<()> {
+  rustix::fs::fsync(file).map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+  Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_before_commit(file: &File) -> RailResult<()> {
+  file.sync_all()?;
+  Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory_before_commit(path: &Path) -> RailResult<()> {
+  sync_before_commit(&File::open(path)?)
+}
+
+#[cfg(not(unix))]
+fn sync_directory_before_commit(_path: &Path) -> RailResult<()> {
   Ok(())
 }
 
@@ -3446,6 +4788,25 @@ fn pause_test_publication_after_first_object(_payload: &Path) -> RailResult<()> 
   while !control.join("continue").is_file() {
     if std::time::Instant::now() >= deadline {
       return Err(RailError::message("test publication pause timed out"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+fn pause_test_staging_before_active(_directory: &Path) -> RailResult<()> {
+  const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_BEFORE_ACTIVE";
+  let Some(control) = std::env::var_os(PAUSE_ENV) else {
+    return Ok(());
+  };
+  let control = PathBuf::from(control);
+  fs::create_dir_all(&control)?;
+  write_new_synced(&control.join("ready"), b"ready\n")?;
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+  while !control.join("continue").is_file() {
+    if std::time::Instant::now() >= deadline {
+      return Err(RailError::message("test staging-creation pause timed out"));
     }
     std::thread::sleep(std::time::Duration::from_millis(10));
   }
@@ -3488,7 +4849,7 @@ fn copy_blob_verified(blob: &PreparedBlob, identity: &str, destination: &Path) -
     hasher.update(&buffer[..read]);
     copied = copied.saturating_add(read as u64);
   }
-  output.sync_all()?;
+  sync_before_commit(&output)?;
   let digest = format!("sha256:{}", sha256_hex(hasher));
   if copied != blob.bytes
     || digest != blob.content_digest
@@ -3499,6 +4860,59 @@ fn copy_blob_verified(blob: &PreparedBlob, identity: &str, destination: &Path) -
       blob.source.display()
     )));
   }
+  crate::instrumentation::record_hash(copied as usize);
+  crate::instrumentation::record_hashed_file_bytes_read(copied as usize);
+  Ok(copied)
+}
+
+fn move_blob_verified(blob: &PreparedBlob, identity: &str, destination: &Path) -> RailResult<u64> {
+  let metadata = fs::symlink_metadata(&blob.source)?;
+  if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) || metadata.len() != blob.bytes
+  {
+    return Err(RailError::message(format!(
+      "verified staged output '{}' changed before local CAS publication",
+      blob.source.display()
+    )));
+  }
+  let mut input = File::open(&blob.source)?;
+  if !crate::utils::private_file_matches_path(&input, &blob.source, blob.bytes)? {
+    return Err(RailError::message(format!(
+      "verified staged output '{}' changed while it was opened",
+      blob.source.display()
+    )));
+  }
+  let mut hasher = Sha256::new();
+  let mut copied = 0u64;
+  let mut buffer = [0_u8; IO_BUFFER_BYTES];
+  loop {
+    let read = input.read(&mut buffer)?;
+    if read == 0 {
+      break;
+    }
+    hasher.update(&buffer[..read]);
+    copied = copied.saturating_add(read as u64);
+    if copied > blob.bytes {
+      break;
+    }
+  }
+  let digest = format!("sha256:{}", sha256_hex(hasher));
+  if copied != blob.bytes
+    || digest != blob.content_digest
+    || blob_id(&digest, copied).map_err(fault_to_error)? != identity
+    || !crate::utils::private_file_matches_path(&input, &blob.source, blob.bytes)?
+  {
+    return Err(RailError::message(format!(
+      "verified staged output '{}' changed before zero-copy admission",
+      blob.source.display()
+    )));
+  }
+  // Command-scoped wrapper staging is intentionally not durable: a crash may
+  // lose a candidate, but must never expose authority over unsynced bytes. The
+  // admission worker owns the one required durability boundary immediately
+  // before moving the verified payload into the published result bundle.
+  sync_before_commit(&input)?;
+  drop(input);
+  fs::rename(&blob.source, destination)?;
   crate::instrumentation::record_hash(copied as usize);
   crate::instrumentation::record_hashed_file_bytes_read(copied as usize);
   Ok(copied)
@@ -3520,25 +4934,31 @@ fn unix_nanos() -> u128 {
     .map_or(0, |duration| duration.as_nanos())
 }
 
-struct GcPin {
+enum GcAuthorityKind {
+  Pin { lookup_key: String },
+  NativeAction,
+}
+
+struct GcAuthority {
   path: PathBuf,
   key: String,
-  lookup_key: String,
   result: String,
   last_used: u128,
-  bytes: u64,
+  kind: GcAuthorityKind,
 }
 
 impl LocalCas {
-  fn ensure_capacity(&self, incoming: u64, protected_result: Option<&str>) -> RailResult<()> {
-    let current = checked_tree_bytes(&self.root)?;
-    if current.saturating_add(incoming) <= self.max_bytes {
-      return Ok(());
-    }
-    let target = self.max_bytes.saturating_sub(incoming);
-    self.garbage_collect(target, protected_result)?;
-    let current = checked_tree_bytes(&self.root)?;
+  fn reserve_result_capacity(&self, incoming: u64, protected_result: Option<&str>) -> RailResult<()> {
+    let mut current = validate_capacity_state(&self.root)?.result_bytes;
     if current.saturating_add(incoming) > self.max_bytes {
+      let target = self.max_bytes.saturating_sub(incoming);
+      self.garbage_collect(target, protected_result)?;
+      current = validate_capacity_state(&self.root)?.result_bytes;
+    }
+    let reserved = current
+      .checked_add(incoming)
+      .ok_or_else(|| RailError::message("local CAS size overflow"))?;
+    if reserved > self.max_bytes {
       return Err(RailError::with_help(
         format!(
           "local CAS needs {incoming} bytes but its {}-byte bound cannot be satisfied",
@@ -3547,7 +4967,23 @@ impl LocalCas {
         format!("raise {CACHE_MAX_BYTES_ENV} or run `cargo rail cache clean --scope local`"),
       ));
     }
+    write_capacity_state(&self.root, reserved)?;
     Ok(())
+  }
+
+  fn settle_result_capacity(&self, reserved: u64, written: u64) -> RailResult<()> {
+    if written > reserved {
+      return Err(RailError::message(
+        "local CAS publication wrote more bytes than it reserved",
+      ));
+    }
+    let state = validate_capacity_state(&self.root)?;
+    let result_bytes = state
+      .result_bytes
+      .checked_sub(reserved)
+      .and_then(|bytes| bytes.checked_add(written))
+      .ok_or_else(|| RailError::message("local CAS capacity settlement underflow"))?;
+    write_capacity_state(&self.root, result_bytes)
   }
 
   fn garbage_collect(&self, target_bytes: u64, protected_result: Option<&str>) -> RailResult<()> {
@@ -3587,7 +5023,7 @@ impl LocalCas {
     }
 
     let pins_directory = self.root.join("pins");
-    let mut pins = Vec::new();
+    let mut authorities = Vec::new();
     let mut pin_entries = fs::read_dir(&pins_directory)?.collect::<Result<Vec<_>, _>>()?;
     pin_entries.sort_by_key(|entry| entry.file_name());
     for entry in pin_entries {
@@ -3618,16 +5054,67 @@ impl LocalCas {
       }
       validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX)?;
       validate_any_lookup_key(&pin.lookup_key)?;
-      pins.push(GcPin {
+      authorities.push(GcAuthority {
         path,
         key: pin.action_key,
-        lookup_key: pin.lookup_key,
         result: pin.action_result,
         last_used: last_used_unix_nanos(&metadata, pin.created_unix_nanos),
-        bytes: metadata.len(),
+        kind: GcAuthorityKind::Pin {
+          lookup_key: pin.lookup_key,
+        },
       });
     }
-    pins.sort_by(|left, right| (left.last_used, &left.key).cmp(&(right.last_used, &right.key)));
+
+    let native_actions_directory = self.root.join(NATIVE_ACTION_STATE_DIRECTORY);
+    let mut native_entries = fs::read_dir(&native_actions_directory)?.collect::<Result<Vec<_>, _>>()?;
+    native_entries.sort_by_key(|entry| entry.file_name());
+    for entry in native_entries {
+      let path = entry.path();
+      let metadata = fs::symlink_metadata(&path)?;
+      if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+        return Err(RailError::message(format!(
+          "local CAS native action state '{}' is not a regular file",
+          path.display()
+        )));
+      }
+      let file_name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| RailError::message("local CAS native action state has a non-UTF-8 name"))?;
+      let key_hex = file_name.strip_suffix(".json").ok_or_else(|| {
+        RailError::message(format!(
+          "local CAS native action state '{file_name}' has an invalid name"
+        ))
+      })?;
+      let action_key = format!("{}{key_hex}", crate::compiler::native_cache::ACTION_KEY_PREFIX);
+      crate::compiler::native_cache::validate_action_key(&action_key)?;
+      let state = if metadata.len() <= MAX_OBJECT_METADATA_BYTES {
+        let bytes = fs::read(&path)?;
+        match decode_native_action_state(&bytes, &action_key) {
+          Ok(state) => state,
+          Err(fault) => {
+            let state = quarantined_native_action_state(&action_key, fault, &bytes);
+            self.publish_terminal_native_state(&path, &state)?;
+            state
+          }
+        }
+      } else {
+        let state = quarantined_native_action_state(&action_key, NativeStateFault::Unreadable, &[]);
+        self.publish_terminal_native_state(&path, &state)?;
+        state
+      };
+      if let NativeActionStateKind::UniqueResult { action_result, .. } = state.state {
+        authorities.push(GcAuthority {
+          path,
+          key: action_key,
+          result: action_result,
+          last_used: last_used_unix_nanos(&metadata, 0),
+          kind: GcAuthorityKind::NativeAction,
+        });
+      }
+    }
+    sync_directory(&native_actions_directory)?;
+    authorities.sort_by(|left, right| (left.last_used, &left.key).cmp(&(right.last_used, &right.key)));
 
     let results_directory = self.root.join("results");
     let mut result_sizes = BTreeMap::<String, u64>::new();
@@ -3655,8 +5142,8 @@ impl LocalCas {
     }
 
     let mut references = BTreeMap::<String, usize>::new();
-    for pin in &pins {
-      *references.entry(pin.result.clone()).or_default() += 1;
+    for authority in &authorities {
+      *references.entry(authority.result.clone()).or_default() += 1;
     }
     for (result, size) in result_sizes.clone() {
       if !references.contains_key(&result) && !leased.contains(&result) {
@@ -3667,37 +5154,42 @@ impl LocalCas {
       }
     }
 
-    let mut current = checked_tree_bytes(&self.root)?;
-    for pin in pins {
+    let mut current = result_sizes.values().try_fold(0u64, |total, size| {
+      total
+        .checked_add(*size)
+        .ok_or_else(|| RailError::message("local CAS result size overflow"))
+    })?;
+    for authority in authorities {
       if current <= target_bytes {
         break;
       }
-      if leased.contains(&pin.result) {
+      if leased.contains(&authority.result) {
         continue;
       }
-      fs::remove_file(&pin.path)?;
-      current = current.saturating_sub(pin.bytes);
-      if pin
-        .lookup_key
-        .starts_with(crate::compiler::native_cache::CANDIDATE_KEY_PREFIX)
-      {
-        current = current.saturating_sub(self.remove_native_candidate_index(&pin.key, &pin.lookup_key)?);
-      } else if pin.lookup_key.starts_with(EVIDENCE_CANDIDATE_KEY_PREFIX) {
-        current = current.saturating_sub(self.remove_compiler_evidence_candidate_index(&pin.key, &pin.lookup_key)?);
+      fs::remove_file(&authority.path)?;
+      match &authority.kind {
+        GcAuthorityKind::Pin { lookup_key } if lookup_key.starts_with(EVIDENCE_CANDIDATE_KEY_PREFIX) => {
+          current = current.saturating_sub(self.remove_compiler_evidence_candidate_index(&authority.key, lookup_key)?);
+          sync_directory(&pins_directory)?;
+        }
+        GcAuthorityKind::Pin { .. } => sync_directory(&pins_directory)?,
+        GcAuthorityKind::NativeAction => sync_directory(&native_actions_directory)?,
       }
-      if let Some(count) = references.get_mut(&pin.result) {
+      if let Some(count) = references.get_mut(&authority.result) {
         *count = count.saturating_sub(1);
         if *count == 0 {
-          references.remove(&pin.result);
-          if let Some(size) = result_sizes.remove(&pin.result) {
-            safe_remove_tree(&result_path(&self.root, &pin.result)?)?;
+          references.remove(&authority.result);
+          if let Some(size) = result_sizes.remove(&authority.result) {
+            safe_remove_tree(&result_path(&self.root, &authority.result)?)?;
             current = current.saturating_sub(size);
           }
         }
       }
     }
     sync_directory(&pins_directory)?;
+    sync_directory(&native_actions_directory)?;
     sync_directory(&results_directory)?;
+    write_capacity_state(&self.root, current)?;
     Ok(())
   }
 }
@@ -3712,6 +5204,199 @@ fn result_path(root: &Path, identity: &str) -> RailResult<PathBuf> {
 
 fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
   checked_tree_file_stats(root).map(|(_, bytes)| bytes)
+}
+
+fn reconcile_capacity_state(root: &Path) -> RailResult<()> {
+  write_capacity_state(root, checked_tree_bytes(&root.join("results"))?)
+}
+
+fn validate_capacity_state(root: &Path) -> RailResult<CapacityState> {
+  let path = root.join(CAPACITY_STATE_FILE);
+  let mut stats = ReadStats::default();
+  let state: CapacityState =
+    read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+  if state.version != CAS_VERSION {
+    return Err(RailError::message(
+      "local CAS capacity state has an incompatible schema",
+    ));
+  }
+  Ok(state)
+}
+
+fn write_capacity_state(root: &Path, result_bytes: u64) -> RailResult<()> {
+  write_file_atomic_committed(
+    &root.join(CAPACITY_STATE_FILE),
+    &canonical_json(&CapacityState {
+      version: CAS_VERSION,
+      result_bytes,
+    })?,
+  )
+}
+
+#[cfg(target_os = "macos")]
+fn write_file_atomic_committed(path: &Path, contents: &[u8]) -> RailResult<()> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or(Path::new("."));
+  let mut temporary = tempfile::Builder::new()
+    .prefix(".cargo-rail-")
+    .suffix(".tmp")
+    .tempfile_in(parent)
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to create temporary local CAS file in {}: {error}",
+        parent.display()
+      ))
+    })?;
+  if let Ok(metadata) = fs::symlink_metadata(path)
+    && metadata.file_type().is_file()
+  {
+    temporary.as_file().set_permissions(metadata.permissions())?;
+  }
+  temporary.write_all(contents)?;
+  sync_before_commit(temporary.as_file())?;
+  temporary.persist(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to atomically replace local CAS file {}: {}",
+      path.display(),
+      error.error
+    ))
+  })?;
+  sync_directory_before_commit(parent)
+}
+
+#[cfg(windows)]
+fn write_file_atomic_committed(path: &Path, contents: &[u8]) -> RailResult<()> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or(Path::new("."));
+  let mut temporary = tempfile::Builder::new()
+    .prefix(".cargo-rail-")
+    .suffix(".tmp")
+    .tempfile_in(parent)
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to create temporary local CAS file in {}: {error}",
+        parent.display()
+      ))
+    })?;
+  if let Ok(metadata) = fs::symlink_metadata(path)
+    && metadata.file_type().is_file()
+  {
+    temporary.as_file().set_permissions(metadata.permissions())?;
+  }
+  temporary.write_all(contents)?;
+  sync_before_commit(temporary.as_file())?;
+  let (file, temporary_path) = temporary.keep().map_err(|error| {
+    RailError::message(format!(
+      "failed to retain temporary local CAS file for {}: {}",
+      path.display(),
+      error.error
+    ))
+  })?;
+  if let Err(error) = cargo_rail_windows_fs::rename_write_through(&temporary_path, path, true) {
+    drop(file);
+    let cleanup = fs::remove_file(&temporary_path);
+    return Err(RailError::message(match cleanup {
+      Ok(()) => format!(
+        "failed to atomically replace local CAS file {}: {error}",
+        path.display()
+      ),
+      Err(cleanup) => format!(
+        "failed to atomically replace local CAS file {}: {error}; failed to remove retained temporary file '{}': {cleanup}",
+        path.display(),
+        temporary_path.display()
+      ),
+    }));
+  }
+  drop(file);
+  Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn write_file_atomic_committed(path: &Path, contents: &[u8]) -> RailResult<()> {
+  crate::utils::write_file_atomic(path, contents)
+}
+
+fn reconcile_native_ledger(root: &Path) -> RailResult<()> {
+  let mut terminal_states = 0_u64;
+  let mut terminal_bytes = 0_u64;
+  for entry in bounded_directory_entries(
+    &root.join(NATIVE_ACTION_STATE_DIRECTORY),
+    "local CAS native action-state ledger",
+  )? {
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS native action state '{}' is not a private regular file",
+        path.display()
+      )));
+    }
+    let file_name = entry
+      .file_name()
+      .into_string()
+      .map_err(|_| RailError::message("local CAS native action state has a non-UTF-8 name"))?;
+    let key = file_name
+      .strip_suffix(".json")
+      .ok_or_else(|| RailError::message("local CAS native action state has a noncanonical name"))?;
+    let action_key = format!("{}{key}", crate::compiler::native_cache::ACTION_KEY_PREFIX);
+    crate::compiler::native_cache::validate_action_key(&action_key)?;
+    let terminal = if metadata.len() > MAX_OBJECT_METADATA_BYTES {
+      true
+    } else {
+      let bytes = fs::read(&path)?;
+      decode_native_action_state(&bytes, &action_key).map_or(true, |state| {
+        matches!(
+          state.state,
+          NativeActionStateKind::ConflictedResults { .. } | NativeActionStateKind::Quarantined { .. }
+        )
+      })
+    };
+    if terminal {
+      terminal_states = terminal_states.saturating_add(1);
+      terminal_bytes = terminal_bytes.saturating_add(metadata.len());
+    }
+  }
+  write_native_ledger(
+    root,
+    &NativeLedgerState {
+      version: NATIVE_ACTION_STATE_VERSION,
+      terminal_states,
+      terminal_bytes,
+      disabled: terminal_states > MAX_NATIVE_TERMINAL_STATES || terminal_bytes > MAX_NATIVE_TERMINAL_BYTES,
+    },
+  )
+}
+
+fn validate_native_ledger(root: &Path) -> RailResult<NativeLedgerState> {
+  let path = root.join(NATIVE_LEDGER_STATE_FILE);
+  let mut stats = ReadStats::default();
+  let state: NativeLedgerState =
+    read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+  if state.version == 1 && !root.join(NATIVE_ACTION_STATE_DIRECTORY).exists() {
+    return Ok(NativeLedgerState {
+      version: NATIVE_ACTION_STATE_VERSION,
+      terminal_states: 0,
+      terminal_bytes: 0,
+      disabled: false,
+    });
+  }
+  if state.version != NATIVE_ACTION_STATE_VERSION
+    || (!state.disabled
+      && (state.terminal_states > MAX_NATIVE_TERMINAL_STATES || state.terminal_bytes > MAX_NATIVE_TERMINAL_BYTES))
+  {
+    return Err(RailError::message(
+      "local CAS native terminal-state ledger is incompatible",
+    ));
+  }
+  Ok(state)
+}
+
+fn write_native_ledger(root: &Path, state: &NativeLedgerState) -> RailResult<()> {
+  write_file_atomic_committed(&root.join(NATIVE_LEDGER_STATE_FILE), &canonical_json(state)?)
 }
 
 fn checked_tree_file_stats(root: &Path) -> RailResult<(u64, u64)> {
@@ -3774,7 +5459,11 @@ fn lifecycle_lock_path(root: &Path) -> RailResult<PathBuf> {
     .parent()
     .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
     .ok_or_else(|| RailError::message("local CAS root has no canonical cargo-rail owner directory"))?;
-  Ok(parent.join(LIFECYCLE_LOCK_NAME))
+  let root_name = root
+    .file_name()
+    .and_then(OsStr::to_str)
+    .ok_or_else(|| RailError::message("local CAS root name is not valid UTF-8"))?;
+  Ok(parent.join(format!("{root_name}.lock")))
 }
 
 fn lock_local_cas(path: &Path, create: bool, mode: LockMode) -> RailResult<Option<LocalCasLifecycleLock>> {
@@ -3859,6 +5548,9 @@ fn clear_staging(staging: &Path) -> RailResult<()> {
     let path = entry.path();
     let metadata = fs::symlink_metadata(&path)?;
     if metadata.is_dir() && !is_link_or_reparse(&metadata) {
+      if staging_entry_is_active(&path)? {
+        continue;
+      }
       safe_remove_tree(&path)?;
     } else if metadata.is_dir() || is_directory_reparse(&metadata) {
       fs::remove_dir(&path)?;
@@ -3866,14 +5558,40 @@ fn clear_staging(staging: &Path) -> RailResult<()> {
       fs::remove_file(&path)?;
     }
   }
-  sync_directory(staging)
+  // Staging contains no cache authority. Persist cleanup without forcing an
+  // Apple device-wide drain; a crash can only leave regenerable residue.
+  sync_directory_before_commit(staging)
+}
+
+fn staging_entry_is_active(path: &Path) -> RailResult<bool> {
+  let active = path.join("ACTIVE");
+  let metadata = match fs::symlink_metadata(&active) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    Err(error) => return Err(error.into()),
+  };
+  if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) || metadata.len() != 0 {
+    return Err(RailError::message(format!(
+      "local CAS staging lease '{}' is not a private empty file",
+      active.display()
+    )));
+  }
+  let file = OpenOptions::new().read(true).write(true).open(&active)?;
+  match file.try_lock() {
+    Ok(()) => Ok(false),
+    Err(fs::TryLockError::WouldBlock) => Ok(true),
+    Err(fs::TryLockError::Error(error)) => Err(error.into()),
+  }
 }
 
 pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
-  if !root.is_absolute()
-    || root.file_name() != Some(OsStr::new("local-cas-v1"))
-    || root.parent().and_then(Path::file_name) != Some(OsStr::new("cargo-rail"))
-  {
+  let valid_name = root.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+    name == CAS_ROOT_NAME
+      || name
+        .strip_prefix(&format!("{CAS_ROOT_NAME}-"))
+        .is_some_and(|trust_domain| validate_trust_domain(trust_domain).is_ok())
+  });
+  if !root.is_absolute() || !valid_name || root.parent().and_then(Path::file_name) != Some(OsStr::new("cargo-rail")) {
     return Err(RailError::message(format!(
       "local CAS reference '{}' is not a cargo-rail-owned cache path",
       root.display()
@@ -3891,20 +5609,27 @@ pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
       root.display()
     )));
   }
-  ensure_owner_marker_existing(root)?;
+  ensure_owner_marker_existing(root, None)?;
   validate_root_entries(root)?;
   for name in [
     "results",
     "pins",
     "leases",
     "staging",
-    NATIVE_CANDIDATE_INDEX_DIRECTORY,
+    NATIVE_ACTION_STATE_DIRECTORY,
+    NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
     EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
   ] {
     validate_optional_real_directory(&root.join(name), "local CAS domain")?;
   }
-  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  validate_optional_real_directory(
+    &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
+    "legacy local CAS native action state",
+  )?;
+  #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
   validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
+  validate_capacity_state(root)?;
+  validate_native_ledger(root)?;
   Ok(Some(root.to_path_buf()))
 }
 
@@ -3952,6 +5677,54 @@ fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Option<LocalCas
     let last_used = last_used_unix_nanos(&metadata, pin.created_unix_nanos);
     oldest_used = Some(oldest_used.map_or(last_used, |current| current.min(last_used)));
     newest_used = Some(newest_used.map_or(last_used, |current| current.max(last_used)));
+  }
+
+  let native_entries =
+    bounded_optional_directory_entries(&root.join(NATIVE_ACTION_STATE_DIRECTORY), "local CAS native actions")?;
+  let mut native_unique = 0_u64;
+  let mut native_conflicted = 0_u64;
+  let mut native_quarantined = 0_u64;
+  let mut native_local_origins = 0_u64;
+  let mut native_remote_origins = 0_u64;
+  for entry in &native_entries {
+    let path = entry.path();
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+      return Err(RailError::message(format!(
+        "local CAS native action state '{}' is not a bounded regular file",
+        path.display()
+      )));
+    }
+    let name = entry
+      .file_name()
+      .into_string()
+      .map_err(|_| RailError::message("local CAS native action state has a non-UTF-8 name"))?;
+    let key = name
+      .strip_suffix(".json")
+      .ok_or_else(|| RailError::message("local CAS native action state has a noncanonical name"))?;
+    let action_key = format!("{}{key}", crate::compiler::native_cache::ACTION_KEY_PREFIX);
+    let bytes = fs::read(&path)?;
+    let state = decode_native_action_state(&bytes, &action_key)
+      .map_err(|_| RailError::message("local CAS native action state is malformed"))?;
+    match state.state {
+      NativeActionStateKind::UniqueResult {
+        action_result, origins, ..
+      } => {
+        native_unique = native_unique.saturating_add(1);
+        native_local_origins = native_local_origins.saturating_add(u64::from(origins.local));
+        native_remote_origins = native_remote_origins.saturating_add(u64::from(origins.remote.is_some()));
+        referenced_results.insert(action_result);
+        let last_used = last_used_unix_nanos(&metadata, 0);
+        oldest_used = Some(oldest_used.map_or(last_used, |current| current.min(last_used)));
+        newest_used = Some(newest_used.map_or(last_used, |current| current.max(last_used)));
+      }
+      NativeActionStateKind::ConflictedResults { .. } => {
+        native_conflicted = native_conflicted.saturating_add(1);
+      }
+      NativeActionStateKind::Quarantined { .. } => {
+        native_quarantined = native_quarantined.saturating_add(1);
+      }
+    }
   }
 
   let mut active_leases = 0u64;
@@ -4002,15 +5775,30 @@ fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Option<LocalCas
   let staging = &root.join("staging");
   let staging_entries = bounded_optional_directory_entries(staging, "local CAS staging")?.len() as u64;
   let (_, staging_bytes) = optional_tree_file_stats(staging)?;
-  let mut index_files = optional_tree_file_stats(&root.join(NATIVE_CANDIDATE_INDEX_DIRECTORY))?.0;
-  index_files = index_files.saturating_add(optional_tree_file_stats(&root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY))?.0);
+  let index_files = optional_tree_file_stats(&root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY))?
+    .0
+    .checked_add(optional_tree_file_stats(&root.join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY))?.0)
+    .ok_or_else(|| RailError::message("local CAS index file count overflow"))?;
+  let capacity = validate_capacity_state(&root)?;
+  let ledger = validate_native_ledger(&root)?;
 
   Ok(Some(LocalCasStatus {
     root: root.to_string_lossy().into_owned(),
+    trust_domain: owner_trust_domain(&root)?,
     bytes: checked_tree_bytes(&root)?,
     max_bytes,
+    committed_result_bytes: capacity.result_bytes,
     results,
     pins: pin_entries.len() as u64,
+    native_actions: native_entries.len() as u64,
+    native_unique,
+    native_conflicted,
+    native_quarantined,
+    native_local_origins,
+    native_remote_origins,
+    native_ledger_bytes: ledger.terminal_bytes,
+    native_ledger_max_bytes: MAX_NATIVE_TERMINAL_BYTES,
+    native_ledger_disabled: ledger.disabled,
     objects,
     active_leases,
     stale_leases,
@@ -4042,6 +5830,75 @@ pub(super) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u
   let bytes = removable_tree_bytes(&root)?;
   safe_remove_tree(&root)?;
   Ok(Some((root, bytes)))
+}
+
+pub(super) fn legacy_status_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+  let Some(root) = existing_legacy_root_at(root)? else {
+    return Ok(None);
+  };
+  let lifecycle_lock = root
+    .parent()
+    .ok_or_else(|| RailError::message("legacy local CAS has no owner directory"))?
+    .join(format!("{LEGACY_CAS_ROOT_NAME}.lock"));
+  let _lock = lock_local_cas(&lifecycle_lock, false, LockMode::Exclusive)?;
+  let Some(root) = existing_legacy_root_at(&root)? else {
+    return Ok(None);
+  };
+  let bytes = removable_tree_bytes(&root)?;
+  Ok(Some((root, bytes)))
+}
+
+pub(super) fn remove_legacy_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+  let lifecycle_lock = root
+    .parent()
+    .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
+    .ok_or_else(|| RailError::message("legacy local CAS has no canonical owner directory"))?
+    .join(format!("{LEGACY_CAS_ROOT_NAME}.lock"));
+  let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+    .ok_or_else(|| RailError::message("legacy local CAS lifecycle lock was not created"))?;
+  let Some(root) = existing_legacy_root_at(root)? else {
+    return Ok(None);
+  };
+  let bytes = removable_tree_bytes(&root)?;
+  safe_remove_tree(&root)?;
+  Ok(Some((root, bytes)))
+}
+
+fn existing_legacy_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
+  if !root.is_absolute()
+    || root.file_name() != Some(OsStr::new(LEGACY_CAS_ROOT_NAME))
+    || root.parent().and_then(Path::file_name) != Some(OsStr::new("cargo-rail"))
+  {
+    return Err(RailError::message(format!(
+      "legacy local CAS reference '{}' is not a cargo-rail-owned cache path",
+      root.display()
+    )));
+  }
+  match fs::symlink_metadata(root) {
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(error) => return Err(error.into()),
+    Ok(_) => validate_real_directory(root, "legacy local CAS root")?,
+  }
+  if fs::canonicalize(root)? != root {
+    return Err(RailError::message("legacy local CAS reference is not canonical"));
+  }
+  let marker = root.join("OWNER");
+  let metadata = fs::symlink_metadata(&marker)?;
+  if !metadata.is_file()
+    || is_link_or_reparse(&metadata)
+    || !has_single_link(&metadata)
+    || metadata.len() != LEGACY_OWNER_MARKER.len() as u64
+    || fs::read(&marker)? != LEGACY_OWNER_MARKER
+  {
+    return Err(RailError::with_help(
+      format!(
+        "legacy local CAS root '{}' has an invalid ownership marker",
+        root.display()
+      ),
+      "cargo-rail will not reclaim an unowned legacy path",
+    ));
+  }
+  Ok(Some(root.to_path_buf()))
 }
 
 /// Measure an owned tree without following links so cleanup can still recover
@@ -4088,7 +5945,12 @@ fn removable_tree_bytes(root: &Path) -> RailResult<u64> {
   Ok(bytes)
 }
 
-fn ensure_owner_marker_existing(root: &Path) -> RailResult<()> {
+fn owner_marker_bytes(trust_domain: &str) -> RailResult<Vec<u8>> {
+  validate_trust_domain(trust_domain)?;
+  Ok(format!("{OWNER_MARKER_PREFIX}{trust_domain}\n").into_bytes())
+}
+
+fn ensure_owner_marker_existing(root: &Path, expected_trust_domain: Option<&str>) -> RailResult<()> {
   let marker = root.join("OWNER");
   let metadata = fs::symlink_metadata(&marker).map_err(|error| {
     RailError::message(format!(
@@ -4096,18 +5958,42 @@ fn ensure_owner_marker_existing(root: &Path) -> RailResult<()> {
       root.display()
     ))
   })?;
-  if !metadata.is_file()
-    || is_link_or_reparse(&metadata)
-    || !has_single_link(&metadata)
-    || metadata.len() != OWNER_MARKER.len() as u64
-    || fs::read(&marker)? != OWNER_MARKER
+  let bytes = if metadata.is_file()
+    && !is_link_or_reparse(&metadata)
+    && has_single_link(&metadata)
+    && metadata.len() == (OWNER_MARKER_PREFIX.len() + 65) as u64
   {
+    fs::read(&marker)?
+  } else {
+    Vec::new()
+  };
+  let trust_domain = bytes
+    .strip_prefix(OWNER_MARKER_PREFIX.as_bytes())
+    .and_then(|value| value.strip_suffix(b"\n"))
+    .and_then(|value| std::str::from_utf8(value).ok());
+  if trust_domain.is_none_or(|value| {
+    validate_trust_domain(value).is_err() || expected_trust_domain.is_some_and(|expected| value != expected)
+  }) {
     return Err(RailError::with_help(
-      format!("local CAS root '{}' has an invalid ownership marker", root.display()),
-      "cargo-rail will not recursively remove an unowned cache root",
+      format!(
+        "local CAS root '{}' has an invalid or mismatched authority marker",
+        root.display()
+      ),
+      "select the matching machine-owned trust domain or explicitly clean the isolated cache root",
     ));
   }
   Ok(())
+}
+
+fn owner_trust_domain(root: &Path) -> RailResult<String> {
+  ensure_owner_marker_existing(root, None)?;
+  let bytes = fs::read(root.join("OWNER"))?;
+  bytes
+    .strip_prefix(OWNER_MARKER_PREFIX.as_bytes())
+    .and_then(|value| value.strip_suffix(b"\n"))
+    .and_then(|value| std::str::from_utf8(value).ok())
+    .map(str::to_string)
+    .ok_or_else(|| RailError::message("local CAS authority marker is malformed"))
 }
 
 fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
@@ -4150,6 +6036,10 @@ mod tests {
 
   fn action_key(value: u8) -> String {
     format!("{ACTION_KEY_PREFIX}{value:064x}")
+  }
+
+  fn base_action_key(value: u8) -> String {
+    format!("{}{value:064x}", crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
   }
 
   fn write_fixture(root: &Path, bytes: &[u8]) -> OutputManifest {
@@ -4235,10 +6125,14 @@ mod tests {
   }
 
   fn native_fixture(root: &Path) -> (OutputManifest, NativeCompilerValidation) {
+    native_fixture_with_stdout(root, b"")
+  }
+
+  fn native_fixture_with_stdout(root: &Path, stdout: &[u8]) -> (OutputManifest, NativeCompilerValidation) {
     let files = [
       ("target/outputs/dep-info", b"dep-info".as_slice()),
       ("target/outputs/metadata", b"metadata".as_slice()),
-      ("target/streams/stdout", b"".as_slice()),
+      ("target/streams/stdout", stdout),
       ("target/streams/stderr", b"".as_slice()),
     ];
     let mut paths = Vec::new();
@@ -4249,7 +6143,7 @@ mod tests {
       paths.push(path);
     }
     let manifest = super::super::capture_native_compiler_outputs(root, &paths).expect("native output manifest");
-    let validation = crate::compiler::native_cache::tests::cas_validation();
+    let validation = crate::compiler::native_cache::tests::cas_validation_with_stdout(stdout);
     (manifest, validation)
   }
 
@@ -4259,21 +6153,759 @@ mod tests {
     manifest: &OutputManifest,
     validation: &NativeCompilerValidation,
   ) -> StoreStats {
-    let result = validation.result_digest(manifest.digest());
     cas
-      .store_native(NativeStoreRequest {
-        action_key: validation.action_key(),
-        candidate_key: validation.candidate_key(),
-        result_digest: &result,
-        manifest,
-        validation,
-        source_root: output,
-      })
+      .store_native(prepared_native_fixture(output, manifest, validation))
       .expect("native fixture should enter the CAS")
+      .1
+  }
+
+  fn prepared_native_fixture(
+    output: &Path,
+    manifest: &OutputManifest,
+    validation: &NativeCompilerValidation,
+  ) -> PreparedNativeResult {
+    let staging = tempfile::tempdir().expect("native prepared staging");
+    for entry in &manifest.entries {
+      let source = output.join(&entry.path);
+      let destination = staging.path().join(&entry.path);
+      match entry.kind {
+        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
+        OutputEntryKind::File { .. } => {
+          fs::copy(source, destination).expect("prepared file");
+        }
+        OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
+      }
+    }
+    PreparedNativeResult::from_verified_staging(staging, manifest.clone(), validation.clone())
+  }
+
+  fn native_revision_validation(base: &NativeCompilerValidation, revision: u64) -> NativeCompilerValidation {
+    let revision_bytes = revision.to_le_bytes();
+    let action_key = format!(
+      "{}{}",
+      crate::compiler::native_cache::ACTION_KEY_PREFIX,
+      framed_identity(
+        b"cargo-rail-cas-test-hot-crate-revision\0",
+        &[(b"revision", revision_bytes.as_slice())],
+      )
+    );
+
+    // Keep the production descriptor encoding as the fixture authority. Only
+    // its fixed-width action identity changes between logical source revisions.
+    let association = crate::compiler::native_cache::pack::association(base).expect("base association");
+    let mut descriptor = association.bytes().to_vec();
+    let action_offset = descriptor
+      .windows(base.action_key().len())
+      .position(|window| window == base.action_key().as_bytes())
+      .expect("descriptor action identity");
+    assert_eq!(action_key.len(), base.action_key().len());
+    descriptor[action_offset..action_offset + action_key.len()].copy_from_slice(action_key.as_bytes());
+
+    let result_version = 4_u32.to_le_bytes();
+    let result_key = format!(
+      "{}{}",
+      crate::compiler::native_cache::RESULT_KEY_PREFIX,
+      framed_identity(
+        b"cargo-rail-native-compiler-result\0",
+        &[
+          (b"version", result_version.as_slice()),
+          (b"descriptor", descriptor.as_slice()),
+        ],
+      )
+    );
+    crate::compiler::native_cache::pack::decode_association(&descriptor, &action_key, &result_key)
+      .expect("revision association");
+
+    let mut value = serde_json::to_value(base).expect("native validation fixture");
+    let object = value.as_object_mut().expect("native validation object");
+    object.insert("action_key".to_string(), action_key.into());
+    object.insert("result_key".to_string(), result_key.into());
+    let validation = serde_json::from_value::<NativeCompilerValidation>(value).expect("revision validation");
+    validation.validate_object().expect("valid revision identity");
+    validation
+  }
+
+  fn native_action_result_for_revision(revision: u64) -> String {
+    let revision_bytes = revision.to_le_bytes();
+    format!(
+      "{ACTION_RESULT_PREFIX}{}",
+      framed_identity(
+        b"cargo-rail-cas-test-hot-crate-action-result\0",
+        &[(b"revision", revision_bytes.as_slice())],
+      )
+    )
+  }
+
+  fn write_native_revision_state(cas: &LocalCas, validation: &NativeCompilerValidation, action_result: &str) {
+    let state = NativeActionState {
+      version: NATIVE_ACTION_STATE_VERSION,
+      action_key: validation.action_key().to_string(),
+      state: NativeActionStateKind::UniqueResult {
+        result_key: validation.result_key().to_string(),
+        action_result: action_result.to_string(),
+        origins: NativeResultOrigins {
+          local: true,
+          remote: None,
+        },
+      },
+    };
+    validate_native_action_state(&state, validation.action_key()).expect("revision action state");
+    let action_hex = validated_id_hex(
+      validation.action_key(),
+      crate::compiler::native_cache::ACTION_KEY_PREFIX,
+    )
+    .expect("revision action key");
+    fs::write(
+      cas
+        .root()
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
+        .join(format!("{action_hex}.json")),
+      canonical_json(&state).expect("canonical revision state"),
+    )
+    .expect("revision action state should be written");
   }
 
   #[test]
-  fn native_candidate_lookup_does_not_materialize_and_retained_view_restores() {
+  fn native_environment_selector_round_trips_canonical_names_and_status() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let key = base_action_key(1);
+    let names = vec!["CARGO_CFG_TARGET_ARCH".to_string(), "P73_SELECTED".to_string()];
+
+    assert_eq!(cas.native_environment_selector(&key).expect("missing lookup"), None);
+    assert_eq!(
+      cas
+        .publish_native_environment_selector(&key, &names)
+        .expect("initial publication"),
+      NativeEnvironmentSelectorPublication::Created
+    );
+    assert_eq!(
+      cas.native_environment_selector(&key).expect("published lookup"),
+      Some(names.clone())
+    );
+    assert_eq!(
+      cas
+        .publish_native_environment_selector(&key, &names)
+        .expect("equal publication"),
+      NativeEnvironmentSelectorPublication::Converged
+    );
+    assert_eq!(cas.status().expect("status").index_files, 1);
+
+    let path = cas.native_environment_selector_path(&key).expect("selector path");
+    assert_eq!(
+      fs::read(&path).expect("selector bytes"),
+      br#"["CARGO_CFG_TARGET_ARCH","P73_SELECTED"]"#
+    );
+    let file = File::open(&path).expect("selector file");
+    assert!(
+      crate::utils::private_file_matches_path(&file, &path, file.metadata().expect("selector metadata").len())
+        .expect("selector privacy")
+    );
+  }
+
+  #[test]
+  fn native_environment_selector_divergence_preserves_the_first_binding() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let key = base_action_key(2);
+    let first = vec!["FIRST".to_string()];
+    let second = vec!["SECOND".to_string()];
+    cas
+      .publish_native_environment_selector(&key, &first)
+      .expect("first publication");
+
+    assert_eq!(
+      cas
+        .publish_native_environment_selector(&key, &second)
+        .expect("divergent publication"),
+      NativeEnvironmentSelectorPublication::Diverged
+    );
+    let selector_path = cas.native_environment_selector_path(&key).expect("selector path");
+    assert_eq!(
+      fs::read(&selector_path).expect("selector bytes"),
+      canonical_json(&first).expect("canonical first selector")
+    );
+    let conflict_path = cas
+      .native_environment_selector_conflict_path(&key)
+      .expect("conflict path");
+    assert_eq!(
+      fs::read(&conflict_path).expect("conflict bytes"),
+      NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES
+    );
+    let error = cas
+      .native_environment_selector(&key)
+      .expect_err("conflicted selector must fail closed");
+    assert!(error.to_string().contains("durably conflicted"), "{error}");
+    assert_eq!(cas.status().expect("status").index_files, 2);
+
+    drop(cas);
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+    let error = reopened
+      .native_environment_selector(&key)
+      .expect_err("conflict must survive reopening");
+    assert!(error.to_string().contains("durably conflicted"), "{error}");
+  }
+
+  #[test]
+  fn concurrent_native_environment_selector_publishers_converge() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
+    let barrier = Arc::new(Barrier::new(2));
+    let key = base_action_key(3);
+    let names = vec!["P73_SELECTED".to_string()];
+    let outcomes = std::thread::scope(|scope| {
+      let mut handles = Vec::new();
+      for _ in 0..2 {
+        let cas = Arc::clone(&cas);
+        let barrier = Arc::clone(&barrier);
+        let key = key.clone();
+        let names = names.clone();
+        handles.push(scope.spawn(move || {
+          barrier.wait();
+          cas
+            .publish_native_environment_selector(&key, &names)
+            .expect("concurrent publication")
+        }));
+      }
+      handles
+        .into_iter()
+        .map(|handle| handle.join().expect("publisher should finish"))
+        .collect::<Vec<_>>()
+    });
+
+    assert_eq!(
+      outcomes
+        .iter()
+        .filter(|outcome| **outcome == NativeEnvironmentSelectorPublication::Created)
+        .count(),
+      1
+    );
+    assert_eq!(
+      outcomes
+        .iter()
+        .filter(|outcome| **outcome == NativeEnvironmentSelectorPublication::Converged)
+        .count(),
+      1
+    );
+    assert_eq!(cas.native_environment_selector(&key).expect("lookup"), Some(names));
+  }
+
+  #[test]
+  fn concurrent_differing_native_environment_selector_publishers_conflict_terminally() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
+    let barrier = Arc::new(Barrier::new(2));
+    let key = base_action_key(10);
+    let selectors = [vec!["FIRST".to_string()], vec!["SECOND".to_string()]];
+    let outcomes = std::thread::scope(|scope| {
+      selectors
+        .iter()
+        .map(|names| {
+          let cas = Arc::clone(&cas);
+          let barrier = Arc::clone(&barrier);
+          let key = key.clone();
+          scope.spawn(move || {
+            barrier.wait();
+            cas
+              .publish_native_environment_selector(&key, names)
+              .expect("concurrent publication")
+          })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().expect("publisher should finish"))
+        .collect::<Vec<_>>()
+    });
+
+    assert!(
+      outcomes
+        .iter()
+        .all(|outcome| *outcome != NativeEnvironmentSelectorPublication::Converged),
+      "differing selectors cannot converge: {outcomes:?}"
+    );
+    assert!(
+      outcomes.contains(&NativeEnvironmentSelectorPublication::Diverged),
+      "one publisher must observe divergence: {outcomes:?}"
+    );
+    let selector_path = cas.native_environment_selector_path(&key).expect("selector path");
+    let selector_bytes = fs::read(&selector_path).expect("winning selector bytes");
+    assert!(
+      selectors
+        .iter()
+        .any(|names| canonical_json(names).expect("canonical selector") == selector_bytes),
+      "the immutable selector must contain one complete publication"
+    );
+    let conflict_path = cas
+      .native_environment_selector_conflict_path(&key)
+      .expect("conflict path");
+    assert_eq!(
+      fs::read(conflict_path).expect("conflict bytes"),
+      NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES
+    );
+    let error = cas
+      .native_environment_selector(&key)
+      .expect_err("differing concurrent publications must fail closed");
+    assert!(error.to_string().contains("durably conflicted"), "{error}");
+  }
+
+  #[test]
+  fn retained_native_action_hit_blocks_selector_conflict_publication() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let (manifest, validation) = native_fixture(output.path());
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    let key = base_action_key(13);
+    let first = vec!["FIRST".to_string()];
+    let second = vec!["SECOND".to_string()];
+    cas
+      .publish_native_environment_selector(&key, &first)
+      .expect("first selector publication");
+    let NativeActionLookup::Hit(hit) = cas
+      .native_action(validation.action_key())
+      .expect("native action lookup")
+    else {
+      panic!("stored native action must be authoritative");
+    };
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+      let publisher = scope.spawn(|| {
+        started_tx.send(()).expect("publisher start signal");
+        let outcome = cas
+          .publish_native_environment_selector(&key, &second)
+          .expect("conflicting selector publication");
+        finished_tx.send(outcome).expect("publisher completion signal");
+      });
+      started_rx.recv().expect("publisher must start");
+      hit
+        .validate_environment_selector(&key, first.iter().map(String::as_str))
+        .expect("retained selector authority");
+      assert!(matches!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+      ));
+
+      drop(hit);
+      assert_eq!(
+        finished_rx
+          .recv_timeout(std::time::Duration::from_secs(5))
+          .expect("publisher must finish after the hit is released"),
+        NativeEnvironmentSelectorPublication::Diverged
+      );
+      publisher.join().expect("publisher thread");
+    });
+  }
+
+  #[test]
+  fn native_environment_selector_rejects_noncanonical_input_and_state() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let unsorted_key = base_action_key(4);
+    let unsorted = vec!["Z".to_string(), "A".to_string()];
+    let error = cas
+      .publish_native_environment_selector(&unsorted_key, &unsorted)
+      .expect_err("unsorted names must fail");
+    assert!(error.to_string().contains("strictly sorted and unique"), "{error}");
+    assert_eq!(
+      cas
+        .native_environment_selector(&unsorted_key)
+        .expect("missing selector"),
+      None
+    );
+
+    let malformed_key = base_action_key(5);
+    cas
+      .publish_native_environment_selector(&malformed_key, &["VALID".to_string()])
+      .expect("valid publication");
+    let malformed_path = cas
+      .native_environment_selector_path(&malformed_key)
+      .expect("malformed selector path");
+    fs::write(&malformed_path, b"{").expect("malformed selector");
+    let error = cas
+      .native_environment_selector(&malformed_key)
+      .expect_err("malformed state must fail");
+    assert!(error.to_string().contains("is malformed"), "{error}");
+
+    let noncanonical_key = base_action_key(6);
+    let noncanonical_path = cas
+      .native_environment_selector_path(&noncanonical_key)
+      .expect("noncanonical selector path");
+    fs::write(&noncanonical_path, b"[ \"VALID\" ]").expect("noncanonical selector");
+    let error = cas
+      .native_environment_selector(&noncanonical_key)
+      .expect_err("noncanonical state must fail");
+    assert!(error.to_string().contains("not canonically encoded"), "{error}");
+  }
+
+  #[test]
+  fn native_environment_selector_validates_its_identity_names_and_bounds() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let key = base_action_key(9);
+
+    let error = cas
+      .native_environment_selector(&format!(
+        "{}not-a-digest",
+        crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX
+      ))
+      .expect_err("invalid identity must fail");
+    assert!(error.to_string().contains("canonical SHA-256"), "{error}");
+
+    for invalid in [
+      String::new(),
+      "A\0B".to_string(),
+      "A=B".to_string(),
+      "A\nB".to_string(),
+      CACHE_BASE_ENV.to_string(),
+      "A".repeat(257),
+    ] {
+      let error = cas
+        .publish_native_environment_selector(&key, &[invalid])
+        .expect_err("invalid environment name must fail");
+      assert!(error.to_string().contains("invalid environment name"), "{error}");
+    }
+
+    let too_many = (0..=512).map(|index| format!("ENV_{index:04}")).collect::<Vec<_>>();
+    let error = cas
+      .publish_native_environment_selector(&key, &too_many)
+      .expect_err("name-count bound must fail");
+    assert!(error.to_string().contains("512-name bound"), "{error}");
+  }
+
+  #[test]
+  fn native_environment_selector_rejects_canonical_compiler_invalid_state() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let private_key = base_action_key(11);
+    let private_path = cas
+      .native_environment_selector_path(&private_key)
+      .expect("private selector path");
+    fs::write(
+      private_path,
+      canonical_json(&vec![CACHE_BASE_ENV.to_string()]).expect("canonical private selector"),
+    )
+    .expect("private selector bytes");
+    let error = cas
+      .native_environment_selector(&private_key)
+      .expect_err("private compiler capability must fail");
+    assert!(error.to_string().contains("invalid environment name"), "{error}");
+
+    let too_many_key = base_action_key(12);
+    let too_many_path = cas
+      .native_environment_selector_path(&too_many_key)
+      .expect("bounded selector path");
+    let too_many = (0..=512).map(|index| format!("ENV_{index:04}")).collect::<Vec<_>>();
+    fs::write(
+      too_many_path,
+      canonical_json(&too_many).expect("canonical oversized selector"),
+    )
+    .expect("oversized selector bytes");
+    let error = cas
+      .native_environment_selector(&too_many_key)
+      .expect_err("canonical selector over compiler name bound must fail");
+    assert!(error.to_string().contains("512-name bound"), "{error}");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn native_environment_selector_rejects_linked_state() {
+    use std::os::unix::fs::symlink;
+
+    let cache = tempfile::tempdir().expect("cache base");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    let hard_link_key = base_action_key(7);
+    cas
+      .publish_native_environment_selector(&hard_link_key, &["VALID".to_string()])
+      .expect("valid publication");
+    let hard_link_path = cas
+      .native_environment_selector_path(&hard_link_key)
+      .expect("hard-linked selector path");
+    fs::hard_link(&hard_link_path, cache.path().join("outside-hard-link")).expect("hard link");
+    let error = cas
+      .native_environment_selector(&hard_link_key)
+      .expect_err("hard-linked state must fail");
+    assert!(
+      error.to_string().contains("not a private bounded regular file"),
+      "{error}"
+    );
+
+    let symlink_key = base_action_key(8);
+    let symlink_path = cas
+      .native_environment_selector_path(&symlink_key)
+      .expect("linked selector path");
+    let outside = cache.path().join("outside-selector");
+    fs::write(&outside, b"[]").expect("outside selector");
+    symlink(&outside, &symlink_path).expect("selector symlink");
+    let error = cas
+      .native_environment_selector(&symlink_key)
+      .expect_err("symlinked state must fail");
+    assert!(
+      error.to_string().contains("not a private bounded regular file"),
+      "{error}"
+    );
+  }
+
+  #[test]
+  fn native_hot_crate_revision_index_keeps_current_lookup_history_independent() {
+    const REVISIONS: u64 = 4_096;
+
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, base) = native_fixture(output.path());
+    let current = native_revision_validation(&base, REVISIONS - 1);
+    let cas = LocalCas::open_at(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+    let current_stats = store_native_fixture(&cas, output.path(), &manifest, &current);
+    let current_action_result = current_stats.action_result.expect("current action result");
+
+    let NativeActionLookup::Hit(before) = cas
+      .native_action(current.action_key())
+      .expect("baseline current lookup")
+    else {
+      panic!("current action should be authoritative");
+    };
+    let baseline_bytes_read = before.bytes_read;
+    drop(before);
+
+    // Past payloads are intentionally not materialized: this is a structural
+    // proof that the exact action-state index does not traverse revision
+    // history. Retained wall/RSS and payload-scale claims belong to benchmarks.
+    let mut action_keys = BTreeSet::new();
+    let mut result_keys = BTreeSet::new();
+    for revision in 0..REVISIONS {
+      let validation = native_revision_validation(&base, revision);
+      assert!(action_keys.insert(validation.action_key().to_string()));
+      assert!(result_keys.insert(validation.result_key().to_string()));
+      if revision != REVISIONS - 1 {
+        let action_result = native_action_result_for_revision(revision);
+        assert_ne!(action_result, current_action_result);
+        write_native_revision_state(&cas, &validation, &action_result);
+      }
+    }
+    assert_eq!(action_keys.len(), REVISIONS as usize);
+    assert_eq!(result_keys.len(), REVISIONS as usize);
+
+    let mut fanout = BTreeMap::<String, BTreeSet<String>>::new();
+    for entry in fs::read_dir(cas.root().join(NATIVE_ACTION_STATE_DIRECTORY)).expect("native action states") {
+      let entry = entry.expect("native action entry");
+      let name = entry.file_name().into_string().expect("UTF-8 action state name");
+      let action_hex = name.strip_suffix(".json").expect("canonical action state name");
+      let action_key = format!("{}{action_hex}", crate::compiler::native_cache::ACTION_KEY_PREFIX);
+      let state = decode_native_action_state(&fs::read(entry.path()).expect("action state"), &action_key)
+        .expect("canonical action state");
+      let NativeActionStateKind::UniqueResult { result_key, .. } = state.state else {
+        panic!("a revision must have exactly one result");
+      };
+      fanout.entry(action_key).or_default().insert(result_key);
+    }
+    assert_eq!(fanout.len(), REVISIONS as usize);
+    assert!(fanout.values().all(|results| results.len() == 1));
+    assert_eq!(fanout.keys().cloned().collect::<BTreeSet<_>>(), action_keys);
+
+    let NativeActionLookup::Hit(after) = cas
+      .native_action(current.action_key())
+      .expect("current lookup after history")
+    else {
+      panic!("revision history must not weaken current authority");
+    };
+    assert_eq!(after.validation, current);
+    assert_eq!(after.bytes_read, baseline_bytes_read);
+    assert_eq!(
+      fs::read_dir(cas.root().join("results"))
+        .expect("result namespace")
+        .count(),
+      1
+    );
+  }
+
+  fn prepopulate_unrelated_result_namespace(cas: &LocalCas, population: usize, reserved: &BTreeSet<String>) {
+    let results = cas.root().join("results");
+    let mut candidate = 0_u64;
+    let mut created = 0usize;
+    // Canonically named empty directories are scan tripwires, not result
+    // fixtures. An under-capacity direct admission must ignore every unrelated
+    // entry; trying to validate one would fail the test immediately.
+    while created < population {
+      let action_result = format!("{ACTION_RESULT_PREFIX}{candidate:064x}");
+      candidate = candidate.checked_add(1).expect("bounded result population");
+      if reserved.contains(&action_result) {
+        continue;
+      }
+      let result_hex = validated_id_hex(&action_result, ACTION_RESULT_PREFIX).expect("tripwire result identity");
+      fs::create_dir(results.join(result_hex)).expect("result namespace tripwire");
+      created += 1;
+    }
+    assert_eq!(fs::read_dir(results).expect("result namespace").count(), population);
+  }
+
+  #[cfg(any(unix, windows))]
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  struct TestFileIdentity {
+    volume: u64,
+    index: u64,
+    bytes: u64,
+  }
+
+  #[cfg(unix)]
+  fn test_file_identity(path: &Path) -> TestFileIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(path).expect("staged blob metadata");
+    assert!(metadata.is_file());
+    assert_eq!(metadata.nlink(), 1);
+    TestFileIdentity {
+      volume: metadata.dev(),
+      index: metadata.ino(),
+      bytes: metadata.len(),
+    }
+  }
+
+  #[cfg(windows)]
+  fn test_file_identity(path: &Path) -> TestFileIdentity {
+    let file = cargo_rail_windows_fs::open_for_observation(path).expect("staged blob file");
+    let information = cargo_rail_windows_fs::observe_file(&file).expect("staged blob identity");
+    cargo_rail_windows_fs::prove_local_ntfs(&file, information.volume_serial_number)
+      .expect("staged blob local NTFS proof");
+    assert_eq!(information.number_of_links, 1);
+    TestFileIdentity {
+      volume: information.volume_serial_number,
+      index: information.file_id,
+      bytes: information.size,
+    }
+  }
+
+  type NativeBatchAdmissionEvidence = (Vec<(String, String, u64, u64)>, Vec<u64>, u64);
+
+  fn observe_native_batch_admission(population: usize, batch_size: usize) -> NativeBatchAdmissionEvidence {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, base) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+    let staged = (0..batch_size)
+      .map(|revision| {
+        let validation = native_revision_validation(&base, revision as u64);
+        cas
+          .stage_native(prepared_native_fixture(output.path(), &manifest, &validation))
+          .expect("native result should stage")
+      })
+      .collect::<Vec<_>>();
+    #[cfg(any(unix, windows))]
+    let staged_blob_identities = staged
+      .iter()
+      .flat_map(|result| {
+        fs::read_dir(result.staged.payload.join("blobs"))
+          .expect("staged blob directory")
+          .map(|entry| {
+            let entry = entry.expect("staged blob entry");
+            (
+              result.action_result.clone(),
+              entry.file_name(),
+              test_file_identity(&entry.path()),
+            )
+          })
+          .collect::<Vec<_>>()
+      })
+      .collect::<Vec<_>>();
+    let reserved = staged
+      .iter()
+      .map(|result| result.action_result.clone())
+      .collect::<BTreeSet<_>>();
+    assert_eq!(reserved.len(), batch_size);
+    prepopulate_unrelated_result_namespace(&cas, population, &reserved);
+
+    let missing = native_revision_validation(&base, u64::MAX);
+    let NativeActionLookup::Miss(miss) = cas.native_action(missing.action_key()).expect("absent action lookup") else {
+      panic!("an absent action must miss");
+    };
+    assert_eq!(miss.reason, "action_not_found");
+    let miss_bytes_read = miss.bytes_read;
+
+    let committed = cas.commit_new_native_batch(staged).expect("native batch admission");
+    assert_eq!(committed.len(), batch_size);
+    #[cfg(any(unix, windows))]
+    for (action_result, name, identity) in staged_blob_identities {
+      let destination = result_path(cas.root(), &action_result)
+        .expect("published result path")
+        .join("blobs")
+        .join(name);
+      assert_eq!(
+        test_file_identity(&destination),
+        identity,
+        "authoritative admission recopied an already staged immutable blob"
+      );
+    }
+    assert_eq!(
+      fs::read_dir(cas.root().join("results"))
+        .expect("result namespace")
+        .count(),
+      population + batch_size
+    );
+    assert_eq!(
+      fs::read_dir(cas.root().join(NATIVE_ACTION_STATE_DIRECTORY))
+        .expect("native action namespace")
+        .count(),
+      batch_size
+    );
+
+    let writes = committed
+      .iter()
+      .map(|(validation, stats)| {
+        (
+          validation.action_key().to_string(),
+          stats.action_result.clone().expect("admitted action result"),
+          stats.objects_written,
+          stats.bytes_written,
+        )
+      })
+      .collect::<Vec<_>>();
+    let unit_objects = writes[0].2;
+    let unit_bytes = writes[0].3;
+    assert!(unit_objects > 0 && unit_bytes > 0);
+    assert!(
+      writes
+        .iter()
+        .all(|(_, _, objects, bytes)| *objects == unit_objects && *bytes == unit_bytes)
+    );
+    assert_eq!(
+      writes.iter().map(|(_, _, objects, _)| objects).sum::<u64>(),
+      unit_objects * batch_size as u64
+    );
+    assert_eq!(
+      writes.iter().map(|(_, _, _, bytes)| bytes).sum::<u64>(),
+      unit_bytes * batch_size as u64
+    );
+
+    let lookup_bytes = committed
+      .iter()
+      .map(|(validation, _)| {
+        let NativeActionLookup::Hit(hit) = cas
+          .native_action(validation.action_key())
+          .expect("admitted action lookup")
+        else {
+          panic!("admitted native action should be authoritative");
+        };
+        hit.bytes_read
+      })
+      .collect();
+    (writes, lookup_bytes, miss_bytes_read)
+  }
+
+  #[test]
+  fn native_batch_admission_work_is_independent_of_result_namespace_population() {
+    for batch_size in [1, 32, 256] {
+      let small = observe_native_batch_admission(100, batch_size);
+      let large = observe_native_batch_admission(10_000, batch_size);
+      assert_eq!(small, large, "batch {batch_size} work changed with store population");
+      assert_eq!(
+        small.2, 0,
+        "an exact absent-action lookup must not read unrelated results"
+      );
+    }
+  }
+
+  #[test]
+  fn native_action_lookup_does_not_materialize_and_retained_view_restores() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let restore_parent = tempfile::tempdir().expect("restore parent");
@@ -4282,14 +6914,12 @@ mod tests {
     store_native_fixture(&cas, output.path(), &manifest, &validation);
 
     let destination = restore_parent.path().join("native-output");
-    let candidates = cas
-      .native_candidates(validation.candidate_key())
-      .expect("candidate index should load");
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].action_key, validation.action_key());
-    assert!(!destination.exists(), "candidate lookup must not materialize output");
+    let NativeActionLookup::Hit(cached) = cas.native_action(validation.action_key()).expect("action lookup") else {
+      panic!("verified native action should be authoritative");
+    };
+    assert!(!destination.exists(), "action lookup must not materialize output");
 
-    let NativeCacheLookup::Hit(hit) = candidates.restore(0, &destination) else {
+    let NativeCacheLookup::Hit(hit) = cached.restore(&destination) else {
       panic!("verified native action should restore");
     };
     assert_eq!(hit.bytes_restored, manifest.bytes);
@@ -4301,16 +6931,94 @@ mod tests {
       fs::read(destination.join("target/outputs/metadata")).expect("metadata"),
       b"metadata"
     );
-    drop(candidates);
+    drop(cached);
 
     let action_hex = validated_action_key_hex(validation.action_key()).expect("native action key");
-    fs::remove_file(cas.root.join("pins").join(format!("{action_hex}.json"))).expect("remove authoritative pin");
-    assert!(
+    fs::remove_file(
       cas
-        .native_candidates(validation.candidate_key())
-        .expect("stale discovery entry should be harmless")
-        .is_empty(),
-      "the discovery index must never authorize a result without its action pin"
+        .root
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
+        .join(format!("{action_hex}.json")),
+    )
+    .expect("remove authoritative action state");
+    assert!(matches!(
+      cas
+        .native_action(validation.action_key())
+        .expect("missing action lookup"),
+      NativeActionLookup::Miss(_)
+    ));
+  }
+
+  #[test]
+  fn native_registered_restore_uses_only_the_supplied_staging_path() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let restore_parent = tempfile::tempdir().expect("restore parent");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    let NativeActionLookup::Hit(cached) = cas.native_action(validation.action_key()).expect("action lookup") else {
+      panic!("verified native action should be authoritative");
+    };
+    let destination = restore_parent.path().join("registered-output");
+    let staging = restore_parent.path().join("registered-staging");
+
+    let NativeCacheLookup::Hit(hit) = cached.restore_registered(&destination, &staging) else {
+      panic!("verified native action should restore through registered staging");
+    };
+
+    assert_eq!(hit.bytes_restored, manifest.bytes);
+    assert!(
+      !staging.exists(),
+      "successful restore must remove the empty staging shell"
+    );
+    assert_eq!(
+      fs::read(destination.join("target/outputs/metadata")).expect("metadata"),
+      b"metadata"
+    );
+    let entries = fs::read_dir(restore_parent.path())
+      .expect("restore parent entries")
+      .map(|entry| entry.expect("restore parent entry").file_name())
+      .collect::<Vec<_>>();
+    assert_eq!(entries, [std::ffi::OsString::from("registered-output")]);
+  }
+
+  #[test]
+  fn native_registered_restore_rejects_prepositioned_paths_without_creating_residue() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let restore_parent = tempfile::tempdir().expect("restore parent");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    let NativeActionLookup::Hit(cached) = cas.native_action(validation.action_key()).expect("action lookup") else {
+      panic!("verified native action should be authoritative");
+    };
+
+    let destination = restore_parent.path().join("prepositioned-output");
+    let absent_staging = restore_parent.path().join("absent-staging");
+    fs::write(&destination, b"existing").expect("preposition destination");
+    let NativeCacheLookup::Miss(miss) = cached.restore_registered(&destination, &absent_staging) else {
+      panic!("prepositioned destination must fail closed");
+    };
+    assert_eq!(miss.reason, "materialization_destination_prepositioned");
+    assert!(
+      !absent_staging.exists(),
+      "destination rejection must not create staging"
+    );
+
+    let absent_destination = restore_parent.path().join("absent-output");
+    let staging = restore_parent.path().join("prepositioned-staging");
+    fs::create_dir(&staging).expect("preposition staging");
+    fs::write(staging.join("sentinel"), b"untouched").expect("staging sentinel");
+    let NativeCacheLookup::Miss(miss) = cached.restore_registered(&absent_destination, &staging) else {
+      panic!("prepositioned staging must fail closed");
+    };
+    assert_eq!(miss.reason, "materialization_staging_prepositioned");
+    assert!(!absent_destination.exists());
+    assert_eq!(
+      fs::read(staging.join("sentinel")).expect("staging sentinel"),
+      b"untouched"
     );
   }
 
@@ -4340,7 +7048,7 @@ mod tests {
   }
 
   #[test]
-  fn native_candidate_lookup_ignores_unrelated_primary_pins() {
+  fn native_action_lookup_ignores_unrelated_primary_pins() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let (manifest, validation) = native_fixture(output.path());
@@ -4367,49 +7075,259 @@ mod tests {
       .expect("irrelevant pin");
     }
 
-    let candidates = cas
-      .native_candidates(validation.candidate_key())
-      .expect("candidate index should load");
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].action_key, validation.action_key());
+    assert!(matches!(
+      cas.native_action(validation.action_key()).expect("action lookup"),
+      NativeActionLookup::Hit(_)
+    ));
   }
 
   #[test]
-  fn pre_index_native_pins_are_migrated_once_without_gaining_authority() {
+  fn legacy_native_action_state_is_upgraded_without_becoming_v6_authority() {
+    const LEGACY_STATE: &[u8] =
+      b"{\"action_key\":\"compiler-action-v5-sha256-legacy\",\"state\":{\"kind\":\"unique_result\"},\"version\":1}\n";
+    const LEGACY_LEDGER: &[u8] = b"{\"version\":1,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}";
+
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
+    let root = initialized.root().to_path_buf();
+    drop(initialized);
+
+    let current_directory = root.join(NATIVE_ACTION_STATE_DIRECTORY);
+    fs::remove_dir(&current_directory).expect("remove post-upgrade action directory from legacy fixture");
+    fs::write(root.join(NATIVE_LEDGER_STATE_FILE), LEGACY_LEDGER).expect("legacy terminal ledger");
+    let legacy_directory = root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY);
+    fs::create_dir(&legacy_directory).expect("legacy native action directory");
+    let action_hex = validated_action_key_hex(validation.action_key()).expect("current action key");
+    let legacy_state = legacy_directory.join(format!("{action_hex}.json"));
+    fs::write(&legacy_state, LEGACY_STATE).expect("legacy state fixture");
+
+    assert!(
+      !current_directory.exists(),
+      "fixture must begin without the v2 namespace"
+    );
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should upgrade around legacy state");
+    assert!(
+      current_directory.is_dir(),
+      "upgrade must create the v2 action namespace"
+    );
+    assert!(
+      root.join(NATIVE_LEDGER_STATE_FILE).is_file(),
+      "upgrade must retain a current ledger"
+    );
+    assert_eq!(fs::read(&legacy_state).expect("preserved legacy state"), LEGACY_STATE);
+    let NativeActionLookup::Miss(miss) = cas.native_action(validation.action_key()).expect("legacy-key lookup") else {
+      panic!("legacy state must not grant current action authority");
+    };
+    assert_eq!(miss.reason, "action_not_found");
+    let ledger = validate_native_ledger(cas.root()).expect("current native ledger");
+    assert_eq!(ledger.terminal_states, 0);
+    assert_eq!(ledger.terminal_bytes, 0);
+    assert!(!ledger.disabled);
+    let status = cas.status().expect("CAS status");
+    assert_eq!(status.native_actions, 0);
+    assert_eq!(status.native_unique, 0);
+    assert_eq!(status.native_conflicted, 0);
+    assert_eq!(status.native_quarantined, 0);
+
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    assert!(
+      cas
+        .root()
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
+        .join(format!("{action_hex}.json"))
+        .is_file(),
+      "new authority must use the v2 action-state namespace"
+    );
+    assert_eq!(
+      fs::read(&legacy_state).expect("legacy bytes after publish"),
+      LEGACY_STATE
+    );
+    let status = cas.status().expect("published CAS status");
+    assert_eq!(status.native_actions, 1);
+    assert_eq!(status.native_unique, 1);
+    assert_eq!(status.native_conflicted, 0);
+    assert_eq!(status.native_quarantined, 0);
+    let ledger = validate_native_ledger(cas.root()).expect("published native ledger");
+    assert_eq!(ledger.terminal_states, 0);
+    assert_eq!(ledger.terminal_bytes, 0);
+    assert!(!ledger.disabled);
+  }
+
+  #[test]
+  fn native_action_state_is_the_only_native_authority() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let (manifest, validation) = native_fixture(output.path());
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     store_native_fixture(&cas, output.path(), &manifest, &validation);
 
-    let candidate_hex = validated_id_hex(
-      validation.candidate_key(),
-      crate::compiler::native_cache::CANDIDATE_KEY_PREFIX,
-    )
-    .expect("candidate key");
     let action_hex = validated_action_key_hex(validation.action_key()).expect("action key");
     fs::remove_file(
       cas
         .root
-        .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
-        .join(candidate_hex)
+        .join(NATIVE_ACTION_STATE_DIRECTORY)
         .join(format!("{action_hex}.json")),
     )
-    .expect("remove indexed entry");
-    fs::remove_file(
-      cas
-        .root
-        .join(NATIVE_CANDIDATE_INDEX_DIRECTORY)
-        .join(NATIVE_CANDIDATE_INDEX_MARKER),
-    )
-    .expect("remove migration marker");
+    .expect("remove action state");
 
-    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("legacy cache should migrate");
-    let candidates = reopened
-      .native_candidates(validation.candidate_key())
-      .expect("migrated candidate should load");
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].action_key, validation.action_key());
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+    assert!(matches!(
+      reopened.native_action(validation.action_key()).expect("missing action"),
+      NativeActionLookup::Miss(_)
+    ));
+  }
+
+  #[test]
+  fn distinct_native_results_make_the_action_permanently_conflicted() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let first_output = tempfile::tempdir().expect("first output root");
+    let second_output = tempfile::tempdir().expect("second output root");
+    let (first_manifest, first_validation) = native_fixture(first_output.path());
+    let (second_manifest, second_validation) = native_fixture_with_stdout(second_output.path(), b"different");
+    assert_eq!(first_validation.action_key(), second_validation.action_key());
+    assert_ne!(first_validation.result_key(), second_validation.result_key());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, first_output.path(), &first_manifest, &first_validation);
+
+    let staging = tempfile::tempdir().expect("second prepared staging");
+    for entry in &second_manifest.entries {
+      let source = second_output.path().join(&entry.path);
+      let destination = staging.path().join(&entry.path);
+      match entry.kind {
+        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
+        OutputEntryKind::File { .. } => {
+          fs::copy(source, destination).expect("prepared file");
+        }
+        OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
+      }
+    }
+    let error = cas
+      .store_native(PreparedNativeResult::from_verified_staging(
+        staging,
+        second_manifest,
+        second_validation,
+      ))
+      .expect_err("a distinct result must conflict");
+    assert!(error.to_string().contains("two different verified results"), "{error}");
+    let NativeActionLookup::Miss(miss) = cas
+      .native_action(first_validation.action_key())
+      .expect("conflict lookup")
+    else {
+      panic!("a conflicted action must not restore");
+    };
+    assert_eq!(miss.reason, "action_conflicted");
+
+    drop(cas);
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+    reopened.garbage_collect(0, None).expect("GC must preserve the ledger");
+    let NativeActionLookup::Miss(miss) = reopened
+      .native_action(first_validation.action_key())
+      .expect("restarted conflict lookup")
+    else {
+      panic!("restart and GC must not make a conflict unique");
+    };
+    assert_eq!(miss.reason, "action_conflicted");
+    assert_eq!(
+      fs::read_dir(reopened.root.join(NATIVE_ACTION_STATE_DIRECTORY))
+        .expect("native actions")
+        .count(),
+      1
+    );
+    assert_eq!(fs::read_dir(reopened.root.join("results")).expect("results").count(), 0);
+  }
+
+  #[test]
+  fn full_terminal_ledger_disables_native_authority_without_erasing_unique_state() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let first_output = tempfile::tempdir().expect("first output root");
+    let second_output = tempfile::tempdir().expect("second output root");
+    let (first_manifest, first_validation) = native_fixture(first_output.path());
+    let (second_manifest, second_validation) = native_fixture_with_stdout(second_output.path(), b"different");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, first_output.path(), &first_manifest, &first_validation);
+    write_native_ledger(
+      cas.root(),
+      &NativeLedgerState {
+        version: NATIVE_ACTION_STATE_VERSION,
+        terminal_states: MAX_NATIVE_TERMINAL_STATES,
+        terminal_bytes: MAX_NATIVE_TERMINAL_BYTES,
+        disabled: false,
+      },
+    )
+    .expect("ledger at exact bound");
+
+    let staging = tempfile::tempdir().expect("second prepared staging");
+    for entry in &second_manifest.entries {
+      let source = second_output.path().join(&entry.path);
+      let destination = staging.path().join(&entry.path);
+      match entry.kind {
+        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
+        OutputEntryKind::File { .. } => {
+          fs::copy(source, destination).expect("prepared file");
+        }
+        OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
+      }
+    }
+    let error = cas
+      .store_native(PreparedNativeResult::from_verified_staging(
+        staging,
+        second_manifest,
+        second_validation,
+      ))
+      .expect_err("terminal ledger must refuse another conflict marker");
+    assert!(error.to_string().contains("ledger is full"), "{error}");
+    assert!(validate_native_ledger(cas.root()).expect("ledger").disabled);
+    let NativeActionLookup::Miss(miss) = cas
+      .native_action(first_validation.action_key())
+      .expect("disabled lookup")
+    else {
+      panic!("a disabled native authority must not restore an old unique state");
+    };
+    assert_eq!(miss.reason, "native_authority_ledger_full");
+    let action_hex = validated_action_key_hex(first_validation.action_key()).expect("action key");
+    let state_path = cas
+      .root()
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    let state: NativeActionState = serde_json::from_slice(&fs::read(state_path).expect("unique state")).expect("state");
+    assert!(matches!(state.state, NativeActionStateKind::UniqueResult { .. }));
+  }
+
+  #[test]
+  fn malformed_native_action_state_is_durably_quarantined() {
+    let cache = tempfile::tempdir().expect("cache base");
+    let output = tempfile::tempdir().expect("output root");
+    let (manifest, validation) = native_fixture(output.path());
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+    store_native_fixture(&cas, output.path(), &manifest, &validation);
+    let action_hex = validated_action_key_hex(validation.action_key()).expect("action key");
+    let state_path = cas
+      .root
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    fs::write(&state_path, b"{").expect("corrupt action state");
+
+    let NativeActionLookup::Miss(miss) = cas.native_action(validation.action_key()).expect("quarantine lookup") else {
+      panic!("malformed state must not restore");
+    };
+    assert_eq!(miss.reason, "action_quarantined");
+    let bytes = fs::read(&state_path).expect("quarantine marker");
+    let state = decode_native_action_state(&bytes, validation.action_key()).expect("valid quarantine marker");
+    assert!(matches!(state.state, NativeActionStateKind::Quarantined { .. }));
+
+    drop(cas);
+    let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+    reopened.garbage_collect(0, None).expect("GC must preserve quarantine");
+    let NativeActionLookup::Miss(miss) = reopened
+      .native_action(validation.action_key())
+      .expect("restarted quarantine lookup")
+    else {
+      panic!("restart and GC must not clear quarantine");
+    };
+    assert_eq!(miss.reason, "action_quarantined");
+    assert!(state_path.is_file());
   }
 
   #[test]
@@ -4439,8 +7357,14 @@ mod tests {
         handle.join().expect("writer should converge");
       }
     });
-    let root = cache.path().join("cargo-rail/local-cas-v1");
-    assert_eq!(fs::read_dir(root.join("pins")).expect("pins").count(), 1);
+    let root = cache.path().join("cargo-rail").join(CAS_ROOT_NAME);
+    assert_eq!(fs::read_dir(root.join("pins")).expect("pins").count(), 0);
+    assert_eq!(
+      fs::read_dir(root.join(NATIVE_ACTION_STATE_DIRECTORY))
+        .expect("native actions")
+        .count(),
+      1
+    );
     assert_eq!(fs::read_dir(root.join("results")).expect("results").count(), 1);
   }
 
@@ -4896,13 +7820,13 @@ mod tests {
       }
     });
     assert_eq!(
-      fs::read_dir(cache.path().join("cargo-rail/local-cas-v1/pins"))
+      fs::read_dir(cache.path().join("cargo-rail").join(CAS_ROOT_NAME).join("pins"))
         .unwrap()
         .count(),
       1
     );
     assert_eq!(
-      fs::read_dir(cache.path().join("cargo-rail/local-cas-v1/results"))
+      fs::read_dir(cache.path().join("cargo-rail").join(CAS_ROOT_NAME).join("results"))
         .unwrap()
         .count(),
       1
@@ -5263,7 +8187,7 @@ mod tests {
   #[test]
   fn cache_open_refuses_to_adopt_a_nonempty_unowned_root() {
     let cache = tempfile::tempdir().expect("cache base");
-    let root = cache.path().join("cargo-rail/local-cas-v1");
+    let root = cache.path().join("cargo-rail").join(CAS_ROOT_NAME);
     fs::create_dir_all(&root).expect("hostile root");
     let sentinel = root.join("user-data");
     fs::write(&sentinel, b"preserve me").expect("hostile sentinel");
@@ -5285,7 +8209,7 @@ mod tests {
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     fs::write(cas.root().join("OWNER"), b"forged\n").expect("tamper owner marker");
     let error = remove_owned_root_at(cas.root()).expect_err("invalid marker must block recursive cleanup");
-    assert!(error.to_string().contains("ownership marker"), "{error}");
+    assert!(error.to_string().contains("authority marker"), "{error}");
     assert!(cas.root().exists());
   }
 
@@ -5339,30 +8263,27 @@ mod tests {
   }
 
   #[test]
-  fn native_gc_removes_discovery_entries_with_authoritative_pins() {
+  fn native_gc_revokes_unique_action_state_before_removing_its_result() {
     let cache = tempfile::tempdir().expect("cache base");
     let output = tempfile::tempdir().expect("output root");
     let (manifest, validation) = native_fixture(output.path());
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     store_native_fixture(&cas, output.path(), &manifest, &validation);
-    let candidate_hex = validated_id_hex(
-      validation.candidate_key(),
-      crate::compiler::native_cache::CANDIDATE_KEY_PREFIX,
+    let action_hex = validated_id_hex(
+      validation.action_key(),
+      crate::compiler::native_cache::ACTION_KEY_PREFIX,
     )
-    .expect("candidate key");
-    let candidate_directory = cas.root().join(NATIVE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
-    assert_eq!(
-      fs::read_dir(&candidate_directory).expect("candidate directory").count(),
-      1
-    );
+    .expect("action key");
+    let action_state = cas
+      .root()
+      .join(NATIVE_ACTION_STATE_DIRECTORY)
+      .join(format!("{action_hex}.json"));
+    assert!(action_state.is_file());
 
     cas.garbage_collect(0, None).expect("GC should remove native result");
     assert_eq!(fs::read_dir(cas.root().join("pins")).unwrap().count(), 0);
     assert_eq!(fs::read_dir(cas.root().join("results")).unwrap().count(), 0);
-    assert_eq!(
-      fs::read_dir(candidate_directory).expect("candidate directory").count(),
-      0
-    );
+    assert!(!action_state.exists());
   }
 
   #[test]
@@ -5422,7 +8343,7 @@ mod tests {
   }
 
   #[test]
-  fn status_and_cleanup_accept_owned_pre_index_transition_state() {
+  fn status_and_cleanup_accept_an_owned_missing_optional_evidence_index() {
     let cache = tempfile::tempdir().expect("cache base");
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     fs::remove_dir(cas.root().join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY)).expect("remove transition directory");
@@ -5430,7 +8351,7 @@ mod tests {
     let status = status_at_with_max(cas.root(), 1024 * 1024)
       .expect("transition status")
       .expect("present transition root");
-    assert_eq!(status.index_files, 1, "the native READY marker remains");
+    assert_eq!(status.index_files, 0);
 
     let removed = remove_owned_root_at(cas.root()).expect("transition cleanup");
     assert!(removed.is_some());
@@ -5468,7 +8389,9 @@ mod tests {
       .set_modified(now + std::time::Duration::from_secs(2))
       .expect("newer use time");
 
-    let current = checked_tree_bytes(cas.root()).expect("current cache bytes");
+    let current = validate_capacity_state(cas.root())
+      .expect("capacity state")
+      .result_bytes;
     cas.garbage_collect(current - 1, None).expect("bounded LRU collection");
 
     assert!(pin(&newer).exists(), "the most recently used result must survive");
@@ -5476,7 +8399,7 @@ mod tests {
   }
 
   #[test]
-  fn publication_metadata_is_admitted_before_any_authoritative_state() {
+  fn result_capacity_excludes_bounded_control_metadata() {
     let measurement_cache = tempfile::tempdir().expect("measurement cache base");
     let output = tempfile::tempdir().expect("output root");
     let manifest = write_fixture(output.path(), b"bounded payload");
@@ -5488,14 +8411,13 @@ mod tests {
 
     let bounded_cache = tempfile::tempdir().expect("bounded cache base");
     let mut bounded = LocalCas::open_at(bounded_cache.path(), 1024 * 1024).expect("bounded CAS");
-    let baseline = checked_tree_bytes(bounded.root()).expect("baseline bytes");
-    bounded.max_bytes = baseline + result_bytes;
+    bounded.max_bytes = result_bytes;
     let key = action_key(32);
     let result_digest = super::super::hermetic_result_digest(&key, manifest.digest());
     let lookup = super::super::test_pre_context_lookup_key();
     let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
 
-    let error = bounded
+    let stored = bounded
       .store(StoreRequest {
         action_key: &key,
         lookup_key: &lookup,
@@ -5505,14 +8427,11 @@ mod tests {
         compiler_units: 1,
         source_root: output.path(),
       })
-      .expect_err("pin and lease bytes must be admitted with the result bundle");
+      .expect("the exact result-byte bound must admit its control metadata separately");
 
-    assert!(
-      error.to_string().contains("pre-publication capacity check failed"),
-      "{error}"
-    );
-    assert_eq!(fs::read_dir(bounded.root().join("pins")).unwrap().count(), 0);
-    assert_eq!(fs::read_dir(bounded.root().join("results")).unwrap().count(), 0);
+    assert_eq!(stored.bytes_written, result_bytes);
+    assert_eq!(fs::read_dir(bounded.root().join("pins")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(bounded.root().join("results")).unwrap().count(), 1);
   }
 
   #[test]
@@ -5532,6 +8451,69 @@ mod tests {
     );
   }
 
+  #[test]
+  fn staging_creation_holds_lifecycle_authority_until_its_active_lease_exists() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_STAGING_CACHE";
+    const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_BEFORE_ACTIVE";
+
+    let root = tempfile::tempdir().expect("staging race root");
+    let cache = root.path().join("cache");
+    let control = root.path().join("control");
+    fs::create_dir(&cache).expect("cache base");
+    let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+      .args([
+        "--exact",
+        "hermetic::cas::tests::guarded_staging_creation_worker",
+        "--nocapture",
+      ])
+      .env(CACHE_ENV, &cache)
+      .env(PAUSE_ENV, &control)
+      .spawn()
+      .expect("staging worker should start");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !control.join("ready").is_file() {
+      assert!(
+        child.try_wait().expect("worker status").is_none(),
+        "staging worker exited before reaching the unleased-directory boundary"
+      );
+      assert!(
+        std::time::Instant::now() < deadline,
+        "staging worker did not reach the unleased-directory boundary"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let lifecycle = crate::utils::open_cache_lock_file(&cas.lifecycle_lock, false).expect("lifecycle lock file");
+    assert!(
+      matches!(lifecycle.try_lock(), Err(fs::TryLockError::WouldBlock)),
+      "cleanup authority must remain excluded until the staging lease is locked"
+    );
+    assert_eq!(
+      fs::read_dir(cas.root.join("staging"))
+        .expect("staging directory")
+        .count(),
+      1,
+      "the unleased staging directory must remain protected by lifecycle authority"
+    );
+
+    write_new_synced(&control.join("continue"), b"continue\n").expect("release staging worker");
+    let status = child.wait().expect("staging worker status");
+    assert!(status.success(), "staging worker failed: {status}");
+  }
+
+  #[test]
+  fn guarded_staging_creation_worker() {
+    const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_STAGING_CACHE";
+    let Some(cache) = std::env::var_os(CACHE_ENV) else {
+      return;
+    };
+    let base = fs::canonicalize(cache).expect("canonical cache base");
+    let cas = LocalCas::open_initialized_at(&base, 1024 * 1024).expect("initialized CAS should open");
+    let _staging = cas.native_result_staging().expect("guarded staging should be created");
+  }
+
   #[cfg(unix)]
   #[test]
   fn cache_open_rejects_a_linked_lifecycle_lock() {
@@ -5542,7 +8524,7 @@ mod tests {
     fs::create_dir(&owner).expect("CAS owner");
     let outside = tempfile::NamedTempFile::new().expect("outside file");
     fs::write(outside.path(), b"preserve").expect("outside contents");
-    symlink(outside.path(), owner.join(LIFECYCLE_LOCK_NAME)).expect("hostile lock link");
+    symlink(outside.path(), owner.join(format!("{CAS_ROOT_NAME}.lock"))).expect("hostile lock link");
 
     let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("linked lock must fail");
 
@@ -5557,7 +8539,7 @@ mod tests {
     let owner = cache.path().join("cargo-rail");
     fs::create_dir(&owner).expect("CAS owner");
     let outside = tempfile::NamedTempFile::new().expect("outside file");
-    fs::hard_link(outside.path(), owner.join(LIFECYCLE_LOCK_NAME)).expect("hostile hard-linked lock");
+    fs::hard_link(outside.path(), owner.join(format!("{CAS_ROOT_NAME}.lock"))).expect("hostile hard-linked lock");
 
     let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("hard-linked lock must fail");
 

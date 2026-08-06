@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(windows)]
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +16,7 @@ use crate::source::ContentDigest;
 use crate::workspace::WorkspaceSnapshot;
 
 pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 6;
+const COMPILER_CACHE_WRAPPER_METADATA_VERSION: u32 = 2;
 const COMPILATION_UNIT_VERSION: u32 = 2;
 const RAW_INVOCATION_VERSION: u32 = 4;
 
@@ -220,12 +223,7 @@ impl FileObservation {
         absolute.display()
       )));
     }
-    let bytes = fs::read(&absolute).map_err(|error| {
-      RailError::message(format!(
-        "failed to read observed file '{}': {error}",
-        absolute.display()
-      ))
-    })?;
+    let bytes = read_observed_file(&absolute, &metadata)?;
     let bytes_read = bytes.len() as u64;
     Ok((
       Self {
@@ -242,6 +240,80 @@ impl FileObservation {
     let path = self.path.resolve(source_root);
     Self::capture(&path, source_root, source_root).is_ok_and(|current| current == *self)
   }
+}
+
+#[cfg(windows)]
+fn read_observed_file(path: &Path, metadata: &fs::Metadata) -> RailResult<Vec<u8>> {
+  use cargo_rail_windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
+
+  let mut opened = open_for_observation(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to open observed file '{}' without following reparse points: {error}",
+      path.display()
+    ))
+  })?;
+  let before = observe_file(&opened).map_err(|error| {
+    RailError::message(format!(
+      "failed to capture handle-bound evidence for observed file '{}': {error}",
+      path.display()
+    ))
+  })?;
+  prove_local_ntfs(&opened, before.volume_serial_number).map_err(|error| {
+    RailError::message(format!(
+      "observed file '{}' is not on a proven local NTFS volume: {error}",
+      path.display()
+    ))
+  })?;
+  if before.size != metadata.len() {
+    return Err(RailError::message(format!(
+      "observed file '{}' changed before its bytes were read",
+      path.display()
+    )));
+  }
+
+  let capacity = usize::try_from(before.size).map_err(|_| {
+    RailError::message(format!(
+      "observed file '{}' exceeds the addressable byte bound",
+      path.display()
+    ))
+  })?;
+  let limit = before
+    .size
+    .checked_add(1)
+    .ok_or_else(|| RailError::message(format!("observed file '{}' exceeds the byte bound", path.display())))?;
+  let mut bytes = Vec::with_capacity(capacity);
+  (&mut opened).take(limit).read_to_end(&mut bytes)?;
+
+  let after = observe_file(&opened).map_err(|error| {
+    RailError::message(format!(
+      "observed file '{}' changed while its bytes were read: {error}",
+      path.display()
+    ))
+  })?;
+  let current = open_for_observation(path).and_then(|current| {
+    let observation = observe_file(&current)?;
+    prove_local_ntfs(&current, observation.volume_serial_number)?;
+    Ok(observation)
+  });
+  let current = current.map_err(|error| {
+    RailError::message(format!(
+      "observed file '{}' changed before its path was revalidated: {error}",
+      path.display()
+    ))
+  })?;
+  if before != after || after != current || bytes.len() as u64 != before.size {
+    return Err(RailError::message(format!(
+      "observed file '{}' changed while it was captured",
+      path.display()
+    )));
+  }
+  Ok(bytes)
+}
+
+#[cfg(not(windows))]
+fn read_observed_file(path: &Path, _metadata: &fs::Metadata) -> RailResult<Vec<u8>> {
+  fs::read(path)
+    .map_err(|error| RailError::message(format!("failed to read observed file '{}': {error}", path.display())))
 }
 
 /// Environment read reported by rustc dep-info without retaining plaintext values.
@@ -319,9 +391,9 @@ pub(crate) struct CompilerCacheWrapperMetadata {
   status: CompilerCacheWrapperStatus,
   reason: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  candidate_key: Option<String>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
   action_key: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  result_key: Option<String>,
   #[serde(default, skip_serializing_if = "is_zero")]
   bytes_hashed: u64,
   #[serde(default, skip_serializing_if = "is_zero")]
@@ -331,11 +403,11 @@ pub(crate) struct CompilerCacheWrapperMetadata {
 impl CompilerCacheWrapperMetadata {
   pub(crate) fn new(status: CompilerCacheWrapperStatus, reason: &str) -> Self {
     Self {
-      version: 1,
+      version: COMPILER_CACHE_WRAPPER_METADATA_VERSION,
       status,
       reason: reason.to_string(),
-      candidate_key: None,
       action_key: None,
+      result_key: None,
       bytes_hashed: 0,
       bytes_restored: 0,
     }
@@ -344,17 +416,17 @@ impl CompilerCacheWrapperMetadata {
   pub(crate) fn native(
     status: CompilerCacheWrapperStatus,
     reason: impl Into<String>,
-    candidate_key: Option<String>,
     action_key: Option<String>,
+    result_key: Option<String>,
     bytes_hashed: u64,
     bytes_restored: u64,
   ) -> Self {
     Self {
-      version: 1,
+      version: COMPILER_CACHE_WRAPPER_METADATA_VERSION,
       status,
       reason: reason.into(),
-      candidate_key,
       action_key,
+      result_key,
       bytes_hashed,
       bytes_restored,
     }
@@ -364,12 +436,12 @@ impl CompilerCacheWrapperMetadata {
     &self.reason
   }
 
-  pub(crate) fn candidate_key(&self) -> Option<&str> {
-    self.candidate_key.as_deref()
-  }
-
   pub(crate) fn action_key(&self) -> Option<&str> {
     self.action_key.as_deref()
+  }
+
+  pub(crate) fn result_key(&self) -> Option<&str> {
+    self.result_key.as_deref()
   }
 
   pub(crate) fn bytes_hashed(&self) -> u64 {
@@ -413,7 +485,7 @@ impl CompilationObservationManifest {
         .execution
         .cache_wrapper
         .as_ref()
-        .is_none_or(|metadata| metadata.version != 1)
+        .is_none_or(|metadata| metadata.version != COMPILER_CACHE_WRAPPER_METADATA_VERSION)
     {
       return Some("compilation_observation_schema_changed");
     }
@@ -1277,6 +1349,36 @@ impl InvocationRecorder {
 }
 
 pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> RailResult<()> {
+  publish_prepared_raw(prepare_raw_publication(directory, raw)?, false)
+}
+
+/// One encoded content-addressed observation prepared exactly once for a restore transaction.
+pub(crate) struct PreparedRawPublication {
+  directory: PathBuf,
+  destination: PathBuf,
+  encoded: Vec<u8>,
+  content_digest: String,
+}
+
+impl PreparedRawPublication {
+  pub(crate) fn destination(&self) -> &Path {
+    &self.destination
+  }
+
+  pub(crate) fn encoded(&self) -> &[u8] {
+    &self.encoded
+  }
+
+  pub(crate) fn content_digest(&self) -> &str {
+    &self.content_digest
+  }
+}
+
+/// Encode and bind one restored observation before transaction authorization.
+pub(crate) fn prepare_raw_publication(
+  directory: &Path,
+  raw: &RawCompilerInvocation,
+) -> RailResult<PreparedRawPublication> {
   if raw.version != RAW_INVOCATION_VERSION {
     return Err(RailError::message(
       "refusing to publish a compiler observation with an incompatible schema",
@@ -1289,34 +1391,80 @@ pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> Rail
     CompilerMode::Unknown => "compiler",
   };
   let encoded = serde_json::to_vec(raw)?;
-  let path = directory.join(format!("{compiler}-sha256-{}.json", ContentDigest::sha256(&encoded)));
+  let identity = ContentDigest::sha256(&encoded);
+  Ok(PreparedRawPublication {
+    directory: directory.to_path_buf(),
+    destination: raw_publication_path(directory, compiler, identity),
+    encoded,
+    content_digest: format!("sha256:{identity}"),
+  })
+}
+
+/// Publish prepared restore evidence durably before its transaction marker is removed.
+pub(crate) fn publish_prepared_raw_durable(publication: PreparedRawPublication) -> RailResult<()> {
+  publish_prepared_raw(publication, true)
+}
+
+fn publish_prepared_raw(publication: PreparedRawPublication, durable: bool) -> RailResult<()> {
+  let PreparedRawPublication {
+    directory,
+    destination,
+    encoded,
+    content_digest: _,
+  } = publication;
   // The parent owns this private temporary directory and reads it only after
   // Cargo has joined every wrapper. Publish immutable content-addressed bytes,
   // but do not pay durable mutation fsyncs for regenerable evidence.
+  fs::create_dir_all(&directory)?;
   let mut temporary = tempfile::Builder::new()
     .prefix(".cargo-rail-observation-")
     .suffix(".tmp")
-    .tempfile_in(directory)?;
+    .tempfile_in(&directory)?;
   temporary.write_all(&encoded)?;
-  match temporary.persist_noclobber(&path) {
-    Ok(_) => Ok(()),
+  match temporary.persist_noclobber(&destination) {
+    Ok(file) => {
+      if durable {
+        file.sync_all()?;
+        sync_observation_directory(&directory)?;
+      }
+      Ok(())
+    }
     Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-      let existing = fs::read(&path)?;
+      let existing = fs::read(&destination)?;
       if existing == encoded {
+        if durable {
+          fs::File::open(&destination)?.sync_all()?;
+          sync_observation_directory(&directory)?;
+        }
         Ok(())
       } else {
         Err(RailError::message(format!(
           "compiler observation content identity collided at '{}'",
-          path.display()
+          destination.display()
         )))
       }
     }
     Err(error) => Err(RailError::message(format!(
       "failed to publish compiler observation '{}': {}",
-      path.display(),
+      destination.display(),
       error.error
     ))),
   }
+}
+
+#[cfg(unix)]
+fn sync_observation_directory(directory: &Path) -> RailResult<()> {
+  fs::File::open(directory)?.sync_all()?;
+  Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_observation_directory(_directory: &Path) -> RailResult<()> {
+  Ok(())
+}
+
+fn raw_publication_path(directory: &Path, compiler: &str, identity: ContentDigest) -> PathBuf {
+  directory.join(format!("{compiler}-sha256-{identity}.json"))
 }
 
 /// Load all complete wrapper records from one private invocation directory.

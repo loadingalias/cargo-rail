@@ -6,7 +6,7 @@ set -euo pipefail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #
 # Generates docs/commands.md from the CLI's --help output and
-# docs/caching.md from executable support registries and reviewed benchmark evidence.
+# docs/caching.md from executable support registries and the runtime cache contract.
 #
 # Usage:
 #   ./scripts/docs/generate.sh           # Generate docs

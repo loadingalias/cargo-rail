@@ -80,7 +80,7 @@ pub use unify::{run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result of attempting to dispatch a command without building WorkspaceContext.
 #[doc(hidden)]
@@ -103,10 +103,11 @@ pub struct PreparedContext {
   command: Box<Commands>,
   preparation: ContextPreparation,
   pre_context_cache_request: bool,
+  config_override: Option<PathBuf>,
 }
 
 impl PreparedContext {
-  fn new(command: Commands, pre_context_cache_request: bool) -> RailResult<Self> {
+  fn new(command: Commands, pre_context_cache_request: bool, config_override: Option<&Path>) -> RailResult<Self> {
     let preparation = match &command {
       Commands::Run {
         actions,
@@ -149,6 +150,7 @@ impl PreparedContext {
       command: Box::new(command),
       preparation,
       pre_context_cache_request,
+      config_override: config_override.map(Path::to_path_buf),
     })
   }
 
@@ -157,14 +159,20 @@ impl PreparedContext {
   pub fn build(self, workspace_root: &Path) -> RailResult<Option<(Commands, WorkspaceContext, bool)>> {
     let context = match self.preparation {
       ContextPreparation::Standard if self.command.requires_workspace_snapshot() => {
-        WorkspaceContext::build_with_snapshot(workspace_root)
+        WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
       }
-      ContextPreparation::Standard => {
-        WorkspaceContext::build_with_source_capture(workspace_root, self.command.requires_worktree_source_capture())
-      }
+      ContextPreparation::Standard => WorkspaceContext::build_with_source_capture_and_config(
+        workspace_root,
+        self.command.requires_worktree_source_capture(),
+        self.config_override.as_deref(),
+      ),
       ContextPreparation::HermeticBuild => {
         let bootstrap = crate::hermetic::prepare_bootstrap(workspace_root)?;
-        WorkspaceContext::build_with_hermetic_snapshot(workspace_root, bootstrap)
+        WorkspaceContext::build_with_hermetic_snapshot_and_config(
+          workspace_root,
+          bootstrap,
+          self.config_override.as_deref(),
+        )
       }
     };
     let context = match context {
@@ -244,14 +252,29 @@ pub fn try_dispatch_pre_context(
       Commands::Run { print_cmd, explain, .. } => (*print_cmd, *explain),
       _ => unreachable!("pre-context cache predicate only accepts run commands"),
     };
-    match crate::hermetic::try_restore_pre_context(workspace_root)? {
-      crate::hermetic::PreContextCacheAttempt::Hit(hit) => {
-        run::complete_pre_context_cache_hit(workspace_root, *hit, print_cmd, explain)?;
-        return Ok(PreContextDispatch::Handled);
-      }
-      crate::hermetic::PreContextCacheAttempt::Miss(reason) => {
-        if explain {
-          println!("action `build` local cache precheck: miss ({reason})");
+    let captured_config = crate::config::CapturedDiscoveredConfig::capture(workspace_root)?;
+    if let Some(config) = captured_config.config() {
+      config.cache.validate().map_err(crate::error::RailError::Config)?;
+      config
+        .change_detection
+        .validate()
+        .map_err(crate::error::RailError::Config)?;
+      config
+        .unify
+        .validate(workspace_root)
+        .map_err(crate::error::RailError::Config)?;
+      config.run.validate().map_err(crate::error::RailError::Config)?;
+    }
+    if captured_config.cache_enabled() {
+      match crate::hermetic::try_restore_pre_context(workspace_root, &captured_config)? {
+        crate::hermetic::PreContextCacheAttempt::Hit(hit) => {
+          run::complete_pre_context_cache_hit(workspace_root, *hit, print_cmd, explain)?;
+          return Ok(PreContextDispatch::Handled);
+        }
+        crate::hermetic::PreContextCacheAttempt::Miss(reason) => {
+          if explain {
+            println!("action `build` local cache precheck: miss ({reason})");
+          }
         }
       }
     }
@@ -355,6 +378,7 @@ pub fn try_dispatch_pre_context(
           command: cli::ReleaseCommand::Resume { state },
         },
         false,
+        config_override,
       )?))
     }
 
@@ -367,12 +391,14 @@ pub fn try_dispatch_pre_context(
           command: cli::ReleaseCommand::Abort { state, yes },
         },
         false,
+        config_override,
       )?))
     }
 
     other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
       other,
       pre_context_cache_request,
+      config_override,
     )?)),
   }
 }

@@ -167,14 +167,25 @@ fn run_cache_disabled(
     crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
     crate::compiler::native_cache::OuterCacheAction::Store {
       recorder,
+      capture,
+      base_action_key,
       cache_bytes_read,
     } => crate::compiler::native_cache::run_and_store(
       command,
       recorder,
+      capture,
+      base_action_key,
       cache_bytes_read,
       &mut trace,
       "cargo-rail compiler cache wrapper",
     ),
+    crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {
+      eprintln!("cargo-rail compiler cache wrapper: {error}");
+      2
+    }
+    crate::compiler::native_cache::OuterCacheAction::ExecutePortable(execution) => {
+      crate::compiler::native_cache::run_portable_bypass(command, execution, "cargo-rail compiler cache wrapper")
+    }
     crate::compiler::native_cache::OuterCacheAction::Execute => {
       run_transparently(command, "cargo-rail compiler cache wrapper")
     }

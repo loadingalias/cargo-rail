@@ -530,7 +530,7 @@ impl WorkspaceContext {
   /// Returns [`RailError::Config`] if `rail.toml` exists but fails to parse.
   ///
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::None, None)
+    Self::build_inner(workspace_root, ContextCapture::None, None, None)
   }
 
   /// Build a context and optionally capture WORKTREE source before metadata loading.
@@ -541,7 +541,20 @@ impl WorkspaceContext {
     } else {
       ContextCapture::None
     };
-    Self::build_inner(workspace_root, capture, None)
+    Self::build_inner(workspace_root, capture, None, None)
+  }
+
+  pub(crate) fn build_with_source_capture_and_config(
+    workspace_root: &Path,
+    capture_source: bool,
+    config_override: Option<&Path>,
+  ) -> RailResult<Self> {
+    let capture = if capture_source {
+      ContextCapture::Worktree
+    } else {
+      ContextCapture::None
+    };
+    Self::build_inner(workspace_root, capture, None, config_override)
   }
 
   /// Build a context with one complete immutable workspace snapshot.
@@ -558,20 +571,34 @@ impl WorkspaceContext {
   /// configuration URL, or changes during capture. Cargo, rustc, rustdoc, and
   /// configured compiler-wrapper identity commands must also succeed.
   pub fn build_with_snapshot(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::Snapshot, None)
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, None, None)
   }
 
-  pub(crate) fn build_with_hermetic_snapshot(
+  pub(crate) fn build_with_snapshot_and_config(
+    workspace_root: &Path,
+    config_override: Option<&Path>,
+  ) -> RailResult<Self> {
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, None, config_override)
+  }
+
+  pub(crate) fn build_with_hermetic_snapshot_and_config(
     workspace_root: &Path,
     bootstrap: crate::hermetic::HermeticBootstrap,
+    config_override: Option<&Path>,
   ) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::Snapshot, Some(bootstrap))
+    Self::build_inner(
+      workspace_root,
+      ContextCapture::Snapshot,
+      Some(bootstrap),
+      config_override,
+    )
   }
 
   fn build_inner(
     workspace_root: &Path,
     capture: ContextCapture,
     bootstrap: Option<crate::hermetic::HermeticBootstrap>,
+    config_override: Option<&Path>,
   ) -> RailResult<Self> {
     let process_current_dir = std::env::current_dir()
       .map_err(|error| RailError::message(format!("failed to determine Cargo metadata current directory: {error}")))?;
@@ -713,17 +740,27 @@ impl WorkspaceContext {
     });
 
     // Discover once and retain the exact parsed bytes for snapshot coherence.
-    let config_path = RailConfig::find_config_path(&workspace_root);
-    let (config, rail_config) = match config_path {
+    let config_path = config_override.map_or_else(
+      || RailConfig::find_config_path(&workspace_root),
+      |path| {
+        Some(if path.is_absolute() {
+          path.to_path_buf()
+        } else {
+          requested_workspace_root.join(path)
+        })
+      },
+    );
+    let (config, rail_config, rail_config_discovery_root) = match config_path {
       Some(path) => {
         let (parsed, bytes) = RailConfig::load_path_with_bytes(&path)?;
         let parsed = Arc::new(parsed);
         (
           Some(Arc::clone(&parsed)),
           Some(CapturedRailConfig::new(path, bytes, parsed)),
+          None,
         )
       }
-      None => (None, None),
+      None => (None, None, Some(workspace_root.clone())),
     };
 
     // Validate configured targets against rustc's canonical target list
@@ -736,6 +773,9 @@ impl WorkspaceContext {
 
     // Validate config settings that require workspace context
     if let Some(ref cfg) = config {
+      // Validate build-result cache policy before any command may activate it.
+      cfg.cache.validate().map_err(RailError::Config)?;
+
       // Validate change-detection glob patterns
       cfg.change_detection.validate().map_err(RailError::Config)?;
 
@@ -778,6 +818,7 @@ impl WorkspaceContext {
         source,
         Arc::clone(&cargo),
         rail_config,
+        rail_config_discovery_root,
         captured_lockfile,
         inputs.clone(),
         target_identities,
@@ -837,6 +878,11 @@ impl WorkspaceContext {
       .as_ref()
       .and_then(WorkspaceSnapshot::shared_config)
       .or(self.config.as_ref())
+  }
+
+  /// Return whether repository policy allows Cargo-Rail build-result cache work.
+  pub(crate) fn cache_enabled(&self) -> bool {
+    self.config().is_none_or(|config| config.cache.enabled)
   }
 
   /// Return Cargo state paired with the authoritative snapshot metadata.
@@ -1019,9 +1065,19 @@ impl WorkspaceContext {
   }
 
   pub(crate) fn validate_snapshot_unchanged(&self) -> RailResult<()> {
+    self.validate_snapshot_unchanged_excluding(&[])
+  }
+
+  pub(crate) fn validate_snapshot_unchanged_excluding(&self, authorized_outputs: &[PathBuf]) -> RailResult<()> {
     let snapshot = self.snapshot()?;
     if let (Some(capture), Some(git)) = (&self.source_capture, &self.git) {
-      capture.validate_unchanged(git.git())?;
+      if authorized_outputs.is_empty() {
+        capture.validate_unchanged(git.git())?;
+      } else {
+        let mut expected = capture.as_ref().clone();
+        expected.exclude_generated_roots(git.git(), authorized_outputs)?;
+        expected.validate_unchanged(git.git())?;
+      }
     }
     snapshot.validate_live_authoritative_inputs()
   }

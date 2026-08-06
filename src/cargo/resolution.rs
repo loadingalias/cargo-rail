@@ -477,6 +477,44 @@ impl CargoConfigSnapshot {
         .any(|value| is_credential_environment_marker(value))
   }
 
+  /// Resolve Cargo's selected executable without probing the toolchain.
+  pub(crate) fn selected_cargo_program(&self, cargo_current_dir: &Path) -> RailResult<OsString> {
+    selected_program(self, cargo_current_dir, &["CARGO"], &[], Some("cargo"), "Cargo")?
+      .ok_or_else(|| RailError::message("Cargo program selection is empty"))
+  }
+
+  /// Classify Cargo's configured compiler-wrapper chain without invoking it.
+  pub(crate) fn cache_wrapper_plan(
+    &self,
+    cargo_current_dir: &Path,
+  ) -> RailResult<crate::compiler::wrapper::CacheWrapperPlan> {
+    let rustc_wrapper = selected_program(
+      self,
+      cargo_current_dir,
+      RUSTC_WRAPPER_ENV_PRECEDENCE,
+      &["build", "rustc-wrapper"],
+      None,
+      "rustc wrapper",
+    )?;
+    let workspace_wrapper = selected_program(
+      self,
+      cargo_current_dir,
+      RUSTC_WORKSPACE_WRAPPER_ENV_PRECEDENCE,
+      &["build", "rustc-workspace-wrapper"],
+      None,
+      "workspace rustc wrapper",
+    )?;
+    reject_recursive_cargo_rail_wrappers(
+      cargo_current_dir,
+      rustc_wrapper.as_deref(),
+      workspace_wrapper.as_deref(),
+    )?;
+    Ok(crate::compiler::wrapper::CacheWrapperPlan::for_chain(
+      rustc_wrapper.as_deref(),
+      workspace_wrapper.as_deref(),
+    ))
+  }
+
   pub(crate) fn repository_config_paths(&self, source_root: &Path) -> RailResult<Vec<crate::source::RepositoryPath>> {
     self
       .provenance

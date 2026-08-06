@@ -33,7 +33,6 @@ for required in environment.json run.json; do
     exit 2
   }
 done
-
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-native-report.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
 raw_samples="$temporary/raw-samples.jsonl"
@@ -144,7 +143,7 @@ jq -s \
   "$samples" >"$results/summary.json"
 
 if [[ "$mode" == summarize ]]; then
-  jq '{evidence_kind, publishable, runs, attempts, accepted_samples, rejected_samples, validity}' \
+  jq '{run_id, evidence_kind, runs, attempts, accepted_samples, rejected_samples, validity, comparisons}' \
     "$results/summary.json"
   exit 0
 fi
@@ -154,14 +153,10 @@ if ! jq -e --argjson required "$runs" '
   and .validity.minimum_accepted_samples_per_lane >= $required
   and .validity.false_hits == 0
 ' "$results/summary.json" >/dev/null; then
-  echo "native-cache benchmark has not retained $runs equivalent samples in every available lane" >&2
+  echo "native-cache benchmark has not retained $runs equivalent groups in every available lane" >&2
+  jq '{validity}' "$results/summary.json" >&2
   exit 1
 fi
 
-if [[ "$runs" -lt 1 ]]; then
-  echo "native-cache evidence requires at least one accepted sample per lane" >&2
-  exit 1
-fi
-
-jq '{evidence_kind, publishable, runs, attempts, accepted_samples, rejected_samples, validity}' \
+jq '{run_id, evidence_kind, runs, attempts, accepted_samples, rejected_samples, validity, comparisons}' \
   "$results/summary.json"

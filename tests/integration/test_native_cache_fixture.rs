@@ -48,23 +48,25 @@ fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
   Ok(())
 }
 
-fn run_cargo_rail(fixture: &Path, action: &str, cache: &Path) -> Result<String> {
-  run_cargo_rail_with_options(fixture, action, cache, true, &[])
+fn run_cargo_rail(fixture: &Path, action: &str, cache: &Path, cargo_home: &Path) -> Result<String> {
+  run_cargo_rail_with_options(fixture, action, cache, cargo_home, true, &[])
 }
 
 fn run_cargo_rail_with_environment(
   fixture: &Path,
   action: &str,
   cache: &Path,
+  cargo_home: &Path,
   environment: &[(&str, &str)],
 ) -> Result<String> {
-  run_cargo_rail_with_options(fixture, action, cache, true, environment)
+  run_cargo_rail_with_options(fixture, action, cache, cargo_home, true, environment)
 }
 
 fn run_cargo_rail_with_options(
   fixture: &Path,
   action: &str,
   cache: &Path,
+  cargo_home: &Path,
   all_features: bool,
   environment: &[(&str, &str)],
 ) -> Result<String> {
@@ -81,7 +83,9 @@ fn run_cargo_rail_with_options(
   }
   command
     .env("CARGO_RAIL_CACHE_DIR", cache)
+    .env("CARGO_HOME", cargo_home)
     .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_TERM_COLOR", "never")
     .env_remove("RUSTC_WRAPPER")
     .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
     .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -97,6 +101,181 @@ fn run_cargo_rail_with_options(
     "cargo-rail {action} failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
   );
   Ok(format!("{stdout}\n{stderr}"))
+}
+
+fn cargo_metadata(fixture: &Path, cargo_home: Option<&Path>) -> Result<serde_json::Value> {
+  let mut command = Command::new("cargo");
+  command
+    .current_dir(fixture)
+    .args([
+      "metadata",
+      "--locked",
+      "--offline",
+      "--all-features",
+      "--format-version=1",
+    ])
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+  if let Some(cargo_home) = cargo_home {
+    command.env("CARGO_HOME", cargo_home);
+  }
+  let output = command.output()?;
+  ensure!(
+    output.status.success(),
+    "fixture metadata failed:\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  serde_json::from_slice(&output.stdout).context("decode fixture metadata")
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+  let metadata = fs::symlink_metadata(source)?;
+  ensure!(
+    metadata.is_dir(),
+    "fixture cache source is not a directory: {}",
+    source.display()
+  );
+  ensure!(
+    !destination.exists(),
+    "fixture cache destination already exists: {}",
+    destination.display()
+  );
+  fs::create_dir_all(destination)?;
+  let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+  entries.sort_by_key(std::fs::DirEntry::file_name);
+  for entry in entries {
+    let source = entry.path();
+    let destination = destination.join(entry.file_name());
+    let metadata = fs::symlink_metadata(&source)?;
+    ensure!(
+      !metadata.file_type().is_symlink(),
+      "fixture cache source contains a symlink: {}",
+      source.display()
+    );
+    if metadata.is_dir() {
+      copy_tree(&source, &destination)?;
+    } else {
+      ensure!(
+        metadata.is_file(),
+        "fixture cache source is not a regular file: {}",
+        source.display()
+      );
+      fs::copy(&source, &destination)?;
+    }
+  }
+  fs::set_permissions(destination, metadata.permissions())?;
+  Ok(())
+}
+
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+  ensure!(
+    source.is_file(),
+    "fixture cache source is not a file: {}",
+    source.display()
+  );
+  if destination.exists() {
+    return Ok(());
+  }
+  fs::create_dir_all(destination.parent().context("fixture cache file parent")?)?;
+  fs::copy(source, destination)?;
+  Ok(())
+}
+
+fn registry_index_path(crate_name: &str) -> Result<PathBuf> {
+  ensure!(
+    crate_name.is_ascii() && !crate_name.is_empty(),
+    "fixture registry package has an invalid name: {crate_name}"
+  );
+  Ok(match crate_name.len() {
+    1 => PathBuf::from("1").join(crate_name),
+    2 => PathBuf::from("2").join(crate_name),
+    3 => PathBuf::from("3").join(&crate_name[..1]).join(crate_name),
+    _ => PathBuf::from(&crate_name[..2]).join(&crate_name[2..4]).join(crate_name),
+  })
+}
+
+fn seed_isolated_cargo_home(fixture: &Path, cargo_home: &Path) -> Result<()> {
+  let metadata = cargo_metadata(fixture, None)?;
+  let packages = metadata["packages"].as_array().context("fixture metadata packages")?;
+  fs::create_dir_all(cargo_home)?;
+  for package in packages {
+    let Some(source) = package["source"].as_str() else {
+      continue;
+    };
+    let manifest = PathBuf::from(
+      package["manifest_path"]
+        .as_str()
+        .context("fixture package manifest path")?,
+    );
+    if source.starts_with("registry+") {
+      let package_source = manifest.parent().context("fixture registry package root")?;
+      let index_name = package_source
+        .parent()
+        .and_then(Path::file_name)
+        .context("fixture registry source index")?;
+      let registry_root = package_source
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .context("ambient Cargo registry root")?;
+      let package_name = package["name"].as_str().context("fixture registry package name")?;
+      let package_version = package["version"]
+        .as_str()
+        .context("fixture registry package version")?;
+      let cache_index = registry_root.join("cache").join(index_name);
+      let sparse_index = registry_root.join("index").join(index_name);
+      let destination_source_index = cargo_home.join("registry/src").join(index_name);
+      fs::create_dir_all(&destination_source_index)?;
+      copy_tree(
+        package_source,
+        &destination_source_index.join(package_source.file_name().context("package source")?),
+      )?;
+      copy_file(
+        &cache_index.join(format!("{package_name}-{package_version}.crate")),
+        &cargo_home
+          .join("registry/cache")
+          .join(index_name)
+          .join(format!("{package_name}-{package_version}.crate")),
+      )?;
+      copy_file(
+        &sparse_index.join("config.json"),
+        &cargo_home.join("registry/index").join(index_name).join("config.json"),
+      )?;
+      let index_path = registry_index_path(package_name)?;
+      copy_file(
+        &sparse_index.join(".cache").join(&index_path),
+        &cargo_home
+          .join("registry/index")
+          .join(index_name)
+          .join(".cache")
+          .join(index_path),
+      )?;
+    } else if source.starts_with("git+") {
+      let checkout = manifest
+        .ancestors()
+        .find(|ancestor| ancestor.join(".cargo-ok").is_file())
+        .context("ambient Cargo Git checkout root")?;
+      let repository = checkout.parent().context("ambient Cargo Git repository checkout")?;
+      let repository_name = repository.file_name().context("ambient Cargo Git repository name")?;
+      let git_root = repository
+        .parent()
+        .and_then(Path::parent)
+        .context("ambient Cargo Git root")?;
+      let destination_checkout = cargo_home.join("git/checkouts").join(repository_name);
+      if !destination_checkout.exists() {
+        copy_tree(repository, &destination_checkout)?;
+      }
+      let destination_database = cargo_home.join("git/db").join(repository_name);
+      if !destination_database.exists() {
+        copy_tree(&git_root.join("db").join(repository_name), &destination_database)?;
+      }
+    }
+  }
+  cargo_metadata(fixture, Some(cargo_home))?;
+  Ok(())
 }
 
 fn cache_metric(output: &str, name: &str) -> Result<u64> {
@@ -121,10 +300,10 @@ fn reusable_cache_units(output: &str) -> Result<BTreeMap<String, serde_json::Val
       .map(|(_, event)| event)
   }) {
     let event = serde_json::from_str::<serde_json::Value>(event)?;
-    if !event["action_key"].is_string() || !matches!(event["outcome"].as_str(), Some("hit" | "miss")) {
+    if !event["unit_identity"].is_string() || !matches!(event["outcome"].as_str(), Some("hit" | "miss")) {
       continue;
     }
-    ensure!(event["schema_version"] == 4, "unexpected native-cache event: {event}");
+    ensure!(event["schema_version"] == 5, "unexpected native-cache event: {event}");
     ensure!(
       event["unit"].is_object(),
       "native-cache event lacks unit evidence: {event}"
@@ -177,6 +356,277 @@ fn reusable_output_digests(root: &Path, target: &Path, report: &str) -> Result<B
     }
   }
   Ok(outputs)
+}
+
+fn reusable_output_paths(
+  root: &Path,
+  target: &Path,
+  units: &BTreeMap<String, serde_json::Value>,
+  selected: &BTreeSet<String>,
+) -> Result<BTreeSet<PathBuf>> {
+  units
+    .iter()
+    .filter(|(identity, _)| selected.contains(*identity))
+    .flat_map(|(_, event)| {
+      event["unit"]["output_paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path["path"].as_str())
+        .chain(
+          event["unit"]["observed_outputs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|output| output["path"]["path"].as_str()),
+        )
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>()
+    })
+    .map(|path| {
+      root
+        .join(path)
+        .strip_prefix(target)
+        .map(Path::to_path_buf)
+        .with_context(|| "native-cache output escaped target directory".to_string())
+    })
+    .collect()
+}
+
+fn reusable_compiler_output_digests(event: &serde_json::Value) -> BTreeMap<&str, &str> {
+  event["unit"]["observed_outputs"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .filter_map(|output| {
+      let path = output["path"]["path"].as_str()?;
+      let digest = output["content_digest"].as_str()?;
+      (Path::new(path).extension().and_then(|extension| extension.to_str()) != Some("d")).then_some((path, digest))
+    })
+    .collect()
+}
+
+fn unit_by_crate_name<'a>(
+  units: &'a BTreeMap<String, serde_json::Value>,
+  crate_name: &str,
+) -> Result<(&'a str, &'a serde_json::Value)> {
+  let matches = units
+    .iter()
+    .filter(|(_, event)| event["unit"]["descriptor"]["crate_name"] == crate_name)
+    .collect::<Vec<_>>();
+  ensure!(
+    matches.len() == 1,
+    "expected exactly one reusable '{crate_name}' unit, found {}: {matches:#?}",
+    matches.len()
+  );
+  Ok((matches[0].0.as_str(), matches[0].1))
+}
+
+fn identity_hex(identity: &str) -> Result<&str> {
+  let hex = identity
+    .rsplit_once("-sha256-")
+    .map(|(_, hex)| hex)
+    .context("cache identity lacks a SHA-256 suffix")?;
+  ensure!(
+    hex.len() == 64
+      && hex
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+    "cache identity has an invalid SHA-256 suffix: {identity}"
+  );
+  Ok(hex)
+}
+
+fn canonical_result_evidence(cache: &Path, action_key: &str) -> Result<serde_json::Value> {
+  let cas = cache.join("cargo-rail/local-cas-v2");
+  let state_path = cas
+    .join("native-actions-v2")
+    .join(format!("{}.json", identity_hex(action_key)?));
+  let state: serde_json::Value = serde_json::from_slice(
+    &fs::read(&state_path).with_context(|| format!("read native action state {}", state_path.display()))?,
+  )?;
+  ensure!(
+    state["action_key"] == action_key,
+    "native action state changed identity: {state}"
+  );
+  ensure!(
+    state["state"]["kind"] == "unique_result",
+    "native action is not uniquely reusable: {state}"
+  );
+  let action_result = state["state"]["action_result"]
+    .as_str()
+    .context("native action state lacks its immutable result")?;
+  let validation_directory = cas
+    .join("results")
+    .join(identity_hex(action_result)?)
+    .join("validations");
+  let mut validations = fs::read_dir(&validation_directory)?
+    .collect::<Result<Vec<_>, _>>()?
+    .into_iter()
+    .map(|entry| entry.path())
+    .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+    .collect::<Vec<_>>();
+  validations.sort_unstable();
+  ensure!(
+    validations.len() == 1,
+    "native result must contain exactly one validation: {validation_directory:?}"
+  );
+  let validation: serde_json::Value = serde_json::from_slice(&fs::read(&validations[0])?)?;
+  ensure!(
+    validation["action_key"] == action_key,
+    "native validation changed action identity: {validation}"
+  );
+  Ok(serde_json::json!({
+    "result_key": validation["result_key"],
+    "outputs": validation["outputs"],
+    "stdout_digest": validation["stdout_digest"],
+    "stdout_bytes": validation["stdout_bytes"],
+    "stderr_digest": validation["stderr_digest"],
+    "stderr_bytes": validation["stderr_bytes"],
+  }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PhysicalOutputEvidence {
+  content_digest: String,
+  bytes: u64,
+  mode: u32,
+}
+
+#[cfg(unix)]
+fn output_mode(metadata: &fs::Metadata) -> u32 {
+  use std::os::unix::fs::PermissionsExt as _;
+  metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn output_mode(metadata: &fs::Metadata) -> u32 {
+  if metadata.permissions().readonly() {
+    0o444
+  } else {
+    0o644
+  }
+}
+
+fn replace_bytes(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+  if needle.is_empty() {
+    return bytes.to_vec();
+  }
+  let mut replaced = Vec::with_capacity(bytes.len());
+  let mut remaining = bytes;
+  while let Some(index) = remaining.windows(needle.len()).position(|window| window == needle) {
+    replaced.extend_from_slice(&remaining[..index]);
+    replaced.extend_from_slice(replacement);
+    remaining = &remaining[index + needle.len()..];
+  }
+  replaced.extend_from_slice(remaining);
+  replaced
+}
+
+fn root_spellings(path: &Path) -> BTreeSet<Vec<u8>> {
+  let mut spellings = BTreeSet::from([path.to_string_lossy().as_bytes().to_vec()]);
+  if let Ok(canonical) = fs::canonicalize(path) {
+    spellings.insert(canonical.to_string_lossy().as_bytes().to_vec());
+  }
+  for spelling in spellings.clone() {
+    spellings.insert(String::from_utf8_lossy(&spelling).replace('\\', "/").into_bytes());
+  }
+  spellings
+}
+
+fn normalize_dep_info(bytes: &[u8], workspace: &Path, cargo_home: &Path) -> Vec<u8> {
+  let mut bindings = root_spellings(workspace)
+    .into_iter()
+    .map(|spelling| (spelling, b"$WORKSPACE".to_vec()))
+    .chain(
+      root_spellings(cargo_home)
+        .into_iter()
+        .map(|spelling| (spelling, b"$CARGO_HOME".to_vec())),
+    )
+    .collect::<Vec<_>>();
+  bindings.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.0.cmp(&right.0)));
+  bindings
+    .into_iter()
+    .fold(bytes.to_vec(), |bytes, (spelling, replacement)| {
+      replace_bytes(&bytes, &spelling, &replacement)
+    })
+}
+
+fn unit_output_evidence(
+  root: &Path,
+  cargo_home: &Path,
+  identity: &str,
+  event: &serde_json::Value,
+) -> Result<BTreeMap<PathBuf, PhysicalOutputEvidence>> {
+  let units = BTreeMap::from([(identity.to_string(), event.clone())]);
+  let selected = BTreeSet::from([identity.to_string()]);
+  let target = root.join("target");
+  let paths = reusable_output_paths(root, &target, &units, &selected)?;
+  let mut evidence = BTreeMap::new();
+  for relative in paths {
+    let physical = target.join(&relative);
+    if !physical.is_file() {
+      continue;
+    }
+    let metadata = fs::symlink_metadata(&physical)?;
+    let bytes = fs::read(&physical)?;
+    let dep_info = physical.extension().is_some_and(|extension| extension == "d");
+    let identity_bytes = if dep_info {
+      normalize_dep_info(&bytes, root, cargo_home)
+    } else {
+      bytes
+    };
+    let identity_bytes_len = identity_bytes.len() as u64;
+    let content_digest = Sha256::digest(identity_bytes)
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    ensure!(
+      evidence
+        .insert(
+          relative.clone(),
+          PhysicalOutputEvidence {
+            content_digest,
+            bytes: if dep_info { identity_bytes_len } else { metadata.len() },
+            mode: output_mode(&metadata),
+          },
+        )
+        .is_none(),
+      "duplicate physical output evidence: {}",
+      relative.display()
+    );
+  }
+  Ok(evidence)
+}
+
+fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
+  let path = fixture.join("crates/fixture-types/src/lib.rs");
+  let mut source = fs::read_to_string(&path)?;
+  source.push_str(
+    "\n/// Emit a stable compiler diagnostic whose source path must follow the active root.\n\
+     pub fn cargo_rail_diagnostic() -> u64 {\n\
+       let cargo_rail_current_root = 0_u64;\n\
+       0\n\
+     }\n",
+  );
+  fs::write(path, source)?;
+  Ok(())
+}
+
+fn current_root_diagnostic(output: &str) -> Result<String> {
+  let lines = output.lines().collect::<Vec<_>>();
+  let start = lines
+    .iter()
+    .position(|line| line.contains("unused variable: `cargo_rail_current_root`"))
+    .with_context(|| format!("fixture compiler diagnostic was not replayed:\n{output}"))?;
+  Ok(
+    lines[start..]
+      .iter()
+      .take_while(|line| !line.trim().is_empty())
+      .copied()
+      .collect::<Vec<_>>()
+      .join("\n"),
+  )
 }
 
 fn output_difference(
@@ -244,23 +694,29 @@ fn executable(path: PathBuf) -> PathBuf {
 }
 
 #[test]
-fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result<()> {
+fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Result<()> {
   let root = tempfile::tempdir()?;
   let first = root.path().join("first");
   let second = root.path().join("second");
   let git_source = root.path().join("git-source");
   let check_cache = root.path().join("check-cache");
+  let forced_cold_cache = root.path().join("forced-cold-cache");
+  let first_cargo_home = root.path().join("first-cargo-home");
+  let second_cargo_home = root.path().join("second-cargo-home");
   materialize_fixture(&first, &git_source)?;
   materialize_fixture(&second, &git_source)?;
+  add_current_root_diagnostic(&first)?;
+  add_current_root_diagnostic(&second)?;
+  seed_isolated_cargo_home(&first, &first_cargo_home)?;
+  seed_isolated_cargo_home(&second, &second_cargo_home)?;
 
-  let first_cold = run_cargo_rail(&first, "build", &check_cache)?;
+  let first_cold = run_cargo_rail(&first, "build", &check_cache, &first_cargo_home)?;
   ensure!(cache_metric(&first_cold, "hits")? == 0, "{first_cold}");
   ensure!(cache_metric(&first_cold, "misses")? >= 12, "{first_cold}");
   ensure!(cache_metric(&first_cold, "cache_bytes_written")? > 0, "{first_cold}");
   let first_units = reusable_cache_units(&first_cold)?;
-  let first_outputs = reusable_output_digests(&first, &first.join("target"), &first_cold)?;
 
-  let second_cold = run_cargo_rail(&second, "build", &check_cache)?;
+  let second_cold = run_cargo_rail(&second, "build", &forced_cold_cache, &second_cargo_home)?;
   ensure!(cache_metric(&second_cold, "hits")? == 0, "{second_cold}");
   ensure!(cache_metric(&second_cold, "misses")? >= 12, "{second_cold}");
   ensure!(cache_metric(&second_cold, "cache_bytes_written")? > 0, "{second_cold}");
@@ -268,36 +724,148 @@ fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result
   let overlapping_units = first_units
     .keys()
     .filter(|identity| second_units.contains_key(*identity))
-    .collect::<Vec<_>>();
+    .cloned()
+    .collect::<BTreeSet<_>>();
   ensure!(
-    overlapping_units.is_empty(),
-    "opaque compiler outputs reused source-root-independent identities: {overlapping_units:#?}"
+    !overlapping_units.is_empty(),
+    "no compiler action crossed isolated roots"
   );
-  let second_outputs = reusable_output_digests(&second, &second.join("target"), &second_cold)?;
-  ensure!(
-    first_outputs != second_outputs,
-    "the fixture must expose rustc's physical source-root binding"
-  );
+  for identity in &overlapping_units {
+    let first_digests = reusable_compiler_output_digests(&first_units[identity]);
+    let second_digests = reusable_compiler_output_digests(&second_units[identity]);
+    ensure!(
+      first_digests == second_digests,
+      "portable action {identity} ({:?}) produced different forced-cold compiler artifacts:\n\
+       first={first_digests:#?}\nsecond={second_digests:#?}",
+      first_units[identity]["unit"]["descriptor"]["crate_name"],
+    );
+  }
+  for (source_class, crate_name) in [
+    ("workspace", "fixture_service_a"),
+    ("registry", "regex_syntax"),
+    ("Git", "fixture_git"),
+  ] {
+    let (first_identity, first_event) = unit_by_crate_name(&first_units, crate_name)?;
+    let (second_identity, second_event) = unit_by_crate_name(&second_units, crate_name)?;
+    ensure!(
+      first_identity == second_identity,
+      "{source_class} unit '{crate_name}' changed action identity across isolated roots: \
+       {first_identity} != {second_identity}\nfirst={first_event:#?}\nsecond={second_event:#?}"
+    );
+    let first_result = first_event["result_key"]
+      .as_str()
+      .context("first forced-cold event lacks result identity")?;
+    let second_result = second_event["result_key"]
+      .as_str()
+      .context("second forced-cold event lacks result identity")?;
+    ensure!(
+      first_result == second_result,
+      "{source_class} unit '{crate_name}' changed result identity across isolated roots: \
+       {first_result} != {second_result}"
+    );
+    ensure!(
+      canonical_result_evidence(&check_cache, first_identity)?
+        == canonical_result_evidence(&forced_cold_cache, second_identity)?,
+      "{source_class} unit '{crate_name}' changed canonical outputs, modes, dep-info, or streams"
+    );
+    let first_outputs = unit_output_evidence(&first, &first_cargo_home, first_identity, first_event)?;
+    let second_outputs = unit_output_evidence(&second, &second_cargo_home, second_identity, second_event)?;
+    ensure!(
+      first_outputs == second_outputs,
+      "{source_class} unit '{crate_name}' changed physical output bytes, modes, or normalized dep-info: \
+       first={first_outputs:#?}\nsecond={second_outputs:#?}"
+    );
+    ensure!(
+      first_outputs
+        .keys()
+        .any(|path| path.extension().is_some_and(|extension| extension == "d")),
+      "{source_class} unit '{crate_name}' did not expose dep-info"
+    );
+  }
+  let portable_paths = reusable_output_paths(&second, &second.join("target"), &second_units, &overlapping_units)?;
+  let second_outputs = output_digests_at(&second.join("target"), portable_paths.iter())?;
 
   fs::remove_dir_all(second.join("target"))?;
-  let second_warm = run_cargo_rail(&second, "build", &check_cache)?;
+  let second_warm = run_cargo_rail(&second, "build", &check_cache, &second_cargo_home)?;
+  let warm_units = reusable_cache_units(&second_warm)?;
   let check_hits = cache_metric(&second_warm, "hits")?;
   ensure!(
-    check_hits == cache_metric(&second_cold, "hits")? + cache_metric(&second_cold, "misses")?,
-    "warm check must restore every cold cache publication:\ncold:\n{second_cold}\nwarm:\n{second_warm}"
+    check_hits == overlapping_units.len() as u64,
+    "arbitrary-root reuse restored an unexpected action set:\nfirst cold:\n{first_cold}\nsecond forced cold:\n{second_cold}\nsecond reuse:\n{second_warm}"
   );
   ensure!(
     cache_metric(&second_warm, "bypasses")? == cache_metric(&second_cold, "bypasses")?,
     "warm check changed the cold bypass set:\ncold:\n{second_cold}\nwarm:\n{second_warm}"
   );
-  ensure!(cache_metric(&second_warm, "misses")? == 0, "{second_warm}");
+  ensure!(
+    cache_metric(&second_warm, "misses")? == second_units.len().saturating_sub(overlapping_units.len()) as u64,
+    "{second_warm}"
+  );
+  for (identity, event) in &warm_units {
+    let equivalent = overlapping_units.contains(identity);
+    ensure!(
+      (event["outcome"] == "hit") == equivalent,
+      "action {identity} crossed roots without equivalent forced-cold artifacts: {event}"
+    );
+  }
+  for (source_class, crate_name) in [
+    ("workspace", "fixture_service_a"),
+    ("registry", "regex_syntax"),
+    ("Git", "fixture_git"),
+  ] {
+    let (cold_identity, cold_event) = unit_by_crate_name(&second_units, crate_name)?;
+    let (warm_identity, warm_event) = unit_by_crate_name(&warm_units, crate_name)?;
+    ensure!(
+      cold_identity == warm_identity,
+      "warm {source_class} unit '{crate_name}' changed action identity"
+    );
+    ensure!(
+      warm_event["outcome"] == "hit",
+      "warm {source_class} unit '{crate_name}' did not hit: {warm_event}"
+    );
+    ensure!(
+      warm_event["result_key"] == cold_event["result_key"],
+      "warm {source_class} unit '{crate_name}' restored a different result: {warm_event}"
+    );
+  }
+  let cold_diagnostic = current_root_diagnostic(&second_cold)?;
+  let warm_diagnostic = current_root_diagnostic(&second_warm)?;
+  ensure!(
+    warm_diagnostic == cold_diagnostic,
+    "a cache hit changed the current-root compiler diagnostic:\ncold:\n{cold_diagnostic}\nwarm:\n{warm_diagnostic}"
+  );
+  ensure!(
+    warm_diagnostic.contains("crates/fixture-types/src/lib.rs"),
+    "compiler diagnostic is not rooted at the current workspace: {warm_diagnostic}"
+  );
+  for stale in root_spellings(&first)
+    .into_iter()
+    .chain(root_spellings(&first_cargo_home))
+  {
+    let stale = String::from_utf8_lossy(&stale);
+    ensure!(
+      !second_warm.contains(stale.as_ref()),
+      "arbitrary-root reuse leaked the first root into current diagnostics: {stale}"
+    );
+  }
+  ensure!(
+    root_spellings(&second)
+      .into_iter()
+      .any(|current| second_warm.contains(String::from_utf8_lossy(&current).as_ref())),
+    "arbitrary-root reuse did not report the current workspace root:\n{second_warm}"
+  );
   let check_bytes_restored = cache_metric(&second_warm, "bytes_restored")?;
   ensure!(check_bytes_restored > 0, "{second_warm}");
   ensure!(
     cache_metric(&second_warm, "cache_bytes_read")? >= check_bytes_restored,
     "{second_warm}"
   );
-  ensure!(cache_metric(&second_warm, "cache_bytes_written")? == 0, "{second_warm}");
+  let warm_misses = cache_metric(&second_warm, "misses")?;
+  let warm_bytes_written = cache_metric(&second_warm, "cache_bytes_written")?;
+  ensure!(
+    (warm_misses == 0) == (warm_bytes_written == 0),
+    "warm publication bytes do not match the remaining cold action set: {second_warm}"
+  );
   let warm_outputs = output_digests_at(&second.join("target"), second_outputs.keys())?;
   ensure!(
     warm_outputs == second_outputs,
@@ -327,8 +895,13 @@ fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result
   } else {
     "/".to_string()
   };
-  let sdk_mutation =
-    run_cargo_rail_with_environment(&second, "build", &check_cache, &[("SDKROOT", sdk_root.as_str())])?;
+  let sdk_mutation = run_cargo_rail_with_environment(
+    &second,
+    "build",
+    &check_cache,
+    &second_cargo_home,
+    &[("SDKROOT", sdk_root.as_str())],
+  )?;
   ensure!(cache_metric(&sdk_mutation, "hits")? == 0, "{sdk_mutation}");
 
   fs::remove_dir_all(second.join("target"))?;
@@ -336,12 +909,14 @@ fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result
     &second,
     "build",
     &check_cache,
+    &second_cargo_home,
     &[("LD", "/cargo-rail/not-used-by-graduated-library-units")],
   )?;
   ensure!(cache_metric(&linker_mutation, "hits")? == 0, "{linker_mutation}");
 
   fs::remove_dir_all(first.join("target"))?;
-  let release_default = run_cargo_rail_with_options(&first, "distribution", &check_cache, false, &[])?;
+  let release_default =
+    run_cargo_rail_with_options(&first, "distribution", &check_cache, &first_cargo_home, false, &[])?;
   ensure!(cache_metric(&release_default, "misses")? >= 8, "{release_default}");
   ensure!(
     cache_metric(&release_default, "cache_bytes_written")? > 0,
@@ -353,7 +928,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result
   ensure!(String::from_utf8_lossy(&default_output.stdout).trim() == "101");
 
   fs::remove_dir_all(first.join("target"))?;
-  let feature_cold = run_cargo_rail(&first, "distribution", &check_cache)?;
+  let feature_cold = run_cargo_rail(&first, "distribution", &check_cache, &first_cargo_home)?;
   ensure!(cache_metric(&feature_cold, "misses")? >= 8, "{feature_cold}");
   let feature_binary = executable(first.join("target/release/fixture-cli"));
   let feature_output = Command::new(&feature_binary).output()?;
@@ -362,7 +937,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_within_clean_roots() -> Result
   let feature_outputs = reusable_output_digests(&first, &first.join("target/release"), &feature_cold)?;
 
   fs::remove_dir_all(first.join("target"))?;
-  let feature_warm = run_cargo_rail(&first, "distribution", &check_cache)?;
+  let feature_warm = run_cargo_rail(&first, "distribution", &check_cache, &first_cargo_home)?;
   let build_hits = cache_metric(&feature_warm, "hits")?;
   ensure!(
     build_hits == cache_metric(&feature_cold, "hits")? + cache_metric(&feature_cold, "misses")?,

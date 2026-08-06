@@ -35,6 +35,16 @@ fn generate_lockfile_with_env(workspace: &Path, environment: &[(&str, &str)]) ->
   Ok(())
 }
 
+fn native_cache_test_toolchain_is_pinned() -> Result<bool> {
+  let release = env!("CARGO_PKG_RUST_VERSION");
+  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
+  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
+  Ok(
+    String::from_utf8_lossy(&rustc.stdout).starts_with(&format!("rustc {release} "))
+      && String::from_utf8_lossy(&cargo.stdout).starts_with(&format!("cargo {release} ")),
+  )
+}
+
 #[cfg(target_os = "macos")]
 fn assert_materialized_output_matches_manifest(root: &Path, manifest: &serde_json::Value) -> Result<()> {
   fn collect(root: &Path, directory: &Path, paths: &mut Vec<String>) -> Result<()> {
@@ -1510,6 +1520,10 @@ fn main() {
   } else {
     std::fs::create_dir_all(output.parent().expect("output parent")).expect("create output directory");
     std::fs::write(output, expected).expect("write generated output");
+    if action == "prepare" && std::env::var_os("WRITE_UNPLANNED").is_some() {
+      std::fs::write(Path::new(&root).join("unplanned.txt"), "outside declared outputs\n")
+        .expect("write unplanned output");
+    }
   }
 }
 "#,
@@ -1573,7 +1587,11 @@ actions = ["finish"]
     &[("TEST_ACTION_SECRET", SECRET)],
   )?;
   let stdout = String::from_utf8_lossy(&regenerate.stdout);
-  assert!(regenerate.status.success(), "generator pipeline failed:\n{stdout}");
+  let stderr = String::from_utf8_lossy(&regenerate.stderr);
+  assert!(
+    regenerate.status.success(),
+    "generator pipeline failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+  );
   let prepare_index = stdout.find("prepare: cargo run").expect("prepare preview");
   let finish_index = stdout.find("finish: cargo run").expect("finish preview");
   assert!(prepare_index < finish_index, "dependency must run before its owner");
@@ -1656,6 +1674,29 @@ actions = ["finish"]
     .collect::<std::io::Result<Vec<_>>>()?;
   assert!(receipts.iter().any(|receipt| receipt.contains("TEST_ACTION_SECRET")));
   assert!(receipts.iter().all(|receipt| !receipt.contains(SECRET)));
+
+  let unplanned = run_cargo_rail_with_env(
+    &ws.path,
+    &[
+      "rail",
+      "run",
+      "--all",
+      "--profile",
+      "pipeline",
+      "--generated",
+      "regenerate",
+    ],
+    &[("TEST_ACTION_SECRET", SECRET), ("WRITE_UNPLANNED", "1")],
+  )?;
+  assert_eq!(
+    unplanned.status.code(),
+    Some(2),
+    "undeclared generator output must fail closed"
+  );
+  assert!(
+    String::from_utf8_lossy(&unplanned.stderr).contains("Git worktree status changed during source capture"),
+    "undeclared generator output escaped snapshot validation: {unplanned:?}"
+  );
 
   Ok(())
 }
@@ -1945,7 +1986,22 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
   ws.add_crate("cache-bypass", "0.1.0", &[])?;
   ws.commit("Add native cache bypass fixture")?;
 
-  let disabled = run_cargo_rail(
+  let cache = tempfile::tempdir()?;
+  let hostile_l1 = cache.path().join("cargo-rail/local-cas-v2");
+  fs::create_dir_all(hostile_l1.parent().expect("local CAS parent"))?;
+  fs::write(&hostile_l1, b"must remain untouched")?;
+  let targets = tempfile::tempdir()?;
+  let malformed_targets = targets.path().join("cache-targets.json");
+  fs::write(&malformed_targets, b"{}")?;
+  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nl2 = \"team\"\n")?;
+  let cache_path = cache.path().to_string_lossy().into_owned();
+  let targets_path = malformed_targets.to_string_lossy().into_owned();
+  let cache_environment = [
+    ("CARGO_RAIL_CACHE_DIR", cache_path.as_str()),
+    ("CARGO_RAIL_CACHE_TARGETS_FILE", targets_path.as_str()),
+  ];
+
+  let disabled = run_cargo_rail_with_env(
     &ws.path,
     &[
       "rail",
@@ -1956,8 +2012,9 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
       "--no-cache",
       "--explain",
       "--",
-      "--quiet",
+      "-vv",
     ],
+    &cache_environment,
   )?;
   assert!(
     disabled.status.success(),
@@ -1970,7 +2027,42 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
     "the explicit opt-out must win: {}",
     String::from_utf8_lossy(&disabled.stdout)
   );
+  assert_eq!(fs::read(&hostile_l1)?, b"must remain untouched");
+  assert!(
+    !String::from_utf8_lossy(&disabled.stderr).contains("cargo-rail-native-rustc-wrapper"),
+    "--no-cache must not install Cargo-Rail's compiler wrapper: {}",
+    String::from_utf8_lossy(&disabled.stderr)
+  );
 
+  fs::write(
+    ws.path.join(".config/rail.toml"),
+    "[cache]\nenabled = false\nl2 = \"team\"\n",
+  )?;
+  fs::remove_dir_all(ws.path.join("target"))?;
+  let configured_disabled = run_cargo_rail_with_env(
+    &ws.path,
+    &["rail", "run", "--all", "--action", "build", "--explain", "--", "-vv"],
+    &cache_environment,
+  )?;
+  assert!(
+    configured_disabled.status.success(),
+    "repository-disabled native-cache run failed: {}",
+    String::from_utf8_lossy(&configured_disabled.stderr)
+  );
+  assert!(
+    String::from_utf8_lossy(&configured_disabled.stdout)
+      .contains("native compiler cache: bypassed (native_cache_disabled_by_configuration)"),
+    "repository policy must win: {}",
+    String::from_utf8_lossy(&configured_disabled.stdout)
+  );
+  assert_eq!(fs::read(&hostile_l1)?, b"must remain untouched");
+  assert!(
+    !String::from_utf8_lossy(&configured_disabled.stderr).contains("cargo-rail-native-rustc-wrapper"),
+    "disabled repository policy must not install Cargo-Rail's compiler wrapper: {}",
+    String::from_utf8_lossy(&configured_disabled.stderr)
+  );
+
+  fs::write(ws.path.join(".config/rail.toml"), "")?;
   fs::remove_dir_all(ws.path.join("target"))?;
   let configured = run_cargo_rail(
     &ws.path,
@@ -2088,11 +2180,7 @@ fn test_native_cache_uses_clean_root_dependencies_without_global_incremental_con
   ) {
     return Ok(());
   }
-  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
-  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
-  if !String::from_utf8_lossy(&rustc.stdout).starts_with("rustc 1.97.1 ")
-    || !String::from_utf8_lossy(&cargo.stdout).starts_with("cargo 1.97.1 ")
-  {
+  if !native_cache_test_toolchain_is_pinned()? {
     return Ok(());
   }
 
@@ -2185,11 +2273,7 @@ fn test_native_cache_bypasses_binary_only_workload_before_toolchain_hashing() ->
   ) {
     return Ok(());
   }
-  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
-  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
-  if !String::from_utf8_lossy(&rustc.stdout).starts_with("rustc 1.97.1 ")
-    || !String::from_utf8_lossy(&cargo.stdout).starts_with("cargo 1.97.1 ")
-  {
+  if !native_cache_test_toolchain_is_pinned()? {
     return Ok(());
   }
 
@@ -2326,9 +2410,9 @@ fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_val
   assert_eq!(report["exit_code"], 0);
 
   let capability = &report["capability"];
-  assert_eq!(capability["schema_version"], 3);
+  assert_eq!(capability["schema_version"], 5);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v4");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v8");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]
@@ -2342,6 +2426,7 @@ fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_val
   );
   assert!(capability.get("certified").is_none());
   assert!(capability.get("evidence").is_none());
+  assert!(report["remote"].is_null());
   assert!(
     !ws.path.join("target/cargo-rail/receipts").exists(),
     "read-only native-cache diagnosis must not write a run receipt"
@@ -2582,7 +2667,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     );
 
     let counters: serde_json::Value = serde_json::from_slice(&fs::read(&hit_diagnostics)?)?;
-    assert_eq!(counters["schema_version"], 7);
+    assert_eq!(counters["schema_version"], 10);
     assert_eq!(
       counters["cargo_metadata_loads"], 0,
       "a cache hit must not execute Cargo metadata"
@@ -2765,7 +2850,7 @@ fn test_local_action_cache_corruption_disable_and_cleanup_fail_closed() -> Resul
     "cold cache population failed:\n{}",
     String::from_utf8_lossy(&cold.stderr)
   );
-  let cas_root = cache.path().join("cargo-rail/local-cas-v1");
+  let cas_root = cache.path().join("cargo-rail/local-cas-v2");
   let preview = run_cargo_rail_with_env(&ws.path, &["rail", "clean", "--cache", "--check"], &environment)?;
   assert_eq!(preview.status.code(), Some(1), "cache preview must report work");
   assert!(
@@ -2821,6 +2906,34 @@ fn test_local_action_cache_corruption_disable_and_cleanup_fail_closed() -> Resul
       && disabled_stdout.contains("cargo_check_executed=true compiler_units_executed=true"),
     "disabled explanation must identify the cold execution:\n{disabled_stdout}"
   );
+  assert!(
+    !disabled_stdout.contains("local cache precheck"),
+    "--no-cache must skip the process-free L1 path:\n{disabled_stdout}"
+  );
+
+  let held_cas = cache.path().join("held-local-cas-v2");
+  fs::rename(&cas_root, &held_cas)?;
+  fs::write(&cas_root, b"must remain untouched")?;
+  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nenabled = false\n")?;
+  let repository_disabled = run_cargo_rail_with_env(&ws.path, &command, &environment)?;
+  assert!(
+    repository_disabled.status.success(),
+    "repository-disabled cache execution failed: {}",
+    String::from_utf8_lossy(&repository_disabled.stderr)
+  );
+  let repository_disabled_stdout = String::from_utf8_lossy(&repository_disabled.stdout);
+  assert!(
+    repository_disabled_stdout.contains("local cache: disabled (disabled_by_configuration)")
+      && repository_disabled_stdout.contains("cargo_check_executed=true compiler_units_executed=true"),
+    "repository policy must force a cold execution:\n{repository_disabled_stdout}"
+  );
+  assert!(
+    !repository_disabled_stdout.contains("local cache precheck"),
+    "repository-disabled caching must skip the process-free L1 path:\n{repository_disabled_stdout}"
+  );
+  assert_eq!(fs::read(&cas_root)?, b"must remain untouched");
+  fs::remove_file(&cas_root)?;
+  fs::rename(&held_cas, &cas_root)?;
 
   let cleaned = run_cargo_rail_with_env(&ws.path, &["rail", "clean", "--cache"], &environment)?;
   assert!(
@@ -2892,7 +3005,7 @@ fn test_local_action_cache_concurrent_cold_writers_converge() -> Result<()> {
       String::from_utf8_lossy(&output.stderr)
     );
   }
-  let cas_root = cache.path().join("cargo-rail/local-cas-v1");
+  let cas_root = cache.path().join("cargo-rail/local-cas-v2");
   assert_eq!(fs::read_dir(cas_root.join("pins"))?.count(), 1, "one action-key pin");
   assert_eq!(
     fs::read_dir(cas_root.join("results"))?.count(),

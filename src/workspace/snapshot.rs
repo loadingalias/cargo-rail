@@ -199,6 +199,8 @@ pub struct WorkspaceSnapshot {
   manifests: Vec<SnapshotFile>,
   lockfile: Option<LockfileSnapshot>,
   rail_config: Option<SnapshotFile>,
+  rail_config_path: Option<PathBuf>,
+  rail_config_discovery_root: Option<PathBuf>,
   config: Option<Arc<RailConfig>>,
   cargo_config: Arc<CargoConfigSnapshot>,
   packages: Vec<SnapshotPackage>,
@@ -321,11 +323,17 @@ impl WorkspaceSnapshot {
     mut source: Arc<SourceSnapshot>,
     cargo: Arc<CargoState>,
     rail_config: Option<CapturedRailConfig>,
+    rail_config_discovery_root: Option<PathBuf>,
     generated_lockfile: Option<CapturedLockfile>,
     resolution_inputs: ResolutionInputs,
     targets: Vec<TargetIdentity>,
     derived: Arc<DerivedViews>,
   ) -> RailResult<Self> {
+    if rail_config.is_some() == rail_config_discovery_root.is_some() {
+      return Err(RailError::message(
+        "workspace snapshot must retain exactly one present or discovered-absent cargo-rail configuration state",
+      ));
+    }
     let metadata = cargo.metadata();
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     let mut partitioned_source_paths = resolution_inputs
@@ -399,9 +407,9 @@ impl WorkspaceSnapshot {
     }
     .map(LockfileSnapshot::from_file)
     .transpose()?;
-    let (rail_config, config) = rail_config
+    let (rail_config, rail_config_path, config) = rail_config
       .map(|config| {
-        let captured = capture_required_file(&source, &source_root, &config.path, "cargo-rail configuration")?;
+        let captured = capture_rail_config(&source, &source_root, &config)?;
         if captured.bytes() != config.bytes.as_slice() {
           return Err(RailError::with_help(
             format!(
@@ -411,10 +419,12 @@ impl WorkspaceSnapshot {
             "retry after workspace configuration changes have stopped",
           ));
         }
-        Ok((captured, config.config))
+        Ok((captured, config.path, config.config))
       })
       .transpose()?
-      .map_or((None, None), |(file, config)| (Some(file), Some(config)));
+      .map_or((None, None, None), |(file, path, config)| {
+        (Some(file), Some(path), Some(config))
+      });
 
     let packages = package_snapshots(metadata, &workspace_members, &package_locations, lockfile.as_ref())?;
     let base_resolution = derived.resolution_view(ResolutionRequest::default())?;
@@ -449,6 +459,8 @@ impl WorkspaceSnapshot {
       manifests,
       lockfile,
       rail_config,
+      rail_config_path,
+      rail_config_discovery_root,
       config,
       cargo_config: resolution_inputs.cargo_config,
       packages,
@@ -613,36 +625,15 @@ impl WorkspaceSnapshot {
       .manifests
       .iter()
       .chain(self.lockfile.iter().map(LockfileSnapshot::file))
-      .chain(self.rail_config.iter())
     {
       let path = self.source_root.join(file.path().as_path());
-      let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        RailError::message(format!(
-          "failed to revalidate authoritative snapshot file '{}': {error}",
-          file.path()
-        ))
-      })?;
-      if !metadata.file_type().is_file() {
-        return Err(RailError::with_help(
-          format!(
-            "authoritative snapshot file '{}' is no longer a regular file",
-            file.path()
-          ),
-          "retry after workspace input changes have stopped",
-        ));
-      }
-      let bytes = fs::read(&path).map_err(|error| {
-        RailError::message(format!(
-          "failed to revalidate authoritative snapshot file '{}': {error}",
-          file.path()
-        ))
-      })?;
-      if ContentDigest::sha256(&bytes) != file.digest() {
-        return Err(RailError::with_help(
-          format!("authoritative snapshot file '{}' changed after capture", file.path()),
-          "retry after workspace input changes have stopped",
-        ));
-      }
+      validate_authoritative_file_unchanged(file, &path)?;
+    }
+    if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
+      validate_authoritative_file_unchanged(file, path)?;
+    }
+    if let Some(root) = &self.rail_config_discovery_root {
+      validate_discovered_rail_config_absence(root)?;
     }
     Ok(())
   }
@@ -661,6 +652,68 @@ impl WorkspaceSnapshot {
     }
     Ok(())
   }
+}
+
+fn validate_discovered_rail_config_absence(discovery_root: &Path) -> RailResult<()> {
+  let Some(path) = RailConfig::find_config_path(discovery_root) else {
+    return Ok(());
+  };
+  Err(RailError::with_help(
+    format!(
+      "cargo-rail configuration '{}' appeared after workspace snapshot capture",
+      path.display()
+    ),
+    "retry after workspace configuration changes have stopped",
+  ))
+}
+
+fn validate_authoritative_file_unchanged(file: &SnapshotFile, path: &Path) -> RailResult<()> {
+  let metadata = fs::symlink_metadata(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to revalidate authoritative snapshot file '{}': {error}",
+      path.display()
+    ))
+  })?;
+  if !metadata.file_type().is_file() {
+    return Err(RailError::with_help(
+      format!(
+        "authoritative snapshot file '{}' is no longer a regular file",
+        path.display()
+      ),
+      "retry after workspace input changes have stopped",
+    ));
+  }
+  let bytes = fs::read(path).map_err(|error| {
+    RailError::message(format!(
+      "failed to revalidate authoritative snapshot file '{}': {error}",
+      path.display()
+    ))
+  })?;
+  if ContentDigest::sha256(&bytes) != file.digest() {
+    return Err(RailError::with_help(
+      format!("authoritative snapshot file '{}' changed after capture", path.display()),
+      "retry after workspace input changes have stopped",
+    ));
+  }
+  Ok(())
+}
+
+fn capture_rail_config(
+  source: &SourceSnapshot,
+  source_root: &Path,
+  config: &CapturedRailConfig,
+) -> RailResult<SnapshotFile> {
+  if relative_path(source_root, &config.path).is_ok() {
+    return capture_required_file(source, source_root, &config.path, "cargo-rail configuration");
+  }
+
+  let logical_path = RepositoryPath::new(Path::new(".cargo-rail/external-config.toml"))?;
+  capture_declared_file_outside_tree(logical_path, &config.path, "cargo-rail configuration")?.ok_or_else(|| {
+    RailError::message(format!(
+      "cargo-rail configuration '{}' disappeared during snapshot capture",
+      config.path.display()
+    ))
+  })
 }
 
 fn capture_generated_lockfile(
@@ -1176,5 +1229,24 @@ mod tests {
     .err()
     .expect("credential-bearing locked source must fail closed");
     assert!(error.to_string().contains("credential-bearing source URL"), "{error}");
+  }
+
+  #[test]
+  fn discovered_config_absence_rejects_a_later_configuration() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    validate_discovered_rail_config_absence(workspace.path()).expect("configuration remains absent");
+
+    let configuration_directory = workspace.path().join(".config");
+    fs::create_dir(&configuration_directory).expect("configuration directory");
+    let configuration = configuration_directory.join("rail.toml");
+    fs::write(&configuration, "[cache]\nenabled = false\n").expect("configuration");
+
+    let error = validate_discovered_rail_config_absence(workspace.path())
+      .expect_err("a newly discovered configuration must invalidate captured absence");
+    assert!(
+      error.to_string().contains(&configuration.display().to_string())
+        && error.to_string().contains("appeared after workspace snapshot capture"),
+      "{error}"
+    );
   }
 }

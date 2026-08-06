@@ -100,24 +100,76 @@ fn run_cache_command(workspace: &TempDir, cache: &TempDir, args: &[&str]) -> std
 }
 
 fn create_empty_local_cas(cache: &TempDir) -> std::path::PathBuf {
+  const TRUST_DOMAIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
   let owner = cache.path().join("cargo-rail");
-  let root = owner.join("local-cas-v1");
+  let root = owner.join("local-cas-v2");
   fs::create_dir_all(&root).unwrap();
-  fs::write(root.join("OWNER"), b"cargo-rail-local-cas\nschema=1\n").unwrap();
+  fs::write(owner.join("LOCAL_TRUST_DOMAIN"), format!("{TRUST_DOMAIN}\n")).unwrap();
+  fs::write(
+    root.join("OWNER"),
+    format!("cargo-rail-local-cas\nschema=2\ntrust-domain={TRUST_DOMAIN}\n"),
+  )
+  .unwrap();
+  fs::write(root.join("CAPACITY.json"), b"{\"version\":2,\"result_bytes\":0}").unwrap();
+  fs::write(
+    root.join("NATIVE_LEDGER.json"),
+    b"{\"version\":1,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}",
+  )
+  .unwrap();
   for directory in [
     "results",
     "pins",
     "leases",
     "staging",
-    "native-candidates",
+    "native-actions",
     "compiler-evidence-candidates",
   ] {
     fs::create_dir(root.join(directory)).unwrap();
   }
   #[cfg(target_os = "macos")]
   fs::create_dir(root.join("sysroot-identities")).unwrap();
-  fs::write(owner.join("local-cas-v1.lock"), b"").unwrap();
+  fs::write(owner.join("local-cas-v2.lock"), b"").unwrap();
   root
+}
+
+fn create_legacy_local_cas(cache: &TempDir) -> std::path::PathBuf {
+  let root = cache.path().join("cargo-rail/local-cas-v1");
+  fs::create_dir_all(&root).unwrap();
+  fs::write(root.join("OWNER"), b"cargo-rail-local-cas\nschema=1\n").unwrap();
+  fs::write(root.join("legacy-byte"), b"reclaim only").unwrap();
+  root
+}
+
+#[test]
+fn legacy_local_cas_is_reclaimable_but_never_adopted_as_current_authority() {
+  let workspace = create_test_workspace();
+  let cache = TempDir::new().unwrap();
+  let legacy = create_legacy_local_cas(&cache);
+
+  let status = run_cache_command(
+    &workspace,
+    &cache,
+    &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+  );
+  assert!(status.status.success(), "legacy status failed: {status:?}");
+  let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+  assert_eq!(status_json["status"]["local"]["present"], true);
+  assert!(status_json["status"]["local"]["cache"].is_null());
+  assert_eq!(
+    status_json["status"]["local"]["legacy"]["root"],
+    fs::canonicalize(&legacy).unwrap().display().to_string()
+  );
+  assert!(!cache.path().join("cargo-rail/local-cas-v2").exists());
+
+  let cleaned = run_cache_command(
+    &workspace,
+    &cache,
+    &["rail", "cache", "clean", "--scope", "local", "-f", "json"],
+  );
+  assert!(cleaned.status.success(), "legacy cleanup failed: {cleaned:?}");
+  assert!(!legacy.exists());
+  assert!(cache.path().join("cargo-rail/local-cas-v1.lock").is_file());
+  assert!(!cache.path().join("cargo-rail/local-cas-v2").exists());
 }
 
 #[test]
@@ -166,7 +218,7 @@ fn local_status_and_cleanup_use_the_configured_domain_without_workspace_state() 
     "an unchanged cache must report the bytes actually removed"
   );
   assert!(!root.exists());
-  let lock = cache.path().join("cargo-rail/local-cas-v1.lock");
+  let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
   assert!(lock.is_file(), "the lifecycle authority must survive root reclamation");
   assert_eq!(fs::metadata(lock).unwrap().len(), 0);
 }
@@ -176,7 +228,7 @@ fn apply_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
   let workspace = create_test_workspace();
   let cache = TempDir::new().unwrap();
   let root = create_empty_local_cas(&cache);
-  let lock = cache.path().join("cargo-rail/local-cas-v1.lock");
+  let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
   fs::remove_file(&lock).unwrap();
 
   let cleaned = run_cache_command(
@@ -201,7 +253,7 @@ fn compatibility_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
   let workspace = create_test_workspace();
   let cache = TempDir::new().unwrap();
   let root = create_empty_local_cas(&cache);
-  let lock = cache.path().join("cargo-rail/local-cas-v1.lock");
+  let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
   fs::remove_file(&lock).unwrap();
 
   let cleaned = run_cache_command(&workspace, &cache, &["rail", "clean", "--cache"]);

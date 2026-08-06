@@ -2,6 +2,10 @@
 /target
 /benchmark_results/
 
+# Python
+__pycache__
+.ruff_cache
+
 # OS
 Thumbs.db
 .DS_Store

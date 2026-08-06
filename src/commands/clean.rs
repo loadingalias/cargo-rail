@@ -121,11 +121,9 @@ pub fn run_clean(
       }
       if let Some(status) = &cache_status {
         let workspace_bytes = status.workspace.as_ref().map_or(0, |workspace| workspace.bytes);
-        let local_bytes = status
-          .local
-          .as_ref()
-          .and_then(|local| local.cache.as_ref())
-          .map_or(0, |local| local.bytes);
+        let local_bytes = status.local.as_ref().map_or(0, |local| {
+          local.cache.as_ref().map_or(0, |cache| cache.bytes) + local.legacy.as_ref().map_or(0, |legacy| legacy.bytes)
+        });
         println!("\n  workspace cache bytes: {workspace_bytes}");
         println!("  shared local CAS bytes: {local_bytes} (affects other workspaces)");
       }
@@ -205,6 +203,9 @@ fn collect_cache_artifacts(status: &crate::cache::CacheStatus, artifacts: &mut C
   }
   if let Some(local) = status.local.as_ref().and_then(|local| local.cache.as_ref()) {
     artifacts.cache_files.push(local.root.clone());
+  }
+  if let Some(legacy) = status.local.as_ref().and_then(|local| local.legacy.as_ref()) {
+    artifacts.cache_files.push(legacy.root.clone());
   }
 }
 

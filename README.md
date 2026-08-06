@@ -10,7 +10,7 @@ Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` replac
 [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml)
 [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
-## One binary, not ten partial workspace models
+## One engine, not ten partial workspace models
 
 Rust monorepos usually acquire a tool for every symptom. Each tool reconstructs part of the same workspace, carries its own configuration, and makes decisions against a slightly different model.
 
@@ -20,7 +20,7 @@ Cargo-Rail replaces that collection with one local, Cargo-native engine:
 |---|---|---|
 | `cargo-hakari`, `cargo-udeps`, `cargo-shear`, `cargo-machete`, feature auditors, workspace-inheritance checks, and MSRV scripts | `cargo rail unify` | One reviewable and reversible graph-repair plan |
 | `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` and `cargo rail run` | Affected work derived from Git and the resolved Cargo graph |
-| Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available across target directories in one source root and after `cargo clean` |
+| Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available across target directories and equivalent source roots after `cargo clean` |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery |
 | Copybara or custom monorepo-to-crate scripts | `cargo rail split` and `cargo rail sync` | Cargo-aware synchronization with source history and recovery evidence |
 
@@ -142,9 +142,8 @@ cargo clean
 and that reuse is gone.
 
 Cargo-Rail's local content-addressed store lives outside `target/`. Eligible compiler results remain available after
-`cargo clean` and across target directories in the same physical source root. A different checkout uses an
-independent cache session because Rust metadata can embed the source root; Cargo-Rail does not claim unsafe
-cross-checkout portability.
+`cargo clean`, across target directories, and across equivalent source roots. Each command still validates its live
+root; versioned compiler remaps and exact rebinding keep stored metadata, dep-info, and diagnostics portable.
 
 On an eligible invocation, this sequence can still reuse exact compiler output:
 
@@ -156,43 +155,34 @@ cargo clean
 cargo rail run --all --action build --explain
 ```
 
-Cargo-Rail does not restore an old target directory or manufacture Cargo freshness. Before a hit, it revalidates the relevant:
+Cargo-Rail does not restore an old target directory or manufacture Cargo freshness. Before a hit, it revalidates:
 
 - Cargo, rustc, rustdoc, sysroot, backend, host, and wrapper identity;
-- source and manifest inputs;
+- the complete bounded source-directory topology and regular-file bytes;
 - dependency artifacts;
-- observed environment reads;
+- every compiler-visible environment name and value;
+- rustc's selected-input containment proof;
 - action and result identity; and
-- exact stored output bytes.
+- exact stored output bytes and regular-file modes.
 
-The cache does not partition every compiler unit by the complete Cargo configuration or `Cargo.lock`. Within one
-physical source root, output-neutral changes such as warning policy, job count, build or target directory, network
-policy, registry settings, and unrelated lockfile entries can reuse a verified result. Rust flags, features,
-dependency contents, target, linker, sysroot, and observed compiler inputs still change or reject reuse at their
-owning boundary.
+The cache does not partition every compiler unit by the complete Cargo configuration or `Cargo.lock`. Output-neutral
+changes such as warning policy, job count, build or target directory, network policy, registry settings, and unrelated
+lockfile entries can reuse a verified result. Rust flags, features, dependency contents, target, linker, sysroot,
+source topology, and compiler environment still change or reject reuse at their owning boundary.
 
 A matching lookup is not enough. Incomplete or unsupported evidence produces a named bypass and runs normal Cargo.
 
 **Fast when proven. Normal Cargo when not.**
 
-The retained v4 Linux and Windows x86-64 qualifications each measured one accepted same-host sample per lane:
+Set `[cache] l2 = "alias"` to share verified results through a machine-owned S3 target. The command parent owns AWS
+access; compiler wrappers receive only a loopback capability. A local hit remains network-free, and remote bytes enter
+the ordinary local proof before restore. Remote unavailability, credentials, authentication, or configuration falls
+back to cold compilation. Remote conflict or malformed evidence fails without restoring output.
 
-| Host | Workload | Cargo-Rail warm | Native Cargo cold | `sccache` 0.16.0 | Warm vs Cargo | Warm vs `sccache` |
-|---|---|---:|---:|---:|---:|---:|
-| Linux | Check | 3.848 s | 9.866 s | 4.735 s | 61.0% faster | 18.7% faster |
-| Linux | Release build | 6.055 s | 12.445 s | 7.918 s | 51.3% faster | 23.5% faster |
-| Windows | Check | 9.744 s | 19.500 s | 12.847 s | 50.0% faster | 24.2% faster |
-| Windows | Release build | 13.579 s | 23.150 s | 17.202 s | 41.3% faster | 21.1% faster |
+The v6 execution contract invalidates earlier measurements. V6 binds each output's exact regular-file mode and uses a
+new result-pack protocol. Cargo-Rail makes no current comparative performance claim.
 
-Linux process-tree accounting measured 25.3% less CPU and 66.1% less peak RSS than `sccache` for check, and 20.4%
-less CPU and 63.1% less peak RSS for release build. Windows retains wall-time comparisons but withholds specialist CPU
-and RSS claims because the detached `sccache` server is outside that host's complete accounting boundary.
-
-Each complete interleaved run accepted all 20 planned lane samples with zero rejections and zero false hits. On both
-hosts and workloads, the measured cold-publication premium was smaller than the saving from one warm reuse. These are
-bounded point measurements for one machine and fixture, not percentile, distribution, or universal workspace claims.
-
-See [Caching](docs/caching.md) for the proof model, support matrix, raw methodology, and current qualification boundaries.
+See [Caching](docs/caching.md) for the proof model, S3 target schema, support matrix, and current evidence limits.
 
 ## Release intent belongs in the pull request
 
@@ -349,6 +339,10 @@ cargo binstall cargo-rail
 
 Pre-built archives, SHA-256 checksums, and signed provenance are published with
 [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases).
+
+Release archives place Cargo-Rail's private compiler shim beside the CLI. Keep both files together when moving a
+manual installation; Cargo-Rail remains correct without the shim but falls back to the larger CLI executable for
+compiler-wrapper processes.
 
 The current MSRV is published in
 [`Cargo.toml`](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml).

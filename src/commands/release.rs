@@ -1871,6 +1871,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry
 
   let mut config = existing_config.unwrap_or_else(|| RailConfig {
     targets: vec![],
+    cache: crate::config::CacheConfig::default(),
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),

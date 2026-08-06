@@ -11,7 +11,7 @@ usage() {
 usage:
   remote-native-cache.sh plan <target>
   remote-native-cache.sh smoke <target> --execute
-  remote-native-cache.sh run <target> [runs] --execute
+  remote-native-cache.sh run <target> <runs> --execute
 
 Targets: aws-linux-x64-bench, aws-linux-arm64-bench, aws-windows-x64-bench
 USAGE
@@ -40,15 +40,13 @@ case "$operation" in
     benchmark_mode=smoke
     ;;
   run)
-    if [[ "$#" -eq 3 && "$3" == --execute ]]; then
-      runs=1
-    elif [[ "$#" -eq 4 && "$4" == --execute ]]; then
+    if [[ "$#" -eq 4 && "$4" == --execute ]]; then
       runs="$3"
     else
       usage
     fi
     [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 1 ]] || {
-      echo "remote retained evidence requires at least one accepted run" >&2
+      echo "remote benchmark runs must be a positive integer" >&2
       exit 2
     }
     benchmark_mode=run

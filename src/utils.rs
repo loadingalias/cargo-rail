@@ -71,28 +71,56 @@ pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected
   }
   #[cfg(windows)]
   {
-    let named = fs::File::open(path)?;
-    let named_handle_metadata = named.metadata()?;
-    if !named_handle_metadata.is_file()
-      || is_symlink_or_reparse(&named_handle_metadata)
-      || named_handle_metadata.len() != expected_len
-    {
-      return Ok(false);
-    }
-    let opened_information = winapi_util::file::information(opened)?;
-    let named_information = winapi_util::file::information(&named)?;
+    let named = cargo_rail_windows_fs::open_for_observation(path)?;
+    let opened_observation = cargo_rail_windows_fs::observe_file(opened)?;
+    let named_observation = cargo_rail_windows_fs::observe_file(&named)?;
+    cargo_rail_windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+    cargo_rail_windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
     Ok(
-      opened_information.volume_serial_number() == named_information.volume_serial_number()
-        && opened_information.file_index() == named_information.file_index()
-        && opened_information.number_of_links() == 1
-        && named_information.number_of_links() == 1
-        && opened_information.file_size() == expected_len
-        && named_information.file_size() == expected_len,
+      opened_observation == named_observation
+        && opened_observation.number_of_links == 1
+        && opened_observation.size == expected_len,
     )
   }
   #[cfg(not(any(unix, windows)))]
   {
     Ok(true)
+  }
+}
+
+/// Verify that a path still names the same opened regular file without
+/// rejecting benign hard links. This is the file-capture identity guard; cache
+/// authority files use the stricter single-link variant above.
+pub(crate) fn opened_file_matches_path(opened: &fs::File, path: &Path, expected_len: u64) -> io::Result<bool> {
+  let opened_metadata = opened.metadata()?;
+  let named_metadata = fs::symlink_metadata(path)?;
+  if !opened_metadata.is_file()
+    || !named_metadata.is_file()
+    || is_symlink_or_reparse(&named_metadata)
+    || opened_metadata.len() != expected_len
+    || named_metadata.len() != expected_len
+  {
+    return Ok(false);
+  }
+
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(opened_metadata.dev() == named_metadata.dev() && opened_metadata.ino() == named_metadata.ino())
+  }
+  #[cfg(windows)]
+  {
+    let named = cargo_rail_windows_fs::open_for_observation(path)?;
+    let opened_observation = cargo_rail_windows_fs::observe_file(opened)?;
+    let named_observation = cargo_rail_windows_fs::observe_file(&named)?;
+    cargo_rail_windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+    cargo_rail_windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
+    Ok(opened_observation == named_observation && opened_observation.size == expected_len)
+  }
+  #[cfg(not(any(unix, windows)))]
+  {
+    Ok(opened_metadata.modified()? == named_metadata.modified()?)
   }
 }
 
@@ -207,6 +235,29 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> 
         path.display()
       ))
     })?;
+  persist_file_atomic(temporary, path)?;
+  Ok(())
+}
+
+/// Atomically replace `path` with a fully prepared temporary file in the same directory.
+pub(crate) fn persist_file_atomic(temporary: tempfile::NamedTempFile, path: &Path) -> RailResult<fs::File> {
+  let parent = destination_parent(path);
+  let file = persist_regenerable_file_atomic(temporary, path)?;
+  sync_parent_directory(parent).map_err(|error| {
+    RailError::message(format!(
+      "failed to persist the atomic replacement for {}: {error}",
+      path.display()
+    ))
+  })?;
+  Ok(file)
+}
+
+/// Atomically publish a regenerable file.
+///
+/// The caller must own crash recovery until a later durable commit makes the
+/// replacement authoritative. Windows uses a write-through rename so a
+/// successful publication has crossed one unambiguous filesystem boundary.
+pub(crate) fn persist_regenerable_file_atomic(temporary: tempfile::NamedTempFile, path: &Path) -> RailResult<fs::File> {
   let persisted = {
     #[cfg(windows)]
     {
@@ -214,42 +265,36 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> 
     }
     #[cfg(not(windows))]
     {
-      temporary.persist(path)
+      temporary.persist(path).map_err(|error| error.error)
     }
   };
-  persisted.map_err(|error| {
-    RailError::message(format!(
-      "failed to atomically replace {}: {}",
-      path.display(),
-      error.error
-    ))
-  })?;
-  sync_parent_directory(parent).map_err(|error| {
-    RailError::message(format!(
-      "failed to persist the atomic replacement for {}: {error}",
-      path.display()
-    ))
-  })?;
-  Ok(())
+  persisted.map_err(|error| RailError::message(format!("failed to atomically replace {}: {}", path.display(), error)))
 }
 
 #[cfg(windows)]
-fn persist_atomic_replacement(
-  mut temporary: tempfile::NamedTempFile,
-  path: &Path,
-) -> Result<fs::File, tempfile::PersistError> {
+fn persist_atomic_replacement(temporary: tempfile::NamedTempFile, path: &Path) -> io::Result<fs::File> {
   const MAX_ATTEMPTS: usize = 50;
+  let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
   let mut attempts = 0;
   loop {
-    match temporary.persist(path) {
-      Ok(file) => return Ok(file),
+    match cargo_rail_windows_fs::rename_write_through(&temporary_path, path, true) {
+      Ok(()) => return Ok(file),
       Err(error) => {
         attempts += 1;
-        let transient_reader_conflict = matches!(error.error.raw_os_error(), Some(5 | 32 | 33));
+        let transient_reader_conflict = matches!(error.raw_os_error(), Some(5 | 32 | 33));
         if !transient_reader_conflict || attempts >= MAX_ATTEMPTS {
-          return Err(error);
+          drop(file);
+          return match fs::remove_file(&temporary_path) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io::Error::new(
+              error.kind(),
+              format!(
+                "{error}; failed to remove retained temporary file '{}': {cleanup}",
+                temporary_path.display()
+              ),
+            )),
+          };
         }
-        temporary = error.file;
         std::thread::sleep(std::time::Duration::from_millis(1));
       }
     }

@@ -18,6 +18,10 @@ ignore = []
 allow = [
   "MIT",
   "Apache-2.0",
+  # aws-lc-sys/aws-lc-rs are transitive AWS SDK TLS dependencies.
+  "BSD-3-Clause",
+  "ISC",
+  "MIT-0",
   "Unicode-3.0",
   "Zlib",
 ]

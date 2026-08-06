@@ -526,6 +526,23 @@ fn test_config_validate_with_missing_config_flag_fails() -> Result<()> {
 }
 
 #[test]
+fn test_config_validate_rejects_noncanonical_cache_alias() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-cache-alias")?;
+  ws.add_crate("test-crate", "0.1.0", &[])?;
+  ws.commit("Add test crate")?;
+  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nl2 = \"Team/Production\"\n")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
+  assert_eq!(output.status.code(), Some(2));
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(
+    stdout.contains("cache.l2") && stdout.contains("lowercase ASCII letter"),
+    "invalid cache aliases must name the canonical field and recovery rule:\n{stdout}"
+  );
+  Ok(())
+}
+
+#[test]
 fn test_config_validate_rejects_invalid_run_profile_action() -> Result<()> {
   let ws = TestWorkspace::new_named("config-validate-run-invalid-surface")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;

@@ -532,9 +532,9 @@ def assert_native_cache_identity(
         or report.get("result") != "success"
         or report.get("exit_code") != 0
         or capability.get("host_target") != expected_host
-        or capability.get("schema_version") != 3
+        or capability.get("schema_version") != 5
         or capability.get("cache_class") != "library_metadata_rlib"
-        or capability.get("execution_contract") != "direct-global-wrapper-v4"
+        or capability.get("execution_contract") != "direct-global-wrapper-v8"
         or not isinstance(capability.get("platform"), str)
         or not capability["platform"]
         or not isinstance(capability.get("identity"), str)

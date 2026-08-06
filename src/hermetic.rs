@@ -241,11 +241,19 @@ pub(crate) fn remove_state(workspace_root: &Path) -> RailResult<()> {
     .map_err(|error| RailError::message(format!("failed to remove hermetic cache '{}': {error}", root.display())))
 }
 
-pub(crate) fn remove_local_cache() -> RailResult<Option<(PathBuf, u64)>> {
-  let Some(root) = cas::configured_root()? else {
-    return Ok(None);
-  };
-  cas::remove_owned_root_at(&root)
+pub(crate) fn remove_local_cache() -> RailResult<Vec<(PathBuf, u64)>> {
+  let mut removed = Vec::new();
+  if let Some(root) = cas::configured_root()?
+    && let Some(entry) = cas::remove_owned_root_at(&root)?
+  {
+    removed.push(entry);
+  }
+  if let Some(root) = cas::configured_legacy_root()?
+    && let Some(entry) = cas::remove_legacy_owned_root_at(&root)?
+  {
+    removed.push(entry);
+  }
+  Ok(removed)
 }
 
 pub(crate) fn local_cache_status() -> RailResult<Option<cas::LocalCasStatus>> {
@@ -253,6 +261,13 @@ pub(crate) fn local_cache_status() -> RailResult<Option<cas::LocalCasStatus>> {
     return Ok(None);
   };
   cas::status_at(&root)
+}
+
+pub(crate) fn legacy_local_cache_status() -> RailResult<Option<(PathBuf, u64)>> {
+  let Some(root) = cas::configured_legacy_root()? else {
+    return Ok(None);
+  };
+  cas::legacy_status_at(&root)
 }
 
 /// Support earned by one concrete action execution.
@@ -2503,6 +2518,7 @@ fn capture_compiler_outputs(
 
 /// Capture a bounded compiler-cache staging tree with the same output-manifest
 /// validation used by the hermetic action CAS.
+#[cfg(test)]
 pub(crate) fn capture_native_compiler_outputs(root: &Path, paths: &[PathBuf]) -> RailResult<OutputManifest> {
   let mut outputs = paths
     .iter()
@@ -2521,6 +2537,76 @@ pub(crate) fn capture_native_compiler_outputs(root: &Path, paths: &[PathBuf]) ->
     )));
   }
   Ok(manifest)
+}
+
+/// Build the ordinary CAS manifest from fixed-pack slots whose bytes and
+/// digests were already authenticated while streaming into private staging.
+pub(crate) fn manifest_from_verified_native_slots(slots: &[(&str, &str, u64, u32)]) -> RailResult<OutputManifest> {
+  let mut entries = BTreeMap::new();
+  let mut bytes = 0u64;
+  for (path, digest, length, mode) in slots {
+    let path = crate::source::RepositoryPath::new(Path::new(path))?;
+    let logical = path.as_str().to_string();
+    if entries
+      .insert(
+        logical.clone(),
+        OutputEntryKind::File {
+          digest: (*digest).to_string(),
+          mode: *mode,
+          bytes: *length,
+        },
+      )
+      .is_some()
+    {
+      return Err(RailError::message("verified native pack contains duplicate slots"));
+    }
+    bytes = bytes
+      .checked_add(*length)
+      .ok_or_else(|| RailError::message("verified native pack byte count overflow"))?;
+    let mut parent = path.as_path().parent();
+    while let Some(directory) = parent {
+      if directory.as_os_str().is_empty() {
+        break;
+      }
+      let logical = crate::utils::path_to_git_format(directory);
+      match entries.entry(logical) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+          entry.insert(OutputEntryKind::Directory { mode: 0o755 });
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+          if matches!(entry.get(), OutputEntryKind::Directory { mode: 0o755 }) => {}
+        std::collections::btree_map::Entry::Occupied(_) => {
+          return Err(RailError::message(
+            "verified native pack slot collides with an output parent",
+          ));
+        }
+      }
+      parent = directory.parent();
+    }
+  }
+  if entries.len() > MAX_OUTPUT_ENTRIES {
+    return Err(RailError::message(
+      "verified native pack exceeds the output-entry bound",
+    ));
+  }
+  let entries = entries
+    .into_iter()
+    .map(|(path, kind)| OutputEntry { path, kind })
+    .collect::<Vec<_>>();
+  let directories = entries
+    .iter()
+    .filter(|entry| matches!(entry.kind, OutputEntryKind::Directory { .. }))
+    .count();
+  let digest = output_manifest_digest(&entries)?;
+  Ok(OutputManifest {
+    version: OUTPUT_MANIFEST_VERSION,
+    digest,
+    files: slots.len(),
+    directories,
+    symlinks: 0,
+    entries,
+    bytes,
+  })
 }
 
 fn add_output_parent_directories(
@@ -3317,16 +3403,25 @@ fn record_cache_candidate_miss(first: &mut Option<String>, reason: String) {
 }
 
 /// Restore a verified action result before any Cargo or rustc process is started.
-pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreContextCacheAttempt> {
+pub(crate) fn try_restore_pre_context(
+  workspace_root: &Path,
+  captured_config: &crate::config::CapturedDiscoveredConfig,
+) -> RailResult<PreContextCacheAttempt> {
   #[cfg(not(target_os = "macos"))]
   {
-    let _ = workspace_root;
+    let _ = (workspace_root, captured_config);
     Ok(PreContextCacheAttempt::Miss(
       "platform_process_isolation_unavailable".to_string(),
     ))
   }
   #[cfg(target_os = "macos")]
   {
+    if !captured_config.cache_enabled() {
+      return Ok(PreContextCacheAttempt::Miss("disabled_by_configuration".to_string()));
+    }
+    if !captured_config.validate_unchanged() {
+      return Ok(PreContextCacheAttempt::Miss("cache_configuration_changed".to_string()));
+    }
     let started = Instant::now();
     let _workspace_cache_lock = crate::cache::lock_workspace(workspace_root)?;
     reclaim_workspace_state(workspace_root)?;
@@ -3371,6 +3466,9 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
         .tempdir_in(&parent)
         .map_err(|error| RailError::message(format!("failed to create declared output root: {error}")))?;
       let destination = temporary.path().join("output");
+      if !captured_config.validate_unchanged() {
+        return Ok(PreContextCacheAttempt::Miss("cache_configuration_changed".to_string()));
+      }
       let hit = match local_cas.restore(&candidate.action_key, &destination) {
         cas::CacheLookup::Hit(hit) => hit,
         cas::CacheLookup::Miss(miss) if miss.kind == cas::CacheMissKind::Miss => {
@@ -3473,7 +3571,7 @@ pub(crate) fn try_restore_pre_context(workspace_root: &Path) -> RailResult<PreCo
 pub(crate) fn execute(
   ctx: &WorkspaceContext,
   action: &ExpandedAction,
-  cache_enabled: bool,
+  cache_disabled_reason: Option<&str>,
   lookup_key: Option<&str>,
 ) -> RailResult<(HermeticExecutionReport, PathBuf)> {
   if action.kind() != ActionKind::Build || !cargo_check_action(action.argv()) {
@@ -3529,8 +3627,8 @@ pub(crate) fn execute(
     ));
   }
   let mut local_cas = None;
-  let mut cache = if !cache_enabled {
-    LocalCacheSummary::new(LocalCacheStatus::Disabled, "disabled_by_request")
+  let mut cache = if let Some(reason) = cache_disabled_reason {
+    LocalCacheSummary::new(LocalCacheStatus::Disabled, reason)
   } else if lookup_key.is_none() {
     LocalCacheSummary::new(LocalCacheStatus::Uncacheable, "pre_context_request_not_graduated")
   } else if preliminary_action_key.is_some() {

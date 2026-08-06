@@ -59,7 +59,7 @@ build-all:
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
-bench-native-cache runs="1":
+bench-native-cache runs:
     @scripts/bench/native-cache.sh run "{{ runs }}"
 
 bench-native-cache-smoke:
@@ -80,38 +80,34 @@ bench-native-cache-aws-plan target:
 bench-native-cache-aws-smoke target *args="":
     @scripts/bench/remote-native-cache.sh smoke "{{ target }}" {{ args }}
 
-bench-native-cache-aws target runs="1" *args="":
-    @scripts/bench/remote-native-cache.sh run "{{ target }}" "{{ runs }}" {{ args }}
+bench-native-cache-aws target runs execute:
+    @scripts/bench/remote-native-cache.sh run "{{ target }}" "{{ runs }}" "{{ execute }}"
 
 bench-native-cache-remote mode runs run_id:
-    @if [ "{{ mode }}" = smoke ]; then \
-      CARGO_RAIL_BENCH_INSTANCE_TYPE="${DEV_MACHINE_INSTANCE_TYPE:-unknown}" \
-      CARGO_RAIL_BENCH_RESULTS="$PWD/benchmark_results/native-cache/{{ run_id }}" \
-      scripts/bench/native-cache.sh smoke; \
-    else \
-      CARGO_RAIL_BENCH_INSTANCE_TYPE="${DEV_MACHINE_INSTANCE_TYPE:-unknown}" \
-      CARGO_RAIL_BENCH_RESULTS="$PWD/benchmark_results/native-cache/{{ run_id }}" \
-      scripts/bench/native-cache.sh run "{{ runs }}"; \
-    fi
+    @scripts/bench/native-cache-remote-dispatch.sh "{{ mode }}" "{{ runs }}" "{{ run_id }}"
 
 install-qualification-tools:
-    @host="$(rustc -vV | sed -n 's/^host: //p')"; \
-      case "$host" in \
-        *-unknown-linux-*) profile=linux-qualification ;; \
-        *-pc-windows-*) profile=windows-qualification ;; \
-        *) echo "remote qualification requires a supported Linux or Windows host, got: $host" >&2; exit 2 ;; \
-      esac; \
-      scripts/ci/install-tools.sh "$profile"
+    @scripts/ci/install-qualification-tools.sh
 
 bench-native-cache-archive run_id:
     @scripts/bench/native-cache-archive.sh "{{ run_id }}"
+
+qualify-native-cache-s3 mode run_id:
+    @scripts/ci/qualify-native-cache-s3.sh "{{ mode }}" "{{ run_id }}"
+
+qualify-native-cache-s3-authority mode run_id region owner bucket prefix:
+    @CARGO_RAIL_CACHE_REGION="{{ region }}" \
+      CARGO_RAIL_CACHE_EXPECTED_OWNER="{{ owner }}" \
+      CARGO_RAIL_CACHE_BUCKET="{{ bucket }}" \
+      CARGO_RAIL_CACHE_PREFIX="{{ prefix }}" \
+      scripts/ci/qualify-native-cache-s3.sh "{{ mode }}" "{{ run_id }}"
 
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
 
 # CI Commands (for GitHub Actions)
 
-ci-check:
+check-ci:
     @scripts/check/check.sh
 
 # Explainability

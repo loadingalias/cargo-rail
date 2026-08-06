@@ -512,120 +512,7 @@ def load_native_cache_contract() -> NativeCacheContract:
     )
 
 
-@dataclass(frozen=True)
-class Qualification:
-    target: str
-    workloads: tuple[str, ...]
-    accepted_samples: int
-    false_hits: int
-
-
-@dataclass(frozen=True)
-class QualificationRegistry:
-    schema_version: int
-    cache_class: str
-    execution_contract: str
-    cargo_release: str
-    rustc_release: str
-    qualifications: dict[str, Qualification]
-
-
-def load_qualifications() -> QualificationRegistry:
-    raw = require_object(
-        load_json(REPOSITORY_ROOT / "distribution/native-cache-qualifications.json"),
-        "native-cache qualifications",
-        {
-            "schema_version",
-            "class",
-            "execution_contract",
-            "fixture",
-            "cargo_release",
-            "rustc_release",
-            "qualifications",
-        },
-    )
-    require(
-        raw["schema_version"] == 2,
-        "native-cache qualification schema_version must be 2",
-    )
-    fixture = require_string(raw["fixture"], "native-cache qualifications.fixture")
-    require(
-        (REPOSITORY_ROOT / fixture).is_dir(),
-        "native-cache qualification fixture does not exist",
-    )
-    qualifications: dict[str, Qualification] = {}
-    corpora: list[str] = []
-    require(
-        isinstance(raw["qualifications"], list),
-        "native-cache qualifications must be an array",
-    )
-    targets: list[str] = []
-    for index, value in enumerate(raw["qualifications"]):
-        entry = require_object(
-            value,
-            f"native-cache qualifications[{index}]",
-            {"target", "corpus", "workloads", "accepted_samples", "false_hits"},
-        )
-        target = require_string(
-            entry["target"], f"native-cache qualifications[{index}].target"
-        )
-        corpora.append(
-            require_string(
-                entry["corpus"], f"native-cache qualifications[{index}].corpus"
-            )
-        )
-        workloads = entry["workloads"]
-        require(
-            isinstance(workloads, list) and workloads,
-            f"native-cache qualifications[{index}].workloads is empty",
-        )
-        require(
-            all(isinstance(workload, str) and workload for workload in workloads),
-            "qualification workloads are invalid",
-        )
-        require_unique_sorted(
-            workloads, f"native-cache qualifications[{index}].workloads"
-        )
-        accepted_samples = entry["accepted_samples"]
-        false_hits = entry["false_hits"]
-        require(
-            isinstance(accepted_samples, int)
-            and not isinstance(accepted_samples, bool)
-            and accepted_samples > 0,
-            f"native-cache qualifications[{index}].accepted_samples must be positive",
-        )
-        require(false_hits == 0, f"native-cache qualifications[{index}] has false hits")
-        targets.append(target)
-        qualifications[target] = Qualification(
-            target, tuple(workloads), accepted_samples, false_hits
-        )
-    require_unique_sorted(targets, "native-cache qualification targets")
-    require(
-        len(corpora) == len(set(corpora)),
-        "native-cache qualification corpus IDs must be unique",
-    )
-    return QualificationRegistry(
-        schema_version=raw["schema_version"],
-        cache_class=require_string(raw["class"], "native-cache qualifications.class"),
-        execution_contract=require_string(
-            raw["execution_contract"],
-            "native-cache qualifications.execution_contract",
-        ),
-        cargo_release=require_string(
-            raw["cargo_release"], "native-cache qualifications.cargo_release"
-        ),
-        rustc_release=require_string(
-            raw["rustc_release"], "native-cache qualifications.rustc_release"
-        ),
-        qualifications=qualifications,
-    )
-
-
-def validate_inventories(
-    manifest: CompatibilityManifest,
-    native_cache: NativeCacheContract,
-    qualifications: QualificationRegistry,
-) -> None:
+def validate_inventories(manifest: CompatibilityManifest) -> None:
     native_targets = {host.target for host in manifest.native_hosts}
     release_cross_targets = set(manifest.release_cross_targets)
     required_release_targets = native_targets | release_cross_targets
@@ -710,19 +597,6 @@ def validate_inventories(
     require(
         required_release_targets <= set(rail_targets),
         ".config/rail.toml is missing advertised native or required release cross targets",
-    )
-
-    require(
-        qualifications.cache_class == native_cache.cache_class,
-        "performance qualification class does not match the runtime cache contract",
-    )
-    require(
-        qualifications.execution_contract == native_cache.execution_contract,
-        "performance qualification execution contract does not match the runtime cache contract",
-    )
-    require(
-        set(qualifications.qualifications) <= native_targets,
-        "performance qualification includes a target outside the advertised native host set",
     )
 
     corpus_runner = (REPOSITORY_ROOT / manifest.corpus_runner).read_text(
@@ -843,7 +717,6 @@ def formatted_list(values: tuple[str, ...]) -> str:
 def render_markdown(
     manifest: CompatibilityManifest,
     native_cache: NativeCacheContract,
-    qualifications: QualificationRegistry,
 ) -> str:
     native_hosts = {host.target: host for host in manifest.native_hosts}
     corpus_cross_targets = {
@@ -872,23 +745,14 @@ def render_markdown(
                 f"Active for structurally eligible `{native_cache.cache_class}` units; "
                 "exact toolchain identity is part of every key"
             )
-        qualification = qualifications.qualifications.get(target)
-        if qualification is None:
-            performance = "Not qualified"
-        else:
-            workloads = " + ".join(qualification.workloads)
-            performance = (
-                f"Qualified: {workloads}; {qualification.accepted_samples} accepted, "
-                f"{qualification.false_hits} false hits"
-            )
         rows.append(
-            f"| `{target}` | {execution} | {cross} | {release} | {cache} | {performance} |"
+            f"| `{target}` | {execution} | {cross} | {release} | {cache} |"
         )
 
     deferred_rows = [
         (
             f"| {host.name} | `{host.target}` | Native execution evidence is not retained yet | "
-            "Structurally active when the exact toolchain identity is captured | Not qualified |"
+            "Structurally active when the exact toolchain identity is captured |"
         )
         for host in manifest.deferred_hosts
     ]
@@ -932,12 +796,10 @@ def render_markdown(
 
     return f"""# Caching
 
-> Auto-generated from executable CI/release registries, native-cache production gates, reviewed qualification
-> manifests, and reviewed benchmark evidence. Do not edit manually.
+> Auto-generated from executable CI/release registries and native-cache production gates. Do not edit manually.
 >
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `{manifest.schema_version}`;
-> native-cache toolchain-identity schema: `{native_cache.schema_version}`; qualification schema:
-> `{qualifications.schema_version}`.
+> native-cache toolchain-identity schema: `{native_cache.schema_version}`.
 
 Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
 prove that the stored result still matches every relevant input.
@@ -961,9 +823,9 @@ Native reuse is automatic for an ordinary `build` or `distribution` action when 
   compilation;
 - no Cargo CLI `--config`, action-defined environment, unknown Cargo setting, `build.dep-info-basedir`, sccache, or
   custom compiler wrapper changes the boundary; and
-- the invocation is an eligible dependency or workspace library with complete rustc-reported filesystem and
-  environment inputs, source-root-bound dep-info, metadata, optional rlib output, Rust-only dependency artifacts, and
-  no linker responsibility.
+- the invocation is an eligible dependency or workspace library whose complete bounded source namespace, exact
+  compiler-visible environment, selected-input proof, metadata, optional rlib output, and Rust-only dependency
+  artifacts remain inside the graduated class, with no linker responsibility.
 
 ```bash
 cargo rail run --all --action build --explain
@@ -971,22 +833,30 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
-The reusable session binds the physical source root, toolchain, compiler class, wrapper protocol, capabilities, and
-compiler-process environment. It does not bind the complete Cargo configuration or `Cargo.lock`. Each compiler unit
-instead binds its exact rustc arguments and cfg, source inputs, dependency artifact contents, and rustc-reported
-filesystem and environment reads.
+Each command session validates one physical source root. Reusable action and result identities replace that root with
+a versioned portable root, so equivalent source, toolchain, environment, dependency, target, and output evidence can
+reuse across arbitrary checkout roots. Each compiler unit binds its exact rustc arguments and cfg, dependency artifact
+contents, every entry and regular-file byte below the crate-root directory, and every compiler-visible environment
+name and value after removing only Cargo-Rail's exact private controls. Rustc observation then proves that the
+successful invocation selected no input outside those capabilities. The action identity is available before lookup;
+lookup work does not grow with retained source history.
+
+The cache deliberately over-invalidates when an unused file in the bounded source directory changes. This is the
+smallest sound contract for Rust's path discovery: positive dep-info alone does not record failed probes such as the
+choice between `foo.rs` and `foo/mod.rs`. A source symlink, unsupported file kind, incomplete capture, mutation during
+capture, or exceeded entry, byte, depth, or time bound runs the original compiler instead of weakening that proof.
+
+The session does not bind the complete Cargo configuration or `Cargo.lock`.
 Changes to `build.warnings`, jobs, build or target directories, network policy, registry settings, and unrelated
 lockfile entries can therefore reuse a result when those exact unit inputs remain unchanged. Rust flags, features,
-dependency contents, target, linker, sysroot, and observed inputs still change or reject reuse at their owning
-boundary.
+dependency contents, target, linker, sysroot, source topology, and compiler environment still change or reject reuse
+at their owning boundary.
 
-Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. Rust metadata contains
-opaque source-root-sensitive bytes, so Cargo-Rail does not claim cross-checkout reuse for this class. It executes
-Cargo's rustc argv and current directory unchanged, binds the session to the source root, and reuses results only
-inside that authority. The CAS stores reversible internal tokens for verified dep-info and JSON compiler-stream output
-paths, including their Windows separator and escaping form, then binds them to Cargo's current output directory after
-verification. Output names and materialized bytes remain exact; ambiguous spellings or any other cached reference to a
-previous output directory fail closed.
+Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. Rust metadata can contain
+source and output roots, so eligible cold invocations use a versioned compiler remap. The CAS stores reversible tokens
+for verified dep-info and JSON compiler-stream paths, including their Windows separator and escaping form, then binds
+them to the current source and output roots after verification. Output names and materialized bytes remain exact;
+ambiguous root spellings or unmodeled cached paths fail closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
 toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
@@ -1007,12 +877,88 @@ action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed
 that fails without returning byte statistics is not inferred:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
-- `miss` means no candidate survived revalidation; successful cold output may populate the local CAS; and
+- `miss` means the exact action has no authoritative result; successful cold output may populate the local CAS; and
 - `bypass` means the session or invocation is outside the graduated class and rustc executed normally.
 
-Corrupt or incompatible native entries never authorize reuse and fall back to the exact cold invocation. Cargo still
-owns its fingerprints; Cargo-Rail never restores a target directory or synthesizes Cargo freshness. Use `--no-cache`
-for an intentional cold baseline.
+The corrected local store resolves an exact action to zero or one authoritative result. A second semantic result for
+the same action becomes a durable conflict; malformed or transaction-ambiguous state becomes quarantined. Neither
+state restores cached output. Restore uses one durable marker for the exact destination set. Failure before the first
+visible replacement falls back to the original compiler; failure after that boundary cleans every owned destination
+and fails without running rustc over a partial commit.
+
+Corrupt or incompatible native entries never authorize reuse. Cargo still owns its fingerprints; Cargo-Rail never
+restores a target directory or synthesizes Cargo freshness. Use `--no-cache` for an intentional cold baseline.
+
+## Shared native cache (L2)
+
+Select one machine target by alias; L1 remains enabled by default:
+
+```toml
+[cache]
+l2 = "team"
+```
+
+An accepted L1 hit is network-free. On an L1 miss, the command-owned coordinator can stream one S3 result into private
+L1 staging. The ordinary L1 proof must accept the imported result before restore. A `read_write` target publishes a
+verified local pack before its action association. The compiler wrapper receives only a loopback capability, never S3
+credentials or a bucket name.
+
+Set `CARGO_RAIL_CACHE_TARGETS_FILE` to an absolute machine-owned JSON file outside the checkout. This is the complete
+version 1 schema; unknown fields are rejected:
+
+```json
+{{
+  "version": 1,
+  "targets": {{
+    "team": {{
+      "protocol": "s3",
+      "region": "us-east-1",
+      "expected_bucket_owner": "123456789012",
+      "bucket": "company-cargo-rail-cache",
+      "prefix": "rust/team",
+      "role": "read_write",
+      "shareable_environment": ["CARGO", "CARGO_CRATE_NAME", "LANG", "PATH"]
+    }}
+  }}
+}}
+```
+
+Aliases use lowercase ASCII letters, digits, `-`, and `_`, and start with a letter. `read` permits `GetObject` only;
+`read_write` also permits conditional `PutObject`. Restrict the AWS principal to the selected bucket prefix.
+`shareable_environment` is a sorted, unique list of non-secret compiler-environment names that may participate in L2
+reuse. An action with any other selected environment name stays local.
+
+Before granting client access, create `<prefix>/native-v3/protocol` with the exact 27-byte body
+`cargo-rail-native-cache-v3\n`. Keep this marker and selector/action objects permanent; apply expiration only to
+`<prefix>/native-v3/results/`. Require TLS and reject every `PutObject` that has neither `If-Match` nor
+`If-None-Match`. Clients need no list, delete, ACL, bucket-policy, or lifecycle authority. The marker is required
+because S3 reports a missing object as `403` when a caller has `GetObject` but not `ListBucket`; Cargo-Rail validates
+the marker before treating `403` on a content-addressed cache key as a miss.
+
+The command parent loads credentials from the standard AWS SDK chain. The target map contains no credentials.
+Cargo-Rail pins the expected bucket owner and the AWS SDK's official regional HTTPS endpoint; custom endpoints and
+S3-compatible services are not supported. Endpoint overrides, access points, multi-region access points, S3 Express,
+FIPS, dual-stack, and accelerated endpoints are disabled or rejected.
+
+Before starting Cargo, an L2-enabled command removes the target-map variable, AWS credential and provider-selector
+variables, and AWS endpoint-override variables from the child environment. This prevents accidental inheritance; it
+is not a sandbox. A same-UID build script or proc macro can still read default AWS credential files or contact a
+workload metadata service. Run untrusted builds under a principal or container with no L2 credentials, or omit
+`cache.l2`.
+
+```bash
+cargo rail cache status --scope local --format json
+cargo rail doctor native-cache --format json
+```
+
+`cache status` validates the selected target without resolving credentials. `doctor native-cache` resolves
+credentials and validates the immutable protocol marker. A missing target, unavailable credentials, authentication error,
+timeout, service failure, or remote miss compiles cold through L1 and opens one command-local remote circuit when
+applicable. A remote conflict, malformed object, or action/result mismatch is an integrity failure and restores
+nothing. Publication failure is reported after local admission and does not change successful compilation.
+
+The S3 protocol and local coordinator are implemented, but live cross-host S3 reuse has not yet been retained as
+release evidence.
 
 ## Hermetic whole-action cache
 
@@ -1049,9 +995,12 @@ Check mode does not edit manifests, but analysis may update cache and report fil
 
 ## Storage and cleanup
 
-The local CAS defaults to `$CARGO_HOME/cargo-rail/local-cas-v1` or
-`$HOME/.cargo/cargo-rail/local-cas-v1`. `CARGO_RAIL_CACHE_DIR` selects another base;
-`CARGO_RAIL_CACHE_MAX_BYTES` changes the positive 10 GiB bound.
+The default local authority root is `$CARGO_HOME/cargo-rail/local-cas-v2` or
+`$HOME/.cargo/cargo-rail/local-cas-v2`. `CARGO_RAIL_CACHE_DIR` selects another machine-authorized base;
+`CARGO_RAIL_CACHE_MAX_BYTES` changes the positive 10 GiB result bound. The owner directory contains a generated opaque
+trust-domain marker, and the CAS validates the matching root marker before every use. An explicit
+`CARGO_RAIL_CACHE_TRUST_DOMAIN` selects `local-cas-v2-<id>` so protected CI, untrusted jobs, and managed interactive
+workloads can use physically isolated roots. The variable names authority; it is not isolation by itself.
 
 ```bash
 cargo rail cache status
@@ -1059,21 +1008,21 @@ cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local
 ```
 
-Workspace cleanup removes reconstructible state for the current checkout. Local cleanup resolves the currently
-configured cache domain, validates its owner marker, waits for in-flight readers, and removes the cross-workspace CAS.
-Use `--scope all` only when both effects are intended. `cargo rail clean --cache` remains a combined compatibility
+Workspace cleanup removes reconstructible state for the current checkout. Local cleanup resolves only the currently
+selected trust domain, validates its owner marker, waits for in-flight readers, and removes that cross-workspace CAS.
+A legacy `local-cas-v1` is reclaim-only and never becomes v2 authority. Use `--scope all` only when both effects are
+intended. `cargo rail clean --cache` remains a combined compatibility
 alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
 
 ## Execution and reuse support
 
-Execution support, cache graduation, and performance qualification are independent. A cache bypass still executes
-Cargo normally. Native reuse is structural and exact-toolchain-keyed; benchmark qualification reports measured
-performance and is not an allowlist.
+Execution support and cache reuse are independent. A cache bypass still executes Cargo normally. Native reuse is
+structural and exact-toolchain-keyed.
 
 ### Hosts and targets
 
-| Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache | Performance qualification |
-|---|---|---|---|---|---|
+| Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache |
+|---|---|---|---|---|
 {chr(10).join(rows)}
 
 Linux musl rows are release cross-builds, not native Linux host evidence.
@@ -1088,12 +1037,12 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 
 ### Deferred native hosts
 
-| Platform | Target | Execution status | Cache status | Performance status |
-|---|---|---|---|---|
+| Platform | Target | Execution status | Cache status |
+|---|---|---|---|
 {chr(10).join(deferred_rows)}
 
-IBM Power and IBM Z need native runners before Cargo-Rail can claim tested execution or performance. They are not
-excluded by a runtime platform allowlist.
+IBM Power and IBM Z need native runners before Cargo-Rail can claim tested execution. They are not excluded by a
+runtime platform allowlist.
 
 ### Linkers and codegen backends
 
@@ -1109,7 +1058,7 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One source-root-bound session, one declared crate root, complete dep-info-observed inputs, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One live-root-bound session, one portable declared crate root, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
 | Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
@@ -1127,33 +1076,28 @@ The fixture contains registry and Git dependencies, build scripts, a proc macro,
 a binary:
 
 ```bash
-just bench-native-cache
+just bench-native-cache-smoke
+just bench-native-cache 10
 ```
 
-The v4 execution contract intentionally invalidates the retained v3 native-cache qualifications. Those measurements
-used a compiler-invocation rewrite and distinct source roots, so they cannot prove the corrected contract. Only hosts
-backed by a retained v4 corpus in the executable qualification registry are performance-qualified; structural cache
-availability is independent of that performance label.
+The v6 execution contract invalidates v5 measurements. V6 binds the command's effective default regular-file creation
+mode (the Unix umask result) into session and action identity, and binds each exact output mode into result identity,
+the canonical descriptor, and the result pack. Different effective creation modes cannot cross-hit. Do not compare
+measurements from different execution contracts.
 
 The benchmark now seeds and measures Cargo-Rail in one authoritative source root with a clean target directory and a
 fresh copy of the populated CAS. Acceptance hashes every `.d`, `.rmeta`, and `.rlib` byte without a root-bound
 exclusion, and requires identical action censuses, runtime behavior, compiler-event identities, cache accounting, and
-measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they cannot qualify
-Cargo-Rail's source-root-bound class.
-
-The final 30-sample M1 Pro active-profile follow-up measured unchanged Cargo at 60.2/60.8 ms p50/p95 and the narrow
-build delegation at 66.3/70.7 ms. The lean path removed workspace capture, metadata, Git, native-cache setup,
-action-key construction, and a false synchronous flush on the observational receipt, reducing the earlier 479.6 ms
-cargo-rail median by 86.2%. The corresponding active distribution profile measured Cargo at 59.3/60.3 ms and
-cargo-rail at 65.3/66.0 ms. The remaining 6.0–6.1 ms p50 premiums had non-overlapping observed ranges, so
-the active-profile policy accepts a 7 ms p50 supervisory budget for exact child exit behavior and a post-success
-receipt. The evidence does not justify process replacement, weaker receipt semantics, or broader static bypasses.
+measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they do not measure
+Cargo-Rail's arbitrary-root reuse path; the independent-root fixture carries that correctness proof.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
 wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
-reasons, and byte-identity findings. Use one accepted interleaved group for a bounded engineering decision.
-Increase the sample count only for distribution or tail claims. Preserve raw output and never combine different
-commits, toolchains, targets, or policies.
+reasons, and byte-identity findings. Choose the group count for the decision being made; one accepted interleaved group
+is a correctness smoke test, while repeated groups support p50/p95 comparisons.
+The benchmark pins the current stable `sccache` release from the CI tool registry and measures both its server and
+opt-in client-side local-disk paths. Preserve raw output and never combine different commits, toolchains, targets,
+policies, or cache modes.
 """
 
 
@@ -1169,8 +1113,7 @@ def main() -> int:
     try:
         manifest = load_compatibility_manifest()
         native_cache = load_native_cache_contract()
-        qualifications = load_qualifications()
-        validate_inventories(manifest, native_cache, qualifications)
+        validate_inventories(manifest)
         if args.github_matrix:
             print(github_matrix(manifest))
         elif args.compatibility_matrix:
@@ -1178,7 +1121,7 @@ def main() -> int:
         elif args.filesystem_matrix:
             print(filesystem_matrix(manifest))
         else:
-            print(render_markdown(manifest, native_cache, qualifications), end="")
+            print(render_markdown(manifest, native_cache), end="")
         return 0
     except (ContractError, OSError) as error:
         print(f"support-matrix: {error}", file=sys.stderr)

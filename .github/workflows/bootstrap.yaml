@@ -58,7 +58,7 @@ jobs:
           tool: cargo-audit
 
       - name: Quality checks
-        run: just ci-check
+        run: just check-ci
 
   compatibility:
     name: Compatibility

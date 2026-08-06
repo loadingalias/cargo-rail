@@ -15,7 +15,7 @@ readonly CARGO_DENY_VERSION=0.20.2
 readonly CARGO_AUDIT_VERSION=0.22.2
 readonly HYPERFINE_VERSION=1.20.0
 readonly JUST_VERSION=1.57.0
-readonly SCCACHE_VERSION=0.16.0
+readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
 
 cargo_bin="$HOME/.cargo/bin"
@@ -172,25 +172,25 @@ install_sccache() {
     x86_64-unknown-linux-gnu)
       archive_target="x86_64-unknown-linux-musl"
       asset="sccache-v$SCCACHE_VERSION-$archive_target.tar.gz"
-      digest="aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588"
+      digest="67c4a96dd237c1f518f6b36083f270f9976d516f1e57fce891755ea782e50006"
       binary=sccache
       ;;
     aarch64-unknown-linux-gnu)
       archive_target="aarch64-unknown-linux-musl"
       asset="sccache-v$SCCACHE_VERSION-$archive_target.tar.gz"
-      digest="f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784"
+      digest="821a86343191aa1cbab74bd42f9e93c9a63bf85e4742945f40d3ae84193c1c77"
       binary=sccache
       ;;
     x86_64-pc-windows-msvc)
       archive_target="x86_64-pc-windows-msvc"
       asset="sccache-v$SCCACHE_VERSION-$archive_target.zip"
-      digest="b8514ed7552e148b0a032114f745118dcb801791adafafeaf9935e4bfb0edf1b"
+      digest="e94cfc5b58cbe439302f586c1d1bd7980c2cd371d47bdf385ade657411e6f3ac"
       binary=sccache.exe
       ;;
     aarch64-pc-windows-msvc)
       archive_target="aarch64-pc-windows-msvc"
       asset="sccache-v$SCCACHE_VERSION-$archive_target.zip"
-      digest="6a715fe44d9b7a2cac15c256411ef232d3b6276e2421bd3be16ab32af71fbf88"
+      digest="82994d1bc92ccc0556f7e6e0ad6cbd08a41a1e84b461fcae628ac2afc8c372bf"
       binary=sccache.exe
       ;;
     *)

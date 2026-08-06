@@ -121,7 +121,7 @@ Options:
           Execute supported Rust actions in fresh isolated roots
 
       --no-cache
-          Disable local result reuse for this execution
+          Disable all Cargo-Rail build-result cache reads and writes for this execution
 
   -f, --format <FORMAT>
           Dry-run action plan format (json/github require --dry-run)
