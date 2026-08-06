@@ -707,7 +707,6 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "aws-types",
- "cargo-rail-windows-fs",
  "cargo_metadata",
  "chrono",
  "clap",
@@ -726,15 +725,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit",
- "winnow",
-]
-
-[[package]]
-name = "cargo-rail-windows-fs"
-version = "0.1.0"
-dependencies = [
- "tempfile",
  "windows-sys 0.61.2",
+ "winnow",
 ]
 
 [[package]]

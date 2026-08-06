@@ -1,6 +1,7 @@
 //! Rust monorepo orchestration: CI optimization, dependency unification, release automation.
 
 #![warn(missing_docs)]
+#![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
@@ -53,6 +54,10 @@ pub mod test;
 pub mod toml;
 /// Shared utilities.
 pub mod utils;
+/// Audited Win32 primitives unavailable through stable `std`.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+pub(crate) mod windows_fs;
 /// Unified workspace context.
 pub mod workspace;
 

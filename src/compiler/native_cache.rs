@@ -1808,12 +1808,12 @@ fn native_metadata_guard(_path: &Path, metadata: &fs::Metadata) -> RailResult<Na
     use std::os::windows::fs::MetadataExt as _;
 
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
-    let opened = cargo_rail_windows_fs::open_for_observation(_path)?;
-    let observation = cargo_rail_windows_fs::observe_file(&opened)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&opened, observation.volume_serial_number)?;
-    let current = cargo_rail_windows_fs::open_for_observation(_path)?;
-    let current_observation = cargo_rail_windows_fs::observe_file(&current)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
+    let opened = crate::windows_fs::open_for_observation(_path)?;
+    let observation = crate::windows_fs::observe_file(&opened)?;
+    crate::windows_fs::prove_local_ntfs(&opened, observation.volume_serial_number)?;
+    let current = crate::windows_fs::open_for_observation(_path)?;
+    let current_observation = crate::windows_fs::observe_file(&current)?;
+    crate::windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
     let observed_type = if observation.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
       NativeGuardEntryType::Directory
     } else {
@@ -5731,7 +5731,7 @@ fn rename_restore_write_through(
       )));
     }
     validate_restore_destination_state(destination, destination_identity)?;
-    match cargo_rail_windows_fs::rename_write_through(source, destination, destination_identity.is_some()) {
+    match crate::windows_fs::rename_write_through(source, destination, destination_identity.is_some()) {
       Ok(()) => return Ok(()),
       Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) && attempt.saturating_add(1) < MAX_ATTEMPTS => {
         std::thread::sleep(Duration::from_millis(1));
@@ -6457,8 +6457,8 @@ fn native_restore_file_identity(opened: &File) -> RailResult<NativeRestoreFileId
   #[cfg(windows)]
   {
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
-    let observation = cargo_rail_windows_fs::observe_file(opened)?;
-    cargo_rail_windows_fs::prove_local_ntfs(opened, observation.volume_serial_number)?;
+    let observation = crate::windows_fs::observe_file(opened)?;
+    crate::windows_fs::prove_local_ntfs(opened, observation.volume_serial_number)?;
     if observation.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
       || observation.number_of_links != 1
       || observation.size != metadata.len()
@@ -6510,12 +6510,12 @@ fn native_restore_directory_identity(path: &Path) -> RailResult<NativeRestoreDir
   #[cfg(windows)]
   {
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
-    let opened = cargo_rail_windows_fs::open_for_observation(path)?;
-    let observation = cargo_rail_windows_fs::observe_file(&opened)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&opened, observation.volume_serial_number)?;
-    let current = cargo_rail_windows_fs::open_for_observation(path)?;
-    let current_observation = cargo_rail_windows_fs::observe_file(&current)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
+    let opened = crate::windows_fs::open_for_observation(path)?;
+    let observation = crate::windows_fs::observe_file(&opened)?;
+    crate::windows_fs::prove_local_ntfs(&opened, observation.volume_serial_number)?;
+    let current = crate::windows_fs::open_for_observation(path)?;
+    let current_observation = crate::windows_fs::observe_file(&current)?;
+    crate::windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
     if observation != current_observation || observation.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
       return Err(RailError::message(
         "native restore transaction path changed while its identity was captured",

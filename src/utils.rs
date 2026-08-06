@@ -71,11 +71,11 @@ pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected
   }
   #[cfg(windows)]
   {
-    let named = cargo_rail_windows_fs::open_for_observation(path)?;
-    let opened_observation = cargo_rail_windows_fs::observe_file(opened)?;
-    let named_observation = cargo_rail_windows_fs::observe_file(&named)?;
-    cargo_rail_windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
+    let named = crate::windows_fs::open_for_observation(path)?;
+    let opened_observation = crate::windows_fs::observe_file(opened)?;
+    let named_observation = crate::windows_fs::observe_file(&named)?;
+    crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+    crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
     Ok(
       opened_observation == named_observation
         && opened_observation.number_of_links == 1
@@ -111,11 +111,11 @@ pub(crate) fn opened_file_matches_path(opened: &fs::File, path: &Path, expected_
   }
   #[cfg(windows)]
   {
-    let named = cargo_rail_windows_fs::open_for_observation(path)?;
-    let opened_observation = cargo_rail_windows_fs::observe_file(opened)?;
-    let named_observation = cargo_rail_windows_fs::observe_file(&named)?;
-    cargo_rail_windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
-    cargo_rail_windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
+    let named = crate::windows_fs::open_for_observation(path)?;
+    let opened_observation = crate::windows_fs::observe_file(opened)?;
+    let named_observation = crate::windows_fs::observe_file(&named)?;
+    crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+    crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
     Ok(opened_observation == named_observation && opened_observation.size == expected_len)
   }
   #[cfg(not(any(unix, windows)))]
@@ -277,7 +277,7 @@ fn persist_atomic_replacement(temporary: tempfile::NamedTempFile, path: &Path) -
   let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
   let mut attempts = 0;
   loop {
-    match cargo_rail_windows_fs::rename_write_through(&temporary_path, path, true) {
+    match crate::windows_fs::rename_write_through(&temporary_path, path, true) {
       Ok(()) => return Ok(file),
       Err(error) => {
         attempts += 1;

@@ -2192,9 +2192,9 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
 fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Option<ExactSysrootEvidence> {
   const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 
-  let root = cargo_rail_windows_fs::open_for_observation(&inventory.root).ok()?;
-  let root_observation = cargo_rail_windows_fs::observe_file(&root).ok()?;
-  cargo_rail_windows_fs::prove_local_ntfs(&root, root_observation.volume_serial_number).ok()?;
+  let root = crate::windows_fs::open_for_observation(&inventory.root).ok()?;
+  let root_observation = crate::windows_fs::observe_file(&root).ok()?;
+  crate::windows_fs::prove_local_ntfs(&root, root_observation.volume_serial_number).ok()?;
   if root_observation.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
     return None;
   }
@@ -2202,12 +2202,12 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
   let volume_identifier = root_observation.volume_serial_number.to_le_bytes().to_vec();
   let mut entries = Vec::with_capacity(inventory.evidence_locations.len());
   for location in &inventory.evidence_locations {
-    let file = cargo_rail_windows_fs::open_for_observation(&location.physical_path).ok()?;
-    let observation = cargo_rail_windows_fs::observe_file(&file).ok()?;
-    cargo_rail_windows_fs::prove_local_ntfs(&file, observation.volume_serial_number).ok()?;
-    let current = cargo_rail_windows_fs::open_for_observation(&location.physical_path).ok()?;
-    let current_observation = cargo_rail_windows_fs::observe_file(&current).ok()?;
-    cargo_rail_windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number).ok()?;
+    let file = crate::windows_fs::open_for_observation(&location.physical_path).ok()?;
+    let observation = crate::windows_fs::observe_file(&file).ok()?;
+    crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number).ok()?;
+    let current = crate::windows_fs::open_for_observation(&location.physical_path).ok()?;
+    let current_observation = crate::windows_fs::observe_file(&current).ok()?;
+    crate::windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number).ok()?;
 
     let is_directory = observation.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     let valid_kind = match location.kind {
@@ -2253,7 +2253,7 @@ fn load_sysroot_identity_memo(
   host_target: &str,
 ) -> Option<SysrootIdentityMemo> {
   #[cfg(windows)]
-  let mut file = cargo_rail_windows_fs::open_for_observation(path).ok()?;
+  let mut file = crate::windows_fs::open_for_observation(path).ok()?;
   #[cfg(not(windows))]
   let mut file = File::open(path).ok()?;
   let metadata = file.metadata().ok()?;

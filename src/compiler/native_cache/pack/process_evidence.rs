@@ -50,12 +50,12 @@ fn file_identity(path: &Path) -> RailResult<FileIdentity> {
 
 #[cfg(windows)]
 fn file_identity(path: &Path) -> RailResult<FileIdentity> {
-  let file = cargo_rail_windows_fs::open_for_observation(path)?;
-  let observation = cargo_rail_windows_fs::observe_file(&file)?;
-  cargo_rail_windows_fs::prove_local_ntfs(&file, observation.volume_serial_number)?;
-  let current = cargo_rail_windows_fs::open_for_observation(path)?;
-  let current_observation = cargo_rail_windows_fs::observe_file(&current)?;
-  cargo_rail_windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
+  let file = crate::windows_fs::open_for_observation(path)?;
+  let observation = crate::windows_fs::observe_file(&file)?;
+  crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number)?;
+  let current = crate::windows_fs::open_for_observation(path)?;
+  let current_observation = crate::windows_fs::observe_file(&current)?;
+  crate::windows_fs::prove_local_ntfs(&current, current_observation.volume_serial_number)?;
   if !file.metadata()?.is_file() || observation != current_observation || observation.number_of_links != 1 {
     return Err(RailError::message(format!(
       "native-pack evidence path '{}' is not one private regular file",

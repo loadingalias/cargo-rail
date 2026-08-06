@@ -2511,7 +2511,7 @@ fn validate_real_directory(path: &Path, description: &str) -> RailResult<()> {
 
 #[cfg(windows)]
 fn prove_local_cache_volume(path: &Path) -> RailResult<()> {
-  use cargo_rail_windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
+  use crate::windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
 
   const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
   let opened = open_for_observation(path).map_err(|error| {
@@ -4708,7 +4708,7 @@ fn persist_noclobber_committed(
   let (file, temporary_path) = temporary
     .keep()
     .map_err(|error| CommittedPersistError { error: error.error })?;
-  if let Err(error) = cargo_rail_windows_fs::rename_write_through(&temporary_path, destination, false) {
+  if let Err(error) = crate::windows_fs::rename_write_through(&temporary_path, destination, false) {
     drop(file);
     let error = match fs::remove_file(&temporary_path) {
       Ok(()) => error,
@@ -4737,7 +4737,7 @@ fn persist_noclobber_committed(
 
 #[cfg(windows)]
 fn rename_committed(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
-  cargo_rail_windows_fs::rename_write_through(source, destination, replace)
+  crate::windows_fs::rename_write_through(source, destination, replace)
 }
 
 #[cfg(not(windows))]
@@ -5296,7 +5296,7 @@ fn write_file_atomic_committed(path: &Path, contents: &[u8]) -> RailResult<()> {
       error.error
     ))
   })?;
-  if let Err(error) = cargo_rail_windows_fs::rename_write_through(&temporary_path, path, true) {
+  if let Err(error) = crate::windows_fs::rename_write_through(&temporary_path, path, true) {
     drop(file);
     let cleanup = fs::remove_file(&temporary_path);
     return Err(RailError::message(match cleanup {
@@ -6763,10 +6763,9 @@ mod tests {
 
   #[cfg(windows)]
   fn test_file_identity(path: &Path) -> TestFileIdentity {
-    let file = cargo_rail_windows_fs::open_for_observation(path).expect("staged blob file");
-    let information = cargo_rail_windows_fs::observe_file(&file).expect("staged blob identity");
-    cargo_rail_windows_fs::prove_local_ntfs(&file, information.volume_serial_number)
-      .expect("staged blob local NTFS proof");
+    let file = crate::windows_fs::open_for_observation(path).expect("staged blob file");
+    let information = crate::windows_fs::observe_file(&file).expect("staged blob identity");
+    crate::windows_fs::prove_local_ntfs(&file, information.volume_serial_number).expect("staged blob local NTFS proof");
     assert_eq!(information.number_of_links, 1);
     TestFileIdentity {
       volume: information.volume_serial_number,

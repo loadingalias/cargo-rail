@@ -1,4 +1,7 @@
-//! Safe Windows filesystem operations.
+//! Audited Windows filesystem operations for exact cache authority.
+//!
+//! This is the only production module allowed to use `unsafe`. Its crate-private
+//! API keeps Win32 pointer and handle contracts out of the rest of Cargo-Rail.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -25,34 +28,23 @@ const MAX_PATH_ARGUMENT_UNITS: usize = 32_766;
 /// Times use Windows' unsigned 100-nanosecond interval representation. The
 /// observation rejects zero identity or time evidence and reparse points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileObservation {
+pub(crate) struct FileObservation {
   /// Serial number of the volume containing the entry.
-  pub volume_serial_number: u64,
+  pub(crate) volume_serial_number: u64,
   /// 64-bit identifier of the entry within its volume.
-  pub file_id: u64,
+  pub(crate) file_id: u64,
   /// Entry creation time.
-  pub creation_time: u64,
+  pub(crate) creation_time: u64,
   /// Last time entry bytes were written.
-  pub last_write_time: u64,
+  pub(crate) last_write_time: u64,
   /// Last time entry bytes or metadata changed.
-  pub change_time: u64,
+  pub(crate) change_time: u64,
   /// Win32 file attributes.
-  pub file_attributes: u32,
+  pub(crate) file_attributes: u32,
   /// Entry size in bytes.
-  pub size: u64,
+  pub(crate) size: u64,
   /// Number of hard links to the entry.
-  pub number_of_links: u64,
-}
-
-/// Proof that an observed handle belongs to one local NTFS volume.
-///
-/// Construction is possible only through [`prove_local_ntfs`]. The volume
-/// serial is retained so callers can bind the proof to every observation made
-/// during one capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalNtfsVolume {
-  /// Serial number of the proven local NTFS volume.
-  pub volume_serial_number: u64,
+  pub(crate) number_of_links: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +60,7 @@ struct BasicObservation {
 /// The handle permits concurrent writers and renames so the caller can detect
 /// them by comparing observations. Reparse points are opened without following
 /// them and are then rejected by [`observe_file`].
-pub fn open_for_observation(path: &Path) -> io::Result<File> {
+pub(crate) fn open_for_observation(path: &Path) -> io::Result<File> {
   let mut options = OpenOptions::new();
   options
     .read(true)
@@ -83,7 +75,7 @@ pub fn open_for_observation(path: &Path) -> io::Result<File> {
 /// The function brackets the legacy identity query with `FileBasicInfo`
 /// queries. A concurrent change returns [`io::ErrorKind::WouldBlock`] instead
 /// of combining fields from different filesystem moments.
-pub fn observe_file(file: &File) -> io::Result<FileObservation> {
+pub(crate) fn observe_file(file: &File) -> io::Result<FileObservation> {
   let before = query_basic_information(file)?;
   let information = query_handle_information(file)?;
   let after = query_basic_information(file)?;
@@ -132,7 +124,7 @@ pub fn observe_file(file: &File) -> io::Result<FileObservation> {
 /// The proof combines handle-bound filesystem information with a normalized
 /// volume-GUID final path. A remote share, another filesystem, missing GUID,
 /// zero evidence, or mismatched serial returns an error.
-pub fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) -> io::Result<LocalNtfsVolume> {
+pub(crate) fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) -> io::Result<()> {
   require_nonzero(expected_volume_serial_number, "expected Windows volume serial number")?;
   let expected_serial = u32::try_from(expected_volume_serial_number)
     .map_err(|_| invalid_data("expected Windows volume serial number exceeds 32 bits"))?;
@@ -184,9 +176,7 @@ pub fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) -> io::
     ));
   }
 
-  Ok(LocalNtfsVolume {
-    volume_serial_number: u64::from(serial),
-  })
+  Ok(())
 }
 
 /// Rename `from` to `to` and ask Windows to complete the move before returning.
@@ -195,7 +185,7 @@ pub fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) -> io::
 /// fails. When it is true, an existing file is replaced. The operation never
 /// enables `MOVEFILE_COPY_ALLOWED`, so a cross-volume request fails instead of
 /// becoming a copy-and-delete operation.
-pub fn rename_write_through(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+pub(crate) fn rename_write_through(from: &Path, to: &Path, replace: bool) -> io::Result<()> {
   let from = encode_path(from)?;
   let to = encode_path(to)?;
   let flags = MOVEFILE_WRITE_THROUGH | if replace { MOVEFILE_REPLACE_EXISTING } else { 0 };
@@ -398,4 +388,141 @@ fn unsupported(message: impl Into<String>) -> io::Error {
 
 fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
   unsupported(format!("{message}: {source}"))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{observe_file, open_for_observation, prove_local_ntfs, rename_write_through};
+  use std::fs::{self, File};
+  use std::io;
+
+  #[test]
+  fn ordinary_byte_mutation_advances_ntfs_change_time() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("input.rs");
+    fs::write(&path, b"X")?;
+
+    let before_file = File::open(&path)?;
+    let before = observe_file(&before_file)?;
+    if !local_ntfs_or_explicitly_unsupported(&before_file, before.volume_serial_number)? {
+      return Ok(());
+    }
+    drop(before_file);
+
+    fs::write(&path, b"Y")?;
+    let after = observe_file(&File::open(&path)?)?;
+    assert_eq!(
+      after.file_id, before.file_id,
+      "ordinary writes must not replace the file"
+    );
+    assert_eq!(
+      after.size, before.size,
+      "the mutation intentionally preserves file length"
+    );
+    assert!(
+      after.change_time > before.change_time,
+      "rapid X-to-Y mutation must advance NTFS ChangeTime: before={}, after={}",
+      before.change_time,
+      after.change_time
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn file_id_is_stable_across_write_through_rename() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let before_path = directory.path().join("before.rmeta");
+    let after_path = directory.path().join("after.rmeta");
+    fs::write(&before_path, b"artifact")?;
+
+    let before_file = File::open(&before_path)?;
+    let before = observe_file(&before_file)?;
+    if !local_ntfs_or_explicitly_unsupported(&before_file, before.volume_serial_number)? {
+      return Ok(());
+    }
+    drop(before_file);
+    rename_write_through(&before_path, &after_path, false)?;
+    let after = observe_file(&File::open(&after_path)?)?;
+
+    assert_eq!(after.volume_serial_number, before.volume_serial_number);
+    assert_eq!(
+      after.file_id, before.file_id,
+      "a same-volume rename must preserve file identity"
+    );
+    assert!(!before_path.exists());
+    assert_eq!(fs::read(&after_path)?, b"artifact");
+    Ok(())
+  }
+
+  #[test]
+  fn local_ntfs_proof_succeeds_or_reports_unsupported() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("proof");
+    fs::write(&path, b"proof")?;
+    let file = File::open(path)?;
+    let observation = observe_file(&file)?;
+
+    let _supported = local_ntfs_or_explicitly_unsupported(&file, observation.volume_serial_number)?;
+    Ok(())
+  }
+
+  #[test]
+  fn directories_have_handle_bound_change_time_and_volume_proof() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let before_file = open_for_observation(directory.path())?;
+    let before = observe_file(&before_file)?;
+    if !local_ntfs_or_explicitly_unsupported(&before_file, before.volume_serial_number)? {
+      return Ok(());
+    }
+    drop(before_file);
+
+    let transient = directory.path().join("transient");
+    fs::write(&transient, b"value")?;
+    fs::remove_file(transient)?;
+
+    let after_file = open_for_observation(directory.path())?;
+    let after = observe_file(&after_file)?;
+    assert_eq!(
+      after.file_id, before.file_id,
+      "the directory itself must not be replaced"
+    );
+    assert!(
+      after.change_time > before.change_time,
+      "a create/delete mutation must advance the parent directory ChangeTime: before={}, after={}",
+      before.change_time,
+      after.change_time
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn write_through_rename_preserves_or_replaces_destination_as_requested() -> io::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    let destination = directory.path().join("destination");
+    fs::write(&source, b"new")?;
+    fs::write(&destination, b"old")?;
+
+    let error = rename_write_through(&source, &destination, false)
+      .expect_err("a no-clobber rename must reject an existing destination");
+    assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(fs::read(&source)?, b"new");
+    assert_eq!(fs::read(&destination)?, b"old");
+
+    rename_write_through(&source, &destination, true)?;
+    assert!(!source.exists());
+    assert_eq!(fs::read(&destination)?, b"new");
+    Ok(())
+  }
+
+  fn local_ntfs_or_explicitly_unsupported(file: &File, volume_serial_number: u64) -> io::Result<bool> {
+    match prove_local_ntfs(file, volume_serial_number) {
+      Ok(()) => Ok(true),
+      Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+        eprintln!("local NTFS proof is unavailable on this test volume: {error}");
+        Ok(false)
+      }
+      Err(error) => Err(error),
+    }
+  }
 }

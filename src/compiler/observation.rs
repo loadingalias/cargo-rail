@@ -244,7 +244,7 @@ impl FileObservation {
 
 #[cfg(windows)]
 fn read_observed_file(path: &Path, metadata: &fs::Metadata) -> RailResult<Vec<u8>> {
-  use cargo_rail_windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
+  use crate::windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
 
   let mut opened = open_for_observation(path).map_err(|error| {
     RailError::message(format!(
