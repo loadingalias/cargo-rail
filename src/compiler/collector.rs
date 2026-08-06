@@ -107,7 +107,7 @@ struct BuildScriptPackageContext {
   working_directory: String,
 }
 
-/// Exact, root-independent toolchain identity used by native-cache keys.
+/// Exact, root-independent rustc toolchain identity used by native-cache keys.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct NativeToolchainCapability {
   schema_version: u32,
@@ -115,12 +115,8 @@ pub(crate) struct NativeToolchainCapability {
   execution_contract: &'static str,
   platform: String,
   host_target: String,
-  cargo_verbose_version: String,
   rustc_verbose_version: String,
-  rustdoc_verbose_version: String,
-  cargo_content_digest: String,
   rustc_content_digest: String,
-  rustdoc_content_digest: String,
   sysroot_identity: String,
   identity: String,
 }
@@ -386,12 +382,10 @@ pub(crate) fn prepare_pre_context_direct_cargo_action(
       .and_then(|cas| cas.native_authority_is_empty())
       .unwrap_or(false);
   if discovery_only {
-    let capability_identity = deferred_native_identity("capability", &cargo_config, &compiler_process_env_fingerprint);
-    let toolchain_identity = deferred_native_identity("toolchain", &cargo_config, &compiler_process_env_fingerprint);
+    let capability_identity = deferred_native_capability_identity(&cargo_config, &compiler_process_env_fingerprint);
     let session = NativeCompilerSession::capture_discovery(
       source_root,
       &capability_identity,
-      &toolchain_identity,
       &compiler_process_env_fingerprint,
       crate::compiler::native_cache::native_cache_execution_contract(),
     )?;
@@ -491,14 +485,11 @@ fn prepare_direct_cargo_action_from_inputs(
       .and_then(|cas| cas.native_authority_is_empty())
       .unwrap_or(false);
   if discovery_only {
-    let capability_identity = deferred_native_identity("capability", cargo_config, &compiler_process_env_fingerprint);
-    let toolchain_identity = deferred_native_identity("toolchain", cargo_config, &compiler_process_env_fingerprint);
+    let capability_identity = deferred_native_capability_identity(cargo_config, &compiler_process_env_fingerprint);
     let session = NativeCompilerSession::capture(
       source_root,
       toolchain.rustc_verbose_version(),
-      toolchain.cargo_verbose_version(),
       &capability_identity,
-      &toolchain_identity,
       &compiler_process_env_fingerprint,
       crate::compiler::native_cache::native_cache_execution_contract(),
       NativeSessionAuthority::Discovery,
@@ -562,9 +553,6 @@ fn capture_exact_direct_session(
       "native compiler session cannot replace an existing compiler wrapper",
     ));
   }
-  let wrapper_executable = crate::compiler::native_cache::direct_wrapper_executable()
-    .with_context(|| "locating cargo-rail compiler-cache wrapper".to_string())?;
-  let cargo_rail_executable = ExecutableIdentity::capture(wrapper_executable.as_os_str(), source_root, source_root)?;
   let executables = ToolchainExecutableIdentities::capture(
     toolchain,
     source_root,
@@ -572,14 +560,11 @@ fn capture_exact_direct_session(
     ToolchainExecutableScope::Compilation,
   )?;
   let native_capability = capture_native_toolchain_capability(toolchain, &executables)?;
-  let toolchain_fingerprint = native_session_toolchain_identity(&native_capability, &cargo_rail_executable);
   let setup_bytes_hashed = native_capability.bytes_hashed;
   let session = NativeCompilerSession::capture(
     source_root,
     toolchain.rustc_verbose_version(),
-    toolchain.cargo_verbose_version(),
     native_capability.report.identity(),
-    &toolchain_fingerprint,
     compiler_process_env_fingerprint,
     crate::compiler::native_cache::native_cache_execution_contract(),
     NativeSessionAuthority::Exact,
@@ -587,32 +572,11 @@ fn capture_exact_direct_session(
   Ok((session, setup_bytes_hashed))
 }
 
-fn native_session_toolchain_identity(
-  capability: &CapturedNativeToolchainCapability,
-  cargo_rail_executable: &ExecutableIdentity,
-) -> String {
-  let mut framed = Vec::from(&b"cargo-rail-native-session-toolchain-v1\0"[..]);
-  append_identity_frame(&mut framed, b"capability", capability.report.identity().as_bytes());
-  append_identity_frame(
-    &mut framed,
-    b"cargo-rail-wrapper-content",
-    cargo_rail_executable.content_digest().as_bytes(),
-  );
-  append_identity_frame(
-    &mut framed,
-    b"cargo-rail-wrapper-executable",
-    &[u8::from(cargo_rail_executable.is_executable())],
-  );
-  format!("sha256:{}", ContentDigest::sha256(&framed))
-}
-
-fn deferred_native_identity(
-  kind: &str,
+fn deferred_native_capability_identity(
   cargo_config: &CargoConfigSnapshot,
   compiler_process_env_fingerprint: &str,
 ) -> String {
   let mut framed = Vec::from(&b"cargo-rail-native-discovery-session-v1\0"[..]);
-  append_identity_frame(&mut framed, b"kind", kind.as_bytes());
   append_identity_frame(&mut framed, b"cargo-configuration", cargo_config.digest().as_bytes());
   append_identity_frame(
     &mut framed,
@@ -1151,15 +1115,13 @@ fn run_workspace_check(
     let capability_identity = identity
       .native_cache_capability_identity
       .as_deref()
-      .ok_or_else(|| RailError::message("native cache is enabled without a captured exact toolchain identity"))?;
+      .ok_or_else(|| RailError::message("native cache is enabled without a captured exact compiler identity"))?;
     Some(
       NativeCompilerSession::write(
         observation_directory.path(),
         workspace_root,
         &identity.rustc_version,
-        &identity.cargo_version,
         capability_identity,
-        &identity.toolchain_fingerprint,
         &identity.native_compiler_process_env_fingerprint,
         DIAGNOSTIC_EXECUTION_CONTRACT,
       )
@@ -1689,9 +1651,7 @@ fn capture_native_toolchain_capability(
     std::env::consts::OS,
     std::env::consts::ARCH
   );
-  let cargo_content_digest = implementation_digest(executables.cargo_implementation(), "Cargo")?.to_string();
   let rustc_content_digest = implementation_digest(executables.rustc_implementation(), "rustc")?.to_string();
-  let rustdoc_content_digest = implementation_digest(executables.rustdoc_implementation(), "rustdoc")?.to_string();
   let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target());
   let (sysroot_identity, bytes_hashed) =
     compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
@@ -1707,26 +1667,19 @@ fn capture_native_toolchain_capability(
     b"execution-contract",
     crate::compiler::native_cache::native_cache_execution_contract().as_bytes(),
   );
+  // A rustc result is owned by the exact compiler capability and invocation.
+  // Cargo's decisions are already present in the captured argv and environment;
+  // rustdoc is not graduated; Cargo-Rail compatibility belongs to the versioned
+  // execution contract. Binding those executable bytes would only partition
+  // equivalent compiler work built or installed on different machines.
   append_identity_frame(&mut framed, b"platform", platform.as_bytes());
   append_identity_frame(&mut framed, b"host-target", toolchain.host_target().as_bytes());
-  append_identity_frame(
-    &mut framed,
-    b"cargo-version",
-    toolchain.cargo_verbose_version().as_bytes(),
-  );
   append_identity_frame(
     &mut framed,
     b"rustc-version",
     toolchain.rustc_verbose_version().as_bytes(),
   );
-  append_identity_frame(
-    &mut framed,
-    b"rustdoc-version",
-    toolchain.rustdoc_verbose_version().as_bytes(),
-  );
-  append_identity_frame(&mut framed, b"cargo-content", cargo_content_digest.as_bytes());
   append_identity_frame(&mut framed, b"rustc-content", rustc_content_digest.as_bytes());
-  append_identity_frame(&mut framed, b"rustdoc-content", rustdoc_content_digest.as_bytes());
   append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
   let identity = format!("sha256:{}", ContentDigest::sha256(&framed));
   Ok(CapturedNativeToolchainCapability {
@@ -1736,12 +1689,8 @@ fn capture_native_toolchain_capability(
       execution_contract: crate::compiler::native_cache::native_cache_execution_contract(),
       platform,
       host_target: toolchain.host_target().to_string(),
-      cargo_verbose_version: toolchain.cargo_verbose_version().to_string(),
       rustc_verbose_version: toolchain.rustc_verbose_version().to_string(),
-      rustdoc_verbose_version: toolchain.rustdoc_verbose_version().to_string(),
-      cargo_content_digest,
       rustc_content_digest,
-      rustdoc_content_digest,
       sysroot_identity,
       identity,
     },
@@ -1762,7 +1711,7 @@ fn executable_toolchain_fingerprint(
   let native_cache_enabled = cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none();
   if native_cache_enabled && native_capability.is_none() {
     return Err(RailError::message(
-      "native cache cannot activate without an exact toolchain identity",
+      "native cache cannot activate without an exact compiler identity",
     ));
   }
   let setup_bytes_hashed = native_capability.map_or(0, |capability| capability.bytes_hashed);
@@ -3032,6 +2981,9 @@ fn compiler_diagnostics_runtime_environment(name: &str) -> bool {
 }
 
 fn native_compiler_process_environment(name: &str) -> bool {
+  // PATH selects the already captured Cargo/rustc launchers, but graduated
+  // library units never invoke an external linker. Any environment rustc reads
+  // while compiling is bound later by the exact per-unit environment witness.
   matches!(
     name,
     "AR"
@@ -3048,7 +3000,6 @@ fn native_compiler_process_environment(name: &str) -> bool {
       | "LD_LIBRARY_PATH"
       | "LD_PRELOAD"
       | "MACOSX_DEPLOYMENT_TARGET"
-      | "PATH"
       | "RANLIB"
       | "RUSTC_BOOTSTRAP"
       | "RUSTC_FORCE_INCREMENTAL"
@@ -3181,10 +3132,10 @@ mod tests {
   use super::*;
 
   #[test]
-  fn native_session_environment_excludes_build_script_only_state() {
+  fn native_session_environment_excludes_launcher_and_build_script_only_state() {
     for name in [
       "LD",
-      "PATH",
+      "LD_LIBRARY_PATH",
       "RUSTC_BOOTSTRAP",
       "SDKROOT",
       "X86_64_UNKNOWN_LINUX_GNU_AR",
@@ -3194,7 +3145,14 @@ mod tests {
         "missing compiler state: {name}"
       );
     }
-    for name in ["BINDGEN_EXTRA_CLANG_ARGS", "CC", "CFLAGS", "CXX", "PKG_CONFIG_PATH"] {
+    for name in [
+      "PATH",
+      "BINDGEN_EXTRA_CLANG_ARGS",
+      "CC",
+      "CFLAGS",
+      "CXX",
+      "PKG_CONFIG_PATH",
+    ] {
       assert!(
         !native_compiler_process_environment(name),
         "build-script-only state partitioned every native compiler unit: {name}"

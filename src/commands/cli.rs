@@ -670,7 +670,7 @@ pub enum DoctorCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: TextJsonOutputFormat,
   },
-  /// Inspect the exact native-cache toolchain identity
+  /// Inspect the exact native-cache compiler identity
   NativeCache {
     /// Report format
     #[arg(long, short = 'f', default_value_t, value_enum)]

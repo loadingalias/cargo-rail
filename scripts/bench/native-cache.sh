@@ -429,9 +429,9 @@ if ! jq -e '
   and .command == "doctor"
   and .mode == "native_cache"
   and .result == "success"
-  and .capability.schema_version == 5
+  and .capability.schema_version == 6
   and .capability.cache_class == "library_metadata_rlib"
-  and .capability.execution_contract == "direct-global-wrapper-v8"
+  and .capability.execution_contract == "direct-global-wrapper-v9"
   and (.capability.platform | type) == "string"
   and (.capability.host_target | type) == "string"
   and (.capability.identity | type) == "string"

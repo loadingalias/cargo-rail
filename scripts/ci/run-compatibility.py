@@ -523,7 +523,7 @@ def assert_native_cache_identity(
         capability = report["capability"]
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise CompatibilityError(
-            f"native-cache toolchain identity report is invalid: {error}"
+            f"native-cache compiler identity report is invalid: {error}"
         ) from error
 
     if (
@@ -532,9 +532,9 @@ def assert_native_cache_identity(
         or report.get("result") != "success"
         or report.get("exit_code") != 0
         or capability.get("host_target") != expected_host
-        or capability.get("schema_version") != 5
+        or capability.get("schema_version") != 6
         or capability.get("cache_class") != "library_metadata_rlib"
-        or capability.get("execution_contract") != "direct-global-wrapper-v8"
+        or capability.get("execution_contract") != "direct-global-wrapper-v9"
         or not isinstance(capability.get("platform"), str)
         or not capability["platform"]
         or not isinstance(capability.get("identity"), str)
@@ -543,7 +543,7 @@ def assert_native_cache_identity(
         or "evidence" in capability
     ):
         raise CompatibilityError(
-            "native-cache doctor did not report the exact structural toolchain identity"
+            "native-cache doctor did not report the exact structural compiler identity"
         )
 
 

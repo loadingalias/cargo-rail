@@ -1708,7 +1708,7 @@ mod tests {
   #[test]
   fn key_uses_digest_shard_and_normalized_prefix() {
     let target = S3Target::from_wire(wire(S3Role::Read, &[])).expect("target");
-    let identity = format!("compiler-action-v8-sha256-{}", "ab".repeat(32));
+    let identity = format!("compiler-action-v9-sha256-{}", "ab".repeat(32));
     assert_eq!(
       target.object_key(ObjectClass::Results, &identity).expect("key"),
       format!("teams/example/native-v3/results/ab/{identity}")

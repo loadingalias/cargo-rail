@@ -2262,7 +2262,7 @@ impl LocalCas {
 }
 
 struct VerifiedResult {
-  #[cfg(any(unix, windows, test))]
+  #[cfg(any(target_os = "macos", test))]
   action_result: String,
   #[cfg(any(unix, windows, test))]
   object: ActionResultObject,
@@ -3473,7 +3473,7 @@ impl LocalCas {
       }
     }
     Ok(VerifiedResult {
-      #[cfg(any(unix, windows, test))]
+      #[cfg(any(target_os = "macos", test))]
       action_result: action_result.to_string(),
       #[cfg(any(unix, windows, test))]
       object,
@@ -3572,7 +3572,7 @@ impl LocalCas {
     Ok(VerifiedCompilerEvidence { validation, evidence })
   }
 
-  #[cfg(any(unix, windows, test))]
+  #[cfg(any(target_os = "macos", test))]
   fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
     let (_, output_tree, _) = output_result_payload(&verified.object)?;
     let parent = validate_materialization_destination(destination)?;

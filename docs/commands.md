@@ -209,7 +209,7 @@ Usage: cargo rail doctor [OPTIONS] <COMMAND>
 
 Commands:
   hermeticity   Explain action-key eligibility and every incomplete input boundary
-  native-cache  Inspect the exact native-cache toolchain identity
+  native-cache  Inspect the exact native-cache compiler identity
   help          Print this message or the help of the given subcommand(s)
 
 Options:
@@ -285,7 +285,7 @@ Options:
 ### cargo rail doctor native-cache
 
 ```
-Inspect the exact native-cache toolchain identity
+Inspect the exact native-cache compiler identity
 
 Usage: cargo rail doctor native-cache [OPTIONS]
 

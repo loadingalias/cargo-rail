@@ -2391,7 +2391,7 @@ fn test_doctor_hermeticity_reports_fail_closed_action_key_reasons_without_receip
 }
 
 #[test]
-fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_value() -> Result<()> {
+fn test_doctor_native_cache_reports_the_exact_compiler_identity_as_one_json_value() -> Result<()> {
   let ws = TestWorkspace::new_named("doctor-native-cache")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add native-cache doctor fixture")?;
@@ -2410,9 +2410,9 @@ fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_val
   assert_eq!(report["exit_code"], 0);
 
   let capability = &report["capability"];
-  assert_eq!(capability["schema_version"], 5);
+  assert_eq!(capability["schema_version"], 6);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v8");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v9");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]
@@ -2424,6 +2424,17 @@ fn test_doctor_native_cache_reports_the_exact_toolchain_identity_as_one_json_val
       .as_str()
       .is_some_and(|value| value.len() == 71 && value.starts_with("sha256:"))
   );
+  for unrelated in [
+    "cargo_verbose_version",
+    "cargo_content_digest",
+    "rustdoc_verbose_version",
+    "rustdoc_content_digest",
+  ] {
+    assert!(
+      capability.get(unrelated).is_none(),
+      "rustc-result authority must not include {unrelated}"
+    );
+  }
   assert!(capability.get("certified").is_none());
   assert!(capability.get("evidence").is_none());
   assert!(report["remote"].is_null());

@@ -743,7 +743,7 @@ def render_markdown(
             release = "Native artifact required"
             cache = (
                 f"Active for structurally eligible `{native_cache.cache_class}` units; "
-                "exact toolchain identity is part of every key"
+                "exact compiler identity is part of every key"
             )
         rows.append(
             f"| `{target}` | {execution} | {cross} | {release} | {cache} |"
@@ -752,7 +752,7 @@ def render_markdown(
     deferred_rows = [
         (
             f"| {host.name} | `{host.target}` | Native execution evidence is not retained yet | "
-            "Structurally active when the exact toolchain identity is captured |"
+            "Structurally active when the exact compiler identity is captured |"
         )
         for host in manifest.deferred_hosts
     ]
@@ -799,7 +799,7 @@ def render_markdown(
 > Auto-generated from executable CI/release registries and native-cache production gates. Do not edit manually.
 >
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `{manifest.schema_version}`;
-> native-cache toolchain-identity schema: `{native_cache.schema_version}`.
+> native-cache compiler-identity schema: `{native_cache.schema_version}`.
 
 Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
 prove that the stored result still matches every relevant input.
@@ -859,7 +859,7 @@ them to the current source and output roots after verification. Output names and
 ambiguous root spellings or unmodeled cached paths fail closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
-toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
+compiler identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
 `native_cache_capability_unavailable`. Existing wrappers remain in their selected order and Cargo-Rail does not add a
 second cache.
 

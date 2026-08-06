@@ -3,7 +3,7 @@
 > Auto-generated from executable CI/release registries and native-cache production gates. Do not edit manually.
 >
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `5`;
-> native-cache toolchain-identity schema: `5`.
+> native-cache compiler-identity schema: `6`.
 
 Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
 prove that the stored result still matches every relevant input.
@@ -63,7 +63,7 @@ them to the current source and output roots after verification. Output names and
 ambiguous root spellings or unmodeled cached paths fail closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
-toolchain identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
+compiler identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
 `native_cache_capability_unavailable`. Existing wrappers remain in their selected order and Cargo-Rail does not add a
 second cache.
 
@@ -228,17 +228,17 @@ structural and exact-toolchain-keyed.
 
 | Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache |
 |---|---|---|---|---|
-| `aarch64-apple-darwin` | Advertised; full-suite CI required (`macos-15`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
-| `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
-| `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
+| `aarch64-apple-darwin` | Advertised; full-suite CI required (`macos-15`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
+| `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
+| `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
 | `aarch64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_not_graduated` |
 | `thumbv7em-none-eabihf` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` |
 | `wasm32-unknown-unknown` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` |
 | `wasm32-wasip1` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` |
 | `wasm32v1-none` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_not_graduated` |
-| `x86_64-apple-darwin` | Advertised; full-suite CI required (`macos-15-intel`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
-| `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
-| `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact toolchain identity is part of every key |
+| `x86_64-apple-darwin` | Advertised; full-suite CI required (`macos-15-intel`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
+| `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
+| `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Active for structurally eligible `library_metadata_rlib` units; exact compiler identity is part of every key |
 | `x86_64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_not_graduated` |
 
 Linux musl rows are release cross-builds, not native Linux host evidence.
@@ -263,8 +263,8 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 
 | Platform | Target | Execution status | Cache status |
 |---|---|---|---|
-| IBM Power | `powerpc64le-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact toolchain identity is captured |
-| IBM Z | `s390x-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact toolchain identity is captured |
+| IBM Power | `powerpc64le-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact compiler identity is captured |
+| IBM Z | `s390x-unknown-linux-gnu` | Native execution evidence is not retained yet | Structurally active when the exact compiler identity is captured |
 
 IBM Power and IBM Z need native runners before Cargo-Rail can claim tested execution. They are not excluded by a
 runtime platform allowlist.

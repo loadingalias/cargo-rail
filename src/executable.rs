@@ -180,10 +180,6 @@ impl ToolchainExecutableIdentities {
     self.rustc_implementation.as_ref()
   }
 
-  pub(crate) fn rustdoc_implementation(&self) -> Option<&ExecutableIdentity> {
-    self.rustdoc_implementation.as_ref()
-  }
-
   pub(crate) fn limitations(&self) -> impl Iterator<Item = &str> {
     self.limitations.iter().map(String::as_str)
   }

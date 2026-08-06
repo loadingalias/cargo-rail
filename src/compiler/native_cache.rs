@@ -33,9 +33,9 @@ use crate::source::ContentDigest;
 pub(crate) mod pack;
 mod publication;
 
-pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v8-sha256-";
+pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v9-sha256-";
 pub(crate) const RESULT_KEY_PREFIX: &str = "compiler-result-v6-sha256-";
-pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v3-sha256-";
+pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v4-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
 const LEGACY_STORE_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE";
@@ -53,9 +53,9 @@ const CAPTURE_PAUSE_PHASE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_PHAS
 const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRATE";
 #[cfg(debug_assertions)]
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v8";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v8";
-const SESSION_FILE: &str = "native-compiler-cache-session-v5.json";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v9";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v9";
+const SESSION_FILE: &str = "native-compiler-cache-session-v6.json";
 const DIRECT_CONTEXT_FILE: &str = "native-compiler-cache-context-v3.json";
 const UNIT_EVIDENCE_DIRECTORY: &str = "native-cache-unit-evidence";
 #[cfg(not(windows))]
@@ -63,11 +63,11 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
-const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 5;
-const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 8;
+const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 6;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 9;
 const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 5;
 const NATIVE_CACHE_RUN_EVENT_VERSION: u32 = 7;
-const NATIVE_COMPILER_SESSION_VERSION: u32 = 8;
+const NATIVE_COMPILER_SESSION_VERSION: u32 = 9;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_MEMORY_SPOOL_BYTES: usize = 64 * 1024;
@@ -110,7 +110,6 @@ pub(crate) struct NativeCompilerSession {
   source_root_identity: String,
   class: NativeCompilerClass,
   capability_identity: String,
-  toolchain_identity: String,
   compiler_process_environment_identity: String,
   execution_contract: String,
   authority: NativeSessionAuthority,
@@ -132,11 +131,10 @@ pub(crate) struct NativeCompilerClass {
   platform: String,
   host_target: String,
   rustc_release: String,
-  cargo_release: String,
 }
 
 impl NativeCompilerClass {
-  fn capture(rustc_verbose_version: &str, cargo_verbose_version: &str) -> Self {
+  fn capture(rustc_verbose_version: &str) -> Self {
     Self {
       name: GRADUATED_NATIVE_CACHE_CLASS.to_string(),
       platform: format!(
@@ -147,7 +145,6 @@ impl NativeCompilerClass {
       ),
       host_target: rustc_host_from_verbose(rustc_verbose_version),
       rustc_release: release_from_verbose(rustc_verbose_version, "rustc"),
-      cargo_release: release_from_verbose(cargo_verbose_version, "cargo"),
     }
   }
 
@@ -156,7 +153,6 @@ impl NativeCompilerClass {
       && !self.platform.is_empty()
       && self.host_target != "unknown"
       && self.rustc_release != "unknown"
-      && self.cargo_release != "unknown"
   }
 }
 
@@ -2719,41 +2715,31 @@ impl NativeCompilerSession {
   pub(crate) fn capture_discovery(
     source_root: &Path,
     capability_identity: &str,
-    toolchain_identity: &str,
     compiler_process_environment_identity: &str,
     execution_contract: &str,
   ) -> RailResult<Self> {
     Self::capture(
       source_root,
       "rustc deferred\nhost: cargo-rail-discovery\n",
-      "cargo deferred\n",
       capability_identity,
-      toolchain_identity,
       compiler_process_environment_identity,
       execution_contract,
       NativeSessionAuthority::Discovery,
     )
   }
 
-  // The identity fields intentionally mirror the serialized session schema at
-  // both call sites; grouping them would add an otherwise unused construction type.
-  #[allow(clippy::too_many_arguments)]
   pub(crate) fn write(
     directory: &Path,
     source_root: &Path,
     rustc_verbose_version: &str,
-    cargo_verbose_version: &str,
     capability_identity: &str,
-    toolchain_identity: &str,
     compiler_process_environment_identity: &str,
     execution_contract: &str,
   ) -> RailResult<PathBuf> {
     Self::capture(
       source_root,
       rustc_verbose_version,
-      cargo_verbose_version,
       capability_identity,
-      toolchain_identity,
       compiler_process_environment_identity,
       execution_contract,
       NativeSessionAuthority::Exact,
@@ -2761,24 +2747,20 @@ impl NativeCompilerSession {
     .persist(directory)
   }
 
-  #[allow(clippy::too_many_arguments)]
   pub(crate) fn capture(
     source_root: &Path,
     rustc_verbose_version: &str,
-    cargo_verbose_version: &str,
     capability_identity: &str,
-    toolchain_identity: &str,
     compiler_process_environment_identity: &str,
     execution_contract: &str,
     authority: NativeSessionAuthority,
   ) -> RailResult<Self> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     let source_root_identity = path_identity(&source_root)?;
-    let class = NativeCompilerClass::capture(rustc_verbose_version, cargo_verbose_version);
+    let class = NativeCompilerClass::capture(rustc_verbose_version);
     let identity = session_identity(
       &class,
       capability_identity,
-      toolchain_identity,
       compiler_process_environment_identity,
       execution_contract,
       authority,
@@ -2789,7 +2771,6 @@ impl NativeCompilerSession {
       source_root_identity,
       class,
       capability_identity: capability_identity.to_string(),
-      toolchain_identity: toolchain_identity.to_string(),
       compiler_process_environment_identity: compiler_process_environment_identity.to_string(),
       execution_contract: execution_contract.to_string(),
       authority,
@@ -2847,7 +2828,6 @@ impl NativeCompilerSession {
       &self.identity,
       &self.source_root_identity,
       &self.capability_identity,
-      &self.toolchain_identity,
       &self.compiler_process_environment_identity,
     ] {
       validate_sha256(digest)?;
@@ -2863,7 +2843,6 @@ impl NativeCompilerSession {
     let expected = session_identity(
       &self.class,
       &self.capability_identity,
-      &self.toolchain_identity,
       &self.compiler_process_environment_identity,
       &self.execution_contract,
       self.authority,
@@ -2931,7 +2910,7 @@ impl NativeCompilerValidation {
       stderr_bytes,
     } = descriptor;
     let validation = Self {
-      version: 8,
+      version: 9,
       action_key,
       result_key,
       session_identity: session.identity.clone(),
@@ -3142,7 +3121,7 @@ impl NativeCompilerValidation {
   }
 
   pub(crate) fn validate_object(&self) -> RailResult<()> {
-    if self.version != 8 {
+    if self.version != 9 {
       return Err(RailError::message(
         "native compiler observation has an incompatible schema",
       ));
@@ -3349,7 +3328,6 @@ fn result_key(
 fn session_identity(
   class: &NativeCompilerClass,
   capability_identity: &str,
-  toolchain_identity: &str,
   compiler_process_environment_identity: &str,
   execution_contract: &str,
   authority: NativeSessionAuthority,
@@ -3359,14 +3337,13 @@ fn session_identity(
     "sha256:",
     b"cargo-rail-native-compiler-session\0",
     &[
-      (b"version", &8_u32.to_le_bytes()),
+      (b"version", &9_u32.to_le_bytes()),
       (
         b"toolchain-capability-contract",
         &NATIVE_CACHE_IDENTITY_CONTRACT_VERSION.to_le_bytes(),
       ),
       (b"class", &class),
       (b"capability", capability_identity.as_bytes()),
-      (b"toolchain", toolchain_identity.as_bytes()),
       (
         b"compiler-process-environment",
         compiler_process_environment_identity.as_bytes(),
@@ -3401,7 +3378,7 @@ fn action_key_from_base(base_action: &str, approved_environment: &ApprovedEnvSta
     ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-action\0",
     &[
-      (b"version", &8_u32.to_le_bytes()),
+      (b"version", &9_u32.to_le_bytes()),
       (b"base-action", base_action.as_bytes()),
       (b"approved-environment", &approved_environment),
     ],
@@ -3430,7 +3407,7 @@ fn base_action_key(
     BASE_ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-base-action\0",
     &[
-      (b"version", &3_u32.to_le_bytes()),
+      (b"version", &4_u32.to_le_bytes()),
       (b"session", session_identity.as_bytes()),
       (b"class", &class),
       (b"pre-execution", &pre_execution),
@@ -8890,16 +8867,13 @@ pub(crate) mod tests {
       platform: "unix-test-x86_64".to_string(),
       host_target: "x86_64-unknown-test".to_string(),
       rustc_release: "1.97.1".to_string(),
-      cargo_release: "1.97.1".to_string(),
     };
     let capability_identity = digest(b"toolchain-capability");
-    let toolchain_identity = digest(b"toolchain");
     let compiler_process_environment_identity = digest(b"compiler-process-environment");
     let execution_contract = DIAGNOSTIC_EXECUTION_CONTRACT.to_string();
     let identity = session_identity(
       &class,
       &capability_identity,
-      &toolchain_identity,
       &compiler_process_environment_identity,
       &execution_contract,
       NativeSessionAuthority::Exact,
@@ -8911,7 +8885,6 @@ pub(crate) mod tests {
       source_root_identity,
       class,
       capability_identity,
-      toolchain_identity,
       compiler_process_environment_identity,
       execution_contract,
       authority: NativeSessionAuthority::Exact,
@@ -9325,12 +9298,10 @@ pub(crate) mod tests {
     fs::create_dir(source_root.path().join("src")).expect("source directory");
     fs::write(source_root.path().join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n").expect("source file");
     let rustc = "rustc 1.97.1 (test)\nhost: aarch64-apple-darwin\n";
-    let cargo = "cargo 1.97.1 (test)\n";
     let environment = digest(b"compiler-process-environment");
     let discovery = NativeCompilerSession::capture_discovery(
       source_root.path(),
       &digest(b"discovery-capability"),
-      &digest(b"discovery-toolchain"),
       &environment,
       DIRECT_EXECUTION_CONTRACT,
     )
@@ -9338,9 +9309,7 @@ pub(crate) mod tests {
     let exact = NativeCompilerSession::capture(
       source_root.path(),
       rustc,
-      cargo,
       &digest(b"exact-capability"),
-      &digest(b"exact-toolchain"),
       &environment,
       DIRECT_EXECUTION_CONTRACT,
       NativeSessionAuthority::Exact,
@@ -10152,7 +10121,6 @@ pub(crate) mod tests {
       class.platform = platform.to_string();
       class.host_target = host_target.to_string();
       class.rustc_release = release.to_string();
-      class.cargo_release = release.to_string();
       assert!(class.is_valid(), "{platform}/{host_target}/{release}");
     }
 
@@ -10162,13 +10130,12 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn session_identity_changes_with_exact_toolchain_identity() {
+  fn session_identity_changes_with_exact_compiler_authority() {
     let session = graduated_session(digest(b"source-root"));
-    let identity = |capability: &str, toolchain: &str, environment: &str, contract: &str| {
+    let identity = |capability: &str, environment: &str, contract: &str| {
       session_identity(
         &session.class,
         capability,
-        toolchain,
         environment,
         contract,
         NativeSessionAuthority::Exact,
@@ -10178,7 +10145,6 @@ pub(crate) mod tests {
     assert_ne!(
       identity(
         &digest(b"changed-capability"),
-        &session.toolchain_identity,
         &session.compiler_process_environment_identity,
         &session.execution_contract,
       ),
@@ -10187,16 +10153,6 @@ pub(crate) mod tests {
     assert_ne!(
       identity(
         &session.capability_identity,
-        &digest(b"changed-toolchain"),
-        &session.compiler_process_environment_identity,
-        &session.execution_contract,
-      ),
-      session.identity
-    );
-    assert_ne!(
-      identity(
-        &session.capability_identity,
-        &session.toolchain_identity,
         &digest(b"changed-environment"),
         &session.execution_contract,
       ),
@@ -10205,7 +10161,6 @@ pub(crate) mod tests {
     assert_ne!(
       identity(
         &session.capability_identity,
-        &session.toolchain_identity,
         &session.compiler_process_environment_identity,
         DIRECT_EXECUTION_CONTRACT,
       ),
@@ -10221,7 +10176,6 @@ pub(crate) mod tests {
     session.identity = session_identity(
       &session.class,
       &session.capability_identity,
-      &session.toolchain_identity,
       &session.compiler_process_environment_identity,
       &session.execution_contract,
       session.authority,
@@ -10229,7 +10183,7 @@ pub(crate) mod tests {
     .expect("session identity");
 
     assert_ne!(session.identity, original_identity);
-    session.validate_object().expect("exact toolchain identity");
+    session.validate_object().expect("exact compiler identity");
   }
 
   #[test]
@@ -10266,7 +10220,7 @@ pub(crate) mod tests {
     observation.cache_wrapper = Some(CompilerCacheWrapperMetadata::native(
       CompilerCacheWrapperStatus::Miss,
       "stored_verified_result",
-      Some("compiler-action-v8-sha256-aaaa".to_string()),
+      Some("compiler-action-v9-sha256-aaaa".to_string()),
       Some("compiler-result-v6-sha256-1111".to_string()),
       10,
       0,
@@ -10283,7 +10237,7 @@ pub(crate) mod tests {
           version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Hit,
           reason: "verified_local_result",
-          action_key: Some("compiler-action-v8-sha256-bbbb"),
+          action_key: Some("compiler-action-v9-sha256-bbbb"),
           result_key: Some("compiler-result-v6-sha256-2222"),
           base_action_key: None,
           bytes_hashed: 20,
@@ -10299,7 +10253,7 @@ pub(crate) mod tests {
           version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Miss,
           reason: "stored_verified_result",
-          action_key: Some("compiler-action-v8-sha256-aaaa"),
+          action_key: Some("compiler-action-v9-sha256-aaaa"),
           result_key: Some("compiler-result-v6-sha256-1111"),
           base_action_key: None,
           bytes_hashed: 10,
@@ -10350,7 +10304,7 @@ pub(crate) mod tests {
     assert_eq!(report.events[0].schema_version, NATIVE_CACHE_EVENT_EVIDENCE_VERSION);
     assert_eq!(
       report.events[0].unit_identity.as_deref(),
-      Some("compiler-action-v8-sha256-aaaa")
+      Some("compiler-action-v9-sha256-aaaa")
     );
     assert_eq!(report.events[0].outcome, CompilerCacheWrapperStatus::Miss);
     let unit = report.events[0].unit.as_ref().expect("unit evidence");
@@ -10375,7 +10329,7 @@ pub(crate) mod tests {
     assert_eq!(unit.claimed_outputs.as_ref(), Some(&observation.emitted_outputs));
     assert_eq!(
       report.events[1].unit_identity.as_deref(),
-      Some("compiler-action-v8-sha256-bbbb")
+      Some("compiler-action-v9-sha256-bbbb")
     );
     assert_eq!(report.events[1].outcome, CompilerCacheWrapperStatus::Hit);
   }

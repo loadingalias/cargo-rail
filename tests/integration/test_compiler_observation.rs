@@ -1084,7 +1084,13 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
     .context("first-root action key")?
     .to_string();
   let second = wrapper_workspace("native-cache-second-independent-root")?;
-  let second_hit = run_unify_without_ambient_wrappers(&second.path, local_cache.path())?;
+  let unused_tools = tempfile::tempdir()?;
+  let alternate_path = std::env::join_paths(
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+      .chain(std::iter::once(unused_tools.path().to_path_buf())),
+  )?;
+  let alternate_path = alternate_path.to_str().context("UTF-8 test PATH")?;
+  let second_hit = run_unify_with_environment(&second.path, local_cache.path(), &[("PATH", alternate_path)])?;
   assert_eq!(
     second_hit.status.code(),
     Some(1),
@@ -1094,7 +1100,7 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
   assert_eq!(
     second_observation["execution"]["cache_wrapper"]["action_key"], first_action,
-    "equivalent workspace actions must have a checkout-root-independent identity"
+    "equivalent workspace actions must ignore checkout root and unused PATH entries"
   );
   let second_target = second.path.join("target");
   let second_outputs = compiler_output_files(&second_target)?;

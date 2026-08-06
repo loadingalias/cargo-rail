@@ -46,7 +46,7 @@ Use the doctor for the cache boundary you are testing:
 # Expanded action-key eligibility
 cargo rail doctor hermeticity --action build --format json
 
-# Exact native compiler-cache toolchain identity
+# Exact native compiler-cache identity
 cargo rail doctor native-cache --format json
 
 # Compiler evidence used by unify
@@ -54,10 +54,10 @@ cargo rail unify --check -f json
 ```
 
 For native reuse, inspect the run summary's hits, misses, bypasses, hashed/restored bytes, and stable reasons. Failure
-to capture the exact toolchain identity, incremental compilation, an existing wrapper, a non-JSON compiler diagnostic
+to capture the exact compiler identity, incremental compilation, an existing wrapper, a non-JSON compiler diagnostic
 format, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache hit. A
-different physical source root produces an independent candidate identity because opaque Rust metadata can contain
-source-root-sensitive bytes. That expected miss prevents cross-checkout reuse from changing compiler output bytes.
+different physical source root can reuse the same portable action only after exact capability, input, and output
+verification; Cargo-Rail then rebinds dep-info and diagnostic paths to the current checkout.
 
 For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
 describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the
