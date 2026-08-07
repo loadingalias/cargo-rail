@@ -33,9 +33,9 @@ use crate::source::ContentDigest;
 pub(crate) mod pack;
 mod publication;
 
-pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v9-sha256-";
+pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v10-sha256-";
 pub(crate) const RESULT_KEY_PREFIX: &str = "compiler-result-v6-sha256-";
-pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v4-sha256-";
+pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v5-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
 const LEGACY_STORE_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE";
@@ -53,9 +53,9 @@ const CAPTURE_PAUSE_PHASE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_PHAS
 const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRATE";
 #[cfg(debug_assertions)]
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v9";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v9";
-const SESSION_FILE: &str = "native-compiler-cache-session-v6.json";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v10";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v10";
+const SESSION_FILE: &str = "native-compiler-cache-session-v7.json";
 const DIRECT_CONTEXT_FILE: &str = "native-compiler-cache-context-v3.json";
 const UNIT_EVIDENCE_DIRECTORY: &str = "native-cache-unit-evidence";
 #[cfg(not(windows))]
@@ -64,10 +64,10 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
 const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 6;
-const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 9;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 10;
 const NATIVE_CACHE_EVENT_EVIDENCE_VERSION: u32 = 5;
 const NATIVE_CACHE_RUN_EVENT_VERSION: u32 = 7;
-const NATIVE_COMPILER_SESSION_VERSION: u32 = 9;
+const NATIVE_COMPILER_SESSION_VERSION: u32 = 10;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_MEMORY_SPOOL_BYTES: usize = 64 * 1024;
@@ -106,7 +106,7 @@ const PORTABLE_PACKAGE_ROOT: &str = "/cargo-rail/native-package/v2";
 pub(crate) struct NativeCompilerSession {
   version: u32,
   identity: String,
-  /// Physical binding for this session file only. It never enters a reusable key.
+  /// Exact workspace-root binding for this session and every reusable action.
   source_root_identity: String,
   class: NativeCompilerClass,
   capability_identity: String,
@@ -714,7 +714,10 @@ struct PublishedRestoreOutput {
 
 impl PublishedRestoreOutput {
   fn sync(&self) -> RailResult<()> {
+    #[cfg(not(windows))]
     self.opened.sync_all()?;
+    // Windows restore sources are flushed through their original writable
+    // handles before the write-through rename publishes them.
     Ok(())
   }
 
@@ -743,9 +746,9 @@ struct PreparedNativeRestore {
 }
 
 struct NativeRestorePaths {
+  identity: ContentDigest,
   output_parent: PathBuf,
   marker: PathBuf,
-  lock: PathBuf,
   transaction_directory: PathBuf,
   output_sources: BTreeMap<PathBuf, PathBuf>,
 }
@@ -761,7 +764,7 @@ struct NativeRestoreTransaction {
   observation_directory: PathBuf,
   registration: NativeRestoreRegistration,
   state: NativeRestoreTransactionState,
-  _lock: File,
+  _lock: crate::hermetic::cas::NativeRestoreLock,
 }
 
 enum RestorePublishFailure {
@@ -1256,6 +1259,35 @@ impl NativeActionCapture {
     ))
   }
 
+  /// Bind exact compiler outputs to the physical source namespace rustc observed.
+  fn compilation_root_identity(&self) -> String {
+    let mut framed = Vec::from(&b"cargo-rail-native-compilation-root\0"[..]);
+    append_frame(
+      &mut framed,
+      b"source-root",
+      self.source_root.as_os_str().as_encoded_bytes(),
+    );
+    append_frame(
+      &mut framed,
+      b"source-root-spelling",
+      self.source_root_spelling.as_os_str().as_encoded_bytes(),
+    );
+    if let Some(package) = &self.package_binding {
+      append_frame(
+        &mut framed,
+        b"package-root",
+        package.root.as_os_str().as_encoded_bytes(),
+      );
+      append_frame(
+        &mut framed,
+        b"package-root-spelling",
+        package.spelling.as_os_str().as_encoded_bytes(),
+      );
+    }
+    crate::instrumentation::record_hash(framed.len());
+    format!("sha256:{}", ContentDigest::sha256(&framed))
+  }
+
   fn remotely_shareable(&self, remote: Option<&crate::remote_cache::RemoteWrapperContext>) -> bool {
     remote.is_some_and(|remote| {
       self
@@ -1738,6 +1770,9 @@ fn capture_guarded_file(
     return Err(RailError::message("native source entry is not a real regular file"));
   }
   let before = native_metadata_guard(path, &before_metadata)?;
+  #[cfg(windows)]
+  let mut file = crate::windows_fs::open_for_stable_byte_observation(path)?;
+  #[cfg(not(windows))]
   let mut file = File::open(path)?;
   if !crate::utils::opened_file_matches_path(&file, path, before.len)? {
     return Err(RailError::message("native source file changed before it was read"));
@@ -1872,10 +1907,10 @@ fn semantic_mode(metadata: &fs::Metadata) -> u32 {
   u32::from(metadata.permissions().readonly())
 }
 
-fn executable_mode_from_guard(metadata: &NativeMetadataGuard) -> bool {
+fn executable_mode_from_guard(_metadata: &NativeMetadataGuard) -> bool {
   #[cfg(unix)]
   {
-    metadata.mode & 0o111 != 0
+    _metadata.mode & 0o111 != 0
   }
   #[cfg(not(unix))]
   {
@@ -1972,25 +2007,11 @@ fn source_root_spellings(source_root: &Path) -> RailResult<Vec<Vec<u8>>> {
   Ok(spellings)
 }
 
-#[cfg(unix)]
 fn source_root_path_spellings(path: &Path) -> Vec<Vec<u8>> {
-  vec![path.as_os_str().as_encoded_bytes().to_vec()]
-}
-
-#[cfg(windows)]
-fn source_root_path_spellings(path: &Path) -> Vec<Vec<u8>> {
-  let native = path.as_os_str().as_encoded_bytes().to_vec();
-  let forward = crate::utils::path_to_git_format(path).into_bytes();
-  let backward = forward
-    .iter()
-    .map(|byte| if *byte == b'/' { b'\\' } else { *byte })
-    .collect();
-  vec![native, forward, backward]
-}
-
-#[cfg(not(any(unix, windows)))]
-fn source_root_path_spellings(path: &Path) -> Vec<Vec<u8>> {
-  vec![path.as_os_str().as_encoded_bytes().to_vec()]
+  source_root_path_forms(path)
+    .into_iter()
+    .map(|(_, spelling)| spelling)
+    .collect()
 }
 
 #[cfg(windows)]
@@ -2221,14 +2242,6 @@ impl DirectNativeCacheRun {
         .reasons
         .entry("local_publication_request_rejected".to_string())
         .or_default() += publication.rejected;
-    }
-    if let Some(publication) = publication
-      && publication.shutdown_abandoned > 0
-    {
-      *report
-        .reasons
-        .entry("local_publication_shutdown_abandoned".to_string())
-        .or_default() += publication.shutdown_abandoned;
     }
     if publication.is_some_and(|publication| publication.session_failed) {
       *report
@@ -2760,6 +2773,7 @@ impl NativeCompilerSession {
     let class = NativeCompilerClass::capture(rustc_verbose_version);
     let identity = session_identity(
       &class,
+      &source_root_identity,
       capability_identity,
       compiler_process_environment_identity,
       execution_contract,
@@ -2842,6 +2856,7 @@ impl NativeCompilerSession {
     }
     let expected = session_identity(
       &self.class,
+      &self.source_root_identity,
       &self.capability_identity,
       &self.compiler_process_environment_identity,
       &self.execution_contract,
@@ -2910,7 +2925,7 @@ impl NativeCompilerValidation {
       stderr_bytes,
     } = descriptor;
     let validation = Self {
-      version: 9,
+      version: 10,
       action_key,
       result_key,
       session_identity: session.identity.clone(),
@@ -3121,7 +3136,7 @@ impl NativeCompilerValidation {
   }
 
   pub(crate) fn validate_object(&self) -> RailResult<()> {
-    if self.version != 9 {
+    if self.version != 10 {
       return Err(RailError::message(
         "native compiler observation has an incompatible schema",
       ));
@@ -3327,6 +3342,7 @@ fn result_key(
 
 fn session_identity(
   class: &NativeCompilerClass,
+  source_root_identity: &str,
   capability_identity: &str,
   compiler_process_environment_identity: &str,
   execution_contract: &str,
@@ -3337,12 +3353,13 @@ fn session_identity(
     "sha256:",
     b"cargo-rail-native-compiler-session\0",
     &[
-      (b"version", &9_u32.to_le_bytes()),
+      (b"version", &10_u32.to_le_bytes()),
       (
         b"toolchain-capability-contract",
         &NATIVE_CACHE_IDENTITY_CONTRACT_VERSION.to_le_bytes(),
       ),
       (b"class", &class),
+      (b"source-root", source_root_identity.as_bytes()),
       (b"capability", capability_identity.as_bytes()),
       (
         b"compiler-process-environment",
@@ -3378,7 +3395,7 @@ fn action_key_from_base(base_action: &str, approved_environment: &ApprovedEnvSta
     ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-action\0",
     &[
-      (b"version", &9_u32.to_le_bytes()),
+      (b"version", &10_u32.to_le_bytes()),
       (b"base-action", base_action.as_bytes()),
       (b"approved-environment", &approved_environment),
     ],
@@ -3407,9 +3424,10 @@ fn base_action_key(
     BASE_ACTION_KEY_PREFIX,
     b"cargo-rail-native-compiler-base-action\0",
     &[
-      (b"version", &4_u32.to_le_bytes()),
+      (b"version", &5_u32.to_le_bytes()),
       (b"session", session_identity.as_bytes()),
       (b"class", &class),
+      (b"compilation-root", capture.compilation_root_identity().as_bytes()),
       (b"pre-execution", &pre_execution),
       (b"source-state", &source_state),
     ],
@@ -4048,16 +4066,8 @@ pub(crate) enum OuterCacheAction {
   },
   /// A restore crossed its irreversible effect boundary and must not run rustc.
   OperationalFailure(RailError),
-  /// Execute a cache-bypassed dependency producer with portable artifacts and
-  /// current-root diagnostics.
-  ExecutePortable(PortableCompilerExecution),
   /// Execute the original invocation unchanged.
   Execute,
-}
-
-#[derive(Clone)]
-pub(crate) struct PortableCompilerExecution {
-  stream_bindings: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Attempt native reuse and configure the cold child without changing Cargo's wrapper order.
@@ -4208,15 +4218,7 @@ pub(crate) fn configure_outer(
       diagnostic_wrapper,
       trace,
     );
-    return portable_bypass_action(
-      command,
-      compiler_arguments,
-      observation,
-      source_root,
-      source_root_spelling,
-      &session.class.host_target,
-      &original_current_dir,
-    );
+    return OuterCacheAction::Execute;
   }
   let Some(output_paths) = recorder.native_output_paths() else {
     configure_cold(
@@ -4228,15 +4230,7 @@ pub(crate) fn configure_outer(
       diagnostic_wrapper,
       trace,
     );
-    return portable_bypass_action(
-      command,
-      compiler_arguments,
-      observation,
-      source_root,
-      source_root_spelling,
-      &session.class.host_target,
-      &original_current_dir,
-    );
+    return OuterCacheAction::Execute;
   };
   if validated_output_parent(&output_paths, source_root).is_err() {
     configure_cold(
@@ -4248,15 +4242,7 @@ pub(crate) fn configure_outer(
       diagnostic_wrapper,
       trace,
     );
-    return portable_bypass_action(
-      command,
-      compiler_arguments,
-      observation,
-      source_root,
-      source_root_spelling,
-      &session.class.host_target,
-      &original_current_dir,
-    );
+    return OuterCacheAction::Execute;
   }
   let action_capture_phase = trace.start(NativeCacheWrapperPhase::ActionCapture);
   let capture = NativeActionCapture::capture(observation, source_root);
@@ -4288,15 +4274,7 @@ pub(crate) fn configure_outer(
         diagnostic_wrapper,
         trace,
       );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        recorder.observation(),
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
+      return OuterCacheAction::Execute;
     }
   };
   if capture_test_pause("after_initial_capture", observation).is_err() {
@@ -4309,15 +4287,7 @@ pub(crate) fn configure_outer(
       diagnostic_wrapper,
       trace,
     );
-    return portable_bypass_action(
-      command,
-      compiler_arguments,
-      recorder.observation(),
-      source_root,
-      source_root_spelling,
-      &session.class.host_target,
-      &original_current_dir,
-    );
+    return OuterCacheAction::Execute;
   }
   if context.retain_event_evidence {
     retain_pre_execution_unit_evidence(
@@ -4344,36 +4314,7 @@ pub(crate) fn configure_outer(
     );
     let mut recorder = recorder;
     recorder.set_cache_wrapper(metadata);
-    if prepare_observed_cold_child(
-      command,
-      rustc,
-      compiler_arguments,
-      source_root,
-      source_root_spelling,
-      &capture,
-      diagnostic_wrapper,
-    )
-    .is_err()
-    {
-      configure_cold(
-        command,
-        CompilerCacheWrapperStatus::Bypassed,
-        "portable_compiler_source_unavailable",
-        Some(provisional_action),
-        metrics.bytes_hashed,
-        diagnostic_wrapper,
-        trace,
-      );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        recorder.observation(),
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
-    }
+    prepare_observed_cold_child(command, rustc, compiler_arguments, diagnostic_wrapper);
     return OuterCacheAction::Store {
       recorder,
       capture,
@@ -4396,15 +4337,7 @@ pub(crate) fn configure_outer(
         diagnostic_wrapper,
         trace,
       );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        observation,
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
+      return OuterCacheAction::Execute;
     }
   };
   let mut missing_selector_reason = "environment_selector_not_found";
@@ -4476,36 +4409,7 @@ pub(crate) fn configure_outer(
       );
       let mut recorder = recorder;
       recorder.set_cache_wrapper(metadata);
-      if prepare_observed_cold_child(
-        command,
-        rustc,
-        compiler_arguments,
-        source_root,
-        source_root_spelling,
-        &capture,
-        diagnostic_wrapper,
-      )
-      .is_err()
-      {
-        configure_cold(
-          command,
-          CompilerCacheWrapperStatus::Bypassed,
-          "portable_compiler_source_unavailable",
-          Some(provisional_action),
-          metrics.bytes_hashed,
-          diagnostic_wrapper,
-          trace,
-        );
-        return portable_bypass_action(
-          command,
-          compiler_arguments,
-          recorder.observation(),
-          source_root,
-          source_root_spelling,
-          &session.class.host_target,
-          &original_current_dir,
-        );
-      }
+      prepare_observed_cold_child(command, rustc, compiler_arguments, diagnostic_wrapper);
       return OuterCacheAction::Store {
         recorder,
         capture,
@@ -4536,15 +4440,7 @@ pub(crate) fn configure_outer(
         diagnostic_wrapper,
         trace,
       );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        observation,
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
+      return OuterCacheAction::Execute;
     }
   }
   let action = match action_key(&session.identity, &session.class, observation, &capture) {
@@ -4559,15 +4455,7 @@ pub(crate) fn configure_outer(
         diagnostic_wrapper,
         trace,
       );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        observation,
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
+      return OuterCacheAction::Execute;
     }
   };
   let remote_shareable = capture.remotely_shareable(context.remote.as_ref());
@@ -4604,15 +4492,7 @@ pub(crate) fn configure_outer(
         diagnostic_wrapper,
         trace,
       );
-      return portable_bypass_action(
-        command,
-        compiler_arguments,
-        observation,
-        source_root,
-        source_root_spelling,
-        &session.class.host_target,
-        &original_current_dir,
-      );
+      return OuterCacheAction::Execute;
     }
   };
   let mut miss_reason = match cached {
@@ -4676,36 +4556,7 @@ pub(crate) fn configure_outer(
   );
   let mut recorder = recorder;
   recorder.set_cache_wrapper(metadata);
-  if prepare_observed_cold_child(
-    command,
-    rustc,
-    compiler_arguments,
-    source_root,
-    source_root_spelling,
-    &capture,
-    diagnostic_wrapper,
-  )
-  .is_err()
-  {
-    configure_cold(
-      command,
-      CompilerCacheWrapperStatus::Bypassed,
-      "portable_compiler_source_unavailable",
-      Some(action),
-      metrics.bytes_hashed,
-      diagnostic_wrapper,
-      trace,
-    );
-    return portable_bypass_action(
-      command,
-      compiler_arguments,
-      recorder.observation(),
-      source_root,
-      source_root_spelling,
-      &session.class.host_target,
-      &original_current_dir,
-    );
-  }
+  prepare_observed_cold_child(command, rustc, compiler_arguments, diagnostic_wrapper);
   OuterCacheAction::Store {
     recorder,
     capture,
@@ -4956,240 +4807,18 @@ fn suppress_nested_observation(command: &mut Command) {
   remove_private_environment(command);
 }
 
-fn append_compiler_remap(command: &mut Command, from: &OsStr, to: &str) {
-  let mut remap = from.to_os_string();
-  remap.push("=");
-  remap.push(to);
-  command.arg("--remap-path-prefix").arg(remap);
-}
-
-fn portable_dependency_producer(observation: &RawCompilerInvocation, host_target: &str) -> bool {
-  observation.mode == CompilerMode::Rustc
-    && !observation.test_mode
-    && observation
-      .target_argument
-      .as_deref()
-      .is_none_or(|target| target == host_target)
-    && compiler_long_option_value(&observation.compiler_arguments, "--error-format") == Some("json")
-    && (observation.crate_types.len() == 1
-      && observation
-        .crate_types
-        .iter()
-        .next()
-        .is_some_and(|crate_type| matches!(crate_type.as_str(), "lib" | "rlib" | "proc-macro")))
-}
-
-fn prepare_portable_bypass_child(
-  command: &mut Command,
-  compiler_arguments: &[OsString],
-  observation: &RawCompilerInvocation,
-  source_root: &Path,
-  source_root_spelling: &Path,
-  host_target: &str,
-  current_dir: &Path,
-) -> RailResult<PortableCompilerExecution> {
-  if !portable_dependency_producer(observation, host_target)
-    || compiler_arguments.iter().any(|argument| {
-      argument.to_str().is_some_and(|argument| {
-        argument == "--remap-path-prefix"
-          || argument.starts_with("--remap-path-prefix=")
-          || argument == "--remap-path-scope"
-          || argument.starts_with("--remap-path-scope=")
-      })
-    })
-  {
-    return Err(RailError::message(
-      "compiler invocation does not admit portable dependency output",
-    ));
-  }
-  let source_arguments = compiler_arguments
-    .iter()
-    .enumerate()
-    .filter(|(_, argument)| {
-      argument
-        .to_str()
-        .is_some_and(|argument| !argument.starts_with('-') && argument.ends_with(".rs"))
-    })
-    .collect::<Vec<_>>();
-  let [(source_argument, source_spelling)] = source_arguments.as_slice() else {
-    return Err(RailError::message(
-      "portable compiler execution requires one positional Rust source argument",
-    ));
-  };
-  let [declared_source] = observation.declared_inputs.as_slice() else {
-    return Err(RailError::message(
-      "portable compiler execution requires one declared Rust source",
-    ));
-  };
-  if declared_source.symlink_target.is_some() {
-    return Err(RailError::message("portable compiler source must not be a symlink"));
-  }
-  let source_path = Path::new(source_spelling);
-  let source_path = if source_path.is_absolute() {
-    source_path.to_path_buf()
-  } else {
-    current_dir.join(source_path)
-  };
-  let source_path = crate::utils::canonicalize_existing(&source_path)?;
-  let declared_path = crate::utils::canonicalize_existing(&declared_source.path.resolve(source_root))?;
-  if source_path != declared_path {
-    return Err(RailError::message(
-      "compiler source argument does not match its declared source",
-    ));
-  }
-
-  source_root_spellings(source_root_spelling)?;
-  let mut package_roots = Vec::new();
-  let (portable_source, package_spelling) = match &declared_source.path {
-    ObservationPath::Repository(relative) => {
-      let relative = native_relative_path(Path::new(relative))?;
-      let portable = if relative.is_empty() {
-        PORTABLE_SOURCE_ROOT.to_string()
-      } else {
-        format!("{PORTABLE_SOURCE_ROOT}/{relative}")
-      };
-      (portable, None)
-    }
-    ObservationPath::Host(_) => {
-      let spelling = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| RailError::message("external compiler source has no Cargo package root"))?;
-      if !spelling.is_absolute() {
-        return Err(RailError::message("external Cargo package root is not absolute"));
-      }
-      let metadata = fs::symlink_metadata(&spelling)?;
-      if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::message(
-          "external Cargo package root is not a real directory",
-        ));
-      }
-      let root = crate::utils::canonicalize_existing(&spelling)?;
-      let relative = native_relative_path(
-        source_path
-          .strip_prefix(&root)
-          .map_err(|_| RailError::message("external compiler source is outside its Cargo package root"))?,
-      )?;
-      source_root_spellings(&spelling)?;
-      package_roots.extend([spelling.clone(), root]);
-      let portable = if relative.is_empty() {
-        PORTABLE_PACKAGE_ROOT.to_string()
-      } else {
-        format!("{PORTABLE_PACKAGE_ROOT}/{relative}")
-      };
-      (portable, Some(spelling))
-    }
-  };
-
-  append_compiler_remap(
-    command,
-    compiler_arguments[*source_argument].as_os_str(),
-    &portable_source,
-  );
-  let mut workspace_roots = vec![source_root_spelling.to_path_buf(), source_root.to_path_buf()];
-  workspace_roots.sort_unstable();
-  workspace_roots.dedup();
-  for workspace_root in workspace_roots {
-    append_compiler_remap(command, workspace_root.as_os_str(), PORTABLE_SOURCE_ROOT);
-  }
-  package_roots.sort_unstable();
-  package_roots.dedup();
-  for package_root in package_roots {
-    append_compiler_remap(command, package_root.as_os_str(), PORTABLE_PACKAGE_ROOT);
-  }
-  command.arg("--remap-path-scope=all");
-
-  let mut stream_bindings = vec![(
-    PORTABLE_SOURCE_ROOT.as_bytes().to_vec(),
-    json_string_contents(&source_root_display_bytes(source_root)),
-  )];
-  if let Some(package_spelling) = package_spelling {
-    stream_bindings.push((
-      PORTABLE_PACKAGE_ROOT.as_bytes().to_vec(),
-      json_string_contents(&source_root_display_bytes(&package_spelling)),
-    ));
-  }
-  Ok(PortableCompilerExecution { stream_bindings })
-}
-
-fn portable_bypass_action(
-  command: &mut Command,
-  compiler_arguments: &[OsString],
-  observation: &RawCompilerInvocation,
-  source_root: &Path,
-  source_root_spelling: &Path,
-  host_target: &str,
-  current_dir: &Path,
-) -> OuterCacheAction {
-  match prepare_portable_bypass_child(
-    command,
-    compiler_arguments,
-    observation,
-    source_root,
-    source_root_spelling,
-    host_target,
-    current_dir,
-  ) {
-    Ok(execution) => OuterCacheAction::ExecutePortable(execution),
-    Err(_) => OuterCacheAction::Execute,
-  }
-}
-
 fn prepare_observed_cold_child(
   command: &mut Command,
   rustc: &OsStr,
   compiler_arguments: &[OsString],
-  source_root: &Path,
-  source_root_spelling: &Path,
-  capture: &NativeActionCapture,
   diagnostic_wrapper: bool,
-) -> RailResult<()> {
-  source_root_spellings(source_root_spelling)?;
-  let source_arguments = compiler_arguments
-    .iter()
-    .enumerate()
-    .filter(|(_, argument)| {
-      argument
-        .to_str()
-        .is_some_and(|argument| !argument.starts_with('-') && argument.ends_with(".rs"))
-    })
-    .map(|(index, _)| index)
-    .collect::<Vec<_>>();
-  let [source_argument] = source_arguments.as_slice() else {
-    return Err(RailError::message(
-      "portable native action requires one positional Rust source argument",
-    ));
-  };
-  let portable_crate_root = capture.portable_crate_root()?;
-  let mut workspace_roots = vec![source_root_spelling, source_root];
-  workspace_roots.sort_unstable();
-  workspace_roots.dedup();
-  let package_roots = capture.package_binding.as_ref().map(|package| {
-    let mut roots = vec![package.spelling.as_path(), package.root.as_path()];
-    roots.sort_unstable();
-    roots.dedup();
-    roots
-  });
+) {
   *command = Command::new(rustc);
   command.args(compiler_arguments);
   if diagnostic_wrapper {
     command.arg("--warn=unused-crate-dependencies");
   }
-  append_compiler_remap(
-    command,
-    compiler_arguments[*source_argument].as_os_str(),
-    &portable_crate_root,
-  );
-  for workspace_root in workspace_roots {
-    append_compiler_remap(command, workspace_root.as_os_str(), PORTABLE_SOURCE_ROOT);
-  }
-  if let Some(package_roots) = package_roots {
-    for package_root in package_roots {
-      append_compiler_remap(command, package_root.as_os_str(), PORTABLE_PACKAGE_ROOT);
-    }
-  }
-  command.arg("--remap-path-scope=all");
   suppress_nested_observation(command);
-  Ok(())
 }
 
 fn configure_cold(
@@ -5432,9 +5061,6 @@ fn prepare_registered_restore(
   }
   let stdout = translate_output_binding_bytes(&stdout, validation, output_paths, source_root, false)?;
   let stderr = translate_output_binding_bytes(&stderr, validation, output_paths, source_root, false)?;
-  let stream_bindings = source_root_stream_bindings(source_root, initial_capture);
-  let stdout = rebind_portable_source_roots(&stdout, &stream_bindings)?;
-  let stderr = rebind_portable_source_roots(&stderr, &stream_bindings)?;
   trace.finish(
     restore_phase,
     NativeCacheWrapperWork {
@@ -5564,6 +5190,9 @@ fn prepare_restore_output(
       "verified native compiler output changed before commit preparation",
     ));
   }
+  #[cfg(windows)]
+  let opened = crate::windows_fs::open_for_stable_byte_observation(source)?;
+  #[cfg(not(windows))]
   let opened = File::open(source)?;
   if !crate::utils::private_file_matches_path(&opened, source, expected.bytes)? {
     return Err(RailError::message(
@@ -5623,6 +5252,13 @@ fn prepare_restore_bytes(
     .open(&source)?;
   opened.write_all(bytes)?;
   set_native_output_mode(&source, expected.mode)?;
+  #[cfg(windows)]
+  opened.sync_all()?;
+  #[cfg(windows)]
+  let opened = {
+    drop(opened);
+    crate::windows_fs::open_for_stable_byte_observation(&source)?
+  };
   if !crate::utils::private_file_matches_path(&opened, &source, bytes.len() as u64)? {
     return Err(RailError::message(
       "prepared native compiler dep-info changed before registration",
@@ -5773,7 +5409,6 @@ fn restore_commit_paths(outputs: &NativeOutputPaths, source_root: &Path) -> Rail
   }
   let identity = ContentDigest::from_sha256_bytes(hasher.finalize().into());
   let marker = output_parent.join(format!(".cargo-rail-restore-{identity}.json"));
-  let lock = output_parent.join(format!(".cargo-rail-restore-{identity}.lock"));
   let transaction_directory = output_parent.join(format!(".cargo-rail-restore-{identity}"));
   let output_sources = bindings
     .into_iter()
@@ -5789,9 +5424,9 @@ fn restore_commit_paths(outputs: &NativeOutputPaths, source_root: &Path) -> Rail
     })
     .collect();
   Ok(NativeRestorePaths {
+    identity,
     output_parent,
     marker,
-    lock,
     transaction_directory,
     output_sources,
   })
@@ -5803,15 +5438,20 @@ fn begin_restore_transaction(
   observation_directory: &Path,
   action_key: &str,
 ) -> RailResult<NativeRestoreTransaction> {
+  let cas = LocalCas::open_initialized()?;
+  begin_restore_transaction_in(&cas, outputs, source_root, observation_directory, action_key)
+}
+
+fn begin_restore_transaction_in(
+  cas: &LocalCas,
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  observation_directory: &Path,
+  action_key: &str,
+) -> RailResult<NativeRestoreTransaction> {
   validate_action_key(action_key)?;
   let paths = restore_commit_paths(outputs, source_root)?;
-  let lock = crate::utils::open_cache_lock_file(&paths.lock, true)?;
-  if !crate::utils::private_file_matches_path(&lock, &paths.lock, 0)? {
-    return Err(RailError::message(
-      "native restore-commit lock is not a private empty file",
-    ));
-  }
-  lock.lock()?;
+  let lock = cas.native_restore_lock(&paths.identity)?;
   recover_restore_commit_locked(&paths, observation_directory)?;
   fs::create_dir(&paths.transaction_directory)?;
   let transaction_identity = native_restore_directory_identity(&paths.transaction_directory)?;
@@ -6012,14 +5652,18 @@ fn recover_restore_commit(
   source_root: &Path,
   observation_directory: &Path,
 ) -> RailResult<()> {
+  let cas = LocalCas::open_initialized()?;
+  recover_restore_commit_in(&cas, outputs, source_root, observation_directory)
+}
+
+fn recover_restore_commit_in(
+  cas: &LocalCas,
+  outputs: &NativeOutputPaths,
+  source_root: &Path,
+  observation_directory: &Path,
+) -> RailResult<()> {
   let paths = restore_commit_paths(outputs, source_root)?;
-  let lock = crate::utils::open_cache_lock_file(&paths.lock, true)?;
-  if !crate::utils::private_file_matches_path(&lock, &paths.lock, 0)? {
-    return Err(RailError::message(
-      "native restore-commit lock is not a private empty file",
-    ));
-  }
-  lock.lock()?;
+  let _lock = cas.native_restore_lock(&paths.identity)?;
   recover_restore_commit_locked(&paths, observation_directory)
 }
 
@@ -7112,15 +6756,17 @@ fn portable_dep_info_source_roots(
   }
   let mut replacements = Vec::new();
   for (root, token) in roots {
-    for spelling in source_root_spellings(root)? {
-      let escaped = escape_dep_info_path(&spelling);
-      if escaped != spelling {
-        replacements.push((escaped, token.as_bytes().to_vec()));
-      }
-      replacements.push((spelling, token.as_bytes().to_vec()));
-    }
+    replacements.extend(dep_info_source_root_replacements(root, token, true)?);
   }
   replacements.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.cmp(right)));
+  if replacements
+    .windows(2)
+    .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+  {
+    return Err(RailError::message(
+      "native compiler dep-info source-root spelling is ambiguous",
+    ));
+  }
   replacements.dedup();
   Ok(replacements.iter().fold(bytes.to_vec(), |current, (from, to)| {
     replace_bytes(&current, from, to).0
@@ -7132,10 +6778,21 @@ fn rebind_dep_info_source_roots(
   source_root: &Path,
   capture: &NativeActionCapture,
 ) -> RailResult<Vec<u8>> {
-  let mut bindings = vec![(
+  let mut bindings = dep_info_source_root_replacements(source_root, PORTABLE_SOURCE_ROOT, false)?;
+  if let Some(package) = &capture.package_binding {
+    bindings.extend(dep_info_source_root_replacements(
+      &package.spelling,
+      PORTABLE_PACKAGE_ROOT,
+      false,
+    )?);
+  }
+  // rustc may emit the remapped root itself. Physical dep-info roots use the
+  // representation-bearing bindings above; bare compiler tokens retain the
+  // platform display spelling used by diagnostics and stream rebinding.
+  bindings.push((
     PORTABLE_SOURCE_ROOT.as_bytes().to_vec(),
     escape_dep_info_path(&source_root_display_bytes(source_root)),
-  )];
+  ));
   if let Some(package) = &capture.package_binding {
     bindings.push((
       PORTABLE_PACKAGE_ROOT.as_bytes().to_vec(),
@@ -7143,6 +6800,62 @@ fn rebind_dep_info_source_roots(
     ));
   }
   rebind_portable_source_roots(bytes, &bindings)
+}
+
+fn dep_info_source_root_replacements(
+  root: &Path,
+  token: &str,
+  to_portable: bool,
+) -> RailResult<Vec<(Vec<u8>, Vec<u8>)>> {
+  source_root_spellings(root)?;
+  let canonical = crate::utils::canonicalize_existing(root)?;
+  let mut seen = BTreeSet::new();
+  let mut replacements = Vec::new();
+  for (scope, path) in [("selected", root), ("canonical", canonical.as_path())] {
+    for (form, spelling) in source_root_path_forms(path) {
+      // Encoding one physical spelling under two tokens would be ambiguous.
+      // Decoding is the inverse: distinct tokens may legitimately converge on
+      // the same spelling when the selected root is already canonical.
+      if to_portable && !seen.insert(spelling.clone()) {
+        continue;
+      }
+      let escaped = escape_dep_info_path(&spelling);
+      let mut representations = vec![("literal", spelling)];
+      if escaped != representations[0].1 {
+        representations.push(("escaped", escaped));
+      }
+      for (representation, rendered) in representations {
+        let portable = format!("{token}/dep-info/{scope}/{form}/{representation}").into_bytes();
+        replacements.push(if to_portable {
+          (rendered, portable)
+        } else {
+          (portable, rendered)
+        });
+      }
+    }
+  }
+  Ok(replacements)
+}
+
+#[cfg(unix)]
+fn source_root_path_forms(path: &Path) -> Vec<(&'static str, Vec<u8>)> {
+  vec![("native", path.as_os_str().as_encoded_bytes().to_vec())]
+}
+
+#[cfg(windows)]
+fn source_root_path_forms(path: &Path) -> Vec<(&'static str, Vec<u8>)> {
+  let native = path.as_os_str().as_encoded_bytes().to_vec();
+  let forward = crate::utils::path_to_git_format(path).into_bytes();
+  let backward = forward
+    .iter()
+    .map(|byte| if *byte == b'/' { b'\\' } else { *byte })
+    .collect();
+  vec![("native", native), ("forward", forward), ("backward", backward)]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_root_path_forms(path: &Path) -> Vec<(&'static str, Vec<u8>)> {
+  vec![("native", path.as_os_str().as_encoded_bytes().to_vec())]
 }
 
 const PORTABLE_OUTPUT_BINDING_PREFIX: &[u8] = b"/cargo-rail/native-output/v3/";
@@ -7468,92 +7181,6 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
     .env_remove(crate::compiler::wrapper::OBSERVATION_ONLY_ENV);
 }
 
-/// Execute an intentionally uncached dependency producer while keeping its
-/// remapped compiler artifacts portable and its live diagnostics root-local.
-pub(crate) fn run_portable_bypass(mut command: Command, execution: PortableCompilerExecution, context: &str) -> i32 {
-  let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-    Ok(child) => child,
-    Err(error) => {
-      eprintln!("{context}: failed to execute compiler: {error}");
-      return 1;
-    }
-  };
-  let Some(stdout) = child.stdout.take() else {
-    let _ = child.kill();
-    let _ = child.wait();
-    eprintln!("{context}: compiler stdout pipe is unavailable");
-    return 1;
-  };
-  let Some(stderr) = child.stderr.take() else {
-    let _ = child.kill();
-    let _ = child.wait();
-    eprintln!("{context}: compiler stderr pipe is unavailable");
-    return 1;
-  };
-  let stdout_bindings = execution.stream_bindings.clone();
-  let stdout_worker = match std::thread::Builder::new()
-    .name("cargo-rail-rustc-stdout".to_string())
-    .spawn(move || forward_rebound_compiler_stream(stdout, std::io::stdout(), stdout_bindings))
-  {
-    Ok(worker) => worker,
-    Err(error) => {
-      let _ = child.kill();
-      let _ = child.wait();
-      eprintln!("{context}: failed to forward compiler stdout: {error}");
-      return 1;
-    }
-  };
-  let stderr = forward_rebound_compiler_stream(stderr, std::io::stderr(), execution.stream_bindings);
-  let status = child.wait();
-  let stdout = stdout_worker
-    .join()
-    .map_err(|_| std::io::Error::other("compiler stdout forwarding thread panicked"))
-    .and_then(|result| result);
-  match status {
-    Ok(status) if status.success() => match stdout.and(stderr) {
-      Ok(()) => 0,
-      Err(error) => {
-        eprintln!("{context}: failed to forward compiler output: {error}");
-        1
-      }
-    },
-    Ok(status) => status.code().unwrap_or(1),
-    Err(error) => {
-      eprintln!("{context}: failed to wait for compiler: {error}");
-      1
-    }
-  }
-}
-
-fn forward_rebound_compiler_stream<R: std::io::Read, W: std::io::Write>(
-  mut source: R,
-  destination: W,
-  bindings: Vec<(Vec<u8>, Vec<u8>)>,
-) -> std::io::Result<()> {
-  let mut destination = SourceRootRebindingWriter::new(destination, bindings);
-  let mut failure = None;
-  let mut buffer = [0u8; 64 * 1024];
-  loop {
-    let read = match source.read(&mut buffer) {
-      Ok(0) => break,
-      Ok(read) => read,
-      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-      Err(error) => return Err(error),
-    };
-    if failure.is_none()
-      && let Err(error) = destination.write_all(&buffer[..read])
-    {
-      failure = Some(error);
-    }
-  }
-  if failure.is_none()
-    && let Err(error) = destination.flush()
-  {
-    failure = Some(error);
-  }
-  failure.map_or(Ok(()), Err)
-}
-
 /// Execute one eligible cold invocation, replay its exact streams, and publish
 /// only a complete successful observation.
 pub(crate) fn run_and_store(
@@ -7572,7 +7199,7 @@ pub(crate) fn run_and_store(
   let source_root = &cache_context.source_root;
   let source_root_spelling = &cache_context.source_root_spelling;
   let output_paths = recorder.native_output_paths();
-  let output = match run_compiler_with_live_streams(command, source_root, &capture) {
+  let output = match run_compiler_with_live_streams(command) {
     Ok(output) => output,
     Err(error) => {
       eprintln!("{context}: failed to execute compiler: {error}");
@@ -7977,11 +7604,7 @@ impl CapturedCompilerStream {
 /// stdout while this wrapper drains stderr, so both pipes retain their native
 /// backpressure. Small streams stay in memory and unusually large streams spill
 /// to an unnamed temporary file before the fixed cache limit is enforced.
-fn run_compiler_with_live_streams(
-  mut command: Command,
-  source_root: &Path,
-  capture: &NativeActionCapture,
-) -> std::io::Result<CapturedCompilerOutput> {
+fn run_compiler_with_live_streams(mut command: Command) -> std::io::Result<CapturedCompilerOutput> {
   let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
   let Some(stdout) = child.stdout.take() else {
     let _ = child.kill();
@@ -7993,16 +7616,10 @@ fn run_compiler_with_live_streams(
     let _ = child.wait();
     return Err(std::io::Error::other("compiler stderr pipe is unavailable"));
   };
-  let stdout_roots = source_root_stream_bindings(source_root, capture);
   let stdout_worker = match std::thread::Builder::new()
     .name("cargo-rail-rustc-stdout".to_string())
-    .spawn(move || {
-      capture_compiler_stream(
-        stdout,
-        SourceRootRebindingWriter::new(std::io::stdout(), stdout_roots),
-        MAX_STREAM_BYTES,
-      )
-    }) {
+    .spawn(move || capture_compiler_stream(stdout, std::io::stdout(), MAX_STREAM_BYTES))
+  {
     Ok(worker) => worker,
     Err(error) => {
       let _ = child.kill();
@@ -8010,11 +7627,7 @@ fn run_compiler_with_live_streams(
       return Err(error);
     }
   };
-  let stderr = capture_compiler_stream(
-    stderr,
-    SourceRootRebindingWriter::new(std::io::stderr(), source_root_stream_bindings(source_root, capture)),
-    MAX_STREAM_BYTES,
-  );
+  let stderr = capture_compiler_stream(stderr, std::io::stderr(), MAX_STREAM_BYTES);
   let status = child.wait();
   let stdout = match stdout_worker.join() {
     Ok(stdout) => stdout,
@@ -8025,86 +7638,6 @@ fn run_compiler_with_live_streams(
     stdout,
     stderr,
   })
-}
-
-struct SourceRootRebindingWriter<W> {
-  destination: W,
-  bindings: Vec<(Vec<u8>, Vec<u8>)>,
-  pending: Vec<u8>,
-}
-
-impl<W: std::io::Write> SourceRootRebindingWriter<W> {
-  fn new(destination: W, bindings: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-    Self {
-      destination,
-      bindings,
-      pending: Vec::new(),
-    }
-  }
-
-  fn forward(&mut self, complete: bool) -> std::io::Result<()> {
-    while let Some((position, binding)) = self
-      .bindings
-      .iter()
-      .enumerate()
-      .filter_map(|(binding, (token, _))| {
-        self
-          .pending
-          .windows(token.len())
-          .position(|window| window == token)
-          .map(|position| (position, binding))
-      })
-      .min_by_key(|(position, _)| *position)
-    {
-      let (token, replacement) = &self.bindings[binding];
-      self.destination.write_all(&self.pending[..position])?;
-      self.destination.write_all(replacement)?;
-      self.pending.drain(..position + token.len());
-    }
-    let retained = if complete {
-      0
-    } else {
-      self
-        .bindings
-        .iter()
-        .map(|(token, _)| token.len())
-        .max()
-        .unwrap_or(1)
-        .saturating_sub(1)
-        .min(self.pending.len())
-    };
-    let ready = self.pending.len().saturating_sub(retained);
-    self.destination.write_all(&self.pending[..ready])?;
-    self.pending.drain(..ready);
-    Ok(())
-  }
-}
-
-impl<W: std::io::Write> std::io::Write for SourceRootRebindingWriter<W> {
-  fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-    self.pending.extend_from_slice(bytes);
-    self.forward(false)?;
-    Ok(bytes.len())
-  }
-
-  fn flush(&mut self) -> std::io::Result<()> {
-    self.forward(true)?;
-    self.destination.flush()
-  }
-}
-
-fn source_root_stream_bindings(source_root: &Path, capture: &NativeActionCapture) -> Vec<(Vec<u8>, Vec<u8>)> {
-  let mut bindings = vec![(
-    PORTABLE_SOURCE_ROOT.as_bytes().to_vec(),
-    json_string_contents(&source_root_display_bytes(source_root)),
-  )];
-  if let Some(package) = &capture.package_binding {
-    bindings.push((
-      PORTABLE_PACKAGE_ROOT.as_bytes().to_vec(),
-      json_string_contents(&source_root_display_bytes(&package.spelling)),
-    ));
-  }
-  bindings
 }
 
 fn rebind_portable_source_roots(bytes: &[u8], bindings: &[(Vec<u8>, Vec<u8>)]) -> RailResult<Vec<u8>> {
@@ -8873,6 +8406,7 @@ pub(crate) mod tests {
     let execution_contract = DIAGNOSTIC_EXECUTION_CONTRACT.to_string();
     let identity = session_identity(
       &class,
+      &source_root_identity,
       &capability_identity,
       &compiler_process_environment_identity,
       &execution_contract,
@@ -9551,6 +9085,14 @@ pub(crate) mod tests {
 
     let capture = synthetic_capture(&base);
     let action = action_key(&session.identity, &session.class, &base, &capture).expect("action");
+    let mut moved_capture = capture.clone();
+    moved_capture.source_root = PathBuf::from("/moved/workspace/src");
+    moved_capture.source_root_spelling = moved_capture.source_root.clone();
+    assert_ne!(
+      action,
+      action_key(&session.identity, &session.class, &base, &moved_capture).expect("moved-root action"),
+      "physical compilation roots must partition exact compiler artifacts"
+    );
     assert_ne!(
       action,
       action_key(
@@ -9971,7 +9513,6 @@ pub(crate) mod tests {
     fs::create_dir_all(&output).expect("output directory");
     let source = staging.join("libfixture.rmeta");
     let destination = output.join("libfixture.rmeta");
-    fs::write(&source, b"verified metadata").expect("verified CAS copy");
     let expected = NativeCompilerOutput {
       role: "metadata".to_string(),
       slot: METADATA_SLOT.to_string(),
@@ -9979,6 +9520,7 @@ pub(crate) mod tests {
       bytes: 17,
       mode: 0o644,
     };
+    write_new_file(&source, b"verified metadata", expected.mode, true).expect("verified CAS copy");
 
     let prepared = prepare_restore_output(&source, &destination, &expected, root.path()).expect("prepared restore");
     let before = prepared.source_identity.clone();
@@ -10013,7 +9555,6 @@ pub(crate) mod tests {
     fs::create_dir_all(&output).expect("output directory");
     let source = staging.join("libfixture.rmeta");
     let destination = output.join("libfixture.rmeta");
-    fs::write(&source, b"verified metadata").expect("verified CAS copy");
     let expected = NativeCompilerOutput {
       role: "metadata".to_string(),
       slot: METADATA_SLOT.to_string(),
@@ -10021,6 +9562,7 @@ pub(crate) mod tests {
       bytes: 17,
       mode: 0o644,
     };
+    write_new_file(&source, b"verified metadata", expected.mode, true).expect("verified CAS copy");
     let prepared = prepare_restore_output(&source, &destination, &expected, root.path()).expect("prepared restore");
     let member = NativeRestoreMember::Output {
       source: source.to_str().expect("UTF-8 source").to_string(),
@@ -10044,6 +9586,8 @@ pub(crate) mod tests {
   #[test]
   fn restore_recovery_discards_partial_private_records_before_authority() {
     let root = tempfile::tempdir().expect("restore root");
+    let cache = tempfile::tempdir().expect("cache root");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     let output = root.path().join("target/debug/deps");
     let observations = root.path().join("observations");
     fs::create_dir_all(&output).expect("output directory");
@@ -10056,12 +9600,12 @@ pub(crate) mod tests {
     let paths = restore_commit_paths(&outputs, root.path()).expect("restore paths");
     fs::create_dir(&paths.transaction_directory).expect("unregistered transaction");
     fs::write(paths.transaction_directory.join(RESTORE_REGISTRATION_FILE), b"{").expect("partial registration");
-    recover_restore_commit(&outputs, root.path(), &observations).expect("partial registration recovery");
+    recover_restore_commit_in(&cas, &outputs, root.path(), &observations).expect("partial registration recovery");
     assert!(!paths.transaction_directory.exists());
 
     let action_key = format!("{ACTION_KEY_PREFIX}{}", "a".repeat(64));
-    let transaction =
-      begin_restore_transaction(&outputs, root.path(), &observations, &action_key).expect("registered transaction");
+    let transaction = begin_restore_transaction_in(&cas, &outputs, root.path(), &observations, &action_key)
+      .expect("registered transaction");
     fs::write(
       transaction
         .paths
@@ -10073,13 +9617,15 @@ pub(crate) mod tests {
     let transaction_directory = transaction.paths.transaction_directory.clone();
     drop(transaction);
 
-    recover_restore_commit(&outputs, root.path(), &observations).expect("partial pending-commit recovery");
+    recover_restore_commit_in(&cas, &outputs, root.path(), &observations).expect("partial pending-commit recovery");
     assert!(!transaction_directory.exists());
   }
 
   #[test]
   fn restore_transaction_rejects_an_rlib_for_a_metadata_only_action() {
     let root = tempfile::tempdir().expect("restore root");
+    let cache = tempfile::tempdir().expect("cache root");
+    let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     let output = root.path().join("target/debug/deps");
     let observations = root.path().join("observations");
     fs::create_dir_all(&output).expect("output directory");
@@ -10090,8 +9636,8 @@ pub(crate) mod tests {
       rlib: None,
     };
     let action_key = format!("{ACTION_KEY_PREFIX}{}", "b".repeat(64));
-    let mut transaction =
-      begin_restore_transaction(&outputs, root.path(), &observations, &action_key).expect("registered transaction");
+    let mut transaction = begin_restore_transaction_in(&cas, &outputs, root.path(), &observations, &action_key)
+      .expect("registered transaction");
     let unowned = transaction
       .paths
       .transaction_directory
@@ -10135,6 +9681,7 @@ pub(crate) mod tests {
     let identity = |capability: &str, environment: &str, contract: &str| {
       session_identity(
         &session.class,
+        &session.source_root_identity,
         capability,
         environment,
         contract,
@@ -10175,6 +9722,7 @@ pub(crate) mod tests {
     session.capability_identity = digest(b"different-exact-toolchain");
     session.identity = session_identity(
       &session.class,
+      &session.source_root_identity,
       &session.capability_identity,
       &session.compiler_process_environment_identity,
       &session.execution_contract,
@@ -10220,7 +9768,7 @@ pub(crate) mod tests {
     observation.cache_wrapper = Some(CompilerCacheWrapperMetadata::native(
       CompilerCacheWrapperStatus::Miss,
       "stored_verified_result",
-      Some("compiler-action-v9-sha256-aaaa".to_string()),
+      Some("compiler-action-v10-sha256-aaaa".to_string()),
       Some("compiler-result-v6-sha256-1111".to_string()),
       10,
       0,
@@ -10237,7 +9785,7 @@ pub(crate) mod tests {
           version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Hit,
           reason: "verified_local_result",
-          action_key: Some("compiler-action-v9-sha256-bbbb"),
+          action_key: Some("compiler-action-v10-sha256-bbbb"),
           result_key: Some("compiler-result-v6-sha256-2222"),
           base_action_key: None,
           bytes_hashed: 20,
@@ -10253,7 +9801,7 @@ pub(crate) mod tests {
           version: NATIVE_CACHE_RUN_EVENT_VERSION,
           status: CompilerCacheWrapperStatus::Miss,
           reason: "stored_verified_result",
-          action_key: Some("compiler-action-v9-sha256-aaaa"),
+          action_key: Some("compiler-action-v10-sha256-aaaa"),
           result_key: Some("compiler-result-v6-sha256-1111"),
           base_action_key: None,
           bytes_hashed: 10,
@@ -10304,7 +9852,7 @@ pub(crate) mod tests {
     assert_eq!(report.events[0].schema_version, NATIVE_CACHE_EVENT_EVIDENCE_VERSION);
     assert_eq!(
       report.events[0].unit_identity.as_deref(),
-      Some("compiler-action-v9-sha256-aaaa")
+      Some("compiler-action-v10-sha256-aaaa")
     );
     assert_eq!(report.events[0].outcome, CompilerCacheWrapperStatus::Miss);
     let unit = report.events[0].unit.as_ref().expect("unit evidence");
@@ -10329,7 +9877,7 @@ pub(crate) mod tests {
     assert_eq!(unit.claimed_outputs.as_ref(), Some(&observation.emitted_outputs));
     assert_eq!(
       report.events[1].unit_identity.as_deref(),
-      Some("compiler-action-v9-sha256-bbbb")
+      Some("compiler-action-v10-sha256-bbbb")
     );
     assert_eq!(report.events[1].outcome, CompilerCacheWrapperStatus::Hit);
   }
@@ -10349,12 +9897,12 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn session_identity_is_portable_while_the_session_file_remains_root_bound() {
+  fn session_identity_and_session_file_are_root_bound() {
     let first = tempfile::tempdir().expect("first source root");
     let second = tempfile::tempdir().expect("second source root");
     let first_session = graduated_session(path_identity(first.path()).expect("first root identity"));
     let second_session = graduated_session(path_identity(second.path()).expect("second root identity"));
-    assert_eq!(first_session.identity, second_session.identity);
+    assert_ne!(first_session.identity, second_session.identity);
 
     let session_file = first.path().join("session.json");
     fs::write(&session_file, serde_json::to_vec(&first_session).expect("session JSON")).expect("session file");
@@ -10363,33 +9911,12 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn cold_execution_injects_the_versioned_portable_root_contract() {
-    let directory = tempfile::tempdir().expect("source parent");
-    let source_root = directory.path().join("root=with-value");
-    fs::create_dir(&source_root).expect("source root");
-    let capture = synthetic_capture(&graduated_observation());
+  fn cold_execution_preserves_the_exact_compiler_arguments() {
     let mut command = Command::new("rustc");
     let compiler_arguments = [OsString::from("src/lib.rs")];
-    prepare_observed_cold_child(
-      &mut command,
-      OsStr::new("rustc"),
-      &compiler_arguments,
-      &source_root,
-      &source_root,
-      &capture,
-      false,
-    )
-    .expect("portable cold command");
+    prepare_observed_cold_child(&mut command, OsStr::new("rustc"), &compiler_arguments, false);
     let arguments = command.get_args().collect::<Vec<_>>();
-    assert_eq!(arguments[0], "src/lib.rs");
-    assert_eq!(arguments[1], "--remap-path-prefix");
-    assert_eq!(arguments[2], "src/lib.rs=/cargo-rail/native-source/v2/src/lib.rs");
-    assert_eq!(arguments[3], "--remap-path-prefix");
-    let mut expected = source_root.as_os_str().to_os_string();
-    expected.push("=");
-    expected.push(PORTABLE_SOURCE_ROOT);
-    assert_eq!(arguments[4], expected);
-    assert_eq!(arguments[5], "--remap-path-scope=all");
+    assert_eq!(arguments, [OsStr::new("src/lib.rs")]);
   }
 
   #[test]
@@ -10783,6 +10310,49 @@ pub(crate) mod tests {
   }
 
   #[test]
+  fn dep_info_source_root_rebinding_preserves_exact_path_spelling() {
+    let parent = tempfile::tempdir().expect("package parent");
+    let first_package = parent.path().join("first package");
+    let second_package = parent.path().join("second package");
+    fs::create_dir(&first_package).expect("first package");
+    fs::create_dir(&second_package).expect("second package");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let package_capture = |package: &Path| {
+      let mut capture = synthetic_capture(&graduated_observation());
+      capture.package_binding = Some(NativePackageBinding {
+        root: crate::utils::canonicalize_existing(package).expect("canonical package"),
+        spelling: package.to_path_buf(),
+        source_relative: "src/lib.rs".to_string(),
+      });
+      capture
+    };
+    let first_bindings =
+      dep_info_source_root_replacements(&first_package, PORTABLE_PACKAGE_ROOT, true).expect("first bindings");
+    let second_bindings =
+      dep_info_source_root_replacements(&second_package, PORTABLE_PACKAGE_ROOT, false).expect("second bindings");
+    let canonical_package = crate::utils::canonicalize_existing(&second_package).expect("canonical second package");
+    let converged_bindings =
+      dep_info_source_root_replacements(&canonical_package, PORTABLE_PACKAGE_ROOT, false).expect("converged bindings");
+    assert!(converged_bindings.iter().any(|(token, root)| {
+      token.starts_with(format!("{PORTABLE_PACKAGE_ROOT}/dep-info/canonical/").as_bytes())
+        && root == canonical_package.as_os_str().as_encoded_bytes()
+    }));
+
+    for (cold_root, portable_root) in first_bindings {
+      let expected_root = second_bindings
+        .iter()
+        .find_map(|(token, root)| (token == &portable_root).then_some(root))
+        .expect("same root spelling in second package");
+      let portable = portable_dep_info_source_roots(&cold_root, workspace.path(), &package_capture(&first_package))
+        .expect("portable package root");
+      assert_eq!(portable, portable_root);
+      let restored = rebind_dep_info_source_roots(&portable, workspace.path(), &package_capture(&second_package))
+        .expect("restored package root");
+      assert_eq!(&restored, expected_root);
+    }
+  }
+
+  #[test]
   fn dep_info_cas_bytes_do_not_depend_on_cargo_output_directory() {
     let source_root = tempfile::tempdir().expect("source root");
     let capture = synthetic_capture(&graduated_observation());
@@ -10822,85 +10392,21 @@ pub(crate) mod tests {
     assert_eq!(captured.into_bytes().expect("bounded captured stream"), input);
   }
 
-  #[test]
-  fn compiler_stream_rebinds_a_source_root_split_across_reads() {
-    let mut forwarded = Vec::new();
-    {
-      let mut writer = SourceRootRebindingWriter::new(
-        &mut forwarded,
-        vec![(PORTABLE_SOURCE_ROOT.as_bytes().to_vec(), b"/live/root".to_vec())],
-      );
-      writer
-        .write_all(b"before /cargo-rail/native-")
-        .expect("first stream part");
-      writer
-        .write_all(b"source/v2/src/lib.rs after")
-        .expect("second stream part");
-      writer.flush().expect("stream flush");
-    }
-    assert_eq!(forwarded, b"before /live/root/src/lib.rs after");
-  }
-
-  #[test]
-  fn portable_bypass_drains_the_compiler_pipe_but_reports_a_forwarding_failure() {
-    struct RejectingWriter;
-
-    impl std::io::Write for RejectingWriter {
-      fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-          std::io::ErrorKind::BrokenPipe,
-          "rejected compiler stream",
-        ))
-      }
-
-      fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-      }
-    }
-
-    let bytes = vec![b'x'; 128 * 1024];
-    let mut source = std::io::Cursor::new(&bytes);
-    let error = forward_rebound_compiler_stream(&mut source, RejectingWriter, Vec::new())
-      .expect_err("forwarding failure must be visible");
-    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
-    assert_eq!(source.position(), bytes.len() as u64, "compiler pipe was not drained");
-  }
-
-  #[test]
-  fn portable_bypass_requires_json_diagnostics_for_exact_rebinding() {
-    let mut observation = graduated_observation();
-    let host_target = "x86_64-unknown-test";
-    assert!(portable_dependency_producer(&observation, host_target));
-    let mut cross_target = observation.clone();
-    cross_target.target_argument = Some("aarch64-unknown-test".to_string());
-    assert!(!portable_dependency_producer(&cross_target, host_target));
-    *observation
-      .compiler_arguments
-      .iter_mut()
-      .find(|argument| argument.starts_with("--error-format="))
-      .expect("diagnostic format") = "--error-format=human".to_string();
-    assert!(!portable_dependency_producer(&observation, host_target));
-  }
-
   #[cfg(unix)]
   #[test]
-  fn source_root_rebinding_preserves_literal_unix_backslashes() {
-    let source_root = Path::new("/tmp/source\\root");
+  fn dep_info_root_rebinding_preserves_literal_unix_backslashes() {
+    let parent = tempfile::tempdir().expect("source parent");
+    let source_root = parent.path().join("source\\root");
+    fs::create_dir(&source_root).expect("source root");
     let capture = synthetic_capture(&graduated_observation());
+    let spelling = source_root.as_os_str().as_encoded_bytes();
 
     assert_eq!(
-      source_root_stream_bindings(source_root, &capture)[0].1,
-      br#"/tmp/source\\root"#
-    );
-    assert_eq!(
-      rebind_dep_info_source_roots(PORTABLE_SOURCE_ROOT.as_bytes(), source_root, &capture)
+      rebind_dep_info_source_roots(PORTABLE_SOURCE_ROOT.as_bytes(), &source_root, &capture)
         .expect("rebound dep-info root"),
-      br"/tmp/source\\root"
+      escape_dep_info_path(spelling)
     );
-    assert_eq!(
-      source_root_path_spellings(source_root),
-      vec![br"/tmp/source\root".to_vec()]
-    );
+    assert_eq!(source_root_path_spellings(&source_root), vec![spelling.to_vec()]);
   }
 
   #[test]

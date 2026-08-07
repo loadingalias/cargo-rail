@@ -94,7 +94,9 @@ impl NativeResultStaging {
   }
 
   pub(super) fn requires_durable_handoff(&self) -> bool {
-    !self.command_scoped
+    // Windows cannot flush a file through the read-only handle reopened by
+    // the admission worker, so the producing wrapper must flush it first.
+    !self.command_scoped || cfg!(windows)
   }
 
   pub(super) fn into_parts(self) -> (tempfile::TempDir, Option<File>, bool) {
@@ -706,14 +708,14 @@ fn decode_counted_inner<R: Read>(
     let parent = path
       .parent()
       .ok_or_else(|| RailError::message("native result pack slot has no staging parent"))?;
-    fs::create_dir_all(parent)?;
+    create_private_slot_parent(staging.path(), parent)?;
     let mut output = OpenOptions::new().write(true).create_new(true).open(&path)?;
     let staged = copy_exact_digest(&mut reader, &mut output, slot.bytes, slot.digest)?;
     bytes_staged = bytes_staged
       .checked_add(staged)
       .ok_or_else(|| RailError::message("native result pack staged-byte count overflow"))?;
-    output.sync_all()?;
     set_private_output_mode(&path, slot.mode)?;
+    output.sync_all()?;
     bytes_read = bytes_read.saturating_add(slot.bytes);
   }
   let mut trailing = [0_u8; 1];
@@ -740,6 +742,21 @@ fn decode_counted_inner<R: Read>(
     association,
     bytes_staged,
   ))
+}
+
+fn create_private_slot_parent(root: &Path, parent: &Path) -> RailResult<()> {
+  if !parent.starts_with(root) {
+    return Err(RailError::message("native result pack slot escaped its staging root"));
+  }
+  fs::create_dir_all(parent)?;
+  let mut current = parent;
+  while current != root {
+    set_private_output_mode(current, 0o755)?;
+    current = current
+      .parent()
+      .ok_or_else(|| RailError::message("native result pack slot escaped its staging root"))?;
+  }
+  Ok(())
 }
 
 fn copy_exact_digest<R: Read, W: Write>(
@@ -967,21 +984,21 @@ mod tests {
   use super::*;
 
   const CANONICAL_ACTION_KEY: &str =
-    "compiler-action-v9-sha256-2547f3799a317c4f1c7146959374b75e44f2af9144d4b8d7e33651cf6df475cd";
+    "compiler-action-v10-sha256-4674195a255b494e5283cd21664d43a059463d53f516041b60ef758490bb1fc8";
   const CANONICAL_RESULT_KEY: &str =
-    "compiler-result-v6-sha256-00bd50ddf1e9945804c7c7c888eeed37a1044477d67d5ce5f05d08812475065e";
-  const CANONICAL_DESCRIPTOR_SHA256: &str = "06d4bc6d4854dc12c5d313c0de3f5a22d58f20d94f2ead4d2712e99920f61962";
-  const CANONICAL_PACK_SHA256: &str = "69278a1c1352fefe318b104ba507406169fce8b348a44f7123aaea9779ea3f25";
+    "compiler-result-v6-sha256-5e3bfec5e3abed48c64c72222e34757da5f9c6edff2163e2212f73e91d124e0b";
+  const CANONICAL_DESCRIPTOR_SHA256: &str = "83d15f18ea97848566cf7fde085bcc4eaa2fceaebcf4c86d0bceef4ee9cd5019";
+  const CANONICAL_PACK_SHA256: &str = "129cf9c450baf8bd700c84888bf4fa70589ad260021c37884f28ff19455e2463";
   const CANONICAL_DESCRIPTOR_HEX: &str = concat!(
-    "43524e444553433102000700020000005a00",
-    "636f6d70696c65722d616374696f6e2d76392d7368613235362d32353437663337393961333137633466316337313436393539333734623735653434663261663931343464346238643765333336353163663664663437356364",
+    "43524e444553433102000700020000005b00",
+    "636f6d70696c65722d616374696f6e2d7631302d7368613235362d34363734313935613235356234393465353238336364323136363464343361303539343633643533663531363034316236306566373538343930626231666338",
     "0100010100000006006c69622e727300000000000000000401",
     "a4010800000000000000d708da5a10078e1c0ec92d1f93c4592e152f1639a0cdf3f545e02fd7e632588302",
     "a401080000000000000045447b7afbd5e544f7d0f1df0fccd26014d9850130abd3f020b89ff96b82079f04",
     "a4010f0000000000000050c560dce53c1b4f84780f00d3177742272b2d6cef2e80347fe8227320ff7c7c05",
     "a4010000000000000000e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   );
-  const CANONICAL_PACK_PRELUDE_HEX: &str = "43524e5041434b31020030010000";
+  const CANONICAL_PACK_PRELUDE_HEX: &str = "43524e5041434b31020031010000";
   const CANONICAL_PACK_FRAMES_HEX: &str = concat!(
     "0108000000000000006465702d696e666f",
     "0208000000000000006d65746164617461",
@@ -990,7 +1007,7 @@ mod tests {
   );
 
   const ACTION_OFFSET: usize = 18;
-  const ACTION_BYTES: usize = 90;
+  const ACTION_BYTES: usize = 91;
   const WITNESS_VERSION_OFFSET: usize = ACTION_OFFSET + ACTION_BYTES;
   const WITNESS_FLAG_OFFSET: usize = WITNESS_VERSION_OFFSET + 2;
   const SOURCE_COUNT_OFFSET: usize = WITNESS_FLAG_OFFSET + 1;
@@ -999,10 +1016,10 @@ mod tests {
   const DEPENDENCY_COUNT_OFFSET: usize = SOURCE_OFFSET + 6;
   const ENVIRONMENT_COUNT_OFFSET: usize = DEPENDENCY_COUNT_OFFSET + 4;
   const SLOT_COUNT_OFFSET: usize = ENVIRONMENT_COUNT_OFFSET + 4;
-  const DESCRIPTOR_SLOT_OFFSETS: [usize; 4] = [132, 175, 218, 261];
+  const DESCRIPTOR_SLOT_OFFSETS: [usize; 4] = [133, 176, 219, 262];
   const PACK_DESCRIPTOR_OFFSET: usize = PACK_PRELUDE_BYTES as usize;
-  const PACK_FRAME_OFFSETS: [usize; 4] = [318, 335, 352, 376];
-  const PACK_END: usize = 385;
+  const PACK_FRAME_OFFSETS: [usize; 4] = [319, 336, 353, 377];
+  const PACK_END: usize = 386;
 
   fn literal_bytes(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0, "hex fixture must contain whole bytes");
@@ -1112,7 +1129,7 @@ mod tests {
   }
 
   #[test]
-  fn independently_assembled_canonical_descriptor_and_pack_match_the_v9_v4_contract() {
+  fn independently_assembled_canonical_descriptor_and_pack_match_the_v10_v4_contract() {
     let expected_descriptor = literal_bytes(CANONICAL_DESCRIPTOR_HEX);
     let descriptor = canonical_descriptor();
     assert_eq!(descriptor.encode().expect("encode descriptor"), expected_descriptor);
@@ -1383,7 +1400,7 @@ mod tests {
     let descriptor = canonical_descriptor();
     let encoded = descriptor.encode().expect("canonical descriptor");
     let mut restrictive = descriptor.clone();
-    restrictive.outputs[0].mode = 0o600;
+    restrictive.outputs[0].mode = if cfg!(unix) { 0o600 } else { 0o444 };
     let restrictive_bytes = restrictive.encode().expect("restrictive mode descriptor");
     assert_eq!(
       NativeResultDescriptor::decode(&restrictive_bytes).expect("restrictive mode decode"),

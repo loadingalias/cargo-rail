@@ -2412,7 +2412,7 @@ fn test_doctor_native_cache_reports_the_exact_compiler_identity_as_one_json_valu
   let capability = &report["capability"];
   assert_eq!(capability["schema_version"], 6);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v9");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v10");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]

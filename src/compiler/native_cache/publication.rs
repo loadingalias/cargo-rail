@@ -28,9 +28,8 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Cross-process wrappers publish queue entries with an atomic rename. A 1 ms
 // scan cadence spent roughly a quarter of a CPU second reopening an empty
 // directory during one seven-second cold build. Eight milliseconds keeps the
-// final drain bounded while removing almost all idle filesystem polling.
+// final drain responsive while removing almost all idle filesystem polling.
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
-const DRAIN_BUDGET: Duration = Duration::from_millis(250);
 const LOCAL_COMMIT_COHORT_RESULTS: usize = 4;
 
 /// Private filesystem capability inherited by compiler wrappers for one Cargo command.
@@ -52,7 +51,6 @@ pub(super) struct Coordinator {
 
 struct PublicationWorker {
   handle: JoinHandle<()>,
-  completion: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Default)]
@@ -60,7 +58,6 @@ struct CoordinatorMetrics {
   rejected: AtomicU64,
   setup_bytes_hashed: AtomicU64,
   session_failed: AtomicBool,
-  shutdown_abandoned: AtomicU64,
   selector_diverged: AtomicBool,
 }
 
@@ -69,7 +66,6 @@ pub(super) struct CoordinatorReport {
   pub(super) rejected: u64,
   pub(super) setup_bytes_hashed: u64,
   pub(super) session_failed: bool,
-  pub(super) shutdown_abandoned: u64,
   pub(super) selector_diverged: bool,
 }
 
@@ -165,14 +161,11 @@ impl Coordinator {
     let worker_metrics = Arc::clone(&metrics);
     let worker_root = staging.path().to_path_buf();
     let worker_observations = observation_directory.to_path_buf();
-    let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
       .name("cargo-rail-local-publication".to_string())
       .spawn(move || {
-        // The worker owns the staging capability and active-file lease. If a
-        // blocking filesystem operation outlives the command drain budget,
-        // detaching the thread cannot invalidate a path or release GC safety
-        // underneath that operation.
+        // The worker owns the staging capability and active-file lease until
+        // every queued publication has reached a terminal outcome.
         let _staging = staging;
         let _active = active;
         let admission_session = match deferred_session {
@@ -197,12 +190,11 @@ impl Coordinator {
           metrics: worker_metrics,
         }
         .serve();
-        let _ = completion_sender.send(());
       })?;
     Ok(Self {
       context,
       stop,
-      worker: Mutex::new(Some(PublicationWorker { handle, completion })),
+      worker: Mutex::new(Some(PublicationWorker { handle })),
       metrics,
     })
   }
@@ -216,19 +208,15 @@ impl Coordinator {
     if let Ok(mut worker) = self.worker.lock()
       && let Some(worker) = worker.take()
     {
-      match finish_worker(worker, DRAIN_BUDGET) {
+      match finish_worker(worker) {
         WorkerDrain::Completed => {}
         WorkerDrain::Panicked => self.metrics.session_failed.store(true, Ordering::Relaxed),
-        WorkerDrain::Abandoned => {
-          self.metrics.shutdown_abandoned.fetch_add(1, Ordering::Relaxed);
-        }
       }
     }
     CoordinatorReport {
       rejected: self.metrics.rejected.load(Ordering::Relaxed),
       setup_bytes_hashed: self.metrics.setup_bytes_hashed.load(Ordering::Relaxed),
       session_failed: self.metrics.session_failed.load(Ordering::Relaxed),
-      shutdown_abandoned: self.metrics.shutdown_abandoned.load(Ordering::Relaxed),
       selector_diverged: self.metrics.selector_diverged.load(Ordering::Relaxed),
     }
   }
@@ -238,20 +226,13 @@ impl Coordinator {
 enum WorkerDrain {
   Completed,
   Panicked,
-  Abandoned,
 }
 
-fn finish_worker(worker: PublicationWorker, budget: Duration) -> WorkerDrain {
-  let PublicationWorker { handle, completion } = worker;
-  match completion.recv_timeout(budget) {
-    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-      if handle.join().is_ok() {
-        WorkerDrain::Completed
-      } else {
-        WorkerDrain::Panicked
-      }
-    }
-    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerDrain::Abandoned,
+fn finish_worker(worker: PublicationWorker) -> WorkerDrain {
+  if worker.handle.join().is_ok() {
+    WorkerDrain::Completed
+  } else {
+    WorkerDrain::Panicked
   }
 }
 
@@ -843,19 +824,15 @@ mod tests {
   }
 
   #[test]
-  fn worker_drain_abandons_without_releasing_worker_owned_state() {
-    let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
-    let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
+  fn worker_drain_waits_for_worker_owned_state() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let worker_completed = Arc::clone(&completed);
     let handle = std::thread::spawn(move || {
-      release_receiver.recv().expect("test releases worker");
-      let _ = completion_sender.send(());
+      worker_completed.store(true, Ordering::Release);
     });
 
-    assert_eq!(
-      finish_worker(PublicationWorker { handle, completion }, Duration::ZERO),
-      WorkerDrain::Abandoned
-    );
-    release_sender.send(()).expect("release detached worker");
+    assert_eq!(finish_worker(PublicationWorker { handle }), WorkerDrain::Completed);
+    assert!(completed.load(Ordering::Acquire));
   }
 
   #[test]

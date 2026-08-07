@@ -12,7 +12,7 @@ retries = 0
 cargo-subprocess = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots$/)'
+filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority$/)'
 test-group = 'cargo-subprocess'
 # This test owns a serial Cargo build matrix with bounded compiler-cache deadlines. Run it first and alone.
 priority = 100
@@ -25,7 +25,7 @@ test-group = 'cargo-subprocess'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_falls_back_only_before_its_first_visible_effect)$/)'
+filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_)/)'
 test-group = 'cargo-subprocess'
 # These exercise bounded setup and a serial crash/recovery matrix; saturation must not turn either into a bypass/timeout.
 threads-required = "num-test-threads"
@@ -45,7 +45,7 @@ leak-timeout = { period = "2s", result = "fail" }
 retries = 0
 
 [[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots$/)'
+filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority$/)'
 test-group = 'cargo-subprocess'
 priority = 100
 threads-required = "num-test-threads"
@@ -58,7 +58,7 @@ test-group = 'cargo-subprocess'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.commit.overrides]]
-filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_falls_back_only_before_its_first_visible_effect)$/)'
+filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_)/)'
 test-group = 'cargo-subprocess'
 threads-required = "num-test-threads"
 

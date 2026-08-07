@@ -393,19 +393,6 @@ fn reusable_output_paths(
     .collect()
 }
 
-fn reusable_compiler_output_digests(event: &serde_json::Value) -> BTreeMap<&str, &str> {
-  event["unit"]["observed_outputs"]
-    .as_array()
-    .into_iter()
-    .flatten()
-    .filter_map(|output| {
-      let path = output["path"]["path"].as_str()?;
-      let digest = output["content_digest"].as_str()?;
-      (Path::new(path).extension().and_then(|extension| extension.to_str()) != Some("d")).then_some((path, digest))
-    })
-    .collect()
-}
-
 fn unit_by_crate_name<'a>(
   units: &'a BTreeMap<String, serde_json::Value>,
   crate_name: &str,
@@ -486,43 +473,6 @@ fn canonical_result_evidence(cache: &Path, action_key: &str) -> Result<serde_jso
   }))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct PhysicalOutputEvidence {
-  content_digest: String,
-  bytes: u64,
-  mode: u32,
-}
-
-#[cfg(unix)]
-fn output_mode(metadata: &fs::Metadata) -> u32 {
-  use std::os::unix::fs::PermissionsExt as _;
-  metadata.permissions().mode() & 0o777
-}
-
-#[cfg(not(unix))]
-fn output_mode(metadata: &fs::Metadata) -> u32 {
-  if metadata.permissions().readonly() {
-    0o444
-  } else {
-    0o644
-  }
-}
-
-fn replace_bytes(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-  if needle.is_empty() {
-    return bytes.to_vec();
-  }
-  let mut replaced = Vec::with_capacity(bytes.len());
-  let mut remaining = bytes;
-  while let Some(index) = remaining.windows(needle.len()).position(|window| window == needle) {
-    replaced.extend_from_slice(&remaining[..index]);
-    replaced.extend_from_slice(replacement);
-    remaining = &remaining[index + needle.len()..];
-  }
-  replaced.extend_from_slice(remaining);
-  replaced
-}
-
 fn root_spellings(path: &Path) -> BTreeSet<Vec<u8>> {
   let mut spellings = BTreeSet::from([path.to_string_lossy().as_bytes().to_vec()]);
   if let Ok(canonical) = fs::canonicalize(path) {
@@ -532,71 +482,6 @@ fn root_spellings(path: &Path) -> BTreeSet<Vec<u8>> {
     spellings.insert(String::from_utf8_lossy(&spelling).replace('\\', "/").into_bytes());
   }
   spellings
-}
-
-fn normalize_dep_info(bytes: &[u8], workspace: &Path, cargo_home: &Path) -> Vec<u8> {
-  let mut bindings = root_spellings(workspace)
-    .into_iter()
-    .map(|spelling| (spelling, b"$WORKSPACE".to_vec()))
-    .chain(
-      root_spellings(cargo_home)
-        .into_iter()
-        .map(|spelling| (spelling, b"$CARGO_HOME".to_vec())),
-    )
-    .collect::<Vec<_>>();
-  bindings.sort_unstable_by(|left, right| right.0.len().cmp(&left.0.len()).then_with(|| left.0.cmp(&right.0)));
-  bindings
-    .into_iter()
-    .fold(bytes.to_vec(), |bytes, (spelling, replacement)| {
-      replace_bytes(&bytes, &spelling, &replacement)
-    })
-}
-
-fn unit_output_evidence(
-  root: &Path,
-  cargo_home: &Path,
-  identity: &str,
-  event: &serde_json::Value,
-) -> Result<BTreeMap<PathBuf, PhysicalOutputEvidence>> {
-  let units = BTreeMap::from([(identity.to_string(), event.clone())]);
-  let selected = BTreeSet::from([identity.to_string()]);
-  let target = root.join("target");
-  let paths = reusable_output_paths(root, &target, &units, &selected)?;
-  let mut evidence = BTreeMap::new();
-  for relative in paths {
-    let physical = target.join(&relative);
-    if !physical.is_file() {
-      continue;
-    }
-    let metadata = fs::symlink_metadata(&physical)?;
-    let bytes = fs::read(&physical)?;
-    let dep_info = physical.extension().is_some_and(|extension| extension == "d");
-    let identity_bytes = if dep_info {
-      normalize_dep_info(&bytes, root, cargo_home)
-    } else {
-      bytes
-    };
-    let identity_bytes_len = identity_bytes.len() as u64;
-    let content_digest = Sha256::digest(identity_bytes)
-      .iter()
-      .map(|byte| format!("{byte:02x}"))
-      .collect();
-    ensure!(
-      evidence
-        .insert(
-          relative.clone(),
-          PhysicalOutputEvidence {
-            content_digest,
-            bytes: if dep_info { identity_bytes_len } else { metadata.len() },
-            mode: output_mode(&metadata),
-          },
-        )
-        .is_none(),
-      "duplicate physical output evidence: {}",
-      relative.display()
-    );
-  }
-  Ok(evidence)
 }
 
 fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
@@ -694,7 +579,7 @@ fn executable(path: PathBuf) -> PathBuf {
 }
 
 #[test]
-fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Result<()> {
+fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() -> Result<()> {
   let root = tempfile::tempdir()?;
   let first = root.path().join("first");
   let second = root.path().join("second");
@@ -727,19 +612,9 @@ fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Re
     .cloned()
     .collect::<BTreeSet<_>>();
   ensure!(
-    !overlapping_units.is_empty(),
-    "no compiler action crossed isolated roots"
+    overlapping_units.is_empty(),
+    "exact compiler actions crossed isolated physical roots: {overlapping_units:#?}"
   );
-  for identity in &overlapping_units {
-    let first_digests = reusable_compiler_output_digests(&first_units[identity]);
-    let second_digests = reusable_compiler_output_digests(&second_units[identity]);
-    ensure!(
-      first_digests == second_digests,
-      "portable action {identity} ({:?}) produced different forced-cold compiler artifacts:\n\
-       first={first_digests:#?}\nsecond={second_digests:#?}",
-      first_units[identity]["unit"]["descriptor"]["crate_name"],
-    );
-  }
   for (source_class, crate_name) in [
     ("workspace", "fixture_service_a"),
     ("registry", "regex_syntax"),
@@ -748,66 +623,62 @@ fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Re
     let (first_identity, first_event) = unit_by_crate_name(&first_units, crate_name)?;
     let (second_identity, second_event) = unit_by_crate_name(&second_units, crate_name)?;
     ensure!(
-      first_identity == second_identity,
-      "{source_class} unit '{crate_name}' changed action identity across isolated roots: \
-       {first_identity} != {second_identity}\nfirst={first_event:#?}\nsecond={second_event:#?}"
-    );
-    let first_result = first_event["result_key"]
-      .as_str()
-      .context("first forced-cold event lacks result identity")?;
-    let second_result = second_event["result_key"]
-      .as_str()
-      .context("second forced-cold event lacks result identity")?;
-    ensure!(
-      first_result == second_result,
-      "{source_class} unit '{crate_name}' changed result identity across isolated roots: \
-       {first_result} != {second_result}"
-    );
-    ensure!(
-      canonical_result_evidence(&check_cache, first_identity)?
-        == canonical_result_evidence(&forced_cold_cache, second_identity)?,
-      "{source_class} unit '{crate_name}' changed canonical outputs, modes, dep-info, or streams"
-    );
-    let first_outputs = unit_output_evidence(&first, &first_cargo_home, first_identity, first_event)?;
-    let second_outputs = unit_output_evidence(&second, &second_cargo_home, second_identity, second_event)?;
-    ensure!(
-      first_outputs == second_outputs,
-      "{source_class} unit '{crate_name}' changed physical output bytes, modes, or normalized dep-info: \
-       first={first_outputs:#?}\nsecond={second_outputs:#?}"
-    );
-    ensure!(
-      first_outputs
-        .keys()
-        .any(|path| path.extension().is_some_and(|extension| extension == "d")),
-      "{source_class} unit '{crate_name}' did not expose dep-info"
+      first_identity != second_identity,
+      "{source_class} unit '{crate_name}' retained one action across isolated roots:\n\
+       first={first_event:#?}\nsecond={second_event:#?}"
     );
   }
-  let portable_paths = reusable_output_paths(&second, &second.join("target"), &second_units, &overlapping_units)?;
-  let second_outputs = output_digests_at(&second.join("target"), portable_paths.iter())?;
+  let second_action_keys = second_units.keys().cloned().collect::<BTreeSet<_>>();
+  let exact_paths = reusable_output_paths(&second, &second.join("target"), &second_units, &second_action_keys)?;
+  let second_outputs = output_digests_at(&second.join("target"), exact_paths.iter())?;
+
+  fs::remove_dir_all(second.join("target"))?;
+  let second_root_cold = run_cargo_rail(&second, "build", &check_cache, &second_cargo_home)?;
+  let second_root_cold_units = reusable_cache_units(&second_root_cold)?;
+  ensure!(
+    cache_metric(&second_root_cold, "hits")? == 0,
+    "a first compilation in the second root restored first-root artifacts:\n\
+     first cold:\n{first_cold}\nsecond forced cold:\n{second_cold}\nsecond root cold:\n{second_root_cold}"
+  );
+  ensure!(
+    cache_metric(&second_root_cold, "bypasses")? == cache_metric(&second_cold, "bypasses")?,
+    "root-bound cold check changed the control bypass set:\ncontrol:\n{second_cold}\nroot-bound:\n{second_root_cold}"
+  );
+  ensure!(
+    cache_metric(&second_root_cold, "misses")? == second_units.len() as u64,
+    "{second_root_cold}"
+  );
+  for (source_class, crate_name) in [
+    ("workspace", "fixture_service_a"),
+    ("registry", "regex_syntax"),
+    ("Git", "fixture_git"),
+  ] {
+    let (control_identity, control_event) = unit_by_crate_name(&second_units, crate_name)?;
+    let (cold_identity, cold_event) = unit_by_crate_name(&second_root_cold_units, crate_name)?;
+    ensure!(
+      control_identity == cold_identity && control_event["result_key"] == cold_event["result_key"],
+      "root-bound {source_class} unit '{crate_name}' changed exact action/result identity:\n\
+       control={control_event:#?}\nroot-bound={cold_event:#?}"
+    );
+    ensure!(
+      canonical_result_evidence(&forced_cold_cache, control_identity)?
+        == canonical_result_evidence(&check_cache, cold_identity)?,
+      "root-bound {source_class} unit '{crate_name}' changed canonical exact outputs"
+    );
+  }
+  ensure!(
+    output_digests_at(&second.join("target"), second_outputs.keys())? == second_outputs,
+    "a root-bound miss differed from the independent forced-cold outputs"
+  );
 
   fs::remove_dir_all(second.join("target"))?;
   let second_warm = run_cargo_rail(&second, "build", &check_cache, &second_cargo_home)?;
   let warm_units = reusable_cache_units(&second_warm)?;
-  let check_hits = cache_metric(&second_warm, "hits")?;
   ensure!(
-    check_hits == overlapping_units.len() as u64,
-    "arbitrary-root reuse restored an unexpected action set:\nfirst cold:\n{first_cold}\nsecond forced cold:\n{second_cold}\nsecond reuse:\n{second_warm}"
+    cache_metric(&second_warm, "hits")? == second_units.len() as u64,
+    "same-root clean-target reuse restored an unexpected action set:\n{second_warm}"
   );
-  ensure!(
-    cache_metric(&second_warm, "bypasses")? == cache_metric(&second_cold, "bypasses")?,
-    "warm check changed the cold bypass set:\ncold:\n{second_cold}\nwarm:\n{second_warm}"
-  );
-  ensure!(
-    cache_metric(&second_warm, "misses")? == second_units.len().saturating_sub(overlapping_units.len()) as u64,
-    "{second_warm}"
-  );
-  for (identity, event) in &warm_units {
-    let equivalent = overlapping_units.contains(identity);
-    ensure!(
-      (event["outcome"] == "hit") == equivalent,
-      "action {identity} crossed roots without equivalent forced-cold artifacts: {event}"
-    );
-  }
+  ensure!(cache_metric(&second_warm, "misses")? == 0, "{second_warm}");
   for (source_class, crate_name) in [
     ("workspace", "fixture_service_a"),
     ("registry", "regex_syntax"),
@@ -835,7 +706,14 @@ fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Re
     "a cache hit changed the current-root compiler diagnostic:\ncold:\n{cold_diagnostic}\nwarm:\n{warm_diagnostic}"
   );
   ensure!(
-    warm_diagnostic.contains("crates/fixture-types/src/lib.rs"),
+    warm_diagnostic.contains(
+      Path::new("crates")
+        .join("fixture-types")
+        .join("src")
+        .join("lib.rs")
+        .to_string_lossy()
+        .as_ref()
+    ),
     "compiler diagnostic is not rooted at the current workspace: {warm_diagnostic}"
   );
   for stale in root_spellings(&first)
@@ -845,14 +723,14 @@ fn real_cargo_check_and_build_reuse_exact_outputs_across_arbitrary_roots() -> Re
     let stale = String::from_utf8_lossy(&stale);
     ensure!(
       !second_warm.contains(stale.as_ref()),
-      "arbitrary-root reuse leaked the first root into current diagnostics: {stale}"
+      "same-root reuse leaked the first root into current diagnostics: {stale}"
     );
   }
   ensure!(
     root_spellings(&second)
       .into_iter()
       .any(|current| second_warm.contains(String::from_utf8_lossy(&current).as_ref())),
-    "arbitrary-root reuse did not report the current workspace root:\n{second_warm}"
+    "same-root reuse did not report the current workspace root:\n{second_warm}"
   );
   let check_bytes_restored = cache_metric(&second_warm, "bytes_restored")?;
   ensure!(check_bytes_restored > 0, "{second_warm}");

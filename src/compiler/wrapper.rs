@@ -183,9 +183,6 @@ fn run_cache_disabled(
       eprintln!("cargo-rail compiler cache wrapper: {error}");
       2
     }
-    crate::compiler::native_cache::OuterCacheAction::ExecutePortable(execution) => {
-      crate::compiler::native_cache::run_portable_bypass(command, execution, "cargo-rail compiler cache wrapper")
-    }
     crate::compiler::native_cache::OuterCacheAction::Execute => {
       run_transparently(command, "cargo-rail compiler cache wrapper")
     }

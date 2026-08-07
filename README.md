@@ -20,7 +20,7 @@ Cargo-Rail replaces that collection with one local, Cargo-native engine:
 |---|---|---|
 | `cargo-hakari`, `cargo-udeps`, `cargo-shear`, `cargo-machete`, feature auditors, workspace-inheritance checks, and MSRV scripts | `cargo rail unify` | One reviewable and reversible graph-repair plan |
 | `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` and `cargo rail run` | Affected work derived from Git and the resolved Cargo graph |
-| Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available across target directories and equivalent source roots after `cargo clean` |
+| Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery |
 | Copybara or custom monorepo-to-crate scripts | `cargo rail split` and `cargo rail sync` | Cargo-aware synchronization with source history and recovery evidence |
 
@@ -142,8 +142,10 @@ cargo clean
 and that reuse is gone.
 
 Cargo-Rail's local content-addressed store lives outside `target/`. Eligible compiler results remain available after
-`cargo clean`, across target directories, and across equivalent source roots. Each command still validates its live
-root; versioned compiler remaps and exact rebinding keep stored metadata, dep-info, and diagnostics portable.
+`cargo clean` and across target directories within the same physical source root. Cargo-Rail runs rustc with its
+original arguments and binds the workspace root plus each unit's physical source namespace into the action. A moved or
+independent checkout compiles cold and records its own exact variant instead of restoring path-bearing metadata from
+another root.
 
 On an eligible invocation, this sequence can still reuse exact compiler output:
 

@@ -431,7 +431,7 @@ if ! jq -e '
   and .result == "success"
   and .capability.schema_version == 6
   and .capability.cache_class == "library_metadata_rlib"
-  and .capability.execution_contract == "direct-global-wrapper-v9"
+  and .capability.execution_contract == "direct-global-wrapper-v10"
   and (.capability.platform | type) == "string"
   and (.capability.host_target | type) == "string"
   and (.capability.identity | type) == "string"

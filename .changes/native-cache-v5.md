@@ -2,6 +2,8 @@
 "cargo-rail" = "minor"
 ---
 
-Rebuilt native compiler reuse around complete source and environment identity, exact output bytes and modes, durable
-conflict and restore state, and an optional bounded shared cache for controlled CI and managed machines. Windows cache
-authority uses handle-bound NTFS identity and write-through publication without a separately published helper package.
+Rebuilt native compiler reuse around complete source, environment, and physical-root identity, exact direct-Cargo
+output bytes and modes, durable conflict and restore state, and optional bounded L2 reuse for controlled CI and managed
+machines. Same-root clean-target, L1, and L2 reuse preserves rustc arguments and artifacts; moved checkouts safely
+compile cold instead of restoring path-bearing metadata. Windows cache authority uses handle-bound NTFS identity and
+write-through publication without a separately published helper package.

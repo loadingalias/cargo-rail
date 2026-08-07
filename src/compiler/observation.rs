@@ -244,9 +244,9 @@ impl FileObservation {
 
 #[cfg(windows)]
 fn read_observed_file(path: &Path, metadata: &fs::Metadata) -> RailResult<Vec<u8>> {
-  use crate::windows_fs::{observe_file, open_for_observation, prove_local_ntfs};
+  use crate::windows_fs::{observe_file, open_for_observation, open_for_stable_byte_observation, prove_local_ntfs};
 
-  let mut opened = open_for_observation(path).map_err(|error| {
+  let mut opened = open_for_stable_byte_observation(path).map_err(|error| {
     RailError::message(format!(
       "failed to open observed file '{}' without following reparse points: {error}",
       path.display()

@@ -55,16 +55,30 @@ struct BasicObservation {
   file_attributes: u32,
 }
 
-/// Open one existing file or directory for handle-bound observation.
+/// Open one existing file or directory for handle-bound identity observation.
 ///
-/// The handle permits concurrent writers and renames so the caller can detect
-/// them by comparing observations. Reparse points are opened without following
-/// them and are then rejected by [`observe_file`].
+/// The handle permits concurrent writers and namespace moves so it can observe
+/// live authority files such as the local-CAS lifecycle lock. Reparse points
+/// are opened without following them and are then rejected by [`observe_file`].
 pub(crate) fn open_for_observation(path: &Path) -> io::Result<File> {
   let mut options = OpenOptions::new();
   options
     .read(true)
     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+  options.open(path)
+}
+
+/// Open one existing file for a stable, handle-bound byte observation.
+///
+/// The handle permits other readers and namespace moves but excludes byte
+/// writers until it is dropped. This kernel-enforced exclusion prevents an
+/// X-to-Y-to-X byte race from escaping timestamp comparison.
+pub(crate) fn open_for_stable_byte_observation(path: &Path) -> io::Result<File> {
+  let mut options = OpenOptions::new();
+  options
+    .read(true)
+    .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
   options.open(path)
 }
@@ -392,39 +406,36 @@ fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-  use super::{observe_file, open_for_observation, prove_local_ntfs, rename_write_through};
+  use super::{
+    observe_file, open_for_observation, open_for_stable_byte_observation, prove_local_ntfs, rename_write_through,
+  };
   use std::fs::{self, File};
   use std::io;
 
   #[test]
-  fn ordinary_byte_mutation_advances_ntfs_change_time() -> io::Result<()> {
+  fn observation_handle_excludes_x_y_x_byte_races() -> io::Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("input.rs");
     fs::write(&path, b"X")?;
 
-    let before_file = File::open(&path)?;
+    let before_file = open_for_stable_byte_observation(&path)?;
     let before = observe_file(&before_file)?;
     if !local_ntfs_or_explicitly_unsupported(&before_file, before.volume_serial_number)? {
       return Ok(());
     }
-    drop(before_file);
 
+    let error = fs::write(&path, b"Y").expect_err("an observation handle must exclude concurrent writers");
+    assert_eq!(
+      error.raw_os_error(),
+      Some(32),
+      "a concurrent writer must receive ERROR_SHARING_VIOLATION"
+    );
+    assert_eq!(fs::read(&path)?, b"X");
+
+    drop(before_file);
     fs::write(&path, b"Y")?;
-    let after = observe_file(&File::open(&path)?)?;
-    assert_eq!(
-      after.file_id, before.file_id,
-      "ordinary writes must not replace the file"
-    );
-    assert_eq!(
-      after.size, before.size,
-      "the mutation intentionally preserves file length"
-    );
-    assert!(
-      after.change_time > before.change_time,
-      "rapid X-to-Y mutation must advance NTFS ChangeTime: before={}, after={}",
-      before.change_time,
-      after.change_time
-    );
+    fs::write(&path, b"X")?;
+    assert_eq!(fs::read(&path)?, b"X");
     Ok(())
   }
 
@@ -435,14 +446,14 @@ mod tests {
     let after_path = directory.path().join("after.rmeta");
     fs::write(&before_path, b"artifact")?;
 
-    let before_file = File::open(&before_path)?;
+    let before_file = open_for_stable_byte_observation(&before_path)?;
     let before = observe_file(&before_file)?;
     if !local_ntfs_or_explicitly_unsupported(&before_file, before.volume_serial_number)? {
       return Ok(());
     }
-    drop(before_file);
     rename_write_through(&before_path, &after_path, false)?;
-    let after = observe_file(&File::open(&after_path)?)?;
+    let after_file = open_for_observation(&after_path)?;
+    let after = observe_file(&after_file)?;
 
     assert_eq!(after.volume_serial_number, before.volume_serial_number);
     assert_eq!(

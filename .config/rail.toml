@@ -11,6 +11,9 @@ targets = [
   "x86_64-unknown-linux-musl",
 ]
 
+[cache]
+l2 = "team"
+
 [unify]
 include_renamed = true
 major_version_conflict = "bump"

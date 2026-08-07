@@ -513,7 +513,11 @@ fn native_restore_residue(root: &Path) -> Result<Vec<PathBuf>> {
       let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
       if name.starts_with(".cargo-rail-native-cache-")
         || name.starts_with(".cargo-rail-restore-output-")
-        || name.starts_with(".cargo-rail-restore-") && name.ends_with(".json")
+        || name.starts_with(".cargo-rail-restore-")
+          && matches!(
+            path.extension().and_then(std::ffi::OsStr::to_str),
+            Some("json" | "lock")
+          )
         || path.is_dir() && restore_transaction_name(name)
       {
         found.push(path);
@@ -912,15 +916,8 @@ fn bundled_codegen_backend_is_content_identified_and_transparent() -> Result<()>
   let cold_outputs = compiler_output_files(&target)?;
   assert!(!cold_outputs.is_empty(), "cache cold produced no compiler outputs");
   assert_eq!(
-    cold_outputs.iter().map(|(path, _)| path).collect::<Vec<_>>(),
-    direct_outputs.iter().map(|(path, _)| path).collect::<Vec<_>>(),
-    "cache cold changed the direct Cargo compiler output inventory"
-  );
-  assert!(
-    cold_outputs.iter().any(|(_, bytes)| bytes
-      .windows(b"/cargo-rail/native-source/v2".len())
-      .any(|window| window == b"/cargo-rail/native-source/v2")),
-    "cache cold outputs did not use the portable source-root contract"
+    cold_outputs, direct_outputs,
+    "cache cold changed the exact direct Cargo compiler outputs"
   );
 
   reset()?;
@@ -1017,7 +1014,8 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
   let local_cache = tempfile::tempdir()?;
   let output = run_unify_without_ambient_wrappers(&workspace.path, local_cache.path())?;
   assert_eq!(output.status.code(), Some(1), "unexpected unify result: {output:?}");
-  let observation = native_cache_observation(local_cache.path())?;
+  let observation = native_cache_observation(local_cache.path())
+    .with_context(|| format!("cold native-cache observation was unavailable: {output:?}"))?;
   assert_eq!(observation["execution"]["cache_wrapper"]["status"], "miss");
   assert!(
     local_cache.path().join("cargo-rail/local-cas-v2").is_dir(),
@@ -1090,17 +1088,17 @@ fn compiler_observation_records_verified_native_cache_miss_and_hit() -> Result<(
       .chain(std::iter::once(unused_tools.path().to_path_buf())),
   )?;
   let alternate_path = alternate_path.to_str().context("UTF-8 test PATH")?;
-  let second_hit = run_unify_with_environment(&second.path, local_cache.path(), &[("PATH", alternate_path)])?;
+  let second_cold = run_unify_with_environment(&second.path, local_cache.path(), &[("PATH", alternate_path)])?;
   assert_eq!(
-    second_hit.status.code(),
+    second_cold.status.code(),
     Some(1),
-    "second-root cache hit: {second_hit:?}"
+    "second-root cold run: {second_cold:?}"
   );
   let second_observation = native_cache_observation(local_cache.path())?;
-  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "hit");
-  assert_eq!(
+  assert_eq!(second_observation["execution"]["cache_wrapper"]["status"], "miss");
+  assert_ne!(
     second_observation["execution"]["cache_wrapper"]["action_key"], first_action,
-    "equivalent workspace actions must ignore checkout root and unused PATH entries"
+    "exact compiler artifacts must be partitioned by physical checkout root"
   );
   let second_target = second.path.join("target");
   let second_outputs = compiler_output_files(&second_target)?;
@@ -1242,9 +1240,16 @@ fn native_cache_partitions_exact_output_modes_by_effective_umask() -> Result<()>
   Ok(())
 }
 
-#[test]
-fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()> {
-  let workspace = wrapper_workspace("native-cache-restore-commit")?;
+struct RestoreCommitFixture {
+  workspace: TestWorkspace,
+  cache: tempfile::TempDir,
+  target: PathBuf,
+  output_count: usize,
+  cold_outputs: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn restore_commit_fixture(name: &str) -> Result<RestoreCommitFixture> {
+  let workspace = wrapper_workspace(name)?;
   let cache = tempfile::tempdir()?;
   let target = workspace.path.join("target");
   fs::write(
@@ -1268,7 +1273,24 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
     output_count,
     "fixture output inventory does not match the restore contract"
   );
+  Ok(RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    output_count,
+    cold_outputs,
+  })
+}
 
+#[test]
+fn restore_commit_faults_fall_back_only_before_the_first_visible_effect() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    cold_outputs,
+    ..
+  } = restore_commit_fixture("native-cache-restore-commit-pre-effect-faults")?;
   let before_effect_phases = [
     "after_registration",
     "before_marker_publish",
@@ -1297,7 +1319,18 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
       "pre-effect fault {phase} retained private restore state"
     );
   }
+  Ok(())
+}
 
+#[test]
+fn restore_commit_faults_fail_after_the_first_visible_effect() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    output_count,
+    cold_outputs,
+  } = restore_commit_fixture("native-cache-restore-commit-post-effect-faults")?;
   let mut after_effect_faults = (1..=output_count)
     .map(|index| (format!("after_output:{index}"), false))
     .collect::<Vec<_>>();
@@ -1353,7 +1386,25 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
     );
     assert_eq!(compiler_artifacts_for_crate(&target, "wrapper_app")?, cold_outputs);
   }
+  Ok(())
+}
 
+#[test]
+fn restore_commit_cancellation_obeys_the_first_visible_effect() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    output_count,
+    cold_outputs,
+  } = restore_commit_fixture("native-cache-restore-commit-cancellation")?;
+  let before_effect_phases = [
+    "after_registration",
+    "before_marker_publish",
+    "after_pending_commit",
+    "after_marker_publish",
+    "after_marker",
+  ];
   for phase in before_effect_phases {
     fs::remove_dir_all(&target)?;
     let cancelled_before_effect = run_direct_native_build_with_environment(
@@ -1373,6 +1424,16 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
     assert!(native_restore_residue(&target)?.is_empty());
   }
 
+  let mut after_effect_faults = (1..=output_count)
+    .map(|index| (format!("after_output:{index}"), false))
+    .collect::<Vec<_>>();
+  after_effect_faults.extend([
+    ("after_observation".to_string(), false),
+    ("after_stdout".to_string(), false),
+    ("after_stderr".to_string(), true),
+    ("before_marker_removal".to_string(), true),
+    ("after_marker_removal".to_string(), true),
+  ]);
   for (phase, replayed_stderr) in &after_effect_faults {
     fs::remove_dir_all(&target)?;
     let cancelled = run_direct_native_build_with_environment(
@@ -1408,7 +1469,18 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
     assert_eq!(native_unit_event(&retry, "wrapper_app")?["outcome"], "hit");
     assert_eq!(compiler_artifacts_for_crate(&target, "wrapper_app")?, cold_outputs);
   }
+  Ok(())
+}
 
+#[test]
+fn restore_commit_recovers_process_death_before_authority() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    cold_outputs,
+    ..
+  } = restore_commit_fixture("native-cache-restore-commit-pre-authority-death")?;
   for phase in ["after_registration", "before_marker_publish", "after_pending_commit"] {
     fs::remove_dir_all(&target)?;
     let killed = run_direct_native_build_with_environment(
@@ -1455,7 +1527,18 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
     assert_eq!(compiler_artifacts_for_crate(&target, "wrapper_app")?, cold_outputs);
     assert!(native_restore_residue(&target)?.is_empty());
   }
+  Ok(())
+}
 
+#[test]
+fn restore_commit_recovers_process_death_after_authority() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    output_count,
+    cold_outputs,
+  } = restore_commit_fixture("native-cache-restore-commit-post-authority-death")?;
   let mut death_phases = vec![
     ("after_marker_publish".to_string(), false),
     ("after_marker".to_string(), false),
@@ -1556,7 +1639,18 @@ fn restore_commit_falls_back_only_before_its_first_visible_effect() -> Result<()
       "abort {phase} recovery retained private restore state: {residue:?}"
     );
   }
+  Ok(())
+}
 
+#[test]
+fn restore_commit_process_death_after_commit_preserves_outputs() -> Result<()> {
+  let RestoreCommitFixture {
+    workspace,
+    cache,
+    target,
+    cold_outputs,
+    ..
+  } = restore_commit_fixture("native-cache-restore-commit-completed-death")?;
   fs::remove_dir_all(&target)?;
   let committed_death = run_direct_native_build_with_environment(
     &workspace.path,
@@ -2152,7 +2246,7 @@ fn output_neutral_cargo_configuration_reuses_across_output_directory_changes() -
   let rebound_event = native_unit_event(&rebound, "wrapper_app")?;
   assert_eq!(
     rebound_event["outcome"], "hit",
-    "changed Cargo output roots did not reuse the root-independent result: {rebound_event}"
+    "changed Cargo output directories did not reuse the output-neutral result: {rebound_event}"
   );
   assert_eq!(rebound_event["unit_identity"], cold_action);
   let outputs = rebound_event["unit"]["observed_outputs"]

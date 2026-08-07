@@ -243,6 +243,14 @@ struct LocalCasLifecycleLock {
   _file: File,
 }
 
+/// One per-destination native restore lock protected from CAS staging cleanup.
+pub(crate) struct NativeRestoreLock {
+  // Struct fields drop in declaration order: release the destination lock
+  // while cleanup is still excluded by the shared lifecycle authority.
+  _file: File,
+  _lifecycle: LocalCasLifecycleLock,
+}
+
 impl NativeActionHit<'_> {
   /// Revalidate the selector that authorized this action without reacquiring the lifecycle lock.
   ///
@@ -710,6 +718,30 @@ impl LocalCas {
   fn read_lock(&self) -> RailResult<LocalCasLifecycleLock> {
     lock_local_cas(&self.lifecycle_lock, false, LockMode::Shared)?
       .ok_or_else(|| RailError::message("local CAS lifecycle lock disappeared"))
+  }
+
+  /// Serialize publication to one exact Cargo output set without leaving target-visible residue.
+  pub(crate) fn native_restore_lock(&self, identity: &crate::source::ContentDigest) -> RailResult<NativeRestoreLock> {
+    let lifecycle = self.read_lock()?;
+    let staging = self.root.join("staging");
+    validate_real_directory(&staging, "local CAS staging")?;
+    let path = staging.join(format!(".native-restore-{identity}.lock"));
+    let file = crate::utils::open_cache_lock_file(&path, true)?;
+    if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+      return Err(RailError::message(
+        "native restore-commit lock is not a private empty file",
+      ));
+    }
+    file.lock()?;
+    if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+      return Err(RailError::message(
+        "native restore-commit lock changed while it was acquired",
+      ));
+    }
+    Ok(NativeRestoreLock {
+      _file: file,
+      _lifecycle: lifecycle,
+    })
   }
 
   /// Load the compiler-selected environment names for one environment-neutral action.
@@ -3634,10 +3666,10 @@ fn materialize_from_staging(
   let payload = staging.join("output");
   fs::create_dir(&payload).map_err(|error| Fault::corrupt(format!("materialization_root_create: {error}")))?;
   // A native result is a regenerable Cargo output backed by an already
-  // durable CAS bundle. Readers need atomic visibility and verified bytes,
-  // not a storage barrier for the private restored copy. Hermetic action
-  // restores retain their stronger durable-materialization behavior.
-  let durable = matches!(&verified.validation, StoredValidation::Hermetic(_));
+  // durable CAS bundle. Unix can flush the published copy through a reopened
+  // read handle. Windows cannot, so its original writable materialization
+  // handle owns the barrier before the write-through rename.
+  let durable = matches!(&verified.validation, StoredValidation::Hermetic(_)) || cfg!(windows);
   materialize_tree(
     &verified.bundle,
     output_tree,
@@ -4050,11 +4082,6 @@ fn materialize_blob(
     digest.update(&buffer[..read]);
     copied = copied.saturating_add(read as u64);
   }
-  if durable {
-    output
-      .sync_all()
-      .map_err(|error| Fault::corrupt(format!("blob_sync: {error}")))?;
-  }
   let actual_digest = format!("sha256:{}", sha256_hex(digest));
   stats.bytes = stats.bytes.saturating_add(copied);
   crate::instrumentation::record_cas_read(copied);
@@ -4066,7 +4093,13 @@ fn materialize_blob(
   crate::instrumentation::record_cas_restore(copied);
   crate::instrumentation::record_hash(copied as usize);
   crate::instrumentation::record_hashed_file_bytes_read(copied as usize);
-  set_exact_mode(destination, mode)
+  set_exact_mode(destination, mode)?;
+  if durable {
+    output
+      .sync_all()
+      .map_err(|error| Fault::corrupt(format!("blob_sync: {error}")))?;
+  }
+  Ok(())
 }
 
 #[cfg(unix)]
@@ -4906,10 +4939,12 @@ fn move_blob_verified(blob: &PreparedBlob, identity: &str, destination: &Path) -
       blob.source.display()
     )));
   }
-  // Command-scoped wrapper staging is intentionally not durable: a crash may
-  // lose a candidate, but must never expose authority over unsynced bytes. The
-  // admission worker owns the one required durability boundary immediately
-  // before moving the verified payload into the published result bundle.
+  // Unix command-scoped wrapper staging is intentionally not durable: a crash
+  // may lose a candidate, but must never expose authority over unsynced bytes.
+  // Its admission worker owns the barrier here. Windows staging was already
+  // flushed through the producer's writable handle because a reopened read
+  // handle cannot provide that barrier.
+  #[cfg(not(windows))]
   sync_before_commit(&input)?;
   drop(input);
   fs::rename(&blob.source, destination)?;
@@ -6168,10 +6203,14 @@ mod tests {
     for entry in &manifest.entries {
       let source = output.join(&entry.path);
       let destination = staging.path().join(&entry.path);
-      match entry.kind {
-        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
-        OutputEntryKind::File { .. } => {
-          fs::copy(source, destination).expect("prepared file");
+      match &entry.kind {
+        OutputEntryKind::Directory { mode } => {
+          fs::create_dir(&destination).expect("prepared directory");
+          set_exact_mode(&destination, *mode).expect("prepared directory mode");
+        }
+        OutputEntryKind::File { mode, .. } => {
+          fs::copy(source, &destination).expect("prepared file");
+          set_exact_mode(&destination, *mode).expect("prepared file mode");
         }
         OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
       }
@@ -7190,23 +7229,11 @@ mod tests {
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     store_native_fixture(&cas, first_output.path(), &first_manifest, &first_validation);
 
-    let staging = tempfile::tempdir().expect("second prepared staging");
-    for entry in &second_manifest.entries {
-      let source = second_output.path().join(&entry.path);
-      let destination = staging.path().join(&entry.path);
-      match entry.kind {
-        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
-        OutputEntryKind::File { .. } => {
-          fs::copy(source, destination).expect("prepared file");
-        }
-        OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
-      }
-    }
     let error = cas
-      .store_native(PreparedNativeResult::from_verified_staging(
-        staging,
-        second_manifest,
-        second_validation,
+      .store_native(prepared_native_fixture(
+        second_output.path(),
+        &second_manifest,
+        &second_validation,
       ))
       .expect_err("a distinct result must conflict");
     assert!(error.to_string().contains("two different verified results"), "{error}");
@@ -7257,23 +7284,11 @@ mod tests {
     )
     .expect("ledger at exact bound");
 
-    let staging = tempfile::tempdir().expect("second prepared staging");
-    for entry in &second_manifest.entries {
-      let source = second_output.path().join(&entry.path);
-      let destination = staging.path().join(&entry.path);
-      match entry.kind {
-        OutputEntryKind::Directory { .. } => fs::create_dir(&destination).expect("prepared directory"),
-        OutputEntryKind::File { .. } => {
-          fs::copy(source, destination).expect("prepared file");
-        }
-        OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
-      }
-    }
     let error = cas
-      .store_native(PreparedNativeResult::from_verified_staging(
-        staging,
-        second_manifest,
-        second_validation,
+      .store_native(prepared_native_fixture(
+        second_output.path(),
+        &second_manifest,
+        &second_validation,
       ))
       .expect_err("terminal ledger must refuse another conflict marker");
     assert!(error.to_string().contains("ledger is full"), "{error}");

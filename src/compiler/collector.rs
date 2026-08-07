@@ -2253,7 +2253,7 @@ fn load_sysroot_identity_memo(
   host_target: &str,
 ) -> Option<SysrootIdentityMemo> {
   #[cfg(windows)]
-  let mut file = crate::windows_fs::open_for_observation(path).ok()?;
+  let mut file = crate::windows_fs::open_for_stable_byte_observation(path).ok()?;
   #[cfg(not(windows))]
   let mut file = File::open(path).ok()?;
   let metadata = file.metadata().ok()?;

@@ -37,13 +37,13 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
-Each command session validates one physical source root. Reusable action and result identities replace that root with
-a versioned portable root, so equivalent source, toolchain, environment, dependency, target, and output evidence can
-reuse across arbitrary checkout roots. Each compiler unit binds its exact rustc arguments and cfg, dependency artifact
-contents, every entry and regular-file byte below the crate-root directory, and every compiler-visible environment
-name and value after removing only Cargo-Rail's exact private controls. Rustc observation then proves that the
-successful invocation selected no input outside those capabilities. The action identity is available before lookup;
-lookup work does not grow with retained source history.
+Each command session binds one physical workspace root, and each compiler action additionally binds the physical source
+namespace for that unit. Cargo-Rail therefore reuses exact path-bearing compiler artifacts only within that root; a
+moved or independent checkout compiles cold and records its own exact variant. Each compiler unit also binds its exact
+rustc arguments and cfg, dependency artifact contents, every entry and regular-file byte below the crate-root
+directory, and every compiler-visible environment name and value after removing only Cargo-Rail's exact private
+controls. Rustc observation then proves that the successful invocation selected no input outside those capabilities.
+The action identity is available before lookup; lookup work does not grow with retained source history.
 
 The cache deliberately over-invalidates when an unused file in the bounded source directory changes. This is the
 smallest sound contract for Rust's path discovery: positive dep-info alone does not record failed probes such as the
@@ -57,10 +57,10 @@ dependency contents, target, linker, sysroot, source topology, and compiler envi
 at their owning boundary.
 
 Filesystem reads include files used through `include!`, `include_str!`, and `include_bytes!`. Rust metadata can contain
-source and output roots, so eligible cold invocations use a versioned compiler remap. The CAS stores reversible tokens
-for verified dep-info and JSON compiler-stream paths, including their Windows separator and escaping form, then binds
-them to the current source and output roots after verification. Output names and materialized bytes remain exact;
-ambiguous root spellings or unmodeled cached paths fail closed.
+source roots, so Cargo-Rail never injects compiler remapping into a cache-requested invocation. The CAS uses reversible
+tokens only for verified dep-info and JSON output-path bindings, including their Windows separator and escaping form,
+then restores the current output paths after verification. Source-root authority remains physical and root-bound;
+output names and materialized bytes remain exact, and ambiguous or unmodeled cached paths fail closed.
 Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
 incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
 compiler identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
@@ -283,7 +283,7 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One live-root-bound session, one portable declared crate root, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One physical-root-bound session and unit source namespace, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
 | Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
 | Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
 | `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
@@ -314,7 +314,8 @@ The benchmark now seeds and measures Cargo-Rail in one authoritative source root
 fresh copy of the populated CAS. Acceptance hashes every `.d`, `.rmeta`, and `.rlib` byte without a root-bound
 exclusion, and requires identical action censuses, runtime behavior, compiler-event identities, cache accounting, and
 measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they do not measure
-Cargo-Rail's arbitrary-root reuse path; the independent-root fixture carries that correctness proof.
+one shared artifact action. The independent-root fixture proves the required miss, exact cold output, and subsequent
+same-root reuse.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
 wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
