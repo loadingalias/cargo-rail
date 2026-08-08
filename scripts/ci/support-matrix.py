@@ -957,8 +957,22 @@ timeout, service failure, or remote miss compiles cold through L1 and opens one 
 applicable. A remote conflict, malformed object, or action/result mismatch is an integrity failure and restores
 nothing. Publication failure is reported after local admission and does not change successful compilation.
 
-The S3 protocol and local coordinator are implemented, but live cross-host S3 reuse has not yet been retained as
-release evidence.
+L2 cost scales with eligible L1 misses and the immutable objects they read or publish. With `--explain`, the remote
+summary reports authenticated coordinator requests and verified result-pack payload bytes; it does not estimate S3
+protocol overhead, storage pricing, or data-transfer charges. Measure those counters on the intended workload and use
+the bucket's billing data before enabling `read_write` broadly. Keep selector and action objects with the protocol
+marker; expire only result packs, as described above.
+
+`cache clean` owns L1 only and never deletes S3 objects. For an immediate cold build that cannot contact or restore
+from L2, use `cargo rail run --all --action build --no-cache`. Diagnose the configured authority with `cache status`
+and `doctor native-cache`; clean a corrupt local import with `cargo rail cache clean --scope local --check` followed by
+the same command without `--check`. A remote integrity conflict deliberately has no client-side repair: stop writers,
+select a fresh prefix for continued work, and let a separately authorized operator inspect and remove only the exact
+conflicting namespace. Do not grant build clients list or delete access for recovery convenience.
+
+The v10 path has retained empty-L1 publication and reuse on macOS ARM64, Linux x64, Windows x64, and Windows ARM64.
+Each proof preserved the platform-specific action and exact output within one canonical physical source root; it does
+not authorize cross-root reuse or a comparative performance claim.
 
 ## Hermetic whole-action cache
 
@@ -1080,10 +1094,10 @@ just bench-native-cache-smoke
 just bench-native-cache 10
 ```
 
-The v6 execution contract invalidates v5 measurements. V6 binds the command's effective default regular-file creation
-mode (the Unix umask result) into session and action identity, and binds each exact output mode into result identity,
-the canonical descriptor, and the result pack. Different effective creation modes cannot cross-hit. Do not compare
-measurements from different execution contracts.
+The v10 execution contract invalidates earlier measurements. V10 binds the canonical physical source root in session
+and action identity, preserves direct Cargo's exact compiler arguments and path-bearing output bytes, and retains each
+output's regular-file mode in result authority. Different roots or effective creation modes cannot cross-hit. Do not
+compare measurements from different execution contracts.
 
 The benchmark now seeds and measures Cargo-Rail in one authoritative source root with a clean target directory and a
 fresh copy of the populated CAS. Acceptance hashes every `.d`, `.rmeta`, and `.rlib` byte without a root-bound

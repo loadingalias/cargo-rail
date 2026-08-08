@@ -56,8 +56,8 @@ cargo rail unify --check -f json
 For native reuse, inspect the run summary's hits, misses, bypasses, hashed/restored bytes, and stable reasons. Failure
 to capture the exact compiler identity, incremental compilation, an existing wrapper, a non-JSON compiler diagnostic
 format, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache hit. A
-different physical source root can reuse the same portable action only after exact capability, input, and output
-verification; Cargo-Rail then rebinds dep-info and diagnostic paths to the current checkout.
+different physical source root has different action authority: Cargo-Rail compiles cold, emits exact output for that
+root, and can reuse the result only in later sessions bound to the same root.
 
 For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
 describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the

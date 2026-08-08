@@ -138,6 +138,34 @@ sha256_file() {
   fi
 }
 
+l2_alias="${CARGO_RAIL_BENCH_L2_ALIAS:-}"
+l2_targets_file="${CARGO_RAIL_BENCH_L2_TARGETS_FILE:-}"
+l2_enabled=false
+if [[ -n "$l2_alias" || -n "$l2_targets_file" ]]; then
+  [[ -n "$l2_alias" && -n "$l2_targets_file" ]] || {
+    echo "native-cache L2 measurement requires both CARGO_RAIL_BENCH_L2_ALIAS and CARGO_RAIL_BENCH_L2_TARGETS_FILE" >&2
+    exit 2
+  }
+  [[ "$l2_alias" =~ ^[a-z][a-z0-9_-]{0,63}$ && "$l2_targets_file" = /* && -f "$l2_targets_file" ]] || {
+    echo "native-cache L2 measurement authority is invalid" >&2
+    exit 2
+  }
+  if ! jq -e --arg alias "$l2_alias" '
+    .version == 1
+    and .targets[$alias].protocol == "s3"
+    and .targets[$alias].role == "read_write"
+    and (.targets[$alias].shareable_environment | index("CARGO_PKG_VERSION") != null)
+  ' "$l2_targets_file" >/dev/null; then
+    echo "native-cache L2 measurement requires a read-write S3 target that permits CARGO_PKG_VERSION" >&2
+    exit 2
+  fi
+  l2_enabled=true
+fi
+l2_targets_sha256=""
+if [[ "$l2_enabled" == true ]]; then
+  l2_targets_sha256="$(sha256_file "$l2_targets_file")"
+fi
+
 tree_content_sha256() {
   local root="$1"
   local manifest="$2"
@@ -228,8 +256,11 @@ jq -n \
   --arg host_cpu "$host_cpu" \
   --arg instance_type "${CARGO_RAIL_BENCH_INSTANCE_TYPE:-local}" \
   --arg filesystem "$filesystem" \
+  --argjson l2_enabled "$l2_enabled" \
+  --arg l2_alias "$l2_alias" \
+  --arg l2_targets_sha256 "$l2_targets_sha256" \
   '{
-    schema_version: 7,
+    schema_version: 8,
     generated_at: $generated_at,
     fixture: $fixture,
     release_binary: $binary,
@@ -248,9 +279,16 @@ jq -n \
     host_cpu: (if $host_cpu == "" then null else $host_cpu end),
     instance_type: $instance_type,
     filesystem: (if $filesystem == "" then null else $filesystem end),
+    l2: {
+      enabled: $l2_enabled,
+      alias: (if $l2_alias == "" then null else $l2_alias end),
+      target_map_sha256: (if $l2_targets_sha256 == "" then null else ("sha256:" + $l2_targets_sha256) end),
+      workload: (if $l2_enabled then "single eligible fixture library" else null end),
+      sampling: (if $l2_enabled then "one publish, one empty-L1 hit, one unavailable-L2 fallback" else null end)
+    },
     environment: {
       cargo_incremental: "clean/native-cache/sccache=0; manifest profile for warm/delegated; explicit bypass pair=1",
-      network: "offline",
+      network: (if $l2_enabled then "Cargo offline; pinned S3 authority enabled only for the L2 cycle" else "offline" end),
       cargo_target_dir: "fixture-local; empty per clean lane; retained per warm/delegated/bypass lane",
       compiler_overrides: "removed",
       benchmark_control_environment: "Hyperfine and nested-shell control variables removed before compiler environment capture",
@@ -415,13 +453,18 @@ fi
 
 native_cache_capability_candidate="$fixture_root/native-cache-capability.json"
 native_cache_capability_stderr_candidate="$fixture_root/native-cache-capability.stderr"
+native_cache_doctor_environment=(env)
+if [[ "$l2_enabled" == true ]]; then
+  native_cache_doctor_environment+=("CARGO_RAIL_CACHE_TARGETS_FILE=$l2_targets_file")
+fi
 if ! (
   cd "$repo_root"
-  "$binary" rail doctor native-cache -f json \
+  "${native_cache_doctor_environment[@]}" "$binary" rail doctor native-cache -f json \
     >"$native_cache_capability_candidate" 2>"$native_cache_capability_stderr_candidate"
 ); then
   echo "cargo-rail native-cache capability inspection failed" >&2
   sed -n '1,80p' "$native_cache_capability_stderr_candidate" >&2
+  jq . "$native_cache_capability_candidate" >&2 || true
   exit 1
 fi
 if ! jq -e '
@@ -1242,6 +1285,106 @@ sccache_report() {
   mv "${output}.updated" "$output"
 }
 
+remote_cache_report() {
+  local stdout="$1"
+  local stderr="$2"
+  local output="$3"
+  local line
+  line="$(grep 'remote compiler cache:' "$stdout" "$stderr" | tail -1 || true)"
+  if [[ -z "$line" ]]; then
+    printf '%s\n' '{"available":false,"status":"missing"}' >"$output"
+    return
+  fi
+  metric() {
+    local name="$1"
+    sed -n "s/.*[[:space:]]$name=\\([0-9][0-9]*\\).*/\\1/p" <<<"$line"
+  }
+  jq -n \
+    --argjson requests "$(metric requests)" \
+    --argjson bytes "$(metric bytes)" \
+    --argjson hits "$(metric hits)" \
+    --argjson misses "$(metric misses)" \
+    --argjson conflicts "$(metric conflicts)" \
+    --argjson failures "$(metric failures)" \
+    --argjson publications "$(metric publications)" \
+    '{
+      available: true,
+      status: "reported",
+      requests: $requests,
+      payload_bytes: $bytes,
+      hits: $hits,
+      misses: $misses,
+      conflicts: $conflicts,
+      failures: $failures,
+      publications: $publications
+    }' >"$output"
+}
+
+tree_file_bytes() {
+  local root="$1"
+  local total=0 path bytes
+  if [[ -d "$root" ]]; then
+    while IFS= read -r -d '' path; do
+      bytes="$(wc -c <"$path" | tr -d ' ')"
+      total=$((total + bytes))
+    done < <(find "$root" -type f -print0)
+  fi
+  printf '%s\n' "$total"
+}
+
+l2_storage_inventory() {
+  local label="$1"
+  local output="$2"
+  if ! command -v aws >/dev/null; then
+    jq -n --arg label "$label" '{
+      schema_version: 1,
+      label: $label,
+      available: false,
+      reason: "AWS CLI unavailable; retain exact namespace inventory from the operator",
+      object_count: null,
+      bytes: null,
+      protocol_markers: null,
+      selectors: null,
+      actions: null,
+      results: null,
+      identity: null
+    }' >"$output"
+    return
+  fi
+  local region owner bucket prefix namespace raw
+  IFS=$'\t' read -r region owner bucket prefix < <(
+    jq -er --arg alias "$l2_alias" '
+      .targets[$alias] | [.region, .expected_bucket_owner, .bucket, .prefix] | @tsv
+    ' "$l2_targets_file"
+  )
+  namespace="${prefix:+$prefix/}native-v3/"
+  raw="${output}.raw"
+  aws s3api list-objects-v2 \
+    --region "$region" \
+    --bucket "$bucket" \
+    --expected-bucket-owner "$owner" \
+    --prefix "$namespace" \
+    --no-cli-pager \
+    --output json >"$raw"
+  jq --arg label "$label" --arg namespace "$namespace" '
+    [(.Contents // [])[] | {path: (.Key | ltrimstr($namespace)), bytes: .Size}]
+    | sort_by(.path) as $objects
+    | {
+        schema_version: 1,
+        label: $label,
+        available: true,
+        object_count: ($objects | length),
+        bytes: ($objects | map(.bytes) | add // 0),
+        protocol_markers: ($objects | map(select(.path == "protocol")) | length),
+        selectors: ($objects | map(select(.path | startswith("selectors/"))) | length),
+        actions: ($objects | map(select(.path | startswith("actions/"))) | length),
+        results: ($objects | map(select(.path | startswith("results/"))) | length),
+        identity: ($objects | map([.path, .bytes]))
+      }
+  ' "$raw" >"$output"
+  rm -f -- "$raw"
+}
+
 runtime_report() {
   local workload="$1"
   local root="$2"
@@ -1282,6 +1425,264 @@ runtime_report() {
       stderr_bytes: $stderr_bytes,
       identity: [$exit_code, $stdout_sha256, $stderr_sha256, $stdout_bytes, $stderr_bytes]
     }' >"$output"
+}
+
+measure_l2_lane() {
+  local lane="$1"
+  local l2_root="$2"
+  local l2_results="$3"
+  local toolchain="$4"
+  local lane_dir="$l2_results/$lane"
+  local l1="$fixture_root/l2-$lane-cache"
+  local stdout="$lane_dir/stdout.txt"
+  local stderr="$lane_dir/stderr.txt"
+  local diagnostics="$lane_dir/diagnostics.json"
+  local timing="$lane_dir/timing.json"
+  local native="$lane_dir/native-cache.json"
+  local remote="$lane_dir/remote-cache.json"
+  local storage="$lane_dir/storage.json"
+  local output_path output_sha256 output_bytes exit_code diagnostics_valid=false
+  local environment_prefix command hyperfine_status
+  local -a environment=(
+    env -i
+    "HOME=$HOME"
+    "PATH=$PATH"
+    "LANG=C.UTF-8"
+    "RUSTUP_TOOLCHAIN=$toolchain"
+    "CARGO_INCREMENTAL=0"
+    "CARGO_RAIL_CACHE_TARGETS_FILE=$l2_targets_file"
+    "CARGO_RAIL_CACHE_DIR=$l1"
+  )
+  local -a arguments=(
+    --locked
+    --offline
+    --message-format=json-render-diagnostics
+    --no-default-features
+    --exclude fixture-api
+    --exclude fixture-build
+    --exclude fixture-cli
+    --exclude fixture-macros
+    --exclude fixture-native
+    --exclude fixture-native-sys
+    --exclude fixture-service-a
+    --exclude fixture-service-b
+    --exclude fixture-storage
+  )
+
+  mkdir -p "$lane_dir"
+  safe_remove "$l2_root/target" "$l1"
+  if [[ "$lane" == unavailable ]]; then
+    environment+=(
+      "AWS_EC2_METADATA_DISABLED=true"
+      "AWS_CONFIG_FILE=/dev/null"
+      "AWS_SHARED_CREDENTIALS_FILE=/dev/null"
+    )
+  else
+    local name
+    for name in \
+      AWS_REGION \
+      AWS_DEFAULT_REGION \
+      AWS_PROFILE \
+      AWS_DEFAULT_PROFILE \
+      AWS_CONFIG_FILE \
+      AWS_SHARED_CREDENTIALS_FILE \
+      AWS_SDK_LOAD_CONFIG \
+      AWS_ROLE_ARN \
+      AWS_WEB_IDENTITY_TOKEN_FILE \
+      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+      AWS_CONTAINER_CREDENTIALS_FULL_URI \
+      AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+    do
+      if [[ -v "$name" ]]; then
+        environment+=("$name=${!name}")
+      fi
+    done
+  fi
+
+  environment_prefix="$(shell_join "${environment[@]}")"
+  command="cd $(shell_join "$l2_root") && $environment_prefix $(shell_join \
+    "$binary" rail --diagnostics-file "$diagnostics" run --all --action build --explain -- "${arguments[@]}") \
+    >$(shell_join "$stdout") 2>$(shell_join "$stderr")"
+  set +e
+  hyperfine --shell=bash --warmup 0 --runs 1 --ignore-failure --export-json "$timing" "$command" \
+    >"$lane_dir/hyperfine.txt" 2>&1
+  hyperfine_status=$?
+  set -e
+  if [[ "$hyperfine_status" -ne 0 || ! -s "$timing" ]]; then
+    jq -n --argjson status "$hyperfine_status" \
+      '{results:[{times:[],user:null,system:null,memory_usage_byte:[],exit_codes:[]}],hyperfine_exit_code:$status}' \
+      >"$timing"
+  fi
+
+  native_cache_report "$stdout" "$stderr" "$native"
+  remote_cache_report "$stdout" "$stderr" "$remote"
+  l2_storage_inventory "after-$lane" "$storage"
+  exit_code="$(jq '.results[0].exit_codes[0] // null' "$timing")"
+  if [[ -s "$diagnostics" ]] && jq -e '.schema_version == 10 and (.phases | length == 7)' "$diagnostics" >/dev/null; then
+    diagnostics_valid=true
+  fi
+  output_path="$(find "$l2_root/target" -type f -name 'libfixture_types-*.rmeta' -print)"
+  if [[ -f "$output_path" && "$(printf '%s\n' "$output_path" | wc -l | tr -d ' ')" -eq 1 ]]; then
+    output_sha256="sha256:$(sha256_file "$output_path")"
+    output_bytes="$(wc -c <"$output_path" | tr -d ' ')"
+  else
+    output_sha256=""
+    output_bytes=0
+  fi
+
+  jq -n \
+    --arg lane "$lane" \
+    --argjson exit_code "$exit_code" \
+    --argjson diagnostics_valid "$diagnostics_valid" \
+    --arg output_sha256 "$output_sha256" \
+    --argjson output_bytes "$output_bytes" \
+    --argjson target_bytes "$(tree_file_bytes "$l2_root/target")" \
+    --argjson l1_bytes "$(tree_file_bytes "$l1")" \
+    --argjson exact_argv "$(argv_to_json \
+      "$binary" rail --diagnostics-file '<result>/diagnostics.json' run --all --action build --explain -- \
+      "${arguments[@]}")" \
+    --slurpfile timing "$timing" \
+    --slurpfile native "$native" \
+    --slurpfile remote "$remote" \
+    --slurpfile storage "$storage" \
+    '{
+      schema_version: 1,
+      lane: $lane,
+      exit_code: $exit_code,
+      diagnostics_valid: $diagnostics_valid,
+      exact_argv: $exact_argv,
+      resources: {
+        wall_seconds: ($timing[0].results[0].times[0] // null),
+        user_seconds: ($timing[0].results[0].user // null),
+        system_seconds: ($timing[0].results[0].system // null),
+        cpu_seconds: (
+          if $timing[0].results[0].user == null or $timing[0].results[0].system == null then null
+          else $timing[0].results[0].user + $timing[0].results[0].system
+          end
+        ),
+        peak_rss_bytes: ($timing[0].results[0].memory_usage_byte[0] // null),
+        target_file_bytes: $target_bytes,
+        l1_file_bytes: $l1_bytes,
+        process_count: null,
+        process_count_unavailable_reason: "the one-shot command path does not inject a process-count sampler"
+      },
+      native: $native[0],
+      remote: $remote[0],
+      storage: $storage[0],
+      output: {
+        available: ($output_sha256 != ""),
+        sha256: (if $output_sha256 == "" then null else $output_sha256 end),
+        bytes: $output_bytes
+      }
+    }' >"$lane_dir/result.json"
+}
+
+measure_l2_cycle() {
+  local l2_results="$results/l2"
+  if [[ -f "$l2_results/summary.json" ]] && jq -e '.accepted' "$l2_results/summary.json" >/dev/null; then
+    echo "native-cache resume: keeping complete L2 cycle" >&2
+    return
+  fi
+  [[ ! -e "$l2_results" ]] || {
+    echo "native-cache L2 result is incomplete; start a new result directory: $l2_results" >&2
+    exit 2
+  }
+  local l2_root="$fixture_root/l2-workspace"
+  local toolchain
+  toolchain="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$repo_root/rust-toolchain.toml" | head -1)"
+  [[ -n "$toolchain" ]] || {
+    echo "native-cache L2 measurement cannot resolve the pinned Rust toolchain" >&2
+    exit 2
+  }
+  mkdir -p "$l2_results"
+  materialize l2-workspace
+  mkdir -p "$l2_root/.config"
+  printf '[cache]\nl2 = "%s"\n' "$l2_alias" >"$l2_root/.config/rail.toml"
+  l2_storage_inventory initial "$l2_results/storage-initial.json"
+  measure_l2_lane publish "$l2_root" "$l2_results" "$toolchain"
+  measure_l2_lane hit "$l2_root" "$l2_results" "$toolchain"
+  measure_l2_lane unavailable "$l2_root" "$l2_results" "$toolchain"
+
+  jq -n \
+    --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg target_map_sha256 "sha256:$l2_targets_sha256" \
+    --arg binary_sha256 "sha256:$binary_sha256" \
+    --argjson binary_bytes "$(wc -c <"$binary" | tr -d ' ')" \
+    --slurpfile initial "$l2_results/storage-initial.json" \
+    --slurpfile publish "$l2_results/publish/result.json" \
+    --slurpfile hit "$l2_results/hit/result.json" \
+    --slurpfile unavailable "$l2_results/unavailable/result.json" \
+    '
+      $publish[0] as $p
+      | $hit[0] as $h
+      | $unavailable[0] as $u
+      | {
+          schema_version: 1,
+          generated_at: $generated_at,
+          sampling: "single retained operational observation per lane; no warmup and no percentile claim",
+          workload: "one clean eligible fixture library at one canonical physical source root",
+          identity: {
+            target_map_sha256: $target_map_sha256,
+            cargo_rail_binary_sha256: $binary_sha256,
+            cargo_rail_binary_bytes: $binary_bytes
+          },
+          accounting: {
+            requests: "authenticated compiler-wrapper coordinator requests, not raw S3 API attempts",
+            network_bytes: "verified result-pack payload bytes transferred, excluding protocol and transport overhead",
+            storage_cost_input: "exact S3 object bytes when an inventory client is present; otherwise operator-retained",
+            resource_scope: "whole command process tree as reported by hyperfine"
+          },
+          storage_initial: $initial[0],
+          lanes: {publish: $p, hit: $h, unavailable: $u},
+          output_identity_preserved: (
+            $p.output.available and $p.output.sha256 == $h.output.sha256 and $p.output.sha256 == $u.output.sha256
+          ),
+          action_identity_preserved: (
+            ($p.native.eligible_units | length) == 1
+            and $p.native.eligible_units == $h.native.eligible_units
+            and $p.native.eligible_units == $u.native.eligible_units
+          ),
+          storage_stable_after_publication: (
+            if $initial[0].available then
+              $initial[0].object_count == 1
+              and $p.storage.protocol_markers == 1
+              and $p.storage.selectors == 1
+              and $p.storage.actions == 1
+              and $p.storage.results == 1
+              and $p.storage.identity == $h.storage.identity
+              and $p.storage.identity == $u.storage.identity
+            else null
+            end
+          )
+        }
+      | .accepted = (
+          .output_identity_preserved
+          and .action_identity_preserved
+          and (.storage_stable_after_publication != false)
+          and ([.lanes[]] | all(
+            .exit_code == 0
+            and .diagnostics_valid
+            and .resources.wall_seconds != null
+            and .resources.cpu_seconds != null
+            and .resources.peak_rss_bytes != null
+          ))
+          and $p.native.hits == 0 and $p.native.misses == 1
+          and $p.remote.hits == 0 and $p.remote.misses == 1
+          and $p.remote.conflicts == 0 and $p.remote.failures == 0 and $p.remote.publications == 1
+          and $h.native.hits == 1 and $h.native.misses == 0
+          and $h.remote.hits == 2 and $h.remote.misses == 0
+          and $h.remote.conflicts == 0 and $h.remote.failures == 0 and $h.remote.publications == 0
+          and $u.native.hits == 0 and $u.native.misses == 1
+          and $u.remote.hits == 0 and $u.remote.failures >= 1 and $u.remote.publications == 0
+        )
+    ' >"$l2_results/summary.json"
+  if ! jq -e '.accepted' "$l2_results/summary.json" >/dev/null; then
+    echo "native-cache L2 operational cycle failed validation" >&2
+    jq '{accepted, output_identity_preserved, action_identity_preserved, storage_stable_after_publication, lanes}' \
+      "$l2_results/summary.json" >&2
+    return 1
+  fi
 }
 
 measure_lane() {
@@ -1917,6 +2318,9 @@ for round in $(seq 1 "$attempts"); do
   done
 done
 
+if [[ "$l2_enabled" == true ]]; then
+  measure_l2_cycle
+fi
 
 timing_wrapper="$repo_root/scripts/bench/rustc-timing-wrapper.sh"
 timing_evidence_kind="$evidence_kind"

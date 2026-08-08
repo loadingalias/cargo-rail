@@ -1,5 +1,5 @@
 ---
-"cargo-rail" = "minor"
+"cargo-rail" = "major"
 ---
 
 Rebuilt native compiler reuse around complete source, environment, and physical-root identity, exact direct-Cargo

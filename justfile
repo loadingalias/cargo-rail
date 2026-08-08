@@ -86,6 +86,10 @@ bench-native-cache-aws target runs execute:
 bench-native-cache-remote mode runs run_id:
     @scripts/bench/native-cache-remote-dispatch.sh "{{ mode }}" "{{ runs }}" "{{ run_id }}"
 
+bench-native-cache-l2-remote run_id alias region owner bucket prefix:
+    @scripts/bench/native-cache-remote-dispatch.sh l2 1 "{{ run_id }}" \
+      "{{ alias }}" "{{ region }}" "{{ owner }}" "{{ bucket }}" "{{ prefix }}"
+
 install-qualification-tools:
     @scripts/ci/install-qualification-tools.sh
 

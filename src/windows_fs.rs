@@ -411,6 +411,7 @@ mod tests {
   };
   use std::fs::{self, File};
   use std::io;
+  use std::time::Duration;
 
   #[test]
   fn observation_handle_excludes_x_y_x_byte_races() -> io::Result<()> {
@@ -487,6 +488,8 @@ mod tests {
     }
     drop(before_file);
 
+    // FILE_BASIC_INFO has 100 ns units, but Windows may assign the same timestamp within one system-clock tick.
+    std::thread::sleep(Duration::from_millis(20));
     let transient = directory.path().join("transient");
     fs::write(&transient, b"value")?;
     fs::remove_file(transient)?;

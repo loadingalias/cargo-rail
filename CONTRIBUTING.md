@@ -18,7 +18,8 @@ just check
 just test
 ```
 
-`just check` is workspace-wide and mutates: it formats and applies Clippy's automatic fixes. CI runs `just check-ci`, the read-only equivalent that never touches the worktree.
+`just check` is workspace-wide and read-only. Use `just fix` only when you intend to format files and apply Clippy's
+automatic fixes; CI runs the same read-only checks through `just check-ci`.
 
 After changing features, dependency resolution, or target-specific behavior, run the full suite:
 
@@ -64,7 +65,7 @@ The repository benchmarks accept package and run counts:
 ```bash
 just bench-unify 25 10
 cargo build --release --locked
-just bench-native-cache
+just bench-native-cache 1
 ```
 
 Use `just bench-native-cache 10` only when the decision requires distribution or tail evidence.

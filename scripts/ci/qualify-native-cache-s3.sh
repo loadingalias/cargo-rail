@@ -24,6 +24,8 @@ bucket="${CARGO_RAIL_CACHE_BUCKET:?set CARGO_RAIL_CACHE_BUCKET}"
 prefix="${CARGO_RAIL_CACHE_PREFIX:?set CARGO_RAIL_CACHE_PREFIX}"
 target_map="${CARGO_RAIL_CACHE_TARGETS_FILE:-$HOME/.config/cargo-rail/cache-targets.json}"
 results="$repo_root/benchmark_results/native-cache/$run_id"
+# V10 binds compiler outputs to this canonical path, so both modes must recreate the fixture at the same root.
+fixture_root="$repo_root/target/native-cache-s3-qualification"
 binary="$repo_root/target/release/cargo-rail"
 wrapper="$repo_root/target/release/cargo-rail-native-rustc-wrapper"
 toolchain="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$repo_root/rust-toolchain.toml" | head -1)"
@@ -48,9 +50,13 @@ toolchain="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".
   echo "native-cache S3 qualification result already exists: $results" >&2
   exit 2
 }
+[[ ! -e "$fixture_root" ]] || {
+  echo "native-cache S3 qualification workspace already exists: $fixture_root" >&2
+  exit 2
+}
 
 umask 077
-mkdir -p "$(dirname "$target_map")" "$results"
+mkdir -p "$(dirname "$target_map")" "$results" "$fixture_root"
 target_map_staging="${target_map}.staging.$$"
 trap 'rm -f -- "${target_map_staging:-}"; rm -rf -- "${fixture_root:-}"' EXIT
 jq -n \
@@ -83,23 +89,57 @@ cargo build --manifest-path "$repo_root/Cargo.toml" --package cargo-rail --bins 
   exit 1
 }
 
-fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-s3-qualification.XXXXXX")"
 fixture="$fixture_root/workspace"
 "$repo_root/scripts/fixtures/materialize-native-cache.sh" "$fixture" "$fixture_root/git-source"
 printf '[cache]\nl2 = "%s"\n' "$alias" >"$fixture/.config/rail.toml"
+
+# The action is expected to cross runner boundaries. Do not let a hosted or
+# managed runner's ambient compiler-process environment partition its exact
+# session identity. Keep only the process authority required by this fixture;
+# per-unit compiler environment reads remain bound by the native-cache oracle.
+qualification_environment=(
+  env -i
+  "HOME=$HOME"
+  "PATH=$PATH"
+  "LANG=C.UTF-8"
+  "RUSTUP_TOOLCHAIN=$toolchain"
+  "CARGO_RAIL_CACHE_TARGETS_FILE=$target_map"
+  "CARGO_RAIL_CACHE_DIR=$fixture_root/l1"
+)
+for name in \
+  AWS_ACCESS_KEY_ID \
+  AWS_SECRET_ACCESS_KEY \
+  AWS_SESSION_TOKEN \
+  AWS_REGION \
+  AWS_DEFAULT_REGION \
+  AWS_PROFILE \
+  AWS_DEFAULT_PROFILE \
+  AWS_CONFIG_FILE \
+  AWS_SHARED_CREDENTIALS_FILE \
+  AWS_SDK_LOAD_CONFIG \
+  AWS_ROLE_ARN \
+  AWS_WEB_IDENTITY_TOKEN_FILE \
+  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+  AWS_CONTAINER_CREDENTIALS_FULL_URI \
+  AWS_CONTAINER_AUTHORIZATION_TOKEN \
+  AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE \
+  AWS_EC2_METADATA_DISABLED
+do
+  if [[ -v "$name" ]]; then
+    qualification_environment+=("$name=${!name}")
+  fi
+done
 
 diagnostics="$results/diagnostics.json"
 stdout="$results/stdout"
 stderr="$results/stderr"
 (
   cd "$fixture"
-  env \
-    -u CARGO_INCREMENTAL \
-    -u RUSTC_WRAPPER \
-    -u RUSTC_WORKSPACE_WRAPPER \
-    RUSTUP_TOOLCHAIN="$toolchain" \
-    CARGO_RAIL_CACHE_TARGETS_FILE="$target_map" \
-    CARGO_RAIL_CACHE_DIR="$fixture_root/l1" \
+  "${qualification_environment[@]}" "$binary" rail doctor native-cache -f json
+) >"$results/capability.json"
+(
+  cd "$fixture"
+  "${qualification_environment[@]}" \
     "$binary" rail --diagnostics-file "$diagnostics" run --all --action build --explain -- \
       --locked \
       --offline \
@@ -172,5 +212,6 @@ jq -n \
     remote_summary: $remote_summary
   }' >"$results/run.json"
 
+"$repo_root/scripts/bench/native-cache-archive.sh" "$run_id"
 printf '%s\n%s\n' "$native_summary" "$remote_summary"
 echo "native-cache S3 qualification result: $results" >&2

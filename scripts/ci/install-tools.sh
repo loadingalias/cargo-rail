@@ -3,9 +3,9 @@ set -euo pipefail
 
 profile="${1:-}"
 case "$profile" in
-  linux-* | windows-*) ;;
+  bench | linux-* | windows-*) ;;
   *)
-    echo "usage: $0 <linux-*|windows-* dev-machines profile>" >&2
+    echo "usage: $0 <bench|linux-*|windows-* dev-machines profile>" >&2
     exit 2
     ;;
 esac
@@ -302,7 +302,7 @@ case "$profile" in
     cargo deny --version
     cargo audit --version
     ;;
-  *-bench)
+  bench | *-bench)
     install_hyperfine
     install_sccache
     hyperfine --version

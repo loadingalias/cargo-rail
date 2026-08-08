@@ -38,6 +38,13 @@ Each result has one measurement authority and rebuildable projections:
   cache-I/O evidence. The group is rejected unless measured and replayed outcomes, action censuses, and outputs agree.
 - `samples.jsonl`, `invalid-samples.jsonl`, `compiler-event-diffs.json`, and `summary.json` are derived views.
 
+Set both `CARGO_RAIL_BENCH_L2_ALIAS` and `CARGO_RAIL_BENCH_L2_TARGETS_FILE` to add one same-root operational L2 cycle.
+The target must be a machine-owned, read-write S3 authority that permits the fixture's `CARGO_PKG_VERSION` input. The
+cycle records one publication, one empty-L1 hit, and one credential-unavailable fallback under `l2/`; it validates the
+same compiler action and output bytes across all three commands. Request counts cover authenticated wrapper requests,
+and network bytes cover verified result-pack payloads rather than S3 protocol overhead. Retain an exact S3 namespace
+inventory separately when the benchmark host has no inventory client.
+
 Rebuild a partial summary at any time, validate a completed run, or resume it on the same machine:
 
 ```bash
@@ -64,14 +71,17 @@ performance lane or a request to add the toolchain to an allowlist.
 
 ## Current evidence
 
-The v6 execution contract invalidates earlier retained measurements. Run the current harness before making a
-comparative performance claim.
+The v10 execution contract invalidates earlier retained measurements. The current harness has one retained Linux x64
+operational observation with accepted native Cargo, sccache, L1, L2 publication, empty-L1 hit, and unavailable-L2
+paths. One observation validates operation; it does not estimate a distribution or support a comparative performance
+claim. Run repeated same-host groups before making any p50, p95, ratio, faster, or superiority claim.
 
 ## Maintainer AWS runners
 
-The maintainer workflow delegates provider mechanics and credentials to `~/dev-machines`. Cargo-Rail adds no AWS SDK,
-cloud state, remote cache, or provider abstraction. Benchmark sccache lanes use machine-local storage; the harness
-removes S3 and other remote-cache environment variables before measurement.
+The maintainer workflow delegates provider mechanics and credentials to `~/dev-machines`; benchmark orchestration adds
+no cloud-state or provider abstraction. Benchmark sccache lanes use machine-local storage, and the ordinary comparison
+lanes remove S3 and other specialist remote-cache environment variables. The opt-in L2 cycle is the only lane that
+uses Cargo-Rail's pinned S3 target authority.
 
 The bounded AWS matrix is:
 

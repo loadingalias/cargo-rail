@@ -176,13 +176,15 @@ A matching lookup is not enough. Incomplete or unsupported evidence produces a n
 
 **Fast when proven. Normal Cargo when not.**
 
-Set `[cache] l2 = "alias"` to share verified results through a machine-owned S3 target. The command parent owns AWS
-access; compiler wrappers receive only a loopback capability. A local hit remains network-free, and remote bytes enter
-the ordinary local proof before restore. Remote unavailability, credentials, authentication, or configuration falls
-back to cold compilation. Remote conflict or malformed evidence fails without restoring output.
+Set `[cache] l2 = "alias"` to share verified results through a machine-owned S3 target when the canonical physical
+source root is identical. The command parent owns AWS access; compiler wrappers receive only a loopback capability. A
+local hit remains network-free, and remote bytes enter the ordinary local proof before restore. A moved or independent
+checkout compiles cold. Remote unavailability, credentials, authentication, or configuration also falls back to cold
+compilation. Remote conflict or malformed evidence fails without restoring output.
 
-The v6 execution contract invalidates earlier measurements. V6 binds each output's exact regular-file mode and uses a
-new result-pack protocol. Cargo-Rail makes no current comparative performance claim.
+The v10 execution contract invalidates earlier measurements. V10 binds the canonical physical source root and preserves
+the exact compiler arguments, output bytes, and regular-file modes produced by direct Cargo. Cargo-Rail makes no current
+comparative performance claim.
 
 See [Caching](docs/caching.md) for the proof model, S3 target schema, support matrix, and current evidence limits.
 
