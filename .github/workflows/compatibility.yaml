@@ -226,6 +226,10 @@ jobs:
       - name: Build cargo-rail outside the qualified volume
         run: cargo build --locked --bins
 
+      - name: Strip Linux native wrapper debug sections
+        if: runner.os == 'Linux'
+        run: strip --strip-debug target/debug/cargo-rail-native-rustc-wrapper
+
       - name: Provision case-sensitive APFS volume
         if: matrix.filesystem.setup == 'macos-apfs-case-sensitive'
         shell: bash
