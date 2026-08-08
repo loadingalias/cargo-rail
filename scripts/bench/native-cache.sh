@@ -458,7 +458,7 @@ if [[ "$l2_enabled" == true ]]; then
   native_cache_doctor_environment+=("CARGO_RAIL_CACHE_TARGETS_FILE=$l2_targets_file")
 fi
 if ! (
-  cd "$repo_root"
+  cd "$fixture_root/check-native-cargo"
   "${native_cache_doctor_environment[@]}" "$binary" rail doctor native-cache -f json \
     >"$native_cache_capability_candidate" 2>"$native_cache_capability_stderr_candidate"
 ); then

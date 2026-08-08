@@ -71,10 +71,41 @@ performance lane or a request to add the toolchain to an allowlist.
 
 ## Current evidence
 
-The v10 execution contract invalidates earlier retained measurements. The current harness has one retained Linux x64
-operational observation with accepted native Cargo, sccache, L1, L2 publication, empty-L1 hit, and unavailable-L2
-paths. One observation validates operation; it does not estimate a distribution or support a comparative performance
-claim. Run repeated same-host groups before making any p50, p95, ratio, faster, or superiority claim.
+The v10 contract invalidates measurements from earlier execution contracts. The retained
+`readme-v10-l1-macos-arm64` corpus ran ten interleaved groups on an Apple M1 Pro with macOS 26.5.2, APFS,
+and Rust 1.95.0. The release binary came from commit `8a03afb0ba9d2a48cbadbb7c4db41498984290be`; the captured
+worktree diff contains only the benchmark ownership correction that runs native-cache capability inspection from the
+materialized fixture instead of discovering unrelated policy from the outer repository. The environment record binds
+that diff, the harness, both binaries, toolchain, host, fixture, lockfile, and every benchmark control.
+
+Both native Cargo and Cargo-Rail clean-target lanes used disabled incremental compilation, offline dependencies, and an
+empty target directory. Cargo-Rail's warm lane used a fresh copy of the populated local CAS:
+
+| Workload and lane | p50 wall | Empirical p95 wall | p50 process-tree CPU | Empirical p95 CPU |
+|---|---:|---:|---:|---:|
+| Native Cargo `check` | 6.65 s | 7.45 s | 31.70 s | 33.83 s |
+| Cargo-Rail warm-L1 `check` | 4.91 s | 6.43 s | 13.44 s | 13.99 s |
+| Native Cargo `build --release` | 9.88 s | 10.89 s | 34.59 s | 37.31 s |
+| Cargo-Rail warm-L1 `build --release` | 7.40 s | 7.80 s | 17.91 s | 18.73 s |
+
+The paired median wall reduction was 25.7% for `check` and 27.3% for `build`. Exact nonparametric p50 intervals were
+19.6%–31.6% and 23.6%–28.7%, respectively, with at least 95% one-sided coverage at both bounds. Lane-median
+process-tree CPU fell 57.6% for `check` and 48.2% for `build`. Ten groups do not provide a complete upper confidence
+bound for p95, so the table labels p95 as an empirical order statistic rather than a population-tail claim.
+
+All 20 groups and 220 lane samples were accepted. Output manifests, runtime output, diagnostics, action censuses,
+compiler-event identities, cache accounting, and measured-versus-proof-replay outcomes matched. The validator found
+zero rejected samples and zero false hits. Each Cargo-Rail warm command accepted 26 verified hits, restored the exact
+stored results, and bypassed 31 ungraduated invocations.
+
+This comparison measures an empty `target/` with a warm L1. It does not measure Cargo with an intact warm target, where
+Cargo-Rail delegates to Cargo's fingerprints, or first-import L2 performance, which includes S3 latency and payload
+transfer. The exact p50 confidence interval for the Cargo-Rail-versus-sccache difference includes zero for both
+workloads, so this corpus does not support a superiority claim.
+
+One retained Linux x64 operational observation separately covers native Cargo, sccache, L1, L2 publication, empty-L1
+import, and unavailable-L2 fallback. Retained macOS ARM64, Linux x64, Windows x64, and Windows ARM64 proofs establish
+same-root L2 operation and exact-output preservation; they do not form one timing population.
 
 ## Maintainer AWS runners
 

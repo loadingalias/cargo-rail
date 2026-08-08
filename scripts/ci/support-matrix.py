@@ -903,6 +903,10 @@ L1 staging. The ordinary L1 proof must accept the imported result before restore
 verified local pack before its action association. The compiler wrapper receives only a loopback capability, never S3
 credentials or a bucket name.
 
+Compatible CI runners and SSH build hosts can exchange results when they use the same canonical physical checkout root,
+toolchain, flags, and selected compiler environment. Each machine retains a private L1 and its own AWS principal. See
+[Share native compiler results across CI and SSH](cache-sharing.md) for local, CI, SSH, and end-to-end transfer examples.
+
 Set `CARGO_RAIL_CACHE_TARGETS_FILE` to an absolute machine-owned JSON file outside the checkout. This is the complete
 version 1 schema; unknown fields are rejected:
 
@@ -972,7 +976,7 @@ conflicting namespace. Do not grant build clients list or delete access for reco
 
 The v10 path has retained empty-L1 publication and reuse on macOS ARM64, Linux x64, Windows x64, and Windows ARM64.
 Each proof preserved the platform-specific action and exact output within one canonical physical source root; it does
-not authorize cross-root reuse or a comparative performance claim.
+not authorize cross-root reuse. The repeated comparison below is scoped to its named macOS ARM64 host and local L1.
 
 ## Hermetic whole-action cache
 
@@ -1105,6 +1109,24 @@ exclusion, and requires identical action censuses, runtime behavior, compiler-ev
 measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they do not measure
 one shared artifact action. The independent-root fixture proves the required miss, exact cold output, and subsequent
 same-root reuse.
+
+The retained `readme-v10-l1-macos-arm64` corpus ran ten accepted interleaved groups on an Apple M1 Pro with macOS,
+APFS, Rust 1.95.0, offline dependencies, disabled incremental compilation, and empty target directories for both the
+native Cargo and Cargo-Rail clean-target lanes:
+
+| Workload | Native Cargo p50 wall | Cargo-Rail warm-L1 p50 wall | Paired median wall reduction | Median CPU reduction |
+|---|---:|---:|---:|---:|
+| `cargo check` | 6.65 s | 4.91 s | 25.7% | 57.6% |
+| `cargo build --release` | 9.88 s | 7.40 s | 27.3% | 48.2% |
+
+The exact nonparametric p50 interval was 19.6%–31.6% for `check` and 23.6%–28.7% for `build`, with at least 95%
+one-sided coverage at both bounds. All 220 measured lane samples were accepted with exact output, diagnostics, action
+census, and runtime equivalence; the validator found zero rejected samples and zero false hits. Each warm command
+accepted 26 verified hits and bypassed 31 ungraduated invocations.
+
+These are local L1 results for the cold-target problem, not intact-target Cargo timing or first-import S3 timing. The
+fixture and host bound the numbers. Operational L2 evidence proves publication and empty-L1 import across the supported
+platform set but does not estimate network performance.
 
 When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
 wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass

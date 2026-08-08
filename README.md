@@ -182,11 +182,34 @@ local hit remains network-free, and remote bytes enter the ordinary local proof 
 checkout compiles cold. Remote unavailability, credentials, authentication, or configuration also falls back to cold
 compilation. Remote conflict or malformed evidence fails without restoring output.
 
-The v10 execution contract invalidates earlier measurements. V10 binds the canonical physical source root and preserves
-the exact compiler arguments, output bytes, and regular-file modes produced by direct Cargo. Cargo-Rail makes no current
-comparative performance claim.
+Use one canonical checkout path and toolchain on compatible CI runners and SSH build hosts to exchange results through
+L2. Each machine keeps a private L1; CI and SSH principals can have separate read or read-write authority over the same
+immutable S3 namespace. See [Share native compiler results across CI and SSH](docs/cache-sharing.md) for the complete
+local, CI, SSH, and CI-to-SSH workflow.
 
-See [Caching](docs/caching.md) for the proof model, S3 target schema, support matrix, and current evidence limits.
+### Measured clean-target impact
+
+The retained v10 benchmark ran ten accepted interleaved groups on an Apple M1 Pro with macOS, APFS, and Rust 1.95.0.
+Each native Cargo baseline and Cargo-Rail warm-L1 lane started with an empty target directory. The fixture includes
+registry and Git dependencies, build scripts, a proc macro, native code, workspace libraries, and a binary.
+
+| Workload | Native Cargo p50 wall | Cargo-Rail warm-L1 p50 wall | Paired median wall reduction |
+|---|---:|---:|---:|
+| `cargo check` | 6.65 s | 4.91 s | **25.7%** |
+| `cargo build --release` | 9.88 s | 7.40 s | **27.3%** |
+
+Median process-tree CPU fell from 31.70 to 13.44 CPU-seconds for `check` (**57.6% less**) and from 34.59 to 17.91
+CPU-seconds for the release build (**48.2% less**). Every warm command accepted 26 verified hits and deliberately
+bypassed 31 ungraduated invocations. All 220 measured lane samples preserved exact outputs, diagnostics, action
+censuses, and runtime behavior; the validator found zero rejected samples and zero false hits.
+
+This measures the cold-target problem: cleanup, ephemeral CI runners, and fresh remote build hosts. With an intact warm
+target directory, Cargo's own fingerprints are already faster and Cargo-Rail delegates that path. These figures measure
+local L1 reuse, not first-import S3 latency, and they describe this fixture and host rather than predicting another
+workspace. Affected planning compounds the gain by removing unrelated actions before cache lookup begins.
+
+See [Caching](docs/caching.md) for the proof model and support matrix, and [Benchmarking](docs/benchmarking.md) for the
+complete measurement scope and confidence bounds.
 
 ## Release intent belongs in the pull request
 
@@ -358,6 +381,7 @@ The current MSRV is published in
 - [Command reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
 - [Caching](docs/caching.md)
+- [Share native compiler results across CI and SSH](docs/cache-sharing.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Troubleshooting and recovery](docs/troubleshooting.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)

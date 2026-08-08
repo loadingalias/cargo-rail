@@ -65,6 +65,7 @@ verification = ["verification/**"]
 | Field | Default | Behavior |
 |---|---:|---|
 | `targets` | `[]` | Additional target triples used for target-aware resolution and compiler evidence. `init` can detect these from repository configuration. |
+| `cache` | defaults | Local and shared native compiler-result cache policy. |
 | `unify` | defaults | Dependency and manifest policy. |
 | `release` | defaults | Release, changelog, and remote-effect policy. |
 | `change-detection` | defaults | Planner classification policy. |
@@ -72,6 +73,26 @@ verification = ["verification/**"]
 | `crates` | `{}` | Per-crate split, release, and changelog policy. |
 
 The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had no behavior and are deprecated.
+
+## `[cache]`
+
+Local native compiler-result reuse is enabled by default and requires no repository policy. Configure `l2` only when
+compatible machines should exchange verified results through a machine-owned S3 target:
+
+| Field | Default | Behavior |
+|---|---:|---|
+| `enabled` | `true` | Enable Cargo-Rail build-result cache reads and writes. `--no-cache` disables them for one run. |
+| `l2` | unset | Select a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. L1 remains enabled and an accepted L1 hit remains network-free. |
+
+```toml
+[cache]
+l2 = "team"
+```
+
+The alias is at most 64 bytes, starts with a lowercase ASCII letter, and contains only lowercase ASCII letters, digits,
+`-`, or `_`. The target map is an absolute JSON file outside the checkout and contains no credentials. See
+[Caching](caching.md#shared-native-cache-l2) for the complete target schema and
+[Share native compiler results across CI and SSH](cache-sharing.md) for an end-to-end deployment.
 
 ## `[unify]`
 
