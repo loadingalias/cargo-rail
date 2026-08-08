@@ -202,6 +202,7 @@ pub(crate) enum DirectCacheBypass {
   SessionUnavailable,
   WrapperExecutableUnavailable,
   SourceRootUnavailable,
+  TargetDirectoryOutsideSourceRoot,
 }
 
 impl DirectCacheBypass {
@@ -231,6 +232,7 @@ impl DirectCacheBypass {
       Self::SessionUnavailable => "native_cache_session_unavailable",
       Self::WrapperExecutableUnavailable => "compiler_wrapper_executable_unavailable",
       Self::SourceRootUnavailable => "native_cache_source_root_unavailable",
+      Self::TargetDirectoryOutsideSourceRoot => "target_directory_outside_source_root_not_graduated",
     }
   }
 }

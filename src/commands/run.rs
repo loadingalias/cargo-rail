@@ -2235,18 +2235,10 @@ fn native_cache_policy_bypass_reason(
   if rustc_force_incremental {
     return Some(DirectCacheBypass::ForcedIncremental);
   }
-  match cargo_incremental {
-    Some(value) if value == "0" => return None,
+  let explicit_non_incremental = match cargo_incremental {
+    Some(value) if value == "0" => true,
     Some(_) => return Some(DirectCacheBypass::ExplicitIncremental),
-    None => {}
-  }
-
-  let profile = match cargo_option_value(arguments, "--profile") {
-    Some("dev") => "debug",
-    Some("release") => "release",
-    Some(_) => return Some(DirectCacheBypass::CustomCargoProfile),
-    None if action == ActionKind::Distribution || cargo_flag_selected(arguments, "--release") => "release",
-    None => "debug",
+    None => false,
   };
   let target = cargo_option_value(arguments, "--target");
   let target_directory = cargo_option_value(arguments, "--target-dir").map_or_else(
@@ -2260,6 +2252,28 @@ fn native_cache_policy_bypass_reason(
       }
     },
   );
+  let target_directory = match crate::utils::canonicalize_allow_missing(&target_directory) {
+    Ok(directory) => directory,
+    Err(_) => return Some(DirectCacheBypass::TargetDirectoryOutsideSourceRoot),
+  };
+  let execution_workspace_root = match crate::utils::canonicalize_existing(execution_workspace_root) {
+    Ok(root) => root,
+    Err(_) => return Some(DirectCacheBypass::SourceRootUnavailable),
+  };
+  if !target_directory.starts_with(&execution_workspace_root) {
+    return Some(DirectCacheBypass::TargetDirectoryOutsideSourceRoot);
+  }
+  if explicit_non_incremental {
+    return None;
+  }
+
+  let profile = match cargo_option_value(arguments, "--profile") {
+    Some("dev") => "debug",
+    Some("release") => "release",
+    Some(_) => return Some(DirectCacheBypass::CustomCargoProfile),
+    None if action == ActionKind::Distribution || cargo_flag_selected(arguments, "--release") => "release",
+    None => "debug",
+  };
   let profile_root = target.map_or_else(
     || target_directory.clone(),
     |target| {
@@ -2706,6 +2720,62 @@ mod tests {
         false,
       ),
       Some(DirectCacheBypass::ActiveCargoProfile)
+    );
+  }
+
+  #[test]
+  fn native_cache_policy_bypasses_target_directories_outside_the_source_root() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let external = tempfile::tempdir().expect("external target parent");
+    let default_target = workspace.path().join("target");
+    let external_target = external.path().join("missing-target");
+    let external_target = external_target.to_string_lossy();
+
+    assert_eq!(
+      native_cache_policy_bypass_reason(
+        ActionKind::Build,
+        &args(&["check", "--target-dir", &external_target]),
+        &default_target,
+        workspace.path(),
+        Some(std::ffi::OsStr::new("0")),
+        false,
+      ),
+      Some(DirectCacheBypass::TargetDirectoryOutsideSourceRoot)
+    );
+    assert_eq!(
+      native_cache_policy_bypass_reason(
+        ActionKind::Build,
+        &args(&["check", "--target-dir", "missing-target"]),
+        &default_target,
+        workspace.path(),
+        Some(std::ffi::OsStr::new("0")),
+        false,
+      ),
+      None,
+      "a missing target directory within the source root remains eligible"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn native_cache_policy_resolves_target_directory_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let external = tempfile::tempdir().expect("external target parent");
+    let default_target = workspace.path().join("target");
+    symlink(external.path(), workspace.path().join("escaped-target")).expect("external target symlink");
+
+    assert_eq!(
+      native_cache_policy_bypass_reason(
+        ActionKind::Build,
+        &args(&["check", "--target-dir", "escaped-target/missing"]),
+        &default_target,
+        workspace.path(),
+        Some(std::ffi::OsStr::new("0")),
+        false,
+      ),
+      Some(DirectCacheBypass::TargetDirectoryOutsideSourceRoot)
     );
   }
 

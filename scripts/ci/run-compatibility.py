@@ -675,12 +675,11 @@ def assert_cross_target_corpus(
     cargo_rail: Path,
     root: Path,
     *,
-    action_cache_state: str,
     env: dict[str, str],
 ) -> None:
-    expected_bypass_reasons = ("cross_target_not_graduated",)
-    if action_cache_state != "active":
-        expected_bypass_reasons += (action_cache_state,)
+    expected_bypass_reasons = (
+        "target_directory_outside_source_root_not_graduated",
+    )
     for cross_target in cross_target_cases():
         workspace = root / f"workspace-{cross_target.target}"
         target = root / f"target-{cross_target.target}"
@@ -830,7 +829,7 @@ def assert_cross_target_mutations(
         source_mutation,
     ) in probes:
         workspace = root / f"mutation-workspace-{label}"
-        target = root / f"mutation-target-{label}"
+        target = workspace / f"target/mutation-{label}"
         shutil.copytree(fixtures[target_name], workspace)
         if source_mutation is not None:
             relative, old = source_mutation
@@ -903,7 +902,7 @@ def assert_custom_target_json(
         ) from error
 
     workspace = root / "custom-target-workspace"
-    target = root / "custom-target-output"
+    target = workspace / "target/custom-target-output"
     spec = root / "cargo-rail-custom-target.json"
     shutil.copytree(fixture, workspace)
     initialize_git_repository(workspace, env)
@@ -1766,7 +1765,6 @@ def main() -> int:
                 assert_cross_target_corpus(
                     cargo_rail,
                     root,
-                    action_cache_state=expected_cache_state,
                     env=environment,
                 )
             if args.cross_target_mutation_probes:

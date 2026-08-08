@@ -2093,6 +2093,65 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
 }
 
 #[test]
+fn test_native_cache_bypasses_an_external_target_directory_before_installing_the_wrapper() -> Result<()> {
+  let ws = TestWorkspace::new_named("native-cache-external-target")?;
+  ws.add_crate("external-target", "0.1.0", &[])?;
+  ws.commit("Add external target fixture")?;
+
+  let external = tempfile::tempdir()?;
+  let target = external.path().join("missing-target");
+  let cache = tempfile::tempdir()?;
+  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&ws.path)
+    .args([
+      "rail",
+      "run",
+      "--quiet",
+      "--all",
+      "--action",
+      "build",
+      "--explain",
+      "--",
+      "--quiet",
+      "--target-dir",
+    ])
+    .arg(&target)
+    .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_RAIL_CACHE_DIR", cache.path())
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+
+  assert!(
+    output.status.success(),
+    "external target build failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(
+    target.join("debug").is_dir(),
+    "Cargo did not populate the external target"
+  );
+  assert!(
+    String::from_utf8_lossy(&output.stdout)
+      .contains("native compiler cache: bypassed (target_directory_outside_source_root_not_graduated)"),
+    "the external target bypass was not explicit: {}",
+    String::from_utf8_lossy(&output.stdout)
+  );
+  assert!(
+    !cache.path().join("cargo-rail/local-cas-v2").exists(),
+    "an external target directory must bypass cache setup"
+  );
+  assert!(
+    !String::from_utf8_lossy(&output.stderr).contains("cargo-rail-native-rustc-wrapper"),
+    "the external target bypass must not install Cargo-Rail's compiler wrapper: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  Ok(())
+}
+
+#[test]
 fn test_native_cache_preserves_active_incremental_development_automatically() -> Result<()> {
   let ws = TestWorkspace::new_named("native-cache-incremental-bypass")?;
   ws.add_crate("incremental-bypass", "0.1.0", &[])?;
