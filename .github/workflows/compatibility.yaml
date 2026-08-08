@@ -224,7 +224,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build cargo-rail outside the qualified volume
-        run: cargo build --locked --bin cargo-rail
+        run: cargo build --locked --bins
 
       - name: Provision case-sensitive APFS volume
         if: matrix.filesystem.setup == 'macos-apfs-case-sensitive'

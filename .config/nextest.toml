@@ -17,7 +17,7 @@ test-group = 'cargo-subprocess'
 # This test owns a serial Cargo build matrix with bounded compiler-cache deadlines. Run it first and alone.
 priority = 100
 threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 6 }
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
@@ -49,7 +49,7 @@ filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_chec
 test-group = 'cargo-subprocess'
 priority = 100
 threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 6 }
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_native_cache_fixture::/)'

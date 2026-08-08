@@ -6,5 +6,6 @@ Rebuilt native compiler reuse around complete source, environment, and physical-
 output bytes and modes, durable conflict and restore state, and optional bounded L2 reuse for controlled CI and managed
 machines. Same-root clean-target, L1, and L2 reuse preserves rustc arguments and artifacts; moved checkouts safely
 compile cold instead of restoring path-bearing metadata, while external Cargo target directories bypass root-bound
-publication and execute normally. Windows cache authority uses handle-bound NTFS identity and write-through publication
-without a separately published helper package.
+publication and execute normally. Restored output evidence follows the current Cargo output directory across alternate
+Windows path spellings. Windows cache authority uses handle-bound NTFS identity and write-through publication without a
+separately published helper package.

@@ -163,12 +163,16 @@ impl ObservationPath {
 
 fn canonical_repository_relative(path: &Path, source_root: &Path) -> Option<PathBuf> {
   let root = crate::utils::canonicalize_existing(source_root).ok()?;
-  let metadata = fs::symlink_metadata(path).ok()?;
-  let canonical = if metadata.file_type().is_symlink() {
-    let parent = crate::utils::canonicalize_existing(path.parent()?).ok()?;
-    parent.join(path.file_name()?)
-  } else {
-    crate::utils::canonicalize_existing(path).ok()?
+  let canonical = match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.file_type().is_symlink() => {
+      let parent = crate::utils::canonicalize_existing(path.parent()?).ok()?;
+      parent.join(path.file_name()?)
+    }
+    Ok(_) => crate::utils::canonicalize_existing(path).ok()?,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      crate::utils::canonicalize_allow_missing(path).ok()?
+    }
+    Err(_) => return None,
   };
   canonical.strip_prefix(root).ok().map(Path::to_path_buf)
 }
@@ -2019,6 +2023,26 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[cfg(unix)]
+  #[test]
+  fn missing_repository_path_resolves_through_an_alternate_root_spelling() {
+    use std::os::unix::fs::symlink;
+
+    let source_root = tempfile::tempdir().expect("source root");
+    let alias_root = tempfile::tempdir().expect("alias root");
+    let output_parent = source_root.path().join("build-two/debug/deps");
+    fs::create_dir_all(&output_parent).expect("output parent");
+    let alias = alias_root.path().join("workspace");
+    symlink(source_root.path(), &alias).expect("source-root alias");
+    let output = alias.join("build-two/debug/deps/libfixture.rmeta");
+
+    assert_eq!(
+      ObservationPath::capture(&output, source_root.path(), source_root.path()),
+      ObservationPath::Repository("build-two/debug/deps/libfixture.rmeta".to_string())
+    );
+    assert!(!output.exists(), "the restore destination must still be missing");
+  }
 
   fn base_unit() -> CompilationUnit {
     CompilationUnit {
