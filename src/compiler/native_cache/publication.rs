@@ -19,9 +19,9 @@ use super::{
   NativeCompilerValidation, NativePublicationProof, NativeSessionAuthority, PreparedNativeOrigin, PreparedNativeResult,
   PreparedNativeStaging, RawCompilerInvocation, cold_input_bytes, write_cache_event_at,
 };
+use crate::cache::cas::{LocalCas, StagedNativeResult, StoreStats};
+use crate::cache::result::OutputManifest;
 use crate::error::{RailError, RailResult};
-use crate::hermetic::OutputManifest;
-use crate::hermetic::cas::{LocalCas, StagedNativeResult, StoreStats};
 
 const REQUEST_VERSION: u32 = 4;
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -683,12 +683,12 @@ impl PublicationServer {
 
 fn record_environment_selector_publication(
   metrics: &CoordinatorMetrics,
-  publication: crate::hermetic::cas::NativeEnvironmentSelectorPublication,
+  publication: crate::cache::cas::NativeEnvironmentSelectorPublication,
 ) -> RailResult<()> {
   match publication {
-    crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created
-    | crate::hermetic::cas::NativeEnvironmentSelectorPublication::Converged => Ok(()),
-    crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged => {
+    crate::cache::cas::NativeEnvironmentSelectorPublication::Created
+    | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged => Ok(()),
+    crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged => {
       metrics.selector_diverged.store(true, Ordering::Relaxed);
       Err(RailError::message("native environment selector diverged"))
     }
@@ -838,8 +838,8 @@ mod tests {
   #[test]
   fn only_selector_divergence_sets_the_operational_report_bit() {
     for publication in [
-      crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created,
-      crate::hermetic::cas::NativeEnvironmentSelectorPublication::Converged,
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Created,
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Converged,
     ] {
       let metrics = CoordinatorMetrics::default();
       record_environment_selector_publication(&metrics, publication).expect("ordinary selector publication");
@@ -849,7 +849,7 @@ mod tests {
     let metrics = CoordinatorMetrics::default();
     record_environment_selector_publication(
       &metrics,
-      crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged,
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged,
     )
     .expect_err("divergent selector publication must fail");
     assert!(metrics.selector_diverged.load(Ordering::Relaxed));

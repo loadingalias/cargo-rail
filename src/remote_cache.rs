@@ -835,9 +835,9 @@ fn handle_publication(
   if !shared.target.can_write() {
     return Ok(false);
   }
-  let cas = crate::hermetic::cas::LocalCas::open_initialized()
+  let cas = crate::cache::cas::LocalCas::open_initialized()
     .map_err(|error| RemoteStoreError::unavailable(error.to_string()))?;
-  let crate::hermetic::cas::NativeActionLookup::Hit(hit) = cas
+  let crate::cache::cas::NativeActionLookup::Hit(hit) = cas
     .native_action(action_key)
     .map_err(|error| RemoteStoreError::unavailable(error.to_string()))?
   else {

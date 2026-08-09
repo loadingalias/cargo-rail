@@ -173,6 +173,8 @@ lockfile entries can reuse a verified result. Rust flags, features, dependency c
 source topology, and compiler environment still change or reject reuse at their owning boundary.
 
 A matching lookup is not enough. Incomplete or unsupported evidence produces a named bypass and runs normal Cargo.
+The pre-Clap compiler boundary rejects ambiguous wrapper roles and skips session/CAS acquisition for disabled,
+incremental, clippy, response-file, and other clearly unsupported invocations.
 
 **Fast when proven. Normal Cargo when not.**
 

@@ -65,6 +65,20 @@ A cache lookup is never proof by itself. Cargo-Rail revalidates the inputs, acti
 owned by that cache layer before reuse. Unsupported or incomplete evidence bypasses reuse and executes the normal tool.
 The three cache layers and their current support are documented in [Caching](caching.md).
 
+## Compiler process boundary
+
+Compiler roles are classified once, before Clap and workspace capture. The invocation boundary captures Cargo's exact
+program and argv. Transparent execution preserves the live working directory, inherited non-private environment,
+wrapper order, streams, signals, and exit status. The analysis role adds only its owned lint or observation-output
+arguments. Cache and compiler-fact domains receive narrow invocation inputs; neither constructs a run action or
+`WorkspaceContext` inside a rustc process.
+
+The wrapper order is Cargo-Rail cache, analysis workspace driver, explicitly compatible existing workspace wrapper,
+then the selected compiler. The cache and fact domains retain separate identities and authority. Analysis uses a
+private capability bound to one source root and observation directory. Shared immutable objects and output manifests
+belong to `cache/`; whole-action policy remains in `hermetic/`, and compiler sessions and evidence remain in
+`compiler/`.
+
 ## Module ownership
 
 | Modules | Responsibility |
@@ -73,7 +87,9 @@ The three cache layers and their current support are documented in [Caching](cac
 | `cargo/`, `graph/`, `toml/` | Cargo resolution, graph algorithms, and lossless editing |
 | `change_detection/`, `commands/plan.rs` | File semantics, impact, surfaces, and scope |
 | `action.rs`, `action_key.rs`, `commands/run.rs` | Action expansion, validation, identity, and execution |
-| `compiler/`, `hermetic/` | Compiler observation and verified reuse boundaries |
+| `compiler/` | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
+| `cache/` | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation |
+| `hermetic/` | Whole-action isolation, policy, validation, and reproducibility proof |
 | `mutation/` | Plan/apply drift checks, authorized paths, and receipts |
 | `release/`, `split/`, `sync/` | Workflows that cross repository or publication boundaries |
 | `git/`, source path types, process helpers | External capabilities and containment |

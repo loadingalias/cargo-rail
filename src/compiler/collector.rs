@@ -4,10 +4,15 @@ use crate::build_script::{
   BuildScriptActionInputs, BuildScriptCargoOutputSummary, BuildScriptResultInputs,
   analyze_action_key as analyze_build_script_action_key, analyze_result as analyze_build_script_result,
 };
+use crate::cache::cas::LocalCas;
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
 use crate::cargo::resolution::{ResolutionInputs, capture_target_identities};
 use crate::cargo::{CargoConfigSnapshot, DepKind, ToolchainIdentity};
 use crate::compiler::diagnostics_store::CompilerDiagnosticsStore;
+use crate::compiler::invocation::{
+  CACHE_WRAPPER_MARKER, CacheWrapperPlan, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
+  WRAPPER_MARKER,
+};
 use crate::compiler::model::{
   AnalysisConfiguration, COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId,
   CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
@@ -24,13 +29,9 @@ use crate::compiler::observation::{
   CompilerWrapperRole, FileObservation, ObservationPath, attach_build_script_result_dependencies,
   attach_execution_identities, build_manifests, load_raw,
 };
-use crate::compiler::wrapper::{
-  CACHE_WRAPPER_MARKER, CacheWrapperPlan, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
-  WRAPPER_MARKER,
-};
+use crate::compiler::session::{CompilerFactSession, FACT_SESSION_ENV};
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
-use crate::hermetic::cas::LocalCas;
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
@@ -1109,6 +1110,7 @@ fn run_workspace_check(
     .prefix("cargo-rail-compiler-observations-")
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
+  let fact_session = CompilerFactSession::write(observation_directory.path(), workspace_root)?;
   let native_cache_enabled =
     identity.cache_wrapper_plan.installs_cargo_rail() && identity.native_cache_bypass_reason.is_none();
   let native_cache_session = if native_cache_enabled {
@@ -1167,6 +1169,7 @@ fn run_workspace_check(
     .env(WRAPPER_MARKER, "1")
     .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
     .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
+    .env(FACT_SESSION_ENV, fact_session)
     .env_remove(CACHE_WRAPPER_MARKER)
     .args(&args);
   if native_cache_enabled {

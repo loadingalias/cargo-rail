@@ -1,5 +1,8 @@
 //! Exact ownership, measurement, and reclamation for cargo-rail cache state.
 
+pub(crate) mod cas;
+pub(crate) mod result;
+
 use crate::error::{RailError, RailResult};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -88,7 +91,7 @@ pub(crate) struct SharedCacheStatus {
   pub(crate) present: bool,
   pub(crate) cross_workspace: bool,
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub(crate) cache: Option<crate::hermetic::cas::LocalCasStatus>,
+  pub(crate) cache: Option<crate::cache::cas::LocalCasStatus>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) legacy: Option<LegacyLocalCacheStatus>,
 }

@@ -487,7 +487,7 @@ impl CargoConfigSnapshot {
   pub(crate) fn cache_wrapper_plan(
     &self,
     cargo_current_dir: &Path,
-  ) -> RailResult<crate::compiler::wrapper::CacheWrapperPlan> {
+  ) -> RailResult<crate::compiler::invocation::CacheWrapperPlan> {
     let rustc_wrapper = selected_program(
       self,
       cargo_current_dir,
@@ -509,7 +509,7 @@ impl CargoConfigSnapshot {
       rustc_wrapper.as_deref(),
       workspace_wrapper.as_deref(),
     )?;
-    Ok(crate::compiler::wrapper::CacheWrapperPlan::for_chain(
+    Ok(crate::compiler::invocation::CacheWrapperPlan::for_chain(
       rustc_wrapper.as_deref(),
       workspace_wrapper.as_deref(),
     ))
@@ -2210,7 +2210,7 @@ fn configured_rustc_command(
   rustc_wrapper_program: Option<&OsStr>,
   rustc_workspace_wrapper_program: Option<&OsStr>,
 ) -> Command {
-  crate::compiler::wrapper::rustc_command(rustc_program, rustc_wrapper_program, rustc_workspace_wrapper_program)
+  crate::compiler::invocation::rustc_command(rustc_program, rustc_wrapper_program, rustc_workspace_wrapper_program)
 }
 
 fn apply_cargo_environment(command: &mut Command, cargo_config: &CargoConfigSnapshot) -> RailResult<()> {
@@ -4726,7 +4726,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
       [OsStr::new("workspace-wrapper"), OsStr::new("selected-rustc")]
     );
 
-    let diagnostics = crate::compiler::wrapper::rustc_command(
+    let diagnostics = crate::compiler::invocation::rustc_command(
       OsStr::new("selected-rustc"),
       Some(OsStr::new("sccache")),
       Some(OsStr::new("cargo-rail")),
@@ -4736,7 +4736,7 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
       diagnostics.get_args().collect::<Vec<_>>(),
       [OsStr::new("cargo-rail"), OsStr::new("selected-rustc")]
     );
-    let inner = crate::compiler::wrapper::rustc_command(
+    let inner = crate::compiler::invocation::rustc_command(
       OsStr::new("selected-rustc"),
       None,
       Some(OsStr::new("workspace-wrapper")),

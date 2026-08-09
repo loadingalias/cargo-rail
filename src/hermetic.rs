@@ -1,12 +1,10 @@
 //! Explicit isolated execution and reproducibility proof for Rust actions.
 
-pub(crate) mod cas;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufReader, Read as _, Write as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -19,12 +17,18 @@ use crate::action::{ActionKind, ActionWorkingDirectory, ExpandedAction};
 #[cfg(target_os = "macos")]
 use crate::action_key::{DeclaredInputEntry, DeclaredInputKind};
 use crate::action_key::{DeclaredInputManifest, declared_input_manifest};
+use crate::cache::cas;
+use crate::cache::result::{
+  OUTPUT_MANIFEST_VERSION, OutputEntry, OutputEntryKind, OutputManifest, output_manifest_digest, output_mode,
+  symlink_target_escapes,
+};
 use crate::cargo::resolution::ResolutionInputs;
 use crate::cargo::{CargoConfigSnapshot, ToolchainIdentity};
-use crate::compiler::observation::{FileObservation, ObservationPath, RawCompilerInvocation, load_raw};
-use crate::compiler::wrapper::{
+use crate::compiler::invocation::{
   CACHE_WRAPPER_MARKER, OBSERVATION_DIRECTORY_ENV, OBSERVATION_ONLY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
 };
+use crate::compiler::observation::{FileObservation, ObservationPath, RawCompilerInvocation, load_raw};
+use crate::compiler::session::{CompilerFactSession, FACT_SESSION_ENV};
 use crate::error::{RailError, RailResult};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableScope};
 use crate::git::SystemGit;
@@ -38,7 +42,6 @@ const HERMETIC_PROFILE_VERSION: u32 = 1;
 #[cfg(target_os = "macos")]
 const MACOS_SANDBOX_POLICY_VERSION: u32 = 1;
 const FETCH_ACTION_VERSION: u32 = 1;
-const OUTPUT_MANIFEST_VERSION: u32 = 1;
 const RESULT_VERSION: u32 = 3;
 const FAST_CACHE_VALIDATION_VERSION: u32 = 1;
 const MAX_OUTPUT_ENTRIES: usize = 1_000_000;
@@ -449,10 +452,10 @@ struct FetchManifest {
 /// Non-authorizing exact observations used only to find a P6 action key before Cargo starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct FastCacheValidation {
-  version: u32,
-  lookup_key: String,
-  action_key: String,
+pub(crate) struct FastCacheValidation {
+  pub(crate) version: u32,
+  pub(crate) lookup_key: String,
+  pub(crate) action_key: String,
   workspace_prefix: String,
   cargo_current_directory: String,
   declared_inputs: DeclaredInputManifest,
@@ -470,7 +473,7 @@ pub(super) struct FastCacheValidation {
 }
 
 impl FastCacheValidation {
-  fn validate_object(&self) -> RailResult<()> {
+  pub(crate) fn validate_object(&self) -> RailResult<()> {
     if self.version != FAST_CACHE_VALIDATION_VERSION {
       return Err(RailError::message(
         "local cache validation manifest has an incompatible schema",
@@ -570,7 +573,7 @@ impl FastCacheValidation {
   }
 
   #[cfg(test)]
-  fn fixture(action_key: &str, lookup_key: &str) -> Self {
+  pub(crate) fn fixture(action_key: &str, lookup_key: &str) -> Self {
     let digest = format!("sha256-{}", "0".repeat(64));
     let inventory_result_digest = fetch_result_digest(&[]).expect("empty dependency-result identity");
     Self {
@@ -907,80 +910,6 @@ enum ExactTreeEntryKind {
 struct ExactTreeEntry {
   path: crate::source::RepositoryPath,
   kind: ExactTreeEntryKind,
-}
-
-/// Exact declared compiler-output tree for one action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OutputManifest {
-  version: u32,
-  digest: String,
-  entries: Vec<OutputEntry>,
-  files: usize,
-  directories: usize,
-  symlinks: usize,
-  bytes: u64,
-}
-
-impl OutputManifest {
-  pub(crate) fn digest(&self) -> &str {
-    &self.digest
-  }
-
-  fn validate_unchanged(&self, root: &Path) -> RailResult<()> {
-    for entry in &self.entries {
-      let relative = crate::source::RepositoryPath::new(Path::new(&entry.path))?;
-      let path = root.join(relative.as_path());
-      let metadata = fs::symlink_metadata(&path).map_err(|error| {
-        RailError::message(format!(
-          "declared compiler output '{}' disappeared before publication: {error}",
-          entry.path
-        ))
-      })?;
-      let unchanged = match &entry.kind {
-        OutputEntryKind::Directory { mode } => {
-          metadata.is_dir() && !metadata.file_type().is_symlink() && output_mode(&metadata) == *mode
-        }
-        OutputEntryKind::File { digest, mode, bytes } => {
-          if !metadata.is_file() || metadata.file_type().is_symlink() || output_mode(&metadata) != *mode {
-            false
-          } else {
-            let (current, current_bytes, _) = digest_and_scan_file(&path, &[])?;
-            current_bytes == *bytes && format!("sha256:{current}") == *digest
-          }
-        }
-        OutputEntryKind::Symlink { target } => {
-          metadata.file_type().is_symlink()
-            && fs::read_link(&path)
-              .ok()
-              .and_then(|current| current.to_str().map(str::to_string))
-              .is_some_and(|current| current == *target)
-        }
-      };
-      if !unchanged {
-        return Err(RailError::with_help(
-          format!("declared compiler output '{}' changed before publication", entry.path),
-          "retry after concurrent writes to the isolated execution root have stopped",
-        ));
-      }
-    }
-    Ok(())
-  }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct OutputEntry {
-  path: String,
-  #[serde(flatten)]
-  kind: OutputEntryKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OutputEntryKind {
-  Directory { mode: u32 },
-  File { digest: String, mode: u32, bytes: u64 },
-  Symlink { target: String },
 }
 
 struct RunLayout {
@@ -1770,28 +1699,6 @@ fn copy_verified_file(source: &Path, destination: &Path, expected: ContentDigest
   Ok(())
 }
 
-fn symlink_target_escapes(path: &crate::source::RepositoryPath, target: &str) -> bool {
-  let target = Path::new(target);
-  if target.is_absolute() {
-    return true;
-  }
-  let mut depth = path.as_path().parent().map_or(0usize, |parent| {
-    parent
-      .components()
-      .filter(|component| matches!(component, Component::Normal(_)))
-      .count()
-  });
-  for component in target.components() {
-    match component {
-      Component::CurDir => {}
-      Component::Normal(_) => depth = depth.saturating_add(1),
-      Component::ParentDir if depth > 0 => depth -= 1,
-      Component::ParentDir | Component::RootDir | Component::Prefix(_) => return true,
-    }
-  }
-  false
-}
-
 #[cfg(unix)]
 fn create_symlink(target: &Path, destination: &Path, _source: &Path) -> RailResult<()> {
   std::os::unix::fs::symlink(target, destination).map_err(|error| {
@@ -2050,6 +1957,7 @@ fn run_cargo_check(
   let rustc = toolchain_program(snapshot.toolchain().rustc_sysroot(), "rustc");
   let current_executable = std::env::current_exe()
     .map_err(|error| RailError::message(format!("failed to locate cargo-rail compiler observer: {error}")))?;
+  let fact_session = CompilerFactSession::write(&layout.observations, &layout.root)?;
   command.args(arguments).current_dir(&working_directory).env_clear();
   let rustflags = hermetic_rustflags(action, snapshot, layout, inventory)?;
   for (name, value, _) in cargo_environment {
@@ -2077,11 +1985,12 @@ fn run_cargo_check(
     .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
     .env("RUSTC_WRAPPER", &current_executable)
     .env_remove(CACHE_WRAPPER_MARKER)
-    .env_remove(crate::compiler::wrapper::INNER_WRAPPER_ENV)
+    .env_remove(crate::compiler::invocation::INNER_WRAPPER_ENV)
     .env(WRAPPER_MARKER, "1")
     .env(OBSERVATION_ONLY_ENV, "1")
     .env(OBSERVATION_DIRECTORY_ENV, &layout.observations)
-    .env(OBSERVATION_SOURCE_ROOT_ENV, &layout.root);
+    .env(OBSERVATION_SOURCE_ROOT_ENV, &layout.root)
+    .env(FACT_SESSION_ENV, fact_session);
   command.output().map_err(|error| {
     RailError::message(format!(
       "failed to execute hermetic Cargo check through '{}': {error}",
@@ -2539,76 +2448,6 @@ pub(crate) fn capture_native_compiler_outputs(root: &Path, paths: &[PathBuf]) ->
   Ok(manifest)
 }
 
-/// Build the ordinary CAS manifest from fixed-pack slots whose bytes and
-/// digests were already authenticated while streaming into private staging.
-pub(crate) fn manifest_from_verified_native_slots(slots: &[(&str, &str, u64, u32)]) -> RailResult<OutputManifest> {
-  let mut entries = BTreeMap::new();
-  let mut bytes = 0u64;
-  for (path, digest, length, mode) in slots {
-    let path = crate::source::RepositoryPath::new(Path::new(path))?;
-    let logical = path.as_str().to_string();
-    if entries
-      .insert(
-        logical.clone(),
-        OutputEntryKind::File {
-          digest: (*digest).to_string(),
-          mode: *mode,
-          bytes: *length,
-        },
-      )
-      .is_some()
-    {
-      return Err(RailError::message("verified native pack contains duplicate slots"));
-    }
-    bytes = bytes
-      .checked_add(*length)
-      .ok_or_else(|| RailError::message("verified native pack byte count overflow"))?;
-    let mut parent = path.as_path().parent();
-    while let Some(directory) = parent {
-      if directory.as_os_str().is_empty() {
-        break;
-      }
-      let logical = crate::utils::path_to_git_format(directory);
-      match entries.entry(logical) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-          entry.insert(OutputEntryKind::Directory { mode: 0o755 });
-        }
-        std::collections::btree_map::Entry::Occupied(entry)
-          if matches!(entry.get(), OutputEntryKind::Directory { mode: 0o755 }) => {}
-        std::collections::btree_map::Entry::Occupied(_) => {
-          return Err(RailError::message(
-            "verified native pack slot collides with an output parent",
-          ));
-        }
-      }
-      parent = directory.parent();
-    }
-  }
-  if entries.len() > MAX_OUTPUT_ENTRIES {
-    return Err(RailError::message(
-      "verified native pack exceeds the output-entry bound",
-    ));
-  }
-  let entries = entries
-    .into_iter()
-    .map(|(path, kind)| OutputEntry { path, kind })
-    .collect::<Vec<_>>();
-  let directories = entries
-    .iter()
-    .filter(|entry| matches!(entry.kind, OutputEntryKind::Directory { .. }))
-    .count();
-  let digest = output_manifest_digest(&entries)?;
-  Ok(OutputManifest {
-    version: OUTPUT_MANIFEST_VERSION,
-    digest,
-    files: slots.len(),
-    directories,
-    symlinks: 0,
-    entries,
-    bytes,
-  })
-}
-
 fn add_output_parent_directories(
   run_root: &Path,
   output: &Path,
@@ -2710,35 +2549,6 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
   needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-fn output_manifest_digest(entries: &[OutputEntry]) -> RailResult<String> {
-  let mut identity = FramedHasher::new(b"cargo-rail-output-manifest\0");
-  identity.frame(b"version", &OUTPUT_MANIFEST_VERSION.to_le_bytes());
-  for entry in entries {
-    identity.frame(b"entry", &serde_json::to_vec(entry)?);
-  }
-  Ok(format!(
-    "output-manifest-v{OUTPUT_MANIFEST_VERSION}-sha256-{}",
-    identity.finish()
-  ))
-}
-
-#[cfg(unix)]
-fn output_mode(metadata: &fs::Metadata) -> u32 {
-  use std::os::unix::fs::PermissionsExt as _;
-
-  metadata.permissions().mode() & 0o7777
-}
-
-#[cfg(windows)]
-fn output_mode(metadata: &fs::Metadata) -> u32 {
-  if metadata.is_dir() { 0o755 } else { 0o644 }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn output_mode(metadata: &fs::Metadata) -> u32 {
-  u32::from(metadata.permissions().readonly())
-}
-
 pub(crate) fn pre_context_lookup_key(workspace_root: &Path) -> RailResult<String> {
   let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
   let mut identity = FramedHasher::new(b"cargo-rail-local-action-lookup\0");
@@ -2798,7 +2608,7 @@ fn frame_lookup_file(identity: &mut FramedHasher, label: &str, path: &Path, requ
 }
 
 #[cfg(test)]
-fn test_pre_context_lookup_key() -> String {
+pub(crate) fn test_pre_context_lookup_key() -> String {
   let mut identity = FramedHasher::new(b"cargo-rail-local-action-lookup\0");
   identity.frame(b"version", &FAST_CACHE_VALIDATION_VERSION.to_le_bytes());
   identity.frame(b"test", b"fixture");
@@ -3993,7 +3803,9 @@ fn hermetic_environment_name_is_controlled(name: &str) -> bool {
     "CARGO_HOME"
       | "CARGO_INCREMENTAL"
       | "CARGO_NET_OFFLINE"
+      | "CARGO_RAIL_CACHE"
       | "CARGO_RAIL_COMPILER_CACHE_WRAPPER"
+      | "CARGO_RAIL_COMPILER_FACT_SESSION"
       | "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY"
       | "CARGO_RAIL_COMPILER_OBSERVATION_ONLY"
       | "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT"
@@ -4171,7 +3983,7 @@ fn hermetic_action_key(
   ))
 }
 
-fn hermetic_result_digest(action_key: &str, output_manifest: &str) -> String {
+pub(crate) fn hermetic_result_digest(action_key: &str, output_manifest: &str) -> String {
   let mut identity = FramedHasher::new(b"cargo-rail-hermetic-result\0");
   identity.frame(b"version", &RESULT_VERSION.to_le_bytes());
   identity.frame(b"action", action_key.as_bytes());
@@ -4941,7 +4753,9 @@ mod tests {
   #[test]
   fn private_observation_environment_cannot_override_the_hermetic_wrapper() {
     for name in [
+      "CARGO_RAIL_CACHE",
       "CARGO_RAIL_COMPILER_CACHE_WRAPPER",
+      "CARGO_RAIL_COMPILER_FACT_SESSION",
       "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY",
       "CARGO_RAIL_COMPILER_OBSERVATION_ONLY",
       "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT",

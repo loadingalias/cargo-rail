@@ -750,15 +750,18 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     "verified check hits changed exact cold compiler output bytes: {:?}",
     output_difference(&second_outputs, &warm_outputs)
   );
-  for reason in [
+  ensure!(
+    second_warm.contains("native_linking_not_graduated"),
+    "missing post-acquisition native-linking bypass:\n{second_warm}"
+  );
+  for acquisition_free_reason in [
     "build_script_not_graduated",
     "proc_macro_not_graduated",
-    "native_linking_not_graduated",
     "binary_not_graduated",
   ] {
     ensure!(
-      second_warm.contains(reason),
-      "missing bypass '{reason}':\n{second_warm}"
+      !second_warm.contains(acquisition_free_reason),
+      "an acquisition-free compiler shape persisted a cache event '{acquisition_free_reason}':\n{second_warm}"
     );
   }
 

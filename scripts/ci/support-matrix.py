@@ -833,6 +833,18 @@ cargo rail run --all --action distribution --explain
 cargo rail doctor native-cache --format json
 ```
 
+Every compiler process first enters one pre-Clap boundary that captures Cargo's selected program and byte-exact argv.
+Transparent execution preserves the working directory, inherited non-private environment, wrapper order, streams, and
+process status; the analysis role adds only its owned lint or observation-output arguments. The boundary distinguishes
+the cache wrapper, workspace fact driver, and rustdoc proxy before loading a compiler session. Ambiguous roles fail
+before Clap or compiler execution. Information requests, response files, clippy, incremental compilation, unsupported
+crate types, and invocations without modeled outputs execute the original chain before session or CAS acquisition.
+
+`CARGO_RAIL_CACHE=off` is the process-local kill switch for an already-selected Cargo-Rail compiler wrapper. It removes
+cache authority and directly executes the original compiler chain without reading session state or opening the CAS.
+Use `--no-cache` for ordinary `cargo rail run` cold baselines; use the environment control only when supervising the
+wrapper boundary itself.
+
 Each command session binds one physical workspace root, and each compiler action additionally binds the physical source
 namespace for that unit. Cargo-Rail therefore reuses exact path-bearing compiler artifacts only within that root; a
 moved or independent checkout compiles cold and records its own exact variant. Each compiler unit also binds its exact
@@ -873,8 +885,9 @@ preserve ambient wrappers and record their deliberately absent snapshot in the o
 
 Default text mode emits one concise decision with `hits`, `misses`, `bypasses`, and `bytes_restored`, or the stable
 action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, accounted verified-result
-`cache_bytes_read` and `cache_bytes_written` totals, the complete reason census, and per-unit evidence. Low-level I/O
-that fails without returning byte statistics is not inferred:
+`cache_bytes_read` and `cache_bytes_written` totals, the retained-event reason census, and per-unit evidence.
+Acquisition-free shapes execute before event persistence, so the bypass count is not a census of every rustc process.
+Low-level I/O that fails without returning byte statistics is not inferred:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
 - `miss` means the exact action has no authoritative result; successful cold output may populate the local CAS; and
@@ -1007,6 +1020,12 @@ use `--no-cache` for a deliberate cold run or validated cleanup to discard it.
 `cargo rail unify --check` may reuse compiler observations after revalidating the compiler, source, manifest, target,
 features, Cargo configuration, dependency artifacts, emitted outputs, executable identity, and recorded environment
 reads. This store contains diagnostic evidence, not restorable Cargo artifacts.
+
+An explicitly launched analysis run creates one private fact capability bound to its exact source root and observation
+directory. Rustc and rustdoc publish only while that capability validates. An absent capability bypasses fact
+collection and preserves the original compiler; an incomplete, moved, or tampered capability fails the analysis run
+instead of silently accepting partial evidence. Fact identity remains separate from native cache action/result
+identity.
 
 Check mode does not edit manifests, but analysis may update cache and report files under `target/cargo-rail/`.
 `cargo rail unify --check -f json` exposes `evidence_cache` hits, misses, and reasons.

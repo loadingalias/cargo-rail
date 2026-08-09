@@ -271,7 +271,7 @@ fn validate_identity(value: &str, prefix: &str) -> RailResult<()> {
 pub struct CompilerDiagnosticsStore {
   path: PathBuf,
   cache: CompilerDiagCacheFile,
-  cas: Option<crate::hermetic::cas::LocalCas>,
+  cas: Option<crate::cache::cas::LocalCas>,
   legacy_digest: Option<crate::source::ContentDigest>,
   pending: HashSet<String>,
   dirty: bool,
@@ -283,11 +283,11 @@ pub struct CompilerDiagnosticsStore {
 impl CompilerDiagnosticsStore {
   /// Load compiler evidence from the shared local CAS and any bounded legacy file.
   pub fn load(workspace_root: &Path) -> Self {
-    let cas = crate::hermetic::cas::LocalCas::open().ok();
+    let cas = crate::cache::cas::LocalCas::open().ok();
     Self::load_with_cas(workspace_root, cas)
   }
 
-  fn load_with_cas(workspace_root: &Path, cas: Option<crate::hermetic::cas::LocalCas>) -> Self {
+  fn load_with_cas(workspace_root: &Path, cas: Option<crate::cache::cas::LocalCas>) -> Self {
     let path = crate::workspace::cargo_rail_state_root(workspace_root)
       .join("cache")
       .join("compiler-diags-v1.json");
@@ -457,7 +457,7 @@ impl CompilerDiagnosticsStore {
       }
       let validation = CompilerEvidenceValidation::from_entry(entry)?;
       let evidence = CompilerEvidenceObject::from_entry(entry);
-      cas.store_compiler_evidence(crate::hermetic::cas::CompilerEvidenceStoreRequest {
+      cas.store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
         validation: &validation,
         evidence: &evidence,
       })?;
@@ -593,10 +593,7 @@ fn remove_legacy_if_unchanged(path: &Path, expected: crate::source::ContentDiges
   Ok(true)
 }
 
-fn store_unavailable_reason(
-  legacy_available: bool,
-  cas: &Option<crate::hermetic::cas::LocalCas>,
-) -> Option<&'static str> {
+fn store_unavailable_reason(legacy_available: bool, cas: &Option<crate::cache::cas::LocalCas>) -> Option<&'static str> {
   (!legacy_available && cas.is_none()).then_some("local_cache_unavailable")
 }
 
@@ -915,7 +912,7 @@ mod tests {
     };
     fs::write(&path, serde_json::to_vec(&cache).expect("cache should serialize")).expect("cache should be written");
 
-    let cas = crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+    let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
     let mut store = CompilerDiagnosticsStore::load_with_cas(root.path(), Some(cas));
     assert!(store.get(&key).is_none());
     assert_eq!(store.miss_reason(&key), "cold_cache");
@@ -929,7 +926,7 @@ mod tests {
     let second_root = tempfile::tempdir().expect("second workspace should be created");
     let cache_root = tempfile::tempdir().expect("temporary cache should be created");
     let first_cas =
-      crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+      crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
     let original = entry("member", now_unix_ms(), 0);
     let mut first = CompilerDiagnosticsStore::load_with_cas(first_root.path(), Some(first_cas));
     first.put(original.clone());
@@ -943,7 +940,7 @@ mod tests {
     );
 
     let second_cas =
-      crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
+      crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
     let mut equivalent_key = original.key.clone();
     equivalent_key.package_id.repr = "path+file:///different/root#member@0.1.0".to_string();
     let mut second = CompilerDiagnosticsStore::load_with_cas(second_root.path(), Some(second_cas));
@@ -974,7 +971,7 @@ mod tests {
     )
     .expect("legacy cache should be written");
 
-    let cas = crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+    let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
     let mut migrating = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(cas));
     assert!(
       migrating.get(&original.key).is_some(),
@@ -984,7 +981,7 @@ mod tests {
     assert!(!path.exists(), "legacy input should disappear only after publication");
 
     let reopened =
-      crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
+      crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
     let mut store = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(reopened));
     assert_eq!(
       store.get(&original.key).map(|entry| &entry.evidence),
@@ -998,7 +995,7 @@ mod tests {
     let workspace = tempfile::tempdir().expect("workspace should be created");
     let cache_root = tempfile::tempdir().expect("temporary cache should be created");
     let original = entry("member", now_unix_ms(), 0);
-    let cas = crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+    let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
     let mut writer = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(cas));
     writer.put(original.clone());
     writer.flush().expect("compiler evidence should publish");
@@ -1022,7 +1019,7 @@ mod tests {
     fs::write(evidence, bytes).expect("evidence should be corrupted");
 
     let reopened =
-      crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
+      crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
     let mut reader = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(reopened));
     assert!(reader.get(&original.key).is_none());
     assert_eq!(reader.miss_reason(&original.key), "local_cache_unreadable");
@@ -1040,10 +1037,10 @@ mod tests {
         let validation = validation.clone();
         let evidence = evidence.clone();
         scope.spawn(move || {
-          let cas = crate::hermetic::cas::LocalCas::open_at(&cache_root, 1024 * 1024)
-            .expect("concurrent local CAS should open");
+          let cas =
+            crate::cache::cas::LocalCas::open_at(&cache_root, 1024 * 1024).expect("concurrent local CAS should open");
           cas
-            .store_compiler_evidence(crate::hermetic::cas::CompilerEvidenceStoreRequest {
+            .store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
               validation: &validation,
               evidence: &evidence,
             })
@@ -1066,8 +1063,8 @@ mod tests {
         .count(),
       1
     );
-    let reopened = crate::hermetic::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024)
-      .expect("local CAS should reopen for status");
+    let reopened =
+      crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen for status");
     let status = reopened.status().expect("local CAS status should be readable");
     assert_eq!(status.results, 1);
     assert_eq!(status.pins, 1);

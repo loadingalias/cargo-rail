@@ -13,8 +13,9 @@ use clap::Parser;
 use std::time::Instant;
 
 fn main() {
-  if let Some(exit_code) = cargo_rail::compiler::wrapper::run_if_requested() {
-    std::process::exit(exit_code);
+  match cargo_rail::compiler::invocation::dispatch() {
+    cargo_rail::compiler::invocation::PreClapDispatch::Cli => {}
+    cargo_rail::compiler::invocation::PreClapDispatch::Exit(exit_code) => std::process::exit(exit_code),
   }
 
   let cli_preparation_started = Instant::now();

@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::{DecodedNativePack, NativeResultDescriptor, decode_counted};
+use crate::cache::cas::{LocalCas, NativeActionLookup, NativeCacheLookup};
 use crate::compiler::native_cache::{
   ACTION_KEY_PREFIX, DEP_INFO_SLOT, METADATA_SLOT, NativeCompilerValidation, NativeResultIdentity,
   PreparedNativeResult, RLIB_SLOT, RemoteAuthorityId, STDERR_SLOT, STDOUT_SLOT, sha256_identity,
 };
 use crate::error::{RailError, RailResult};
-use crate::hermetic::cas::{LocalCas, NativeActionLookup, NativeCacheLookup};
 
 const MODE_ENV: &str = "CARGO_RAIL_NATIVE_PACK_PROCESS_MODE";
 const ROOT_ENV: &str = "CARGO_RAIL_NATIVE_PACK_PROCESS_ROOT";
@@ -371,11 +371,11 @@ fn pack_path(root: &Path, index: usize) -> PathBuf {
   root.join("packs").join(format!("{index:03}.pack"))
 }
 
-fn manifest_for(validation: &NativeCompilerValidation) -> RailResult<crate::hermetic::OutputManifest> {
+fn manifest_for(validation: &NativeCompilerValidation) -> RailResult<crate::cache::result::OutputManifest> {
   let outputs = validation.cas_output_bindings().collect::<Vec<_>>();
   let streams = validation.cas_stream_bindings();
   let slots = outputs.iter().copied().chain(streams).collect::<Vec<_>>();
-  crate::hermetic::manifest_from_verified_native_slots(&slots)
+  crate::cache::result::manifest_from_verified_native_slots(&slots)
 }
 
 fn setup(root: &Path, batch_size: usize) -> RailResult<WorkerReport> {

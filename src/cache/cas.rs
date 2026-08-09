@@ -1,4 +1,4 @@
-//! Immutable machine-local storage for verified hermetic action outputs.
+//! Immutable machine-local storage for verified cache objects.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -10,13 +10,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{FastCacheValidation, OutputEntry, OutputEntryKind, OutputManifest};
+use crate::cache::result::{
+  OUTPUT_MANIFEST_VERSION, OutputEntry, OutputEntryKind, OutputManifest, output_manifest_digest, symlink_target_escapes,
+};
 use crate::compiler::diagnostics_store::{
   CompilerEvidenceObject, CompilerEvidenceValidation, EVIDENCE_ACTION_KEY_PREFIX, EVIDENCE_CANDIDATE_KEY_PREFIX,
   EVIDENCE_OBJECT_PREFIX, validate_evidence_action_key, validate_evidence_candidate_key, validate_evidence_object,
 };
 use crate::compiler::native_cache::{NativeCompilerValidation, PreparedNativeOrigin, PreparedNativeResult};
 use crate::error::{RailError, RailResult};
+use crate::hermetic::FastCacheValidation;
 
 const CAS_VERSION: u32 = 2;
 const CAS_ROOT_NAME: &str = "local-cas-v2";
@@ -66,45 +69,45 @@ const LOOKUP_PREFIX: &str = "local-lookup-v1-sha256-";
 /// A verified cache lookup restored into an isolated output root.
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) struct CacheHit {
-  pub(super) action_result: String,
-  pub(super) result_digest: String,
-  pub(super) output_manifest: OutputManifest,
-  pub(super) compiler_units: usize,
-  pub(super) objects_verified: u64,
-  pub(super) bytes_read: u64,
-  pub(super) bytes_restored: u64,
+pub(crate) struct CacheHit {
+  pub(crate) action_result: String,
+  pub(crate) result_digest: String,
+  pub(crate) output_manifest: OutputManifest,
+  pub(crate) compiler_units: usize,
+  pub(crate) objects_verified: u64,
+  pub(crate) bytes_read: u64,
+  pub(crate) bytes_restored: u64,
 }
 
 /// A fail-closed lookup outcome that permits ordinary cold execution.
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(super) struct CacheMiss {
-  pub(super) kind: CacheMissKind,
-  pub(super) reason: String,
-  pub(super) objects_verified: u64,
-  pub(super) bytes_read: u64,
+pub(crate) struct CacheMiss {
+  pub(crate) kind: CacheMissKind,
+  pub(crate) reason: String,
+  pub(crate) objects_verified: u64,
+  pub(crate) bytes_read: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CacheMissKind {
+pub(crate) enum CacheMissKind {
   Miss,
   Corrupt,
   Incompatible,
 }
 
 #[cfg(any(target_os = "macos", test))]
-pub(super) enum CacheLookup {
+pub(crate) enum CacheLookup {
   Hit(CacheHit),
   Miss(CacheMiss),
 }
 
 /// A fully verified action-result bundle that may be checked against current raw inputs.
 #[cfg(target_os = "macos")]
-pub(super) struct CacheCandidate {
-  pub(super) action_key: String,
-  pub(super) validation: FastCacheValidation,
+pub(crate) struct CacheCandidate {
+  pub(crate) action_key: String,
+  pub(crate) validation: FastCacheValidation,
 }
 
 #[cfg(any(unix, windows, test))]
@@ -165,14 +168,14 @@ pub(crate) struct StoreStats {
   pub(crate) bytes_written: u64,
 }
 
-pub(super) struct StoreRequest<'a> {
-  pub(super) action_key: &'a str,
-  pub(super) lookup_key: &'a str,
-  pub(super) result_digest: &'a str,
-  pub(super) manifest: &'a OutputManifest,
-  pub(super) validation: &'a FastCacheValidation,
-  pub(super) compiler_units: usize,
-  pub(super) source_root: &'a Path,
+pub(crate) struct StoreRequest<'a> {
+  pub(crate) action_key: &'a str,
+  pub(crate) lookup_key: &'a str,
+  pub(crate) result_digest: &'a str,
+  pub(crate) manifest: &'a OutputManifest,
+  pub(crate) validation: &'a FastCacheValidation,
+  pub(crate) compiler_units: usize,
+  pub(crate) source_root: &'a Path,
 }
 
 pub(crate) struct CompilerEvidenceStoreRequest<'a> {
@@ -676,7 +679,7 @@ impl StoredValidation {
 
   fn result_digest(&self, output_manifest: &str) -> String {
     match self {
-      Self::Hermetic(validation) => super::hermetic_result_digest(&validation.action_key, output_manifest),
+      Self::Hermetic(validation) => crate::hermetic::hermetic_result_digest(&validation.action_key, output_manifest),
       Self::NativeCompiler(validation) => validation.result_digest(output_manifest),
     }
   }
@@ -1231,7 +1234,7 @@ impl LocalCas {
   }
 
   #[cfg(any(target_os = "macos", test))]
-  pub(super) fn restore(&self, action_key: &str, destination: &Path) -> CacheLookup {
+  pub(crate) fn restore(&self, action_key: &str, destination: &Path) -> CacheLookup {
     let mut stats = ReadStats::default();
     match self.restore_inner(action_key, destination, &mut stats) {
       Ok(hit) => CacheLookup::Hit(CacheHit {
@@ -1257,7 +1260,7 @@ impl LocalCas {
   }
 
   #[cfg(target_os = "macos")]
-  pub(super) fn candidates(&self, lookup_key: &str) -> RailResult<Vec<CacheCandidate>> {
+  pub(crate) fn candidates(&self, lookup_key: &str) -> RailResult<Vec<CacheCandidate>> {
     let _lock = self.read_lock()?;
     validate_lookup_key(lookup_key)?;
     let pins_directory = self.root.join("pins");
@@ -1581,7 +1584,7 @@ impl LocalCas {
     Ok(candidates)
   }
 
-  pub(super) fn store(&self, request: StoreRequest<'_>) -> RailResult<StoreStats> {
+  pub(crate) fn store(&self, request: StoreRequest<'_>) -> RailResult<StoreStats> {
     let StoreRequest {
       action_key,
       lookup_key,
@@ -2424,7 +2427,7 @@ fn validate_trust_domain(value: &str) -> RailResult<()> {
 }
 
 /// Resolve the selected user-wide CAS without creating cache state.
-pub(super) fn configured_root() -> RailResult<Option<PathBuf>> {
+pub(crate) fn configured_root() -> RailResult<Option<PathBuf>> {
   let base = cache_base()?;
   let base = match fs::canonicalize(&base) {
     Ok(base) => base,
@@ -2461,7 +2464,7 @@ pub(super) fn configured_root() -> RailResult<Option<PathBuf>> {
   }
 }
 
-pub(super) fn configured_legacy_root() -> RailResult<Option<PathBuf>> {
+pub(crate) fn configured_legacy_root() -> RailResult<Option<PathBuf>> {
   let base = match fs::canonicalize(cache_base()?) {
     Ok(base) => base,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2797,7 +2800,7 @@ fn decode_native_action_state(bytes: &[u8], expected_action: &str) -> Result<Nat
   Ok(state)
 }
 
-pub(super) fn validate_fast_identity(action_key: &str, lookup_key: &str) -> RailResult<()> {
+pub(crate) fn validate_fast_identity(action_key: &str, lookup_key: &str) -> RailResult<()> {
   validate_action_key(action_key)?;
   validate_lookup_key(lookup_key)
 }
@@ -2976,13 +2979,13 @@ fn fault_to_error(fault: Fault) -> RailError {
 }
 
 fn validate_manifest(manifest: &OutputManifest) -> Result<(), Fault> {
-  if manifest.version != super::OUTPUT_MANIFEST_VERSION {
+  if manifest.version != OUTPUT_MANIFEST_VERSION {
     return Err(Fault::incompatible("output_manifest_schema_version"));
   }
   if manifest.entries.len() > MAX_ENTRIES {
     return Err(Fault::corrupt("output_manifest_entry_limit"));
   }
-  let expected_digest = super::output_manifest_digest(&manifest.entries)
+  let expected_digest = output_manifest_digest(&manifest.entries)
     .map_err(|error| Fault::corrupt(format!("output_manifest_identity: {error}")))?;
   if expected_digest != manifest.digest {
     return Err(Fault::corrupt("output_manifest_digest_mismatch"));
@@ -3180,7 +3183,7 @@ fn validate_symlink(path: &str, target: &str) -> Result<(), Fault> {
     return Err(Fault::corrupt("unsafe_symlink_target"));
   }
   let path = crate::source::RepositoryPath::new(Path::new(path)).map_err(|_| Fault::corrupt("unsafe_symlink_path"))?;
-  if super::symlink_target_escapes(&path, target) {
+  if symlink_target_escapes(&path, target) {
     return Err(Fault::corrupt("symlink_target_escape"));
   }
   Ok(())
@@ -5619,7 +5622,7 @@ fn staging_entry_is_active(path: &Path) -> RailResult<bool> {
   }
 }
 
-pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
+pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
   let valid_name = root.file_name().and_then(OsStr::to_str).is_some_and(|name| {
     name == CAS_ROOT_NAME
       || name
@@ -5668,7 +5671,7 @@ pub(super) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
   Ok(Some(root.to_path_buf()))
 }
 
-pub(super) fn status_at(root: &Path) -> RailResult<Option<LocalCasStatus>> {
+pub(crate) fn status_at(root: &Path) -> RailResult<Option<LocalCasStatus>> {
   status_at_with_max(root, cache_max_bytes()?)
 }
 
@@ -5855,7 +5858,7 @@ fn last_used_unix_nanos(metadata: &fs::Metadata, created_unix_nanos: u128) -> u1
     .max(created_unix_nanos)
 }
 
-pub(super) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+pub(crate) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
   let lifecycle_lock = lifecycle_lock_path(root)?;
   let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
     .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
@@ -5867,7 +5870,7 @@ pub(super) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u
   Ok(Some((root, bytes)))
 }
 
-pub(super) fn legacy_status_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+pub(crate) fn legacy_status_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
   let Some(root) = existing_legacy_root_at(root)? else {
     return Ok(None);
   };
@@ -5883,7 +5886,7 @@ pub(super) fn legacy_status_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>
   Ok(Some((root, bytes)))
 }
 
-pub(super) fn remove_legacy_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+pub(crate) fn remove_legacy_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
   let lifecycle_lock = root
     .parent()
     .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
@@ -6130,9 +6133,9 @@ mod tests {
         _ => None,
       })
       .sum();
-    let digest = super::super::output_manifest_digest(&entries).expect("manifest should hash");
+    let digest = output_manifest_digest(&entries).expect("manifest should hash");
     OutputManifest {
-      version: super::super::OUTPUT_MANIFEST_VERSION,
+      version: OUTPUT_MANIFEST_VERSION,
       digest,
       entries,
       files,
@@ -6143,9 +6146,9 @@ mod tests {
   }
 
   fn store_fixture(cas: &LocalCas, output: &Path, key: &str, manifest: &OutputManifest) -> StoreStats {
-    let result = super::super::hermetic_result_digest(key, manifest.digest());
-    let lookup = super::super::test_pre_context_lookup_key();
-    let validation = super::super::FastCacheValidation::fixture(key, &lookup);
+    let result = crate::hermetic::hermetic_result_digest(key, manifest.digest());
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
+    let validation = crate::hermetic::FastCacheValidation::fixture(key, &lookup);
     cas
       .store(StoreRequest {
         action_key: key,
@@ -6177,7 +6180,7 @@ mod tests {
       fs::write(&path, bytes).expect("fixture output");
       paths.push(path);
     }
-    let manifest = super::super::capture_native_compiler_outputs(root, &paths).expect("native output manifest");
+    let manifest = crate::hermetic::capture_native_compiler_outputs(root, &paths).expect("native output manifest");
     let validation = crate::compiler::native_cache::tests::cas_validation_with_stdout(stdout);
     (manifest, validation)
   }
@@ -7073,7 +7076,7 @@ mod tests {
       panic!("metadata should be a file");
     };
     *digest = format!("sha256:{}", ContentDigest::sha256(b"forged!"));
-    manifest.digest = super::super::output_manifest_digest(&manifest.entries).expect("forged manifest digest");
+    manifest.digest = output_manifest_digest(&manifest.entries).expect("forged manifest digest");
 
     assert!(
       validate_manifest(&manifest).is_ok(),
@@ -7093,7 +7096,7 @@ mod tests {
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024 * 1024).expect("CAS should open");
     store_native_fixture(&cas, output.path(), &manifest, &validation);
 
-    let lookup = super::super::test_pre_context_lookup_key();
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
     for value in 0_u64..32 {
       let action_key = format!("{ACTION_KEY_PREFIX}{value:064x}");
       let pin = ActionPin {
@@ -7406,7 +7409,7 @@ mod tests {
         panic!("artifact should be a file");
       };
       *mode = 0o755;
-      manifest.digest = super::super::output_manifest_digest(&manifest.entries).expect("updated manifest identity");
+      manifest.digest = output_manifest_digest(&manifest.entries).expect("updated manifest identity");
       manifest
     };
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
@@ -7564,9 +7567,9 @@ mod tests {
     .expect("hard link fixture");
     let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
     let key = action_key(10);
-    let result = super::super::hermetic_result_digest(&key, manifest.digest());
-    let lookup = super::super::test_pre_context_lookup_key();
-    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let result = crate::hermetic::hermetic_result_digest(&key, manifest.digest());
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
+    let validation = crate::hermetic::FastCacheValidation::fixture(&key, &lookup);
     let error = cas
       .store(StoreRequest {
         action_key: &key,
@@ -7924,9 +7927,9 @@ mod tests {
       max_bytes: 1,
     };
     let key = action_key(16);
-    let lookup = super::super::test_pre_context_lookup_key();
-    let result = super::super::hermetic_result_digest(&key, manifest.digest());
-    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
+    let result = crate::hermetic::hermetic_result_digest(&key, manifest.digest());
+    let validation = crate::hermetic::FastCacheValidation::fixture(&key, &lookup);
     let error = cas
       .store(StoreRequest {
         action_key: &key,
@@ -7989,7 +7992,7 @@ mod tests {
     let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
       .args([
         "--exact",
-        "hermetic::cas::tests::process_death_publication_worker",
+        "cache::cas::tests::process_death_publication_worker",
         "--nocapture",
       ])
       .env(CACHE_ENV, &cache)
@@ -8071,7 +8074,7 @@ mod tests {
     let child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
       .args([
         "--exact",
-        "hermetic::cas::tests::out_of_space_publication_worker",
+        "cache::cas::tests::out_of_space_publication_worker",
         "--nocapture",
       ])
       .env(CACHE_ENV, &cache)
@@ -8115,9 +8118,9 @@ mod tests {
     let manifest = write_fixture(&output, b"unpublished result");
     let cas = LocalCas::open_at(Path::new(&cache), 1024 * 1024).expect("worker CAS should open");
     let key = action_key(19);
-    let lookup = super::super::test_pre_context_lookup_key();
-    let result = super::super::hermetic_result_digest(&key, manifest.digest());
-    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
+    let result = crate::hermetic::hermetic_result_digest(&key, manifest.digest());
+    let validation = crate::hermetic::FastCacheValidation::fixture(&key, &lookup);
     let error = cas
       .store(StoreRequest {
         action_key: &key,
@@ -8427,9 +8430,9 @@ mod tests {
     let mut bounded = LocalCas::open_at(bounded_cache.path(), 1024 * 1024).expect("bounded CAS");
     bounded.max_bytes = result_bytes;
     let key = action_key(32);
-    let result_digest = super::super::hermetic_result_digest(&key, manifest.digest());
-    let lookup = super::super::test_pre_context_lookup_key();
-    let validation = super::super::FastCacheValidation::fixture(&key, &lookup);
+    let result_digest = crate::hermetic::hermetic_result_digest(&key, manifest.digest());
+    let lookup = crate::hermetic::test_pre_context_lookup_key();
+    let validation = crate::hermetic::FastCacheValidation::fixture(&key, &lookup);
 
     let stored = bounded
       .store(StoreRequest {
@@ -8478,7 +8481,7 @@ mod tests {
     let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
       .args([
         "--exact",
-        "hermetic::cas::tests::guarded_staging_creation_worker",
+        "cache::cas::tests::guarded_staging_creation_worker",
         "--nocapture",
       ])
       .env(CACHE_ENV, &cache)

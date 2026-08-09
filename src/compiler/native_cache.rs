@@ -16,14 +16,15 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::cache::cas::LocalCas;
+use crate::cache::cas::NativeCacheLookup;
+use crate::cache::result::OutputManifest;
+use crate::compiler::invocation::CacheWrapperPlan;
 use crate::compiler::observation::{
   CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, EnvironmentObservation, FileObservation,
   InvocationRecorder, NativeOutputPaths, ObservationPath, PreparedRawPublication, RawCompilerInvocation,
 };
-use crate::compiler::wrapper::CacheWrapperPlan;
 use crate::error::{RailError, RailResult};
-use crate::hermetic::cas::LocalCas;
-use crate::hermetic::cas::NativeCacheLookup;
 use crate::instrumentation::{
   NativeCacheWrapperDiagnostics, NativeCacheWrapperEventDiagnostics, NativeCacheWrapperPhase, NativeCacheWrapperTrace,
   NativeCacheWrapperTraceSnapshot, NativeCacheWrapperWork,
@@ -766,7 +767,7 @@ struct NativeRestoreTransaction {
   observation_directory: PathBuf,
   registration: NativeRestoreRegistration,
   state: NativeRestoreTransactionState,
-  _lock: crate::hermetic::cas::NativeRestoreLock,
+  _lock: crate::cache::cas::NativeRestoreLock,
 }
 
 enum RestorePublishFailure {
@@ -809,7 +810,7 @@ struct NativePublicationProof {
 pub(crate) struct PreparedNativeResult {
   staging: PreparedNativeStaging,
   staging_lock: Option<File>,
-  manifest: crate::hermetic::OutputManifest,
+  manifest: OutputManifest,
   validation: NativeCompilerValidation,
   origin: PreparedNativeOrigin,
   move_preverified_blobs: bool,
@@ -864,7 +865,7 @@ impl PreparedNativeResult {
   #[cfg(test)]
   pub(crate) fn from_verified_staging(
     staging: tempfile::TempDir,
-    manifest: crate::hermetic::OutputManifest,
+    manifest: OutputManifest,
     validation: NativeCompilerValidation,
   ) -> Self {
     Self {
@@ -879,7 +880,7 @@ impl PreparedNativeResult {
 
   fn from_verified_local_cas_staging(
     staging: pack::NativeResultStaging,
-    manifest: crate::hermetic::OutputManifest,
+    manifest: OutputManifest,
     validation: NativeCompilerValidation,
   ) -> Self {
     let (staging, staging_lock, command_scoped) = staging.into_parts();
@@ -897,7 +898,7 @@ impl PreparedNativeResult {
   fn from_authenticated_pack(
     staging: tempfile::TempDir,
     staging_lock: Option<File>,
-    manifest: crate::hermetic::OutputManifest,
+    manifest: OutputManifest,
     validation: NativeCompilerValidation,
     authority: RemoteAuthorityId,
   ) -> Self {
@@ -917,7 +918,7 @@ impl PreparedNativeResult {
   ) -> (
     PreparedNativeStaging,
     Option<File>,
-    crate::hermetic::OutputManifest,
+    OutputManifest,
     NativeCompilerValidation,
     PreparedNativeOrigin,
     bool,
@@ -1008,7 +1009,7 @@ fn prepare_authenticated_native_pack(
     .cas_output_bindings()
     .chain(validation.cas_stream_bindings())
     .collect::<Vec<_>>();
-  let manifest = crate::hermetic::manifest_from_verified_native_slots(&manifest_slots)?;
+  let manifest = crate::cache::result::manifest_from_verified_native_slots(&manifest_slots)?;
   Ok((
     PreparedNativeResult::from_authenticated_pack(staging, staging_lock, manifest, validation, authority),
     bytes_read,
@@ -2046,17 +2047,19 @@ fn private_compiler_environment(name: &OsStr) -> bool {
         | DISPOSITION_ENV
         | LEGACY_STORE_ENV
         | crate::remote_cache::TARGETS_ENV
-        | crate::hermetic::cas::CACHE_BASE_ENV
-        | crate::hermetic::cas::CACHE_MAX_BYTES_ENV
-        | crate::hermetic::cas::CACHE_TRUST_DOMAIN_ENV
-        | crate::compiler::wrapper::CACHE_WRAPPER_MARKER
-        | crate::compiler::wrapper::WRAPPER_MARKER
-        | crate::compiler::wrapper::INNER_WRAPPER_ENV
-        | crate::compiler::wrapper::RUSTDOC_WRAPPER_MARKER
-        | crate::compiler::wrapper::INNER_RUSTDOC_ENV
-        | crate::compiler::wrapper::OBSERVATION_DIRECTORY_ENV
-        | crate::compiler::wrapper::OBSERVATION_SOURCE_ROOT_ENV
-        | crate::compiler::wrapper::OBSERVATION_ONLY_ENV
+        | crate::cache::cas::CACHE_BASE_ENV
+        | crate::cache::cas::CACHE_MAX_BYTES_ENV
+        | crate::cache::cas::CACHE_TRUST_DOMAIN_ENV
+        | crate::compiler::invocation::CACHE_CONTROL_ENV
+        | crate::compiler::invocation::CACHE_WRAPPER_MARKER
+        | crate::compiler::invocation::WRAPPER_MARKER
+        | crate::compiler::invocation::INNER_WRAPPER_ENV
+        | crate::compiler::invocation::RUSTDOC_WRAPPER_MARKER
+        | crate::compiler::invocation::INNER_RUSTDOC_ENV
+        | crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV
+        | crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV
+        | crate::compiler::invocation::OBSERVATION_ONLY_ENV
+        | crate::compiler::session::FACT_SESSION_ENV
     )
   )
 }
@@ -2625,12 +2628,12 @@ impl NativeCacheContext {
   }
 
   pub(crate) fn from_environment() -> Option<Self> {
-    let source_root = std::env::var_os(crate::compiler::wrapper::OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from)?;
+    let source_root = std::env::var_os(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from)?;
     Some(Self {
       session: std::env::var_os(SESSION_ENV).map(PathBuf::from)?,
       source_root_spelling: source_root.clone(),
       source_root,
-      observation_directory: std::env::var_os(crate::compiler::wrapper::OBSERVATION_DIRECTORY_ENV)
+      observation_directory: std::env::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
         .map(PathBuf::from)?,
       discovery_only: false,
       retain_event_evidence: false,
@@ -2640,14 +2643,21 @@ impl NativeCacheContext {
     })
   }
 
-  pub(crate) fn from_direct_invocation()
-  -> Option<(RailResult<Self>, crate::instrumentation::NativeCacheWrapperProcessStart)> {
-    let invoked = PathBuf::from(std::env::args_os().next()?);
-    if invoked.file_name() != Some(OsStr::new(DIRECT_WRAPPER_NAME)) {
-      return None;
-    }
+  /// Detect the dedicated wrapper without loading its private context.
+  pub(crate) fn is_direct_invocation() -> bool {
+    std::env::args_os()
+      .next()
+      .is_some_and(|invoked| Path::new(&invoked).file_name() == Some(OsStr::new(DIRECT_WRAPPER_NAME)))
+  }
+
+  /// Load the direct wrapper context after acquisition-free controls are resolved.
+  pub(crate) fn load_direct_invocation() -> (RailResult<Self>, crate::instrumentation::NativeCacheWrapperProcessStart) {
+    let invoked = std::env::args_os()
+      .next()
+      .map(PathBuf::from)
+      .ok_or_else(|| RailError::message("native compiler wrapper has no process executable"));
     let started = crate::instrumentation::NativeCacheWrapperProcessStart::capture();
-    Some((Self::load_direct(&invoked), started))
+    (invoked.and_then(|invoked| Self::load_direct(&invoked)), started)
   }
 
   fn load_direct(invoked: &Path) -> RailResult<Self> {
@@ -3926,6 +3936,98 @@ fn invocation_bypass_reason(
   None
 }
 
+/// Return a sufficient acquisition-free bypass for an obviously unsupported rustc shape.
+///
+/// The complete classifier still runs after observation. This prefilter only
+/// recognizes shapes that cannot enter the graduated class, so it can never
+/// turn an eligible invocation into a cache hit or store under a second rule.
+pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Option<&'static str> {
+  if Path::new(program)
+    .file_stem()
+    .and_then(OsStr::to_str)
+    .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
+  {
+    return Some("clippy_not_graduated");
+  }
+  let mut crate_type_seen = false;
+  let mut crate_type_supported = true;
+  let mut emit_seen = false;
+  let mut emits_dep_info = false;
+  let mut emits_metadata = false;
+  let mut emit_supported = true;
+  let mut json_diagnostics = false;
+  let mut output_directory = false;
+
+  for (index, argument) in arguments.iter().enumerate() {
+    let Some(argument) = argument.to_str() else {
+      return Some("non_utf8_compiler_argument");
+    };
+    let next = || arguments.get(index + 1).and_then(|argument| argument.to_str());
+    if matches!(argument, "-h" | "--help" | "-V" | "--version" | "-vV" | "--print") || argument.starts_with("--print=")
+    {
+      return Some("compiler_information_request");
+    }
+    if argument.starts_with('@') {
+      return Some("response_file_not_graduated");
+    }
+    if argument == "--test" {
+      return Some("test_compilation_not_graduated");
+    }
+    if argument == "-" {
+      return Some("compiler_stdin_not_graduated");
+    }
+    if argument.contains("incremental=") {
+      return Some("incremental_compilation_not_graduated");
+    }
+    if let Some(value) = inline_or_next(argument, next(), "--crate-type") {
+      crate_type_seen = true;
+      crate_type_supported &= value.split(',').all(|crate_type| crate_type == "lib");
+    }
+    if let Some(value) = inline_or_next(argument, next(), "--emit") {
+      emit_seen = true;
+      for mode in value
+        .split(',')
+        .map(|mode| mode.split_once('=').map_or(mode, |(name, _)| name))
+      {
+        match mode {
+          "dep-info" => emits_dep_info = true,
+          "metadata" => emits_metadata = true,
+          "link" => {}
+          _ => emit_supported = false,
+        }
+      }
+    }
+    if let Some(value) = inline_or_next(argument, next(), "--error-format") {
+      json_diagnostics = value == "json";
+    }
+    if inline_or_next(argument, next(), "--out-dir").is_some() {
+      output_directory = true;
+    }
+  }
+
+  if !crate_type_seen || !crate_type_supported {
+    return Some("compiler_crate_type_not_graduated");
+  }
+  if !emit_seen || !emit_supported || !emits_dep_info || !emits_metadata {
+    return Some("compiler_emit_mode_not_graduated");
+  }
+  if !json_diagnostics {
+    return Some("compiler_diagnostic_format_not_graduated");
+  }
+  if !output_directory {
+    return Some("compiler_output_paths_unavailable");
+  }
+  None
+}
+
+fn inline_or_next<'a>(argument: &'a str, next: Option<&'a str>, option: &str) -> Option<&'a str> {
+  if argument == option {
+    next
+  } else {
+    argument.strip_prefix(option).and_then(|value| value.strip_prefix('='))
+  }
+}
+
 fn compiler_long_option_value<'a>(arguments: &'a [String], option: &str) -> Option<&'a str> {
   let inline = format!("{option}=");
   let mut selected = None;
@@ -4358,10 +4460,10 @@ pub(crate) fn configure_outer(
           } else {
             match cas.publish_native_environment_selector(&base_action, &names) {
               Ok(
-                crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created
-                | crate::hermetic::cas::NativeEnvironmentSelectorPublication::Converged,
+                crate::cache::cas::NativeEnvironmentSelectorPublication::Created
+                | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged,
               ) => Some(names),
-              Ok(crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged) => {
+              Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged) => {
                 return OuterCacheAction::OperationalFailure(RailError::message(
                   "remote compiler environment selector conflicts with local authority",
                 ));
@@ -4471,8 +4573,8 @@ pub(crate) fn configure_outer(
       .map(crate::remote_cache::RemoteWrapperContext::authority),
   );
   let lookup_bytes = match &cached {
-    Ok(crate::hermetic::cas::NativeActionLookup::Hit(cached)) => cached.bytes_read,
-    Ok(crate::hermetic::cas::NativeActionLookup::Miss(miss)) => miss.bytes_read,
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) => cached.bytes_read,
+    Ok(crate::cache::cas::NativeActionLookup::Miss(miss)) => miss.bytes_read,
     Err(_) => 0,
   };
   trace.finish(
@@ -4498,7 +4600,7 @@ pub(crate) fn configure_outer(
     }
   };
   let mut miss_reason = match cached {
-    crate::hermetic::cas::NativeActionLookup::Hit(cached)
+    crate::cache::cas::NativeActionLookup::Hit(cached)
       if cached.validation.session_identity == session.identity
         && cached.validation.class == session.class
         && cached.validation.action_key == action
@@ -4516,11 +4618,11 @@ pub(crate) fn configure_outer(
         }
       }
     }
-    crate::hermetic::cas::NativeActionLookup::Hit(cached) => {
+    crate::cache::cas::NativeActionLookup::Hit(cached) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
       "action_descriptor_incompatible".to_string()
     }
-    crate::hermetic::cas::NativeActionLookup::Miss(miss) => {
+    crate::cache::cas::NativeActionLookup::Miss(miss) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
       miss.reason
     }
@@ -4574,7 +4676,7 @@ enum RemoteReuseOutcome {
 }
 
 enum RemoteAdmissionRecovery<'a> {
-  Authoritative(Box<crate::hermetic::cas::NativeActionHit<'a>>),
+  Authoritative(Box<crate::cache::cas::NativeActionHit<'a>>),
   Cold,
   OperationalFailure(RailError),
 }
@@ -4586,11 +4688,11 @@ fn recover_failed_remote_admission<'a>(
   admission_error: RailError,
 ) -> RemoteAdmissionRecovery<'a> {
   match cas.native_action_for_authority(action_key, Some(authority)) {
-    Ok(crate::hermetic::cas::NativeActionLookup::Hit(cached)) => RemoteAdmissionRecovery::Authoritative(cached),
-    Ok(crate::hermetic::cas::NativeActionLookup::Miss(miss)) if miss.reason == "action_not_found" => {
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) => RemoteAdmissionRecovery::Authoritative(cached),
+    Ok(crate::cache::cas::NativeActionLookup::Miss(miss)) if miss.reason == "action_not_found" => {
       RemoteAdmissionRecovery::Cold
     }
-    Ok(crate::hermetic::cas::NativeActionLookup::Miss(miss)) => {
+    Ok(crate::cache::cas::NativeActionLookup::Miss(miss)) => {
       RemoteAdmissionRecovery::OperationalFailure(RailError::message(format!(
         "remote pack admission failed and the local action state is terminal or incompatible ({}): {admission_error}",
         miss.reason
@@ -4680,7 +4782,7 @@ fn attempt_remote_reuse(
   };
   if attached_local {
     match cas.native_action_for_authority(action_key, Some(remote.authority())) {
-      Ok(crate::hermetic::cas::NativeActionLookup::Hit(cached))
+      Ok(crate::cache::cas::NativeActionLookup::Hit(cached))
         if cached.validation.session_identity == session.identity
           && cached.validation.class == session.class
           && cached.validation.action_key == action_key
@@ -4699,14 +4801,14 @@ fn attempt_remote_reuse(
           }
         };
       }
-      Ok(crate::hermetic::cas::NativeActionLookup::Hit(cached)) => {
+      Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) => {
         metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
         drop(stream);
         return RemoteReuseOutcome::OperationalFailure(RailError::message(
           "remote cache integrity failure: the accepted local result is incompatible with the live action",
         ));
       }
-      Ok(crate::hermetic::cas::NativeActionLookup::Miss(miss)) => {
+      Ok(crate::cache::cas::NativeActionLookup::Miss(miss)) => {
         metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
       }
       Err(error) => return remote_integrity_failure("accepted local-result verification", error),
@@ -4770,8 +4872,8 @@ fn attempt_remote_reuse(
   };
   metrics.cache_bytes_written = metrics.cache_bytes_written.saturating_add(stored.bytes_written);
   let cached = match cas.native_action_for_authority(action_key, Some(remote.authority())) {
-    Ok(crate::hermetic::cas::NativeActionLookup::Hit(cached)) => cached,
-    Ok(crate::hermetic::cas::NativeActionLookup::Miss(miss)) => {
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) => cached,
+    Ok(crate::cache::cas::NativeActionLookup::Miss(miss)) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
       return RemoteReuseOutcome::OperationalFailure(RailError::message(
         "remote cache integrity failure: imported pack did not become locally authoritative",
@@ -4854,7 +4956,7 @@ fn configure_cold(
 }
 
 fn is_diagnostic_workspace_wrapper(program: &OsStr) -> bool {
-  if std::env::var_os(crate::compiler::wrapper::WRAPPER_MARKER).is_none() {
+  if std::env::var_os(crate::compiler::invocation::WRAPPER_MARKER).is_none() {
     return false;
   }
   let Ok(current) = std::env::current_exe().and_then(fs::canonicalize) else {
@@ -4882,7 +4984,7 @@ fn estimated_input_bytes(observation: &RawCompilerInvocation, source_root: &Path
 }
 
 fn validate_restore_environment_authority(
-  cached: &crate::hermetic::cas::NativeActionHit<'_>,
+  cached: &crate::cache::cas::NativeActionHit<'_>,
   capture: &NativeActionCapture,
   observation: &RawCompilerInvocation,
 ) -> Result<String, RestorePublishFailure> {
@@ -4903,7 +5005,7 @@ fn validate_restore_environment_authority(
 }
 
 fn restore_and_publish(
-  cached: &crate::hermetic::cas::NativeActionHit<'_>,
+  cached: &crate::cache::cas::NativeActionHit<'_>,
   initial_capture: &NativeActionCapture,
   current_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
@@ -5022,7 +5124,7 @@ fn restore_and_publish(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_registered_restore(
-  cached: &crate::hermetic::cas::NativeActionHit<'_>,
+  cached: &crate::cache::cas::NativeActionHit<'_>,
   transaction: &NativeRestoreTransaction,
   initial_capture: &NativeActionCapture,
   current_observation: &RawCompilerInvocation,
@@ -7154,7 +7256,8 @@ fn digest(bytes: &[u8]) -> String {
   format!("sha256:{}", ContentDigest::sha256(bytes))
 }
 
-pub(crate) fn remove_private_environment(command: &mut Command) {
+/// Remove cache-only authority while preserving an explicitly selected inner observation role.
+pub(crate) fn remove_cache_environment(command: &mut Command) {
   #[cfg(debug_assertions)]
   command
     .env_remove(RESTORE_FAULT_ENV)
@@ -7170,17 +7273,25 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
     .env_remove(DISPOSITION_ENV)
     .env_remove(LEGACY_STORE_ENV)
     .env_remove(crate::remote_cache::TARGETS_ENV)
-    .env_remove(crate::hermetic::cas::CACHE_BASE_ENV)
-    .env_remove(crate::hermetic::cas::CACHE_MAX_BYTES_ENV)
-    .env_remove(crate::hermetic::cas::CACHE_TRUST_DOMAIN_ENV)
-    .env_remove(crate::compiler::wrapper::CACHE_WRAPPER_MARKER)
-    .env_remove(crate::compiler::wrapper::WRAPPER_MARKER)
-    .env_remove(crate::compiler::wrapper::INNER_WRAPPER_ENV)
-    .env_remove(crate::compiler::wrapper::RUSTDOC_WRAPPER_MARKER)
-    .env_remove(crate::compiler::wrapper::INNER_RUSTDOC_ENV)
-    .env_remove(crate::compiler::wrapper::OBSERVATION_DIRECTORY_ENV)
-    .env_remove(crate::compiler::wrapper::OBSERVATION_SOURCE_ROOT_ENV)
-    .env_remove(crate::compiler::wrapper::OBSERVATION_ONLY_ENV);
+    .env_remove(crate::cache::cas::CACHE_BASE_ENV)
+    .env_remove(crate::cache::cas::CACHE_MAX_BYTES_ENV)
+    .env_remove(crate::cache::cas::CACHE_TRUST_DOMAIN_ENV)
+    .env_remove(crate::compiler::invocation::CACHE_CONTROL_ENV)
+    .env_remove(crate::compiler::invocation::CACHE_WRAPPER_MARKER);
+}
+
+/// Remove every Cargo-Rail compiler capability before transparent execution.
+pub(crate) fn remove_private_environment(command: &mut Command) {
+  remove_cache_environment(command);
+  command
+    .env_remove(crate::compiler::invocation::WRAPPER_MARKER)
+    .env_remove(crate::compiler::invocation::INNER_WRAPPER_ENV)
+    .env_remove(crate::compiler::invocation::RUSTDOC_WRAPPER_MARKER)
+    .env_remove(crate::compiler::invocation::INNER_RUSTDOC_ENV)
+    .env_remove(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
+    .env_remove(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV)
+    .env_remove(crate::compiler::invocation::OBSERVATION_ONLY_ENV)
+    .env_remove(crate::compiler::session::FACT_SESSION_ENV);
 }
 
 /// Execute one eligible cold invocation, replay its exact streams, and publish
@@ -7470,9 +7581,9 @@ pub(crate) fn run_and_store(
               admission_failure = "cold_inputs_changed_before_admission";
             })?;
           match cas.publish_native_environment_selector(&base_action_key, &environment_names) {
-            Ok(crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created)
-            | Ok(crate::hermetic::cas::NativeEnvironmentSelectorPublication::Converged) => Ok(()),
-            Ok(crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged) => {
+            Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Created)
+            | Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Converged) => Ok(()),
+            Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged) => {
               admission_failure = "environment_selector_diverged";
               Err(RailError::message("native compiler environment selector diverged"))
             }
@@ -7893,7 +8004,7 @@ fn prepare_cold_result(
       .cas_output_bindings()
       .chain(validation.cas_stream_bindings())
       .collect::<Vec<_>>();
-    let manifest = crate::hermetic::manifest_from_verified_native_slots(&slots)?;
+    let manifest = crate::cache::result::manifest_from_verified_native_slots(&slots)?;
     Ok((staging, manifest, validation))
   })();
   let (staging, manifest, validation) = prepared.map_err(|_| "cold_result_preparation_failed")?;
@@ -8396,6 +8507,47 @@ pub(crate) mod tests {
     }
   }
 
+  #[test]
+  fn fast_bypass_only_rejects_shapes_outside_the_graduated_class() {
+    let eligible = [
+      "--crate-name",
+      "fixture",
+      "--crate-type=lib",
+      "--emit=dep-info,metadata",
+      "--error-format=json",
+      "--out-dir",
+      "target/debug/deps",
+      "src/lib.rs",
+    ]
+    .map(OsString::from);
+    assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &eligible), None);
+
+    for (argument, reason) in [
+      ("--test", "test_compilation_not_graduated"),
+      (
+        "-Cincremental=target/incremental",
+        "incremental_compilation_not_graduated",
+      ),
+      ("@rustc.rsp", "response_file_not_graduated"),
+    ] {
+      let mut unsupported = eligible.to_vec();
+      unsupported.push(argument.into());
+      assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &unsupported), Some(reason));
+    }
+    for crate_type in ["bin", "proc-macro", "dylib"] {
+      let mut unsupported = eligible.to_vec();
+      unsupported[2] = OsString::from(format!("--crate-type={crate_type}"));
+      assert_eq!(
+        fast_bypass_reason(OsStr::new("rustc"), &unsupported),
+        Some("compiler_crate_type_not_graduated")
+      );
+    }
+    assert_eq!(
+      fast_bypass_reason(OsStr::new("clippy-driver"), &eligible),
+      Some("clippy_not_graduated")
+    );
+  }
+
   fn graduated_session(source_root_identity: String) -> NativeCompilerSession {
     let class = NativeCompilerClass {
       name: "library_metadata_rlib".to_string(),
@@ -8656,7 +8808,7 @@ pub(crate) mod tests {
         cas
           .publish_native_environment_selector(&key, &first)
           .expect("initial selector publication"),
-        crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created
+        crate::cache::cas::NativeEnvironmentSelectorPublication::Created
       );
       assert_eq!(
         cas.native_environment_selector(&key).expect("published selector"),
@@ -8666,7 +8818,7 @@ pub(crate) mod tests {
         cas
           .publish_native_environment_selector(&key, &second)
           .expect("divergent selector publication"),
-        crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged
+        crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged
       );
       cas
         .native_environment_selector(&key)
@@ -8708,7 +8860,7 @@ pub(crate) mod tests {
       .store_native_revalidated(prepared_cas_fixture(validation), |_| {
         assert!(matches!(
           cas.native_action(&action).expect("pre-commit action lookup"),
-          crate::hermetic::cas::NativeActionLookup::Miss(_)
+          crate::cache::cas::NativeActionLookup::Miss(_)
         ));
         assert_eq!(
           cas
@@ -8720,7 +8872,7 @@ pub(crate) mod tests {
           cas
             .publish_native_environment_selector(&base_action, &[])
             .expect("empty selector publication"),
-          crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created
+          crate::cache::cas::NativeEnvironmentSelectorPublication::Created
         );
         revalidated = true;
         Ok(())
@@ -8736,7 +8888,7 @@ pub(crate) mod tests {
     );
     assert!(matches!(
       cas.native_action(&action).expect("committed action lookup"),
-      crate::hermetic::cas::NativeActionLookup::Hit(_)
+      crate::cache::cas::NativeActionLookup::Hit(_)
     ));
   }
 
@@ -8754,7 +8906,7 @@ pub(crate) mod tests {
           cas
             .publish_native_environment_selector(&base_action, &[])
             .expect("empty selector publication"),
-          crate::hermetic::cas::NativeEnvironmentSelectorPublication::Created
+          crate::cache::cas::NativeEnvironmentSelectorPublication::Created
         );
         Err(RailError::message("stop before action authority"))
       })
@@ -8769,7 +8921,7 @@ pub(crate) mod tests {
     );
     assert!(matches!(
       cas.native_action(&action).expect("aborted action lookup"),
-      crate::hermetic::cas::NativeActionLookup::Miss(_)
+      crate::cache::cas::NativeActionLookup::Miss(_)
     ));
   }
 
@@ -8798,11 +8950,10 @@ pub(crate) mod tests {
           cas
             .publish_native_environment_selector(&base_action, &second)
             .expect("second selector publication"),
-          crate::hermetic::cas::NativeEnvironmentSelectorPublication::Diverged
+          crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged
         );
       }
-      let crate::hermetic::cas::NativeActionLookup::Hit(hit) =
-        cas.native_action(&action).expect("native action lookup")
+      let crate::cache::cas::NativeActionLookup::Hit(hit) = cas.native_action(&action).expect("native action lookup")
       else {
         panic!("stored native action must be authoritative");
       };
@@ -8912,7 +9063,7 @@ pub(crate) mod tests {
       .expect_err("discovery validation must never become authoritative");
     assert!(matches!(
       cas.native_action(&discovery_action).expect("discovery lookup"),
-      crate::hermetic::cas::NativeActionLookup::Miss(_)
+      crate::cache::cas::NativeActionLookup::Miss(_)
     ));
 
     let rebound = validation
@@ -8942,7 +9093,7 @@ pub(crate) mod tests {
     first
       .store_native(prepared_cas_fixture(validation))
       .expect("local admission");
-    let crate::hermetic::cas::NativeActionLookup::Hit(hit) = first.native_action(&action).expect("local lookup") else {
+    let crate::cache::cas::NativeActionLookup::Hit(hit) = first.native_action(&action).expect("local lookup") else {
       panic!("locally admitted result should be authoritative");
     };
     let mut pack_bytes = Vec::new();
@@ -8986,9 +9137,9 @@ pub(crate) mod tests {
 
     assert!(matches!(
       second.native_action(&action).expect("unscoped lookup"),
-      crate::hermetic::cas::NativeActionLookup::Miss(_)
+      crate::cache::cas::NativeActionLookup::Miss(_)
     ));
-    let crate::hermetic::cas::NativeActionLookup::Hit(imported_hit) = second
+    let crate::cache::cas::NativeActionLookup::Hit(imported_hit) = second
       .native_action_for_authority(&action, Some(&authority))
       .expect("accepted remote lookup")
     else {
@@ -9006,7 +9157,7 @@ pub(crate) mod tests {
     let restored = restore_parent.path().join("restored");
     assert!(matches!(
       imported_hit.restore(&restored),
-      crate::hermetic::cas::NativeCacheLookup::Hit(_)
+      crate::cache::cas::NativeCacheLookup::Hit(_)
     ));
     assert_eq!(fs::read(restored.join(DEP_INFO_SLOT)).expect("dep-info"), b"dep-info");
     assert_eq!(fs::read(restored.join(METADATA_SLOT)).expect("metadata"), b"metadata");
@@ -9043,7 +9194,7 @@ pub(crate) mod tests {
       second
         .native_action_for_authority(&action, Some(&authority))
         .expect("repeated accepted lookup"),
-      crate::hermetic::cas::NativeActionLookup::Hit(_)
+      crate::cache::cas::NativeActionLookup::Hit(_)
     ));
 
     let mut corrupt = pack_bytes.clone();
@@ -10463,7 +10614,7 @@ pub(crate) mod tests {
 
     let outcome = remote_conflict_failure(&cas, first.action_key(), first.result_key(), second.result_key());
     assert!(matches!(outcome, RemoteReuseOutcome::OperationalFailure(_)));
-    let crate::hermetic::cas::NativeActionLookup::Miss(miss) =
+    let crate::cache::cas::NativeActionLookup::Miss(miss) =
       cas.native_action(first.action_key()).expect("terminal local lookup")
     else {
       panic!("remote conflict must never authorize one local result");

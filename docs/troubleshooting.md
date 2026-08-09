@@ -53,11 +53,16 @@ cargo rail doctor native-cache --format json
 cargo rail unify --check -f json
 ```
 
-For native reuse, inspect the run summary's hits, misses, bypasses, hashed/restored bytes, and stable reasons. Failure
+For native reuse, inspect the run summary's hits, misses, retained bypasses, hashed/restored bytes, and stable reasons.
+Clearly unsupported shapes execute before cache event persistence, so bypass totals are not a census of rustc. Failure
 to capture the exact compiler identity, incremental compilation, an existing wrapper, a non-JSON compiler diagnostic
 format, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache hit. A
 different physical source root has different action authority: Cargo-Rail compiles cold, emits exact output for that
 root, and can reuse the result only in later sessions bound to the same root.
+
+If an already-installed Cargo-Rail compiler wrapper must be disabled independently of `cargo rail run`, set
+`CARGO_RAIL_CACHE=off`. The wrapper executes the selected compiler chain without reading its session or opening the
+CAS. Prefer `--no-cache` when invoking `cargo rail run`; it records the intended action-level decision.
 
 For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
 describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the

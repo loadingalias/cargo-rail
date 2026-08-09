@@ -1,4 +1,4 @@
-//! Transparent compiler proxies for exact invocation observations.
+//! Exact pre-Clap compiler invocation boundary.
 //!
 //! Cargo invokes rustc mode through `RUSTC_WORKSPACE_WRAPPER`, so the unused
 //! dependency lint is applied only to workspace members. Rustdoc observation
@@ -9,30 +9,126 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Process-local control for the outer compiler cache boundary.
+pub(crate) const CACHE_CONTROL_ENV: &str = "CARGO_RAIL_CACHE";
+
 /// Marker set when this executable is the cache-disabled outer compiler wrapper.
-pub const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
+pub(crate) const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
 
 /// Marker set by the diagnostics collector when this executable is acting as a
 /// rustc workspace wrapper.
-pub const WRAPPER_MARKER: &str = "CARGO_RAIL_RUSTC_WRAPPER";
+pub(crate) const WRAPPER_MARKER: &str = "CARGO_RAIL_RUSTC_WRAPPER";
 
 /// Existing workspace wrapper saved by the collector for transparent chaining.
-pub const INNER_WRAPPER_ENV: &str = "CARGO_RAIL_INNER_WORKSPACE_WRAPPER";
+pub(crate) const INNER_WRAPPER_ENV: &str = "CARGO_RAIL_INNER_WORKSPACE_WRAPPER";
 
 /// Marker set when this executable is transparently proxying rustdoc.
-pub const RUSTDOC_WRAPPER_MARKER: &str = "CARGO_RAIL_RUSTDOC_WRAPPER";
+pub(crate) const RUSTDOC_WRAPPER_MARKER: &str = "CARGO_RAIL_RUSTDOC_WRAPPER";
 
 /// Selected rustdoc executable retained behind the cargo-rail observation proxy.
-pub const INNER_RUSTDOC_ENV: &str = "CARGO_RAIL_INNER_RUSTDOC";
+pub(crate) const INNER_RUSTDOC_ENV: &str = "CARGO_RAIL_INNER_RUSTDOC";
 
 /// Private directory where diagnostics wrappers publish immutable invocation evidence.
-pub const OBSERVATION_DIRECTORY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY";
+pub(crate) const OBSERVATION_DIRECTORY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY";
 
 /// Physical source root used only to normalize and revalidate observation paths.
-pub const OBSERVATION_SOURCE_ROOT_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT";
+pub(crate) const OBSERVATION_SOURCE_ROOT_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT";
 
 /// Record invocations without enabling cargo-rail's workspace diagnostic lint.
-pub const OBSERVATION_ONLY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_ONLY";
+pub(crate) const OBSERVATION_ONLY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_ONLY";
+
+/// Result of classifying the process before Clap or workspace acquisition.
+#[doc(hidden)]
+pub enum PreClapDispatch {
+  /// No compiler role was requested; continue with the ordinary CLI.
+  Cli,
+  /// A compiler role ran and produced this process exit code.
+  Exit(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvocationRole {
+  DirectCache,
+  MarkedCache,
+  RustcObservation,
+  RustdocObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InvocationSignals {
+  direct_cache: bool,
+  marked_cache: bool,
+  rustc_observation: bool,
+  rustdoc_observation: bool,
+}
+
+impl InvocationSignals {
+  fn classify(self) -> Result<Option<InvocationRole>, &'static str> {
+    if self.direct_cache {
+      if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
+        return Err("direct cache wrapper received conflicting compiler role markers");
+      }
+      return Ok(Some(InvocationRole::DirectCache));
+    }
+    if self.rustdoc_observation && (self.marked_cache || self.rustc_observation) {
+      return Err("rustdoc proxy received conflicting compiler role markers");
+    }
+    if self.marked_cache {
+      // The outer cache marker deliberately coexists with the rustc observation
+      // marker. Cargo invokes the cache wrapper first, which removes only its
+      // own authority before starting the observation wrapper.
+      return Ok(Some(InvocationRole::MarkedCache));
+    }
+    if self.rustc_observation {
+      return Ok(Some(InvocationRole::RustcObservation));
+    }
+    if self.rustdoc_observation {
+      return Ok(Some(InvocationRole::RustdocObservation));
+    }
+    Ok(None)
+  }
+}
+
+/// Exact program and argv selected by Cargo for one compiler process.
+struct CompilerInvocation {
+  program: OsString,
+  arguments: Vec<OsString>,
+}
+
+impl CompilerInvocation {
+  fn from_wrapper_arguments(context: &str) -> Result<Self, i32> {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(program) = arguments.next() else {
+      eprintln!("{context}: missing compiler executable");
+      return Err(1);
+    };
+    Ok(Self {
+      program,
+      arguments: arguments.collect(),
+    })
+  }
+
+  fn selected(program: OsString, arguments: Vec<OsString>) -> Self {
+    Self { program, arguments }
+  }
+
+  fn command(&self) -> Command {
+    let mut command = Command::new(&self.program);
+    command.args(&self.arguments);
+    command
+  }
+
+  fn compiler_selection(&self, observation_wrapper: bool) -> Option<(&std::ffi::OsStr, &[OsString])> {
+    if observation_wrapper {
+      self
+        .arguments
+        .split_first()
+        .map(|(program, arguments)| (program.as_os_str(), arguments))
+    } else {
+      Some((self.program.as_os_str(), &self.arguments))
+    }
+  }
+}
 
 /// Whether cargo-rail may install its cache-disabled compiler wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,43 +205,109 @@ pub(crate) fn rustc_command(
   }
 }
 
-/// Run rustc wrapper mode when requested by the diagnostics collector.
-///
-/// Returns `None` during normal cargo-rail CLI execution.
+/// Classify and run compiler roles before Clap or workspace acquisition.
 #[must_use]
-pub fn run_if_requested() -> Option<i32> {
-  if let Some((context, started)) = crate::compiler::native_cache::NativeCacheContext::from_direct_invocation() {
-    return Some(match context {
-      Ok(context) => {
-        let trace = started.finish_context_load(context.captures_wrapper_diagnostics());
-        run_cache_disabled(Some(context), trace)
-      }
-      Err(error) => {
-        eprintln!("cargo-rail compiler cache wrapper: {error}");
-        2
-      }
-    });
-  }
-  if std::env::var_os(CACHE_WRAPPER_MARKER).is_some() {
-    return Some(run_cache_disabled(
+pub fn dispatch() -> PreClapDispatch {
+  let signals = InvocationSignals {
+    direct_cache: crate::compiler::native_cache::NativeCacheContext::is_direct_invocation(),
+    marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
+    rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
+    rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
+  };
+  let role = match signals.classify() {
+    Ok(role) => role,
+    Err(error) => {
+      eprintln!("cargo-rail compiler invocation: {error}");
+      return PreClapDispatch::Exit(2);
+    }
+  };
+  let Some(role) = role else {
+    if is_unmarked_recursive_wrapper_invocation() {
+      eprintln!("cargo-rail rustc wrapper: recursive cargo-rail rustc wrapper configuration");
+      return PreClapDispatch::Exit(2);
+    }
+    return PreClapDispatch::Cli;
+  };
+
+  let exit_code = match role {
+    InvocationRole::DirectCache => run_direct_cache(),
+    InvocationRole::MarkedCache => run_cache(
       crate::compiler::native_cache::NativeCacheContext::from_environment(),
       crate::instrumentation::NativeCacheWrapperTrace::disabled(),
-    ));
-  }
-  if std::env::var_os(WRAPPER_MARKER).is_some() {
-    return Some(run_rustc());
-  }
-  if std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some() {
-    return Some(run_rustdoc());
-  }
-  if is_unmarked_recursive_wrapper_invocation() {
-    eprintln!("cargo-rail rustc wrapper: recursive cargo-rail rustc wrapper configuration");
-    return Some(2);
-  }
-  None
+      signals.rustc_observation,
+    ),
+    InvocationRole::RustcObservation => run_rustc(),
+    InvocationRole::RustdocObservation => run_rustdoc(),
+  };
+  PreClapDispatch::Exit(exit_code)
 }
 
-fn run_cache_disabled(
+/// Run the compiler boundary from the dedicated wrapper executable.
+#[must_use]
+pub fn dispatch_required() -> i32 {
+  match dispatch() {
+    PreClapDispatch::Exit(exit_code) => exit_code,
+    PreClapDispatch::Cli => {
+      eprintln!("cargo-rail compiler cache wrapper: missing private invocation context");
+      2
+    }
+  }
+}
+
+fn run_direct_cache() -> i32 {
+  let invocation = match CompilerInvocation::from_wrapper_arguments("cargo-rail compiler cache wrapper") {
+    Ok(invocation) => invocation,
+    Err(exit_code) => return exit_code,
+  };
+  if cache_disabled() || cache_fast_bypass(&invocation, false) {
+    return run_cache_bypass(invocation);
+  }
+  let (context, started) = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation();
+  match context {
+    Ok(context) => {
+      let trace = started.finish_context_load(context.captures_wrapper_diagnostics());
+      run_cache_invocation(invocation, Some(context), trace)
+    }
+    Err(error) => {
+      eprintln!("cargo-rail compiler cache wrapper: {error}");
+      2
+    }
+  }
+}
+
+fn run_cache(
+  context: Option<crate::compiler::native_cache::NativeCacheContext>,
+  trace: crate::instrumentation::NativeCacheWrapperTrace,
+  observation_wrapper: bool,
+) -> i32 {
+  let invocation = match CompilerInvocation::from_wrapper_arguments("cargo-rail compiler cache wrapper") {
+    Ok(invocation) => invocation,
+    Err(exit_code) => return exit_code,
+  };
+  if cache_disabled() || context.is_none() || cache_fast_bypass(&invocation, observation_wrapper) {
+    return run_cache_bypass(invocation);
+  }
+  run_cache_invocation(invocation, context, trace)
+}
+
+fn cache_fast_bypass(invocation: &CompilerInvocation, observation_wrapper: bool) -> bool {
+  invocation
+    .compiler_selection(observation_wrapper)
+    .is_none_or(|(program, arguments)| crate::compiler::native_cache::fast_bypass_reason(program, arguments).is_some())
+}
+
+fn cache_disabled() -> bool {
+  std::env::var_os(CACHE_CONTROL_ENV).is_some_and(|value| value == "off")
+}
+
+fn run_cache_bypass(invocation: CompilerInvocation) -> i32 {
+  let mut command = invocation.command();
+  crate::compiler::native_cache::remove_cache_environment(&mut command);
+  run_transparently(command, "cargo-rail compiler cache wrapper")
+}
+
+fn run_cache_invocation(
+  invocation: CompilerInvocation,
   context: Option<crate::compiler::native_cache::NativeCacheContext>,
   mut trace: crate::instrumentation::NativeCacheWrapperTrace,
 ) -> i32 {
@@ -155,15 +317,14 @@ fn run_cache_disabled(
     eprintln!("cargo-rail compiler cache wrapper: {error}");
     return 2;
   }
-  let mut args = std::env::args_os().skip(1);
-  let Some(program) = args.next() else {
-    eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");
-    return 1;
-  };
-  let arguments = args.collect::<Vec<_>>();
-  let mut command = Command::new(&program);
-  command.args(&arguments).env_remove(CACHE_WRAPPER_MARKER);
-  match crate::compiler::native_cache::configure_outer(&program, &arguments, &mut command, &mut trace) {
+  let mut command = invocation.command();
+  command.env_remove(CACHE_WRAPPER_MARKER).env_remove(CACHE_CONTROL_ENV);
+  match crate::compiler::native_cache::configure_outer(
+    &invocation.program,
+    &invocation.arguments,
+    &mut command,
+    &mut trace,
+  ) {
     crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
     crate::compiler::native_cache::OuterCacheAction::Store {
       recorder,
@@ -220,31 +381,36 @@ fn is_unmarked_recursive_wrapper_invocation() -> bool {
 }
 
 fn run_rustc() -> i32 {
-  let mut args = std::env::args_os().skip(1);
-  let Some(rustc) = args.next() else {
-    eprintln!("cargo-rail rustc wrapper: missing rustc executable");
-    return 1;
+  let invocation = match CompilerInvocation::from_wrapper_arguments("cargo-rail rustc wrapper") {
+    Ok(invocation) => invocation,
+    Err(exit_code) => return exit_code,
   };
-
-  let remaining: Vec<OsString> = args.collect();
   let inner_wrapper = std::env::var_os(INNER_WRAPPER_ENV);
-  let recorder = (!is_rustc_information_request(&remaining))
-    .then(|| {
-      std::env::var_os(OBSERVATION_DIRECTORY_ENV)
-        .zip(std::env::var_os(OBSERVATION_SOURCE_ROOT_ENV))
-        .and_then(|(directory, source_root)| {
-          crate::compiler::observation::begin_invocation(
-            &PathBuf::from(directory),
-            &PathBuf::from(source_root),
-            &rustc,
-            &remaining,
-          )
-          .ok()
-        })
-    })
-    .flatten();
-  let mut command = rustc_command(&rustc, None, inner_wrapper.as_deref());
-  command.args(&remaining);
+  if is_rustc_information_request(&invocation.arguments) {
+    return run_rustc_bypass(invocation, inner_wrapper.as_deref());
+  }
+  let fact_session = match fact_session() {
+    Ok(Some(session)) => session,
+    Ok(None) => return run_rustc_bypass(invocation, inner_wrapper.as_deref()),
+    Err(error) => {
+      eprintln!("cargo-rail rustc wrapper: {error}");
+      return 2;
+    }
+  };
+  let recorder = match crate::compiler::observation::begin_invocation(
+    fact_session.observation_directory(),
+    fact_session.source_root(),
+    &invocation.program,
+    &invocation.arguments,
+  ) {
+    Ok(recorder) => recorder,
+    Err(error) => {
+      eprintln!("cargo-rail rustc wrapper: failed to begin compiler fact collection: {error}");
+      return 2;
+    }
+  };
+  let mut command = rustc_command(&invocation.program, None, inner_wrapper.as_deref());
+  command.args(&invocation.arguments);
   if std::env::var_os(OBSERVATION_ONLY_ENV).is_none() {
     command.arg("--warn=unused-crate-dependencies");
   }
@@ -257,18 +423,27 @@ fn run_rustc() -> i32 {
   crate::compiler::native_cache::remove_private_environment(&mut command);
 
   let status = command.status();
+  let fact_result = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
 
-  if let Some(recorder) = recorder {
-    let _ = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
-  }
-
-  match status {
-    Ok(status) => status.code().unwrap_or(1),
-    Err(error) => {
+  match (status, fact_result) {
+    (Ok(status), Ok(())) => compiler_status_code(status),
+    (Ok(status), Err(_)) if !status.success() => compiler_status_code(status),
+    (Ok(_), Err(error)) => {
+      eprintln!("cargo-rail rustc wrapper: failed to publish compiler facts: {error}");
+      2
+    }
+    (Err(error), _) => {
       eprintln!("cargo-rail rustc wrapper: failed to execute compiler: {error}");
       1
     }
   }
+}
+
+fn run_rustc_bypass(invocation: CompilerInvocation, inner_wrapper: Option<&std::ffi::OsStr>) -> i32 {
+  let mut command = rustc_command(&invocation.program, None, inner_wrapper);
+  command.args(&invocation.arguments);
+  crate::compiler::native_cache::remove_private_environment(&mut command);
+  run_transparently(command, "cargo-rail rustc wrapper")
 }
 
 fn is_rustc_information_request(arguments: &[OsString]) -> bool {
@@ -288,41 +463,92 @@ fn run_rustdoc() -> i32 {
     return 1;
   };
   let original_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-  let records_compilation = !is_rustdoc_information_request(&original_arguments);
-  let arguments = rustdoc_observation_arguments(&rustdoc, original_arguments);
-  let recorder = if records_compilation {
-    std::env::var_os(OBSERVATION_DIRECTORY_ENV)
-      .zip(std::env::var_os(OBSERVATION_SOURCE_ROOT_ENV))
-      .and_then(|(directory, source_root)| {
-        crate::compiler::observation::begin_rustdoc_invocation(
-          &PathBuf::from(directory),
-          &PathBuf::from(source_root),
-          &arguments,
-        )
-        .ok()
-      })
-  } else {
-    None
+  if is_rustdoc_information_request(&original_arguments) {
+    return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments));
+  }
+  let fact_session = match fact_session() {
+    Ok(Some(session)) => session,
+    Ok(None) => return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments)),
+    Err(error) => {
+      eprintln!("cargo-rail rustdoc proxy: {error}");
+      return 2;
+    }
   };
-  let status = Command::new(&rustdoc)
-    .args(&arguments)
-    .env("RUSTDOC", &rustdoc)
+  let arguments = rustdoc_observation_arguments(&rustdoc, original_arguments);
+  let invocation = CompilerInvocation::selected(rustdoc, arguments);
+  let recorder = match crate::compiler::observation::begin_rustdoc_invocation(
+    fact_session.observation_directory(),
+    fact_session.source_root(),
+    &invocation.arguments,
+  ) {
+    Ok(recorder) => recorder,
+    Err(error) => {
+      eprintln!("cargo-rail rustdoc proxy: failed to begin compiler fact collection: {error}");
+      return 2;
+    }
+  };
+  let mut command = invocation.command();
+  command
+    .env("RUSTDOC", &invocation.program)
     .env_remove(RUSTDOC_WRAPPER_MARKER)
     .env_remove(INNER_RUSTDOC_ENV)
     .env_remove(OBSERVATION_DIRECTORY_ENV)
-    .env_remove(OBSERVATION_SOURCE_ROOT_ENV)
-    .status();
+    .env_remove(OBSERVATION_SOURCE_ROOT_ENV);
+  crate::compiler::native_cache::remove_private_environment(&mut command);
+  let status = command.status();
+  let fact_result = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
 
-  if let Some(recorder) = recorder {
-    let _ = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
-  }
-
-  match status {
-    Ok(status) => status.code().unwrap_or(1),
-    Err(error) => {
+  match (status, fact_result) {
+    (Ok(status), Ok(())) => compiler_status_code(status),
+    (Ok(status), Err(_)) if !status.success() => compiler_status_code(status),
+    (Ok(_), Err(error)) => {
+      eprintln!("cargo-rail rustdoc proxy: failed to publish compiler facts: {error}");
+      2
+    }
+    (Err(error), _) => {
       eprintln!("cargo-rail rustdoc proxy: failed to execute rustdoc: {error}");
       1
     }
+  }
+}
+
+fn run_rustdoc_bypass(invocation: CompilerInvocation) -> i32 {
+  let mut command = invocation.command();
+  command.env("RUSTDOC", &invocation.program);
+  crate::compiler::native_cache::remove_private_environment(&mut command);
+  run_transparently(command, "cargo-rail rustdoc proxy")
+}
+
+#[cfg(unix)]
+fn compiler_status_code(status: std::process::ExitStatus) -> i32 {
+  use std::os::unix::process::ExitStatusExt as _;
+
+  let Some(raw_signal) = status.signal() else {
+    return status.code().unwrap_or(1);
+  };
+  if let Some(signal) = rustix::process::Signal::from_named_raw(raw_signal) {
+    let _ = rustix::process::kill_process(rustix::process::getpid(), signal);
+  }
+  128 + raw_signal
+}
+
+#[cfg(not(unix))]
+fn compiler_status_code(status: std::process::ExitStatus) -> i32 {
+  status.code().unwrap_or(1)
+}
+
+fn fact_session() -> crate::error::RailResult<Option<crate::compiler::session::CompilerFactSession>> {
+  let capability = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
+  let observation_directory = std::env::var_os(OBSERVATION_DIRECTORY_ENV).map(PathBuf::from);
+  let source_root = std::env::var_os(OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from);
+  match (capability, observation_directory, source_root) {
+    (None, None, None) => Ok(None),
+    (Some(capability), Some(observation_directory), Some(source_root)) => {
+      crate::compiler::session::CompilerFactSession::load(&capability, &observation_directory, &source_root).map(Some)
+    }
+    _ => Err(crate::error::RailError::message(
+      "compiler fact capability is incomplete",
+    )),
   }
 }
 
@@ -485,6 +711,52 @@ mod tests {
   use std::ffi::OsStr;
 
   use super::*;
+
+  #[test]
+  fn compiler_roles_reject_ambiguity_but_allow_cache_then_observation() {
+    assert_eq!(
+      InvocationSignals {
+        marked_cache: true,
+        rustc_observation: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::MarkedCache))
+    );
+
+    for signals in [
+      InvocationSignals {
+        direct_cache: true,
+        marked_cache: true,
+        ..InvocationSignals::default()
+      },
+      InvocationSignals {
+        rustc_observation: true,
+        rustdoc_observation: true,
+        ..InvocationSignals::default()
+      },
+      InvocationSignals {
+        marked_cache: true,
+        rustdoc_observation: true,
+        ..InvocationSignals::default()
+      },
+    ] {
+      assert!(signals.classify().is_err(), "ambiguous role was accepted: {signals:?}");
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn compiler_invocation_preserves_non_utf8_program_and_arguments() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let program = OsString::from_vec(vec![b'r', b'u', b's', b't', b'c', 0x80]);
+    let arguments = vec![OsString::from_vec(vec![b'-', b'-', b'c', b'f', b'g', 0xff])];
+    let invocation = CompilerInvocation::selected(program.clone(), arguments.clone());
+
+    assert_eq!(invocation.program, program);
+    assert_eq!(invocation.arguments, arguments);
+  }
 
   #[test]
   fn rustc_information_requests_do_not_become_compilation_units() {
