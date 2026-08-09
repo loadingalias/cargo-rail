@@ -103,9 +103,9 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() -> Result<()> {
       .is_some_and(|identity| identity.starts_with("v1-sha256-")),
     "current plan commands must expose one versioned authoritative identity"
   );
-  assert_eq!(counters["cargo_metadata_loads"], 2);
+  assert_eq!(counters["cargo_metadata_loads"], 1);
   assert_eq!(counters["cargo_metadata_cache_hits"], 0);
-  assert_eq!(counters["target_view_loads"], 1);
+  assert_eq!(counters["target_view_loads"], 0);
   assert!(counters["hash_operations"].as_u64().is_some_and(|count| count >= 3));
   assert!(counters["hash_input_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
   assert!(

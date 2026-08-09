@@ -10,7 +10,7 @@ Cargo-Rail has five workflows:
 | Workflow | Authority | Result |
 |---|---|---|
 | `unify` | Resolved Cargo graph plus compiler evidence | A checked or applied manifest mutation plan |
-| `plan` / `run` | Changed source plus resolved dependency graph | Selected surfaces, package scopes, and ordered actions |
+| `plan` / `run` | Changed source plus the declared dependency universe | Selected surfaces, package scopes, and ordered actions |
 | caching | Exact action inputs and verified result bytes | Diagnostic reuse, one compiler-result restore, or one whole-action restore |
 | `change` / `release` | Reviewed change intent plus exact Git and registry state | Versions, changelogs, publications, and durable recovery state |
 | `split` / `sync` | Captured source, Git history, and split ownership | Standalone history or mapped changes with origin evidence |
@@ -35,8 +35,9 @@ for convenience.
 
 ## Planning and execution
 
-`plan` owns change classification, crate ownership, reverse dependency impact, surface selection, and package scope.
-`run` consumes that plan, refines Cargo actions for their exact feature and target views, expands direct argv arrays,
+`plan` owns change classification, crate ownership, conservative reverse dependency impact, surface selection, and
+package scope. Its declared dependency universe includes optional and target-gated edges without changing the exact
+Cargo graph. `run` consumes final surface scope, expands direct argv arrays, binds exact action-resolution evidence,
 validates the complete action graph, and only then starts processes.
 
 Text explanations, JSON and GitHub projections, dry-run previews, decision receipts, and execution all come from this

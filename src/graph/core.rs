@@ -14,7 +14,7 @@
 //!
 //! - **Directed Graph**: `A → B` means "A depends on B"
 //! - **Nodes**: Packages (workspace members + dependencies)
-//! - **Edges**: Resolved aliases with independent kind and target semantics
+//! - **Edges**: Exact resolved aliases with independent kind and target semantics
 //! - **Index**: Exact package IDs for graph work; package names only for user selection
 //! - **Algorithms**: Shortest paths, reachability, transitive closure
 //! - **Ownership index**: Longest package-root prefix → exact workspace package
@@ -455,15 +455,6 @@ impl WorkspaceGraph {
       sorted_members,
       ownership_index,
     })
-  }
-
-  /// Propagate changed package outputs through Cargo's resolved dependency domains.
-  pub(crate) fn propagate_impact(
-    &self,
-    package_ids: &HashSet<PackageId>,
-    target_filtered: bool,
-  ) -> RailResult<crate::graph::ImpactPropagation> {
-    crate::graph::impact::propagate(self, package_ids, target_filtered)
   }
 
   /// Get all workspace member crate names (pre-sorted).
@@ -1013,43 +1004,6 @@ mod tests {
     }
   }
 
-  fn add_test_edge(
-    graph: &mut WorkspaceGraph,
-    from: &str,
-    to: &str,
-    kind: DependencyKind,
-    target: Option<&str>,
-    optional: Option<bool>,
-  ) {
-    let from = graph.workspace_name_index[from][0];
-    let to = graph.workspace_name_index[to][0];
-    graph.graph.add_edge(
-      from,
-      to,
-      DependencyEdge {
-        name: graph.graph[to].name.clone(),
-        kind,
-        target: target.map(|target| target.parse().expect("test target predicate should parse")),
-        optional,
-        uses_default_features: optional.map(|_| true),
-        features: Vec::new(),
-      },
-    );
-  }
-
-  fn package_ids(graph: &WorkspaceGraph, names: &[&str]) -> HashSet<PackageId> {
-    names
-      .iter()
-      .map(|name| {
-        graph
-          .workspace_package_by_name(name)
-          .expect("test package should be unique")
-          .id
-          .clone()
-      })
-      .collect()
-  }
-
   fn write_test_package(root: &Path, relative: &str, name: &str, version: &str, dependencies: &str) {
     let package_root = root.join(relative);
     std::fs::create_dir_all(package_root.join("src")).expect("test package directory should be created");
@@ -1178,91 +1132,6 @@ mod tests {
         ("c".to_string(), "d".to_string()),
       ]
     );
-  }
-
-  #[test]
-  fn semantic_impact_stops_after_crossing_a_development_edge() {
-    let mut graph = test_graph(&[]);
-    add_test_edge(&mut graph, "b", "a", DependencyKind::Development, None, Some(false));
-    add_test_edge(&mut graph, "c", "b", DependencyKind::Normal, None, Some(false));
-
-    let impact = graph
-      .propagate_impact(&package_ids(&graph, &["a"]), false)
-      .expect("semantic impact should propagate");
-
-    assert!(impact.build.is_empty());
-    assert_eq!(impact.development, package_ids(&graph, &["b"]).into_iter().collect());
-    assert!(
-      impact
-        .steps
-        .iter()
-        .all(|step| step.domain == crate::graph::ImpactDomain::Development)
-    );
-  }
-
-  #[test]
-  fn semantic_impact_propagates_normal_and_build_edges_transitively() {
-    let mut graph = test_graph(&[]);
-    add_test_edge(&mut graph, "b", "a", DependencyKind::Build, None, Some(false));
-    add_test_edge(&mut graph, "c", "b", DependencyKind::Normal, None, Some(false));
-
-    let impact = graph
-      .propagate_impact(&package_ids(&graph, &["a"]), false)
-      .expect("semantic impact should propagate");
-
-    assert_eq!(impact.build, package_ids(&graph, &["b", "c"]).into_iter().collect());
-    assert!(impact.development.is_empty());
-    assert!(
-      impact
-        .steps
-        .iter()
-        .any(|step| step.kind == DependencyKind::Build && step.host)
-    );
-  }
-
-  #[test]
-  fn semantic_impact_explains_target_optional_and_proc_macro_domains() {
-    let mut graph = test_graph(&[]);
-    let a = graph.workspace_name_index["a"][0];
-    graph.graph[a].is_proc_macro = true;
-    add_test_edge(
-      &mut graph,
-      "b",
-      "a",
-      DependencyKind::Normal,
-      Some("cfg(unix)"),
-      Some(true),
-    );
-
-    let unfiltered = graph
-      .propagate_impact(&package_ids(&graph, &["a"]), false)
-      .expect("unfiltered semantic impact should propagate conservatively");
-    let step = unfiltered.steps.first().expect("impact should contain one step");
-    assert!(step.proc_macro);
-    assert!(step.host);
-    assert_eq!(step.optional, Some(true));
-    assert_eq!(step.target.as_deref(), Some("cfg(unix)"));
-    assert_eq!(step.fallbacks, vec![crate::graph::ImpactFallback::TargetUnfiltered]);
-
-    let filtered = graph
-      .propagate_impact(&package_ids(&graph, &["a"]), true)
-      .expect("filtered semantic impact should propagate");
-    assert!(filtered.steps[0].fallbacks.is_empty());
-  }
-
-  #[test]
-  fn semantic_impact_prefers_build_over_parallel_development_impact() {
-    let mut graph = test_graph(&[]);
-    add_test_edge(&mut graph, "b", "a", DependencyKind::Development, None, Some(false));
-    add_test_edge(&mut graph, "b", "a", DependencyKind::Normal, None, Some(false));
-
-    let impact = graph
-      .propagate_impact(&package_ids(&graph, &["a"]), false)
-      .expect("parallel semantic impact should propagate");
-
-    assert_eq!(impact.build, package_ids(&graph, &["b"]).into_iter().collect());
-    assert!(impact.development.is_empty());
-    assert_eq!(impact.steps.len(), 2);
   }
 
   #[test]

@@ -157,7 +157,15 @@ fn portable_plan_value(value: &Value) -> RailResult<Value> {
     .ok_or_else(|| RailError::message("planner contract must be a JSON object"))?;
 
   let mut portable = serde_json::Map::new();
-  for key in ["plan_contract_version", "files", "impact", "scope", "surfaces", "trace"] {
+  for key in [
+    "plan_contract_version",
+    "resolution_universe",
+    "files",
+    "impact",
+    "scope",
+    "surfaces",
+    "trace",
+  ] {
     let field = plan
       .get(key)
       .ok_or_else(|| RailError::message(format!("planner contract is missing '{}'", key)))?;

@@ -950,7 +950,7 @@ fn test_runner_build_surface_uses_planner_selected_packages() -> Result<()> {
 }
 
 #[test]
-fn test_runner_refines_optional_impact_for_the_action_feature_view() -> Result<()> {
+fn test_runner_consumes_conservative_optional_scope_for_every_feature_view() -> Result<()> {
   let ws = TestWorkspace::new_named("test-run-optional-feature-view")?;
   ws.add_crate("optional-a", "0.1.0", &[])?;
   let optional_b = ws.add_crate("optional-b", "0.1.0", &[])?;
@@ -990,7 +990,7 @@ optional-a = { path = "../optional-a", optional = true }
   let default: serde_json::Value = serde_json::from_slice(&default.stdout)?;
   assert_eq!(
     default["actions"][0]["selected_packages"],
-    serde_json::json!(["optional-a"])
+    serde_json::json!(["optional-a", "optional-b"])
   );
 
   let all_features = run_cargo_rail(
@@ -1027,7 +1027,7 @@ optional-a = { path = "../optional-a", optional = true }
 }
 
 #[test]
-fn test_runner_refines_target_impact_for_the_action_target_view() -> Result<()> {
+fn test_runner_consumes_conservative_target_scope_without_refinement() -> Result<()> {
   let ws = TestWorkspace::new_named("test-run-target-view")?;
   ws.add_crate("target-a", "0.1.0", &[])?;
   let target_b = ws.add_crate("target-b", "0.1.0", &[])?;

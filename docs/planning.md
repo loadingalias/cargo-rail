@@ -13,12 +13,14 @@ selection from path filters.
    complete. Unknown resolver, membership, source, parse, or removed-resolution changes widen to the workspace.
 3. **Classify files.** Built-in rules select build, test, benchmark, documentation, or infrastructure surfaces.
    Configured globs add infrastructure and custom surfaces.
-4. **Resolve ownership and impact.** Cargo metadata maps files to packages. The planner walks active reverse dependency
-   edges and keeps build-transitive and development-only impact separate.
+4. **Resolve ownership and impact.** Cargo metadata maps files to packages. The planner builds one declared-dependency
+   universe where optional and target-gated edges can participate, then keeps build-transitive and development-only
+   impact separate.
 5. **Build execution scopes.** Each package-scoped surface receives `empty`, `crates`, or `workspace` scope and the
    matching Cargo arguments.
-6. **Expand actions.** `run` selects built-in or configured actions, refines Cargo package impact for each action's
-   exact features and targets, orders dependencies, validates paths and outputs, and then starts direct process argv.
+6. **Expand actions.** `run` selects built-in or configured actions, consumes each surface's final package scope,
+   orders dependencies, validates paths and outputs, binds exact Cargo resolution evidence, and then starts direct
+   process argv.
 
 Generated source roots and Cargo-Rail state are excluded from change collection. Worktree plans use one captured source
 and resolution view; they do not combine file decisions from one moment with Cargo decisions from another.
@@ -68,6 +70,7 @@ Use planner fields according to their ownership:
 - `surfaces.NAME.enabled` and `.reasons` are the decision for one surface.
 - `surfaces.NAME.scope` is the exact package handoff for that surface.
 - `scope` is the compatibility union of active package-scoped surfaces.
+- `resolution_universe` identifies the declared dependency semantics used to compute every surface scope.
 - `trace` is the stable reason chain.
 - `impact` explains graph propagation; it is not an execution scope.
 
@@ -108,12 +111,13 @@ ownership.
 widens it to workspace scope and records `historical_resolution_unavailable`. Current-graph edges may still appear as
 explanation, but they do not narrow historical execution.
 
-Worktree plans resolve Cargo's default features for each effective build target. `run` then refines package selection
-again for the exact feature and target view of each Cargo action.
+Worktree plans derive one command-independent universe from captured declarations. Every optional and target-gated
+edge can propagate impact regardless of default features or the host target. `run` records each action's exact feature
+and target resolution but does not change planner scope.
 
 ## Machine contract
 
-`cargo rail plan -f json` is a versioned API. The current output is planner contract v5 and scope contract v3 inside
+`cargo rail plan -f json` is a versioned API. The current output is planner contract v6 and scope contract v4 inside
 machine envelope v1:
 
 ```bash
@@ -121,7 +125,7 @@ cargo rail plan --schema > plan.schema.json
 cargo rail plan --merge-base -f json > plan.json
 ```
 
-[`schemas/plan-v5.schema.json`](../schemas/plan-v5.schema.json) is the checked-in schema. `plan --schema` runs before
+[`schemas/plan-v6.schema.json`](../schemas/plan-v6.schema.json) is the checked-in schema. `plan --schema` runs before
 workspace context construction, so a consumer can check compatibility without opening a repository.
 
 Compatibility rules:
@@ -144,11 +148,13 @@ key and never authorizes result reuse.
 
 [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) installs Cargo-Rail, runs the
 planner once, validates the planner and scope versions, and exports their projections. Action major v6 consumes planner
-v5 and scope v3; its `version` input independently selects the Cargo-Rail release.
+v6 and scope v4; its `version` input independently selects the Cargo-Rail release.
 
 ```yaml
 - uses: loadingalias/cargo-rail-action@v6
   id: rail
+  with:
+    version: 0.22.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
@@ -160,6 +166,11 @@ v5 and scope v3; its `version` input independently selects the Cargo-Rail releas
 Minimal mode exports the built-in surface booleans, `surfaces-json`, `scope-json`, `cargo-args`, and `base-ref`. Debug
 mode also exports the full `plan-json`. Pin the action to a full commit SHA when immutable third-party action execution
 is required.
+
+The direct `cargo test` handoff above consumes Cargo-Rail's package scope but does not use Cargo-Rail's native compiler
+cache. Execution jobs that want local or shared reuse must configure the cache target and invoke `cargo rail run`; see
+[Share native compiler results across CI and SSH](cache-sharing.md). The planner action remains a job gate and contract
+transport, not a process-wide Cargo wrapper.
 
 ## Diagnose and validate
 

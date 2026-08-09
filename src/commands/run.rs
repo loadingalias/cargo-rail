@@ -1,8 +1,6 @@
 //! `cargo rail run` - planner-contract executor.
 
-use super::plan::{
-  ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain, resolve_action_packages,
-};
+use super::plan::{ExecutionScopeMode, PlanOptions, PlanOutput, build_plan_output, render_plan_explain};
 use crate::action::{
   ActionEnvironmentEntry, ActionExpansion, ActionFeatureSelection, ActionGraph, ActionKind, ActionReason,
   ActionResolutionBinding, ActionSpec, ActionWorkingDirectory, ArgvTemplate, ExpandedAction, PackageArguments,
@@ -203,7 +201,6 @@ pub fn run_run(ctx: &WorkspaceContext, opts: RunOptions) -> RailResult<()> {
     selected_features: &selected_features,
     platform: &platform,
     base_ref,
-    plan: plan.as_ref(),
   };
   for action in &effective.actions {
     if !action_enabled(ctx, &opts, plan.as_ref(), action) {
@@ -523,10 +520,7 @@ fn action_enabled(ctx: &WorkspaceContext, opts: &RunOptions, plan: Option<&PlanO
   }
   if let Some(kind) = ActionKind::from_name(action) {
     return kind.planner_surface().is_some_and(|surface| {
-      plan.is_some_and(|plan| {
-        plan.surfaces.get(surface).is_some_and(|decision| decision.enabled)
-          || (plan.has_semantic_seeds() && matches!(surface, "build" | "test" | "bench"))
-      })
+      plan.is_some_and(|plan| plan.surfaces.get(surface).is_some_and(|decision| decision.enabled))
     });
   }
   ctx
@@ -938,7 +932,6 @@ struct RunExpansionContext<'a> {
   selected_features: &'a ActionFeatureSelection,
   platform: &'a str,
   base_ref: &'a str,
-  plan: Option<&'a PlanOutput>,
 }
 
 fn merge_action_reasons(
@@ -1282,34 +1275,7 @@ fn expand_builtin_action(
   if matches!(kind, ActionKind::Lint | ActionKind::Msrv) {
     expanded_features = ActionFeatureSelection::requested(true, true, Vec::new());
   }
-  let mut targets = if !opts.all
-    && matches!(
-      kind,
-      ActionKind::Build
-        | ActionKind::Test
-        | ActionKind::Bench
-        | ActionKind::Lint
-        | ActionKind::Msrv
-        | ActionKind::Package
-        | ActionKind::Distribution
-    ) {
-    let plan = expansion
-      .plan
-      .ok_or_else(|| RailError::message(format!("action '{}' has no semantic plan", kind.as_str())))?;
-    let all_packages: BTreeSet<_> = ctx.cargo().metadata().workspace_members.iter().cloned().collect();
-    let features = action_resolution_features(ctx, &all_packages, &expanded_features)?;
-    resolve_action_packages(
-      ctx,
-      plan,
-      kind
-        .planner_surface()
-        .ok_or_else(|| RailError::message(format!("action '{}' has no planner surface", kind.as_str())))?,
-      features,
-      &expanded_targets,
-    )?
-  } else {
-    targets.to_vec()
-  };
+  let mut targets = targets.to_vec();
   if opts.ignore_bin_crates && package_scoped {
     targets.retain(|crate_name| !ctx.cargo().is_binary_only(crate_name));
   }
@@ -1822,7 +1788,7 @@ fn action_reasons(
       .map(String::as_str)
       .collect()
   };
-  let mut reasons = surfaces
+  let reasons = surfaces
     .iter()
     .copied()
     .filter_map(|surface| output.surfaces.get(surface).map(|decision| (surface, decision)))
@@ -1834,22 +1800,6 @@ fn action_reasons(
       })
     })
     .collect::<Vec<_>>();
-  if reasons.is_empty() && kind.is_some() && output.has_semantic_seeds() {
-    for surface in surfaces
-      .into_iter()
-      .filter(|surface| matches!(*surface, "build" | "test" | "bench"))
-    {
-      reasons.extend(
-        output
-          .semantic_seed_reason_ids()
-          .into_iter()
-          .map(|trace_id| ActionReason::Planner {
-            surface: surface.to_string(),
-            trace_id,
-          }),
-      );
-    }
-  }
   if reasons.is_empty() {
     return Err(RailError::message(format!(
       "planner enabled '{}' action without a reason",

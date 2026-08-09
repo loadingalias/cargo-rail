@@ -35,11 +35,15 @@
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 5,
+  "plan_contract_version": 6,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",
     "git_shallow_clone": false
+  },
+  "resolution_universe": {
+    "identity": "resolution-universe-v1:sha256:d9951bcb0228ff1649b59fc0ef804e75b2f9c6cbb6736197b851a3e542a98d95",
+    "mode": "declared_dependencies"
   },
   "scope": {
     "cargo_args": [
@@ -49,16 +53,23 @@
     "mode": "workspace",
     "resolved_base": "origin/main",
     "resolved_head": "WORKTREE",
-    "scope_contract_version": 3
+    "scope_contract_version": 4
   },
   "surfaces": {
     "bench": {
-      "enabled": false,
-      "reasons": [],
+      "enabled": true,
+      "reasons": [
+        4
+      ],
       "scope": {
-        "cargo_args": [],
-        "crates": [],
-        "mode": "empty"
+        "cargo_args": [
+          "-p",
+          "lib-b"
+        ],
+        "crates": [
+          "lib-b"
+        ],
+        "mode": "crates"
       }
     },
     "build": {
@@ -146,6 +157,7 @@
       "optional": false,
       "package_id": "<PACKAGE_ID:lib-b>",
       "selected_surfaces": [
+        "bench",
         "build",
         "test"
       ],

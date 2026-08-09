@@ -9,7 +9,7 @@ use std::process::Command;
 const GOLDEN_PLAN_JSON: &str = include_str!("../fixtures/plan/plan_json.golden");
 const GOLDEN_PLAN_GITHUB: &str = include_str!("../fixtures/plan/plan_github.golden");
 const GOLDEN_PLAN_GITHUB_DEBUG: &str = include_str!("../fixtures/plan/plan_github_debug.golden");
-const PLAN_V5_SCHEMA: &str = include_str!("../../schemas/plan-v5.schema.json");
+const PLAN_V6_SCHEMA: &str = include_str!("../../schemas/plan-v6.schema.json");
 
 #[test]
 fn test_plan_schema_command_matches_published_schema() -> Result<()> {
@@ -20,7 +20,7 @@ fn test_plan_schema_command_matches_published_schema() -> Result<()> {
     output.status.success(),
     "plan --schema should not require workspace metadata"
   );
-  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V5_SCHEMA);
+  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V6_SCHEMA);
   assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
 
   Ok(())
@@ -35,7 +35,7 @@ fn test_plan_json_validates_against_published_schema() -> Result<()> {
   )?;
   assert!(output.status.success(), "plan json should succeed");
 
-  let schema: Value = serde_json::from_str(PLAN_V5_SCHEMA)?;
+  let schema: Value = serde_json::from_str(PLAN_V6_SCHEMA)?;
   let instance: Value = serde_json::from_slice(&output.stdout)?;
   let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid planner schema: {error}"))?;
   let errors: Vec<_> = validator
@@ -86,8 +86,14 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert_eq!(json["mode"], serde_json::Value::String("inspect".to_string()));
   assert_eq!(json["result"], serde_json::Value::String("success".to_string()));
   assert_eq!(json["exit_code"], serde_json::Value::Number(0.into()));
-  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(5.into()));
+  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(6.into()));
   assert!(json.get("inputs").is_some(), "missing inputs");
+  assert_eq!(json["resolution_universe"]["mode"], "declared_dependencies");
+  assert!(
+    json["resolution_universe"]["identity"]
+      .as_str()
+      .is_some_and(|identity| identity.starts_with("resolution-universe-v1:sha256:"))
+  );
   assert!(json.get("files").is_some(), "missing files");
   assert!(json.get("impact").is_some(), "missing impact");
   assert!(json.get("scope").is_some(), "missing scope");
@@ -113,7 +119,7 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert_eq!(json["impact"]["development_transitive_crates"], serde_json::json!([]));
   assert_eq!(
     json["scope"]["scope_contract_version"],
-    serde_json::Value::Number(3.into())
+    serde_json::Value::Number(4.into())
   );
   assert_eq!(
     json["scope"]["mode"],
@@ -318,7 +324,7 @@ fn test_plan_text_output_is_concise() -> Result<()> {
   assert!(output.status.success(), "plan text should succeed");
 
   let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.contains("surfaces: build, test"));
+  assert!(stdout.contains("surfaces: bench, build, test"));
   assert!(stdout.contains("scope: workspace"));
   assert!(stdout.contains("why:"));
   assert!(!stdout.contains("transitive crates:"));
@@ -764,10 +770,115 @@ fn test_plan_partial_workspace_scope_uses_crates_mode() -> Result<()> {
 }
 
 #[test]
+fn test_plan_cargo_args_preserve_hyphenated_package_tokens() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-exact-cargo-args")?;
+  ws.add_crate("core-lib", "0.1.0", &[])?;
+  ws.add_crate("consumer-tool", "0.1.0", &[("core-lib", r#"{ path = "../core-lib" }"#)])?;
+  ws.add_crate("unrelated-bin", "0.1.0", &[])?;
+  ws.commit("add hyphenated packages")?;
+  ws.modify_file("core-lib", "src/lib.rs", "pub fn changed() {}\n")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(
+    json["surfaces"]["build"]["scope"]["cargo_args"],
+    serde_json::json!(["-p", "consumer-tool", "-p", "core-lib"])
+  );
+  Ok(())
+}
+
+#[test]
+fn test_plan_deleted_and_renamed_files_keep_deterministic_ownership() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-deleted-renamed-ownership")?;
+  let package = ws.add_crate("owned-lib", "0.1.0", &[])?;
+  std::fs::write(package.join("src/deleted.rs"), "pub fn deleted() {}\n")?;
+  std::fs::write(package.join("src/old.rs"), "pub fn renamed() {}\n")?;
+  ws.commit("add owned files")?;
+
+  std::fs::remove_file(package.join("src/deleted.rs"))?;
+  std::fs::rename(package.join("src/old.rs"), package.join("src/new.rs"))?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  let files = json["files"]
+    .as_array()
+    .ok_or_else(|| anyhow!("files must be an array"))?;
+  assert_eq!(
+    files.iter().map(|file| file["path"].as_str()).collect::<Vec<_>>(),
+    [
+      Some("crates/owned-lib/src/deleted.rs"),
+      Some("crates/owned-lib/src/new.rs"),
+      Some("crates/owned-lib/src/old.rs")
+    ]
+  );
+  assert!(
+    files
+      .iter()
+      .all(|file| { file["owner_scope"] == "crate" && file["owners"] == serde_json::json!(["owned-lib"]) })
+  );
+  Ok(())
+}
+
+#[test]
+fn test_plan_resolution_universe_identity_covers_edges_and_package_facts() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-universe-identity")?;
+  let identity_a = ws.add_crate("identity-a", "0.1.0", &[])?;
+  let identity_b = ws.add_crate("identity-b", "0.1.0", &[])?;
+  ws.commit("add identity packages")?;
+
+  let before = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(before.status.success(), "baseline plan failed");
+  let before: Value = serde_json::from_slice(&before.stdout)?;
+
+  let manifest_path = identity_b.join("Cargo.toml");
+  let mut manifest = std::fs::read_to_string(&manifest_path)?;
+  manifest.push_str("identity-a = { path = \"../identity-a\", optional = true }\n");
+  std::fs::write(manifest_path, manifest)?;
+  generate_lockfile(&ws)?;
+  let after = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    after.status.success(),
+    "changed-universe plan failed:\nstdout: {}\nstderr: {}",
+    String::from_utf8_lossy(&after.stdout),
+    String::from_utf8_lossy(&after.stderr),
+  );
+  let after: Value = serde_json::from_slice(&after.stdout)?;
+
+  assert_ne!(
+    before["resolution_universe"]["identity"], after["resolution_universe"]["identity"],
+    "a declared optional edge must change the versioned universe identity"
+  );
+
+  let manifest_path = identity_a.join("Cargo.toml");
+  let mut manifest = std::fs::read_to_string(&manifest_path)?;
+  manifest.push_str("\n[lib]\nproc-macro = true\n");
+  std::fs::write(manifest_path, manifest)?;
+  let package_facts = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(package_facts.status.success(), "package-fact plan failed");
+  let package_facts: Value = serde_json::from_slice(&package_facts.stdout)?;
+  assert_ne!(
+    after["resolution_universe"]["identity"], package_facts["resolution_universe"]["identity"],
+    "a proc-macro package fact must change the versioned universe identity"
+  );
+  Ok(())
+}
+
+#[test]
 fn test_plan_scopes_development_dependents_to_test_and_bench() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-development-domain")?;
   ws.add_crate("domain-a", "0.1.0", &[])?;
   let domain_b = ws.add_crate("domain-b", "0.1.0", &[])?;
+  ws.add_crate("domain-c", "0.1.0", &[("domain-b", r#"{ path = "../domain-b" }"#)])?;
   std::fs::write(
     domain_b.join("Cargo.toml"),
     r#"[package]
@@ -800,14 +911,103 @@ domain-a = { path = "../domain-a" }
     serde_json::json!(["domain-a"])
   );
   assert_eq!(
-    json["surfaces"]["test"]["scope"]["mode"],
-    serde_json::json!("workspace")
+    json["surfaces"]["test"]["scope"]["crates"],
+    serde_json::json!(["domain-a", "domain-b"])
   );
   assert_eq!(json["surfaces"]["bench"]["scope"]["mode"], serde_json::json!("crates"));
   assert_eq!(
     json["surfaces"]["bench"]["scope"]["crates"],
     serde_json::json!(["domain-b"])
   );
+  assert!(json["trace"].as_array().is_some_and(|trace| {
+    trace
+      .iter()
+      .all(|reason| reason["crate"] != "domain-c" && reason["depends_on"] != "domain-b")
+  }));
+  Ok(())
+}
+
+#[test]
+fn test_plan_scopes_build_dependents_to_build_test_and_bench() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-build-domain")?;
+  ws.add_crate("build-a", "0.1.0", &[])?;
+  let build_b = ws.add_crate("build-b", "0.1.0", &[])?;
+  ws.add_crate("build-c", "0.1.0", &[("build-b", r#"{ path = "../build-b" }"#)])?;
+  std::fs::write(
+    build_b.join("Cargo.toml"),
+    r#"[package]
+name = "build-b"
+version = "0.1.0"
+edition.workspace = true
+
+[build-dependencies]
+build-a = { path = "../build-a" }
+"#,
+  )?;
+  ws.commit("add build dependency")?;
+  ws.modify_file("build-a", "src/lib.rs", "pub fn changed() {}\n")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  let reason = json["trace"]
+    .as_array()
+    .and_then(|trace| {
+      trace
+        .iter()
+        .find(|reason| reason["code"] == "TRANSITIVE_DEPENDS_ON_DIRECT" && reason["edge_kind"] == "build")
+    })
+    .ok_or_else(|| anyhow!("missing build dependency reason"))?;
+  assert_eq!(reason["edge_kind"], "build");
+  assert_eq!(reason["host"], true);
+  assert_eq!(
+    reason["selected_surfaces"],
+    serde_json::json!(["bench", "build", "test"])
+  );
+  assert_eq!(
+    json["impact"]["build_transitive_crates"],
+    serde_json::json!(["build-b", "build-c"])
+  );
+  Ok(())
+}
+
+#[test]
+fn test_plan_preserves_proc_macro_host_evidence() -> Result<()> {
+  let ws = TestWorkspace::new_named("plan-proc-macro-domain")?;
+  let proc_macro = ws.add_crate("derive-core", "0.1.0", &[])?;
+  let manifest_path = proc_macro.join("Cargo.toml");
+  let mut manifest = std::fs::read_to_string(&manifest_path)?;
+  manifest.push_str("\n[lib]\nproc-macro = true\n");
+  std::fs::write(manifest_path, manifest)?;
+  ws.add_crate(
+    "macro-user",
+    "0.1.0",
+    &[("derive-core", r#"{ path = "../derive-core" }"#)],
+  )?;
+  ws.commit("add proc macro dependency")?;
+  ws.modify_file("derive-core", "src/lib.rs", "use proc_macro::TokenStream;\n")?;
+
+  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "plan failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json: Value = serde_json::from_slice(&output.stdout)?;
+  let reason = json["trace"]
+    .as_array()
+    .and_then(|trace| {
+      trace
+        .iter()
+        .find(|reason| reason["code"] == "TRANSITIVE_DEPENDS_ON_DIRECT")
+    })
+    .ok_or_else(|| anyhow!("missing proc-macro dependency reason"))?;
+  assert_eq!(reason["proc_macro"], true);
+  assert_eq!(reason["host"], true);
   Ok(())
 }
 
@@ -850,12 +1050,19 @@ fn test_plan_propagates_normal_dependencies_with_exact_edge_evidence() -> Result
       .as_str()
       .is_some_and(|id| id.contains("normal-a"))
   );
-  assert_eq!(reason["selected_surfaces"], serde_json::json!(["build", "test"]));
+  assert_eq!(
+    reason["selected_surfaces"],
+    serde_json::json!(["bench", "build", "test"])
+  );
+  assert_eq!(
+    json["surfaces"]["bench"]["scope"]["crates"],
+    serde_json::json!(["normal-b"])
+  );
   Ok(())
 }
 
 #[test]
-fn test_plan_skips_optional_edges_inactive_in_default_resolution() -> Result<()> {
+fn test_plan_includes_optional_edges_outside_default_features() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-optional-inactive")?;
   ws.add_crate("optional-a", "0.1.0", &[])?;
   let optional_b = ws.add_crate("optional-b", "0.1.0", &[])?;
@@ -884,17 +1091,29 @@ optional-a = { path = "../optional-a", optional = true }
     String::from_utf8_lossy(&output.stderr)
   );
   let json: Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(json["impact"]["build_transitive_crates"], serde_json::json!([]));
+  assert_eq!(
+    json["impact"]["build_transitive_crates"],
+    serde_json::json!(["optional-b"])
+  );
   assert_eq!(json["impact"]["development_transitive_crates"], serde_json::json!([]));
   assert_eq!(
-    json["surfaces"]["build"]["scope"]["crates"],
-    serde_json::json!(["optional-a"])
+    json["surfaces"]["build"]["scope"]["mode"],
+    serde_json::json!("workspace")
   );
+  let reason = json["trace"]
+    .as_array()
+    .and_then(|trace| {
+      trace
+        .iter()
+        .find(|reason| reason["code"] == "TRANSITIVE_DEPENDS_ON_DIRECT")
+    })
+    .ok_or_else(|| anyhow!("missing optional dependency reason"))?;
+  assert_eq!(reason["optional"], true);
   Ok(())
 }
 
 #[test]
-fn test_plan_skips_target_edges_inactive_for_the_host_resolution() -> Result<()> {
+fn test_plan_includes_target_edges_outside_the_host_resolution() -> Result<()> {
   let ws = TestWorkspace::new_named("plan-target-inactive")?;
   ws.add_crate("target-a", "0.1.0", &[])?;
   let target_b = ws.add_crate("target-b", "0.1.0", &[])?;
@@ -919,12 +1138,23 @@ target-a = { path = "../target-a" }
     String::from_utf8_lossy(&output.stderr)
   );
   let json: Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(json["impact"]["build_transitive_crates"], serde_json::json!([]));
-  assert!(json["trace"].as_array().is_some_and(|trace| {
-    trace
-      .iter()
-      .all(|reason| reason["code"] != "TRANSITIVE_DEPENDS_ON_DIRECT")
-  }));
+  assert_eq!(
+    json["impact"]["build_transitive_crates"],
+    serde_json::json!(["target-b"])
+  );
+  assert_eq!(
+    json["surfaces"]["build"]["scope"]["mode"],
+    serde_json::json!("workspace")
+  );
+  let reason = json["trace"]
+    .as_array()
+    .and_then(|trace| {
+      trace
+        .iter()
+        .find(|reason| reason["code"] == "TRANSITIVE_DEPENDS_ON_DIRECT")
+    })
+    .ok_or_else(|| anyhow!("missing target dependency reason"))?;
+  assert_eq!(reason["target_predicate"], "thumbv7em-none-eabihf");
   Ok(())
 }
 
@@ -1011,7 +1241,7 @@ target-a = { path = "../target-a" }
   assert_eq!(reason["target_predicate"], "thumbv7em-none-eabihf");
   assert_eq!(
     reason["fallback_reasons"],
-    serde_json::json!(["historical_resolution_unavailable", "target_unfiltered"])
+    serde_json::json!(["historical_resolution_unavailable"])
   );
 
   let text_output = run_cargo_rail(&ws.path, &["rail", "plan", "--from", &base, "--to", &head, "--explain"])?;
@@ -1030,8 +1260,8 @@ target-a = { path = "../target-a" }
     "target predicate missing from text explain: {text}"
   );
   assert!(
-    text.contains("target_unfiltered"),
-    "fallback reason missing from text explain: {text}"
+    !text.contains("target_unfiltered"),
+    "declared target edges are not an unfiltered-resolution fallback: {text}"
   );
   assert!(
     text.contains("historical_resolution_unavailable"),
@@ -1188,7 +1418,7 @@ fn test_plan_output_file_overwrites_existing_content() -> Result<()> {
 
   let content = std::fs::read_to_string(&output_path)?;
   let parsed: Value = serde_json::from_str(&content)?;
-  assert_eq!(parsed["plan_contract_version"], Value::Number(5.into()));
+  assert_eq!(parsed["plan_contract_version"], Value::Number(6.into()));
   assert_eq!(
     content.matches("\"plan_contract_version\"").count(),
     1,
@@ -2117,7 +2347,7 @@ fn test_plan_github_projections() -> Result<()> {
   assert_eq!(scope_json["mode"], serde_json::json!("workspace"));
   assert_eq!(scope_json["crates"], serde_json::json!([]));
   assert_eq!(scope_json["cargo_args"], serde_json::json!(["--workspace"]));
-  assert_eq!(scope_json["scope_contract_version"], serde_json::json!(3));
+  assert_eq!(scope_json["scope_contract_version"], serde_json::json!(4));
   assert_eq!(scope_json["resolved_head"], serde_json::json!("WORKTREE"));
   assert!(
     !kv.contains_key("plan_json"),

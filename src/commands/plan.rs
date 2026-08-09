@@ -1,6 +1,5 @@
 //! `cargo rail plan` - deterministic file-first change planner.
 
-use crate::cargo::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, TargetSpecificationIdentity};
 use crate::change_detection::classify::{
   FileProfile, RC_FILE_KIND_CI, RC_FILE_KIND_CUSTOM, RC_FILE_KIND_DOCS, RC_FILE_KIND_INFRA_PATTERN,
   RC_FILE_KIND_REPO_CONFIG, RC_FILE_KIND_RUST_BENCH, RC_FILE_KIND_RUST_BUILD_SCRIPT, RC_FILE_KIND_RUST_EXAMPLE,
@@ -14,7 +13,9 @@ use crate::commands::common::{PlanOutputFormat, format_preview_list};
 use crate::config::{ConfidenceProfile, UnknownFilePolicy};
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
-use crate::graph::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
+use crate::graph::{
+  DEPENDENCY_UNIVERSE_MODE, DependencyUniverse, ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep,
+};
 use crate::utils::{config_fingerprint, toolchain_fingerprint};
 use crate::workspace::WorkspaceContext;
 use cargo_metadata::PackageId;
@@ -111,33 +112,19 @@ impl ResolvedRefs {
 pub(crate) struct PlanOutput {
   pub(crate) plan_contract_version: u32,
   pub(crate) inputs: PlanInputs,
+  pub(crate) resolution_universe: ResolutionUniverse,
   pub(crate) files: Vec<PlannedFile>,
   pub(crate) impact: PlanImpact,
   pub(crate) scope: ExecutionScope,
   pub(crate) surfaces: BTreeMap<String, SurfaceDecision>,
   pub(crate) trace: Vec<TraceReason>,
   pub(crate) reproducibility: Reproducibility,
-  #[serde(skip)]
-  semantic_seeds: HashSet<PackageId>,
-  #[serde(skip)]
-  direct_surface_packages: BTreeMap<String, BTreeSet<String>>,
-  #[serde(skip)]
-  workspace_surfaces: BTreeSet<String>,
 }
 
-impl PlanOutput {
-  pub(crate) fn has_semantic_seeds(&self) -> bool {
-    !self.semantic_seeds.is_empty()
-  }
-
-  pub(crate) fn semantic_seed_reason_ids(&self) -> Vec<u32> {
-    self
-      .trace
-      .iter()
-      .filter(|reason| reason.code == RC_SEMANTIC_INPUT_PACKAGES)
-      .map(|reason| reason.id)
-      .collect()
-  }
+#[derive(Debug, Serialize)]
+pub(crate) struct ResolutionUniverse {
+  pub(crate) mode: &'static str,
+  pub(crate) identity: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,9 +261,9 @@ const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIV
 const RC_SEMANTIC_INPUT_UNCHANGED: &str = "SEMANTIC_INPUT_UNCHANGED";
 const RC_SEMANTIC_INPUT_PACKAGES: &str = "SEMANTIC_INPUT_PACKAGES";
 const RC_SEMANTIC_INPUT_FALLBACK: &str = "SEMANTIC_INPUT_FALLBACK";
-const PLAN_CONTRACT_VERSION: u32 = 5;
-const SCOPE_CONTRACT_VERSION: u32 = 3;
-const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v5.schema.json");
+const PLAN_CONTRACT_VERSION: u32 = 6;
+const SCOPE_CONTRACT_VERSION: u32 = 4;
+const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v6.schema.json");
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +319,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     ResolvedRefs::Objects { .. } => None,
   };
   let historical_resolution_unavailable = snapshot.is_none();
+  let dependency_universe = DependencyUniverse::from_metadata(ctx.cargo().metadata(), ctx.git()?.repo_root())?;
   let changed_files = collect_changed_files(ctx, &refs)?;
   let semantic_head = match &refs {
     ResolvedRefs::Objects { to, .. } => Some(to.as_str()),
@@ -599,44 +587,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
     });
   }
 
-  let impact_views = snapshot
-    .filter(|_| !build_test_seed_package_ids.is_empty())
-    .map(|snapshot| {
-      snapshot
-        .targets()
-        .iter()
-        .filter(|target| target.is_build_target())
-        .map(|target| {
-          let target = match target.specification() {
-            TargetSpecificationIdentity::BuiltIn(target) => target.clone(),
-            TargetSpecificationIdentity::Custom(target) => target.name().to_string(),
-          };
-          ResolutionRequest::new(ResolutionPackages::Workspace, ResolutionFeatures::Default, Some(target))
-            .and_then(|request| snapshot.resolution_view(request))
-        })
-        .collect::<RailResult<Vec<_>>>()
-    })
-    .transpose()?
-    .unwrap_or_default();
-  let direct_surface_packages = surface_packages.clone();
-  let mut semantic_impact = ImpactPropagation::default();
-  if impact_views.is_empty() {
-    let active_impact_seeds = build_test_seed_package_ids
-      .iter()
-      .filter(|package_id| ctx.graph().package(package_id).is_some())
-      .cloned()
-      .collect();
-    semantic_impact.merge(ctx.graph().propagate_impact(&active_impact_seeds, false)?);
-  } else {
-    for view in impact_views {
-      let active_impact_seeds = build_test_seed_package_ids
-        .iter()
-        .filter(|package_id| view.graph().package(package_id).is_some())
-        .cloned()
-        .collect();
-      semantic_impact.merge(view.graph().propagate_impact(&active_impact_seeds, true)?);
-    }
-  }
+  let mut semantic_impact = dependency_universe.propagate(&build_test_seed_package_ids)?;
   if historical_resolution_unavailable {
     for step in &mut semantic_impact.steps {
       if !step
@@ -705,6 +656,10 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       confidence_profile: confidence_profile_name(confidence.profile).to_string(),
       confidence_profile_source: confidence.source.to_string(),
     },
+    resolution_universe: ResolutionUniverse {
+      mode: DEPENDENCY_UNIVERSE_MODE,
+      identity: dependency_universe.identity().to_string(),
+    },
     files: planned_files,
     impact,
     scope,
@@ -716,9 +671,6 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
       git_merge_base,
       git_shallow_clone: is_shallow_clone(ctx.workspace_root()),
     },
-    semantic_seeds: build_test_seed_package_ids,
-    direct_surface_packages,
-    workspace_surfaces,
   };
 
   validate_surface_reason_invariants(&output)?;
@@ -893,51 +845,6 @@ fn cargo_args_for_scope(mode: ExecutionScopeMode, crates: &[String]) -> Vec<Stri
 /// Render concise planner explain text used by command surfaces that consume planning.
 pub(crate) fn render_plan_explain(output: &PlanOutput) -> String {
   format_text(output, true)
-}
-
-/// Resolve one action's packages through its exact feature and target views.
-pub(crate) fn resolve_action_packages(
-  ctx: &WorkspaceContext,
-  output: &PlanOutput,
-  surface: &str,
-  features: ResolutionFeatures,
-  targets: &[String],
-) -> RailResult<Vec<String>> {
-  if output.workspace_surfaces.contains(surface) {
-    return Ok(ctx.graph().workspace_members().to_vec());
-  }
-
-  let mut packages = output.direct_surface_packages.get(surface).cloned().unwrap_or_default();
-  if !matches!(surface, "build" | "test" | "bench") || output.semantic_seeds.is_empty() {
-    return Ok(packages.into_iter().collect());
-  }
-
-  for target in targets {
-    let request = ResolutionRequest::new(ResolutionPackages::Workspace, features.clone(), Some(target.clone()))?;
-    let view = ctx.resolution_view(request)?;
-    let active_seeds = output
-      .semantic_seeds
-      .iter()
-      .filter(|package_id| view.graph().package(package_id).is_some())
-      .cloned()
-      .collect();
-    let impact = view.graph().propagate_impact(&active_seeds, true)?;
-    let package_ids = match surface {
-      "build" => impact.build,
-      "test" | "bench" => impact.build.union(&impact.development).cloned().collect(),
-      _ => BTreeSet::new(),
-    };
-    for package_id in package_ids {
-      let package = view.graph().package(&package_id).ok_or_else(|| {
-        RailError::message(format!(
-          "action impact package '{}' is missing from its resolution view",
-          package_id
-        ))
-      })?;
-      packages.insert(package.name.clone());
-    }
-  }
-  Ok(packages.into_iter().collect())
 }
 
 fn reason_description(code: &str) -> &'static str {
@@ -1169,8 +1076,8 @@ fn emit_semantic_impact_trace(
       ))
     })?;
     let surfaces = match step.domain {
-      ImpactDomain::Build => ["build", "test"].as_slice(),
-      ImpactDomain::Development => ["test", "bench"].as_slice(),
+      ImpactDomain::Build => ["bench", "build", "test"].as_slice(),
+      ImpactDomain::Development => ["bench", "test"].as_slice(),
     };
     for surface in surfaces {
       surface_packages
@@ -1393,8 +1300,8 @@ fn push_impact_trace(
     edge_kind: Some(dependency_kind_name(step.kind).to_string()),
     alias: Some(step.alias.clone()),
     target_predicate: step.target.clone(),
-    optional: step.optional,
-    uses_default_features: step.uses_default_features,
+    optional: Some(step.optional),
+    uses_default_features: Some(step.uses_default_features),
     proc_macro: step.proc_macro,
     host: step.host,
     features: step.features.clone(),
@@ -1419,9 +1326,7 @@ fn dependency_kind_name(kind: cargo_metadata::DependencyKind) -> &'static str {
 fn fallback_reason(fallback: ImpactFallback) -> &'static str {
   match fallback {
     ImpactFallback::HistoricalResolutionUnavailable => "historical_resolution_unavailable",
-    ImpactFallback::TargetUnfiltered => "target_unfiltered",
     ImpactFallback::UnknownDependencyKind => "dependency_kind_unknown",
-    ImpactFallback::DeclarationUnknown => "declaration_unknown",
   }
 }
 
