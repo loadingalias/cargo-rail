@@ -1,7 +1,7 @@
 # cargo-rail configuration
 # For projects WITHOUT a task runner
 #
-# Strategy: cargo rail run owns planning and execution.
+# Strategy: cargo-rail owns scope; Cargo and CI own execution.
 
 [change-detection]
 infrastructure = [
@@ -15,31 +15,6 @@ infrastructure = [
 confidence_profile = "balanced"
 unknown_file_policy = "strict"
 
-# Custom surfaces (optional)
+# Custom gating surfaces (optional)
 # [change-detection.custom]
 # stress_test = ["stress-test/**"]
-
-[run]
-default_profile = "local"
-
-# Workflow-to-profile mapping for CI
-[run.workflow]
-commit = "ci"
-nightly = "nightly"
-
-# Local development: just tests
-[run.profile.local]
-actions = ["test"]
-baseline = { kind = "merge-base" }
-
-# CI: build + test
-[run.profile.ci]
-actions = ["build", "test"]
-run_args = ["{cargo_args}"]
-baseline = { kind = "merge-base" }
-
-# Nightly: full validation
-[run.profile.nightly]
-actions = ["build", "test", "docs", "bench"]
-run_args = ["{cargo_args}"]
-baseline = { kind = "merge-base" }

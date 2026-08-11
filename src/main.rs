@@ -87,20 +87,17 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
     Err(error) => return Err(error),
   };
 
-  // Build workspace context (single-load pattern). Hermetic execution performs
-  // its explicit fetch boundary before any full Cargo resolution is loaded.
+  // Build one workspace context for the selected command.
   let workspace_capture_started = Instant::now();
   let context = prepared.build(&workspace_root);
   cargo_rail::instrumentation::record_workspace_capture_cargo_metadata(workspace_capture_started);
-  let Some((command, ctx, pre_context_cache_request)) = context? else {
-    return Ok(());
-  };
+  let (command, ctx) = context?;
   if let Some(snapshot_id) = ctx.snapshot_id() {
     cargo_rail::instrumentation::record_snapshot_id(snapshot_id.to_string());
   }
 
   // Dispatch to command handler
-  commands::dispatch(command, &ctx, pre_context_cache_request)
+  commands::dispatch(command, &ctx)
 }
 
 fn exit_with_error(err: RailError) -> ! {

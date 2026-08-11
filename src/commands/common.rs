@@ -183,28 +183,6 @@ impl PlanOutputFormat {
   }
 }
 
-/// Output format for a dry-run action graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionOutputFormat {
-  /// Human-readable execution or preview output (default).
-  #[default]
-  Text,
-  /// Versioned machine-readable action plan.
-  Json,
-  /// GitHub Actions key/value output containing the ordered action IDs.
-  #[value(name = "github")]
-  #[serde(rename = "github")]
-  GitHub,
-}
-
-impl ActionOutputFormat {
-  /// Whether this format emits structured machine output.
-  pub const fn is_json_like(self) -> bool {
-    !matches!(self, Self::Text)
-  }
-}
-
 /// Builder for split/sync configurations
 ///
 /// Centralizes the logic for selecting crates (by name, --all, etc.)

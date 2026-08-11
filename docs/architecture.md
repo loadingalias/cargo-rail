@@ -10,8 +10,8 @@ Cargo-Rail has five workflows:
 | Workflow | Authority | Result |
 |---|---|---|
 | `unify` | Resolved Cargo graph plus compiler evidence | A checked or applied manifest mutation plan |
-| `plan` / `run` | Changed source plus the declared dependency universe | Selected surfaces, package scopes, and ordered actions |
-| caching | Exact action inputs and verified result bytes | Diagnostic reuse, one compiler-result restore, or one whole-action restore |
+| `plan` | Changed source plus the declared dependency universe | Selected surfaces and typed package scopes |
+| caching | Exact compiler inputs and verified result bytes | Diagnostic reuse or one compiler-result restore |
 | `change` / `release` | Reviewed change intent plus exact Git and registry state | Versions, changelogs, publications, and durable recovery state |
 | `split` / `sync` | Captured source, Git history, and split ownership | Standalone history or mapped changes with origin evidence |
 
@@ -33,15 +33,14 @@ Source capture happens before metadata can create generated state. Snapshot-boun
 before mutation. Commands derive narrower views from the context; they do not reload an independent workspace model
 for convenience.
 
-## Planning and execution
+## Planning and direct consumption
 
 `plan` owns change classification, crate ownership, conservative reverse dependency impact, surface selection, and
 package scope. Its declared dependency universe includes optional and target-gated edges without changing the exact
-Cargo graph. `run` consumes final surface scope, expands direct argv arrays, binds exact action-resolution evidence,
-validates the complete action graph, and only then starts processes.
+Cargo graph. Cargo, cargo-nextest, Just, and CI consume each surface's final `cargo_args` array directly.
 
-Text explanations, JSON and GitHub projections, dry-run previews, decision receipts, and execution all come from this
-protocol. See [Planning and execution](planning.md).
+Text explanations, JSON, schema, hashing, and GitHub projections all come from this protocol. See
+[Planning](planning.md).
 
 ## Mutation and external effects
 
@@ -63,21 +62,20 @@ the operation's ownership.
 
 A cache lookup is never proof by itself. Cargo-Rail revalidates the inputs, action/result binding, and stored bytes
 owned by that cache layer before reuse. Unsupported or incomplete evidence bypasses reuse and executes the normal tool.
-The three cache layers and their current support are documented in [Caching](caching.md).
+The compiler-evidence and native compiler-result layers are documented in [Caching](caching.md).
 
 ## Compiler process boundary
 
 Compiler roles are classified once, before Clap and workspace capture. The invocation boundary captures Cargo's exact
 program and argv. Transparent execution preserves the live working directory, inherited non-private environment,
 wrapper order, streams, signals, and exit status. The analysis role adds only its owned lint or observation-output
-arguments. Cache and compiler-fact domains receive narrow invocation inputs; neither constructs a run action or
+arguments. Cache and compiler-fact domains receive narrow invocation inputs; neither constructs a command plan or
 `WorkspaceContext` inside a rustc process.
 
 The wrapper order is Cargo-Rail cache, analysis workspace driver, explicitly compatible existing workspace wrapper,
 then the selected compiler. The cache and fact domains retain separate identities and authority. Analysis uses a
 private capability bound to one source root and observation directory. Shared immutable objects and output manifests
-belong to `cache/`; whole-action policy remains in `hermetic/`, and compiler sessions and evidence remain in
-`compiler/`.
+belong to `cache/`; compiler sessions and evidence remain in `compiler/`.
 
 ## Module ownership
 
@@ -86,10 +84,8 @@ belong to `cache/`; whole-action policy remains in `hermetic/`, and compiler ses
 | `workspace/`, `source/` | Captured authority and derived workspace views |
 | `cargo/`, `graph/`, `toml/` | Cargo resolution, graph algorithms, and lossless editing |
 | `change_detection/`, `commands/plan.rs` | File semantics, impact, surfaces, and scope |
-| `action.rs`, `action_key.rs`, `commands/run.rs` | Action expansion, validation, identity, and execution |
 | `compiler/` | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
 | `cache/` | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation |
-| `hermetic/` | Whole-action isolation, policy, validation, and reproducibility proof |
 | `mutation/` | Plan/apply drift checks, authorized paths, and receipts |
 | `release/`, `split/`, `sync/` | Workflows that cross repository or publication boundaries |
 | `git/`, source path types, process helpers | External capabilities and containment |

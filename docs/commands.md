@@ -5,9 +5,9 @@
 > Regenerate with: `./scripts/docs/generate.sh`
 
 This is the exhaustive CLI surface. Start with `cargo rail plan --merge-base --explain` to inspect affected work,
-then use `cargo rail run --merge-base --dry-run --print-cmd` to preview execution. Adopt dependency, release, and
-split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo state in
-separate tools.
+then pass each selected surface's typed Cargo arguments to Cargo, cargo-nextest, Just, or CI. Adopt dependency,
+release, and split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo
+state in separate tools.
 
 ---
 
@@ -21,8 +21,8 @@ dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
   cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
-  cargo rail run --merge-base --dry-run --print-cmd  # Preview selected actions
-  cargo rail run --merge-base --profile ci        # Run affected CI actions
+  cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
 
 Docs: https://github.com/loadingalias/cargo-rail
@@ -30,8 +30,7 @@ Docs: https://github.com/loadingalias/cargo-rail
 Usage: cargo rail [OPTIONS] <COMMAND>
 
 Commands:
-  run          Execute planner-selected actions
-  doctor       Inspect action hermeticity and native-cache capability
+  doctor       Inspect native compiler-cache capability
   cache        Inspect or reclaim explicitly scoped cache state
   plan         Build a deterministic file-first change plan
   unify        Unify workspace dependencies (replaces workspace-hack crates)
@@ -70,145 +69,14 @@ Options:
 
 ---
 
-## cargo rail run
-
-```
-Execute planner-selected actions
-
-Usage: cargo rail run [OPTIONS] [-- <RUN_ARGS>...]
-
-Arguments:
-  [RUN_ARGS]...
-          Pass harness args after `--` for tests; runner args for other actions
-
-Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --since <SINCE>
-          Git ref to compare against (auto-detects default branch)
-
-      --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
-
-      --merge-base
-          Use merge-base with default branch (better for feature branches)
-
-  -a, --all
-          Skip change detection and run all workspace crates
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --action <ACTION>
-          Action(s) to execute (repeatable; --surface is a compatibility alias)
-
-          [alias: --surface]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-      --profile <PROFILE>
-          Named profile to map to one or more actions
-
-      --workflow <WORKFLOW>
-          Named workflow mapped to a profile via `[run.workflow]`
-
-      --dry-run
-          Preview selected execution without spawning subprocesses
-
-      --hermetic
-          Execute supported Rust actions in fresh isolated roots
-
-      --no-cache
-          Disable all Cargo-Rail build-result cache reads and writes for this execution
-
-  -f, --format <FORMAT>
-          Dry-run action plan format (json/github require --dry-run)
-
-          Possible values:
-          - text:   Human-readable execution or preview output (default)
-          - json:   Versioned machine-readable action plan
-          - github: GitHub Actions key/value output containing the ordered action IDs
-
-          [default: text]
-
-      --generated <GENERATED>
-          Generated-output behavior
-
-          Possible values:
-          - check:      Run each generator's read-only staleness check
-          - regenerate: Update each generator's declared outputs
-
-          [default: regenerate]
-
-      --print-cmd
-          Print command(s) prior to execution
-
-      --explain
-          Explain why actions and targets were selected
-
-      --ignore-bin-crates
-          Ignore binary-only crates (packages with `[[bin]]` but no lib target)
-
-      --skip-nextest
-          Disable automatic use of cargo-nextest
-
-      --test-runner <TEST_RUNNER>
-          Test runner backend (auto selects nextest when available)
-
-          Possible values:
-          - auto:    Prefer nextest when installed and otherwise use Cargo
-          - cargo:   Require `cargo test`
-          - nextest: Require `cargo nextest run`
-
-          [default: auto]
-
-      --cargo-test-arg <ARG>
-          Pass an option only to `cargo test` (repeatable)
-
-      --nextest-arg <ARG>
-          Pass an option only to `cargo nextest run` (repeatable)
-
-      --test-filter <FILTER>
-          Portable test-name filter placed before the test-binary separator
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Examples:
-  cargo rail run                              # Execute planner-selected test action
-  cargo rail run --merge-base                 # Compare from branch point (CI)
-  cargo rail run --action build --action test
-  cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
-  cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
-  cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
-  cargo rail run --all --action test          # Force full test run
-  cargo rail run --all --action build --hermetic  # Prove a locked/offline Cargo check
-  cargo rail run --dry-run --print-cmd        # Preview exact execution
-  cargo rail run --dry-run -f json            # Versioned CI action plan
-  cargo rail run --dry-run -f github          # GitHub Actions key=value plan
-  cargo rail run --action codegen --generated check
-  cargo rail run --test-filter parser         # Portable test-name filter
-  cargo rail run --cargo-test-arg=--all-features --test-runner cargo
-  cargo rail run --nextest-arg=-P --nextest-arg=commit
-  cargo rail run -- --nocapture               # Pass harness args after --
-```
-
----
-
 ## cargo rail doctor
 
 ```
-Inspect action hermeticity and native-cache capability
+Inspect native compiler-cache capability
 
 Usage: cargo rail doctor [OPTIONS] <COMMAND>
 
 Commands:
-  hermeticity   Explain action-key eligibility and every incomplete input boundary
   native-cache  Inspect the exact native-cache compiler identity
   help          Print this message or the help of the given subcommand(s)
 
@@ -219,65 +87,6 @@ Options:
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
   -V, --version                Print version
-```
-
----
-
-### cargo rail doctor hermeticity
-
-```
-Explain action-key eligibility and every incomplete input boundary
-
-Usage: cargo rail doctor hermeticity [OPTIONS]
-
-Options:
-      --action <ACTION>
-          Action(s) to inspect (repeatable)
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
-
-      --profile <PROFILE>
-          Named profile to inspect
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --workflow <WORKFLOW>
-          Named workflow mapped to a profile via `[run.workflow]`
-
-      --generated <GENERATED>
-          Generated-output behavior to inspect
-
-          Possible values:
-          - check:      Run each generator's read-only staleness check
-          - regenerate: Update each generator's declared outputs
-
-          [default: regenerate]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-      --ignore-bin-crates
-          Ignore binary-only crates
-
-  -f, --format <FORMAT>
-          Report format
-
-          Possible values:
-          - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
-
-          [default: text]
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---

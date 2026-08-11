@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
@@ -36,13 +36,6 @@ struct Counters {
   cas_bytes_written: AtomicU64,
   cas_bytes_read: AtomicU64,
   cas_bytes_restored: AtomicU64,
-  hermetic_cargo_executions: AtomicU64,
-  hermetic_compiler_units: AtomicU64,
-  hermetic_fetch_executions: AtomicU64,
-  hermetic_cargo_probes: AtomicU64,
-  hermetic_rustc_probes: AtomicU64,
-  hermetic_rustdoc_probes: AtomicU64,
-  hermetic_platform_probes: AtomicU64,
 }
 
 impl Counters {
@@ -68,13 +61,6 @@ impl Counters {
       cas_bytes_written: AtomicU64::new(0),
       cas_bytes_read: AtomicU64::new(0),
       cas_bytes_restored: AtomicU64::new(0),
-      hermetic_cargo_executions: AtomicU64::new(0),
-      hermetic_compiler_units: AtomicU64::new(0),
-      hermetic_fetch_executions: AtomicU64::new(0),
-      hermetic_cargo_probes: AtomicU64::new(0),
-      hermetic_rustc_probes: AtomicU64::new(0),
-      hermetic_rustdoc_probes: AtomicU64::new(0),
-      hermetic_platform_probes: AtomicU64::new(0),
     }
   }
 
@@ -101,13 +87,6 @@ impl Counters {
       cas_bytes_written: self.cas_bytes_written.load(Ordering::Relaxed),
       cas_bytes_read: self.cas_bytes_read.load(Ordering::Relaxed),
       cas_bytes_restored: self.cas_bytes_restored.load(Ordering::Relaxed),
-      hermetic_cargo_executions: self.hermetic_cargo_executions.load(Ordering::Relaxed),
-      hermetic_compiler_units: self.hermetic_compiler_units.load(Ordering::Relaxed),
-      hermetic_fetch_executions: self.hermetic_fetch_executions.load(Ordering::Relaxed),
-      hermetic_cargo_probes: self.hermetic_cargo_probes.load(Ordering::Relaxed),
-      hermetic_rustc_probes: self.hermetic_rustc_probes.load(Ordering::Relaxed),
-      hermetic_rustdoc_probes: self.hermetic_rustdoc_probes.load(Ordering::Relaxed),
-      hermetic_platform_probes: self.hermetic_platform_probes.load(Ordering::Relaxed),
     }
   }
 }
@@ -115,9 +94,7 @@ impl Counters {
 struct PhaseCounters {
   cli_pre_context_preparation: PhaseCounter,
   workspace_capture_cargo_metadata: PhaseCounter,
-  action_expansion_key_construction: PhaseCounter,
   sysroot_fingerprinting: PhaseCounter,
-  cargo_child_execution: PhaseCounter,
 }
 
 impl PhaseCounters {
@@ -125,9 +102,7 @@ impl PhaseCounters {
     Self {
       cli_pre_context_preparation: PhaseCounter::new(),
       workspace_capture_cargo_metadata: PhaseCounter::new(),
-      action_expansion_key_construction: PhaseCounter::new(),
       sysroot_fingerprinting: PhaseCounter::new(),
-      cargo_child_execution: PhaseCounter::new(),
     }
   }
 
@@ -135,9 +110,7 @@ impl PhaseCounters {
     PhaseSnapshots {
       cli_pre_context_preparation: self.cli_pre_context_preparation.snapshot(),
       workspace_capture_cargo_metadata: self.workspace_capture_cargo_metadata.snapshot(),
-      action_expansion_key_construction: self.action_expansion_key_construction.snapshot(),
       sysroot_fingerprinting: self.sysroot_fingerprinting.snapshot(),
-      cargo_child_execution: self.cargo_child_execution.snapshot(),
     }
   }
 }
@@ -172,9 +145,7 @@ impl PhaseCounter {
 struct PhaseSnapshots {
   cli_pre_context_preparation: PhaseSnapshot,
   workspace_capture_cargo_metadata: PhaseSnapshot,
-  action_expansion_key_construction: PhaseSnapshot,
   sysroot_fingerprinting: PhaseSnapshot,
-  cargo_child_execution: PhaseSnapshot,
 }
 
 #[derive(Serialize)]
@@ -206,83 +177,11 @@ struct CounterSnapshot {
   cas_bytes_written: u64,
   cas_bytes_read: u64,
   cas_bytes_restored: u64,
-  hermetic_cargo_executions: u64,
-  hermetic_compiler_units: u64,
-  hermetic_fetch_executions: u64,
-  hermetic_cargo_probes: u64,
-  hermetic_rustc_probes: u64,
-  hermetic_rustdoc_probes: u64,
-  hermetic_platform_probes: u64,
-}
-
-/// Former compiler-wrapper phases retained as zero-cost call-site labels.
-/// Transparent compiler processes no longer report telemetry through a parent
-/// runner, so collecting these values would create hot-path work with no owner.
-#[derive(Clone, Copy)]
-pub(crate) enum NativeCacheWrapperPhase {
-  SessionLoad,
-  ArgumentNormalizationInputCapture,
-  BypassClassification,
-  ActionCapture,
-  CasOpen,
-  ActionLookup,
-  ColdResultPreparation,
-  ColdResultAdmission,
-  FinalActionRevalidation,
-  ResultRestoreMaterialization,
-  CargoOutputPublication,
-}
-
-/// Former per-phase byte counters retained until cache call sites are flattened.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct NativeCacheWrapperWork {
-  pub(crate) bytes_hashed: u64,
-  pub(crate) cache_bytes_read: u64,
-  pub(crate) cache_bytes_written: u64,
-  pub(crate) bytes_restored: u64,
-}
-
-/// Zero-state anchor for the transparent compiler entry point.
-pub(crate) struct NativeCacheWrapperProcessStart;
-
-impl NativeCacheWrapperProcessStart {
-  pub(crate) fn capture() -> Self {
-    Self
-  }
-
-  pub(crate) fn finish_context_load(self, _enabled: bool) -> NativeCacheWrapperTrace {
-    NativeCacheWrapperTrace
-  }
-}
-
-/// Zero-state compatibility shim for cache instrumentation call sites.
-pub(crate) struct NativeCacheWrapperTrace;
-
-impl NativeCacheWrapperTrace {
-  pub(crate) fn disabled() -> Self {
-    Self
-  }
-
-  pub(crate) fn start(&self, _phase: NativeCacheWrapperPhase) -> Option<()> {
-    None
-  }
-
-  pub(crate) fn finish(&mut self, _started: Option<()>, work: NativeCacheWrapperWork) {
-    let NativeCacheWrapperWork {
-      bytes_hashed,
-      cache_bytes_read,
-      cache_bytes_written,
-      bytes_restored,
-    } = work;
-    let _ = (bytes_hashed, cache_bytes_read, cache_bytes_written, bytes_restored);
-  }
 }
 
 #[derive(Clone, Copy)]
 enum DiagnosticPhase {
-  ActionExpansionKeyConstruction,
   SysrootFingerprinting,
-  CargoChildExecution,
 }
 
 /// Active timer for one fixed diagnostic phase.
@@ -306,9 +205,7 @@ impl Drop for DiagnosticPhaseGuard {
       return;
     };
     let counter = match self.phase {
-      DiagnosticPhase::ActionExpansionKeyConstruction => &counters.phases.action_expansion_key_construction,
       DiagnosticPhase::SysrootFingerprinting => &counters.phases.sysroot_fingerprinting,
-      DiagnosticPhase::CargoChildExecution => &counters.phases.cargo_child_execution,
     };
     counter.record(started);
   }
@@ -402,16 +299,8 @@ pub fn record_workspace_capture_cargo_metadata(started: Instant) {
   }
 }
 
-pub(crate) fn action_expansion_key_construction_phase() -> DiagnosticPhaseGuard {
-  DiagnosticPhaseGuard::start(DiagnosticPhase::ActionExpansionKeyConstruction)
-}
-
 pub(crate) fn sysroot_fingerprinting_phase() -> DiagnosticPhaseGuard {
   DiagnosticPhaseGuard::start(DiagnosticPhase::SysrootFingerprinting)
-}
-
-pub(crate) fn cargo_child_execution_phase() -> DiagnosticPhaseGuard {
-  DiagnosticPhaseGuard::start(DiagnosticPhase::CargoChildExecution)
 }
 
 pub(crate) fn record_cargo_metadata_load(target_view: bool) {
@@ -482,34 +371,4 @@ pub(crate) fn record_cas_read(bytes: u64) {
 #[cfg(any(unix, windows, test))]
 pub(crate) fn record_cas_restore(bytes: u64) {
   add(|counters| &counters.cas_bytes_restored, bytes);
-}
-
-pub(crate) fn record_hermetic_cargo_execution() {
-  add(|counters| &counters.hermetic_cargo_executions, 1);
-}
-
-pub(crate) fn record_hermetic_compiler_units(units: usize) {
-  add(|counters| &counters.hermetic_compiler_units, amount(units));
-}
-
-pub(crate) fn record_hermetic_fetch_execution() {
-  add(|counters| &counters.hermetic_fetch_executions, 1);
-}
-
-pub(crate) fn record_hermetic_toolchain_probe(program: &std::ffi::OsStr) {
-  let name = std::path::Path::new(program)
-    .file_stem()
-    .and_then(std::ffi::OsStr::to_str)
-    .unwrap_or_default();
-  match name {
-    "cargo" => add(|counters| &counters.hermetic_cargo_probes, 1),
-    "rustc" => add(|counters| &counters.hermetic_rustc_probes, 1),
-    "rustdoc" => add(|counters| &counters.hermetic_rustdoc_probes, 1),
-    _ => {}
-  }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn record_hermetic_platform_probe() {
-  add(|counters| &counters.hermetic_platform_probes, 1);
 }

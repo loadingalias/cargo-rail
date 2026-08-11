@@ -41,12 +41,6 @@ pub(crate) struct ToolchainExecutableIdentities {
   limitations: BTreeSet<String>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ToolchainExecutableScope {
-  Compilation,
-  Documentation,
-}
-
 impl ExecutableIdentity {
   /// Resolve and digest the executable that `Command` would select.
   pub(crate) fn capture(selection: &OsStr, current_dir: &Path, source_root: &Path) -> RailResult<Self> {
@@ -58,17 +52,13 @@ impl ExecutableIdentity {
     serde_json::to_vec(self).map_err(Into::into)
   }
 
-  /// Fail-closed limitations that prevent this executable alone from proving a hermetic process.
+  /// Fail-closed limitations that prevent this executable from proving an exact process identity.
   pub(crate) fn limitations(&self) -> impl Iterator<Item = &str> {
     self.limitations.iter().map(String::as_str)
   }
 
   pub(crate) fn content_digest(&self) -> &str {
     &self.content_digest
-  }
-
-  pub(crate) fn is_executable(&self) -> bool {
-    self.executable
   }
 
   pub(crate) fn same_resolved_file(&self, other: &Self) -> bool {
@@ -90,7 +80,6 @@ impl ToolchainExecutableIdentities {
     toolchain: &crate::cargo::ToolchainIdentity,
     current_dir: &Path,
     source_root: &Path,
-    _scope: ToolchainExecutableScope,
   ) -> RailResult<Self> {
     let mut captured = std::collections::BTreeMap::<PathBuf, ExecutableIdentity>::new();
     let mut capture = |program: &OsStr| -> RailResult<ExecutableIdentity> {
@@ -161,16 +150,8 @@ impl ToolchainExecutableIdentities {
     })
   }
 
-  pub(crate) fn cargo(&self) -> &ExecutableIdentity {
-    &self.cargo
-  }
-
   pub(crate) fn rustc(&self) -> &ExecutableIdentity {
     &self.rustc
-  }
-
-  pub(crate) fn rustdoc(&self) -> Option<&ExecutableIdentity> {
-    self.rustdoc.as_ref()
   }
 
   pub(crate) fn rustc_wrapper(&self) -> Option<&ExecutableIdentity> {
@@ -179,10 +160,6 @@ impl ToolchainExecutableIdentities {
 
   pub(crate) fn rustc_workspace_wrapper(&self) -> Option<&ExecutableIdentity> {
     self.rustc_workspace_wrapper.as_ref()
-  }
-
-  pub(crate) fn cargo_implementation(&self) -> Option<&ExecutableIdentity> {
-    self.cargo_implementation.as_ref()
   }
 
   pub(crate) fn rustc_implementation(&self) -> Option<&ExecutableIdentity> {

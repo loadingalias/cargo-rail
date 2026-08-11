@@ -109,7 +109,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() -> Result<(
   )?;
   assert!(status.status.success(), "installation status failed: {status:?}");
   let status = json(&status)?;
-  assert_eq!(status["status"]["schema_version"], 8);
+  assert_eq!(status["status"]["schema_version"], 9);
   assert_eq!(status["status"]["installation"]["state"], "installed");
   assert_eq!(status["status"]["installation"]["healthy"], true);
   let wrapper = PathBuf::from(
@@ -244,7 +244,7 @@ fn cache_status_labels_retained_remote_configuration_as_inactive() -> Result<()>
     .output()?;
   assert!(output.status.success(), "configuration-only status failed: {output:?}");
   let value = json(&output)?;
-  assert_eq!(value["status"]["schema_version"], 8);
+  assert_eq!(value["status"]["schema_version"], 9);
   assert_eq!(
     value["status"]["remote"]["activation"],
     "configuration_only_transparent_cache_is_local"

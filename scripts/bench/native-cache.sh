@@ -430,7 +430,6 @@ else
       workloads: $workloads,
       lanes: $lanes,
       interleaving: "deterministic rotation by workload and round",
-      retired_lanes: [{lane: "runner-owned-cache", reason: "runner ownership removed"}],
       qualification: {
         rust_action_coverage_gate: "same_and_faster_or_four_dimensional_more_and_faster",
         minimum_samples: 5,

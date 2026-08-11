@@ -55,7 +55,7 @@ directory.
 
 - `environment.json` binds the commit, worktree diff, release binary, harness, Cargo, rustc, pinned sccache, host, and
   local-only authority.
-- `run.json` binds workloads, lanes, sample count, rotation, retired runner lane, and qualification thresholds.
+- `run.json` binds workloads, lanes, sample count, rotation, and qualification thresholds.
 - `coverage/<workload>/coverage.json` is the authoritative per-action coverage and cold-cost join. It records the Cargo
   census, Cargo-Rail and sccache outcomes, matched/extra/missing actions, ambiguity, logical output roles/bytes, and one
   complete serial cold timing record per rustc action. Timing claims are invalid unless this ledger is complete, has
@@ -94,8 +94,8 @@ even when no performance claim is made.
 
 ## Qualification claims
 
-Earlier runner-owned, pre-linked, and operational L2 measurements describe removed architectures and are not evidence
-for this contract. Publish a scoped performance claim only from one accepted five-sample corpus whose summary reports
+Earlier pre-linked and operational L2 measurements describe different architectures and are not evidence for this
+contract. Publish a scoped performance claim only from one accepted five-sample corpus whose summary reports
 `performance_qualified: true`. Retain a failed corpus as the canonical result for that exact worktree and host; do not
 replace it with a larger population or combine it with another run.
 

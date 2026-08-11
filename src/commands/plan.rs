@@ -169,7 +169,7 @@ pub(crate) struct PlanImpact {
 
 /// Execution-focused projection of the planner contract.
 ///
-/// This is the stable handoff for runners and CI transport layers.
+/// This is the stable handoff for Cargo, nextest, Just, and CI consumers.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ExecutionScope {
   pub(crate) scope_contract_version: u32,
@@ -840,11 +840,6 @@ fn cargo_args_for_scope(mode: ExecutionScopeMode, crates: &[String]) -> Vec<Stri
       .flat_map(|crate_name| ["-p".to_string(), crate_name.clone()])
       .collect(),
   }
-}
-
-/// Render concise planner explain text used by command surfaces that consume planning.
-pub(crate) fn render_plan_explain(output: &PlanOutput) -> String {
-  format_text(output, true)
 }
 
 fn reason_description(code: &str) -> &'static str {

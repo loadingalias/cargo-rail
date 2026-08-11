@@ -15,7 +15,6 @@
 //!
 //! ## Inspection
 //! - **plan**: Deterministic file-first planner (primary planning surface)
-//! - **run**: Surface-driven executor using planner contract
 //!
 //! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
 
@@ -43,8 +42,6 @@ pub mod init;
 pub mod plan;
 /// Release planning and publishing
 pub mod release;
-/// Surface-driven execution built on planner contract
-pub mod run;
 /// Split crates into standalone repositories
 pub mod split;
 /// Bidirectional sync between monorepo and split repos
@@ -73,7 +70,6 @@ pub use release::{
   run_release_check, run_release_finalize, run_release_init, run_release_plan, run_release_publish,
   run_release_status_standalone,
 };
-pub use run::run_run;
 pub use split::{run_split, run_split_init};
 pub use sync::run_sync;
 pub use unify::{run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_undo};
@@ -91,146 +87,35 @@ pub enum PreContextDispatch {
   NeedsContext(PreparedContext),
 }
 
-#[derive(Clone, Copy)]
-enum ContextPreparation {
-  Standard,
-  HermeticBuild,
-}
-
 /// A command paired with the context-construction contract it requires.
 #[doc(hidden)]
 pub struct PreparedContext {
   command: Box<Commands>,
-  preparation: ContextPreparation,
-  pre_context_cache_request: bool,
   config_override: Option<PathBuf>,
 }
 
 impl PreparedContext {
-  fn new(command: Commands, pre_context_cache_request: bool, config_override: Option<&Path>) -> RailResult<Self> {
-    let preparation = match &command {
-      Commands::Run {
-        actions,
-        profile,
-        workflow,
-        dry_run: false,
-        hermetic: true,
-        format,
-        run_args,
-        ..
-      } => {
-        if format.is_json_like() {
-          return Err(crate::error::RailError::with_help(
-            "structured run output is a non-executing action plan",
-            "add --dry-run when using --format json or --format github",
-          ));
-        }
-        if profile.is_some()
-          || workflow.is_some()
-          || actions.is_empty()
-          || actions.iter().any(|action| action != "build")
-        {
-          let requested = actions.first().map_or_else(
-            || profile.as_deref().or(workflow.as_deref()).unwrap_or("default"),
-            String::as_str,
-          );
-          let kind =
-            crate::action::ActionKind::from_name(requested).map_or("configured", crate::action::ActionKind::as_str);
-          return Err(crate::error::RailError::with_help(
-            format!("hermetic execution does not yet support action '{requested}' ({kind})"),
-            "use the explicit built-in build action (`--action build`); other action classes remain explicitly uncacheable",
-          ));
-        }
-        validate_hermetic_run_arguments(run_args)?;
-        ContextPreparation::HermeticBuild
-      }
-      _ => ContextPreparation::Standard,
-    };
+  fn new(command: Commands, config_override: Option<&Path>) -> RailResult<Self> {
     Ok(Self {
       command: Box::new(command),
-      preparation,
-      pre_context_cache_request,
       config_override: config_override.map(Path::to_path_buf),
     })
   }
 
   /// Build the exact workspace context required by this command.
   #[doc(hidden)]
-  pub fn build(self, workspace_root: &Path) -> RailResult<Option<(Commands, WorkspaceContext, bool)>> {
-    let context = match self.preparation {
-      ContextPreparation::Standard if self.command.requires_workspace_snapshot() => {
-        WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
-      }
-      ContextPreparation::Standard => WorkspaceContext::build_with_source_capture_and_config(
+  pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext)> {
+    let context = if self.command.requires_workspace_snapshot() {
+      WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
+    } else {
+      WorkspaceContext::build_with_source_capture_and_config(
         workspace_root,
         self.command.requires_worktree_source_capture(),
         self.config_override.as_deref(),
-      ),
-      ContextPreparation::HermeticBuild => {
-        let bootstrap = crate::hermetic::prepare_bootstrap(workspace_root)?;
-        WorkspaceContext::build_with_hermetic_snapshot_and_config(
-          workspace_root,
-          bootstrap,
-          self.config_override.as_deref(),
-        )
-      }
-    };
-    let context = match context {
-      Ok(context) => context,
-      Err(error) => {
-        if run::try_complete_codegen_backend_probe_failure(&self.command, workspace_root, &error)? {
-          return Ok(None);
-        }
-        return Err(error);
-      }
-    };
-    Ok(Some((*self.command, context, self.pre_context_cache_request)))
-  }
-}
-
-fn validate_hermetic_run_arguments(arguments: &[String]) -> RailResult<()> {
-  let mut blocked = std::collections::BTreeSet::new();
-  for argument in arguments {
-    let option = argument.split_once('=').map_or(argument.as_str(), |(option, _)| option);
-    if argument == "--"
-      || matches!(
-        option,
-        "--all"
-          | "--artifact-dir"
-          | "--build-dir"
-          | "--config"
-          | "--exclude"
-          | "--future-incompat-report"
-          | "--lockfile-path"
-          | "--manifest-path"
-          | "--out-dir"
-          | "--package"
-          | "--target-dir"
-          | "--timings"
-          | "--unit-graph"
-          | "--workspace"
-          | "-C"
-          | "-Z"
-          | "-m"
-          | "-p"
       )
-      || ["-C", "-Z", "-m", "-p"]
-        .iter()
-        .any(|prefix| argument.starts_with(prefix) && !argument.starts_with("--"))
-    {
-      blocked.insert(option);
-    }
+    };
+    Ok((*self.command, context?))
   }
-  if blocked.is_empty() {
-    return Ok(());
-  }
-  Err(crate::error::RailError::with_help(
-    format!(
-      "hermetic Cargo arguments override the modeled action boundary: {}",
-      blocked.into_iter().collect::<Vec<_>>().join(", ")
-    ),
-    "select packages with cargo-rail's --all/change scope; workspace, output, configuration, and raw rustc overrides remain explicitly uncacheable",
-  ))
 }
 
 /// Handle commands that don't need WorkspaceContext.
@@ -243,43 +128,6 @@ pub fn try_dispatch_pre_context(
   config_override: Option<&Path>,
   json: bool,
 ) -> RailResult<PreContextDispatch> {
-  if config_override.is_none() && !json && run::try_complete_exact_builtin_cargo_action(&cmd, workspace_root)? {
-    return Ok(PreContextDispatch::Handled);
-  }
-  let pre_context_cache_request = config_override.is_none() && !json && cmd.is_pre_context_cache_request();
-  if pre_context_cache_request {
-    let (print_cmd, explain) = match &cmd {
-      Commands::Run { print_cmd, explain, .. } => (*print_cmd, *explain),
-      _ => unreachable!("pre-context cache predicate only accepts run commands"),
-    };
-    let captured_config = crate::config::CapturedDiscoveredConfig::capture(workspace_root)?;
-    if let Some(config) = captured_config.config() {
-      config.cache.validate().map_err(crate::error::RailError::Config)?;
-      config
-        .change_detection
-        .validate()
-        .map_err(crate::error::RailError::Config)?;
-      config
-        .unify
-        .validate(workspace_root)
-        .map_err(crate::error::RailError::Config)?;
-      config.run.validate().map_err(crate::error::RailError::Config)?;
-    }
-    if captured_config.cache_enabled() {
-      match crate::hermetic::try_restore_pre_context(workspace_root, &captured_config)? {
-        crate::hermetic::PreContextCacheAttempt::Hit(hit) => {
-          run::complete_pre_context_cache_hit(workspace_root, *hit, print_cmd, explain)?;
-          return Ok(PreContextDispatch::Handled);
-        }
-        crate::hermetic::PreContextCacheAttempt::Miss(reason) => {
-          if explain {
-            println!("action `build` local cache precheck: miss ({reason})");
-          }
-        }
-      }
-    }
-  }
-
   match cmd {
     Commands::Plan { schema: true, .. } => {
       plan::print_plan_schema();
@@ -384,7 +232,6 @@ pub fn try_dispatch_pre_context(
         Commands::Release {
           command: cli::ReleaseCommand::Resume { state },
         },
-        false,
         config_override,
       )?))
     }
@@ -397,14 +244,12 @@ pub fn try_dispatch_pre_context(
         Commands::Release {
           command: cli::ReleaseCommand::Abort { state, yes },
         },
-        false,
         config_override,
       )?))
     }
 
     other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
       other,
-      pre_context_cache_request,
       config_override,
     )?)),
   }
@@ -414,87 +259,8 @@ pub fn try_dispatch_pre_context(
 ///
 /// This is the main command routing logic. It takes a parsed `Commands` enum
 /// and the workspace context, then calls the appropriate handler.
-pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, pre_context_cache_request: bool) -> RailResult<()> {
+pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
   match cmd {
-    Commands::Run {
-      since,
-      merge_base,
-      all,
-      actions,
-      profile,
-      workflow,
-      dry_run,
-      hermetic,
-      no_cache,
-      format,
-      generated,
-      print_cmd,
-      explain,
-      ignore_bin_crates,
-      skip_nextest,
-      test_runner,
-      cargo_test_args,
-      nextest_args,
-      test_filter,
-      run_args,
-    } => run_run(
-      ctx,
-      run::RunOptions {
-        since,
-        merge_base,
-        all,
-        actions,
-        profile,
-        workflow,
-        dry_run,
-        hermetic,
-        no_cache,
-        format,
-        generated,
-        print_cmd,
-        explain,
-        ignore_bin_crates,
-        skip_nextest,
-        test_runner,
-        cargo_test_args,
-        nextest_args,
-        test_filter,
-        run_args,
-        hermeticity_doctor: false,
-        pre_context_cache_request,
-      },
-    ),
-
-    Commands::Doctor {
-      command:
-        cli::DoctorCommand::Hermeticity {
-          actions,
-          profile,
-          workflow,
-          generated,
-          ignore_bin_crates,
-          format,
-        },
-    } => run_run(
-      ctx,
-      run::RunOptions {
-        all: true,
-        actions,
-        profile,
-        workflow,
-        dry_run: true,
-        format: match format {
-          TextJsonOutputFormat::Text => common::ActionOutputFormat::Text,
-          TextJsonOutputFormat::Json => common::ActionOutputFormat::Json,
-        },
-        generated,
-        explain: true,
-        ignore_bin_crates,
-        hermeticity_doctor: true,
-        hermetic: false,
-        ..run::RunOptions::default()
-      },
-    ),
     Commands::Doctor {
       command: cli::DoctorCommand::NativeCache { format },
     } => run_native_cache_doctor(ctx, format),

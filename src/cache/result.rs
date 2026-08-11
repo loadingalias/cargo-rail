@@ -160,6 +160,40 @@ pub(crate) fn manifest_from_verified_native_slots(slots: &[(&str, &str, u64, u32
   })
 }
 
+/// Capture regular-file compiler outputs for Local CAS tests.
+#[cfg(test)]
+pub(crate) fn capture_native_compiler_outputs(root: &Path, paths: &[std::path::PathBuf]) -> RailResult<OutputManifest> {
+  let mut captured = Vec::with_capacity(paths.len());
+  let mut unique = std::collections::BTreeSet::new();
+  for path in paths {
+    let relative = path
+      .strip_prefix(root)
+      .map_err(|_| RailError::message("native compiler cache staging output escapes its root"))?;
+    let relative = RepositoryPath::new(relative)?;
+    if !unique.insert(relative.as_str().to_string()) {
+      return Err(RailError::message("native compiler cache staging paths are not unique"));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+      return Err(RailError::message(
+        "native compiler cache staging output is not a regular file",
+      ));
+    }
+    let (digest, bytes) = digest_file(path)?;
+    captured.push((
+      relative.as_str().to_string(),
+      format!("sha256:{digest}"),
+      bytes,
+      output_mode(&metadata),
+    ));
+  }
+  let slots = captured
+    .iter()
+    .map(|(path, digest, bytes, mode)| (path.as_str(), digest.as_str(), *bytes, *mode))
+    .collect::<Vec<_>>();
+  manifest_from_verified_native_slots(&slots)
+}
+
 pub(crate) fn output_manifest_digest(entries: &[OutputEntry]) -> RailResult<String> {
   let domain = b"cargo-rail-output-manifest\0";
   let mut hasher = Sha256::new();

@@ -7,26 +7,14 @@ const MAX_L2_ALIAS_BYTES: usize = 64;
 
 /// Repository policy for Cargo-Rail build-result caching.
 ///
-/// Local reuse is enabled by default. An optional L2 alias selects authority
-/// from machine-owned configuration; repository configuration never contains
-/// storage locations or credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Transparent local reuse is installed as machine state. An optional L2 alias
+/// selects authority from machine-owned configuration; repository configuration
+/// never contains storage locations or credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheConfig {
-  /// Enable Cargo-Rail build-result cache reads and writes.
-  #[serde(default = "default_enabled")]
-  pub enabled: bool,
   /// Optional machine-owned shared-cache target alias.
   #[serde(default)]
   pub l2: Option<String>,
-}
-
-impl Default for CacheConfig {
-  fn default() -> Self {
-    Self {
-      enabled: default_enabled(),
-      l2: None,
-    }
-  }
 }
 
 impl CacheConfig {
@@ -37,10 +25,6 @@ impl CacheConfig {
     }
     Ok(())
   }
-}
-
-const fn default_enabled() -> bool {
-  true
 }
 
 fn validate_l2_alias(alias: &str) -> Result<(), ConfigError> {
@@ -70,7 +54,6 @@ mod tests {
   #[test]
   fn cache_defaults_to_local_reuse_without_l2() {
     let cache = CacheConfig::default();
-    assert!(cache.enabled);
     assert_eq!(cache.l2, None);
 
     let config: RailConfig = toml_edit::de::from_str("").expect("empty configuration");
@@ -82,12 +65,10 @@ mod tests {
     let config: RailConfig = toml_edit::de::from_str(
       r#"
 [cache]
-enabled = false
 l2 = "team_2"
 "#,
     )
     .expect("cache configuration");
-    assert!(!config.cache.enabled);
     assert_eq!(config.cache.l2.as_deref(), Some("team_2"));
     config.cache.validate().expect("valid cache policy");
   }
@@ -97,7 +78,6 @@ l2 = "team_2"
     for alias in ["a", "team", "team-2", "team_2", &format!("a{}", "0".repeat(63))] {
       CacheConfig {
         l2: Some(alias.to_string()),
-        ..CacheConfig::default()
       }
       .validate()
       .expect("canonical alias");
@@ -114,7 +94,6 @@ l2 = "team_2"
     ] {
       let error = CacheConfig {
         l2: Some(alias.to_string()),
-        ..CacheConfig::default()
       }
       .validate()
       .expect_err("noncanonical alias");

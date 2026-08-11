@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Smart Test Runner
+# Planner-scoped tests
 #
-# Uses cargo-rail for intelligent change detection.
-# Uses a single planner/executor invocation in smart mode.
+# Cargo-Rail owns package selection. cargo-nextest owns execution.
 #
 # Usage:
 #   ./test.sh              # Smart: test affected crates only
@@ -59,14 +58,31 @@ if [ -n "$ARG" ]; then
 fi
 
 echo "Testing affected crates..."
-if [ "$MODE" = "commit" ]; then
-  # CI mode: force commit profile and nextest JUnit output path.
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --action test --explain \
-    --test-runner nextest \
-    --nextest-arg=-P \
-    --nextest-arg="$NEXTEST_PROFILE" \
-    --nextest-arg=--config-file \
-    --nextest-arg=.config/nextest.toml
-else
-  "${RAIL_CMD[@]}" run "${PLAN_ARGS[@]}" --action test --explain
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: smart tests require jq to read 'cargo rail plan -f json'" >&2
+  exit 2
 fi
+
+PLAN_JSON="$("${RAIL_CMD[@]}" plan "${PLAN_ARGS[@]}" -f json)"
+if ! jq -e '
+  .plan_contract_version == 6 and
+  .scope.scope_contract_version == 4 and
+  (.surfaces.test.enabled | type == "boolean") and
+  (.surfaces.test.scope.cargo_args | type == "array") and
+  all(.surfaces.test.scope.cargo_args[]; type == "string")
+' <<<"$PLAN_JSON" >/dev/null; then
+  echo "error: cargo-rail returned an unsupported test scope contract" >&2
+  exit 2
+fi
+
+if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" != "true" ]; then
+  echo "No affected test targets."
+  exit 0
+fi
+
+CARGO_ARGS=()
+while IFS= read -r argument; do
+  CARGO_ARGS+=("$argument")
+done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+
+cargo nextest run "${CARGO_ARGS[@]}" -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml

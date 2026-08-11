@@ -81,10 +81,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "Selects additional Cargo target-resolution views that the repository supports.",
   ),
   policy(
-    "cache.enabled",
-    "Selects whether Cargo-Rail may read or write build-result caches.",
-  ),
-  policy(
     "cache.l2",
     "Selects one machine-owned shared-cache target by non-secret alias.",
   ),
@@ -378,109 +374,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "Preserves an old provider-specific planner override during its compatibility window.",
     "Deprecated: provider identity no longer changes planner policy. Run `cargo rail config migrate` to remove it.",
   ),
-  policy(
-    "run.default_profile",
-    "Selects the named action profile used when the CLI does not choose one.",
-  ),
-  policy("run.profile", "Defines repository-specific named action profiles."),
-  policy(
-    "run.profile.<name>.actions",
-    "Selects ordered built-in or repository action IDs for a named profile.",
-  ),
-  compatibility(
-    "run.profile.<name>.surfaces",
-    "Preserves the old executable-surface spelling during the action migration.",
-    "Deprecated: migrate to `run.profile.<name>.actions` with `cargo rail config migrate`.",
-  ),
-  policy(
-    "run.profile.<name>.run_args",
-    "Adds literal Cargo/test arguments to a named profile.",
-  ),
-  policy(
-    "run.profile.<name>.baseline.kind",
-    "Selects one baseline mode for a named profile.",
-  ),
-  policy(
-    "run.profile.<name>.baseline.reference",
-    "Selects the explicit reference used by a since baseline.",
-  ),
-  compatibility(
-    "run.profile.<name>.since",
-    "Preserves the old since field until its baseline is migrated.",
-    "Deprecated: migrate to the typed run profile `baseline` with `cargo rail config migrate`.",
-  ),
-  compatibility(
-    "run.profile.<name>.merge_base",
-    "Preserves the old merge-base boolean until its baseline is migrated.",
-    "Deprecated: migrate to the typed run profile `baseline` with `cargo rail config migrate`.",
-  ),
-  policy("run.workflow", "Defines repository workflow-to-profile mappings."),
-  policy(
-    "run.workflow.<name>",
-    "Maps a repository workflow name to a named profile.",
-  ),
-  policy("run.action", "Defines bounded direct-argv repository actions."),
-  policy(
-    "run.action.<name>.kind",
-    "Distinguishes ordinary tasks from generated-output owners.",
-  ),
-  policy(
-    "run.action.<name>.argv",
-    "Defines the direct executable and literal regeneration argument vector.",
-  ),
-  policy(
-    "run.action.<name>.check_argv",
-    "Defines the read-only staleness check for generated outputs.",
-  ),
-  policy(
-    "run.action.<name>.dependencies",
-    "Orders prerequisites in the deterministic action graph.",
-  ),
-  policy(
-    "run.action.<name>.when",
-    "Maps planner impact surfaces to repository action selection.",
-  ),
-  policy(
-    "run.action.<name>.working_directory",
-    "Selects a repository-contained logical working directory.",
-  ),
-  policy(
-    "run.action.<name>.packages",
-    "Selects typed planner-package insertion behavior.",
-  ),
-  policy("run.action.<name>.targets", "Declares explicit Cargo target arguments."),
-  policy(
-    "run.action.<name>.features",
-    "Declares the feature domain represented by the action.",
-  ),
-  policy(
-    "run.action.<name>.inputs",
-    "Declares repository input scopes for the action contract.",
-  ),
-  policy(
-    "run.action.<name>.outputs",
-    "Declares repository outputs owned by a generated action.",
-  ),
-  policy(
-    "run.action.<name>.environment.inherit",
-    "Chooses whether a repository action inherits ambient environment state.",
-  ),
-  policy(
-    "run.action.<name>.environment.entries",
-    "Defines typed fixed, pass-through, Cargo-derived, and secret environment entries.",
-  ),
-  policy(
-    "run.action.<name>.environment.entries.<index>.kind",
-    "Selects one typed environment entry variant.",
-  ),
-  policy(
-    "run.action.<name>.environment.entries.<index>.name",
-    "Names the environment capability without exposing secret values.",
-  ),
-  policy(
-    "run.action.<name>.environment.entries.<index>.value",
-    "Defines a fixed non-secret value or a Cargo-derived value source.",
-  ),
   policy("crates", "Defines per-crate policy overrides."),
   policy(
     "crates.<name>.split.remote",
@@ -689,8 +582,6 @@ mod tests {
       field_spec("release.changelog.groups.0.title").map(|field| field.path),
       Some("release.changelog.groups.<index>.title")
     );
-    assert!(is_known_path("run.profile.ci"));
-    assert!(!is_known_path("run.profile.ci.unknown"));
   }
 
   #[test]

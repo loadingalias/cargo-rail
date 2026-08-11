@@ -8,7 +8,6 @@ do not infer it from the final Cargo command.
 ```bash
 cargo rail plan --merge-base --explain
 cargo rail plan --merge-base -f json
-cargo rail run --merge-base --dry-run --print-cmd --explain
 ```
 
 Read these fields in order:
@@ -18,14 +17,12 @@ Read these fields in order:
 3. `trace` — which ownership, semantic, graph, confidence, or fallback reason fired?
 4. `surfaces.NAME` — was the relevant surface enabled, and with which reason IDs?
 5. `surfaces.NAME.scope` — which packages belong to that surface?
-6. the run preview — which profile actions, feature/target view, and argv were expanded?
 
 Use `scope` for combined execution and `surfaces.NAME.scope` for one surface. `impact` is explanation, not an execution
 handoff. Historical `--from/--to` plans widen package work because Cargo cannot resolve an unchecked-out tree.
 
-If `plan` is right but `run` is wrong, check the selected action/profile, configured `when` policies, trailing Cargo
-arguments, and `--ignore-bin-crates`. Planner surfaces such as `infra` and `custom:*` are conditions, not executable
-action IDs. See [Planning and execution](planning.md).
+If the plan is right but execution is wrong, inspect the Cargo or nextest command that consumed
+`surfaces.NAME.scope.cargo_args`. Command-specific flags belong to that tool. See [Planning](planning.md).
 
 ## Configuration is not what you expected
 
@@ -43,9 +40,6 @@ bypasses the normal search order.
 Use the doctor for the cache boundary you are testing:
 
 ```bash
-# Expanded action-key eligibility
-cargo rail doctor hermeticity --action build --format json
-
 # Exact native compiler-cache identity
 cargo rail doctor native-cache --format json
 
@@ -68,12 +62,7 @@ hit. A different physical source root has different action authority and compile
 
 If an installed wrapper must be disabled for one process tree, set `CARGO_RAIL_CACHE=off`. The minimal launcher
 executes the selected compiler chain without starting the cache worker or reading installation context, session state,
-or CAS data and preserves the environment control for the compiler. Prefer `--no-cache` when invoking
-`cargo rail run`; it delegates with the same control.
-
-For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
-describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the
-isolated check ran without an authorizing cache key.
+or CAS data and preserves the environment control for the compiler.
 
 For `unify`, `evidence_cache` reports diagnostic-observation reuse. That cache never restores Cargo build artifacts.
 

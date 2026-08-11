@@ -474,9 +474,6 @@ pub struct WorkspaceContext {
   /// worktree. Access the repository root through [`WorkspaceContext::git`].
   pub workspace_root: PathBuf,
 
-  /// Cargo workspace root using the caller's captured path spelling.
-  execution_workspace_root: PathBuf,
-
   /// Git state and operations, when the workspace is inside a Git repository.
   ///
   /// Commands that require Git must call [`WorkspaceContext::git`] so Cargo-only
@@ -502,12 +499,6 @@ pub struct WorkspaceContext {
   /// Complete authoritative snapshot when requested during context construction.
   snapshot: Option<WorkspaceSnapshot>,
 
-  /// Explicit dependency inventory prepared before hermetic snapshot metadata.
-  hermetic_fetch_inventory: Option<crate::hermetic::FetchInventory>,
-
-  /// Serializes cache-owned workspace state for one hermetic command.
-  _hermetic_cache_lock: Option<crate::cache::WorkspaceCacheLock>,
-
   /// Cargo-Rail configuration (`rail.toml`).
   /// Optional because not all commands require configuration
   /// Wrapped in Arc for efficient sharing
@@ -530,7 +521,7 @@ impl WorkspaceContext {
   /// Returns [`RailError::Config`] if `rail.toml` exists but fails to parse.
   ///
   pub fn build(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::None, None, None)
+    Self::build_inner(workspace_root, ContextCapture::None, None)
   }
 
   /// Build a context and optionally capture WORKTREE source before metadata loading.
@@ -541,7 +532,7 @@ impl WorkspaceContext {
     } else {
       ContextCapture::None
     };
-    Self::build_inner(workspace_root, capture, None, None)
+    Self::build_inner(workspace_root, capture, None)
   }
 
   pub(crate) fn build_with_source_capture_and_config(
@@ -554,7 +545,7 @@ impl WorkspaceContext {
     } else {
       ContextCapture::None
     };
-    Self::build_inner(workspace_root, capture, None, config_override)
+    Self::build_inner(workspace_root, capture, config_override)
   }
 
   /// Build a context with one complete immutable workspace snapshot.
@@ -571,35 +562,17 @@ impl WorkspaceContext {
   /// configuration URL, or changes during capture. Cargo, rustc, rustdoc, and
   /// configured compiler-wrapper identity commands must also succeed.
   pub fn build_with_snapshot(workspace_root: &Path) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::Snapshot, None, None)
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, None)
   }
 
   pub(crate) fn build_with_snapshot_and_config(
     workspace_root: &Path,
     config_override: Option<&Path>,
   ) -> RailResult<Self> {
-    Self::build_inner(workspace_root, ContextCapture::Snapshot, None, config_override)
+    Self::build_inner(workspace_root, ContextCapture::Snapshot, config_override)
   }
 
-  pub(crate) fn build_with_hermetic_snapshot_and_config(
-    workspace_root: &Path,
-    bootstrap: crate::hermetic::HermeticBootstrap,
-    config_override: Option<&Path>,
-  ) -> RailResult<Self> {
-    Self::build_inner(
-      workspace_root,
-      ContextCapture::Snapshot,
-      Some(bootstrap),
-      config_override,
-    )
-  }
-
-  fn build_inner(
-    workspace_root: &Path,
-    capture: ContextCapture,
-    bootstrap: Option<crate::hermetic::HermeticBootstrap>,
-    config_override: Option<&Path>,
-  ) -> RailResult<Self> {
+  fn build_inner(workspace_root: &Path, capture: ContextCapture, config_override: Option<&Path>) -> RailResult<Self> {
     let process_current_dir = std::env::current_dir()
       .map_err(|error| RailError::message(format!("failed to determine Cargo metadata current directory: {error}")))?;
     let requested_workspace_root = if workspace_root.is_absolute() {
@@ -607,30 +580,10 @@ impl WorkspaceContext {
     } else {
       process_current_dir.join(workspace_root)
     };
-    let (
-      preloaded_metadata,
-      preloaded_inputs,
-      preloaded_cargo_current_dir,
-      hermetic_cargo_home,
-      preloaded_lockfile,
-      hermetic_fetch_inventory,
-      hermetic_cache_lock,
-    ) = bootstrap.map_or_else(
-      || (None, None, None, None, None, None, None),
-      |bootstrap| {
-        let cargo_home = bootstrap.inventory.cargo_home().to_path_buf();
-        (
-          Some(bootstrap.metadata),
-          Some(bootstrap.resolution_inputs),
-          Some(bootstrap.cargo_current_dir),
-          Some(cargo_home),
-          Some(bootstrap.lockfile),
-          Some(bootstrap.inventory),
-          Some(bootstrap.workspace_cache_lock),
-        )
-      },
-    );
-    let cargo_current_dir = preloaded_cargo_current_dir.unwrap_or(process_current_dir);
+    let cargo_current_dir = process_current_dir;
+    let preloaded_metadata = None;
+    let preloaded_inputs = None;
+    let preloaded_lockfile = None;
 
     // Load git state when available. Cargo-only commands such as `unify --check`
     // must work in source sandboxes that intentionally omit `.git`.
@@ -673,9 +626,6 @@ impl WorkspaceContext {
       CargoState::load(workspace_root)?
     });
     let workspace_root = cargo.workspace_root().to_path_buf();
-    let execution_workspace_root =
-      select_execution_workspace_root(&requested_workspace_root, &cargo_current_dir, &workspace_root);
-
     // Repository paths are the authority for Git-backed capture and mutation.
     // A Cargo workspace may be nested inside that boundary, but never contain it
     // or escape it. Capture this relation once so every path consumer agrees.
@@ -713,23 +663,13 @@ impl WorkspaceContext {
     let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
 
     let resolution_views = Arc::new(if let Some(inputs) = resolution_inputs.clone() {
-      match hermetic_cargo_home {
-        Some(cargo_home) => ResolutionViews::new_hermetic_with_inputs(
-          workspace_root.clone(),
-          cargo_current_dir.clone(),
-          cargo.shared_metadata(),
-          Arc::clone(&graph),
-          inputs,
-          cargo_home,
-        ),
-        None => ResolutionViews::new_with_inputs(
-          workspace_root.clone(),
-          cargo_current_dir.clone(),
-          cargo.shared_metadata(),
-          Arc::clone(&graph),
-          inputs,
-        ),
-      }
+      ResolutionViews::new_with_inputs(
+        workspace_root.clone(),
+        cargo_current_dir.clone(),
+        cargo.shared_metadata(),
+        Arc::clone(&graph),
+        inputs,
+      )
     } else {
       ResolutionViews::new(
         workspace_root.clone(),
@@ -781,9 +721,6 @@ impl WorkspaceContext {
 
       // Validate unify config (e.g., the transitive pinning host path).
       cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
-
-      // Validate run profile schema.
-      cfg.run.validate().map_err(RailError::Config)?;
     }
 
     // Store targets for lazy multi-target metadata loading by unify.
@@ -828,11 +765,7 @@ impl WorkspaceContext {
         capture.validate_unchanged(git.git())?;
       }
       snapshot.validate_authoritative_files_unchanged()?;
-      let current_inputs = if hermetic_fetch_inventory.is_some() {
-        ResolutionInputs::capture_hermetic(resolution_views.cargo_current_dir())?
-      } else {
-        ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?
-      };
+      let current_inputs = ResolutionViews::capture_inputs(resolution_views.cargo_current_dir())?;
       validate_resolution_inputs_unchanged(&inputs, &current_inputs)?;
       snapshot.validate_external_targets_unchanged()?;
       if let Some((path, digest)) = generated_lock_marker {
@@ -845,7 +778,6 @@ impl WorkspaceContext {
 
     Ok(Self {
       workspace_root,
-      execution_workspace_root,
       git,
       cargo,
       workspace_prefix,
@@ -853,8 +785,6 @@ impl WorkspaceContext {
       graph,
       derived_views,
       snapshot,
-      hermetic_fetch_inventory,
-      _hermetic_cache_lock: hermetic_cache_lock,
       config,
     })
   }
@@ -878,11 +808,6 @@ impl WorkspaceContext {
       .as_ref()
       .and_then(WorkspaceSnapshot::shared_config)
       .or(self.config.as_ref())
-  }
-
-  /// Return whether repository policy allows Cargo-Rail build-result cache work.
-  pub(crate) fn cache_enabled(&self) -> bool {
-    self.config().is_none_or(|config| config.cache.enabled)
   }
 
   /// Return Cargo state paired with the authoritative snapshot metadata.
@@ -1082,10 +1007,6 @@ impl WorkspaceContext {
     snapshot.validate_live_authoritative_inputs()
   }
 
-  pub(crate) fn hermetic_fetch_inventory(&self) -> Option<&crate::hermetic::FetchInventory> {
-    self.hermetic_fetch_inventory.as_ref()
-  }
-
   /// Load each target's exact rustc cfg set once for the command context.
   pub fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
     if let Some(snapshot) = &self.snapshot {
@@ -1098,10 +1019,6 @@ impl WorkspaceContext {
   /// Get workspace root as Path reference (convenience)
   pub fn workspace_root(&self) -> &Path {
     &self.workspace_root
-  }
-
-  pub(crate) fn execution_workspace_root(&self) -> &Path {
-    &self.execution_workspace_root
   }
 
   /// Get the validated relative path from the Git root to the Cargo workspace.
@@ -1142,11 +1059,6 @@ enum ContextCapture {
 }
 
 fn validate_resolution_inputs_unchanged(initial: &ResolutionInputs, current: &ResolutionInputs) -> RailResult<()> {
-  if current.hermetic != initial.hermetic {
-    return Err(RailError::message(
-      "workspace snapshot toolchain capture mode changed during construction",
-    ));
-  }
   if current.cargo_config != initial.cargo_config {
     return Err(RailError::with_help(
       "Cargo configuration changed while constructing the workspace snapshot",
@@ -1342,38 +1254,6 @@ fn validate_cargo_output_root(
   Ok(())
 }
 
-fn select_execution_workspace_root(requested: &Path, cargo_current_dir: &Path, authoritative: &Path) -> PathBuf {
-  let Ok(canonical_workspace) = crate::utils::canonicalize_existing(authoritative) else {
-    return authoritative.to_path_buf();
-  };
-  let same_directory =
-    |candidate: &Path| crate::utils::canonicalize_existing(candidate).is_ok_and(|path| path == canonical_workspace);
-  if same_directory(requested) {
-    return requested.to_path_buf();
-  }
-  if same_directory(cargo_current_dir) {
-    return cargo_current_dir.to_path_buf();
-  }
-
-  let Ok(canonical_current_dir) = crate::utils::canonicalize_existing(cargo_current_dir) else {
-    return authoritative.to_path_buf();
-  };
-  let Ok(relative_current_dir) = canonical_current_dir.strip_prefix(&canonical_workspace) else {
-    return authoritative.to_path_buf();
-  };
-  let mut candidate = cargo_current_dir.to_path_buf();
-  for _ in relative_current_dir.components() {
-    if !candidate.pop() {
-      return authoritative.to_path_buf();
-    }
-  }
-  if same_directory(&candidate) {
-    candidate
-  } else {
-    authoritative.to_path_buf()
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1525,21 +1405,5 @@ mod tests {
         member
       );
     }
-  }
-
-  #[cfg(unix)]
-  #[test]
-  fn execution_workspace_root_preserves_a_captured_alias() {
-    let temporary = tempfile::tempdir().unwrap();
-    let workspace = temporary.path().join("workspace");
-    let nested = workspace.join("nested");
-    let alias = temporary.path().join("workspace-alias");
-    fs::create_dir_all(&nested).unwrap();
-    std::os::unix::fs::symlink(&workspace, &alias).unwrap();
-
-    assert_eq!(
-      select_execution_workspace_root(&alias.join("nested"), &alias.join("nested"), &workspace),
-      alias
-    );
   }
 }

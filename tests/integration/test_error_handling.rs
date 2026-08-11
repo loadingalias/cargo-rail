@@ -208,24 +208,6 @@ fn test_single_crate_workspace() -> Result<()> {
   Ok(())
 }
 
-// Test Command Error Tests
-
-/// Test run command with invalid --since ref
-#[test]
-fn test_run_invalid_since() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-test-since")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
-
-  // Use invalid since ref
-  let output = run_cargo_rail(&ws.path, &["rail", "run", "--since", "invalid-ref-xyz"])?;
-
-  // Should fail with error
-  assert!(!output.status.success(), "run with invalid ref should fail");
-
-  Ok(())
-}
-
 // Init Error Tests
 
 /// Test init refuses to overwrite existing config without --force

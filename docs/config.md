@@ -69,7 +69,6 @@ verification = ["verification/**"]
 | `unify` | defaults | Dependency and manifest policy. |
 | `release` | defaults | Release, changelog, and remote-effect policy. |
 | `change-detection` | defaults | Planner classification policy. |
-| `run` | defaults | Named execution profiles. |
 | `crates` | `{}` | Per-crate split, release, and changelog policy. |
 
 The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had no behavior and are deprecated.
@@ -82,8 +81,7 @@ target configuration, but does not activate remote transfer:
 
 | Field | Default | Behavior |
 |---|---:|---|
-| `enabled` | `true` | Permit cache use for Cargo-Rail-owned actions. `--no-cache` also delegates child compiler work with `CARGO_RAIL_CACHE=off`. It does not uninstall transparent machine setup. |
-| `l2` | unset | Select and validate a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. Status schema 8 reports it as configuration-only; transparent caching remains local. |
+| `l2` | unset | Select and validate a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. Status schema 9 reports it as configuration-only; transparent caching remains local. |
 
 ```toml
 [cache]
@@ -233,74 +231,10 @@ verification = ["verification/**"]
 assets = ["web/assets/**"]
 ```
 
-## `[run]`
+## Removed execution configuration
 
-`run` consumes planner scope instead of reclassifying the workspace. Profiles select ordered action IDs. Built-ins are
-`build`, `test`, `bench`, `docs`, `format`, `lint`, `msrv`, `package`, `audit`, and `distribution`. Planner-only
-`infra` and `custom:*` values can enable configured actions through `when`, but are not executable action IDs.
-
-| Field | Default | Behavior |
-|---|---:|---|
-| `default_profile` | unset | Built-in or configured profile used when the CLI does not select one. |
-| `profile.NAME.actions` | required | Non-empty ordered list of built-in or configured action IDs. |
-| `profile.NAME.run_args` | `[]` | Arguments prepended to CLI run arguments. Supports `{workspace_root}`, `{base_ref}`, and `{cargo_args}`. |
-| `profile.NAME.baseline` | unset | One typed baseline: `{ kind = "merge-base" }` or `{ kind = "since", reference = "..." }`. References support `{workspace_root}` and `{base_ref}`. |
-| `workflow.NAME` | unset | Map a workflow convention to a built-in or configured profile. |
-| `action.NAME.kind` | `"task"` | `"task"` or `"generated"`; only generated actions may own outputs. |
-| `action.NAME.argv` | required | Direct regeneration/task program and argv. No shell is involved. |
-| `action.NAME.check_argv` | generated only | Required read-only staleness check for a generated action. |
-| `action.NAME.dependencies` | `[]` | Action IDs that must complete first. |
-| `action.NAME.when` | required | Planner surfaces that enable this action without `--all`. |
-| `action.NAME.working_directory` | `"."` | Canonical `/`-separated repository-contained process directory. |
-| `action.NAME.packages` | `"none"` | `"none"`, `"selected"`, or `"workspace-or-selected"`; controls `{packages}`. |
-| `action.NAME.targets`, `features` | `[]` | Explicit values inserted at `{targets}` and `{features}`. |
-| `action.NAME.inputs` | `[]` | Canonical `/`-separated repository-relative input scopes; `"."` means the workspace snapshot. |
-| `action.NAME.outputs` | `[]` | Canonical repository-relative paths owned by one generated action without case-insensitive overlap. |
-| `action.NAME.environment.inherit` | `false` | Inherit the complete caller environment before applying typed entries. |
-| `action.NAME.environment.entries` | `[]` | Fixed, pass-through, Cargo-derived, or secret-capability entries. |
-
-```toml
-[run]
-default_profile = "commit"
-
-[run.profile.commit]
-actions = ["format", "lint", "test"]
-baseline = { kind = "merge-base" }
-
-[run.workflow]
-pull_request = "commit"
-```
-
-Repository actions are bounded direct-process declarations. Each substitution must occupy one complete argv value;
-the closed set is `{workspace_root}`, `{base_ref}`, `{packages}`, `{targets}`, and `{features}`. Shell executables,
-unknown interpolation, dependency cycles, path escapes, missing generated ownership, and overlapping outputs fail
-before any action process starts. Secret entries serialize only the capability name.
-
-```toml
-[run.action.codegen]
-kind = "generated"
-argv = ["cargo", "run", "-p", "xtask", "--", "codegen"]
-check_argv = ["cargo", "run", "-p", "xtask", "--", "codegen", "--check"]
-dependencies = ["format"]
-when = ["build", "infra"]
-working_directory = "."
-inputs = ["Cargo.toml", "schema"]
-outputs = ["src/generated"]
-
-[run.action.codegen.environment]
-inherit = true
-entries = [
-  { kind = "cargo", name = "WORKSPACE_ROOT", value = "workspace-root" },
-  { kind = "secret", name = "SCHEMA_TOKEN" },
-]
-
-[run.profile.codegen]
-actions = ["codegen"]
-```
-
-Use `--generated check` to run the declared read-only checks, the default `--generated regenerate` to update outputs,
-and `--explain` to show ownership. `run --dry-run -f json` emits the versioned action plan; `-f github` emits the same
-topological order as GitHub key/value outputs. Structured formats require `--dry-run`.
+The former execution table is rejected with an actionable diagnostic. Keep repository commands in Cargo,
+cargo-nextest, Just, or CI, and pass typed package scope from `cargo rail plan`.
 
 ## `[crates.NAME]`
 
@@ -363,8 +297,6 @@ Deprecated fields remain parseable for a bounded compatibility window, emit acti
 | Boolean `change-detection.unknown_file_policy` | Replace `true` with `"owned_build_test"` or `false` with `"docs"`. |
 | `release.require_clean`, `release.publish_delay` | Remove; cleanliness is fixed command behavior and registry convergence is an explicit stop-and-resume boundary. |
 | `release.push`, `release.create_github_release`, `release.forge` | Merge the valid effect combination into one `release.remote_effects` value. |
-| `run.profile.NAME.surfaces` | Rename to `run.profile.NAME.actions`. |
-| `run.profile.NAME.since`, `run.profile.NAME.merge_base` | Merge one valid baseline into `run.profile.NAME.baseline`. |
 
 ```bash
 cargo rail config migrate --check -f json
@@ -378,7 +310,6 @@ cargo rail config validate --strict
 |---|---|---|---|
 | `config migrate --check` | No migration pending | Migration pending | Error |
 | Mutation command `--check` | No mutation pending | Mutation pending | Error |
-| `--dry-run` | Preview completed | — | Error |
 | `config validate` | Valid under selected strictness | — | Invalid or unreadable configuration |
 
 ## Environment
@@ -388,5 +319,5 @@ cargo rail config validate --strict
 ## See also
 
 - [Command reference](commands.md)
-- [Planning and execution](planning.md)
+- [Planning](planning.md)
 - [Split/sync example](../examples/split-sync/README.md)

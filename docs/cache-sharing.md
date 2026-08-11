@@ -1,7 +1,7 @@
 # Share local compiler reuse across workspaces
 
 Cargo-Rail's transparent compiler cache is a private, user-wide L1. One setup enables eligible reuse for ordinary
-Cargo, nextest, Just, IDE, CI, and `cargo rail run` invocations that use the same effective Cargo home:
+Cargo, nextest, Just, IDE, and CI invocations that use the same effective Cargo home:
 
 ```bash
 cargo rail cache setup --check
@@ -51,7 +51,7 @@ CARGO_RAIL_CACHE=off cargo check
 
 The wrapper immediately executes the original compiler command without loading installation context, session state,
 or CAS data. It preserves argv, working directory, inherited environment—including `CARGO_RAIL_CACHE=off`—streams,
-and exit status. `cargo rail run --no-cache` delegates with the same opt-out.
+and exit status.
 
 ## Cleanup and removal
 
@@ -70,11 +70,11 @@ commands revalidate bytes immediately before mutation and refuse changed, shadow
 
 ## Remote sharing is deferred
 
-Transparent reuse is local-only. The earlier runner-owned S3 import/publication coordinator was removed, and ordinary
-Cargo invocations do not contact remote storage. Existing `[cache].l2` and machine target-map configuration can still
+Transparent reuse is local-only. Ordinary Cargo invocations do not contact remote storage. Existing `[cache].l2` and
+machine target-map configuration can still
 be validated by status and doctor commands, which report
 `configuration_only_transparent_cache_is_local`; they do not activate transfer.
 
 Do not build automation around the retained target-map schema as if it were a functioning remote data plane. Remote
-reuse must later consume the same authenticated compiler-result protocol directly, without recreating runner ownership,
-adding a daemon, or weakening exact local verification.
+reuse must later consume the same authenticated compiler-result protocol directly, without adding a daemon or
+weakening exact local verification.

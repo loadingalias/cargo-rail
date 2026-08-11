@@ -21,7 +21,6 @@ mod test_plan_apply;
 mod test_plan_classification_corpus;
 mod test_release_changelog;
 mod test_resolution_view;
-mod test_run;
 #[cfg(unix)]
 mod test_scale_fixture;
 mod test_source_snapshot;

@@ -24,16 +24,3 @@ unknown_file_policy = "strict"
 themes = ["runtime/themes/**"]
 queries = ["runtime/queries/**"]
 book = ["book/**"]
-
-# Run profiles are optional when using external task runner
-# Include them for fallback or local convenience
-[run]
-default_profile = "local"
-
-[run.profile.local]
-actions = ["test"]
-baseline = { kind = "merge-base" }
-
-[run.profile.ci]
-actions = ["build", "test"]
-baseline = { kind = "merge-base" }

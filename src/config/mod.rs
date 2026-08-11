@@ -3,7 +3,6 @@
 mod cache;
 mod change_detection;
 mod release;
-mod run;
 pub(crate) mod schema;
 mod split;
 mod unify;
@@ -13,11 +12,6 @@ pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFile
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
   Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
-};
-pub(crate) use run::{BUILTIN_ACTION_NAMES, MAX_ACTIONS, first_repository_output_overlap};
-pub use run::{
-  CargoEnvironmentValue, RepositoryAction, RepositoryActionKind, RepositoryEnvironment, RepositoryEnvironmentEntry,
-  RepositoryPackageSelection, RunBaseline, RunConfig, RunProfile, is_builtin_profile,
 };
 pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use unify::{
@@ -31,49 +25,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// One discovered repository configuration retained across a pre-context cache shortcut.
-///
-/// Absence is captured as deliberately as file bytes so a configuration change
-/// cannot authorize cache work from a different filesystem moment.
-pub(crate) struct CapturedDiscoveredConfig {
-  workspace_root: PathBuf,
-  file: Option<(PathBuf, Vec<u8>)>,
-  config: Option<Box<RailConfig>>,
-}
+pub(crate) const REMOVED_RUN_CONFIG_MESSAGE: &str = "[run] configuration is no longer supported; execute Cargo and cargo-nextest directly, keep repository tasks in Just or CI, and consume typed package scope from `cargo rail plan`";
 
-impl CapturedDiscoveredConfig {
-  pub(crate) fn capture(workspace_root: &Path) -> RailResult<Self> {
-    let Some(path) = RailConfig::find_config_path(workspace_root) else {
-      return Ok(Self {
-        workspace_root: workspace_root.to_path_buf(),
-        file: None,
-        config: None,
-      });
-    };
-    let (config, bytes) = RailConfig::load_path_with_bytes(&path)?;
-    Ok(Self {
-      workspace_root: workspace_root.to_path_buf(),
-      file: Some((path, bytes)),
-      config: Some(Box::new(config)),
-    })
-  }
-
-  pub(crate) fn config(&self) -> Option<&RailConfig> {
-    self.config.as_deref()
-  }
-
-  pub(crate) fn cache_enabled(&self) -> bool {
-    self.config().is_none_or(|config| config.cache.enabled)
-  }
-
-  pub(crate) fn validate_unchanged(&self) -> bool {
-    match &self.file {
-      None => RailConfig::find_config_path(&self.workspace_root).is_none(),
-      Some((path, bytes)) => {
-        RailConfig::find_config_path(&self.workspace_root).as_ref() == Some(path)
-          && fs::read(path).is_ok_and(|current| current.as_slice() == bytes.as_slice())
-      }
-    }
+pub(crate) fn reject_removed_run_config(doc: &toml_edit::DocumentMut) -> Result<(), String> {
+  if doc.as_table().contains_key("run") {
+    Err(REMOVED_RUN_CONFIG_MESSAGE.to_string())
+  } else {
+    Ok(())
   }
 }
 
@@ -97,9 +55,6 @@ pub struct RailConfig {
   /// Change detection settings (for planner classification)
   #[serde(default, rename = "change-detection")]
   pub change_detection: ChangeDetectionConfig,
-  /// Run profile settings for `cargo rail run`.
-  #[serde(default)]
-  pub run: RunConfig,
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
   pub crates: BTreeMap<String, CrateConfig>,
@@ -138,6 +93,7 @@ impl RailConfig {
     let doc: toml_edit::DocumentMut = content
       .parse()
       .map_err(|error: toml_edit::TomlError| error.to_string())?;
+    reject_removed_run_config(&doc)?;
     for deprecation in schema::present_deprecations(&doc) {
       if let Some(message) = deprecation.spec.deprecation {
         crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);

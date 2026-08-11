@@ -2,7 +2,7 @@
 
 **Cargo already knows your workspace. Stop teaching it to ten other tools.**
 
-Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` replaces the dep-hygiene stack. `plan` and `run` execute only affected work. Verified compiler reuse survives `cargo clean`. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered publication, and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and history.
+Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` replaces the dep-hygiene stack. `plan` emits typed affected scope for Cargo, nextest, Just, and CI. Verified compiler reuse survives `cargo clean`. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered publication, and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and history.
 
 **Keep Cargo. Delete the Rest.**
 
@@ -19,7 +19,7 @@ Cargo-Rail replaces that collection with one local, Cargo-native engine:
 | Retire | Use | What changes |
 |---|---|---|
 | `cargo-hakari`, `cargo-udeps`, `cargo-shear`, `cargo-machete`, feature auditors, workspace-inheritance checks, and MSRV scripts | `cargo rail unify` | One reviewable and reversible graph-repair plan |
-| `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` and `cargo rail run` | Affected work derived from Git and the resolved Cargo graph |
+| `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` | Typed affected scope derived from Git and the resolved Cargo graph |
 | Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery |
 | Copybara or custom monorepo-to-crate scripts | `cargo rail split` and `cargo rail sync` | Cargo-aware synchronization with source history and recovery evidence |
@@ -31,7 +31,7 @@ flowchart TB
     source["Git History + Cargo"] --> rail["Cargo-Rail"]
 
     rail --> unify["unify<br/>coherent dependencies"]
-    rail --> plan["plan / run<br/>affected execution"]
+    rail --> plan["plan<br/>affected scope"]
     rail --> cache["verified reuse<br/>compiler results"]
     rail --> release["change / release<br/>exact-SHA publication"]
     rail --> sync["split / sync<br/>crate repositories"]
@@ -39,7 +39,7 @@ flowchart TB
 
 No hosted service. No second build language. No hand-rolled crate maps.
 
-Cargo, nextest, GitHub Actions, your task runner, and your runners remain in place. Cargo-Rail just makes them do less work and consume fewer resources.
+Cargo, nextest, GitHub Actions, Just, and your CI workers remain in place. Cargo-Rail makes them do less work and consume fewer resources.
 
 ## Proof First; Then Migrate
 
@@ -52,19 +52,20 @@ cargo rail plan --merge-base --explain
 
 `plan` is read-only. It does not execute selected work or edit tracked files.
 
-Preview the exact commands Cargo-Rail would run:
+Inspect the typed test scope, then pass its argument vector to nextest:
 
 ```bash
-cargo rail run --merge-base --dry-run --print-cmd --explain
+PLAN_JSON=$(cargo rail plan --merge-base -f json)
+if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
+  CARGO_ARGS=()
+  while IFS= read -r argument; do
+    CARGO_ARGS+=("$argument")
+  done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+  cargo nextest run "${CARGO_ARGS[@]}"
+fi
 ```
 
-Then keep the rest of your toolchain and execute only affected CI work:
-
-```bash
-cargo rail run --merge-base --profile ci
-```
-
-The built-in `ci` profile runs selected build and test actions. Existing jobs can consume the same versioned plan through [`cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action), JSON, or GitHub output.
+The plan carries separate build and test scopes. Existing jobs can consume the same versioned contract through [`cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action), JSON, or GitHub output; Cargo-Rail does not reinterpret Cargo or nextest arguments.
 
 ## One `unify` command, not a dependency-tool stack
 
@@ -114,10 +115,11 @@ changed source
   → reverse-dependency impact
   → build / test / docs / bench / infra / custom surfaces
   → surface-specific Cargo scope
-  → validated commands and CI outputs
+  → typed Cargo arguments and CI gates
 ```
 
-A formatting-only manifest edit can select no package work. A shared-library change can select its affected dependent closure. Infrastructure changes can select repository-level actions without pretending they belong to a crate.
+A formatting-only manifest edit can select no package work. A shared-library change can select its affected dependent
+closure. Infrastructure changes can gate repository-level jobs without pretending they belong to a crate.
 
 When planning evidence is incomplete, Cargo-Rail widens the scope instead of guessing narrowly.
 
@@ -125,9 +127,8 @@ The same versioned plan drives:
 
 - human explanations;
 - JSON and GitHub output;
-- dry-run command previews;
-- direct execution; and
-- durable decision receipts.
+- surface gates; and
+- typed Cargo package arguments.
 
 There is only one implementation of “affected.”
 
@@ -161,8 +162,8 @@ cargo clean
 cargo check
 ```
 
-The same setup covers ordinary Cargo, nextest, Just, IDE, CI, and `cargo rail run` invocations that use that Cargo
-home. Cargo freshness and incremental compilation remain the faster L0; eligible compiler work that L0 does not remove
+The same setup covers ordinary Cargo, nextest, Just, IDE, and CI invocations that use that Cargo home. Cargo freshness
+and incremental compilation remain the faster L0; eligible compiler work that L0 does not remove
 can use the verified local CAS as L1.
 
 Cargo-Rail does not restore an old target directory or manufacture Cargo freshness. Before a hit, it revalidates:
@@ -203,14 +204,13 @@ Incremental, clippy, native proc-macro consumer, custom-target-layout, ambiguous
 unsupported invocations bypass before session or CAS acquisition. Existing workspace wrappers are preserved and
 bypassed; conflicting global wrapper ownership makes setup fail.
 
-Transparent reuse is local-only. The previous runner-owned S3 coordinator was removed instead of being duplicated in
-the compiler path. Existing remote target configuration can be diagnosed, but it does not activate transfer. See
+Transparent reuse is local-only. Existing remote target configuration can be diagnosed, but it does not activate transfer. See
 [Share local compiler reuse across workspaces](docs/cache-sharing.md) for authority, isolation, cleanup, and removal.
 
 ### Performance qualification
 
-The transparent activation contract invalidates earlier runner-owned and pre-linked benchmark numbers. Its canonical
-five-sample interleaved corpus measures intact-target overhead, cold-path overhead, and empty-target L1 against pinned
+The transparent activation contract invalidates earlier pre-linked benchmark numbers. Its canonical five-sample
+interleaved corpus measures intact-target overhead, cold-path overhead, and empty-target L1 against pinned
 local `sccache` independently. A matrix cell qualifies only when all five samples pass the declared correctness and
 coverage gates and warm L1 is strictly faster at both p50 and p95. Cargo-Rail makes no blanket superiority claim from a
 failed cell. The exact correctness fixture remains independent of timing and verifies root isolation, environment
@@ -321,10 +321,10 @@ unify
   → removes graph waste, hidden coupling, background resource consumption
 
 plan
-  → removes unaffected actions
+  → removes unaffected jobs
 
 package scope
-  → removes unaffected crates inside selected actions
+  → removes unaffected crates inside selected jobs
 
 verified reuse
   → removes compiler invocations from the work that remains
@@ -338,13 +338,12 @@ Independent tools cannot compound as effectively: each optimization is bounded b
 
 Cargo-Rail treats speed as conditional and side effects as transactions:
 
-- **Plan before effect.** Checks, explanations, schemas, and dry runs expose decisions before execution or mutation.
+- **Plan before effect.** Checks, explanations, schemas, and mutation previews expose decisions before effects.
 - **Widen instead of undertesting.** Incomplete planning evidence selects more work rather than silently excluding required work.
 - **Run cold instead of trusting weak cache evidence.** Unsupported or incomplete reuse cases execute normal Cargo.
 - **Revalidate before mutation.** Snapshot-bound commands confirm their assumptions immediately before writing, publishing, or synchronizing.
 - **Preserve user-owned configuration.** Manifest and configuration edits are lossless outside fields owned by the operation.
 - **Record recovery state.** Backups, plans, receipts, and durable release or sync state remain available where recovery requires them.
-- **Keep execution explicit.** Repository actions are validated direct-process argument vectors, not an embedded shell language.
 
 Fast paths are used only when their proof boundary holds.
 
@@ -353,8 +352,8 @@ Fast paths are used only when their proof boundary holds.
 Each workflow is independently adoptable:
 
 1. **Observe** with `cargo rail plan --merge-base --explain`.
-2. **Compare** with `cargo rail run --dry-run --print-cmd`.
-3. **Delegate** affected scope to existing jobs.
+2. **Inspect** each selected surface's typed `cargo_args`.
+3. **Pass** that argument vector to Cargo or nextest in existing jobs.
 4. **Enforce** read-only dependency and changeset checks.
 5. **Apply** graph repairs, release effects, or repository synchronization after the team trusts their plans and recovery boundaries.
 
@@ -384,7 +383,7 @@ The current MSRV is published in
 
 ## Documentation
 
-- [Planning and execution](docs/planning.md)
+- [Planning](docs/planning.md)
 - [Configuration reference](docs/config.md)
 - [Command reference](docs/commands.md)
 - [Architecture](docs/architecture.md)

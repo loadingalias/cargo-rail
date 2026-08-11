@@ -24,7 +24,6 @@ use crate::compiler::observation::{
   NativeOutputPaths, NativeOutputRole, ObservationPath, PreparedRawPublication, RawCompilerInvocation,
 };
 use crate::error::{RailError, RailResult};
-use crate::instrumentation::{NativeCacheWrapperPhase, NativeCacheWrapperTrace, NativeCacheWrapperWork};
 use crate::source::ContentDigest;
 
 pub(crate) mod pack;
@@ -610,7 +609,6 @@ struct PreparedRestoreOutput {
   observation: FileObservation,
   bytes: u64,
   mode: u32,
-  bytes_hashed: u64,
 }
 
 #[derive(Debug)]
@@ -651,7 +649,6 @@ struct PreparedNativeRestore {
   stdout: Vec<u8>,
   stderr: Vec<u8>,
   observation: PreparedRawPublication,
-  publication_bytes_hashed: u64,
 }
 
 struct NativeRestorePaths {
@@ -3294,16 +3291,9 @@ impl NativeCacheContext {
   pub(crate) fn load_direct_invocation(
     rustc_program: &OsStr,
     rustc_arguments: &[OsString],
-  ) -> (
-    Result<Self, &'static str>,
-    crate::instrumentation::NativeCacheWrapperProcessStart,
-  ) {
+  ) -> Result<Self, &'static str> {
     let invoked = std::env::current_exe().map_err(|_| "native_cache_worker_unavailable");
-    let started = crate::instrumentation::NativeCacheWrapperProcessStart::capture();
-    (
-      invoked.and_then(|invoked| Self::load_installed(&invoked, rustc_program, rustc_arguments)),
-      started,
-    )
+    invoked.and_then(|invoked| Self::load_installed(&invoked, rustc_program, rustc_arguments))
   }
 
   fn load_installed(invoked: &Path, rustc_program: &OsStr, rustc_arguments: &[OsString]) -> Result<Self, &'static str> {
@@ -3324,10 +3314,6 @@ impl NativeCacheContext {
       installation: Some(receipt),
       _runtime: Some(runtime),
     })
-  }
-
-  pub(crate) fn captures_wrapper_diagnostics(&self) -> bool {
-    false
   }
 }
 
@@ -4966,12 +4952,7 @@ pub(crate) enum OuterCacheAction {
 /// `arguments` starts with the rustc executable because `program` is Cargo's
 /// workspace-wrapper slot. A returned code means verified outputs and streams
 /// were already restored; `Execute` preserves the ordinary child execution.
-pub(crate) fn configure_outer(
-  program: &OsStr,
-  arguments: &[OsString],
-  command: &mut Command,
-  trace: &mut NativeCacheWrapperTrace,
-) -> OuterCacheAction {
+pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: &mut Command) -> OuterCacheAction {
   command.env_remove(DISPOSITION_ENV);
   let Some(context) = active_context() else {
     return OuterCacheAction::Execute;
@@ -4987,7 +4968,6 @@ pub(crate) fn configure_outer(
       None,
       0,
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   }
@@ -5006,16 +4986,13 @@ pub(crate) fn configure_outer(
       None,
       0,
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   };
   let source_root = &context.source_root;
   let source_root_spelling = &context.source_root_spelling;
   let observation_directory = &context.observation_directory;
-  let session_phase = trace.start(NativeCacheWrapperPhase::SessionLoad);
   let session = context.session.load(source_root);
-  trace.finish(session_phase, NativeCacheWrapperWork::default());
   let session = match session {
     Ok(session) => session,
     Err(_) => {
@@ -5026,7 +5003,6 @@ pub(crate) fn configure_outer(
         None,
         0,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5039,11 +5015,9 @@ pub(crate) fn configure_outer(
       None,
       0,
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   }
-  let input_capture_phase = trace.start(NativeCacheWrapperPhase::ArgumentNormalizationInputCapture);
   let original_current_dir = match std::env::current_dir() {
     Ok(directory) => directory,
     Err(_) => {
@@ -5054,7 +5028,6 @@ pub(crate) fn configure_outer(
         None,
         0,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5075,23 +5048,13 @@ pub(crate) fn configure_outer(
         None,
         0,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
   };
   let observation = recorder.observation();
   let initial_input_bytes = estimated_input_bytes(observation, source_root);
-  trace.finish(
-    input_capture_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: initial_input_bytes,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
-  let classification_phase = trace.start(NativeCacheWrapperPhase::BypassClassification);
   let bypass_reason = invocation_bypass_reason(observation, false, &session.class.host_target);
-  trace.finish(classification_phase, NativeCacheWrapperWork::default());
   if let Some(reason) = bypass_reason {
     configure_cold(
       command,
@@ -5100,7 +5063,6 @@ pub(crate) fn configure_outer(
       None,
       initial_input_bytes,
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   }
@@ -5112,7 +5074,6 @@ pub(crate) fn configure_outer(
       None,
       estimated_input_bytes(observation, source_root),
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   };
@@ -5124,13 +5085,10 @@ pub(crate) fn configure_outer(
       None,
       estimated_input_bytes(observation, source_root),
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   }
-  let cas_open_phase = trace.start(NativeCacheWrapperPhase::CasOpen);
   let cas = open_active_local_cas();
-  trace.finish(cas_open_phase, NativeCacheWrapperWork::default());
   let cas = match cas {
     Ok(cas) => cas,
     Err(error) => return OuterCacheAction::OperationalFailure(error),
@@ -5138,7 +5096,6 @@ pub(crate) fn configure_outer(
   if let Err(error) = recover_restore_commit_in(&cas, &output_paths, source_root, observation_directory) {
     return OuterCacheAction::OperationalFailure(error);
   }
-  let action_capture_phase = trace.start(NativeCacheWrapperPhase::ActionCapture);
   let capture = NativeActionCapture::capture(observation, source_root);
   let capture_bytes = capture.as_ref().map_or(0, |capture| capture.bytes_hashed);
   let base_action = capture
@@ -5149,13 +5106,6 @@ pub(crate) fn configure_outer(
     .as_ref()
     .ok()
     .and_then(|capture| action_key(&session.identity, &session.class, observation, capture).ok());
-  trace.finish(
-    action_capture_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: capture_bytes,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   let (capture, base_action, provisional_action) = match (capture, base_action, provisional_action) {
     (Ok(capture), Some(base_action), Some(provisional_action)) => (capture, base_action, provisional_action),
     _ => {
@@ -5166,7 +5116,6 @@ pub(crate) fn configure_outer(
         None,
         initial_input_bytes.saturating_add(capture_bytes),
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5179,7 +5128,6 @@ pub(crate) fn configure_outer(
       None,
       initial_input_bytes.saturating_add(capture.bytes_hashed),
       diagnostic_wrapper,
-      trace,
     );
     return OuterCacheAction::Execute;
   }
@@ -5198,7 +5146,6 @@ pub(crate) fn configure_outer(
         Some(provisional_action),
         metrics.bytes_hashed,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5213,7 +5160,6 @@ pub(crate) fn configure_outer(
         Some(provisional_action.clone()),
         metrics.bytes_hashed,
         diagnostic_wrapper,
-        trace,
       );
       let mut recorder = recorder;
       recorder.set_cache_wrapper(metadata);
@@ -5253,7 +5199,6 @@ pub(crate) fn configure_outer(
         Some(provisional_action),
         metrics.bytes_hashed,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5268,7 +5213,6 @@ pub(crate) fn configure_outer(
         Some(provisional_action),
         metrics.bytes_hashed,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5285,7 +5229,6 @@ pub(crate) fn configure_outer(
           Some(pre_link_action),
           metrics.bytes_hashed,
           diagnostic_wrapper,
-          trace,
         );
         return OuterCacheAction::Execute;
       }
@@ -5293,7 +5236,6 @@ pub(crate) fn configure_outer(
   } else {
     pre_link_action.clone()
   };
-  let action_lookup_phase = trace.start(NativeCacheWrapperPhase::ActionLookup);
   let cached = lookup_native_action(
     &cas,
     &session,
@@ -5309,18 +5251,6 @@ pub(crate) fn configure_outer(
   if let Ok((_, bytes_hashed)) = &cached {
     metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(*bytes_hashed);
   }
-  let lookup_bytes = match &cached {
-    Ok((crate::cache::cas::NativeActionLookup::Hit(cached), _)) => cached.bytes_read,
-    Ok((crate::cache::cas::NativeActionLookup::Miss(miss), _)) => miss.bytes_read,
-    Err(_) => 0,
-  };
-  trace.finish(
-    action_lookup_phase,
-    NativeCacheWrapperWork {
-      cache_bytes_read: lookup_bytes,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   let cached = match cached {
     Ok((cached, _)) => cached,
     Err(_) => {
@@ -5331,7 +5261,6 @@ pub(crate) fn configure_outer(
         Some(lookup_key),
         metrics.bytes_hashed,
         diagnostic_wrapper,
-        trace,
       );
       return OuterCacheAction::Execute;
     }
@@ -5345,7 +5274,7 @@ pub(crate) fn configure_outer(
         && capture.validates_witness(&cached.validation.witness, observation) =>
     {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
-      match restore_and_publish(&cas, &cached, &capture, observation, &output_paths, &mut metrics, trace) {
+      match restore_and_publish(&cas, &cached, &capture, observation, &output_paths, &mut metrics) {
         Ok(()) => return OuterCacheAction::Hit(0),
         Err(RestorePublishFailure::BeforeEffect(error)) => {
           drop(error);
@@ -5372,7 +5301,6 @@ pub(crate) fn configure_outer(
     Some(lookup_key.clone()),
     metrics.bytes_hashed,
     diagnostic_wrapper,
-    trace,
   );
   let mut recorder = recorder;
   recorder.set_cache_wrapper(metadata);
@@ -5515,7 +5443,6 @@ fn configure_cold(
   action_key: Option<String>,
   bytes_hashed: u64,
   propagate_metadata: bool,
-  trace: &NativeCacheWrapperTrace,
 ) -> CompilerCacheWrapperMetadata {
   let metadata = CompilerCacheWrapperMetadata::native(status, reason, action_key.clone(), None, bytes_hashed, 0);
   if propagate_metadata && let Ok(encoded) = serde_json::to_string(&metadata) {
@@ -5532,7 +5459,6 @@ fn configure_cold(
         bytes_hashed,
         ..NativeCacheMetrics::default()
       },
-      trace,
     );
   }
   metadata
@@ -5594,7 +5520,6 @@ fn restore_and_publish(
   current_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
   metrics: &mut NativeCacheMetrics,
-  trace: &mut NativeCacheWrapperTrace,
 ) -> Result<(), RestorePublishFailure> {
   validate_restore_environment_authority(cached, initial_capture, current_observation)?;
   let before = RestorePublishFailure::BeforeEffect;
@@ -5623,7 +5548,6 @@ fn restore_and_publish(
     current_observation,
     output_paths,
     metrics,
-    trace,
     source_root,
     source_root_spelling,
     observation_directory,
@@ -5645,9 +5569,7 @@ fn restore_and_publish(
     stdout,
     stderr,
     observation,
-    publication_bytes_hashed,
   } = prepared;
-  let publication_phase = trace.start(NativeCacheWrapperPhase::CargoOutputPublication);
   let mut visible_effects = 0usize;
   let commit_result = (|| -> RailResult<()> {
     restore_commit_test_fault("after_marker", 0, current_observation)?;
@@ -5684,13 +5606,6 @@ fn restore_and_publish(
   if let Err(error) = commit_result {
     return Err(fail_restore_transaction(&mut transaction, error, visible_effects));
   }
-  trace.finish(
-    publication_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: publication_bytes_hashed,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   write_cache_event(
     CompilerCacheWrapperStatus::Hit,
     "verified_local_result",
@@ -5698,7 +5613,6 @@ fn restore_and_publish(
     Some(&validation.result_key),
     None,
     NativeCacheMetrics { ..*metrics },
-    trace,
   );
   Ok(())
 }
@@ -5711,14 +5625,11 @@ fn prepare_registered_restore(
   current_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
   metrics: &mut NativeCacheMetrics,
-  trace: &mut NativeCacheWrapperTrace,
   source_root: &Path,
   source_root_spelling: &Path,
   observation_directory: &Path,
 ) -> RailResult<PreparedNativeRestore> {
   let validation = &cached.validation;
-  let restore_phase = trace.start(NativeCacheWrapperPhase::ResultRestoreMaterialization);
-  let cache_bytes_before = metrics.cache_bytes_read;
   let restored = transaction.paths.transaction_directory.join(RESTORE_VERIFIED_DIRECTORY);
   let staging = transaction
     .paths
@@ -5747,18 +5658,8 @@ fn prepare_registered_restore(
   }
   let stdout = translate_output_binding_bytes(&stdout, validation, output_paths, source_root, false)?;
   let stderr = translate_output_binding_bytes(&stderr, validation, output_paths, source_root, false)?;
-  trace.finish(
-    restore_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: hit.bytes_restored,
-      cache_bytes_read: metrics.cache_bytes_read.saturating_sub(cache_bytes_before),
-      bytes_restored: hit.bytes_restored,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   let bindings = native_output_bindings(output_paths);
   let mut prepared_outputs = Vec::with_capacity(bindings.len());
-  let mut publication_bytes_hashed = 0u64;
   for ((role, slot, destination), expected) in bindings.iter().zip(&validation.outputs) {
     let prepared = if *role == "dep_info" {
       let source = restored.join(slot);
@@ -5781,21 +5682,11 @@ fn prepare_registered_restore(
     } else {
       prepare_restore_output(&restored.join(slot), destination, expected, source_root)?
     };
-    publication_bytes_hashed = publication_bytes_hashed.saturating_add(prepared.bytes_hashed);
     prepared_outputs.push(prepared);
   }
   capture_test_pause("before_restore_revalidation", current_observation)?;
-  let final_capture_phase = trace.start(NativeCacheWrapperPhase::FinalActionRevalidation);
   let final_capture =
     initial_capture.revalidate_before_restore_commit(current_observation, source_root, source_root_spelling);
-  let final_capture_bytes = final_capture.as_ref().copied().unwrap_or(0);
-  trace.finish(
-    final_capture_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: final_capture_bytes,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   let final_capture_bytes = final_capture?;
   metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(final_capture_bytes);
   if !initial_capture.validates_witness(&validation.witness, current_observation) {
@@ -5829,7 +5720,6 @@ fn prepare_registered_restore(
     stdout,
     stderr,
     observation,
-    publication_bytes_hashed,
   })
 }
 
@@ -5894,7 +5784,6 @@ fn prepare_restore_output(
     observation,
     bytes: expected.bytes,
     mode: expected.mode,
-    bytes_hashed: 0,
   })
 }
 
@@ -5959,7 +5848,6 @@ fn prepare_restore_bytes(
     },
     bytes: bytes.len() as u64,
     mode: expected.mode,
-    bytes_hashed: bytes.len() as u64,
   })
 }
 
@@ -8108,7 +7996,6 @@ pub(crate) fn run_and_store(
   mut capture: NativeActionCapture,
   base_action_key: String,
   cache_bytes_read: u64,
-  trace: &mut NativeCacheWrapperTrace,
   context: &str,
 ) -> i32 {
   let Some(cache_context) = active_context() else {
@@ -8134,27 +8021,11 @@ pub(crate) fn run_and_store(
     Err(_) => return status.code().unwrap_or(1),
   };
   if !status.success() {
-    let _ = publish_and_record_cold_observation(
-      &mut raw,
-      "compiler_execution_failed",
-      None,
-      None,
-      0,
-      cache_bytes_read,
-      trace,
-    );
+    let _ = publish_and_record_cold_observation(&mut raw, "compiler_execution_failed", None, None, 0, cache_bytes_read);
     return status.code().unwrap_or(1);
   }
   if capture_pause_failed {
-    let _ = publish_and_record_cold_observation(
-      &mut raw,
-      "capture_test_pause_failed",
-      None,
-      None,
-      0,
-      cache_bytes_read,
-      trace,
-    );
+    let _ = publish_and_record_cold_observation(&mut raw, "capture_test_pause_failed", None, None, 0, cache_bytes_read);
     return status.code().unwrap_or(1);
   }
   let Some(output_paths) = output_paths else {
@@ -8165,7 +8036,6 @@ pub(crate) fn run_and_store(
       None,
       0,
       cache_bytes_read,
-      trace,
     );
     return status.code().unwrap_or(1);
   };
@@ -8177,7 +8047,6 @@ pub(crate) fn run_and_store(
       None,
       0,
       cache_bytes_read,
-      trace,
     );
     return status.code().unwrap_or(1);
   }
@@ -8192,14 +8061,13 @@ pub(crate) fn run_and_store(
         None,
         0,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
   };
   if let Some(reason) = invocation_bypass_reason(&raw, true, &session.class.host_target) {
     let bytes_hashed = cold_input_bytes(&raw, source_root, 0);
-    let _ = publish_and_record_cold_observation(&mut raw, reason, None, None, bytes_hashed, cache_bytes_read, trace);
+    let _ = publish_and_record_cold_observation(&mut raw, reason, None, None, bytes_hashed, cache_bytes_read);
     return status.code().unwrap_or(1);
   }
   let environment_names = raw
@@ -8224,7 +8092,6 @@ pub(crate) fn run_and_store(
         None,
         bytes_hashed,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
@@ -8241,7 +8108,6 @@ pub(crate) fn run_and_store(
         None,
         bytes_hashed,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
@@ -8257,7 +8123,6 @@ pub(crate) fn run_and_store(
         None,
         bytes_hashed,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
@@ -8289,7 +8154,6 @@ pub(crate) fn run_and_store(
         None,
         bytes_hashed,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
@@ -8313,7 +8177,6 @@ pub(crate) fn run_and_store(
         None,
         bytes_hashed,
         cache_bytes_read,
-        trace,
       );
       return status.code().unwrap_or(1);
     }
@@ -8321,34 +8184,19 @@ pub(crate) fn run_and_store(
   let stdout = match stdout.into_bytes() {
     Some(bytes) => bytes,
     None => {
-      let _ = publish_and_record_cold_observation(
-        &mut raw,
-        "compiler_stdout_unavailable",
-        None,
-        None,
-        0,
-        cache_bytes_read,
-        trace,
-      );
+      let _ =
+        publish_and_record_cold_observation(&mut raw, "compiler_stdout_unavailable", None, None, 0, cache_bytes_read);
       return status.code().unwrap_or(1);
     }
   };
   let stderr = match stderr.into_bytes() {
     Some(bytes) => bytes,
     None => {
-      let _ = publish_and_record_cold_observation(
-        &mut raw,
-        "compiler_stderr_unavailable",
-        None,
-        None,
-        0,
-        cache_bytes_read,
-        trace,
-      );
+      let _ =
+        publish_and_record_cold_observation(&mut raw, "compiler_stderr_unavailable", None, None, 0, cache_bytes_read);
       return status.code().unwrap_or(1);
     }
   };
-  let preparation_phase = trace.start(NativeCacheWrapperPhase::ColdResultPreparation);
   let cas = open_active_local_cas();
   let prepared = match &cas {
     Ok(cas) => {
@@ -8377,16 +8225,6 @@ pub(crate) fn run_and_store(
     }
     Err(_) => Err("local_cache_open_failed"),
   };
-  let preparation_bytes = selected_environment_bytes
-    .saturating_add(link_witness_bytes)
-    .saturating_add(prepared.as_ref().map_or(0, |(_, proof)| proof.environment_bytes_hashed));
-  trace.finish(
-    preparation_phase,
-    NativeCacheWrapperWork {
-      bytes_hashed: preparation_bytes,
-      ..NativeCacheWrapperWork::default()
-    },
-  );
   let initial = raw.cache_wrapper.clone().or_else(metadata_from_environment);
   let base_reason = initial
     .as_ref()
@@ -8394,12 +8232,11 @@ pub(crate) fn run_and_store(
     .unwrap_or("exact_action_not_found")
     .to_string();
   let publication = prepared.and_then(|(prepared, proof)| {
-    let admission_phase = trace.start(NativeCacheWrapperPhase::ColdResultAdmission);
     let mut final_capture_bytes = 0;
     let mut admission_failure = "local_cache_store_failed";
-    let admitted = (|| {
+    (|| {
       let cas = cas.as_ref().map_err(|_| "local_cache_open_failed")?;
-      let (validation, stats) = cas
+      let (validation, _stats) = cas
         .store_native_revalidated(prepared, |validation| {
           final_capture_bytes = validation
             .revalidate_publication(
@@ -8435,18 +8272,11 @@ pub(crate) fn run_and_store(
           .publish_native_link_candidate(candidate, validation.action_key())
           .map_err(|_| admission_failure)?;
       }
-      Ok((validation, stats.bytes_written, final_capture_bytes))
-    })();
-    trace.finish(
-      admission_phase,
-      NativeCacheWrapperWork {
-        ..NativeCacheWrapperWork::default()
-      },
-    );
-    admitted
+      Ok((validation, final_capture_bytes))
+    })()
   });
   match publication {
-    Ok((validation, _written, final_capture_bytes)) => {
+    Ok((validation, final_capture_bytes)) => {
       let stored_reason = format!("{base_reason};stored_verified_result");
       let bytes_hashed = cold_input_bytes(
         &raw,
@@ -8473,7 +8303,6 @@ pub(crate) fn run_and_store(
           bytes_hashed,
           cache_bytes_read,
         },
-        trace,
       );
     }
     Err(failure_reason) => {
@@ -8507,7 +8336,6 @@ pub(crate) fn run_and_store(
           bytes_hashed,
           cache_bytes_read,
         },
-        trace,
       );
     }
   }
@@ -8669,7 +8497,6 @@ fn publish_and_record_cold_observation(
   result_key: Option<String>,
   bytes_hashed: u64,
   cache_bytes_read: u64,
-  trace: &NativeCacheWrapperTrace,
 ) -> RailResult<()> {
   publish_cold_observation(raw, reason, action_key, result_key, bytes_hashed)?;
   let metadata = raw.cache_wrapper.as_ref();
@@ -8683,7 +8510,6 @@ fn publish_and_record_cold_observation(
       bytes_hashed,
       cache_bytes_read,
     },
-    trace,
   );
   Ok(())
 }
@@ -9044,7 +8870,6 @@ fn write_cache_event(
   result_key: Option<&str>,
   remote_base_action_key: Option<&str>,
   metrics: NativeCacheMetrics,
-  _trace: &NativeCacheWrapperTrace,
 ) {
   let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) else {
     return;
@@ -10031,7 +9856,7 @@ pub(crate) mod tests {
       .map(|slot| staging.path().join(slot))
       .collect::<Vec<_>>();
     let manifest =
-      crate::hermetic::capture_native_compiler_outputs(staging.path(), &paths).expect("native result manifest");
+      crate::cache::result::capture_native_compiler_outputs(staging.path(), &paths).expect("native result manifest");
     PreparedNativeResult::from_verified_staging(staging, manifest, validation)
   }
 
@@ -11222,7 +11047,7 @@ pub(crate) mod tests {
 
   #[cfg(any(unix, windows))]
   #[test]
-  fn restore_commit_moves_the_verified_cas_copy_without_a_second_hash_or_copy() {
+  fn restore_commit_moves_the_verified_cas_copy_with_the_registered_identity() {
     let root = tempfile::tempdir().expect("restore root");
     let staging = root.path().join("private-staging");
     let output = root.path().join("target/debug/deps");
@@ -11249,7 +11074,6 @@ pub(crate) mod tests {
       previous_identity: None,
       content_digest: expected.content_digest.clone(),
     };
-    assert_eq!(prepared.bytes_hashed, 0);
     let published = publish_prepared_restore_output(prepared, &member).expect("atomic restore publication");
     published.sync().expect("durable restored output");
     published.revalidate().expect("registered restored output");

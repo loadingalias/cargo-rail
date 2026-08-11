@@ -6,8 +6,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
-pub(crate) mod action;
-pub(crate) mod action_key;
 /// Backup and restore for undo operations.
 pub mod backup;
 pub(crate) mod build_script;
@@ -29,7 +27,6 @@ pub(crate) mod executable;
 pub mod git;
 /// Dependency graph analysis.
 pub mod graph;
-pub(crate) mod hermetic;
 /// Diagnostic-only performance instrumentation.
 #[doc(hidden)]
 pub mod instrumentation;
@@ -48,8 +45,6 @@ pub mod split;
 pub mod sync;
 /// Target triple detection.
 pub mod targets;
-/// Test runner integration.
-pub mod test;
 /// TOML editing utilities.
 pub mod toml;
 /// Shared utilities.

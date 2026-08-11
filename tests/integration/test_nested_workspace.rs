@@ -198,38 +198,3 @@ fn test_workspace_outside_git_worktree_is_rejected() -> Result<()> {
   );
   Ok(())
 }
-
-#[test]
-fn test_run_from_nested_workspace_uses_planner_selection() -> Result<()> {
-  let ws = NestedWorkspace::new("rust")?;
-  ws.add_crate("lib-a", "0.1.0")?;
-  ws.commit("add lib-a")?;
-
-  git(&ws.git_root, &["branch", "origin/main"])?;
-
-  ws.modify_file("lib-a", "src/lib.rs", "pub fn changed_for_run() -> bool { true }")?;
-  ws.commit("change lib-a src")?;
-
-  let output = run_cargo_rail(
-    &ws.workspace_root,
-    &[
-      "rail",
-      "run",
-      "--since",
-      "origin/main",
-      "--dry-run",
-      "--print-cmd",
-      "--explain",
-    ],
-  )?;
-  assert!(output.status.success(), "run should succeed in nested workspace");
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(
-    stdout.contains("direct crates: lib-a") || stdout.contains("why:"),
-    "explain output should include planner summary context"
-  );
-  assert!(stdout.contains("test: "), "dry-run should print test command");
-
-  Ok(())
-}

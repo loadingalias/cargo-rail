@@ -45,13 +45,6 @@ fn create_test_workspace() -> TempDir {
     "{\"version\":1,\"entries\":{}}",
   )
   .unwrap();
-  fs::create_dir_all(workspace.join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry")).unwrap();
-  fs::write(
-    workspace.join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry/source.rs"),
-    "pub fn fetched() {}\n",
-  )
-  .unwrap();
-
   // Initialize git repo
   std::process::Command::new("git")
     .arg("init")
@@ -132,58 +125,11 @@ fn create_empty_local_cas(cache: &TempDir) -> std::path::PathBuf {
   root
 }
 
-fn create_legacy_local_cas(cache: &TempDir) -> std::path::PathBuf {
-  let root = cache.path().join("cargo-rail/local-cas-v1");
-  fs::create_dir_all(&root).unwrap();
-  fs::write(root.join("OWNER"), b"cargo-rail-local-cas\nschema=1\n").unwrap();
-  fs::write(root.join("legacy-byte"), b"reclaim only").unwrap();
-  root
-}
-
-#[test]
-fn legacy_local_cas_is_reclaimable_but_never_adopted_as_current_authority() {
-  let workspace = create_test_workspace();
-  let cache = TempDir::new().unwrap();
-  let legacy = create_legacy_local_cas(&cache);
-
-  let status = run_cache_command(
-    &workspace,
-    &cache,
-    &["rail", "cache", "status", "--scope", "local", "-f", "json"],
-  );
-  assert!(status.status.success(), "legacy status failed: {status:?}");
-  let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-  assert_eq!(status_json["status"]["local"]["present"], true);
-  assert!(status_json["status"]["local"]["cache"].is_null());
-  assert_eq!(
-    status_json["status"]["local"]["legacy"]["root"],
-    fs::canonicalize(&legacy).unwrap().display().to_string()
-  );
-  assert!(!cache.path().join("cargo-rail/local-cas-v2").exists());
-
-  let cleaned = run_cache_command(
-    &workspace,
-    &cache,
-    &["rail", "cache", "clean", "--scope", "local", "-f", "json"],
-  );
-  assert!(cleaned.status.success(), "legacy cleanup failed: {cleaned:?}");
-  assert!(!legacy.exists());
-  assert!(cache.path().join("cargo-rail/local-cas-v1.lock").is_file());
-  assert!(!cache.path().join("cargo-rail/local-cas-v2").exists());
-}
-
 #[test]
 fn local_status_and_cleanup_use_the_configured_domain_without_workspace_state() {
   let workspace = create_test_workspace();
   let cache = TempDir::new().unwrap();
   let root = create_empty_local_cas(&cache);
-  assert!(
-    !workspace
-      .path()
-      .join("target/cargo-rail/hermetic/local-cas-v1.json")
-      .exists()
-  );
-
   let status = run_cache_command(
     &workspace,
     &cache,
@@ -320,7 +266,6 @@ fn cache_status_and_cleanup_keep_workspace_and_shared_scopes_explicit() {
   assert!(cleaned.status.success(), "cleanup failed: {cleaned:?}");
   assert!(!workspace.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!workspace.path().join("target/cargo-rail/cache").exists());
-  assert!(!workspace.path().join("target/cargo-rail/hermetic").exists());
   assert!(workspace.path().join("target/cargo-rail/report.md").exists());
   assert!(workspace.path().join("target/cargo-rail/backups").exists());
 }
@@ -349,7 +294,6 @@ fn test_clean_all() {
   // Verify artifacts removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
-  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   assert_eq!(manager.list_backups().unwrap().len(), 0);
 }
@@ -359,17 +303,6 @@ fn test_clean_cache_only() {
   let temp = create_test_workspace();
   let cache = TempDir::new().unwrap();
 
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let inventory = temp
-      .path()
-      .join("target/cargo-rail/hermetic/inventories/example/cargo-home/registry");
-    fs::set_permissions(inventory.join("source.rs"), fs::Permissions::from_mode(0o444)).unwrap();
-    fs::set_permissions(&inventory, fs::Permissions::from_mode(0o555)).unwrap();
-  }
-
   // Run clean --cache
   let output = run_cache_command(&temp, &cache, &["rail", "clean", "--cache"]);
   assert!(output.status.success(), "cache cleanup failed: {output:?}");
@@ -377,7 +310,6 @@ fn test_clean_cache_only() {
   // Verify cache removed, others remain
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
-  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -385,16 +317,16 @@ fn test_clean_cache_only() {
 
 #[cfg(unix)]
 #[test]
-fn test_clean_refuses_to_follow_a_hermetic_state_symlink() {
+fn test_clean_refuses_to_follow_a_cache_state_symlink() {
   use std::os::unix::fs::symlink;
 
   let temp = create_test_workspace();
   let cache = TempDir::new().unwrap();
   let outside = TempDir::new().unwrap();
   fs::write(outside.path().join("keep"), "outside state\n").unwrap();
-  let hermetic = temp.path().join("target/cargo-rail/hermetic");
-  fs::remove_dir_all(&hermetic).unwrap();
-  symlink(outside.path(), &hermetic).unwrap();
+  let cache_state = temp.path().join("target/cargo-rail/cache");
+  fs::remove_dir_all(&cache_state).unwrap();
+  symlink(outside.path(), &cache_state).unwrap();
 
   let output = run_cache_command(&temp, &cache, &["rail", "clean", "--cache"]);
   assert_eq!(output.status.code(), Some(2), "cache cleanup must fail: {output:?}");
@@ -420,7 +352,6 @@ fn test_clean_reports_only() {
   // Verify reports removed, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(temp.path().join("target/cargo-rail/cache").exists());
-  assert!(temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -437,7 +368,6 @@ fn test_clean_backups_prune() {
   // Verify backups pruned, others remain
   assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(temp.path().join("target/cargo-rail/cache").exists());
-  assert!(temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 3);
@@ -455,7 +385,6 @@ fn test_clean_default() {
   // Verify everything removed
   assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
   assert!(!temp.path().join("target/cargo-rail/cache").exists());
-  assert!(!temp.path().join("target/cargo-rail/hermetic").exists());
   assert!(!temp.path().join("target/cargo-rail/report.md").exists());
   let manager = BackupManager::new(temp.path());
   assert_eq!(manager.list_backups().unwrap().len(), 0);

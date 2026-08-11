@@ -62,7 +62,6 @@ pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCache
   }
   Ok(WorkspaceCacheLock { _file: file })
 }
-
 /// One cache-owned workspace artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WorkspaceCacheArtifact {
@@ -93,15 +92,6 @@ pub(crate) struct SharedCacheStatus {
   pub(crate) cross_workspace: bool,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) cache: Option<crate::cache::cas::LocalCasStatus>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub(crate) legacy: Option<LegacyLocalCacheStatus>,
-}
-
-/// Legacy authority root retained only for explicit scoped reclamation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct LegacyLocalCacheStatus {
-  pub(crate) root: String,
-  pub(crate) bytes: u64,
 }
 
 /// Versioned read-only cache status projection.
@@ -147,7 +137,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
     None
   };
   Ok(CacheStatus {
-    schema_version: 8,
+    schema_version: 9,
     installation,
     workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
     local: local
@@ -155,21 +145,17 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
         let cache = if transparent_installed {
           crate::cache::installation::local_cache_status(workspace_root)?
         } else {
-          crate::hermetic::local_cache_status()?
-        };
-        let legacy = if transparent_installed {
-          None
-        } else {
-          crate::hermetic::legacy_local_cache_status()?.map(|(root, bytes)| LegacyLocalCacheStatus {
-            root: root.to_string_lossy().into_owned(),
-            bytes,
-          })
+          let selection = crate::cache::cas::LocalCacheSelection::from_environment()?;
+          selection
+            .configured_root()?
+            .map(|root| crate::cache::cas::status_at_with_max(&root, selection.max_bytes()))
+            .transpose()?
+            .flatten()
         };
         Ok::<_, RailError>(SharedCacheStatus {
-          present: cache.is_some() || legacy.is_some(),
+          present: cache.is_some(),
           cross_workspace: true,
           cache,
-          legacy,
         })
       })
       .transpose()?,
@@ -199,7 +185,6 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
   let root = crate::workspace::cargo_rail_state_root(workspace_root);
   let metadata = root.join("metadata.json");
   let legacy = root.join("cache");
-  let hermetic = root.join("hermetic");
 
   // Validate and measure the complete owned scope before deleting any part of it.
   // The lifecycle lock keeps current cargo-rail processes from changing the view.
@@ -221,10 +206,6 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
   if remove_owned_tree(&legacy)? {
     paths.push(legacy.to_string_lossy().into_owned());
   }
-  if hermetic.exists() {
-    crate::hermetic::remove_state(workspace_root)?;
-    paths.push(hermetic.to_string_lossy().into_owned());
-  }
   Ok(CacheRemoval { paths, bytes })
 }
 
@@ -232,7 +213,16 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
 pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
   let removed = match crate::cache::installation::remove_local_cache(workspace_root)? {
     Some(removed) => removed,
-    None => crate::hermetic::remove_local_cache()?,
+    None => {
+      let selection = crate::cache::cas::LocalCacheSelection::from_environment()?;
+      selection
+        .configured_root()?
+        .map(|root| crate::cache::cas::remove_owned_root_at(&root))
+        .transpose()?
+        .flatten()
+        .into_iter()
+        .collect()
+    }
   };
   removed
     .into_iter()
@@ -258,11 +248,6 @@ fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
       "legacy_compiler_evidence",
       root.join("cache"),
       Some(crate::compiler::diagnostics_store::MAX_CACHE_BYTES as u64),
-    ),
-    (
-      "hermetic_workspace_state",
-      root.join("hermetic"),
-      Some(crate::hermetic::HERMETIC_WORKSPACE_MAX_BYTES),
     ),
     (
       "workspace_cache_lock",

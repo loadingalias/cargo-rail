@@ -5,12 +5,8 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{
-  ActionOutputFormat, ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
-};
-use super::run::GeneratedMode;
+use super::common::{ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat};
 use crate::sync::ConflictStrategy;
-use crate::test::runner::TestRunnerPreference;
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::Shell;
 use std::path::PathBuf;
@@ -23,8 +19,8 @@ dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
   cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
-  cargo rail run --merge-base --dry-run --print-cmd  # Preview selected actions
-  cargo rail run --merge-base --profile ci        # Run affected CI actions
+  cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
 
 Docs: https://github.com/loadingalias/cargo-rail";
@@ -77,25 +73,6 @@ pub struct RailCli {
   #[command(subcommand)]
   pub command: Commands,
 }
-
-const RUN_HELP: &str = "\
-Examples:
-  cargo rail run                              # Execute planner-selected test action
-  cargo rail run --merge-base                 # Compare from branch point (CI)
-  cargo rail run --action build --action test
-  cargo rail run --profile ci                 # Built-in profile (local|ci|nightly)
-  cargo rail run --workflow commit            # Resolve profile from [run.workflow.commit]
-  cargo rail run --profile bench              # User-defined profile from [run.profile.bench]
-  cargo rail run --all --action test          # Force full test run
-  cargo rail run --all --action build --hermetic  # Prove a locked/offline Cargo check
-  cargo rail run --dry-run --print-cmd        # Preview exact execution
-  cargo rail run --dry-run -f json            # Versioned CI action plan
-  cargo rail run --dry-run -f github          # GitHub Actions key=value plan
-  cargo rail run --action codegen --generated check
-  cargo rail run --test-filter parser         # Portable test-name filter
-  cargo rail run --cargo-test-arg=--all-features --test-runner cargo
-  cargo rail run --nextest-arg=-P --nextest-arg=commit
-  cargo rail run -- --nocapture               # Pass harness args after --";
 
 const PLAN_HELP: &str = "\
 Examples:
@@ -253,77 +230,7 @@ Installation:
 /// Available subcommands
 #[derive(Subcommand)]
 pub enum Commands {
-  /// Execute planner-selected actions
-  #[command(after_long_help = RUN_HELP)]
-  Run {
-    /// Git ref to compare against (auto-detects default branch)
-    #[arg(long)]
-    since: Option<String>,
-    /// Use merge-base with default branch (better for feature branches)
-    #[arg(long, conflicts_with = "since")]
-    merge_base: bool,
-    /// Skip change detection and run all workspace crates
-    #[arg(long, short = 'a')]
-    all: bool,
-    /// Action(s) to execute (repeatable; --surface is a compatibility alias)
-    #[arg(long = "action", visible_alias = "surface", value_name = "ACTION")]
-    actions: Vec<String>,
-    /// Named profile to map to one or more actions
-    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["actions", "workflow"])]
-    profile: Option<String>,
-    /// Named workflow mapped to a profile via `[run.workflow]`
-    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["actions", "profile"])]
-    workflow: Option<String>,
-    /// Preview selected execution without spawning subprocesses
-    #[arg(long)]
-    dry_run: bool,
-    /// Execute supported Rust actions in fresh isolated roots
-    #[arg(long)]
-    hermetic: bool,
-    /// Disable all Cargo-Rail build-result cache reads and writes for this execution
-    #[arg(long)]
-    no_cache: bool,
-    /// Dry-run action plan format (json/github require --dry-run)
-    #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: ActionOutputFormat,
-    /// Generated-output behavior
-    #[arg(long, default_value_t, value_enum)]
-    generated: GeneratedMode,
-    /// Print command(s) prior to execution
-    #[arg(long)]
-    print_cmd: bool,
-    /// Explain why actions and targets were selected
-    #[arg(long)]
-    explain: bool,
-    /// Ignore binary-only crates (packages with `[[bin]]` but no lib target)
-    #[arg(long)]
-    ignore_bin_crates: bool,
-    /// Disable automatic use of cargo-nextest
-    #[arg(long, conflicts_with = "test_runner")]
-    skip_nextest: bool,
-    /// Test runner backend (auto selects nextest when available)
-    #[arg(long, value_enum, default_value = "auto")]
-    test_runner: TestRunnerPreference,
-    /// Pass an option only to `cargo test` (repeatable)
-    #[arg(long = "cargo-test-arg", value_name = "ARG", allow_hyphen_values = true)]
-    cargo_test_args: Vec<String>,
-    /// Pass an option only to `cargo nextest run` (repeatable)
-    #[arg(
-      long = "nextest-arg",
-      value_name = "ARG",
-      allow_hyphen_values = true,
-      conflicts_with = "skip_nextest"
-    )]
-    nextest_args: Vec<String>,
-    /// Portable test-name filter placed before the test-binary separator
-    #[arg(long, value_name = "FILTER")]
-    test_filter: Option<String>,
-    /// Pass harness args after `--` for tests; runner args for other actions
-    #[arg(last = true)]
-    run_args: Vec<String>,
-  },
-
-  /// Inspect action hermeticity and native-cache capability
+  /// Inspect native compiler-cache capability
   Doctor {
     /// Diagnostic to run
     #[command(subcommand)]
@@ -588,44 +495,11 @@ pub enum Commands {
 }
 
 impl Commands {
-  /// Return whether this exact request is eligible for the process-free P7.1 lookup path.
-  #[doc(hidden)]
-  pub(crate) fn is_pre_context_cache_request(&self) -> bool {
-    matches!(
-      self,
-      Self::Run {
-        since: None,
-        merge_base: false,
-        all: true,
-        actions,
-        profile: None,
-        workflow: None,
-        dry_run: false,
-        hermetic: true,
-        no_cache: false,
-        format: ActionOutputFormat::Text,
-        generated: GeneratedMode::Regenerate,
-        ignore_bin_crates: false,
-        skip_nextest: false,
-        test_runner: TestRunnerPreference::Auto,
-        cargo_test_args,
-        nextest_args,
-        test_filter: None,
-        run_args,
-        ..
-      } if actions.as_slice() == ["build"]
-        && cargo_test_args.is_empty()
-        && nextest_args.is_empty()
-        && run_args.is_empty()
-    )
-  }
-
   /// Return whether this command consumes one authoritative workspace snapshot.
   #[doc(hidden)]
   pub fn requires_workspace_snapshot(&self) -> bool {
     match self {
-      Self::Run { .. }
-      | Self::Doctor { .. }
+      Self::Doctor { .. }
       | Self::Unify { .. }
       | Self::Split { .. }
       | Self::Sync { .. }
@@ -641,7 +515,6 @@ impl Commands {
   #[doc(hidden)]
   pub fn requires_worktree_source_capture(&self) -> bool {
     match self {
-      Self::Run { all, .. } => !all,
       Self::Doctor { .. } => false,
       Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
       Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
@@ -653,27 +526,6 @@ impl Commands {
 /// Subcommands for `cargo rail doctor`.
 #[derive(Subcommand)]
 pub enum DoctorCommand {
-  /// Explain action-key eligibility and every incomplete input boundary
-  Hermeticity {
-    /// Action(s) to inspect (repeatable)
-    #[arg(long = "action", value_name = "ACTION")]
-    actions: Vec<String>,
-    /// Named profile to inspect
-    #[arg(long, value_name = "PROFILE", conflicts_with_all = ["actions", "workflow"])]
-    profile: Option<String>,
-    /// Named workflow mapped to a profile via `[run.workflow]`
-    #[arg(long, value_name = "WORKFLOW", conflicts_with_all = ["actions", "profile"])]
-    workflow: Option<String>,
-    /// Generated-output behavior to inspect
-    #[arg(long, default_value_t, value_enum)]
-    generated: GeneratedMode,
-    /// Ignore binary-only crates
-    #[arg(long)]
-    ignore_bin_crates: bool,
-    /// Report format
-    #[arg(long, short = 'f', default_value_t, value_enum)]
-    format: TextJsonOutputFormat,
-  },
   /// Inspect the exact native-cache compiler identity
   NativeCache {
     /// Report format
@@ -1083,9 +935,8 @@ impl Commands {
   /// Used for early JSON mode detection to suppress progress messages.
   pub fn is_json_format(&self) -> bool {
     match self {
-      Commands::Run { format, .. } => format.is_json_like(),
       Commands::Doctor {
-        command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
+        command: DoctorCommand::NativeCache { format },
       } => format.is_json_like(),
       Commands::Cache { command } => match command {
         CacheCommand::Setup { format, .. }
@@ -1164,9 +1015,8 @@ impl Commands {
     }
 
     match self {
-      Commands::Run { format, .. } => *format = ActionOutputFormat::Json,
       Commands::Doctor {
-        command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
+        command: DoctorCommand::NativeCache { format },
       } => *format = TextJsonOutputFormat::Json,
       Commands::Cache { command } => match command {
         CacheCommand::Setup { format, .. }

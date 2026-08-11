@@ -30,13 +30,6 @@ confidence_profile = "strict"
 [change-detection.custom]
 verification = ["verification/**"]
 
-[run]
-default_profile = "commit"
-
-[run.profile.commit]
-actions = ["build", "test"]
-baseline = { kind = "merge-base" }
-
 [crates.my-crate.split]
 remote = "git@github.com:your-org/my-crate.git"
 branch = "main"

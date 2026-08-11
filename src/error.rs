@@ -127,17 +127,6 @@ impl RailError {
       _ => None,
     }
   }
-
-  /// Return whether context construction failed in a Cargo/rustc discovery
-  /// probe that must not replace the requested Cargo action's diagnostic.
-  pub(crate) fn is_compiler_configuration_probe_failure(&self) -> bool {
-    let Self::Message { message, .. } = self else {
-      return false;
-    };
-    message.starts_with("cargo metadata failed:")
-      || message == "Cargo metadata failed while credential capabilities were active"
-      || message.starts_with("rustc target cfg query failed with status")
-  }
 }
 
 impl fmt::Display for RailError {

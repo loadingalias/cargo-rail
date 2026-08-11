@@ -1,4 +1,4 @@
-# Planning and Execution: Standalone
+# Planner Scope: Direct Cargo
 
 Use this pattern when CI should pass planner-selected package arguments directly to Cargo without a repository-specific task runner.
 
@@ -6,8 +6,14 @@ Use this pattern when CI should pass planner-selected package arguments directly
 
 ```bash
 cargo rail plan --merge-base --explain
-cargo rail run --merge-base --action test
-cargo rail run --merge-base --dry-run --print-cmd
+PLAN_JSON=$(cargo rail plan --merge-base -f json)
+if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
+  CARGO_ARGS=()
+  while IFS= read -r argument; do
+    CARGO_ARGS+=("$argument")
+  done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+  cargo nextest run "${CARGO_ARGS[@]}"
+fi
 ```
 
 ## CI example
@@ -15,33 +21,30 @@ cargo rail run --merge-base --dry-run --print-cmd
 ```yaml
 - uses: loadingalias/cargo-rail-action@v6
   id: rail
+  with:
+    mode: debug
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
   env:
-    CARGO_ARGS: ${{ steps.rail.outputs.cargo-args }}
-  run: cargo test $CARGO_ARGS
+    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+  run: |
+    CARGO_ARGS=()
+    while IFS= read -r argument; do
+      CARGO_ARGS+=("$argument")
+    done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+    cargo nextest run "${CARGO_ARGS[@]}"
 
 - name: Build selected packages
   if: steps.rail.outputs.build == 'true'
   env:
-    CARGO_ARGS: ${{ steps.rail.outputs.cargo-args }}
-  run: cargo build $CARGO_ARGS
+    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+  run: |
+    CARGO_ARGS=()
+    while IFS= read -r argument; do
+      CARGO_ARGS+=("$argument")
+    done < <(jq -r '.surfaces.build.scope.cargo_args[]' <<<"$PLAN_JSON")
+    cargo build "${CARGO_ARGS[@]}"
 ```
 
-## Built-in actions
-
-- `build`
-- `test`
-- `bench`
-- `docs`
-- `format`
-- `lint`
-- `msrv`
-- `package`
-- `audit`
-- `distribution`
-
-`infra` remains a planner surface for gating configured repository actions; it is not executable itself.
-
-Use `cargo rail run` instead when profiles, test-runner selection, or decision receipts should be owned by Cargo-Rail.
+Cargo-Rail decides scope. Cargo, cargo-nextest, and CI retain command semantics and exit behavior.

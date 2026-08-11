@@ -50,9 +50,3 @@ infrastructure = [
   "Cargo.toml",
   "Cargo.lock",
 ]
-
-[run]
-default_profile = "local"
-
-[run.profile.commit]
-actions = ["build", "test"]

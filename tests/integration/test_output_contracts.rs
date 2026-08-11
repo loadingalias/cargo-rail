@@ -114,21 +114,16 @@ fn test_global_json_rejects_commands_without_structured_contracts() -> Result<()
 }
 
 #[test]
-fn test_global_json_emits_non_executing_run_action_plan() -> Result<()> {
-  let ws = TestWorkspace::new_named("global-json-run-plan")?;
+fn test_removed_top_level_run_is_rejected_during_cli_parsing() -> Result<()> {
+  let ws = TestWorkspace::new_named("removed-top-level-run")?;
   ws.add_crate("lib-a", "0.1.0", &[])?;
   ws.commit("Add lib-a")?;
 
-  let output = run_cargo_rail(
-    &ws.path,
-    &["rail", "--json", "run", "--all", "--action", "build", "--dry-run"],
-  )?;
-  assert!(output.status.success(), "run JSON plan failed");
-  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-  assert_eq!(json["command"], "run");
-  assert_eq!(json["mode"], "plan");
-  assert_eq!(json["artifact"], "action_plan");
-  assert_eq!(json["actions"][0]["id"], "build");
+  let output = run_cargo_rail(&ws.path, &["rail", "run"])?;
+  assert_eq!(output.status.code(), Some(2));
+  assert!(output.stdout.is_empty());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(stderr.contains("unrecognized subcommand 'run'"), "{stderr}");
 
   Ok(())
 }

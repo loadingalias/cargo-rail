@@ -18,7 +18,7 @@ use crate::cargo::resolution::{
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
-use crate::executable::{ToolchainExecutableIdentities, ToolchainExecutableScope};
+use crate::executable::ToolchainExecutableIdentities;
 use crate::source::{ContentDigest, RepositoryPath, SourceEntryKind, SourceSnapshot};
 use crate::workspace::context::CargoState;
 
@@ -205,9 +205,7 @@ pub struct WorkspaceSnapshot {
   cargo_config: Arc<CargoConfigSnapshot>,
   packages: Vec<SnapshotPackage>,
   toolchain: ToolchainIdentity,
-  hermetic_toolchain: bool,
   compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
-  documentation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
   targets: Vec<TargetIdentity>,
   base_resolution: Arc<ResolutionView>,
   derived: Arc<DerivedViews>,
@@ -446,7 +444,6 @@ impl WorkspaceSnapshot {
       &targets,
       &excluded_paths,
     )?;
-    let hermetic_toolchain = resolution_inputs.hermetic;
     Ok(Self {
       id,
       source_root,
@@ -465,9 +462,7 @@ impl WorkspaceSnapshot {
       cargo_config: resolution_inputs.cargo_config,
       packages,
       toolchain: resolution_inputs.toolchain,
-      hermetic_toolchain,
       compilation_executable_identities: OnceLock::new(),
-      documentation_executable_identities: OnceLock::new(),
       targets,
       base_resolution,
       derived,
@@ -564,16 +559,9 @@ impl WorkspaceSnapshot {
     &self.toolchain
   }
 
-  pub(crate) fn executable_identities(
-    &self,
-    scope: ToolchainExecutableScope,
-  ) -> RailResult<&ToolchainExecutableIdentities> {
-    let cell = match scope {
-      ToolchainExecutableScope::Compilation => &self.compilation_executable_identities,
-      ToolchainExecutableScope::Documentation => &self.documentation_executable_identities,
-    };
-    match cell.get_or_init(|| {
-      ToolchainExecutableIdentities::capture(&self.toolchain, &self.source_root, &self.source_root, scope)
+  pub(crate) fn executable_identities(&self) -> RailResult<&ToolchainExecutableIdentities> {
+    match self.compilation_executable_identities.get_or_init(|| {
+      ToolchainExecutableIdentities::capture(&self.toolchain, &self.source_root, &self.source_root)
         .map_err(|error| error.to_string())
     }) {
       Ok(identities) => Ok(identities),
@@ -639,11 +627,7 @@ impl WorkspaceSnapshot {
   }
 
   pub(crate) fn validate_resolution_environment_unchanged(&self) -> RailResult<()> {
-    let current = if self.hermetic_toolchain {
-      ResolutionInputs::capture_hermetic(self.derived.cargo_current_dir())?
-    } else {
-      ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?
-    };
+    let current = ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?;
     if current.cargo_config != self.cargo_config || current.toolchain != self.toolchain {
       return Err(RailError::with_help(
         "Cargo configuration or toolchain identity changed after workspace snapshot capture",

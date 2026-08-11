@@ -43,7 +43,7 @@ test crate="":
     @scripts/test/test.sh "{{ crate }}"
 
 build:
-    @cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action build --explain
+    @scripts/build/build.sh
 
 build-release:
     cargo build --workspace --all-targets --all-features --release --locked
@@ -104,9 +104,6 @@ check-ci:
 
 plan:
     cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
-
-dry-run action="test":
-    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail run --merge-base --action {{ action }} --dry-run --print-cmd --explain
 
 # Maintenance
 

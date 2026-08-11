@@ -1,15 +1,15 @@
-# Planning and Execution Examples
+# Planner Scope Examples
 
-Choose the execution owner:
+Choose the direct consumer:
 
-- [`with-task-runner/`](with-task-runner/) if your repo already has `just`, `make`, `xtask`, or scripts
-- [`standalone/`](standalone/) if you want Cargo-Rail to plan and execute directly
+- [`with-task-runner/`](with-task-runner/) for `just`, `make`, `xtask`, or scripts
+- [`standalone/`](standalone/) for Cargo and cargo-nextest
 
 ## Quick start
 
 ```bash
 cargo rail plan --merge-base --explain
-cargo rail run --merge-base --action test
+cargo nextest run --workspace
 ```
 
 `scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced that selection.
@@ -34,4 +34,4 @@ cargo rail plan --merge-base --explain
 ## See also
 
 - [Configuration Reference](../../docs/config.md)
-- [Planning and Execution Guide](../../docs/planning.md)
+- [Planning Guide](../../docs/planning.md)

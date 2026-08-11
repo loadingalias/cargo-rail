@@ -130,18 +130,11 @@ jobs:
           if [ "${{ matrix.compatibility.cross-target-mutation-probes }}" = "true" ]; then
             selection_args+=(--cross-target-mutation-probes)
           fi
-          if [ "${{ matrix.compatibility.linker-probes }}" = "true" ]; then
-            selection_args+=(--linker-probes)
-          fi
-          if [ "${{ matrix.compatibility.direct-repeatability-probe }}" = "true" ]; then
-            selection_args+=(--direct-repeatability-probe)
-          fi
           "$python_command" scripts/ci/run-compatibility.py \
             --cargo-rail "$cargo_rail" \
             --toolchain "${{ matrix.compatibility.toolchain }}" \
             --expected-rust-release "${{ matrix.compatibility.release }}" \
             --expected-host "${{ matrix.compatibility.target }}" \
-            --expected-cache-state "${{ matrix.compatibility.expected-cache-state }}" \
             "${selection_args[@]}"
 
       - name: Build all endpoint targets
@@ -338,7 +331,7 @@ jobs:
         shell: bash
         run: |
           cargo nextest run -p cargo-rail --all-features --lib \
-            -E 'test(~hermetic::cas::tests) | test(~utils::tests)'
+            -E 'test(~cache::cas::tests) | test(~utils::tests)'
 
       - name: Run front-door corpus on the qualified filesystem
         shell: bash
@@ -356,7 +349,6 @@ jobs:
             --toolchain "${{ matrix.filesystem.toolchain }}" \
             --expected-rust-release "${{ matrix.filesystem.release }}" \
             --expected-host "${{ matrix.filesystem.target }}" \
-            --expected-cache-state "${{ matrix.filesystem.expected-cache-state }}" \
             --skip-cross-target-corpus \
             --temporary-root "$FILESYSTEM_ROOT"
 

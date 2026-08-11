@@ -195,7 +195,6 @@ pub fn dispatch() -> PreClapDispatch {
     InvocationRole::DirectCache => run_direct_cache(),
     InvocationRole::MarkedCache => run_cache(
       crate::compiler::native_cache::NativeCacheContext::from_environment(),
-      crate::instrumentation::NativeCacheWrapperTrace::disabled(),
       signals.rustc_observation,
     ),
     InvocationRole::RustcObservation => run_rustc(),
@@ -276,15 +275,12 @@ fn run_direct_cache() -> i32 {
     }
     return run_transparently(command, "cargo-rail compiler cache wrapper");
   }
-  let (context, started) = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(
+  let context = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(
     &invocation.program,
     &invocation.arguments,
   );
   match context {
-    Ok(context) => {
-      let trace = started.finish_context_load(context.captures_wrapper_diagnostics());
-      run_cache_invocation(invocation, Some(context), trace)
-    }
+    Ok(context) => run_cache_invocation(invocation, Some(context)),
     Err(reason) => {
       crate::compiler::native_cache::record_benchmark_coverage_bypass(
         &invocation.program,
@@ -300,11 +296,7 @@ fn run_direct_cache() -> i32 {
   }
 }
 
-fn run_cache(
-  context: Option<crate::compiler::native_cache::NativeCacheContext>,
-  trace: crate::instrumentation::NativeCacheWrapperTrace,
-  observation_wrapper: bool,
-) -> i32 {
+fn run_cache(context: Option<crate::compiler::native_cache::NativeCacheContext>, observation_wrapper: bool) -> i32 {
   let invocation = match CompilerInvocation::from_wrapper_arguments("cargo-rail compiler cache wrapper") {
     Ok(invocation) => invocation,
     Err(exit_code) => return exit_code,
@@ -315,7 +307,7 @@ fn run_cache(
   {
     return run_cache_bypass(invocation);
   }
-  run_cache_invocation(invocation, context, trace)
+  run_cache_invocation(invocation, context)
 }
 
 fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper: bool) -> Option<&'static str> {
@@ -361,7 +353,6 @@ fn run_cache_bypass(invocation: CompilerInvocation) -> i32 {
 fn run_cache_invocation(
   invocation: CompilerInvocation,
   context: Option<crate::compiler::native_cache::NativeCacheContext>,
-  mut trace: crate::instrumentation::NativeCacheWrapperTrace,
 ) -> i32 {
   if let Some(context) = context
     && let Err(error) = context.activate()
@@ -371,12 +362,7 @@ fn run_cache_invocation(
   }
   let mut command = invocation.command();
   command.env_remove(CACHE_WRAPPER_MARKER).env_remove(CACHE_CONTROL_ENV);
-  match crate::compiler::native_cache::configure_outer(
-    &invocation.program,
-    &invocation.arguments,
-    &mut command,
-    &mut trace,
-  ) {
+  match crate::compiler::native_cache::configure_outer(&invocation.program, &invocation.arguments, &mut command) {
     crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
     crate::compiler::native_cache::OuterCacheAction::Store {
       recorder,
@@ -389,7 +375,6 @@ fn run_cache_invocation(
       capture,
       base_action_key,
       cache_bytes_read,
-      &mut trace,
       "cargo-rail compiler cache wrapper",
     ),
     crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {

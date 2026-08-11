@@ -62,9 +62,9 @@ generate_docs() {
 > Regenerate with: \`./scripts/docs/generate.sh\`
 
 This is the exhaustive CLI surface. Start with \`cargo rail plan --merge-base --explain\` to inspect affected work,
-then use \`cargo rail run --merge-base --dry-run --print-cmd\` to preview execution. Adopt dependency, release, and
-split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo state in
-separate tools.
+then pass each selected surface's typed Cargo arguments to Cargo, cargo-nextest, Just, or CI. Adopt dependency,
+release, and split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo
+state in separate tools.
 
 ---
 

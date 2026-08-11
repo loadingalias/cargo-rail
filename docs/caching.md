@@ -5,13 +5,12 @@
 > Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `5`;
 > native-cache compiler-identity schema: `8`.
 
-Planning removes actions that do not need to run. Caching removes work from selected actions only when Cargo-Rail can
+Planning removes jobs that do not need to run. Caching removes compiler or analysis work only when Cargo-Rail can
 prove that the stored result still matches every relevant input.
 
 | Cache | Purpose | Work skipped on a hit |
 |---|---|---|
 | Compiler evidence | Reuse `unify` observations after complete input revalidation | Workspace diagnostic collection |
-| Hermetic whole action | Restore one eligible isolated Cargo check | Cargo and compiler work; the exact fast path also skips bootstrap |
 | Native compiler result | Restore one eligible rustc result through Cargo's wrapper boundary | That rustc invocation |
 
 The layers have separate eligibility. A lookup or Cargo `fresh` flag never authorizes reuse. Cargo-Rail revalidates the
@@ -20,8 +19,8 @@ cold with a stable reason. **Fast when proven. Normal Cargo when not.**
 
 ## Transparent native compiler-result cache
 
-One machine-local setup enables verified L1 reuse for ordinary Cargo, nextest, Just, IDE, CI, and `cargo rail run`
-invocations that use the same effective Cargo home:
+One machine-local setup enables verified L1 reuse for ordinary Cargo, nextest, Just, IDE, and CI invocations that use
+the same effective Cargo home:
 
 ```bash
 cargo rail cache setup --check
@@ -57,8 +56,7 @@ crate types, and invocations without modeled outputs execute the original chain 
 
 `CARGO_RAIL_CACHE=off` is the process-local kill switch for an already-selected Cargo-Rail compiler wrapper. The
 minimal launcher directly executes the original compiler chain without starting the cache worker, reading the
-installation receipt or session state, or opening the CAS. Use `--no-cache` for ordinary `cargo rail run` cold
-baselines; use the environment control only when supervising the wrapper boundary itself.
+installation receipt or session state, or opening the CAS. Use this control for deliberate cold baselines.
 
 Each authenticated installation session binds one physical workspace root, and each compiler action additionally
 binds the physical source namespace for that unit. Cargo-Rail therefore reuses exact path-bearing compiler artifacts
@@ -125,9 +123,8 @@ rustc never runs over a partial restored output set.
 
 ## Shared native cache (L2)
 
-Transparent compiler reuse is deliberately local-only in this release. Runner-owned L2 import/publication was removed
-with runner cache ownership; ordinary Cargo invocations do not start a daemon, open a loopback coordinator, resolve
-cloud credentials, or read/write remote cache objects.
+Transparent compiler reuse is deliberately local-only in this release. Ordinary Cargo invocations do not start a
+daemon, open a loopback coordinator, resolve cloud credentials, or read/write remote cache objects.
 
 The existing machine target schema remains accepted so operators can validate and migrate configuration deliberately:
 
@@ -162,35 +159,11 @@ cargo rail cache status --scope local --format json
 cargo rail doctor native-cache --format json
 ```
 
-Status schema 8 labels this target `configuration_only_transparent_cache_is_local`. Status and doctor validate only
+Status schema 9 labels this target `configuration_only_transparent_cache_is_local`. Status and doctor validate only
 the bounded machine-owned declaration; neither resolves credentials nor contacts S3. The target map must remain an
 absolute machine-owned file with no embedded credentials; unknown fields, ambiguous authority, and secret-like shared
 environment names remain rejected. L2 transport activation is deferred until it can
-consume the compiler-result protocol without recreating runner ownership or weakening the local proof.
-
-## Hermetic whole-action cache
-
-```bash
-cargo rail run --all --action build --hermetic --explain
-cargo rail run --all --action build --hermetic --no-cache
-```
-
-The graduated class is a pure-Rust, current-host Cargo check on macOS. A cold run requires an exact `Cargo.lock`,
-performs one `cargo fetch --locked` network boundary, then runs locked and offline in fresh roots with read-only source
-and dependency inputs.
-
-The process-free lookup accepts `cargo rail run --all --action build --hermetic` in text mode, optionally with
-`--explain` or `--print-cmd`, and no configuration override or trailing Cargo arguments. Its verified hit restores the
-complete output manifest before workspace context, metadata, fetch, Cargo, or compiler processes start. Other requests
-bootstrap normally before any action-cache decision.
-
-Other hosts run the isolated check but report `platform_limited` and receive no action key until Cargo-Rail can enforce
-an equivalent filesystem and network boundary. Build scripts, proc macros, documentation, linked or native artifacts,
-cross targets, custom tools, configured wrappers, and unmodeled Cargo overrides fail closed for this profile.
-
-`target/cargo-rail/hermetic/reports/` records support, enforcement, action and result identities, fetch reuse, outputs,
-cache status, and stable reasons. A corrupt or incompatible whole-action entry fails rather than silently restoring;
-use `--no-cache` for a deliberate cold run or validated cleanup to discard it.
+consume the compiler-result protocol without weakening the local proof.
 
 ## Compiler-evidence cache
 
@@ -321,8 +294,8 @@ just bench-native-cache-smoke
 just bench-native-cache 5
 ```
 
-Transparent activation invalidates the earlier runner-owned timing corpus. The current workflow invokes Cargo directly
-under one isolated setup receipt and measures three different questions independently: intact-target L0 overhead,
+The current workflow invokes Cargo directly under one isolated setup receipt and measures three different questions
+independently: intact-target L0 overhead,
 empty-target L1 restoration, and cold-path overhead. The comparison rotates lane order, preserves raw samples, records
 tool/host/configuration identity and usage counters, and checks exact outputs before accepting a sample.
 

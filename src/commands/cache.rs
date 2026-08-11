@@ -234,7 +234,7 @@ fn has_state(status: &CacheStatus) -> bool {
 }
 
 fn total_bytes(status: &CacheStatus) -> u64 {
-  let bytes = status
+  status
     .workspace
     .as_ref()
     .map_or(0, |workspace| workspace.bytes)
@@ -244,14 +244,7 @@ fn total_bytes(status: &CacheStatus) -> u64 {
         .as_ref()
         .and_then(|local| local.cache.as_ref())
         .map_or(0, |local| local.bytes),
-    );
-  bytes.saturating_add(
-    status
-      .local
-      .as_ref()
-      .and_then(|local| local.legacy.as_ref())
-      .map_or(0, |legacy| legacy.bytes),
-  )
+    )
 }
 
 fn render_status(status: &CacheStatus) {
@@ -338,9 +331,6 @@ fn render_status(status: &CacheStatus) {
       }
     } else {
       println!("    current authority root: absent");
-    }
-    if let Some(legacy) = &local.legacy {
-      println!("    legacy reclaim-only root: {} bytes ({})", legacy.bytes, legacy.root);
     }
   }
   if let Some(remote) = &status.remote {

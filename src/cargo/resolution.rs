@@ -231,45 +231,6 @@ impl ToolchainIdentity {
   pub(crate) fn rustc_sysroot(&self) -> &Path {
     &self.rustc_sysroot
   }
-
-  /// Discover a preinstalled toolchain without invoking Cargo compiler wrappers.
-  pub(crate) fn capture_hermetic(cargo_current_dir: &Path) -> RailResult<Self> {
-    let selected_rustc = OsStr::new("rustc");
-    let rustc_sysroot = PathBuf::from(hermetic_command_identity(
-      selected_rustc,
-      "--print=sysroot",
-      cargo_current_dir,
-      "preinstalled 'rustc --print=sysroot'",
-    )?);
-    let cargo_program = toolchain_program(&rustc_sysroot, "cargo").into_os_string();
-    let rustc_program = toolchain_program(&rustc_sysroot, "rustc").into_os_string();
-    let rustdoc_program = toolchain_program(&rustc_sysroot, "rustdoc").into_os_string();
-    let rustc_verbose_version =
-      hermetic_command_identity(&rustc_program, "-vV", cargo_current_dir, "exact sysroot 'rustc -vV'")?;
-    let host_target = parse_rustc_host(&rustc_verbose_version)?;
-    Ok(Self {
-      cargo_verbose_version: hermetic_command_identity(
-        &cargo_program,
-        "-Vv",
-        cargo_current_dir,
-        "exact sysroot 'cargo -Vv'",
-      )?,
-      rustdoc_verbose_version: hermetic_command_identity(
-        &rustdoc_program,
-        "-vV",
-        cargo_current_dir,
-        "exact sysroot 'rustdoc -vV'",
-      )?,
-      cargo_program,
-      rustc_program,
-      rustc_verbose_version,
-      rustdoc_program,
-      rustc_wrapper_program: None,
-      rustc_workspace_wrapper_program: None,
-      host_target,
-      rustc_sysroot,
-    })
-  }
 }
 
 /// Exact identity of a custom rustc target specification.
@@ -463,7 +424,7 @@ impl CargoConfigSnapshot {
     &self.credential_capabilities
   }
 
-  /// Return Cargo settings outside the explicit hermetic build contract.
+  /// Return Cargo settings outside the modeled compiler-evidence contract.
   pub(crate) fn unmodeled_settings(&self) -> &BTreeSet<String> {
     &self.unmodeled_settings
   }
@@ -477,12 +438,6 @@ impl CargoConfigSnapshot {
         .any(|value| is_credential_environment_marker(value))
   }
 
-  /// Resolve Cargo's selected executable without probing the toolchain.
-  pub(crate) fn selected_cargo_program(&self, cargo_current_dir: &Path) -> RailResult<OsString> {
-    selected_program(self, cargo_current_dir, &["CARGO"], &[], Some("cargo"), "Cargo")?
-      .ok_or_else(|| RailError::message("Cargo program selection is empty"))
-  }
-
   pub(crate) fn repository_config_paths(&self, source_root: &Path) -> RailResult<Vec<crate::source::RepositoryPath>> {
     self
       .provenance
@@ -492,57 +447,6 @@ impl CargoConfigSnapshot {
       .filter_map(|path| path.strip_prefix(source_root).ok())
       .map(crate::source::RepositoryPath::new)
       .collect()
-  }
-
-  pub(crate) fn materialized_environment(
-    &self,
-    source_root: &Path,
-    materialized_root: &Path,
-  ) -> RailResult<Vec<(String, OsString, String)>> {
-    let Some(environment) = self.effective_file_settings.get("env") else {
-      return Ok(Vec::new());
-    };
-    let environment = environment
-      .as_object()
-      .ok_or_else(|| RailError::message("Cargo configuration key 'env' must be a table"))?;
-    let mut bindings = Vec::with_capacity(environment.len());
-    for (name, setting) in environment {
-      if is_credential_capability(setting) {
-        return Err(RailError::with_help(
-          format!("hermetic execution cannot apply redacted Cargo environment value 'env.{name}'"),
-          "move build secrets out of Cargo configuration; acquisition credentials remain fetch-only capabilities",
-        ));
-      }
-      let (configured, force, relative, value_path) = cargo_environment_setting(name, setting)?;
-      let (value, identity) = if !force && let Some(captured) = self.environment.get(name) {
-        if is_credential_environment_marker(captured) {
-          return Err(RailError::with_help(
-            format!("hermetic execution cannot apply secret environment variable '{name}'"),
-            "remove the secret from the build environment or keep the action explicitly uncacheable",
-          ));
-        }
-        materialize_environment_value(captured, source_root, materialized_root)?
-      } else if relative {
-        let (_, source) = self
-          .config_string_with_source(&value_path)?
-          .ok_or_else(|| RailError::message(format!("Cargo configuration key 'env.{name}' has no path provenance")))?;
-        let resolved = config_relative_root(source.path())?.join(configured);
-        let relative = resolved.strip_prefix(source_root).map_err(|_| {
-          RailError::with_help(
-            format!("relative Cargo environment value 'env.{name}' resolves outside the captured repository"),
-            "move the referenced input into the repository or keep the action explicitly uncacheable",
-          )
-        })?;
-        (
-          materialized_root.join(relative).into_os_string(),
-          format!("repository:{}", crate::utils::path_to_git_format(relative)),
-        )
-      } else {
-        materialize_environment_value(configured, source_root, materialized_root)?
-      };
-      bindings.push((name.clone(), value, identity));
-    }
-    Ok(bindings)
   }
 
   fn config_string_with_source(&self, path: &[&str]) -> RailResult<Option<(&str, &CargoConfigSource)>> {
@@ -743,126 +647,6 @@ impl CargoConfigSnapshot {
     }
     Ok(identity)
   }
-
-  pub(crate) fn portable_acquisition_identity(&self, source_root: &Path) -> RailResult<Vec<u8>> {
-    let mut identity = Vec::from(&b"cargo-acquisition-snapshot-v1\0"[..]);
-    append_frame(
-      &mut identity,
-      b"effective-settings",
-      &serde_json::to_vec(&acquisition_settings(&self.effective_file_settings))?,
-    );
-    let environment = self
-      .environment
-      .iter()
-      .filter(|(name, _)| is_acquisition_environment(name))
-      .map(|(name, value)| (name.clone(), value.clone()))
-      .collect::<BTreeMap<_, _>>();
-    append_frame(
-      &mut identity,
-      b"environment",
-      &serde_json::to_vec(&portable_environment(&environment, source_root)?)?,
-    );
-    append_frame(
-      &mut identity,
-      b"credential-capabilities",
-      &serde_json::to_vec(&self.credential_capabilities)?,
-    );
-    for source in &self.provenance {
-      let settings = acquisition_settings(source.settings());
-      if settings.as_object().is_none_or(JsonMap::is_empty) {
-        continue;
-      }
-      let mut provenance = Vec::new();
-      append_frame(
-        &mut provenance,
-        b"path",
-        portable_path(source_root, source.path(), "Cargo acquisition configuration provenance")?.as_bytes(),
-      );
-      append_frame(&mut provenance, b"settings", &serde_json::to_vec(&settings)?);
-      append_frame(&mut identity, b"provenance", &provenance);
-    }
-    Ok(identity)
-  }
-
-  pub(crate) fn non_secret_acquisition_environment(&self) -> BTreeMap<String, String> {
-    self
-      .environment
-      .iter()
-      .filter(|(name, value)| is_acquisition_environment(name) && !is_credential_environment_marker(value))
-      .map(|(name, value)| (name.clone(), value.clone()))
-      .collect()
-  }
-}
-
-fn acquisition_settings(settings: &JsonValue) -> JsonValue {
-  const KEYS: &[&str] = &[
-    "credential-alias",
-    "http",
-    "net",
-    "patch",
-    "paths",
-    "registries",
-    "registry",
-    "source",
-  ];
-  let Some(settings) = settings.as_object() else {
-    return JsonValue::Object(JsonMap::new());
-  };
-  let mut acquisition = settings
-    .iter()
-    .filter(|(key, _)| KEYS.contains(&key.as_str()))
-    .map(|(key, value)| (key.clone(), value.clone()))
-    .collect::<JsonMap<_, _>>();
-  if let Some(environment) = settings.get("env").and_then(JsonValue::as_object) {
-    let environment = environment
-      .iter()
-      .filter(|(name, _)| is_acquisition_environment(name))
-      .map(|(name, value)| (name.clone(), value.clone()))
-      .collect::<JsonMap<_, _>>();
-    if !environment.is_empty() {
-      acquisition.insert("env".to_string(), JsonValue::Object(environment));
-    }
-  }
-  JsonValue::Object(acquisition)
-}
-
-fn is_acquisition_environment(name: &str) -> bool {
-  name.starts_with("CARGO_NET_")
-    || name.starts_with("CARGO_REGISTRIES_")
-    || name.starts_with("CARGO_REGISTRY_")
-    || name.starts_with("CARGO_SOURCE_")
-    || matches!(
-      name,
-      "ALL_PROXY"
-        | "GIT_SSH_COMMAND"
-        | "HTTP_PROXY"
-        | "HTTPS_PROXY"
-        | "NO_PROXY"
-        | "SSH_AUTH_SOCK"
-        | "SSL_CERT_DIR"
-        | "SSL_CERT_FILE"
-        | "all_proxy"
-        | "http_proxy"
-        | "https_proxy"
-        | "no_proxy"
-    )
-}
-
-fn materialize_environment_value(
-  value: &str,
-  source_root: &Path,
-  materialized_root: &Path,
-) -> RailResult<(OsString, String)> {
-  let path = Path::new(value);
-  if path.is_absolute()
-    && let Ok(relative) = path.strip_prefix(source_root)
-  {
-    return Ok((
-      materialized_root.join(relative).into_os_string(),
-      format!("repository:{}", crate::utils::path_to_git_format(relative)),
-    ));
-  }
-  Ok((OsString::from(value), value.to_string()))
 }
 
 fn portable_environment(
@@ -1084,7 +868,6 @@ fn json_value_at<'a>(value: &'a JsonValue, path: &[&str]) -> Option<&'a JsonValu
 pub(crate) struct ResolutionInputs {
   pub(crate) cargo_config: Arc<CargoConfigSnapshot>,
   pub(crate) toolchain: ToolchainIdentity,
-  pub(crate) hermetic: bool,
 }
 
 impl ResolutionInputs {
@@ -1096,25 +879,6 @@ impl ResolutionInputs {
     Ok(Self {
       cargo_config,
       toolchain,
-      hermetic: false,
-    })
-  }
-
-  pub(crate) fn capture_hermetic(cargo_current_dir: &Path) -> RailResult<Self> {
-    Self::from_hermetic_config(
-      cargo_current_dir,
-      Arc::new(CargoConfigSnapshot::capture(cargo_current_dir)?),
-    )
-  }
-
-  pub(crate) fn from_hermetic_config(
-    cargo_current_dir: &Path,
-    cargo_config: Arc<CargoConfigSnapshot>,
-  ) -> RailResult<Self> {
-    Ok(Self {
-      cargo_config,
-      toolchain: ToolchainIdentity::capture_hermetic(cargo_current_dir)?,
-      hermetic: true,
     })
   }
 }
@@ -1148,7 +912,6 @@ type ViewCell = OnceLock<CachedView>;
 pub(crate) struct ResolutionViews {
   workspace_root: PathBuf,
   cargo_current_dir: PathBuf,
-  hermetic_cargo_home: Option<PathBuf>,
   base: Arc<ResolutionView>,
   cache: Mutex<FxHashMap<ResolutionViewKey, Arc<ViewCell>>>,
   cargo_config: OnceLock<Result<Arc<CargoConfigSnapshot>, CachedResolutionError>>,
@@ -1162,7 +925,7 @@ impl ResolutionViews {
     metadata: Arc<Metadata>,
     graph: Arc<WorkspaceGraph>,
   ) -> Self {
-    Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, None, None)
+    Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, None)
   }
 
   pub(crate) fn new_with_inputs(
@@ -1172,25 +935,7 @@ impl ResolutionViews {
     graph: Arc<WorkspaceGraph>,
     inputs: ResolutionInputs,
   ) -> Self {
-    Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, Some(inputs), None)
-  }
-
-  pub(crate) fn new_hermetic_with_inputs(
-    workspace_root: PathBuf,
-    cargo_current_dir: PathBuf,
-    metadata: Arc<Metadata>,
-    graph: Arc<WorkspaceGraph>,
-    inputs: ResolutionInputs,
-    cargo_home: PathBuf,
-  ) -> Self {
-    Self::new_inner(
-      workspace_root,
-      cargo_current_dir,
-      metadata,
-      graph,
-      Some(inputs),
-      Some(cargo_home),
-    )
+    Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, Some(inputs))
   }
 
   fn new_inner(
@@ -1199,7 +944,6 @@ impl ResolutionViews {
     metadata: Arc<Metadata>,
     graph: Arc<WorkspaceGraph>,
     inputs: Option<ResolutionInputs>,
-    hermetic_cargo_home: Option<PathBuf>,
   ) -> Self {
     let cargo_config = OnceLock::new();
     let toolchain = OnceLock::new();
@@ -1210,7 +954,6 @@ impl ResolutionViews {
     Self {
       workspace_root,
       cargo_current_dir,
-      hermetic_cargo_home,
       base: Arc::new(ResolutionView {
         request: ResolutionRequest::default(),
         metadata,
@@ -1239,7 +982,6 @@ impl ResolutionViews {
     Ok(ResolutionInputs {
       cargo_config,
       toolchain,
-      hermetic: self.hermetic_cargo_home.is_some(),
     })
   }
 
@@ -1281,10 +1023,7 @@ impl ResolutionViews {
   fn load(&self, key: &ResolutionViewKey, options: ResolutionCommandOptions) -> RailResult<Arc<ResolutionView>> {
     self.validate_cargo_config_unchanged(key.cargo_config)?;
     let mut command = MetadataCommand::new();
-    let cargo_program = self.hermetic_cargo_home.as_ref().map_or_else(
-      || PathBuf::from(&key.toolchain.cargo_program),
-      |_| toolchain_program(key.toolchain.rustc_sysroot(), "cargo"),
-    );
+    let cargo_program = PathBuf::from(&key.toolchain.cargo_program);
     command
       .cargo_path(cargo_program)
       .current_dir(&self.cargo_current_dir)
@@ -1299,25 +1038,10 @@ impl ResolutionViews {
       command.features(CargoOpt::SomeFeatures(options.features));
     }
     let mut other_options = vec!["--locked".to_string()];
-    if self.hermetic_cargo_home.is_some() {
-      other_options.push("--offline".to_string());
-    }
     if let Some(target) = key.request.target_filter() {
       other_options.extend(["--filter-platform".to_string(), target.to_string()]);
     }
     command.other_options(other_options);
-    if let Some(cargo_home) = &self.hermetic_cargo_home {
-      for (name, value) in self.inputs()?.cargo_config.non_secret_acquisition_environment() {
-        command.env(name, value);
-      }
-      command
-        .env("CARGO_HOME", cargo_home)
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("CARGO_CACHE_RUSTC_INFO", "0")
-        .env("RUSTC", toolchain_program(key.toolchain.rustc_sysroot(), "rustc"))
-        .env("RUSTDOC", toolchain_program(key.toolchain.rustc_sysroot(), "rustdoc"));
-    }
-
     crate::instrumentation::record_cargo_metadata_load(key.request.target_filter().is_some());
     let metadata = command.exec();
     self.validate_cargo_config_unchanged(key.cargo_config)?;
@@ -1346,12 +1070,6 @@ impl ResolutionViews {
       "retry after Cargo configuration and environment changes have stopped",
     ))
   }
-}
-
-fn toolchain_program(sysroot: &Path, name: &str) -> PathBuf {
-  #[cfg(windows)]
-  let name = format!("{name}.exe");
-  sysroot.join("bin").join(name)
 }
 
 fn cached_value<T: Clone>(value: &Result<T, CachedResolutionError>) -> RailResult<T> {
@@ -2587,37 +2305,6 @@ fn run_identity_command(
   Ok(identity)
 }
 
-fn hermetic_command_identity(
-  program: &OsStr,
-  argument: &str,
-  workspace_root: &Path,
-  description: &str,
-) -> RailResult<String> {
-  crate::instrumentation::record_hermetic_toolchain_probe(program);
-  let mut command = Command::new(program);
-  for name in [
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "LIBPATH",
-    "RUSTC",
-    "RUSTC_WRAPPER",
-    "RUSTC_WORKSPACE_WRAPPER",
-    "RUSTDOC",
-    "SHLIB_PATH",
-  ] {
-    command.env_remove(name);
-  }
-  run_identity_command(
-    command,
-    argument,
-    workspace_root,
-    description,
-    "install the selected Rust toolchain before hermetic execution; cargo-rail will not auto-install it",
-  )
-}
-
 fn disable_implicit_toolchain_install(command: &mut Command) {
   command
     .env("RUSTUP_AUTO_INSTALL", "0")
@@ -3455,7 +3142,6 @@ mod tests {
     ResolutionInputs {
       cargo_config: Arc::new(cargo_config),
       toolchain,
-      hermetic: false,
     }
   }
 
@@ -4585,69 +4271,6 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
           .as_os_str()
       )
     );
-  }
-
-  #[test]
-  fn materialized_cargo_environment_remaps_repository_relative_values() {
-    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
-    let cargo_dir = workspace.path().join(".cargo");
-    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
-    fs::write(
-      cargo_dir.join("config.toml"),
-      "[env]\nCARGO_RAIL_LITERAL = { value = \"stable\", force = true }\nCARGO_RAIL_RELATIVE = { value = \"tools\", relative = true, force = true }\n",
-    )
-    .expect("Cargo config should be written");
-    let captured = CargoConfigSnapshot::capture(workspace.path()).expect("Cargo config should capture");
-    let source_root = canonicalize_existing(workspace.path()).expect("workspace should canonicalize");
-    let destination = Path::new("/isolated/workspace");
-    let bindings = captured
-      .materialized_environment(&source_root, destination)
-      .expect("Cargo environment should materialize");
-    assert!(bindings.contains(&(
-      "CARGO_RAIL_LITERAL".to_string(),
-      OsString::from("stable"),
-      "stable".to_string()
-    )));
-    assert!(bindings.contains(&(
-      "CARGO_RAIL_RELATIVE".to_string(),
-      destination.join("tools").into_os_string(),
-      "repository:tools".to_string()
-    )));
-  }
-
-  #[test]
-  fn acquisition_identity_excludes_build_only_configuration() {
-    let workspace = tempfile::tempdir().expect("temporary Cargo workspace should be created");
-    let cargo_dir = workspace.path().join(".cargo");
-    fs::create_dir_all(&cargo_dir).expect("Cargo config directory should be created");
-    let config = cargo_dir.join("config.toml");
-    let write = |rustflag: &str, registry: &str| {
-      fs::write(
-        &config,
-        format!(
-          "[build]\nrustflags = [\"--cfg\", \"{rustflag}\"]\n[env]\nCARGO_RAIL_BUILD_VALUE = {{ value = \"{rustflag}\", force = true }}\n[source.crates-io]\nreplace-with = \"mirror\"\n[source.mirror]\nregistry = \"{registry}\"\n"
-        ),
-      )
-      .expect("Cargo config should be written");
-    };
-    write("first", "https://example.invalid/first-index");
-    let first = CargoConfigSnapshot::capture(workspace.path())
-      .expect("first Cargo config should capture")
-      .portable_acquisition_identity(workspace.path())
-      .expect("first acquisition identity should encode");
-    write("second", "https://example.invalid/first-index");
-    let build_changed = CargoConfigSnapshot::capture(workspace.path())
-      .expect("changed build config should capture")
-      .portable_acquisition_identity(workspace.path())
-      .expect("changed build acquisition identity should encode");
-    assert_eq!(first, build_changed);
-
-    write("second", "https://example.invalid/second-index");
-    let acquisition_changed = CargoConfigSnapshot::capture(workspace.path())
-      .expect("changed acquisition config should capture")
-      .portable_acquisition_identity(workspace.path())
-      .expect("changed acquisition identity should encode");
-    assert_ne!(first, acquisition_changed);
   }
 
   #[test]

@@ -25,7 +25,7 @@ use crate::compiler::observation::{
 };
 use crate::compiler::session::{CompilerFactSession, FACT_SESSION_ENV};
 use crate::error::{RailError, RailResult, ResultExt};
-use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities, ToolchainExecutableScope};
+use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities};
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
@@ -185,7 +185,7 @@ impl CompilerCacheIdentity {
       snapshot.source_root(),
       snapshot.source_root(),
     )?;
-    let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
+    let executables = snapshot.executable_identities()?;
     let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
     let toolchain_fingerprint =
       executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable)?;
@@ -1486,7 +1486,7 @@ fn reconcile_exact_artifact_observations(
 
 /// Capture the exact native-cache toolchain identity for operator inspection.
 pub(crate) fn native_cache_capability(snapshot: &WorkspaceSnapshot) -> RailResult<NativeToolchainCapability> {
-  let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
+  let executables = snapshot.executable_identities()?;
   capture_native_toolchain_capability(snapshot.toolchain(), executables)
 }
 

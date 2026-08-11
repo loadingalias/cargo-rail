@@ -374,16 +374,6 @@ fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json
     path if path.starts_with("unify.msrv_policy.") => {
       contains_any(&["unify.msrv", "unify.msrv_source", "unify.enforce_msrv_inheritance"])
     }
-    path if path.starts_with("run.profile.") && path.contains(".baseline.") => {
-      let Some((profile, _)) = path.rsplit_once(".baseline.") else {
-        return false;
-      };
-      configured.contains_key(&format!("{profile}.since")) || configured.contains_key(&format!("{profile}.merge_base"))
-    }
-    path if path.starts_with("run.profile.") && path.ends_with(".actions") => {
-      let profile = path.trim_end_matches(".actions");
-      configured.contains_key(&format!("{profile}.surfaces"))
-    }
     _ => false,
   }
 }
@@ -506,6 +496,9 @@ pub fn run_config_validate_standalone(
 
   // Check for unknown keys (only if parsing succeeded)
   if let Ok(doc) = &raw_doc {
+    if let Err(message) = crate::config::reject_removed_run_config(doc) {
+      errors.push(ValidationIssue::new("run", message));
+    }
     check_unknown_keys(doc, &mut warnings);
     for deprecation in schema::present_deprecations(doc) {
       if let Some(message) = deprecation.spec.deprecation {
@@ -528,9 +521,6 @@ pub fn run_config_validate_standalone(
       // Validate change detection config
       if let Err(e) = config.change_detection.validate() {
         errors.push(ValidationIssue::new("change_detection", e.to_string()));
-      }
-      if let Err(e) = config.run.validate() {
-        errors.push(ValidationIssue::new("run", e.to_string()));
       }
       if let Err(e) = config.unify.validate(workspace_root) {
         errors.push(ValidationIssue::new("unify", e.to_string()));
@@ -739,6 +729,7 @@ pub fn run_config_migrate(
 
   let config_path = resolve_config_path(workspace_root, config_override)?;
   let mut editor = TomlEditor::open(&config_path)?;
+  crate::config::reject_removed_run_config(editor.doc()).map_err(RailError::message)?;
   let mut changes = Vec::new();
 
   migrate_removed_field(
@@ -803,8 +794,6 @@ pub fn run_config_migrate(
   );
   migrate_unify_typed_policies(&mut editor, &mut changes)?;
   migrate_release_remote_effects(&mut editor, &mut changes)?;
-  migrate_run_profile_actions(&mut editor, &mut changes)?;
-  migrate_run_profile_baselines(&mut editor, &mut changes)?;
   migrate_split_member_paths(workspace_root, &mut editor, &mut changes)?;
   migrate_removed_field(
     &mut editor,
@@ -1224,144 +1213,6 @@ fn legacy_table_bool(table: &toml_edit::Table, key: &str) -> RailResult<Option<b
         .ok_or_else(|| RailError::message(format!("unify.{key} must be a boolean before it can be migrated")))
     })
     .transpose()
-}
-
-fn migrate_run_profile_baselines(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
-  let profile_names: Vec<String> = editor
-    .doc()
-    .get("run")
-    .and_then(toml_edit::Item::as_table)
-    .and_then(|run| run.get("profile"))
-    .and_then(toml_edit::Item::as_table)
-    .map(|profiles| profiles.iter().map(|(name, _)| name.to_string()).collect())
-    .unwrap_or_default();
-
-  for profile_name in profile_names {
-    let profile = editor
-      .doc_mut()
-      .get_mut("run")
-      .and_then(toml_edit::Item::as_table_mut)
-      .and_then(|run| run.get_mut("profile"))
-      .and_then(toml_edit::Item::as_table_mut)
-      .and_then(|profiles| profiles.get_mut(&profile_name))
-      .and_then(toml_edit::Item::as_table_mut)
-      .ok_or_else(|| RailError::message(format!("run.profile.{profile_name} must be a table")))?;
-    let has_since = profile.contains_key("since");
-    let has_merge_base = profile.contains_key("merge_base");
-    if !has_since && !has_merge_base {
-      continue;
-    }
-
-    let since = profile
-      .get("since")
-      .map(|item| {
-        item
-          .as_str()
-          .map(str::to_string)
-          .ok_or_else(|| RailError::message(format!("run.profile.{profile_name}.since must be a string")))
-      })
-      .transpose()?;
-    let merge_base = profile
-      .get("merge_base")
-      .map(|item| {
-        item
-          .as_bool()
-          .ok_or_else(|| RailError::message(format!("run.profile.{profile_name}.merge_base must be a boolean")))
-      })
-      .transpose()?;
-    if since.is_some() && merge_base == Some(true) && !profile.contains_key("baseline") {
-      return Err(RailError::with_help(
-        format!("cannot migrate conflicting baseline in run.profile.{profile_name}"),
-        "remove either since or merge_base = true so the profile selects one baseline mode",
-      ));
-    }
-
-    let replacement = if let Some(item) = profile.get("baseline") {
-      format!("run.profile.{profile_name}.baseline = {}", display_toml_item(item))
-    } else if let Some(reference) = since {
-      let mut baseline = toml_edit::InlineTable::new();
-      baseline.insert("kind", "since".into());
-      baseline.insert("reference", reference.into());
-      let value = toml_edit::Value::InlineTable(baseline);
-      let replacement = value.to_string();
-      profile.insert("baseline", toml_edit::Item::Value(value));
-      format!("run.profile.{profile_name}.baseline = {replacement}")
-    } else if merge_base == Some(true) {
-      let mut baseline = toml_edit::InlineTable::new();
-      baseline.insert("kind", "merge-base".into());
-      let value = toml_edit::Value::InlineTable(baseline);
-      let replacement = value.to_string();
-      profile.insert("baseline", toml_edit::Item::Value(value));
-      format!("run.profile.{profile_name}.baseline = {replacement}")
-    } else {
-      "field omitted (the profile has no baseline by default)".to_string()
-    };
-
-    for key in ["since", "merge_base"] {
-      if profile.remove(key).is_some() {
-        changes.push(MigrationChange {
-          kind: "merge",
-          path: format!("run.profile.{profile_name}.{key}"),
-          replacement: Some(replacement.clone()),
-          message: "The legacy baseline pair is now one typed policy.",
-        });
-      }
-    }
-  }
-  Ok(())
-}
-
-fn migrate_run_profile_actions(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
-  let profile_names: Vec<String> = editor
-    .doc()
-    .get("run")
-    .and_then(toml_edit::Item::as_table)
-    .and_then(|run| run.get("profile"))
-    .and_then(toml_edit::Item::as_table)
-    .map(|profiles| profiles.iter().map(|(name, _)| name.to_string()).collect())
-    .unwrap_or_default();
-
-  for profile_name in profile_names {
-    let profile = editor
-      .doc_mut()
-      .get_mut("run")
-      .and_then(toml_edit::Item::as_table_mut)
-      .and_then(|run| run.get_mut("profile"))
-      .and_then(toml_edit::Item::as_table_mut)
-      .and_then(|profiles| profiles.get_mut(&profile_name))
-      .and_then(toml_edit::Item::as_table_mut)
-      .ok_or_else(|| RailError::message(format!("run.profile.{profile_name} must be a table")))?;
-    if !profile.contains_key("surfaces") {
-      continue;
-    }
-    if profile.contains_key("actions") {
-      return Err(RailError::with_help(
-        format!("cannot migrate conflicting selection in run.profile.{profile_name}"),
-        "remove either actions or deprecated surfaces so the profile has one ordered action list",
-      ));
-    }
-    let surfaces = profile.remove("surfaces").ok_or_else(|| {
-      RailError::message(format!(
-        "run.profile.{profile_name}.surfaces disappeared during migration"
-      ))
-    })?;
-    let replacement = surfaces
-      .as_value()
-      .map(|value| {
-        let mut value = value.clone();
-        value.decor_mut().clear();
-        value.to_string()
-      })
-      .unwrap_or_else(|| surfaces.to_string());
-    profile.insert("actions", surfaces);
-    changes.push(MigrationChange {
-      kind: "rename",
-      path: format!("run.profile.{profile_name}.surfaces"),
-      replacement: Some(format!("run.profile.{profile_name}.actions = {replacement}")),
-      message: "Executable profile selections are action IDs; planner surfaces remain impact outputs.",
-    });
-  }
-  Ok(())
 }
 
 fn legacy_bool(editor: &TomlEditor, path: &str) -> RailResult<Option<bool>> {

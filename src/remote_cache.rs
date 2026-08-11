@@ -1,8 +1,7 @@
 //! Machine-owned remote target validation and doctor probing.
 //!
-//! Transparent compiler reuse is local-only. The command-owned remote
-//! coordinator was removed with runner cache ownership; a future remote
-//! transport can consume the retained compiler-result protocol directly.
+//! Transparent compiler reuse is local-only. A future remote transport can
+//! consume the retained compiler-result protocol directly.
 
 mod s3;
 

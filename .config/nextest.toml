@@ -29,12 +29,6 @@ filter = 'binary(integration) & test(=test_compiler_observation::source_capture_
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_)/)'
-test-group = 'cargo-subprocess'
-# These exercise bounded setup and a serial crash/recovery matrix; saturation must not turn either into a bypass/timeout.
-threads-required = "num-test-threads"
-
-[[profile.default.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
@@ -64,11 +58,6 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(=test_compiler_observation::source_capture_limit_bypasses_cold_without_creating_authority)'
 leak-timeout = { period = "10s", result = "fail" }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(/(clean_native_cache_execution_skips_planner_acquisition_and_retains_a_receipt|restore_commit_)/)'
-test-group = 'cargo-subprocess'
-threads-required = "num-test-threads"
 
 [[profile.commit.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'

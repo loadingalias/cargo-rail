@@ -543,175 +543,23 @@ fn test_config_validate_rejects_noncanonical_cache_alias() -> Result<()> {
 }
 
 #[test]
-fn test_config_validate_rejects_invalid_run_profile_action() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-run-invalid-surface")?;
+fn test_config_validate_rejects_removed_run_configuration() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-removed-run")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
-
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"[run.profile.bad]
-surfaces = ["not-a-surface"]
-"#,
-  )?;
+  fs::write(ws.path.join(".config/rail.toml"), "[run]\n")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
-  assert!(!output.status.success(), "invalid run action should fail validation");
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-  assert_eq!(json["valid"], false);
-  let errors = json["errors"].as_array().unwrap();
-  assert!(
-    errors
-      .iter()
-      .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown action 'not-a-surface'")),
-    "expected unknown action error. Output:\n{}",
-    stdout
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_validate_rejects_infra_run_profile_surface() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-run-infra-surface")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"[run.profile.bad]
-surfaces = ["infra"]
-"#,
-  )?;
-
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
-  assert!(!output.status.success(), "infra run surface should fail validation");
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-  assert_eq!(json["valid"], false);
-  let errors = json["errors"].as_array().unwrap();
-  assert!(
-    errors
-      .iter()
-      .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("`infra` is a planner output")),
-    "expected infra planner-output error. Output:\n{}",
-    stdout
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_validate_strict_reports_unknown_run_profile_key() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-run-unknown-key")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"[run.profile.ci]
-surfaces = ["build", "test"]
-unexpected = true
-"#,
-  )?;
-
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
-  assert!(
-    !output.status.success(),
-    "strict mode should fail on unknown run profile key"
-  );
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-  assert_eq!(json["valid"], false);
-  let errors = json["errors"].as_array().unwrap();
-  assert!(
-    errors
-      .iter()
-      .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown configuration key 'run.profile.ci.unexpected'")),
-    "expected strict unknown-key error. Output:\n{}",
-    stdout
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_validate_rejects_invalid_run_workflow_mapping() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-run-invalid-workflow")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"[run.workflow]
-commit = "missing_profile"
-"#,
-  )?;
-
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
-  assert!(
-    !output.status.success(),
-    "invalid run workflow mapping should fail validation"
-  );
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-  assert_eq!(json["valid"], false);
-  let errors = json["errors"].as_array().unwrap();
-  assert!(
-    errors
-      .iter()
-      .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown profile 'missing_profile'")),
-    "expected unknown workflow profile error. Output:\n{}",
-    stdout
-  );
-
-  Ok(())
-}
-
-#[test]
-fn test_config_validate_rejects_invalid_run_profile_token() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-run-invalid-token")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add test crate")?;
-
-  let config_path = ws.path.join(".config").join("rail.toml");
-  fs::write(
-    &config_path,
-    r#"[run.profile.docs_custom]
-surfaces = ["docs"]
-run_args = ["--manifest-path", "{bad_token}/Cargo.toml"]
-"#,
-  )?;
-
-  let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "-f", "json"])?;
-  assert!(!output.status.success(), "invalid token should fail validation");
-
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let json: serde_json::Value = serde_json::from_str(&stdout)?;
-  assert_eq!(json["valid"], false);
-  let errors = json["errors"].as_array().unwrap();
-  assert!(
-    errors
-      .iter()
-      .filter_map(|e| e["message"].as_str())
-      .any(|msg| msg.contains("unknown token '{bad_token}'")),
-    "expected unknown token validation error. Output:\n{}",
-    stdout
-  );
-
+  assert_eq!(output.status.code(), Some(2));
+  let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let errors = json["errors"].as_array().expect("validation errors");
+  let message = errors
+    .iter()
+    .find_map(|error| error["message"].as_str())
+    .expect("removed run diagnostic");
+  for expected in ["[run]", "Cargo", "cargo-nextest", "Just", "CI", "cargo rail plan"] {
+    assert!(message.contains(expected), "diagnostic must name {expected}: {message}");
+  }
   Ok(())
 }
 
@@ -942,14 +790,6 @@ forge = "gitlab"
 conservative_unclassified_owner_fallback = true
 bot_pr_confidence_profile = "strict"
 
-[run.profile.ci]
-surfaces = ["build", "test"]
-merge_base = true
-
-[run.profile.local]
-surfaces = ["test"]
-since = "HEAD~1"
-
 [crates.demo.sync]
 "#,
   )?;
@@ -983,11 +823,6 @@ since = "HEAD~1"
   assert!(!migrated.contains("[crates.demo.sync]"));
   assert!(!migrated.contains("conservative_unclassified_owner_fallback"));
   assert!(migrated.contains("unknown_file_policy = \"owned_build_test\""));
-  assert!(!migrated.contains("merge_base"));
-  assert!(migrated.contains("baseline = { kind = \"merge-base\" }"));
-  assert!(!migrated.contains("since ="));
-  assert!(migrated.contains("baseline = { kind = \"since\", reference = \"HEAD~1\" }"));
-
   let second = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check"])?;
   assert!(second.status.success(), "applied migrations must be idempotent");
 
@@ -1034,10 +869,6 @@ enforce_msrv_inheritance = false
 [release]
 push = false
 create_github_release = false
-
-[run.profile.ci]
-surfaces = ["test"]
-merge_base = false
 "#;
   fs::write(&config_path, original)?;
 
@@ -1055,21 +886,12 @@ merge_base = false
   assert!(
     replacements
       .iter()
-      .any(|replacement| { replacement == &"run.profile.ci.actions = [\"test\"]" })
-  );
-  assert!(
-    replacements
-      .iter()
-      .filter(|replacement| !replacement.starts_with("run.profile.ci.actions"))
       .all(|replacement| replacement.starts_with("field omitted ("))
   );
 
   let apply = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
   assert!(apply.status.success());
-  assert_eq!(
-    fs::read_to_string(&config_path)?.trim_start(),
-    "[run.profile.ci]\nactions = [\"test\"]\n"
-  );
+  assert_eq!(fs::read_to_string(&config_path)?.trim(), "");
 
   Ok(())
 }
@@ -1093,18 +915,21 @@ fn test_config_migrate_refuses_invalid_legacy_release_effects() -> Result<()> {
 }
 
 #[test]
-fn test_config_migrate_refuses_conflicting_legacy_run_baseline() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-migrate-invalid-run-baseline")?;
+fn test_config_migrate_rejects_removed_run_configuration_without_mutation() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-migrate-removed-run")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
   let config_path = ws.path.join(".config/rail.toml");
-  let original = "[run.profile.ci]\nsurfaces = [\"test\"]\nsince = \"HEAD~1\"\nmerge_base = true\n";
+  let original = "[run]\n";
   fs::write(&config_path, original)?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
   assert_eq!(output.status.code(), Some(2));
   assert_eq!(fs::read_to_string(&config_path)?, original);
-  assert!(String::from_utf8_lossy(&output.stderr).contains("selects one baseline mode"));
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  for expected in ["[run]", "Cargo", "cargo-nextest", "Just", "CI", "cargo rail plan"] {
+    assert!(stderr.contains(expected), "diagnostic must name {expected}: {stderr}");
+  }
 
   Ok(())
 }
