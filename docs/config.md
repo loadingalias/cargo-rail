@@ -76,13 +76,14 @@ The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had 
 
 ## `[cache]`
 
-Local native compiler-result reuse is enabled by default and requires no repository policy. Configure `l2` only when
-compatible machines should exchange verified results through a machine-owned S3 target:
+Transparent local compiler-result reuse is installed as machine state with `cargo rail cache setup`; repository policy
+does not own that wrapper or CAS. The retained cache table controls Cargo-Rail command behavior and validates remote
+target configuration, but does not activate remote transfer:
 
 | Field | Default | Behavior |
 |---|---:|---|
-| `enabled` | `true` | Enable Cargo-Rail build-result cache reads and writes. `--no-cache` disables them for one run. |
-| `l2` | unset | Select a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. L1 remains enabled and an accepted L1 hit remains network-free. |
+| `enabled` | `true` | Permit cache use for Cargo-Rail-owned actions. `--no-cache` also delegates child compiler work with `CARGO_RAIL_CACHE=off`. It does not uninstall transparent machine setup. |
+| `l2` | unset | Select and validate a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. Status schema 8 reports it as configuration-only; transparent caching remains local. |
 
 ```toml
 [cache]
@@ -91,8 +92,8 @@ l2 = "team"
 
 The alias is at most 64 bytes, starts with a lowercase ASCII letter, and contains only lowercase ASCII letters, digits,
 `-`, or `_`. The target map is an absolute JSON file outside the checkout and contains no credentials. See
-[Caching](caching.md#shared-native-cache-l2) for the complete target schema and
-[Share native compiler results across CI and SSH](cache-sharing.md) for an end-to-end deployment.
+[Caching](caching.md#shared-native-cache-l2) for the retained validation schema. Do not treat it as an active remote
+data plane.
 
 ## `[unify]`
 

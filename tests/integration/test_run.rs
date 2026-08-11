@@ -4,7 +4,6 @@
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -33,16 +32,6 @@ fn generate_lockfile_with_env(workspace: &Path, environment: &[(&str, &str)]) ->
     String::from_utf8_lossy(&output.stderr)
   );
   Ok(())
-}
-
-fn native_cache_test_toolchain_is_pinned() -> Result<bool> {
-  let release = env!("CARGO_PKG_RUST_VERSION");
-  let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
-  let cargo = std::process::Command::new("cargo").arg("-Vv").output()?;
-  Ok(
-    String::from_utf8_lossy(&rustc.stdout).starts_with(&format!("rustc {release} "))
-      && String::from_utf8_lossy(&cargo.stdout).starts_with(&format!("cargo {release} ")),
-  )
 }
 
 #[cfg(target_os = "macos")]
@@ -1981,29 +1970,24 @@ fn test_action_key_cargo_cli_config_bypass_respects_argument_domains() -> Result
 }
 
 #[test]
-fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Result<()> {
-  let ws = TestWorkspace::new_named("native-cache-explicit-bypasses")?;
-  ws.add_crate("cache-bypass", "0.1.0", &[])?;
-  ws.commit("Add native cache bypass fixture")?;
-
+fn test_runner_delegates_transparent_cache_authority_to_cargo_configuration() -> Result<()> {
+  let ws = TestWorkspace::new_named("runner-transparent-cache-delegation")?;
+  ws.add_crate("cache-delegation", "0.1.0", &[])?;
+  ws.commit("Add transparent cache delegation fixture")?;
+  let cargo_home = tempfile::tempdir()?;
   let cache = tempfile::tempdir()?;
   let hostile_l1 = cache.path().join("cargo-rail/local-cas-v2");
   fs::create_dir_all(hostile_l1.parent().expect("local CAS parent"))?;
   fs::write(&hostile_l1, b"must remain untouched")?;
-  let targets = tempfile::tempdir()?;
-  let malformed_targets = targets.path().join("cache-targets.json");
-  fs::write(&malformed_targets, b"{}")?;
-  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nl2 = \"team\"\n")?;
   let cache_path = cache.path().to_string_lossy().into_owned();
-  let targets_path = malformed_targets.to_string_lossy().into_owned();
-  let cache_environment = [
+  let cargo_home_path = cargo_home.path().to_string_lossy().into_owned();
+  let environment = [
+    ("CARGO_HOME", cargo_home_path.as_str()),
     ("CARGO_RAIL_CACHE_DIR", cache_path.as_str()),
-    ("CARGO_RAIL_CACHE_TARGETS_FILE", targets_path.as_str()),
   ];
 
-  let disabled = run_cargo_rail_with_env(
-    &ws.path,
-    &[
+  for arguments in [
+    vec![
       "rail",
       "run",
       "--all",
@@ -2012,61 +1996,9 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
       "--no-cache",
       "--explain",
       "--",
-      "-vv",
+      "--quiet",
     ],
-    &cache_environment,
-  )?;
-  assert!(
-    disabled.status.success(),
-    "explicitly disabled native-cache run failed: {}",
-    String::from_utf8_lossy(&disabled.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&disabled.stdout)
-      .contains("native compiler cache: bypassed (native_cache_disabled_by_request)"),
-    "the explicit opt-out must win: {}",
-    String::from_utf8_lossy(&disabled.stdout)
-  );
-  assert_eq!(fs::read(&hostile_l1)?, b"must remain untouched");
-  assert!(
-    !String::from_utf8_lossy(&disabled.stderr).contains("cargo-rail-native-rustc-wrapper"),
-    "--no-cache must not install Cargo-Rail's compiler wrapper: {}",
-    String::from_utf8_lossy(&disabled.stderr)
-  );
-
-  fs::write(
-    ws.path.join(".config/rail.toml"),
-    "[cache]\nenabled = false\nl2 = \"team\"\n",
-  )?;
-  fs::remove_dir_all(ws.path.join("target"))?;
-  let configured_disabled = run_cargo_rail_with_env(
-    &ws.path,
-    &["rail", "run", "--all", "--action", "build", "--explain", "--", "-vv"],
-    &cache_environment,
-  )?;
-  assert!(
-    configured_disabled.status.success(),
-    "repository-disabled native-cache run failed: {}",
-    String::from_utf8_lossy(&configured_disabled.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&configured_disabled.stdout)
-      .contains("native compiler cache: bypassed (native_cache_disabled_by_configuration)"),
-    "repository policy must win: {}",
-    String::from_utf8_lossy(&configured_disabled.stdout)
-  );
-  assert_eq!(fs::read(&hostile_l1)?, b"must remain untouched");
-  assert!(
-    !String::from_utf8_lossy(&configured_disabled.stderr).contains("cargo-rail-native-rustc-wrapper"),
-    "disabled repository policy must not install Cargo-Rail's compiler wrapper: {}",
-    String::from_utf8_lossy(&configured_disabled.stderr)
-  );
-
-  fs::write(ws.path.join(".config/rail.toml"), "")?;
-  fs::remove_dir_all(ws.path.join("target"))?;
-  let configured = run_cargo_rail(
-    &ws.path,
-    &[
+    vec![
       "rail",
       "run",
       "--all",
@@ -2077,334 +2009,20 @@ fn test_native_cache_honors_explicit_opt_out_and_cargo_cli_configuration() -> Re
       "--quiet",
       "--config=build.jobs=1",
     ],
-  )?;
-  assert!(
-    configured.status.success(),
-    "Cargo CLI configuration run failed: {}",
-    String::from_utf8_lossy(&configured.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&configured.stdout)
-      .contains("native compiler cache: bypassed (cargo_cli_configuration_not_graduated)"),
-    "Cargo CLI configuration must remain authoritative: {}",
-    String::from_utf8_lossy(&configured.stdout)
-  );
-  Ok(())
-}
-
-#[test]
-fn test_native_cache_bypasses_an_external_target_directory_before_installing_the_wrapper() -> Result<()> {
-  let ws = TestWorkspace::new_named("native-cache-external-target")?;
-  ws.add_crate("external-target", "0.1.0", &[])?;
-  ws.commit("Add external target fixture")?;
-
-  let external = tempfile::tempdir()?;
-  let target = external.path().join("missing-target");
-  let cache = tempfile::tempdir()?;
-  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(&ws.path)
-    .args([
-      "rail",
-      "run",
-      "--quiet",
-      "--all",
-      "--action",
-      "build",
-      "--explain",
-      "--",
-      "--quiet",
-      "--target-dir",
-    ])
-    .arg(&target)
-    .env("CARGO_INCREMENTAL", "0")
-    .env("CARGO_RAIL_CACHE_DIR", cache.path())
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-
-  assert!(
-    output.status.success(),
-    "external target build failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  assert!(
-    target.join("debug").is_dir(),
-    "Cargo did not populate the external target"
-  );
-  assert!(
-    String::from_utf8_lossy(&output.stdout)
-      .contains("native compiler cache: bypassed (target_directory_outside_source_root_not_graduated)"),
-    "the external target bypass was not explicit: {}",
-    String::from_utf8_lossy(&output.stdout)
-  );
-  assert!(
-    !cache.path().join("cargo-rail/local-cas-v2").exists(),
-    "an external target directory must bypass cache setup"
-  );
-  assert!(
-    !String::from_utf8_lossy(&output.stderr).contains("cargo-rail-native-rustc-wrapper"),
-    "the external target bypass must not install Cargo-Rail's compiler wrapper: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  Ok(())
-}
-
-#[test]
-fn test_native_cache_preserves_active_incremental_development_automatically() -> Result<()> {
-  let ws = TestWorkspace::new_named("native-cache-incremental-bypass")?;
-  ws.add_crate("incremental-bypass", "0.1.0", &[])?;
-  ws.commit("Add incremental native cache bypass fixture")?;
-
-  let direct = std::process::Command::new("cargo")
-    .current_dir(&ws.path)
-    .args(["check", "--workspace", "--quiet"])
-    .env_remove("CARGO_INCREMENTAL")
-    .env_remove("RUSTC_FORCE_INCREMENTAL")
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-  assert!(direct.status.success(), "initial Cargo check failed: {direct:?}");
-
-  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(&ws.path)
-    .args([
-      "rail",
-      "run",
-      "--all",
-      "--action",
-      "build",
-      "--explain",
-      "--",
-      "--quiet",
-    ])
-    .env_remove("CARGO_INCREMENTAL")
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-  assert!(
-    output.status.success(),
-    "default incremental build failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&output.stdout)
-      .contains("native compiler cache: bypassed (active_cargo_profile_preferred)"),
-    "an active Cargo profile must retain its incremental loop: {}",
-    String::from_utf8_lossy(&output.stdout)
-  );
-
-  fs::remove_dir_all(ws.path.join("target"))?;
-  let forced = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(&ws.path)
-    .args([
-      "rail",
-      "run",
-      "--all",
-      "--action",
-      "build",
-      "--explain",
-      "--",
-      "--quiet",
-    ])
-    .env("CARGO_INCREMENTAL", "0")
-    .env("RUSTC_FORCE_INCREMENTAL", "1")
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-  assert!(
-    forced.status.success(),
-    "forced incremental build failed: {}",
-    String::from_utf8_lossy(&forced.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&forced.stdout)
-      .contains("native compiler cache: bypassed (forced_incremental_compilation_preserved)"),
-    "rustc's forced incremental mode must bypass native-cache setup: {}",
-    String::from_utf8_lossy(&forced.stdout)
-  );
-  Ok(())
-}
-
-#[test]
-fn test_native_cache_uses_clean_root_dependencies_without_global_incremental_configuration() -> Result<()> {
-  if !matches!(
-    (std::env::consts::OS, std::env::consts::ARCH),
-    ("macos", "aarch64") | ("linux", "aarch64") | ("linux", "x86_64") | ("windows", "x86_64")
-  ) {
-    return Ok(());
+  ] {
+    let output = run_cargo_rail_with_env(&ws.path, &arguments, &environment)?;
+    assert!(
+      output.status.success(),
+      "delegated Cargo run failed: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+      !String::from_utf8_lossy(&output.stdout).contains("native compiler cache:"),
+      "the runner still reports compiler-cache decisions: {}",
+      String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(fs::read(&hostile_l1)?, b"must remain untouched");
   }
-  if !native_cache_test_toolchain_is_pinned()? {
-    return Ok(());
-  }
-
-  let ws = TestWorkspace::new_named("native-cache-automatic-clean-root")?;
-  let root_manifest = fs::read_to_string(ws.path.join("Cargo.toml"))?
-    .replace("resolver = \"2\"", "exclude = [\"vendor/cache-dep\"]\nresolver = \"2\"");
-  fs::write(ws.path.join("Cargo.toml"), root_manifest)?;
-  fs::create_dir_all(ws.path.join("vendor/cache-dep/src"))?;
-  fs::write(
-    ws.path.join("vendor/cache-dep/Cargo.toml"),
-    "[package]\nname = \"cache-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-  )?;
-  let mut dependency_source = String::with_capacity(900_000);
-  dependency_source.push_str("pub fn value() -> u8 { 7 }\n");
-  for index in 0..20_000 {
-    writeln!(
-      dependency_source,
-      "pub fn generated_{index}(value: u64) -> u64 {{ value.wrapping_mul({index}) }}"
-    )?;
-  }
-  fs::write(ws.path.join("vendor/cache-dep/src/lib.rs"), dependency_source)?;
-  ws.add_crate(
-    "cache-app",
-    "0.1.0",
-    &[("cache-dep", "{ path = \"../../vendor/cache-dep\" }")],
-  )?;
-  fs::write(
-    ws.path.join("crates/cache-app/src/lib.rs"),
-    "pub fn value() -> u8 { cache_dep::value() }\n",
-  )?;
-  ws.commit("Add automatic native cache fixture")?;
-  let local_cache = tempfile::tempdir()?;
-
-  let run = |incremental: Option<&str>| -> Result<std::process::Output> {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
-    command
-      .current_dir(&ws.path)
-      .args([
-        "rail",
-        "run",
-        "--quiet",
-        "--all",
-        "--action",
-        "build",
-        "--explain",
-        "--",
-        "--quiet",
-      ])
-      .env("CARGO_BUILD_JOBS", "1")
-      .env("CARGO_RAIL_CACHE_DIR", local_cache.path())
-      .env_remove("RUSTC_FORCE_INCREMENTAL")
-      .env_remove("RUSTC_WRAPPER")
-      .env_remove("RUSTC_WORKSPACE_WRAPPER");
-    if let Some(incremental) = incremental {
-      command.env("CARGO_INCREMENTAL", incremental);
-    } else {
-      command.env_remove("CARGO_INCREMENTAL");
-    }
-    Ok(command.output()?)
-  };
-
-  let seed = run(None)?;
-  assert!(seed.status.success(), "cache seed failed: {seed:?}");
-  let clean = std::process::Command::new("cargo")
-    .current_dir(&ws.path)
-    .arg("clean")
-    .output()?;
-  assert!(clean.status.success(), "cargo clean failed: {clean:?}");
-
-  let automatic = run(None)?;
-  assert!(automatic.status.success(), "automatic cache run failed: {automatic:?}");
-  let stdout = String::from_utf8_lossy(&automatic.stdout);
-  let summary = stdout
-    .lines()
-    .find(|line| line.contains("native compiler cache: hits="))
-    .unwrap_or_default();
-  assert!(
-    !summary.is_empty() && !summary.contains("hits=0 "),
-    "a clean profile must reuse verified results without caller-supplied CARGO_INCREMENTAL=0: {stdout}\nstderr: {}",
-    String::from_utf8_lossy(&automatic.stderr)
-  );
-  Ok(())
-}
-
-#[test]
-fn test_native_cache_bypasses_binary_only_workload_before_toolchain_hashing() -> Result<()> {
-  if !matches!(
-    (std::env::consts::OS, std::env::consts::ARCH),
-    ("macos", "aarch64") | ("linux", "aarch64")
-  ) {
-    return Ok(());
-  }
-  if !native_cache_test_toolchain_is_pinned()? {
-    return Ok(());
-  }
-
-  let ws = TestWorkspace::new_single_crate("native-cache-binary-only", "0.1.0")?;
-  fs::remove_file(ws.path.join("src/lib.rs"))?;
-  fs::write(ws.path.join("src/main.rs"), "fn main() {}\n")?;
-  git(&ws.path, &["add", "src"])?;
-  git(&ws.path, &["commit", "-m", "Use a binary-only target"])?;
-
-  let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(&ws.path)
-    .args([
-      "rail",
-      "run",
-      "--all",
-      "--action",
-      "build",
-      "--explain",
-      "--",
-      "--quiet",
-    ])
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env("CARGO_INCREMENTAL", "0")
-    .output()?;
-  assert!(
-    output.status.success(),
-    "binary-only build failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&output.stdout)
-      .contains("native compiler cache: bypassed (native_cache_no_eligible_library_units)"),
-    "an unsupported workload must bypass before native-cache setup: {}",
-    String::from_utf8_lossy(&output.stdout)
-  );
-
-  fs::create_dir(ws.path.join(".cargo"))?;
-  fs::write(
-    ws.path.join(".cargo/config.toml"),
-    "[build]\nunmodeled-native-cache-test = true\n",
-  )?;
-  git(&ws.path, &["add", ".cargo/config.toml"])?;
-  git(&ws.path, &["commit", "-m", "Add unmodeled Cargo build configuration"])?;
-  fs::remove_dir_all(ws.path.join("target"))?;
-  let unmodeled = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(&ws.path)
-    .args([
-      "rail",
-      "run",
-      "--all",
-      "--action",
-      "build",
-      "--explain",
-      "--",
-      "--quiet",
-    ])
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env("CARGO_INCREMENTAL", "0")
-    .output()?;
-  assert!(
-    unmodeled.status.success(),
-    "unmodeled Cargo configuration build failed: {}",
-    String::from_utf8_lossy(&unmodeled.stderr)
-  );
-  assert!(
-    String::from_utf8_lossy(&unmodeled.stdout)
-      .contains("native compiler cache: bypassed (cargo_configuration_unmodeled)"),
-    "unmodeled Cargo build settings must bypass native-cache setup: {}",
-    String::from_utf8_lossy(&unmodeled.stdout)
-  );
   Ok(())
 }
 
@@ -2469,9 +2087,9 @@ fn test_doctor_native_cache_reports_the_exact_compiler_identity_as_one_json_valu
   assert_eq!(report["exit_code"], 0);
 
   let capability = &report["capability"];
-  assert_eq!(capability["schema_version"], 6);
+  assert_eq!(capability["schema_version"], 8);
   assert_eq!(capability["cache_class"], "library_metadata_rlib");
-  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v10");
+  assert_eq!(capability["execution_contract"], "direct-global-wrapper-v12");
   assert!(capability["platform"].as_str().is_some_and(|value| !value.is_empty()));
   assert!(
     capability["host_target"]
@@ -2737,7 +2355,7 @@ fn test_hermetic_build_proves_identical_check_result_in_two_roots() -> Result<()
     );
 
     let counters: serde_json::Value = serde_json::from_slice(&fs::read(&hit_diagnostics)?)?;
-    assert_eq!(counters["schema_version"], 10);
+    assert_eq!(counters["schema_version"], 11);
     assert_eq!(
       counters["cargo_metadata_loads"], 0,
       "a cache hit must not execute Cargo metadata"

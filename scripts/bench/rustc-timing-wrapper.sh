@@ -80,13 +80,24 @@ if [[ "${CARGO_RAIL_LINK_PROBE:-0}" == 1 && "$OSTYPE" == darwin* && "$linker_pro
   "$emit" == *link* && "$test_mode" == false ]]; then
   link_dependencies="$record.link-dependencies"
   link_stdout="$record.link-stdout"
-  if [[ "$link_dependencies" == *,* ]]; then
+  oso_prefix="${CARGO_RAIL_LINK_OSO_PREFIX:-}"
+  linker_probe="${CARGO_RAIL_LINK_ADAPTER:-}"
+  link_driver="${CARGO_RAIL_LINK_DRIVER:-}"
+  if [[ "$link_dependencies" == *,* || "$oso_prefix" == *,* || \
+    ( -n "$linker_probe" && ( "$linker_probe" != /* || "$link_driver" != /* ) ) ]]; then
     link_probe="unsupported_path"
     /usr/bin/time -p -o "$record.time" "$@"
     status=$?
   else
-    /usr/bin/time -p -o "$record.time" "$@" --print=link-args \
-      "-Clink-arg=-Wl,-dependency_info,$link_dependencies" >"$link_stdout"
+    link_probe_arguments=("--print=link-args" "-Clink-arg=-Wl,-dependency_info,$link_dependencies")
+    if [[ -n "$linker_probe" ]]; then
+      link_probe_arguments=("--print=link-args" "-Clinker=$linker_probe")
+      export CARGO_RAIL_LINK_CERTIFICATE="$link_dependencies"
+      export CARGO_RAIL_LINK_COMMAND_RECORD="$record.link-command-argv"
+    elif [[ -n "$oso_prefix" ]]; then
+      link_probe_arguments+=("-Clink-arg=-Wl,-oso_prefix,$oso_prefix")
+    fi
+    /usr/bin/time -p -o "$record.time" "$@" "${link_probe_arguments[@]}" >"$link_stdout"
     status=$?
     if [[ "$status" -eq 0 && -s "$link_dependencies" && "$(head -c 4 "$link_stdout")" == "env " ]]; then
       head -n 1 "$link_stdout" >"$record.link-command"

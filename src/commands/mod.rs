@@ -352,10 +352,17 @@ pub fn try_dispatch_pre_context(
 
     Commands::Cache { command } => {
       match command {
+        cli::CacheCommand::Setup {
+          local_dir,
+          max_size,
+          check,
+          format,
+        } => cache::run_setup(workspace_root, local_dir, max_size, check, format)?,
         cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
         cli::CacheCommand::Clean { scope, check, format } => {
           cache::run_clean(workspace_root, scope, check, format)?;
         }
+        cli::CacheCommand::Remove { check, format } => cache::run_remove(workspace_root, check, format)?,
       }
       Ok(PreContextDispatch::Handled)
     }

@@ -53,16 +53,23 @@ cargo rail doctor native-cache --format json
 cargo rail unify --check -f json
 ```
 
-For native reuse, inspect the run summary's hits, misses, retained bypasses, hashed/restored bytes, and stable reasons.
-Clearly unsupported shapes execute before cache event persistence, so bypass totals are not a census of rustc. Failure
-to capture the exact compiler identity, incremental compilation, an existing wrapper, a non-JSON compiler diagnostic
-format, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache hit. A
-different physical source root has different action authority: Cargo-Rail compiles cold, emits exact output for that
-root, and can reuse the result only in later sessions bound to the same root.
+For native reuse, inspect installation health and the bounded usage ledger:
 
-If an already-installed Cargo-Rail compiler wrapper must be disabled independently of `cargo rail run`, set
-`CARGO_RAIL_CACHE=off`. The wrapper executes the selected compiler chain without reading its session or opening the
-CAS. Prefer `--no-cache` when invoking `cargo rail run`; it records the intended action-level decision.
+```bash
+cargo rail cache setup --check
+cargo rail cache status --scope local --format json
+cargo rail doctor native-cache --format json
+```
+
+Clearly unsupported shapes execute before session, ledger, or CAS acquisition, so early-bypass totals are not a census
+of rustc. Failure to capture the exact compiler identity, incremental compilation, an ambiguous wrapper, a nonstandard
+target layout, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache
+hit. A different physical source root has different action authority and compiles its own exact variant.
+
+If an installed wrapper must be disabled for one process tree, set `CARGO_RAIL_CACHE=off`. The minimal launcher
+executes the selected compiler chain without starting the cache worker or reading installation context, session state,
+or CAS data and preserves the environment control for the compiler. Prefer `--no-cache` when invoking
+`cargo rail run`; it delegates with the same control.
 
 For the hermetic whole-action profile, read the report under `target/cargo-rail/hermetic/reports/`. `fetch.reused`
 describes only the dependency inventory; it does not mean the action result was restored. `platform_limited` means the
@@ -81,7 +88,14 @@ cargo rail cache clean --scope workspace
 cargo rail cache status --scope local
 cargo rail cache clean --scope local --check
 cargo rail cache clean --scope local
+cargo rail cache setup                    # repair the selected empty CAS
+
+cargo rail cache remove --check
+cargo rail cache remove                   # preserve CAS data
 ```
+
+Setup refuses persistent environment/workspace shadowing and unowned global wrappers. Removal refuses a changed Cargo
+field, launcher, worker, or receipt; resolve the ownership drift instead of deleting configuration by hand.
 
 ## Release stopped
 

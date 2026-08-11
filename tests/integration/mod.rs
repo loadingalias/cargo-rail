@@ -1,4 +1,5 @@
 mod helpers;
+mod test_cache_installation;
 mod test_check;
 mod test_classification;
 mod test_clean;

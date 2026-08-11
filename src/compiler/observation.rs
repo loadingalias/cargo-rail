@@ -18,7 +18,7 @@ use crate::workspace::WorkspaceSnapshot;
 pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 6;
 const COMPILER_CACHE_WRAPPER_METADATA_VERSION: u32 = 2;
 const COMPILATION_UNIT_VERSION: u32 = 2;
-const RAW_INVOCATION_VERSION: u32 = 4;
+const RAW_INVOCATION_VERSION: u32 = 5;
 
 /// Typed Cargo target domain for one compiler or rustdoc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -377,17 +377,6 @@ pub(crate) enum CompilerCacheWrapperStatus {
   Bypassed,
 }
 
-impl CompilerCacheWrapperStatus {
-  pub(crate) const fn as_str(self) -> &'static str {
-    match self {
-      Self::Hit => "hit",
-      Self::Miss => "miss",
-      Self::Disabled => "disabled",
-      Self::Bypassed => "bypassed",
-    }
-  }
-}
-
 /// Redaction-safe compiler-cache disposition attached to the exact wrapper chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompilerCacheWrapperMetadata {
@@ -544,8 +533,39 @@ pub(crate) struct InvocationRecorder {
 
 pub(crate) struct NativeOutputPaths {
   pub(crate) dep_info: PathBuf,
-  pub(crate) metadata: PathBuf,
-  pub(crate) rlib: Option<PathBuf>,
+  pub(crate) artifacts: Vec<NativeOutputArtifact>,
+}
+
+/// One typed compiler artifact destination from the original rustc invocation.
+pub(crate) struct NativeOutputArtifact {
+  pub(crate) role: NativeOutputRole,
+  pub(crate) path: PathBuf,
+}
+
+/// Closed output-role vocabulary shared by action identity, CAS slots, and restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeOutputRole {
+  Metadata,
+  Rlib,
+  Executable,
+  ProcMacro,
+  Dylib,
+  Cdylib,
+  Staticlib,
+}
+
+impl NativeOutputRole {
+  pub(crate) const fn name(self) -> &'static str {
+    match self {
+      Self::Metadata => "metadata",
+      Self::Rlib => "rlib",
+      Self::Executable => "executable",
+      Self::ProcMacro => "proc_macro",
+      Self::Dylib => "dylib",
+      Self::Cdylib => "cdylib",
+      Self::Staticlib => "staticlib",
+    }
+  }
 }
 
 /// Wrapper evidence before Cargo compiler-artifact correlation.
@@ -1289,18 +1309,61 @@ impl InvocationRecorder {
     let [dep_info] = self.dep_info_paths.as_slice() else {
       return None;
     };
-    let [metadata] = self.metadata_paths.as_slice() else {
+    if self.metadata_paths.len() > 1 || self.rlib_paths.len() > 1 {
       return None;
-    };
-    let rlib = match self.rlib_paths.as_slice() {
-      [] => None,
-      [rlib] => Some(rlib.clone()),
-      _ => return None,
-    };
+    }
+    let mut artifacts = Vec::new();
+    if let [metadata] = self.metadata_paths.as_slice() {
+      artifacts.push(NativeOutputArtifact {
+        role: NativeOutputRole::Metadata,
+        path: metadata.clone(),
+      });
+    }
+    if let [rlib] = self.rlib_paths.as_slice() {
+      artifacts.push(NativeOutputArtifact {
+        role: NativeOutputRole::Rlib,
+        path: rlib.clone(),
+      });
+    }
+    let known = self
+      .dep_info_paths
+      .iter()
+      .chain(&self.metadata_paths)
+      .chain(&self.rlib_paths)
+      .collect::<BTreeSet<_>>();
+    let linked = self
+      .output_paths
+      .iter()
+      .filter(|path| !known.contains(path))
+      .collect::<Vec<_>>();
+    if !linked.is_empty() {
+      let [linked] = linked.as_slice() else {
+        return None;
+      };
+      let role = if self.raw.crate_types == BTreeSet::from(["bin".to_string()]) {
+        NativeOutputRole::Executable
+      } else if self.raw.crate_types == BTreeSet::from(["proc-macro".to_string()]) {
+        NativeOutputRole::ProcMacro
+      } else if self.raw.crate_types == BTreeSet::from(["dylib".to_string()]) {
+        NativeOutputRole::Dylib
+      } else if self.raw.crate_types == BTreeSet::from(["cdylib".to_string()]) {
+        NativeOutputRole::Cdylib
+      } else if self.raw.crate_types == BTreeSet::from(["staticlib".to_string()]) {
+        NativeOutputRole::Staticlib
+      } else {
+        return None;
+      };
+      artifacts.push(NativeOutputArtifact {
+        role,
+        path: (*linked).clone(),
+      });
+    }
+    if artifacts.is_empty() {
+      return None;
+    }
     Some(NativeOutputPaths {
       dep_info: dep_info.clone(),
-      metadata: metadata.clone(),
-      rlib,
+      artifacts,
     })
   }
 
@@ -1353,7 +1416,7 @@ impl InvocationRecorder {
 }
 
 pub(crate) fn publish_raw(directory: &Path, raw: &RawCompilerInvocation) -> RailResult<()> {
-  publish_prepared_raw(prepare_raw_publication(directory, raw)?, false)
+  publish_prepared_raw(prepare_raw_publication(directory, raw)?)
 }
 
 /// One encoded content-addressed observation prepared exactly once for a restore transaction.
@@ -1404,12 +1467,8 @@ pub(crate) fn prepare_raw_publication(
   })
 }
 
-/// Publish prepared restore evidence durably before its transaction marker is removed.
-pub(crate) fn publish_prepared_raw_durable(publication: PreparedRawPublication) -> RailResult<()> {
-  publish_prepared_raw(publication, true)
-}
-
-fn publish_prepared_raw(publication: PreparedRawPublication, durable: bool) -> RailResult<()> {
+/// Publish one prepared, regenerable compiler observation.
+pub(crate) fn publish_prepared_raw(publication: PreparedRawPublication) -> RailResult<()> {
   let PreparedRawPublication {
     directory,
     destination,
@@ -1426,20 +1485,10 @@ fn publish_prepared_raw(publication: PreparedRawPublication, durable: bool) -> R
     .tempfile_in(&directory)?;
   temporary.write_all(&encoded)?;
   match temporary.persist_noclobber(&destination) {
-    Ok(file) => {
-      if durable {
-        file.sync_all()?;
-        sync_observation_directory(&directory)?;
-      }
-      Ok(())
-    }
+    Ok(_) => Ok(()),
     Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
       let existing = fs::read(&destination)?;
       if existing == encoded {
-        if durable {
-          fs::File::open(&destination)?.sync_all()?;
-          sync_observation_directory(&directory)?;
-        }
         Ok(())
       } else {
         Err(RailError::message(format!(
@@ -1454,17 +1503,6 @@ fn publish_prepared_raw(publication: PreparedRawPublication, durable: bool) -> R
       error.error
     ))),
   }
-}
-
-#[cfg(unix)]
-fn sync_observation_directory(directory: &Path) -> RailResult<()> {
-  fs::File::open(directory)?.sync_all()?;
-  Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_observation_directory(_directory: &Path) -> RailResult<()> {
-  Ok(())
 }
 
 fn raw_publication_path(directory: &Path, compiler: &str, identity: ContentDigest) -> PathBuf {
@@ -1510,6 +1548,7 @@ struct ParsedArguments {
   dep_info_paths: Vec<PathBuf>,
   metadata_paths: Vec<PathBuf>,
   rlib_paths: Vec<PathBuf>,
+  explicit_link_paths: Vec<PathBuf>,
   output_paths: Vec<PathBuf>,
   out_dir: Option<PathBuf>,
   extra_filename: String,
@@ -1670,12 +1709,19 @@ impl ParsedArguments {
     }
     if parsed.emit_modes.contains("metadata")
       && parsed.metadata_paths.is_empty()
-      && parsed.crate_types == BTreeSet::from(["lib".to_string()])
+      && matches!(
+        parsed.crate_types.iter().next().map(String::as_str),
+        Some("lib" | "proc-macro")
+      )
+      && parsed.crate_types.len() == 1
       && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
     {
       let path = out_dir.join(format!("lib{crate_name}{}.rmeta", parsed.extra_filename));
       parsed.metadata_paths.push(path.clone());
       parsed.output_paths.push(path);
+    }
+    if parsed.crate_types == BTreeSet::from(["lib".to_string()]) {
+      parsed.rlib_paths.append(&mut parsed.explicit_link_paths);
     }
     if parsed.emit_modes.contains("link")
       && parsed.rlib_paths.is_empty()
@@ -1685,6 +1731,21 @@ impl ParsedArguments {
       let path = out_dir.join(format!("lib{crate_name}{}.rlib", parsed.extra_filename));
       parsed.rlib_paths.push(path.clone());
       parsed.output_paths.push(path);
+    }
+    if parsed.emit_modes.contains("link")
+      && parsed.explicit_link_paths.is_empty()
+      && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
+      && let Some(file_name) = implicit_apple_link_output(&parsed.crate_types, crate_name, &parsed.extra_filename)
+    {
+      let known_outputs = parsed
+        .dep_info_paths
+        .iter()
+        .chain(&parsed.metadata_paths)
+        .chain(&parsed.rlib_paths)
+        .collect::<BTreeSet<_>>();
+      if !parsed.output_paths.iter().any(|path| !known_outputs.contains(path)) {
+        parsed.output_paths.push(out_dir.join(file_name));
+      }
     }
     parsed
   }
@@ -1708,7 +1769,7 @@ impl ParsedArguments {
         } else if mode == "metadata" {
           self.metadata_paths.push(path.clone());
         } else if mode == "link" {
-          self.rlib_paths.push(path.clone());
+          self.explicit_link_paths.push(path.clone());
         }
         self.output_paths.push(path);
       } else if compiler_mode != CompilerMode::Rustdoc && !matches!(mode, "dep-info" | "link" | "metadata") {
@@ -1719,7 +1780,9 @@ impl ParsedArguments {
 
   fn capture_extern(&mut self, value: &str, current_dir: &Path, bypasses: &mut BTreeSet<String>) {
     let Some((name, path)) = value.split_once('=') else {
-      bypasses.insert("dependency_artifact_path_unavailable".to_string());
+      if value != "proc_macro" {
+        bypasses.insert("dependency_artifact_path_unavailable".to_string());
+      }
       return;
     };
     self
@@ -1731,6 +1794,22 @@ impl ParsedArguments {
     if let Some(extra_filename) = value.strip_prefix("extra-filename=") {
       self.extra_filename = extra_filename.to_string();
     }
+  }
+}
+
+fn implicit_apple_link_output(
+  crate_types: &BTreeSet<String>,
+  crate_name: &str,
+  extra_filename: &str,
+) -> Option<String> {
+  if !cfg!(target_os = "macos") || crate_types.len() != 1 {
+    return None;
+  }
+  match crate_types.iter().next().map(String::as_str) {
+    Some("bin") => Some(format!("{crate_name}{extra_filename}")),
+    Some("proc-macro" | "dylib" | "cdylib") => Some(format!("lib{crate_name}{extra_filename}.dylib")),
+    Some("staticlib") => Some(format!("lib{crate_name}{extra_filename}.a")),
+    _ => None,
   }
 }
 
@@ -2328,6 +2407,63 @@ mod tests {
     assert!(bypasses.is_empty());
   }
 
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn native_link_path_inference_matches_apple_rustc_names() {
+    for (crate_type, crate_name, expected) in [
+      ("bin", "build_script_build", "build_script_build-1234"),
+      ("proc-macro", "fixture_macros", "libfixture_macros-1234.dylib"),
+      ("dylib", "fixture_dynamic", "libfixture_dynamic-1234.dylib"),
+      ("cdylib", "fixture_c", "libfixture_c-1234.dylib"),
+      ("staticlib", "fixture_static", "libfixture_static-1234.a"),
+    ] {
+      let mut bypasses = BTreeSet::new();
+      let arguments = [
+        "--crate-name".to_string(),
+        crate_name.to_string(),
+        "--crate-type".to_string(),
+        crate_type.to_string(),
+        "--emit=dep-info,link".to_string(),
+        "-C".to_string(),
+        "extra-filename=-1234".to_string(),
+        "--out-dir".to_string(),
+        "/tmp/target".to_string(),
+      ];
+
+      let parsed = ParsedArguments::parse(&arguments, Path::new("/workspace"), CompilerMode::Rustc, &mut bypasses);
+
+      assert!(
+        parsed
+          .output_paths
+          .contains(&PathBuf::from("/tmp/target").join(expected))
+      );
+      assert!(bypasses.is_empty());
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn explicit_native_link_path_is_authoritative() {
+    let mut bypasses = BTreeSet::new();
+    let arguments = [
+      "--crate-name=fixture_cli".to_string(),
+      "--crate-type=bin".to_string(),
+      "--emit=dep-info,link=/tmp/explicit-output".to_string(),
+      "-Cextra-filename=-ignored".to_string(),
+      "--out-dir=/tmp/target".to_string(),
+    ];
+
+    let parsed = ParsedArguments::parse(&arguments, Path::new("/workspace"), CompilerMode::Rustc, &mut bypasses);
+
+    assert!(parsed.output_paths.contains(&PathBuf::from("/tmp/explicit-output")));
+    assert!(
+      !parsed
+        .output_paths
+        .contains(&PathBuf::from("/tmp/target/fixture_cli-ignored"))
+    );
+    assert!(bypasses.is_empty());
+  }
+
   #[test]
   fn cargo_fresh_is_result_metadata_not_artifact_identity() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -2522,6 +2658,55 @@ mod tests {
       ),
       ["-C", "metadata=/var/workspace"]
     );
+  }
+
+  #[test]
+  fn compiler_arguments_classify_only_proc_macro_as_a_toolchain_owned_pathless_extern() {
+    let mut bypasses = BTreeSet::new();
+    let parsed = ParsedArguments::parse(
+      &["--extern".to_string(), "proc_macro".to_string()],
+      Path::new("/workspace"),
+      CompilerMode::Rustc,
+      &mut bypasses,
+    );
+    assert!(parsed.dependency_paths.is_empty());
+    assert!(bypasses.is_empty());
+
+    ParsedArguments::parse(
+      &["--extern=dependency_without_path".to_string()],
+      Path::new("/workspace"),
+      CompilerMode::Rustc,
+      &mut bypasses,
+    );
+    assert_eq!(
+      bypasses,
+      BTreeSet::from(["dependency_artifact_path_unavailable".to_string()])
+    );
+  }
+
+  #[test]
+  fn metadata_only_proc_macro_has_one_typed_rmeta_output() {
+    let mut bypasses = BTreeSet::new();
+    let parsed = ParsedArguments::parse(
+      &[
+        "--crate-name=fixture_macros".to_string(),
+        "--crate-type=proc-macro".to_string(),
+        "--emit=dep-info,metadata".to_string(),
+        "-Cextra-filename=-known".to_string(),
+        "--out-dir=/tmp/target".to_string(),
+        "--extern=proc_macro".to_string(),
+        "src/lib.rs".to_string(),
+      ],
+      Path::new("/workspace"),
+      CompilerMode::Rustc,
+      &mut bypasses,
+    );
+
+    assert_eq!(
+      parsed.metadata_paths,
+      [PathBuf::from("/tmp/target/libfixture_macros-known.rmeta")]
+    );
+    assert!(bypasses.is_empty());
   }
 
   #[test]

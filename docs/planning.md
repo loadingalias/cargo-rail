@@ -167,10 +167,10 @@ Minimal mode exports the built-in surface booleans, `surfaces-json`, `scope-json
 mode also exports the full `plan-json`. Pin the action to a full commit SHA when immutable third-party action execution
 is required.
 
-The direct `cargo test` handoff above consumes Cargo-Rail's package scope but does not use Cargo-Rail's native compiler
-cache. Execution jobs that want local or shared reuse must configure the cache target and invoke `cargo rail run`; see
-[Share native compiler results across CI and SSH](cache-sharing.md). The planner action remains a job gate and contract
-transport, not a process-wide Cargo wrapper.
+The direct `cargo test` handoff above consumes Cargo-Rail's package scope. It can also use transparent local L1 after
+the execution machine runs `cargo rail cache setup`; the planner Action does not install or activate that machine
+authority. See [Share local compiler reuse across workspaces](cache-sharing.md). The planner Action remains a job gate
+and contract transport, not a process-wide Cargo wrapper.
 
 ## Diagnose and validate
 

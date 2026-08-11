@@ -86,25 +86,11 @@ bench-native-cache-aws target runs execute:
 bench-native-cache-remote mode runs run_id:
     @scripts/bench/native-cache-remote-dispatch.sh "{{ mode }}" "{{ runs }}" "{{ run_id }}"
 
-bench-native-cache-l2-remote run_id alias region owner bucket prefix:
-    @scripts/bench/native-cache-remote-dispatch.sh l2 1 "{{ run_id }}" \
-      "{{ alias }}" "{{ region }}" "{{ owner }}" "{{ bucket }}" "{{ prefix }}"
-
 install-qualification-tools:
     @scripts/ci/install-qualification-tools.sh
 
 bench-native-cache-archive run_id:
     @scripts/bench/native-cache-archive.sh "{{ run_id }}"
-
-qualify-native-cache-s3 mode run_id:
-    @scripts/ci/qualify-native-cache-s3.sh "{{ mode }}" "{{ run_id }}"
-
-qualify-native-cache-s3-authority mode run_id region owner bucket prefix:
-    @CARGO_RAIL_CACHE_REGION="{{ region }}" \
-      CARGO_RAIL_CACHE_EXPECTED_OWNER="{{ owner }}" \
-      CARGO_RAIL_CACHE_BUCKET="{{ bucket }}" \
-      CARGO_RAIL_CACHE_PREFIX="{{ prefix }}" \
-      scripts/ci/qualify-native-cache-s3.sh "{{ mode }}" "{{ run_id }}"
 
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"

@@ -4,7 +4,125 @@ use super::TextJsonOutputFormat;
 use super::cli::CacheScope;
 use crate::cache::CacheStatus;
 use crate::error::{RailError, RailResult};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Preview or apply one exact transparent compiler-cache installation.
+pub(crate) fn run_setup(
+  current_dir: &Path,
+  local_dir: Option<PathBuf>,
+  max_bytes: Option<u64>,
+  check: bool,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
+  if format.is_json() {
+    crate::output::set_json_mode(true);
+  }
+  let plan = crate::cache::installation::plan_setup(
+    current_dir,
+    &crate::cache::installation::SetupRequest { local_dir, max_bytes },
+  )?;
+  let pending = plan.pending();
+  let receipt_path = plan.receipt_path()?;
+  let details = serde_json::json!({
+    "changed": pending,
+    "config_path": plan.config_path(),
+    "config_field": "build.rustc-wrapper",
+    "config_action": plan.config_action(),
+    "wrapper_path": plan.wrapper_path(),
+    "receipt_path": receipt_path,
+    "private_state_action": if pending { "install_or_repair" } else { "verify" },
+    "cache_base": plan.cache_base(),
+    "max_bytes": plan.max_bytes(),
+  });
+  if check {
+    render_installation_operation("setup_check", pending, &details, format)?;
+    return if pending {
+      Err(RailError::CheckHasPendingChanges)
+    } else {
+      Ok(())
+    };
+  }
+  crate::cache::installation::apply_setup(plan)?;
+  render_installation_operation("setup", false, &details, format)
+}
+
+/// Preview or apply removal of the exact receipt-owned installation.
+pub(crate) fn run_remove(current_dir: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
+  if format.is_json() {
+    crate::output::set_json_mode(true);
+  }
+  let plan = crate::cache::installation::plan_removal(current_dir)?;
+  let pending = plan.pending();
+  let details = serde_json::json!({
+    "changed": pending,
+    "config_path": plan.config_path(),
+    "config_field": "build.rustc-wrapper",
+    "config_action": plan.config_action(),
+    "wrapper_path": plan.wrapper_path(),
+    "receipt_path": plan.receipt_path(),
+    "private_state_action": if pending { "remove_receipt_owned_installation" } else { "none" },
+    "cache_preserved": true,
+  });
+  if check {
+    render_installation_operation("remove_check", pending, &details, format)?;
+    return if pending {
+      Err(RailError::CheckHasPendingChanges)
+    } else {
+      Ok(())
+    };
+  }
+  crate::cache::installation::apply_removal(plan)?;
+  render_installation_operation("remove", false, &details, format)
+}
+
+fn render_installation_operation(
+  operation: &str,
+  pending: bool,
+  details: &serde_json::Value,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
+  if format.is_json() {
+    let mut payload = details.clone();
+    payload["pending"] = serde_json::Value::Bool(pending);
+    let output = crate::output::machine_json_envelope(
+      "cache",
+      operation,
+      if pending { "pending_changes" } else { "success" },
+      if pending { 1 } else { 0 },
+      payload,
+    );
+    println!("{}", serde_json::to_string_pretty(&output)?);
+  } else {
+    println!("transparent compiler cache {operation}");
+    println!(
+      "  Cargo config: {}",
+      details["config_path"].as_str().unwrap_or("unknown")
+    );
+    println!(
+      "  Cargo field: {} ({})",
+      details["config_field"].as_str().unwrap_or("build.rustc-wrapper"),
+      details["config_action"].as_str().unwrap_or("unknown")
+    );
+    if let Some(wrapper) = details["wrapper_path"].as_str() {
+      println!("  wrapper: {wrapper}");
+    }
+    if let Some(cache) = details["cache_base"].as_str() {
+      println!("  local cache base: {cache}");
+    }
+    if let Some(receipt) = details["receipt_path"].as_str() {
+      println!("  setup receipt: {receipt}");
+    }
+    if let Some(action) = details["private_state_action"].as_str() {
+      println!("  private state: {action}");
+    }
+    if pending {
+      println!("  changes pending");
+    } else {
+      println!("  no pending changes");
+    }
+  }
+  Ok(())
+}
 
 /// Report selected cache scopes without creating workspace context or cache state.
 pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJsonOutputFormat) -> RailResult<()> {
@@ -76,7 +194,7 @@ pub(crate) fn run_clean(
   }
   let mut removal = crate::cache::CacheRemoval::default();
   if scope.includes_local() {
-    removal.extend(crate::cache::remove_local()?)?;
+    removal.extend(crate::cache::remove_local(workspace_root)?)?;
   }
   if scope.includes_workspace() {
     removal.extend(crate::cache::remove_workspace(workspace_root)?)?;
@@ -138,6 +256,34 @@ fn total_bytes(status: &CacheStatus) -> u64 {
 
 fn render_status(status: &CacheStatus) {
   println!("cache status");
+  println!("  transparent compiler reuse");
+  println!("    state: {}", status.installation.state);
+  println!("    healthy: {}", status.installation.healthy);
+  println!("    Cargo home: {}", status.installation.cargo_home);
+  println!("    Cargo config: {}", status.installation.config_path);
+  if let Some(wrapper) = &status.installation.wrapper_path {
+    println!("    wrapper: {wrapper}");
+  }
+  if let Some(cache) = &status.installation.cache_base {
+    println!("    local cache base: {cache}");
+  }
+  println!("    Cargo L0: {}", status.installation.cargo_l0);
+  println!(
+    "    observed L1: {} hits / {} misses / {} bypasses / {} failures",
+    status.installation.usage.hits,
+    status.installation.usage.misses,
+    status.installation.usage.bypasses,
+    status.installation.usage.failures
+  );
+  println!(
+    "    usage ledger: {} events (full: {}; early bypasses: {})",
+    status.installation.usage.recorded_events,
+    status.installation.usage.ledger_full,
+    status.installation.usage.early_bypasses
+  );
+  for issue in &status.installation.issues {
+    println!("    issue: {issue}");
+  }
   if let Some(workspace) = &status.workspace {
     println!("  workspace");
     println!("    root: {}", workspace.root);
@@ -199,6 +345,7 @@ fn render_status(status: &CacheStatus) {
   }
   if let Some(remote) = &status.remote {
     println!("  remote (machine-owned)");
+    println!("    activation: {}", remote.activation);
     println!("    alias: {}", remote.alias);
     println!("    transport: {}", remote.transport);
     println!("    authority: {}", remote.authority);

@@ -147,15 +147,23 @@ original arguments and binds the workspace root plus each unit's physical source
 independent checkout compiles cold and records its own exact variant instead of restoring path-bearing metadata from
 another root.
 
-On an eligible invocation, this sequence can still reuse exact compiler output:
+Install the private user-wide launcher and authenticated cache worker once. Preview is read-only and exits 1 when
+setup or repair is pending:
 
 ```bash
-cargo rail run --all --action build --explain
+cargo rail cache setup --check
+cargo rail cache setup
+
+cargo check
 
 cargo clean
 
-cargo rail run --all --action build --explain
+cargo check
 ```
+
+The same setup covers ordinary Cargo, nextest, Just, IDE, CI, and `cargo rail run` invocations that use that Cargo
+home. Cargo freshness and incremental compilation remain the faster L0; eligible compiler work that L0 does not remove
+can use the verified local CAS as L1.
 
 Cargo-Rail does not restore an old target directory or manufacture Cargo freshness. Before a hit, it revalidates:
 
@@ -164,6 +172,10 @@ Cargo-Rail does not restore an old target directory or manufacture Cargo freshne
 - dependency artifacts;
 - every compiler-visible environment name and value;
 - rustc's selected-input containment proof;
+- exact native-static search namespaces and generated inputs;
+- on macOS linked actions, the default Apple driver/linker, found and missing lookup paths, SDK inputs, symlink
+  resolution, direct driver inputs, adapter-certified LTO objects and rustc-selected aggregate archives in an
+  owner-controlled namespace that is not writable by group or other users, and stable debug-map normalization;
 - action and result identity; and
 - exact stored output bytes and regular-file modes.
 
@@ -176,42 +188,36 @@ A matching lookup is not enough. Incomplete or unsupported evidence produces a n
 The pre-Clap compiler boundary rejects ambiguous wrapper roles and skips session/CAS acquisition for disabled,
 incremental, clippy, response-file, and other clearly unsupported invocations.
 
+Metadata/rlib results, including metadata-only proc-macro producers, and exact native-static consumers use the direct
+action protocol. On macOS, the installed default Apple linker can also certify build-script executables, proc-macro
+producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs. The pre-link action is only a candidate
+selector; a hit requires the complete witnessed action and exact result pack. Native proc-macro consumers remain cold
+because running a proc macro can observe ambient filesystem, environment, process, network, clock, and randomness
+state that rustc does not certify.
+
 **Fast when proven. Normal Cargo when not.**
 
-Set `[cache] l2 = "alias"` to share verified results through a machine-owned S3 target when the canonical physical
-source root is identical. The command parent owns AWS access; compiler wrappers receive only a loopback capability. A
-local hit remains network-free, and remote bytes enter the ordinary local proof before restore. A moved or independent
-checkout compiles cold. Remote unavailability, credentials, authentication, or configuration also falls back to cold
-compilation. Remote conflict or malformed evidence fails without restoring output.
+`CARGO_RAIL_CACHE=off cargo check` disables both L1 reads and writes for that process tree. The minimal launcher
+directly executes the selected compiler chain without starting the cache worker or reading installation state.
+Incremental, clippy, native proc-macro consumer, custom-target-layout, ambiguous-wrapper, custom-linker, and otherwise
+unsupported invocations bypass before session or CAS acquisition. Existing workspace wrappers are preserved and
+bypassed; conflicting global wrapper ownership makes setup fail.
 
-Use one canonical checkout path and toolchain on compatible CI runners and SSH build hosts to exchange results through
-L2. Each machine keeps a private L1; CI and SSH principals can have separate read or read-write authority over the same
-immutable S3 namespace. See [Share native compiler results across CI and SSH](docs/cache-sharing.md) for the complete
-local, CI, SSH, and CI-to-SSH workflow.
+Transparent reuse is local-only. The previous runner-owned S3 coordinator was removed instead of being duplicated in
+the compiler path. Existing remote target configuration can be diagnosed, but it does not activate transfer. See
+[Share local compiler reuse across workspaces](docs/cache-sharing.md) for authority, isolation, cleanup, and removal.
 
-### Measured clean-target impact
+### Performance qualification
 
-The retained v10 benchmark ran ten accepted interleaved groups on an Apple M1 Pro with macOS, APFS, and Rust 1.95.0.
-Each native Cargo baseline and Cargo-Rail warm-L1 lane started with an empty target directory. The fixture includes
-registry and Git dependencies, build scripts, a proc macro, native code, workspace libraries, and a binary.
-
-| Workload | Native Cargo p50 wall | Cargo-Rail warm-L1 p50 wall | Paired median wall reduction |
-|---|---:|---:|---:|
-| `cargo check` | 6.65 s | 4.91 s | **25.7%** |
-| `cargo build --release` | 9.88 s | 7.40 s | **27.3%** |
-
-Median process-tree CPU fell from 31.70 to 13.44 CPU-seconds for `check` (**57.6% less**) and from 34.59 to 17.91
-CPU-seconds for the release build (**48.2% less**). Every warm command accepted 26 verified hits and deliberately
-bypassed 31 ungraduated invocations. All 220 measured lane samples preserved exact outputs, diagnostics, action
-censuses, and runtime behavior; the validator found zero rejected samples and zero false hits.
-
-This measures the cold-target problem: cleanup, ephemeral CI runners, and fresh remote build hosts. With an intact warm
-target directory, Cargo's own fingerprints are already faster and Cargo-Rail delegates that path. These figures measure
-local L1 reuse, not first-import S3 latency, and they describe this fixture and host rather than predicting another
-workspace. Affected planning compounds the gain by removing unrelated actions before cache lookup begins.
+The transparent activation contract invalidates earlier runner-owned and pre-linked benchmark numbers. Its canonical
+five-sample interleaved corpus measures intact-target overhead, cold-path overhead, and empty-target L1 against pinned
+local `sccache` independently. A matrix cell qualifies only when all five samples pass the declared correctness and
+coverage gates and warm L1 is strictly faster at both p50 and p95. Cargo-Rail makes no blanket superiority claim from a
+failed cell. The exact correctness fixture remains independent of timing and verifies root isolation, environment
+invalidation, diagnostic replay, output bytes, Cargo L0 behavior, cold publication, and warm reuse.
 
 See [Caching](docs/caching.md) for the proof model and support matrix, and [Benchmarking](docs/benchmarking.md) for the
-complete measurement scope and confidence bounds.
+complete measurement scope and acceptance rules.
 
 ## Release intent belongs in the pull request
 
@@ -383,7 +389,7 @@ The current MSRV is published in
 - [Command reference](docs/commands.md)
 - [Architecture](docs/architecture.md)
 - [Caching](docs/caching.md)
-- [Share native compiler results across CI and SSH](docs/cache-sharing.md)
+- [Share local compiler reuse across workspaces](docs/cache-sharing.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Troubleshooting and recovery](docs/troubleshooting.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)

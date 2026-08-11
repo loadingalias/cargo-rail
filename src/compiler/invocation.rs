@@ -11,6 +11,7 @@ use std::process::Command;
 
 /// Process-local control for the outer compiler cache boundary.
 pub(crate) const CACHE_CONTROL_ENV: &str = "CARGO_RAIL_CACHE";
+const BENCH_COVERAGE_CACHE_CONTROL: &str = "__cargo_rail_benchmark_coverage_v1";
 
 /// Marker set when this executable is the cache-disabled outer compiler wrapper.
 pub(crate) const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
@@ -48,6 +49,7 @@ pub enum PreClapDispatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvocationRole {
+  AppleLinkAdapter,
   DirectCache,
   MarkedCache,
   RustcObservation,
@@ -56,6 +58,7 @@ enum InvocationRole {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InvocationSignals {
+  apple_link_adapter: bool,
   direct_cache: bool,
   marked_cache: bool,
   rustc_observation: bool,
@@ -64,6 +67,12 @@ struct InvocationSignals {
 
 impl InvocationSignals {
   fn classify(self) -> Result<Option<InvocationRole>, &'static str> {
+    if self.apple_link_adapter {
+      if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
+        return Err("Apple linker adapter received conflicting compiler role markers");
+      }
+      return Ok(Some(InvocationRole::AppleLinkAdapter));
+    }
     if self.direct_cache {
       if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
         return Err("direct cache wrapper received conflicting compiler role markers");
@@ -130,55 +139,6 @@ impl CompilerInvocation {
   }
 }
 
-/// Whether cargo-rail may install its cache-disabled compiler wrapper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CacheWrapperPlan {
-  /// No external wrapper exists, so the transparent boundary can be exercised.
-  DisabledPassThrough,
-  /// An existing sccache wrapper keeps Cargo's original position in the chain.
-  PreserveSccache,
-  /// An existing wrapper of unknown cache behavior is preserved fail-closed.
-  PreserveExisting,
-}
-
-impl CacheWrapperPlan {
-  pub(crate) fn for_chain(
-    rustc_wrapper: Option<&std::ffi::OsStr>,
-    workspace_wrapper: Option<&std::ffi::OsStr>,
-  ) -> Self {
-    if [rustc_wrapper, workspace_wrapper]
-      .into_iter()
-      .flatten()
-      .any(is_sccache_selection)
-    {
-      Self::PreserveSccache
-    } else if rustc_wrapper.is_some() || workspace_wrapper.is_some() {
-      Self::PreserveExisting
-    } else {
-      Self::DisabledPassThrough
-    }
-  }
-
-  pub(crate) fn installs_cargo_rail(self) -> bool {
-    self == Self::DisabledPassThrough
-  }
-
-  pub(crate) fn reason(self) -> &'static str {
-    match self {
-      Self::DisabledPassThrough => "native_compiler_cache_per_invocation",
-      Self::PreserveSccache => "sccache_wrapper_preserved",
-      Self::PreserveExisting => "existing_compiler_wrapper_preserved",
-    }
-  }
-}
-
-fn is_sccache_selection(program: &std::ffi::OsStr) -> bool {
-  Path::new(program)
-    .file_stem()
-    .and_then(std::ffi::OsStr::to_str)
-    .is_some_and(|name| name.eq_ignore_ascii_case("sccache"))
-}
-
 /// Compose Cargo's stable wrapper order: global wrapper, workspace wrapper, rustc.
 pub(crate) fn rustc_command(
   rustc: &std::ffi::OsStr,
@@ -209,6 +169,7 @@ pub(crate) fn rustc_command(
 #[must_use]
 pub fn dispatch() -> PreClapDispatch {
   let signals = InvocationSignals {
+    apple_link_adapter: std::env::var_os(crate::compiler::native_cache::APPLE_LINK_ADAPTER_ENV).is_some(),
     direct_cache: crate::compiler::native_cache::NativeCacheContext::is_direct_invocation(),
     marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
     rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
@@ -230,6 +191,7 @@ pub fn dispatch() -> PreClapDispatch {
   };
 
   let exit_code = match role {
+    InvocationRole::AppleLinkAdapter => run_apple_link_adapter(),
     InvocationRole::DirectCache => run_direct_cache(),
     InvocationRole::MarkedCache => run_cache(
       crate::compiler::native_cache::NativeCacheContext::from_environment(),
@@ -240,6 +202,35 @@ pub fn dispatch() -> PreClapDispatch {
     InvocationRole::RustdocObservation => run_rustdoc(),
   };
   PreClapDispatch::Exit(exit_code)
+}
+
+fn run_apple_link_adapter() -> i32 {
+  let Some(driver) = std::env::var_os(crate::compiler::native_cache::APPLE_LINK_DRIVER_ENV) else {
+    eprintln!("cargo-rail Apple linker adapter: missing selected linker driver");
+    return 1;
+  };
+  let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+  let mut command = Command::new(driver);
+  let instrumented = crate::compiler::native_cache::configure_apple_link_adapter(&mut command, &arguments);
+  if !instrumented {
+    command.args(&arguments);
+  }
+  crate::compiler::native_cache::remove_private_environment(&mut command);
+  if !instrumented {
+    return run_transparently(command, "cargo-rail Apple linker adapter");
+  }
+  match command.status() {
+    Ok(status) => {
+      if status.success() {
+        let _ = crate::compiler::native_cache::finalize_apple_link_adapter();
+      }
+      compiler_status_code(status)
+    }
+    Err(error) => {
+      eprintln!("cargo-rail Apple linker adapter: failed to execute compiler: {error}");
+      1
+    }
+  }
 }
 
 /// Run the compiler boundary from the dedicated wrapper executable.
@@ -255,22 +246,56 @@ pub fn dispatch_required() -> i32 {
 }
 
 fn run_direct_cache() -> i32 {
+  let cache_control = cache_control();
+  if cache_control == CacheControl::Disabled {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(program) = arguments.next() else {
+      eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");
+      return 1;
+    };
+    let mut command = Command::new(program);
+    command.args(arguments);
+    return run_transparently(command, "cargo-rail compiler cache wrapper");
+  }
   let invocation = match CompilerInvocation::from_wrapper_arguments("cargo-rail compiler cache wrapper") {
     Ok(invocation) => invocation,
     Err(exit_code) => return exit_code,
   };
-  if cache_disabled() || cache_fast_bypass(&invocation, false) {
-    return run_cache_bypass(invocation);
+  if cache_control == CacheControl::BenchmarkCoverage {
+    crate::compiler::native_cache::activate_benchmark_coverage();
   }
-  let (context, started) = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation();
+  if crate::compiler::native_cache::NativeCacheContext::is_direct_wrapper_program(&invocation.program) {
+    eprintln!("cargo-rail compiler cache wrapper: recursive transparent wrapper configuration");
+    return 2;
+  }
+  if let Some(reason) = cache_fast_bypass_reason(&invocation, false) {
+    crate::compiler::native_cache::record_benchmark_coverage_bypass(&invocation.program, &invocation.arguments, reason);
+    let mut command = invocation.command();
+    if cache_control == CacheControl::BenchmarkCoverage {
+      crate::compiler::native_cache::remove_cache_environment(&mut command);
+    }
+    return run_transparently(command, "cargo-rail compiler cache wrapper");
+  }
+  let (context, started) = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(
+    &invocation.program,
+    &invocation.arguments,
+  );
   match context {
     Ok(context) => {
       let trace = started.finish_context_load(context.captures_wrapper_diagnostics());
       run_cache_invocation(invocation, Some(context), trace)
     }
-    Err(error) => {
-      eprintln!("cargo-rail compiler cache wrapper: {error}");
-      2
+    Err(reason) => {
+      crate::compiler::native_cache::record_benchmark_coverage_bypass(
+        &invocation.program,
+        &invocation.arguments,
+        reason,
+      );
+      let mut command = invocation.command();
+      if cache_control == CacheControl::BenchmarkCoverage {
+        crate::compiler::native_cache::remove_cache_environment(&mut command);
+      }
+      run_transparently(command, "cargo-rail compiler cache wrapper")
     }
   }
 }
@@ -284,20 +309,47 @@ fn run_cache(
     Ok(invocation) => invocation,
     Err(exit_code) => return exit_code,
   };
-  if cache_disabled() || context.is_none() || cache_fast_bypass(&invocation, observation_wrapper) {
+  if cache_control() == CacheControl::Disabled
+    || context.is_none()
+    || cache_fast_bypass_reason(&invocation, observation_wrapper).is_some()
+  {
     return run_cache_bypass(invocation);
   }
   run_cache_invocation(invocation, context, trace)
 }
 
-fn cache_fast_bypass(invocation: &CompilerInvocation, observation_wrapper: bool) -> bool {
-  invocation
-    .compiler_selection(observation_wrapper)
-    .is_none_or(|(program, arguments)| crate::compiler::native_cache::fast_bypass_reason(program, arguments).is_some())
+fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper: bool) -> Option<&'static str> {
+  let Some((program, arguments)) = invocation.compiler_selection(observation_wrapper) else {
+    return Some("compiler_argv_unavailable");
+  };
+  if !observation_wrapper && !direct_rustc_program_shape(program) {
+    return Some("compiler_program_not_graduated");
+  }
+  crate::compiler::native_cache::fast_bypass_reason(program, arguments)
 }
 
-fn cache_disabled() -> bool {
-  std::env::var_os(CACHE_CONTROL_ENV).is_some_and(|value| value == "off")
+fn direct_rustc_program_shape(program: &std::ffi::OsStr) -> bool {
+  Path::new(program)
+    .file_stem()
+    .and_then(std::ffi::OsStr::to_str)
+    .is_some_and(|name| {
+      name.eq_ignore_ascii_case("rustc") || name.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rustc"))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheControl {
+  Enabled,
+  Disabled,
+  BenchmarkCoverage,
+}
+
+fn cache_control() -> CacheControl {
+  match std::env::var_os(CACHE_CONTROL_ENV).as_deref() {
+    Some(value) if value == "off" => CacheControl::Disabled,
+    Some(value) if value == BENCH_COVERAGE_CACHE_CONTROL => CacheControl::BenchmarkCoverage,
+    _ => CacheControl::Enabled,
+  }
 }
 
 fn run_cache_bypass(invocation: CompilerInvocation) -> i32 {
@@ -341,6 +393,7 @@ fn run_cache_invocation(
       "cargo-rail compiler cache wrapper",
     ),
     crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {
+      crate::compiler::native_cache::record_active_failure();
       eprintln!("cargo-rail compiler cache wrapper: {error}");
       2
     }
@@ -772,28 +825,6 @@ mod tests {
       OsString::from("unit"),
       OsString::from("src/lib.rs"),
     ]));
-  }
-
-  #[test]
-  fn cache_wrapper_plan_never_layers_over_existing_or_sccache_wrappers() {
-    assert_eq!(
-      CacheWrapperPlan::for_chain(None, None),
-      CacheWrapperPlan::DisabledPassThrough
-    );
-    assert_eq!(
-      CacheWrapperPlan::for_chain(Some(OsStr::new("sccache")), None),
-      CacheWrapperPlan::PreserveSccache
-    );
-    assert_eq!(
-      CacheWrapperPlan::for_chain(None, Some(OsStr::new("/tools/SCCACHE.exe"))),
-      CacheWrapperPlan::PreserveSccache
-    );
-    assert_eq!(
-      CacheWrapperPlan::for_chain(Some(OsStr::new("custom-wrapper")), None),
-      CacheWrapperPlan::PreserveExisting
-    );
-    assert!(!CacheWrapperPlan::PreserveSccache.installs_cargo_rail());
-    assert!(!CacheWrapperPlan::PreserveExisting.installs_cargo_rail());
   }
 
   #[test]

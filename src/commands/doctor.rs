@@ -11,11 +11,17 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
   }
 
   let capability = crate::compiler::collector::native_cache_capability(ctx.snapshot()?)?;
+  let installation = crate::cache::installation::status(ctx.workspace_root())?;
   let alias = ctx.config().and_then(|config| config.cache.l2.as_deref());
-  let remote = crate::remote_cache::probe(ctx.workspace_root(), alias)
-    .map_err(|error| RailError::message(format!("remote cache probe failed: {error}")))?;
+  let remote = crate::remote_cache::configuration_status(ctx.workspace_root(), alias)
+    .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?;
   if format.is_json() {
-    let payload = serde_json::json!({ "capability": capability, "remote": remote });
+    let payload = serde_json::json!({
+      "capability": capability,
+      "installation": installation,
+      "repair": "cargo rail cache setup",
+      "remote": remote,
+    });
     let output = crate::output::machine_json_envelope("doctor", "native_cache", "success", 0, payload);
     println!(
       "{}",
@@ -29,7 +35,16 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
   println!("  platform: {}", capability.platform());
   println!("  host target: {}", capability.host_target());
   println!("  identity: {}", capability.identity());
+  println!("  installation: {}", installation.state);
+  println!("  installation healthy: {}", installation.healthy);
+  for issue in &installation.issues {
+    println!("  installation issue: {issue}");
+  }
+  if !installation.healthy {
+    println!("  repair: cargo rail cache setup");
+  }
   if let Some(remote) = remote {
+    println!("  remote activation: {}", remote.activation);
     println!("  remote alias: {}", remote.alias);
     println!("  remote transport: {}", remote.transport);
     println!("  remote authority: {}", remote.authority);

@@ -328,8 +328,10 @@ Inspect or reclaim explicitly scoped cache state
 Usage: cargo rail cache [OPTIONS] <COMMAND>
 
 Commands:
+  setup   Install or repair transparent verified local compiler reuse
   status  Report exact bytes, counts, bounds, leases, and ownership scope
   clean   Reclaim one explicitly selected cache scope
+  remove  Remove only transparent compiler-cache state owned by the setup receipt
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -352,10 +354,61 @@ Options:
           Print version
 
 Examples:
+  cargo rail cache setup --check                  # Preview transparent compiler reuse setup
+  cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
   cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
+  cargo rail cache remove --check                 # Preview exact setup-state removal
+  cargo rail cache remove                         # Remove setup state but preserve the CAS
+```
+
+---
+
+### cargo rail cache setup
+
+```
+Install or repair transparent verified local compiler reuse
+
+Usage: cargo rail cache setup [OPTIONS]
+
+Options:
+      --local-dir <PATH>
+          Local cache base directory (defaults to Cargo home)
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --max-size <SIZE>
+          Positive binary byte size such as 10GiB
+
+  -c, --check
+          Preview exact Cargo configuration and private-state changes
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ---
@@ -444,6 +497,47 @@ Options:
           - json: Machine-readable JSON output
 
           [default: text]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail cache remove
+
+```
+Remove only transparent compiler-cache state owned by the setup receipt
+
+Usage: cargo rail cache remove [OPTIONS]
+
+Options:
+  -c, --check
+          Preview exact Cargo configuration and private-state changes
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)

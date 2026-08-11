@@ -88,6 +88,149 @@ pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected
   }
 }
 
+/// Ask a copy-on-write filesystem to clone one opened regular file.
+///
+/// The caller still owns content verification. Failure means the source and
+/// destination do not share a supported clone boundary, so byte copying is the
+/// correct fallback.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn try_clone_regular_file(source: &fs::File, destination: &Path) -> Option<fs::File> {
+  let parent = fs::File::open(destination.parent()?).ok()?;
+  let name = destination.file_name()?;
+  if rustix::fs::fclonefileat(
+    source,
+    &parent,
+    name,
+    rustix::fs::CloneFlags::NOFOLLOW | rustix::fs::CloneFlags::NOOWNERCOPY,
+  )
+  .is_ok()
+  {
+    match fs::OpenOptions::new().read(true).write(true).open(destination) {
+      Ok(output) => Some(output),
+      Err(_) => {
+        let _ = fs::remove_file(destination);
+        None
+      }
+    }
+  } else {
+    let _ = fs::remove_file(destination);
+    None
+  }
+}
+
+#[cfg(all(target_os = "linux", not(any(target_arch = "sparc", target_arch = "sparc64"))))]
+pub(crate) fn try_clone_regular_file(source: &fs::File, destination: &Path) -> Option<fs::File> {
+  let output = fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create_new(true)
+    .open(destination)
+    .ok()?;
+  match rustix::fs::ioctl_ficlone(&output, source) {
+    Ok(()) => Some(output),
+    Err(_) => {
+      drop(output);
+      let _ = fs::remove_file(destination);
+      None
+    }
+  }
+}
+
+#[cfg(not(any(
+  target_vendor = "apple",
+  all(target_os = "linux", not(any(target_arch = "sparc", target_arch = "sparc64")))
+)))]
+pub(crate) fn try_clone_regular_file(_source: &fs::File, _destination: &Path) -> Option<fs::File> {
+  None
+}
+
+/// Capture stable local filesystem generation evidence without reading file
+/// contents. Callers may reuse a previously verified digest only while this
+/// evidence remains exact.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
+  use std::os::macos::fs::MetadataExt as _;
+
+  let metadata = fs::symlink_metadata(path).ok()?;
+  if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
+    return None;
+  }
+  let mut generation = Vec::from(&b"macos-file-generation-v1\0"[..]);
+  for value in [
+    metadata.st_dev(),
+    metadata.st_ino(),
+    u64::from(metadata.st_mode()),
+    metadata.st_nlink(),
+    metadata.st_size(),
+    metadata.st_mtime() as u64,
+    metadata.st_mtime_nsec() as u64,
+    metadata.st_ctime() as u64,
+    metadata.st_ctime_nsec() as u64,
+    metadata.st_birthtime() as u64,
+    metadata.st_birthtime_nsec() as u64,
+    u64::from(metadata.st_gen()),
+  ] {
+    generation.extend_from_slice(&value.to_le_bytes());
+  }
+  Some(generation)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
+  use std::os::unix::fs::MetadataExt as _;
+
+  let metadata = fs::symlink_metadata(path).ok()?;
+  if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
+    return None;
+  }
+  let mut generation = Vec::from(&b"linux-file-generation-v1\0"[..]);
+  for value in [
+    metadata.dev(),
+    metadata.ino(),
+    metadata.mode() as u64,
+    metadata.nlink(),
+    metadata.size(),
+    metadata.mtime() as u64,
+    metadata.mtime_nsec() as u64,
+    metadata.ctime() as u64,
+    metadata.ctime_nsec() as u64,
+  ] {
+    generation.extend_from_slice(&value.to_le_bytes());
+  }
+  Some(generation)
+}
+
+#[cfg(windows)]
+pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
+  let file = crate::windows_fs::open_for_observation(path).ok()?;
+  let observation = crate::windows_fs::observe_file(&file).ok()?;
+  crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number).ok()?;
+  let repeated = crate::windows_fs::open_for_observation(path).ok()?;
+  let repeated = crate::windows_fs::observe_file(&repeated).ok()?;
+  if observation != repeated || observation.file_attributes & 0x10 != 0 {
+    return None;
+  }
+  let mut generation = Vec::from(&b"windows-file-generation-v1\0"[..]);
+  for value in [
+    observation.volume_serial_number,
+    observation.file_id,
+    observation.creation_time,
+    observation.last_write_time,
+    observation.change_time,
+    u64::from(observation.file_attributes),
+    observation.size,
+    observation.number_of_links,
+  ] {
+    generation.extend_from_slice(&value.to_le_bytes());
+  }
+  Some(generation)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn stable_file_generation(_path: &Path) -> Option<Vec<u8>> {
+  None
+}
+
 /// Verify that a path still names the same opened regular file without
 /// rejecting benign hard links. This is the file-capture identity guard; cache
 /// authority files use the stricter single-link variant above.

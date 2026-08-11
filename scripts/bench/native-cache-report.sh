@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 mode="${1:-}"
 results="${2:-}"
-
 case "$mode" in
   summarize | validate) ;;
   *)
@@ -12,151 +10,141 @@ case "$mode" in
     exit 2
     ;;
 esac
-[[ -n "$results" ]] || {
-  echo "native-cache result directory is required" >&2
-  exit 2
-}
 results="$(cd "$results" 2>/dev/null && pwd -P)" || {
   echo "native-cache result directory does not exist: $results" >&2
   exit 2
 }
-
-for tool in find jq sort; do
-  command -v "$tool" >/dev/null || {
-    echo "missing required benchmark report tool: $tool" >&2
-    exit 2
-  }
-done
 for required in environment.json run.json; do
   [[ -f "$results/$required" ]] || {
     echo "native-cache result is missing $required: $results" >&2
     exit 2
   }
 done
-temporary="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-native-report.XXXXXX")"
-trap 'rm -rf -- "$temporary"' EXIT
-raw_samples="$temporary/raw-samples.jsonl"
-: >"$raw_samples"
-
-while IFS= read -r -d '' group; do
-  jq -c '
-    . as $group
-    | .samples[]
-    | . + {
-        accepted: $group.accepted,
-        group_validity: {
-          complete: $group.complete,
-          output_manifests_identical: $group.output_manifests_identical,
-          cross_root_artifacts: $group.cross_root_artifacts,
-          runtime_outputs_identical: $group.runtime_outputs_identical,
-          action_census_identical: $group.action_census_identical,
-          bypass_cache_io_zero: $group.bypass_cache_io_zero,
-          cache_event_streams_complete: $group.cache_event_streams_complete,
-          cache_proof_replays_valid: $group.cache_proof_replays_valid,
-          cache_equivalent: $group.cache_equivalent,
-          cache_io_consistent: $group.cache_io_consistent,
-          rejection_reasons: $group.rejection_reasons
-        }
-      }
-  ' "$group" >>"$raw_samples"
-done < <(find "$results/raw" -type f -name group.json -print0 2>/dev/null | sort -z)
 
 samples="$results/samples.jsonl"
-invalid_samples="$results/invalid-samples.jsonl"
-event_diffs="$results/compiler-event-diffs.json"
-jq -c -s -f "$repo_root/scripts/bench/native-cache-validate.jq" "$raw_samples" >"$samples"
-jq -c 'select(.accepted | not)' "$samples" >"$invalid_samples"
-jq -s '
-  group_by([.workload, .lane])
-  | map(
-      sort_by(.round) as $lane
-      | $lane[0] as $reference
-      | $lane[]
-      | select(.repeated_sample_equivalence.accepted | not)
-      | {
-          sample_id,
-          workload,
-          lane,
-          reference_sample_id: $reference.sample_id,
-          reference_event_count: (($reference.cache.events // []) | length),
-          sample_event_count: ((.cache.events // []) | length),
-          eligible_units_added: ((.cache.eligible_units // []) - ($reference.cache.eligible_units // [])),
-          eligible_units_removed: (($reference.cache.eligible_units // []) - (.cache.eligible_units // [])),
-          events_added: ((.cache.events // []) - ($reference.cache.events // [])),
-          events_removed: (($reference.cache.events // []) - (.cache.events // [])),
-          output_manifest_identical: .repeated_sample_equivalence.output_manifest_identical,
-          action_census_identical: .repeated_sample_equivalence.action_census_identical,
-          runtime_output_identical: .repeated_sample_equivalence.runtime_output_identical,
-          eligible_units_identical: .repeated_sample_equivalence.eligible_units_identical,
-          outcomes_identical: .repeated_sample_equivalence.outcomes_identical
-        }
-    )
-  | flatten
-' "$samples" >"$event_diffs"
-
-optional_json() {
-  local path="$1"
-  local fallback="$2"
-  if [[ -f "$path" ]]; then
-    printf '%s\n' "$path"
-  else
-    local temporary_path
-    temporary_path="$temporary/$(basename "$path")"
-    printf '%s\n' "$fallback" >"$temporary_path"
-    printf '%s\n' "$temporary_path"
-  fi
-}
-
-runs="$(jq -er '.required_accepted_samples' "$results/run.json")"
-attempts="$(jq -er '.attempts' "$results/run.json")"
-warmup_runs="$(jq -r '.warmup_runs // if .evidence_kind == "smoke" then 0 else 1 end' "$results/run.json")"
-evidence_kind="$(jq -er '.evidence_kind' "$results/run.json")"
-sccache_available="$(jq -r '.sccache.available' "$results/run.json")"
-[[ "$sccache_available" == true || "$sccache_available" == false ]] || {
-  echo "native-cache run metadata has an invalid sccache availability value" >&2
-  exit 2
-}
-sccache_path="$(jq -r '.sccache.path // ""' "$results/run.json")"
-sccache_version="$(jq -r '.sccache.version // ""' "$results/run.json")"
-sccache_unavailable_reason="$(jq -r '.sccache.unavailable_reason // ""' "$results/run.json")"
-check_units="$(optional_json "$results/unit-check.json" '{"available":false,"reason":"unit timing has not completed"}')"
-build_units="$(optional_json "$results/unit-build.json" '{"available":false,"reason":"unit timing has not completed"}')"
-check_seed="$(optional_json "$results/seed-check-cache-status.json" 'null')"
-build_seed="$(optional_json "$results/seed-build-cache-status.json" 'null')"
+: >"$samples"
+while IFS= read -r -d '' sample; do
+  jq -c . "$sample" >>"$samples"
+done < <(find "$results/raw" -type f -name sample.json -print0 2>/dev/null | sort -z)
 
 jq -s \
-  --argjson runs "$runs" \
-  --argjson attempts "$attempts" \
-  --argjson warmup_runs "$warmup_runs" \
-  --arg evidence_kind "$evidence_kind" \
-  --argjson sccache_available "$sccache_available" \
-  --arg sccache_path "$sccache_path" \
-  --arg sccache_version "$sccache_version" \
-  --arg sccache_unavailable_reason "$sccache_unavailable_reason" \
   --slurpfile environment "$results/environment.json" \
-  --slurpfile run "$results/run.json" \
-  --slurpfile check_units "$check_units" \
-  --slurpfile build_units "$build_units" \
-  --slurpfile check_seed "$check_seed" \
-  --slurpfile build_seed "$build_seed" \
-  -f "$repo_root/scripts/bench/native-cache-summary.jq" \
-  "$samples" >"$results/summary.json"
+  --slurpfile check_coverage "$results/coverage/check/coverage.json" \
+  --slurpfile build_coverage "$results/coverage/build/coverage.json" \
+  --slurpfile run "$results/run.json" '
+  def quantile($values; $p):
+    ($values | sort) as $sorted
+    | if ($sorted | length) == 0 then null
+      else $sorted[((($sorted | length) - 1) * $p | floor)]
+      end;
+  def times($samples; $workload; $lane):
+    [$samples[] | select(.accepted and .workload == $workload and .lane == $lane) | .measurement.elapsed_seconds];
+  def metric($samples; $workload; $lane):
+    times($samples; $workload; $lane) as $times
+    | {
+        workload: $workload,
+        lane: $lane,
+        accepted_samples: ($times | length),
+        p50_elapsed_seconds: quantile($times; 0.50),
+        p95_elapsed_seconds: quantile($times; 0.95),
+        mean_elapsed_seconds: (if ($times | length) == 0 then null else ($times | add / length) end),
+        min_elapsed_seconds: (if ($times | length) == 0 then null else ($times | min) end),
+        max_elapsed_seconds: (if ($times | length) == 0 then null else ($times | max) end)
+      };
+  def reduction($baseline; $candidate):
+    if $baseline == null or $candidate == null or $baseline == 0 then null
+    else 100 * ($baseline - $candidate) / $baseline
+    end;
+  def overhead_within_bound($baseline; $candidate):
+    if $baseline == null or $candidate == null then false
+    else $candidate <= ([$baseline * 1.03, $baseline + 0.05] | max)
+    end;
+  . as $samples
+  | $run[0] as $contract
+  | [
+      $contract.workloads[] as $workload
+      | $contract.lanes[] as $lane
+      | metric($samples; $workload; $lane)
+    ] as $metrics
+  | [
+      $contract.workloads[] as $workload
+      | (metric($samples; $workload; "cargo-l0")) as $cargo_l0
+      | (metric($samples; $workload; "cargo-empty")) as $cargo_empty
+      | (metric($samples; $workload; "transparent-l0")) as $transparent_l0
+      | (metric($samples; $workload; "cache-off")) as $cache_off
+      | (metric($samples; $workload; "transparent-cold")) as $cold
+      | (metric($samples; $workload; "transparent-warm")) as $warm
+      | (metric($samples; $workload; "sccache-server")) as $sccache
+      | {
+          workload: $workload,
+          l0_p50_overhead_percent: reduction($cargo_l0.p50_elapsed_seconds; $transparent_l0.p50_elapsed_seconds) * -1,
+          l0_p95_overhead_percent: reduction($cargo_l0.p95_elapsed_seconds; $transparent_l0.p95_elapsed_seconds) * -1,
+          cache_off_p50_overhead_percent: reduction($cargo_empty.p50_elapsed_seconds; $cache_off.p50_elapsed_seconds) * -1,
+          cache_off_p95_overhead_percent: reduction($cargo_empty.p95_elapsed_seconds; $cache_off.p95_elapsed_seconds) * -1,
+          cold_p50_overhead_percent: reduction($cargo_empty.p50_elapsed_seconds; $cold.p50_elapsed_seconds) * -1,
+          cold_p95_overhead_percent: reduction($cargo_empty.p95_elapsed_seconds; $cold.p95_elapsed_seconds) * -1,
+          l1_vs_sccache_p50_reduction_percent: reduction($sccache.p50_elapsed_seconds; $warm.p50_elapsed_seconds),
+          l1_vs_sccache_p95_reduction_percent: reduction($sccache.p95_elapsed_seconds; $warm.p95_elapsed_seconds),
+          l0_p95_within_bound: overhead_within_bound($cargo_l0.p95_elapsed_seconds; $transparent_l0.p95_elapsed_seconds),
+          cache_off_p95_within_bound: overhead_within_bound($cargo_empty.p95_elapsed_seconds; $cache_off.p95_elapsed_seconds)
+        }
+    ] as $comparisons
+  | {
+      schema_version: 10,
+      evidence_kind: $contract.evidence_kind,
+      requested_samples_per_lane: $contract.required_accepted_samples,
+      total_samples: ($samples | length),
+      accepted_samples: ([$samples[] | select(.accepted)] | length),
+      rejected_samples: ([$samples[] | select(.accepted | not)] | length),
+      minimum_accepted_samples_per_lane: ($metrics | map(.accepted_samples) | min // 0),
+      false_hits: ([$samples[] | select((.lane == "transparent-warm") and (.cache_outcome_valid | not))] | length),
+      metrics: $metrics,
+      comparisons: $comparisons,
+      coverage: {
+        check: $check_coverage[0],
+        build: $build_coverage[0]
+      },
+      performance_qualified: (
+        $contract.required_accepted_samples >= $contract.qualification.minimum_samples
+        and $check_coverage[0].coverage_gate.passed
+        and $build_coverage[0].coverage_gate.passed
+        and ($comparisons | all(
+          .l0_p95_within_bound
+          and .cache_off_p95_within_bound
+          and .l1_vs_sccache_p50_reduction_percent
+            > $contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_min_percent
+          and .l1_vs_sccache_p95_reduction_percent
+            > $contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_min_percent
+        ))
+      ),
+      environment: $environment[0],
+      contract: $contract
+    }
+' "$samples" >"$results/summary.json"
 
-if [[ "$mode" == summarize ]]; then
-  jq '{run_id, evidence_kind, runs, attempts, accepted_samples, rejected_samples, validity, comparisons}' \
-    "$results/summary.json"
-  exit 0
+if [[ "$mode" == validate ]]; then
+  required="$(jq -er '.required_accepted_samples' "$results/run.json")"
+  if ! jq -e --argjson required "$required" '
+    .rejected_samples == 0
+    and .false_hits == 0
+    and .coverage.check.coverage_gate.passed
+    and .coverage.build.coverage_gate.passed
+    and .minimum_accepted_samples_per_lane >= $required
+  ' "$results/summary.json" >/dev/null; then
+    echo "native-cache benchmark did not retain the requested accepted samples" >&2
+    jq '{requested_samples_per_lane, accepted_samples, rejected_samples, false_hits, minimum_accepted_samples_per_lane}' \
+      "$results/summary.json" >&2
+    exit 1
+  fi
 fi
 
-if ! jq -e --argjson required "$runs" '
-  .validity.measurement_complete
-  and .validity.minimum_accepted_samples_per_lane >= $required
-  and .validity.false_hits == 0
-' "$results/summary.json" >/dev/null; then
-  echo "native-cache benchmark has not retained $runs equivalent groups in every available lane" >&2
-  jq '{validity}' "$results/summary.json" >&2
-  exit 1
-fi
-
-jq '{run_id, evidence_kind, runs, attempts, accepted_samples, rejected_samples, validity, comparisons}' \
-  "$results/summary.json"
+jq '{
+  evidence_kind,
+  requested_samples_per_lane,
+  accepted_samples,
+  rejected_samples,
+  false_hits,
+  minimum_accepted_samples_per_lane,
+  performance_qualified,
+  comparisons
+}' "$results/summary.json"

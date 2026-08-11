@@ -483,38 +483,6 @@ impl CargoConfigSnapshot {
       .ok_or_else(|| RailError::message("Cargo program selection is empty"))
   }
 
-  /// Classify Cargo's configured compiler-wrapper chain without invoking it.
-  pub(crate) fn cache_wrapper_plan(
-    &self,
-    cargo_current_dir: &Path,
-  ) -> RailResult<crate::compiler::invocation::CacheWrapperPlan> {
-    let rustc_wrapper = selected_program(
-      self,
-      cargo_current_dir,
-      RUSTC_WRAPPER_ENV_PRECEDENCE,
-      &["build", "rustc-wrapper"],
-      None,
-      "rustc wrapper",
-    )?;
-    let workspace_wrapper = selected_program(
-      self,
-      cargo_current_dir,
-      RUSTC_WORKSPACE_WRAPPER_ENV_PRECEDENCE,
-      &["build", "rustc-workspace-wrapper"],
-      None,
-      "workspace rustc wrapper",
-    )?;
-    reject_recursive_cargo_rail_wrappers(
-      cargo_current_dir,
-      rustc_wrapper.as_deref(),
-      workspace_wrapper.as_deref(),
-    )?;
-    Ok(crate::compiler::invocation::CacheWrapperPlan::for_chain(
-      rustc_wrapper.as_deref(),
-      workspace_wrapper.as_deref(),
-    ))
-  }
-
   pub(crate) fn repository_config_paths(&self, source_root: &Path) -> RailResult<Vec<crate::source::RepositoryPath>> {
     self
       .provenance
@@ -2700,6 +2668,11 @@ fn wrapped_rustc_query(
 }
 
 impl CargoConfigSnapshot {
+  /// Resolve Cargo's user configuration directory without loading metadata.
+  pub(crate) fn cargo_home(cargo_current_dir: &Path) -> RailResult<PathBuf> {
+    cargo_home(cargo_current_dir)
+  }
+
   pub(crate) fn capture(cargo_current_dir: &Path) -> RailResult<Self> {
     let cargo_current_dir = canonicalize_existing(cargo_current_dir).map_err(|error| {
       RailError::message(format!(

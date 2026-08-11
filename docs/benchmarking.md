@@ -1,51 +1,79 @@
 # Benchmarking
 
-The native-cache corpus measures release-binary behavior, not an isolated cache function. It interleaves native Cargo,
-Cargo incremental, Cargo-Rail delegated, disabled, bypassed, cold, and warm paths with the pinned specialist-cache
-lane. Every available lane must preserve command exits, diagnostics, action censuses, runtime output, and the output
-bytes that Cargo-Rail owns. A mismatch rejects the complete interleaved group.
+The native-cache workflow measures transparent activation under direct Cargo. Runner-owned cache lanes and operational
+L2 lanes are retired because neither is part of the compiler-cache architecture.
 
-## Local workflow
+## Questions measured separately
 
-Use the one-group smoke first when checking the harness or host:
+The real-world fixture runs `cargo check` and `cargo build --release` in deterministic interleaved lane order:
+
+| Lane | Target state | Cache state | Question |
+|---|---|---|---|
+| `cargo-l0` | intact | no wrapper | Native Cargo no-op authority |
+| `transparent-l0` | intact | installed L1 | Transparent no-op overhead |
+| `cargo-empty` | empty | no wrapper | Native cold-target baseline |
+| `cache-off` | empty | installed but `CARGO_RAIL_CACHE=off` | Exact opt-out overhead |
+| `transparent-cold` | empty | empty receipt-selected L1 | Cold publication overhead |
+| `transparent-warm` | empty | verified same-root L1 | Restored compiler work |
+| `sccache-server` | empty | warm pinned local sccache | Specialist server baseline |
+| `sccache-client` | empty | warm pinned client-side sccache | Specialist daemonless baseline |
+| `transparent-incremental` | empty | installed L1, incremental forced | Unsupported early bypass |
+
+Each lane has an isolated Cargo home and cache authority below the result directory. Setup is performed through
+`cargo rail cache setup`; the developer's Cargo configuration is never read or changed as installation authority.
+Registry and Git dependency stores may be linked read-only from the invoking Cargo home on platforms that support
+links, but configuration, receipt, wrapper, sessions, ledgers, CAS, target directories, and sccache data remain
+isolated.
+
+## Run the five-sample qualification corpus
 
 ```bash
 just bench-native-cache-smoke
 ```
 
-A smoke runs one check and release-build group and validates diagnostic integrity, output equivalence, and zero false
-hits.
+One accepted sample per lane checks orchestration, exact lane-local authoritative output bytes, expected cache outcomes,
+zero false hits, and reporting. It is not performance qualification.
 
-Choose the retained group count for the decision being made. One group is a correctness check; repeated groups support
-p50/p95 and paired comparisons. Run timing measurements on an idle host:
+Run the canonical interleaved qualification corpus next:
 
 ```bash
-just bench-native-cache 10
+just bench-native-cache 5
 ```
 
-Results default to `target/benchmarks/native-cache/<UTC timestamp>/`. Set `CARGO_RAIL_BENCH_RESULTS` to choose an
-empty result directory. A run refuses to overwrite a non-empty directory.
+- Cargo L0 and `CARGO_RAIL_CACHE=off` p95 overhead is at most the larger of 3% or 50 ms;
+- transparent empty-target L1 is strictly faster at both p50 and p95 than accepted `sccache-server`; and
+- every accepted sample has exact outputs, an explicit cache outcome, and zero ambiguity or false hits.
 
-Each result has one measurement authority and rebuildable projections:
+Five accepted samples per lane are the complete qualification unit. A failed corpus is useful evidence: retain it,
+profile the failing lane when further optimization is justified, and make no superiority claim. Do not expand the
+sample count merely to average away a missed bound.
 
-- `environment.json` binds the repository commit and worktree, untracked content, release binary, benchmark harness,
-  toolchain, host, filesystem, and environment.
-- `run.json` binds the workload, lanes, sample count, fixture, interleaving policy, Cargo-Rail toolchain identity, and
-  specialist version. `native-cache-capability.json` retains the exact identity inspection.
-- `raw/<workload>/round-N/group.json` is an atomically finalized interleaved measurement group. Incomplete lane
-  directories have no authority. Cargo-Rail cold/warm timing uses the ordinary compact-output command. A separate
-  unmeasured replay recreates the identical pre-run target and cache state, adds `--explain`, and retains unit and
-  cache-I/O evidence. The group is rejected unless measured and replayed outcomes, action censuses, and outputs agree.
-- `samples.jsonl`, `invalid-samples.jsonl`, `compiler-event-diffs.json`, and `summary.json` are derived views.
+## Evidence layout
 
-Set both `CARGO_RAIL_BENCH_L2_ALIAS` and `CARGO_RAIL_BENCH_L2_TARGETS_FILE` to add one same-root operational L2 cycle.
-The target must be a machine-owned, read-write S3 authority that permits the fixture's `CARGO_PKG_VERSION` input. The
-cycle records one publication, one empty-L1 hit, and one credential-unavailable fallback under `l2/`; it validates the
-same compiler action and output bytes across all three commands. Request counts cover authenticated wrapper requests,
-and network bytes cover verified result-pack payloads rather than S3 protocol overhead. Retain an exact S3 namespace
-inventory separately when the benchmark host has no inventory client.
+Results default to `target/benchmarks/native-cache/<UTC timestamp>/`. Set `CARGO_RAIL_BENCH_RESULTS` to choose an empty
+directory.
 
-Rebuild a partial summary at any time, validate a completed run, or resume it on the same machine:
+- `environment.json` binds the commit, worktree diff, release binary, harness, Cargo, rustc, pinned sccache, host, and
+  local-only authority.
+- `run.json` binds workloads, lanes, sample count, rotation, retired runner lane, and qualification thresholds.
+- `coverage/<workload>/coverage.json` is the authoritative per-action coverage and cold-cost join. It records the Cargo
+  census, Cargo-Rail and sccache outcomes, matched/extra/missing actions, ambiguity, logical output roles/bytes, and one
+  complete serial cold timing record per rustc action. Timing claims are invalid unless this ledger is complete, has
+  zero ambiguity, and shows that Cargo-Rail's verified hit set strictly exceeds sccache's accepted hit set.
+- `state/` contains the isolated resumable fixtures, Cargo homes, receipts, target trees, and cache roots. Never treat
+  it as a portable result; action identity is physical-root-bound.
+- `raw/<workload>/round-N/<lane>/` retains stdout, stderr, timing/resource evidence, cache status deltas, and the
+  authoritative output manifest. Every lane hashes modes and bytes for cacheable dep-info and Rust library metadata.
+  Private rustc incremental-session files are excluded because their session paths are not Cargo-facing outputs.
+  The unsupported incremental control also excludes `.rlib` archives: native incremental codegen rewrites their
+  session-dependent bytes across clean-target invocations, and this lane proves early bypass rather than archive reuse.
+  The verified warm L1 lane additionally hashes every file Cargo reports as a compiler artifact, including build-script
+  executables, proc-macro dylibs, and final binaries. Competitor lanes do not claim exact hits for linked outputs they
+  always rebuild, so the harness does not misclassify their linker nondeterminism as a cache-integrity failure.
+- `samples.jsonl` and `summary.json` are rebuildable projections. Summary reports sample counts, p50/p95/mean/min/max,
+  overheads, sccache reductions, false hits, and whether the complete five-sample qualification passed.
+
+Rebuild or validate projections, or resume without changing the physical state root:
 
 ```bash
 just bench-native-cache-summarize target/benchmarks/native-cache/<run>
@@ -53,131 +81,23 @@ just bench-native-cache-validate target/benchmarks/native-cache/<run>
 just bench-native-cache-resume target/benchmarks/native-cache/<run>
 ```
 
-Resume recreates deterministic fixture and seed state, retains finalized groups, replaces an incomplete group, and
-continues the fixed interleaving schedule. It refuses to combine measurements after any bound identity changes. Start
-a new result directory after changing source, the harness, binary, toolchain, host, filesystem, or specialist.
+Resume refuses a changed repository commit or worktree diff. Start a new result after changing source, harness,
+binary, toolchain, host, policy, or cache protocol.
 
-`summary.json` reports p50/p95 wall and complete CPU time, complete peak RSS, acquisition and compiler counts, cache
-bytes, restored bytes, cache growth, publication repayment, paired comparisons, rejected samples, unsupported lanes,
-and false-hit evidence. On Linux, the harness runs sccache's server in the foreground under a separate process-tree CPU
-authority and samples aggregate RSS across the command and server process forests every 10 ms. Specialist wall time
-adds the isolated server's startup interval to the ordinary command interval. On hosts without this accounting
-boundary, raw client counters remain retained but are not projected as complete specialist CPU or RSS results.
+## Correctness is independent
 
-Validation requires every requested group, the requested accepted sample count for every available lane, output and
-runtime equivalence, and zero false hits. Cargo-Rail cold/warm lanes run for every toolchain whose exact Cargo, rustc,
-rustdoc, sysroot, and host identity can be captured. Identity-capture failure is a benchmark failure, not an unsupported
-performance lane or a request to add the toolchain to an allowlist.
+Timing acceptance does not prove compiler-cache correctness. The integration fixture separately proves exact `.d`,
+`.rmeta`, `.rlib`, build-script executable, proc-macro producer, and final linked bytes; diagnostic replay; root
+isolation; environment and linker-input invalidation; L0 no-op behavior; L1 outage fallback; compiler-class
+boundaries; and same-root cold-then-warm reuse. Platform qualification must run those oracles on every claimed host
+even when no performance claim is made.
 
-## Current evidence
+## Qualification claims
 
-The v10 contract invalidates measurements from earlier execution contracts. The retained
-`readme-v10-l1-macos-arm64` corpus ran ten interleaved groups on an Apple M1 Pro with macOS 26.5.2, APFS,
-and Rust 1.95.0. The release binary came from commit `8a03afb0ba9d2a48cbadbb7c4db41498984290be`; the captured
-worktree diff contains only the benchmark ownership correction that runs native-cache capability inspection from the
-materialized fixture instead of discovering unrelated policy from the outer repository. The environment record binds
-that diff, the harness, both binaries, toolchain, host, fixture, lockfile, and every benchmark control.
+Earlier runner-owned, pre-linked, and operational L2 measurements describe removed architectures and are not evidence
+for this contract. Publish a scoped performance claim only from one accepted five-sample corpus whose summary reports
+`performance_qualified: true`. Retain a failed corpus as the canonical result for that exact worktree and host; do not
+replace it with a larger population or combine it with another run.
 
-Both native Cargo and Cargo-Rail clean-target lanes used disabled incremental compilation, offline dependencies, and an
-empty target directory. Cargo-Rail's warm lane used a fresh copy of the populated local CAS:
-
-| Workload and lane | p50 wall | Empirical p95 wall | p50 process-tree CPU | Empirical p95 CPU |
-|---|---:|---:|---:|---:|
-| Native Cargo `check` | 6.65 s | 7.45 s | 31.70 s | 33.83 s |
-| Cargo-Rail warm-L1 `check` | 4.91 s | 6.43 s | 13.44 s | 13.99 s |
-| Native Cargo `build --release` | 9.88 s | 10.89 s | 34.59 s | 37.31 s |
-| Cargo-Rail warm-L1 `build --release` | 7.40 s | 7.80 s | 17.91 s | 18.73 s |
-
-The paired median wall reduction was 25.7% for `check` and 27.3% for `build`. Exact nonparametric p50 intervals were
-19.6%–31.6% and 23.6%–28.7%, respectively, with at least 95% one-sided coverage at both bounds. Lane-median
-process-tree CPU fell 57.6% for `check` and 48.2% for `build`. Ten groups do not provide a complete upper confidence
-bound for p95, so the table labels p95 as an empirical order statistic rather than a population-tail claim.
-
-All 20 groups and 220 lane samples were accepted. Output manifests, runtime output, diagnostics, action censuses,
-compiler-event identities, cache accounting, and measured-versus-proof-replay outcomes matched. The validator found
-zero rejected samples and zero false hits. Each Cargo-Rail warm command accepted 26 verified hits, restored the exact
-stored results, and bypassed 31 ungraduated invocations.
-
-This comparison measures an empty `target/` with a warm L1. It does not measure Cargo with an intact warm target, where
-Cargo-Rail delegates to Cargo's fingerprints, or first-import L2 performance, which includes S3 latency and payload
-transfer. The exact p50 confidence interval for the Cargo-Rail-versus-sccache difference includes zero for both
-workloads, so this corpus does not support a superiority claim.
-
-One retained Linux x64 operational observation separately covers native Cargo, sccache, L1, L2 publication, empty-L1
-import, and unavailable-L2 fallback. Retained macOS ARM64, Linux x64, Windows x64, and Windows ARM64 proofs establish
-same-root L2 operation and exact-output preservation; they do not form one timing population.
-
-## Maintainer AWS runners
-
-The maintainer workflow delegates provider mechanics and credentials to `~/dev-machines`; benchmark orchestration adds
-no cloud-state or provider abstraction. Benchmark sccache lanes use machine-local storage, and the ordinary comparison
-lanes remove S3 and other specialist remote-cache environment variables. The opt-in L2 cycle is the only lane that
-uses Cargo-Rail's pinned S3 target authority.
-
-The bounded AWS matrix is:
-
-| Target | Host | Shape | Purpose |
-|---|---|---|---|
-| `aws-linux-x64-bench` | Ubuntu 24.04 x86-64 | `c8i.xlarge` | Linux x86-64 correctness and performance |
-| `aws-linux-arm64-bench` | Ubuntu 24.04 ARM64 | `c8g.xlarge` | Linux ARM64 correctness and performance |
-| `aws-windows-x64-bench` | Windows Server 2025 x86-64 | `c8i.xlarge` | Windows x86-64 correctness and performance |
-
-These are fixed-performance compute instances. Burstable and Flex instances are cheaper in some conditions but add
-credit or baseline variability to CPU-bound compiler measurements. Windows ARM64 is not in the AWS matrix because
-[AWS documents that Windows Server runs only on x86 processors](https://docs.aws.amazon.com/prescriptive-guidance/latest/optimize-costs-microsoft-workloads/right-size-selection.html).
-Adding Azure solely to fill that cell would create another provider lifecycle without improving the current cache
-experiment.
-
-Always validate the current AMI, permissions, region availability, metadata policy, tags, volume mapping, and launch
-request without spending first:
-
-```bash
-just bench-native-cache-aws-plan aws-linux-x64-bench
-just bench-native-cache-aws-plan aws-linux-arm64-bench
-just bench-native-cache-aws-plan aws-windows-x64-bench
-```
-
-An executed run requires the explicit `--execute` token. Inspect the dry-run plan and pass smoke before starting a
-longer paid run:
-
-```bash
-just bench-native-cache-aws-smoke aws-linux-x64-bench --execute
-just bench-native-cache-aws aws-linux-x64-bench 10 --execute
-```
-
-The wrapper creates one project-scoped instance, synchronizes the primary checkout one way, bootstraps only the
-benchmark tools, and runs the corpus. It then atomically freezes only that run, resumes its digest-bound transfer for
-up to three attempts, and publishes the verified result under `target/benchmarks/remote/<target>/<UTC run id>/` with
-one local rename. Unrelated remote results are never collected, and an interrupted transfer never authorizes a local
-result. A sibling `<UTC run id>.orchestration.log` retains the complete create-through-teardown transcript even when
-compilation fails before the benchmark can create raw results. The wrapper attempts collection after any benchmark
-exit.
-
-The benchmark bootstrap stays lean. Before using a live benchmark host for full validation, install the pinned
-check/test tools and run the repository gates explicitly:
-
-```bash
-just ssh-qualification-tools aws-linux-x64-bench
-just ssh-just aws-linux-x64-bench check
-just ssh-just aws-linux-x64-bench build-all
-just ssh-just aws-linux-x64-bench test-all
-```
-
-Use the matching Windows target for Windows validation. This profile installs `cargo-nextest`, `cargo-deny`, and
-`cargo-audit`; it does not add those tools to ordinary benchmark-only images.
-
-The exit trap then invokes `dev-machine kill`. AWS instances use IMDSv2-only metadata, encrypted gp3 root volumes,
-guest-shutdown termination, and `DeleteOnTermination=true`. Teardown waits for instance termination, finds every EBS
-volume with the Cargo-Rail project and target tags, deletes residual volumes, and fails if any remain. The guest also
-terminates after five idle minutes if the local orchestration process disappears.
-
-If teardown reports a failure, retry and inspect the exact target before doing anything else:
-
-```bash
-just ssh-kill aws-linux-x64-bench
-just ssh-status aws-linux-x64-bench
-```
-
-Do not compare absolute timings across hosts as if they were one population. Each host produces a separate corpus
-bound to its own CPU, operating system, filesystem, toolchain, and target. Choose enough same-host groups for the claim:
-one for a correctness smoke test, repeated groups for distribution or tail comparisons.
+Do not compare absolute timings across hosts or combine distinct commits, worktrees, toolchains, target-state policies,
+physical roots, cache protocols, or machines into one population.

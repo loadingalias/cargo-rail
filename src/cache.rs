@@ -1,6 +1,7 @@
 //! Exact ownership, measurement, and reclamation for cargo-rail cache state.
 
 pub(crate) mod cas;
+pub(crate) mod installation;
 pub(crate) mod result;
 
 use crate::error::{RailError, RailResult};
@@ -107,6 +108,7 @@ pub(crate) struct LegacyLocalCacheStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CacheStatus {
   pub(crate) schema_version: u32,
+  pub(crate) installation: crate::cache::installation::InstallationStatus,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) workspace: Option<WorkspaceCacheStatus>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,8 @@ impl CacheRemoval {
 
 /// Inspect selected cache scopes without creating or modifying cache state.
 pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> RailResult<CacheStatus> {
+  let installation = crate::cache::installation::status(workspace_root)?;
+  let transparent_installed = installation.wrapper_path.is_some();
   let remote = if local {
     let alias = configured_l2_alias(workspace_root)?;
     crate::remote_cache::configuration_status(workspace_root, alias.as_deref())
@@ -143,15 +147,24 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
     None
   };
   Ok(CacheStatus {
-    schema_version: 5,
+    schema_version: 8,
+    installation,
     workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
     local: local
       .then(|| {
-        let cache = crate::hermetic::local_cache_status()?;
-        let legacy = crate::hermetic::legacy_local_cache_status()?.map(|(root, bytes)| LegacyLocalCacheStatus {
-          root: root.to_string_lossy().into_owned(),
-          bytes,
-        });
+        let cache = if transparent_installed {
+          crate::cache::installation::local_cache_status(workspace_root)?
+        } else {
+          crate::hermetic::local_cache_status()?
+        };
+        let legacy = if transparent_installed {
+          None
+        } else {
+          crate::hermetic::legacy_local_cache_status()?.map(|(root, bytes)| LegacyLocalCacheStatus {
+            root: root.to_string_lossy().into_owned(),
+            bytes,
+          })
+        };
         Ok::<_, RailError>(SharedCacheStatus {
           present: cache.is_some() || legacy.is_some(),
           cross_workspace: true,
@@ -216,8 +229,12 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
 }
 
 /// Remove the validated shared local CAS in the selected local cache domain.
-pub(crate) fn remove_local() -> RailResult<CacheRemoval> {
-  crate::hermetic::remove_local_cache()?
+pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
+  let removed = match crate::cache::installation::remove_local_cache(workspace_root)? {
+    Some(removed) => removed,
+    None => crate::hermetic::remove_local_cache()?,
+  };
+  removed
     .into_iter()
     .try_fold(CacheRemoval::default(), |mut removal, (path, bytes)| {
       removal.bytes = removal

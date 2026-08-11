@@ -482,12 +482,13 @@ def load_native_cache_contract() -> NativeCacheContract:
     )
     run_source = (REPOSITORY_ROOT / "src/commands/run.rs").read_text(encoding="utf-8")
     require(
-        "ActionKind::Build | ActionKind::Distribution" in run_source,
-        "native cache must remain limited to build and distribution actions",
+        "NativeCacheContext" not in run_source and "CACHE_WRAPPER" not in run_source,
+        "runner must not own transparent native-cache activation",
     )
     require(
-        'std::env::var_os("CARGO_INCREMENTAL")' in run_source,
-        "native cache must retain the explicit incremental policy gate",
+        "load_direct_invocation" in source
+        and "incremental_compilation_not_graduated" in source,
+        "transparent native cache must retain direct activation and the incremental bypass",
     )
     bypass_source = source + (REPOSITORY_ROOT / "src/compiler/collector.rs").read_text(
         encoding="utf-8"
@@ -495,10 +496,11 @@ def load_native_cache_contract() -> NativeCacheContract:
     for reason in (
         "compiler_diagnostic_format_not_graduated",
         "compiler_flag_not_graduated",
-        "configured_linker_not_graduated",
+        "compiler_output_root_not_graduated",
         "cross_target_not_graduated",
-        "custom_sysroot_not_graduated",
-        "native_cache_capability_unavailable",
+        "custom_target_directory_not_graduated",
+        "incremental_compilation_not_graduated",
+        "local_cache_unavailable",
     ):
         require(
             f'"{reason}"' in bypass_source,
@@ -742,8 +744,13 @@ def render_markdown(
             cross = "—"
             release = "Native artifact required"
             cache = (
-                f"Active for structurally eligible `{native_cache.cache_class}` units; "
-                "exact compiler identity is part of every key"
+                f"Active for structurally eligible `{native_cache.cache_class}` units"
+                + (
+                    " and certified default-Apple-linker producers/final artifacts"
+                    if target.endswith("-apple-darwin")
+                    else ""
+                )
+                + "; exact compiler identity is part of every key"
             )
         rows.append(
             f"| `{target}` | {execution} | {cross} | {release} | {cache} |"
@@ -814,24 +821,35 @@ The layers have separate eligibility. A lookup or Cargo `fresh` flag never autho
 input identity, action/result binding, manifest, and exact stored bytes owned by the layer. Incomplete evidence runs
 cold with a stable reason. **Fast when proven. Normal Cargo when not.**
 
-## Native compiler-result cache
+## Transparent native compiler-result cache
 
-Native reuse is automatic for an ordinary `build` or `distribution` action when all of these are true:
-
-- Cargo-Rail can content-identify the exact Cargo, rustc, rustdoc, complete sysroot, host, and wrapper protocol;
-- the selected Cargo profile has no active fingerprints and neither the environment nor rustc forces incremental
-  compilation;
-- no Cargo CLI `--config`, action-defined environment, unknown Cargo setting, `build.dep-info-basedir`, sccache, or
-  custom compiler wrapper changes the boundary; and
-- the invocation is an eligible dependency or workspace library whose complete bounded source namespace, exact
-  compiler-visible environment, selected-input proof, metadata, optional rlib output, and Rust-only dependency
-  artifacts remain inside the graduated class, with no linker responsibility.
+One machine-local setup enables verified L1 reuse for ordinary Cargo, nextest, Just, IDE, CI, and `cargo rail run`
+invocations that use the same effective Cargo home:
 
 ```bash
-cargo rail run --all --action build --explain
-cargo rail run --all --action distribution --explain
-cargo rail doctor native-cache --format json
+cargo rail cache setup --check
+cargo rail cache setup
+cargo rail cache status
+cargo rail doctor native-cache
 ```
+
+Setup losslessly sets Cargo's global `build.rustc-wrapper`, installs a private minimal launcher plus compiler-cache
+worker, initializes the bounded local CAS, and writes a versioned receipt under the effective Cargo home. The receipt
+binds the content and stable file generation of both executables; the worker authenticates itself and its launcher
+before acquiring installation context. `--check` previews the exact Cargo field and private paths and exits 1 when
+changes are pending. Setup refuses a conflicting wrapper, an environment or workspace configuration that shadows the
+global field, an ambiguous Cargo home, linked authority paths, or receipt drift. Repeating setup verifies or repairs
+only the same owned authority.
+
+Cargo freshness and incremental compilation remain authoritative L0. Cargo invokes the wrapper only for compiler work
+that L0 did not eliminate; Cargo-Rail never restores a target directory or synthesizes fingerprints. Incremental,
+clippy, rustdoc, response-file, information, test-mode, cross-target, custom-target-directory, native proc-macro
+consumer, explicitly configured linker, and otherwise unsupported shapes execute the selected compiler chain before
+session or CAS acquisition. Eligible metadata/rlib units, including exact native-static consumers, use L1 only when
+Cargo-Rail can identify the exact toolchain, complete bounded source and native-search namespaces, compiler
+environment, dependency artifacts, arguments, outputs, and physical workspace root. On macOS, the graduated default
+Apple-linker path also admits build-script executables, proc-macro producers, ordinary final binaries, `dylib`, and
+`cdylib` outputs after linker certification. Build-script execution itself is never cached.
 
 Every compiler process first enters one pre-Clap boundary that captures Cargo's selected program and byte-exact argv.
 Transparent execution preserves the working directory, inherited non-private environment, wrapper order, streams, and
@@ -840,18 +858,34 @@ the cache wrapper, workspace fact driver, and rustdoc proxy before loading a com
 before Clap or compiler execution. Information requests, response files, clippy, incremental compilation, unsupported
 crate types, and invocations without modeled outputs execute the original chain before session or CAS acquisition.
 
-`CARGO_RAIL_CACHE=off` is the process-local kill switch for an already-selected Cargo-Rail compiler wrapper. It removes
-cache authority and directly executes the original compiler chain without reading session state or opening the CAS.
-Use `--no-cache` for ordinary `cargo rail run` cold baselines; use the environment control only when supervising the
-wrapper boundary itself.
+`CARGO_RAIL_CACHE=off` is the process-local kill switch for an already-selected Cargo-Rail compiler wrapper. The
+minimal launcher directly executes the original compiler chain without starting the cache worker, reading the
+installation receipt or session state, or opening the CAS. Use `--no-cache` for ordinary `cargo rail run` cold
+baselines; use the environment control only when supervising the wrapper boundary itself.
 
-Each command session binds one physical workspace root, and each compiler action additionally binds the physical source
-namespace for that unit. Cargo-Rail therefore reuses exact path-bearing compiler artifacts only within that root; a
-moved or independent checkout compiles cold and records its own exact variant. Each compiler unit also binds its exact
-rustc arguments and cfg, dependency artifact contents, every entry and regular-file byte below the crate-root
-directory, and every compiler-visible environment name and value after removing only Cargo-Rail's exact private
-controls. Rustc observation then proves that the successful invocation selected no input outside those capabilities.
-The action identity is available before lookup; lookup work does not grow with retained source history.
+Each authenticated installation session binds one physical workspace root, and each compiler action additionally
+binds the physical source namespace for that unit. Cargo-Rail therefore reuses exact path-bearing compiler artifacts
+only within that root; a moved or independent checkout compiles cold and records its own exact variant. Each compiler
+unit also binds its exact rustc arguments and cfg, dependency artifact contents, every entry and regular-file byte
+below the crate-root directory, and every compiler-visible environment name and value after removing only Cargo-Rail's
+exact private controls. Rustc observation then proves that the successful invocation selected no input outside those
+capabilities. The action identity is available before lookup; lookup work does not grow with retained source history.
+
+One protocol owns every accepted result. The pre-execution action binds the compiler session, argv, source topology,
+environment, dependencies, generated inputs, and native-search state. Linked Apple actions use that value only as a
+non-authoritative candidate selector until the cold linker certificate closes found and missing lookup paths, driver
+and linker bytes, SDK inputs, exact dependency archives, and rustc-endogenous objects. The witnessed action then binds
+one result descriptor and exact output/stream objects. L1 verifies the same action, witness, result association, and
+objects at restore time; future L2 support may transport that pack but may not redefine its authority.
+
+Apple certification is deliberately narrow. Cargo-Rail invokes the selected default `/usr/bin/cc` chain, asks the
+installed Apple linker for dependency evidence, and records direct driver inputs in a private sidecar. For LTO, the
+adapter snapshots owner-controlled rustc temporary namespaces that are not writable by group or other users before
+driver execution, certifies new regular objects reported by the linker before those namespaces disappear, and treats
+only non-user-selected temporary aggregate archives passed by the exact rustc driver as endogenous. Cargo-Rail uses
+`-oso_prefix` only for that certified random temporary prefix. A user link argument, custom linker, unknown certificate
+record, preexisting or unbound temporary object/archive, appeared negative lookup, changed symlink resolution,
+SDK/tool change, or non-byte-stable result runs cold and receives no linked cache authority.
 
 The cache deliberately over-invalidates when an unused file in the bounded source directory changes. This is the
 smallest sound contract for Rust's path discovery: positive dep-info alone does not record failed probes such as the
@@ -869,25 +903,14 @@ source roots, so Cargo-Rail never injects compiler remapping into a cache-reques
 tokens only for verified dep-info and JSON output-path bindings, including their Windows separator and escaping form,
 then restores the current output paths after verification. Source-root authority remains physical and root-bound;
 output names and materialized bytes remain exact, and ambiguous or unmodeled cached paths fail closed.
-Cargo-Rail sets `CARGO_INCREMENTAL=0` only for an eligible clean-profile child. An active profile, an explicit nonzero
-incremental request, or forced incremental compilation keeps Cargo's ordinary path. The doctor reports the exact
-compiler identity without running a build. If that exact identity cannot be captured, Cargo executes normally with
-`native_cache_capability_unavailable`. Existing wrappers remain in their selected order and Cargo-Rail does not add a
-second cache.
+Cargo-Rail never changes incremental policy. An active or requested incremental invocation stays on Cargo's ordinary
+path. The doctor reports the exact compiler identity and installation health without running a build. An existing
+`rustc-workspace-wrapper` remains in Cargo's selected chain; Cargo-Rail bypasses reuse for that composition. Setup
+refuses an existing `rustc-wrapper`, and the compiler boundary rejects ambiguous or recursive wrapper chains.
 
-For the exact normal all-workspace `build` and `distribution` shapes, an unambiguous active profile delegates the
-unchanged built-in Cargo action before metadata, Git, tool hashing, and action-key construction. Cargo configuration
-that makes the target location ambiguous, a non-workspace manifest, or an explicit incremental setting retains the
-captured planner/runner path. An eligible clean profile uses one locked, no-dependencies Cargo metadata query to prove
-the workspace-library boundary, then enters the same verified compiler-result cache without capturing Git state or
-expanding the full action plan. Any ambiguity or acquisition failure falls back to the captured path. Both shortcuts
-preserve ambient wrappers and record their deliberately absent snapshot in the ordinary decision receipt.
-
-Default text mode emits one concise decision with `hits`, `misses`, `bypasses`, and `bytes_restored`, or the stable
-action-level bypass reason. `--explain` adds `setup_bytes_hashed`, `bytes_hashed`, accounted verified-result
-`cache_bytes_read` and `cache_bytes_written` totals, the retained-event reason census, and per-unit evidence.
-Acquisition-free shapes execute before event persistence, so the bypass count is not a census of every rustc process.
-Low-level I/O that fails without returning byte statistics is not inferred:
+`cache status` reports installation health, Cargo L0 ownership, a bounded best-effort usage ledger, and exact CAS
+ownership. Acquisition-free early bypasses are reported separately and do not touch session or CAS state. The ledger
+is operational evidence, not reuse authority:
 
 - `hit` means current inputs and every stored object were reverified before exact output bytes were restored;
 - `miss` means the exact action has no authoritative result; successful cold output may populate the local CAS; and
@@ -899,26 +922,22 @@ state restores cached output. Restore uses one durable marker for the exact dest
 visible replacement falls back to the original compiler; failure after that boundary cleans every owned destination
 and fails without running rustc over a partial commit.
 
-Corrupt or incompatible native entries never authorize reuse. Cargo still owns its fingerprints; Cargo-Rail never
-restores a target directory or synthesizes Cargo freshness. Use `--no-cache` for an intentional cold baseline.
+Corrupt or incompatible native entries never authorize reuse. Missing installation state, an unavailable CAS, or
+incomplete pre-commit evidence executes cold. A failure after the first visible restore replacement fails closed so
+rustc never runs over a partial restored output set.
 
 ## Shared native cache (L2)
 
-Select one machine target by alias; L1 remains enabled by default:
+Transparent compiler reuse is deliberately local-only in this release. Runner-owned L2 import/publication was removed
+with runner cache ownership; ordinary Cargo invocations do not start a daemon, open a loopback coordinator, resolve
+cloud credentials, or read/write remote cache objects.
+
+The existing machine target schema remains accepted so operators can validate and migrate configuration deliberately:
 
 ```toml
 [cache]
 l2 = "team"
 ```
-
-An accepted L1 hit is network-free. On an L1 miss, the command-owned coordinator can stream one S3 result into private
-L1 staging. The ordinary L1 proof must accept the imported result before restore. A `read_write` target publishes a
-verified local pack before its action association. The compiler wrapper receives only a loopback capability, never S3
-credentials or a bucket name.
-
-Compatible CI runners and SSH build hosts can exchange results when they use the same canonical physical checkout root,
-toolchain, flags, and selected compiler environment. Each machine retains a private L1 and its own AWS principal. See
-[Share native compiler results across CI and SSH](cache-sharing.md) for local, CI, SSH, and end-to-end transfer examples.
 
 Set `CARGO_RAIL_CACHE_TARGETS_FILE` to an absolute machine-owned JSON file outside the checkout. This is the complete
 version 1 schema; unknown fields are rejected:
@@ -940,56 +959,17 @@ version 1 schema; unknown fields are rejected:
 }}
 ```
 
-Aliases use lowercase ASCII letters, digits, `-`, and `_`, and start with a letter. `read` permits `GetObject` only;
-`read_write` also permits conditional `PutObject`. Restrict the AWS principal to the selected bucket prefix.
-`shareable_environment` is a sorted, unique list of non-secret compiler-environment names that may participate in L2
-reuse. An action with any other selected environment name stays local.
-
-Before granting client access, create `<prefix>/native-v3/protocol` with the exact 27-byte body
-`cargo-rail-native-cache-v3\n`. Keep this marker and selector/action objects permanent; apply expiration only to
-`<prefix>/native-v3/results/`. Require TLS and reject every `PutObject` that has neither `If-Match` nor
-`If-None-Match`. Clients need no list, delete, ACL, bucket-policy, or lifecycle authority. The marker is required
-because S3 reports a missing object as `403` when a caller has `GetObject` but not `ListBucket`; Cargo-Rail validates
-the marker before treating `403` on a content-addressed cache key as a miss.
-
-The command parent loads credentials from the standard AWS SDK chain. The target map contains no credentials.
-Cargo-Rail pins the expected bucket owner and the AWS SDK's official regional HTTPS endpoint; custom endpoints and
-S3-compatible services are not supported. Endpoint overrides, access points, multi-region access points, S3 Express,
-FIPS, dual-stack, and accelerated endpoints are disabled or rejected.
-
-Before starting Cargo, an L2-enabled command removes the target-map variable, AWS credential and provider-selector
-variables, and AWS endpoint-override variables from the child environment. This prevents accidental inheritance; it
-is not a sandbox. A same-UID build script or proc macro can still read default AWS credential files or contact a
-workload metadata service. Run untrusted builds under a principal or container with no L2 credentials, or omit
-`cache.l2`.
 
 ```bash
 cargo rail cache status --scope local --format json
 cargo rail doctor native-cache --format json
 ```
 
-`cache status` validates the selected target without resolving credentials. `doctor native-cache` resolves
-credentials and validates the immutable protocol marker. A missing target, unavailable credentials, authentication error,
-timeout, service failure, or remote miss compiles cold through L1 and opens one command-local remote circuit when
-applicable. A remote conflict, malformed object, or action/result mismatch is an integrity failure and restores
-nothing. Publication failure is reported after local admission and does not change successful compilation.
-
-L2 cost scales with eligible L1 misses and the immutable objects they read or publish. With `--explain`, the remote
-summary reports authenticated coordinator requests and verified result-pack payload bytes; it does not estimate S3
-protocol overhead, storage pricing, or data-transfer charges. Measure those counters on the intended workload and use
-the bucket's billing data before enabling `read_write` broadly. Keep selector and action objects with the protocol
-marker; expire only result packs, as described above.
-
-`cache clean` owns L1 only and never deletes S3 objects. For an immediate cold build that cannot contact or restore
-from L2, use `cargo rail run --all --action build --no-cache`. Diagnose the configured authority with `cache status`
-and `doctor native-cache`; clean a corrupt local import with `cargo rail cache clean --scope local --check` followed by
-the same command without `--check`. A remote integrity conflict deliberately has no client-side repair: stop writers,
-select a fresh prefix for continued work, and let a separately authorized operator inspect and remove only the exact
-conflicting namespace. Do not grant build clients list or delete access for recovery convenience.
-
-The v10 path has retained empty-L1 publication and reuse on macOS ARM64, Linux x64, Windows x64, and Windows ARM64.
-Each proof preserved the platform-specific action and exact output within one canonical physical source root; it does
-not authorize cross-root reuse. The repeated comparison below is scoped to its named macOS ARM64 host and local L1.
+Status schema 8 labels this target `configuration_only_transparent_cache_is_local`. Status and doctor validate only
+the bounded machine-owned declaration; neither resolves credentials nor contacts S3. The target map must remain an
+absolute machine-owned file with no embedded credentials; unknown fields, ambiguous authority, and secret-like shared
+environment names remain rejected. L2 transport activation is deferred until it can
+consume the compiler-result protocol without recreating runner ownership or weakening the local proof.
 
 ## Hermetic whole-action cache
 
@@ -1032,24 +1012,26 @@ Check mode does not edit manifests, but analysis may update cache and report fil
 
 ## Storage and cleanup
 
-The default local authority root is `$CARGO_HOME/cargo-rail/local-cas-v2` or
-`$HOME/.cargo/cargo-rail/local-cas-v2`. `CARGO_RAIL_CACHE_DIR` selects another machine-authorized base;
-`CARGO_RAIL_CACHE_MAX_BYTES` changes the positive 10 GiB result bound. The owner directory contains a generated opaque
-trust-domain marker, and the CAS validates the matching root marker before every use. An explicit
-`CARGO_RAIL_CACHE_TRUST_DOMAIN` selects `local-cas-v2-<id>` so protected CI, untrusted jobs, and managed interactive
-workloads can use physically isolated roots. The variable names authority; it is not isolation by itself.
+Setup records the exact local authority base and positive byte bound in its receipt. The default base is the effective
+Cargo home and the default result bound is 10 GiB; `--local-dir` and `--max-size` select explicit alternatives. Runtime
+environment variables do not override the receipt, so setup, status, compiler reuse, and cleanup share one authority.
+The private CAS validates its opaque owner marker before every use and never follows linked authority paths.
 
 ```bash
+cargo rail cache setup --check
 cargo rail cache status
 cargo rail cache clean --scope workspace --check
-cargo rail cache clean --scope local
+cargo rail cache clean --scope local --check
+cargo rail cache remove --check
 ```
 
 Workspace cleanup removes reconstructible state for the current checkout. Local cleanup resolves only the currently
-selected trust domain, validates its owner marker, waits for in-flight readers, and removes that cross-workspace CAS.
-A legacy `local-cas-v1` is reclaim-only and never becomes v2 authority. Use `--scope all` only when both effects are
-intended. `cargo rail clean --cache` remains a combined compatibility
-alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
+installed receipt authority, validates its owner marker, waits for in-flight readers, and removes that cross-workspace
+CAS. Removing active L1 leaves setup drift that the next cold compiler invocation bypasses safely; `cache setup`
+repairs the same root. `cache remove` losslessly removes only the receipt-owned Cargo field, wrapper, session state, and
+receipt; it preserves CAS data. It refuses changed or unowned state. A legacy `local-cas-v1` is reclaim-only and never
+becomes v2 authority. Use `--scope all` only when both cache-cleanup effects are intended. `cargo rail clean --cache`
+remains a combined compatibility alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
 
 ## Execution and reuse support
 
@@ -1085,7 +1067,7 @@ runtime platform allowlist.
 
 | Capability | Advertised non-default implementations | Current contract |
 |---|---|---|
-| Linker | {linkers} | Default and bundled host linkers are tested. An explicitly configured linker keeps the complete action on Cargo's path until Cargo-Rail can preserve its exact argv and effects. |
+| Linker | {linkers} | The installed default Apple driver/linker is certified for the explicit macOS linked class. Other defaults remain pass-through for linked outputs; an explicitly configured linker always keeps the complete linked action on Cargo's path. |
 | Codegen backend | {backends} | Bundled named backends are bound by the complete sysroot identity and compiler arguments. An external backend path bypasses until its executable bytes are content-identified. |
 
 Pass-through execution is not cache graduation. A non-default implementation needs a named compatibility fixture on
@@ -1095,17 +1077,22 @@ every applicable native host before Cargo-Rail advertises it.
 
 | Class | Reuse status | Boundary |
 |---|---|---|
-| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One physical-root-bound session and unit source namespace, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, Rust-only dependencies, no linker responsibility |
-| Incremental compilation | Automatic clean-profile policy | Active fingerprints, explicit nonzero incremental requests, and forced incremental mode preserve Cargo's path; eligible clean profiles run non-incrementally without global setup |
-| Binary, test, example, and benchmark linking | Bypassed; compiler/linker executes | Linker-producing invocations are not graduated |
-| `dylib`, `cdylib`, and `staticlib` | Bypassed; compiler/linker executes | Native linker, SDK, runtime, and archive boundaries are incomplete |
-| Proc macros and their consumers | Bypassed; compiler executes | Compile-time filesystem and process reads are not completely observed |
-| Build scripts and generated output | Bypassed; build script executes | Cargo messages do not prove the ordered instruction stream, runtime reads, output tree, or freshness |
-| Native dependencies and `links` contracts | Bypassed; native tools execute | External tools, headers, SDKs, libraries, discovery inputs, and outputs are incomplete |
+| Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One physical-root-bound session and unit source namespace, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, dependency contents, and exact native-static search namespaces |
+| Incremental compilation | Bypassed before session or CAS acquisition | Cargo owns freshness and incremental policy; Cargo-Rail never disables incremental compilation |
+| Certified Apple linked producers and final binaries | Active for the installed default Apple driver/linker on macOS | The witnessed action binds the linker certificate's found/missing namespace, driver/linker and SDK bytes, symlink resolution, dependency archives, certified rustc-generated objects, and byte-stable linked output |
+| Tests and unsupported binary/example/benchmark shapes | Bypassed; compiler/linker executes | Test mode and shapes outside the explicit Apple linked class are not graduated |
+| `dylib` and `cdylib` | Structurally admitted only through certified Apple linking | Other native linker, SDK, runtime, and post-link boundaries remain incomplete |
+| `staticlib` | Bypassed; compiler/archive creation executes | Archive creation is a distinct deterministic boundary and is not covered by native-static consumption evidence |
+| Proc-macro producers | Metadata-only producer `.rmeta` is active directly; the producer dylib is active only through certified Apple linking | Neither result certifies later macro execution |
+| Native proc-macro consumers | Bypassed before context acquisition | Compile-time filesystem, environment, process, network, clock, and randomness reads are not completely observed; unsafe sccache hits are not copied |
+| Build-script executable compilation | Active only through certified Apple linking | The compiler result is reusable; build-script execution and its generated outputs remain Cargo-owned cold work |
+| Native dependencies and `links` contracts | Exact native-static consumers may reuse metadata/rlib; native tools still execute | Search order, modifiers, missing candidates, shadowing, replacement, symlinks, archives, and generated namespaces are bound; external tool execution is not cached |
 | rustdoc and doctests | Bypassed; rustdoc/test executes | Stable Cargo output does not enumerate the complete documentation tree |
 | Cross compilation and custom targets | Bypassed; compiler executes | Host/target tools, runners, SDKs, and target specifications are not graduated |
-| Existing sccache or custom wrappers | Preserved; Cargo-Rail reuse bypassed | The selected wrapper chain remains authoritative and is never double-cached |
-| Cargo CLI `--config` and action environments | Bypassed; Cargo executes | Effective configuration or environment is outside the graduated direct-action contract |
+| Existing workspace wrapper | Preserved; Cargo-Rail reuse bypassed | The selected wrapper chain remains authoritative and is never double-cached; ambiguous and recursive chains are rejected |
+| Existing global or environment wrapper | Setup refused or shadowed | Setup never silently replaces another `rustc-wrapper` authority |
+| Custom Cargo target directory | Bypassed; Cargo executes | The wrapper cannot prove one physical workspace root from the standard `<root>/target` output layout |
+| Per-invocation Cargo CLI `--config` | May shadow setup for that invocation | Cargo precedence remains authoritative; status and setup detect persistent environment and workspace shadowing |
 
 ## Benchmark evidence
 
@@ -1114,46 +1101,24 @@ a binary:
 
 ```bash
 just bench-native-cache-smoke
-just bench-native-cache 10
+just bench-native-cache 5
 ```
 
-The v10 execution contract invalidates earlier measurements. V10 binds the canonical physical source root in session
-and action identity, preserves direct Cargo's exact compiler arguments and path-bearing output bytes, and retains each
-output's regular-file mode in result authority. Different roots or effective creation modes cannot cross-hit. Do not
-compare measurements from different execution contracts.
+Transparent activation invalidates the earlier runner-owned timing corpus. The current workflow invokes Cargo directly
+under one isolated setup receipt and measures three different questions independently: intact-target L0 overhead,
+empty-target L1 restoration, and cold-path overhead. The comparison rotates lane order, preserves raw samples, records
+tool/host/configuration identity and usage counters, and checks exact outputs before accepting a sample.
 
-The benchmark now seeds and measures Cargo-Rail in one authoritative source root with a clean target directory and a
-fresh copy of the populated CAS. Acceptance hashes every `.d`, `.rmeta`, and `.rlib` byte without a root-bound
-exclusion, and requires identical action censuses, runtime behavior, compiler-event identities, cache accounting, and
-measured/proof-replay outcomes. Specialist comparisons may still use distinct roots, but they do not measure
-one shared artifact action. The independent-root fixture proves the required miss, exact cold output, and subsequent
-same-root reuse.
+The canonical performance corpus contains five accepted interleaved samples per lane. It qualifies only when
+transparent empty-target L1 is strictly faster than the pinned local `sccache` lane at both p50 and p95, Cargo L0 and
+cache-off p95 overhead are within the declared bound, and correctness and coverage acceptance are clean. A failed
+corpus is a valid result: retain it and do not claim superiority. One accepted group is only a workflow smoke test; it
+is not performance qualification.
 
-The retained `readme-v10-l1-macos-arm64` corpus ran ten accepted interleaved groups on an Apple M1 Pro with macOS,
-APFS, Rust 1.95.0, offline dependencies, disabled incremental compilation, and empty target directories for both the
-native Cargo and Cargo-Rail clean-target lanes:
-
-| Workload | Native Cargo p50 wall | Cargo-Rail warm-L1 p50 wall | Paired median wall reduction | Median CPU reduction |
-|---|---:|---:|---:|---:|
-| `cargo check` | 6.65 s | 4.91 s | 25.7% | 57.6% |
-| `cargo build --release` | 9.88 s | 7.40 s | 27.3% | 48.2% |
-
-The exact nonparametric p50 interval was 19.6%–31.6% for `check` and 23.6%–28.7% for `build`, with at least 95%
-one-sided coverage at both bounds. All 220 measured lane samples were accepted with exact output, diagnostics, action
-census, and runtime equivalence; the validator found zero rejected samples and zero false hits. Each warm command
-accepted 26 verified hits and bypassed 31 ungraduated invocations.
-
-These are local L1 results for the cold-target problem, not intact-target Cargo timing or first-import S3 timing. The
-fixture and host bound the numbers. Operational L2 evidence proves publication and empty-L1 import across the supported
-platform set but does not estimate network performance.
-
-When evaluating another workspace, record the repository commit, tool and host/target identities, linker, runner,
-wrappers, flags, exact action argv, clean-root method, native/disabled/cold/warm timings, hit and byte counts, all bypass
-reasons, and byte-identity findings. Choose the group count for the decision being made; one accepted interleaved group
-is a correctness smoke test, while repeated groups support p50/p95 comparisons.
-The benchmark pins the current stable `sccache` release from the CI tool registry and measures both its server and
-opt-in client-side local-disk paths. Preserve raw output and never combine different commits, toolchains, targets,
-policies, or cache modes.
+When evaluating another workspace, record the repository commit, tool and host/target identities, wrappers, flags,
+target-state policy, disabled/cold/warm/sccache timings, hit and byte counts, bypass reasons, and byte-identity findings.
+Never combine different commits, toolchains, targets, cache protocols, policies, or machines into one timing
+population.
 """
 
 

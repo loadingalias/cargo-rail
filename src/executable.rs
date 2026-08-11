@@ -76,6 +76,15 @@ impl ExecutableIdentity {
   }
 }
 
+/// Resolve the executable one direct `Command` would launch without reading
+/// its contents. Callers must bind separate change evidence before trusting a
+/// memoized content identity.
+pub(crate) fn resolve_executable_path(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
+  resolve_program(selection, current_dir)?
+    .canonicalize()
+    .map_err(Into::into)
+}
+
 impl ToolchainExecutableIdentities {
   pub(crate) fn capture(
     toolchain: &crate::cargo::ToolchainIdentity,

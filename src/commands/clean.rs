@@ -314,7 +314,7 @@ fn clean_release_journals(paths: &[String]) -> RailResult<Vec<String>> {
 
 fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
   progress!("removing validated cache state...");
-  let mut removal = crate::cache::remove_local()?;
+  let mut removal = crate::cache::remove_local(ctx.workspace_root())?;
   removal.extend(crate::cache::remove_workspace(ctx.workspace_root())?)?;
   Ok(removal.paths)
 }

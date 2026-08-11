@@ -4,25 +4,19 @@ use crate::build_script::{
   BuildScriptActionInputs, BuildScriptCargoOutputSummary, BuildScriptResultInputs,
   analyze_action_key as analyze_build_script_action_key, analyze_result as analyze_build_script_result,
 };
-use crate::cache::cas::LocalCas;
+use crate::cache::cas::{LocalCacheSelection, LocalCas};
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
-use crate::cargo::resolution::{ResolutionInputs, capture_target_identities};
 use crate::cargo::{CargoConfigSnapshot, DepKind, ToolchainIdentity};
 use crate::compiler::diagnostics_store::CompilerDiagnosticsStore;
 use crate::compiler::invocation::{
-  CACHE_WRAPPER_MARKER, CacheWrapperPlan, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
-  WRAPPER_MARKER,
+  CACHE_WRAPPER_MARKER, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
 };
 use crate::compiler::model::{
   AnalysisConfiguration, COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId,
   CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
   FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
 };
-use crate::compiler::native_cache::{
-  DIAGNOSTIC_EXECUTION_CONTRACT, DirectCacheBypass, DirectNativeCacheIdentity, DirectNativeCacheSetup,
-  NativeCompilerSession, NativeSessionAuthority, SESSION_ENV, direct_cache_bypass_reason,
-  direct_target_configuration_bypass_reason, prepare_direct_cargo_cache,
-};
+use crate::compiler::native_cache::{NativeCompilerSession, NativeSessionAuthority};
 use crate::compiler::observation::{
   BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
   CompilationProfile, CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, CompilerWrapperIdentity,
@@ -41,12 +35,9 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// One exact rustc crate candidate and the platforms where its declaration applies.
@@ -83,7 +74,6 @@ pub(crate) struct CompilerCacheIdentity {
   lock_fingerprint: String,
   compiler_env_fingerprint: String,
   cargo_config_fingerprint: String,
-  native_compiler_process_env_fingerprint: String,
   cargo_program: OsString,
   rustc_workspace_wrapper: Option<OsString>,
   manifest_fingerprints: HashMap<PackageId, String>,
@@ -95,11 +85,8 @@ pub(crate) struct CompilerCacheIdentity {
   rustc_executable: ExecutableIdentity,
   wrapper_chain: Vec<CompilerWrapperIdentity>,
   cache_wrapper: CompilerCacheWrapperMetadata,
-  cache_wrapper_plan: CacheWrapperPlan,
   executable_bypasses: BTreeSet<String>,
   cache_bypass_reason: Option<CompilerCacheBypass>,
-  native_cache_bypass_reason: Option<DirectCacheBypass>,
-  native_cache_capability_identity: Option<String>,
 }
 
 #[derive(Clone)]
@@ -136,10 +123,29 @@ impl NativeToolchainCapability {
   }
 }
 
-struct CapturedNativeToolchainCapability {
-  report: NativeToolchainCapability,
-  bytes_hashed: u64,
+const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 1;
+
+/// Regenerable, receipt-private proof that a direct compiler session remains
+/// exact without launching two identity probes for every rustc unit.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransparentNativeSessionMemo {
+  version: u32,
+  source_root: String,
+  rustc_program: String,
+  rustc_program_generation: Vec<u8>,
+  rustc_sysroot: String,
+  host_target: String,
+  sysroot_evidence: ExactSysrootEvidence,
+  compiler_environment_identity: String,
+  session: NativeCompilerSession,
+  digest: String,
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TransparentNativeSessionMemo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CargoBuildScriptOutput {
@@ -164,15 +170,6 @@ impl CompilerCacheBypass {
       Self::ExternalSourceDigest => "external_source_digest_unavailable",
     }
   }
-
-  const fn direct(self) -> DirectCacheBypass {
-    match self {
-      Self::CargoConfiguration => DirectCacheBypass::CargoConfiguration,
-      Self::BuildScriptObservations => DirectCacheBypass::BuildScriptObservations,
-      Self::ProcMacroObservations => DirectCacheBypass::ProcMacroObservations,
-      Self::ExternalSourceDigest => DirectCacheBypass::ExternalSourceDigest,
-    }
-  }
 }
 
 impl CompilerCacheIdentity {
@@ -189,50 +186,13 @@ impl CompilerCacheIdentity {
       snapshot.source_root(),
     )?;
     let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-    let cache_wrapper_plan = CacheWrapperPlan::for_chain(
-      snapshot.toolchain().rustc_wrapper_program(),
-      snapshot.toolchain().rustc_workspace_wrapper_program(),
-    );
     let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
-    let mut native_cache_bypass_reason = snapshot
-      .config()
-      .is_some_and(|config| !config.cache.enabled)
-      .then_some(DirectCacheBypass::DisabledByConfiguration)
-      .or_else(|| direct_target_configuration_bypass_reason(snapshot.targets()))
-      .or_else(|| native_cargo_configuration_bypass_reason(snapshot.cargo_config()))
-      .or_else(|| {
-        cache_bypass_reason
-          .filter(|reason| *reason != CompilerCacheBypass::CargoConfiguration)
-          .map(CompilerCacheBypass::direct)
-      })
-      .or_else(|| direct_cache_bypass_reason(cache_wrapper_plan));
-    let native_capability = if native_cache_bypass_reason.is_none() {
-      match capture_native_toolchain_capability(snapshot.toolchain(), executables) {
-        Ok(capability) => Some(capability),
-        Err(_) => {
-          native_cache_bypass_reason = Some(DirectCacheBypass::CapabilityUnavailable);
-          None
-        }
-      }
-    } else {
-      None
-    };
-    let (toolchain_fingerprint, _) = executable_toolchain_fingerprint(
-      snapshot.toolchain(),
-      executables,
-      &cargo_rail_executable,
-      cache_wrapper_plan,
-      native_cache_bypass_reason.map(DirectCacheBypass::as_str),
-      native_capability.as_ref(),
-    )?;
-    let native_cache_capability_identity = native_capability
-      .as_ref()
-      .map(|capability| capability.report.identity().to_string());
+    let toolchain_fingerprint =
+      executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable)?;
     let target_fingerprints = target_fingerprints(snapshot)?;
     let lock_fingerprint = snapshot.lockfile_fingerprint();
     let compiler_env_fingerprint = compiler_env_fingerprint(snapshot.cargo_config())?;
     let cargo_config_fingerprint = cargo_config_fingerprint(snapshot.cargo_config(), snapshot.source_root())?;
-    let native_compiler_process_env_fingerprint = native_compiler_process_env_fingerprint(snapshot.cargo_config())?;
     let cargo_program = snapshot.toolchain().cargo_program().to_owned();
     let rustc_workspace_wrapper = snapshot
       .toolchain()
@@ -264,12 +224,6 @@ impl CompilerCacheIdentity {
         .map(|limitation| format!("compiler_wrapper_{limitation}")),
     );
     let mut wrapper_chain = Vec::with_capacity(4);
-    if cache_wrapper_plan.installs_cargo_rail() && native_cache_bypass_reason.is_none() {
-      wrapper_chain.push(CompilerWrapperIdentity::new(
-        CompilerWrapperRole::Cache,
-        cargo_rail_executable.clone(),
-      ));
-    }
     wrapper_chain.extend(
       executables
         .rustc_wrapper()
@@ -287,8 +241,8 @@ impl CompilerCacheIdentity {
         .map(|executable| CompilerWrapperIdentity::new(CompilerWrapperRole::Workspace, executable)),
     );
     let cache_wrapper = CompilerCacheWrapperMetadata::new(
-      CompilerCacheWrapperStatus::Bypassed,
-      native_cache_bypass_reason.map_or_else(|| cache_wrapper_plan.reason(), DirectCacheBypass::as_str),
+      CompilerCacheWrapperStatus::Disabled,
+      "transparent_cache_owned_by_cargo_configuration",
     );
 
     Ok(Self {
@@ -300,7 +254,6 @@ impl CompilerCacheIdentity {
       lock_fingerprint,
       compiler_env_fingerprint,
       cargo_config_fingerprint,
-      native_compiler_process_env_fingerprint,
       cargo_program,
       rustc_workspace_wrapper,
       manifest_fingerprints,
@@ -312,279 +265,207 @@ impl CompilerCacheIdentity {
       rustc_executable,
       wrapper_chain,
       cache_wrapper,
-      cache_wrapper_plan,
       executable_bypasses,
       cache_bypass_reason,
-      native_cache_bypass_reason,
-      native_cache_capability_identity,
     })
   }
 }
 
-/// Prepare native reuse for an ordinary Cargo action without capturing
-/// diagnostic-only package graphs and source closures.
-pub(crate) fn prepare_direct_cargo_action(
-  snapshot: &WorkspaceSnapshot,
-  source_root_spelling: &Path,
-  retain_event_evidence: bool,
-) -> RailResult<DirectNativeCacheSetup> {
-  if snapshot.config().is_some_and(|config| !config.cache.enabled) {
-    return Ok(DirectNativeCacheSetup::Bypassed(
-      DirectCacheBypass::DisabledByConfiguration,
-    ));
-  }
-  let has_eligible_library_units = snapshot
-    .base_resolution()
-    .metadata()
-    .packages
-    .iter()
-    .flat_map(|package| &package.targets)
-    .any(|target| target.kind.contains(&TargetKind::Lib));
-  let l2_alias = snapshot.config().and_then(|config| config.cache.l2.as_deref());
-  prepare_direct_cargo_action_from_inputs(
-    snapshot.source_root(),
-    source_root_spelling,
-    snapshot.cargo_config(),
-    snapshot.toolchain(),
-    snapshot.targets(),
-    has_eligible_library_units,
-    l2_alias,
-    retain_event_evidence,
-  )
-}
-
-/// Prepare native reuse from the narrow authority required by one exact
-/// all-workspace Cargo action.
-pub(crate) fn prepare_pre_context_direct_cargo_action(
+/// Capture the retained exact v10 session from the compiler Cargo selected for
+/// one transparent wrapper invocation. This runs only after acquisition-free
+/// eligibility gates have accepted the rustc shape.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn capture_transparent_native_session(
   source_root: &Path,
-  cargo_config: Arc<CargoConfigSnapshot>,
-  cache_enabled: bool,
-  l2_alias: Option<&str>,
-  retain_event_evidence: bool,
-) -> RailResult<(DirectNativeCacheSetup, OsString)> {
-  let cargo_program = cargo_config.selected_cargo_program(source_root)?;
-  if !cache_enabled {
-    return Ok((
-      DirectNativeCacheSetup::Bypassed(DirectCacheBypass::DisabledByConfiguration),
-      cargo_program,
-    ));
-  }
-  let wrapper_plan = cargo_config.cache_wrapper_plan(source_root)?;
-  if let Some(reason) = native_cargo_configuration_bypass_reason(&cargo_config) {
-    return Ok((DirectNativeCacheSetup::Bypassed(reason), cargo_program));
-  }
-  if let Some(reason) = direct_cache_bypass_reason(wrapper_plan) {
-    return Ok((DirectNativeCacheSetup::Bypassed(reason), cargo_program));
-  }
-
-  let compiler_process_env_fingerprint = native_compiler_process_env_fingerprint(&cargo_config)?;
-  let discovery_only = l2_alias.is_none()
-    && LocalCas::open()
-      .and_then(|cas| cas.native_authority_is_empty())
-      .unwrap_or(false);
-  if discovery_only {
-    let capability_identity = deferred_native_capability_identity(&cargo_config, &compiler_process_env_fingerprint);
-    let session = NativeCompilerSession::capture_discovery(
-      source_root,
-      &capability_identity,
-      &compiler_process_env_fingerprint,
-      crate::compiler::native_cache::native_cache_execution_contract(),
-    )?;
-    let deferred_source_root = source_root.to_path_buf();
-    let deferred_config = Arc::clone(&cargo_config);
-    let deferred_environment = compiler_process_env_fingerprint.clone();
-    if let Ok(deferred_session) = std::thread::Builder::new()
-      .name("cargo-rail-toolchain-identity".to_string())
-      .spawn(move || {
-        let inputs = ResolutionInputs::capture_with_config(&deferred_source_root, deferred_config)?;
-        let exact_wrapper_plan = CacheWrapperPlan::for_chain(
-          inputs.toolchain.rustc_wrapper_program(),
-          inputs.toolchain.rustc_workspace_wrapper_program(),
-        );
-        if exact_wrapper_plan != wrapper_plan {
-          return Err(RailError::message(
-            "native compiler wrapper selection changed during deferred capture",
-          ));
-        }
-        let targets = capture_target_identities(&deferred_source_root, &[], &inputs)?;
-        if let Some(reason) = direct_target_configuration_bypass_reason(&targets) {
-          return Err(RailError::message(format!(
-            "deferred native compiler identity is not cacheable: {}",
-            reason.as_str()
-          )));
-        }
-        capture_exact_direct_session(
-          &deferred_source_root,
-          &inputs.toolchain,
-          wrapper_plan,
-          &deferred_environment,
-        )
-      })
-    {
-      let setup = prepare_direct_cargo_cache(DirectNativeCacheIdentity {
-        source_root,
-        source_root_spelling: source_root,
-        session,
-        deferred_session: Some(deferred_session),
-        wrapper_plan,
-        setup_bytes_hashed: 0,
-        l2_alias,
-        retain_event_evidence,
-      });
-      return Ok((setup, cargo_program));
-    }
-  }
-
-  let inputs = ResolutionInputs::capture_with_config(source_root, cargo_config)?;
-  let targets = capture_target_identities(source_root, &[], &inputs)?;
-  let setup = prepare_direct_cargo_action_from_inputs(
-    source_root,
-    source_root,
-    &inputs.cargo_config,
-    &inputs.toolchain,
-    &targets,
-    true,
-    l2_alias,
-    retain_event_evidence,
-  )?;
-  Ok((setup, inputs.toolchain.cargo_program().to_owned()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_direct_cargo_action_from_inputs(
-  source_root: &Path,
-  source_root_spelling: &Path,
-  cargo_config: &CargoConfigSnapshot,
-  toolchain: &ToolchainIdentity,
-  targets: &[crate::cargo::TargetIdentity],
-  has_eligible_library_units: bool,
-  l2_alias: Option<&str>,
-  retain_event_evidence: bool,
-) -> RailResult<DirectNativeCacheSetup> {
-  let wrapper_plan = CacheWrapperPlan::for_chain(
-    toolchain.rustc_wrapper_program(),
-    toolchain.rustc_workspace_wrapper_program(),
+  rustc_program: &OsStr,
+  cache: &LocalCacheSelection,
+) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
+  let source_root = crate::utils::canonicalize_existing(source_root)?;
+  let resolved_rustc = crate::executable::resolve_executable_path(rustc_program, &source_root)?;
+  let rustc_program_generation = crate::utils::stable_file_generation(&resolved_rustc)
+    .ok_or_else(|| RailError::message("selected rustc has no stable local file generation"))?;
+  let rustc_verbose_version = transparent_rustc_query(rustc_program, "-vV", &source_root)?;
+  let host_target = rustc_verbose_version
+    .lines()
+    .find_map(|line| line.strip_prefix("host: "))
+    .filter(|host| !host.is_empty())
+    .ok_or_else(|| RailError::message("selected rustc verbose identity has no host target"))?;
+  let rustc_sysroot = PathBuf::from(transparent_rustc_query(rustc_program, "--print=sysroot", &source_root)?);
+  let rustc_sysroot = crate::utils::canonicalize_existing(&rustc_sysroot)?;
+  #[cfg(windows)]
+  let rustc_implementation = rustc_sysroot.join("bin/rustc.exe");
+  #[cfg(not(windows))]
+  let rustc_implementation = rustc_sysroot.join("bin/rustc");
+  let rustc_content_digest = ExecutableIdentity::capture(rustc_implementation.as_os_str(), &source_root, &source_root)?
+    .content_digest()
+    .to_string();
+  let memo_path = compiler_sysroot_memo_path(&rustc_sysroot, host_target, Some(cache));
+  let (sysroot_identity, bytes_hashed) =
+    compiler_sysroot_fingerprint(&rustc_sysroot, host_target, memo_path.as_deref())?;
+  let platform = format!(
+    "{}-{}-{}",
+    std::env::consts::FAMILY,
+    std::env::consts::OS,
+    std::env::consts::ARCH
   );
-  if let Some(reason) = native_cargo_configuration_bypass_reason(cargo_config) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if let Some(reason) = direct_target_configuration_bypass_reason(targets) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if let Some(reason) = direct_cache_bypass_reason(wrapper_plan) {
-    return Ok(DirectNativeCacheSetup::Bypassed(reason));
-  }
-  if !has_eligible_library_units {
-    return Ok(DirectNativeCacheSetup::Bypassed(
-      DirectCacheBypass::NoEligibleLibraryUnits,
-    ));
-  }
-
-  let compiler_process_env_fingerprint = native_compiler_process_env_fingerprint(cargo_config)?;
-  let discovery_only = l2_alias.is_none()
-    && LocalCas::open()
-      .and_then(|cas| cas.native_authority_is_empty())
-      .unwrap_or(false);
-  if discovery_only {
-    let capability_identity = deferred_native_capability_identity(cargo_config, &compiler_process_env_fingerprint);
-    let session = NativeCompilerSession::capture(
-      source_root,
-      toolchain.rustc_verbose_version(),
-      &capability_identity,
-      &compiler_process_env_fingerprint,
-      crate::compiler::native_cache::native_cache_execution_contract(),
-      NativeSessionAuthority::Discovery,
-    )?;
-    let deferred_source_root = source_root.to_path_buf();
-    let deferred_toolchain = toolchain.clone();
-    let deferred_environment = compiler_process_env_fingerprint.clone();
-    if let Ok(deferred_session) = std::thread::Builder::new()
-      .name("cargo-rail-toolchain-identity".to_string())
-      .spawn(move || {
-        capture_exact_direct_session(
-          &deferred_source_root,
-          &deferred_toolchain,
-          wrapper_plan,
-          &deferred_environment,
-        )
-      })
-    {
-      return Ok(prepare_direct_cargo_cache(DirectNativeCacheIdentity {
-        source_root,
-        source_root_spelling,
-        session,
-        deferred_session: Some(deferred_session),
-        wrapper_plan,
-        setup_bytes_hashed: 0,
-        l2_alias,
-        retain_event_evidence,
-      }));
-    }
-  }
-
-  let (session, setup_bytes_hashed) =
-    match capture_exact_direct_session(source_root, toolchain, wrapper_plan, &compiler_process_env_fingerprint) {
-      Ok(session) => session,
-      Err(_) => {
-        return Ok(DirectNativeCacheSetup::Bypassed(
-          DirectCacheBypass::CapabilityUnavailable,
-        ));
-      }
-    };
-  Ok(prepare_direct_cargo_cache(DirectNativeCacheIdentity {
-    source_root,
-    source_root_spelling,
-    session,
-    deferred_session: None,
-    wrapper_plan,
-    setup_bytes_hashed,
-    l2_alias,
-    retain_event_evidence,
-  }))
-}
-
-fn capture_exact_direct_session(
-  source_root: &Path,
-  toolchain: &ToolchainIdentity,
-  wrapper_plan: CacheWrapperPlan,
-  compiler_process_env_fingerprint: &str,
-) -> RailResult<(NativeCompilerSession, u64)> {
-  if !wrapper_plan.installs_cargo_rail() {
-    return Err(RailError::message(
-      "native compiler session cannot replace an existing compiler wrapper",
-    ));
-  }
-  let executables = ToolchainExecutableIdentities::capture(
-    toolchain,
-    source_root,
-    source_root,
-    ToolchainExecutableScope::Compilation,
-  )?;
-  let native_capability = capture_native_toolchain_capability(toolchain, &executables)?;
-  let setup_bytes_hashed = native_capability.bytes_hashed;
+  let mut framed = Vec::from(&b"cargo-rail-native-toolchain-capability-v1\0"[..]);
+  append_identity_frame(
+    &mut framed,
+    b"cache-class",
+    crate::compiler::native_cache::native_cache_class().as_bytes(),
+  );
+  append_identity_frame(
+    &mut framed,
+    b"execution-contract",
+    crate::compiler::native_cache::native_cache_execution_contract().as_bytes(),
+  );
+  append_identity_frame(&mut framed, b"platform", platform.as_bytes());
+  append_identity_frame(&mut framed, b"host-target", host_target.as_bytes());
+  append_identity_frame(&mut framed, b"rustc-version", rustc_verbose_version.as_bytes());
+  append_identity_frame(&mut framed, b"rustc-content", rustc_content_digest.as_bytes());
+  append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
+  let capability_identity = format!("sha256:{}", ContentDigest::sha256(&framed));
+  let compiler_environment = transparent_native_compiler_process_env_fingerprint()?;
   let session = NativeCompilerSession::capture(
-    source_root,
-    toolchain.rustc_verbose_version(),
-    native_capability.report.identity(),
-    compiler_process_env_fingerprint,
+    &source_root,
+    &rustc_verbose_version,
+    &capability_identity,
+    &compiler_environment,
     crate::compiler::native_cache::native_cache_execution_contract(),
     NativeSessionAuthority::Exact,
   )?;
-  Ok((session, setup_bytes_hashed))
+  let inventory = compiler_sysroot_inventory(&rustc_sysroot, host_target)?;
+  let sysroot_evidence = capture_exact_sysroot_evidence(&inventory)
+    .ok_or_else(|| RailError::message("selected rustc sysroot has no stable local generation evidence"))?;
+  let mut memo = TransparentNativeSessionMemo {
+    version: TRANSPARENT_SESSION_MEMO_VERSION,
+    source_root: source_root
+      .to_str()
+      .ok_or_else(|| RailError::message("transparent compiler source root is not valid UTF-8"))?
+      .to_string(),
+    rustc_program: resolved_rustc
+      .to_str()
+      .ok_or_else(|| RailError::message("selected rustc path is not valid UTF-8"))?
+      .to_string(),
+    rustc_program_generation,
+    rustc_sysroot: rustc_sysroot
+      .to_str()
+      .ok_or_else(|| RailError::message("selected rustc sysroot is not valid UTF-8"))?
+      .to_string(),
+    host_target: host_target.to_string(),
+    sysroot_evidence,
+    compiler_environment_identity: compiler_environment,
+    session: session.clone(),
+    digest: String::new(),
+  };
+  memo.digest = transparent_session_memo_digest(&memo)?;
+  Ok((session, bytes_hashed, memo))
 }
 
-fn deferred_native_capability_identity(
-  cargo_config: &CargoConfigSnapshot,
-  compiler_process_env_fingerprint: &str,
-) -> String {
-  let mut framed = Vec::from(&b"cargo-rail-native-discovery-session-v1\0"[..]);
-  append_identity_frame(&mut framed, b"cargo-configuration", cargo_config.digest().as_bytes());
-  append_identity_frame(
-    &mut framed,
-    b"compiler-process-environment",
-    compiler_process_env_fingerprint.as_bytes(),
-  );
-  format!("sha256:{}", ContentDigest::sha256(&framed))
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn capture_transparent_native_session(
+  _source_root: &Path,
+  _rustc_program: &OsStr,
+  _cache: &LocalCacheSelection,
+) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
+  Err(RailError::message(
+    "transparent compiler session memoization is unsupported on this platform",
+  ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn reuse_transparent_native_session(
+  memo: &TransparentNativeSessionMemo,
+  source_root: &Path,
+  rustc_program: &OsStr,
+) -> RailResult<Option<NativeCompilerSession>> {
+  let source_root = crate::utils::canonicalize_existing(source_root)?;
+  if memo.version != TRANSPARENT_SESSION_MEMO_VERSION
+    || memo.digest != transparent_session_memo_digest(memo)?
+    || memo.source_root != source_root.to_string_lossy()
+    || memo.compiler_environment_identity != transparent_native_compiler_process_env_fingerprint()?
+  {
+    return Ok(None);
+  }
+  let resolved_rustc = crate::executable::resolve_executable_path(rustc_program, &source_root)?;
+  if memo.rustc_program != resolved_rustc.to_string_lossy()
+    || crate::utils::stable_file_generation(&resolved_rustc).as_ref() != Some(&memo.rustc_program_generation)
+  {
+    return Ok(None);
+  }
+  let inventory = compiler_sysroot_inventory(Path::new(&memo.rustc_sysroot), &memo.host_target)?;
+  let Some(before) = capture_exact_sysroot_evidence(&inventory) else {
+    return Ok(None);
+  };
+  if before != memo.sysroot_evidence || capture_exact_sysroot_evidence(&inventory).as_ref() != Some(&before) {
+    return Ok(None);
+  }
+  memo.session.validate_for_source_root(&source_root)?;
+  Ok(Some(memo.session.clone()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn reuse_transparent_native_session(
+  _memo: &TransparentNativeSessionMemo,
+  _source_root: &Path,
+  _rustc_program: &OsStr,
+) -> RailResult<Option<NativeCompilerSession>> {
+  Ok(None)
+}
+
+impl TransparentNativeSessionMemo {
+  pub(crate) fn decode(bytes: &[u8]) -> RailResult<Self> {
+    let memo: Self = serde_json::from_slice(bytes)?;
+    if serde_json::to_vec(&memo)? != bytes {
+      return Err(RailError::message("transparent compiler session memo is not canonical"));
+    }
+    Ok(memo)
+  }
+
+  pub(crate) fn encode(&self) -> RailResult<Vec<u8>> {
+    serde_json::to_vec(self).map_err(Into::into)
+  }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn transparent_session_memo_digest(memo: &TransparentNativeSessionMemo) -> RailResult<String> {
+  let mut unsigned = memo.clone();
+  unsigned.digest.clear();
+  Ok(format!(
+    "sha256:{}",
+    ContentDigest::sha256(&serde_json::to_vec(&unsigned)?)
+  ))
+}
+
+fn transparent_rustc_query(program: &OsStr, argument: &str, current_dir: &Path) -> RailResult<String> {
+  let output = Command::new(program)
+    .arg(argument)
+    .current_dir(current_dir)
+    .env("RUSTUP_AUTO_INSTALL", "0")
+    .env("RUSTUP_NO_UPDATE_CHECK", "1")
+    .output()
+    .map_err(|error| {
+      RailError::message(format!(
+        "failed to query selected rustc '{}': {error}",
+        program.to_string_lossy()
+      ))
+    })?;
+  if !output.status.success() {
+    return Err(RailError::message(format!(
+      "selected rustc '{}' query failed with status {}",
+      program.to_string_lossy(),
+      output.status
+    )));
+  }
+  let value = String::from_utf8(output.stdout)
+    .map_err(|_| RailError::message("selected rustc query returned non-UTF-8 output"))?
+    .replace("\r\n", "\n")
+    .trim_end()
+    .to_string();
+  if value.is_empty() {
+    return Err(RailError::message("selected rustc query returned empty output"));
+  }
+  Ok(value)
 }
 
 impl<'a> CompilerDiagnosticsCollector<'a> {
@@ -1111,27 +992,6 @@ fn run_workspace_check(
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
   let fact_session = CompilerFactSession::write(observation_directory.path(), workspace_root)?;
-  let native_cache_enabled =
-    identity.cache_wrapper_plan.installs_cargo_rail() && identity.native_cache_bypass_reason.is_none();
-  let native_cache_session = if native_cache_enabled {
-    let capability_identity = identity
-      .native_cache_capability_identity
-      .as_deref()
-      .ok_or_else(|| RailError::message("native cache is enabled without a captured exact compiler identity"))?;
-    Some(
-      NativeCompilerSession::write(
-        observation_directory.path(),
-        workspace_root,
-        &identity.rustc_version,
-        capability_identity,
-        &identity.native_compiler_process_env_fingerprint,
-        DIAGNOSTIC_EXECUTION_CONTRACT,
-      )
-      .unwrap_or_else(|_| observation_directory.path().join("native-cache-session-unavailable")),
-    )
-  } else {
-    None
-  };
 
   let mut args: Vec<OsString> = vec![
     "check".into(),
@@ -1172,12 +1032,6 @@ fn run_workspace_check(
     .env(FACT_SESSION_ENV, fact_session)
     .env_remove(CACHE_WRAPPER_MARKER)
     .args(&args);
-  if native_cache_enabled {
-    command.env("RUSTC_WRAPPER", &wrapper).env(CACHE_WRAPPER_MARKER, "1");
-    if let Some(session) = &native_cache_session {
-      command.env(SESSION_ENV, session);
-    }
-  }
   if let Some(inner_wrapper) = existing_workspace_wrapper
     && inner_wrapper != wrapper.as_os_str()
   {
@@ -1633,13 +1487,13 @@ fn reconcile_exact_artifact_observations(
 /// Capture the exact native-cache toolchain identity for operator inspection.
 pub(crate) fn native_cache_capability(snapshot: &WorkspaceSnapshot) -> RailResult<NativeToolchainCapability> {
   let executables = snapshot.executable_identities(ToolchainExecutableScope::Compilation)?;
-  Ok(capture_native_toolchain_capability(snapshot.toolchain(), executables)?.report)
+  capture_native_toolchain_capability(snapshot.toolchain(), executables)
 }
 
 fn capture_native_toolchain_capability(
   toolchain: &ToolchainIdentity,
   executables: &ToolchainExecutableIdentities,
-) -> RailResult<CapturedNativeToolchainCapability> {
+) -> RailResult<NativeToolchainCapability> {
   fn implementation_digest<'a>(executable: Option<&'a ExecutableIdentity>, name: &str) -> RailResult<&'a str> {
     executable.map(ExecutableIdentity::content_digest).ok_or_else(|| {
       RailError::message(format!(
@@ -1655,8 +1509,8 @@ fn capture_native_toolchain_capability(
     std::env::consts::ARCH
   );
   let rustc_content_digest = implementation_digest(executables.rustc_implementation(), "rustc")?.to_string();
-  let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target());
-  let (sysroot_identity, bytes_hashed) =
+  let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), None);
+  let (sysroot_identity, _) =
     compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
 
   let mut framed = Vec::from(&b"cargo-rail-native-toolchain-capability-v1\0"[..]);
@@ -1685,19 +1539,16 @@ fn capture_native_toolchain_capability(
   append_identity_frame(&mut framed, b"rustc-content", rustc_content_digest.as_bytes());
   append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
   let identity = format!("sha256:{}", ContentDigest::sha256(&framed));
-  Ok(CapturedNativeToolchainCapability {
-    report: NativeToolchainCapability {
-      schema_version: crate::compiler::native_cache::native_cache_capability_schema_version(),
-      cache_class: crate::compiler::native_cache::native_cache_class(),
-      execution_contract: crate::compiler::native_cache::native_cache_execution_contract(),
-      platform,
-      host_target: toolchain.host_target().to_string(),
-      rustc_verbose_version: toolchain.rustc_verbose_version().to_string(),
-      rustc_content_digest,
-      sysroot_identity,
-      identity,
-    },
-    bytes_hashed,
+  Ok(NativeToolchainCapability {
+    schema_version: crate::compiler::native_cache::native_cache_capability_schema_version(),
+    cache_class: crate::compiler::native_cache::native_cache_class(),
+    execution_contract: crate::compiler::native_cache::native_cache_execution_contract(),
+    platform,
+    host_target: toolchain.host_target().to_string(),
+    rustc_verbose_version: toolchain.rustc_verbose_version().to_string(),
+    rustc_content_digest,
+    sysroot_identity,
+    identity,
   })
 }
 
@@ -1705,26 +1556,9 @@ fn executable_toolchain_fingerprint(
   toolchain: &ToolchainIdentity,
   executables: &ToolchainExecutableIdentities,
   cargo_rail_executable: &ExecutableIdentity,
-  cache_wrapper_plan: CacheWrapperPlan,
-  cache_bypass_reason: Option<&'static str>,
-  native_capability: Option<&CapturedNativeToolchainCapability>,
-) -> RailResult<(String, u64)> {
+) -> RailResult<String> {
   let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
   append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
-  let native_cache_enabled = cache_wrapper_plan.installs_cargo_rail() && cache_bypass_reason.is_none();
-  if native_cache_enabled && native_capability.is_none() {
-    return Err(RailError::message(
-      "native cache cannot activate without an exact compiler identity",
-    ));
-  }
-  let setup_bytes_hashed = native_capability.map_or(0, |capability| capability.bytes_hashed);
-  if let Some(capability) = native_capability {
-    append_identity_frame(
-      &mut framed,
-      b"native-toolchain-capability",
-      capability.report.identity().as_bytes(),
-    );
-  }
   append_identity_frame(
     &mut framed,
     b"cargo-version",
@@ -1752,18 +1586,9 @@ fn executable_toolchain_fingerprint(
   append_identity_frame(
     &mut framed,
     b"compiler-cache-disposition",
-    cache_bypass_reason
-      .unwrap_or_else(|| cache_wrapper_plan.reason())
-      .as_bytes(),
+    b"transparent-cache-owned-by-cargo-configuration",
   );
-  if native_cache_enabled {
-    append_identity_frame(
-      &mut framed,
-      b"cargo-rail-cache-wrapper",
-      &cargo_rail_executable.identity_bytes()?,
-    );
-  }
-  Ok((format!("sha256:{}", ContentDigest::sha256(&framed)), setup_bytes_hashed))
+  Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1808,7 +1633,8 @@ struct SysrootChangeEvidence {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExactSysrootEvidence {
   volume_identifier: Vec<u8>,
   entries: Vec<SysrootChangeEvidence>,
@@ -1828,17 +1654,28 @@ struct SysrootIdentityMemo {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn compiler_sysroot_memo_path(sysroot: &Path, host_target: &str) -> Option<PathBuf> {
+fn compiler_sysroot_memo_path(
+  sysroot: &Path,
+  host_target: &str,
+  selection: Option<&LocalCacheSelection>,
+) -> Option<PathBuf> {
   let sysroot = crate::utils::canonicalize_existing(sysroot).ok()?;
   let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-location-v1\0"[..]);
   append_identity_frame(&mut framed, b"sysroot", sysroot.as_os_str().as_encoded_bytes());
   append_identity_frame(&mut framed, b"host-target", host_target.as_bytes());
   let lookup = ContentDigest::sha256(&framed);
-  LocalCas::open().ok().map(|cas| cas.sysroot_identity_memo_path(&lookup))
+  selection
+    .map_or_else(LocalCas::open, LocalCas::open_initialized_selected)
+    .ok()
+    .map(|cas| cas.sysroot_identity_memo_path(&lookup))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn compiler_sysroot_memo_path(_sysroot: &Path, _host_target: &str) -> Option<PathBuf> {
+fn compiler_sysroot_memo_path(
+  _sysroot: &Path,
+  _host_target: &str,
+  _selection: Option<&LocalCacheSelection>,
+) -> Option<PathBuf> {
   None
 }
 
@@ -1987,11 +1824,16 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
 
   #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
   let evidence_locations = {
+    #[cfg(windows)]
+    let rustc_implementation = sysroot.join("bin/rustc.exe");
+    #[cfg(not(windows))]
+    let rustc_implementation = sysroot.join("bin/rustc");
     let mut locations = vec![
       evidence_location(&sysroot, &sysroot, SysrootEvidenceKind::Directory)?,
       evidence_location(&sysroot, &rustlib, SysrootEvidenceKind::Directory)?,
       evidence_location(&sysroot, &target_lib, SysrootEvidenceKind::Directory)?,
       evidence_location(&sysroot, &driver_lib, SysrootEvidenceKind::Directory)?,
+      evidence_location(&sysroot, &rustc_implementation, SysrootEvidenceKind::File)?,
     ];
     if codegen_backends.is_dir() {
       locations.push(evidence_location(
@@ -2558,17 +2400,6 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
     .then_some(CompilerCacheBypass::ExternalSourceDigest)
 }
 
-fn native_cargo_configuration_bypass_reason(cargo_config: &CargoConfigSnapshot) -> Option<DirectCacheBypass> {
-  let build = cargo_config
-    .effective_file_settings()
-    .get("build")
-    .and_then(serde_json::Value::as_object);
-  (!cargo_config.unmodeled_settings().is_empty()
-    || build.is_some_and(|build| build.contains_key("dep-info-basedir"))
-    || cargo_config.environment().contains_key("CARGO_BUILD_DEP_INFO_BASEDIR"))
-  .then_some(DirectCacheBypass::CargoConfiguration)
-}
-
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {
   match target.specification() {
     crate::cargo::resolution::TargetSpecificationIdentity::BuiltIn(name) => name,
@@ -2877,37 +2708,20 @@ fn compiler_env_fingerprint(cargo_config: &CargoConfigSnapshot) -> RailResult<St
   Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
 }
 
-fn native_compiler_process_env_fingerprint(cargo_config: &CargoConfigSnapshot) -> RailResult<String> {
-  let configured = cargo_config
-    .effective_file_settings()
-    .get("env")
-    .and_then(serde_json::Value::as_object);
-  let names = std::env::vars_os()
-    .filter_map(|(name, _)| name.into_string().ok())
-    .chain(cargo_config.environment().keys().cloned())
-    .chain(
-      configured
-        .into_iter()
-        .flat_map(|environment| environment.keys().cloned()),
-    )
-    .filter(|name| native_compiler_process_environment(name))
-    .collect::<BTreeSet<_>>();
-  let mut runtime = BTreeMap::new();
-  for name in names {
-    let value = cargo_config
-      .effective_environment_value(&name)?
-      .or_else(|| std::env::var_os(&name));
-    runtime.insert(
-      name,
-      value
-        .as_deref()
-        .map(OsStr::as_encoded_bytes)
-        .map(ContentDigest::sha256)
-        .map(|digest| format!("sha256:{digest}")),
-    );
-  }
+fn transparent_native_compiler_process_env_fingerprint() -> RailResult<String> {
+  let runtime = std::env::vars_os()
+    .filter_map(|(name, value)| {
+      let name = name.into_string().ok()?;
+      native_compiler_process_environment(&name).then(|| {
+        (
+          name,
+          Some(format!("sha256:{}", ContentDigest::sha256(value.as_encoded_bytes()))),
+        )
+      })
+    })
+    .collect::<BTreeMap<_, _>>();
   #[cfg(unix)]
-  let default_regular_file_mode = default_regular_file_creation_mode()?;
+  let default_regular_file_mode = transparent_default_regular_file_creation_mode();
   #[cfg(not(unix))]
   let default_regular_file_mode = 0o644_u32;
   let mut framed = Vec::from(&b"cargo-rail-native-compiler-process-environment-v2\0"[..]);
@@ -2921,24 +2735,13 @@ fn native_compiler_process_env_fingerprint(cargo_config: &CargoConfigSnapshot) -
 }
 
 #[cfg(unix)]
-fn default_regular_file_creation_mode() -> RailResult<u32> {
-  use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-  let directory = tempfile::Builder::new()
-    .prefix("cargo-rail-file-mode-probe-")
-    .tempdir()?;
-  let file = OpenOptions::new()
-    .write(true)
-    .create_new(true)
-    .mode(0o666)
-    .open(directory.path().join("regular"))?;
-  let mode = file.metadata()?.permissions().mode() & 0o777;
-  if mode & !0o666 != 0 {
-    return Err(RailError::message(
-      "default regular-file creation mode contains an executable bit",
-    ));
-  }
-  Ok(mode)
+fn transparent_default_regular_file_creation_mode() -> u32 {
+  // The pre-Clap compiler wrapper is single-threaded at this boundary. Reading
+  // and restoring umask avoids a filesystem transaction for every rustc unit
+  // without exposing process-global mutation to another thread.
+  let current = rustix::process::umask(rustix::fs::Mode::empty());
+  let _ = rustix::process::umask(current);
+  u32::from(0o666 & !current.bits())
 }
 
 fn compiler_diagnostics_runtime_environment(name: &str) -> bool {
@@ -3434,6 +3237,12 @@ mod tests {
     let driver = sysroot.path().join("bin/rustc_driver-test.dll");
     std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
     std::fs::write(&driver, b"driver-one").expect("driver library");
+    #[cfg(windows)]
+    let rustc_implementation = sysroot.path().join("bin/rustc.exe");
+    #[cfg(not(windows))]
+    let rustc_implementation = sysroot.path().join("bin/rustc");
+    std::fs::create_dir_all(rustc_implementation.parent().expect("rustc parent")).expect("rustc directory");
+    std::fs::write(rustc_implementation, b"rustc").expect("rustc implementation");
 
     let baseline =
       compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("baseline fingerprint");

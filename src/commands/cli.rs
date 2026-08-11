@@ -196,10 +196,14 @@ Examples:
 
 const CACHE_HELP: &str = "\
 Examples:
+  cargo rail cache setup --check                  # Preview transparent compiler reuse setup
+  cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
-  cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS";
+  cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
+  cargo rail cache remove --check                 # Preview exact setup-state removal
+  cargo rail cache remove                         # Remove setup state but preserve the CAS";
 
 const CONFIG_HELP: &str = "\
 Examples:
@@ -710,6 +714,21 @@ impl CacheScope {
 /// Subcommands for `cargo rail cache`.
 #[derive(Subcommand)]
 pub enum CacheCommand {
+  /// Install or repair transparent verified local compiler reuse.
+  Setup {
+    /// Local cache base directory (defaults to Cargo home).
+    #[arg(long, value_name = "PATH")]
+    local_dir: Option<PathBuf>,
+    /// Positive binary byte size such as 10GiB.
+    #[arg(long, value_name = "SIZE", value_parser = parse_cache_size)]
+    max_size: Option<u64>,
+    /// Preview exact Cargo configuration and private-state changes.
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Report format.
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
   /// Report exact bytes, counts, bounds, leases, and ownership scope.
   Status {
     /// Cache scope to inspect.
@@ -731,6 +750,44 @@ pub enum CacheCommand {
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: TextJsonOutputFormat,
   },
+  /// Remove only transparent compiler-cache state owned by the setup receipt.
+  Remove {
+    /// Preview exact Cargo configuration and private-state changes.
+    #[arg(long, short = 'c')]
+    check: bool,
+    /// Report format.
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
+}
+
+fn parse_cache_size(value: &str) -> Result<u64, String> {
+  let split = value
+    .find(|character: char| !character.is_ascii_digit())
+    .ok_or_else(|| "cache size requires an explicit unit: B, KiB, MiB, GiB, or TiB".to_string())?;
+  let (number, unit) = value.split_at(split);
+  if number.is_empty() || number.starts_with('0') && number != "0" {
+    return Err("cache size must be a canonical positive integer".to_string());
+  }
+  let number = number
+    .parse::<u64>()
+    .map_err(|_| "cache size integer is invalid or overflowing".to_string())?;
+  let multiplier = match unit {
+    "B" => 1_u64,
+    "KiB" => 1024,
+    "MiB" => 1024 * 1024,
+    "GiB" => 1024 * 1024 * 1024,
+    "TiB" => 1024 * 1024 * 1024 * 1024,
+    _ => return Err("cache size unit must be B, KiB, MiB, GiB, or TiB".to_string()),
+  };
+  let bytes = number
+    .checked_mul(multiplier)
+    .filter(|bytes| *bytes > 0)
+    .ok_or_else(|| "cache size must be positive and fit in u64".to_string())?;
+  if bytes > usize::MAX as u64 {
+    return Err("cache size exceeds this platform's supported limit".to_string());
+  }
+  Ok(bytes)
 }
 
 /// Subcommands for `cargo rail config`
@@ -1031,7 +1088,10 @@ impl Commands {
         command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => format.is_json_like(),
       Commands::Cache { command } => match command {
-        CacheCommand::Status { format, .. } | CacheCommand::Clean { format, .. } => format.is_json_like(),
+        CacheCommand::Setup { format, .. }
+        | CacheCommand::Status { format, .. }
+        | CacheCommand::Clean { format, .. }
+        | CacheCommand::Remove { format, .. } => format.is_json_like(),
       },
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
       Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
@@ -1109,7 +1169,10 @@ impl Commands {
         command: DoctorCommand::Hermeticity { format, .. } | DoctorCommand::NativeCache { format },
       } => *format = TextJsonOutputFormat::Json,
       Commands::Cache { command } => match command {
-        CacheCommand::Status { format, .. } | CacheCommand::Clean { format, .. } => {
+        CacheCommand::Setup { format, .. }
+        | CacheCommand::Status { format, .. }
+        | CacheCommand::Clean { format, .. }
+        | CacheCommand::Remove { format, .. } => {
           *format = TextJsonOutputFormat::Json;
         }
       },
@@ -1156,4 +1219,27 @@ impl Commands {
 pub fn generate_completions(shell: Shell) {
   let mut cmd = CargoCli::command();
   clap_complete::generate(shell, &mut cmd, "cargo-rail", &mut std::io::stdout());
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parse_cache_size;
+
+  #[test]
+  fn transparent_cache_size_grammar_is_exact_and_bounded() {
+    assert_eq!(parse_cache_size("1B"), Ok(1));
+    assert_eq!(parse_cache_size("10GiB"), Ok(10 * 1024 * 1024 * 1024));
+    for invalid in [
+      "0B",
+      "01GiB",
+      "10",
+      "1GB",
+      "1.5GiB",
+      "-1GiB",
+      "1gib",
+      "18446744073709551615TiB",
+    ] {
+      assert!(parse_cache_size(invalid).is_err(), "accepted invalid size {invalid}");
+    }
+  }
 }

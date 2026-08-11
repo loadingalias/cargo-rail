@@ -43,11 +43,6 @@ actions/attest:
   sha: "508db95dd578ae2727ebd6217d5ba78e4fbda05d"
   updated: "2026-07-31T19:03:57Z"
   notes: "Generate signed SLSA provenance for release archives"
-aws-actions/configure-aws-credentials:
-  ref: v6.2.3
-  sha: "e6de054238d6b7531b4efff3b6587d9aade6a06c"
-  updated: "2026-08-06T04:41:53Z"
-  notes: "Exchange the cache-qualification OIDC token for a scoped AWS role"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # cargo-rail Ecosystem
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
