@@ -13,7 +13,7 @@ const BENCH_COVERAGE_CONTROL: &str = "__cargo_rail_benchmark_coverage_v1";
 const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
 
 fn compiler_fact_path_identity(path: &Path) -> Result<String> {
-  let path = fs::canonicalize(path)?;
+  let path = cargo_rail::utils::canonicalize_existing(path)?;
   let bytes = path.as_os_str().as_encoded_bytes();
   let mut hasher = Sha256::new();
   hasher.update(b"cargo-rail-compiler-fact-path-v1\0");

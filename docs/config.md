@@ -65,33 +65,15 @@ verification = ["verification/**"]
 | Field | Default | Behavior |
 |---|---:|---|
 | `targets` | `[]` | Additional target triples used for target-aware resolution and compiler evidence. `init` can detect these from repository configuration. |
-| `cache` | defaults | Local and shared native compiler-result cache policy. |
 | `unify` | defaults | Dependency and manifest policy. |
 | `release` | defaults | Release, changelog, and remote-effect policy. |
 | `change-detection` | defaults | Planner classification policy. |
 | `crates` | `{}` | Per-crate split, release, and changelog policy. |
 
 The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had no behavior and are deprecated.
-
-## `[cache]`
-
-Transparent local compiler-result reuse is installed as machine state with `cargo rail cache setup`; repository policy
-does not own that wrapper or CAS. The retained cache table controls Cargo-Rail command behavior and validates remote
-target configuration, but does not activate remote transfer:
-
-| Field | Default | Behavior |
-|---|---:|---|
-| `l2` | unset | Select and validate a target alias from `CARGO_RAIL_CACHE_TARGETS_FILE`. Status schema 9 reports it as configuration-only; transparent caching remains local. |
-
-```toml
-[cache]
-l2 = "team"
-```
-
-The alias is at most 64 bytes, starts with a lowercase ASCII letter, and contains only lowercase ASCII letters, digits,
-`-`, or `_`. The target map is an absolute JSON file outside the checkout and contains no credentials. See
-[Caching](caching.md#shared-native-cache-l2) for the retained validation schema. Do not treat it as an active remote
-data plane.
+Repository `[cache]` configuration is rejected: transparent L1 setup and optional L2 selection are machine state, not
+project policy. `cargo rail config migrate` removes the old table without materializing a destination. See
+[Caching](caching.md#shared-native-cache-l2) for the non-secret URL grammar and current activation boundary.
 
 ## `[unify]`
 

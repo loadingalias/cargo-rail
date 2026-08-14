@@ -566,7 +566,7 @@ impl CacheScope {
 /// Subcommands for `cargo rail cache`.
 #[derive(Subcommand)]
 pub enum CacheCommand {
-  /// Install or repair transparent verified local compiler reuse.
+  /// Install or repair transparent verified compiler reuse.
   Setup {
     /// Local cache base directory (defaults to Cargo home).
     #[arg(long, value_name = "PATH")]
@@ -574,9 +574,36 @@ pub enum CacheCommand {
     /// Positive binary byte size such as 10GiB.
     #[arg(long, value_name = "SIZE", value_parser = parse_cache_size)]
     max_size: Option<u64>,
+    /// Machine-owned remote cache URL to persist with this installation.
+    #[arg(long, value_name = "URL", conflicts_with = "local_only")]
+    remote: Option<String>,
+    /// Maximum remote authority; explicit selection defaults to read-write.
+    #[arg(long, value_name = "MODE", value_parser = ["read", "read-write"], requires = "remote")]
+    remote_mode: Option<String>,
+    /// Additional reviewed compiler environment name admitted to L2 identity.
+    #[arg(long = "remote-environment", value_name = "NAME", requires = "remote")]
+    remote_environment: Vec<String>,
+    /// Remove persisted remote activation while preserving local reuse.
+    #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment"])]
+    local_only: bool,
     /// Preview exact Cargo configuration and private-state changes.
     #[arg(long, short = 'c')]
     check: bool,
+    /// Report format.
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: TextJsonOutputFormat,
+  },
+  /// Validate and normalize one machine-owned remote cache URL without network access.
+  Normalize {
+    /// AWS S3, Azure Blob Storage, or Cloudflare R2 URL.
+    #[arg(value_name = "URL")]
+    url: String,
+    /// Maximum authority; explicit selection defaults to read-write.
+    #[arg(long, value_name = "MODE", value_parser = ["read", "read-write"])]
+    mode: Option<String>,
+    /// Additional reviewed compiler environment name admitted to L2 identity.
+    #[arg(long = "environment", value_name = "NAME")]
+    environment: Vec<String>,
     /// Report format.
     #[arg(long, short = 'f', default_value_t, value_enum)]
     format: TextJsonOutputFormat,
@@ -940,6 +967,7 @@ impl Commands {
       } => format.is_json_like(),
       Commands::Cache { command } => match command {
         CacheCommand::Setup { format, .. }
+        | CacheCommand::Normalize { format, .. }
         | CacheCommand::Status { format, .. }
         | CacheCommand::Clean { format, .. }
         | CacheCommand::Remove { format, .. } => format.is_json_like(),
@@ -1020,6 +1048,7 @@ impl Commands {
       } => *format = TextJsonOutputFormat::Json,
       Commands::Cache { command } => match command {
         CacheCommand::Setup { format, .. }
+        | CacheCommand::Normalize { format, .. }
         | CacheCommand::Status { format, .. }
         | CacheCommand::Clean { format, .. }
         | CacheCommand::Remove { format, .. } => {

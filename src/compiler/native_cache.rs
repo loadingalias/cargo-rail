@@ -11,6 +11,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -20,18 +21,19 @@ use crate::cache::cas::LocalCas;
 use crate::cache::cas::NativeCacheLookup;
 use crate::cache::result::OutputManifest;
 use crate::compiler::observation::{
-  CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, FileObservation, InvocationRecorder,
-  NativeOutputPaths, NativeOutputRole, ObservationPath, PreparedRawPublication, RawCompilerInvocation,
+  CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, EnvironmentObservation, FileObservation,
+  InvocationRecorder, NativeOutputPaths, NativeOutputRole, ObservationPath, PreparedRawPublication,
+  RawCompilerInvocation,
 };
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
 pub(crate) mod pack;
 
-pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v15-sha256-";
-pub(crate) const RESULT_KEY_PREFIX: &str = "compiler-result-v9-sha256-";
-pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v9-sha256-";
-pub(crate) const CANDIDATE_SELECTOR_PREFIX: &str = "compiler-candidate-v6-sha256-";
+pub(crate) const ACTION_KEY_PREFIX: &str = "compiler-action-v16-sha256-";
+pub(crate) const RESULT_KEY_PREFIX: &str = "compiler-result-v10-sha256-";
+pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v10-sha256-";
+pub(crate) const CANDIDATE_SELECTOR_PREFIX: &str = "compiler-candidate-v7-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
 const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
@@ -40,6 +42,10 @@ pub(crate) const APPLE_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_APPLE_LINK_ADAPTER";
 pub(crate) const APPLE_LINK_DRIVER_ENV: &str = "CARGO_RAIL_APPLE_LINK_DRIVER";
 pub(crate) const APPLE_LINK_CERTIFICATE_ENV: &str = "CARGO_RAIL_APPLE_LINK_CERTIFICATE";
 pub(crate) const APPLE_LINK_DRIVER_INPUTS_ENV: &str = "CARGO_RAIL_APPLE_LINK_DRIVER_INPUTS";
+pub(crate) const ELF_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_ELF_LINK_ADAPTER";
+pub(crate) const ELF_LINK_DRIVER_ENV: &str = "CARGO_RAIL_ELF_LINK_DRIVER";
+pub(crate) const ELF_LINK_DEPENDENCIES_ENV: &str = "CARGO_RAIL_ELF_LINK_DEPENDENCIES";
+pub(crate) const ELF_LINK_DRIVER_INPUTS_ENV: &str = "CARGO_RAIL_ELF_LINK_DRIVER_INPUTS";
 #[cfg(debug_assertions)]
 const RESTORE_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_FAULT";
 #[cfg(debug_assertions)]
@@ -54,8 +60,8 @@ const CAPTURE_PAUSE_PHASE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_PHAS
 const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRATE";
 #[cfg(debug_assertions)]
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v12";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v12";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v13";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v13";
 #[cfg(not(windows))]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
@@ -66,9 +72,9 @@ const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker";
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker.exe";
 const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
-const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 8;
-const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 14;
-const NATIVE_COMPILER_SESSION_VERSION: u32 = 14;
+const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 9;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 15;
+const NATIVE_COMPILER_SESSION_VERSION: u32 = 15;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BENCH_COVERAGE_EVENT_BYTES: usize = 1024 * 1024;
@@ -95,9 +101,12 @@ const MAX_TEST_CAPTURE_LIMIT_BYTES: usize = 96;
 const MAX_COMPILER_ENVIRONMENT_NAMES: usize = 512;
 const MAX_COMPILER_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_COMPILER_ENVIRONMENT_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(target_os = "macos")]
 const MAX_APPLE_LINK_CERTIFICATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_APPLE_LINK_INPUTS: usize = 16 * 1024;
 const MAX_APPLE_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_ELF_LINK_DEPENDENCY_BYTES: u64 = 8 * 1024 * 1024;
 const DEP_INFO_SLOT: &str = "target/outputs/dep-info";
 const METADATA_SLOT: &str = "target/outputs/metadata";
 const RLIB_SLOT: &str = "target/outputs/rlib";
@@ -110,6 +119,9 @@ const STDOUT_SLOT: &str = "target/streams/stdout";
 const STDERR_SLOT: &str = "target/streams/stderr";
 const APPLE_LINK_CERTIFICATE_FILE: &str = "apple-linker-dependencies.bin";
 const APPLE_LINK_DRIVER_INPUTS_FILE: &str = "apple-linker-driver-inputs.json";
+const ELF_LINK_DEPENDENCIES_FILE: &str = "elf-linker-dependencies.d";
+const ELF_LINK_DRIVER_INPUTS_FILE: &str = "elf-linker-driver-inputs.json";
+#[cfg(target_os = "macos")]
 const APPLE_LINK_DRIVER_EVIDENCE_VERSION: u32 = 2;
 const PORTABLE_SOURCE_ROOT: &str = "/cargo-rail/native-source/v2";
 const PORTABLE_PACKAGE_ROOT: &str = "/cargo-rail/native-package/v2";
@@ -175,6 +187,8 @@ pub(crate) struct NativeCacheContext {
   source_root_spelling: PathBuf,
   observation_directory: PathBuf,
   local_cas: Option<LocalCas>,
+  remote: Option<crate::remote_cache::RemoteCacheSelection>,
+  remote_store: OnceLock<Result<crate::remote_cache::RemoteStore, crate::remote_cache::RemoteStoreError>>,
   installation: Option<crate::cache::installation::InstallationReceipt>,
   _runtime: Option<tempfile::TempDir>,
 }
@@ -195,6 +209,127 @@ impl NativeCacheSession {
 
 static ACTIVE_CONTEXT: OnceLock<NativeCacheContext> = OnceLock::new();
 static BENCH_COVERAGE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+static BENCH_DURABILITY_COUNTERS: OnceLock<NativeDurabilityCounters> = OnceLock::new();
+
+const NATIVE_DURABILITY_PHASE_COUNT: usize = 8;
+
+/// Benchmark-only ownership phases at synchronous cache durability boundaries.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum NativeDurabilityPhase {
+  L1FileSync,
+  L1DirectorySync,
+  OutputFileSync,
+  OutputDirectorySync,
+  CasLockWait,
+  CasCommit,
+  RestoreLockWait,
+  RestoreTransaction,
+}
+
+struct NativeDurabilityCounters {
+  counts: [AtomicU64; NATIVE_DURABILITY_PHASE_COUNT],
+  elapsed_ns: [AtomicU64; NATIVE_DURABILITY_PHASE_COUNT],
+}
+
+impl NativeDurabilityCounters {
+  const fn new() -> Self {
+    Self {
+      counts: [const { AtomicU64::new(0) }; NATIVE_DURABILITY_PHASE_COUNT],
+      elapsed_ns: [const { AtomicU64::new(0) }; NATIVE_DURABILITY_PHASE_COUNT],
+    }
+  }
+
+  fn snapshot(&self) -> NativeDurabilitySnapshot {
+    NativeDurabilitySnapshot {
+      l1_file_sync: self.measurement(NativeDurabilityPhase::L1FileSync),
+      l1_directory_sync: self.measurement(NativeDurabilityPhase::L1DirectorySync),
+      output_file_sync: self.measurement(NativeDurabilityPhase::OutputFileSync),
+      output_directory_sync: self.measurement(NativeDurabilityPhase::OutputDirectorySync),
+      cas_lock_wait: self.measurement(NativeDurabilityPhase::CasLockWait),
+      cas_commit: self.measurement(NativeDurabilityPhase::CasCommit),
+      restore_lock_wait: self.measurement(NativeDurabilityPhase::RestoreLockWait),
+      restore_transaction: self.measurement(NativeDurabilityPhase::RestoreTransaction),
+    }
+  }
+
+  fn measurement(&self, phase: NativeDurabilityPhase) -> NativePhaseMeasurement {
+    NativePhaseMeasurement {
+      count: self.counts[phase as usize].load(Ordering::Relaxed),
+      elapsed_ns: self.elapsed_ns[phase as usize].load(Ordering::Relaxed),
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct NativePhaseMeasurement {
+  count: u64,
+  elapsed_ns: u64,
+}
+
+impl NativePhaseMeasurement {
+  fn record(&mut self, started: Instant) {
+    self.count = self.count.saturating_add(1);
+    self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed_nanos(started));
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct NativeDurabilitySnapshot {
+  l1_file_sync: NativePhaseMeasurement,
+  l1_directory_sync: NativePhaseMeasurement,
+  output_file_sync: NativePhaseMeasurement,
+  output_directory_sync: NativePhaseMeasurement,
+  cas_lock_wait: NativePhaseMeasurement,
+  cas_commit: NativePhaseMeasurement,
+  restore_lock_wait: NativePhaseMeasurement,
+  restore_transaction: NativePhaseMeasurement,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct NativeRemoteTimingSnapshot {
+  total: NativePhaseMeasurement,
+  store_connect: NativePhaseMeasurement,
+  lookup: NativePhaseMeasurement,
+  decode: NativePhaseMeasurement,
+  validation: NativePhaseMeasurement,
+  l1_admission: NativePhaseMeasurement,
+  output_restore: NativePhaseMeasurement,
+}
+
+/// Active timer that is a no-op unless benchmark coverage was explicitly enabled.
+pub(crate) struct NativeDurabilityGuard {
+  phase: NativeDurabilityPhase,
+  started: Option<Instant>,
+}
+
+impl Drop for NativeDurabilityGuard {
+  fn drop(&mut self) {
+    let (Some(counters), Some(started)) = (BENCH_DURABILITY_COUNTERS.get(), self.started) else {
+      return;
+    };
+    let index = self.phase as usize;
+    counters.counts[index].fetch_add(1, Ordering::Relaxed);
+    counters.elapsed_ns[index].fetch_add(elapsed_nanos(started), Ordering::Relaxed);
+  }
+}
+
+pub(crate) fn native_durability_phase(phase: NativeDurabilityPhase) -> NativeDurabilityGuard {
+  NativeDurabilityGuard {
+    phase,
+    started: BENCH_DURABILITY_COUNTERS.get().map(|_| Instant::now()),
+  }
+}
+
+fn native_durability_snapshot() -> NativeDurabilitySnapshot {
+  BENCH_DURABILITY_COUNTERS
+    .get()
+    .map_or_else(NativeDurabilitySnapshot::default, NativeDurabilityCounters::snapshot)
+}
+
+fn elapsed_nanos(started: Instant) -> u64 {
+  u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 pub(crate) const fn native_cache_class() -> &'static str {
   GRADUATED_NATIVE_CACHE_CLASS
@@ -212,6 +347,22 @@ pub(crate) const fn native_cache_capability_schema_version() -> u32 {
 struct NativeCacheMetrics {
   bytes_hashed: u64,
   cache_bytes_read: u64,
+  remote_started: Option<Instant>,
+  remote_timing: NativeRemoteTimingSnapshot,
+}
+
+impl NativeCacheMetrics {
+  fn begin_remote(&mut self) {
+    if self.remote_started.is_none() {
+      self.remote_started = Some(Instant::now());
+    }
+  }
+
+  fn finish_remote(&mut self) {
+    if let Some(started) = self.remote_started.take() {
+      self.remote_timing.total.record(started);
+    }
+  }
 }
 
 /// Complete pre-execution source namespace bound into one native action.
@@ -417,6 +568,8 @@ struct NativeCompilerWitness {
   environment_names: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   apple_linker: Option<AppleLinkerWitness>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  elf_linker: Option<ElfLinkerWitness>,
 }
 
 /// Revalidatable closure emitted by one certified Apple linker execution.
@@ -425,15 +578,42 @@ struct NativeCompilerWitness {
 struct AppleLinkerWitness {
   version: u32,
   certificate_version: String,
-  driver: AppleLinkFile,
-  linker: AppleLinkFile,
-  found: Vec<AppleLinkFile>,
+  driver: LinkFileWitness,
+  linker: LinkFileWitness,
+  found: Vec<LinkFileWitness>,
   missing: Vec<String>,
   endogenous_objects: u32,
   endogenous_archives: u32,
   dependency_archives: Vec<String>,
 }
 
+/// Revalidatable closure emitted by one GNU ELF linker dependency file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ElfLinkerWitness {
+  version: u32,
+  driver: LinkFileWitness,
+  linker: LinkFileWitness,
+  found: Vec<LinkFileWitness>,
+  missing: Vec<String>,
+  endogenous_objects: u32,
+  dependency_archives: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ElfLinkDriverEvidence {
+  version: u32,
+  current_directory: String,
+  driver: String,
+  linker: String,
+  tool_inputs: Vec<String>,
+  search_directories: Vec<String>,
+  direct_inputs: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppleLinkDriverEvidence {
@@ -444,6 +624,7 @@ struct AppleLinkDriverEvidence {
   generated_inputs: Vec<String>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct CertifiedAppleLinkInputs {
   direct: BTreeSet<PathBuf>,
@@ -452,7 +633,7 @@ struct CertifiedAppleLinkInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AppleLinkFile {
+struct LinkFileWitness {
   /// Exact absolute path spelling reported by the linker.
   path: String,
   /// Canonical file selected through that exact path at capture time.
@@ -466,7 +647,7 @@ struct AppleLinkFile {
 /// digests while the underlying files retain their exact local generations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AppleLinkerGenerationWitness {
+struct LinkerGenerationWitness {
   version: u32,
   installation_authority: String,
   driver: String,
@@ -748,9 +929,19 @@ impl NativePublicationRevalidationFailure {
 pub(crate) struct PreparedNativeResult {
   staging: tempfile::TempDir,
   staging_lock: Option<File>,
+  verified_generations: BTreeMap<PathBuf, Vec<u8>>,
   manifest: OutputManifest,
   validation: NativeCompilerValidation,
   move_preverified_blobs: bool,
+}
+
+pub(crate) struct PreparedNativeParts {
+  pub(crate) staging: tempfile::TempDir,
+  pub(crate) staging_lock: Option<File>,
+  pub(crate) verified_generations: BTreeMap<PathBuf, Vec<u8>>,
+  pub(crate) manifest: OutputManifest,
+  pub(crate) validation: NativeCompilerValidation,
+  pub(crate) move_preverified_blobs: bool,
 }
 
 /// Identity of one deployment-pinned authenticated remote authority tuple.
@@ -779,6 +970,7 @@ impl PreparedNativeResult {
     Self {
       staging,
       staging_lock: None,
+      verified_generations: BTreeMap::new(),
       manifest,
       validation,
       move_preverified_blobs: false,
@@ -790,34 +982,130 @@ impl PreparedNativeResult {
     manifest: OutputManifest,
     validation: NativeCompilerValidation,
   ) -> Self {
-    let (staging, staging_lock) = staging.into_parts();
+    let (staging, staging_lock, verified_generations) = staging.into_parts();
     let move_preverified_blobs = staging_lock.is_some();
     Self {
       staging,
       staging_lock,
+      verified_generations,
       manifest,
       validation,
       move_preverified_blobs,
     }
   }
 
-  pub(crate) fn into_parts(
-    self,
-  ) -> (
-    tempfile::TempDir,
-    Option<File>,
-    OutputManifest,
-    NativeCompilerValidation,
-    bool,
-  ) {
-    (
-      self.staging,
-      self.staging_lock,
-      self.manifest,
-      self.validation,
-      self.move_preverified_blobs,
-    )
+  pub(crate) fn into_parts(self) -> PreparedNativeParts {
+    PreparedNativeParts {
+      staging: self.staging,
+      staging_lock: self.staging_lock,
+      verified_generations: self.verified_generations,
+      manifest: self.manifest,
+      validation: self.validation,
+      move_preverified_blobs: self.move_preverified_blobs,
+    }
   }
+}
+
+fn prepare_authenticated_native_handoff(
+  decoded: pack::DecodedNativePack,
+  session: &NativeCompilerSession,
+  initial_capture: &NativeActionCapture,
+  current_observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  source_root: &Path,
+) -> RailResult<(NativeCompilerValidation, pack::NativePackHandoff, u64)> {
+  let (staging, _manifest, validation, bytes_read) = authenticate_native_pack(
+    decoded,
+    session,
+    initial_capture,
+    current_observation,
+    output_paths,
+    source_root,
+  )?;
+  Ok((validation, staging.into_output_handoff(), bytes_read))
+}
+
+/// Bind one authenticated, byte-verified pack to the current live action.
+fn authenticate_native_pack(
+  decoded: pack::DecodedNativePack,
+  session: &NativeCompilerSession,
+  initial_capture: &NativeActionCapture,
+  current_observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  source_root: &Path,
+) -> RailResult<(pack::NativeResultStaging, OutputManifest, NativeCompilerValidation, u64)> {
+  let pack::DecodedNativePack {
+    staging,
+    descriptor,
+    bytes_read,
+  } = decoded;
+  let pre_link_action = action_key(&session.identity, &session.class, current_observation, initial_capture)?;
+  let (live_action, _) =
+    revalidate_selected_action(current_observation, &descriptor.witness, None, &pre_link_action, None)?;
+  if descriptor.action_key != live_action
+    || !initial_capture.validates_witness(&descriptor.witness, current_observation)
+  {
+    return Err(RailError::message(
+      "native result pack descriptor does not match the current action capability",
+    ));
+  }
+  let current_bindings = native_output_bindings(output_paths);
+  if current_bindings.len() != descriptor.outputs.len()
+    || current_bindings
+      .iter()
+      .zip(&descriptor.outputs)
+      .any(|((role, slot, _), expected)| *role != expected.role || *slot != expected.slot)
+  {
+    return Err(RailError::message(
+      "native result pack output contract does not match the current invocation",
+    ));
+  }
+
+  let mut observation = current_observation.clone();
+  observation.observed_reads =
+    current_observed_reads(initial_capture, &descriptor.witness, current_observation, source_root)?;
+  observation.environment_reads = descriptor
+    .witness
+    .environment_names
+    .iter()
+    .map(|name| EnvironmentObservation {
+      name: name.clone(),
+      value_digest: initial_capture
+        .approved_environment
+        .entries
+        .binary_search_by(|entry| entry.name.as_str().cmp(name))
+        .ok()
+        .and_then(|index| initial_capture.approved_environment.entries[index].value_digest.clone()),
+      secret_capability: false,
+    })
+    .collect();
+  observation.emitted_outputs = current_bindings
+    .iter()
+    .zip(&descriptor.outputs)
+    .map(|((_, _, path), expected)| FileObservation {
+      path: ObservationPath::capture(path, source_root, source_root),
+      content_digest: expected.content_digest.clone(),
+      executable: expected.mode & 0o111 != 0,
+      symlink_target: None,
+    })
+    .collect();
+  observation.emitted_outputs.sort();
+  observation.success = true;
+  observation.cache_wrapper = None;
+
+  let validation = NativeCompilerValidation::new(
+    session,
+    observation,
+    &initial_capture.approved_environment,
+    None,
+    descriptor,
+  )?;
+  let slots = validation
+    .cas_output_bindings()
+    .chain(validation.cas_stream_bindings())
+    .collect::<Vec<_>>();
+  let manifest = crate::cache::result::manifest_from_verified_native_slots(&slots)?;
+  Ok((staging, manifest, validation, bytes_read))
 }
 
 fn current_observed_reads(
@@ -1516,13 +1804,14 @@ impl NativeActionCapture {
     environment_names.sort_unstable();
     environment_names.dedup();
     Ok(NativeCompilerWitness {
-      version: 3,
+      version: 4,
       complete: true,
       source_paths,
       generated_paths,
       dependency_names,
       environment_names,
       apple_linker: None,
+      elf_linker: None,
     })
   }
 
@@ -1533,7 +1822,7 @@ impl NativeActionCapture {
       .map(|(name, _)| name.as_str())
       .collect::<Vec<_>>();
     dependencies.sort_unstable();
-    witness.version == 3
+    witness.version == 4
       && witness.complete
       && !witness.source_paths.is_empty()
       && strictly_sorted_unique_strings(&witness.source_paths)
@@ -1582,6 +1871,11 @@ impl NativeActionCapture {
         .apple_linker
         .as_ref()
         .is_none_or(|witness| validate_apple_linker_witness(witness).is_ok())
+      && witness
+        .elf_linker
+        .as_ref()
+        .is_none_or(|witness| validate_elf_linker_witness(witness).is_ok())
+      && !(witness.apple_linker.is_some() && witness.elf_linker.is_some())
   }
 }
 
@@ -1663,7 +1957,7 @@ fn validate_apple_linker_witness(witness: &AppleLinkerWitness) -> RailResult<()>
 }
 
 fn validate_apple_linker_generations(
-  generations: &AppleLinkerGenerationWitness,
+  generations: &LinkerGenerationWitness,
   witness: &AppleLinkerWitness,
 ) -> RailResult<()> {
   if generations.version != 1
@@ -1679,15 +1973,131 @@ fn validate_apple_linker_generations(
   Ok(())
 }
 
+fn validate_elf_linker_witness(witness: &ElfLinkerWitness) -> RailResult<()> {
+  if witness.version != 1
+    || witness.found.len() > MAX_APPLE_LINK_INPUTS
+    || witness.missing.len() > MAX_APPLE_LINK_INPUTS
+    || witness.endogenous_objects == 0
+    || !strictly_sorted_unique_strings(&witness.missing)
+    || !strictly_sorted_unique_strings(&witness.dependency_archives)
+  {
+    return Err(RailError::message("ELF linker witness is invalid"));
+  }
+  let mut path_bytes = 0usize;
+  let mut previous = None::<&str>;
+  for file in std::iter::once(&witness.driver)
+    .chain(std::iter::once(&witness.linker))
+    .chain(&witness.found)
+  {
+    validate_link_file(file)?;
+    path_bytes = path_bytes
+      .saturating_add(file.path.len())
+      .saturating_add(file.canonical_path.len());
+  }
+  for file in &witness.found {
+    if previous.is_some_and(|previous| previous >= file.path.as_str()) {
+      return Err(RailError::message(
+        "ELF linker found inputs are not strictly sorted and unique",
+      ));
+    }
+    previous = Some(&file.path);
+  }
+  for path in &witness.missing {
+    if !Path::new(path).is_absolute() || path.as_bytes().contains(&0) {
+      return Err(RailError::message(
+        "ELF linker witness contains an invalid missing path",
+      ));
+    }
+    path_bytes = path_bytes.saturating_add(path.len());
+  }
+  if path_bytes > MAX_APPLE_LINK_PATH_BYTES
+    || witness
+      .dependency_archives
+      .iter()
+      .any(|name| name.is_empty() || name.as_bytes().contains(&0))
+  {
+    return Err(RailError::message("ELF linker witness exceeds its bounds"));
+  }
+  Ok(())
+}
+
+fn validate_link_file(file: &LinkFileWitness) -> RailResult<()> {
+  if file.path.is_empty()
+    || !Path::new(&file.path).is_absolute()
+    || file.path.as_bytes().contains(&0)
+    || file.canonical_path.is_empty()
+    || !Path::new(&file.canonical_path).is_absolute()
+    || file.canonical_path.as_bytes().contains(&0)
+    || file.bytes == 0
+    || validate_sha256(&file.content_digest).is_err()
+    || file.mode & !0o777 != 0
+    || file.mode & 0o400 == 0
+  {
+    return Err(RailError::message("linker witness contains an invalid file"));
+  }
+  Ok(())
+}
+
+fn validate_elf_linker_generations(
+  generations: &LinkerGenerationWitness,
+  witness: &ElfLinkerWitness,
+) -> RailResult<()> {
+  if generations.version != 1
+    || generations.found.len() != witness.found.len()
+    || validate_sha256(&generations.installation_authority).is_err()
+    || std::iter::once(&generations.driver)
+      .chain(std::iter::once(&generations.linker))
+      .chain(&generations.found)
+      .any(|generation| validate_sha256(generation).is_err())
+  {
+    return Err(RailError::message("ELF linker generation witness is invalid"));
+  }
+  Ok(())
+}
+
+fn platform_linker_witness_is_valid(
+  observation: &RawCompilerInvocation,
+  witness: &NativeCompilerWitness,
+  generations: Option<&LinkerGenerationWitness>,
+) -> bool {
+  if apple_linked_observation(observation) {
+    witness.elf_linker.is_none()
+      && witness
+        .apple_linker
+        .as_ref()
+        .is_some_and(|linker| validate_apple_linker_witness(linker).is_ok())
+      && match (&witness.apple_linker, generations) {
+        (Some(linker), Some(generations)) => validate_apple_linker_generations(generations, linker).is_ok(),
+        (Some(_), None) => true,
+        _ => false,
+      }
+  } else if elf_linked_observation(observation) {
+    witness.apple_linker.is_none()
+      && witness
+        .elf_linker
+        .as_ref()
+        .is_some_and(|linker| validate_elf_linker_witness(linker).is_ok())
+      && match (&witness.elf_linker, generations) {
+        (Some(linker), Some(generations)) => validate_elf_linker_generations(generations, linker).is_ok(),
+        (Some(_), None) => true,
+        _ => false,
+      }
+  } else {
+    witness.apple_linker.is_none() && witness.elf_linker.is_none() && generations.is_none()
+  }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn installation_authority_identity(authority: &str) -> String {
   format!("sha256:{authority}")
 }
 
-fn apple_linker_generation_identity(path: &Path) -> Option<String> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn linker_generation_identity(path: &Path) -> Option<String> {
   crate::utils::stable_file_generation(path).map(|generation| {
     sha256_identity(
       "sha256:",
-      b"cargo-rail-apple-linker-file-generation\0",
+      b"cargo-rail-linker-file-generation\0",
       &[(b"generation", &generation)],
     )
   })
@@ -1700,7 +2110,7 @@ fn capture_apple_linker_witness(
   certificate: &Path,
   driver_inputs: &Path,
   installation_authority: Option<&str>,
-) -> RailResult<(AppleLinkerWitness, Option<AppleLinkerGenerationWitness>, u64)> {
+) -> RailResult<(AppleLinkerWitness, Option<LinkerGenerationWitness>, u64)> {
   let bytes = read_bounded(certificate, MAX_APPLE_LINK_CERTIFICATE_BYTES as usize)?;
   let (certificate_version, entries) = parse_apple_link_certificate(&bytes)?;
   let driver_inputs = read_apple_link_driver_inputs(driver_inputs)?;
@@ -1823,12 +2233,12 @@ fn capture_apple_linker_witness(
 
   let started = Instant::now();
   let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
-  let (driver, driver_generation) = capture_apple_link_file(Path::new("/usr/bin/cc"), started, &mut budget)?;
+  let (driver, driver_generation) = capture_link_file(Path::new("/usr/bin/cc"), started, &mut budget)?;
   let linker_path = resolve_selected_apple_linker()?;
-  let (linker, linker_generation) = capture_apple_link_file(&linker_path, started, &mut budget)?;
+  let (linker, linker_generation) = capture_link_file(&linker_path, started, &mut budget)?;
   let found = found_paths
     .into_iter()
-    .map(|path| capture_apple_link_file(&path, started, &mut budget))
+    .map(|path| capture_link_file(&path, started, &mut budget))
     .collect::<RailResult<Vec<_>>>()?;
   let (found, found_generations): (Vec<_>, Vec<_>) = found.into_iter().unzip();
   let witness = AppleLinkerWitness {
@@ -1844,7 +2254,7 @@ fn capture_apple_linker_witness(
   };
   validate_apple_linker_witness(&witness)?;
   let generations = installation_authority.and_then(|authority| {
-    Some(AppleLinkerGenerationWitness {
+    Some(LinkerGenerationWitness {
       version: 1,
       installation_authority: installation_authority_identity(authority),
       driver: driver_generation?,
@@ -1858,6 +2268,248 @@ fn capture_apple_linker_witness(
   Ok((witness, generations, budget.bytes_hashed))
 }
 
+#[cfg(target_os = "linux")]
+fn capture_elf_linker_witness(
+  observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  dependencies: &Path,
+  driver_inputs: &Path,
+  installation_authority: Option<&str>,
+) -> RailResult<(ElfLinkerWitness, Option<LinkerGenerationWitness>, u64)> {
+  let dependency_metadata = fs::metadata(dependencies).map_err(|error| {
+    RailError::message(format!(
+      "ELF linker dependency file '{}' is unavailable: {error}",
+      dependencies.display()
+    ))
+  })?;
+  if dependency_metadata.len() > MAX_ELF_LINK_DEPENDENCY_BYTES {
+    return Err(RailError::message("ELF linker dependency file exceeds its byte bound"));
+  }
+  let evidence = read_elf_link_driver_evidence(driver_inputs).map_err(|error| {
+    RailError::message(format!(
+      "ELF linker driver evidence '{}' is unavailable: {error}",
+      driver_inputs.display()
+    ))
+  })?;
+  let current_directory = Path::new(&evidence.current_directory);
+  let (target, dependencies) =
+    crate::compiler::observation::makefile_dependency_paths(dependencies, current_directory)?;
+  let linked = output_paths
+    .artifacts
+    .iter()
+    .filter(|artifact| !matches!(artifact.role, NativeOutputRole::Metadata | NativeOutputRole::Rlib))
+    .collect::<Vec<_>>();
+  let [linked] = linked.as_slice() else {
+    return Err(RailError::message(
+      "ELF linker evidence requires one linked compiler output",
+    ));
+  };
+  let linked_path = crate::utils::canonicalize_existing(&linked.path).map_err(|error| {
+    RailError::message(format!(
+      "ELF linked output '{}' is unavailable: {error}",
+      linked.path.display()
+    ))
+  })?;
+  let dependency_target = crate::utils::canonicalize_existing(&target).map_err(|error| {
+    RailError::message(format!(
+      "ELF linker dependency target '{}' is unavailable: {error}",
+      target.display()
+    ))
+  })?;
+  if dependency_target != linked_path {
+    return Err(RailError::message(
+      "ELF linker dependency file does not bind the exact linked output",
+    ));
+  }
+  let linked_parent = linked_path
+    .parent()
+    .ok_or_else(|| RailError::message("ELF linked output has no parent directory"))?;
+
+  let direct_inputs = evidence
+    .direct_inputs
+    .iter()
+    .map(PathBuf::from)
+    .collect::<BTreeSet<_>>();
+  let mut dependency_by_file = BTreeMap::new();
+  for (name, artifact) in &observation.dependency_artifacts {
+    let file_name = observation_path_basename(&artifact.path)
+      .ok_or_else(|| RailError::message("rustc dependency artifact has no UTF-8 file name"))?;
+    if dependency_by_file
+      .insert(file_name.to_string(), name.as_str())
+      .is_some()
+    {
+      return Err(RailError::message(
+        "ELF linked action has ambiguous dependency artifact names",
+      ));
+    }
+  }
+
+  let mut found_paths = evidence.tool_inputs.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+  let mut dependency_archives = BTreeSet::new();
+  let mut endogenous_objects = 0u32;
+  for dependency in dependencies {
+    let spelling = if dependency.is_absolute() {
+      dependency
+    } else {
+      current_directory.join(dependency)
+    };
+    let file_name = spelling.file_name().and_then(OsStr::to_str).unwrap_or_default();
+    let rustc_temporary_parent = spelling
+      .parent()
+      .and_then(Path::file_name)
+      .and_then(OsStr::to_str)
+      .is_some_and(is_rustc_temporary_name);
+    let rustc_temporary_input = rustc_temporary_parent
+      && spelling
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|parent| crate::utils::canonicalize_existing(parent).ok())
+        .is_some_and(|parent| parent == linked_parent);
+    let rustc_codegen_object = file_name.ends_with(".rcgu.o")
+      && direct_inputs.contains(&spelling)
+      && spelling
+        .parent()
+        .and_then(|parent| crate::utils::canonicalize_existing(parent).ok())
+        .is_some_and(|parent| parent == linked_parent);
+    if rustc_temporary_input || rustc_codegen_object {
+      endogenous_objects = endogenous_objects
+        .checked_add(1)
+        .ok_or_else(|| RailError::message("ELF linker endogenous input count overflow"))?;
+      continue;
+    }
+    let canonical = crate::utils::canonicalize_existing(&spelling).map_err(|error| {
+      RailError::message(format!(
+        "ELF linker dependency '{}' is unavailable: {error}",
+        spelling.display()
+      ))
+    })?;
+    if canonical == linked_path {
+      continue;
+    }
+    if matches!(spelling.extension().and_then(OsStr::to_str), Some("rlib" | "a"))
+      && let Some(dependency) = dependency_by_file.get(file_name)
+    {
+      dependency_archives.insert((*dependency).to_string());
+      continue;
+    }
+    found_paths.insert(spelling);
+  }
+  if endogenous_objects == 0 {
+    return Err(RailError::message(
+      "ELF linker dependency file contains no certified rustc object",
+    ));
+  }
+
+  // Positive linker dependency files do not record failed search attempts.
+  // Bind every same-name candidate in every selected driver/linker search
+  // directory and record every absence. Any later path-selection change then
+  // invalidates the witness before outputs can be restored.
+  let selected_names = found_paths
+    .iter()
+    .filter_map(|path| path.file_name().and_then(OsStr::to_str))
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+  let mut missing = BTreeSet::new();
+  for directory in evidence.search_directories.iter().map(PathBuf::from) {
+    for name in &selected_names {
+      let candidate = directory.join(name);
+      match fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) => {
+          found_paths.insert(candidate);
+        }
+        Ok(metadata) if crate::utils::is_symlink_or_reparse(&metadata) => {
+          found_paths.insert(candidate);
+        }
+        Ok(_) => {
+          return Err(RailError::message("ELF linker search candidate is not a file"));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+          let value = candidate
+            .to_str()
+            .ok_or_else(|| RailError::message("ELF linker search path is not valid UTF-8"))?;
+          missing.insert(value.to_string());
+        }
+        Err(error) => return Err(error.into()),
+      }
+      if found_paths.len().saturating_add(missing.len()) > MAX_APPLE_LINK_INPUTS {
+        return Err(RailError::message("ELF linker witness exceeds its input bound"));
+      }
+    }
+  }
+
+  let started = Instant::now();
+  let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+  let capture_elf_file = |path: &Path, budget: &mut NativeCaptureBudget| {
+    capture_link_file(path, started, budget)
+      .map_err(|error| RailError::message(format!("ELF linker input '{}' is unavailable: {error}", path.display())))
+  };
+  let (driver, driver_generation) = capture_elf_file(Path::new(&evidence.driver), &mut budget)?;
+  let (linker, linker_generation) = capture_elf_file(Path::new(&evidence.linker), &mut budget)?;
+  found_paths.remove(Path::new(&evidence.driver));
+  found_paths.remove(Path::new(&evidence.linker));
+  let found = found_paths
+    .into_iter()
+    .map(|path| capture_elf_file(&path, &mut budget))
+    .collect::<RailResult<Vec<_>>>()?;
+  let (mut found, mut found_generations): (Vec<_>, Vec<_>) = found.into_iter().unzip();
+  let mut ordered = found.into_iter().zip(found_generations).collect::<Vec<_>>();
+  ordered.sort_unstable_by(|left, right| left.0.path.cmp(&right.0.path));
+  (found, found_generations) = ordered.into_iter().unzip();
+  let witness = ElfLinkerWitness {
+    version: 1,
+    driver,
+    linker,
+    found,
+    missing: missing.into_iter().collect(),
+    endogenous_objects,
+    dependency_archives: dependency_archives.into_iter().collect(),
+  };
+  validate_elf_linker_witness(&witness)?;
+  let generations = installation_authority.and_then(|authority| {
+    Some(LinkerGenerationWitness {
+      version: 1,
+      installation_authority: installation_authority_identity(authority),
+      driver: driver_generation?,
+      linker: linker_generation?,
+      found: found_generations.into_iter().collect::<Option<Vec<_>>>()?,
+    })
+  });
+  if let Some(generations) = &generations {
+    validate_elf_linker_generations(generations, &witness)?;
+  }
+  Ok((witness, generations, budget.bytes_hashed))
+}
+
+#[cfg(target_os = "linux")]
+fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidence> {
+  let bytes = read_bounded(path, MAX_ELF_LINK_DEPENDENCY_BYTES as usize)?;
+  let evidence: ElfLinkDriverEvidence = serde_json::from_slice(&bytes)?;
+  let path_count = evidence
+    .direct_inputs
+    .len()
+    .saturating_add(evidence.tool_inputs.len())
+    .saturating_add(evidence.search_directories.len());
+  if evidence.version != 1
+    || path_count > MAX_APPLE_LINK_INPUTS
+    || serde_json::to_vec(&evidence)? != bytes
+    || !Path::new(&evidence.current_directory).is_absolute()
+    || !Path::new(&evidence.driver).is_absolute()
+    || !Path::new(&evidence.linker).is_absolute()
+    || !strictly_sorted_unique_strings(&evidence.direct_inputs)
+    || !strictly_sorted_unique_strings(&evidence.tool_inputs)
+    || !strictly_sorted_unique_strings(&evidence.search_directories)
+    || evidence
+      .direct_inputs
+      .iter()
+      .chain(&evidence.tool_inputs)
+      .chain(&evidence.search_directories)
+      .any(|path| !Path::new(path).is_absolute() || path.as_bytes().contains(&0))
+  {
+    return Err(RailError::message("ELF linker driver evidence is invalid"));
+  }
+  Ok(evidence)
+}
+
 fn complete_linked_witness(
   observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
@@ -1866,8 +2518,8 @@ fn complete_linked_witness(
   pre_link_action: &str,
   witness: &mut NativeCompilerWitness,
   installation_authority: Option<&str>,
-) -> RailResult<(Option<String>, Option<AppleLinkerGenerationWitness>, u64)> {
-  if !apple_linked_observation(observation) {
+) -> RailResult<(Option<String>, Option<LinkerGenerationWitness>, u64)> {
+  if !linked_observation(observation) {
     return Ok((None, None, 0));
   }
   #[cfg(target_os = "macos")]
@@ -1886,7 +2538,23 @@ fn complete_linked_witness(
       bytes_hashed,
     ))
   }
-  #[cfg(not(target_os = "macos"))]
+  #[cfg(target_os = "linux")]
+  {
+    let (elf_linker, generations, bytes_hashed) = capture_elf_linker_witness(
+      observation,
+      output_paths,
+      certificate,
+      driver_inputs,
+      installation_authority,
+    )?;
+    witness.elf_linker = Some(elf_linker);
+    Ok((
+      Some(link_candidate_selector(pre_link_action)?),
+      generations,
+      bytes_hashed,
+    ))
+  }
+  #[cfg(not(any(target_os = "macos", target_os = "linux")))]
   {
     let _ = (
       output_paths,
@@ -1897,7 +2565,7 @@ fn complete_linked_witness(
       installation_authority,
     );
     Err(RailError::message(
-      "Apple linked compiler action is unavailable on this platform",
+      "linked compiler action is unavailable on this platform",
     ))
   }
 }
@@ -2038,7 +2706,7 @@ fn read_apple_link_c_string(bytes: &[u8], offset: &mut usize) -> RailResult<Stri
   Ok(value)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_rustc_temporary_name(name: &str) -> bool {
   name.len() == 11 && name.starts_with("rustc") && name[5..].bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
@@ -2058,26 +2726,26 @@ fn resolve_selected_apple_linker() -> RailResult<PathBuf> {
   Ok(crate::utils::canonicalize_existing(Path::new(path))?)
 }
 
-#[cfg(target_os = "macos")]
-fn capture_apple_link_file(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn capture_link_file(
   path: &Path,
   started: Instant,
   budget: &mut NativeCaptureBudget,
-) -> RailResult<(AppleLinkFile, Option<String>)> {
+) -> RailResult<(LinkFileWitness, Option<String>)> {
   if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
     return Err(RailError::message("Apple linker input path is invalid"));
   }
   let canonical = crate::utils::canonicalize_existing(path)?;
-  let generation_before = apple_linker_generation_identity(&canonical);
+  let generation_before = linker_generation_identity(&canonical);
   let (content_digest, metadata, _) = capture_guarded_file(&canonical, started, budget)?;
-  let generation_after = apple_linker_generation_identity(&canonical);
+  let generation_after = linker_generation_identity(&canonical);
   if generation_before != generation_after || crate::utils::canonicalize_existing(path)? != canonical {
     return Err(RailError::message(
       "Apple linker input path changed while it was captured",
     ));
   }
   Ok((
-    AppleLinkFile {
+    LinkFileWitness {
       path: path
         .to_str()
         .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))?
@@ -2097,25 +2765,25 @@ fn capture_apple_link_file(
   ))
 }
 
-#[cfg(target_os = "macos")]
-fn revalidate_apple_link_file(
-  expected: &AppleLinkFile,
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn revalidate_link_file(
+  expected: &LinkFileWitness,
   generation: Option<&str>,
   started: Instant,
   budget: &mut NativeCaptureBudget,
 ) -> RailResult<()> {
   if let Some(generation) = generation {
     let canonical = crate::utils::canonicalize_existing(Path::new(&expected.path))?;
-    let generation_before = apple_linker_generation_identity(&canonical);
+    let generation_before = linker_generation_identity(&canonical);
     if canonical == Path::new(&expected.canonical_path)
       && generation_before.as_deref() == Some(generation)
       && crate::utils::canonicalize_existing(Path::new(&expected.path))? == canonical
-      && apple_linker_generation_identity(&canonical) == generation_before
+      && linker_generation_identity(&canonical) == generation_before
     {
       return Ok(());
     }
   }
-  let (current, _) = capture_apple_link_file(Path::new(&expected.path), started, budget)?;
+  let (current, _) = capture_link_file(Path::new(&expected.path), started, budget)?;
   if current != *expected {
     return Err(RailError::message("Apple linker found input changed"));
   }
@@ -2125,7 +2793,7 @@ fn revalidate_apple_link_file(
 #[cfg(target_os = "macos")]
 fn revalidate_apple_linker_witness(
   witness: &AppleLinkerWitness,
-  generations: Option<&AppleLinkerGenerationWitness>,
+  generations: Option<&LinkerGenerationWitness>,
   installation_authority: Option<&str>,
 ) -> RailResult<u64> {
   validate_apple_linker_witness(witness)?;
@@ -2141,20 +2809,20 @@ fn revalidate_apple_linker_witness(
   }
   let started = Instant::now();
   let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
-  revalidate_apple_link_file(
+  revalidate_link_file(
     &witness.driver,
     trusted_generations.map(|generations| generations.driver.as_str()),
     started,
     &mut budget,
   )?;
-  revalidate_apple_link_file(
+  revalidate_link_file(
     &witness.linker,
     trusted_generations.map(|generations| generations.linker.as_str()),
     started,
     &mut budget,
   )?;
   for (index, expected) in witness.found.iter().enumerate() {
-    revalidate_apple_link_file(
+    revalidate_link_file(
       expected,
       trusted_generations.and_then(|generations| generations.found.get(index).map(String::as_str)),
       started,
@@ -2164,6 +2832,60 @@ fn revalidate_apple_linker_witness(
   for missing in &witness.missing {
     if !fs::symlink_metadata(missing).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
       return Err(RailError::message("Apple linker missing input appeared"));
+    }
+  }
+  Ok(budget.bytes_hashed)
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_elf_linker_witness(
+  witness: &ElfLinkerWitness,
+  generations: Option<&LinkerGenerationWitness>,
+  installation_authority: Option<&str>,
+) -> RailResult<u64> {
+  validate_elf_linker_witness(witness)?;
+  if let Some(generations) = generations {
+    validate_elf_linker_generations(generations, witness)?;
+  }
+  let current_directory = std::env::current_dir()?;
+  let current_driver = crate::executable::resolve_executable_path(OsStr::new("cc"), &current_directory)?;
+  if current_driver != Path::new(&witness.driver.canonical_path) {
+    return Err(RailError::message("selected ELF linker driver changed"));
+  }
+  let current_linker = resolve_selected_elf_linker(&current_driver, &current_directory)?;
+  if current_linker != Path::new(&witness.linker.canonical_path)
+    || !elf_linker_supports_dependency_file(&current_linker)?
+  {
+    return Err(RailError::message("selected ELF linker changed"));
+  }
+  let trusted_generations = generations.filter(|generations| {
+    installation_authority.map(installation_authority_identity).as_ref() == Some(&generations.installation_authority)
+  });
+  let started = Instant::now();
+  let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+  revalidate_link_file(
+    &witness.driver,
+    trusted_generations.map(|generations| generations.driver.as_str()),
+    started,
+    &mut budget,
+  )?;
+  revalidate_link_file(
+    &witness.linker,
+    trusted_generations.map(|generations| generations.linker.as_str()),
+    started,
+    &mut budget,
+  )?;
+  for (index, expected) in witness.found.iter().enumerate() {
+    revalidate_link_file(
+      expected,
+      trusted_generations.and_then(|generations| generations.found.get(index).map(String::as_str)),
+      started,
+      &mut budget,
+    )?;
+  }
+  for missing in &witness.missing {
+    if !fs::symlink_metadata(missing).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+      return Err(RailError::message("ELF linker missing input appeared"));
     }
   }
   Ok(budget.bytes_hashed)
@@ -3173,7 +3895,9 @@ fn private_compiler_environment(name: &OsStr) -> bool {
         | DISPOSITION_ENV
         | BENCH_COVERAGE_DIRECTORY_ENV
         | LEGACY_STORE_ENV
-        | crate::remote_cache::TARGETS_ENV
+        | crate::remote_cache::REMOTE_URL_ENV
+        | crate::remote_cache::REMOTE_MODE_ENV
+        | crate::remote_cache::REMOTE_ENVIRONMENT_ENV
         | crate::cache::cas::CACHE_BASE_ENV
         | crate::cache::cas::CACHE_MAX_BYTES_ENV
         | crate::cache::cas::CACHE_TRUST_DOMAIN_ENV
@@ -3188,6 +3912,14 @@ fn private_compiler_environment(name: &OsStr) -> bool {
         | crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV
         | crate::compiler::invocation::OBSERVATION_ONLY_ENV
         | crate::compiler::session::FACT_SESSION_ENV
+        | APPLE_LINK_ADAPTER_ENV
+        | APPLE_LINK_DRIVER_ENV
+        | APPLE_LINK_CERTIFICATE_ENV
+        | APPLE_LINK_DRIVER_INPUTS_ENV
+        | ELF_LINK_ADAPTER_ENV
+        | ELF_LINK_DRIVER_ENV
+        | ELF_LINK_DEPENDENCIES_ENV
+        | ELF_LINK_DRIVER_INPUTS_ENV
     )
   )
 }
@@ -3266,6 +3998,10 @@ impl NativeCacheContext {
       observation_directory: std::env::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
         .map(PathBuf::from)?,
       local_cas: None,
+      remote: crate::remote_cache::RemoteCacheSelection::from_environment()
+        .ok()
+        .flatten(),
+      remote_store: OnceLock::new(),
       installation: None,
       _runtime: None,
     })
@@ -3305,12 +4041,17 @@ impl NativeCacheContext {
     let session = installed_native_session(&receipt, &source_root, rustc_program)
       .map_err(|_| "native_cache_session_unavailable")?;
     let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
+    let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
+      .ok()
+      .flatten();
     Ok(Self {
       session: NativeCacheSession::Prepared(session),
       source_root,
       source_root_spelling,
       observation_directory: runtime.path().to_path_buf(),
       local_cas: Some(local_cas),
+      remote,
+      remote_store: OnceLock::new(),
       installation: Some(receipt),
       _runtime: Some(runtime),
     })
@@ -3408,6 +4149,31 @@ fn open_active_local_cas() -> RailResult<LocalCas> {
   active_context()
     .and_then(|context| context.local_cas.clone())
     .map_or_else(LocalCas::open_initialized, Ok)
+}
+
+fn active_remote_selection() -> Option<&'static crate::remote_cache::RemoteCacheSelection> {
+  active_context().and_then(|context| context.remote.as_ref())
+}
+
+fn open_active_remote_store()
+-> Result<Option<&'static crate::remote_cache::RemoteStore>, crate::remote_cache::RemoteStoreError> {
+  let Some(context) = active_context() else {
+    return Ok(None);
+  };
+  let Some(selection) = context
+    .remote
+    .as_ref()
+    .filter(|selection| selection.direct_transport_supported())
+  else {
+    return Ok(None);
+  };
+  match context
+    .remote_store
+    .get_or_init(|| crate::remote_cache::RemoteStore::connect(selection, context.installation.as_ref()))
+  {
+    Ok(store) => Ok(Some(store)),
+    Err(error) => Err(error.clone()),
+  }
 }
 
 impl NativeCompilerSession {
@@ -3548,7 +4314,7 @@ pub(crate) struct NativeCompilerValidation {
   class: NativeCompilerClass,
   witness: NativeCompilerWitness,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  apple_linker_generations: Option<AppleLinkerGenerationWitness>,
+  linker_generations: Option<LinkerGenerationWitness>,
   observation: RawCompilerInvocation,
   compiler_environment_names: Vec<String>,
   outputs: Vec<NativeCompilerOutput>,
@@ -3563,7 +4329,7 @@ impl NativeCompilerValidation {
     session: &NativeCompilerSession,
     observation: RawCompilerInvocation,
     approved_environment: &ApprovedEnvState,
-    apple_linker_generations: Option<AppleLinkerGenerationWitness>,
+    linker_generations: Option<LinkerGenerationWitness>,
     descriptor: pack::NativeResultDescriptor,
   ) -> RailResult<Self> {
     let result_key = descriptor.result_key()?;
@@ -3577,14 +4343,14 @@ impl NativeCompilerValidation {
       stderr_bytes,
     } = descriptor;
     let validation = Self {
-      version: 15,
+      version: 16,
       action_key,
       result_key,
       session_identity: session.identity.clone(),
       session_authority: session.authority,
       class: session.class.clone(),
       witness,
-      apple_linker_generations,
+      linker_generations,
       observation,
       compiler_environment_names: approved_environment
         .entries
@@ -3611,6 +4377,43 @@ impl NativeCompilerValidation {
 
   pub(crate) fn result_key(&self) -> &str {
     &self.result_key
+  }
+
+  pub(crate) fn remote_environment_is_approved(&self, approved_names: &[String]) -> bool {
+    self
+      .compiler_environment_names
+      .iter()
+      .all(|name| approved_names.binary_search(name).is_ok())
+  }
+
+  /// Verify that this exact action was derived from the supplied base action.
+  pub(crate) fn remote_publication_environment_names(&self, base_action_key: &str) -> RailResult<&[String]> {
+    self.validate_object()?;
+    let approved_environment = ApprovedEnvState {
+      version: 3,
+      entries: self
+        .observation
+        .environment_reads
+        .iter()
+        .map(|environment| ApprovedEnvEntry {
+          name: environment.name.clone(),
+          value_digest: environment.value_digest.clone(),
+          root_mapped: false,
+        })
+        .collect(),
+    };
+    let pre_link_action = action_key_from_base(base_action_key, &approved_environment)?;
+    let selected_action = if linked_observation(&self.observation) {
+      witnessed_action_key(&pre_link_action, &self.witness)?
+    } else {
+      pre_link_action
+    };
+    if selected_action != self.action_key {
+      return Err(RailError::message(
+        "native remote publication base action does not bind its exact action",
+      ));
+    }
+    Ok(&self.compiler_environment_names)
   }
 
   #[cfg(test)]
@@ -3678,7 +4481,7 @@ impl NativeCompilerValidation {
     let (selected_action, linker_bytes_hashed) = revalidate_selected_action(
       &self.observation,
       &self.witness,
-      self.apple_linker_generations.as_ref(),
+      self.linker_generations.as_ref(),
       &pre_link_action,
       installation_authority,
     )
@@ -3735,7 +4538,7 @@ impl NativeCompilerValidation {
   }
 
   pub(crate) fn validate_object(&self) -> RailResult<()> {
-    if self.version != 15 {
+    if self.version != 16 {
       return Err(RailError::message(
         "native compiler observation has an incompatible schema",
       ));
@@ -3778,7 +4581,7 @@ impl NativeCompilerValidation {
         "native compiler observation is outside the graduated class",
       ));
     }
-    if self.witness.version != 3
+    if self.witness.version != 4
       || !self.witness.complete
       || !strictly_sorted_unique_strings(&self.witness.source_paths)
       || !strictly_sorted_unique_strings(&self.witness.generated_paths)
@@ -3808,17 +4611,7 @@ impl NativeCompilerValidation {
         .dependency_names
         .iter()
         .any(|name| name.is_empty() || name.as_bytes().contains(&0))
-      || apple_linked_observation(&self.observation) != self.witness.apple_linker.is_some()
-      || self
-        .witness
-        .apple_linker
-        .as_ref()
-        .is_some_and(|witness| validate_apple_linker_witness(witness).is_err())
-      || match (&self.witness.apple_linker, &self.apple_linker_generations) {
-        (Some(witness), Some(generations)) => validate_apple_linker_generations(generations, witness).is_err(),
-        (None, Some(_)) => true,
-        _ => false,
-      }
+      || !platform_linker_witness_is_valid(&self.observation, &self.witness, self.linker_generations.as_ref())
     {
       return Err(RailError::message("native compiler witness is invalid"));
     }
@@ -4015,7 +4808,7 @@ fn link_candidate_selector(pre_link_action: &str) -> RailResult<String> {
     CANDIDATE_SELECTOR_PREFIX,
     b"cargo-rail-native-link-candidate\0",
     &[
-      (b"version", &4_u32.to_le_bytes()),
+      (b"version", &5_u32.to_le_bytes()),
       (b"pre-link-action", pre_link_action.as_bytes()),
     ],
   ))
@@ -4023,52 +4816,77 @@ fn link_candidate_selector(pre_link_action: &str) -> RailResult<String> {
 
 fn witnessed_action_key(pre_link_action: &str, witness: &NativeCompilerWitness) -> RailResult<String> {
   validate_action_key(pre_link_action)?;
-  let apple_linker = witness
-    .apple_linker
-    .as_ref()
-    .ok_or_else(|| RailError::message("linked compiler action has no Apple linker witness"))?;
-  validate_apple_linker_witness(apple_linker)?;
-  let linker = serde_json::to_vec(apple_linker)?;
-  Ok(sha256_identity(
-    ACTION_KEY_PREFIX,
-    b"cargo-rail-native-witnessed-compiler-action\0",
-    &[
-      (b"version", &15_u32.to_le_bytes()),
-      (b"pre-link-action", pre_link_action.as_bytes()),
-      (b"apple-linker", &linker),
-    ],
-  ))
+  match (&witness.apple_linker, &witness.elf_linker) {
+    (Some(linker), None) => {
+      validate_apple_linker_witness(linker)?;
+      let linker = serde_json::to_vec(linker)?;
+      Ok(sha256_identity(
+        ACTION_KEY_PREFIX,
+        b"cargo-rail-native-witnessed-compiler-action\0",
+        &[
+          (b"version", &16_u32.to_le_bytes()),
+          (b"pre-link-action", pre_link_action.as_bytes()),
+          (b"apple-linker", &linker),
+        ],
+      ))
+    }
+    (None, Some(linker)) => {
+      validate_elf_linker_witness(linker)?;
+      let linker = serde_json::to_vec(linker)?;
+      Ok(sha256_identity(
+        ACTION_KEY_PREFIX,
+        b"cargo-rail-native-witnessed-compiler-action\0",
+        &[
+          (b"version", &16_u32.to_le_bytes()),
+          (b"pre-link-action", pre_link_action.as_bytes()),
+          (b"elf-linker", &linker),
+        ],
+      ))
+    }
+    _ => Err(RailError::message(
+      "linked compiler action must contain exactly one platform linker witness",
+    )),
+  }
 }
 
 fn revalidate_selected_action(
   observation: &RawCompilerInvocation,
   witness: &NativeCompilerWitness,
-  generations: Option<&AppleLinkerGenerationWitness>,
+  generations: Option<&LinkerGenerationWitness>,
   pre_link_action: &str,
   installation_authority: Option<&str>,
 ) -> RailResult<(String, u64)> {
-  if !apple_linked_observation(observation) {
-    if witness.apple_linker.is_some() || generations.is_some() {
+  if !linked_observation(observation) {
+    if witness.apple_linker.is_some() || witness.elf_linker.is_some() || generations.is_some() {
       return Err(RailError::message(
         "non-linked compiler action contains a linker witness",
       ));
     }
     return Ok((pre_link_action.to_string(), 0));
   }
-  let linker = witness
-    .apple_linker
-    .as_ref()
-    .ok_or_else(|| RailError::message("linked compiler action has no Apple linker witness"))?;
   #[cfg(target_os = "macos")]
   {
+    let linker = witness
+      .apple_linker
+      .as_ref()
+      .ok_or_else(|| RailError::message("linked compiler action has no Apple linker witness"))?;
     let bytes_hashed = revalidate_apple_linker_witness(linker, generations, installation_authority)?;
     Ok((witnessed_action_key(pre_link_action, witness)?, bytes_hashed))
   }
-  #[cfg(not(target_os = "macos"))]
+  #[cfg(target_os = "linux")]
   {
-    let _ = (linker, generations, installation_authority);
+    let linker = witness
+      .elf_linker
+      .as_ref()
+      .ok_or_else(|| RailError::message("linked compiler action has no ELF linker witness"))?;
+    let bytes_hashed = revalidate_elf_linker_witness(linker, generations, installation_authority)?;
+    Ok((witnessed_action_key(pre_link_action, witness)?, bytes_hashed))
+  }
+  #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+  {
+    let _ = (witness, generations, installation_authority);
     Err(RailError::message(
-      "Apple linked compiler action is unavailable on this platform",
+      "linked compiler action is unavailable on this platform",
     ))
   }
 }
@@ -4530,7 +5348,7 @@ fn invocation_bypass_reason(
   let metadata = BTreeSet::from(["dep-info".to_string(), "metadata".to_string()]);
   let metadata_and_rlib = BTreeSet::from(["dep-info".to_string(), "link".to_string(), "metadata".to_string()]);
   let linked = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
-  let apple_linked = cfg!(target_os = "macos")
+  let linked = cfg!(any(target_os = "macos", target_os = "linux"))
     && observation.emit_modes == linked
     && matches!(
       observation.crate_types.iter().next().map(String::as_str),
@@ -4538,7 +5356,7 @@ fn invocation_bypass_reason(
     )
     && observation.crate_types.len() == 1;
   let compiler_only = proc_macro && observation.emit_modes == metadata;
-  if !library && !apple_linked && !compiler_only {
+  if !library && !linked && !compiler_only {
     return Some("compiler_crate_type_not_graduated");
   }
   if library && observation.emit_modes != metadata && observation.emit_modes != metadata_and_rlib {
@@ -4701,7 +5519,7 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
 
   let library = crate_types == BTreeSet::from(["lib".to_string()]);
   let proc_macro = crate_types == BTreeSet::from(["proc-macro".to_string()]);
-  let apple_linked = cfg!(target_os = "macos")
+  let linked = cfg!(any(target_os = "macos", target_os = "linux"))
     && emits_link
     && !emits_metadata
     && crate_types.len() == 1
@@ -4716,7 +5534,7 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
   {
     return Some("dependency_artifact_path_unavailable");
   }
-  if !library && !apple_linked && !compiler_only {
+  if !library && !linked && !compiler_only {
     return Some("compiler_crate_type_not_graduated");
   }
   if !emit_seen || !emit_supported || !emits_dep_info || library && !emits_metadata {
@@ -5135,7 +5953,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     bytes_hashed: initial_input_bytes.saturating_add(capture.bytes_hashed),
     ..NativeCacheMetrics::default()
   };
-  let environment_names = match cas.native_environment_selector(&base_action) {
+  let mut remote_entry = None;
+  let mut selector_miss_reason = "environment_selector_not_found";
+  let mut environment_names = match cas.native_environment_selector(&base_action) {
     Ok(Some(names)) => Some(names),
     Ok(None) => None,
     Err(_) => {
@@ -5150,13 +5970,71 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
+  if environment_names.is_none()
+    && let Some(selection) = active_remote_selection()
+  {
+    if !selection.direct_transport_supported() {
+      selector_miss_reason = "remote_transport_not_qualified";
+    } else {
+      metrics.begin_remote();
+      let started = Instant::now();
+      let remote = open_active_remote_store();
+      metrics.remote_timing.store_connect.record(started);
+      let lookup = remote.and_then(|store| {
+        let store =
+          store.ok_or_else(|| crate::remote_cache::RemoteStoreError::unavailable("remote store is inactive"))?;
+        let started = Instant::now();
+        let lookup = store.lookup(&base_action);
+        metrics.remote_timing.lookup.record(started);
+        lookup
+      });
+      match lookup {
+        Ok(crate::remote_cache::RemoteLookup::Unique {
+          environment_names: names,
+          action_key,
+          result_key,
+          body,
+          bytes,
+          compressed_bytes,
+        }) if selection.approves_environment_names(&names) => {
+          match cas.publish_native_environment_selector(&base_action, &names) {
+            Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Created)
+            | Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Converged) => {
+              environment_names = Some(names.clone());
+              remote_entry = Some(crate::remote_cache::RemoteLookup::Unique {
+                environment_names: names,
+                action_key,
+                result_key,
+                body,
+                bytes,
+                compressed_bytes,
+              });
+            }
+            Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged) | Err(_) => {
+              selector_miss_reason = "remote_environment_selector_admission_failed";
+            }
+          }
+        }
+        Ok(crate::remote_cache::RemoteLookup::Unique { .. }) => {
+          selector_miss_reason = "remote_environment_not_shareable";
+        }
+        Ok(crate::remote_cache::RemoteLookup::Conflict) => {
+          selector_miss_reason = "remote_entry_conflicted";
+        }
+        Ok(crate::remote_cache::RemoteLookup::Miss) => {
+          selector_miss_reason = "remote_entry_not_found";
+        }
+        Err(error) => selector_miss_reason = error.cold_reason(),
+      }
+    }
+  }
   let environment_names = match environment_names {
     Some(names) => names,
     None => {
       let metadata = configure_cold(
         command,
         CompilerCacheWrapperStatus::Miss,
-        "environment_selector_not_found",
+        selector_miss_reason,
         Some(provisional_action.clone()),
         metrics.bytes_hashed,
         diagnostic_wrapper,
@@ -5217,7 +6095,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
-  let linked = apple_linked_observation(observation);
+  let linked = linked_observation(observation);
   let lookup_key = if linked {
     match link_candidate_selector(&pre_link_action) {
       Ok(selector) => selector,
@@ -5253,7 +6131,10 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
   }
   let cached = match cached {
     Ok((cached, _)) => cached,
-    Err(_) => {
+    Err(error) => {
+      if BENCH_COVERAGE_DIRECTORY.get().is_some() {
+        eprintln!("cargo-rail native coverage: local linked lookup unavailable: {error}");
+      }
       configure_cold(
         command,
         CompilerCacheWrapperStatus::Bypassed,
@@ -5265,20 +6146,33 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
-  let miss_reason = match cached {
+  let (mut miss_reason, local_miss) = match cached {
     crate::cache::cas::NativeActionLookup::Hit(cached)
       if cached.validation.session_identity == session.identity
         && cached.validation.class == session.class
-        && (!linked || cached.validation.witness.apple_linker.is_some())
+        && (!linked
+          || platform_linker_witness_is_valid(
+            observation,
+            &cached.validation.witness,
+            cached.validation.linker_generations.as_ref(),
+          ))
         && (linked || cached.validation.action_key == pre_link_action)
         && capture.validates_witness(&cached.validation.witness, observation) =>
     {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
-      match restore_and_publish(&cas, &cached, &capture, observation, &output_paths, &mut metrics) {
+      match restore_and_publish(
+        &cas,
+        NativeRestoreSource::Materialized(&cached),
+        &capture,
+        observation,
+        &output_paths,
+        &mut metrics,
+        NativeHitSource::Local,
+      ) {
         Ok(()) => return OuterCacheAction::Hit(0),
         Err(RestorePublishFailure::BeforeEffect(error)) => {
           drop(error);
-          "verified_result_materialization_failed".to_string()
+          ("verified_result_materialization_failed".to_string(), false)
         }
         Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {
           return OuterCacheAction::OperationalFailure(error);
@@ -5287,13 +6181,67 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     }
     crate::cache::cas::NativeActionLookup::Hit(cached) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
-      "action_descriptor_incompatible".to_string()
+      ("action_descriptor_incompatible".to_string(), false)
+    }
+    crate::cache::cas::NativeActionLookup::Packed(cached) => {
+      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
+      match attempt_local_packed_reuse(
+        &cas,
+        &cached,
+        &session,
+        &capture,
+        observation,
+        &output_paths,
+        &mut metrics,
+      ) {
+        PackedLocalReuse::Hit => return OuterCacheAction::Hit(0),
+        PackedLocalReuse::Cold(reason) => (reason.to_string(), false),
+        PackedLocalReuse::Reject(reason) => {
+          let action_key = cached.action_key().to_string();
+          drop(cached);
+          let _ = cas.quarantine_packed_native_action(&action_key, reason);
+          (reason.to_string(), false)
+        }
+        PackedLocalReuse::Operational(error) => return OuterCacheAction::OperationalFailure(error),
+      }
     }
     crate::cache::cas::NativeActionLookup::Miss(miss) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
-      miss.reason
+      (miss.reason, true)
     }
   };
+  if local_miss
+    && let Some(selection) = active_remote_selection()
+    && selection.direct_transport_supported()
+    && selection.approves_environment_names(&environment_names)
+  {
+    metrics.begin_remote();
+    let started = Instant::now();
+    let remote = open_active_remote_store();
+    metrics.remote_timing.store_connect.record(started);
+    match remote {
+      Ok(Some(remote)) => match attempt_direct_remote_reuse(
+        &cas,
+        remote,
+        selection,
+        &session,
+        &pre_link_action,
+        &base_action,
+        &environment_names,
+        remote_entry,
+        &capture,
+        observation,
+        &output_paths,
+        &mut metrics,
+      ) {
+        DirectRemoteReuse::Hit => return OuterCacheAction::Hit(0),
+        DirectRemoteReuse::Cold(reason) => miss_reason = reason.to_string(),
+        DirectRemoteReuse::Operational(error) => return OuterCacheAction::OperationalFailure(error),
+      },
+      Ok(None) => miss_reason = "remote_cache_unavailable".to_string(),
+      Err(error) => miss_reason = error.cold_reason().to_string(),
+    }
+  }
   let metadata = configure_cold(
     command,
     CompilerCacheWrapperStatus::Miss,
@@ -5321,11 +6269,26 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
 }
 
 fn prepare_original_child(command: &mut Command, diagnostic_wrapper: bool) {
+  crate::remote_cache::scrub_child_environment(command);
   if !diagnostic_wrapper {
     suppress_nested_observation(command);
   }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn lookup_native_action<'a>(
+  cas: &'a LocalCas,
+  _session: &NativeCompilerSession,
+  lookup_key: &str,
+  _pre_link_action: &str,
+  _capture: &NativeActionCapture,
+  _observation: &RawCompilerInvocation,
+  _installation_authority: Option<&str>,
+) -> RailResult<(crate::cache::cas::NativeActionLookup<'a>, u64)> {
+  cas.native_action(lookup_key).map(|lookup| (lookup, 0))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn lookup_native_action<'a>(
   cas: &'a LocalCas,
   session: &NativeCompilerSession,
@@ -5335,17 +6298,18 @@ fn lookup_native_action<'a>(
   observation: &RawCompilerInvocation,
   installation_authority: Option<&str>,
 ) -> RailResult<(crate::cache::cas::NativeActionLookup<'a>, u64)> {
-  if !apple_linked_observation(observation) {
+  if !linked_observation(observation) {
     return cas.native_action(lookup_key).map(|lookup| (lookup, 0));
   }
   let candidates = cas.native_link_candidates(lookup_key)?;
   let mut bytes_hashed = 0u64;
   for action_key in candidates {
-    let crate::cache::cas::NativeActionLookup::Hit(hit) = cas.native_action(&action_key)? else {
-      continue;
-    };
-    let Some(linker) = hit.validation.witness.apple_linker.as_ref() else {
-      continue;
+    let hit = match cas.native_action(&action_key)? {
+      crate::cache::cas::NativeActionLookup::Hit(hit) => hit,
+      crate::cache::cas::NativeActionLookup::Packed(hit) => {
+        return Ok((crate::cache::cas::NativeActionLookup::Packed(hit), bytes_hashed));
+      }
+      crate::cache::cas::NativeActionLookup::Miss(_) => continue,
     };
     if hit.validation.session_identity != session.identity
       || hit.validation.class != session.class
@@ -5354,23 +6318,20 @@ fn lookup_native_action<'a>(
     {
       continue;
     }
-    #[cfg(target_os = "macos")]
-    {
-      let hashed = match revalidate_apple_linker_witness(
-        linker,
-        hit.validation.apple_linker_generations.as_ref(),
-        installation_authority,
-      ) {
-        Ok(hashed) => hashed,
-        Err(_) => continue,
-      };
-      bytes_hashed = bytes_hashed.saturating_add(hashed);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-      let _ = linker;
+    let (selected_action, hashed) = match revalidate_selected_action(
+      observation,
+      &hit.validation.witness,
+      hit.validation.linker_generations.as_ref(),
+      pre_link_action,
+      installation_authority,
+    ) {
+      Ok(selected) => selected,
+      Err(_) => continue,
+    };
+    if selected_action != action_key {
       continue;
     }
+    bytes_hashed = bytes_hashed.saturating_add(hashed);
     return Ok((crate::cache::cas::NativeActionLookup::Hit(hit), bytes_hashed));
   }
   Ok((
@@ -5380,6 +6341,270 @@ fn lookup_native_action<'a>(
     }),
     bytes_hashed,
   ))
+}
+
+enum DirectRemoteReuse {
+  Hit,
+  Cold(&'static str),
+  Operational(RailError),
+}
+
+enum PackedLocalReuse {
+  Hit,
+  Cold(&'static str),
+  Reject(&'static str),
+  Operational(RailError),
+}
+
+fn attempt_local_packed_reuse(
+  cas: &LocalCas,
+  authority: &crate::cache::cas::PackedNativeActionHit<'_>,
+  session: &NativeCompilerSession,
+  capture: &NativeActionCapture,
+  observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  metrics: &mut NativeCacheMetrics,
+) -> PackedLocalReuse {
+  let context = match active_context() {
+    Some(context) => context,
+    None => return PackedLocalReuse::Cold("packed_context_unavailable"),
+  };
+  let output_parent = match validated_output_parent(output_paths, &context.source_root) {
+    Ok(parent) => parent,
+    Err(_) => return PackedLocalReuse::Cold("packed_output_root_unavailable"),
+  };
+  let staging = match pack::NativeResultStaging::temporary_in(&output_parent) {
+    Ok(staging) => staging,
+    Err(_) => return PackedLocalReuse::Cold("packed_output_staging_unavailable"),
+  };
+  let compressed = match authority.compressed_reader() {
+    Ok(reader) => reader,
+    Err(_) => return PackedLocalReuse::Reject("packed_entry_unavailable"),
+  };
+  let (decoded, association) = match pack::decode_zstd_for_action(
+    compressed,
+    authority.compressed_bytes(),
+    authority.action_key(),
+    authority.pack_bytes(),
+    staging,
+  ) {
+    Ok(decoded) => decoded,
+    Err(_) => return PackedLocalReuse::Reject("packed_entry_rejected"),
+  };
+  if association.result_key() != authority.result_key() {
+    return PackedLocalReuse::Reject("packed_result_identity_mismatch");
+  }
+  let (validation, handoff, pack_bytes) = match prepare_authenticated_native_handoff(
+    decoded,
+    session,
+    capture,
+    observation,
+    output_paths,
+    &context.source_root,
+  ) {
+    Ok(prepared) => prepared,
+    Err(_) => return PackedLocalReuse::Cold("packed_capability_mismatch"),
+  };
+  if validation.action_key() != authority.action_key()
+    || validation.result_key() != authority.result_key()
+    || validation.session_identity != session.identity
+    || validation.class != session.class
+    || !capture.validates_witness(&validation.witness, observation)
+  {
+    return PackedLocalReuse::Cold("packed_action_descriptor_incompatible");
+  }
+  metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(pack_bytes);
+  match restore_and_publish(
+    cas,
+    NativeRestoreSource::Packed {
+      authority,
+      validation: &validation,
+      handoff,
+    },
+    capture,
+    observation,
+    output_paths,
+    metrics,
+    NativeHitSource::Local,
+  ) {
+    Ok(()) => PackedLocalReuse::Hit,
+    Err(RestorePublishFailure::BeforeEffect(_)) => PackedLocalReuse::Cold("packed_result_materialization_failed"),
+    Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {
+      PackedLocalReuse::Operational(error)
+    }
+  }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attempt_direct_remote_reuse(
+  cas: &LocalCas,
+  remote: &crate::remote_cache::RemoteStore,
+  selection: &crate::remote_cache::RemoteCacheSelection,
+  session: &NativeCompilerSession,
+  pre_link_action: &str,
+  base_action_key: &str,
+  environment_names: &[String],
+  remote_entry: Option<crate::remote_cache::RemoteLookup>,
+  capture: &NativeActionCapture,
+  observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  metrics: &mut NativeCacheMetrics,
+) -> DirectRemoteReuse {
+  let lookup = match remote_entry {
+    Some(entry) => Ok(entry),
+    None => {
+      let started = Instant::now();
+      let lookup = remote.lookup(base_action_key);
+      metrics.remote_timing.lookup.record(started);
+      lookup
+    }
+  };
+  let linked = linked_observation(observation);
+  let (selected_action, result_key, mut body, bytes, compressed_bytes) = match lookup {
+    Ok(crate::remote_cache::RemoteLookup::Miss) => return DirectRemoteReuse::Cold("remote_entry_not_found"),
+    Ok(crate::remote_cache::RemoteLookup::Conflict) => return DirectRemoteReuse::Cold("remote_entry_conflicted"),
+    Ok(crate::remote_cache::RemoteLookup::Unique {
+      environment_names: remote_environment_names,
+      action_key: remote_action_key,
+      result_key,
+      body,
+      bytes,
+      compressed_bytes,
+    }) => {
+      if remote_environment_names != environment_names
+        || (!linked && remote_action_key != pre_link_action)
+        || validate_action_key(&remote_action_key).is_err()
+      {
+        return DirectRemoteReuse::Cold("remote_entry_identity_mismatch");
+      }
+      (remote_action_key, result_key, body, bytes, compressed_bytes)
+    }
+    Err(error) => return DirectRemoteReuse::Cold(error.cold_reason()),
+  };
+  let context = match active_context() {
+    Some(context) => context,
+    None => return DirectRemoteReuse::Cold("remote_context_unavailable"),
+  };
+  let output_parent = match validated_output_parent(output_paths, &context.source_root) {
+    Ok(parent) => parent,
+    Err(_) => return DirectRemoteReuse::Cold("remote_output_root_unavailable"),
+  };
+  let mut packed = match cas.packed_native_action_staging(
+    base_action_key,
+    environment_names,
+    &selected_action,
+    &result_key,
+    selection.authority(),
+    bytes,
+    compressed_bytes,
+  ) {
+    Ok(staging) => staging,
+    Err(_) => return DirectRemoteReuse::Cold("remote_pack_staging_unavailable"),
+  };
+  let started = Instant::now();
+  let copied = match body.copy_compressed_to(packed.writer()) {
+    Ok(copied) => copied,
+    Err(_) => return DirectRemoteReuse::Cold("remote_compressed_entry_stream_failed"),
+  };
+  if copied != compressed_bytes || packed.finish_payload().is_err() {
+    return DirectRemoteReuse::Cold("remote_compressed_entry_length_mismatch");
+  }
+  let output_staging = match pack::NativeResultStaging::temporary_in(&output_parent) {
+    Ok(staging) => staging,
+    Err(_) => return DirectRemoteReuse::Cold("remote_output_staging_unavailable"),
+  };
+  let compressed = match packed.compressed_reader() {
+    Ok(reader) => reader,
+    Err(_) => return DirectRemoteReuse::Cold("remote_compressed_entry_staging_failed"),
+  };
+  let (decoded, association) =
+    match pack::decode_zstd_for_action(compressed, compressed_bytes, &selected_action, bytes, output_staging) {
+      Ok(decoded) => decoded,
+      Err(_) => return DirectRemoteReuse::Cold("remote_entry_rejected"),
+    };
+  metrics.remote_timing.decode.record(started);
+  if association.result_key() != result_key {
+    return DirectRemoteReuse::Cold("remote_action_result_mismatch");
+  }
+  let started = Instant::now();
+  let (validation, handoff, pack_bytes) = match prepare_authenticated_native_handoff(
+    decoded,
+    session,
+    capture,
+    observation,
+    output_paths,
+    &context.source_root,
+  ) {
+    Ok(prepared) => prepared,
+    Err(_) => return DirectRemoteReuse::Cold("remote_pack_capability_mismatch"),
+  };
+  metrics.remote_timing.validation.record(started);
+  metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(pack_bytes);
+  let started = Instant::now();
+  let mut recapture_bytes = 0_u64;
+  if cas
+    .commit_packed_native_action_revalidated(packed, &validation, |validation| {
+      if validation.action_key() != selected_action
+        || !validation.remote_environment_is_approved(selection.approved_environment_names())
+      {
+        return Err(RailError::message("remote result changed before local admission"));
+      }
+      recapture_bytes =
+        capture.revalidate_before_restore_commit(observation, &context.source_root, &context.source_root_spelling)?;
+      Ok(())
+    })
+    .is_err()
+  {
+    return DirectRemoteReuse::Cold("remote_pack_admission_failed");
+  }
+  metrics.remote_timing.l1_admission.record(started);
+  metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(recapture_bytes);
+  if linked {
+    let candidate = match link_candidate_selector(pre_link_action) {
+      Ok(candidate) => candidate,
+      Err(_) => return DirectRemoteReuse::Cold("remote_link_candidate_unavailable"),
+    };
+    if cas.publish_native_link_candidate(&candidate, &selected_action).is_err() {
+      return DirectRemoteReuse::Cold("remote_link_candidate_admission_failed");
+    }
+  }
+  let restored = match cas.native_action(&selected_action) {
+    Ok(crate::cache::cas::NativeActionLookup::Packed(authority)) => {
+      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(authority.bytes_read);
+      restore_and_publish(
+        cas,
+        NativeRestoreSource::Packed {
+          authority: &authority,
+          validation: &validation,
+          handoff,
+        },
+        capture,
+        observation,
+        output_paths,
+        metrics,
+        NativeHitSource::Remote { base_action_key },
+      )
+    }
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) if cached.validation == validation => restore_and_publish(
+      cas,
+      NativeRestoreSource::Materialized(&cached),
+      capture,
+      observation,
+      output_paths,
+      metrics,
+      NativeHitSource::Remote { base_action_key },
+    ),
+    Ok(crate::cache::cas::NativeActionLookup::Hit(_) | crate::cache::cas::NativeActionLookup::Miss(_)) | Err(_) => {
+      return DirectRemoteReuse::Cold("remote_pack_authority_changed");
+    }
+  };
+  match restored {
+    Ok(()) => DirectRemoteReuse::Hit,
+    Err(RestorePublishFailure::BeforeEffect(_)) => DirectRemoteReuse::Cold("remote_result_materialization_failed"),
+    Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {
+      DirectRemoteReuse::Operational(error)
+    }
+  }
 }
 
 fn suppress_nested_observation(command: &mut Command) {
@@ -5394,6 +6619,8 @@ fn prepare_observed_cold_child(
   observation: &RawCompilerInvocation,
   observation_directory: &Path,
 ) {
+  #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+  let _ = (observation, observation_directory);
   *command = Command::new(rustc);
   command.args(compiler_arguments);
   if diagnostic_wrapper {
@@ -5424,6 +6651,42 @@ fn prepare_observed_cold_child(
         .env(APPLE_LINK_DRIVER_INPUTS_ENV, driver_inputs);
     }
   }
+  #[cfg(target_os = "linux")]
+  if elf_linked_observation(observation) {
+    let adapter = std::env::current_exe().ok();
+    let current_directory = std::env::current_dir().ok();
+    let driver = current_directory
+      .as_deref()
+      .and_then(|current| crate::executable::resolve_executable_path(OsStr::new("cc"), current).ok());
+    let linker = driver.as_deref().and_then(|driver| {
+      current_directory
+        .as_deref()
+        .and_then(|current| resolve_selected_elf_linker(driver, current).ok())
+    });
+    let supported = linker
+      .as_deref()
+      .is_some_and(|linker| elf_linker_supports_dependency_file(linker).unwrap_or(false));
+    let dependencies = observation_directory.join(ELF_LINK_DEPENDENCIES_FILE);
+    let driver_inputs = observation_directory.join(ELF_LINK_DRIVER_INPUTS_FILE);
+    if let Some(driver) = driver
+      && adapter.as_ref().is_some_and(|adapter| adapter.is_absolute())
+      && supported
+      && fs::symlink_metadata(&dependencies).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+      && fs::symlink_metadata(&driver_inputs).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+      command
+        .arg(format!(
+          "-Clinker={}",
+          adapter
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string())
+        ))
+        .env(ELF_LINK_ADAPTER_ENV, "1")
+        .env(ELF_LINK_DRIVER_ENV, driver)
+        .env(ELF_LINK_DEPENDENCIES_ENV, dependencies)
+        .env(ELF_LINK_DRIVER_INPUTS_ENV, driver_inputs);
+    }
+  }
 }
 
 fn apple_linked_observation(observation: &RawCompilerInvocation) -> bool {
@@ -5434,6 +6697,20 @@ fn apple_linked_observation(observation: &RawCompilerInvocation) -> bool {
       observation.crate_types.iter().next().map(String::as_str),
       Some("bin" | "proc-macro" | "dylib" | "cdylib")
     )
+}
+
+fn elf_linked_observation(observation: &RawCompilerInvocation) -> bool {
+  cfg!(target_os = "linux")
+    && observation.emit_modes == BTreeSet::from(["dep-info".to_string(), "link".to_string()])
+    && observation.crate_types.len() == 1
+    && matches!(
+      observation.crate_types.iter().next().map(String::as_str),
+      Some("bin" | "proc-macro" | "dylib" | "cdylib")
+    )
+}
+
+fn linked_observation(observation: &RawCompilerInvocation) -> bool {
+  apple_linked_observation(observation) || elf_linked_observation(observation)
 }
 
 fn configure_cold(
@@ -5513,23 +6790,92 @@ fn validate_restore_environment_authority(
   Ok(base_action)
 }
 
+enum NativeHitSource<'a> {
+  Local,
+  Remote { base_action_key: &'a str },
+}
+
+enum NativeRestoreSource<'a> {
+  Materialized(&'a crate::cache::cas::NativeActionHit<'a>),
+  Packed {
+    authority: &'a crate::cache::cas::PackedNativeActionHit<'a>,
+    validation: &'a NativeCompilerValidation,
+    handoff: pack::NativePackHandoff,
+  },
+}
+
+impl NativeRestoreSource<'_> {
+  fn validation(&self) -> &NativeCompilerValidation {
+    match self {
+      Self::Materialized(cached) => &cached.validation,
+      Self::Packed { validation, .. } => validation,
+    }
+  }
+}
+
+impl NativeHitSource<'_> {
+  const fn reason(&self) -> &'static str {
+    match self {
+      Self::Local => "verified_local_result",
+      Self::Remote { .. } => "verified_remote_result",
+    }
+  }
+
+  const fn remote_action_key(&self) -> Option<&str> {
+    match self {
+      Self::Local => None,
+      Self::Remote { base_action_key } => Some(base_action_key),
+    }
+  }
+}
+
 fn restore_and_publish(
   cas: &LocalCas,
-  cached: &crate::cache::cas::NativeActionHit<'_>,
+  source: NativeRestoreSource<'_>,
   initial_capture: &NativeActionCapture,
   current_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
   metrics: &mut NativeCacheMetrics,
+  hit_source: NativeHitSource<'_>,
 ) -> Result<(), RestorePublishFailure> {
-  validate_restore_environment_authority(cached, initial_capture, current_observation)?;
+  let restore_started = Instant::now();
+  let durability = native_durability_phase(NativeDurabilityPhase::RestoreTransaction);
+  match &source {
+    NativeRestoreSource::Materialized(cached) => {
+      validate_restore_environment_authority(cached, initial_capture, current_observation)?;
+    }
+    NativeRestoreSource::Packed {
+      authority, validation, ..
+    } => {
+      let base_action = base_action_key(
+        &validation.session_identity,
+        &validation.class,
+        current_observation,
+        initial_capture,
+      )
+      .map_err(RestorePublishFailure::Operational)?;
+      if authority.base_action_key() != base_action
+        || authority.action_key() != validation.action_key()
+        || authority.result_key() != validation.result_key()
+        || authority.environment_names() != validation.witness.environment_names
+      {
+        return Err(RestorePublishFailure::Operational(RailError::message(
+          "packed native authority does not match its live validation",
+        )));
+      }
+      authority
+        .validate_environment_selector()
+        .map_err(RestorePublishFailure::Operational)?;
+    }
+  }
   let before = RestorePublishFailure::BeforeEffect;
-  let validation = &cached.validation;
+  let validation = source.validation().clone();
   let context =
     active_context().ok_or_else(|| before(RailError::message("native compiler cache context disappeared")))?;
   let source_root = &context.source_root;
   let source_root_spelling = &context.source_root_spelling;
   let observation_directory = &context.observation_directory;
-  validate_current_output_binding(validation, output_paths, source_root).map_err(before)?;
+  validate_current_output_binding(&validation, output_paths, source_root).map_err(before)?;
   let mut transaction = begin_restore_transaction_in(
     cas,
     output_paths,
@@ -5542,7 +6888,7 @@ fn restore_and_publish(
     return Err(fail_restore_transaction(&mut transaction, error, 0));
   }
   let prepared = match prepare_registered_restore(
-    cached,
+    source,
     &transaction,
     initial_capture,
     current_observation,
@@ -5606,12 +6952,15 @@ fn restore_and_publish(
   if let Err(error) = commit_result {
     return Err(fail_restore_transaction(&mut transaction, error, visible_effects));
   }
+  drop(durability);
+  metrics.remote_timing.output_restore.record(restore_started);
+  metrics.finish_remote();
   write_cache_event(
     CompilerCacheWrapperStatus::Hit,
-    "verified_local_result",
+    hit_source.reason(),
     Some(&validation.action_key),
     Some(&validation.result_key),
-    None,
+    hit_source.remote_action_key(),
     NativeCacheMetrics { ..*metrics },
   );
   Ok(())
@@ -5619,7 +6968,7 @@ fn restore_and_publish(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_registered_restore(
-  cached: &crate::cache::cas::NativeActionHit<'_>,
+  source: NativeRestoreSource<'_>,
   transaction: &NativeRestoreTransaction,
   initial_capture: &NativeActionCapture,
   current_observation: &RawCompilerInvocation,
@@ -5629,23 +6978,36 @@ fn prepare_registered_restore(
   source_root_spelling: &Path,
   observation_directory: &Path,
 ) -> RailResult<PreparedNativeRestore> {
-  let validation = &cached.validation;
+  let validation = source.validation().clone();
   let restored = transaction.paths.transaction_directory.join(RESTORE_VERIFIED_DIRECTORY);
   let staging = transaction
     .paths
     .transaction_directory
     .join(RESTORE_MATERIALIZING_DIRECTORY);
-  let hit = match cached.restore_registered(&restored, &staging) {
-    NativeCacheLookup::Hit(hit) => {
-      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(hit.bytes_read);
-      hit
-    }
-    NativeCacheLookup::Miss(miss) => {
-      metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
-      return Err(RailError::message(format!(
-        "native compiler cache restore rejected the result: {}",
-        miss.reason
-      )));
+  let hit = match source {
+    NativeRestoreSource::Materialized(cached) => match cached.restore_registered(&restored, &staging) {
+      NativeCacheLookup::Hit(hit) => {
+        metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(hit.bytes_read);
+        hit
+      }
+      NativeCacheLookup::Miss(miss) => {
+        metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(miss.bytes_read);
+        return Err(RailError::message(format!(
+          "native compiler cache restore rejected the result: {}",
+          miss.reason
+        )));
+      }
+    },
+    NativeRestoreSource::Packed { authority, handoff, .. } => {
+      let bytes_restored = handoff
+        .materialize(&validation, &restored)?
+        .ok_or_else(|| RailError::message("authenticated native pack handoff changed before restore"))?;
+      authority.refresh_access_if_stale();
+      crate::instrumentation::record_cas_restore(bytes_restored);
+      crate::cache::cas::NativeCacheHit {
+        bytes_read: 0,
+        bytes_restored,
+      }
     }
   };
 
@@ -5656,8 +7018,8 @@ fn prepare_registered_restore(
       "native compiler cache stream binding changed after restore",
     ));
   }
-  let stdout = translate_output_binding_bytes(&stdout, validation, output_paths, source_root, false)?;
-  let stderr = translate_output_binding_bytes(&stderr, validation, output_paths, source_root, false)?;
+  let stdout = translate_output_binding_bytes(&stdout, &validation, output_paths, source_root, false)?;
+  let stderr = translate_output_binding_bytes(&stderr, &validation, output_paths, source_root, false)?;
   let bindings = native_output_bindings(output_paths);
   let mut prepared_outputs = Vec::with_capacity(bindings.len());
   for ((role, slot, destination), expected) in bindings.iter().zip(&validation.outputs) {
@@ -5670,7 +7032,7 @@ fn prepare_registered_restore(
         ));
       }
       let materialized =
-        translate_dep_info_output_bindings(&bytes, validation, output_paths, source_root, initial_capture)?;
+        translate_dep_info_output_bindings(&bytes, &validation, output_paths, source_root, initial_capture)?;
       prepare_restore_bytes(
         &materialized,
         &source,
@@ -6124,7 +7486,9 @@ impl NativeRestoreTransaction {
     let pending = write_restore_record(&pending_path, &commit)?;
     #[cfg(windows)]
     let pending_identity = native_restore_file_identity(&pending)?;
-    sync_native_directory(&self.paths.transaction_directory)?;
+    // The record itself is durable. Its source-directory entry is transient:
+    // the post-rename source and destination barriers below establish the only
+    // name that can authorize visible output replacement.
     restore_commit_test_fault("after_pending_commit", 0, current_observation)?;
     #[cfg(windows)]
     let marker = {
@@ -6870,9 +8234,10 @@ fn cleanup_restore_transaction_directory(
   for directory in nested {
     remove_restore_directory_if_present(&directory)?;
   }
-  sync_native_directory(&paths.transaction_directory)?;
+  // The private directory is removed immediately. Syncing its intermediate
+  // deletions cannot strengthen recovery once the final parent barrier makes
+  // the directory removal durable.
   remove_restore_file_if_present(&registration)?;
-  sync_native_directory(&paths.transaction_directory)?;
   fs::remove_dir(&paths.transaction_directory)?;
   sync_native_directory(&paths.output_parent)
 }
@@ -6966,7 +8331,8 @@ fn restore_path_string(path: &Path) -> RailResult<&str> {
 
 #[cfg(unix)]
 fn sync_native_directory(path: &Path) -> RailResult<()> {
-  sync_native_before_commit(&File::open(path)?)
+  let _durability = native_durability_phase(NativeDurabilityPhase::OutputDirectorySync);
+  sync_native_before_commit_unmeasured(&File::open(path)?)
 }
 
 #[cfg(not(unix))]
@@ -6982,12 +8348,24 @@ fn sync_native_directory(_path: &Path) -> RailResult<()> {
 /// more expensive `F_FULLFSYNC` on Apple platforms.
 #[cfg(target_os = "macos")]
 fn sync_native_before_commit(file: &File) -> RailResult<()> {
+  let _durability = native_durability_phase(NativeDurabilityPhase::OutputFileSync);
+  sync_native_before_commit_unmeasured(file)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_native_before_commit_unmeasured(file: &File) -> RailResult<()> {
   rustix::fs::fsync(file).map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
   Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn sync_native_before_commit(file: &File) -> RailResult<()> {
+  let _durability = native_durability_phase(NativeDurabilityPhase::OutputFileSync);
+  sync_native_before_commit_unmeasured(file)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_native_before_commit_unmeasured(file: &File) -> RailResult<()> {
   file.sync_all()?;
   Ok(())
 }
@@ -7177,7 +8555,9 @@ fn output_role_path_matches(role: &str, output: &Path) -> bool {
     "metadata" => output.extension() == Some(OsStr::new("rmeta")),
     "rlib" => output.extension() == Some(OsStr::new("rlib")),
     "executable" => output.file_name().is_some() && output.extension().is_none(),
-    "proc_macro" | "dylib" | "cdylib" => output.extension() == Some(OsStr::new("dylib")),
+    "proc_macro" | "dylib" | "cdylib" => {
+      output.extension() == Some(OsStr::new(if cfg!(target_os = "linux") { "so" } else { "dylib" }))
+    }
     "staticlib" => output.extension() == Some(OsStr::new("a")),
     _ => false,
   }
@@ -7646,6 +9026,7 @@ fn contains_path_prefix(bytes: &[u8], path: &[u8]) -> bool {
 /// Write one file in a command-owned private temporary directory before any
 /// child can observe it. These bytes are regenerable process handoff, not
 /// durable cache authority, so an Apple device-wide sync would be pure stall.
+#[cfg(any(target_os = "macos", target_os = "linux", debug_assertions, all(test, unix)))]
 fn write_private_command_file(path: &Path, bytes: &[u8]) -> RailResult<()> {
   let mut options = OpenOptions::new();
   options.write(true).create_new(true);
@@ -7660,6 +9041,7 @@ fn write_private_command_file(path: &Path, bytes: &[u8]) -> RailResult<()> {
   Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn overwrite_private_command_file(path: &Path, bytes: &[u8]) -> RailResult<()> {
   let metadata = fs::symlink_metadata(path)?;
   if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) || !single_link(&metadata) {
@@ -7733,6 +9115,7 @@ fn digest(bytes: &[u8]) -> String {
 
 /// Remove cache-only authority while preserving an explicitly selected inner observation role.
 pub(crate) fn remove_cache_environment(command: &mut Command) {
+  crate::remote_cache::scrub_child_environment(command);
   #[cfg(debug_assertions)]
   command
     .env_remove(RESTORE_FAULT_ENV)
@@ -7748,7 +9131,6 @@ pub(crate) fn remove_cache_environment(command: &mut Command) {
     .env_remove(DISPOSITION_ENV)
     .env_remove(BENCH_COVERAGE_DIRECTORY_ENV)
     .env_remove(LEGACY_STORE_ENV)
-    .env_remove(crate::remote_cache::TARGETS_ENV)
     .env_remove(crate::cache::cas::CACHE_BASE_ENV)
     .env_remove(crate::cache::cas::CACHE_MAX_BYTES_ENV)
     .env_remove(crate::cache::cas::CACHE_TRUST_DOMAIN_ENV)
@@ -7771,7 +9153,11 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
     .env_remove(APPLE_LINK_ADAPTER_ENV)
     .env_remove(APPLE_LINK_DRIVER_ENV)
     .env_remove(APPLE_LINK_CERTIFICATE_ENV)
-    .env_remove(APPLE_LINK_DRIVER_INPUTS_ENV);
+    .env_remove(APPLE_LINK_DRIVER_INPUTS_ENV)
+    .env_remove(ELF_LINK_ADAPTER_ENV)
+    .env_remove(ELF_LINK_DRIVER_ENV)
+    .env_remove(ELF_LINK_DEPENDENCIES_ENV)
+    .env_remove(ELF_LINK_DRIVER_INPUTS_ENV);
 }
 
 /// Add Apple linker evidence arguments without changing the selected driver.
@@ -7910,6 +9296,226 @@ pub(crate) fn configure_apple_link_adapter(command: &mut Command, arguments: &[O
   }
 }
 
+/// Add a GNU-compatible linker dependency-file argument and persist the exact
+/// driver resolution namespace used by this link. Unsupported drivers execute
+/// unchanged and the outer wrapper declines publication.
+pub(crate) fn configure_elf_link_adapter(command: &mut Command, arguments: &[OsString]) -> bool {
+  #[cfg(not(target_os = "linux"))]
+  {
+    let _ = (command, arguments);
+    false
+  }
+  #[cfg(target_os = "linux")]
+  {
+    let Some(dependencies) = std::env::var_os(ELF_LINK_DEPENDENCIES_ENV).map(PathBuf::from) else {
+      return false;
+    };
+    let Some(driver_inputs) = std::env::var_os(ELF_LINK_DRIVER_INPUTS_ENV).map(PathBuf::from) else {
+      return false;
+    };
+    let Some(driver) = std::env::var_os(ELF_LINK_DRIVER_ENV).map(PathBuf::from) else {
+      return false;
+    };
+    if !dependencies.is_absolute()
+      || dependencies.as_os_str().as_encoded_bytes().contains(&0)
+      || dependencies.as_os_str().as_encoded_bytes().contains(&b',')
+      || !driver_inputs.is_absolute()
+      || driver_inputs.parent() != dependencies.parent()
+      || arguments
+        .iter()
+        .any(|argument| argument.as_encoded_bytes().starts_with(b"@"))
+      || !fs::symlink_metadata(&dependencies).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+      || !fs::symlink_metadata(&driver_inputs).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+      return false;
+    }
+    let Ok(evidence) = capture_elf_link_driver_evidence(&driver, arguments) else {
+      return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(&evidence) else {
+      return false;
+    };
+    if write_private_command_file(&driver_inputs, &bytes).is_err() {
+      return false;
+    }
+    command
+      .args(arguments)
+      .arg(format!("-Wl,--dependency-file={}", dependencies.display()));
+    true
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> RailResult<ElfLinkDriverEvidence> {
+  let current_directory = crate::utils::canonicalize_existing(&std::env::current_dir()?)?;
+  let driver = crate::utils::canonicalize_existing(driver)?;
+  let linker = resolve_selected_elf_linker(&driver, &current_directory)?;
+  if !elf_linker_supports_dependency_file(&linker)? {
+    return Err(RailError::message(
+      "selected ELF linker does not support dependency-file evidence",
+    ));
+  }
+
+  let mut direct_inputs = BTreeSet::new();
+  let mut search_directories = BTreeSet::new();
+  let mut index = 0usize;
+  while index < arguments.len() {
+    let argument = &arguments[index];
+    let path = Path::new(argument);
+    let absolute = if path.is_absolute() {
+      path.to_path_buf()
+    } else {
+      current_directory.join(path)
+    };
+    if fs::metadata(&absolute).is_ok_and(|metadata| metadata.is_file()) {
+      direct_inputs.insert(crate::utils::canonicalize_existing(&absolute)?);
+    }
+    let mut library = None::<&OsStr>;
+    if argument == "-L" {
+      library = arguments.get(index + 1).map(OsString::as_os_str);
+      index = index.saturating_add(1);
+    } else if let Some(value) = argument.to_str().and_then(|value| value.strip_prefix("-L"))
+      && !value.is_empty()
+    {
+      library = Some(OsStr::new(value));
+    } else if let Some(value) = argument.to_str().and_then(|value| value.strip_prefix("-Wl,-L,")) {
+      library = Some(OsStr::new(value));
+    } else if let Some(value) = argument.to_str().and_then(|value| value.strip_prefix("-Wl,-L")) {
+      library = Some(OsStr::new(value));
+    }
+    if let Some(library) = library {
+      let library = Path::new(library);
+      let absolute = if library.is_absolute() {
+        library.to_path_buf()
+      } else {
+        current_directory.join(library)
+      };
+      if fs::metadata(&absolute).is_ok_and(|metadata| metadata.is_dir()) {
+        search_directories.insert(crate::utils::canonicalize_existing(&absolute)?);
+      }
+    }
+    index = index.saturating_add(1);
+  }
+
+  let sysroot = elf_driver_stdout(&driver, &["-print-sysroot"], &current_directory)?;
+  let sysroot = PathBuf::from(sysroot.trim());
+  let driver_search = elf_driver_stdout(&driver, &["-print-search-dirs"], &current_directory)?;
+  if let Some(libraries) = driver_search.lines().find_map(|line| {
+    line
+      .strip_prefix("libraries: =")
+      .or_else(|| line.strip_prefix("libraries: "))
+  }) {
+    for directory in std::env::split_paths(OsStr::new(libraries)) {
+      let directory = resolve_elf_search_directory(&directory, &sysroot, &current_directory);
+      if fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+        search_directories.insert(crate::utils::canonicalize_existing(&directory)?);
+      }
+    }
+  }
+  let linker_verbose = elf_driver_stdout(&linker, &["--verbose"], &current_directory)?;
+  for directory in elf_linker_script_search_directories(&linker_verbose) {
+    let directory = resolve_elf_search_directory(Path::new(&directory), &sysroot, &current_directory);
+    if fs::metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+      search_directories.insert(crate::utils::canonicalize_existing(&directory)?);
+    }
+  }
+
+  let mut tool_inputs = BTreeSet::new();
+  for tool in ["collect2", "lto-wrapper"] {
+    let selected = elf_driver_stdout(&driver, &[&format!("-print-prog-name={tool}")], &current_directory)?;
+    let selected = selected.trim();
+    if selected.is_empty() || selected == tool {
+      continue;
+    }
+    let selected = crate::executable::resolve_executable_path(OsStr::new(selected), &current_directory)?;
+    if selected != driver && selected != linker {
+      tool_inputs.insert(selected);
+    }
+  }
+  let to_strings = |paths: BTreeSet<PathBuf>| -> RailResult<Vec<String>> {
+    paths
+      .into_iter()
+      .map(|path| {
+        path
+          .into_os_string()
+          .into_string()
+          .map_err(|_| RailError::message("ELF linker evidence path is not valid UTF-8"))
+      })
+      .collect()
+  };
+  let evidence = ElfLinkDriverEvidence {
+    version: 1,
+    current_directory: current_directory
+      .into_os_string()
+      .into_string()
+      .map_err(|_| RailError::message("ELF linker current directory is not valid UTF-8"))?,
+    driver: driver
+      .into_os_string()
+      .into_string()
+      .map_err(|_| RailError::message("ELF linker driver path is not valid UTF-8"))?,
+    linker: linker
+      .into_os_string()
+      .into_string()
+      .map_err(|_| RailError::message("ELF linker path is not valid UTF-8"))?,
+    tool_inputs: to_strings(tool_inputs)?,
+    search_directories: to_strings(search_directories)?,
+    direct_inputs: to_strings(direct_inputs)?,
+  };
+  if evidence.direct_inputs.is_empty() {
+    return Err(RailError::message("ELF linker driver exposed no direct file inputs"));
+  }
+  Ok(evidence)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_selected_elf_linker(driver: &Path, current_directory: &Path) -> RailResult<PathBuf> {
+  let selected = elf_driver_stdout(driver, &["-print-prog-name=ld"], current_directory)?;
+  let selected = selected.trim();
+  if selected.is_empty() {
+    return Err(RailError::message("ELF linker driver returned no selected linker"));
+  }
+  crate::executable::resolve_executable_path(OsStr::new(selected), current_directory)
+}
+
+#[cfg(target_os = "linux")]
+fn elf_linker_supports_dependency_file(linker: &Path) -> RailResult<bool> {
+  Ok(elf_driver_stdout(linker, &["--help"], &std::env::current_dir()?)?.contains("--dependency-file"))
+}
+
+#[cfg(target_os = "linux")]
+fn elf_driver_stdout(program: &Path, arguments: &[&str], current_directory: &Path) -> RailResult<String> {
+  let output = Command::new(program)
+    .args(arguments)
+    .current_dir(current_directory)
+    .output()?;
+  if !output.status.success() || output.stdout.len() > MAX_ELF_LINK_DEPENDENCY_BYTES as usize {
+    return Err(RailError::message("ELF linker capability probe failed"));
+  }
+  String::from_utf8(output.stdout).map_err(|_| RailError::message("ELF linker capability probe was not UTF-8"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_elf_search_directory(path: &Path, sysroot: &Path, current_directory: &Path) -> PathBuf {
+  if let Some(path) = path.to_str().and_then(|path| path.strip_prefix('=')) {
+    sysroot.join(path)
+  } else if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    current_directory.join(path)
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn elf_linker_script_search_directories(verbose: &str) -> Vec<String> {
+  verbose
+    .split("SEARCH_DIR(")
+    .skip(1)
+    .filter_map(|tail| tail.split_once(')').map(|(value, _)| value))
+    .map(|value| value.trim().trim_matches('"').to_string())
+    .filter(|value| !value.is_empty() && !value.as_bytes().contains(&0))
+    .collect()
+}
+
 /// Certify linker-generated LTO objects while the selected driver still owns
 /// its private temporary namespace. Failure leaves the initial evidence file
 /// intact, causing the outer wrapper to bypass publication.
@@ -7990,6 +9596,57 @@ pub(crate) fn finalize_apple_link_adapter() -> bool {
 
 /// Execute one eligible cold invocation, replay its exact streams, and publish
 /// only a complete successful observation.
+fn publish_direct_remote_result(
+  cas: &LocalCas,
+  validation: &NativeCompilerValidation,
+  base_action_key: &str,
+) -> Option<&'static str> {
+  let selection = active_remote_selection()?;
+  if !selection.direct_transport_supported() {
+    return Some("remote_transport_not_qualified");
+  }
+  if selection.mode() != crate::remote_cache::RemoteCacheMode::ReadWrite {
+    return Some("remote_read_only");
+  }
+  let remote = match open_active_remote_store() {
+    Ok(Some(remote)) => remote,
+    Ok(None) | Err(_) => return Some("remote_publication_unavailable"),
+  };
+  let cached = match cas.native_action(validation.action_key()) {
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) => cached,
+    Ok(crate::cache::cas::NativeActionLookup::Packed(_) | crate::cache::cas::NativeActionLookup::Miss(_)) | Err(_) => {
+      return Some("remote_publication_local_result_unavailable");
+    }
+  };
+  let environment_names = match cached.validate_remote_publication(base_action_key) {
+    Ok(names) if selection.approves_environment_names(names) => names.to_vec(),
+    Ok(_) | Err(_) => return Some("remote_environment_not_shareable"),
+  };
+  let association = match cached.association() {
+    Ok(association) => association,
+    Err(_) => return Some("remote_publication_association_failed"),
+  };
+  let mut pack = match tempfile::tempfile() {
+    Ok(pack) => pack,
+    Err(_) => return Some("remote_publication_staging_failed"),
+  };
+  match cached.export_pack(&mut pack) {
+    Ok(exported)
+      if exported.content_length == association.pack_length()
+        && exported.bytes_written == association.pack_length() => {}
+    Ok(_) | Err(_) => return Some("remote_publication_export_failed"),
+  }
+  drop(cached);
+  if pack.metadata().is_err() || pack.rewind().is_err() {
+    return Some("remote_publication_staging_failed");
+  }
+  match remote.publish(&association, base_action_key, &environment_names, pack) {
+    Ok(crate::remote_cache::RemotePublication::Unique) => Some("remote_published"),
+    Ok(crate::remote_cache::RemotePublication::Conflict) => Some("remote_entry_conflicted"),
+    Err(_) => Some("remote_publication_failed"),
+  }
+}
+
 pub(crate) fn run_and_store(
   command: Command,
   recorder: InvocationRecorder,
@@ -8127,9 +9784,17 @@ pub(crate) fn run_and_store(
       return status.code().unwrap_or(1);
     }
   };
-  let certificate = cache_context.observation_directory.join(APPLE_LINK_CERTIFICATE_FILE);
-  let driver_inputs = cache_context.observation_directory.join(APPLE_LINK_DRIVER_INPUTS_FILE);
-  let (link_candidate, apple_linker_generations, link_witness_bytes) = match complete_linked_witness(
+  let certificate = cache_context.observation_directory.join(if cfg!(target_os = "linux") {
+    ELF_LINK_DEPENDENCIES_FILE
+  } else {
+    APPLE_LINK_CERTIFICATE_FILE
+  });
+  let driver_inputs = cache_context.observation_directory.join(if cfg!(target_os = "linux") {
+    ELF_LINK_DRIVER_INPUTS_FILE
+  } else {
+    APPLE_LINK_DRIVER_INPUTS_FILE
+  });
+  let (link_candidate, linker_generations, link_witness_bytes) = match complete_linked_witness(
     &raw,
     &output_paths,
     &certificate,
@@ -8144,12 +9809,16 @@ pub(crate) fn run_and_store(
     Ok(completed) => completed,
     Err(error) => {
       if BENCH_COVERAGE_DIRECTORY.get().is_some() {
-        eprintln!("cargo-rail native coverage: Apple linker witness unavailable: {error}");
+        eprintln!("cargo-rail native coverage: linker witness unavailable: {error}");
       }
       let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
       let _ = publish_and_record_cold_observation(
         &mut raw,
-        "apple_linker_witness_unavailable",
+        if cfg!(target_os = "linux") {
+          "elf_linker_witness_unavailable"
+        } else {
+          "apple_linker_witness_unavailable"
+        },
         Some(pre_link_action),
         None,
         bytes_hashed,
@@ -8209,7 +9878,7 @@ pub(crate) fn run_and_store(
           SelectedNativeAction {
             action_key: selected_action,
             witness,
-            apple_linker_generations,
+            linker_generations,
           },
           &raw,
           &output_paths,
@@ -8277,7 +9946,14 @@ pub(crate) fn run_and_store(
   });
   match publication {
     Ok((validation, final_capture_bytes)) => {
-      let stored_reason = format!("{base_reason};stored_verified_result");
+      let remote_reason = cas
+        .as_ref()
+        .ok()
+        .and_then(|cas| publish_direct_remote_result(cas, &validation, &base_action_key));
+      let stored_reason = remote_reason.map_or_else(
+        || format!("{base_reason};stored_verified_result"),
+        |remote| format!("{base_reason};stored_verified_result;{remote}"),
+      );
       let bytes_hashed = cold_input_bytes(
         &raw,
         source_root,
@@ -8302,6 +9978,7 @@ pub(crate) fn run_and_store(
         NativeCacheMetrics {
           bytes_hashed,
           cache_bytes_read,
+          ..NativeCacheMetrics::default()
         },
       );
     }
@@ -8335,6 +10012,7 @@ pub(crate) fn run_and_store(
         NativeCacheMetrics {
           bytes_hashed,
           cache_bytes_read,
+          ..NativeCacheMetrics::default()
         },
       );
     }
@@ -8509,6 +10187,7 @@ fn publish_and_record_cold_observation(
     NativeCacheMetrics {
       bytes_hashed,
       cache_bytes_read,
+      ..NativeCacheMetrics::default()
     },
   );
   Ok(())
@@ -8549,7 +10228,7 @@ fn publish_cold_observation(
 struct SelectedNativeAction {
   action_key: String,
   witness: NativeCompilerWitness,
-  apple_linker_generations: Option<AppleLinkerGenerationWitness>,
+  linker_generations: Option<LinkerGenerationWitness>,
 }
 
 struct CapturedCompilerStreams<'a> {
@@ -8576,7 +10255,7 @@ fn prepare_cold_result(
   let SelectedNativeAction {
     action_key: selected_action,
     witness,
-    apple_linker_generations,
+    linker_generations,
   } = selected;
   let CapturedCompilerStreams { stdout, stderr } = streams;
   let durable_handoff = staging.requires_durable_handoff();
@@ -8635,7 +10314,7 @@ fn prepare_cold_result(
       session,
       cache_observation,
       &initial_capture.approved_environment,
-      apple_linker_generations,
+      linker_generations,
       pack::NativeResultDescriptor {
         action_key: selected_action,
         witness,
@@ -8900,6 +10579,15 @@ struct NativeBenchmarkCoverageEvent<'a> {
   current_directory: String,
   bytes_hashed: u64,
   cache_bytes_read: u64,
+  remote_request_attempts: u64,
+  remote_coordinator_requests: u64,
+  remote_payload_bytes_read: u64,
+  remote_payload_bytes_written: u64,
+  remote_service_elapsed_ns: u64,
+  timing: NativeRemoteTimingSnapshot,
+  durability: NativeDurabilitySnapshot,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  remote_error: Option<String>,
 }
 
 /// Retain benchmark-only per-invocation evidence after ordinary cache outcome recording.
@@ -8965,8 +10653,23 @@ fn write_benchmark_coverage_invocation(
     .into_os_string()
     .into_string()
     .map_err(|_| RailError::message("benchmark compiler coverage has a non-UTF-8 working directory"))?;
+  let remote_state = active_context().and_then(|context| context.remote_store.get());
+  let remote = remote_state
+    .and_then(|store| store.as_ref().ok())
+    .map_or_else(crate::remote_cache::RemoteTransferMetrics::default, |store| {
+      store.metrics()
+    });
+  let remote_error = remote_state
+    .and_then(|store| store.as_ref().err())
+    .map(ToString::to_string)
+    .or_else(|| {
+      remote_state
+        .and_then(|store| store.as_ref().ok())
+        .and_then(crate::remote_cache::RemoteStore::coordinator_connect_error)
+        .map(ToString::to_string)
+    });
   let encoded = serde_json::to_vec(&NativeBenchmarkCoverageEvent {
-    schema_version: 1,
+    schema_version: 5,
     lane: "cargo-rail",
     status,
     reason,
@@ -8978,6 +10681,14 @@ fn write_benchmark_coverage_invocation(
     current_directory,
     bytes_hashed: metrics.bytes_hashed,
     cache_bytes_read: metrics.cache_bytes_read,
+    remote_request_attempts: remote.request_attempts,
+    remote_coordinator_requests: remote.coordinator_requests,
+    remote_payload_bytes_read: remote.payload_bytes_read,
+    remote_payload_bytes_written: remote.payload_bytes_written,
+    remote_service_elapsed_ns: remote.service_elapsed_ns,
+    timing: metrics.remote_timing,
+    durability: native_durability_snapshot(),
+    remote_error,
   })?;
   if encoded.len() > MAX_BENCH_COVERAGE_EVENT_BYTES {
     return Err(RailError::message(
@@ -9014,6 +10725,7 @@ pub(crate) fn activate_benchmark_coverage() {
   };
   if validate_benchmark_coverage_directory(&directory).is_ok() {
     let _ = BENCH_COVERAGE_DIRECTORY.set(directory);
+    let _ = BENCH_DURABILITY_COUNTERS.set(NativeDurabilityCounters::new());
   }
 }
 
@@ -9069,6 +10781,10 @@ pub(crate) fn record_active_failure() {
 
 pub(crate) fn validate_action_key(value: &str) -> RailResult<()> {
   validate_identity(value, ACTION_KEY_PREFIX).map(|_| ())
+}
+
+pub(crate) fn validate_base_action_key(value: &str) -> RailResult<()> {
+  validate_identity(value, BASE_ACTION_KEY_PREFIX).map(|_| ())
 }
 
 pub(crate) fn validate_result_key(value: &str) -> RailResult<()> {
@@ -9428,7 +11144,10 @@ pub(crate) mod tests {
       OsString::from("--crate-type=lib"),
     ];
     let (_, root) = direct_compilation_root(&arguments).expect("standard Cargo target root");
-    assert_eq!(root, fs::canonicalize(workspace.path()).expect("canonical workspace"));
+    assert_eq!(
+      root,
+      crate::utils::canonicalize_existing(workspace.path()).expect("canonical workspace")
+    );
 
     let custom = workspace.path().join("custom/debug/deps");
     fs::create_dir_all(&custom).expect("custom output directory");
@@ -9695,7 +11414,7 @@ pub(crate) mod tests {
       .collect::<Vec<_>>();
     dependency_names.sort_unstable();
     NativeCompilerWitness {
-      version: 3,
+      version: 4,
       complete: true,
       source_paths: vec!["lib.rs".to_string()],
       generated_paths: Vec::new(),
@@ -9706,6 +11425,7 @@ pub(crate) mod tests {
         .map(|entry| entry.name.clone())
         .collect(),
       apple_linker: None,
+      elf_linker: None,
     }
   }
 
@@ -9841,6 +11561,12 @@ pub(crate) mod tests {
 
   pub(crate) fn prepared_cas_fixture(validation: NativeCompilerValidation) -> PreparedNativeResult {
     let staging = tempfile::tempdir().expect("native result staging");
+    for directory in ["target", "target/outputs", "target/streams"] {
+      let path = staging.path().join(directory);
+      fs::create_dir(&path).expect("slot directory");
+      #[cfg(unix)]
+      set_native_output_mode(&path, 0o755).expect("slot directory mode");
+    }
     for (slot, bytes) in [
       (DEP_INFO_SLOT, b"dep-info".as_slice()),
       (METADATA_SLOT, b"metadata".as_slice()),
@@ -9848,8 +11574,8 @@ pub(crate) mod tests {
       (STDERR_SLOT, b"".as_slice()),
     ] {
       let path = staging.path().join(slot);
-      fs::create_dir_all(path.parent().expect("slot parent")).expect("slot directory");
-      fs::write(path, bytes).expect("slot bytes");
+      fs::write(&path, bytes).expect("slot bytes");
+      set_native_output_mode(&path, 0o644).expect("slot mode");
     }
     let paths = [DEP_INFO_SLOT, METADATA_SLOT, STDOUT_SLOT, STDERR_SLOT]
       .into_iter()
@@ -10880,7 +12606,7 @@ pub(crate) mod tests {
         .expect("emit modes") = "--emit=dep-info,link".to_string();
       assert_eq!(
         invocation_bypass_reason(&linked, true, &session.class.host_target),
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
           None
         } else {
           Some("compiler_crate_type_not_graduated")
@@ -11009,6 +12735,92 @@ pub(crate) mod tests {
     graduated_validation(observation)
       .validate_object()
       .expect("default-format result validation");
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn elf_linker_witness_accepts_a_rustc_object_removed_after_linking() {
+    let root = tempfile::tempdir().expect("link root");
+    let current_directory = crate::utils::canonicalize_existing(root.path()).expect("canonical link root");
+    let output = current_directory.join("fixture-bin");
+    fs::write(&output, b"linked output").expect("linked output");
+    let object = current_directory.join("fixture.fixture.abc-cgu.0.rcgu.o");
+    fs::write(&object, b"object").expect("rustc object");
+    let object = crate::utils::canonicalize_existing(&object).expect("canonical rustc object");
+    fs::remove_file(&object).expect("rustc removed its codegen object");
+    let rustc_temporary = current_directory.join("rustcABC123");
+    fs::create_dir(&rustc_temporary).expect("rustc temporary directory");
+    let response_list = rustc_temporary.join("list");
+    fs::write(&response_list, b"object list").expect("rustc response list");
+    let response_list = crate::utils::canonicalize_existing(&response_list).expect("canonical response list");
+    fs::remove_dir_all(&rustc_temporary).expect("rustc removed its temporary directory");
+
+    let dependencies = current_directory.join("link.d");
+    fs::write(
+      &dependencies,
+      format!(
+        "{}: {} {}\n",
+        output.display(),
+        object.display(),
+        response_list.display()
+      ),
+    )
+    .expect("link dependencies");
+    let driver = crate::utils::canonicalize_existing(Path::new("/usr/bin/cc")).expect("system C driver");
+    let linker = resolve_selected_elf_linker(&driver, &current_directory).expect("selected ELF linker");
+    let evidence = ElfLinkDriverEvidence {
+      version: 1,
+      current_directory: current_directory.to_string_lossy().into_owned(),
+      driver: driver.to_string_lossy().into_owned(),
+      linker: linker.to_string_lossy().into_owned(),
+      direct_inputs: vec![object.to_string_lossy().into_owned()],
+      tool_inputs: Vec::new(),
+      search_directories: Vec::new(),
+    };
+    let driver_inputs = current_directory.join("driver.json");
+    fs::write(&driver_inputs, serde_json::to_vec(&evidence).expect("driver evidence")).expect("driver evidence file");
+    let outputs = NativeOutputPaths {
+      dep_info: current_directory.join("fixture-bin.d"),
+      artifacts: vec![crate::compiler::observation::NativeOutputArtifact {
+        role: NativeOutputRole::Executable,
+        path: output,
+      }],
+    };
+
+    let (witness, _, _) =
+      capture_elf_linker_witness(&graduated_observation(), &outputs, &dependencies, &driver_inputs, None)
+        .expect("ELF linker witness");
+    assert_eq!(witness.endogenous_objects, 2);
+
+    let external = tempfile::tempdir().expect("external link root");
+    let external_rustc_temporary = external.path().join("rustcABC123");
+    fs::create_dir(&external_rustc_temporary).expect("external rustc-shaped directory");
+    let external_response_list = external_rustc_temporary.join("list");
+    fs::write(&external_response_list, b"external object list").expect("external response list");
+    let external_response_list =
+      crate::utils::canonicalize_existing(&external_response_list).expect("canonical external response list");
+    fs::remove_dir_all(&external_rustc_temporary).expect("remove external rustc-shaped directory");
+    fs::write(
+      &dependencies,
+      format!(
+        "{}: {}\n",
+        outputs.artifacts[0].path.display(),
+        external_response_list.display()
+      ),
+    )
+    .expect("external link dependencies");
+    let error = capture_elf_linker_witness(&graduated_observation(), &outputs, &dependencies, &driver_inputs, None)
+      .expect_err("rustc-shaped input outside the linked output directory must remain exogenous");
+    assert!(error.to_string().contains("is unavailable"));
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn linked_output_roles_accept_elf_shared_objects() {
+    assert!(output_role_path_matches("proc_macro", Path::new("libfixture.so")));
+    assert!(output_role_path_matches("dylib", Path::new("libfixture.so")));
+    assert!(output_role_path_matches("cdylib", Path::new("libfixture.so")));
+    assert!(!output_role_path_matches("proc_macro", Path::new("libfixture.dylib")));
   }
 
   #[test]

@@ -1,7 +1,8 @@
 # Benchmarking
 
-The native-cache workflow measures transparent activation under direct Cargo. Runner-owned cache lanes and operational
-L2 lanes are retired because neither is part of the compiler-cache architecture.
+The native-cache workflow measures transparent local activation under direct Cargo. Runner-owned cache lanes are
+retired because they are not part of the compiler-cache architecture. The harness deliberately leaves remote cache
+activation disabled: it establishes the L0/L1 baseline, not official S3 correctness or performance.
 
 ## Questions measured separately
 
@@ -25,7 +26,7 @@ Registry and Git dependency stores may be linked read-only from the invoking Car
 links, but configuration, receipt, wrapper, sessions, ledgers, CAS, target directories, and sccache data remain
 isolated.
 
-## Run the five-sample qualification corpus
+## Run the five-sample local qualification corpus
 
 ```bash
 just bench-native-cache-smoke
@@ -48,13 +49,48 @@ Five accepted samples per lane are the complete qualification unit. A failed cor
 profile the failing lane when further optimization is justified, and make no superiority claim. Do not expand the
 sample count merely to average away a missed bound.
 
+## Qualify remote providers separately
+
+Remote correctness qualification uses a disposable real provider authority and independent roots with empty local
+caches. AWS S3, Azure Blob Storage, and Cloudflare R2 must each prove producer/consumer import, conditional
+publication, read-only operation, a subsequent valid L1 hit with no remote request, exact outputs, and cold fallback
+for absence, corruption, and outage. Provider credentials stay outside retained evidence, and cleanup must verify the
+exact disposable prefix, multipart uploads, and provider resources are absent.
+
+The retained direct-provider harness has a historical S3 name but accepts normalized AWS S3, Azure Blob, and R2 URLs.
+R2 adds guarded fault and cleanup recipes because its S3-compatible transport still has distinct endpoint and
+credential authority:
+
+```bash
+just qualify-native-cache-s3 <producer|consumer> <run-id> <remote-url>
+just qualify-native-cache-r2-faults <run-id> <r2-url> <bucket>
+just cleanup-native-cache-r2-prefix <account-id> <bucket> <exact-task-prefix>
+```
+
+The R2 fault recipe can resume an interrupted outage assertion without repeating the destructive corruption step by
+using `qualify-native-cache-r2-faults-resume-outage` with the same arguments.
+
+### Qualify official S3 performance separately
+
+Remote performance qualification uses a disposable real AWS S3 authority and independent machines with empty local
+caches.
+
+Do not treat this local harness, a loopback protocol test, or an SDK mock as remote performance evidence. A remote
+comparison must interleave empty-L1 S3 import with the accepted pinned remote sccache lane and retain 20–30 accepted
+samples across the complete matrix. Five to seven rounds produce 20–28 total samples, with 5–7 samples in each of the
+two workloads and two lanes; the harness refuses a larger population. The target is at least 15% faster at both p50
+and p95. At least 10% at both percentiles is an accepted win; below 10% is an availability result, not superiority.
+Every accepted claim also requires zero false hits and reported bytes, requests, CPU, memory, eligibility, conflicts,
+and operational requirements.
+
 ## Evidence layout
 
 Results default to `target/benchmarks/native-cache/<UTC timestamp>/`. Set `CARGO_RAIL_BENCH_RESULTS` to choose an empty
 directory.
 
-- `environment.json` binds the commit, worktree diff, release binary, harness, Cargo, rustc, pinned sccache, host, and
-  local-only authority.
+- `environment.json` binds the commit, complete non-ignored worktree patch, release binary, harness, Cargo, rustc,
+  pinned sccache, host, and local-only authority. `worktree.diff` includes untracked file bytes so a retained result can
+  reconstruct the measured source state; keep credentials and other private data in ignored files.
 - `run.json` binds workloads, lanes, sample count, rotation, and qualification thresholds.
 - `coverage/<workload>/coverage.json` is the authoritative per-action coverage and cold-cost join. It records the Cargo
   census, Cargo-Rail and sccache outcomes, matched/extra/missing actions, ambiguity, logical output roles/bytes, and one
@@ -94,10 +130,11 @@ even when no performance claim is made.
 
 ## Qualification claims
 
-Earlier pre-linked and operational L2 measurements describe different architectures and are not evidence for this
-contract. Publish a scoped performance claim only from one accepted five-sample corpus whose summary reports
-`performance_qualified: true`. Retain a failed corpus as the canonical result for that exact worktree and host; do not
-replace it with a larger population or combine it with another run.
+Earlier pre-linked and runner-owned L2 measurements describe different architectures and are not evidence for this
+contract. Publish a scoped local performance claim only from one accepted five-sample corpus whose summary reports
+`performance_qualified: true`. Publish a scoped remote claim only from the separate real-backend corpus above. Retain
+a failed corpus as the canonical result for that exact worktree and host; do not replace it with a larger population
+or combine it with another run.
 
 Do not compare absolute timings across hosts or combine distinct commits, worktrees, toolchains, target-state policies,
 physical roots, cache protocols, or machines into one population.

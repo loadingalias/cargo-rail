@@ -1223,7 +1223,7 @@ mod tests {
     let configuration_directory = workspace.path().join(".config");
     fs::create_dir(&configuration_directory).expect("configuration directory");
     let configuration = configuration_directory.join("rail.toml");
-    fs::write(&configuration, "[cache]\nenabled = false\n").expect("configuration");
+    fs::write(&configuration, "[unify]\ninclude_paths = false\n").expect("configuration");
 
     let error = validate_discovered_rail_config_absence(workspace.path())
       .expect_err("a newly discovered configuration must invalidate captured absence");

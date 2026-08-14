@@ -251,7 +251,7 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6  # v1.30.2
         with:
-          bin: cargo-rail,cargo-rail-native-rustc-wrapper
+          bin: cargo-rail,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker
           archive: cargo-rail-${{ matrix.target }}
           target: ${{ matrix.target }}
           locked: true
@@ -273,11 +273,15 @@ jobs:
           tar -xzf "$ARCHIVE" -C smoke
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
           wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
+          worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
           test -n "$binary"
           test -n "$wrapper"
+          test -n "$worker"
           test "$(dirname "$binary")" = "$(dirname "$wrapper")"
+          test "$(dirname "$binary")" = "$(dirname "$worker")"
           chmod +x "$binary"
           chmod +x "$wrapper"
+          chmod +x "$worker"
           test "$("$binary" rail --version)" = "cargo-rail $VERSION"
 
       - name: Smoke-test zip archive
@@ -293,14 +297,18 @@ jobs:
           Expand-Archive -Path $env:ARCHIVE -DestinationPath smoke
           $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
           $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
+          $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
           }
           if (-not $wrapper) {
             throw "cargo-rail-native-rustc-wrapper.exe is missing from $env:ARCHIVE"
           }
-          if ($binary.DirectoryName -ne $wrapper.DirectoryName) {
-            throw "cargo-rail compiler wrapper is not adjacent to cargo-rail.exe"
+          if (-not $worker) {
+            throw "cargo-rail-native-rustc-worker.exe is missing from $env:ARCHIVE"
+          }
+          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName) {
+            throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

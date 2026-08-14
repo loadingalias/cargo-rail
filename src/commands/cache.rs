@@ -4,25 +4,65 @@ use super::TextJsonOutputFormat;
 use super::cli::CacheScope;
 use crate::cache::CacheStatus;
 use crate::error::{RailError, RailResult};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+/// Validate and normalize one machine-owned remote authority without contacting it.
+pub(crate) fn run_normalize(
+  remote_url: &str,
+  mode: Option<&str>,
+  environment: Vec<String>,
+  format: TextJsonOutputFormat,
+) -> RailResult<()> {
+  if format.is_json() {
+    crate::output::set_json_mode(true);
+  }
+  let selection = crate::remote_cache::RemoteCacheSelection::parse(remote_url, mode, &environment)
+    .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
+  let status = crate::remote_cache::RemoteCacheConfigurationStatus::from_selection(&selection);
+  if format.is_json() {
+    let output = crate::output::machine_json_envelope(
+      "cache",
+      "normalize",
+      "success",
+      0,
+      serde_json::json!({
+        "normalized_url": selection.normalized_url(),
+        "remote": status,
+      }),
+    );
+    println!("{}", serde_json::to_string_pretty(&output)?);
+  } else {
+    println!("remote compiler cache authority");
+    println!("  normalized URL: {}", selection.normalized_url());
+    println!("  provider: {}", status.provider);
+    println!("  protocol: {}", status.protocol);
+    println!("  authority: {}", status.authority);
+    println!("  mode: {}", status.mode);
+    println!(
+      "  shared compiler environment names: {}",
+      status.shared_environment_names
+    );
+  }
+  Ok(())
+}
 
 /// Preview or apply one exact transparent compiler-cache installation.
 pub(crate) fn run_setup(
   current_dir: &Path,
-  local_dir: Option<PathBuf>,
-  max_bytes: Option<u64>,
+  request: crate::cache::installation::SetupRequest,
   check: bool,
   format: TextJsonOutputFormat,
 ) -> RailResult<()> {
   if format.is_json() {
     crate::output::set_json_mode(true);
   }
-  let plan = crate::cache::installation::plan_setup(
-    current_dir,
-    &crate::cache::installation::SetupRequest { local_dir, max_bytes },
-  )?;
+  let plan = crate::cache::installation::plan_setup(current_dir, &request)?;
   let pending = plan.pending();
   let receipt_path = plan.receipt_path()?;
+  let remote = plan
+    .remote_selection()?
+    .as_ref()
+    .map(crate::remote_cache::RemoteCacheConfigurationStatus::from_selection);
   let details = serde_json::json!({
     "changed": pending,
     "config_path": plan.config_path(),
@@ -33,6 +73,7 @@ pub(crate) fn run_setup(
     "private_state_action": if pending { "install_or_repair" } else { "verify" },
     "cache_base": plan.cache_base(),
     "max_bytes": plan.max_bytes(),
+    "remote": remote,
   });
   if check {
     render_installation_operation("setup_check", pending, &details, format)?;
@@ -336,10 +377,10 @@ fn render_status(status: &CacheStatus) {
   if let Some(remote) = &status.remote {
     println!("  remote (machine-owned)");
     println!("    activation: {}", remote.activation);
-    println!("    alias: {}", remote.alias);
-    println!("    transport: {}", remote.transport);
+    println!("    provider: {}", remote.provider);
+    println!("    protocol: {}", remote.protocol);
     println!("    authority: {}", remote.authority);
-    println!("    role: {}", remote.role);
+    println!("    mode: {}", remote.mode);
     println!(
       "    shared compiler environment names: {}",
       remote.shared_environment_names

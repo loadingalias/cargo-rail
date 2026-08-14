@@ -713,9 +713,6 @@ impl WorkspaceContext {
 
     // Validate config settings that require workspace context
     if let Some(ref cfg) = config {
-      // Validate build-result cache policy before any command may activate it.
-      cfg.cache.validate().map_err(RailError::Config)?;
-
       // Validate change-detection glob patterns
       cfg.change_detection.validate().map_err(RailError::Config)?;
 

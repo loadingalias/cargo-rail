@@ -74,7 +74,7 @@ install_release_binary() {
     -o "$archive"
   printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
   case "$asset" in
-    *.tar.gz) tar -xOzf "$archive" "$member" >"$staged" ;;
+    *.tar.gz | *.tgz) tar -xOzf "$archive" "$member" >"$staged" ;;
     *.zip)
       python.exe - "$archive" "$member" "$staged" <<'PY'
 import shutil
@@ -203,30 +203,45 @@ install_sccache() {
 }
 
 install_cargo_nextest() {
-  local path="$cargo_bin/cargo-nextest.exe"
+  local asset binary digest path temporary
+  binary=cargo-nextest
+  [[ "$rust_host" == *-pc-windows-msvc ]] && binary=cargo-nextest.exe
+  path="$cargo_bin/$binary"
   if [[ -x "$path" ]] && "$path" --version 2>&1 | grep -Fq "$CARGO_NEXTEST_VERSION"; then
     echo "cargo-nextest $CARGO_NEXTEST_VERSION is already installed"
     return
   fi
 
   case "$rust_host" in
-    aarch64-pc-windows-msvc) ;;
+    x86_64-unknown-linux-gnu)
+      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+      digest="4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3"
+      ;;
+    aarch64-unknown-linux-gnu)
+      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-aarch64-unknown-linux-gnu.tar.gz"
+      digest="8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6"
+      ;;
+    x86_64-pc-windows-msvc)
+      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-x86_64-pc-windows-msvc.tar.gz"
+      digest="b75c287b89df1fbfe033a98df058a94cd1f5119dab6ff56e4916e5a1597c7ac9"
+      ;;
+    aarch64-pc-windows-msvc)
+      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-aarch64-pc-windows-msvc.tar.gz"
+      digest="c1d88ca5dfa07367399e64be499ad867f62f29958156b356d54bef05581bfc1b"
+      ;;
     *)
       install_cargo_tool cargo-nextest "$CARGO_NEXTEST_VERSION" cargo-nextest
       return
       ;;
   esac
 
-  local asset digest temporary
-  asset="cargo-nextest-$CARGO_NEXTEST_VERSION-aarch64-pc-windows-msvc.tar.gz"
-  digest="c1d88ca5dfa07367399e64be499ad867f62f29958156b356d54bef05581bfc1b"
   temporary="$(mktemp "${TMPDIR:-/tmp}/cargo-nextest.XXXXXX")"
   trap 'rm -f -- "$temporary"' RETURN
   curl --proto '=https' --tlsv1.2 -fsSL \
     "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$CARGO_NEXTEST_VERSION/$asset" \
     -o "$temporary"
   printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
-  tar -xzf "$temporary" -C "$cargo_bin" cargo-nextest.exe
+  tar -xzf "$temporary" -C "$cargo_bin" "$binary"
   chmod +x "$path"
   "$path" --version 2>&1 | grep -Fq "$CARGO_NEXTEST_VERSION" || {
     echo "cargo-nextest archive did not install version $CARGO_NEXTEST_VERSION" >&2
@@ -234,6 +249,64 @@ install_cargo_nextest() {
   }
   rm -f -- "$temporary"
   trap - RETURN
+}
+
+install_cargo_deny() {
+  local archive_target asset binary digest
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      archive_target=x86_64-unknown-linux-musl
+      binary=cargo-deny
+      digest="9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+      ;;
+    aarch64-unknown-linux-gnu)
+      archive_target=aarch64-unknown-linux-musl
+      binary=cargo-deny
+      digest="995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d"
+      ;;
+    x86_64-pc-windows-msvc)
+      archive_target=x86_64-pc-windows-msvc
+      binary=cargo-deny.exe
+      digest="975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc"
+      ;;
+    *)
+      install_cargo_tool cargo-deny "$CARGO_DENY_VERSION" cargo-deny
+      return
+      ;;
+  esac
+  asset="cargo-deny-$CARGO_DENY_VERSION-$archive_target.tar.gz"
+  install_release_binary cargo-deny "$CARGO_DENY_VERSION" EmbarkStudios/cargo-deny "$CARGO_DENY_VERSION" \
+    "$asset" "$digest" "cargo-deny-$CARGO_DENY_VERSION-$archive_target/$binary" "$binary"
+}
+
+install_cargo_audit() {
+  local archive_target asset binary digest
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      archive_target=x86_64-unknown-linux-gnu
+      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.tgz"
+      binary=cargo-audit
+      digest="ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39"
+      ;;
+    aarch64-unknown-linux-gnu)
+      archive_target=aarch64-unknown-linux-gnu
+      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.tgz"
+      binary=cargo-audit
+      digest="c6603814ddaa45e51263dafd31c0ac98808f688d26f7395804f9670b0fd599dd"
+      ;;
+    x86_64-pc-windows-msvc)
+      archive_target=x86_64-pc-windows-msvc
+      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.zip"
+      binary=cargo-audit.exe
+      digest="0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be2710ab"
+      ;;
+    *)
+      install_cargo_tool cargo-audit "$CARGO_AUDIT_VERSION" cargo-audit
+      return
+      ;;
+  esac
+  install_release_binary cargo-audit "$CARGO_AUDIT_VERSION" RustSec/rustsec "cargo-audit/v$CARGO_AUDIT_VERSION" \
+    "$asset" "$digest" "cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION/$binary" "$binary"
 }
 
 install_jq() {
@@ -296,8 +369,8 @@ case "$profile" in
     # Benchmark images stay lean. Qualification explicitly adds the tools used
     # by `just check` and `just test-all` before measurements are retained.
     install_cargo_nextest
-    install_cargo_tool cargo-deny "$CARGO_DENY_VERSION" cargo-deny
-    install_cargo_tool cargo-audit "$CARGO_AUDIT_VERSION" cargo-audit
+    install_cargo_deny
+    install_cargo_audit
     cargo nextest --version
     cargo deny --version
     cargo audit --version
@@ -310,8 +383,8 @@ case "$profile" in
     ;;
   *)
     install_cargo_nextest
-    install_cargo_tool cargo-deny "$CARGO_DENY_VERSION" cargo-deny
-    install_cargo_tool cargo-audit "$CARGO_AUDIT_VERSION" cargo-audit
+    install_cargo_deny
+    install_cargo_audit
     install_hyperfine
     install_sccache
     cargo deny --version

@@ -16,7 +16,7 @@ import tempfile
 from typing import Any
 
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 5
 REPORT_SCHEMA_VERSION = 3
 DIRECT_WRAPPER_NAMES = {"cargo-rail-native-rustc-wrapper", "cargo-rail-native-rustc-wrapper.exe"}
 
@@ -458,6 +458,14 @@ def load_cargo_rail_events(directory: Path, verbose_log: Path, cwd: Path) -> lis
                 "remote_base_action_key",
                 "bytes_hashed",
                 "cache_bytes_read",
+                "remote_request_attempts",
+                "remote_coordinator_requests",
+                "remote_payload_bytes_read",
+                "remote_payload_bytes_written",
+                "remote_service_elapsed_ns",
+                "timing",
+                "durability",
+                "remote_error",
             ):
                 if name in detail:
                     event[name] = detail[name]

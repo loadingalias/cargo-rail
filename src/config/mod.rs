@@ -1,13 +1,11 @@
 //! Typed `rail.toml` configuration and discovery.
 
-mod cache;
 mod change_detection;
 mod release;
 pub(crate) mod schema;
 mod split;
 mod unify;
 
-pub use cache::CacheConfig;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
   ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig, GroupSpec,
@@ -26,13 +24,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const REMOVED_RUN_CONFIG_MESSAGE: &str = "[run] configuration is no longer supported; execute Cargo and cargo-nextest directly, keep repository tasks in Just or CI, and consume typed package scope from `cargo rail plan`";
+pub(crate) const REMOVED_CACHE_CONFIG_MESSAGE: &str = "[cache] repository configuration is no longer supported; select optional L2 authority from machine or CI state with CARGO_RAIL_CACHE_REMOTE";
 
-pub(crate) fn reject_removed_run_config(doc: &toml_edit::DocumentMut) -> Result<(), String> {
-  if doc.as_table().contains_key("run") {
-    Err(REMOVED_RUN_CONFIG_MESSAGE.to_string())
-  } else {
-    Ok(())
+pub(crate) fn reject_removed_configuration(doc: &toml_edit::DocumentMut) -> Result<(), String> {
+  for (name, message) in [
+    ("run", REMOVED_RUN_CONFIG_MESSAGE),
+    ("cache", REMOVED_CACHE_CONFIG_MESSAGE),
+  ] {
+    if doc.as_table().contains_key(name) {
+      return Err(message.to_string());
+    }
   }
+  Ok(())
 }
 
 /// Configuration for cargo-rail
@@ -43,9 +46,6 @@ pub struct RailConfig {
   /// Detected via `cargo rail init`, used by multiple commands
   #[serde(default)]
   pub targets: Vec<String>,
-  /// Build-result cache policy.
-  #[serde(default)]
-  pub cache: CacheConfig,
   /// Dependency unification settings
   #[serde(default)]
   pub unify: UnifyConfig,
@@ -93,7 +93,7 @@ impl RailConfig {
     let doc: toml_edit::DocumentMut = content
       .parse()
       .map_err(|error: toml_edit::TomlError| error.to_string())?;
-    reject_removed_run_config(&doc)?;
+    reject_removed_configuration(&doc)?;
     for deprecation in schema::present_deprecations(&doc) {
       if let Some(message) = deprecation.spec.deprecation {
         crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);

@@ -375,19 +375,35 @@ fn benchmark_events(directory: &Path) -> Result<Vec<serde_json::Value>> {
     .collect()
 }
 
-fn benchmark_hit_keys(directory: &Path) -> Result<Vec<String>> {
+fn benchmark_action_keys(directory: &Path, status: &str) -> Result<Vec<String>> {
   let mut keys = Vec::new();
   for event in benchmark_events(directory)? {
-    if event["status"] == "hit" {
+    if event["status"] == status {
       keys.push(
         event["action_key"]
           .as_str()
-          .context("benchmark hit action key")?
+          .with_context(|| format!("benchmark {status} action key"))?
           .to_string(),
       );
     }
   }
   Ok(keys)
+}
+
+fn benchmark_action_crates(directory: &Path, status: &str) -> Result<Vec<String>> {
+  benchmark_events(directory)?
+    .into_iter()
+    .filter(|event| event["status"] == status)
+    .map(|event| {
+      let arguments = event["arguments"].as_array().context("benchmark compiler arguments")?;
+      arguments
+        .windows(2)
+        .find(|arguments| arguments[0] == "--crate-name")
+        .and_then(|arguments| arguments[1].as_str())
+        .map(str::to_string)
+        .context("benchmark compiler crate name")
+    })
+    .collect()
 }
 
 fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
@@ -398,6 +414,29 @@ fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
     *summary.entry(format!("{status}:{reason}")).or_default() += 1;
   }
   Ok(summary)
+}
+
+#[cfg(windows)]
+fn ensure_windows_native_miss_boundary(
+  usage: Usage,
+  miss_crates: &[String],
+  summary: &BTreeMap<String, u64>,
+  phase: &str,
+) -> Result<()> {
+  let allowed_native_misses = BTreeSet::from(["fixture_native", "fixture_native_sys", "fixture_service_b"]);
+  let observed_native_misses = miss_crates.iter().map(String::as_str).collect::<BTreeSet<_>>();
+  ensure!(
+    observed_native_misses.len() == miss_crates.len()
+      && miss_crates.len() as u64 == usage.misses
+      && observed_native_misses.is_subset(&allowed_native_misses)
+      && (observed_native_misses.is_empty()
+        || summary
+          .get("bypassed:dependency_artifact_class_not_graduated")
+          .is_some_and(|count| *count > 0)),
+    "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
+     usage={usage:?}, misses={miss_crates:?}, events={summary:?}"
+  );
+  Ok(())
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
@@ -470,7 +509,8 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
       ),
     ],
   )?;
-  let root_bound_hits = benchmark_hit_keys(&root_bound_events)?;
+  let root_bound_hits = benchmark_action_keys(&root_bound_events, "hit")?;
+  let root_bound_misses = benchmark_action_keys(&root_bound_events, "miss")?;
   ensure!(
     root_bound_hits.len() as u64 == root_bound_cold.hits,
     "usage and action ledgers disagree: {root_bound_cold:?}, {root_bound_hits:?}"
@@ -485,7 +525,15 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     root_bound_cold.hits.saturating_add(root_bound_cold.misses) == second_cold.misses,
     "root-bound reconstruction changed the eligible action count: {root_bound_cold:?}"
   );
-  ensure!(native_action_keys(&first_cache)?.is_superset(&second_keys));
+  let reconstructed_keys = native_action_keys(&first_cache)?;
+  ensure!(
+    root_bound_misses.len() as u64 == root_bound_cold.misses
+      && root_bound_misses.iter().all(|key| reconstructed_keys.contains(key)),
+    "root-bound reconstruction did not publish every action missed by the current execution: \
+     usage={root_bound_cold:?}, reconstructed={}, misses={root_bound_misses:?}, events={:?}",
+    reconstructed_keys.len(),
+    benchmark_event_summary(&root_bound_events)?
+  );
   ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
 
   fs::remove_dir_all(second.join("target"))?;
@@ -505,14 +553,23 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     ],
   )?;
   let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
+  let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
   ensure!(
-    second_warm.hits == second_keys.len() as u64,
-    "same-root warm restore did not hit every action: expected={}, usage={second_warm:?}, events={second_warm_summary:?}",
+    second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
+    "same-root warm reconstruction changed the eligible action count: expected={}, usage={second_warm:?}, \
+     misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
     second_keys.len(),
   );
+  #[cfg(not(windows))]
   ensure!(
-    second_warm.misses == 0 && second_warm.failures == 0,
+    second_warm.hits == second_keys.len() as u64 && second_warm.misses == 0,
     "same-root warm restore was not clean: {second_warm:?}"
+  );
+  #[cfg(windows)]
+  ensure_windows_native_miss_boundary(second_warm, &second_warm_miss_crates, &second_warm_summary, "check")?;
+  ensure!(
+    second_warm.failures == 0,
+    "same-root warm restore failed: {second_warm:?}"
   );
   ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
   ensure!(current_root_diagnostic(&second_warm_output)? == second_diagnostic);
@@ -540,11 +597,37 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
   ensure!(String::from_utf8_lossy(&cold_binary.stdout).trim() == "119");
 
   fs::remove_dir_all(first.join("target"))?;
-  let (_, build_warm) = run_cargo(&first, &first_cargo_home, "build", &[])?;
+  let build_warm_events = fs::canonicalize(root.path())?.join("build-warm-events");
+  create_private_directory(&build_warm_events)?;
+  let build_warm_events_value = build_warm_events.to_string_lossy().into_owned();
+  let (_, build_warm) = run_cargo(
+    &first,
+    &first_cargo_home,
+    "build",
+    &[
+      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+      (
+        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+        build_warm_events_value.as_str(),
+      ),
+    ],
+  )?;
+  ensure!(
+    build_warm.hits.saturating_add(build_warm.misses) == build_cold.misses,
+    "warm build changed the eligible action count: cold={build_cold:?}, warm={build_warm:?}"
+  );
+  #[cfg(not(windows))]
   ensure!(
     build_warm.hits == build_cold.misses && build_warm.misses == 0,
-    "{build_warm:?}"
+    "warm build was not clean: {build_warm:?}"
   );
+  #[cfg(windows)]
+  ensure_windows_native_miss_boundary(
+    build_warm,
+    &benchmark_action_crates(&build_warm_events, "miss")?,
+    &benchmark_event_summary(&build_warm_events)?,
+    "build",
+  )?;
   ensure!(build_warm.failures == 0);
   ensure!(reusable_outputs(&first.join("target/release"))? == build_outputs);
   let warm_binary = Command::new(binary).output()?;

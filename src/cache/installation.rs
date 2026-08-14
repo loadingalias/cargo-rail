@@ -19,6 +19,7 @@ const RECEIPT_FILE: &str = "setup.json";
 const SESSION_MEMO_FILE: &str = "session.json";
 const SESSION_LOCK_FILE: &str = "session.lock";
 const USAGE_FILE: &str = "usage-v1.log";
+const COORDINATOR_STATE_PREFIX: &str = "remote-coordinator-v1-";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_MEMO_BYTES: u64 = 256 * 1024;
 const MAX_USAGE_BYTES: u64 = 64 * 1024;
@@ -37,6 +38,10 @@ const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 pub(crate) struct SetupRequest {
   pub(crate) local_dir: Option<PathBuf>,
   pub(crate) max_bytes: Option<u64>,
+  pub(crate) remote_url: Option<String>,
+  pub(crate) remote_mode: Option<String>,
+  pub(crate) remote_environment: Vec<String>,
+  pub(crate) local_only: bool,
 }
 
 /// One lossless Cargo configuration and private-state mutation preview.
@@ -118,6 +123,16 @@ impl SetupPlan {
     self.receipt.cache.max_bytes()
   }
 
+  pub(crate) fn remote_selection(&self) -> RailResult<Option<crate::remote_cache::RemoteCacheSelection>> {
+    self
+      .receipt
+      .remote
+      .as_ref()
+      .map(crate::remote_cache::InstalledRemoteCache::selection)
+      .transpose()
+      .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))
+  }
+
   pub(crate) fn receipt_path(&self) -> RailResult<PathBuf> {
     Ok(self.receipt.installation_directory()?.join(RECEIPT_FILE))
   }
@@ -148,6 +163,8 @@ pub(crate) struct InstallationReceipt {
   worker_digest: String,
   worker_generation: Vec<u8>,
   cache: LocalCacheSelection,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  remote: Option<crate::remote_cache::InstalledRemoteCache>,
 }
 
 pub(crate) struct InstallationSessionLock {
@@ -179,11 +196,23 @@ impl InstallationReceipt {
     &self.wrapper_path
   }
 
-  fn installation_directory(&self) -> RailResult<&Path> {
+  pub(crate) fn worker_path(&self) -> &Path {
+    &self.worker_path
+  }
+
+  pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
+    self.remote.as_ref()
+  }
+
+  pub(crate) fn installation_directory(&self) -> RailResult<&Path> {
     self
       .wrapper_path
       .parent()
       .ok_or_else(|| RailError::message("installed compiler wrapper has no parent"))
+  }
+
+  pub(crate) fn worker_digest(&self) -> &str {
+    &self.worker_digest
   }
 
   fn session_memo_path(&self) -> RailResult<PathBuf> {
@@ -233,6 +262,11 @@ impl InstallationReceipt {
       self.cache.max_bytes(),
       self.cache.trust_domain().map(str::to_string),
     )?;
+    if let Some(remote) = &self.remote {
+      remote
+        .selection()
+        .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))?;
+    }
     Ok(())
   }
 }
@@ -402,9 +436,9 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
   let worker_path = install_directory.join(WORKER_FILE);
   let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, existing.as_ref())?;
   let source_wrapper = crate::compiler::native_cache::direct_wrapper_executable()?;
-  let source_wrapper_digest = file_digest(&source_wrapper)?;
+  let source_wrapper_digest = installation_source_digest(&source_wrapper)?;
   let source_worker = crate::compiler::native_cache::direct_worker_executable()?;
-  let source_worker_digest = file_digest(&source_worker)?;
+  let source_worker_digest = installation_source_digest(&source_worker)?;
   let wrapper_current = optional_file_digest(&wrapper_path)?;
   let wrapper_generation = if wrapper_current.as_deref() == Some(source_wrapper_digest.as_str()) {
     crate::utils::stable_file_generation(&wrapper_path)
@@ -431,6 +465,23 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     .or_else(|| existing.as_ref().map(|receipt| receipt.cache.max_bytes()))
     .unwrap_or(DEFAULT_CACHE_MAX_BYTES);
   let cache = LocalCacheSelection::new(cache_base, max_bytes, None)?;
+  let remote = if request.local_only {
+    None
+  } else if let Some(remote_url) = request.remote_url.as_deref() {
+    let selection = crate::remote_cache::RemoteCacheSelection::parse(
+      remote_url,
+      request.remote_mode.as_deref(),
+      &request.remote_environment,
+    )
+    .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
+    Some(crate::remote_cache::InstalledRemoteCache::from_selection(&selection))
+  } else if request.remote_mode.is_some() || !request.remote_environment.is_empty() {
+    return Err(RailError::message(
+      "remote cache mode and environment policy require --remote URL",
+    ));
+  } else {
+    existing.as_ref().and_then(|receipt| receipt.remote.clone())
+  };
   let authority = existing
     .as_ref()
     .map(|receipt| receipt.authority.clone())
@@ -453,6 +504,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     worker_digest: source_worker_digest.clone(),
     worker_generation,
     cache,
+    remote,
   };
   receipt.validate()?;
   let encoded_receipt = encode_receipt(&receipt)?;
@@ -502,15 +554,18 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     .ok_or_else(|| RailError::message("installed compiler wrapper has no parent"))?
     .join(RECEIPT_FILE);
   revalidate_optional(&receipt_path, plan.receipt_before.as_deref(), MAX_RECEIPT_BYTES)?;
-  if file_digest(&plan.source_wrapper)? != plan.source_wrapper_digest {
+  if installation_source_digest(&plan.source_wrapper)? != plan.source_wrapper_digest {
     return Err(RailError::message(
       "compiler wrapper executable changed after setup planning",
     ));
   }
-  if file_digest(&plan.source_worker)? != plan.source_worker_digest {
+  if installation_source_digest(&plan.source_worker)? != plan.source_worker_digest {
     return Err(RailError::message(
       "compiler worker executable changed after setup planning",
     ));
+  }
+  if let Some(existing) = plan.receipt_before.as_deref().map(parse_receipt).transpose()? {
+    crate::remote_cache::stop_installed_coordinators(&existing);
   }
 
   ensure_real_directory(&plan.cargo_home)?;
@@ -650,6 +705,7 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
       ));
     }
   }
+  crate::remote_cache::stop_installed_coordinators(&receipt);
 
   match plan.config_after {
     Some(contents) => crate::utils::write_file_atomic(&plan.config_path, &contents)?,
@@ -718,6 +774,92 @@ pub(crate) fn load_for_wrapper(invoked: &Path) -> RailResult<InstallationReceipt
     ));
   }
   Ok(receipt)
+}
+
+/// Load and validate the receipt adjacent to a coordinator worker process.
+pub(crate) fn load_for_coordinator(invoked: &Path) -> RailResult<InstallationReceipt> {
+  let invoked = absolute(invoked)?;
+  let directory = invoked
+    .parent()
+    .ok_or_else(|| RailError::message("installed compiler worker has no parent directory"))?;
+  let bytes = read_required_regular(&directory.join(RECEIPT_FILE), MAX_RECEIPT_BYTES)?;
+  let receipt = parse_receipt(&bytes)?;
+  if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
+    || crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
+    || file_digest(&invoked)? != receipt.worker_digest
+  {
+    return Err(RailError::message(
+      "remote coordinator worker does not match its setup authority",
+    ));
+  }
+  Ok(receipt)
+}
+
+fn coordinator_state_path(receipt: &InstallationReceipt, identity: &str, suffix: &str) -> RailResult<PathBuf> {
+  if identity.len() != 64
+    || !identity
+      .bytes()
+      .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+  {
+    return Err(RailError::message("remote coordinator identity is invalid"));
+  }
+  Ok(
+    receipt
+      .installation_directory()?
+      .join(format!("{COORDINATOR_STATE_PREFIX}{identity}.{suffix}")),
+  )
+}
+
+pub(crate) fn coordinator_state_file(receipt: &InstallationReceipt, identity: &str) -> RailResult<PathBuf> {
+  coordinator_state_path(receipt, identity, "json")
+}
+
+pub(crate) fn coordinator_lock_file(receipt: &InstallationReceipt, identity: &str) -> RailResult<PathBuf> {
+  coordinator_state_path(receipt, identity, "lock")
+}
+
+pub(crate) fn read_coordinator_state(
+  receipt: &InstallationReceipt,
+  identity: &str,
+  maximum: u64,
+) -> RailResult<Option<Vec<u8>>> {
+  read_optional_regular(&coordinator_state_file(receipt, identity)?, maximum)
+}
+
+pub(crate) fn write_coordinator_state(receipt: &InstallationReceipt, identity: &str, bytes: &[u8]) -> RailResult<()> {
+  write_private_atomic(&coordinator_state_file(receipt, identity)?, bytes)
+}
+
+pub(crate) fn remove_coordinator_state_if(
+  receipt: &InstallationReceipt,
+  identity: &str,
+  expected: &[u8],
+) -> RailResult<()> {
+  let path = coordinator_state_file(receipt, identity)?;
+  if read_optional_regular(&path, expected.len() as u64)?.as_deref() == Some(expected) {
+    fs::remove_file(path)?;
+  }
+  Ok(())
+}
+
+/// Load the optional non-secret remote policy selected by one installation.
+pub(crate) fn installed_remote(current_dir: &Path) -> RailResult<Option<crate::remote_cache::InstalledRemoteCache>> {
+  let cargo_home = resolve_cargo_home(current_dir)?;
+  let config_path = selected_user_config(&cargo_home);
+  let receipt_path = cargo_home
+    .join("cargo-rail")
+    .join(INSTALLATION_DIRECTORY)
+    .join(RECEIPT_FILE);
+  let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
+    return Ok(None);
+  };
+  let receipt = parse_receipt(&bytes)?;
+  if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
+    return Err(RailError::message(
+      "transparent compiler-cache setup authority does not match the selected Cargo home",
+    ));
+  }
+  Ok(receipt.remote)
 }
 
 /// Inspect installation health without creating Cargo or cache state.
@@ -1150,7 +1292,15 @@ fn encode_receipt(receipt: &InstallationReceipt) -> RailResult<Vec<u8>> {
   Ok(bytes)
 }
 
+fn installation_source_digest(path: &Path) -> RailResult<String> {
+  digest_regular_file(path, false)
+}
+
 fn file_digest(path: &Path) -> RailResult<String> {
+  digest_regular_file(path, true)
+}
+
+fn digest_regular_file(path: &Path, require_single_link: bool) -> RailResult<String> {
   let metadata = fs::symlink_metadata(path)?;
   if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
     return Err(RailError::message(format!(
@@ -1159,7 +1309,12 @@ fn file_digest(path: &Path) -> RailResult<String> {
     )));
   }
   let mut file = File::open(path)?;
-  if !crate::utils::private_file_matches_path(&file, path, metadata.len())? {
+  let matches = if require_single_link {
+    crate::utils::private_file_matches_path(&file, path, metadata.len())?
+  } else {
+    crate::utils::opened_file_matches_path(&file, path, metadata.len())?
+  };
+  if !matches {
     return Err(RailError::message(format!(
       "'{}' changed before it was opened",
       path.display()
@@ -1178,7 +1333,12 @@ fn file_digest(path: &Path) -> RailResult<String> {
       .ok_or_else(|| RailError::message("compiler wrapper size overflow"))?;
     hasher.update(&buffer[..count]);
   }
-  if read != metadata.len() || !crate::utils::private_file_matches_path(&file, path, metadata.len())? {
+  let matches = if require_single_link {
+    crate::utils::private_file_matches_path(&file, path, metadata.len())?
+  } else {
+    crate::utils::opened_file_matches_path(&file, path, metadata.len())?
+  };
+  if read != metadata.len() || !matches {
     return Err(RailError::message(format!(
       "'{}' changed while it was read",
       path.display()
@@ -1252,5 +1412,24 @@ mod tests {
     fs::write(&path, b"after\n").expect("write drift");
     let error = revalidate_optional(&path, Some(b"before\n"), 1024).expect_err("drift must fail");
     assert!(error.to_string().contains("changed after planning"));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn setup_accepts_a_hard_linked_build_artifact_without_weakening_installed_authority() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("source");
+    let linked = directory.path().join("linked");
+    fs::write(&source, b"compiler wrapper").expect("write source");
+    fs::hard_link(&source, &linked).expect("create build-artifact hard link");
+
+    assert_eq!(
+      installation_source_digest(&source).expect("hard-linked source digest"),
+      installation_source_digest(&linked).expect("hard-linked alias digest")
+    );
+    assert!(
+      file_digest(&source).is_err(),
+      "installed authority must stay single-link"
+    );
   }
 }

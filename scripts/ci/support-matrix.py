@@ -863,7 +863,7 @@ environment, dependencies, generated inputs, and native-search state. Linked App
 non-authoritative candidate selector until the cold linker certificate closes found and missing lookup paths, driver
 and linker bytes, SDK inputs, exact dependency archives, and rustc-endogenous objects. The witnessed action then binds
 one result descriptor and exact output/stream objects. L1 verifies the same action, witness, result association, and
-objects at restore time; future L2 support may transport that pack but may not redefine its authority.
+objects at restore time. L2 transports the same pack and cannot redefine its authority.
 
 Apple certification is deliberately narrow. Cargo-Rail invokes the selected default `/usr/bin/cc` chain, asks the
 installed Apple linker for dependency evidence, and records direct driver inputs in a private sidecar. For LTO, the
@@ -915,47 +915,84 @@ rustc never runs over a partial restored output set.
 
 ## Shared native cache (L2)
 
-Transparent compiler reuse is deliberately local-only in this release. Ordinary Cargo invocations do not start a
-daemon, open a loopback coordinator, resolve cloud credentials, or read/write remote cache objects.
+Repository `[cache]` configuration is rejected because a checkout must not select a network write destination. Persist
+one machine-owned authority during the same setup used for L1, then run ordinary Cargo without wrapper commands or
+Cargo-Rail environment variables:
 
-The existing machine target schema remains accepted so operators can validate and migrate configuration deliberately:
-
-```toml
-[cache]
-l2 = "team"
+```bash
+cargo rail cache setup --check --remote \\
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \\
+  --remote-mode read-write
+cargo rail cache setup --remote \\
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \\
+  --remote-mode read-write
+cargo build --workspace --all-features --locked
 ```
 
-Set `CARGO_RAIL_CACHE_TARGETS_FILE` to an absolute machine-owned JSON file outside the checkout. This is the complete
-version 1 schema; unknown fields are rejected:
+`loadingalias/cargo-rail-action/cache@v6` accepts the same URL as `url`, runs setup once, and leaves later ordinary
+Cargo commands in that GitHub Actions job on the installed cache path. Configure provider credentials before Cargo
+runs and invoke the cache Action separately in each execution job because hosted jobs do not share a machine or Cargo
+home.
 
-```json
-{{
-  "version": 1,
-  "targets": {{
-    "team": {{
-      "protocol": "s3",
-      "region": "us-east-1",
-      "expected_bucket_owner": "123456789012",
-      "bucket": "company-cargo-rail-cache",
-      "prefix": "rust/team",
-      "role": "read_write",
-      "shareable_environment": ["CARGO", "CARGO_CRATE_NAME", "LANG", "PATH"]
-    }}
-  }}
-}}
+Validate or canonicalize a URL without resolving credentials or contacting storage:
+
+```bash
+cargo rail cache normalize \\
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012'
 ```
 
+The accepted authority families are:
+
+```text
+s3://BUCKET/PREFIX?region=REGION&owner=AWS_ACCOUNT_ID
+r2://ACCOUNT_ID/BUCKET/PREFIX
+azure://ACCOUNT/CONTAINER/PREFIX
+```
+
+Official S3 requires the expected 12-digit owner. R2 derives its documented account endpoint and region `auto`; Azure
+derives the public Blob endpoint from the storage-account name. User information, fragments, encoded separators, dot
+segments, duplicate or unknown query keys, ambiguous ports, and credentials are rejected before identity.
 
 ```bash
 cargo rail cache status --scope local --format json
 cargo rail doctor native-cache --format json
 ```
 
-Status schema 9 labels this target `configuration_only_transparent_cache_is_local`. Status and doctor validate only
-the bounded machine-owned declaration; neither resolves credentials nor contacts S3. The target map must remain an
-absolute machine-owned file with no embedded credentials; unknown fields, ambiguous authority, and secret-like shared
-environment names remain rejected. L2 transport activation is deferred until it can
-consume the compiler-result protocol without weakening the local proof.
+`--remote-mode` accepts `read` or `read-write` and defaults to `read-write` for an explicit selection. Read mode
+requires an existing compatible protocol marker and never writes. Read-write mode conditionally creates that marker
+and one compressed, bounded entry per base action. The entry binds the selected environment names, exact action,
+result identity, and verified result pack. A second distinct identity conditionally replaces it with a terminal
+metadata-only conflict. Build clients use only object reads and conditional writes; they do not list or delete objects.
+`--local-only` removes persisted L2 activation without removing L1. The environment variables remain transient
+overrides for qualification and advanced automation.
+
+L1 remains authoritative. A verified L1 hit makes no remote request. Only an L1 miss contacts a short-lived private
+loopback coordinator. It shares one AWS SDK runtime, credential resolution, client, and connection pool across rustc
+processes, holds no build-result memory cache, and exits after bounded inactivity. Coordinator startup or IPC failure
+falls back to the direct transport; every remote failure still compiles cold. An empty-L1 hit needs one entry GET after
+the coordinator's protocol check. Downloaded packs must match the base action, selected environment names, exact
+action, declared length, canonical descriptor, result identity, every payload digest, current compiler invocation,
+source capture, and reviewed environment-name policy before L1 admits them.
+
+Official S3 URLs require a region and expected 12-digit bucket-owner account. Cargo-Rail pins both on every object
+operation and rejects configured endpoint overrides for official AWS authority. Credentials remain outside URLs,
+configuration, result packs, compiler arguments, diagnostics, and cache keys. A domain-separated digest isolates live
+coordinators by credential authority without storing raw credential values. Cargo-Rail removes remote selection and
+credential environment from every compiler child it launches. Prefer a machine/container role, OIDC, or a
+preconfigured profile; keep exported credentials job-scoped and least-privilege when a provider requires them.
+
+`CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT` may add a sorted comma-separated set of reviewed, non-secret compiler
+environment names to the built-in `CARGO_PKG_NAME` and `OUT_DIR` policy. Only value digests enter action identity; raw
+values are never uploaded. An unapproved name bypasses L2 for that compiler unit without disabling an existing valid
+L1 result.
+
+Status schema 10 reports provider, protocol, mode, approved-name count, and a redacted authority identity as
+`direct_transport_selected`; it never prints the URL. Status and doctor remain network-free.
+
+AWS S3 and R2 use the same bounded conditional-object protocol; Azure Blob Storage implements the same cache protocol
+through its native conditional operations. Cleartext transport exists only for deterministic loopback protocol
+fixtures and is not a supported remote provider. No remote superiority claim is made until retained real-backend
+measurements satisfy the benchmark contract.
 
 ## Compiler-evidence cache
 

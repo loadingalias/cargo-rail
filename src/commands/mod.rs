@@ -203,9 +203,31 @@ pub fn try_dispatch_pre_context(
         cli::CacheCommand::Setup {
           local_dir,
           max_size,
+          remote,
+          remote_mode,
+          remote_environment,
+          local_only,
           check,
           format,
-        } => cache::run_setup(workspace_root, local_dir, max_size, check, format)?,
+        } => cache::run_setup(
+          workspace_root,
+          crate::cache::installation::SetupRequest {
+            local_dir,
+            max_bytes: max_size,
+            remote_url: remote,
+            remote_mode,
+            remote_environment,
+            local_only,
+          },
+          check,
+          format,
+        )?,
+        cli::CacheCommand::Normalize {
+          url,
+          mode,
+          environment,
+          format,
+        } => cache::run_normalize(&url, mode.as_deref(), environment, format)?,
         cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
         cli::CacheCommand::Clean { scope, check, format } => {
           cache::run_clean(workspace_root, scope, check, format)?;

@@ -3,8 +3,14 @@
 use anyhow::{Context as _, Result};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::helpers::TestWorkspace;
 
@@ -36,6 +42,387 @@ fn cargo_check(workspace: &Path, cargo_home: &Path, rustc: Option<&Path>, cache:
     command.env("CARGO_RAIL_CACHE", cache);
   }
   command.output().context("run isolated cargo check")
+}
+
+#[cfg(unix)]
+fn cargo_check_remote(
+  workspace: &Path,
+  cargo_home: &Path,
+  remote: &str,
+  mode: &str,
+  rustc: Option<&Path>,
+  coverage: Option<&Path>,
+) -> Result<Output> {
+  let mut command = Command::new("cargo");
+  command
+    .current_dir(workspace)
+    .args(["check", "--quiet"])
+    .env("CARGO_HOME", cargo_home)
+    .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_RAIL_CACHE_REMOTE", remote)
+    .env("CARGO_RAIL_CACHE_MODE", mode)
+    .env("AWS_ACCESS_KEY_ID", "fixture-access-key")
+    .env("AWS_SECRET_ACCESS_KEY", "fixture-secret-key")
+    .env("AWS_SESSION_TOKEN", "fixture-session-token")
+    .env("AWS_EC2_METADATA_DISABLED", "true")
+    .env("AWS_CONFIG_FILE", workspace.join("missing-aws-config"))
+    .env("AWS_SHARED_CREDENTIALS_FILE", workspace.join("missing-aws-credentials"))
+    .env_remove("AWS_ENDPOINT_URL")
+    .env_remove("AWS_ENDPOINT_URL_S3")
+    .env_remove("AWS_PROFILE")
+    .env_remove("AWS_DEFAULT_PROFILE")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER");
+  if let Some(rustc) = rustc {
+    command
+      .env("RUSTC", rustc)
+      .env("REAL_RUSTC", "rustc")
+      .env("REMOTE_ENV_LOG", workspace.join("remote-compiler-environment.log"));
+  }
+  if let Some(coverage) = coverage {
+    let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
+    command
+      .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+      .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage);
+  }
+  command.output().context("run cargo check with loopback remote cache")
+}
+
+fn cargo_check_installed_remote(workspace: &Path, cargo_home: &Path, coverage: &Path) -> Result<Output> {
+  let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
+  Command::new("cargo")
+    .current_dir(workspace)
+    .args(["check", "--quiet"])
+    .env("CARGO_HOME", cargo_home)
+    .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+    .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage)
+    .env("AWS_ACCESS_KEY_ID", "fixture-access-key")
+    .env("AWS_SECRET_ACCESS_KEY", "fixture-secret-key")
+    .env("AWS_SESSION_TOKEN", "fixture-session-token")
+    .env("AWS_EC2_METADATA_DISABLED", "true")
+    .env("AWS_CONFIG_FILE", workspace.join("missing-aws-config"))
+    .env("AWS_SHARED_CREDENTIALS_FILE", workspace.join("missing-aws-credentials"))
+    .env_remove("AWS_ENDPOINT_URL")
+    .env_remove("AWS_ENDPOINT_URL_S3")
+    .env_remove("CARGO_RAIL_CACHE_REMOTE")
+    .env_remove("CARGO_RAIL_CACHE_MODE")
+    .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+    .env_remove("AWS_SECURITY_TOKEN")
+    .env_remove("AWS_PROFILE")
+    .env_remove("AWS_DEFAULT_PROFILE")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()
+    .context("run cargo check with installed remote policy")
+}
+
+#[derive(Clone)]
+struct FixtureObject {
+  body: Vec<u8>,
+  etag: String,
+}
+
+#[derive(Default)]
+struct LoopbackS3State {
+  objects: BTreeMap<String, FixtureObject>,
+  requests: Vec<(String, String)>,
+  generation: u64,
+}
+
+struct LoopbackS3 {
+  address: SocketAddr,
+  state: Arc<Mutex<LoopbackS3State>>,
+  #[cfg(unix)]
+  available: Arc<AtomicBool>,
+  stopping: Arc<AtomicBool>,
+  worker: Option<JoinHandle<()>>,
+}
+
+impl LoopbackS3 {
+  fn start() -> Result<Self> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    listener.set_nonblocking(true)?;
+    let state = Arc::new(Mutex::new(LoopbackS3State::default()));
+    let available = Arc::new(AtomicBool::new(true));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker_state = Arc::clone(&state);
+    let worker_available = Arc::clone(&available);
+    let worker_stopping = Arc::clone(&stopping);
+    let worker = thread::spawn(move || {
+      let mut requests = Vec::new();
+      while !worker_stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+          Ok((stream, _)) => {
+            let request_state = Arc::clone(&worker_state);
+            let request_available = Arc::clone(&worker_available);
+            requests.push(thread::spawn(move || {
+              let _ = serve_s3_request(stream, &request_state, request_available.load(Ordering::Acquire));
+            }));
+          }
+          Err(error)
+            if matches!(
+              error.kind(),
+              std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+          {
+            thread::sleep(Duration::from_millis(2));
+          }
+          Err(_) => break,
+        }
+        let mut index = 0usize;
+        while index < requests.len() {
+          if requests[index].is_finished() {
+            let request = requests.swap_remove(index);
+            let _ = request.join();
+          } else {
+            index = index.saturating_add(1);
+          }
+        }
+      }
+      for request in requests {
+        let _ = request.join();
+      }
+    });
+    Ok(Self {
+      address,
+      state,
+      #[cfg(unix)]
+      available,
+      stopping,
+      worker: Some(worker),
+    })
+  }
+
+  fn remote_url(&self) -> String {
+    format!("s3+http://{}/fixture-bucket/team?region=test-1", self.address)
+  }
+
+  #[cfg(unix)]
+  fn request_count(&self) -> usize {
+    self.state.lock().map_or(0, |state| state.requests.len())
+  }
+
+  fn requests(&self) -> Vec<(String, String)> {
+    self
+      .state
+      .lock()
+      .map_or_else(|_| Vec::new(), |state| state.requests.clone())
+  }
+
+  #[cfg(unix)]
+  fn set_available(&self, available: bool) {
+    self.available.store(available, Ordering::Release);
+  }
+
+  #[cfg(unix)]
+  fn corrupt_result(&self) -> bool {
+    let Ok(mut state) = self.state.lock() else {
+      return false;
+    };
+    let Some(object) = state
+      .objects
+      .iter_mut()
+      .find_map(|(key, object)| key.contains("/entries/").then_some(object))
+    else {
+      return false;
+    };
+    let Some(last) = object.body.last_mut() else {
+      return false;
+    };
+    *last ^= 0xff;
+    object.etag = "\"corrupt-result\"".to_string();
+    true
+  }
+}
+
+impl Drop for LoopbackS3 {
+  fn drop(&mut self) {
+    self.stopping.store(true, Ordering::Release);
+    let _ = TcpStream::connect(self.address);
+    if let Some(worker) = self.worker.take() {
+      let _ = worker.join();
+    }
+  }
+}
+
+fn serve_s3_request(
+  mut stream: TcpStream,
+  state: &Arc<Mutex<LoopbackS3State>>,
+  available: bool,
+) -> std::io::Result<()> {
+  stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+  stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+  let mut request = Vec::new();
+  let header_end = loop {
+    if request.len() > 1024 * 1024 {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "fixture request headers exceeded their bound",
+      ));
+    }
+    let mut buffer = [0_u8; 16 * 1024];
+    let read = stream.read(&mut buffer)?;
+    if read == 0 {
+      return Ok(());
+    }
+    request.extend_from_slice(&buffer[..read]);
+    if let Some(offset) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+      break offset + 4;
+    }
+  };
+  let header = std::str::from_utf8(&request[..header_end])
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture request header was not UTF-8"))?;
+  let mut lines = header.split("\r\n");
+  let request_line = lines
+    .next()
+    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture request line was absent"))?;
+  let mut request_parts = request_line.split_whitespace();
+  let method = request_parts.next().unwrap_or_default().to_string();
+  let target = request_parts.next().unwrap_or_default();
+  let path = target.split('?').next().unwrap_or(target).to_string();
+  let headers = lines
+    .filter_map(|line| line.split_once(':'))
+    .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+    .collect::<BTreeMap<_, _>>();
+  let content_length = headers
+    .get("content-length")
+    .and_then(|value| value.parse::<usize>().ok())
+    .unwrap_or(0);
+  if content_length > 64 * 1024 * 1024 {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      "fixture request body exceeded its bound",
+    ));
+  }
+  while request.len() < header_end.saturating_add(content_length) {
+    let mut buffer = [0_u8; 64 * 1024];
+    let read = stream.read(&mut buffer)?;
+    if read == 0 {
+      break;
+    }
+    request.extend_from_slice(&buffer[..read]);
+  }
+  if request.len() != header_end.saturating_add(content_length) {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::UnexpectedEof,
+      "fixture request body was truncated",
+    ));
+  }
+  let encoded_body = &request[header_end..];
+  let body = if headers
+    .get("content-encoding")
+    .is_some_and(|value| value.split(',').any(|encoding| encoding.trim() == "aws-chunked"))
+  {
+    decode_chunked_fixture_body(encoded_body)?
+  } else {
+    encoded_body.to_vec()
+  };
+
+  let mut state = state
+    .lock()
+    .map_err(|_| std::io::Error::other("fixture state lock was poisoned"))?;
+  state.requests.push((method.clone(), path.clone()));
+  if !available {
+    return write_s3_error(&mut stream, 503, "ServiceUnavailable");
+  }
+  match method.as_str() {
+    "GET" => match state.objects.get(&path) {
+      Some(object) => write_s3_response(&mut stream, 200, &object.etag, &object.body),
+      None => write_s3_error(&mut stream, 404, "NoSuchKey"),
+    },
+    "PUT" => {
+      let allowed = match (
+        headers.get("if-none-match"),
+        headers.get("if-match"),
+        state.objects.get(&path),
+      ) {
+        (Some(value), _, None) if value == "*" => true,
+        (Some(value), _, Some(_)) if value == "*" => false,
+        (_, Some(expected), Some(object)) => expected == &object.etag,
+        (_, Some(_), None) => false,
+        (None, None, _) => true,
+        _ => false,
+      };
+      if !allowed {
+        return write_s3_error(&mut stream, 412, "PreconditionFailed");
+      }
+      state.generation = state.generation.saturating_add(1);
+      let etag = format!("\"fixture-{}\"", state.generation);
+      state.objects.insert(
+        path,
+        FixtureObject {
+          body,
+          etag: etag.clone(),
+        },
+      );
+      write_s3_response(&mut stream, 200, &etag, b"")
+    }
+    _ => write_s3_error(&mut stream, 405, "MethodNotAllowed"),
+  }
+}
+
+fn decode_chunked_fixture_body(encoded: &[u8]) -> std::io::Result<Vec<u8>> {
+  let mut decoded = Vec::new();
+  let mut offset = 0usize;
+  loop {
+    let line_end = encoded[offset..]
+      .windows(2)
+      .position(|window| window == b"\r\n")
+      .map(|position| offset + position)
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture chunk header was truncated"))?;
+    let header = std::str::from_utf8(&encoded[offset..line_end])
+      .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture chunk header was not UTF-8"))?;
+    let length = usize::from_str_radix(header.split(';').next().unwrap_or_default(), 16)
+      .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture chunk length was invalid"))?;
+    offset = line_end.saturating_add(2);
+    if length == 0 {
+      break;
+    }
+    let end = offset
+      .checked_add(length)
+      .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "fixture chunk length overflowed"))?;
+    if end.saturating_add(2) > encoded.len() || &encoded[end..end + 2] != b"\r\n" {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "fixture chunk payload was truncated",
+      ));
+    }
+    decoded.extend_from_slice(&encoded[offset..end]);
+    offset = end + 2;
+  }
+  Ok(decoded)
+}
+
+fn write_s3_response(stream: &mut TcpStream, status: u16, etag: &str, body: &[u8]) -> std::io::Result<()> {
+  let reason = if status == 200 { "OK" } else { "Error" };
+  write!(
+    stream,
+    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nETag: {etag}\r\nx-amz-request-id: fixture\r\nConnection: close\r\n\r\n",
+    body.len()
+  )?;
+  stream.write_all(body)
+}
+
+fn write_s3_error(stream: &mut TcpStream, status: u16, code: &str) -> std::io::Result<()> {
+  let body = format!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message><RequestId>fixture</RequestId><HostId>fixture</HostId></Error>"
+  );
+  write!(
+    stream,
+    "HTTP/1.1 {status} Error\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nx-amz-request-id: fixture\r\nConnection: close\r\n\r\n{body}",
+    body.len()
+  )
+}
+
+fn coverage_events(directory: &Path) -> Result<Vec<serde_json::Value>> {
+  fs::read_dir(directory)?
+    .map(|entry| {
+      let path = entry?.path();
+      serde_json::from_slice(&fs::read(path)?).context("decode native-cache coverage event")
+    })
+    .collect()
 }
 
 fn json(output: &Output) -> Result<serde_json::Value> {
@@ -109,7 +496,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() -> Result<(
   )?;
   assert!(status.status.success(), "installation status failed: {status:?}");
   let status = json(&status)?;
-  assert_eq!(status["status"]["schema_version"], 9);
+  assert_eq!(status["status"]["schema_version"], 10);
   assert_eq!(status["status"]["installation"]["state"], "installed");
   assert_eq!(status["status"]["installation"]["healthy"], true);
   let wrapper = PathBuf::from(
@@ -219,35 +606,502 @@ fn setup_refuses_global_conflicts_and_workspace_shadowing() -> Result<()> {
 }
 
 #[test]
-fn cache_status_labels_retained_remote_configuration_as_inactive() -> Result<()> {
+fn cache_status_reports_only_redacted_machine_selected_remote_authority() -> Result<()> {
   let workspace = TestWorkspace::new_single_crate("transparent-remote-status", "0.1.0")?;
   let cargo_home = tempfile::tempdir()?;
-  fs::create_dir_all(workspace.path.join(".config"))?;
-  fs::write(workspace.path.join(".config/rail.toml"), "[cache]\nl2 = 'team'\n")?;
-  let target_map = cargo_home.path().join("targets.json");
-  fs::write(
-    &target_map,
-    r#"{"version":1,"targets":{"team":{"protocol":"s3","region":"us-east-1","expected_bucket_owner":"123456789012","bucket":"cargo-rail-cache-fixture","prefix":"cache","role":"read","shareable_environment":[]}}}"#,
-  )?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(&target_map, fs::Permissions::from_mode(0o600))?;
-  }
   let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
     .current_dir(&workspace.path)
     .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
     .env("CARGO_HOME", cargo_home.path())
-    .env("CARGO_RAIL_CACHE_TARGETS_FILE", &target_map)
+    .env(
+      "CARGO_RAIL_CACHE_REMOTE",
+      "s3://cargo-rail-cache-fixture/cache?region=us-east-1&owner=123456789012",
+    )
+    .env("CARGO_RAIL_CACHE_MODE", "read")
     .env_remove("RUSTC_WRAPPER")
     .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
     .output()?;
-  assert!(output.status.success(), "configuration-only status failed: {output:?}");
+  assert!(output.status.success(), "remote status failed: {output:?}");
   let value = json(&output)?;
-  assert_eq!(value["status"]["schema_version"], 9);
+  assert_eq!(value["status"]["schema_version"], 10);
+  assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
+  assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
+  assert_eq!(value["status"]["remote"]["mode"], "read");
+  assert!(value["status"]["remote"].get("normalized_url").is_none());
+  assert!(
+    value["status"]["remote"]["authority"]
+      .as_str()
+      .is_some_and(|identity| identity.starts_with("remote-authority-v1-sha256-"))
+  );
+  Ok(())
+}
+
+#[test]
+fn setup_owned_remote_is_automatic_coordinated_and_removable() -> Result<()> {
+  #[cfg(unix)]
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let workspace = TestWorkspace::new_single_crate("transparent-remote-setup", "0.1.0")?;
+  let remote = LoopbackS3::start()?;
+  let remote_url = remote.remote_url();
+
+  let seed_home = tempfile::tempdir()?;
+  let seed_setup = rail(
+    &workspace.path,
+    seed_home.path(),
+    &[
+      "rail",
+      "cache",
+      "setup",
+      "--remote",
+      &remote_url,
+      "--remote-mode",
+      "read-write",
+      "-f",
+      "json",
+    ],
+  )?;
+  assert!(seed_setup.status.success(), "remote setup failed: {seed_setup:?}");
+  let setup_value = json(&seed_setup)?;
+  assert_eq!(setup_value["remote"]["activation"], "direct_transport_selected");
+  assert_eq!(setup_value["remote"]["mode"], "read-write");
+  assert!(setup_value["remote"].get("normalized_url").is_none());
+
+  let seed_coverage = tempfile::tempdir()?;
+  #[cfg(unix)]
+  fs::set_permissions(seed_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let seed = cargo_check_installed_remote(&workspace.path, seed_home.path(), seed_coverage.path())?;
+  assert!(seed.status.success(), "automatic remote seed failed: {seed:?}");
+  let seed_events = coverage_events(seed_coverage.path())?;
+  assert_setup_owned_remote_transport(&seed_events, "seed");
+  assert!(
+    remote
+      .requests()
+      .iter()
+      .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
+    "automatic remote seed did not publish an entry"
+  );
+
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let import_home = tempfile::tempdir()?;
+  let import_setup = rail(
+    &workspace.path,
+    import_home.path(),
+    &[
+      "rail",
+      "cache",
+      "setup",
+      "--remote",
+      &remote_url,
+      "--remote-mode",
+      "read",
+    ],
+  )?;
+  assert!(
+    import_setup.status.success(),
+    "remote import setup failed: {import_setup:?}"
+  );
+  let import_coverage = tempfile::tempdir()?;
+  #[cfg(unix)]
+  fs::set_permissions(import_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let imported = cargo_check_installed_remote(&workspace.path, import_home.path(), import_coverage.path())?;
+  assert!(
+    imported.status.success(),
+    "automatic remote import failed: {imported:?}"
+  );
+  let imported_events = coverage_events(import_coverage.path())?;
+  assert!(
+    imported_events
+      .iter()
+      .any(|event| event["status"] == "hit" && event["reason"] == "verified_remote_result"),
+    "ordinary Cargo did not restore the setup-owned remote result: {imported_events:?}"
+  );
+  assert_setup_owned_remote_transport(&imported_events, "import");
+
+  let local_only = rail(
+    &workspace.path,
+    import_home.path(),
+    &["rail", "cache", "setup", "--local-only", "-f", "json"],
+  )?;
+  assert!(local_only.status.success(), "local-only setup failed: {local_only:?}");
+  assert!(json(&local_only)?["remote"].is_null());
+  let status = rail(
+    &workspace.path,
+    import_home.path(),
+    &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+  )?;
+  assert!(status.status.success(), "local-only status failed: {status:?}");
+  assert!(json(&status)?["status"]["remote"].is_null());
+  let remove = rail(&workspace.path, import_home.path(), &["rail", "cache", "remove"])?;
+  assert!(
+    remove.status.success(),
+    "coordinator installation removal failed: {remove:?}"
+  );
+  let installation = import_home.path().join("cargo-rail/compiler-cache-v1");
+  let residue = fs::read_dir(&installation)
+    .map(|entries| {
+      entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  assert!(
+    !installation.exists(),
+    "coordinator state survived exact installation removal: {residue:?}"
+  );
+  Ok(())
+}
+
+fn assert_setup_owned_remote_transport(events: &[serde_json::Value], phase: &str) {
+  let coordinated = events
+    .iter()
+    .filter_map(|event| event["remote_coordinator_requests"].as_u64())
+    .sum::<u64>()
+    > 0;
+  #[cfg(not(windows))]
+  assert!(
+    coordinated,
+    "setup-owned remote {phase} bypassed coordination: {events:?}"
+  );
+  #[cfg(windows)]
+  {
+    let explicit_direct_fallback = events.iter().any(|event| {
+      event["remote_request_attempts"]
+        .as_u64()
+        .is_some_and(|attempts| attempts > 0)
+        && event["remote_error"].as_str().is_some_and(|error| !error.is_empty())
+    });
+    assert!(
+      coordinated || explicit_direct_fallback,
+      "setup-owned remote {phase} used neither coordination nor an evidenced direct fallback: {events:?}"
+    );
+  }
+}
+
+#[test]
+fn cache_normalize_is_network_free_canonical_and_rejects_credentials() -> Result<()> {
+  let workspace = TestWorkspace::new_single_crate("remote-normalize", "0.1.0")?;
+  let cargo_home = tempfile::tempdir()?;
+  let normalized = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &[
+      "rail",
+      "cache",
+      "normalize",
+      "s3://Rail-Cache//team/%61?region=us-east-1&owner=123456789012",
+      "--mode",
+      "read",
+      "-f",
+      "json",
+    ],
+  )?;
+  assert!(normalized.status.success(), "normalization failed: {normalized:?}");
+  let normalized = json(&normalized)?;
   assert_eq!(
-    value["status"]["remote"]["activation"],
-    "configuration_only_transparent_cache_is_local"
+    normalized["normalized_url"],
+    "s3://rail-cache/team/a?owner=123456789012&region=us-east-1"
+  );
+  assert_eq!(normalized["remote"]["mode"], "read");
+
+  let rejected = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &[
+      "rail",
+      "cache",
+      "normalize",
+      "s3://user:top-secret@rail-cache/team?owner=123456789012&region=us-east-1",
+    ],
+  )?;
+  assert_eq!(rejected.status.code(), Some(2));
+  assert!(!String::from_utf8_lossy(&rejected.stderr).contains("top-secret"));
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() -> Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let workspace = TestWorkspace::new_single_crate("transparent-remote", "0.1.0")?;
+  let remote = LoopbackS3::start()?;
+  let remote_url = remote.remote_url();
+  let rustc = workspace.path.join("rustc-remote-proof");
+  fs::write(
+    &rustc,
+    "#!/bin/sh\nprintf 'url=%s access=%s secret=%s token=%s config=%s args=%s\\n' \"${CARGO_RAIL_CACHE_REMOTE-unset}\" \"${AWS_ACCESS_KEY_ID-unset}\" \"${AWS_SECRET_ACCESS_KEY-unset}\" \"${AWS_SESSION_TOKEN-unset}\" \"${AWS_CONFIG_FILE-unset}\" \"$*\" >> \"$REMOTE_ENV_LOG\"\nexec \"$REAL_RUSTC\" \"$@\"\n",
+  )?;
+  fs::set_permissions(&rustc, fs::Permissions::from_mode(0o700))?;
+
+  let credential_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, credential_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "credential cache setup failed: {setup:?}");
+  let credential_probe = cargo_check_remote(
+    &workspace.path,
+    credential_home.path(),
+    &remote_url,
+    "read-write",
+    Some(&rustc),
+    None,
+  )?;
+  assert!(
+    credential_probe.status.success(),
+    "credential scrub probe failed: {credential_probe:?}"
+  );
+  let compiler_environments = fs::read_to_string(workspace.path.join("remote-compiler-environment.log"))?;
+  let controlled_compilers = compiler_environments
+    .lines()
+    .filter(|line| line.contains("--crate-name transparent_remote"))
+    .collect::<Vec<_>>();
+  assert!(
+    !controlled_compilers.is_empty()
+      && controlled_compilers
+        .iter()
+        .all(|line| { line.starts_with("url=unset access=unset secret=unset token=unset config=unset args=") }),
+    "remote authority entered a Cargo-Rail-controlled compiler subprocess: {compiler_environments:?}"
+  );
+  fs::remove_dir_all(workspace.path.join("target"))?;
+
+  let seed_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, seed_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "seed cache setup failed: {setup:?}");
+  let seed_coverage = tempfile::tempdir()?;
+  fs::set_permissions(seed_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let seed = cargo_check_remote(
+    &workspace.path,
+    seed_home.path(),
+    &remote_url,
+    "read-write",
+    None,
+    Some(seed_coverage.path()),
+  )?;
+  assert!(seed.status.success(), "remote seed compilation failed: {seed:?}");
+  let requests = remote.requests();
+  assert!(
+    requests
+      .iter()
+      .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
+    "remote seed did not publish a compressed entry: {requests:?}"
+  );
+
+  remote.set_available(false);
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let before_l1_hit = remote.request_count();
+  let l1_coverage = tempfile::tempdir()?;
+  fs::set_permissions(l1_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let l1_hit = cargo_check_remote(
+    &workspace.path,
+    seed_home.path(),
+    &remote_url,
+    "read-write",
+    None,
+    Some(l1_coverage.path()),
+  )?;
+  assert!(
+    l1_hit.status.success(),
+    "L1 reuse failed during remote outage: {l1_hit:?}"
+  );
+  assert_eq!(
+    remote.request_count(),
+    before_l1_hit,
+    "a verified L1 hit performed an L2 request"
+  );
+  let l1_events = coverage_events(l1_coverage.path())?;
+  assert!(
+    !l1_events.is_empty()
+      && l1_events
+        .iter()
+        .all(|event| event["remote_request_attempts"] == 0 && event["remote_coordinator_requests"] == 0),
+    "a verified L1 hit reported an L2 request: {l1_events:?}"
+  );
+
+  remote.set_available(true);
+  let import_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, import_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "import cache setup failed: {setup:?}");
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let import_coverage = tempfile::tempdir()?;
+  fs::set_permissions(import_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let writes_before_import = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
+  let requests_before_import = remote.request_count();
+  let imported = cargo_check_remote(
+    &workspace.path,
+    import_home.path(),
+    &remote_url,
+    "read",
+    None,
+    Some(import_coverage.path()),
+  )?;
+  assert!(imported.status.success(), "remote import failed: {imported:?}");
+  let imported_events = coverage_events(import_coverage.path())?;
+  assert!(
+    imported_events
+      .iter()
+      .any(|event| event["status"] == "hit" && event["reason"] == "verified_remote_result"),
+    "empty L1 did not import and verify the remote result: {imported_events:?}"
+  );
+  assert_eq!(
+    remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
+    writes_before_import,
+    "read-only remote import performed a write"
+  );
+  let import_request_attempts = imported_events
+    .iter()
+    .filter_map(|event| event["remote_request_attempts"].as_u64())
+    .sum::<u64>();
+  let coordinator_requests = imported_events
+    .iter()
+    .filter_map(|event| event["remote_coordinator_requests"].as_u64())
+    .sum::<u64>();
+  let coordinated_events = imported_events
+    .iter()
+    .filter(|event| {
+      event["remote_coordinator_requests"]
+        .as_u64()
+        .is_some_and(|requests| requests > 0)
+    })
+    .count();
+  let observed_remote_requests = u64::try_from(remote.request_count().saturating_sub(requests_before_import))?;
+  assert!(
+    observed_remote_requests > 0 && import_request_attempts >= observed_remote_requests,
+    "coordinated import under-reported fixture-observed S3 requests: attempts={import_request_attempts}, \
+     observed={observed_remote_requests}, events={imported_events:?}"
+  );
+  assert!(
+    coordinator_requests > 0 && import_request_attempts > 0,
+    "coordinated import performed no remote work: {imported_events:?}"
+  );
+  assert_eq!(
+    coordinator_requests,
+    u64::try_from(coordinated_events)?,
+    "coordinated import performed control-plane requests beyond its cache lookup: {imported_events:?}"
+  );
+  assert!(
+    imported_events
+      .iter()
+      .filter_map(|event| event["remote_payload_bytes_read"].as_u64())
+      .sum::<u64>()
+      > 0,
+    "remote import reported no downloaded payload bytes: {imported_events:?}"
+  );
+  assert!(
+    imported_events
+      .iter()
+      .filter_map(|event| event["remote_service_elapsed_ns"].as_u64())
+      .sum::<u64>()
+      > 0,
+    "remote import reported no provider/coordinator service time: {imported_events:?}"
+  );
+  let remote_hits = imported_events
+    .iter()
+    .filter(|event| event["status"] == "hit" && event["reason"] == "verified_remote_result")
+    .collect::<Vec<_>>();
+  assert!(
+    remote_hits.iter().all(|event| {
+      event["timing"]["total"]["count"].as_u64() == Some(1)
+        && event["timing"]["lookup"]["count"].as_u64() == Some(1)
+        && event["timing"]["decode"]["count"].as_u64() == Some(1)
+        && event["timing"]["validation"]["count"].as_u64() == Some(1)
+        && event["timing"]["l1_admission"]["count"].as_u64() == Some(1)
+        && event["timing"]["output_restore"]["count"].as_u64() == Some(1)
+    }),
+    "remote-hit phase accounting is incomplete: {remote_hits:?}"
+  );
+  assert!(
+    remote_hits
+      .iter()
+      .filter_map(|event| event["durability"]["l1_file_sync"]["count"].as_u64())
+      .sum::<u64>()
+      > 0,
+    "remote-hit L1 durability accounting is empty: {remote_hits:?}"
+  );
+  assert!(
+    imported_events
+      .iter()
+      .all(|event| event["remote_payload_bytes_written"] == 0),
+    "read-only remote import reported uploaded payload bytes: {imported_events:?}"
+  );
+
+  remote.set_available(false);
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let requests_before_packed_hit = remote.request_count();
+  let packed_coverage = tempfile::tempdir()?;
+  fs::set_permissions(packed_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let packed_hit = cargo_check_remote(
+    &workspace.path,
+    import_home.path(),
+    &remote_url,
+    "read",
+    None,
+    Some(packed_coverage.path()),
+  )?;
+  assert!(
+    packed_hit.status.success(),
+    "packed L1 reuse failed during remote outage: {packed_hit:?}"
+  );
+  assert_eq!(
+    remote.request_count(),
+    requests_before_packed_hit,
+    "a packed L1 hit performed an L2 request"
+  );
+  let packed_events = coverage_events(packed_coverage.path())?;
+  assert!(
+    packed_events
+      .iter()
+      .any(|event| event["status"] == "hit" && event["reason"] == "verified_local_result")
+      && packed_events
+        .iter()
+        .all(|event| event["remote_request_attempts"] == 0 && event["remote_coordinator_requests"] == 0),
+    "the imported packed authority did not serve an offline L1 hit: {packed_events:?}"
+  );
+
+  remote.set_available(true);
+  assert!(remote.corrupt_result(), "fixture had no remote result to corrupt");
+  let corrupt_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, corrupt_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "corrupt cache setup failed: {setup:?}");
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let corrupt_coverage = tempfile::tempdir()?;
+  fs::set_permissions(corrupt_coverage.path(), fs::Permissions::from_mode(0o700))?;
+  let corrupt = cargo_check_remote(
+    &workspace.path,
+    corrupt_home.path(),
+    &remote_url,
+    "read-write",
+    None,
+    Some(corrupt_coverage.path()),
+  )?;
+  assert!(
+    corrupt.status.success(),
+    "remote corruption blocked the cold compilation: {corrupt:?}"
+  );
+  let corrupt_events = coverage_events(corrupt_coverage.path())?;
+  assert!(
+    corrupt_events.iter().any(|event| event["status"] == "miss"
+      && event["reason"].as_str().is_some_and(|reason| {
+        reason.starts_with("remote_entry_rejected;") && reason.ends_with("remote_publication_failed")
+      })),
+    "corrupt remote data was not rejected before cold fallback: {corrupt_events:?}"
+  );
+
+  remote.set_available(false);
+  let outage_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, outage_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "outage cache setup failed: {setup:?}");
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let outage = cargo_check_remote(
+    &workspace.path,
+    outage_home.path(),
+    &remote_url,
+    "read-write",
+    None,
+    None,
+  )?;
+  assert!(
+    outage.status.success(),
+    "remote outage blocked the cold compilation: {outage:?}"
   );
   Ok(())
 }

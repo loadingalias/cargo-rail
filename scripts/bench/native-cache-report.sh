@@ -90,7 +90,7 @@ jq -s \
         }
     ] as $comparisons
   | {
-      schema_version: 10,
+      schema_version: 11,
       evidence_kind: $contract.evidence_kind,
       requested_samples_per_lane: $contract.required_accepted_samples,
       total_samples: ($samples | length),

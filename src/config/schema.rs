@@ -80,10 +80,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "targets",
     "Selects additional Cargo target-resolution views that the repository supports.",
   ),
-  policy(
-    "cache.l2",
-    "Selects one machine-owned shared-cache target by non-secret alias.",
-  ),
   implementation(
     "workspace",
     "Deprecated: this reserved table had no behavior. Run `cargo rail config migrate` to remove it.",

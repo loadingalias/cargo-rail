@@ -496,8 +496,8 @@ pub fn run_config_validate_standalone(
 
   // Check for unknown keys (only if parsing succeeded)
   if let Ok(doc) = &raw_doc {
-    if let Err(message) = crate::config::reject_removed_run_config(doc) {
-      errors.push(ValidationIssue::new("run", message));
+    if let Err(message) = crate::config::reject_removed_configuration(doc) {
+      errors.push(ValidationIssue::new("removed_configuration", message));
     }
     check_unknown_keys(doc, &mut warnings);
     for deprecation in schema::present_deprecations(doc) {
@@ -515,9 +515,6 @@ pub fn run_config_validate_standalone(
     .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())));
   match parsed_config {
     Ok(config) => {
-      if let Err(e) = config.cache.validate() {
-        errors.push(ValidationIssue::new("cache", e.to_string()));
-      }
       // Validate change detection config
       if let Err(e) = config.change_detection.validate() {
         errors.push(ValidationIssue::new("change_detection", e.to_string()));
@@ -729,8 +726,15 @@ pub fn run_config_migrate(
 
   let config_path = resolve_config_path(workspace_root, config_override)?;
   let mut editor = TomlEditor::open(&config_path)?;
-  crate::config::reject_removed_run_config(editor.doc()).map_err(RailError::message)?;
   let mut changes = Vec::new();
+
+  migrate_removed_field(
+    &mut editor,
+    &mut changes,
+    "cache",
+    "Remote cache selection moved from repository aliases to machine-owned CARGO_RAIL_CACHE_REMOTE authority.",
+  );
+  crate::config::reject_removed_configuration(editor.doc()).map_err(RailError::message)?;
 
   migrate_removed_field(
     &mut editor,

@@ -438,18 +438,19 @@ fn transparent_session_memo_digest(memo: &TransparentNativeSessionMemo) -> RailR
 }
 
 fn transparent_rustc_query(program: &OsStr, argument: &str, current_dir: &Path) -> RailResult<String> {
-  let output = Command::new(program)
+  let mut command = Command::new(program);
+  command
     .arg(argument)
     .current_dir(current_dir)
     .env("RUSTUP_AUTO_INSTALL", "0")
-    .env("RUSTUP_NO_UPDATE_CHECK", "1")
-    .output()
-    .map_err(|error| {
-      RailError::message(format!(
-        "failed to query selected rustc '{}': {error}",
-        program.to_string_lossy()
-      ))
-    })?;
+    .env("RUSTUP_NO_UPDATE_CHECK", "1");
+  crate::remote_cache::scrub_child_environment(&mut command);
+  let output = command.output().map_err(|error| {
+    RailError::message(format!(
+      "failed to query selected rustc '{}': {error}",
+      program.to_string_lossy()
+    ))
+  })?;
   if !output.status.success() {
     return Err(RailError::message(format!(
       "selected rustc '{}' query failed with status {}",
@@ -2735,6 +2736,10 @@ fn transparent_native_compiler_process_env_fingerprint() -> RailResult<String> {
 }
 
 #[cfg(unix)]
+#[allow(
+  clippy::useless_conversion,
+  reason = "rustix Mode bits are u16 on macOS and u32 on Linux"
+)]
 fn transparent_default_regular_file_creation_mode() -> u32 {
   // The pre-Clap compiler wrapper is single-threaded at this boundary. Reading
   // and restoring umask avoids a filesystem transaction for every rustc unit
@@ -2787,9 +2792,11 @@ fn compiler_diagnostics_runtime_environment(name: &str) -> bool {
 }
 
 fn native_compiler_process_environment(name: &str) -> bool {
-  // PATH selects the already captured Cargo/rustc launchers, but graduated
-  // library units never invoke an external linker. Any environment rustc reads
-  // while compiling is bound later by the exact per-unit environment witness.
+  // Linked native actions bind their resolved driver, linker, and search
+  // namespace in the platform linker witness. Raw PATH is intentionally not a
+  // session-wide partition: setup-owned wrappers prepend their installation
+  // directory, even though the selected toolchain is unchanged. Per-unit
+  // environment observation still binds any additional values rustc reads.
   matches!(
     name,
     "AR"
@@ -2797,6 +2804,8 @@ fn native_compiler_process_environment(name: &str) -> bool {
       | "DYLD_FALLBACK_LIBRARY_PATH"
       | "DYLD_INSERT_LIBRARIES"
       | "DYLD_LIBRARY_PATH"
+      | "GCC_EXEC_PREFIX"
+      | "GNUTARGET"
       | "IPHONEOS_DEPLOYMENT_TARGET"
       | "LANG"
       | "LC_ALL"
@@ -2805,6 +2814,10 @@ fn native_compiler_process_environment(name: &str) -> bool {
       | "LDFLAGS"
       | "LD_LIBRARY_PATH"
       | "LD_PRELOAD"
+      | "LD_RUN_PATH"
+      | "LDEMULATION"
+      | "LIBRARY_PATH"
+      | "LPATH"
       | "MACOSX_DEPLOYMENT_TARGET"
       | "RANLIB"
       | "RUSTC_BOOTSTRAP"
@@ -2817,6 +2830,8 @@ fn native_compiler_process_environment(name: &str) -> bool {
       | "VISIONOS_DEPLOYMENT_TARGET"
       | "WATCHOS_DEPLOYMENT_TARGET"
       | "ZERO_AR_DATE"
+      | "COMPILER_PATH"
+      | "COLLECT_NO_DEMANGLE"
   ) || ["AR_", "LC_", "RANLIB_", "RUSTC_"]
     .iter()
     .any(|prefix| name.starts_with(prefix))
@@ -2951,14 +2966,7 @@ mod tests {
         "missing compiler state: {name}"
       );
     }
-    for name in [
-      "PATH",
-      "BINDGEN_EXTRA_CLANG_ARGS",
-      "CC",
-      "CFLAGS",
-      "CXX",
-      "PKG_CONFIG_PATH",
-    ] {
+    for name in ["BINDGEN_EXTRA_CLANG_ARGS", "CC", "CFLAGS", "CXX", "PKG_CONFIG_PATH"] {
       assert!(
         !native_compiler_process_environment(name),
         "build-script-only state partitioned every native compiler unit: {name}"
@@ -2966,6 +2974,16 @@ mod tests {
       assert!(
         compiler_diagnostics_runtime_environment(name),
         "diagnostic evidence still needs the broader environment: {name}"
+      );
+    }
+    assert!(
+      !native_compiler_process_environment("PATH"),
+      "raw PATH must not partition every native compiler unit"
+    );
+    for name in ["GCC_EXEC_PREFIX", "COMPILER_PATH", "LIBRARY_PATH", "LDEMULATION"] {
+      assert!(
+        native_compiler_process_environment(name),
+        "linked compiler state is not partitioned: {name}"
       );
     }
   }
@@ -3208,6 +3226,12 @@ mod tests {
     let driver = sysroot.path().join("lib/librustc_driver-test.so");
     std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
     std::fs::write(&driver, b"driver-one").expect("driver library");
+    #[cfg(windows)]
+    let rustc_implementation = sysroot.path().join("bin/rustc.exe");
+    #[cfg(not(windows))]
+    let rustc_implementation = sysroot.path().join("bin/rustc");
+    std::fs::create_dir_all(rustc_implementation.parent().expect("rustc parent")).expect("rustc directory");
+    std::fs::write(rustc_implementation, b"rustc").expect("rustc implementation");
 
     let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("baseline fingerprint");
     assert_eq!(baseline.1, 20);

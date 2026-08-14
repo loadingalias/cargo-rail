@@ -49,7 +49,7 @@ pub enum PreClapDispatch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InvocationRole {
-  AppleLinkAdapter,
+  LinkAdapter,
   DirectCache,
   MarkedCache,
   RustcObservation,
@@ -58,7 +58,7 @@ enum InvocationRole {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InvocationSignals {
-  apple_link_adapter: bool,
+  link_adapter: bool,
   direct_cache: bool,
   marked_cache: bool,
   rustc_observation: bool,
@@ -67,11 +67,11 @@ struct InvocationSignals {
 
 impl InvocationSignals {
   fn classify(self) -> Result<Option<InvocationRole>, &'static str> {
-    if self.apple_link_adapter {
+    if self.link_adapter {
       if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
-        return Err("Apple linker adapter received conflicting compiler role markers");
+        return Err("linker adapter received conflicting compiler role markers");
       }
-      return Ok(Some(InvocationRole::AppleLinkAdapter));
+      return Ok(Some(InvocationRole::LinkAdapter));
     }
     if self.direct_cache {
       if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
@@ -168,8 +168,12 @@ pub(crate) fn rustc_command(
 /// Classify and run compiler roles before Clap or workspace acquisition.
 #[must_use]
 pub fn dispatch() -> PreClapDispatch {
+  if let Some(exit_code) = crate::remote_cache::run_coordinator_if_requested() {
+    return PreClapDispatch::Exit(exit_code);
+  }
   let signals = InvocationSignals {
-    apple_link_adapter: std::env::var_os(crate::compiler::native_cache::APPLE_LINK_ADAPTER_ENV).is_some(),
+    link_adapter: std::env::var_os(crate::compiler::native_cache::APPLE_LINK_ADAPTER_ENV).is_some()
+      || std::env::var_os(crate::compiler::native_cache::ELF_LINK_ADAPTER_ENV).is_some(),
     direct_cache: crate::compiler::native_cache::NativeCacheContext::is_direct_invocation(),
     marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
     rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
@@ -191,7 +195,7 @@ pub fn dispatch() -> PreClapDispatch {
   };
 
   let exit_code = match role {
-    InvocationRole::AppleLinkAdapter => run_apple_link_adapter(),
+    InvocationRole::LinkAdapter => run_link_adapter(),
     InvocationRole::DirectCache => run_direct_cache(),
     InvocationRole::MarkedCache => run_cache(
       crate::compiler::native_cache::NativeCacheContext::from_environment(),
@@ -203,30 +207,40 @@ pub fn dispatch() -> PreClapDispatch {
   PreClapDispatch::Exit(exit_code)
 }
 
-fn run_apple_link_adapter() -> i32 {
-  let Some(driver) = std::env::var_os(crate::compiler::native_cache::APPLE_LINK_DRIVER_ENV) else {
-    eprintln!("cargo-rail Apple linker adapter: missing selected linker driver");
+fn run_link_adapter() -> i32 {
+  let elf = std::env::var_os(crate::compiler::native_cache::ELF_LINK_ADAPTER_ENV).is_some();
+  let driver = if elf {
+    std::env::var_os(crate::compiler::native_cache::ELF_LINK_DRIVER_ENV)
+  } else {
+    std::env::var_os(crate::compiler::native_cache::APPLE_LINK_DRIVER_ENV)
+  };
+  let Some(driver) = driver else {
+    eprintln!("cargo-rail linker adapter: missing selected linker driver");
     return 1;
   };
   let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
   let mut command = Command::new(driver);
-  let instrumented = crate::compiler::native_cache::configure_apple_link_adapter(&mut command, &arguments);
+  let instrumented = if elf {
+    crate::compiler::native_cache::configure_elf_link_adapter(&mut command, &arguments)
+  } else {
+    crate::compiler::native_cache::configure_apple_link_adapter(&mut command, &arguments)
+  };
   if !instrumented {
     command.args(&arguments);
   }
   crate::compiler::native_cache::remove_private_environment(&mut command);
   if !instrumented {
-    return run_transparently(command, "cargo-rail Apple linker adapter");
+    return run_transparently(command, "cargo-rail linker adapter");
   }
   match command.status() {
     Ok(status) => {
-      if status.success() {
+      if status.success() && !elf {
         let _ = crate::compiler::native_cache::finalize_apple_link_adapter();
       }
       compiler_status_code(status)
     }
     Err(error) => {
-      eprintln!("cargo-rail Apple linker adapter: failed to execute compiler: {error}");
+      eprintln!("cargo-rail linker adapter: failed to execute compiler: {error}");
       1
     }
   }

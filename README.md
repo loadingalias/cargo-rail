@@ -204,8 +204,12 @@ Incremental, clippy, native proc-macro consumer, custom-target-layout, ambiguous
 unsupported invocations bypass before session or CAS acquisition. Existing workspace wrappers are preserved and
 bypassed; conflicting global wrapper ownership makes setup fail.
 
-Transparent reuse is local-only. Existing remote target configuration can be diagnosed, but it does not activate transfer. See
-[Share local compiler reuse across workspaces](docs/cache-sharing.md) for authority, isolation, cleanup, and removal.
+The same one-time setup can persist an AWS S3, Azure Blob Storage, or Cloudflare R2 team authority beneath L1. Ordinary
+Cargo then uses a short-lived private coordinator to reuse credential resolution, the SDK client, and connections
+across rustc processes; it retains no build-result memory cache. Local hits make no remote request, and coordinator,
+remote, integrity, credential, or outage failures compile cold or use the qualified direct fallback. Repository
+configuration cannot select a destination. See [Share compiler reuse across workspaces](docs/cache-sharing.md) for URL,
+trust, read-only, and provider-qualification boundaries.
 
 ### Performance qualification
 

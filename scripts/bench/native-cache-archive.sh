@@ -42,7 +42,11 @@ mkdir -p "$transfer_root"
 rm -f -- "$archive_staging" "$manifest_staging" "$archive" "$manifest"
 trap 'rm -f -- "$archive_staging" "$manifest_staging"' EXIT
 
-tar -cf "$archive_staging" -C "$results_root" "native-cache/$run_id"
+tar -cf "$archive_staging" \
+  --exclude="native-cache/$run_id/state/fixtures" \
+  --exclude="native-cache/$run_id/state/homes" \
+  --exclude="native-cache/$run_id/state/caches" \
+  -C "$results_root" "native-cache/$run_id"
 digest="$(sha256_file "$archive_staging")"
 mv "$archive_staging" "$archive"
 printf '%s  %s\n' "$digest" "$run_id.tar" >"$manifest_staging"

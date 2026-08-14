@@ -526,18 +526,19 @@ fn test_config_validate_with_missing_config_flag_fails() -> Result<()> {
 }
 
 #[test]
-fn test_config_validate_rejects_noncanonical_cache_alias() -> Result<()> {
-  let ws = TestWorkspace::new_named("config-validate-cache-alias")?;
+fn test_config_validate_rejects_removed_repository_cache_authority() -> Result<()> {
+  let ws = TestWorkspace::new_named("config-validate-removed-cache")?;
   ws.add_crate("test-crate", "0.1.0", &[])?;
   ws.commit("Add test crate")?;
-  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nl2 = \"Team/Production\"\n")?;
+  fs::write(ws.path.join(".config/rail.toml"), "[cache]\nl2 = \"team\"\n")?;
 
   let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
   assert_eq!(output.status.code(), Some(2));
   let stdout = String::from_utf8_lossy(&output.stdout);
   assert!(
-    stdout.contains("cache.l2") && stdout.contains("lowercase ASCII letter"),
-    "invalid cache aliases must name the canonical field and recovery rule:\n{stdout}"
+    stdout.contains("[cache] repository configuration is no longer supported")
+      && stdout.contains("CARGO_RAIL_CACHE_REMOTE"),
+    "removed repository cache authority must name the machine-owned recovery rule:\n{stdout}"
   );
   Ok(())
 }
@@ -759,7 +760,10 @@ fn test_config_migrate_applies_explicit_renames_and_removals() -> Result<()> {
   let config_path = ws.path.join(".config").join("rail.toml");
   fs::write(
     &config_path,
-    r#"[workspace]
+    r#"[cache]
+l2 = "team"
+
+[workspace]
 root = "."
 
 [toolchain]
@@ -798,6 +802,8 @@ bot_pr_confidence_profile = "strict"
   assert!(output.status.success(), "config migrate should apply known migrations");
 
   let migrated = fs::read_to_string(&config_path)?;
+  assert!(!migrated.contains("[cache]"));
+  assert!(!migrated.contains("l2 ="));
   assert!(!migrated.contains("compiler_diag_cache"));
   assert!(!migrated.contains("sort_dependencies"));
   assert!(!migrated.contains("prune_dead_features"));

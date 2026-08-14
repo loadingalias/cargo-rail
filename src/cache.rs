@@ -130,14 +130,13 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
   let installation = crate::cache::installation::status(workspace_root)?;
   let transparent_installed = installation.wrapper_path.is_some();
   let remote = if local {
-    let alias = configured_l2_alias(workspace_root)?;
-    crate::remote_cache::configuration_status(workspace_root, alias.as_deref())
+    crate::remote_cache::configuration_status(workspace_root)
       .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
   } else {
     None
   };
   Ok(CacheStatus {
-    schema_version: 9,
+    schema_version: 10,
     installation,
     workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
     local: local
@@ -161,22 +160,6 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
       .transpose()?,
     remote,
   })
-}
-
-fn configured_l2_alias(workspace_root: &Path) -> RailResult<Option<String>> {
-  match crate::config::RailConfig::try_load(workspace_root) {
-    crate::config::ConfigLoadResult::Loaded(config) => {
-      config.cache.validate().map_err(RailError::Config)?;
-      Ok(config.cache.l2.clone())
-    }
-    crate::config::ConfigLoadResult::ParseError { path, message } => {
-      Err(RailError::Config(crate::error::ConfigError::ParseError {
-        path,
-        message,
-      }))
-    }
-    crate::config::ConfigLoadResult::NotFound => Ok(None),
-  }
 }
 
 /// Remove reconstructible cache state inside one workspace.

@@ -137,11 +137,12 @@ Inspect or reclaim explicitly scoped cache state
 Usage: cargo rail cache [OPTIONS] <COMMAND>
 
 Commands:
-  setup   Install or repair transparent verified local compiler reuse
-  status  Report exact bytes, counts, bounds, leases, and ownership scope
-  clean   Reclaim one explicitly selected cache scope
-  remove  Remove only transparent compiler-cache state owned by the setup receipt
-  help    Print this message or the help of the given subcommand(s)
+  setup      Install or repair transparent verified compiler reuse
+  normalize  Validate and normalize one machine-owned remote cache URL without network access
+  status     Report exact bytes, counts, bounds, leases, and ownership scope
+  clean      Reclaim one explicitly selected cache scope
+  remove     Remove only transparent compiler-cache state owned by the setup receipt
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -q, --quiet
@@ -178,7 +179,7 @@ Examples:
 ### cargo rail cache setup
 
 ```
-Install or repair transparent verified local compiler reuse
+Install or repair transparent verified compiler reuse
 
 Usage: cargo rail cache setup [OPTIONS]
 
@@ -195,8 +196,72 @@ Options:
       --max-size <SIZE>
           Positive binary byte size such as 10GiB
 
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --remote <URL>
+          Machine-owned remote cache URL to persist with this installation
+
+      --remote-mode <MODE>
+          Maximum remote authority; explicit selection defaults to read-write
+
+          [possible values: read, read-write]
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --remote-environment <NAME>
+          Additional reviewed compiler environment name admitted to L2 identity
+
+      --local-only
+          Remove persisted remote activation while preserving local reuse
+
   -c, --check
           Preview exact Cargo configuration and private-state changes
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail cache normalize
+
+```
+Validate and normalize one machine-owned remote cache URL without network access
+
+Usage: cargo rail cache normalize [OPTIONS] <URL>
+
+Arguments:
+  <URL>
+          AWS S3, Azure Blob Storage, or Cloudflare R2 URL
+
+Options:
+      --mode <MODE>
+          Maximum authority; explicit selection defaults to read-write
+
+          [possible values: read, read-write]
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --environment <NAME>
+          Additional reviewed compiler environment name admitted to L2 identity
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)

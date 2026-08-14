@@ -12,8 +12,7 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
 
   let capability = crate::compiler::collector::native_cache_capability(ctx.snapshot()?)?;
   let installation = crate::cache::installation::status(ctx.workspace_root())?;
-  let alias = ctx.config().and_then(|config| config.cache.l2.as_deref());
-  let remote = crate::remote_cache::configuration_status(ctx.workspace_root(), alias)
+  let remote = crate::remote_cache::configuration_status(ctx.workspace_root())
     .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?;
   if format.is_json() {
     let payload = serde_json::json!({
@@ -45,10 +44,10 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
   }
   if let Some(remote) = remote {
     println!("  remote activation: {}", remote.activation);
-    println!("  remote alias: {}", remote.alias);
-    println!("  remote transport: {}", remote.transport);
+    println!("  remote provider: {}", remote.provider);
+    println!("  remote protocol: {}", remote.protocol);
     println!("  remote authority: {}", remote.authority);
-    println!("  remote role: {}", remote.role);
+    println!("  remote mode: {}", remote.mode);
   } else {
     println!("  remote: not configured");
   }

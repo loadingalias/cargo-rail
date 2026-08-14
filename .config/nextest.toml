@@ -25,6 +25,21 @@ test-group = 'cargo-subprocess'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
+filter = 'binary(integration) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
+test-group = 'cargo-subprocess'
+priority = 90
+threads-required = "num-test-threads"
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+[[profile.default.overrides]]
+filter = 'binary(integration) & test(=test_cache_installation::setup_owned_remote_is_automatic_coordinated_and_removable)'
+test-group = 'cargo-subprocess'
+# This test owns a bounded loopback server plus two coordinator process trees.
+priority = 80
+threads-required = "num-test-threads"
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+[[profile.default.overrides]]
 filter = 'binary(integration) & test(=test_compiler_observation::source_capture_limit_bypasses_cold_without_creating_authority)'
 leak-timeout = { period = "10s", result = "fail" }
 
@@ -53,6 +68,20 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
 test-group = 'cargo-subprocess'
 # Custom-profile overrides inherit each unset setting from matching default overrides.
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+[[profile.commit.overrides]]
+filter = 'binary(integration) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
+test-group = 'cargo-subprocess'
+priority = 90
+threads-required = "num-test-threads"
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+[[profile.commit.overrides]]
+filter = 'binary(integration) & test(=test_cache_installation::setup_owned_remote_is_automatic_coordinated_and_removable)'
+test-group = 'cargo-subprocess'
+priority = 80
+threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.commit.overrides]]

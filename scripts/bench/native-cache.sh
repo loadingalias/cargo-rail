@@ -68,6 +68,21 @@ sccache_version="$("$sccache_bin" --version)"
   exit 2
 }
 
+benchmark_lock="$repo_root/target/benchmarks/.native-cache.lock"
+mkdir -p "$(dirname "$benchmark_lock")"
+if ! mkdir "$benchmark_lock" 2>/dev/null; then
+  owner="$(cat "$benchmark_lock/pid" 2>/dev/null || true)"
+  echo "native-cache benchmark is already running${owner:+ as PID $owner}: $benchmark_lock" >&2
+  exit 2
+fi
+printf '%s\n' "$$" >"$benchmark_lock/pid"
+
+release_benchmark_lock() {
+  [[ "$(cat "$benchmark_lock/pid" 2>/dev/null || true)" == "$$" ]] || return
+  rm -rf -- "$benchmark_lock"
+}
+trap release_benchmark_lock EXIT
+
 binary="${CARGO_RAIL_BIN:-$repo_root/target/release/cargo-rail}"
 if [[ -z "${CARGO_RAIL_BIN+x}" ]]; then
   cargo build --manifest-path "$repo_root/Cargo.toml" --package cargo-rail --bins --all-features --release --locked
@@ -84,6 +99,23 @@ sha256_file() {
   else
     sha256sum "$1" | awk '{print $1}'
   fi
+}
+
+capture_worktree_patch() {
+  local output="$1"
+  git -C "$repo_root" diff --binary HEAD -- >"$output"
+  while IFS= read -r -d '' untracked; do
+    [[ -f "$repo_root/$untracked" || -L "$repo_root/$untracked" ]] || {
+      echo "native-cache evidence cannot capture non-file untracked input: $untracked" >&2
+      return 1
+    }
+    local status=0
+    git -C "$repo_root" diff --binary --no-index -- /dev/null "$untracked" >>"$output" || status=$?
+    [[ "$status" -eq 1 ]] || {
+      echo "native-cache evidence could not capture untracked input: $untracked" >&2
+      return 1
+    }
+  done < <(git -C "$repo_root" ls-files --others --exclude-standard -z)
 }
 
 if [[ "$operation" != resume ]]; then
@@ -122,6 +154,7 @@ stop_sccache() {
 cleanup() {
   stop_sccache
   rm -rf -- "$sccache_runtime"
+  release_benchmark_lock
 }
 trap cleanup EXIT
 
@@ -181,8 +214,6 @@ for workload in "${workloads[@]}"; do
     if [[ ! -f "$root/Cargo.toml" ]]; then
       "$repo_root/scripts/fixtures/materialize-native-cache.sh" "$root" "$shared_git" >/dev/null
     fi
-    mkdir -p "$root/.config"
-    printf '[cache]\nenabled = true\n' >"$root/.config/rail.toml"
   done
 done
 for lane in "${installed_lanes[@]}"; do
@@ -366,7 +397,7 @@ worktree_status="$identity_directory/worktree-status.txt"
 git -C "$repo_root" status --porcelain=v1 --untracked-files=all >"$worktree_status"
 worktree_status_sha256="$(sha256_file "$worktree_status")"
 worktree_diff="$identity_directory/worktree.diff"
-git -C "$repo_root" diff --binary HEAD -- >"$worktree_diff"
+capture_worktree_patch "$worktree_diff"
 worktree_diff_sha256="$(sha256_file "$worktree_diff")"
 
 if [[ "$operation" == resume ]]; then
@@ -403,7 +434,7 @@ else
     --arg host "$(uname -a)" \
     --arg sccache "$sccache_version" \
     '{
-      schema_version: 10,
+      schema_version: 11,
       generated_at: $generated_at,
       repository_commit: $commit,
       worktree_diff_sha256: $diff_sha256,
@@ -424,7 +455,7 @@ else
     --argjson lanes "$(printf '%s\n' "${lanes[@]}" | jq -Rsc 'split("\n")[:-1]')" \
     --argjson workloads "$(printf '%s\n' "${workloads[@]}" | jq -Rsc 'split("\n")[:-1]')" \
     '{
-      schema_version: 10,
+      schema_version: 11,
       evidence_kind: $evidence_kind,
       required_accepted_samples: $runs,
       workloads: $workloads,
@@ -639,7 +670,7 @@ sample_lane() {
     --argjson usage "$usage" \
     --slurpfile timing "$directory/timing.json" \
     '{
-      schema_version: 10,
+      schema_version: 11,
       sample_id: $sample_id,
       workload: $workload,
       lane: $lane,

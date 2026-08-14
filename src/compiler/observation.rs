@@ -1735,7 +1735,7 @@ impl ParsedArguments {
     if parsed.emit_modes.contains("link")
       && parsed.explicit_link_paths.is_empty()
       && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
-      && let Some(file_name) = implicit_apple_link_output(&parsed.crate_types, crate_name, &parsed.extra_filename)
+      && let Some(file_name) = implicit_native_link_output(&parsed.crate_types, crate_name, &parsed.extra_filename)
     {
       let known_outputs = parsed
         .dep_info_paths
@@ -1797,17 +1797,20 @@ impl ParsedArguments {
   }
 }
 
-fn implicit_apple_link_output(
+fn implicit_native_link_output(
   crate_types: &BTreeSet<String>,
   crate_name: &str,
   extra_filename: &str,
 ) -> Option<String> {
-  if !cfg!(target_os = "macos") || crate_types.len() != 1 {
+  if !cfg!(any(target_os = "macos", target_os = "linux")) || crate_types.len() != 1 {
     return None;
   }
   match crate_types.iter().next().map(String::as_str) {
     Some("bin") => Some(format!("{crate_name}{extra_filename}")),
+    #[cfg(target_os = "macos")]
     Some("proc-macro" | "dylib" | "cdylib") => Some(format!("lib{crate_name}{extra_filename}.dylib")),
+    #[cfg(target_os = "linux")]
+    Some("proc-macro" | "dylib" | "cdylib") => Some(format!("lib{crate_name}{extra_filename}.so")),
     Some("staticlib") => Some(format!("lib{crate_name}{extra_filename}.a")),
     _ => None,
   }
@@ -1904,19 +1907,9 @@ fn parse_dep_info(
   current_dir: &Path,
   source_root: &Path,
 ) -> RailResult<(Vec<FileObservation>, BTreeSet<EnvironmentObservation>)> {
-  let text = fs::read_to_string(path)
-    .map_err(|error| RailError::message(format!("failed to read dep-info '{}': {error}", path.display())))?;
-  let logical = text.replace("\\\r\n", "").replace("\\\n", "");
-  let dependency_line = logical
-    .lines()
-    .find(|line| !line.starts_with('#') && line.contains(": "))
-    .ok_or_else(|| RailError::message(format!("dep-info '{}' has no dependency rule", path.display())))?;
-  let (_, dependencies) = dependency_line
-    .split_once(": ")
-    .ok_or_else(|| RailError::message(format!("dep-info '{}' has an invalid dependency rule", path.display())))?;
+  let (logical, _, dependencies) = makefile_dependency_rule(path, current_dir)?;
   let mut reads = Vec::new();
-  for dependency in makefile_words(dependencies)? {
-    let dependency = resolve_argument_path(&dependency, current_dir);
+  for dependency in dependencies {
     if let Ok(file) = FileObservation::capture(&dependency, current_dir, source_root) {
       reads.push(file);
     } else {
@@ -1951,6 +1944,46 @@ fn parse_dep_info(
     });
   }
   Ok((reads, environment))
+}
+
+/// Parse the first Make dependency rule without assigning cache authority to it.
+///
+/// Rustc dep-info and ELF linker dependency files use the same escaped path
+/// grammar. Callers must still validate the target and capture every returned
+/// path under their own authority boundary.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn makefile_dependency_paths(path: &Path, current_dir: &Path) -> RailResult<(PathBuf, Vec<PathBuf>)> {
+  let (_, target, dependencies) = makefile_dependency_rule(path, current_dir)?;
+  Ok((target, dependencies))
+}
+
+fn makefile_dependency_rule(path: &Path, current_dir: &Path) -> RailResult<(String, PathBuf, Vec<PathBuf>)> {
+  let text = fs::read_to_string(path)
+    .map_err(|error| RailError::message(format!("failed to read dep-info '{}': {error}", path.display())))?;
+  let logical = text.replace("\\\r\n", "").replace("\\\n", "");
+  let dependency_line = logical
+    .lines()
+    .find(|line| !line.starts_with('#') && line.contains(": "))
+    .ok_or_else(|| RailError::message(format!("dep-info '{}' has no dependency rule", path.display())))?;
+  let (target, dependencies) = dependency_line
+    .split_once(": ")
+    .ok_or_else(|| RailError::message(format!("dep-info '{}' has an invalid dependency rule", path.display())))?;
+  let mut targets = makefile_words(target)?.into_iter();
+  let target = targets
+    .next()
+    .ok_or_else(|| RailError::message(format!("dep-info '{}' has no dependency target", path.display())))?;
+  if targets.next().is_some() {
+    return Err(RailError::message(format!(
+      "dep-info '{}' has multiple dependency targets",
+      path.display()
+    )));
+  }
+  let target = resolve_argument_path(&target, current_dir);
+  let dependencies = makefile_words(dependencies)?
+    .into_iter()
+    .map(|dependency| resolve_argument_path(&dependency, current_dir))
+    .collect();
+  Ok((logical, target, dependencies))
 }
 
 fn decode_makefile_value(input: &str) -> RailResult<String> {
@@ -2407,15 +2440,27 @@ mod tests {
     assert!(bypasses.is_empty());
   }
 
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
   #[test]
-  fn native_link_path_inference_matches_apple_rustc_names() {
+  fn native_link_path_inference_matches_platform_rustc_names() {
+    #[cfg(target_os = "macos")]
+    let dynamic_suffix = "dylib";
+    #[cfg(target_os = "linux")]
+    let dynamic_suffix = "so";
     for (crate_type, crate_name, expected) in [
-      ("bin", "build_script_build", "build_script_build-1234"),
-      ("proc-macro", "fixture_macros", "libfixture_macros-1234.dylib"),
-      ("dylib", "fixture_dynamic", "libfixture_dynamic-1234.dylib"),
-      ("cdylib", "fixture_c", "libfixture_c-1234.dylib"),
-      ("staticlib", "fixture_static", "libfixture_static-1234.a"),
+      ("bin", "build_script_build", "build_script_build-1234".to_string()),
+      (
+        "proc-macro",
+        "fixture_macros",
+        format!("libfixture_macros-1234.{dynamic_suffix}"),
+      ),
+      (
+        "dylib",
+        "fixture_dynamic",
+        format!("libfixture_dynamic-1234.{dynamic_suffix}"),
+      ),
+      ("cdylib", "fixture_c", format!("libfixture_c-1234.{dynamic_suffix}")),
+      ("staticlib", "fixture_static", "libfixture_static-1234.a".to_string()),
     ] {
       let mut bypasses = BTreeSet::new();
       let arguments = [
@@ -2600,6 +2645,28 @@ mod tests {
       r"C:\work\fixture root"
     );
     assert_eq!(decode_makefile_value("").expect("decode empty value"), "");
+  }
+
+  #[test]
+  fn makefile_dependency_rule_selects_one_exact_target_and_continued_inputs() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let dep_info = directory.path().join("link.d");
+    fs::write(
+      &dep_info,
+      "target\\ output: first\\ input.o \\\n second.a\n# ignored comment\n",
+    )
+    .expect("dependency file");
+
+    let (target, dependencies) =
+      makefile_dependency_paths(&dep_info, directory.path()).expect("parse make dependency rule");
+    assert_eq!(target, directory.path().join("target output"));
+    assert_eq!(
+      dependencies,
+      [
+        directory.path().join("first input.o"),
+        directory.path().join("second.a")
+      ]
+    );
   }
 
   #[test]
