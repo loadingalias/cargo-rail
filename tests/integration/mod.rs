@@ -25,6 +25,7 @@ mod test_resolution_view;
 mod test_scale_fixture;
 mod test_source_snapshot;
 mod test_split;
+mod test_surface;
 mod test_sync;
 mod test_undeclared_features;
 mod test_unify;

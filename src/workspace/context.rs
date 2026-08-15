@@ -716,12 +716,28 @@ impl WorkspaceContext {
       // Validate change-detection glob patterns
       cfg.change_detection.validate().map_err(RailError::Config)?;
 
+      // Validate source-surface policy before any compiler acquisition.
+      cfg.surface.validate().map_err(RailError::Config)?;
+
       // Validate unify config (e.g., the transitive pinning host path).
       cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
     }
 
-    // Store targets for lazy multi-target metadata loading by unify.
-    let targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
+    // Capture every target required by either workspace-wide analysis or the
+    // surface domain. `host` names the already-captured native/default view.
+    let mut targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
+    if let Some(cfg) = &config {
+      targets.extend(
+        cfg
+          .surface
+          .targets
+          .iter()
+          .filter(|target| target.as_str() != "host")
+          .cloned(),
+      );
+    }
+    targets.sort();
+    targets.dedup();
     let derived_views = Arc::new(DerivedViews::new(
       workspace_root.clone(),
       targets.clone(),
@@ -978,6 +994,14 @@ impl WorkspaceContext {
         "construct it with WorkspaceContext::build_with_snapshot",
       )
     })
+  }
+
+  /// Capture the authoritative post-mutation workspace using the same config
+  /// selection as this command. This boundary is reserved for verification
+  /// after an authorized write invalidates the original snapshot.
+  pub(crate) fn recapture_after_mutation(&self) -> RailResult<Self> {
+    let config_path = self.snapshot()?.rail_config_path().map(Path::to_path_buf);
+    Self::build_with_snapshot_and_config(&self.workspace_root, config_path.as_deref())
   }
 
   /// Return the authoritative snapshot identity when this context owns one.

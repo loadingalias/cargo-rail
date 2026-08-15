@@ -171,6 +171,31 @@ pub enum PlanOutputFormat {
   GitHubDebug,
 }
 
+/// Output format for `cargo rail surface`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum SurfaceOutputFormat {
+  /// Human-readable text output (default)
+  #[default]
+  Text,
+  /// Machine-readable JSON output
+  Json,
+  /// GitHub Actions key/value output
+  #[value(name = "github")]
+  GitHub,
+}
+
+impl SurfaceOutputFormat {
+  /// Check if this format is JSON.
+  pub fn is_json(&self) -> bool {
+    matches!(self, Self::Json)
+  }
+
+  /// Check if this format is structured output.
+  pub fn is_json_like(&self) -> bool {
+    matches!(self, Self::Json | Self::GitHub)
+  }
+}
+
 impl PlanOutputFormat {
   /// Check if this format is JSON.
   pub fn is_json(&self) -> bool {

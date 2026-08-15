@@ -603,6 +603,14 @@ impl RawCompilerInvocation {
   /// (`-C metadata`, artifact paths, and dependency filenames) out of this
   /// unit identity lets an otherwise exact object move between workspace roots.
   pub(crate) fn compiler_fact_invocation_identity(&self) -> RailResult<String> {
+    self.compiler_fact_invocation_identity_with_input(None)
+  }
+
+  /// Bind compiler facts to stdin when rustdoc generates a standalone doctest unit.
+  pub(crate) fn compiler_fact_invocation_identity_with_input(
+    &self,
+    input_identity: Option<&str>,
+  ) -> RailResult<String> {
     let bytes = serde_json::to_vec(&(
       self.version,
       self.mode,
@@ -613,6 +621,7 @@ impl RawCompilerInvocation {
       &self.emit_modes,
       self.test_mode,
       &self.declared_inputs,
+      input_identity,
     ))?;
     Ok(format!(
       "{}{}",
@@ -2990,6 +2999,18 @@ mod tests {
         .expect("changed fact invocation identity"),
       identity
     );
+
+    let first_doctest = moved_root
+      .compiler_fact_invocation_identity_with_input(Some("sha256:first"))
+      .expect("first doctest identity");
+    let equivalent_doctest = moved_root
+      .compiler_fact_invocation_identity_with_input(Some("sha256:first"))
+      .expect("equivalent doctest identity");
+    let second_doctest = moved_root
+      .compiler_fact_invocation_identity_with_input(Some("sha256:second"))
+      .expect("second doctest identity");
+    assert_eq!(first_doctest, equivalent_doctest);
+    assert_ne!(first_doctest, second_doctest);
   }
 
   #[test]

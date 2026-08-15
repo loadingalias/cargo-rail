@@ -44,6 +44,8 @@ pub mod plan;
 pub mod release;
 /// Split crates into standalone repositories
 pub mod split;
+/// Complete Rust declaration reachability and visibility analysis.
+pub mod surface;
 /// Bidirectional sync between monorepo and split repos
 pub mod sync;
 /// Workspace dependency unification commands
@@ -56,7 +58,7 @@ pub use cli::{
   CacheCommand, CacheScope, CargoCli, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand,
   generate_completions,
 };
-pub use common::{ChangeOutputFormat, SplitOutputFormat, TextJsonOutputFormat};
+pub use common::{ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat};
 pub use config::{
   StrictnessMode, run_config_explain, run_config_locate, run_config_migrate, run_config_print,
   run_config_validate_standalone,
@@ -71,6 +73,7 @@ pub use release::{
   run_release_status_standalone,
 };
 pub use split::{run_split, run_split_init};
+pub use surface::{SurfaceOptions, run_surface};
 pub use sync::run_sync;
 pub use unify::{run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_undo};
 
@@ -131,6 +134,11 @@ pub fn try_dispatch_pre_context(
   match cmd {
     Commands::Plan { schema: true, .. } => {
       plan::print_plan_schema();
+      Ok(PreContextDispatch::Handled)
+    }
+
+    Commands::Surface { schema: true, .. } => {
+      surface::print_surface_schema();
       Ok(PreContextDispatch::Handled)
     }
 
@@ -308,6 +316,28 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         output,
         explain,
         confidence_profile,
+      },
+    ),
+
+    Commands::Surface {
+      check,
+      fix,
+      dry_run,
+      backup,
+      format,
+      output,
+      explain,
+      schema: _,
+    } => run_surface(
+      ctx,
+      SurfaceOptions {
+        check,
+        fix,
+        dry_run,
+        backup,
+        format,
+        output,
+        explain,
       },
     ),
 

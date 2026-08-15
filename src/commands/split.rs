@@ -303,6 +303,7 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_r
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
+    surface: crate::config::SurfaceConfig::default(),
     crates: Default::default(),
   });
 

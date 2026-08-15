@@ -4,6 +4,7 @@ mod change_detection;
 mod release;
 pub(crate) mod schema;
 mod split;
+mod surface;
 mod unify;
 
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
@@ -12,6 +13,10 @@ pub use release::{
   Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
 };
 pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
+pub use surface::{
+  SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceExclude, SurfaceLintLevel, SurfaceOverride,
+  SurfaceProduct,
+};
 pub use unify::{
   ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource, TransitiveFeatureHost,
   TransitivePinning, UnifyConfig,
@@ -55,6 +60,9 @@ pub struct RailConfig {
   /// Change detection settings (for planner classification)
   #[serde(default, rename = "change-detection")]
   pub change_detection: ChangeDetectionConfig,
+  /// Rust source-surface analysis policy
+  #[serde(default)]
+  pub surface: SurfaceConfig,
   /// Per-crate configuration (overrides workspace defaults)
   #[serde(default)]
   pub crates: BTreeMap<String, CrateConfig>,

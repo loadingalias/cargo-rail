@@ -9,7 +9,7 @@ use std::process::Command;
 const GOLDEN_PLAN_JSON: &str = include_str!("../fixtures/plan/plan_json.golden");
 const GOLDEN_PLAN_GITHUB: &str = include_str!("../fixtures/plan/plan_github.golden");
 const GOLDEN_PLAN_GITHUB_DEBUG: &str = include_str!("../fixtures/plan/plan_github_debug.golden");
-const PLAN_V6_SCHEMA: &str = include_str!("../../schemas/plan-v6.schema.json");
+const PLAN_V7_SCHEMA: &str = include_str!("../../schemas/plan-v7.schema.json");
 
 #[test]
 fn test_plan_schema_command_matches_published_schema() -> Result<()> {
@@ -20,7 +20,7 @@ fn test_plan_schema_command_matches_published_schema() -> Result<()> {
     output.status.success(),
     "plan --schema should not require workspace metadata"
   );
-  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V6_SCHEMA);
+  assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V7_SCHEMA);
   assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
 
   Ok(())
@@ -35,7 +35,7 @@ fn test_plan_json_validates_against_published_schema() -> Result<()> {
   )?;
   assert!(output.status.success(), "plan json should succeed");
 
-  let schema: Value = serde_json::from_str(PLAN_V6_SCHEMA)?;
+  let schema: Value = serde_json::from_str(PLAN_V7_SCHEMA)?;
   let instance: Value = serde_json::from_slice(&output.stdout)?;
   let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid planner schema: {error}"))?;
   let errors: Vec<_> = validator
@@ -86,7 +86,7 @@ fn test_plan_json_contract_and_impact() -> Result<()> {
   assert_eq!(json["mode"], serde_json::Value::String("inspect".to_string()));
   assert_eq!(json["result"], serde_json::Value::String("success".to_string()));
   assert_eq!(json["exit_code"], serde_json::Value::Number(0.into()));
-  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(6.into()));
+  assert_eq!(json["plan_contract_version"], serde_json::Value::Number(7.into()));
   assert!(json.get("inputs").is_some(), "missing inputs");
   assert_eq!(json["resolution_universe"]["mode"], "declared_dependencies");
   assert!(
@@ -324,7 +324,7 @@ fn test_plan_text_output_is_concise() -> Result<()> {
   assert!(output.status.success(), "plan text should succeed");
 
   let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.contains("surfaces: bench, build, test"));
+  assert!(stdout.contains("surfaces: bench, build, surface, test"));
   assert!(stdout.contains("scope: workspace"));
   assert!(stdout.contains("why:"));
   assert!(!stdout.contains("transitive crates:"));
@@ -1418,7 +1418,7 @@ fn test_plan_output_file_overwrites_existing_content() -> Result<()> {
 
   let content = std::fs::read_to_string(&output_path)?;
   let parsed: Value = serde_json::from_str(&content)?;
-  assert_eq!(parsed["plan_contract_version"], Value::Number(6.into()));
+  assert_eq!(parsed["plan_contract_version"], Value::Number(7.into()));
   assert_eq!(
     content.matches("\"plan_contract_version\"").count(),
     1,
@@ -2332,6 +2332,7 @@ fn test_plan_github_projections() -> Result<()> {
     "bench",
     "docs",
     "infra",
+    "surface",
     "base_ref",
     "cargo_args",
     "scope_json",
@@ -2441,6 +2442,7 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
     "bench",
     "docs",
     "infra",
+    "surface",
     "base_ref",
     "cargo_args",
     "scope_json",
@@ -2491,6 +2493,7 @@ fn normalize_plan_github_debug_output(stdout: &str) -> Result<String> {
     "bench",
     "docs",
     "infra",
+    "surface",
     "base_ref",
     "cargo_args",
     "scope_json",

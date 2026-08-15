@@ -8,6 +8,7 @@ use crate::cargo::unify_types::{
   DependencyProof, IssueSeverity, MemberEdit, UnifyIssue, UnifyIssueKind, UnusedDep, UnusedReason,
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
+use crate::compiler::scheduler::planned_feature_selections;
 use crate::compiler::{
   CompilerCacheIdentity, CompilerCandidate, CompilerDiagnosticsCollector, DependencyEvidenceState, DependencyIdentity,
   FeatureSelection, MemberEvidence,
@@ -73,6 +74,7 @@ impl<'a> UnusedDepFinder<'a> {
 
     for declaration in declarations {
       if let Some(resolved) = declaration.resolved {
+        let required_features = planned_feature_selections(declaration.member);
         for usage in declaration.usages {
           if self.should_skip_usage(usage, &configured_targets, self.target_cfg_sets)
             || (usage.kind == DepKind::Build && self.metadata.package_has_links(&resolved.package_ids))
@@ -105,7 +107,9 @@ impl<'a> UnusedDepFinder<'a> {
             target: usage.target.clone(),
             optional: usage.optional,
           };
-          if member_evidence.dependency_state(&dependency, &required_targets) != DependencyEvidenceState::Unused {
+          if member_evidence.dependency_state_for_features(&dependency, &required_targets, &required_features)
+            != DependencyEvidenceState::Unused
+          {
             continue;
           }
 
@@ -115,7 +119,7 @@ impl<'a> UnusedDepFinder<'a> {
             kind: usage.kind,
             target: usage.target.as_deref().map(Arc::from),
             reason: UnusedReason::NotUsedInSource,
-            proof: compiler_proof(&dependency, member_evidence, &required_targets),
+            proof: compiler_proof(&dependency, member_evidence, &required_targets, &required_features),
           });
         }
         continue;
@@ -486,8 +490,9 @@ fn compiler_proof(
   dependency: &DependencyIdentity,
   evidence: &MemberEvidence,
   required_targets: &[&str],
+  required_features: &[FeatureSelection],
 ) -> DependencyProof {
-  let summary = evidence.dependency_summary(dependency, required_targets);
+  let summary = evidence.dependency_summary_for_features(dependency, required_targets, required_features);
   DependencyProof {
     schema_version: 1,
     package_ids: dependency

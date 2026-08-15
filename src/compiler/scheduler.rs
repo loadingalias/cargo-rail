@@ -375,8 +375,17 @@ fn dependency_domain(kind: DepKind) -> CompilerFactDomain {
   }
 }
 
-fn planned_feature_selections(member: &ParsedManifest) -> Vec<FeatureSelection> {
-  let mut selections = FeatureSelection::BASELINES.to_vec();
+pub(crate) fn planned_feature_selections(member: &ParsedManifest) -> Vec<FeatureSelection> {
+  let has_optional_dependency = member
+    .dependencies
+    .values()
+    .flatten()
+    .any(|dependency| dependency.optional);
+  let mut selections = if member.declared_features.is_empty() && !has_optional_dependency {
+    vec![FeatureSelection::Default]
+  } else {
+    FeatureSelection::BASELINES.to_vec()
+  };
   selections.extend(
     member
       .condition_feature_selections
@@ -576,6 +585,36 @@ mod tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn featureless_packages_have_one_semantic_feature_selection() {
+    let mut app = manifest("app", "app");
+    app.declared_features.clear();
+    app.required_feature_selections.clear();
+    app.condition_feature_selections.clear();
+
+    assert_eq!(planned_feature_selections(&app), vec![FeatureSelection::Default]);
+
+    app
+      .dependencies
+      .entry(crate::cargo::manifest_analyzer::DepKey::new("optional-dep"))
+      .or_default()
+      .push(crate::cargo::manifest_analyzer::DepUsage {
+        unconditional_features: BTreeSet::new(),
+        conditional_features: BTreeSet::new(),
+        default_features: true,
+        kind: DepKind::Normal,
+        target: None,
+        used_by: "app".into(),
+        optional: true,
+        path: None,
+        declared_version: None,
+        manifest_path: None,
+        cargo_toml_key: "optional-dep".into(),
+        referenced_in_features: false,
+      });
+    assert_eq!(planned_feature_selections(&app), FeatureSelection::BASELINES);
   }
 
   #[test]

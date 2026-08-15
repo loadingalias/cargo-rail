@@ -42,10 +42,10 @@ pub const RC_FILE_KIND_CUSTOM: &str = "FILE_KIND_CUSTOM";
 /// Trace code for planner-classified unknown files.
 pub const RC_FILE_KIND_UNCLASSIFIED: &str = "FILE_KIND_UNCLASSIFIED";
 
-const BUILD_TEST_SURFACES: &[&str] = &["build", "test"];
-const TEST_ONLY_SURFACES: &[&str] = &["test"];
-const BENCH_ONLY_SURFACES: &[&str] = &["bench"];
-const INFRA_BUILD_TEST_SURFACES: &[&str] = &["infra", "build", "test"];
+const BUILD_TEST_SURFACE: &[&str] = &["build", "test", "surface"];
+const TEST_SURFACE: &[&str] = &["test", "surface"];
+const BENCH_SURFACE: &[&str] = &["bench", "surface"];
+const INFRA_BUILD_TEST_SURFACE: &[&str] = &["infra", "build", "test", "surface"];
 const INFRA_ONLY_SURFACES: &[&str] = &["infra"];
 const DOCS_ONLY_SURFACES: &[&str] = &["docs"];
 const NO_SURFACES: &[&str] = &[];
@@ -200,12 +200,12 @@ impl FileProfile {
   /// Builtin planner surfaces implied by this profile.
   pub fn default_surfaces(self) -> &'static [&'static str] {
     match self {
-      Self::RustSrc | Self::RustBuildScript | Self::TomlManifest => BUILD_TEST_SURFACES,
-      Self::RustTest => TEST_ONLY_SURFACES,
-      Self::RustBench => BENCH_ONLY_SURFACES,
-      Self::RustExample => TEST_ONLY_SURFACES,
+      Self::RustSrc | Self::RustBuildScript | Self::TomlManifest => BUILD_TEST_SURFACE,
+      Self::RustTest => TEST_SURFACE,
+      Self::RustBench => BENCH_SURFACE,
+      Self::RustExample => TEST_SURFACE,
       Self::TomlWorkspace | Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling | Self::CargoLock => {
-        INFRA_BUILD_TEST_SURFACES
+        INFRA_BUILD_TEST_SURFACE
       }
       Self::Ci | Self::Script => INFRA_ONLY_SURFACES,
       Self::Docs | Self::RepoConfig => DOCS_ONLY_SURFACES,

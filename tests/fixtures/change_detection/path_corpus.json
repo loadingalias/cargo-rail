@@ -29,13 +29,13 @@
     "path": "Cargo.toml",
     "kind": "toml",
     "sub_kind": "workspace",
-    "surfaces": ["infra", "build", "test"]
+    "surfaces": ["infra", "build", "test", "surface"]
   },
   {
     "path": "Cargo.lock",
     "kind": "toml",
     "sub_kind": "lock",
-    "surfaces": ["infra", "build", "test"]
+    "surfaces": ["infra", "build", "test", "surface"]
   },
   {
     "path": "vendor/foreign/Cargo.lock",
@@ -47,19 +47,19 @@
     "path": "crates/lib-a/Cargo.toml",
     "kind": "toml",
     "sub_kind": "manifest",
-    "surfaces": ["build", "test"]
+    "surfaces": ["build", "test", "surface"]
   },
   {
     "path": "rust-toolchain.toml",
     "kind": "toml",
     "sub_kind": "tooling",
-    "surfaces": ["infra", "build", "test"]
+    "surfaces": ["infra", "build", "test", "surface"]
   },
   {
     "path": "crates/lib-a/benches/smoke.rs",
     "kind": "rust",
     "sub_kind": "bench",
-    "surfaces": ["bench"]
+    "surfaces": ["bench", "surface"]
   },
   {
     "path": ".gitignore",

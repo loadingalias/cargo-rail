@@ -11,10 +11,11 @@ use crate::compiler::diagnostics_store::{CompilerDiagnosticsStore, CompilerFactC
 use crate::compiler::driver::{CompilerFactDoctestSysroot, CompilerFactDriverAuthority, PreparedCompilerFactDriver};
 use crate::compiler::fact_store::CompilerFactStore;
 use crate::compiler::facts::{
-  COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, CompilerFactAnnouncement,
-  CompilerFactAnnouncementExpectation, CompilerFactExpectation, CompilerFactRunAuthority, CompilerFactTargetKind,
-  RUN_IDENTITY_PREFIX, ValidatedCompilerFactAnnouncement, ValidatedCompilerFactFragment, ValidatedCompilerFactObject,
-  load_announced_fragment, load_discovered_doctest_fragment, required_compiler_fact_coverage,
+  COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, COMPILER_FACT_PROTOCOL_VERSION,
+  CompilerFactAnnouncement, CompilerFactAnnouncementExpectation, CompilerFactExpectation, CompilerFactRunAuthority,
+  CompilerFactTargetKind, RUN_IDENTITY_PREFIX, ValidatedCompilerFactAnnouncement, ValidatedCompilerFactFragment,
+  ValidatedCompilerFactObject, load_announced_fragment, load_discovered_doctest_fragment,
+  required_compiler_fact_coverage,
 };
 use crate::compiler::invocation::{
   CACHE_WRAPPER_MARKER, INNER_RUSTDOC_ENV, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
@@ -64,10 +65,26 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
 }
 
 /// Independently validated products from one shared set of Cargo acquisitions.
-#[allow(dead_code, reason = "typed facts are consumed by the Task 7 surface analyzer")]
 pub(crate) struct CompilerAnalysisEvidence {
   pub(crate) diagnostics: HashMap<PackageId, MemberEvidence>,
   pub(crate) compiler_facts: Vec<ValidatedCompilerFactObject>,
+  pub(crate) metrics: CompilerAnalysisMetrics,
+}
+
+/// Work performed to acquire one combined compiler-evidence set.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompilerAnalysisMetrics {
+  pub(crate) analysis_views: usize,
+  pub(crate) cargo_views_executed: usize,
+  pub(crate) compiler_invocations: usize,
+  pub(crate) diagnostic_cache_hits: usize,
+  pub(crate) diagnostic_cache_misses: usize,
+  pub(crate) fact_cache_hits: usize,
+  pub(crate) fact_cache_misses: usize,
+  pub(crate) fact_cache_store_failures: usize,
+  pub(crate) fact_cache_bypass_reasons: BTreeMap<String, usize>,
+  pub(crate) fresh_fragment_bytes: u64,
+  pub(crate) retained_fact_object_bytes: u64,
 }
 
 /// Exact snapshot-derived inputs shared by every compiler-evidence key.
@@ -519,7 +536,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
   }
 
   /// Collect diagnostics and typed items through the same normalized Cargo views.
-  #[allow(dead_code, reason = "the surface-analysis consumer is introduced by Task 7")]
   pub(crate) fn collect_with_typed_items(
     &self,
     snapshot: &WorkspaceSnapshot,
@@ -544,11 +560,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       typed_packages,
       doctest_packages,
     )?;
+    let mut metrics = CompilerAnalysisMetrics {
+      analysis_views: schedule.views().len(),
+      ..CompilerAnalysisMetrics::default()
+    };
     let members = schedule.packages().iter().map(String::as_str).collect::<HashSet<_>>();
     if members.is_empty() {
       return Ok(CompilerAnalysisEvidence {
         diagnostics: HashMap::new(),
         compiler_facts: Vec::new(),
+        metrics,
       });
     }
     let typed_snapshot =
@@ -562,6 +583,14 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     let producer_authority = typed_snapshot
       .map(|snapshot| {
         CompilerFactDriverAuthority::producer_authority(snapshot.toolchain(), &self.identity.toolchain_fingerprint)
+      })
+      .transpose()?;
+    let typed_cargo_target = typed_snapshot
+      .map(|_| {
+        tempfile::Builder::new()
+          .prefix("cargo-rail-compiler-target-")
+          .tempdir()
+          .with_context(|| "creating shared compiler-analysis target directory".to_string())
       })
       .transpose()?;
     let mut prepared_driver = None;
@@ -620,6 +649,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             let miss = compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
             if miss.is_none() {
               cache_hit = true;
+              metrics.diagnostic_cache_hits += 1;
               cache_by_member.entry(member.to_string()).or_default().hits += 1;
               update_candidate_survivors(
                 &mut surviving_unused,
@@ -646,6 +676,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           .or(observation_miss)
           .unwrap_or_else(|| store.miss_reason(&key).to_string());
         let summary = cache_by_member.entry(member.to_string()).or_default();
+        metrics.diagnostic_cache_misses += 1;
         summary.misses += 1;
         *summary.miss_reasons.entry(reason).or_default() += 1;
 
@@ -695,6 +726,19 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       let cached_facts = fact_cache_key
         .as_ref()
         .and_then(|key| fact_store.get(key).ok().flatten());
+      if !typed_members.is_empty() {
+        if cached_facts.is_some() {
+          metrics.fact_cache_hits += 1;
+        } else {
+          metrics.fact_cache_misses += 1;
+          if let Some(reason) = self.identity.cache_bypass_reason {
+            *metrics
+              .fact_cache_bypass_reasons
+              .entry(reason.as_str().to_string())
+              .or_default() += 1;
+          }
+        }
+      }
       let collect_typed = !typed_members.is_empty() && cached_facts.is_none();
       if let Some(cached) = cached_facts {
         compiler_facts.extend(cached);
@@ -721,24 +765,35 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       );
       let started = Instant::now();
       if collect_typed && prepared_driver.is_none() {
-        prepared_driver = Some(PreparedCompilerFactDriver::prepare(
-          typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
-          producer_authority
-            .as_ref()
-            .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
-        )?);
+        prepared_driver = Some(
+          PreparedCompilerFactDriver::prepare(
+            typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+            producer_authority
+              .as_ref()
+              .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
+          )
+          .with_context(|| "preparing authenticated compiler fact driver".to_string())?,
+        );
       }
       if collect_typed && view.compiles_doctests() && prepared_doctest_sysroot.is_none() {
-        let wrapper = compiler_observation_wrapper()?;
+        let snapshot = typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?;
+        let wrapper = compiler_observation_wrapper().map_err(|error| {
+          RailError::message(format!("failed to locate the typed-doctest compiler wrapper: {error}"))
+        })?;
+        let rustdoc = crate::executable::resolve_executable_path(
+          snapshot.toolchain().rustdoc_program(),
+          snapshot.cargo_current_dir(),
+        )?;
         prepared_doctest_sysroot = Some(
           prepared_driver
             .as_ref()
             .ok_or_else(|| RailError::message("typed compiler fact driver disappeared before doctest staging"))?
-            .stage_doctest_sysroot(
-              typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
-              &wrapper,
-              Path::new(&self.identity.rustdoc_program),
-            )?,
+            .stage_doctest_sysroot(snapshot, &wrapper, &rustdoc)
+            .map_err(|error| {
+              RailError::message(format!(
+                "failed to stage the private typed-doctest compiler sysroot: {error}"
+              ))
+            })?,
         );
       }
       let typed_context = if collect_typed {
@@ -748,6 +803,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             .as_ref()
             .ok_or_else(|| RailError::message("typed compiler fact driver disappeared"))?,
           doctest_sysroot: prepared_doctest_sysroot.as_ref(),
+          cargo_target: typed_cargo_target
+            .as_ref()
+            .ok_or_else(|| RailError::message("typed compiler target directory disappeared"))?
+            .path(),
           packages: &typed_members,
         })
       } else {
@@ -759,18 +818,50 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         &view,
         &active_members,
         typed_context.as_ref(),
-      )?;
+      )
+      .with_context(|| {
+        format!(
+          "acquiring compiler evidence for target '{} / {}'",
+          view.platform().as_str(),
+          view.features().label()
+        )
+      })?;
+      metrics.cargo_views_executed += 1;
+      metrics.compiler_invocations += run.invocations.len();
       if collect_typed {
+        metrics.fresh_fragment_bytes =
+          run
+            .compiler_facts
+            .iter()
+            .try_fold(metrics.fresh_fragment_bytes, |total, fragment| {
+              total
+                .checked_add(fragment.bytes())
+                .ok_or_else(|| RailError::message("compiler fact fragment byte count overflow"))
+            })?;
         let fresh_facts = std::mem::take(&mut run.compiler_facts)
           .into_iter()
           .map(ValidatedCompilerFactFragment::into_object)
           .collect::<Vec<_>>();
         if run.success
-          && fact_cache_key.is_some()
-          && fact_invocations_are_cacheable(&run.invocations)
           && let Some(key) = &fact_cache_key
         {
-          let _ = fact_store.put(key, &fresh_facts);
+          let bypasses = fact_invocation_cache_bypasses(&run.invocations);
+          let complete_empty_view =
+            fresh_facts.is_empty() && bypasses == BTreeSet::from(["no_typed_compiler_invocation".to_string()]);
+          if bypasses.is_empty() || complete_empty_view {
+            if let Err(error) = fact_store.put(key, &fresh_facts) {
+              metrics.fact_cache_store_failures += 1;
+              progress!("    Compiler fact cache store bypassed: {error}");
+            }
+          } else {
+            for bypass in &bypasses {
+              *metrics.fact_cache_bypass_reasons.entry(bypass.clone()).or_default() += 1;
+            }
+            progress!(
+              "    Compiler fact cache bypassed: {}",
+              bypasses.into_iter().collect::<Vec<_>>().join(", ")
+            );
+          }
         }
         compiler_facts.extend(fresh_facts);
       }
@@ -903,9 +994,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     }
 
     compiler_facts.sort_by(|left, right| left.identity().cmp(right.identity()));
+    compiler_facts.dedup_by(|left, right| left.identity() == right.identity());
+    metrics.retained_fact_object_bytes = compiler_facts.iter().try_fold(0_u64, |total, fact| {
+      total
+        .checked_add(fact.bytes())
+        .ok_or_else(|| RailError::message("compiler fact object byte count overflow"))
+    })?;
     Ok(CompilerAnalysisEvidence {
       diagnostics: result,
       compiler_facts,
+      metrics,
     })
   }
 
@@ -1146,6 +1244,7 @@ struct TypedAcquisitionContext<'a> {
   snapshot: &'a WorkspaceSnapshot,
   driver: &'a PreparedCompilerFactDriver,
   doctest_sysroot: Option<&'a CompilerFactDoctestSysroot>,
+  cargo_target: &'a Path,
   packages: &'a BTreeSet<String>,
 }
 
@@ -1162,7 +1261,12 @@ fn run_workspace_check(
     .prefix("cargo-rail-compiler-observations-")
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
-  let typed_cargo_target = typed.map(|_| observation_directory.path().join("cargo-target"));
+  let workspace_wrapper = if typed.is_some() {
+    stage_view_workspace_wrapper(&wrapper, observation_directory.path())?
+  } else {
+    wrapper.clone()
+  };
+  let typed_cargo_target = typed.map(|typed| typed.cargo_target);
   let doctest_sysroot = if view.compiles_doctests() {
     let typed = typed.ok_or_else(|| RailError::message("compile-only doctest view has no typed compiler authority"))?;
     Some(
@@ -1180,9 +1284,7 @@ fn run_workspace_check(
         view,
         members,
         observation_directory.path(),
-        typed_cargo_target
-          .as_deref()
-          .ok_or_else(|| RailError::message("typed Cargo output authority disappeared"))?,
+        typed_cargo_target.ok_or_else(|| RailError::message("typed Cargo output authority disappeared"))?,
         doctest_sysroot,
       )
     })
@@ -1206,7 +1308,7 @@ fn run_workspace_check(
   );
   command
     .current_dir(workspace_root)
-    .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+    .env("RUSTC_WORKSPACE_WRAPPER", &workspace_wrapper)
     .env(WRAPPER_MARKER, "1")
     .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
     .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
@@ -1218,7 +1320,7 @@ fn run_workspace_check(
   }
   if view.compiles_doctests() {
     command
-      .env("RUSTDOC", &wrapper)
+      .env("RUSTDOC", &workspace_wrapper)
       .env(INNER_RUSTDOC_ENV, &identity.rustdoc_program)
       .env(RUSTDOC_WRAPPER_MARKER, "1");
   }
@@ -1291,6 +1393,20 @@ fn run_workspace_check(
   })
 }
 
+fn stage_view_workspace_wrapper(wrapper: &Path, directory: &Path) -> RailResult<PathBuf> {
+  let staged = directory.join(format!("cargo-rail-compiler-wrapper{}", std::env::consts::EXE_SUFFIX));
+  fs::hard_link(wrapper, &staged)
+    .or_else(|_| fs::copy(wrapper, &staged).map(|_| ()))
+    .with_context(|| {
+      format!(
+        "staging compiler-observation wrapper '{}' as '{}'",
+        wrapper.display(),
+        staged.display()
+      )
+    })?;
+  Ok(staged)
+}
+
 fn cargo_failure_diagnostics(stdout: &[u8]) -> String {
   const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
   let mut diagnostics = String::new();
@@ -1315,18 +1431,25 @@ fn cargo_failure_diagnostics(stdout: &[u8]) -> String {
   diagnostics
 }
 
-fn fact_invocations_are_cacheable(invocations: &[crate::compiler::observation::RawCompilerInvocation]) -> bool {
+fn fact_invocation_cache_bypasses(
+  invocations: &[crate::compiler::observation::RawCompilerInvocation],
+) -> BTreeSet<String> {
   let mut observed = false;
+  let mut bypasses = BTreeSet::new();
   for invocation in invocations
     .iter()
     .filter(|invocation| invocation.compiler_fact_unit.is_some())
   {
     observed = true;
-    if !invocation.success || !invocation.bypasses.is_empty() {
-      return false;
+    if !invocation.success {
+      bypasses.insert("compiler_invocation_failed".to_string());
     }
+    bypasses.extend(invocation.bypasses.iter().cloned());
   }
-  observed
+  if !observed {
+    bypasses.insert("no_typed_compiler_invocation".to_string());
+  }
+  bypasses
 }
 
 fn selected_typed_artifact_count(
@@ -1494,15 +1617,17 @@ fn load_compiler_fact_fragments(
         "typed compiler fact invocation failed before publishing complete facts",
       ));
     }
-    if expected.insert(unit.identity.clone(), unit).is_some() {
+    if let Some(previous) = expected.insert(unit.identity.clone(), unit)
+      && previous != unit
+    {
       return Err(RailError::message(
-        "typed compiler fact acquisition observed a duplicate compilation-unit identity",
+        "typed compiler fact acquisition observed a compilation-unit identity collision",
       ));
     }
   }
-  let authorized_count = expected.len();
   let mut fragments = Vec::with_capacity(expected.len());
   let mut announced_sidecars = BTreeSet::new();
+  let mut announced_units = BTreeMap::<String, (String, String, u64)>::new();
   for line in stdout.lines() {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
       continue;
@@ -1519,8 +1644,25 @@ fn load_compiler_fact_fragments(
       .strip_prefix(COMPILER_FACT_ANNOUNCEMENT_PREFIX)
       .ok_or_else(|| RailError::message("compiler fact announcement has an incompatible message envelope"))?;
     let untrusted: CompilerFactAnnouncement = serde_json::from_str(payload)?;
-    let unit = expected.remove(&untrusted.unit_identity).ok_or_else(|| {
-      RailError::message("compiler fact announcement names an unauthorized or duplicate compilation unit")
+    if untrusted.run_authority != session.run_authority {
+      if untrusted.version == COMPILER_FACT_PROTOCOL_VERSION
+        && untrusted.producer_authority == session.producer_authority
+      {
+        // Cargo replays cached diagnostics when a later view reuses the shared
+        // target directory. The run authority proves this announcement belongs
+        // to an earlier acquisition; its authenticated object was already
+        // consumed by that view and cannot authorize the current one.
+        continue;
+      }
+      return Err(RailError::message(
+        "compiler fact announcement has incompatible replay authority",
+      ));
+    }
+    let unit = expected.get(&untrusted.unit_identity).ok_or_else(|| {
+      RailError::message(format!(
+        "current compiler fact announcement names unauthorized compilation unit '{}'",
+        untrusted.unit_identity
+      ))
     })?;
     validate_compiler_fact_cargo_envelope(&event, unit, session)?;
     let announcement_expectation = CompilerFactAnnouncementExpectation::new(
@@ -1539,6 +1681,19 @@ fn load_compiler_fact_fragments(
       .strip_prefix("sha256:")
       .ok_or_else(|| RailError::message("compiler fact announcement content digest is invalid"))?;
     announced_sidecars.insert(format!("compiler-fact-fragment-sha256-{digest}.json"));
+    let announcement_identity = (
+      announcement.object_identity().to_string(),
+      announcement.content_digest().to_string(),
+      announcement.bytes(),
+    );
+    if let Some(previous) = announced_units.get(&unit.identity) {
+      if previous != &announcement_identity {
+        return Err(RailError::message(
+          "repeated compiler fact announcement names conflicting content for one compilation unit",
+        ));
+      }
+      continue;
+    }
     let fragment_expectation = CompilerFactExpectation::new(
       session.run_authority.clone(),
       session.producer_authority.clone(),
@@ -1550,6 +1705,10 @@ fn load_compiler_fact_fragments(
       &announcement,
       &fragment_expectation,
     )?);
+    announced_units.insert(unit.identity.clone(), announcement_identity);
+  }
+  for unit in announced_units.keys() {
+    expected.remove(unit);
   }
   if expected
     .values()
@@ -1573,7 +1732,6 @@ fn load_compiler_fact_fragments(
       )
     })
     .collect::<BTreeMap<_, _>>();
-  let mut sidecar_count = 0_usize;
   for entry in fs::read_dir(observation_directory)? {
     let entry = entry?;
     let file_name = entry.file_name();
@@ -1582,14 +1740,6 @@ fn load_compiler_fact_fragments(
     };
     if !file_name.starts_with("compiler-fact-fragment-sha256-") {
       continue;
-    }
-    sidecar_count = sidecar_count
-      .checked_add(1)
-      .ok_or_else(|| RailError::message("compiler fact sidecar count overflow"))?;
-    if sidecar_count > authorized_count {
-      return Err(RailError::message(
-        "typed compiler fact acquisition produced more sidecars than authorized units",
-      ));
     }
     if announced_sidecars.contains(file_name) {
       continue;

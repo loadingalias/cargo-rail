@@ -5,7 +5,9 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, TextJsonOutputFormat, UnifyOutputFormat};
+use super::common::{
+  ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
+};
 use crate::sync::ConflictStrategy;
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::Shell;
@@ -86,6 +88,14 @@ Examples:
   cargo rail plan -f json                   # Full machine-readable contract
   cargo rail plan -f github                 # Compact GitHub Actions key=value output
   cargo rail plan -f github-debug           # GitHub Actions output plus plan_json";
+
+const SURFACE_HELP: &str = "\
+Examples:
+  cargo rail surface --check --explain      # Inspect complete Rust reachability
+  cargo rail surface --check -f json        # Emit the versioned machine contract
+  cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
+  cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
+  cargo rail surface --schema               # Print the versioned JSON Schema";
 
 const UNIFY_HELP: &str = "\
 Examples:
@@ -274,6 +284,35 @@ pub enum Commands {
     confidence_profile: Option<String>,
     /// Print the versioned planner JSON Schema and exit
     #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "output", "explain", "confidence_profile"])]
+    schema: bool,
+  },
+
+  /// Analyze complete Rust declaration reachability and visibility
+  #[command(after_long_help = SURFACE_HELP)]
+  Surface {
+    /// Check for enabled findings without modifying source (exit 1 when found)
+    #[arg(long, conflicts_with = "fix")]
+    check: bool,
+    /// Apply exact visibility reductions
+    #[arg(long, conflicts_with = "check")]
+    fix: bool,
+    /// Render the exact mutation plan without writing
+    #[arg(long, requires = "fix", conflicts_with = "backup")]
+    dry_run: bool,
+    /// Create a bounded backup before applying visibility edits
+    #[arg(long, requires = "fix")]
+    backup: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    format: SurfaceOutputFormat,
+    /// Write output to file (overwrites existing content)
+    #[arg(long, short = 'o', value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Show the reason chain for every finding
+    #[arg(long)]
+    explain: bool,
+    /// Print the versioned surface JSON Schema and exit
+    #[arg(long, conflicts_with_all = ["check", "fix", "dry_run", "backup", "output", "explain"])]
     schema: bool,
   },
 
@@ -503,6 +542,7 @@ impl Commands {
       | Self::Unify { .. }
       | Self::Split { .. }
       | Self::Sync { .. }
+      | Self::Surface { schema: false, .. }
       | Self::Release { .. }
       | Self::Change { .. } => true,
       Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
@@ -515,7 +555,7 @@ impl Commands {
   #[doc(hidden)]
   pub fn requires_worktree_source_capture(&self) -> bool {
     match self {
-      Self::Doctor { .. } => false,
+      Self::Doctor { .. } | Self::Surface { .. } => false,
       Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
       Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
       _ => false,
@@ -1057,6 +1097,7 @@ impl Commands {
       },
       Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
       Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
+      Commands::Surface { format, .. } => *format = SurfaceOutputFormat::Json,
       Commands::Unify {
         command: Some(UnifyCommand::Doctor { format }),
         ..

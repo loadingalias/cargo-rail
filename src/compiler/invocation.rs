@@ -7,9 +7,13 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use sha2::{Digest as _, Sha256};
+
+use crate::source::ContentDigest;
 
 /// Process-local control for the outer compiler cache boundary.
 pub(crate) const CACHE_CONTROL_ENV: &str = "CARGO_RAIL_CACHE";
@@ -538,7 +542,7 @@ fn run_rustc() -> i32 {
       return 2;
     }
   };
-  run_rustc_with_session(invocation, inner_wrapper.as_deref(), fact_session)
+  run_rustc_with_session(invocation, inner_wrapper.as_deref(), fact_session, None)
 }
 
 fn run_doctest_builder() -> i32 {
@@ -565,8 +569,43 @@ fn run_doctest_builder() -> i32 {
     eprintln!("cargo-rail doctest compiler: missing typed doctest authority");
     return 2;
   };
+  let input = match capture_doctest_input() {
+    Ok(input) => input,
+    Err(error) => {
+      eprintln!("cargo-rail doctest compiler: failed to capture generated input: {error}");
+      return 2;
+    }
+  };
   let invocation = CompilerInvocation::selected(typed.rustc_program.clone().into(), arguments);
-  run_rustc_with_session(invocation, None, fact_session)
+  run_rustc_with_session(invocation, None, fact_session, Some(input))
+}
+
+struct CapturedDoctestInput {
+  file: fs::File,
+  identity: String,
+}
+
+fn capture_doctest_input() -> crate::error::RailResult<CapturedDoctestInput> {
+  capture_doctest_input_from(std::io::stdin().lock())
+}
+
+fn capture_doctest_input_from(mut source: impl std::io::Read) -> crate::error::RailResult<CapturedDoctestInput> {
+  let mut file = tempfile::tempfile()?;
+  let mut hasher = Sha256::new();
+  let mut buffer = [0_u8; 64 * 1024];
+  loop {
+    let read = source.read(&mut buffer)?;
+    if read == 0 {
+      break;
+    }
+    hasher.update(&buffer[..read]);
+    file.write_all(&buffer[..read])?;
+  }
+  file.seek(std::io::SeekFrom::Start(0))?;
+  Ok(CapturedDoctestInput {
+    file,
+    identity: format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into())),
+  })
 }
 
 fn is_merged_doctest_probe(arguments: &[OsString]) -> bool {
@@ -582,6 +621,7 @@ fn run_rustc_with_session(
   invocation: CompilerInvocation,
   inner_wrapper: Option<&std::ffi::OsStr>,
   fact_session: crate::compiler::session::CompilerFactSession,
+  doctest_input: Option<CapturedDoctestInput>,
 ) -> i32 {
   let mut recorder = match crate::compiler::observation::begin_invocation(
     fact_session.observation_directory(),
@@ -602,6 +642,7 @@ fn run_rustc_with_session(
       fact_session.observation_directory(),
       fact_session.source_root(),
       doctest_builder,
+      doctest_input.as_ref().map(|input| input.identity.as_str()),
     ) {
       Ok(invocation) => invocation,
       Err(error) => {
@@ -637,6 +678,9 @@ fn run_rustc_with_session(
       .or(inner_wrapper),
   );
   command.args(&invocation.arguments);
+  if let Some(input) = doctest_input {
+    command.stdin(Stdio::from(input.file));
+  }
   if std::env::var_os(OBSERVATION_ONLY_ENV).is_none()
     && fact_session
       .fact_families()
@@ -1143,8 +1187,20 @@ fn rustdoc_emit_modes_from_help(help: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
   use std::ffi::OsStr;
+  use std::io::Read as _;
 
   use super::*;
+
+  #[test]
+  fn captured_doctest_input_is_replayable_and_content_bound() {
+    let source = b"fn main() { assert!(true); }\n";
+    let mut captured = capture_doctest_input_from(source.as_slice()).expect("capture doctest stdin");
+    let mut replayed = Vec::new();
+    captured.file.read_to_end(&mut replayed).expect("replay captured stdin");
+
+    assert_eq!(replayed, source);
+    assert_eq!(captured.identity, format!("sha256:{}", ContentDigest::sha256(source)));
+  }
 
   #[test]
   fn compiler_roles_reject_ambiguity_but_allow_cache_then_observation() {

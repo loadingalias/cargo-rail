@@ -41,6 +41,7 @@ pub(crate) mod remote_cache;
 pub mod source;
 /// Crate extraction to standalone repos.
 pub mod split;
+pub(crate) mod surface;
 /// Bidirectional monorepo sync.
 pub mod sync;
 /// Target triple detection.

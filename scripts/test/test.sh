@@ -65,7 +65,7 @@ fi
 
 PLAN_JSON="$("${RAIL_CMD[@]}" plan "${PLAN_ARGS[@]}" -f json)"
 if ! jq -e '
-  .plan_contract_version == 6 and
+  .plan_contract_version == 7 and
   .scope.scope_contract_version == 4 and
   (.surfaces.test.enabled | type == "boolean") and
   (.surfaces.test.scope.cargo_args | type == "array") and

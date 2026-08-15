@@ -21,7 +21,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPOSITORY_ROOT / "tests/compatibility/fixtures/front-door"
 MANIFEST_PATH = REPOSITORY_ROOT / "tests/compatibility/manifest.json"
 PACKAGE = "cargo-rail-compatibility-fixture"
-PLAN_CONTRACT_VERSION = 6
+PLAN_CONTRACT_VERSION = 7
 SCOPE_CONTRACT_VERSION = 4
 SCRUBBED_ENVIRONMENT = (
     "CARGO",

@@ -35,7 +35,7 @@
     "toolchain_fingerprint": "<TOOLCHAIN_FP>",
     "workspace_root": "<WORKSPACE_ROOT>"
   },
-  "plan_contract_version": 6,
+  "plan_contract_version": 7,
   "reproducibility": {
     "cargo_rail_version": "<VERSION>",
     "config_hash": "<CONFIG_HASH>",
@@ -104,6 +104,17 @@
         "mode": "empty"
       }
     },
+    "surface": {
+      "enabled": true,
+      "reasons": [
+        3
+      ],
+      "scope": {
+        "cargo_args": [],
+        "crates": [],
+        "mode": "empty"
+      }
+    },
     "test": {
       "enabled": true,
       "reasons": [
@@ -142,7 +153,8 @@
       "id": 3,
       "selected_surfaces": [
         "build",
-        "test"
+        "test",
+        "surface"
       ]
     },
     {

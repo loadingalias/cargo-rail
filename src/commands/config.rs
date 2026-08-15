@@ -522,6 +522,9 @@ pub fn run_config_validate_standalone(
       if let Err(e) = config.unify.validate(workspace_root) {
         errors.push(ValidationIssue::new("unify", e.to_string()));
       }
+      if let Err(e) = config.surface.validate() {
+        errors.push(ValidationIssue::new("surface", e.to_string()));
+      }
       if let Err(e) = config.release.changelog.filters.validate("release.changelog.filters") {
         errors.push(ValidationIssue::new("release.changelog.filters", e.to_string()));
       }

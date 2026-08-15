@@ -26,10 +26,20 @@ sha256_stream() {
   fi
 }
 
-env RUSTC_BOOTSTRAP=cargo_rail_fact_driver \
-  cargo build --locked --manifest-path "$manifest"
+profile="debug"
+driver_build_arguments=(build --locked --manifest-path "$manifest")
+for argument in "$@"; do
+  if [[ "$argument" == "--release" ]]; then
+    profile="release"
+    driver_build_arguments+=(--release)
+    break
+  fi
+done
 
-driver="$repository_root/tools/compiler-fact-driver/target/debug/cargo-rail-fact-driver"
+env RUSTC_BOOTSTRAP=cargo_rail_fact_driver \
+  cargo "${driver_build_arguments[@]}"
+
+driver="$repository_root/tools/compiler-fact-driver/target/$profile/cargo-rail-fact-driver"
 driver_file="cargo-rail-fact-driver"
 if [[ "${OS:-}" == Windows_NT ]]; then
   driver="$driver.exe"
@@ -56,6 +66,7 @@ if command -v cygpath >/dev/null 2>&1; then
 fi
 compiler_libraries="$(find "$sysroot/lib" "$sysroot/bin" -maxdepth 1 -type f \( \
   -name 'librustc_driver-*.so' -o \
+  -name 'librustc_driver-*.dylib' -o \
   -name 'rustc_driver-*.dll' \
 \) 2>/dev/null || true)"
 if [[ "$(printf '%s\n' "$compiler_libraries" | sed '/^$/d' | wc -l | tr -d ' ')" != 1 ]]; then
@@ -72,8 +83,8 @@ compiler_library_digest="$(sha256_file "$compiler_library")"
 
 # Reproduce release archive topology: the embedded authority selects exactly
 # one authenticated component beside the cargo-rail executable.
-mkdir -p "$repository_root/target/debug"
-staged_driver="$repository_root/target/debug/$driver_file"
+mkdir -p "$repository_root/target/$profile"
+staged_driver="$repository_root/target/$profile/$driver_file"
 cp "$driver" "$staged_driver"
 if [[ "$(sha256_file "$staged_driver")" != "$driver_digest" ]]; then
   echo "staged compiler fact driver does not match its manufactured bytes" >&2

@@ -426,9 +426,6 @@ fn fact_validation_candidate_key(validation: &CompilerFactEvidenceValidationKind
 }
 
 fn validate_fact_references(objects: &[CompilerFactObjectReference]) -> RailResult<()> {
-  if objects.is_empty() {
-    return Err(RailError::message("compiler fact cache set is empty"));
-  }
   let mut previous = None;
   let mut units = BTreeSet::new();
   for reference in objects {

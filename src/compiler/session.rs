@@ -299,6 +299,7 @@ impl CompilerFactTypedSession {
     observation_directory: &Path,
     source_root: &Path,
     doctest_builder: bool,
+    doctest_input_identity: Option<&str>,
   ) -> RailResult<Option<CompilerFactInvocation>> {
     if self.doctest != doctest_builder {
       return Ok(None);
@@ -383,9 +384,17 @@ impl CompilerFactTypedSession {
       .collect::<Vec<_>>();
     features.sort();
     features.dedup();
+    let invocation_identity = if doctest_builder {
+      raw.compiler_fact_invocation_identity_with_input(Some(
+        doctest_input_identity
+          .ok_or_else(|| RailError::message("typed doctest compiler invocation has no captured stdin identity"))?,
+      ))?
+    } else {
+      raw.compiler_fact_invocation_identity()?
+    };
     let unit = CompilerFactUnit {
       identity: String::new(),
-      invocation_identity: raw.compiler_fact_invocation_identity()?,
+      invocation_identity,
       package: target.package.clone(),
       cargo_target: target.cargo_target.clone(),
       crate_name: crate_name.to_string(),

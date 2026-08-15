@@ -1874,6 +1874,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry
     unify: crate::config::UnifyConfig::default(),
     release: crate::config::ReleaseConfig::default(),
     change_detection: crate::config::ChangeDetectionConfig::default(),
+    surface: crate::config::SurfaceConfig::default(),
     crates: Default::default(),
   });
 

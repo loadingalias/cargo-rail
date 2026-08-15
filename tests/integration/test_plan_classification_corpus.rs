@@ -115,7 +115,7 @@ fn test_plan_classification_corpus() -> Result<()> {
       case.path
     );
 
-    for surface in ["build", "test", "bench", "docs", "infra"] {
+    for surface in ["build", "test", "bench", "docs", "infra", "surface"] {
       let expected = case.surfaces.iter().any(|configured| configured == surface);
       assert_eq!(
         json["surfaces"][surface]["enabled"],

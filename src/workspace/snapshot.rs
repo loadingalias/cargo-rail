@@ -541,6 +541,10 @@ impl WorkspaceSnapshot {
     self.rail_config.as_ref()
   }
 
+  pub(crate) fn rail_config_path(&self) -> Option<&Path> {
+    self.rail_config_path.as_deref()
+  }
+
   /// Return the parsed cargo-rail configuration paired with the lossless bytes.
   pub fn config(&self) -> Option<&RailConfig> {
     self.config.as_deref()

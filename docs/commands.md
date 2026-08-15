@@ -33,6 +33,7 @@ Commands:
   doctor       Inspect native compiler-cache capability
   cache        Inspect or reclaim explicitly scoped cache state
   plan         Build a deterministic file-first change plan
+  surface      Analyze complete Rust declaration reachability and visibility
   unify        Unify workspace dependencies (replaces workspace-hack crates)
   init         Initialize configuration (rail.toml)
   split        (Advanced) Split a crate to a standalone repository with git history
@@ -499,6 +500,73 @@ Examples:
   cargo rail plan -f json                   # Full machine-readable contract
   cargo rail plan -f github                 # Compact GitHub Actions key=value output
   cargo rail plan -f github-debug           # GitHub Actions output plus plan_json
+```
+
+---
+
+## cargo rail surface
+
+```
+Analyze complete Rust declaration reachability and visibility
+
+Usage: cargo rail surface [OPTIONS]
+
+Options:
+      --check
+          Check for enabled findings without modifying source (exit 1 when found)
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+      --fix
+          Apply exact visibility reductions
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --dry-run
+          Render the exact mutation plan without writing
+
+      --backup
+          Create a bounded backup before applying visibility edits
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text:   Human-readable text output (default)
+          - json:   Machine-readable JSON output
+          - github: GitHub Actions key/value output
+
+          [default: text]
+
+  -o, --output <PATH>
+          Write output to file (overwrites existing content)
+
+      --explain
+          Show the reason chain for every finding
+
+      --schema
+          Print the versioned surface JSON Schema and exit
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Examples:
+  cargo rail surface --check --explain      # Inspect complete Rust reachability
+  cargo rail surface --check -f json        # Emit the versioned machine contract
+  cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
+  cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
+  cargo rail surface --schema               # Print the versioned JSON Schema
 ```
 
 ---

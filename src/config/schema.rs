@@ -360,6 +360,91 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     "change-detection.confidence_profile",
     "Selects the repository's default planner safety profile.",
   ),
+  policy(
+    "surface.consumer_scope",
+    "Declares whether the workspace is the complete consumer universe for internal source visibility.",
+  ),
+  policy(
+    "surface.targets",
+    "Selects the host and configured target views required for source-surface conclusions.",
+  ),
+  policy(
+    "surface.crate_visibility",
+    "Chooses whether pub(crate) to pub(super) findings are enabled.",
+  ),
+  policy(
+    "surface.preserve_uniform_fields",
+    "Chooses whether visibility repair preserves uniform field visibility within a declaration.",
+  ),
+  policy(
+    "surface.product",
+    "Defines the complete set of shipped production roots.",
+  ),
+  policy(
+    "surface.product.<index>.package",
+    "Selects the exact workspace package that owns a production root.",
+  ),
+  policy(
+    "surface.product.<index>.bin",
+    "Selects one shipped Cargo binary target as a production root.",
+  ),
+  policy(
+    "surface.product.<index>.lib",
+    "Selects one shipped Cargo library target as a public production root.",
+  ),
+  policy(
+    "surface.product.<index>.reason",
+    "Records why the selected target belongs to the complete production root set.",
+  ),
+  policy("surface.override", "Defines item-specific surface diagnostic policy."),
+  policy(
+    "surface.override.<index>.lint",
+    "Selects the exact surface lint to override.",
+  ),
+  policy(
+    "surface.override.<index>.package",
+    "Selects the exact workspace package owning the overridden declaration.",
+  ),
+  policy(
+    "surface.override.<index>.item",
+    "Selects the declaration by its compiler diagnostic path.",
+  ),
+  policy(
+    "surface.override.<index>.kind",
+    "Disambiguates the selected declaration by its exact Rust item kind.",
+  ),
+  policy(
+    "surface.override.<index>.level",
+    "Keeps, suppresses, or expects the selected surface finding.",
+  ),
+  policy(
+    "surface.override.<index>.reason",
+    "Records why the item-specific surface policy exists.",
+  ),
+  policy(
+    "surface.exclude",
+    "Excludes one module or source file from surface diagnostics.",
+  ),
+  policy(
+    "surface.exclude.<index>.package",
+    "Selects the exact workspace package owning the excluded scope.",
+  ),
+  policy(
+    "surface.exclude.<index>.module",
+    "Selects an excluded compiler diagnostic module path.",
+  ),
+  policy(
+    "surface.exclude.<index>.file",
+    "Selects an excluded repository-relative source file.",
+  ),
+  policy(
+    "surface.exclude.<index>.level",
+    "Suppresses or expects findings in the excluded scope.",
+  ),
+  policy(
+    "surface.exclude.<index>.reason",
+    "Records why the excluded source scope exists.",
+  ),
   compatibility(
     "change-detection.conservative_unclassified_owner_fallback",
     "Preserves the old boolean spelling until it is explicitly migrated.",

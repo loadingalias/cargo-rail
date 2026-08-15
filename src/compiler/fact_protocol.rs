@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_CODE: &str = "cargo_rail_compiler_fact_v1";
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_PREFIX: &str = "cargo-rail-compiler-fact-v1:";
 pub(crate) const COMPILER_FACT_INVOCATION_ENV: &str = "CARGO_RAIL_COMPILER_FACT_INVOCATION";
@@ -216,6 +216,7 @@ pub(crate) struct CompilerFactPhysicalIdentity {
 pub(crate) enum CompilerFactVisibility {
   Private,
   Restricted(CompilerItemId),
+  RestrictedCrateRoot,
   Crate,
   Public,
 }

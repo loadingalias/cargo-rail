@@ -14,7 +14,7 @@ pub(crate) use crate::compiler::fact_protocol::*;
 use crate::error::{RailError, RailResult};
 use crate::source::{ContentDigest, RepositoryPath};
 
-pub(crate) const MAX_COMPILER_FACT_FRAGMENT_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_COMPILER_FACT_FRAGMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COMPILER_FACT_ANNOUNCEMENT_BYTES: usize = 4 * 1024;
 const MAX_FACT_ITEMS: usize = 1_000_000;
 const MAX_FACT_EDGES: usize = 8_000_000;
@@ -197,14 +197,28 @@ impl CompilerFactAnnouncement {
     validate_identity(&self.unit_identity, UNIT_IDENTITY_PREFIX, "compilation unit")?;
     validate_identity(&self.object_identity, FRAGMENT_OBJECT_IDENTITY_PREFIX, "object")?;
     validate_sha256(&self.content_digest, "compiler fact announcement content digest")?;
-    if self.bytes == 0
-      || self.bytes > u64::try_from(MAX_COMPILER_FACT_FRAGMENT_BYTES).unwrap_or(u64::MAX)
-      || self.run_authority != expected.run_authority
-      || self.producer_authority != expected.producer_authority
-      || self.unit_identity != expected.unit_identity
-    {
+    if self.bytes == 0 {
+      return Err(RailError::message("compiler fact announcement names an empty fragment"));
+    }
+    if self.bytes > u64::try_from(MAX_COMPILER_FACT_FRAGMENT_BYTES).unwrap_or(u64::MAX) {
+      return Err(RailError::message(format!(
+        "compiler fact announcement names a {}-byte fragment above its {}-byte bound",
+        self.bytes, MAX_COMPILER_FACT_FRAGMENT_BYTES
+      )));
+    }
+    if self.run_authority != expected.run_authority {
       return Err(RailError::message(
-        "compiler fact announcement does not match its authorized run, producer, unit, or byte bound",
+        "compiler fact announcement does not match its authorized run",
+      ));
+    }
+    if self.producer_authority != expected.producer_authority {
+      return Err(RailError::message(
+        "compiler fact announcement does not match its authorized producer",
+      ));
+    }
+    if self.unit_identity != expected.unit_identity {
+      return Err(RailError::message(
+        "compiler fact announcement does not match its authorized compilation unit",
       ));
     }
     Ok(())
@@ -326,6 +340,8 @@ fn read_fragment_sidecar(path: &Path) -> RailResult<Vec<u8>> {
 pub(crate) struct ValidatedCompilerFactFragment {
   fragment: CompilerFactFragment,
   object_identity: String,
+  bytes: u64,
+  object_bytes: u64,
 }
 
 /// Canonical run-independent fact content accepted for exact reuse.
@@ -333,6 +349,7 @@ pub(crate) struct ValidatedCompilerFactFragment {
 pub(crate) struct ValidatedCompilerFactObject {
   object: CompilerFactObject,
   identity: String,
+  bytes: u64,
 }
 
 impl ValidatedCompilerFactFragment {
@@ -349,10 +366,12 @@ impl ValidatedCompilerFactFragment {
     if canonical != bytes {
       return Err(RailError::message("compiler fact fragment is not canonical JSON"));
     }
-    let object_identity = fragment.object.identity()?;
+    let (object_identity, object_bytes) = fragment.object.identity_and_bytes()?;
     Ok(Self {
       fragment,
       object_identity,
+      bytes: bytes.len() as u64,
+      object_bytes,
     })
   }
 
@@ -360,10 +379,15 @@ impl ValidatedCompilerFactFragment {
     &self.object_identity
   }
 
+  pub(crate) const fn bytes(&self) -> u64 {
+    self.bytes
+  }
+
   pub(crate) fn into_object(self) -> ValidatedCompilerFactObject {
     ValidatedCompilerFactObject {
       object: self.fragment.object,
       identity: self.object_identity,
+      bytes: self.object_bytes,
     }
   }
 }
@@ -383,7 +407,11 @@ impl ValidatedCompilerFactObject {
       return Err(RailError::message("compiler fact object is not canonical JSON"));
     }
     let identity = CompilerFactObject::identity_from_bytes(bytes);
-    Ok(Self { object, identity })
+    Ok(Self {
+      object,
+      identity,
+      bytes: bytes.len() as u64,
+    })
   }
 
   pub(crate) fn object(&self) -> &CompilerFactObject {
@@ -392,6 +420,10 @@ impl ValidatedCompilerFactObject {
 
   pub(crate) fn identity(&self) -> &str {
     &self.identity
+  }
+
+  pub(crate) const fn bytes(&self) -> u64 {
+    self.bytes
   }
 }
 
@@ -494,9 +526,9 @@ impl CompilerFactObject {
     Ok(())
   }
 
-  fn identity(&self) -> RailResult<String> {
+  fn identity_and_bytes(&self) -> RailResult<(String, u64)> {
     let bytes = serde_json::to_vec(self)?;
-    Ok(Self::identity_from_bytes(&bytes))
+    Ok((Self::identity_from_bytes(&bytes), bytes.len() as u64))
   }
 
   fn identity_from_bytes(bytes: &[u8]) -> String {
@@ -667,9 +699,14 @@ impl CompilerItemFact {
           || visibility.start < self.physical.span.start
           || visibility.end > self.physical.span.end
         {
-          return Err(RailError::message(
-            "compiler fact visibility span is outside its declaration",
-          ));
+          return Err(RailError::message(format!(
+            "compiler fact visibility span {}..{} is outside declaration {}..{} for '{}'",
+            visibility.start,
+            visibility.end,
+            self.physical.span.start,
+            self.physical.span.end,
+            strings[self.diagnostic_path.0 as usize]
+          )));
         }
       }
     }
@@ -1098,7 +1135,7 @@ mod tests {
         run_authority: fragment.run_authority.clone(),
         producer_authority: fragment.object.producer_authority.clone(),
         unit_identity: fragment.object.unit.identity.clone(),
-        object_identity: fragment.object.identity().expect("object identity"),
+        object_identity: fragment.object.identity_and_bytes().expect("object identity").0,
         content_digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
         bytes: bytes.len() as u64,
       },

@@ -42,6 +42,7 @@ struct RawItem {
   diagnostic_path: String,
   parent: Option<CompilerItemId>,
   written_visibility: CompilerFactVisibility,
+  written_visibility_complete: bool,
   visibility_span: Option<RawSpan>,
   effective_visibility: CompilerFactVisibility,
   macro_provenance: RawMacroProvenance,
@@ -140,6 +141,20 @@ impl<'tcx> Collector<'tcx> {
     entry_points.dedup();
 
     let mut retentions = self.collect_retentions(&definitions, &externally_addressed);
+    retentions.extend(
+      raw_items
+        .iter()
+        .filter(|item| !item.written_visibility_complete)
+        .map(|item| CompilerFactRetention {
+          item: item.id,
+          reason: CompilerFactRetentionReason::IncompleteProvenance,
+        }),
+    );
+    retentions.extend(generated_registration_retentions(
+      &raw_items,
+      &edges,
+      invocation.unit.domain,
+    ));
     retentions.sort();
     retentions.dedup();
 
@@ -299,15 +314,19 @@ impl<'tcx> Collector<'tcx> {
     defined_ids: &HashMap<LocalDefId, CompilerItemId>,
   ) -> Result<RawItem, String> {
     let span = node_span(self.tcx, def_id);
-    let raw_span = self
+    let mut raw_span = self
       .capture_span(span)
       .map_err(|error| format!("{}: {error}", self.tcx.def_path_str(def_id.to_def_id())))?;
     let visibility_span = visibility_span(self.tcx, def_id).filter(|span| span.lo() < span.hi());
-    let written_visibility = if visibility_span.is_some() {
-      fact_visibility(self.tcx, self.tcx.local_visibility(def_id))
-    } else {
-      CompilerFactVisibility::Private
-    };
+    let (written_visibility, written_visibility_complete) = written_visibility(self.tcx, def_id, visibility_span);
+    let raw_visibility_span = visibility_span.map(|span| self.capture_span(span)).transpose()?;
+    if let Some(visibility) = &raw_visibility_span {
+      if visibility.path != raw_span.path {
+        return Err("declaration and written visibility span different source files".to_string());
+      }
+      raw_span.start = raw_span.start.min(visibility.start);
+      raw_span.end = raw_span.end.max(visibility.end);
+    }
     let effective_visibility = self
       .tcx
       .effective_visibilities(())
@@ -350,7 +369,8 @@ impl<'tcx> Collector<'tcx> {
       diagnostic_path,
       parent,
       written_visibility,
-      visibility_span: visibility_span.map(|span| self.capture_span(span)).transpose()?,
+      written_visibility_complete,
+      visibility_span: raw_visibility_span,
       effective_visibility,
       macro_provenance,
     })
@@ -551,6 +571,37 @@ impl<'tcx> Collector<'tcx> {
   }
 }
 
+fn generated_registration_retentions(
+  items: &[RawItem],
+  edges: &[CompilerFactEdge],
+  domain: crate::fact_protocol::CompilerFactDomain,
+) -> Vec<CompilerFactRetention> {
+  if domain != crate::fact_protocol::CompilerFactDomain::NonProduction {
+    return Vec::new();
+  }
+  let by_id = items.iter().map(|item| (item.id, item)).collect::<HashMap<_, _>>();
+  items
+    .iter()
+    .filter(|item| {
+      item.kind == CompilerFactItemKind::Constant
+        && matches!(item.macro_provenance, RawMacroProvenance::Expansion(_))
+        && edges.iter().any(|edge| {
+          edge.source == item.id
+            && edge.kind == CompilerFactEdgeKind::Body
+            && by_id.get(&edge.target).is_some_and(|target| {
+              target.kind == CompilerFactItemKind::Function
+                && matches!(target.macro_provenance, RawMacroProvenance::Written)
+                && target.diagnostic_path == item.diagnostic_path
+            })
+        })
+    })
+    .map(|item| CompilerFactRetention {
+      item: item.id,
+      reason: CompilerFactRetentionReason::GeneratedRegistration,
+    })
+    .collect()
+}
+
 fn fact_span(span: &RawSpan, sources: &BTreeMap<CompilerFactSourcePath, u32>) -> Result<CompilerFactSpan, String> {
   Ok(CompilerFactSpan {
     source: *sources
@@ -678,6 +729,38 @@ fn visibility_span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<rustc_span::Sp
     Node::ImplItem(item) => item.vis_span(),
     Node::Field(field) => Some(field.vis_span),
     _ => None,
+  }
+}
+
+fn written_visibility(
+  tcx: TyCtxt<'_>,
+  def_id: LocalDefId,
+  span: Option<rustc_span::Span>,
+) -> (CompilerFactVisibility, bool) {
+  let Some(span) = span else {
+    return (CompilerFactVisibility::Private, true);
+  };
+  let semantic = fact_visibility(tcx, tcx.local_visibility(def_id));
+  let Some(compact) = tcx.sess.source_map().span_to_snippet(span).ok().map(|source| {
+    source
+      .chars()
+      .filter(|character| !character.is_ascii_whitespace())
+      .collect::<String>()
+  }) else {
+    return (semantic, false);
+  };
+  match compact.as_str() {
+    "pub" if semantic == CompilerFactVisibility::Public => (CompilerFactVisibility::Public, true),
+    "pub(crate)" => (CompilerFactVisibility::Crate, true),
+    visibility if visibility.starts_with("pub(") && visibility.ends_with(')') => match tcx.local_visibility(def_id) {
+      ty::Visibility::Restricted(scope) if scope == CRATE_DEF_ID => (CompilerFactVisibility::RestrictedCrateRoot, true),
+      ty::Visibility::Restricted(scope) => (
+        CompilerFactVisibility::Restricted(item_id(tcx, scope.to_def_id())),
+        true,
+      ),
+      ty::Visibility::Public => (semantic, false),
+    },
+    _ => (semantic, false),
   }
 }
 

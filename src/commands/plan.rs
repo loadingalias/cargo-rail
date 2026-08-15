@@ -261,9 +261,9 @@ const RC_CONFIDENCE_FAST_SKIP_TRANSITIVE: &str = "CONFIDENCE_FAST_SKIP_TRANSITIV
 const RC_SEMANTIC_INPUT_UNCHANGED: &str = "SEMANTIC_INPUT_UNCHANGED";
 const RC_SEMANTIC_INPUT_PACKAGES: &str = "SEMANTIC_INPUT_PACKAGES";
 const RC_SEMANTIC_INPUT_FALLBACK: &str = "SEMANTIC_INPUT_FALLBACK";
-const PLAN_CONTRACT_VERSION: u32 = 6;
+const PLAN_CONTRACT_VERSION: u32 = 7;
 const SCOPE_CONTRACT_VERSION: u32 = 4;
-const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v6.schema.json");
+const PLAN_SCHEMA_JSON: &str = include_str!("../../schemas/plan-v7.schema.json");
 const PACKAGE_SCOPED_SURFACES: &[&str] = &["build", "test", "bench"];
 
 #[derive(Debug, Clone, Copy)]
@@ -1100,7 +1100,7 @@ fn build_surfaces(
   workspace_members: &[String],
 ) -> BTreeMap<String, SurfaceDecision> {
   // Use static slice and map to owned strings
-  static BUILTIN_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra"];
+  static BUILTIN_SURFACES: &[&str] = &["build", "test", "bench", "docs", "infra", "surface"];
   let mut surface_names: Vec<String> = BUILTIN_SURFACES.iter().map(|&s| String::from(s)).collect();
   surface_names.extend(custom_surfaces.iter().cloned());
 
@@ -1170,7 +1170,7 @@ fn record_surface_scope(
 
 fn apply_semantic_surface_policy(change: Option<&SemanticFileChange>, surfaces: &mut Vec<String>) {
   if matches!(change.map(|change| &change.scope), Some(SemanticScope::None)) {
-    surfaces.retain(|surface| !PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()));
+    surfaces.retain(|surface| !PACKAGE_SCOPED_SURFACES.contains(&surface.as_str()) && surface != "surface");
   }
 }
 
@@ -1459,6 +1459,7 @@ fn format_github(output: &PlanOutput, debug: bool) -> RailResult<String> {
   let _ = writeln!(out, "bench={}", surface_enabled(output, "bench"));
   let _ = writeln!(out, "docs={}", surface_enabled(output, "docs"));
   let _ = writeln!(out, "infra={}", surface_enabled(output, "infra"));
+  let _ = writeln!(out, "surface={}", surface_enabled(output, "surface"));
   let _ = writeln!(out, "base_ref={}", output.inputs.refs.resolved_base);
   let _ = writeln!(out, "cargo_args={}", output.scope.cargo_args.join(" "));
   let _ = writeln!(out, "scope_json={}", scope_json);

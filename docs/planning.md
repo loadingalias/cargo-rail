@@ -104,7 +104,7 @@ can propagate impact regardless of default features or the host target.
 
 ## Machine contract
 
-`cargo rail plan -f json` is a versioned API. The current output is planner contract v6 and scope contract v4 inside
+`cargo rail plan -f json` is a versioned API. The current output is planner contract v7 and scope contract v4 inside
 machine envelope v1:
 
 ```bash
@@ -112,7 +112,7 @@ cargo rail plan --schema > plan.schema.json
 cargo rail plan --merge-base -f json > plan.json
 ```
 
-[`schemas/plan-v6.schema.json`](../schemas/plan-v6.schema.json) is the checked-in schema. `plan --schema` runs before
+[`schemas/plan-v7.schema.json`](../schemas/plan-v7.schema.json) is the checked-in schema. `plan --schema` runs before
 workspace context construction, so a consumer can check compatibility without opening a repository.
 
 Compatibility rules:
@@ -135,7 +135,8 @@ authorizes result reuse.
 
 [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) installs Cargo-Rail, runs the
 planner once, validates planner and scope versions, and exports their projections. Action major v6 consumes planner v6
-and scope v4; its `version` input independently selects the Cargo-Rail release.
+and scope v4, so it cannot consume this release's planner v7 contract. Use the direct planner command until an action
+major that declares planner v7 support is available; the action's `version` input independently selects Cargo-Rail.
 
 ```yaml
 - uses: loadingalias/cargo-rail-action@v6

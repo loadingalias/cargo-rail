@@ -75,9 +75,9 @@ impl CompilerFactStore {
     let Some(cas) = &self.cas else {
       return Ok(());
     };
-    if objects.is_empty() || objects.len() > MAX_FACT_OBJECTS_PER_VIEW {
+    if objects.len() > MAX_FACT_OBJECTS_PER_VIEW {
       return Err(RailError::message(
-        "compiler fact cache set is empty or exceeds its object-count bound",
+        "compiler fact cache set exceeds its object-count bound",
       ));
     }
     let mut objects_by_identity = BTreeMap::new();
@@ -181,8 +181,11 @@ fn load_object(
 }
 
 fn set_covers_requested_packages(key: &CompilerFactCacheKey, references: &[CompilerFactObjectReference]) -> bool {
-  if references.is_empty() || references.len() > MAX_FACT_OBJECTS_PER_VIEW {
+  if references.len() > MAX_FACT_OBJECTS_PER_VIEW {
     return false;
+  }
+  if references.is_empty() {
+    return true;
   }
   references
     .iter()
@@ -222,6 +225,18 @@ mod tests {
     let hit = reopened.get(&key).expect("fact lookup").expect("complete hit");
     assert_eq!(hit.len(), 1);
     assert_eq!(hit[0].identity(), identity);
+  }
+
+  #[test]
+  fn empty_fact_set_is_a_complete_reusable_result() {
+    let cache = tempfile::tempdir().expect("cache root");
+    let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+    let store = CompilerFactStore { cas: Some(cas) };
+    let (key, _) = fact_fixture();
+
+    store.put(&key, &[]).expect("publish empty fact set");
+    let hit = store.get(&key).expect("fact lookup").expect("complete empty hit");
+    assert!(hit.is_empty());
   }
 
   #[test]
